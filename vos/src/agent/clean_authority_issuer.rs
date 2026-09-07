@@ -2047,12 +2047,8 @@ mod tests {
     ) -> (AuthorityCredentialCall, ManagementApproval) {
         let credential_key = SigningKey::from_bytes(&[0x29; 32]);
         let credential_public_key = credential_key.verifying_key().to_bytes();
-        let invocation_byte = u8::try_from(authorization_sequence)
-            .ok()
-            .and_then(|value| value.checked_add(0x20))
-            .unwrap();
         let mut call = AuthorityCredentialCall {
-            invocation: crate::agent::sdk::InvocationId([invocation_byte; 32]),
+            invocation: crate::agent::sdk::InvocationId::ZERO,
             authority: crate::agent::sdk::authority::AuthorityActorTarget {
                 space: fixture.space,
                 system_agent: AgentId([0x22; 32]),
@@ -2066,6 +2062,7 @@ mod tests {
             },
             principal: PrincipalId([0x24; 32]),
             credential: crate::agent::sdk::CredentialId::of_public_key(&credential_public_key),
+            request_sequence: NonZeroU64::new(authorization_sequence).unwrap(),
             credential_public_key,
             authenticated_node: Some(crate::agent::sdk::NodeId([0x25; 32])),
             requested_valid_from: 1,
@@ -2073,6 +2070,7 @@ mod tests {
             request,
             signature: [0; 64],
         };
+        call.invocation = call.expected_invocation();
         call.signature = credential_key.sign(&call.signing_bytes()).to_bytes();
         let approval = ManagementApproval::from_call(
             &call,

@@ -1424,7 +1424,7 @@ mod tests {
         }
 
         fn call(&self, discriminator: u64) -> AuthorityOperationCall {
-            self.call_with_invocation(discriminator, InvocationId(id(0x41, discriminator)))
+            self.call_with_invocation(discriminator, InvocationId::ZERO)
         }
 
         fn call_with_invocation(
@@ -1465,6 +1465,7 @@ mod tests {
                 authority: self.authority,
                 principal,
                 credential,
+                request_sequence: core::num::NonZeroU64::new(discriminator).unwrap(),
                 credential_public_key,
                 authenticated_node: Some(node),
                 requested_valid_from: 10,
@@ -1472,6 +1473,9 @@ mod tests {
                 intent: AuthorityOperationIntent::invoke(&work).unwrap(),
                 signature: [0; CREDENTIAL_SIGNATURE_BYTES],
             };
+            if call.invocation == InvocationId::ZERO {
+                call.invocation = call.expected_invocation();
+            }
             call.signature = self.credential_key.sign(&call.signing_bytes()).to_bytes();
             call
         }
@@ -2105,7 +2109,7 @@ mod tests {
                 &mut signer
             ),
             Err(AuthorityOperationCoordinatorError::Rejected(
-                AuthorityOperationCoordinatorRejection::DivergentRetry
+                AuthorityOperationCoordinatorRejection::InvalidCall
             ))
         ));
 
@@ -2164,10 +2168,11 @@ mod tests {
             2,
             AuthorityOperationApproval::derive_acknowledgement_invocation(&first),
         );
+        assert!(collision.validate_shape().is_err());
         assert!(matches!(
             coordinator.coordinate(&collision, fixture.context(&collision, 20), 20, &mut signer),
             Err(AuthorityOperationCoordinatorError::Rejected(
-                AuthorityOperationCoordinatorRejection::InvocationCollision
+                AuthorityOperationCoordinatorRejection::InvalidCall
             ))
         ));
 
@@ -2180,13 +2185,11 @@ mod tests {
             AuthorityOperationApproval::derive_acknowledgement_invocation(&second),
         );
         let mut coordinator = open(coordinator_store, issuer_store, dispatcher, &fixture);
-        coordinator
-            .coordinate(&first, fixture.context(&first, 20), 20, &mut signer)
-            .unwrap();
+        assert!(first.validate_shape().is_err());
         assert!(matches!(
-            coordinator.coordinate(&second, fixture.context(&second, 20), 20, &mut signer),
+            coordinator.coordinate(&first, fixture.context(&first, 20), 20, &mut signer),
             Err(AuthorityOperationCoordinatorError::Rejected(
-                AuthorityOperationCoordinatorRejection::InvocationCollision
+                AuthorityOperationCoordinatorRejection::InvalidCall
             ))
         ));
     }

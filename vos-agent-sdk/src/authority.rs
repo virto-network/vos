@@ -140,6 +140,10 @@ pub struct AuthorityCredentialCall {
     pub managed: ManagedAgentTarget,
     pub principal: PrincipalId,
     pub credential: CredentialId,
+    /// Monotonic sequence in this credential's management-call domain.
+    /// The authority actor accepts exactly the successor of its durable
+    /// per-credential high-water mark.
+    pub request_sequence: NonZeroU64,
     pub credential_public_key: [u8; CREDENTIAL_PUBLIC_KEY_BYTES],
     pub authenticated_node: Option<NodeId>,
     pub requested_valid_from: u64,
@@ -149,6 +153,41 @@ pub struct AuthorityCredentialCall {
 }
 
 impl AuthorityCredentialCall {
+    /// Commitment of every caller-selected field except the derived
+    /// invocation and the signature. Keeping those two outputs out of this
+    /// preimage avoids a circular derivation while still binding the complete
+    /// management request and caller/target tuple.
+    pub fn invocation_payload_commitment(&self) -> Hash {
+        crate::wire::authority_credential_call_invocation_payload_commitment(self)
+    }
+
+    pub fn derive_invocation(
+        credential: CredentialId,
+        request_sequence: NonZeroU64,
+        payload: Hash,
+    ) -> InvocationId {
+        InvocationId(
+            Hash::digest(
+                b"vos/agent/authority-management-invocation/v2",
+                &[
+                    crate::RUNTIME_ABI_ID.as_bytes(),
+                    credential.as_bytes(),
+                    &request_sequence.get().to_le_bytes(),
+                    payload.as_bytes(),
+                ],
+            )
+            .0,
+        )
+    }
+
+    pub fn expected_invocation(&self) -> InvocationId {
+        Self::derive_invocation(
+            self.credential,
+            self.request_sequence,
+            self.invocation_payload_commitment(),
+        )
+    }
+
     /// Bytes verified by the injected Ed25519 implementation.
     pub fn signing_bytes(&self) -> Vec<u8> {
         crate::wire::authority_credential_call_signing_bytes(self)
@@ -183,6 +222,9 @@ impl AuthorityCredentialCall {
         }
         if !mutating_request_matches_targets(&self.authority, &self.managed, &self.request) {
             return Err(AuthorityActorProtocolError::InvalidRequest);
+        }
+        if self.invocation != self.expected_invocation() {
+            return Err(AuthorityActorProtocolError::InvalidTarget);
         }
         if self.signature == [0; CREDENTIAL_SIGNATURE_BYTES] {
             return Err(AuthorityActorProtocolError::InvalidSignature);
@@ -347,6 +389,9 @@ pub struct AuthorityAdminCall {
     pub authority: AuthorityActorTarget,
     pub administrator: PrincipalId,
     pub credential: CredentialId,
+    /// Monotonic sequence in this credential's identity-administration
+    /// domain. It is independent from the global projection generation.
+    pub request_sequence: NonZeroU64,
     pub credential_public_key: [u8; CREDENTIAL_PUBLIC_KEY_BYTES],
     pub authenticated_node: NodeId,
     pub observed_slot: u64,
@@ -356,6 +401,39 @@ pub struct AuthorityAdminCall {
 }
 
 impl AuthorityAdminCall {
+    /// Commitment of every caller-selected field except the derived
+    /// invocation and signature.
+    pub fn invocation_payload_commitment(&self) -> Hash {
+        crate::wire::authority_admin_call_invocation_payload_commitment(self)
+    }
+
+    pub fn derive_invocation(
+        credential: CredentialId,
+        request_sequence: NonZeroU64,
+        payload: Hash,
+    ) -> InvocationId {
+        InvocationId(
+            Hash::digest(
+                b"vos/agent/authority-admin-invocation/v3",
+                &[
+                    crate::RUNTIME_ABI_ID.as_bytes(),
+                    credential.as_bytes(),
+                    &request_sequence.get().to_le_bytes(),
+                    payload.as_bytes(),
+                ],
+            )
+            .0,
+        )
+    }
+
+    pub fn expected_invocation(&self) -> InvocationId {
+        Self::derive_invocation(
+            self.credential,
+            self.request_sequence,
+            self.invocation_payload_commitment(),
+        )
+    }
+
     pub fn signing_bytes(&self) -> Vec<u8> {
         crate::wire::authority_admin_call_signing_bytes(self)
     }
@@ -388,6 +466,9 @@ impl AuthorityAdminCall {
         }
         if !self.operation.validate_shape() || self.next_generation().is_none() {
             return Err(AuthorityActorProtocolError::InvalidRequest);
+        }
+        if self.invocation != self.expected_invocation() {
+            return Err(AuthorityActorProtocolError::InvalidTarget);
         }
         if self.signature == [0; CREDENTIAL_SIGNATURE_BYTES] {
             return Err(AuthorityActorProtocolError::InvalidSignature);
@@ -634,7 +715,7 @@ impl ManagementApproval {
 /// Authorization and acknowledgement are distinct actor invocations. Reusing
 /// the authorization invocation identifier for a different acknowledgement
 /// message would violate the runtime's exact-retry contract, so both IDs are
-/// explicit and must differ. The actor retains the ACC1 and MAP1 preimages;
+/// explicit and must differ. The actor retains the ACC2 and MAP1 preimages;
 /// this bounded message carries their commitments rather than embedding them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManagementApplicationAck {
@@ -745,7 +826,7 @@ impl ManagementApplicationAck {
             && self.approval == approval.commitment()
             && self.authorization_sequence == approval.authorization_sequence
             && self.request == approval.request_commitment
-            && management_application_reply_matches(call, &self.application)
+            && management_application_reply_shape_matches(call, &self.application)
             && receipt_matches_approval(&self.receipt, approval)
     }
 
@@ -764,7 +845,13 @@ impl ManagementApplicationAck {
     }
 }
 
-fn management_application_reply_matches(
+/// Match application facts using only fields present in ACC2. Every variant is
+/// exact against the call except `ReplicasChanged`: its generation also binds
+/// the Agent creation nonce, which ACC2 intentionally does not duplicate. The
+/// authority actor must compare that value with its projected replica
+/// transition before accepting MAA2; this SDK boundary only rejects zero or a
+/// reply of the wrong variant.
+fn management_application_reply_shape_matches(
     call: &AuthorityCredentialCall,
     application: &ManagementReply,
 ) -> bool {
@@ -1203,11 +1290,12 @@ mod tests {
     fn credential_call(request: ManagementRequest) -> AuthorityCredentialCall {
         let public_key = [33; CREDENTIAL_PUBLIC_KEY_BYTES];
         let mut call = AuthorityCredentialCall {
-            invocation: InvocationId([34; 32]),
+            invocation: InvocationId::ZERO,
             authority: authority_target(),
             managed: managed_target(),
             principal: PrincipalId([35; 32]),
             credential: CredentialId::of_public_key(&public_key),
+            request_sequence: NonZeroU64::new(1).unwrap(),
             credential_public_key: public_key,
             authenticated_node: Some(NodeId([36; 32])),
             requested_valid_from: 100,
@@ -1215,21 +1303,24 @@ mod tests {
             request,
             signature: [1; CREDENTIAL_SIGNATURE_BYTES],
         };
+        call.invocation = call.expected_invocation();
         call.signature = test_signature(&public_key, &call.signing_bytes());
         call
     }
 
     fn resign(call: &mut AuthorityCredentialCall) {
+        call.invocation = call.expected_invocation();
         call.signature = test_signature(&call.credential_public_key, &call.signing_bytes());
     }
 
     fn admin_call() -> AuthorityAdminCall {
         let public_key = [45; CREDENTIAL_PUBLIC_KEY_BYTES];
         let mut call = AuthorityAdminCall {
-            invocation: InvocationId([46; 32]),
+            invocation: InvocationId::ZERO,
             authority: authority_target(),
             administrator: PrincipalId([47; 32]),
             credential: CredentialId::of_public_key(&public_key),
+            request_sequence: NonZeroU64::new(1).unwrap(),
             credential_public_key: public_key,
             authenticated_node: NodeId([48; 32]),
             observed_slot: 101,
@@ -1243,6 +1334,7 @@ mod tests {
             },
             signature: [1; CREDENTIAL_SIGNATURE_BYTES],
         };
+        call.invocation = call.expected_invocation();
         call.signature = test_signature(&public_key, &call.signing_bytes());
         call
     }

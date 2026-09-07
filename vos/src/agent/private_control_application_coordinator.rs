@@ -1850,10 +1850,11 @@ mod tests {
             let principal = PrincipalId(id(0x22, 1));
             let credential = CredentialId::of_public_key(&public_key);
             let mut call = AuthorityOperationCall {
-                invocation: InvocationId(id(0x31, discriminator)),
+                invocation: InvocationId::ZERO,
                 authority: self.authority,
                 principal,
                 credential,
+                request_sequence: core::num::NonZeroU64::new(discriminator).unwrap(),
                 credential_public_key: public_key,
                 authenticated_node: Some(NodeId(id(0x23, 1))),
                 requested_valid_from: 10,
@@ -1865,6 +1866,7 @@ mod tests {
                 .unwrap(),
                 signature: [0; CREDENTIAL_SIGNATURE_BYTES],
             };
+            call.invocation = call.expected_invocation();
             call.signature = self.credential_key.sign(&call.signing_bytes()).to_bytes();
             let approval = AuthorityOperationApproval::from_call(
                 &call,

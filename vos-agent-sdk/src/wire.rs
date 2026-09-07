@@ -910,6 +910,13 @@ fn encode_authority_credential_call_unsigned(
     value: &AuthorityCredentialCall,
 ) {
     encoder.fixed(value.invocation.as_bytes());
+    encode_authority_credential_call_invocation_payload(encoder, value);
+}
+
+fn encode_authority_credential_call_invocation_payload(
+    encoder: &mut Encoder<'_>,
+    value: &AuthorityCredentialCall,
+) {
     encode_authority_actor_target(encoder, value.authority);
     encode_managed_agent_target(encoder, value.managed);
     encode_credential_caller(
@@ -919,14 +926,28 @@ fn encode_authority_credential_call_unsigned(
         &value.credential_public_key,
         value.authenticated_node,
     );
+    encoder.u64(value.request_sequence.get());
     encoder.u64(value.requested_valid_from);
     encoder.u64(value.requested_expires_at);
     encoder.bytes(&encode_canonical_management_request(&value.request));
 }
 
+pub(crate) fn authority_credential_call_invocation_payload_commitment(
+    value: &AuthorityCredentialCall,
+) -> Hash {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"ACP2");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_authority_credential_call_invocation_payload(&mut Encoder(&mut bytes), value);
+    Hash::digest(
+        b"vos/agent/authority-management-invocation-payload/v2",
+        &[&bytes],
+    )
+}
+
 pub(crate) fn authority_credential_call_signing_bytes(value: &AuthorityCredentialCall) -> Vec<u8> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"ACS1");
+    bytes.extend_from_slice(b"AC2S");
     bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
     encode_authority_credential_call_unsigned(&mut Encoder(&mut bytes), value);
     bytes
@@ -941,7 +962,7 @@ pub(crate) fn authority_credential_call_encoded_len(value: &AuthorityCredentialC
 }
 
 impl CanonicalWire for AuthorityCredentialCall {
-    const MAGIC: [u8; 4] = *b"ACC1";
+    const MAGIC: [u8; 4] = *b"ACC2";
     const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES;
 
     fn validate_wire(&self) -> bool {
@@ -959,6 +980,8 @@ impl CanonicalWire for AuthorityCredentialCall {
         let managed = decode_managed_agent_target(decoder)?;
         let (principal, credential, credential_public_key, authenticated_node) =
             decode_credential_caller(decoder)?;
+        let request_sequence =
+            core::num::NonZeroU64::new(decoder.u64()?).ok_or(DecodeError::NonCanonical)?;
         let requested_valid_from = decoder.u64()?;
         let requested_expires_at = decoder.u64()?;
         let request = decode_canonical_management_request(
@@ -974,6 +997,7 @@ impl CanonicalWire for AuthorityCredentialCall {
             managed,
             principal,
             credential,
+            request_sequence,
             credential_public_key,
             authenticated_node,
             requested_valid_from,
@@ -1115,9 +1139,17 @@ pub(crate) fn authority_admin_operation_commitment(value: &AuthorityAdminOperati
 
 fn encode_authority_admin_call_unsigned(encoder: &mut Encoder<'_>, value: &AuthorityAdminCall) {
     encoder.fixed(value.invocation.as_bytes());
+    encode_authority_admin_call_invocation_payload(encoder, value);
+}
+
+fn encode_authority_admin_call_invocation_payload(
+    encoder: &mut Encoder<'_>,
+    value: &AuthorityAdminCall,
+) {
     encode_authority_actor_target(encoder, value.authority);
     encoder.fixed(value.administrator.as_bytes());
     encoder.fixed(value.credential.as_bytes());
+    encoder.u64(value.request_sequence.get());
     encoder.0.extend_from_slice(&value.credential_public_key);
     encoder.fixed(value.authenticated_node.as_bytes());
     encoder.u64(value.observed_slot);
@@ -1125,9 +1157,22 @@ fn encode_authority_admin_call_unsigned(encoder: &mut Encoder<'_>, value: &Autho
     encode_authority_admin_operation(encoder, &value.operation);
 }
 
+pub(crate) fn authority_admin_call_invocation_payload_commitment(
+    value: &AuthorityAdminCall,
+) -> Hash {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"AIP3");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_authority_admin_call_invocation_payload(&mut Encoder(&mut bytes), value);
+    Hash::digest(
+        b"vos/agent/authority-admin-invocation-payload/v3",
+        &[&bytes],
+    )
+}
+
 pub(crate) fn authority_admin_call_signing_bytes(value: &AuthorityAdminCall) -> Vec<u8> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"AA2S");
+    bytes.extend_from_slice(b"AA3S");
     bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
     encode_authority_admin_call_unsigned(&mut Encoder(&mut bytes), value);
     bytes
@@ -1154,6 +1199,8 @@ fn decode_authority_admin_call_body(
         authority: decode_authority_actor_target(decoder)?,
         administrator: PrincipalId(decoder.fixed()?),
         credential: CredentialId(decoder.fixed()?),
+        request_sequence: core::num::NonZeroU64::new(decoder.u64()?)
+            .ok_or(DecodeError::NonCanonical)?,
         credential_public_key: decoder
             .take(CREDENTIAL_PUBLIC_KEY_BYTES)?
             .try_into()
@@ -1176,7 +1223,7 @@ fn decode_authority_admin_call_body(
 }
 
 impl CanonicalWire for AuthorityAdminCall {
-    const MAGIC: [u8; 4] = *b"AAD2";
+    const MAGIC: [u8; 4] = *b"AAD3";
     const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_ADMIN_CALL_WIRE_BYTES;
 
     fn validate_wire(&self) -> bool {
@@ -1205,14 +1252,14 @@ pub(crate) fn authority_admin_result_encoded_len(value: &AuthorityAdminResult) -
 
 pub(crate) fn authority_admin_result_commitment(value: &AuthorityAdminResult) -> Hash {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"AAR2");
+    bytes.extend_from_slice(b"AAR3");
     bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
     encode_authority_admin_result_body(&mut Encoder(&mut bytes), value);
-    Hash::digest(b"vos/agent/authority-admin-result/v2", &[&bytes])
+    Hash::digest(b"vos/agent/authority-admin-result/v3", &[&bytes])
 }
 
 impl CanonicalWire for AuthorityAdminResult {
-    const MAGIC: [u8; 4] = *b"AAR2";
+    const MAGIC: [u8; 4] = *b"AAR3";
     const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_ADMIN_RESULT_WIRE_BYTES;
 
     fn validate_wire(&self) -> bool {
@@ -3275,10 +3322,10 @@ pub(crate) fn encode_private_node(encoder: &mut Encoder<'_>, value: &PrivateNode
     encoder.0.extend_from_slice(&value.transport_signature);
 }
 
-/// Commitment carried by an AOC1 Private Invite for one exact enrolled
+/// Commitment carried by an AOC3 Private Invite for one exact enrolled
 /// transport/encryption identity.
 ///
-/// This public computation lets an authority guest compare the compact AOC1
+/// This public computation lets an authority guest compare the compact AOC3
 /// field with its verified NEN1 row without trusting a caller-supplied second
 /// encoding of the identity.
 pub fn authority_private_node_identity_commitment(value: &PrivateNodeIdentity) -> Hash {
@@ -3816,12 +3863,13 @@ mod tests {
 
     fn authority_credential_call() -> AuthorityCredentialCall {
         let credential_public_key = [0x2b; CREDENTIAL_PUBLIC_KEY_BYTES];
-        AuthorityCredentialCall {
-            invocation: InvocationId([0x2c; 32]),
+        let mut call = AuthorityCredentialCall {
+            invocation: InvocationId::ZERO,
             authority: authority_actor_target(),
             managed: managed_agent_target(),
             principal: PrincipalId([0x2d; 32]),
             credential: CredentialId::of_public_key(&credential_public_key),
+            request_sequence: core::num::NonZeroU64::new(1).unwrap(),
             credential_public_key,
             authenticated_node: Some(NodeId([0x2e; 32])),
             requested_valid_from: 47,
@@ -3831,7 +3879,9 @@ mod tests {
                 expected_deployment: DeploymentId([0x31; 32]),
             },
             signature: [0x32; CREDENTIAL_SIGNATURE_BYTES],
-        }
+        };
+        call.invocation = call.expected_invocation();
+        call
     }
 
     fn management_approval() -> ManagementApproval {
@@ -3904,11 +3954,12 @@ mod tests {
 
     fn authority_admin_call() -> AuthorityAdminCall {
         let credential_public_key = [0x61; CREDENTIAL_PUBLIC_KEY_BYTES];
-        AuthorityAdminCall {
-            invocation: InvocationId([0x62; 32]),
+        let mut call = AuthorityAdminCall {
+            invocation: InvocationId::ZERO,
             authority: authority_actor_target(),
             administrator: PrincipalId([0x63; 32]),
             credential: CredentialId::of_public_key(&credential_public_key),
+            request_sequence: core::num::NonZeroU64::new(1).unwrap(),
             credential_public_key,
             authenticated_node: NodeId([0x64; 32]),
             observed_slot: 65,
@@ -3921,21 +3972,23 @@ mod tests {
                 ),
             },
             signature: [0x68; CREDENTIAL_SIGNATURE_BYTES],
-        }
+        };
+        call.invocation = call.expected_invocation();
+        call
     }
 
     #[test]
     fn authority_actor_protocol_has_bounded_distinct_golden_wires() {
         let call = authority_credential_call();
         let call_bytes = call.encode().unwrap();
-        assert_eq!(call_bytes.get(..4), Some(b"ACC1".as_slice()));
+        assert_eq!(call_bytes.get(..4), Some(b"ACC2".as_slice()));
         assert!(call_bytes.len() <= MAX_INVOCATION_MESSAGE_BYTES);
         assert_eq!(AuthorityCredentialCall::decode(&call_bytes), Ok(call));
         assert_eq!(
-            Hash::digest(b"vos/test/acc1-golden", &[&call_bytes]).0,
+            Hash::digest(b"vos/test/acc2-golden", &[&call_bytes]).0,
             [
-                0, 129, 102, 136, 52, 35, 157, 157, 121, 2, 170, 164, 20, 232, 121, 95, 7, 234, 7,
-                98, 121, 234, 33, 120, 221, 0, 119, 45, 171, 76, 92, 231,
+                49, 58, 30, 82, 238, 124, 228, 48, 36, 124, 112, 178, 33, 113, 95, 191, 162, 206,
+                252, 116, 106, 55, 199, 194, 92, 218, 155, 114, 113, 122, 116, 103,
             ]
         );
 
@@ -3947,8 +4000,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/map1-golden", &[&approval_bytes]).0,
             [
-                234, 232, 236, 192, 5, 113, 255, 62, 13, 132, 77, 70, 87, 165, 209, 140, 126, 14,
-                152, 82, 191, 255, 134, 217, 184, 33, 38, 70, 129, 121, 219, 221,
+                173, 222, 97, 3, 219, 249, 213, 24, 126, 98, 166, 85, 228, 142, 207, 209, 219, 95,
+                239, 180, 200, 30, 143, 129, 239, 159, 95, 61, 247, 90, 36, 72,
             ]
         );
 
@@ -3963,8 +4016,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/maa2-golden", &[&acknowledgement_bytes]).0,
             [
-                75, 120, 138, 76, 173, 29, 115, 44, 75, 8, 137, 177, 72, 124, 130, 44, 137, 137,
-                126, 244, 162, 67, 209, 253, 125, 111, 12, 97, 229, 197, 142, 224,
+                224, 219, 196, 98, 23, 178, 77, 101, 122, 160, 127, 87, 153, 88, 128, 21, 166, 158,
+                153, 184, 73, 116, 80, 169, 231, 144, 73, 62, 223, 94, 33, 98,
             ]
         );
     }
@@ -3973,30 +4026,30 @@ mod tests {
     fn authority_admin_call_and_result_are_exact_bounded_clean_wires() {
         let call = authority_admin_call();
         let bytes = call.encode().unwrap();
-        assert_eq!(bytes.get(..4), Some(b"AAD2".as_slice()));
+        assert_eq!(bytes.get(..4), Some(b"AAD3".as_slice()));
         assert!(bytes.len() <= MAX_AUTHORITY_ADMIN_CALL_WIRE_BYTES);
         assert_eq!(AuthorityAdminCall::decode(&bytes), Ok(call.clone()));
         assert_eq!(
-            Hash::digest(b"vos/test/aad2-golden", &[&bytes]).0,
+            Hash::digest(b"vos/test/aad3-golden", &[&bytes]).0,
             [
-                15, 102, 177, 154, 123, 213, 113, 83, 196, 171, 213, 250, 170, 107, 110, 185, 5,
-                44, 29, 248, 196, 214, 130, 163, 207, 204, 105, 163, 158, 21, 87, 255,
+                70, 84, 9, 35, 42, 97, 13, 92, 252, 206, 61, 219, 253, 59, 2, 184, 142, 218, 150,
+                142, 205, 0, 54, 130, 5, 85, 215, 146, 28, 24, 170, 70,
             ]
         );
 
         let result = AuthorityAdminResult::from_call(call.clone()).unwrap();
         let result_bytes = result.encode().unwrap();
-        assert_eq!(result_bytes.get(..4), Some(b"AAR2".as_slice()));
+        assert_eq!(result_bytes.get(..4), Some(b"AAR3".as_slice()));
         assert!(result_bytes.len() <= MAX_AUTHORITY_ADMIN_RESULT_WIRE_BYTES);
         assert_eq!(
             AuthorityAdminResult::decode(&result_bytes),
             Ok(result.clone())
         );
         assert_eq!(
-            Hash::digest(b"vos/test/aar2-golden", &[&result_bytes]).0,
+            Hash::digest(b"vos/test/aar3-golden", &[&result_bytes]).0,
             [
-                81, 197, 104, 54, 223, 138, 161, 87, 2, 136, 118, 99, 156, 96, 210, 204, 4, 77, 88,
-                177, 204, 146, 170, 50, 162, 235, 164, 1, 216, 48, 184, 206,
+                246, 222, 29, 40, 33, 13, 77, 249, 65, 66, 150, 108, 234, 114, 27, 181, 128, 24,
+                71, 188, 185, 182, 55, 96, 122, 184, 50, 37, 82, 237, 0, 35,
             ]
         );
         assert_ne!(call.commitment(), result.commitment());
@@ -4020,18 +4073,19 @@ mod tests {
         trailing.push(0);
         assert!(AuthorityAdminCall::decode(&trailing).is_err());
         let mut previous_generation = bytes.clone();
-        previous_generation[..4].copy_from_slice(b"AAD1");
+        previous_generation[..4].copy_from_slice(b"AAD2");
         assert!(AuthorityAdminCall::decode(&previous_generation).is_err());
         let mut previous_result_generation = result_bytes;
-        previous_result_generation[..4].copy_from_slice(b"AAR1");
+        previous_result_generation[..4].copy_from_slice(b"AAR2");
         assert!(AuthorityAdminResult::decode(&previous_result_generation).is_err());
         let mut prior_abi = bytes;
         prior_abi[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r9");
         assert!(AuthorityAdminCall::decode(&prior_abi).is_err());
         let mut unknown_operation = call.encode().unwrap();
         // Header + invocation + full AuthorityActorTarget + caller tuple,
-        // observed slot, and expected generation precede the operation tag.
-        let operation_tag = 36 + 32 + 328 + 32 + 32 + 32 + 32 + 8 + 8;
+        // request sequence, observed slot, and expected generation precede
+        // the operation tag.
+        let operation_tag = 36 + 32 + 328 + 32 + 32 + 8 + 32 + 32 + 8 + 8;
         unknown_operation[operation_tag] = 0xff;
         assert!(AuthorityAdminCall::decode(&unknown_operation).is_err());
     }
@@ -4041,12 +4095,15 @@ mod tests {
         let call = authority_credential_call();
         let signing = call.signing_bytes();
         let commitment = call.commitment();
-        assert_eq!(signing.get(..4), Some(b"ACS1".as_slice()));
+        assert_eq!(signing.get(..4), Some(b"AC2S".as_slice()));
+
+        let mut forced_invocation = call.clone();
+        forced_invocation.invocation = InvocationId([0x40; 32]);
+        assert!(forced_invocation.validate_shape().is_err());
+        assert_ne!(forced_invocation.signing_bytes(), signing);
+        assert_ne!(forced_invocation.commitment(), commitment);
 
         let mut variants = Vec::new();
-        let mut value = call.clone();
-        value.invocation = InvocationId([0x40; 32]);
-        variants.push(value);
         let mut value = call.clone();
         value.authority.space = SpaceId([0x41; 32]);
         value.managed.space = value.authority.space;
@@ -4114,7 +4171,8 @@ mod tests {
         };
         variants.push(value);
 
-        for variant in variants {
+        for mut variant in variants {
+            variant.invocation = variant.expected_invocation();
             assert_eq!(variant.validate_shape(), Ok(()));
             assert_ne!(variant.signing_bytes(), signing);
             assert_ne!(variant.commitment(), commitment);
@@ -4168,6 +4226,9 @@ mod tests {
     fn authority_actor_protocol_rejects_old_corrupt_and_ambiguous_wires() {
         let call = authority_credential_call();
         let encoded = call.encode().unwrap();
+        let mut old_generation = encoded.clone();
+        old_generation[..4].copy_from_slice(b"ACC1");
+        assert!(AuthorityCredentialCall::decode(&old_generation).is_err());
         let mut old = encoded.clone();
         old[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r9");
         assert_eq!(
@@ -4270,10 +4331,11 @@ mod tests {
             replicas,
         };
         assert!(request.is_valid());
-        let call = AuthorityCredentialCall {
+        let mut call = AuthorityCredentialCall {
             request,
             ..authority_credential_call()
         };
+        call.invocation = call.expected_invocation();
         assert!(authority_credential_call_encoded_len(&call) > MAX_INVOCATION_MESSAGE_BYTES);
         assert_eq!(
             call.validate_shape(),

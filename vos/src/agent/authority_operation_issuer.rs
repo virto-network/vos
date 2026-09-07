@@ -1498,11 +1498,7 @@ mod tests {
             discriminator: u64,
             authorization_sequence: u64,
         ) -> (AuthorityOperationCall, AuthorityOperationApproval) {
-            self.approved_with_invocation(
-                discriminator,
-                authorization_sequence,
-                InvocationId(id(0x41, discriminator)),
-            )
+            self.approved_with_invocation(discriminator, authorization_sequence, InvocationId::ZERO)
         }
 
         fn approved_with_invocation(
@@ -1544,6 +1540,7 @@ mod tests {
                 authority: self.authority,
                 principal,
                 credential,
+                request_sequence: core::num::NonZeroU64::new(discriminator).unwrap(),
                 credential_public_key,
                 authenticated_node: Some(node),
                 requested_valid_from: 10,
@@ -1551,6 +1548,9 @@ mod tests {
                 intent: AuthorityOperationIntent::invoke(&work).unwrap(),
                 signature: [0; CREDENTIAL_SIGNATURE_BYTES],
             };
+            if call.invocation == InvocationId::ZERO {
+                call.invocation = call.expected_invocation();
+            }
             call.signature = self.credential_key.sign(&call.signing_bytes()).to_bytes();
             let approval = AuthorityOperationApproval::from_call(
                 &call,
@@ -1585,10 +1585,11 @@ mod tests {
             let credential = CredentialId::of_public_key(&credential_public_key);
             let node = NodeId(id(0x23, 1));
             let mut call = AuthorityOperationCall {
-                invocation: InvocationId(id(0x81, discriminator)),
+                invocation: InvocationId::ZERO,
                 authority: self.authority,
                 principal,
                 credential,
+                request_sequence: core::num::NonZeroU64::new(discriminator).unwrap(),
                 credential_public_key,
                 authenticated_node: Some(node),
                 requested_valid_from: 10,
@@ -1600,6 +1601,7 @@ mod tests {
                 .unwrap(),
                 signature: [0; CREDENTIAL_SIGNATURE_BYTES],
             };
+            call.invocation = call.expected_invocation();
             call.signature = self.credential_key.sign(&call.signing_bytes()).to_bytes();
             let approval = AuthorityOperationApproval::from_call(
                 &call,
@@ -1995,8 +1997,14 @@ mod tests {
             ))
         ));
 
-        let (authorization_collision, authorization_collision_approval) =
-            fixture.approved_with_invocation(2, 2, approval.acknowledgement_invocation);
+        let (mut authorization_collision, authorization_collision_approval) =
+            fixture.approved(2, 2);
+        authorization_collision.invocation = approval.acknowledgement_invocation;
+        authorization_collision.signature = fixture
+            .credential_key
+            .sign(&authorization_collision.signing_bytes())
+            .to_bytes();
+        assert!(authorization_collision.validate_shape().is_err());
         assert!(matches!(
             issuer.issue(
                 &authorization_collision,
@@ -2005,24 +2013,31 @@ mod tests {
                 &mut signer
             ),
             Err(AuthorityOperationIssuerError::Rejected(
-                AuthorityOperationIssuerRejection::InvocationCollision
+                AuthorityOperationIssuerRejection::InvalidCall
             ))
         ));
 
         let store = MemoryImageStore::default();
         let mut issuer = open(store, &fixture);
         let (second, second_approval) = fixture.approved(3, 3);
-        let (first, first_approval) =
-            fixture.approved_with_invocation(2, 2, second_approval.acknowledgement_invocation);
+        let (mut first, first_approval) = fixture.approved(2, 2);
+        first.invocation = second_approval.acknowledgement_invocation;
+        first.signature = fixture
+            .credential_key
+            .sign(&first.signing_bytes())
+            .to_bytes();
+        assert!(first.validate_shape().is_err());
+        assert!(matches!(
+            issuer.issue(&first, &first_approval, 20, &mut signer),
+            Err(AuthorityOperationIssuerError::Rejected(
+                AuthorityOperationIssuerRejection::InvalidCall
+            ))
+        ));
+        assert!(second.validate_shape().is_ok());
+        let (first, first_approval) = fixture.approved(2, 2);
         issuer
             .issue(&first, &first_approval, 20, &mut signer)
             .unwrap();
-        assert!(matches!(
-            issuer.issue(&second, &second_approval, 20, &mut signer),
-            Err(AuthorityOperationIssuerError::Rejected(
-                AuthorityOperationIssuerRejection::InvocationCollision
-            ))
-        ));
 
         let (same_sequence, same_sequence_approval) = fixture.approved(4, 2);
         assert!(matches!(

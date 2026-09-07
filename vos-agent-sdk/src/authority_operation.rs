@@ -1,6 +1,6 @@
 //! Self-authenticating authority calls for non-management operation domains.
 //!
-//! Management keeps its ACC1/MAP1/MAA1 replay protocol. This sibling family
+//! Management keeps its ACC2/MAP1/MAA2 replay protocol. This sibling family
 //! covers invocation, catalog, and Private-Agent controls without widening or
 //! accepting those older wire generations. A call authenticates the complete
 //! requested intent with a credential signature; an approval materializes the
@@ -34,14 +34,14 @@ use crate::{
 
 const HEADER_BYTES: usize = 4 + 32;
 
-/// AOC2 is intentionally small even though the generic invocation message
+/// AOC3 is intentionally small even though the generic invocation message
 /// ceiling is larger. Private ciphertext and actor messages are represented
 /// only by exact commitments here.
 pub const MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES: usize = 4 * 1024;
-/// AOP2 repeats the call's identity tuple and one complete receipt selector.
+/// AOP3 repeats the call's identity tuple and one complete receipt selector.
 pub const MAX_AUTHORITY_OPERATION_APPROVAL_WIRE_BYTES: usize = 4 * 1024;
 /// AOI1 contains one complete receipt and fixed-size retained-preimage
-/// commitments; it never embeds the AOC2 or AOP2 bytes themselves.
+/// commitments; it never embeds the AOC3 or AOP3 bytes themselves.
 pub const MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES: usize = 4 * 1024;
 /// PCA1 is a fixed-size acknowledgement of one durably reopened Private
 /// control application. It carries commitments and the resulting projection,
@@ -497,7 +497,7 @@ fn private_node_identity_commitment(node: &PrivateNodeIdentity) -> Hash {
 }
 
 /// Commit one canonically sorted, unique, nonempty post-application Private
-/// Node set without embedding that list in AOC2 or PCA1.
+/// Node set without embedding that list in AOC3 or PCA1.
 pub fn private_member_set_commitment(nodes: impl Iterator<Item = NodeId>) -> Option<Hash> {
     let nodes: Vec<NodeId> = nodes.collect();
     if nodes.is_empty()
@@ -550,6 +550,9 @@ pub struct AuthorityOperationCall {
     pub authority: AuthorityActorTarget,
     pub principal: PrincipalId,
     pub credential: CredentialId,
+    /// Monotonic sequence in this credential's general-operation domain.
+    /// The authority accepts exactly the successor of its durable high-water.
+    pub request_sequence: NonZeroU64,
     pub credential_public_key: [u8; CREDENTIAL_PUBLIC_KEY_BYTES],
     pub authenticated_node: Option<NodeId>,
     pub requested_valid_from: u64,
@@ -559,13 +562,48 @@ pub struct AuthorityOperationCall {
 }
 
 impl AuthorityOperationCall {
+    /// Commitment of every caller-selected field except the derived
+    /// invocation and signature. Excluding those outputs avoids a circular
+    /// derivation while binding the complete caller, target, validity, and
+    /// operation-intent tuple.
+    pub fn invocation_payload_commitment(&self) -> Hash {
+        authority_operation_call_invocation_payload_commitment(self)
+    }
+
+    pub fn derive_invocation(
+        credential: CredentialId,
+        request_sequence: NonZeroU64,
+        payload: Hash,
+    ) -> InvocationId {
+        InvocationId(
+            Hash::digest(
+                b"vos/agent/authority-operation-authorization-invocation/v3",
+                &[
+                    crate::RUNTIME_ABI_ID.as_bytes(),
+                    credential.as_bytes(),
+                    &request_sequence.get().to_le_bytes(),
+                    payload.as_bytes(),
+                ],
+            )
+            .0,
+        )
+    }
+
+    pub fn expected_invocation(&self) -> InvocationId {
+        Self::derive_invocation(
+            self.credential,
+            self.request_sequence,
+            self.invocation_payload_commitment(),
+        )
+    }
+
     pub fn signing_bytes(&self) -> Vec<u8> {
         authority_operation_call_signing_bytes(self)
     }
 
     pub fn commitment(&self) -> Hash {
         Hash::digest(
-            b"vos/agent/authority-operation-call/v2",
+            b"vos/agent/authority-operation-call/v3",
             &[&self.signing_bytes(), &self.signature],
         )
     }
@@ -594,6 +632,9 @@ impl AuthorityOperationCall {
         }
         if self.requested_valid_from > self.requested_expires_at {
             return Err(AuthorityOperationProtocolError::InvalidValidity);
+        }
+        if self.invocation != self.expected_invocation() {
+            return Err(AuthorityOperationProtocolError::InvalidTarget);
         }
         if self.signature == [0; CREDENTIAL_SIGNATURE_BYTES] {
             return Err(AuthorityOperationProtocolError::InvalidSignature);
@@ -646,7 +687,7 @@ impl AuthorityOperationCall {
 /// It is intentionally distinct from the selector's management decision
 /// clock, which must remain zero for every operation in this protocol.
 /// Shape validation alone cannot reconstruct `operation_call`: before signing
-/// a receipt, a consumer must reopen the retained AOC2 preimage and require
+/// a receipt, a consumer must reopen the retained AOC3 preimage and require
 /// [`AuthorityOperationApproval::matches_call`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorityOperationApproval {
@@ -654,11 +695,12 @@ pub struct AuthorityOperationApproval {
     pub authorization_sequence: NonZeroU64,
     pub invocation: InvocationId,
     /// Distinct Linear invocation reserved for acknowledging durable receipt
-    /// issuance. Its derivation commits the complete signed AOC2 preimage.
+    /// issuance. Its derivation commits the complete signed AOC3 preimage.
     pub acknowledgement_invocation: InvocationId,
     pub authority: AuthorityActorTarget,
     pub principal: PrincipalId,
     pub credential: CredentialId,
+    pub request_sequence: NonZeroU64,
     pub credential_public_key: [u8; CREDENTIAL_PUBLIC_KEY_BYTES],
     pub authenticated_node: Option<NodeId>,
     pub intent: AuthorityOperationIntent,
@@ -671,13 +713,34 @@ impl AuthorityOperationApproval {
     /// against every retained authorization and acknowledgement invocation
     /// before admitting the call.
     pub fn derive_acknowledgement_invocation(call: &AuthorityOperationCall) -> InvocationId {
+        Self::derive_acknowledgement_invocation_from_call_parts(
+            call.credential,
+            call.request_sequence,
+            call.invocation,
+            call.invocation_payload_commitment(),
+            call.commitment(),
+        )
+    }
+
+    /// Recompute the AOI1 invocation after the AOC3 preimage has compacted.
+    /// Every input is retained in the credential-bounded latest-result row.
+    pub fn derive_acknowledgement_invocation_from_call_parts(
+        credential: CredentialId,
+        request_sequence: NonZeroU64,
+        authorization_invocation: InvocationId,
+        invocation_payload: Hash,
+        operation_call: Hash,
+    ) -> InvocationId {
         InvocationId(
             Hash::digest(
-                b"vos/agent/authority-operation-issuance-acknowledgement-invocation/v1",
+                b"vos/agent/authority-operation-issuance-acknowledgement-invocation/v3",
                 &[
                     crate::RUNTIME_ABI_ID.as_bytes(),
-                    call.invocation.as_bytes(),
-                    call.commitment().as_bytes(),
+                    credential.as_bytes(),
+                    &request_sequence.get().to_le_bytes(),
+                    authorization_invocation.as_bytes(),
+                    invocation_payload.as_bytes(),
+                    operation_call.as_bytes(),
                 ],
             )
             .0,
@@ -686,7 +749,7 @@ impl AuthorityOperationApproval {
 
     #[allow(clippy::too_many_arguments)]
     /// Build an approval directly from its retained call preimage. Code which
-    /// decodes an AOP2 instead must make the equivalent `matches_call` check
+    /// decodes an AOP3 instead must make the equivalent `matches_call` check
     /// before signing the materialized selector.
     pub fn from_call(
         call: &AuthorityOperationCall,
@@ -718,6 +781,7 @@ impl AuthorityOperationApproval {
             authority: call.authority,
             principal: call.principal,
             credential: call.credential,
+            request_sequence: call.request_sequence,
             credential_public_key: call.credential_public_key,
             authenticated_node: call.authenticated_node,
             intent: call.intent.clone(),
@@ -811,6 +875,7 @@ impl AuthorityOperationApproval {
             && self.authority == call.authority
             && self.principal == call.principal
             && self.credential == call.credential
+            && self.request_sequence == call.request_sequence
             && self.credential_public_key == call.credential_public_key
             && self.authenticated_node == call.authenticated_node
             && self.intent == call.intent
@@ -878,7 +943,7 @@ impl AuthorityOperationApproval {
 
 /// Authority-signed proof that one exact non-management receipt was issued.
 ///
-/// The actor retains the AOC2 and AOP2 preimages until this AOI1 verifies and
+/// The actor retains the AOC3 and AOP3 preimages until this AOI1 verifies and
 /// matches both. Only then may its authorization sequence become a retirement
 /// fact. Receipt issuance and acknowledgement use distinct Linear invocation
 /// IDs so exact retries can never reinterpret one message as the other.
@@ -967,7 +1032,7 @@ impl AuthorityOperationIssuanceAck {
         Ok(())
     }
 
-    /// Match the exact actor-retained AOC2 and AOP2 preimages. A valid AOI1
+    /// Match the exact actor-retained AOC3 and AOP3 preimages. A valid AOI1
     /// must not retire anything unless this check and `verify_with` both pass.
     pub fn matches_pending(
         &self,
@@ -1140,8 +1205,8 @@ impl PrivateControlApplicationFact {
 /// and reopened after its non-management receipt had been issued.
 ///
 /// PCA1 is distinct from AOI1: issuance alone never proves application. Its
-/// three invocation IDs reserve independent exact-retry domains for AOC2,
-/// AOI1, and PCA1. The AOC2/AOP2 commitments are repeated for auditability;
+/// three invocation IDs reserve independent exact-retry domains for AOC3,
+/// AOI1, and PCA1. The AOC3/AOP3 commitments are repeated for auditability;
 /// the invocation pair, authorization sequence, and AOI1 commitment are also
 /// sufficient to match an issuance tombstone after those preimages retire.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1287,7 +1352,7 @@ impl PrivateControlApplicationAck {
         Ok(())
     }
 
-    /// Match all retained AOC2/AOP2/AOI1 preimages and the exact runtime
+    /// Match all retained AOC3/AOP3/AOI1 preimages and the exact runtime
     /// application observation. Verification remains a separate explicit step.
     pub fn matches_pending(
         &self,
@@ -1340,7 +1405,7 @@ impl PrivateControlApplicationAck {
         self.verify_with(authority, verifier)
     }
 
-    /// Match the compact issuance tuple retained after AOC2/AOP2/AOI1
+    /// Match the compact issuance tuple retained after AOC3/AOP3/AOI1
     /// preimages have retired. The PCA1 signature still must be independently
     /// verified; this method deliberately does not reconstruct discarded data.
     pub fn matches_issuance_tombstone(
@@ -1408,7 +1473,7 @@ impl PrivateControlApplicationAck {
 
 /// Verified issuance evidence for exactly one authorization sequence.
 /// Fields are private so callers cannot manufacture a retirement capability
-/// without reopening the retained AOC2/AOP2 and verifying AOI1.
+/// without reopening the retained AOC3/AOP3 and verifying AOI1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuthorityOperationRetirementFact {
     authority: AuthorityActorTarget,
@@ -1434,7 +1499,7 @@ impl AuthorityOperationRetirementFact {
 ///
 /// Out-of-order verified facts must remain pending. The actor may advance this
 /// floor only one sequence at a time, durably committing the new floor before
-/// discarding the corresponding AOC2/AOP2/AOI1 preimages. On restart it
+/// discarding the corresponding AOC3/AOP3/AOI1 preimages. On restart it
 /// reopens this value from its own authenticated Linear state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuthorityOperationRetirementFloor {
@@ -1755,6 +1820,10 @@ fn decode_private_control_common(
 
 fn encode_call_unsigned(encoder: &mut Encoder<'_>, value: &AuthorityOperationCall) {
     encoder.fixed(value.invocation.as_bytes());
+    encode_call_invocation_payload(encoder, value);
+}
+
+fn encode_call_invocation_payload(encoder: &mut Encoder<'_>, value: &AuthorityOperationCall) {
     crate::wire::encode_authority_actor_target(encoder, value.authority);
     crate::wire::encode_credential_caller(
         encoder,
@@ -1763,14 +1832,26 @@ fn encode_call_unsigned(encoder: &mut Encoder<'_>, value: &AuthorityOperationCal
         &value.credential_public_key,
         value.authenticated_node,
     );
+    encoder.u64(value.request_sequence.get());
     encoder.u64(value.requested_valid_from);
     encoder.u64(value.requested_expires_at);
     encode_intent(encoder, &value.intent);
 }
 
+fn authority_operation_call_invocation_payload_commitment(value: &AuthorityOperationCall) -> Hash {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"OCP3");
+    bytes.extend_from_slice(crate::RUNTIME_ABI_ID.as_bytes());
+    encode_call_invocation_payload(&mut Encoder(&mut bytes), value);
+    Hash::digest(
+        b"vos/agent/authority-operation-invocation-payload/v3",
+        &[&bytes],
+    )
+}
+
 fn authority_operation_call_signing_bytes(value: &AuthorityOperationCall) -> Vec<u8> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"AO2S");
+    bytes.extend_from_slice(b"AO3S");
     bytes.extend_from_slice(crate::RUNTIME_ABI_ID.as_bytes());
     encode_call_unsigned(&mut Encoder(&mut bytes), value);
     bytes
@@ -1785,7 +1866,7 @@ fn authority_operation_call_encoded_len(value: &AuthorityOperationCall) -> usize
 }
 
 impl CanonicalWire for AuthorityOperationCall {
-    const MAGIC: [u8; 4] = *b"AOC2";
+    const MAGIC: [u8; 4] = *b"AOC3";
     const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES;
 
     fn validate_wire(&self) -> bool {
@@ -1807,6 +1888,7 @@ impl CanonicalWire for AuthorityOperationCall {
             authority,
             principal,
             credential,
+            request_sequence: NonZeroU64::new(decoder.u64()?).ok_or(DecodeError::NonCanonical)?,
             credential_public_key,
             authenticated_node,
             requested_valid_from: decoder.u64()?,
@@ -1838,6 +1920,7 @@ fn encode_approval_body(encoder: &mut Encoder<'_>, value: &AuthorityOperationApp
         &value.credential_public_key,
         value.authenticated_node,
     );
+    encoder.u64(value.request_sequence.get());
     encode_intent(encoder, &value.intent);
     crate::wire::encode_authority_selector(encoder, &value.selector);
 }
@@ -1850,14 +1933,14 @@ fn authority_operation_approval_encoded_len(value: &AuthorityOperationApproval) 
 
 fn authority_operation_approval_commitment(value: &AuthorityOperationApproval) -> Hash {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"AO2C");
+    bytes.extend_from_slice(b"AO3C");
     bytes.extend_from_slice(crate::RUNTIME_ABI_ID.as_bytes());
     encode_approval_body(&mut Encoder(&mut bytes), value);
-    Hash::digest(b"vos/agent/authority-operation-approval/v2", &[&bytes])
+    Hash::digest(b"vos/agent/authority-operation-approval/v3", &[&bytes])
 }
 
 impl CanonicalWire for AuthorityOperationApproval {
-    const MAGIC: [u8; 4] = *b"AOP2";
+    const MAGIC: [u8; 4] = *b"AOP3";
     const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_OPERATION_APPROVAL_WIRE_BYTES;
 
     fn validate_wire(&self) -> bool {
@@ -1885,6 +1968,7 @@ impl CanonicalWire for AuthorityOperationApproval {
             authority,
             principal,
             credential,
+            request_sequence: NonZeroU64::new(decoder.u64()?).ok_or(DecodeError::NonCanonical)?,
             credential_public_key,
             authenticated_node,
             intent: decode_intent(decoder)?,
@@ -2252,10 +2336,11 @@ mod tests {
     ) -> AuthorityOperationCall {
         let key = credential_key();
         let mut call = AuthorityOperationCall {
-            invocation: InvocationId([discriminator; 32]),
+            invocation: InvocationId::ZERO,
             authority: authority_target(),
             principal: caller_principal(),
             credential: CredentialId::of_public_key(&key),
+            request_sequence: NonZeroU64::new(u64::from(discriminator)).unwrap(),
             credential_public_key: key,
             authenticated_node,
             requested_valid_from: 10,
@@ -2263,6 +2348,7 @@ mod tests {
             intent,
             signature: [0; CREDENTIAL_SIGNATURE_BYTES],
         };
+        call.invocation = call.expected_invocation();
         call.signature = test_signature(&call.credential_public_key, &call.signing_bytes());
         call.validate_shape().unwrap();
         call
@@ -2602,26 +2688,26 @@ mod tests {
     }
 
     #[test]
-    fn aoc2_aop2_and_aoi1_are_distinct_bounded_canonical_golden_wires() {
+    fn aoc3_aop3_and_aoi1_are_distinct_bounded_canonical_golden_wires() {
         let call = invoke_call();
         let call_bytes = call.encode().unwrap();
-        assert_eq!(call_bytes.get(..4), Some(b"AOC2".as_slice()));
+        assert_eq!(call_bytes.get(..4), Some(b"AOC3".as_slice()));
         assert!(call_bytes.len() <= MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES);
         assert_eq!(
             AuthorityOperationCall::decode(&call_bytes),
             Ok(call.clone())
         );
         assert_eq!(
-            Hash::digest(b"vos/test/aoc2-golden", &[&call_bytes]).0,
+            Hash::digest(b"vos/test/aoc3-golden", &[&call_bytes]).0,
             [
-                121, 201, 55, 162, 212, 121, 212, 45, 107, 120, 106, 41, 114, 47, 46, 93, 249, 65,
-                142, 84, 34, 175, 35, 4, 153, 63, 208, 0, 194, 71, 215, 149,
+                253, 99, 119, 122, 117, 95, 211, 240, 53, 9, 140, 171, 245, 6, 16, 211, 38, 251,
+                87, 128, 209, 3, 98, 60, 94, 186, 106, 18, 36, 100, 245, 102,
             ]
         );
 
         let approval = approval(&call);
         let approval_bytes = approval.encode().unwrap();
-        assert_eq!(approval_bytes.get(..4), Some(b"AOP2".as_slice()));
+        assert_eq!(approval_bytes.get(..4), Some(b"AOP3".as_slice()));
         assert!(approval_bytes.len() <= MAX_AUTHORITY_OPERATION_APPROVAL_WIRE_BYTES);
         assert_eq!(
             AuthorityOperationApproval::decode(&approval_bytes),
@@ -2629,10 +2715,10 @@ mod tests {
         );
         assert_ne!(call.commitment(), approval.commitment());
         assert_eq!(
-            Hash::digest(b"vos/test/aop2-golden", &[&approval_bytes]).0,
+            Hash::digest(b"vos/test/aop3-golden", &[&approval_bytes]).0,
             [
-                8, 188, 176, 82, 207, 212, 8, 44, 103, 219, 159, 207, 243, 249, 73, 150, 58, 217,
-                155, 69, 84, 171, 154, 216, 60, 86, 218, 132, 193, 133, 50, 53,
+                157, 208, 130, 32, 56, 135, 223, 31, 209, 214, 33, 243, 128, 124, 201, 172, 174, 9,
+                9, 175, 159, 207, 201, 48, 147, 240, 212, 6, 144, 173, 59, 241,
             ]
         );
 
@@ -2647,8 +2733,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/aoi1-golden", &[&acknowledgement_bytes]).0,
             [
-                174, 23, 74, 116, 63, 80, 102, 189, 66, 78, 8, 44, 93, 95, 102, 97, 250, 131, 129,
-                35, 27, 146, 40, 130, 245, 105, 219, 193, 21, 129, 105, 15,
+                154, 98, 170, 195, 138, 191, 62, 130, 135, 31, 148, 78, 180, 19, 252, 60, 209, 25,
+                217, 195, 191, 27, 196, 110, 62, 1, 68, 105, 23, 95, 157, 142,
             ]
         );
     }
@@ -2672,8 +2758,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/pca1-golden", &[&encoded]).0,
             [
-                11, 60, 161, 182, 140, 253, 102, 182, 226, 191, 72, 225, 102, 169, 31, 213, 81,
-                202, 84, 89, 194, 111, 105, 144, 142, 119, 116, 67, 68, 113, 203, 52,
+                102, 164, 249, 242, 154, 94, 14, 77, 3, 253, 254, 27, 155, 245, 170, 80, 248, 194,
+                204, 157, 68, 127, 244, 220, 130, 27, 180, 40, 106, 206, 183, 35,
             ]
         );
         assert_ne!(application.commitment(), Hash::ZERO);
@@ -3004,8 +3090,22 @@ mod tests {
         let mut changed = call.clone();
         changed.requested_expires_at -= 1;
         assert_ne!(changed.commitment(), original);
+        changed.invocation = changed.expected_invocation();
         assert_eq!(
             changed.verify_with(&TestVerifier),
+            Err(AuthorityOperationProtocolError::InvalidSignature)
+        );
+
+        let mut changed_sequence = call.clone();
+        changed_sequence.request_sequence =
+            NonZeroU64::new(call.request_sequence.get() + 1).unwrap();
+        assert_eq!(
+            changed_sequence.validate_shape(),
+            Err(AuthorityOperationProtocolError::InvalidTarget)
+        );
+        changed_sequence.invocation = changed_sequence.expected_invocation();
+        assert_eq!(
+            changed_sequence.verify_with(&TestVerifier),
             Err(AuthorityOperationProtocolError::InvalidSignature)
         );
 
@@ -3136,6 +3236,7 @@ mod tests {
 
         let mut different_call = call.clone();
         different_call.requested_expires_at -= 1;
+        different_call.invocation = different_call.expected_invocation();
         different_call.signature = test_signature(
             &different_call.credential_public_key,
             &different_call.signing_bytes(),
@@ -3293,7 +3394,7 @@ mod tests {
         assert_eq!(approval.selector.acknowledged_through, 0);
         assert_eq!(approval.selector.request, work.commitment());
 
-        // AOP2 cannot reconstruct its retained AOC2 preimage. A substituted
+        // AOP3 cannot reconstruct its retained AOC3 preimage. A substituted
         // nonzero commitment is structurally canonical, so a signer must
         // reopen the call and require `matches_call` before issuing a receipt.
         let mut detached = approval.clone();
@@ -3512,8 +3613,11 @@ mod tests {
         let mut old = bytes.clone();
         old[..4].copy_from_slice(b"AOC1");
         assert!(AuthorityOperationCall::decode(&old).is_err());
+        let mut old = bytes.clone();
+        old[..4].copy_from_slice(b"AOC2");
+        assert!(AuthorityOperationCall::decode(&old).is_err());
         let mut wrong_family = bytes.clone();
-        wrong_family[..4].copy_from_slice(b"ACC1");
+        wrong_family[..4].copy_from_slice(b"ACC2");
         assert!(AuthorityOperationCall::decode(&wrong_family).is_err());
         let mut old_abi = bytes.clone();
         old_abi[4] ^= 1;
@@ -3529,6 +3633,9 @@ mod tests {
         let approved = approval(&call);
         let mut old = approved.encode().unwrap();
         old[..4].copy_from_slice(b"AOP1");
+        assert!(AuthorityOperationApproval::decode(&old).is_err());
+        let mut old = approved.encode().unwrap();
+        old[..4].copy_from_slice(b"AOP2");
         assert!(AuthorityOperationApproval::decode(&old).is_err());
         let mut wrong_family = approved.encode().unwrap();
         wrong_family[..4].copy_from_slice(b"MAP1");

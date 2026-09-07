@@ -1,7 +1,7 @@
 //! Clean, portable policy actor for standard Agent management.
 //!
-//! The actor accepts canonical `ACC1` management calls, canonical `AOC1`
-//! general-operation calls, and self-authenticating `AAD2` identity-admin calls
+//! The actor accepts canonical `ACC2` management calls, canonical `AOC3`
+//! general-operation calls, and self-authenticating `AAD3` identity-admin calls
 //! delivered with an exact clean `AIC1` invocation context. It performs policy,
 //! credential, and Admin-accessibility checks inside the guest and retains exact
 //! results for replay. Agent and actor lifecycle approvals remain pending until
@@ -66,19 +66,15 @@ pub const MAX_MANAGED_ACTORS: usize = vos::agent_sdk::STANDARD_MAX_ACTORS as usi
 /// otherwise empty canonical actor state; aggregate state sizing is stricter.
 pub const MAX_RETIRED_ACTOR_INSTALLATIONS: usize =
     MAX_RUNTIME_STATE_BYTES / (2 * core::mem::size_of::<[u8; 32]>());
-/// Exact approvals are deliberately bounded. Saturation fails closed; records
-/// from general operations are retired only by their explicitly ordered AOI1
-/// acknowledgement floor.
+/// Exact pending approvals are deliberately bounded by the credential table:
+/// each credential may have at most one application-bearing request in flight.
+/// Completed results compact to one exact latest acknowledgement per credential.
 pub const MAX_EXACT_RETRY_RECORDS: usize = 128;
-/// Compact retired-operation identities preserve cross-domain invocation
-/// collision safety after AOC1/AOP1/AOI1 preimages are discarded. Saturation
-/// fails closed because an invocation ID must never become reusable.
-pub const MAX_RETIRED_AUTHORITY_OPERATIONS: usize = 4_096;
 /// One Private Agent may consume the runtime's complete bounded control-chain
 /// ceiling. Compact rows preserve exact PCA1 retry and invocation collision
 /// identity after a later control supersedes the current projection.
 pub const MAX_PRIVATE_APPLICATION_RECORDS: usize = 4_096;
-/// Worst-case canonical ACC1/AOC1/AAD2 calls plus MAP1/AOP1/AAR2 results and
+/// Worst-case canonical ACC2/AOC3/AAD3 calls plus MAP1/AOP3/AAR3 results and
 /// MAA2/AOI1 acknowledgements retained by the bounded exact-retry tables. This
 /// leaves over one MiB of the standard state ceiling for row metadata and
 /// actor framing.
@@ -99,6 +95,7 @@ const CONFIG_ENCODED_BYTES: usize = SYSTEM_AUTHORITY_CONFIGURATION_MAGIC.len()
     + PRIVATE_SIGNATURE_BYTES;
 const EVIDENCE_DOMAIN: &[u8] = b"vos/system-authority/policy-evidence/v1";
 const OPERATION_EVIDENCE_DOMAIN: &[u8] = b"vos/system-authority/operation-evidence/v1";
+const STATE_INTEGRITY_DOMAIN: &[u8] = b"vos/system-authority/state-integrity/v10";
 
 const _: () = assert!(MAX_RETAINED_EXACT_WIRE_BYTES < MAX_RUNTIME_STATE_BYTES);
 
@@ -418,6 +415,16 @@ pub struct CredentialRow {
     pub kind: u8,
     pub public_key: [u8; 32],
     pub status: CredentialStatus,
+    /// Highest admitted ACC2 request sequence for this credential. Revocation
+    /// never erases this replay boundary.
+    pub management_request_high_water: u64,
+    /// Reserved for the clean-break sequenced AOC generation. Keeping it in
+    /// this state generation avoids a second schema transition when general
+    /// operation retirement is compacted.
+    pub operation_request_high_water: u64,
+    /// Highest applied AAD3 request sequence for this credential. Revocation
+    /// never erases this replay boundary.
+    pub admin_request_high_water: u64,
 }
 
 #[derive(
@@ -567,7 +574,7 @@ pub struct ManagedActorRow {
     pub root_provenance: bool,
     pub suspended: bool,
     // Runtime-selected incarnation and lifecycle debt are deliberately absent:
-    // neither is carried by ACC1/MAP1/MAA2, so the authority cannot prove them
+    // neither is carried by ACC2/MAP1/MAA2, so the authority cannot prove them
     // from the signed durable-reopen protocol.
     pub installation_id: [u8; 32],
     pub registry_reservation: [u8; 32],
@@ -692,22 +699,45 @@ pub enum PendingManagementEffect {
 #[rkyv(crate = vos::rkyv)]
 pub struct ExactRetryRecord {
     pub invocation: [u8; 32],
-    /// Deterministic MAA2 invocation reserved atomically with this ACC1.
+    /// Deterministic MAA2 invocation reserved atomically with this ACC2.
     pub acknowledgement_invocation: [u8; 32],
+    pub credential: [u8; 32],
+    pub request_sequence: u64,
     pub credential_call: [u8; 32],
     pub credential_call_bytes: Vec<u8>,
     pub approval_commitment: [u8; 32],
     pub authorization_sequence: u64,
     pub approval: Vec<u8>,
     pub effect: PendingManagementEffect,
-    pub finalized: bool,
-    pub acknowledgement: Option<[u8; 32]>,
-    pub acknowledgement_bytes: Option<Vec<u8>>,
-    pub reopened_state: Option<[u8; 32]>,
-    pub applied_at: Option<u64>,
 }
 
-/// Exact retained AOC1/AOP1 pair and, once observed, its exact AOI1. An
+/// The newest finalized management application for one credential. The ACC2
+/// and MAA2 preimages are retained so the credential/request-sequence binding
+/// and acknowledgement signature remain independently checkable, but MAP1 is
+/// never synthesized after finalization. Older calls are rejected by the
+/// credential high-water mark.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct LatestManagementAckRow {
+    pub credential: [u8; 32],
+    pub request_sequence: u64,
+    pub authorization_invocation: [u8; 32],
+    pub acknowledgement_invocation: [u8; 32],
+    pub authorization_sequence: u64,
+    pub credential_call: [u8; 32],
+    pub credential_call_bytes: Vec<u8>,
+    pub approval: [u8; 32],
+    pub request: [u8; 32],
+    pub application: [u8; 32],
+    pub acknowledgement: [u8; 32],
+    pub acknowledgement_bytes: Vec<u8>,
+    pub reopened_state: [u8; 32],
+    pub applied_at: u64,
+}
+
+/// Exact retained AOC3/AOP3 pair and, once observed, its exact AOI1. An
 /// out-of-order acknowledgement remains here until every earlier global
 /// authorization position is safe to cross.
 #[derive(
@@ -717,6 +747,12 @@ pub struct ExactRetryRecord {
 pub struct AuthorityOperationRetryRecord {
     pub invocation: [u8; 32],
     pub acknowledgement_invocation: [u8; 32],
+    pub credential: [u8; 32],
+    pub request_sequence: u64,
+    /// Commitment of every caller-selected AOC3 field except the derived
+    /// invocation and signature. This permits exact ID reconstruction after
+    /// the full call preimage compacts.
+    pub invocation_payload: [u8; 32],
     pub operation_call: [u8; 32],
     pub operation_call_bytes: Vec<u8>,
     pub approval_commitment: [u8; 32],
@@ -731,34 +767,30 @@ pub struct AuthorityOperationRetryRecord {
     pub private_application_invocation: Option<[u8; 32]>,
 }
 
-/// Compact collision tombstone retained after the durable retirement floor
-/// has crossed one general authorization. The exact AOC1/AOP1/AOI1 preimages
-/// are intentionally absent, but their invocation pair and signed AOI1
-/// commitment can never be admitted again.
+/// The newest durably issued operation for one credential. Exact AOI1 bytes
+/// remain retryable, while the AOC3/AOP3 preimages are intentionally absent.
+/// Older requests are rejected by the credential's monotonic high-water.
 #[derive(
-    vos::rkyv::Archive,
-    vos::rkyv::Serialize,
-    vos::rkyv::Deserialize,
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
 )]
 #[rkyv(crate = vos::rkyv)]
-pub struct RetiredAuthorityOperationRow {
-    pub invocation: [u8; 32],
+pub struct LatestOperationAckRow {
+    pub credential: [u8; 32],
+    pub request_sequence: u64,
+    pub invocation_payload: [u8; 32],
+    pub authorization_invocation: [u8; 32],
     pub acknowledgement_invocation: [u8; 32],
     pub authorization_sequence: u64,
     pub operation_call: [u8; 32],
     pub approval: [u8; 32],
     pub issuance_ack: [u8; 32],
+    pub issuance_ack_bytes: Vec<u8>,
     pub issued_at: u64,
     pub private_application_invocation: Option<[u8; 32]>,
     pub private_operation: Option<RetiredPrivateOperationRow>,
 }
 
-/// Exact Private-control intent fields which remain after the AOC1/AOP1/AOI1
+/// Exact Private-control intent fields which remain after the AOC3/AOP3/AOI1
 /// preimages retire. They let PCA1 prove the original operation without
 /// reconstructing or relabeling discarded bytes.
 #[derive(
@@ -781,15 +813,23 @@ pub struct RetiredPrivateOperationRow {
     pub control_sequence: u64,
     pub control_previous: Option<[u8; 32]>,
     pub epoch: u64,
-    /// Exact membership target retained from AOC1. Recover has no single
+    /// Exact membership target retained from AOC3. Recover has no single
     /// target and is not authorizable in this generation.
     pub node: Option<[u8; 32]>,
     /// Invite's exact transport/encryption identity commitment. A separate
     /// enrollment projection can bind this retained value before admission.
     pub node_identity: Option<[u8; 32]>,
-    /// Revoke fixes the complete post-apply set in AOC1. Invite fixes the
+    /// Revoke fixes the complete post-apply set in AOC3. Invite fixes the
     /// invited Node identity, while only PCA1 can report the resulting set.
     pub post_member_set: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PrivateApplicationSource {
+    credential: [u8; 32],
+    request_sequence: u64,
+    invocation_payload: [u8; 32],
+    private: RetiredPrivateOperationRow,
 }
 
 /// Current policy-visible Private control projection. Creation supplies the
@@ -802,6 +842,11 @@ pub struct PrivateAgentProjectionRow {
     pub agent: [u8; 32],
     pub owner: [u8; 32],
     pub runtime_deployment: [u8; 32],
+    /// Immutable membership admitted by the finalized Private Create. It is
+    /// retained because later PCA transitions cannot reconstruct genesis from
+    /// a compacted management history.
+    pub genesis_members: Vec<[u8; 32]>,
+    pub genesis_member_set: [u8; 32],
     pub control_head: Option<[u8; 32]>,
     pub control_sequence: Option<u64>,
     pub epoch: u64,
@@ -832,6 +877,9 @@ pub struct PrivateAgentProjectionRow {
 )]
 #[rkyv(crate = vos::rkyv)]
 pub struct PrivateApplicationRecord {
+    pub credential: [u8; 32],
+    pub request_sequence: u64,
+    pub invocation_payload: [u8; 32],
     pub authorization_invocation: [u8; 32],
     pub issuance_invocation: [u8; 32],
     pub application_invocation: [u8; 32],
@@ -861,6 +909,8 @@ pub struct PrivateApplicationRecord {
 )]
 #[rkyv(crate = vos::rkyv)]
 pub struct AdminRetryRecord {
+    pub credential: [u8; 32],
+    pub request_sequence: u64,
     pub invocation: [u8; 32],
     pub call_commitment: [u8; 32],
     pub call_bytes: Vec<u8>,
@@ -885,14 +935,19 @@ pub struct AuthorityLinearState {
     managed_actors: Vec<ManagedActorRow>,
     retired_actor_installations: Vec<RetiredActorInstallationRow>,
     retries: Vec<ExactRetryRecord>,
+    latest_management_acks: Vec<LatestManagementAckRow>,
     operation_retries: Vec<AuthorityOperationRetryRecord>,
     operation_retirement_floor: u64,
-    operation_retirement_commitment: [u8; 32],
-    retired_authority_operations: Vec<RetiredAuthorityOperationRow>,
+    latest_operation_acks: Vec<LatestOperationAckRow>,
     private_agents: Vec<PrivateAgentProjectionRow>,
     private_applications: Vec<PrivateApplicationRecord>,
     private_application_commitment: [u8; 32],
     admin_retries: Vec<AdminRetryRecord>,
+    /// Redundant digest of the exact clean-generation state image with this
+    /// field zeroed. The runtime journal remains the authenticity boundary;
+    /// this commitment makes accidental or partial reconstructed-state drift
+    /// fail closed instead of being mistaken for compacted history.
+    state_integrity_commitment: [u8; 32],
 }
 
 impl AuthorityLinearState {
@@ -909,14 +964,15 @@ impl AuthorityLinearState {
             managed_actors: Vec::new(),
             retired_actor_installations: Vec::new(),
             retries: Vec::new(),
+            latest_management_acks: Vec::new(),
             operation_retries: Vec::new(),
             operation_retirement_floor: 0,
-            operation_retirement_commitment: [0; 32],
-            retired_authority_operations: Vec::new(),
+            latest_operation_acks: Vec::new(),
             private_agents: Vec::new(),
             private_applications: Vec::new(),
             private_application_commitment: [0; 32],
             admin_retries: Vec::new(),
+            state_integrity_commitment: [0; 32],
         }
     }
 
@@ -929,6 +985,9 @@ impl AuthorityLinearState {
             kind: config.bootstrap_credential_kind,
             public_key: config.bootstrap_credential_public_key,
             status: CredentialStatus::Active,
+            management_request_high_water: 0,
+            operation_request_high_water: 0,
+            admin_request_high_water: 0,
         });
         let mut nodes = Vec::with_capacity(1);
         nodes.push(NodeOwnerRow::from_enrollment(
@@ -941,7 +1000,7 @@ impl AuthorityLinearState {
         });
         let mut managed_agents = Vec::with_capacity(1);
         managed_agents.push(root_managed_agent(config));
-        Self {
+        let mut state = Self {
             initialized: true,
             epoch: config.binding.initial_epoch,
             authorization_sequence: config.bootstrap_authorization_high_water,
@@ -953,20 +1012,57 @@ impl AuthorityLinearState {
             managed_actors: Vec::new(),
             retired_actor_installations: Vec::new(),
             retries: Vec::new(),
+            latest_management_acks: Vec::new(),
             operation_retries: Vec::new(),
             operation_retirement_floor: config.bootstrap_authorization_high_water,
-            operation_retirement_commitment: initial_operation_retirement_commitment(config).0,
-            retired_authority_operations: Vec::new(),
+            latest_operation_acks: Vec::new(),
             private_agents: Vec::new(),
             private_applications: Vec::new(),
             private_application_commitment: initial_private_application_commitment(config).0,
             admin_retries: Vec::new(),
+            state_integrity_commitment: [0; 32],
+        };
+        // Every field above is already canonical and bounded. Serialization
+        // failure is unreachable for this fixed bootstrap image; fail inert if
+        // that invariant is ever broken by a future state-shape change.
+        if !refresh_state_integrity_commitment(&config, &mut state) {
+            return Self::inert();
         }
+        state
     }
 }
 
+fn computed_state_integrity_commitment(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+) -> Option<Hash> {
+    let mut image = state.clone();
+    image.state_integrity_commitment = [0; 32];
+    let configuration_bytes = configuration.encode();
+    let state_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&image).ok()?;
+    Some(Hash::digest(
+        STATE_INTEGRITY_DOMAIN,
+        &[
+            RUNTIME_ABI_ID.as_bytes(),
+            &configuration_bytes,
+            &state_bytes,
+        ],
+    ))
+}
+
+fn refresh_state_integrity_commitment(
+    configuration: &SystemAuthorityConfiguration,
+    state: &mut AuthorityLinearState,
+) -> bool {
+    let Some(commitment) = computed_state_integrity_commitment(configuration, state) else {
+        return false;
+    };
+    state.state_integrity_commitment = commitment.0;
+    true
+}
+
 /// Linear policy state for one Space's built-in system Agent.
-#[actor(agent, state_version = 8)]
+#[actor(agent, state_version = 10)]
 pub struct SystemAuthority {
     #[state(const)]
     configuration: SystemAuthorityConfiguration,
@@ -988,7 +1084,7 @@ impl SystemAuthority {
         }
     }
 
-    /// Verify and authorize one exact ACC1 call. Refusal is represented by an
+    /// Verify and authorize one exact ACC2 call. Refusal is represented by an
     /// empty byte string and never mutates Linear state.
     #[msg(linear)]
     fn authorize(&mut self, call: Vec<u8>, ctx: &mut Context<Self>) -> Vec<u8> {
@@ -1009,7 +1105,7 @@ impl SystemAuthority {
         finalize_application(&self.configuration, &mut self.state, &ack, &context)
     }
 
-    /// Verify one exact credential-signed AOC1 and return its canonical AOP1.
+    /// Verify one exact credential-signed AOC3 and return its canonical AOP3.
     /// The approval shares the management authorization clock and remains
     /// retained until its exact signed AOI1 is consumed.
     #[msg(linear)]
@@ -1094,7 +1190,51 @@ fn exact_retry_count(state: &AuthorityLinearState) -> usize {
         .retries
         .len()
         .saturating_add(state.operation_retries.len())
-        .saturating_add(state.admin_retries.len())
+}
+
+fn credential_index(
+    state: &AuthorityLinearState,
+    credential: CredentialId,
+) -> core::result::Result<usize, usize> {
+    state
+        .credentials
+        .binary_search_by(|row| row.credential.cmp(&credential.0))
+}
+
+fn credential_has_pending_application(
+    state: &AuthorityLinearState,
+    credential: CredentialId,
+) -> bool {
+    state
+        .retries
+        .iter()
+        .any(|record| record.credential == credential.0)
+        || state.latest_management_acks.iter().any(|record| {
+            record.credential == credential.0
+                && record.authorization_sequence > state.operation_retirement_floor
+        })
+        || state
+            .operation_retries
+            .iter()
+            .any(|record| record.credential == credential.0)
+        || state.latest_operation_acks.iter().any(|record| {
+            record.credential == credential.0
+                && (record.authorization_sequence > state.operation_retirement_floor
+                    || (record.private_operation.is_some()
+                        && !private_operation_source_is_applied(
+                            state,
+                            record.authorization_invocation,
+                            record.acknowledgement_invocation,
+                            record.authorization_sequence,
+                        )))
+        })
+}
+
+fn principal_has_pending_application(state: &AuthorityLinearState, principal: PrincipalId) -> bool {
+    state.credentials.iter().any(|credential| {
+        credential.principal == principal.0
+            && credential_has_pending_application(state, CredentialId(credential.credential))
+    })
 }
 
 fn authorize_call(
@@ -1143,16 +1283,22 @@ fn authorize_call(
             return Vec::new();
         }
         Err(index) => {
-            if exact_retry_count(state) >= MAX_EXACT_RETRY_RECORDS {
-                return Vec::new();
-            }
-            if !invocation_pair_is_available(state, call.invocation, acknowledgement_invocation) {
-                return Vec::new();
-            }
-
             let Some(role) = authenticated_role(state, &call) else {
                 return Vec::new();
             };
+            let Ok(caller_index) = credential_index(state, call.credential) else {
+                return Vec::new();
+            };
+            if exact_retry_count(state) >= MAX_EXACT_RETRY_RECORDS
+                || state.credentials[caller_index]
+                    .management_request_high_water
+                    .checked_add(1)
+                    != Some(call.request_sequence.get())
+                || credential_has_pending_application(state, call.credential)
+                || !invocation_pair_is_available(state, call.invocation, acknowledgement_invocation)
+            {
+                return Vec::new();
+            }
             let Some(effect) = policy_effect(configuration, state, &call, role) else {
                 return Vec::new();
             };
@@ -1209,26 +1355,30 @@ fn authorize_call(
             let record = ExactRetryRecord {
                 invocation: call.invocation.0,
                 acknowledgement_invocation: acknowledgement_invocation.0,
+                credential: call.credential.0,
+                request_sequence: call.request_sequence.get(),
                 credential_call: call_commitment.0,
                 credential_call_bytes: encoded_call.to_vec(),
                 approval_commitment: approval.commitment().0,
                 authorization_sequence,
                 approval: approval_bytes.clone(),
                 effect,
-                finalized: false,
-                acknowledgement: None,
-                acknowledgement_bytes: None,
-                reopened_state: None,
-                applied_at: None,
             };
-            // Every fallible check precedes this point. These two mutations
-            // form the single Linear decision transition.
-            state.authorization_sequence = authorization_sequence;
-            state.retries.insert(index, record);
+            let mut candidate = state.clone();
+            candidate.authorization_sequence = authorization_sequence;
+            candidate.credentials[caller_index].management_request_high_water =
+                call.request_sequence.get();
+            candidate.retries.insert(index, record);
             // Management records remain in their own exact journal. They are
             // merely durable pass-through positions for the shared general
             // operation retirement floor.
-            advance_operation_retirement_floor(state);
+            if !advance_operation_retirement_floor(&mut candidate)
+                || !refresh_state_integrity_commitment(configuration, &mut candidate)
+                || !authority_state_is_valid(configuration, &candidate)
+            {
+                return Vec::new();
+            }
+            *state = candidate;
             approval_bytes
         }
     }
@@ -1263,6 +1413,9 @@ fn authorize_operation_call(
             let record = &state.operation_retries[index];
             if record.operation_call != call_commitment.0
                 || record.operation_call_bytes != encoded_call
+                || record.credential != call.credential.0
+                || record.request_sequence != call.request_sequence.get()
+                || record.invocation_payload != call.invocation_payload_commitment().0
                 || record.acknowledgement_invocation != acknowledgement_invocation.0
             {
                 return Vec::new();
@@ -1281,18 +1434,25 @@ fn authorize_operation_call(
             Vec::new()
         }
         Err(index) => {
-            // Once AOI1 has advanced the floor, the AOP1 bytes are
-            // intentionally gone. A replayed retired AOC1 is rejected via its
-            // collision tombstone; no approval is synthesized from hashes.
+            let Some(role) = authenticated_operation_role(state, &call) else {
+                return Vec::new();
+            };
+            let Ok(caller_index) = credential_index(state, call.credential) else {
+                return Vec::new();
+            };
+            // Once AOI1 has advanced the floor, AOP3 bytes are intentionally
+            // gone. The signed per-credential sequence rejects every retired
+            // AOC3 without synthesizing a result from commitments.
             if exact_retry_count(state) >= MAX_EXACT_RETRY_RECORDS
-                || state.retired_authority_operations.len() >= MAX_RETIRED_AUTHORITY_OPERATIONS
+                || state.credentials[caller_index]
+                    .operation_request_high_water
+                    .checked_add(1)
+                    != Some(call.request_sequence.get())
+                || credential_has_pending_application(state, call.credential)
                 || !invocation_pair_is_available(state, call.invocation, acknowledgement_invocation)
             {
                 return Vec::new();
             }
-            let Some(role) = authenticated_operation_role(state, &call) else {
-                return Vec::new();
-            };
             if !operation_policy_allows(configuration, state, &call, role) {
                 return Vec::new();
             }
@@ -1342,6 +1502,9 @@ fn authorize_operation_call(
             let record = AuthorityOperationRetryRecord {
                 invocation: call.invocation.0,
                 acknowledgement_invocation: acknowledgement_invocation.0,
+                credential: call.credential.0,
+                request_sequence: call.request_sequence.get(),
+                invocation_payload: call.invocation_payload_commitment().0,
                 operation_call: call_commitment.0,
                 operation_call_bytes: encoded_call.to_vec(),
                 approval_commitment: approval.commitment().0,
@@ -1354,8 +1517,17 @@ fn authorize_operation_call(
                 issued_at: None,
                 private_application_invocation: None,
             };
-            state.authorization_sequence = authorization_sequence;
-            state.operation_retries.insert(index, record);
+            let mut candidate = state.clone();
+            candidate.authorization_sequence = authorization_sequence;
+            candidate.credentials[caller_index].operation_request_high_water =
+                call.request_sequence.get();
+            candidate.operation_retries.insert(index, record);
+            if !refresh_state_integrity_commitment(configuration, &mut candidate)
+                || !authority_state_is_valid(configuration, &candidate)
+            {
+                return Vec::new();
+            }
+            *state = candidate;
             approval_bytes
         }
     }
@@ -1406,12 +1578,12 @@ fn administer_call(
     }
 
     let call_commitment = call.commitment();
-    match admin_retry_record(state, call.invocation) {
-        Ok(index) => {
-            let record = &state.admin_retries[index];
+    if let Ok(index) = admin_retry_record(state, call.credential) {
+        let record = &state.admin_retries[index];
+        if record.invocation == call.invocation.0 {
             if record.call_commitment != call_commitment.0
                 || record.call_bytes != encoded_call
-                || record.invocation != call.invocation.0
+                || record.request_sequence != call.request_sequence.get()
             {
                 return Vec::new();
             }
@@ -1426,51 +1598,66 @@ fn administer_call(
             {
                 return record.result_bytes.clone();
             }
-            Vec::new()
-        }
-        Err(index) => {
-            if exact_retry_count(state) >= MAX_EXACT_RETRY_RECORDS
-                || !admin_invocation_is_available(state, call.invocation)
-                || call.expected_generation.get() != state.administration_generation
-                || !authenticated_admin(state, &call)
-            {
-                return Vec::new();
-            }
-            let Some(generation) = call.next_generation() else {
-                return Vec::new();
-            };
-            let mut candidate = state.clone();
-            if !apply_admin_operation(configuration, &mut candidate, &call.operation) {
-                return Vec::new();
-            }
-            candidate.administration_generation = generation.get();
-            let Ok(result) = AuthorityAdminResult::from_call(call.clone()) else {
-                return Vec::new();
-            };
-            let Ok(result_bytes) = result.encode() else {
-                return Vec::new();
-            };
-            if result_bytes.len() > MAX_INVOCATION_REPLY_BYTES {
-                return Vec::new();
-            }
-            candidate.admin_retries.insert(
-                index,
-                AdminRetryRecord {
-                    invocation: call.invocation.0,
-                    call_commitment: call_commitment.0,
-                    call_bytes: encoded_call.to_vec(),
-                    result_commitment: result.commitment().0,
-                    result_bytes: result_bytes.clone(),
-                    generation: generation.get(),
-                },
-            );
-            if !authority_state_is_valid(configuration, &candidate) {
-                return Vec::new();
-            }
-            *state = candidate;
-            result_bytes
+            return Vec::new();
         }
     }
+
+    let Ok(caller_index) = credential_index(state, call.credential) else {
+        return Vec::new();
+    };
+    if !admin_invocation_is_available(state, call.invocation)
+        || call.expected_generation.get() != state.administration_generation
+        || state.credentials[caller_index]
+            .admin_request_high_water
+            .checked_add(1)
+            != Some(call.request_sequence.get())
+        || credential_has_pending_application(state, call.credential)
+        || !authenticated_admin(state, &call)
+    {
+        return Vec::new();
+    }
+    let Some(generation) = call.next_generation() else {
+        return Vec::new();
+    };
+    let mut candidate = state.clone();
+    candidate.credentials[caller_index].admin_request_high_water = call.request_sequence.get();
+    if !apply_admin_operation(configuration, &mut candidate, &call.operation) {
+        return Vec::new();
+    }
+    candidate.administration_generation = generation.get();
+    let Ok(result) = AuthorityAdminResult::from_call(call.clone()) else {
+        return Vec::new();
+    };
+    let Ok(result_bytes) = result.encode() else {
+        return Vec::new();
+    };
+    if result_bytes.len() > MAX_INVOCATION_REPLY_BYTES {
+        return Vec::new();
+    }
+    let record = AdminRetryRecord {
+        credential: call.credential.0,
+        request_sequence: call.request_sequence.get(),
+        invocation: call.invocation.0,
+        call_commitment: call_commitment.0,
+        call_bytes: encoded_call.to_vec(),
+        result_commitment: result.commitment().0,
+        result_bytes: result_bytes.clone(),
+        generation: generation.get(),
+    };
+    match candidate
+        .admin_retries
+        .binary_search_by(|row| row.credential.cmp(&call.credential.0))
+    {
+        Ok(index) => candidate.admin_retries[index] = record,
+        Err(index) => candidate.admin_retries.insert(index, record),
+    }
+    if !refresh_state_integrity_commitment(configuration, &mut candidate)
+        || !authority_state_is_valid(configuration, &candidate)
+    {
+        return Vec::new();
+    }
+    *state = candidate;
+    result_bytes
 }
 
 fn authenticated_admin(state: &AuthorityLinearState, call: &AuthorityAdminCall) -> bool {
@@ -1580,6 +1767,7 @@ fn apply_admin_operation(
             if state.credentials[index].principal != principal.0
                 || state.credentials[index].status != CredentialStatus::Active
                 || active_credential_count(state, *principal) <= 1
+                || credential_has_pending_application(state, *credential)
             {
                 return false;
             }
@@ -1624,7 +1812,9 @@ fn apply_admin_operation(
                 return false;
             };
             let role = builtin_role(*role);
-            if state.roles[index].role == role {
+            if state.roles[index].role == role
+                || principal_has_pending_application(state, *principal)
+            {
                 return false;
             }
             state.roles[index].role = role;
@@ -1653,7 +1843,7 @@ fn node_is_in_use(
             .private_applications
             .iter()
             .any(|application| application.node == node.0)
-        || state.retired_authority_operations.iter().any(|record| {
+        || state.latest_operation_acks.iter().any(|record| {
             record
                 .private_operation
                 .is_some_and(|operation| operation.node == Some(node.0))
@@ -1661,26 +1851,35 @@ fn node_is_in_use(
     {
         return true;
     }
-    if state.retries.iter().any(|record| match &record.effect {
-        PendingManagementEffect::Create(row) => {
-            row.replicas.iter().any(|replica| replica.node == node.0)
-        }
-        PendingManagementEffect::ChangeReplicas { replicas, .. } => {
-            replicas.iter().any(|replica| replica.node == node.0)
-        }
-        _ => false,
+    if state.retries.iter().any(|record| {
+        AuthorityCredentialCall::decode(&record.credential_call_bytes)
+            .is_ok_and(|call| call.authenticated_node == Some(node))
+            || match &record.effect {
+                PendingManagementEffect::Create(row) => {
+                    row.replicas.iter().any(|replica| replica.node == node.0)
+                }
+                PendingManagementEffect::ChangeReplicas { replicas, .. } => {
+                    replicas.iter().any(|replica| replica.node == node.0)
+                }
+                _ => false,
+            }
     }) {
         return true;
     }
     state.operation_retries.iter().any(|record| {
         AuthorityOperationCall::decode(&record.operation_call_bytes)
             .ok()
-            .and_then(|call| match call.intent {
-                AuthorityOperationIntent::InvitePrivateNode { node, .. }
-                | AuthorityOperationIntent::RevokePrivateNode { node, .. } => Some(node),
-                AuthorityOperationIntent::InvokeActor { .. }
-                | AuthorityOperationIntent::Catalog { .. }
-                | AuthorityOperationIntent::RecoverPrivateAgent { .. } => None,
+            .and_then(|call| {
+                if call.authenticated_node == Some(node) {
+                    return Some(node);
+                }
+                match call.intent {
+                    AuthorityOperationIntent::InvitePrivateNode { node, .. }
+                    | AuthorityOperationIntent::RevokePrivateNode { node, .. } => Some(node),
+                    AuthorityOperationIntent::InvokeActor { .. }
+                    | AuthorityOperationIntent::Catalog { .. }
+                    | AuthorityOperationIntent::RecoverPrivateAgent { .. } => None,
+                }
             })
             == Some(node)
     })
@@ -1696,6 +1895,9 @@ fn credential_row(
         kind: credential.kind as u8,
         public_key: credential.public_key,
         status: CredentialStatus::Active,
+        management_request_high_water: 0,
+        operation_request_high_water: 0,
+        admin_request_high_water: 0,
     }
 }
 
@@ -1717,11 +1919,11 @@ fn active_credential_count(state: &AuthorityLinearState, principal: PrincipalId)
 
 fn admin_retry_record(
     state: &AuthorityLinearState,
-    invocation: InvocationId,
+    credential: CredentialId,
 ) -> core::result::Result<usize, usize> {
     state
         .admin_retries
-        .binary_search_by(|record| record.invocation.cmp(&invocation.0))
+        .binary_search_by(|record| record.credential.cmp(&credential.0))
 }
 
 fn admin_invocation_is_available(state: &AuthorityLinearState, invocation: InvocationId) -> bool {
@@ -1733,20 +1935,25 @@ fn admin_invocation_is_available(state: &AuthorityLinearState, invocation: Invoc
         && state.retries.iter().all(|record| {
             record.invocation != invocation.0 && record.acknowledgement_invocation != invocation.0
         })
+        && state.latest_management_acks.iter().all(|record| {
+            record.authorization_invocation != invocation.0
+                && record.acknowledgement_invocation != invocation.0
+        })
         && state.operation_retries.iter().all(|record| {
             record.invocation != invocation.0
                 && record.acknowledgement_invocation != invocation.0
                 && record.private_application_invocation != Some(invocation.0)
         })
-        && state.retired_authority_operations.iter().all(|record| {
-            record.invocation != invocation.0
+        && state.latest_operation_acks.iter().all(|record| {
+            record.authorization_invocation != invocation.0
                 && record.acknowledgement_invocation != invocation.0
                 && record.private_application_invocation != Some(invocation.0)
         })
-        && state
-            .private_applications
-            .iter()
-            .all(|record| record.application_invocation != invocation.0)
+        && state.private_applications.iter().all(|record| {
+            record.authorization_invocation != invocation.0
+                && record.issuance_invocation != invocation.0
+                && record.application_invocation != invocation.0
+        })
 }
 
 fn finalize_application(
@@ -1771,6 +1978,27 @@ fn finalize_application(
     }
     let ack_commitment = ack.commitment();
 
+    // Only the newest completed application for a credential remains
+    // exact-retryable. Older MAA2 values are rejected by the credential
+    // request high-water rather than reconstructed from discarded MAP1 bytes.
+    if let Some(record) = state
+        .latest_management_acks
+        .iter()
+        .find(|record| record.acknowledgement_invocation == ack.acknowledgement_invocation.0)
+    {
+        return record.authorization_invocation == ack.authorization_invocation.0
+            && record.authorization_sequence == ack.authorization_sequence.get()
+            && record.credential_call == ack.credential_call.0
+            && record.approval == ack.approval.0
+            && record.request == ack.request.0
+            && record.application
+                == vos::agent_sdk::wire::management_reply_commitment(&ack.application).0
+            && record.acknowledgement == ack_commitment.0
+            && record.acknowledgement_bytes == encoded_ack
+            && record.reopened_state == ack.reopened_state.0
+            && record.applied_at == ack.applied_at;
+    }
+
     let Some(record_index) = state
         .retries
         .iter()
@@ -1781,13 +2009,6 @@ fn finalize_application(
     let record = &state.retries[record_index];
     if record.invocation != ack.authorization_invocation.0 {
         return false;
-    }
-    if record.finalized {
-        return record.invocation == ack.authorization_invocation.0
-            && record.acknowledgement == Some(ack_commitment.0)
-            && record.acknowledgement_bytes.as_deref() == Some(encoded_ack)
-            && record.reopened_state == Some(ack.reopened_state.0)
-            && record.applied_at == Some(ack.applied_at);
     }
     if record.credential_call != ack.credential_call.0
         || record.approval_commitment != ack.approval.0
@@ -1808,15 +2029,40 @@ fn finalize_application(
     let Some(plan) = application_plan(configuration, state, &record.effect, &call, &ack) else {
         return false;
     };
+    let latest = LatestManagementAckRow {
+        credential: record.credential,
+        request_sequence: record.request_sequence,
+        authorization_invocation: record.invocation,
+        acknowledgement_invocation: record.acknowledgement_invocation,
+        authorization_sequence: record.authorization_sequence,
+        credential_call: record.credential_call,
+        credential_call_bytes: record.credential_call_bytes.clone(),
+        approval: record.approval_commitment,
+        request: ack.request.0,
+        application: vos::agent_sdk::wire::management_reply_commitment(&ack.application).0,
+        acknowledgement: ack_commitment.0,
+        acknowledgement_bytes: encoded_ack.to_vec(),
+        reopened_state: ack.reopened_state.0,
+        applied_at: ack.applied_at,
+    };
     let mut candidate = state.clone();
     apply_application_plan(&mut candidate, plan);
-    let record = &mut candidate.retries[record_index];
-    record.finalized = true;
-    record.acknowledgement = Some(ack_commitment.0);
-    record.acknowledgement_bytes = Some(encoded_ack.to_vec());
-    record.reopened_state = Some(ack.reopened_state.0);
-    record.applied_at = Some(ack.applied_at);
-    if !authority_state_is_valid(configuration, &candidate) {
+    candidate.retries.remove(record_index);
+    match candidate
+        .latest_management_acks
+        .binary_search_by(|record| record.credential.cmp(&latest.credential))
+    {
+        Ok(index) => {
+            if candidate.latest_management_acks[index].request_sequence >= latest.request_sequence {
+                return false;
+            }
+            candidate.latest_management_acks[index] = latest;
+        }
+        Err(index) => candidate.latest_management_acks.insert(index, latest),
+    }
+    if !refresh_state_integrity_commitment(configuration, &mut candidate)
+        || !authority_state_is_valid(configuration, &candidate)
+    {
         return false;
     }
     *state = candidate;
@@ -1847,17 +2093,18 @@ fn acknowledge_operation_issuance(
     }
     let ack_commitment = ack.commitment();
 
-    // A compact tombstone makes an exact AOI1 retry idempotent after its full
-    // preimages have been retired. It deliberately cannot answer an AOC1
-    // retry, because reconstructing AOP1 bytes from commitments is forbidden.
-    if let Some(retired) = state
-        .retired_authority_operations
+    // The credential-bounded latest result makes an exact AOI1 retry
+    // idempotent after its AOC3/AOP3 preimages compact. It deliberately cannot
+    // answer an AOC3 retry.
+    if let Some(latest) = state
+        .latest_operation_acks
         .iter()
         .find(|row| row.acknowledgement_invocation == ack.acknowledgement_invocation.0)
     {
-        return retired.invocation == ack.authorization_invocation.0
-            && retired.authorization_sequence == ack.authorization_sequence.get()
-            && retired.issuance_ack == ack_commitment.0;
+        return latest.authorization_invocation == ack.authorization_invocation.0
+            && latest.authorization_sequence == ack.authorization_sequence.get()
+            && latest.issuance_ack == ack_commitment.0
+            && latest.issuance_ack_bytes == encoded_ack;
     }
 
     let Some(record_index) = state
@@ -1912,6 +2159,7 @@ fn acknowledge_operation_issuance(
     record.private_application_invocation =
         private_application_invocation.map(|invocation| invocation.0);
     if !advance_operation_retirement_floor(&mut candidate)
+        || !refresh_state_integrity_commitment(configuration, &mut candidate)
         || !authority_state_is_valid(configuration, &candidate)
     {
         return false;
@@ -1973,9 +2221,9 @@ fn acknowledge_private_control_application(
     };
     let managed = &state.managed_agents[managed_index];
     if managed.profile != AgentProfile::Private as u8
-        || managed.owner != source.principal
+        || managed.owner != source.private.principal
         || managed.authority != configuration.binding
-        || !retired_private_operation_matches_application(&source, &ack.application)
+        || !retired_private_operation_matches_application(&source.private, &ack.application)
     {
         return false;
     }
@@ -1984,13 +2232,16 @@ fn acknowledge_private_control_application(
     if ack.application.operation == AuthorityOperationKind::RecoverPrivateAgent {
         return false;
     }
-    let Some(node) = source.node else {
+    let Some(node) = source.private.node else {
         return false;
     };
     let Ok(private_index) = private_agent(state, target.agent) else {
         return false;
     };
     let record = PrivateApplicationRecord {
+        credential: source.credential,
+        request_sequence: source.request_sequence,
+        invocation_payload: source.invocation_payload,
         authorization_invocation: ack.authorization_invocation.0,
         issuance_invocation: ack.issuance_invocation.0,
         application_invocation: ack.application_invocation.0,
@@ -2008,7 +2259,7 @@ fn acknowledge_private_control_application(
         control_previous: ack.application.control_previous.map(|previous| previous.0),
         epoch: ack.application.epoch,
         node,
-        node_identity: source.node_identity,
+        node_identity: source.private.node_identity,
         member_set: ack.application.post_member_set.0,
         reopened_control_state: ack.application.reopened_control_state.0,
         issued_at: ack.issued_at,
@@ -2026,6 +2277,7 @@ fn acknowledge_private_control_application(
         private_application_commitment(Hash(candidate.private_application_commitment), &record).0;
     candidate.private_applications.push(record);
     if !synchronize_private_managed_replicas(configuration, &mut candidate, private_index)
+        || !refresh_state_integrity_commitment(configuration, &mut candidate)
         || !authority_state_is_valid(configuration, &candidate)
     {
         return false;
@@ -2068,7 +2320,7 @@ fn private_application_source(
     configuration: &SystemAuthorityConfiguration,
     state: &AuthorityLinearState,
     ack: &PrivateControlApplicationAck,
-) -> Option<RetiredPrivateOperationRow> {
+) -> Option<PrivateApplicationSource> {
     if let Some(record) = state.operation_retries.iter().find(|record| {
         record.acknowledgement_invocation == ack.issuance_invocation.0
             && record.invocation == ack.authorization_invocation.0
@@ -2099,12 +2351,17 @@ fn private_application_source(
         {
             return None;
         }
-        return retained_private_operation(&call);
+        return Some(PrivateApplicationSource {
+            credential: record.credential,
+            request_sequence: record.request_sequence,
+            invocation_payload: record.invocation_payload,
+            private: retained_private_operation(&call)?,
+        });
     }
 
-    let retired = state.retired_authority_operations.iter().find(|record| {
+    let retired = state.latest_operation_acks.iter().find(|record| {
         record.acknowledgement_invocation == ack.issuance_invocation.0
-            && record.invocation == ack.authorization_invocation.0
+            && record.authorization_invocation == ack.authorization_invocation.0
     })?;
     let sequence = NonZeroU64::new(retired.authorization_sequence)?;
     if retired.operation_call != ack.operation_call.0
@@ -2115,7 +2372,7 @@ fn private_application_source(
         || ack
             .verify_issuance_tombstone_with(
                 configured_authority_target(configuration),
-                InvocationId(retired.invocation),
+                InvocationId(retired.authorization_invocation),
                 InvocationId(retired.acknowledgement_invocation),
                 sequence,
                 Hash(retired.issuance_ack),
@@ -2125,7 +2382,12 @@ fn private_application_source(
     {
         return None;
     }
-    retired.private_operation
+    Some(PrivateApplicationSource {
+        credential: retired.credential,
+        request_sequence: retired.request_sequence,
+        invocation_payload: retired.invocation_payload,
+        private: retired.private_operation?,
+    })
 }
 
 fn retained_private_operation(call: &AuthorityOperationCall) -> Option<RetiredPrivateOperationRow> {
@@ -2327,13 +2589,19 @@ fn advance_operation_retirement_floor(state: &mut AuthorityLinearState) -> bool 
         if next > state.authorization_sequence {
             return true;
         }
-        // ACC1/MAP1/MAA2 rows remain byte-exactly retained in their separate
-        // journal. A management position merely proves there is no general
-        // AOC1/AOP1 material to retire at this shared sequence number.
+        // Pending ACC2/MAP1 or the credential-bounded latest MAA2 row proves
+        // that this shared authorization position contains no AOC material.
+        // A credential cannot advance again while its completed management
+        // position remains ahead of this floor, so this pass-through set is
+        // bounded by the credential table rather than operation history.
         if state
             .retries
             .iter()
             .any(|record| record.authorization_sequence == next)
+            || state
+                .latest_management_acks
+                .iter()
+                .any(|record| record.authorization_sequence == next)
         {
             state.operation_retirement_floor = next;
             continue;
@@ -2355,28 +2623,54 @@ fn advance_operation_retirement_floor(state: &mut AuthorityLinearState) -> bool 
         let Ok(call) = AuthorityOperationCall::decode(&record.operation_call_bytes) else {
             return false;
         };
-        if state.retired_authority_operations.len() >= MAX_RETIRED_AUTHORITY_OPERATIONS {
+        let Some(issuance_ack_bytes) = record.issuance_ack_bytes.clone() else {
             return false;
-        }
-        let retired = RetiredAuthorityOperationRow {
-            invocation: record.invocation,
+        };
+        let latest = LatestOperationAckRow {
+            credential: record.credential,
+            request_sequence: record.request_sequence,
+            invocation_payload: record.invocation_payload,
+            authorization_invocation: record.invocation,
             acknowledgement_invocation: record.acknowledgement_invocation,
             authorization_sequence: record.authorization_sequence,
             operation_call: record.operation_call,
             approval: record.approval_commitment,
             issuance_ack,
+            issuance_ack_bytes,
             issued_at,
             private_application_invocation: record.private_application_invocation,
             private_operation: retained_private_operation(&call),
         };
-        // The durable floor is advanced before the retireable AOC1/AOP1/AOI1
+        // The durable floor is advanced before the retireable AOC3/AOP3
         // buffers are removed. Actor state commits atomically, while this
         // ordering preserves the protocol's reopen rule explicitly.
         state.operation_retirement_floor = next;
-        state.operation_retirement_commitment =
-            operation_retirement_commitment(Hash(state.operation_retirement_commitment), &retired)
-                .0;
-        state.retired_authority_operations.push(retired);
+        match state
+            .latest_operation_acks
+            .binary_search_by(|row| row.credential.cmp(&latest.credential))
+        {
+            Ok(latest_index) => {
+                let previous = &state.latest_operation_acks[latest_index];
+                if previous.request_sequence.checked_add(1) != Some(latest.request_sequence)
+                    || (previous.private_operation.is_some()
+                        && !private_operation_source_is_applied(
+                            state,
+                            previous.authorization_invocation,
+                            previous.acknowledgement_invocation,
+                            previous.authorization_sequence,
+                        ))
+                {
+                    return false;
+                }
+                state.latest_operation_acks[latest_index] = latest;
+            }
+            Err(latest_index) => {
+                if latest.request_sequence != 1 {
+                    return false;
+                }
+                state.latest_operation_acks.insert(latest_index, latest);
+            }
+        }
         state.operation_retries.remove(index);
     }
 }
@@ -2465,6 +2759,8 @@ fn application_plan(
                         agent: row.agent,
                         owner: row.owner,
                         runtime_deployment: row.runtime_deployment,
+                        genesis_members: members.clone(),
+                        genesis_member_set: member_set.0,
                         control_head: None,
                         control_sequence: None,
                         epoch: 0,
@@ -2745,6 +3041,12 @@ fn invocation_pair_is_available(
                 && record.acknowledgement_invocation != authorization.0
                 && record.acknowledgement_invocation != acknowledgement.0
         })
+        && state.latest_management_acks.iter().all(|record| {
+            record.authorization_invocation != authorization.0
+                && record.authorization_invocation != acknowledgement.0
+                && record.acknowledgement_invocation != authorization.0
+                && record.acknowledgement_invocation != acknowledgement.0
+        })
         && state.operation_retries.iter().all(|record| {
             record.invocation != authorization.0
                 && record.invocation != acknowledgement.0
@@ -2753,9 +3055,9 @@ fn invocation_pair_is_available(
                 && record.private_application_invocation != Some(authorization.0)
                 && record.private_application_invocation != Some(acknowledgement.0)
         })
-        && state.retired_authority_operations.iter().all(|record| {
-            record.invocation != authorization.0
-                && record.invocation != acknowledgement.0
+        && state.latest_operation_acks.iter().all(|record| {
+            record.authorization_invocation != authorization.0
+                && record.authorization_invocation != acknowledgement.0
                 && record.acknowledgement_invocation != authorization.0
                 && record.acknowledgement_invocation != acknowledgement.0
                 && record.private_application_invocation != Some(authorization.0)
@@ -2765,7 +3067,11 @@ fn invocation_pair_is_available(
             record.invocation != authorization.0 && record.invocation != acknowledgement.0
         })
         && state.private_applications.iter().all(|record| {
-            record.application_invocation != authorization.0
+            record.authorization_invocation != authorization.0
+                && record.authorization_invocation != acknowledgement.0
+                && record.issuance_invocation != authorization.0
+                && record.issuance_invocation != acknowledgement.0
+                && record.application_invocation != authorization.0
                 && record.application_invocation != acknowledgement.0
         })
 }
@@ -2778,13 +3084,17 @@ fn private_application_invocation_is_unreserved(
         && state.retries.iter().all(|record| {
             record.invocation != application.0 && record.acknowledgement_invocation != application.0
         })
+        && state.latest_management_acks.iter().all(|record| {
+            record.authorization_invocation != application.0
+                && record.acknowledgement_invocation != application.0
+        })
         && state.operation_retries.iter().all(|record| {
             record.invocation != application.0
                 && record.acknowledgement_invocation != application.0
                 && record.private_application_invocation != Some(application.0)
         })
-        && state.retired_authority_operations.iter().all(|record| {
-            record.invocation != application.0
+        && state.latest_operation_acks.iter().all(|record| {
+            record.authorization_invocation != application.0
                 && record.acknowledgement_invocation != application.0
                 && record.private_application_invocation != Some(application.0)
         })
@@ -2792,10 +3102,11 @@ fn private_application_invocation_is_unreserved(
             .admin_retries
             .iter()
             .all(|record| record.invocation != application.0)
-        && state
-            .private_applications
-            .iter()
-            .all(|record| record.application_invocation != application.0)
+        && state.private_applications.iter().all(|record| {
+            record.authorization_invocation != application.0
+                && record.issuance_invocation != application.0
+                && record.application_invocation != application.0
+        })
 }
 
 fn authenticated_role(
@@ -3176,7 +3487,7 @@ fn operation_policy_allows(
                 && projection.epoch.checked_add(1) == Some(*epoch)
                 && next_members.is_some_and(|(_, expected)| expected == *member_set)
         }
-        // The AOC1 projection commits recovery evidence but does not prove a
+        // The AOC3 projection commits recovery evidence but does not prove a
         // recovery kit or the current private control-chain head. Until an
         // authenticated application fact supplies those checks, recovery is
         // not authorizable here; Admin credentials never substitute for keys.
@@ -3211,12 +3522,12 @@ fn outstanding_private_operation_exists(state: &AuthorityLinearState, agent: Age
                         record.authorization_sequence,
                     )
             })
-    }) || state.retired_authority_operations.iter().any(|record| {
+    }) || state.latest_operation_acks.iter().any(|record| {
         record.private_operation.is_some_and(|private| {
             private.agent == agent.0
                 && !private_operation_source_is_applied(
                     state,
-                    record.invocation,
+                    record.authorization_invocation,
                     record.acknowledgement_invocation,
                     record.authorization_sequence,
                 )
@@ -3284,7 +3595,6 @@ fn pending_replica_transition_conflicts(
 ) -> bool {
     state.retries.iter().any(|record| {
         record.invocation != call.invocation.0
-            && !record.finalized
             && matches!(
                 &record.effect,
                 PendingManagementEffect::ChangeReplicas {
@@ -3300,9 +3610,7 @@ fn live_and_pending_agent_count(state: &AuthorityLinearState) -> usize {
         + state
             .retries
             .iter()
-            .filter(|record| {
-                !record.finalized && matches!(record.effect, PendingManagementEffect::Create(_))
-            })
+            .filter(|record| matches!(record.effect, PendingManagementEffect::Create(_)))
             .count()
 }
 
@@ -3346,7 +3654,6 @@ fn pending_actor_effect_conflicts(
                     .iter()
                     .filter(|record| {
                         record.invocation != call.invocation.0
-                            && !record.finalized
                             && matches!(record.effect, PendingManagementEffect::InstallActor { .. })
                     })
                     .count()
@@ -3369,7 +3676,7 @@ fn pending_actor_effect_conflicts(
         _ => return false,
     };
     state.retries.iter().any(|record| {
-        if record.invocation == call.invocation.0 || record.finalized {
+        if record.invocation == call.invocation.0 {
             return false;
         }
         match &record.effect {
@@ -3418,7 +3725,7 @@ fn pending_runtime_transition_conflicts(
 ) -> bool {
     let incoming_runtime_upgrade = matches!(&call.request, ManagementRequest::UpgradeRuntime(_));
     state.retries.iter().any(|record| {
-        if record.invocation == call.invocation.0 || record.finalized {
+        if record.invocation == call.invocation.0 {
             return false;
         }
         if !incoming_runtime_upgrade {
@@ -3947,45 +4254,6 @@ fn configured_authority_target(
     }
 }
 
-fn initial_operation_retirement_commitment(configuration: SystemAuthorityConfiguration) -> Hash {
-    Hash::digest(
-        b"vos/system-authority/operation-retirement-root/v2",
-        &[RUNTIME_ABI_ID.as_bytes(), &configuration.encode()],
-    )
-}
-
-fn operation_retirement_commitment(previous: Hash, record: &RetiredAuthorityOperationRow) -> Hash {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&record.invocation);
-    bytes.extend_from_slice(&record.acknowledgement_invocation);
-    bytes.extend_from_slice(&record.authorization_sequence.to_le_bytes());
-    bytes.extend_from_slice(&record.operation_call);
-    bytes.extend_from_slice(&record.approval);
-    bytes.extend_from_slice(&record.issuance_ack);
-    bytes.extend_from_slice(&record.issued_at.to_le_bytes());
-    encode_optional_hash(&mut bytes, record.private_application_invocation);
-    if let Some(private) = record.private_operation {
-        bytes.push(1);
-        bytes.extend_from_slice(&private.agent);
-        bytes.extend_from_slice(&private.runtime_deployment);
-        bytes.extend_from_slice(&private.principal);
-        bytes.push(private.operation);
-        bytes.extend_from_slice(&private.control);
-        bytes.extend_from_slice(&private.control_sequence.to_le_bytes());
-        encode_optional_hash(&mut bytes, private.control_previous);
-        bytes.extend_from_slice(&private.epoch.to_le_bytes());
-        encode_optional_hash(&mut bytes, private.node);
-        encode_optional_hash(&mut bytes, private.node_identity);
-        encode_optional_hash(&mut bytes, private.post_member_set);
-    } else {
-        bytes.push(0);
-    }
-    Hash::digest(
-        b"vos/system-authority/operation-retirement/v2",
-        &[previous.as_bytes(), &bytes],
-    )
-}
-
 fn encode_optional_hash(bytes: &mut Vec<u8>, value: Option<[u8; 32]>) {
     if let Some(value) = value {
         bytes.push(1);
@@ -3995,26 +4263,18 @@ fn encode_optional_hash(bytes: &mut Vec<u8>, value: Option<[u8; 32]>) {
     }
 }
 
-fn operation_retirement_chain_is_valid(
-    configuration: &SystemAuthorityConfiguration,
-    state: &AuthorityLinearState,
-) -> bool {
-    let mut commitment = initial_operation_retirement_commitment(*configuration);
-    for record in &state.retired_authority_operations {
-        commitment = operation_retirement_commitment(commitment, record);
-    }
-    commitment.0 == state.operation_retirement_commitment
-}
-
 fn initial_private_application_commitment(configuration: SystemAuthorityConfiguration) -> Hash {
     Hash::digest(
-        b"vos/system-authority/private-application-root/v1",
+        b"vos/system-authority/private-application-root/v2",
         &[RUNTIME_ABI_ID.as_bytes(), &configuration.encode()],
     )
 }
 
 fn private_application_commitment(previous: Hash, record: &PrivateApplicationRecord) -> Hash {
     let mut bytes = Vec::new();
+    bytes.extend_from_slice(&record.credential);
+    bytes.extend_from_slice(&record.request_sequence.to_le_bytes());
+    bytes.extend_from_slice(&record.invocation_payload);
     bytes.extend_from_slice(&record.authorization_invocation);
     bytes.extend_from_slice(&record.issuance_invocation);
     bytes.extend_from_slice(&record.application_invocation);
@@ -4038,7 +4298,7 @@ fn private_application_commitment(previous: Hash, record: &PrivateApplicationRec
     bytes.extend_from_slice(&record.issued_at.to_le_bytes());
     bytes.extend_from_slice(&record.applied_at.to_le_bytes());
     Hash::digest(
-        b"vos/system-authority/private-application/v1",
+        b"vos/system-authority/private-application/v2",
         &[previous.as_bytes(), &bytes],
     )
 }
@@ -4088,7 +4348,7 @@ fn retired_private_operation_is_valid(row: RetiredPrivateOperationRow) -> bool {
                 .post_member_set
                 .is_some_and(|member_set| member_set != [0; 32])
     } else {
-        // Recovery AOC1 remains un-authorizable until an offline recovery
+        // Recovery AOC3 remains un-authorizable until an offline recovery
         // proof policy exists, so a retired Recover tombstone is unbacked.
         false
     };
@@ -4127,44 +4387,87 @@ fn private_application_record_source(
     configuration: &SystemAuthorityConfiguration,
     state: &AuthorityLinearState,
     record: &PrivateApplicationRecord,
-) -> Option<RetiredPrivateOperationRow> {
+) -> Option<PrivateApplicationSource> {
     let fact = private_application_fact(configuration, record)?;
-    let source = if let Some(active) = state.operation_retries.iter().find(|source| {
+    let request_sequence = NonZeroU64::new(record.request_sequence)?;
+    let authorization_invocation = AuthorityOperationCall::derive_invocation(
+        CredentialId(record.credential),
+        request_sequence,
+        Hash(record.invocation_payload),
+    );
+    let issuance_invocation =
+        AuthorityOperationApproval::derive_acknowledgement_invocation_from_call_parts(
+            CredentialId(record.credential),
+            request_sequence,
+            authorization_invocation,
+            Hash(record.invocation_payload),
+            Hash(record.operation_call),
+        );
+    let credential =
+        &state.credentials[credential_index(state, CredentialId(record.credential)).ok()?];
+    if credential.principal != record.owner
+        || credential.operation_request_high_water < record.request_sequence
+        || authorization_invocation.0 != record.authorization_invocation
+        || issuance_invocation.0 != record.issuance_invocation
+    {
+        return None;
+    }
+    let private = RetiredPrivateOperationRow {
+        agent: record.agent,
+        runtime_deployment: record.runtime_deployment,
+        principal: record.owner,
+        operation: record.operation,
+        control: record.control,
+        control_sequence: record.control_sequence,
+        control_previous: record.control_previous,
+        epoch: record.epoch,
+        node: Some(record.node),
+        node_identity: record.node_identity,
+        post_member_set: (record.operation == AuthorityOperationKind::RevokePrivateNode as u8)
+            .then_some(record.member_set),
+    };
+    if let Some(active) = state.operation_retries.iter().find(|source| {
         source.invocation == record.authorization_invocation
             && source.acknowledgement_invocation == record.issuance_invocation
     }) {
-        if active.authorization_sequence != record.authorization_sequence
+        let call = AuthorityOperationCall::decode(&active.operation_call_bytes).ok()?;
+        if active.credential != record.credential
+            || active.request_sequence != record.request_sequence
+            || active.invocation_payload != record.invocation_payload
+            || active.authorization_sequence != record.authorization_sequence
             || active.operation_call != record.operation_call
             || active.approval_commitment != record.approval
             || active.issuance_ack != Some(record.issuance_ack)
             || active.issued_at != Some(record.issued_at)
             || active.private_application_invocation != Some(record.application_invocation)
+            || retained_private_operation(&call) != Some(private)
         {
             return None;
         }
-        let call = AuthorityOperationCall::decode(&active.operation_call_bytes).ok()?;
-        retained_private_operation(&call)?
-    } else {
-        let retired = state.retired_authority_operations.iter().find(|source| {
-            source.invocation == record.authorization_invocation
-                && source.acknowledgement_invocation == record.issuance_invocation
-        })?;
-        if retired.authorization_sequence != record.authorization_sequence
-            || retired.operation_call != record.operation_call
-            || retired.approval != record.approval
-            || retired.issuance_ack != record.issuance_ack
-            || retired.issued_at != record.issued_at
-            || retired.private_application_invocation != Some(record.application_invocation)
-        {
-            return None;
-        }
-        retired.private_operation?
-    };
-    (source.principal == record.owner
-        && source.node == Some(record.node)
-        && source.node_identity == record.node_identity
-        && retired_private_operation_matches_application(&source, &fact))
-    .then_some(source)
+    } else if let Some(latest) = state.latest_operation_acks.iter().find(|source| {
+        source.authorization_invocation == record.authorization_invocation
+            && source.acknowledgement_invocation == record.issuance_invocation
+    }) && (latest.credential != record.credential
+        || latest.request_sequence != record.request_sequence
+        || latest.invocation_payload != record.invocation_payload
+        || latest.authorization_sequence != record.authorization_sequence
+        || latest.operation_call != record.operation_call
+        || latest.approval != record.approval
+        || latest.issuance_ack != record.issuance_ack
+        || latest.issued_at != record.issued_at
+        || latest.private_application_invocation != Some(record.application_invocation)
+        || latest.private_operation != Some(private))
+    {
+        return None;
+    }
+    (retired_private_operation_is_valid(private)
+        && retired_private_operation_matches_application(&private, &fact))
+    .then_some(PrivateApplicationSource {
+        credential: record.credential,
+        request_sequence: record.request_sequence,
+        invocation_payload: record.invocation_payload,
+        private,
+    })
 }
 
 fn private_genesis_projection(
@@ -4174,42 +4477,18 @@ fn private_genesis_projection(
     if managed.profile != AgentProfile::Private as u8 {
         return None;
     }
-    let mut descriptor = None;
-    for record in &state.retries {
-        if !record.finalized
-            || !matches!(
-                &record.effect,
-                PendingManagementEffect::Create(row) if row.agent == managed.agent
-            )
-        {
-            continue;
-        }
-        if descriptor.is_some() {
-            return None;
-        }
-        let call = AuthorityCredentialCall::decode(&record.credential_call_bytes).ok()?;
-        let ManagementRequest::Create(candidate) = call.request else {
-            return None;
-        };
-        descriptor = Some(candidate);
-    }
-    let descriptor = descriptor?;
-    if descriptor.identity.agent.0 != managed.agent
-        || descriptor.identity.owner.0 != managed.owner
-        || descriptor.identity.profile != AgentProfile::Private
-    {
+    let current = &state.private_agents[private_agent(state, AgentId(managed.agent)).ok()?];
+    let members = current.genesis_members.clone();
+    let member_set = member_set_commitment(&members)?;
+    if member_set.0 != current.genesis_member_set {
         return None;
     }
-    let members = descriptor
-        .replicas
-        .iter()
-        .map(|replica| replica.node.0)
-        .collect::<Vec<_>>();
-    let member_set = member_set_commitment(&members)?;
     Some(PrivateAgentProjectionRow {
         agent: managed.agent,
         owner: managed.owner,
         runtime_deployment: managed.runtime_deployment,
+        genesis_members: members.clone(),
+        genesis_member_set: member_set.0,
         control_head: None,
         control_sequence: None,
         epoch: 0,
@@ -4230,6 +4509,8 @@ fn private_projection_fields_match(
     left.agent == right.agent
         && left.owner == right.owner
         && left.runtime_deployment == right.runtime_deployment
+        && left.genesis_members == right.genesis_members
+        && left.genesis_member_set == right.genesis_member_set
         && left.control_head == right.control_head
         && left.control_sequence == right.control_sequence
         && left.epoch == right.epoch
@@ -4299,6 +4580,13 @@ fn private_projection_is_valid(
             || member_set_commitment(&row.members).map(|commitment| commitment.0)
                 != Some(row.member_set)
             || row.member_set == [0; 32]
+            || row.genesis_members.is_empty()
+            || row.genesis_members.len() > MAX_PRIVATE_NODES
+            || row.genesis_members.iter().any(|node| *node == [0; 32])
+            || !row.genesis_members.windows(2).all(|pair| pair[0] < pair[1])
+            || member_set_commitment(&row.genesis_members).map(|commitment| commitment.0)
+                != Some(row.genesis_member_set)
+            || row.genesis_member_set == [0; 32]
             || (!genesis && !applied)
             || (genesis && row.epoch != 0)
             || row.control_head == Some([0; 32])
@@ -4358,7 +4646,12 @@ fn private_projection_is_valid(
             } else {
                 false
             };
-        if record.application_invocation == [0; 32]
+        if record.credential == [0; 32]
+            || record.request_sequence == 0
+            || record.invocation_payload == [0; 32]
+            || record.authorization_invocation == [0; 32]
+            || record.issuance_invocation == [0; 32]
+            || record.application_invocation == [0; 32]
             || record.application_ack == [0; 32]
             || record.operation_call == [0; 32]
             || record.approval == [0; 32]
@@ -4413,14 +4706,31 @@ fn private_projection_is_valid(
         let Ok(ack) = PrivateControlApplicationAck::decode(encoded) else {
             return false;
         };
-        let Some(source) = private_application_source(configuration, state, &ack) else {
+        let Some(source) = private_application_record_source(configuration, state, record) else {
+            return false;
+        };
+        let Some(sequence) = NonZeroU64::new(record.authorization_sequence) else {
             return false;
         };
         if ack.encode().ok().as_deref() != Some(encoded)
             || ack.application_invocation.0 != application_invocation
             || ack.commitment().0 != record.application_ack
             || ack.application != private_application_fact(configuration, record).unwrap()
-            || source.principal != row.owner
+            || ack.operation_call.0 != record.operation_call
+            || ack.approval.0 != record.approval
+            || ack.issuance_ack.0 != record.issuance_ack
+            || ack.issued_at != record.issued_at
+            || ack
+                .verify_issuance_tombstone_with(
+                    configured_authority_target(configuration),
+                    InvocationId(record.authorization_invocation),
+                    InvocationId(record.issuance_invocation),
+                    sequence,
+                    Hash(record.issuance_ack),
+                    &Ed25519CredentialVerifier,
+                )
+                .is_err()
+            || source.private.principal != row.owner
         {
             return false;
         }
@@ -4444,24 +4754,25 @@ fn authority_state_is_valid(
         && state.managed_actors.len() <= MAX_MANAGED_ACTORS
         && state.retired_actor_installations.len() <= MAX_RETIRED_ACTOR_INSTALLATIONS
         && exact_retry_count(state) <= MAX_EXACT_RETRY_RECORDS
-        && state.retired_authority_operations.len() <= MAX_RETIRED_AUTHORITY_OPERATIONS
+        && state.latest_management_acks.len() <= state.credentials.len()
+        && state.latest_operation_acks.len() <= state.credentials.len()
         && state.private_agents.len() <= MAX_MANAGED_AGENTS
         && state.private_applications.len() <= MAX_PRIVATE_APPLICATION_RECORDS
         && state.operation_retirement_floor >= configuration.bootstrap_authorization_high_water
         && state.operation_retirement_floor <= state.authorization_sequence
-        && state.operation_retirement_commitment != [0; 32]
         && state.private_application_commitment != [0; 32]
+        && state.state_integrity_commitment != [0; 32]
+        && computed_state_integrity_commitment(configuration, state)
+            .is_some_and(|commitment| commitment.0 == state.state_integrity_commitment)
         && sorted_unique_by(&state.credentials, |row| row.credential)
         && sorted_unique_by(&state.nodes, |row| row.node)
         && sorted_unique_by(&state.roles, |row| row.principal)
         && sorted_unique_by(&state.managed_agents, |row| row.agent)
         && sorted_unique_by(&state.retries, |row| row.invocation)
+        && sorted_unique_by(&state.latest_management_acks, |row| row.credential)
         && sorted_unique_by(&state.operation_retries, |row| row.invocation)
-        && state
-            .retired_authority_operations
-            .windows(2)
-            .all(|pair| pair[0].authorization_sequence < pair[1].authorization_sequence)
-        && sorted_unique_by(&state.admin_retries, |row| row.invocation)
+        && sorted_unique_by(&state.latest_operation_acks, |row| row.credential)
+        && sorted_unique_by(&state.admin_retries, |row| row.credential)
         && state.credentials.iter().all(|row| {
             row.credential != [0; 32]
                 && row.principal != [0; 32]
@@ -4518,296 +4829,367 @@ fn authority_state_is_valid(
                 && row.approval.len() <= MAX_INVOCATION_REPLY_BYTES
                 && operation_retry_ack_shape_is_valid(row)
         })
-        && state.retired_authority_operations.iter().all(|row| {
-            row.invocation != [0; 32]
-                && row.acknowledgement_invocation != [0; 32]
-                && row.invocation != row.acknowledgement_invocation
-                && row.authorization_sequence > configuration.bootstrap_authorization_high_water
-                && row.authorization_sequence <= state.operation_retirement_floor
-                && row.operation_call != [0; 32]
-                && row.approval != [0; 32]
-                && row.issuance_ack != [0; 32]
-                && retired_operation_private_application_shape_is_valid(configuration, row)
-        })
+        && state
+            .latest_operation_acks
+            .iter()
+            .all(|row| latest_operation_ack_is_valid(configuration, state, row))
         && state
             .admin_retries
             .iter()
             .all(|row| admin_retry_shape_is_valid(configuration, state, row))
+        && state.admin_retries.len() <= state.credentials.len()
         && state.administration_generation
-            == u64::try_from(state.admin_retries.len())
-                .ok()
-                .and_then(|count| count.checked_add(1))
+            == state
+                .credentials
+                .iter()
+                .try_fold(1_u64, |generation, credential| {
+                    generation.checked_add(credential.admin_request_high_water)
+                })
                 .unwrap_or(0)
         && admin_generations_are_unique(&state.admin_retries)
         && all_invocation_identifiers_are_unique(state)
-        && operation_retirement_chain_is_valid(configuration, state)
         && private_projection_is_valid(configuration, state)
-        && admin_history_reconstructs_identity(configuration, state)
+        && admin_compact_state_is_valid(configuration, state)
         && authorization_history_reconstructs_policy(configuration, state)
-}
-
-enum AuthorizationHistoryRecord<'a> {
-    Management(&'a ExactRetryRecord),
-    Operation(&'a AuthorityOperationRetryRecord),
-    RetiredOperation(&'a RetiredAuthorityOperationRow),
-}
-
-impl AuthorizationHistoryRecord<'_> {
-    fn sequence(&self) -> u64 {
-        match self {
-            Self::Management(record) => record.authorization_sequence,
-            Self::Operation(record) => record.authorization_sequence,
-            Self::RetiredOperation(record) => record.authorization_sequence,
-        }
-    }
 }
 
 fn authorization_history_reconstructs_policy(
     configuration: &SystemAuthorityConfiguration,
     state: &AuthorityLinearState,
 ) -> bool {
-    let mut replay = AuthorityLinearState::bootstrap(*configuration);
-    // Identity history is reconstructed independently. General-operation
-    // records retain the role actually used at admission, while management
-    // Create effects still require their owner to remain enrolled.
-    replay.credentials.clone_from(&state.credentials);
-    replay.nodes.clone_from(&state.nodes);
-    replay.roles.clone_from(&state.roles);
-    let mut history = Vec::with_capacity(
-        state
-            .retries
-            .len()
-            .saturating_add(state.operation_retries.len())
-            .saturating_add(state.retired_authority_operations.len()),
-    );
-    history.extend(
-        state
-            .retries
-            .iter()
-            .map(AuthorizationHistoryRecord::Management),
-    );
-    history.extend(
-        state
-            .operation_retries
-            .iter()
-            .map(AuthorizationHistoryRecord::Operation),
-    );
-    history.extend(
-        state
-            .retired_authority_operations
-            .iter()
-            .map(AuthorizationHistoryRecord::RetiredOperation),
-    );
-    history.sort_unstable_by_key(AuthorizationHistoryRecord::sequence);
-    let mut private_applications = state.private_applications.iter().collect::<Vec<_>>();
-    private_applications.sort_unstable_by_key(|record| record.authorization_sequence);
-    let mut private_application_index = 0;
-    let Some(expected_history_len) = state
-        .authorization_sequence
-        .checked_sub(configuration.bootstrap_authorization_high_water)
-        .and_then(|len| usize::try_from(len).ok())
+    let Some(management_count) = state.credentials.iter().try_fold(0_u64, |total, row| {
+        total.checked_add(row.management_request_high_water)
+    }) else {
+        return false;
+    };
+    let Some(operation_count) = state.credentials.iter().try_fold(0_u64, |total, row| {
+        total.checked_add(row.operation_request_high_water)
+    }) else {
+        return false;
+    };
+    let Some(expected_authorization_sequence) = configuration
+        .bootstrap_authorization_high_water
+        .checked_add(management_count)
+        .and_then(|value| value.checked_add(operation_count))
     else {
         return false;
     };
-    if history.len() != expected_history_len {
+    if expected_authorization_sequence != state.authorization_sequence {
         return false;
     }
 
-    let mut expected_floor = configuration.bootstrap_authorization_high_water;
-    let mut floor_blocked = false;
-    for history_record in history {
-        let Some(expected_sequence) = replay.authorization_sequence.checked_add(1) else {
-            return false;
-        };
-        if history_record.sequence() != expected_sequence {
-            return false;
-        }
-        while private_application_index < private_applications.len()
-            && private_applications[private_application_index].authorization_sequence
-                < expected_sequence
-        {
-            if !apply_private_application_for_policy_reconstruction(
-                configuration,
-                &mut replay,
-                private_applications[private_application_index],
-            ) {
-                return false;
-            }
-            private_application_index += 1;
-        }
-        match history_record {
-            AuthorizationHistoryRecord::Management(record) => {
-                let Ok(call) = AuthorityCredentialCall::decode(&record.credential_call_bytes)
-                else {
-                    return false;
-                };
-                let Ok(approval) = ManagementApproval::decode(&record.approval) else {
-                    return false;
-                };
-                if call.invocation.0 != record.invocation
-                    || call.commitment().0 != record.credential_call
-                    || call.encode().ok().as_deref()
-                        != Some(record.credential_call_bytes.as_slice())
-                    || call.verify_with(&Ed25519CredentialVerifier).is_err()
-                    || !authority_target_matches(configuration, &call.authority)
-                    || approval.commitment().0 != record.approval_commitment
-                    || approval.encode().ok().as_deref() != Some(record.approval.as_slice())
-                    || approval.authorization_sequence.get() != record.authorization_sequence
-                    || approval.acknowledgement_invocation.0 != record.acknowledgement_invocation
-                    || !approval.matches_call(&call)
-                    || reconstruction_effect(configuration, &replay, &call).as_ref()
-                        != Some(&record.effect)
-                {
-                    return false;
-                }
-                replay.authorization_sequence = expected_sequence;
-                if record.finalized {
-                    let Some(encoded_ack) = record.acknowledgement_bytes.as_deref() else {
-                        return false;
-                    };
-                    let Ok(ack) = ManagementApplicationAck::decode(encoded_ack) else {
-                        return false;
-                    };
-                    if ack.commitment().0 != record.acknowledgement.unwrap_or([0; 32])
-                        || ack.encode().ok().as_deref() != Some(encoded_ack)
-                        || ack.verify_with(&Ed25519CredentialVerifier).is_err()
-                        || !authority_target_matches(configuration, &ack.authority)
-                        || !ack.matches_pending(&call, &approval)
-                    {
-                        return false;
-                    }
-                    let Some(plan) =
-                        application_plan(configuration, &replay, &record.effect, &call, &ack)
-                    else {
-                        return false;
-                    };
-                    apply_application_plan(&mut replay, plan);
-                }
-                replay.retries.push(record.clone());
-                if !floor_blocked {
-                    expected_floor = expected_sequence;
-                }
-            }
-            AuthorizationHistoryRecord::Operation(record) => {
-                let Ok(call) = AuthorityOperationCall::decode(&record.operation_call_bytes) else {
-                    return false;
-                };
-                let Ok(approval) = AuthorityOperationApproval::decode(&record.approval) else {
-                    return false;
-                };
-                let Some((valid_from, expires_at)) = narrowed_validity_window(
-                    call.requested_valid_from,
-                    call.requested_expires_at,
-                    record.observed_slot,
-                ) else {
-                    return false;
-                };
-                if call.invocation.0 != record.invocation
-                    || call.commitment().0 != record.operation_call
-                    || call.encode().ok().as_deref() != Some(record.operation_call_bytes.as_slice())
-                    || call.verify_with(&Ed25519CredentialVerifier).is_err()
-                    || !authority_target_matches(configuration, &call.authority)
-                    || approval.commitment().0 != record.approval_commitment
-                    || approval.encode().ok().as_deref() != Some(record.approval.as_slice())
-                    || approval.authorization_sequence.get() != record.authorization_sequence
-                    || approval.acknowledgement_invocation.0 != record.acknowledgement_invocation
-                    || !approval.matches_call(&call)
-                    || approval.selector.evidence
-                        != operation_evidence(
-                            configuration,
-                            call.commitment(),
-                            record.role,
-                            record.authorization_sequence,
-                            record.observed_slot,
-                        )
-                    || approval.selector.valid_from != valid_from
-                    || approval.selector.expires_at != expires_at
-                    || !operation_policy_allows(configuration, &replay, &call, record.role)
-                {
-                    return false;
-                }
-                if let Some(encoded_ack) = record.issuance_ack_bytes.as_deref() {
-                    let Ok(ack) = AuthorityOperationIssuanceAck::decode(encoded_ack) else {
-                        return false;
-                    };
-                    if ack.commitment().0 != record.issuance_ack.unwrap_or([0; 32])
-                        || ack.encode().ok().as_deref() != Some(encoded_ack)
-                        || ack.issued_at != record.issued_at.unwrap_or(u64::MAX)
-                        || !ack.matches_pending(&call, &approval)
-                        || ack
-                            .verify_with(configuration.binding.sdk(), &Ed25519CredentialVerifier)
-                            .is_err()
-                    {
-                        return false;
-                    }
-                }
-                replay.authorization_sequence = expected_sequence;
-                replay.operation_retries.push(record.clone());
-                if !floor_blocked {
-                    // An acknowledged adjacent record would already have
-                    // compacted. The first retained operation is therefore
-                    // the unique unacknowledged floor gap.
-                    if record.issuance_ack.is_some() {
-                        return false;
-                    }
-                    floor_blocked = true;
-                }
-            }
-            AuthorizationHistoryRecord::RetiredOperation(record) => {
-                if floor_blocked {
-                    return false;
-                }
-                replay.authorization_sequence = expected_sequence;
-                replay.retired_authority_operations.push(*record);
-                expected_floor = expected_sequence;
-            }
-        }
-    }
-    while private_application_index < private_applications.len() {
-        if !apply_private_application_for_policy_reconstruction(
-            configuration,
-            &mut replay,
-            private_applications[private_application_index],
-        ) {
-            return false;
-        }
-        private_application_index += 1;
-    }
-    replay.authorization_sequence == state.authorization_sequence
-        && expected_floor == state.operation_retirement_floor
-        && replay.managed_agents == state.managed_agents
-        && replay.managed_actors == state.managed_actors
-        && replay.retired_actor_installations == state.retired_actor_installations
-        && replay.private_agents.len() == state.private_agents.len()
-        && replay
-            .private_agents
+    for credential in &state.credentials {
+        let pending = state
+            .retries
             .iter()
-            .zip(&state.private_agents)
-            .all(|(expected, actual)| private_projection_fields_match(expected, actual))
-}
+            .find(|record| record.credential == credential.credential);
+        if state
+            .retries
+            .iter()
+            .filter(|record| record.credential == credential.credential)
+            .count()
+            > 1
+        {
+            return false;
+        }
+        let latest = state
+            .latest_management_acks
+            .binary_search_by(|record| record.credential.cmp(&credential.credential))
+            .ok()
+            .map(|index| &state.latest_management_acks[index]);
+        match (credential.management_request_high_water, pending, latest) {
+            (0, None, None) => {}
+            (high_water, Some(pending), latest) => {
+                if pending.request_sequence != high_water
+                    || latest.is_some_and(|latest| {
+                        latest.request_sequence.checked_add(1) != Some(high_water)
+                    })
+                    || (high_water > 1 && latest.is_none())
+                {
+                    return false;
+                }
+            }
+            (high_water, None, Some(latest)) if latest.request_sequence == high_water => {}
+            _ => return false,
+        }
+        let latest_management_is_unretired = latest
+            .is_some_and(|latest| latest.authorization_sequence > state.operation_retirement_floor);
+        if pending.is_some() && latest_management_is_unretired {
+            return false;
+        }
 
-fn apply_private_application_for_policy_reconstruction(
-    configuration: &SystemAuthorityConfiguration,
-    state: &mut AuthorityLinearState,
-    record: &PrivateApplicationRecord,
-) -> bool {
-    let Some(source) = private_application_record_source(configuration, state, record) else {
-        return false;
-    };
-    if source.principal != record.owner
-        || source.node != Some(record.node)
-        || record.operation == AuthorityOperationKind::RecoverPrivateAgent as u8
+        let operation_pending = state
+            .operation_retries
+            .iter()
+            .find(|record| record.credential == credential.credential);
+        if state
+            .operation_retries
+            .iter()
+            .filter(|record| record.credential == credential.credential)
+            .count()
+            > 1
+        {
+            return false;
+        }
+        let operation_latest = state
+            .latest_operation_acks
+            .binary_search_by(|record| record.credential.cmp(&credential.credential))
+            .ok()
+            .map(|index| &state.latest_operation_acks[index]);
+        match (
+            credential.operation_request_high_water,
+            operation_pending,
+            operation_latest,
+        ) {
+            (0, None, None) => {}
+            (high_water, Some(pending), latest) => {
+                if pending.request_sequence != high_water
+                    || latest.is_some_and(|latest| {
+                        latest.request_sequence.checked_add(1) != Some(high_water)
+                            || (latest.private_operation.is_some()
+                                && !private_operation_source_is_applied(
+                                    state,
+                                    latest.authorization_invocation,
+                                    latest.acknowledgement_invocation,
+                                    latest.authorization_sequence,
+                                ))
+                    })
+                    || (high_water > 1 && latest.is_none())
+                {
+                    return false;
+                }
+            }
+            (high_water, None, Some(latest)) if latest.request_sequence == high_water => {}
+            _ => return false,
+        }
+        let latest_operation_is_unsettled = operation_latest.is_some_and(|latest| {
+            latest.authorization_sequence > state.operation_retirement_floor
+                || (latest.private_operation.is_some()
+                    && !private_operation_source_is_applied(
+                        state,
+                        latest.authorization_invocation,
+                        latest.acknowledgement_invocation,
+                        latest.authorization_sequence,
+                    ))
+        });
+        if operation_pending.is_some() && latest_operation_is_unsettled {
+            return false;
+        }
+        if (pending.is_some() || latest_management_is_unretired)
+            && (operation_pending.is_some() || latest_operation_is_unsettled)
+        {
+            return false;
+        }
+    }
+
+    if !state
+        .retries
+        .iter()
+        .all(|record| pending_management_record_is_valid(configuration, state, record))
+        || !state
+            .latest_management_acks
+            .iter()
+            .all(|record| latest_management_ack_is_valid(configuration, state, record))
+        || !state
+            .operation_retries
+            .iter()
+            .all(|record| active_operation_record_is_valid(configuration, state, record))
     {
         return false;
     }
-    let Ok(index) = private_agent(state, AgentId(record.agent)) else {
+
+    let mut retained_sequences = Vec::with_capacity(
+        state
+            .retries
+            .len()
+            .saturating_add(state.latest_management_acks.len())
+            .saturating_add(state.operation_retries.len())
+            .saturating_add(state.latest_operation_acks.len()),
+    );
+    retained_sequences.extend(
+        state
+            .retries
+            .iter()
+            .map(|record| record.authorization_sequence),
+    );
+    retained_sequences.extend(
+        state
+            .latest_management_acks
+            .iter()
+            .map(|record| record.authorization_sequence),
+    );
+    retained_sequences.extend(
+        state
+            .operation_retries
+            .iter()
+            .map(|record| record.authorization_sequence),
+    );
+    retained_sequences.extend(
+        state
+            .latest_operation_acks
+            .iter()
+            .map(|record| record.authorization_sequence),
+    );
+    retained_sequences.sort_unstable();
+    retained_sequences.iter().all(|sequence| {
+        *sequence > configuration.bootstrap_authorization_high_water
+            && *sequence <= state.authorization_sequence
+    }) && retained_sequences.windows(2).all(|pair| pair[0] != pair[1])
+}
+
+fn pending_management_record_is_valid(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+    record: &ExactRetryRecord,
+) -> bool {
+    let Ok(call) = AuthorityCredentialCall::decode(&record.credential_call_bytes) else {
         return false;
     };
-    if !apply_private_application_transition(&mut state.private_agents[index], record) {
+    let Ok(approval) = ManagementApproval::decode(&record.approval) else {
+        return false;
+    };
+    call.invocation.0 == record.invocation
+        && call.credential.0 == record.credential
+        && call.request_sequence.get() == record.request_sequence
+        && call.commitment().0 == record.credential_call
+        && call.encode().ok().as_deref() == Some(record.credential_call_bytes.as_slice())
+        && call.verify_with(&Ed25519CredentialVerifier).is_ok()
+        && authority_target_matches(configuration, &call.authority)
+        && approval.commitment().0 == record.approval_commitment
+        && approval.encode().ok().as_deref() == Some(record.approval.as_slice())
+        && approval.authorization_sequence.get() == record.authorization_sequence
+        && approval.acknowledgement_invocation.0 == record.acknowledgement_invocation
+        && approval.matches_call(&call)
+        && state.credentials.iter().any(|credential| {
+            credential.credential == record.credential
+                && credential.principal == call.principal.0
+                && credential.public_key == call.credential_public_key
+                && credential.management_request_high_water == record.request_sequence
+        })
+        && reconstruction_effect(configuration, state, &call).as_ref() == Some(&record.effect)
+}
+
+fn latest_management_ack_is_valid(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+    record: &LatestManagementAckRow,
+) -> bool {
+    let Ok(call) = AuthorityCredentialCall::decode(&record.credential_call_bytes) else {
+        return false;
+    };
+    let Ok(ack) = ManagementApplicationAck::decode(&record.acknowledgement_bytes) else {
+        return false;
+    };
+    record.credential != [0; 32]
+        && record.request_sequence != 0
+        && record.authorization_invocation != [0; 32]
+        && record.acknowledgement_invocation != [0; 32]
+        && record.authorization_invocation != record.acknowledgement_invocation
+        && record.authorization_sequence != 0
+        && record.credential_call != [0; 32]
+        && record.approval != [0; 32]
+        && record.request != [0; 32]
+        && record.application != [0; 32]
+        && record.acknowledgement != [0; 32]
+        && record.reopened_state != [0; 32]
+        && record.credential_call_bytes.len() <= MAX_INVOCATION_MESSAGE_BYTES
+        && record.acknowledgement_bytes.len() <= MAX_INVOCATION_MESSAGE_BYTES
+        && call.credential.0 == record.credential
+        && call.request_sequence.get() == record.request_sequence
+        && call.invocation.0 == record.authorization_invocation
+        && call.commitment().0 == record.credential_call
+        && call.encode().ok().as_deref() == Some(record.credential_call_bytes.as_slice())
+        && call.verify_with(&Ed25519CredentialVerifier).is_ok()
+        && authority_target_matches(configuration, &call.authority)
+        && ack.authorization_invocation.0 == record.authorization_invocation
+        && ack.acknowledgement_invocation.0 == record.acknowledgement_invocation
+        && ack.authorization_sequence.get() == record.authorization_sequence
+        && ack.credential_call.0 == record.credential_call
+        && ack.approval.0 == record.approval
+        && ack.request.0 == record.request
+        && ack.request == call.request.commitment()
+        && vos::agent_sdk::wire::management_reply_commitment(&ack.application).0
+            == record.application
+        && ack.commitment().0 == record.acknowledgement
+        && ack.encode().ok().as_deref() == Some(record.acknowledgement_bytes.as_slice())
+        && ack.reopened_state.0 == record.reopened_state
+        && ack.applied_at == record.applied_at
+        && ack.verify_with(&Ed25519CredentialVerifier).is_ok()
+        && authority_target_matches(configuration, &ack.authority)
+        && state.credentials.iter().any(|credential| {
+            credential.credential == record.credential
+                && credential.principal == call.principal.0
+                && credential.public_key == call.credential_public_key
+                && credential.management_request_high_water >= record.request_sequence
+        })
+}
+
+fn active_operation_record_is_valid(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+    record: &AuthorityOperationRetryRecord,
+) -> bool {
+    let Ok(call) = AuthorityOperationCall::decode(&record.operation_call_bytes) else {
+        return false;
+    };
+    let Ok(approval) = AuthorityOperationApproval::decode(&record.approval) else {
+        return false;
+    };
+    let Some((valid_from, expires_at)) = narrowed_validity_window(
+        call.requested_valid_from,
+        call.requested_expires_at,
+        record.observed_slot,
+    ) else {
+        return false;
+    };
+    if record.credential == [0; 32]
+        || record.request_sequence == 0
+        || record.invocation_payload == [0; 32]
+        || call.invocation.0 != record.invocation
+        || call.credential.0 != record.credential
+        || call.request_sequence.get() != record.request_sequence
+        || call.invocation_payload_commitment().0 != record.invocation_payload
+        || call.commitment().0 != record.operation_call
+        || call.encode().ok().as_deref() != Some(record.operation_call_bytes.as_slice())
+        || call.verify_with(&Ed25519CredentialVerifier).is_err()
+        || !authority_target_matches(configuration, &call.authority)
+        || approval.commitment().0 != record.approval_commitment
+        || approval.encode().ok().as_deref() != Some(record.approval.as_slice())
+        || approval.authorization_sequence.get() != record.authorization_sequence
+        || approval.acknowledgement_invocation.0 != record.acknowledgement_invocation
+        || !approval.matches_call(&call)
+        || approval.selector.evidence
+            != operation_evidence(
+                configuration,
+                call.commitment(),
+                record.role,
+                record.authorization_sequence,
+                record.observed_slot,
+            )
+        || approval.selector.valid_from != valid_from
+        || approval.selector.expires_at != expires_at
+        || authenticated_operation_role(state, &call) != Some(record.role)
+        || state.credentials.iter().all(|credential| {
+            credential.credential != record.credential
+                || credential.operation_request_high_water != record.request_sequence
+        })
+    {
         return false;
     }
-    state.private_applications.push(*record);
-    synchronize_private_managed_replicas(configuration, state, index)
+    if let Some(encoded_ack) = record.issuance_ack_bytes.as_deref() {
+        let Ok(ack) = AuthorityOperationIssuanceAck::decode(encoded_ack) else {
+            return false;
+        };
+        ack.commitment().0 == record.issuance_ack.unwrap_or([0; 32])
+            && ack.encode().ok().as_deref() == Some(encoded_ack)
+            && ack.issued_at == record.issued_at.unwrap_or(u64::MAX)
+            && ack.matches_pending(&call, &approval)
+            && ack
+                .verify_with(configuration.binding.sdk(), &Ed25519CredentialVerifier)
+                .is_ok()
+    } else {
+        true
+    }
 }
 
 fn reconstruction_effect(
@@ -4822,7 +5204,6 @@ fn reconstruction_effect(
                 || managed_agent(state, descriptor.identity.agent).is_ok()
                 || state.retries.iter().any(|record| {
                     record.invocation != call.invocation.0
-                        && !record.finalized
                         && matches!(
                             &record.effect,
                             PendingManagementEffect::Create(row)
@@ -4835,7 +5216,6 @@ fn reconstruction_effect(
                         .iter()
                         .filter(|record| {
                             record.invocation != call.invocation.0
-                                && !record.finalized
                                 && matches!(record.effect, PendingManagementEffect::Create(_))
                         })
                         .count()
@@ -4916,7 +5296,9 @@ fn admin_retry_shape_is_valid(
     state: &AuthorityLinearState,
     record: &AdminRetryRecord,
 ) -> bool {
-    if record.invocation == [0; 32]
+    if record.credential == [0; 32]
+        || record.request_sequence == 0
+        || record.invocation == [0; 32]
         || record.call_commitment == [0; 32]
         || record.call_bytes.is_empty()
         || record.call_bytes.len() > MAX_INVOCATION_MESSAGE_BYTES
@@ -4934,7 +5316,9 @@ fn admin_retry_shape_is_valid(
     let Ok(result) = AuthorityAdminResult::decode(&record.result_bytes) else {
         return false;
     };
-    call.invocation.0 == record.invocation
+    call.credential.0 == record.credential
+        && call.request_sequence.get() == record.request_sequence
+        && call.invocation.0 == record.invocation
         && call.commitment().0 == record.call_commitment
         && call.encode().ok().as_deref() == Some(record.call_bytes.as_slice())
         && call
@@ -4947,6 +5331,12 @@ fn admin_retry_shape_is_valid(
         && result.commitment().0 == record.result_commitment
         && result.encode().ok().as_deref() == Some(record.result_bytes.as_slice())
         && result.verify_with(&Ed25519CredentialVerifier).is_ok()
+        && state.credentials.iter().any(|credential| {
+            credential.credential == record.credential
+                && credential.principal == call.administrator.0
+                && credential.public_key == call.credential_public_key
+                && credential.admin_request_high_water == record.request_sequence
+        })
 }
 
 fn admin_generations_are_unique(records: &[AdminRetryRecord]) -> bool {
@@ -4957,35 +5347,105 @@ fn admin_generations_are_unique(records: &[AdminRetryRecord]) -> bool {
     })
 }
 
-fn admin_history_reconstructs_identity(
+fn admin_compact_state_is_valid(
     configuration: &SystemAuthorityConfiguration,
     state: &AuthorityLinearState,
 ) -> bool {
-    let mut replay = AuthorityLinearState::bootstrap(*configuration);
-    let mut history = state.admin_retries.iter().collect::<Vec<_>>();
-    history.sort_unstable_by_key(|record| record.generation);
-    for record in history {
-        let Ok(call) = AuthorityAdminCall::decode(&record.call_bytes) else {
-            return false;
-        };
-        if call.expected_generation.get() != replay.administration_generation
-            || call
-                .next_generation()
-                .is_none_or(|generation| generation.get() != record.generation)
-            || !authenticated_admin(&replay, &call)
-            || !apply_admin_operation(configuration, &mut replay, &call.operation)
-        {
-            return false;
-        }
-        replay.administration_generation = record.generation;
-        if !accessible_admin_exists(&replay) {
-            return false;
+    for credential in &state.credentials {
+        let latest = state
+            .admin_retries
+            .binary_search_by(|record| record.credential.cmp(&credential.credential))
+            .ok()
+            .map(|index| &state.admin_retries[index]);
+        match (credential.admin_request_high_water, latest) {
+            (0, None) => {}
+            (high_water, Some(latest)) if latest.request_sequence == high_water => {}
+            _ => return false,
         }
     }
-    replay.administration_generation == state.administration_generation
-        && replay.credentials == state.credentials
-        && replay.nodes == state.nodes
-        && replay.roles == state.roles
+    if state.administration_generation == 1 {
+        return state.admin_retries.is_empty();
+    }
+    let Some(latest) = state
+        .admin_retries
+        .iter()
+        .max_by_key(|record| record.generation)
+    else {
+        return false;
+    };
+    if latest.generation != state.administration_generation {
+        return false;
+    }
+    let Ok(call) = AuthorityAdminCall::decode(&latest.call_bytes) else {
+        return false;
+    };
+    admin_operation_postcondition(configuration, state, &call.operation)
+}
+
+fn admin_operation_postcondition(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+    operation: &AuthorityAdminOperation,
+) -> bool {
+    match operation {
+        AuthorityAdminOperation::EnrollPrincipal {
+            principal,
+            credential,
+        } => {
+            state
+                .roles
+                .binary_search_by(|row| row.principal.cmp(&principal.0))
+                .ok()
+                .is_some_and(|index| state.roles[index].role == BuiltinPrincipalRole::Member)
+                && state
+                    .credentials
+                    .binary_search_by(|row| row.credential.cmp(&credential.credential.0))
+                    .ok()
+                    .is_some_and(|index| {
+                        let row = &state.credentials[index];
+                        row == &credential_row(*principal, *credential)
+                    })
+        }
+        AuthorityAdminOperation::AddCredential {
+            principal,
+            credential,
+        } => state
+            .credentials
+            .binary_search_by(|row| row.credential.cmp(&credential.credential.0))
+            .ok()
+            .is_some_and(|index| {
+                let row = &state.credentials[index];
+                row == &credential_row(*principal, *credential)
+            }),
+        AuthorityAdminOperation::RevokeCredential {
+            principal,
+            credential,
+        } => state
+            .credentials
+            .binary_search_by(|row| row.credential.cmp(&credential.0))
+            .ok()
+            .is_some_and(|index| {
+                state.credentials[index].principal == principal.0
+                    && state.credentials[index].status == CredentialStatus::Revoked
+            }),
+        AuthorityAdminOperation::EnrollNode { enrollment } => state
+            .nodes
+            .binary_search_by(|row| row.node.cmp(&enrollment.node.0))
+            .ok()
+            .is_some_and(|index| {
+                state.nodes[index] == NodeOwnerRow::from_enrollment(*enrollment)
+                    && enrollment.space == SpaceId(configuration.space)
+            }),
+        AuthorityAdminOperation::UnbindNodeOwner { node, .. } => state
+            .nodes
+            .binary_search_by(|row| row.node.cmp(&node.0))
+            .is_err(),
+        AuthorityAdminOperation::SetBuiltinRole { principal, role } => state
+            .roles
+            .binary_search_by(|row| row.principal.cmp(&principal.0))
+            .ok()
+            .is_some_and(|index| state.roles[index].role == builtin_role(*role)),
+    }
 }
 
 fn operation_retry_ack_shape_is_valid(record: &AuthorityOperationRetryRecord) -> bool {
@@ -5014,56 +5474,85 @@ fn operation_retry_ack_shape_is_valid(record: &AuthorityOperationRetryRecord) ->
     }
 }
 
-fn retired_operation_private_application_shape_is_valid(
+fn latest_operation_ack_is_valid(
     configuration: &SystemAuthorityConfiguration,
-    record: &RetiredAuthorityOperationRow,
+    state: &AuthorityLinearState,
+    record: &LatestOperationAckRow,
 ) -> bool {
-    match (
+    let Some(request_sequence) = NonZeroU64::new(record.request_sequence) else {
+        return false;
+    };
+    let Some(authorization_sequence) = NonZeroU64::new(record.authorization_sequence) else {
+        return false;
+    };
+    let Ok(ack) = AuthorityOperationIssuanceAck::decode(&record.issuance_ack_bytes) else {
+        return false;
+    };
+    let authorization_invocation = AuthorityOperationCall::derive_invocation(
+        CredentialId(record.credential),
+        request_sequence,
+        Hash(record.invocation_payload),
+    );
+    let acknowledgement_invocation =
+        AuthorityOperationApproval::derive_acknowledgement_invocation_from_call_parts(
+            CredentialId(record.credential),
+            request_sequence,
+            authorization_invocation,
+            Hash(record.invocation_payload),
+            Hash(record.operation_call),
+        );
+    let private_shape = match (
         record.private_operation,
         record.private_application_invocation,
     ) {
         (None, None) => true,
         (Some(private), Some(application_invocation)) => {
-            let Some(sequence) = NonZeroU64::new(record.authorization_sequence) else {
-                return false;
-            };
             retired_private_operation_is_valid(private)
                 && PrivateControlApplicationAck::derive_application_invocation_from_issuance(
                     configured_authority_target(configuration),
-                    InvocationId(record.invocation),
+                    InvocationId(record.authorization_invocation),
                     InvocationId(record.acknowledgement_invocation),
-                    sequence,
+                    authorization_sequence,
                     Hash(record.issuance_ack),
                 )
                 .0 == application_invocation
         }
         _ => false,
-    }
+    };
+    record.credential != [0; 32]
+        && record.invocation_payload != [0; 32]
+        && record.authorization_invocation != [0; 32]
+        && record.acknowledgement_invocation != [0; 32]
+        && record.authorization_invocation != record.acknowledgement_invocation
+        && record.operation_call != [0; 32]
+        && record.approval != [0; 32]
+        && record.issuance_ack != [0; 32]
+        && !record.issuance_ack_bytes.is_empty()
+        && record.issuance_ack_bytes.len() <= MAX_INVOCATION_MESSAGE_BYTES
+        && record.authorization_sequence <= state.operation_retirement_floor
+        && authorization_invocation.0 == record.authorization_invocation
+        && acknowledgement_invocation.0 == record.acknowledgement_invocation
+        && ack.authorization_invocation.0 == record.authorization_invocation
+        && ack.acknowledgement_invocation.0 == record.acknowledgement_invocation
+        && ack.operation_call.0 == record.operation_call
+        && ack.approval.0 == record.approval
+        && ack.authorization_sequence == authorization_sequence
+        && ack.issued_at == record.issued_at
+        && ack.commitment().0 == record.issuance_ack
+        && ack.encode().ok().as_deref() == Some(record.issuance_ack_bytes.as_slice())
+        && ack
+            .verify_with(configuration.binding.sdk(), &Ed25519CredentialVerifier)
+            .is_ok()
+        && authority_target_matches(configuration, &ack.authority)
+        && state.credentials.iter().any(|credential| {
+            credential.credential == record.credential
+                && credential.operation_request_high_water >= record.request_sequence
+        })
+        && private_shape
 }
 
 fn retry_finalization_shape_is_valid(record: &ExactRetryRecord) -> bool {
-    match (
-        record.finalized,
-        record.acknowledgement,
-        record.acknowledgement_bytes.as_deref(),
-        record.reopened_state,
-        record.applied_at,
-    ) {
-        (false, None, None, None, None) => true,
-        (
-            true,
-            Some(acknowledgement),
-            Some(acknowledgement_bytes),
-            Some(reopened_state),
-            Some(_),
-        ) => {
-            acknowledgement != [0; 32]
-                && !acknowledgement_bytes.is_empty()
-                && acknowledgement_bytes.len() <= MAX_INVOCATION_MESSAGE_BYTES
-                && reopened_state != [0; 32]
-        }
-        _ => false,
-    }
+    record.credential != [0; 32] && record.request_sequence != 0
 }
 
 fn all_invocation_identifiers_are_unique(state: &AuthorityLinearState) -> bool {
@@ -5072,31 +5561,58 @@ fn all_invocation_identifiers_are_unique(state: &AuthorityLinearState) -> bool {
             .retries
             .len()
             .saturating_mul(2)
-            .saturating_add(state.operation_retries.len().saturating_mul(2))
-            .saturating_add(state.retired_authority_operations.len().saturating_mul(2))
-            .saturating_add(state.operation_retries.len())
-            .saturating_add(state.retired_authority_operations.len())
-            .saturating_add(state.admin_retries.len()),
+            .saturating_add(state.latest_management_acks.len().saturating_mul(2))
+            .saturating_add(state.operation_retries.len().saturating_mul(3))
+            .saturating_add(state.latest_operation_acks.len().saturating_mul(3))
+            .saturating_add(state.admin_retries.len())
+            .saturating_add(state.private_applications.len().saturating_mul(3)),
     );
     for record in &state.retries {
         identifiers.push(record.invocation);
         identifiers.push(record.acknowledgement_invocation);
     }
-    for record in &state.operation_retries {
-        identifiers.push(record.invocation);
+    for record in &state.latest_management_acks {
+        identifiers.push(record.authorization_invocation);
         identifiers.push(record.acknowledgement_invocation);
-        if let Some(application_invocation) = record.private_application_invocation {
-            identifiers.push(application_invocation);
+    }
+    for record in &state.operation_retries {
+        let applied = record.private_application_invocation.is_some()
+            && private_operation_source_is_applied(
+                state,
+                record.invocation,
+                record.acknowledgement_invocation,
+                record.authorization_sequence,
+            );
+        if !applied {
+            identifiers.push(record.invocation);
+            identifiers.push(record.acknowledgement_invocation);
+            if let Some(application_invocation) = record.private_application_invocation {
+                identifiers.push(application_invocation);
+            }
         }
     }
-    for record in &state.retired_authority_operations {
-        identifiers.push(record.invocation);
-        identifiers.push(record.acknowledgement_invocation);
-        if let Some(application_invocation) = record.private_application_invocation {
-            identifiers.push(application_invocation);
+    for record in &state.latest_operation_acks {
+        let applied = record.private_application_invocation.is_some()
+            && private_operation_source_is_applied(
+                state,
+                record.authorization_invocation,
+                record.acknowledgement_invocation,
+                record.authorization_sequence,
+            );
+        if !applied {
+            identifiers.push(record.authorization_invocation);
+            identifiers.push(record.acknowledgement_invocation);
+            if let Some(application_invocation) = record.private_application_invocation {
+                identifiers.push(application_invocation);
+            }
         }
     }
     identifiers.extend(state.admin_retries.iter().map(|record| record.invocation));
+    for record in &state.private_applications {
+        identifiers.push(record.authorization_invocation);
+        identifiers.push(record.issuance_invocation);
+        identifiers.push(record.application_invocation);
+    }
     identifiers.sort_unstable();
     identifiers.windows(2).all(|pair| pair[0] != pair[1])
 }
@@ -5425,11 +5941,12 @@ mod tests {
     ) -> AuthorityCredentialCall {
         let public_key = key.verifying_key().to_bytes();
         let mut call = AuthorityCredentialCall {
-            invocation: InvocationId([invocation_byte; 32]),
+            invocation: InvocationId::ZERO,
             authority: authority_target(config),
             managed,
             principal,
             credential: CredentialId::of_public_key(&public_key),
+            request_sequence: NonZeroU64::new(1).unwrap(),
             credential_public_key: public_key,
             authenticated_node: node,
             requested_valid_from: 1,
@@ -5437,6 +5954,8 @@ mod tests {
             request,
             signature: [1; 64],
         };
+        let _ = invocation_byte;
+        call.invocation = call.expected_invocation();
         resign(&mut call, key);
         call
     }
@@ -5466,6 +5985,28 @@ mod tests {
     fn resign(call: &mut AuthorityCredentialCall, key: &SigningKey) {
         call.signature = [1; 64];
         call.signature = key.sign(&call.signing_bytes()).to_bytes();
+    }
+
+    fn refresh_management_call(call: &mut AuthorityCredentialCall, key: &SigningKey) {
+        call.invocation = call.expected_invocation();
+        resign(call, key);
+    }
+
+    fn prepare_management_call(
+        actor: &SystemAuthority,
+        call: &mut AuthorityCredentialCall,
+        key: &SigningKey,
+    ) {
+        let index = credential_index(&actor.state, call.credential)
+            .expect("fixture credential must already be enrolled");
+        call.request_sequence = NonZeroU64::new(
+            actor.state.credentials[index]
+                .management_request_high_water
+                .checked_add(1)
+                .expect("fixture management sequence must not exhaust"),
+        )
+        .unwrap();
+        refresh_management_call(call, key);
     }
 
     fn context(call: &AuthorityCredentialCall) -> InvocationContext {
@@ -5504,7 +6045,7 @@ mod tests {
     fn dispatch(actor: &mut SystemAuthority, call: &AuthorityCredentialCall) -> Vec<u8> {
         dispatch_bytes(
             actor,
-            call.encode().expect("valid ACC1 fixture"),
+            call.encode().expect("valid ACC2 fixture"),
             Some(context(call)),
         )
     }
@@ -5519,10 +6060,11 @@ mod tests {
     ) -> AuthorityOperationCall {
         let public_key = key.verifying_key().to_bytes();
         let mut call = AuthorityOperationCall {
-            invocation: InvocationId([invocation_byte; 32]),
+            invocation: InvocationId::ZERO,
             authority: authority_target(config),
             principal,
             credential: CredentialId::of_public_key(&public_key),
+            request_sequence: NonZeroU64::new(1).unwrap(),
             credential_public_key: public_key,
             authenticated_node: node,
             requested_valid_from: 1,
@@ -5530,6 +6072,8 @@ mod tests {
             intent,
             signature: [1; 64],
         };
+        let _ = invocation_byte;
+        call.invocation = call.expected_invocation();
         resign_operation_call(&mut call, key);
         call
     }
@@ -5574,6 +6118,24 @@ mod tests {
         call.signature = key.sign(&call.signing_bytes()).to_bytes();
     }
 
+    fn prepare_operation_call(
+        actor: &SystemAuthority,
+        call: &mut AuthorityOperationCall,
+        key: &SigningKey,
+    ) {
+        let index = credential_index(&actor.state, call.credential)
+            .expect("fixture credential must already be enrolled");
+        call.request_sequence = NonZeroU64::new(
+            actor.state.credentials[index]
+                .operation_request_high_water
+                .checked_add(1)
+                .expect("fixture operation sequence must not exhaust"),
+        )
+        .unwrap();
+        call.invocation = call.expected_invocation();
+        resign_operation_call(call, key);
+    }
+
     fn operation_context(call: &AuthorityOperationCall) -> InvocationContext {
         InvocationContext {
             invocation: call.invocation,
@@ -5610,7 +6172,7 @@ mod tests {
     fn dispatch_operation(actor: &mut SystemAuthority, call: &AuthorityOperationCall) -> Vec<u8> {
         dispatch_operation_bytes(
             actor,
-            call.encode().expect("valid AOC1 fixture"),
+            call.encode().expect("valid AOC3 fixture"),
             Some(operation_context(call)),
         )
     }
@@ -6024,10 +6586,11 @@ mod tests {
     ) -> AuthorityAdminCall {
         let public_key = key.verifying_key().to_bytes();
         let mut call = AuthorityAdminCall {
-            invocation: InvocationId([invocation_byte; 32]),
+            invocation: InvocationId::ZERO,
             authority: authority_target(config),
             administrator,
             credential: CredentialId::of_public_key(&public_key),
+            request_sequence: NonZeroU64::new(expected_generation).unwrap(),
             credential_public_key: public_key,
             authenticated_node,
             observed_slot: OBSERVED_SLOT,
@@ -6035,6 +6598,8 @@ mod tests {
             operation,
             signature: [1; 64],
         };
+        let _ = invocation_byte;
+        call.invocation = call.expected_invocation();
         resign_admin(&mut call, key);
         call
     }
@@ -6042,6 +6607,28 @@ mod tests {
     fn resign_admin(call: &mut AuthorityAdminCall, key: &SigningKey) {
         call.signature = [1; 64];
         call.signature = key.sign(&call.signing_bytes()).to_bytes();
+    }
+
+    fn refresh_admin_call(call: &mut AuthorityAdminCall, key: &SigningKey) {
+        call.invocation = call.expected_invocation();
+        resign_admin(call, key);
+    }
+
+    fn prepare_admin_call(
+        actor: &SystemAuthority,
+        call: &mut AuthorityAdminCall,
+        key: &SigningKey,
+    ) {
+        let index = credential_index(&actor.state, call.credential)
+            .expect("fixture Admin credential must already be enrolled");
+        call.request_sequence = NonZeroU64::new(
+            actor.state.credentials[index]
+                .admin_request_high_water
+                .checked_add(1)
+                .expect("fixture Admin sequence must not exhaust"),
+        )
+        .unwrap();
+        refresh_admin_call(call, key);
     }
 
     fn admin_context(call: &AuthorityAdminCall) -> InvocationContext {
@@ -6080,14 +6667,14 @@ mod tests {
     fn dispatch_admin(actor: &mut SystemAuthority, call: &AuthorityAdminCall) -> Vec<u8> {
         dispatch_admin_bytes(
             actor,
-            call.encode().expect("valid AAD2 fixture"),
+            call.encode().expect("valid AAD3 fixture"),
             Some(admin_context(call)),
         )
     }
 
     fn dispatch_fixture_admin(
         actor: &mut SystemAuthority,
-        invocation: InvocationId,
+        _invocation: InvocationId,
         operation: AuthorityAdminOperation,
     ) {
         let key = signing(0x21);
@@ -6100,7 +6687,10 @@ mod tests {
             actor.state.administration_generation,
             operation,
         );
-        call.invocation = invocation;
+        let caller = credential_index(&actor.state, call.credential).unwrap();
+        call.request_sequence =
+            NonZeroU64::new(actor.state.credentials[caller].admin_request_high_water + 1).unwrap();
+        call.invocation = call.expected_invocation();
         resign_admin(&mut call, &key);
         assert!(!dispatch_admin(actor, &call).is_empty());
     }
@@ -6111,7 +6701,7 @@ mod tests {
     /// rather than quadratic signature-verification time.
     fn record_fixture_admin(
         actor: &mut SystemAuthority,
-        invocation: InvocationId,
+        _invocation: InvocationId,
         operation: AuthorityAdminOperation,
     ) {
         let key = signing(0x21);
@@ -6124,10 +6714,14 @@ mod tests {
             actor.state.administration_generation,
             operation,
         );
-        call.invocation = invocation;
+        let caller = credential_index(&actor.state, call.credential).unwrap();
+        call.request_sequence =
+            NonZeroU64::new(actor.state.credentials[caller].admin_request_high_water + 1).unwrap();
+        call.invocation = call.expected_invocation();
         resign_admin(&mut call, &key);
         assert!(authenticated_admin(&actor.state, &call));
         let generation = call.next_generation().unwrap();
+        actor.state.credentials[caller].admin_request_high_water = call.request_sequence.get();
         assert!(apply_admin_operation(
             &actor.configuration,
             &mut actor.state,
@@ -6140,44 +6734,51 @@ mod tests {
         let index = actor
             .state
             .admin_retries
-            .binary_search_by(|record| record.invocation.cmp(&invocation.0))
-            .expect_err("fixture Admin invocation must be unique");
-        actor.state.admin_retries.insert(
-            index,
-            AdminRetryRecord {
-                invocation: invocation.0,
-                call_commitment: call.commitment().0,
-                call_bytes,
-                result_commitment: result.commitment().0,
-                result_bytes,
-                generation: generation.get(),
-            },
-        );
+            .binary_search_by(|record| record.credential.cmp(&call.credential.0));
+        let record = AdminRetryRecord {
+            credential: call.credential.0,
+            request_sequence: call.request_sequence.get(),
+            invocation: call.invocation.0,
+            call_commitment: call.commitment().0,
+            call_bytes,
+            result_commitment: result.commitment().0,
+            result_bytes,
+            generation: generation.get(),
+        };
+        match index {
+            Ok(index) => actor.state.admin_retries[index] = record,
+            Err(index) => actor.state.admin_retries.insert(index, record),
+        }
+        // Bulk fixtures deliberately seal once after the full prefix is
+        // assembled. Re-hashing the growing identity projection here would
+        // make the explicit table-bound test quadratic without exercising a
+        // different replay invariant.
     }
 
-    /// Append one canonical pending approval without replaying every existing
-    /// history prefix. Capacity tests validate the completed history once.
-    fn record_fixture_approval(
+    /// Apply one signed management request and its exact signed MAA2 while
+    /// assembling a long finalized prefix. Only the newest exact pair is
+    /// retained, matching production compaction, and the caller seals and
+    /// validates the completed prefix once.
+    fn record_fixture_finalized_management(
         actor: &mut SystemAuthority,
-        call: &AuthorityCredentialCall,
-    ) -> Vec<u8> {
-        let state = &mut actor.state;
+        mut call: AuthorityCredentialCall,
+        key: &SigningKey,
+    ) -> (AuthorityCredentialCall, Vec<u8>, ManagementApplicationAck) {
+        prepare_management_call(actor, &mut call, key);
+        let configuration = actor.configuration;
         let encoded_call = call.encode().unwrap();
         assert!(call.verify_with(&Ed25519CredentialVerifier).is_ok());
-        let acknowledgement_invocation =
-            ManagementApproval::derive_acknowledgement_invocation(call);
-        assert!(invocation_pair_is_available(
-            state,
-            call.invocation,
-            acknowledgement_invocation,
+        assert!(!credential_has_pending_application(
+            &actor.state,
+            call.credential,
         ));
-        let role = authenticated_role(state, call).unwrap();
-        let effect = policy_effect(&actor.configuration, state, call, role).unwrap();
-        let authorization_sequence = state.authorization_sequence.checked_add(1).unwrap();
+        let role = authenticated_role(&actor.state, &call).unwrap();
+        let effect = policy_effect(&configuration, &actor.state, &call, role).unwrap();
+        let authorization_sequence = actor.state.authorization_sequence.checked_add(1).unwrap();
         let sequence = NonZeroU64::new(authorization_sequence).unwrap();
-        let (valid_from, expires_at) = narrowed_validity(call, OBSERVED_SLOT).unwrap();
+        let (valid_from, expires_at) = narrowed_validity(&call, OBSERVED_SLOT).unwrap();
         let approval = ManagementApproval::from_call(
-            call,
+            &call,
             sequence,
             AuthorityEvidence {
                 package: None,
@@ -6185,7 +6786,7 @@ mod tests {
                 commitment: Hash::digest(
                     EVIDENCE_DOMAIN,
                     &[
-                        &actor.configuration.binding.policy,
+                        &configuration.binding.policy,
                         call.commitment().as_bytes(),
                         &[role as u8],
                         &authorization_sequence.to_le_bytes(),
@@ -6194,38 +6795,62 @@ mod tests {
                 ),
             },
             AuthorityLaneRoots::default(),
-            state.epoch,
+            actor.state.epoch,
             valid_from,
             expires_at,
         )
         .unwrap();
-        assert_eq!(
-            approval.acknowledgement_invocation,
-            acknowledgement_invocation
-        );
         let approval_bytes = approval.encode().unwrap();
-        let index = retry_record(state, call.invocation).unwrap_err();
-        state.authorization_sequence = authorization_sequence;
-        state.retries.insert(
-            index,
-            ExactRetryRecord {
-                invocation: call.invocation.0,
-                acknowledgement_invocation: acknowledgement_invocation.0,
-                credential_call: call.commitment().0,
-                credential_call_bytes: encoded_call,
-                approval_commitment: approval.commitment().0,
-                authorization_sequence,
-                approval: approval_bytes.clone(),
-                effect,
-                finalized: false,
-                acknowledgement: None,
-                acknowledgement_bytes: None,
-                reopened_state: None,
-                applied_at: None,
-            },
+        let acknowledgement = application_ack(configuration, &actor.state, &call, &approval);
+        assert!(acknowledgement.matches_pending(&call, &approval));
+        assert!(
+            acknowledgement
+                .verify_with(&Ed25519CredentialVerifier)
+                .is_ok()
         );
-        assert!(advance_operation_retirement_floor(state));
-        approval_bytes
+        let plan = application_plan(
+            &configuration,
+            &actor.state,
+            &effect,
+            &call,
+            &acknowledgement,
+        )
+        .unwrap();
+        let acknowledgement_bytes = acknowledgement.encode().unwrap();
+        let latest = LatestManagementAckRow {
+            credential: call.credential.0,
+            request_sequence: call.request_sequence.get(),
+            authorization_invocation: call.invocation.0,
+            acknowledgement_invocation: approval.acknowledgement_invocation.0,
+            authorization_sequence,
+            credential_call: call.commitment().0,
+            credential_call_bytes: encoded_call,
+            approval: approval.commitment().0,
+            request: acknowledgement.request.0,
+            application: vos::agent_sdk::wire::management_reply_commitment(
+                &acknowledgement.application,
+            )
+            .0,
+            acknowledgement: acknowledgement.commitment().0,
+            acknowledgement_bytes,
+            reopened_state: acknowledgement.reopened_state.0,
+            applied_at: acknowledgement.applied_at,
+        };
+
+        apply_application_plan(&mut actor.state, plan);
+        actor.state.authorization_sequence = authorization_sequence;
+        let caller = credential_index(&actor.state, call.credential).unwrap();
+        actor.state.credentials[caller].management_request_high_water = call.request_sequence.get();
+        match actor
+            .state
+            .latest_management_acks
+            .binary_search_by(|record| record.credential.cmp(&latest.credential))
+        {
+            Ok(index) => actor.state.latest_management_acks[index] = latest,
+            Err(index) => actor.state.latest_management_acks.insert(index, latest),
+        }
+        assert!(advance_operation_retirement_floor(&mut actor.state));
+        (call, approval_bytes, acknowledgement)
     }
 
     fn enrollment(
@@ -6362,14 +6987,7 @@ mod tests {
             target_for(descriptor),
             ManagementRequest::Create(Box::new(descriptor.clone())),
         );
-        call.invocation = InvocationId(
-            Hash::digest(
-                b"vos/test/system-authority/create-fixture/v1",
-                &[descriptor.identity.agent.as_bytes()],
-            )
-            .0,
-        );
-        resign(&mut call, &signing(0x21));
+        prepare_management_call(actor, &mut call, &signing(0x21));
         let approval = ManagementApproval::decode(&dispatch(actor, &call))
             .expect("fixture Create must be authorized");
         assert!(dispatch_application_ack(actor, &call, &approval));
@@ -6378,7 +6996,7 @@ mod tests {
     fn install_catalog_projection(actor: &mut SystemAuthority) -> InstallActor {
         let config = actor.configuration;
         let install = catalog_install(config);
-        let call = credential_call(
+        let mut call = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -6387,34 +7005,12 @@ mod tests {
             system_target(config),
             ManagementRequest::Install(Box::new(install.clone())),
         );
+        prepare_management_call(actor, &mut call, &signing(0x21));
         let approval = ManagementApproval::decode(&dispatch(actor, &call))
             .expect("root catalog install must be authorized");
         assert_eq!(approval.authorization_sequence.get(), 3);
         assert!(dispatch_application_ack(actor, &call, &approval));
         install
-    }
-
-    fn fill_pending_management_retries(actor: &mut SystemAuthority, count: usize) {
-        let config = actor.configuration;
-        for ordinal in 1..=count {
-            let byte = u8::try_from(ordinal).expect("bounded retry fixture");
-            let marker = byte.wrapping_add(0x40);
-            let install = actor_install(
-                AgentId(config.system_agent),
-                &std::format!("pending-{ordinal}"),
-                marker,
-            );
-            let call = credential_call(
-                config,
-                &signing(0x21),
-                ADMIN_PRINCIPAL,
-                Some(ADMIN_NODE),
-                marker,
-                system_target(config),
-                ManagementRequest::Install(Box::new(install)),
-            );
-            assert!(!record_fixture_approval(actor, &call).is_empty());
-        }
     }
 
     #[test]
@@ -6426,8 +7022,8 @@ mod tests {
         assert_eq!(SystemAuthorityConfiguration::decode(&encoded), Some(config));
         assert_eq!(
             <SystemAuthority as vos::Actor>::STATE_SCHEMA_VERSION,
-            8,
-            "node identity and replica projection is a clean Linear state generation",
+            10,
+            "credential-sequenced compact retries are a clean Linear state generation",
         );
 
         let mut old_generation = encoded.clone();
@@ -6642,7 +7238,10 @@ mod tests {
         assert_eq!(restarted.state.managed_agents, vec![expected_seed]);
         assert_eq!(restarted.state.managed_actors, vec![expected_actor]);
         assert!(authority_state_is_valid(&config, &restarted.state));
-        assert_eq!(dispatch(&mut restarted, &call), approval_bytes);
+        assert!(
+            dispatch(&mut restarted, &call).is_empty(),
+            "a finalized ACC2 older than the credential high-water is not synthesized"
+        );
         let finalized = restarted.state.clone();
         assert!(dispatch_ack(&mut restarted, &ack));
         assert_eq!(restarted.state, finalized);
@@ -6656,7 +7255,7 @@ mod tests {
         insert_live(&mut actor, &managed_descriptor);
         let managed = target_for(&managed_descriptor);
         let install = actor_install(managed.agent, "lifecycle", 0x50);
-        let install_call = credential_call(
+        let mut install_call = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -6665,12 +7264,13 @@ mod tests {
             managed,
             ManagementRequest::Install(Box::new(install.clone())),
         );
+        prepare_management_call(&actor, &mut install_call, &signing(0x21));
         let install_approval = ManagementApproval::decode(&dispatch(&mut actor, &install_call))
             .expect("valid Install is approved");
         assert_eq!(install_approval.authorization_sequence.get(), 4);
         assert!(actor.state.managed_actors.is_empty());
 
-        let duplicate = credential_call(
+        let mut duplicate = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -6679,6 +7279,7 @@ mod tests {
             managed,
             ManagementRequest::Install(Box::new(install.clone())),
         );
+        prepare_management_call(&actor, &mut duplicate, &signing(0x21));
         let pending = actor.state.clone();
         assert!(dispatch(&mut actor, &duplicate).is_empty());
         assert_eq!(actor.state, pending);
@@ -6696,7 +7297,7 @@ mod tests {
 
         let mut stale_upgrade = actor_upgrade(&install, 0x53);
         stale_upgrade.from_deployment = DeploymentId([0x54; 32]);
-        let stale_call = credential_call(
+        let mut stale_call = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -6705,12 +7306,13 @@ mod tests {
             managed,
             ManagementRequest::UpgradeActor(Box::new(stale_upgrade)),
         );
+        prepare_management_call(&actor, &mut stale_call, &signing(0x21));
         let before_stale = actor.state.clone();
         assert!(dispatch(&mut actor, &stale_call).is_empty());
         assert_eq!(actor.state, before_stale);
 
         let upgrade = actor_upgrade(&install, 0x56);
-        let upgrade_call = credential_call(
+        let mut upgrade_call = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -6719,6 +7321,7 @@ mod tests {
             managed,
             ManagementRequest::UpgradeActor(Box::new(upgrade.clone())),
         );
+        prepare_management_call(&actor, &mut upgrade_call, &signing(0x21));
         let before_upgrade_ack = actor.state.managed_actors.clone();
         let upgrade_approval = ManagementApproval::decode(&dispatch(&mut actor, &upgrade_call))
             .expect("compatible UpgradeActor is approved");
@@ -6757,7 +7360,7 @@ mod tests {
         );
         assert_eq!(projected.install_request, installed.install_request);
 
-        let stale_after_upgrade = credential_call(
+        let mut stale_after_upgrade = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -6769,11 +7372,12 @@ mod tests {
                 expected_deployment: install.entry.deployment,
             },
         );
+        prepare_management_call(&actor, &mut stale_after_upgrade, &signing(0x21));
         let before_stale = actor.state.clone();
         assert!(dispatch(&mut actor, &stale_after_upgrade).is_empty());
         assert_eq!(actor.state, before_stale);
 
-        let suspend_call = credential_call(
+        let mut suspend_call = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -6785,6 +7389,7 @@ mod tests {
                 expected_deployment: upgrade.to_deployment,
             },
         );
+        prepare_management_call(&actor, &mut suspend_call, &signing(0x21));
         let suspend_approval = ManagementApproval::decode(&dispatch(&mut actor, &suspend_call))
             .expect("exact Suspend is approved");
         assert_eq!(suspend_approval.authorization_sequence.get(), 6);
@@ -6796,7 +7401,7 @@ mod tests {
         ));
         assert!(actor.state.managed_actors[0].suspended);
 
-        let resume_call = credential_call(
+        let mut resume_call = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -6808,6 +7413,7 @@ mod tests {
                 expected_deployment: upgrade.to_deployment,
             },
         );
+        prepare_management_call(&actor, &mut resume_call, &signing(0x21));
         let resume_approval = ManagementApproval::decode(&dispatch(&mut actor, &resume_call))
             .expect("exact Resume is approved");
         assert_eq!(resume_approval.authorization_sequence.get(), 7);
@@ -6819,7 +7425,7 @@ mod tests {
         ));
         assert!(!actor.state.managed_actors[0].suspended);
 
-        let remove_call = credential_call(
+        let mut remove_call = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -6831,6 +7437,7 @@ mod tests {
                 expected_deployment: upgrade.to_deployment,
             },
         );
+        prepare_management_call(&actor, &mut remove_call, &signing(0x21));
         let remove_approval = ManagementApproval::decode(&dispatch(&mut actor, &remove_call))
             .expect("exact RemoveLeaf is approved");
         assert_eq!(remove_approval.authorization_sequence.get(), 8);
@@ -6851,7 +7458,7 @@ mod tests {
 
         let mut reuse = actor_install(managed.agent, "replacement", 0x5d);
         reuse.installation_id = install.installation_id;
-        let reuse_call = credential_call(
+        let mut reuse_call = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -6860,6 +7467,7 @@ mod tests {
             managed,
             ManagementRequest::Install(Box::new(reuse)),
         );
+        prepare_management_call(&actor, &mut reuse_call, &signing(0x21));
         let before_reuse = actor.state.clone();
         assert!(dispatch(&mut actor, &reuse_call).is_empty());
         assert_eq!(actor.state, before_reuse);
@@ -6894,7 +7502,7 @@ mod tests {
             role: ReplicaRole::Observer,
         });
         replacement.sort_by_key(|replica| replica.node);
-        let change = credential_call(
+        let mut change = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -6906,6 +7514,7 @@ mod tests {
                 replicas: replacement.clone(),
             },
         );
+        prepare_management_call(&actor, &mut change, &signing(0x21));
         let approval = ManagementApproval::decode(&dispatch(&mut actor, &change))
             .expect("exact Shared replica CAS is approved");
         assert_eq!(actor.state.managed_agents[shared_index], original);
@@ -6952,7 +7561,7 @@ mod tests {
         assert!(dispatch_admin(&mut actor, &unbind_in_use).is_empty());
         assert_eq!(actor.state, before_unbind);
 
-        let stale_revert = credential_call(
+        let mut stale_revert = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -6964,6 +7573,7 @@ mod tests {
                 replicas: shared.replicas.clone(),
             },
         );
+        prepare_management_call(&actor, &mut stale_revert, &signing(0x21));
         let before_stale = actor.state.clone();
         assert!(dispatch(&mut actor, &stale_revert).is_empty());
         assert_eq!(actor.state, before_stale);
@@ -6983,7 +7593,7 @@ mod tests {
                 role: ReplicaRole::Observer,
             });
             proposed.sort_by_key(|replica| replica.node);
-            let denied = credential_call(
+            let mut denied = credential_call(
                 config,
                 &signing(0x21),
                 ADMIN_PRINCIPAL,
@@ -6995,6 +7605,7 @@ mod tests {
                     replicas: proposed,
                 },
             );
+            prepare_management_call(&actor, &mut denied, &signing(0x21));
             let before = actor.state.clone();
             assert!(dispatch(&mut actor, &denied).is_empty());
             assert_eq!(actor.state, before);
@@ -7027,7 +7638,7 @@ mod tests {
         insert_live(&mut actor, &descriptor);
 
         let parent = actor_install(managed.agent, "parent", 0x80);
-        let parent_call = credential_call(
+        let mut parent_call = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -7036,6 +7647,7 @@ mod tests {
             managed,
             ManagementRequest::Install(Box::new(parent.clone())),
         );
+        prepare_management_call(&actor, &mut parent_call, &signing(0x21));
         let parent_approval = ManagementApproval::decode(&dispatch(&mut actor, &parent_call))
             .expect("parent install approved");
         assert!(dispatch_application_ack(
@@ -7047,7 +7659,7 @@ mod tests {
         let mut child = actor_install(managed.agent, "child", 0x82);
         child.entry.parent = Some(parent.entry.actor);
         child.entry.actor = ActorId::owned_child(parent.entry.actor, &child.entry.name);
-        let child_call = credential_call(
+        let mut child_call = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -7056,6 +7668,7 @@ mod tests {
             managed,
             ManagementRequest::Install(Box::new(child.clone())),
         );
+        prepare_management_call(&actor, &mut child_call, &signing(0x21));
         let child_approval = ManagementApproval::decode(&dispatch(&mut actor, &child_call))
             .expect("child install approved");
         assert_eq!(actor.state.managed_actors.len(), 1);
@@ -7076,7 +7689,7 @@ mod tests {
                 },
             ),
         ] {
-            let call = credential_call(
+            let mut call = credential_call(
                 config,
                 &signing(0x21),
                 ADMIN_PRINCIPAL,
@@ -7085,6 +7698,7 @@ mod tests {
                 managed,
                 request,
             );
+            prepare_management_call(&actor, &mut call, &signing(0x21));
             let before = actor.state.clone();
             assert!(dispatch(&mut actor, &call).is_empty());
             assert_eq!(actor.state, before);
@@ -7100,7 +7714,7 @@ mod tests {
                 contract: RuntimePackageContract::canonical(),
                 capabilities: RuntimeCapabilities::standard(),
             }));
-        let blocked_runtime = credential_call(
+        let mut blocked_runtime = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -7109,6 +7723,7 @@ mod tests {
             managed,
             runtime_request.clone(),
         );
+        prepare_management_call(&actor, &mut blocked_runtime, &signing(0x21));
         let before = actor.state.clone();
         assert!(dispatch(&mut actor, &blocked_runtime).is_empty());
         assert_eq!(actor.state, before);
@@ -7118,7 +7733,7 @@ mod tests {
             &child_call,
             &child_approval,
         ));
-        let runtime_call = credential_call(
+        let mut runtime_call = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -7127,9 +7742,10 @@ mod tests {
             managed,
             runtime_request,
         );
+        prepare_management_call(&actor, &mut runtime_call, &signing(0x21));
         assert!(ManagementApproval::decode(&dispatch(&mut actor, &runtime_call)).is_ok());
 
-        let child_suspend = credential_call(
+        let mut child_suspend = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -7141,6 +7757,7 @@ mod tests {
                 expected_deployment: child.entry.deployment,
             },
         );
+        prepare_management_call(&actor, &mut child_suspend, &signing(0x21));
         let before = actor.state.clone();
         assert!(dispatch(&mut actor, &child_suspend).is_empty());
         assert_eq!(actor.state, before);
@@ -7222,7 +7839,7 @@ mod tests {
         insert_live(&mut actor, &descriptor);
         let managed = target_for(&descriptor);
         let install = actor_install(managed.agent, "agent-scoped", 0x69);
-        let install_call = credential_call(
+        let mut install_call = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -7231,6 +7848,7 @@ mod tests {
             managed,
             ManagementRequest::Install(Box::new(install.clone())),
         );
+        prepare_management_call(&actor, &mut install_call, &signing(0x21));
         let approval = ManagementApproval::decode(&dispatch(&mut actor, &install_call)).unwrap();
         assert!(dispatch_application_ack(
             &mut actor,
@@ -7238,7 +7856,7 @@ mod tests {
             &approval,
         ));
 
-        let cross_agent = credential_call(
+        let mut cross_agent = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -7250,12 +7868,13 @@ mod tests {
                 expected_deployment: install.entry.deployment,
             },
         );
+        prepare_management_call(&actor, &mut cross_agent, &signing(0x21));
         let before = actor.state.clone();
         assert!(dispatch(&mut actor, &cross_agent).is_empty());
         assert_eq!(actor.state, before);
 
         let wrong_agent_install = actor_install(managed.agent, "wrong-agent", 0x6c);
-        let wrong_agent_call = credential_call(
+        let mut wrong_agent_call = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -7264,6 +7883,7 @@ mod tests {
             system_target(config),
             ManagementRequest::Install(Box::new(wrong_agent_install)),
         );
+        prepare_management_call(&actor, &mut wrong_agent_call, &signing(0x21));
         assert!(dispatch(&mut actor, &wrong_agent_call).is_empty());
         assert_eq!(actor.state, before);
     }
@@ -7303,7 +7923,7 @@ mod tests {
         assert!(!authority_state_is_valid(&config, &unbacked));
 
         let later_install = actor_install(AgentId(config.system_agent), "later-system", 0x72);
-        let later_call = credential_call(
+        let mut later_call = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -7312,6 +7932,7 @@ mod tests {
             system_target(config),
             ManagementRequest::Install(Box::new(later_install.clone())),
         );
+        prepare_management_call(&actor, &mut later_call, &signing(0x21));
         let later_approval =
             ManagementApproval::decode(&dispatch(&mut actor, &later_call)).unwrap();
         assert!(dispatch_application_ack(
@@ -7407,7 +8028,7 @@ mod tests {
     }
 
     #[test]
-    fn acc1_requires_exact_aic1_and_never_falls_back() {
+    fn acc2_requires_exact_aic1_and_never_falls_back() {
         let config = configuration();
         let key = signing(0x21);
         let call = create_call(
@@ -7462,19 +8083,19 @@ mod tests {
         let mut cases = Vec::new();
         let mut wrong_principal = base.clone();
         wrong_principal.principal = PrincipalId([0x32; 32]);
-        resign(&mut wrong_principal, &admin_key);
+        refresh_management_call(&mut wrong_principal, &admin_key);
         cases.push(wrong_principal);
 
         let other_key = signing(0x22);
         let mut wrong_key = base.clone();
         wrong_key.credential_public_key = other_key.verifying_key().to_bytes();
         wrong_key.credential = CredentialId::of_public_key(&wrong_key.credential_public_key);
-        resign(&mut wrong_key, &other_key);
+        refresh_management_call(&mut wrong_key, &other_key);
         cases.push(wrong_key);
 
         let mut unknown_node = base.clone();
         unknown_node.authenticated_node = Some(NodeId([0x42; 32]));
-        resign(&mut unknown_node, &admin_key);
+        refresh_management_call(&mut unknown_node, &admin_key);
         cases.push(unknown_node);
 
         let mut bad_signature = base;
@@ -7502,7 +8123,7 @@ mod tests {
     }
 
     #[test]
-    fn aoc1_none_node_exact_retry_restart_and_retirement_are_explicit() {
+    fn aoc3_none_node_exact_retry_restart_and_compaction_are_explicit() {
         let config = configuration();
         let mut actor = actor();
         let catalog = install_catalog_projection(&mut actor);
@@ -7528,12 +8149,12 @@ mod tests {
         assert_eq!(actor.state.operation_retirement_floor, 3);
 
         let mut unknown_node = call.clone();
-        unknown_node.invocation = InvocationId([0x83; 32]);
         unknown_node.authenticated_node = Some(NodeId([0x84; 32]));
         let AuthorityOperationIntent::InvokeActor { origin, .. } = &mut unknown_node.intent else {
             unreachable!()
         };
         origin.transport_node = unknown_node.authenticated_node;
+        unknown_node.invocation = unknown_node.expected_invocation();
         resign_operation_call(&mut unknown_node, &signing(0x21));
         let before_unknown = actor.state.clone();
         assert!(dispatch_operation(&mut actor, &unknown_node).is_empty());
@@ -7546,32 +8167,32 @@ mod tests {
             None,
             None,
         )
-        .expect("pending AOC1/AOP1 must restart");
+        .expect("pending AOC3/AOP3 must restart");
         assert_eq!(dispatch_operation(&mut restarted, &call), approval_bytes);
 
         let ack = operation_issuance_ack(config, &call, &approval);
         assert!(dispatch_operation_ack(&mut restarted, &ack));
         assert!(restarted.state.operation_retries.is_empty());
         assert_eq!(restarted.state.operation_retirement_floor, 4);
-        assert_eq!(restarted.state.retired_authority_operations.len(), 1);
+        assert_eq!(restarted.state.latest_operation_acks.len(), 1);
         assert!(dispatch_operation_ack(&mut restarted, &ack));
 
-        // Retirement deliberately ends AOC exact retry: the actor retains a
-        // collision tombstone, not bytes from which it could invent AOP1.
+        // Compaction deliberately ends AOC exact retry: the high-water and
+        // latest AOI cannot be used to invent AOP3 bytes.
         let retired_state = restarted.state.clone();
         assert!(dispatch_operation(&mut restarted, &call).is_empty());
         assert_eq!(restarted.state, retired_state);
         assert!(authority_state_is_valid(&config, &restarted.state));
 
         let mut corrupt_ack = restarted.state.clone();
-        corrupt_ack.retired_authority_operations[0].issuance_ack[0] ^= 1;
+        corrupt_ack.latest_operation_acks[0].issuance_ack[0] ^= 1;
         assert!(!authority_state_is_valid(&config, &corrupt_ack));
         let mut corrupt_floor = restarted.state.clone();
         corrupt_floor.operation_retirement_floor -= 1;
         assert!(!authority_state_is_valid(&config, &corrupt_floor));
-        let mut corrupt_chain = restarted.state.clone();
-        corrupt_chain.operation_retirement_commitment[0] ^= 1;
-        assert!(!authority_state_is_valid(&config, &corrupt_chain));
+        let mut corrupt_payload = restarted.state.clone();
+        corrupt_payload.latest_operation_acks[0].invocation_payload[0] ^= 1;
+        assert!(!authority_state_is_valid(&config, &corrupt_payload));
     }
 
     #[test]
@@ -7579,6 +8200,26 @@ mod tests {
         let config = configuration();
         let mut actor = actor();
         let catalog = install_catalog_projection(&mut actor);
+        let management_key = signing(0x86);
+        let management_principal = PrincipalId([0x87; 32]);
+        let management_node = node_for_principal(config, management_principal);
+        enroll(
+            &mut actor,
+            &management_key,
+            management_principal,
+            management_node,
+            BuiltinPrincipalRole::Admin,
+        );
+        let second_key = signing(0x88);
+        let second_principal = PrincipalId([0x89; 32]);
+        let second_node = node_for_principal(config, second_principal);
+        enroll(
+            &mut actor,
+            &second_key,
+            second_principal,
+            second_node,
+            BuiltinPrincipalRole::Admin,
+        );
         let first_call = invoke_operation_call(
             config,
             &signing(0x21),
@@ -7595,9 +8236,9 @@ mod tests {
 
         let runtime_call = credential_call(
             config,
-            &signing(0x21),
-            ADMIN_PRINCIPAL,
-            Some(ADMIN_NODE),
+            &management_key,
+            management_principal,
+            Some(management_node),
             0x87,
             system_target(config),
             ManagementRequest::UpgradeRuntime(Box::new(vos::agent_sdk::RuntimeUpgrade {
@@ -7618,9 +8259,9 @@ mod tests {
 
         let second_call = invoke_operation_call(
             config,
-            &signing(0x21),
-            ADMIN_PRINCIPAL,
-            Some(ADMIN_NODE),
+            &second_key,
+            second_principal,
+            Some(second_node),
             0x8b,
             0x8c,
             system_target(config),
@@ -7656,19 +8297,18 @@ mod tests {
         assert!(dispatch_operation_ack(&mut restarted, &first_ack));
         assert_eq!(restarted.state.operation_retirement_floor, 6);
         assert!(restarted.state.operation_retries.is_empty());
-        assert_eq!(
-            restarted
-                .state
-                .retired_authority_operations
-                .iter()
-                .map(|record| record.authorization_sequence)
-                .collect::<Vec<_>>(),
-            vec![4, 6]
-        );
+        let mut compacted = restarted
+            .state
+            .latest_operation_acks
+            .iter()
+            .map(|record| record.authorization_sequence)
+            .collect::<Vec<_>>();
+        compacted.sort_unstable();
+        assert_eq!(compacted, vec![4, 6]);
         // Sequence five was crossed but the separate management journal was
         // neither finalized nor compacted.
         assert_eq!(restarted.state.retries, management_journal);
-        assert!(!restarted.state.retries.last().unwrap().finalized);
+        assert!(!restarted.state.retries.is_empty());
         assert!(dispatch_operation_ack(&mut restarted, &second_ack));
         assert!(authority_state_is_valid(&config, &restarted.state));
     }
@@ -7678,6 +8318,16 @@ mod tests {
         let config = configuration();
         let mut actor = actor();
         let catalog = install_catalog_projection(&mut actor);
+        let collision_admin_key = signing(0x94);
+        let collision_admin_principal = PrincipalId([0x95; 32]);
+        let collision_admin_node = node_for_principal(config, collision_admin_principal);
+        enroll(
+            &mut actor,
+            &collision_admin_key,
+            collision_admin_principal,
+            collision_admin_node,
+            BuiltinPrincipalRole::Admin,
+        );
         let call = invoke_operation_call(
             config,
             &signing(0x21),
@@ -7704,6 +8354,7 @@ mod tests {
         let approval = AuthorityOperationApproval::decode(&approval_bytes).unwrap();
         let mut substituted_call = call.clone();
         substituted_call.requested_expires_at -= 1;
+        substituted_call.invocation = substituted_call.expected_invocation();
         resign_operation_call(&mut substituted_call, &signing(0x21));
         let before_substitution = actor.state.clone();
         assert!(dispatch_operation(&mut actor, &substituted_call).is_empty());
@@ -7730,32 +8381,33 @@ mod tests {
         assert_eq!(actor.state, before_ack);
 
         for collision in [
-            actor.state.retries[0].invocation,
-            actor.state.retries[0].acknowledgement_invocation,
+            actor.state.latest_management_acks[0].authorization_invocation,
+            actor.state.latest_management_acks[0].acknowledgement_invocation,
         ] {
             let mut colliding = call.clone();
             colliding.invocation = InvocationId(collision);
             resign_operation_call(&mut colliding, &signing(0x21));
-            assert!(dispatch_operation(&mut actor, &colliding).is_empty());
+            assert!(colliding.encode().is_err());
         }
 
-        let admin = admin_call(
+        let mut admin = admin_call(
             config,
-            &signing(0x21),
-            ADMIN_PRINCIPAL,
-            ADMIN_NODE,
+            &collision_admin_key,
+            collision_admin_principal,
+            collision_admin_node,
             0x94,
             actor.state.administration_generation,
             AuthorityAdminOperation::EnrollPrincipal {
-                principal: PrincipalId([0x95; 32]),
-                credential: enrollment(&signing(0x96), AuthorityCredentialKind::Api),
+                principal: PrincipalId([0x97; 32]),
+                credential: enrollment(&signing(0x98), AuthorityCredentialKind::Api),
             },
         );
+        prepare_admin_call(&actor, &mut admin, &collision_admin_key);
         assert!(!dispatch_admin(&mut actor, &admin).is_empty());
         let mut admin_collision = call.clone();
         admin_collision.invocation = admin.invocation;
         resign_operation_call(&mut admin_collision, &signing(0x21));
-        assert!(dispatch_operation(&mut actor, &admin_collision).is_empty());
+        assert!(admin_collision.encode().is_err());
 
         let mut corrupt_call = actor.state.clone();
         corrupt_call.operation_retries[0].operation_call_bytes[4] ^= 1;
@@ -7799,7 +8451,6 @@ mod tests {
             content: BlobRef::of_bytes(b"published-system-catalog"),
         };
         let intent = AuthorityOperationIntent::catalog(
-            InvocationId([0xa1; 32]),
             catalog,
             CatalogAlias {
                 namespace: "system".into(),
@@ -7807,7 +8458,6 @@ mod tests {
             },
             CatalogMutationKind::Publish,
             publication.clone(),
-            0,
         )
         .unwrap();
         let call = operation_call(config, &signing(0x21), ADMIN_PRINCIPAL, None, 0xa2, intent);
@@ -7817,7 +8467,6 @@ mod tests {
             .expect("exact catalog route and publication must authorize");
         assert!(
             approval
-                .intent
                 .catalog_request()
                 .is_some_and(|request| approval.matches_catalog_request(&request))
         );
@@ -7833,7 +8482,6 @@ mod tests {
         let mut wrong_catalog = catalog;
         wrong_catalog.deployment = DeploymentId([0xa3; 32]);
         let wrong_intent = AuthorityOperationIntent::catalog(
-            InvocationId([0xa4; 32]),
             wrong_catalog,
             CatalogAlias {
                 namespace: "system".into(),
@@ -7841,7 +8489,6 @@ mod tests {
             },
             CatalogMutationKind::Publish,
             publication,
-            0,
         )
         .unwrap();
         let wrong_call = operation_call(
@@ -7950,7 +8597,8 @@ mod tests {
             &invite_application
         ));
 
-        let revoke_call = operation_call(config, &owner_key, owner, None, 0xbd, revoke);
+        let mut revoke_call = operation_call(config, &owner_key, owner, None, 0xbd, revoke);
+        prepare_operation_call(&actor, &mut revoke_call, &owner_key);
         assert!(
             AuthorityOperationApproval::decode(&dispatch_operation(&mut actor, &revoke_call))
                 .is_ok()
@@ -8034,7 +8682,7 @@ mod tests {
             authorize_and_issue_operation(&mut actor, &invite_call);
         assert_eq!(actor.state.private_agents, private_before_issuance);
         assert!(actor.state.operation_retries.is_empty());
-        assert_eq!(actor.state.retired_authority_operations.len(), 1);
+        assert_eq!(actor.state.latest_operation_acks.len(), 1);
 
         let invite_pca = private_application_ack(
             &invite_call,
@@ -8112,7 +8760,7 @@ mod tests {
         assert!(dispatch_private_application(&mut restarted, &invite_pca));
 
         let revoke_control = Hash([0xca; 32]);
-        let revoke_call = operation_call(
+        let mut revoke_call = operation_call(
             config,
             &owner_key,
             owner,
@@ -8128,6 +8776,7 @@ mod tests {
                 member_set: initial_member_set,
             },
         );
+        prepare_operation_call(&restarted, &mut revoke_call, &owner_key);
         let (revoke_approval, revoke_issuance) =
             authorize_and_issue_operation(&mut restarted, &revoke_call);
         let revoke_pca = private_application_ack(
@@ -8169,6 +8818,15 @@ mod tests {
             owner_node,
             BuiltinPrincipalRole::Member,
         );
+        let gap_key = signing(0xd2);
+        dispatch_fixture_admin(
+            &mut actor,
+            InvocationId([0xd2; 32]),
+            AuthorityAdminOperation::AddCredential {
+                principal: owner,
+                credential: enrollment(&gap_key, AuthorityCredentialKind::Api),
+            },
+        );
         let gap_descriptor = descriptor(config, owner, AgentProfile::Private, 0xdc);
         let gap_managed = target_for(&gap_descriptor);
         insert_live(&mut actor, &gap_descriptor);
@@ -8182,7 +8840,7 @@ mod tests {
 
         let gap_call = operation_call(
             config,
-            &owner_key,
+            &gap_key,
             owner,
             None,
             0xd5,
@@ -8236,11 +8894,11 @@ mod tests {
             ),
         );
         assert!(dispatch_private_application(&mut actor, &pca));
-        assert!(actor.state.retired_authority_operations.is_empty());
+        assert!(actor.state.latest_operation_acks.is_empty());
 
         assert!(dispatch_operation_ack(&mut actor, &gap_issuance));
         assert!(actor.state.operation_retries.is_empty());
-        assert_eq!(actor.state.retired_authority_operations.len(), 2);
+        assert_eq!(actor.state.latest_operation_acks.len(), 2);
         assert_eq!(actor.state.operation_retirement_floor, 6);
         let after_compaction = actor.state.clone();
         assert!(dispatch_private_application(&mut actor, &pca));
@@ -8299,7 +8957,7 @@ mod tests {
         );
 
         let new_deployment = DeploymentId([0xe9; 32]);
-        let upgrade_call = credential_call(
+        let mut upgrade_call = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -8316,6 +8974,7 @@ mod tests {
                 capabilities: RuntimeCapabilities::standard(),
             })),
         );
+        prepare_management_call(&actor, &mut upgrade_call, &signing(0x21));
         let upgrade_approval = ManagementApproval::decode(&dispatch(&mut actor, &upgrade_call))
             .expect("runtime upgrade authorized");
         let mut upgrade_ack =
@@ -8493,10 +9152,11 @@ mod tests {
                 credential: enrollment(&collision_key, AuthorityCredentialKind::Ssh),
             },
         );
+        assert_ne!(collision_admin.invocation, pca.application_invocation);
         collision_admin.invocation = pca.application_invocation;
         resign_admin(&mut collision_admin, &signing(0x21));
         let collision_state = collision_actor.state.clone();
-        assert!(dispatch_admin(&mut collision_actor, &collision_admin).is_empty());
+        assert!(collision_admin.encode().is_err());
         assert_eq!(collision_actor.state, collision_state);
         assert!(dispatch_private_application(&mut collision_actor, &pca));
 
@@ -8505,7 +9165,7 @@ mod tests {
         let mut colliding_operation = call.clone();
         colliding_operation.invocation = pca.application_invocation;
         resign_operation_call(&mut colliding_operation, &owner_key);
-        assert!(dispatch_operation(&mut actor, &colliding_operation).is_empty());
+        assert!(colliding_operation.encode().is_err());
         let mut colliding_management = create_call(
             config,
             &signing(0x21),
@@ -8517,7 +9177,7 @@ mod tests {
         );
         colliding_management.invocation = pca.application_invocation;
         resign(&mut colliding_management, &signing(0x21));
-        assert!(dispatch(&mut actor, &colliding_management).is_empty());
+        assert!(colliding_management.encode().is_err());
         let mut colliding_admin = admin_call(
             config,
             &signing(0x21),
@@ -8532,7 +9192,7 @@ mod tests {
         );
         colliding_admin.invocation = pca.application_invocation;
         resign_admin(&mut colliding_admin, &signing(0x21));
-        assert!(dispatch_admin(&mut actor, &colliding_admin).is_empty());
+        assert!(colliding_admin.encode().is_err());
         assert_eq!(actor.state, after_application);
     }
 
@@ -8592,7 +9252,7 @@ mod tests {
         assert!(dispatch_private_application(&mut actor, &first_pca));
 
         let second_control = Hash([0x69; 32]);
-        let second_call = operation_call(
+        let mut second_call = operation_call(
             config,
             &owner_key,
             owner,
@@ -8608,6 +9268,7 @@ mod tests {
                 member_set: initial_member_set,
             },
         );
+        prepare_operation_call(&actor, &mut second_call, &owner_key);
         let (second_approval, second_issuance) =
             authorize_and_issue_operation(&mut actor, &second_call);
         let second_pca = private_application_ack(
@@ -8626,7 +9287,7 @@ mod tests {
         let third_node = enroll_additional_node(&mut actor, owner, 0xf5);
         let third_identity = enrolled_identity_commitment(&actor, third_node, owner);
         let third_member_set = fixture_member_set([descriptor.replicas[0].node, third_node]);
-        let third_call = operation_call(
+        let mut third_call = operation_call(
             config,
             &owner_key,
             owner,
@@ -8642,6 +9303,7 @@ mod tests {
                 node_identity: third_identity,
             },
         );
+        prepare_operation_call(&actor, &mut third_call, &owner_key);
         let before_out_of_order = actor.state.clone();
         assert!(dispatch_operation(&mut actor, &third_call).is_empty());
         assert_eq!(actor.state, before_out_of_order);
@@ -8751,7 +9413,8 @@ mod tests {
             ),
         ];
         for (invocation, intent) in hostile {
-            let call = operation_call(config, &owner_key, owner, None, invocation, intent);
+            let mut call = operation_call(config, &owner_key, owner, None, invocation, intent);
+            prepare_operation_call(&actor, &mut call, &owner_key);
             let before = actor.state.clone();
             assert!(dispatch_operation(&mut actor, &call).is_empty());
             assert_eq!(actor.state, before);
@@ -8761,7 +9424,7 @@ mod tests {
         let fourth_identity = enrolled_identity_commitment(&actor, fourth_node, owner);
         let fourth_member_set =
             fixture_member_set([descriptor.replicas[0].node, third_node, fourth_node]);
-        let fourth_call = operation_call(
+        let mut fourth_call = operation_call(
             config,
             &owner_key,
             owner,
@@ -8777,10 +9440,11 @@ mod tests {
                 node_identity: fourth_identity,
             },
         );
+        prepare_operation_call(&actor, &mut fourth_call, &owner_key);
         let (fourth_approval, fourth_issuance) =
             authorize_and_issue_operation(&mut actor, &fourth_call);
 
-        let fork = operation_call(
+        let mut fork = operation_call(
             config,
             &owner_key,
             owner,
@@ -8796,6 +9460,7 @@ mod tests {
                 node_identity: Hash([0x8e; 32]),
             },
         );
+        prepare_operation_call(&actor, &mut fork, &owner_key);
         assert!(dispatch_operation(&mut actor, &fork).is_empty());
 
         let wrong_member_set = private_application_ack(
@@ -8949,53 +9614,37 @@ mod tests {
         assert!(!authority_state_is_valid(&config, &rewritten_audit));
 
         let mut rewritten_source = actor.state.clone();
-        rewritten_source.retired_authority_operations[0].operation_call[0] ^= 1;
-        rewritten_source.operation_retirement_commitment =
-            initial_operation_retirement_commitment(config).0;
-        for record in &rewritten_source.retired_authority_operations {
-            rewritten_source.operation_retirement_commitment = operation_retirement_commitment(
-                Hash(rewritten_source.operation_retirement_commitment),
-                record,
-            )
-            .0;
-        }
+        rewritten_source.latest_operation_acks[0].operation_call[0] ^= 1;
+        assert!(refresh_state_integrity_commitment(
+            &config,
+            &mut rewritten_source
+        ));
         assert!(!authority_state_is_valid(&config, &rewritten_source));
 
         let mut rewritten_reservation = actor.state.clone();
-        rewritten_reservation.retired_authority_operations[0].private_application_invocation = None;
-        rewritten_reservation.operation_retirement_commitment =
-            initial_operation_retirement_commitment(config).0;
-        for record in &rewritten_reservation.retired_authority_operations {
-            rewritten_reservation.operation_retirement_commitment =
-                operation_retirement_commitment(
-                    Hash(rewritten_reservation.operation_retirement_commitment),
-                    record,
-                )
-                .0;
-        }
+        rewritten_reservation.latest_operation_acks[0].private_application_invocation = None;
+        assert!(refresh_state_integrity_commitment(
+            &config,
+            &mut rewritten_reservation
+        ));
         assert!(!authority_state_is_valid(&config, &rewritten_reservation));
 
         let mut rewritten_target = actor.state.clone();
-        rewritten_target.retired_authority_operations[0]
+        rewritten_target.latest_operation_acks[0]
             .private_operation
             .as_mut()
             .unwrap()
             .node = Some([0xfe; 32]);
-        rewritten_target.operation_retirement_commitment =
-            initial_operation_retirement_commitment(config).0;
-        for record in &rewritten_target.retired_authority_operations {
-            rewritten_target.operation_retirement_commitment = operation_retirement_commitment(
-                Hash(rewritten_target.operation_retirement_commitment),
-                record,
-            )
-            .0;
-        }
+        assert!(refresh_state_integrity_commitment(
+            &config,
+            &mut rewritten_target
+        ));
         assert!(!authority_state_is_valid(&config, &rewritten_target));
 
         let mut collision = actor.state.clone();
-        collision.retired_authority_operations[0].private_application_invocation =
-            Some(collision.retired_authority_operations[0].invocation);
-        assert!(!all_invocation_identifiers_are_unique(&collision));
+        collision.latest_operation_acks[0].private_application_invocation =
+            Some(collision.latest_operation_acks[0].authorization_invocation);
+        assert!(refresh_state_integrity_commitment(&config, &mut collision));
         assert!(!authority_state_is_valid(&config, &collision));
 
         let mut rewritten_application_invocation = actor.state.clone();
@@ -9014,110 +9663,82 @@ mod tests {
     }
 
     #[test]
-    fn general_retry_and_retirement_bounds_fail_closed_without_sequence_drift() {
+    fn general_operation_compacts_beyond_the_legacy_retry_bound() {
         let config = configuration();
-        let mut actor = actor();
+        let key = signing(0x21);
+        let mut actor = SystemAuthority::new(&config.encode());
         let catalog = install_catalog_projection(&mut actor);
-        let reserve = MAX_EXACT_RETRY_RECORDS - exact_retry_count(&actor.state) - 1;
-        fill_pending_management_retries(&mut actor, reserve);
-        assert_eq!(exact_retry_count(&actor.state), MAX_EXACT_RETRY_RECORDS - 1);
-        let last = invoke_operation_call(
-            config,
-            &signing(0x21),
-            ADMIN_PRINCIPAL,
-            Some(ADMIN_NODE),
-            0xd1,
-            0xd2,
-            system_target(config),
-            &catalog,
-        );
-        assert!(AuthorityOperationApproval::decode(&dispatch_operation(&mut actor, &last)).is_ok());
-        assert_eq!(exact_retry_count(&actor.state), MAX_EXACT_RETRY_RECORDS);
-        let overflow = invoke_operation_call(
-            config,
-            &signing(0x21),
-            ADMIN_PRINCIPAL,
-            Some(ADMIN_NODE),
-            0xd3,
-            0xd4,
-            system_target(config),
-            &catalog,
-        );
-        let before = actor.state.clone();
-        assert!(dispatch_operation(&mut actor, &overflow).is_empty());
-        assert_eq!(actor.state, before);
+        let mut first_call = None;
+        let mut first_ack = None;
+        let mut latest_call = None;
+        let mut latest_ack = None;
+        let mut compact_size = 0;
 
-        let mut retired = SystemAuthority::new(&config.encode());
-        let catalog = install_catalog_projection(&mut retired);
-        for ordinal in 0..MAX_RETIRED_AUTHORITY_OPERATIONS {
-            let sequence = retired.state.authorization_sequence + 1;
-            let ordinal = u64::try_from(ordinal).unwrap().to_le_bytes();
-            let row = RetiredAuthorityOperationRow {
-                invocation: Hash::digest(
-                    b"vos/test/system-authority/retired-operation-auth/v1",
-                    &[&ordinal],
-                )
-                .0,
-                acknowledgement_invocation: Hash::digest(
-                    b"vos/test/system-authority/retired-operation-ack/v1",
-                    &[&ordinal],
-                )
-                .0,
-                authorization_sequence: sequence,
-                operation_call: Hash::digest(
-                    b"vos/test/system-authority/retired-operation-call/v1",
-                    &[&ordinal],
-                )
-                .0,
-                approval: Hash::digest(
-                    b"vos/test/system-authority/retired-operation-approval/v1",
-                    &[&ordinal],
-                )
-                .0,
-                issuance_ack: Hash::digest(
-                    b"vos/test/system-authority/retired-operation-aoi/v1",
-                    &[&ordinal],
-                )
-                .0,
-                issued_at: OBSERVED_SLOT,
-                private_application_invocation: None,
-                private_operation: None,
+        for ordinal in 0..=MAX_EXACT_RETRY_RECORDS {
+            let mut call = invoke_operation_call(
+                config,
+                &key,
+                ADMIN_PRINCIPAL,
+                None,
+                0xd5,
+                0xd6,
+                system_target(config),
+                &catalog,
+            );
+            let AuthorityOperationIntent::InvokeActor { work, .. } = &mut call.intent else {
+                unreachable!()
             };
-            retired.state.authorization_sequence = sequence;
-            retired.state.operation_retirement_floor = sequence;
-            retired.state.operation_retirement_commitment = operation_retirement_commitment(
-                Hash(retired.state.operation_retirement_commitment),
-                &row,
-            )
-            .0;
-            retired.state.retired_authority_operations.push(row);
+            *work = Hash::digest(
+                b"vos/test/system-authority/compacted-operation/v1",
+                &[&u64::try_from(ordinal).unwrap().to_le_bytes()],
+            );
+            prepare_operation_call(&actor, &mut call, &key);
+            let (approval, ack) = authorize_and_issue_operation(&mut actor, &call);
+            if ordinal == 0 {
+                compact_size = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&actor.state)
+                    .unwrap()
+                    .len();
+                first_call = Some(call.clone());
+                first_ack = Some(ack.clone());
+            }
+            latest_call = Some(call);
+            latest_ack = Some(ack);
+            assert_eq!(approval.request_sequence.get(), ordinal as u64 + 1);
+            assert_eq!(actor.state.latest_operation_acks.len(), 1);
+            assert!(actor.state.operation_retries.is_empty());
         }
-        assert!(authority_state_is_valid(&config, &retired.state));
-        let saturated = invoke_operation_call(
-            config,
-            &signing(0x21),
-            ADMIN_PRINCIPAL,
-            None,
-            0xd5,
-            0xd6,
-            system_target(config),
-            &catalog,
-        );
-        let before = retired.state.clone();
-        assert!(dispatch_operation(&mut retired, &saturated).is_empty());
-        assert_eq!(retired.state, before);
 
-        let mut over_limit = retired.state.clone();
-        let mut extra = *over_limit.retired_authority_operations.last().unwrap();
-        extra.authorization_sequence += 1;
-        extra.invocation[0] ^= 1;
-        extra.acknowledgement_invocation[0] ^= 1;
-        over_limit.retired_authority_operations.push(extra);
+        let credential = credential_index(
+            &actor.state,
+            CredentialId::of_public_key(&key.verifying_key().to_bytes()),
+        )
+        .unwrap();
         assert_eq!(
-            over_limit.retired_authority_operations.len(),
-            MAX_RETIRED_AUTHORITY_OPERATIONS + 1
+            actor.state.credentials[credential].operation_request_high_water,
+            u64::try_from(MAX_EXACT_RETRY_RECORDS).unwrap() + 1
         );
-        assert!(!authority_state_is_valid(&config, &over_limit));
+        assert!(authority_state_is_valid(&config, &actor.state));
+        let final_size = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&actor.state)
+            .unwrap()
+            .len();
+        assert!(final_size <= compact_size + 64);
+
+        let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
+        let mut restarted = <SystemAuthority as vos::Actor>::__load_agent_state(
+            Some(&config.encode()),
+            Some(&linear),
+            None,
+            None,
+        )
+        .expect("compacted latest AOI1 must restart");
+        let before = restarted.state.clone();
+        assert!(dispatch_operation(&mut restarted, &first_call.unwrap()).is_empty());
+        assert!(!dispatch_operation_ack(&mut restarted, &first_ack.unwrap()));
+        assert_eq!(restarted.state, before);
+        assert!(dispatch_operation_ack(&mut restarted, &latest_ack.unwrap()));
+        assert_eq!(restarted.state, before);
+        assert!(dispatch_operation(&mut restarted, &latest_call.unwrap()).is_empty());
+        assert_eq!(restarted.state, before);
     }
 
     #[test]
@@ -9272,7 +9893,7 @@ mod tests {
         insert_live(&mut actor, &managed_descriptor);
 
         let install = actor_install(managed.agent, "owned", 0x98);
-        let install_call = credential_call(
+        let mut install_call = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -9281,6 +9902,7 @@ mod tests {
             managed,
             ManagementRequest::Install(Box::new(install.clone())),
         );
+        prepare_management_call(&actor, &mut install_call, &signing(0x21));
         let install_approval = ManagementApproval::decode(&dispatch(&mut actor, &install_call))
             .expect("admin installs the owned actor");
         assert!(dispatch_application_ack(
@@ -9323,7 +9945,7 @@ mod tests {
             &owner_approval,
         ));
 
-        let admin_call = credential_call(
+        let mut admin_call = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -9335,6 +9957,7 @@ mod tests {
                 expected_deployment: install.entry.deployment,
             },
         );
+        prepare_management_call(&actor, &mut admin_call, &signing(0x21));
         let admin_approval = ManagementApproval::decode(&dispatch(&mut actor, &admin_call))
             .expect("admin may resume an exactly projected actor");
         assert!(dispatch_application_ack(
@@ -9347,7 +9970,7 @@ mod tests {
             runtime_deployment: DeploymentId([0xaa; 32]),
             ..managed
         };
-        let mismatch = credential_call(
+        let mut mismatch = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
@@ -9356,6 +9979,7 @@ mod tests {
             mismatched_target,
             request,
         );
+        prepare_management_call(&actor, &mut mismatch, &signing(0x21));
         let before = actor.state.clone();
         assert!(dispatch(&mut actor, &mismatch).is_empty());
         assert_eq!(actor.state, before);
@@ -9379,7 +10003,7 @@ mod tests {
             unreachable!()
         };
         descriptor.authority = call.authority.binding;
-        resign(&mut call, &key);
+        refresh_management_call(&mut call, &key);
         assert_eq!(call.validate_shape(), Ok(()));
 
         let mut actor = actor();
@@ -9411,7 +10035,7 @@ mod tests {
 
         let mut conflict = call;
         conflict.requested_expires_at -= 1;
-        resign(&mut conflict, &key);
+        refresh_management_call(&mut conflict, &key);
         let before_conflict = actor.state.clone();
         assert!(dispatch(&mut actor, &conflict).is_empty());
         assert_eq!(actor.state, before_conflict);
@@ -9479,9 +10103,7 @@ mod tests {
 
         let mut confused = right;
         confused.authenticated_node = Some(left_node);
-        resign(&mut confused, &right_key);
-        confused.invocation = InvocationId([0xd5; 32]);
-        resign(&mut confused, &right_key);
+        refresh_management_call(&mut confused, &right_key);
         let before = actor.state.clone();
         assert!(dispatch(&mut actor, &confused).is_empty());
         assert_eq!(actor.state, before);
@@ -9507,31 +10129,115 @@ mod tests {
     }
 
     #[test]
-    fn retry_capacity_saturates_without_partial_sequence_mutation() {
+    fn finalized_management_compacts_beyond_four_thousand_lifecycle_operations() {
         let config = configuration();
         let mut actor = actor();
-        fill_pending_management_retries(&mut actor, MAX_EXACT_RETRY_RECORDS);
-        assert!(authority_state_is_valid(&config, &actor.state));
-
-        let call = create_call(
+        let descriptor = descriptor(config, ADMIN_PRINCIPAL, AgentProfile::Local, 0xf1);
+        insert_live(&mut actor, &descriptor);
+        let managed = target_for(&descriptor);
+        let install = actor_install(managed.agent, "compacted-worker", 0xf2);
+        let install_call = credential_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
             Some(ADMIN_NODE),
             0xf0,
-            AgentProfile::Local,
-            0xf1,
+            managed,
+            ManagementRequest::Install(Box::new(install.clone())),
         );
-        let before = actor.state.clone();
-        assert!(dispatch(&mut actor, &call).is_empty());
-        assert_eq!(actor.state, before);
+        let (_, _, first_ack) =
+            record_fixture_finalized_management(&mut actor, install_call, &signing(0x21));
+        let compact_size_after_first =
+            vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&actor.state)
+                .unwrap()
+                .len();
+
+        // Model the 4,095 discarded exact predecessors directly. The durable
+        // journal is their authenticity boundary; the actor state retains the
+        // cumulative credential/global high-waters and their exact projected
+        // effect. The final (4,096th) transition below is retained and fully
+        // signed, then the complete compact image is validated once.
+        let caller = credential_index(
+            &actor.state,
+            CredentialId::of_public_key(&signing(0x21).verifying_key().to_bytes()),
+        )
+        .unwrap();
+        actor.state.credentials[caller].management_request_high_water += 4_095;
+        actor.state.authorization_sequence += 4_095;
+        actor.state.operation_retirement_floor += 4_095;
+        let installed = managed_actor(&actor.state, managed.agent, install.entry.actor).unwrap();
+        actor.state.managed_actors[installed].suspended = true;
+
+        let final_call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0xf3,
+            managed,
+            ManagementRequest::Resume {
+                actor: install.entry.actor,
+                expected_deployment: install.entry.deployment,
+            },
+        );
+        let (latest_call, latest_approval, latest_ack) =
+            record_fixture_finalized_management(&mut actor, final_call, &signing(0x21));
+        assert!(refresh_state_integrity_commitment(
+            &actor.configuration,
+            &mut actor.state,
+        ));
+        assert!(authority_state_is_valid(&config, &actor.state));
+
+        let credential = credential_index(
+            &actor.state,
+            CredentialId::of_public_key(&signing(0x21).verifying_key().to_bytes()),
+        )
+        .unwrap();
+        assert_eq!(
+            actor.state.credentials[credential].management_request_high_water, 4_098,
+            "Create + Install + 4,096 finalized lifecycle calls share one monotonic credential clock",
+        );
+        assert_eq!(actor.state.authorization_sequence, 4_100);
+        assert_eq!(actor.state.operation_retirement_floor, 4_100);
+        assert!(actor.state.retries.is_empty());
+        assert_eq!(actor.state.latest_management_acks.len(), 1);
+        assert_eq!(
+            actor.state.managed_actors
+                [managed_actor(&actor.state, managed.agent, install.entry.actor).unwrap()]
+            .suspended,
+            false,
+        );
+        let final_size = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&actor.state)
+            .unwrap()
+            .len();
+        assert!(final_size <= compact_size_after_first + 64);
+
+        let completed = actor.state.clone();
+        assert!(dispatch(&mut actor, &latest_call).is_empty());
+        assert_ne!(latest_approval, Vec::<u8>::new());
+        assert_eq!(actor.state, completed);
+        assert!(dispatch_ack(&mut actor, &latest_ack));
+        assert_eq!(actor.state, completed);
+        assert!(!dispatch_ack(&mut actor, &first_ack));
+        assert_eq!(actor.state, completed);
+
+        let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
+        let restarted = <SystemAuthority as vos::Actor>::__load_agent_state(
+            Some(&config.encode()),
+            Some(&linear),
+            None,
+            None,
+        )
+        .expect("compacted lifecycle high-water must survive restart");
+        assert_eq!(restarted.state, actor.state);
     }
 
     #[test]
-    fn admin_exact_retry_survives_combined_retry_capacity() {
+    fn admin_latest_exact_result_survives_long_compacted_churn_and_restart() {
         let config = configuration();
         let key = signing(0x21);
-        let call = admin_call(
+        let principal = PrincipalId([0xf1; 32]);
+        let first_call = admin_call(
             config,
             &key,
             ADMIN_PRINCIPAL,
@@ -9539,37 +10245,71 @@ mod tests {
             0xf0,
             1,
             AuthorityAdminOperation::EnrollPrincipal {
-                principal: PrincipalId([0xf1; 32]),
+                principal,
                 credential: enrollment(&signing(0xf2), AuthorityCredentialKind::Api),
             },
         );
         let mut actor = actor();
-        let result = dispatch_admin(&mut actor, &call);
-        assert!(!result.is_empty());
-
-        fill_pending_management_retries(&mut actor, MAX_EXACT_RETRY_RECORDS - 1);
+        let first_result = dispatch_admin(&mut actor, &first_call);
+        assert!(!first_result.is_empty());
+        let compact_size_after_first =
+            vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&actor.state)
+                .unwrap()
+                .len();
+        for ordinal in 0..512_u64 {
+            record_fixture_admin(
+                &mut actor,
+                InvocationId::ZERO,
+                AuthorityAdminOperation::SetBuiltinRole {
+                    principal,
+                    role: if ordinal & 1 == 0 {
+                        AuthorityBuiltinRole::Developer
+                    } else {
+                        AuthorityBuiltinRole::Member
+                    },
+                },
+            );
+        }
+        assert!(refresh_state_integrity_commitment(
+            &actor.configuration,
+            &mut actor.state,
+        ));
         assert!(authority_state_is_valid(&config, &actor.state));
-
-        let saturated = actor.state.clone();
-        assert_eq!(dispatch_admin(&mut actor, &call), result);
-        assert_eq!(actor.state, saturated);
-        let fresh = admin_call(
-            config,
-            &key,
-            ADMIN_PRINCIPAL,
-            ADMIN_NODE,
-            0xf3,
-            2,
-            AuthorityAdminOperation::EnrollNode {
-                enrollment: signed_node_enrollment(
-                    SpaceId(config.space),
-                    PrincipalId([0xf1; 32]),
-                    0xf4,
-                ),
-            },
+        assert_eq!(actor.state.admin_retries.len(), 1);
+        assert_eq!(actor.state.administration_generation, 514);
+        let root_credential = credential_index(
+            &actor.state,
+            CredentialId::of_public_key(&key.verifying_key().to_bytes()),
+        )
+        .unwrap();
+        assert_eq!(
+            actor.state.credentials[root_credential].admin_request_high_water,
+            513,
         );
-        assert!(dispatch_admin(&mut actor, &fresh).is_empty());
-        assert_eq!(actor.state, saturated);
+        let final_size = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&actor.state)
+            .unwrap()
+            .len();
+        assert!(final_size <= compact_size_after_first + 64);
+
+        let latest = &actor.state.admin_retries[0];
+        let latest_call = AuthorityAdminCall::decode(&latest.call_bytes).unwrap();
+        let latest_result = latest.result_bytes.clone();
+        let compacted = actor.state.clone();
+        assert_eq!(dispatch_admin(&mut actor, &latest_call), latest_result);
+        assert_eq!(actor.state, compacted);
+        assert!(dispatch_admin(&mut actor, &first_call).is_empty());
+        assert_eq!(actor.state, compacted);
+
+        let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
+        let mut restarted = <SystemAuthority as vos::Actor>::__load_agent_state(
+            Some(&config.encode()),
+            Some(&linear),
+            None,
+            None,
+        )
+        .expect("compacted Admin high-water must survive restart");
+        assert_eq!(dispatch_admin(&mut restarted, &latest_call), latest_result);
+        assert_eq!(restarted.state, actor.state);
     }
 
     #[test]
@@ -9650,7 +10390,8 @@ mod tests {
             [managed_agent(&actor.state, call.managed.agent).expect("acknowledged Agent is live")];
         assert_eq!(live.agent, call.managed.agent.0);
         assert_eq!(live.authority, config.binding);
-        assert!(actor.state.retries[0].finalized);
+        assert!(actor.state.retries.is_empty());
+        assert_eq!(actor.state.latest_management_acks.len(), 1);
 
         let after_finalize = actor.state.clone();
         assert!(dispatch_ack(&mut actor, &ack));
@@ -9779,10 +10520,9 @@ mod tests {
         );
         let candidate_ack = ManagementApproval::derive_acknowledgement_invocation(&candidate);
 
-        // First reserve the candidate's prospective MAA2 ID as another ACC1
-        // ID. The candidate must be denied before consuming a sequence or
-        // adding its pending Create effect.
-        let mut blocker = create_call(
+        // ACC2 authorization IDs are credential/sequence/payload-derived and
+        // cannot canonically claim the separately derived MAA2 domain.
+        let blocker = create_call(
             config,
             &key,
             ADMIN_PRINCIPAL,
@@ -9791,8 +10531,11 @@ mod tests {
             AgentProfile::Local,
             0x78,
         );
-        blocker.invocation = candidate_ack;
-        resign(&mut blocker, &key);
+        assert_ne!(blocker.invocation, candidate_ack);
+        let mut forged_blocker = blocker.clone();
+        forged_blocker.invocation = candidate_ack;
+        resign(&mut forged_blocker, &key);
+        assert!(forged_blocker.encode().is_err());
         let mut actor = actor();
         let blocker_approval = ManagementApproval::decode(&dispatch(&mut actor, &blocker)).unwrap();
         assert_eq!(actor.state.retries.len(), 1);
@@ -9801,9 +10544,8 @@ mod tests {
         assert!(dispatch(&mut actor, &candidate).is_empty());
         assert_eq!(actor.state, before);
 
-        // The reciprocal collision is also reserved immediately: a later
-        // ACC1 cannot claim the blocker's prospective MAA2 ID while the
-        // blocker is still pending finalization.
+        // The reciprocal substitution is likewise noncanonical before the
+        // actor sees it.
         let mut authorization_collision = create_call(
             config,
             &key,
@@ -9813,9 +10555,13 @@ mod tests {
             AgentProfile::Local,
             0x7a,
         );
+        assert_ne!(
+            authorization_collision.invocation,
+            blocker_approval.acknowledgement_invocation
+        );
         authorization_collision.invocation = blocker_approval.acknowledgement_invocation;
         resign(&mut authorization_collision, &key);
-        assert!(dispatch(&mut actor, &authorization_collision).is_empty());
+        assert!(authorization_collision.encode().is_err());
         assert_eq!(actor.state, before);
     }
 
@@ -9852,12 +10598,11 @@ mod tests {
             AgentProfile::Local,
             0x74,
         );
+        assert_ne!(other_call.invocation, ack.acknowledgement_invocation);
         other_call.invocation = ack.acknowledgement_invocation;
         resign(&mut other_call, &signing(0x21));
         let before = actor.state.clone();
-        // The actor also rejects an ACC1 that reuses a finalized MAA2 runtime
-        // invocation, even though the runtime should catch this first.
-        assert!(dispatch(&mut actor, &other_call).is_empty());
+        assert!(other_call.encode().is_err());
         assert_eq!(actor.state, before);
     }
 
@@ -10151,8 +10896,112 @@ mod tests {
         )
         .expect("complete canonical Admin history restarts");
         let before_retry = reopened.state.clone();
-        assert_eq!(dispatch_admin(&mut reopened, &enroll_call), enrolled);
+        assert!(
+            dispatch_admin(&mut reopened, &enroll_call).is_empty(),
+            "only the credential's newest finalized AAR3 remains exact-retryable"
+        );
         assert_eq!(reopened.state, before_retry);
+    }
+
+    #[test]
+    fn cross_credential_revoke_and_unbind_wait_for_pending_authority_work() {
+        let config = configuration();
+        let admin_key = signing(0x21);
+        let worker_key = signing(0x8a);
+        let worker_credential = enrollment(&worker_key, AuthorityCredentialKind::Api).credential;
+        let mut actor = actor();
+
+        dispatch_fixture_admin(
+            &mut actor,
+            InvocationId([0x8b; 32]),
+            AuthorityAdminOperation::AddCredential {
+                principal: ADMIN_PRINCIPAL,
+                credential: enrollment(&worker_key, AuthorityCredentialKind::Api),
+            },
+        );
+        let worker_node = enroll_additional_node(&mut actor, ADMIN_PRINCIPAL, 0x8c);
+        let catalog = install_catalog_projection(&mut actor);
+        let pending_call = invoke_operation_call(
+            config,
+            &worker_key,
+            ADMIN_PRINCIPAL,
+            Some(worker_node),
+            0x8d,
+            0x8e,
+            system_target(config),
+            &catalog,
+        );
+        let approval =
+            AuthorityOperationApproval::decode(&dispatch_operation(&mut actor, &pending_call))
+                .expect("the secondary credential must retain one pending AOC3/AOP3");
+
+        for (invocation, operation) in [
+            (
+                0x8f,
+                AuthorityAdminOperation::RevokeCredential {
+                    principal: ADMIN_PRINCIPAL,
+                    credential: worker_credential,
+                },
+            ),
+            (
+                0x90,
+                AuthorityAdminOperation::UnbindNodeOwner {
+                    node: worker_node,
+                    owner: ADMIN_PRINCIPAL,
+                },
+            ),
+        ] {
+            let mut mutation = admin_call(
+                config,
+                &admin_key,
+                ADMIN_PRINCIPAL,
+                ADMIN_NODE,
+                invocation,
+                actor.state.administration_generation,
+                operation,
+            );
+            prepare_admin_call(&actor, &mut mutation, &admin_key);
+            let before = actor.state.clone();
+            assert!(dispatch_admin(&mut actor, &mutation).is_empty());
+            assert_eq!(actor.state, before);
+        }
+
+        let issuance = operation_issuance_ack(config, &pending_call, &approval);
+        assert!(dispatch_operation_ack(&mut actor, &issuance));
+        assert!(!credential_has_pending_application(
+            &actor.state,
+            worker_credential,
+        ));
+
+        for (invocation, operation) in [
+            (
+                0x91,
+                AuthorityAdminOperation::RevokeCredential {
+                    principal: ADMIN_PRINCIPAL,
+                    credential: worker_credential,
+                },
+            ),
+            (
+                0x92,
+                AuthorityAdminOperation::UnbindNodeOwner {
+                    node: worker_node,
+                    owner: ADMIN_PRINCIPAL,
+                },
+            ),
+        ] {
+            let mut mutation = admin_call(
+                config,
+                &admin_key,
+                ADMIN_PRINCIPAL,
+                ADMIN_NODE,
+                invocation,
+                actor.state.administration_generation,
+                operation,
+            );
+            prepare_admin_call(&actor, &mut mutation, &admin_key);
+            assert!(!dispatch_admin(&mut actor, &mutation).is_empty());
+        }
+        assert!(authority_state_is_valid(&config, &actor.state));
     }
 
     #[test]
@@ -10188,22 +11037,22 @@ mod tests {
 
         let mut cross_space = call.clone();
         cross_space.authority.space = SpaceId([0xa1; 32]);
-        resign_admin(&mut cross_space, &key);
+        refresh_admin_call(&mut cross_space, &key);
         assert!(dispatch_admin(&mut actor, &cross_space).is_empty());
 
         let mut cross_target = call.clone();
         cross_target.authority.system_agent = AgentId([0xa2; 32]);
-        resign_admin(&mut cross_target, &key);
+        refresh_admin_call(&mut cross_target, &key);
         assert!(dispatch_admin(&mut actor, &cross_target).is_empty());
 
         let mut cross_node = call.clone();
         cross_node.authenticated_node = NodeId([0xa3; 32]);
-        resign_admin(&mut cross_node, &key);
+        refresh_admin_call(&mut cross_node, &key);
         assert!(dispatch_admin(&mut actor, &cross_node).is_empty());
 
         let mut cross_principal = call.clone();
         cross_principal.administrator = PrincipalId([0xa4; 32]);
-        resign_admin(&mut cross_principal, &key);
+        refresh_admin_call(&mut cross_principal, &key);
         assert!(dispatch_admin(&mut actor, &cross_principal).is_empty());
 
         let mut weak_enrollment = call.clone();
@@ -10216,7 +11065,7 @@ mod tests {
                 weak_key,
             ),
         };
-        resign_admin(&mut weak_enrollment, &key);
+        refresh_admin_call(&mut weak_enrollment, &key);
         assert!(dispatch_admin(&mut actor, &weak_enrollment).is_empty());
 
         let mut wrong_context = admin_context(&call);
@@ -10287,7 +11136,7 @@ mod tests {
         conflict.operation = AuthorityAdminOperation::EnrollNode {
             enrollment: signed_node_enrollment(SpaceId(config.space), principal, 0xb4),
         };
-        resign_admin(&mut conflict, &key);
+        refresh_admin_call(&mut conflict, &key);
         assert!(dispatch_admin(&mut actor, &conflict).is_empty());
         assert_eq!(actor.state, after_first);
 
@@ -10300,7 +11149,11 @@ mod tests {
             AgentProfile::Local,
             0xb5,
         );
-        assert!(dispatch(&mut actor, &colliding_management).is_empty());
+        assert_ne!(colliding_management.invocation, conflict.invocation);
+        let mut forged_management_collision = colliding_management;
+        forged_management_collision.invocation = conflict.invocation;
+        resign(&mut forged_management_collision, &key);
+        assert!(forged_management_collision.encode().is_err());
         assert_eq!(actor.state, after_first);
 
         let mut management_first = SystemAuthority::new(&config.encode());
@@ -10326,6 +11179,11 @@ mod tests {
                 credential: enrollment(&signing(0xb9), AuthorityCredentialKind::Ssh),
             },
         );
+        assert_ne!(colliding_admin.invocation, management.invocation);
+        let mut forged_admin_collision = colliding_admin.clone();
+        forged_admin_collision.invocation = management.invocation;
+        resign_admin(&mut forged_admin_collision, &key);
+        assert!(forged_admin_collision.encode().is_err());
         let before_collision = management_first.state.clone();
         assert!(dispatch_admin(&mut management_first, &colliding_admin).is_empty());
         assert_eq!(management_first.state, before_collision);
@@ -10376,7 +11234,7 @@ mod tests {
                 .iter()
                 .all(|row| row.owner != inaccessible.0)
         );
-        let no_node_admin = admin_call(
+        let mut no_node_admin = admin_call(
             config,
             &inaccessible_key,
             inaccessible,
@@ -10388,6 +11246,7 @@ mod tests {
                 credential: enrollment(&signing(0xcf), AuthorityCredentialKind::Api),
             },
         );
+        prepare_admin_call(&actor, &mut no_node_admin, &inaccessible_key);
         let before = actor.state.clone();
         assert!(dispatch_admin(&mut actor, &no_node_admin).is_empty());
         assert_eq!(actor.state, before);
@@ -10435,7 +11294,7 @@ mod tests {
             },
         );
         assert!(!dispatch_admin(&mut actor, &add_replacement).is_empty());
-        let revoke_bootstrap = admin_call(
+        let mut revoke_bootstrap = admin_call(
             config,
             &replacement_key,
             ADMIN_PRINCIPAL,
@@ -10447,8 +11306,9 @@ mod tests {
                 credential: CredentialId::of_public_key(&bootstrap_key.verifying_key().to_bytes()),
             },
         );
+        prepare_admin_call(&actor, &mut revoke_bootstrap, &replacement_key);
         assert!(!dispatch_admin(&mut actor, &revoke_bootstrap).is_empty());
-        let revoke_last = admin_call(
+        let mut revoke_last = admin_call(
             config,
             &replacement_key,
             ADMIN_PRINCIPAL,
@@ -10462,11 +11322,12 @@ mod tests {
                 ),
             },
         );
+        prepare_admin_call(&actor, &mut revoke_last, &replacement_key);
         let before = actor.state.clone();
         assert!(dispatch_admin(&mut actor, &revoke_last).is_empty());
         assert_eq!(actor.state, before);
 
-        let bind_replacement = admin_call(
+        let mut bind_replacement = admin_call(
             config,
             &replacement_key,
             ADMIN_PRINCIPAL,
@@ -10477,8 +11338,9 @@ mod tests {
                 enrollment: replacement_node_enrollment,
             },
         );
+        prepare_admin_call(&actor, &mut bind_replacement, &replacement_key);
         assert!(!dispatch_admin(&mut actor, &bind_replacement).is_empty());
-        let demote_bootstrap = admin_call(
+        let mut demote_bootstrap = admin_call(
             config,
             &replacement_key,
             ADMIN_PRINCIPAL,
@@ -10490,8 +11352,9 @@ mod tests {
                 role: AuthorityBuiltinRole::Member,
             },
         );
+        prepare_admin_call(&actor, &mut demote_bootstrap, &replacement_key);
         assert!(!dispatch_admin(&mut actor, &demote_bootstrap).is_empty());
-        let unbind_last_admin_node = admin_call(
+        let mut unbind_last_admin_node = admin_call(
             config,
             &inaccessible_key,
             inaccessible,
@@ -10503,6 +11366,7 @@ mod tests {
                 owner: inaccessible,
             },
         );
+        prepare_admin_call(&actor, &mut unbind_last_admin_node, &inaccessible_key);
         let before = actor.state.clone();
         assert!(dispatch_admin(&mut actor, &unbind_last_admin_node).is_empty());
         assert_eq!(actor.state, before);
@@ -10546,9 +11410,11 @@ mod tests {
         let mut reordered = actor.state.clone();
         reordered.credentials.swap(0, 1);
         assert!(!authority_state_is_valid(&config, &reordered));
-        let mut reordered_history = actor.state.clone();
-        reordered_history.admin_retries.swap(0, 1);
-        assert!(!authority_state_is_valid(&config, &reordered_history));
+        let mut duplicate_history = actor.state.clone();
+        duplicate_history
+            .admin_retries
+            .push(duplicate_history.admin_retries[0].clone());
+        assert!(!authority_state_is_valid(&config, &duplicate_history));
         let mut duplicate = actor.state.clone();
         duplicate.roles.push(duplicate.roles[0].clone());
         assert!(!authority_state_is_valid(&config, &duplicate));
@@ -10672,6 +11538,10 @@ mod tests {
                 },
             );
         }
+        assert!(refresh_state_integrity_commitment(
+            &actor.configuration,
+            &mut actor.state,
+        ));
         assert_eq!(actor.state.roles.len(), MAX_AUTHORITY_PRINCIPALS);
         assert_eq!(actor.state.credentials.len(), MAX_AUTHORITY_CREDENTIALS);
         assert_eq!(actor.state.nodes.len(), MAX_AUTHORITY_NODES);
@@ -10695,7 +11565,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_management_has_no_acc1_actor_message() {
+    fn read_only_management_has_no_acc2_actor_message() {
         let config = configuration();
         let descriptor = descriptor(config, ADMIN_PRINCIPAL, AgentProfile::Local, 0x61);
         let managed = target_for(&descriptor);
@@ -10731,7 +11601,7 @@ mod tests {
         );
         call.requested_valid_from = OBSERVED_SLOT + 10;
         call.requested_expires_at = u64::MAX;
-        resign(&mut call, &key);
+        refresh_management_call(&mut call, &key);
         let mut actor = actor();
         let reply = dispatch(&mut actor, &call);
         let approval = ManagementApproval::decode(&reply).unwrap();
@@ -10752,7 +11622,7 @@ mod tests {
         );
         impossible.requested_valid_from = OBSERVED_SLOT + MAX_APPROVAL_VALIDITY_SLOTS + 1;
         impossible.requested_expires_at = u64::MAX;
-        resign(&mut impossible, &key);
+        refresh_management_call(&mut impossible, &key);
         let before = actor.state.clone();
         assert!(dispatch(&mut actor, &impossible).is_empty());
         assert_eq!(actor.state, before);
