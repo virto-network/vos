@@ -2342,16 +2342,6 @@ fn acknowledge_private_control_application(
     {
         return false;
     }
-    // Resource-policy and actor-lifecycle controls still need a real durable
-    // Private runtime application/reopen path. None is acknowledgeable in this
-    // generation merely because a PCA-shaped message reached this method.
-    if matches!(
-        ack.application.operation,
-        AuthorityOperationKind::SetPrivateResourcePolicy
-            | AuthorityOperationKind::PrivateActorLifecycle
-    ) {
-        return false;
-    }
     let Ok(private_index) = private_agent(state, target.agent) else {
         return false;
     };
@@ -4069,13 +4059,32 @@ fn operation_policy_allows(
                 && projection.epoch.checked_add(1) == Some(*epoch)
                 && *member_set == Hash(projection.member_set)
         }
-        // The current Private host persists only encrypted objects and the
-        // owner control chain. It has no durably reopenable resource-policy or
-        // actor-runtime state and the lifecycle PCTL carries only a request
-        // hash, not the request itself. Do not issue evidence which could be
-        // mistaken for application until that runtime bridge exists.
-        AuthorityOperationIntent::SetPrivateResourcePolicy { .. }
-        | AuthorityOperationIntent::PrivateActorLifecycle { .. } => false,
+        AuthorityOperationIntent::SetPrivateResourcePolicy {
+            control_sequence,
+            control_previous,
+            ..
+        }
+        | AuthorityOperationIntent::PrivateActorLifecycle {
+            control_sequence,
+            control_previous,
+            ..
+        } => {
+            let Ok(index) = private_agent(state, target.agent) else {
+                return false;
+            };
+            let projection = &state.private_agents[index];
+            managed.profile == AgentProfile::Private as u8
+                && managed.owner == call.principal.0
+                && projection.owner == managed.owner
+                && projection.runtime_deployment == managed.runtime_deployment
+                && private_application_resolution_count(state) < MAX_PRIVATE_APPLICATION_RECORDS
+                && !outstanding_private_operation_exists(state, target.agent)
+                && private_control_position_is_next(
+                    projection,
+                    *control_sequence,
+                    *control_previous,
+                )
+        }
         AuthorityOperationIntent::RecoverPrivateAgent { proof } => {
             let Ok(index) = private_agent(state, target.agent) else {
                 return false;
@@ -10635,7 +10644,7 @@ mod tests {
     }
 
     #[test]
-    fn private_rotation_is_restartable_and_unimplemented_controls_fail_closed() {
+    fn private_rotation_resource_policy_and_actor_lifecycle_are_restartable() {
         let config = configuration();
         let owner = PrincipalId([0x41; 32]);
         let owner_node = node_for_principal(config, owner);
@@ -10790,45 +10799,127 @@ mod tests {
         assert_eq!(actor.state.private_agents[0].member_set, member_set.0);
         assert_eq!(actor.state.private_agents[0].members.len(), 1);
 
-        // Owner authentication is not enough to authorize operations which
-        // the Private host cannot durably apply and reopen. Neither denial may
-        // create an outstanding operation or advance the projected chain.
-        let unavailable = [
+        let resource_control = Hash([0x52; 32]);
+        let mut resource_call = operation_call(
+            config,
+            &owner_key,
+            owner,
+            None,
+            0x53,
             AuthorityOperationIntent::SetPrivateResourcePolicy {
                 managed,
-                control: Hash([0x52; 32]),
+                control: resource_control,
                 control_sequence: 1,
                 control_previous: Some(rotate_control),
                 policy: BlobRef::of_bytes(b"private-resource-policy"),
             },
-            AuthorityOperationIntent::PrivateActorLifecycle {
-                managed,
-                control: Hash([0x56; 32]),
-                control_sequence: 1,
-                control_previous: Some(rotate_control),
-                actor: ActorId([0x55; 32]),
-                lifecycle: PrivateActorLifecycleKind::Upgrade,
-                request: Hash([0x58; 32]),
-            },
-        ];
-        let retry_count = actor.state.operation_retries.len();
-        let latest_ack_count = actor.state.latest_operation_acks.len();
-        let mut unavailable_calls = Vec::new();
-        for (seed, intent) in [0x53, 0x57].into_iter().zip(unavailable) {
-            let mut call = operation_call(config, &owner_key, owner, None, seed, intent);
-            prepare_operation_call(&actor, &mut call, &owner_key);
-            let before = actor.state.clone();
-            assert!(dispatch_operation(&mut actor, &call).is_empty());
-            assert_eq!(actor.state, before);
-            unavailable_calls.push(call);
-        }
-        assert_eq!(actor.state.operation_retries.len(), retry_count);
-        assert_eq!(actor.state.latest_operation_acks.len(), latest_ack_count);
+        );
+        prepare_operation_call(&actor, &mut resource_call, &owner_key);
+        let (resource_approval, resource_issuance) =
+            authorize_and_issue_operation(&mut actor, &resource_call);
+        assert_eq!(resource_approval.selector.request, resource_control);
+        assert_eq!(
+            resource_approval.selector.operation,
+            AuthorityOperationKind::SetPrivateResourcePolicy
+        );
+        assert_eq!(resource_approval.selector.actor, None);
+        assert_eq!(resource_approval.selector.actor_deployment, None);
+
+        let mut resource_application = private_application_fact(
+            &resource_call,
+            member_set,
+            Hash([0x54; 32]),
+            OBSERVED_SLOT + 2,
+        );
+        resource_application.epoch = 1;
+        let mut wrong_resource_epoch = private_application_ack(
+            &resource_call,
+            &resource_approval,
+            &resource_issuance,
+            resource_application,
+        );
+        wrong_resource_epoch.application.epoch = 0;
+        resign_private_application_ack(&mut wrong_resource_epoch);
+        let before_resource_application = actor.state.clone();
+        assert!(!dispatch_private_application(
+            &mut actor,
+            &wrong_resource_epoch
+        ));
+        assert_eq!(actor.state, before_resource_application);
+        let mut wrong_resource_members = wrong_resource_epoch.clone();
+        wrong_resource_members.application.epoch = 1;
+        wrong_resource_members.application.post_member_set = Hash([0x55; 32]);
+        resign_private_application_ack(&mut wrong_resource_members);
+        assert!(!dispatch_private_application(
+            &mut actor,
+            &wrong_resource_members
+        ));
+        assert_eq!(actor.state, before_resource_application);
+
+        let resource_pca = private_application_ack(
+            &resource_call,
+            &resource_approval,
+            &resource_issuance,
+            resource_application,
+        );
+        assert!(dispatch_private_application(&mut actor, &resource_pca));
+        assert!(dispatch_private_application(&mut actor, &resource_pca));
         assert_eq!(
             actor.state.private_agents[0].control_head,
-            Some(rotate_control.0)
+            Some(resource_control.0)
         );
-        assert_eq!(actor.state.private_agents[0].control_sequence, Some(0));
+        assert_eq!(actor.state.private_agents[0].control_sequence, Some(1));
+        assert_eq!(actor.state.private_agents[0].epoch, 1);
+        assert_eq!(actor.state.private_agents[0].member_set, member_set.0);
+
+        let lifecycle_control = Hash([0x56; 32]);
+        let lifecycle_actor = ActorId([0x57; 32]);
+        let mut lifecycle_call = operation_call(
+            config,
+            &owner_key,
+            owner,
+            None,
+            0x58,
+            AuthorityOperationIntent::PrivateActorLifecycle {
+                managed,
+                control: lifecycle_control,
+                control_sequence: 2,
+                control_previous: Some(resource_control),
+                actor: lifecycle_actor,
+                lifecycle: PrivateActorLifecycleKind::Upgrade,
+                request: Hash([0x59; 32]),
+            },
+        );
+        prepare_operation_call(&actor, &mut lifecycle_call, &owner_key);
+        let (lifecycle_approval, lifecycle_issuance) =
+            authorize_and_issue_operation(&mut actor, &lifecycle_call);
+        assert_eq!(lifecycle_approval.selector.request, lifecycle_control);
+        assert_eq!(
+            lifecycle_approval.selector.operation,
+            AuthorityOperationKind::PrivateActorLifecycle
+        );
+        assert_eq!(lifecycle_approval.selector.actor, Some(lifecycle_actor));
+        assert_eq!(lifecycle_approval.selector.actor_deployment, None);
+        let mut lifecycle_application = private_application_fact(
+            &lifecycle_call,
+            member_set,
+            Hash([0x5a; 32]),
+            OBSERVED_SLOT + 3,
+        );
+        lifecycle_application.epoch = 1;
+        let lifecycle_pca = private_application_ack(
+            &lifecycle_call,
+            &lifecycle_approval,
+            &lifecycle_issuance,
+            lifecycle_application,
+        );
+        assert!(dispatch_private_application(&mut actor, &lifecycle_pca));
+        assert!(dispatch_private_application(&mut actor, &lifecycle_pca));
+        assert_eq!(
+            actor.state.private_agents[0].control_head,
+            Some(lifecycle_control.0)
+        );
+        assert_eq!(actor.state.private_agents[0].control_sequence, Some(2));
         assert_eq!(actor.state.private_agents[0].epoch, 1);
         assert_eq!(actor.state.private_agents[0].member_set, member_set.0);
 
@@ -10839,14 +10930,11 @@ mod tests {
             None,
             None,
         )
-        .expect("the applied Private rotation restarts from exact state");
+        .expect("the applied Private control sequence restarts from exact state");
         assert_eq!(restarted.state, actor.state);
-        for call in &unavailable_calls {
-            let before = restarted.state.clone();
-            assert!(dispatch_operation(&mut restarted, call).is_empty());
-            assert_eq!(restarted.state, before);
-        }
         assert!(dispatch_private_application(&mut restarted, &rotate_pca));
+        assert!(dispatch_private_application(&mut restarted, &resource_pca));
+        assert!(dispatch_private_application(&mut restarted, &lifecycle_pca));
         assert_eq!(restarted.state, actor.state);
         assert!(authority_state_is_valid(&config, &restarted.state));
     }
