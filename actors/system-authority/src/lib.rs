@@ -1063,7 +1063,7 @@ fn refresh_state_integrity_commitment(
 }
 
 /// Linear policy state for one Space's built-in system Agent.
-#[actor(agent, state_version = 10)]
+#[actor(agent, state_version = 11)]
 pub struct SystemAuthority {
     #[state(const)]
     configuration: SystemAuthorityConfiguration,
@@ -7260,8 +7260,8 @@ mod tests {
         assert_eq!(SystemAuthorityConfiguration::decode(&encoded), Some(config));
         assert_eq!(
             <SystemAuthority as vos::Actor>::STATE_SCHEMA_VERSION,
-            10,
-            "credential-sequenced compact retries are a clean Linear state generation",
+            11,
+            "optional Private application Nodes are a clean Linear state generation",
         );
 
         let mut old_generation = encoded.clone();
