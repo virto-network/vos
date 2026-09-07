@@ -2426,6 +2426,7 @@ mod tests {
             ))
         });
         let work = crate::agent_sdk::RuntimeWork::Manage {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             space: descriptor.identity.space,
             agent: descriptor.identity.agent,
             runtime_deployment: authority
@@ -2463,6 +2464,7 @@ mod tests {
             crate::agent_sdk::PublicPreflight::for_work(&work, 20),
         );
         let input = crate::agent_sdk::RuntimeWork::Invoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: state.clone(),
             invocation: Box::new(work),
             authorization: Box::new(authorization),
@@ -2630,6 +2632,7 @@ mod tests {
         );
         let placeholder_identity = clean_identity_bytes(&placeholder_descriptor.identity);
         let create_work = crate::agent_sdk::RuntimeWork::Manage {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             space: placeholder_descriptor.identity.space,
             agent: placeholder_descriptor.identity.agent,
             runtime_deployment: placeholder_descriptor.identity.runtime_deployment,

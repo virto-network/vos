@@ -2,7 +2,8 @@
 
 use crate::{
     Hash, MAX_CATALOG_ARTIFACT_REFERENCED_BYTES, MAX_CATALOG_ARTIFACT_REFERENCES,
-    MAX_RUNTIME_STATE_BYTES, RUNTIME_ABI_ID,
+    MAX_RUNTIME_STATE_BYTES, MAX_TRANSITION_PROOF_MATERIAL_BYTES, RUNTIME_ABI_ID,
+    RuntimeCapabilities, RuntimeResourceUsage,
 };
 
 /// Actor entry ABI emitted by the canonical actor toolchain.
@@ -14,8 +15,8 @@ pub const CONTROL_SCHEMA_DESCRIPTOR: &[u8] = &RUNTIME_ABI_ID.0;
 /// Canonical management schema. This constant is BLAKE2b-256 over
 /// `vos/agent/control-schema` followed by [`CONTROL_SCHEMA_DESCRIPTOR`].
 pub const CONTROL_SCHEMA_ID: Hash = Hash([
-    0x8c, 0xb6, 0xb7, 0x9e, 0x39, 0x14, 0x8d, 0x50, 0x35, 0xb7, 0x2a, 0x74, 0xb2, 0x1d, 0x80, 0x65,
-    0x25, 0xeb, 0xae, 0x45, 0x48, 0xf7, 0x4f, 0xdf, 0x57, 0x88, 0xee, 0xd7, 0xab, 0xa3, 0x95, 0xc9,
+    0xc3, 0x67, 0x56, 0x35, 0x26, 0xfc, 0x90, 0x84, 0x2d, 0xfc, 0xa6, 0xeb, 0x99, 0x3e, 0x38, 0xad,
+    0x3a, 0x96, 0x64, 0x2e, 0x0c, 0xba, 0x2a, 0xb4, 0xa4, 0xfa, 0xd8, 0xd7, 0x24, 0x63, 0xe9, 0x74,
 ]);
 
 /// One actor ABI requirement signed into an actor package.
@@ -67,6 +68,7 @@ pub struct RuntimeResourceLimits {
     pub max_runtime_state_bytes: u32,
     pub max_artifact_references: u32,
     pub max_artifact_referenced_bytes: u64,
+    pub max_proof_material_bytes: u64,
 }
 
 impl RuntimeResourceLimits {
@@ -75,6 +77,7 @@ impl RuntimeResourceLimits {
             max_runtime_state_bytes: MAX_RUNTIME_STATE_BYTES as u32,
             max_artifact_references: MAX_CATALOG_ARTIFACT_REFERENCES,
             max_artifact_referenced_bytes: MAX_CATALOG_ARTIFACT_REFERENCED_BYTES,
+            max_proof_material_bytes: MAX_TRANSITION_PROOF_MATERIAL_BYTES,
         }
     }
 
@@ -85,6 +88,82 @@ impl RuntimeResourceLimits {
             && self.max_artifact_references <= MAX_CATALOG_ARTIFACT_REFERENCES
             && self.max_artifact_referenced_bytes != 0
             && self.max_artifact_referenced_bytes <= MAX_CATALOG_ARTIFACT_REFERENCED_BYTES
+            && self.max_proof_material_bytes != 0
+            && self.max_proof_material_bytes <= MAX_TRANSITION_PROOF_MATERIAL_BYTES
+    }
+}
+
+/// Mutable runtime resource policy selected beneath immutable package limits.
+///
+/// Every mutable ceiling may be narrowed only when the current usage still
+/// fits. Immutable package limits remain the signed upper bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeResourcePolicy {
+    pub max_actors: u32,
+    pub max_runtime_state_bytes: u32,
+    pub max_artifact_references: u32,
+    pub max_artifact_referenced_bytes: u64,
+    pub max_proof_material_bytes: u64,
+}
+
+impl RuntimeResourcePolicy {
+    pub const fn standard() -> Self {
+        Self {
+            max_actors: crate::STANDARD_MAX_ACTORS,
+            max_runtime_state_bytes: MAX_RUNTIME_STATE_BYTES as u32,
+            max_artifact_references: MAX_CATALOG_ARTIFACT_REFERENCES,
+            max_artifact_referenced_bytes: MAX_CATALOG_ARTIFACT_REFERENCED_BYTES,
+            max_proof_material_bytes: MAX_TRANSITION_PROOF_MATERIAL_BYTES,
+        }
+    }
+
+    /// Deterministic initial policy for one descriptor's signed runtime
+    /// capabilities and immutable resource limits.
+    pub const fn initial(capabilities: RuntimeCapabilities, limits: RuntimeResourceLimits) -> Self {
+        Self {
+            max_actors: capabilities.max_actors,
+            max_runtime_state_bytes: limits.max_runtime_state_bytes,
+            max_artifact_references: limits.max_artifact_references,
+            max_artifact_referenced_bytes: limits.max_artifact_referenced_bytes,
+            max_proof_material_bytes: limits.max_proof_material_bytes,
+        }
+    }
+
+    pub const fn is_valid(self) -> bool {
+        self.max_actors != 0
+            && self.max_actors <= crate::STANDARD_MAX_ACTORS
+            && self.max_runtime_state_bytes != 0
+            && self.max_runtime_state_bytes <= MAX_RUNTIME_STATE_BYTES as u32
+            && self.max_artifact_references != 0
+            && self.max_artifact_references <= MAX_CATALOG_ARTIFACT_REFERENCES
+            && self.max_artifact_referenced_bytes != 0
+            && self.max_artifact_referenced_bytes <= MAX_CATALOG_ARTIFACT_REFERENCED_BYTES
+            && self.max_proof_material_bytes != 0
+            && self.max_proof_material_bytes <= MAX_TRANSITION_PROOF_MATERIAL_BYTES
+    }
+
+    pub const fn is_within(
+        self,
+        capabilities: RuntimeCapabilities,
+        limits: RuntimeResourceLimits,
+    ) -> bool {
+        self.is_valid()
+            && capabilities.max_actors != 0
+            && self.max_actors <= capabilities.max_actors
+            && limits.is_valid()
+            && self.max_runtime_state_bytes <= limits.max_runtime_state_bytes
+            && self.max_artifact_references <= limits.max_artifact_references
+            && self.max_artifact_referenced_bytes <= limits.max_artifact_referenced_bytes
+            && self.max_proof_material_bytes <= limits.max_proof_material_bytes
+    }
+
+    pub const fn admits_usage(self, usage: RuntimeResourceUsage) -> bool {
+        self.is_valid()
+            && usage.actors <= self.max_actors
+            && usage.state_bytes <= self.max_runtime_state_bytes
+            && usage.artifact_references <= self.max_artifact_references
+            && usage.artifact_referenced_bytes <= self.max_artifact_referenced_bytes
+            && usage.proof_material_bytes <= self.max_proof_material_bytes
     }
 }
 
@@ -160,6 +239,165 @@ mod tests {
         assert!(contract.supports(ActorPackageContract::canonical()));
         assert_eq!(crate::STANDARD_MAX_ACTORS, 4_096);
         assert_eq!(contract.resources.max_runtime_state_bytes, 4 * 1024 * 1024);
+        assert_eq!(
+            contract.resources.max_proof_material_bytes,
+            64 * 1024 * 1024
+        );
+        let policy = RuntimeResourcePolicy::initial(
+            crate::RuntimeCapabilities::standard(),
+            contract.resources,
+        );
+        assert_eq!(policy, RuntimeResourcePolicy::standard());
+        assert!(policy.is_within(crate::RuntimeCapabilities::standard(), contract.resources));
+        assert!(policy.admits_usage(crate::RuntimeResourceUsage::default()));
+    }
+
+    #[test]
+    fn runtime_resource_limits_cover_every_signed_ceiling() {
+        let canonical = RuntimeResourceLimits::standard();
+        assert!(canonical.is_valid());
+        for invalid in [
+            RuntimeResourceLimits {
+                max_runtime_state_bytes: 0,
+                ..canonical
+            },
+            RuntimeResourceLimits {
+                max_runtime_state_bytes: MAX_RUNTIME_STATE_BYTES as u32 + 1,
+                ..canonical
+            },
+            RuntimeResourceLimits {
+                max_artifact_references: 0,
+                ..canonical
+            },
+            RuntimeResourceLimits {
+                max_artifact_references: MAX_CATALOG_ARTIFACT_REFERENCES + 1,
+                ..canonical
+            },
+            RuntimeResourceLimits {
+                max_artifact_referenced_bytes: 0,
+                ..canonical
+            },
+            RuntimeResourceLimits {
+                max_artifact_referenced_bytes: MAX_CATALOG_ARTIFACT_REFERENCED_BYTES + 1,
+                ..canonical
+            },
+            RuntimeResourceLimits {
+                max_proof_material_bytes: 0,
+                ..canonical
+            },
+            RuntimeResourceLimits {
+                max_proof_material_bytes: MAX_TRANSITION_PROOF_MATERIAL_BYTES + 1,
+                ..canonical
+            },
+        ] {
+            assert!(!invalid.is_valid());
+        }
+    }
+
+    #[test]
+    fn rrp1_covers_all_mutable_ceilings_and_current_usage() {
+        let standard = RuntimeResourcePolicy::standard();
+        let limits = RuntimeResourceLimits::standard();
+        let capabilities = RuntimeCapabilities::standard();
+        assert_eq!(standard.max_actors, 4_096);
+        assert_eq!(
+            RuntimeResourcePolicy::initial(capabilities, limits),
+            standard
+        );
+        assert!(standard.is_within(capabilities, limits));
+
+        for invalid in [
+            RuntimeResourcePolicy {
+                max_actors: 0,
+                ..standard
+            },
+            RuntimeResourcePolicy {
+                max_actors: crate::STANDARD_MAX_ACTORS + 1,
+                ..standard
+            },
+            RuntimeResourcePolicy {
+                max_runtime_state_bytes: 0,
+                ..standard
+            },
+            RuntimeResourcePolicy {
+                max_runtime_state_bytes: MAX_RUNTIME_STATE_BYTES as u32 + 1,
+                ..standard
+            },
+            RuntimeResourcePolicy {
+                max_artifact_references: 0,
+                ..standard
+            },
+            RuntimeResourcePolicy {
+                max_artifact_references: MAX_CATALOG_ARTIFACT_REFERENCES + 1,
+                ..standard
+            },
+            RuntimeResourcePolicy {
+                max_artifact_referenced_bytes: 0,
+                ..standard
+            },
+            RuntimeResourcePolicy {
+                max_artifact_referenced_bytes: MAX_CATALOG_ARTIFACT_REFERENCED_BYTES + 1,
+                ..standard
+            },
+            RuntimeResourcePolicy {
+                max_proof_material_bytes: 0,
+                ..standard
+            },
+            RuntimeResourcePolicy {
+                max_proof_material_bytes: MAX_TRANSITION_PROOF_MATERIAL_BYTES + 1,
+                ..standard
+            },
+        ] {
+            assert!(!invalid.is_valid());
+        }
+
+        let narrowed_limits = RuntimeResourceLimits {
+            max_runtime_state_bytes: 10,
+            max_artifact_references: 11,
+            max_artifact_referenced_bytes: 12,
+            max_proof_material_bytes: 13,
+        };
+        let narrowed_capabilities = RuntimeCapabilities {
+            max_actors: 9,
+            ..capabilities
+        };
+        let narrowed = RuntimeResourcePolicy::initial(narrowed_capabilities, narrowed_limits);
+        assert!(narrowed.is_within(narrowed_capabilities, narrowed_limits));
+        assert!(!standard.is_within(narrowed_capabilities, narrowed_limits));
+
+        let usage = RuntimeResourceUsage {
+            actors: narrowed.max_actors,
+            state_bytes: narrowed.max_runtime_state_bytes,
+            artifact_references: narrowed.max_artifact_references,
+            artifact_referenced_bytes: narrowed.max_artifact_referenced_bytes,
+            proof_material_bytes: narrowed.max_proof_material_bytes,
+            ..RuntimeResourceUsage::default()
+        };
+        assert!(narrowed.admits_usage(usage));
+        for over in [
+            RuntimeResourceUsage {
+                actors: usage.actors + 1,
+                ..usage
+            },
+            RuntimeResourceUsage {
+                state_bytes: usage.state_bytes + 1,
+                ..usage
+            },
+            RuntimeResourceUsage {
+                artifact_references: usage.artifact_references + 1,
+                ..usage
+            },
+            RuntimeResourceUsage {
+                artifact_referenced_bytes: usage.artifact_referenced_bytes + 1,
+                ..usage
+            },
+            RuntimeResourceUsage {
+                proof_material_bytes: usage.proof_material_bytes + 1,
+                ..usage
+            },
+        ] {
+            assert!(!narrowed.admits_usage(over));
+        }
     }
 
     #[test]

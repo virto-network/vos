@@ -80,6 +80,7 @@ pub enum DispatchError {
     InvalidCapabilities,
     InvalidWork,
     NonCanonicalWork,
+    UnsupportedExecutionContext,
     InvalidTransition,
     NonCanonicalTransition,
 }
@@ -101,6 +102,9 @@ pub fn dispatch<R: AgentRuntime>(runtime: &mut R, input: &[u8]) -> Result<Vec<u8
     let canonical_work = work.encode().map_err(|_| DispatchError::NonCanonicalWork)?;
     if canonical_work.as_slice() != input {
         return Err(DispatchError::NonCanonicalWork);
+    }
+    if !work.execution_context().is_direct() {
+        return Err(DispatchError::UnsupportedExecutionContext);
     }
 
     let transition = runtime.apply(work);
@@ -265,6 +269,7 @@ mod tests {
 
     fn work() -> Vec<u8> {
         RuntimeWork::Manage {
+            context: vos_agent_sdk::RuntimeExecutionContext::Direct,
             space: vos_agent_sdk::SpaceId([1; 32]),
             agent: vos_agent_sdk::AgentId([2; 32]),
             runtime_deployment: vos_agent_sdk::DeploymentId([3; 32]),
@@ -275,6 +280,29 @@ mod tests {
         }
         .encode()
         .unwrap()
+    }
+
+    #[test]
+    fn canonical_attested_work_never_reaches_the_current_runtime() {
+        let mut attested = RuntimeWork::decode(&work()).unwrap();
+        let RuntimeWork::Manage { context, .. } = &mut attested else {
+            unreachable!()
+        };
+        *context = vos_agent_sdk::RuntimeExecutionContext::Attested {
+            proof_system: vos_agent_sdk::Hash([0xa9; 32]),
+        };
+        let encoded = attested.encode().unwrap();
+        let calls = Cell::new(0);
+        let mut runtime = ProbeRuntime {
+            calls: &calls,
+            capabilities: RuntimeCapabilities::standard(),
+            invalid_transition: false,
+        };
+        assert_eq!(
+            dispatch(&mut runtime, &encoded),
+            Err(DispatchError::UnsupportedExecutionContext)
+        );
+        assert_eq!(calls.get(), 0);
     }
 
     #[test]

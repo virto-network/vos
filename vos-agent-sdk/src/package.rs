@@ -798,6 +798,7 @@ fn encode_runtime_contract(encoder: &mut Encoder<'_>, value: RuntimePackageContr
     encoder.u32(value.resources.max_runtime_state_bytes);
     encoder.u32(value.resources.max_artifact_references);
     encoder.u64(value.resources.max_artifact_referenced_bytes);
+    encoder.u64(value.resources.max_proof_material_bytes);
     encoder.u8(value.migration as u8);
 }
 
@@ -815,6 +816,7 @@ fn decode_runtime_contract(
             max_runtime_state_bytes: decoder.u32()?,
             max_artifact_references: decoder.u32()?,
             max_artifact_referenced_bytes: decoder.u64()?,
+            max_proof_material_bytes: decoder.u64()?,
         },
         migration: match decoder.u8()? {
             0 => RuntimeMigrationPolicy::None,
@@ -939,6 +941,7 @@ fn manifest_encoded_len(
                     + 32
                     + 4
                     + 4
+                    + 8
                     + 8
                     + 1
                     + 1

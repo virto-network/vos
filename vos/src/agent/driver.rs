@@ -574,6 +574,7 @@ pub(crate) fn sdk_management_reply_matches(
 fn expected_standard_sdk_management_transition(
     work: &crate::agent_sdk::RuntimeWork,
 ) -> Result<crate::agent_sdk::RuntimeTransition, AgentDriverError> {
+    require_direct_runtime_work(work)?;
     let crate::agent_sdk::RuntimeWork::Manage {
         space,
         agent,
@@ -582,6 +583,7 @@ fn expected_standard_sdk_management_transition(
         request,
         authority,
         observed_slot,
+        ..
     } = work
     else {
         return Err(AgentDriverError::InvalidRuntime);
@@ -620,10 +622,12 @@ fn expected_standard_sdk_management_transition(
 fn expected_standard_sdk_acknowledgement_transition(
     work: &crate::agent_sdk::RuntimeWork,
 ) -> Result<crate::agent_sdk::RuntimeTransition, AgentDriverError> {
+    require_direct_runtime_work(work)?;
     let crate::agent_sdk::RuntimeWork::Acknowledge {
         state,
         invocation,
         authorization,
+        ..
     } = work
     else {
         return Err(AgentDriverError::InvalidRuntime);
@@ -644,6 +648,15 @@ fn expected_standard_sdk_acknowledgement_transition(
         },
         outcome: crate::agent_sdk::RuntimeOutcome::Acknowledged(result),
     })
+}
+
+fn require_direct_runtime_work(
+    work: &crate::agent_sdk::RuntimeWork,
+) -> Result<(), AgentDriverError> {
+    work.execution_context()
+        .is_direct()
+        .then_some(())
+        .ok_or(AgentDriverError::InvalidRuntime)
 }
 
 fn validate_standard_sdk_acknowledgement_transition(
@@ -2127,6 +2140,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         let request = crate::agent_sdk::ManagementRequest::Create(Box::new(descriptor.clone()));
         verify_clean_management_receipt(&descriptor, &request, &authority, observed_slot, false)?;
         let work = crate::agent_sdk::RuntimeWork::Manage {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             space: descriptor.identity.space,
             agent: descriptor.identity.agent,
             runtime_deployment: descriptor.identity.runtime_deployment,
@@ -3151,6 +3165,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             None => current.identity.runtime_deployment,
         };
         let work = crate::agent_sdk::RuntimeWork::Manage {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             space: current.identity.space,
             agent: current.identity.agent,
             runtime_deployment,
@@ -3325,6 +3340,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             .ok_or(AgentDriverError::InvalidRuntime)?;
         self.apply_sdk_work(
             crate::agent_sdk::RuntimeWork::Invoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                 state: legacy_state_as_sdk(&self.image.runtime_state),
                 invocation: Box::new(invocation),
                 authorization: Box::new(authorization),
@@ -3352,6 +3368,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         }
         self.apply_sdk_work(
             crate::agent_sdk::RuntimeWork::Resume {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                 state: legacy_state_as_sdk(&self.image.runtime_state),
                 resume: Box::new(resume),
             },
@@ -3376,6 +3393,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             .checked_add(invocation.gas)
             .ok_or(AgentDriverError::InvalidRuntime)?;
         let work = crate::agent_sdk::RuntimeWork::Acknowledge {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: legacy_state_as_sdk(&self.image.runtime_state),
             invocation: Box::new(invocation),
             authorization: Box::new(authorization),
@@ -3400,6 +3418,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         work: crate::agent_sdk::RuntimeWork,
         gas: Gas,
     ) -> Result<crate::agent_sdk::RuntimeOutcome, AgentDriverError> {
+        require_direct_runtime_work(&work)?;
         let (expected, mode) = match &work {
             crate::agent_sdk::RuntimeWork::Invoke { invocation, .. } => (
                 (
@@ -3887,6 +3906,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 limit: page_limit,
             };
             let work = crate::agent_sdk::RuntimeWork::Manage {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                 space: descriptor.identity.space,
                 agent: descriptor.identity.agent,
                 runtime_deployment: descriptor.identity.runtime_deployment,
@@ -5322,6 +5342,7 @@ mod tests {
             signature: [0x34; 64],
         };
         crate::agent_sdk::RuntimeWork::Invoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: crate::agent_sdk::RuntimeState {
                 control: prior.control.clone(),
                 linear: prior.linear.clone(),
@@ -5351,6 +5372,7 @@ mod tests {
             unreachable!()
         };
         let work = RuntimeWork::Acknowledge {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: legacy_state_as_sdk(&prior),
             invocation,
             authorization,
@@ -5368,6 +5390,23 @@ mod tests {
             validate_standard_sdk_acknowledgement_transition(&expected, &hostile),
             Err(AgentDriverError::InvalidRuntime),
             "the driver requires both the exact acknowledgement result and exact successor"
+        );
+    }
+
+    #[test]
+    fn current_driver_gate_rejects_attested_runtime_work() {
+        let observed_slot = 9;
+        let (prior, _, invocation) = standard_exact_transition_fixture(observed_slot);
+        let mut work = sdk_exact_invoke_work(&prior, &invocation, observed_slot);
+        let crate::agent_sdk::RuntimeWork::Invoke { context, .. } = &mut work else {
+            unreachable!()
+        };
+        *context = crate::agent_sdk::RuntimeExecutionContext::Attested {
+            proof_system: crate::agent_sdk::Hash([0xa8; 32]),
+        };
+        assert_eq!(
+            require_direct_runtime_work(&work),
+            Err(AgentDriverError::InvalidRuntime)
         );
     }
 

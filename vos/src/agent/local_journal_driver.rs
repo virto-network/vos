@@ -880,6 +880,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             self.validate_clean_management_artifacts(&descriptor, request)?;
         }
         let work = crate::agent_sdk::RuntimeWork::Manage {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             space: descriptor.identity.space,
             agent: descriptor.identity.agent,
             runtime_deployment: authority.selector.runtime_deployment,
@@ -939,6 +940,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         )?;
         let observed_slot = self.current_logical_slot()?;
         let work = crate::agent_sdk::RuntimeWork::Manage {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             space: descriptor.identity.space,
             agent: descriptor.identity.agent,
             runtime_deployment: descriptor.identity.runtime_deployment,
@@ -993,6 +995,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                 limit: crate::agent_sdk::MAX_DIRECTORY_PAGE_ENTRIES as u16,
             };
             let work = RuntimeWork::Manage {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                 space: descriptor.identity.space,
                 agent: descriptor.identity.agent,
                 runtime_deployment: descriptor.identity.runtime_deployment,
@@ -1086,6 +1089,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             return Err(LocalReplayExecutorError::InvalidRequest);
         };
         let sdk_work = crate::agent_sdk::RuntimeWork::Invoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: crate::agent_sdk::RuntimeState {
                 control: before.control.clone(),
                 linear: before.linear.clone(),
@@ -2563,6 +2567,7 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                 .as_ref()
                 .ok_or(LocalReplayExecutorError::InvalidState)?;
             let work = crate::agent_sdk::RuntimeWork::Manage {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                 space: crate::agent_sdk::SpaceId(input.runtime.space.0),
                 agent: crate::agent_sdk::AgentId(input.runtime.agent.0),
                 runtime_deployment: authority.selector.runtime_deployment,
@@ -2793,6 +2798,7 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
                 observed_slot,
             } => {
                 let sdk_work = crate::agent_sdk::RuntimeWork::Invoke {
+                    context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                     state: crate::agent_sdk::RuntimeState {
                         control: before.control.clone(),
                         linear: before.linear.clone(),
@@ -5973,6 +5979,7 @@ mod tests {
     ) -> super::super::package_admission::ScriptedRuntimeCase {
         let authority = clean_test_receipt(descriptor, &request, sequence, authority_key);
         let input = crate::agent_sdk::RuntimeWork::Manage {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             space: descriptor.identity.space,
             agent: descriptor.identity.agent,
             runtime_deployment: authority.selector.runtime_deployment,

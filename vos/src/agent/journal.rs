@@ -2844,6 +2844,7 @@ fn encode_replay_operation(encoder: &mut Encoder<'_>, operation: &ReplayOperatio
         } => {
             encoder.u8(5);
             let canonical = crate::agent_sdk::RuntimeWork::Manage {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                 space: authority.selector.space,
                 agent: authority.selector.agent,
                 runtime_deployment: authority.selector.runtime_deployment,
@@ -2873,6 +2874,7 @@ fn encode_replay_operation(encoder: &mut Encoder<'_>, operation: &ReplayOperatio
         } => {
             encoder.u8(4);
             let canonical = crate::agent_sdk::RuntimeWork::Invoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                 state: crate::agent_sdk::RuntimeState::default(),
                 invocation: alloc::boxed::Box::new(work.clone()),
                 authorization: alloc::boxed::Box::new(authorization.clone()),
@@ -2929,6 +2931,7 @@ fn decode_replay_operation(decoder: &mut Decoder<'_>) -> Result<ReplayOperation,
             )?)
             .map_err(|_| DecodeError::NonCanonical)?;
             let crate::agent_sdk::RuntimeWork::Invoke {
+                context,
                 state,
                 invocation,
                 authorization,
@@ -2937,7 +2940,7 @@ fn decode_replay_operation(decoder: &mut Decoder<'_>) -> Result<ReplayOperation,
             else {
                 return Err(DecodeError::NonCanonical);
             };
-            if !state.is_empty() {
+            if !context.is_direct() || !state.is_empty() {
                 return Err(DecodeError::NonCanonical);
             }
             Ok(ReplayOperation::CleanInvoke {
@@ -2955,6 +2958,7 @@ fn decode_replay_operation(decoder: &mut Decoder<'_>) -> Result<ReplayOperation,
                 return Err(DecodeError::NonCanonical);
             }
             let crate::agent_sdk::RuntimeWork::Manage {
+                context,
                 space,
                 agent,
                 runtime_deployment,
@@ -2966,7 +2970,8 @@ fn decode_replay_operation(decoder: &mut Decoder<'_>) -> Result<ReplayOperation,
             else {
                 return Err(DecodeError::NonCanonical);
             };
-            if !state.is_empty()
+            if !context.is_direct()
+                || !state.is_empty()
                 || request.authority_operation().is_none()
                 || space != authority.selector.space
                 || agent != authority.selector.agent
@@ -3010,6 +3015,7 @@ fn validate_clean_management_request(
         return Err(DecodeError::NonCanonical);
     }
     let canonical = crate::agent_sdk::RuntimeWork::Manage {
+        context: crate::agent_sdk::RuntimeExecutionContext::Direct,
         space: crate::agent_sdk::SpaceId(runtime.space.0),
         agent: crate::agent_sdk::AgentId(runtime.agent.0),
         runtime_deployment: selector_deployment,
@@ -3053,6 +3059,7 @@ fn validate_clean_invocation_authorization(
     observed_slot: u64,
 ) -> Result<(), DecodeError> {
     let canonical = crate::agent_sdk::RuntimeWork::Invoke {
+        context: crate::agent_sdk::RuntimeExecutionContext::Direct,
         state: crate::agent_sdk::RuntimeState::default(),
         invocation: alloc::boxed::Box::new(work.clone()),
         authorization: alloc::boxed::Box::new(authorization.clone()),
@@ -4856,6 +4863,7 @@ mod tests {
             unreachable!()
         };
         let hidden_state = crate::agent_sdk::RuntimeWork::Invoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: crate::agent_sdk::RuntimeState {
                 control: vec![1],
                 ..crate::agent_sdk::RuntimeState::default()
@@ -4915,6 +4923,7 @@ mod tests {
         let authority = base_authority.clone();
         let observed_slot = *base_observed_slot;
         let canonical_work = crate::agent_sdk::RuntimeWork::Manage {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             space: authority.selector.space,
             agent: authority.selector.agent,
             runtime_deployment: authority.selector.runtime_deployment,
@@ -4963,7 +4972,21 @@ mod tests {
             Err(DecodeError::NonCanonical)
         );
 
+        let mut attested = crate::agent_sdk::RuntimeWork::decode(&canonical_work).unwrap();
+        let crate::agent_sdk::RuntimeWork::Manage { context, .. } = &mut attested else {
+            unreachable!()
+        };
+        *context = crate::agent_sdk::RuntimeExecutionContext::Attested {
+            proof_system: crate::agent_sdk::Hash([0xa4; 32]),
+        };
+        assert_eq!(
+            decode_wrapped(&attested.encode().unwrap()),
+            Err(DecodeError::NonCanonical),
+            "durable replay must not turn attested work into direct work"
+        );
+
         let missing_receipt = crate::agent_sdk::RuntimeWork::Manage {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             space: authority.selector.space,
             agent: authority.selector.agent,
             runtime_deployment: authority.selector.runtime_deployment,
@@ -4976,6 +4999,7 @@ mod tests {
         assert!(missing_receipt.is_err());
 
         let inspect = crate::agent_sdk::RuntimeWork::Manage {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             space: authority.selector.space,
             agent: authority.selector.agent,
             runtime_deployment: authority.selector.runtime_deployment,

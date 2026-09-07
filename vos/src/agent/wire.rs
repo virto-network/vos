@@ -1665,20 +1665,25 @@ pub fn apply_standard_execution(
 pub fn apply_standard_runtime_work(
     work: crate::agent_sdk::RuntimeWork,
 ) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
+    if !work.execution_context().is_direct() {
+        return Err(DecodeError::NonCanonical);
+    }
     match work {
         crate::agent_sdk::RuntimeWork::Invoke {
             state,
             invocation,
             authorization,
             observed_slot,
+            ..
         } => apply_clean_invoke(state, *invocation, *authorization, observed_slot),
-        crate::agent_sdk::RuntimeWork::Resume { state, resume } => {
+        crate::agent_sdk::RuntimeWork::Resume { state, resume, .. } => {
             apply_clean_resume(state, *resume)
         }
         crate::agent_sdk::RuntimeWork::Acknowledge {
             state,
             invocation,
             authorization,
+            ..
         } => apply_clean_acknowledge(state, *invocation, *authorization),
         crate::agent_sdk::RuntimeWork::Manage {
             space,
@@ -1688,6 +1693,7 @@ pub fn apply_standard_runtime_work(
             request,
             authority,
             observed_slot,
+            ..
         } => apply_clean_manage(
             space,
             agent,
@@ -4418,6 +4424,7 @@ mod tests {
             None => descriptor.identity.runtime_deployment,
         };
         apply_standard_runtime_work(crate::agent_sdk::RuntimeWork::Manage {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             space: descriptor.identity.space,
             agent: descriptor.identity.agent,
             runtime_deployment,
@@ -4427,6 +4434,28 @@ mod tests {
             observed_slot,
         })
         .unwrap()
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn standard_runtime_executor_fails_closed_on_attested_work() {
+        let descriptor = clean_test_descriptor(crate::agent_sdk::AgentProfile::Shared);
+        let work = crate::agent_sdk::RuntimeWork::Manage {
+            context: crate::agent_sdk::RuntimeExecutionContext::Attested {
+                proof_system: crate::agent_sdk::Hash([0xa7; 32]),
+            },
+            space: descriptor.identity.space,
+            agent: descriptor.identity.agent,
+            runtime_deployment: descriptor.identity.runtime_deployment,
+            state: crate::agent_sdk::RuntimeState::default(),
+            request: Box::new(crate::agent_sdk::ManagementRequest::InspectResources),
+            authority: None,
+            observed_slot: 1,
+        };
+        assert_eq!(
+            apply_standard_runtime_work(work),
+            Err(DecodeError::NonCanonical)
+        );
     }
 
     #[cfg(feature = "pvm")]
@@ -5300,6 +5329,7 @@ mod tests {
         assert_eq!(rejected.state, first_upgrade_retry.state);
 
         let divergent = crate::agent_sdk::RuntimeWork::Manage {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             space: after_second.identity.space,
             agent: after_second.identity.agent,
             runtime_deployment: old_receipt.selector.runtime_deployment,
@@ -6049,6 +6079,7 @@ mod tests {
         );
 
         let retried = apply_standard_runtime_work(RuntimeWork::Invoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: committed.clone(),
             invocation: Box::new(work.clone()),
             authorization: Box::new(authorization.clone()),
@@ -6059,6 +6090,7 @@ mod tests {
         assert_eq!(retried.state, committed);
 
         let different_slot = RuntimeWork::Invoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: committed.clone(),
             invocation: Box::new(work.clone()),
             authorization: Box::new(authorization.clone()),
@@ -6074,6 +6106,7 @@ mod tests {
         let unseen_state =
             legacy_state_to_clean(encode_standard_runtime_state(&runtime.snapshot()));
         let stale_unseen = apply_standard_runtime_work(RuntimeWork::Invoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: unseen_state.clone(),
             authorization: Box::new(InvocationAuthorization::PublicPreflight(
                 PublicPreflight::for_work(&unseen_work, 1),
@@ -6089,6 +6122,7 @@ mod tests {
         );
 
         let acknowledged = apply_standard_runtime_work(RuntimeWork::Acknowledge {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: retried_later.state,
             invocation: Box::new(work.clone()),
             authorization: Box::new(authorization.clone()),
@@ -6125,6 +6159,7 @@ mod tests {
         let state = legacy_state_to_clean(encode_standard_runtime_state(&runtime.snapshot()));
         let public = InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&work, 1));
         let denied = apply_standard_runtime_work(RuntimeWork::Invoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: state.clone(),
             invocation: Box::new(work),
             authorization: Box::new(public),
@@ -6222,6 +6257,7 @@ mod tests {
 
         let (state, work, authority, yielded) = clean_pending_fixture();
         let retried = apply_standard_runtime_work(RuntimeWork::Invoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: state.clone(),
             invocation: Box::new(work.clone()),
             authorization: Box::new(crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
@@ -6235,6 +6271,7 @@ mod tests {
 
         let assert_rejected = |resume: crate::agent_sdk::ResumeWork, expected| {
             let transition = apply_standard_runtime_work(RuntimeWork::Resume {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                 state: state.clone(),
                 resume: Box::new(resume),
             })
@@ -6297,6 +6334,7 @@ mod tests {
             &divergent,
         );
         let rejected = apply_standard_runtime_work(RuntimeWork::Invoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: state.clone(),
             invocation: Box::new(divergent),
             authorization: Box::new(crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
@@ -6370,6 +6408,7 @@ mod tests {
         );
 
         let retried = apply_standard_runtime_work(RuntimeWork::Invoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: committed.clone(),
             invocation: Box::new(work.clone()),
             authorization: Box::new(crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
@@ -6393,6 +6432,7 @@ mod tests {
         );
 
         let acknowledged = apply_standard_runtime_work(RuntimeWork::Acknowledge {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: retried.state.clone(),
             invocation: Box::new(work.clone()),
             authorization: Box::new(crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
@@ -6429,6 +6469,7 @@ mod tests {
         let after_restart =
             legacy_state_to_clean(encode_standard_runtime_state(&restarted.snapshot()));
         let missing = apply_standard_runtime_work(RuntimeWork::Acknowledge {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: after_restart.clone(),
             invocation: Box::new(work),
             authorization: Box::new(crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
@@ -6453,6 +6494,7 @@ mod tests {
                             authority: crate::agent_sdk::authority::AuthorityReceipt,
                             expected| {
             let transition = apply_standard_runtime_work(RuntimeWork::Acknowledge {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                 state: state.clone(),
                 invocation: Box::new(work),
                 authorization: Box::new(

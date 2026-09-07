@@ -33,8 +33,8 @@ use vos::agent_sdk::{
     InvocationAcknowledgement, InvocationAuthorization, InvocationError, InvocationId,
     InvocationStatus, InvocationWork, LaneSet, ManagementError, ManagementReply, ManagementRequest,
     MethodMode, NodeId, PrincipalId, ProducerId, ProgramId, ReplicaRole, ResumeWork, RuntimeBlob,
-    RuntimeCapabilities, RuntimeOutcome, RuntimeRequirements, RuntimeState, RuntimeTransition,
-    RuntimeWork, SpaceId, StateLane, YieldReason,
+    RuntimeCapabilities, RuntimeExecutionContext, RuntimeOutcome, RuntimeRequirements,
+    RuntimeState, RuntimeTransition, RuntimeWork, SpaceId, StateLane, YieldReason,
 };
 use vos_pvm::ExitReason;
 use vos_pvm::refine_host::RefineContext;
@@ -305,6 +305,7 @@ fn apply_management(
             receipt.selector.runtime_deployment
         });
     apply_runtime(RuntimeWork::Manage {
+        context: RuntimeExecutionContext::Direct,
         space: descriptor.identity.space,
         agent: descriptor.identity.agent,
         runtime_deployment,
@@ -770,6 +771,7 @@ fn bundled_runtime_installs_exact_catalog_executes_retries_and_acknowledges() {
         .retain(|blob| blob.reference != BlobRef::of_bytes(actor_package.program_bytes()));
     let missing_authority = invocation_receipt(&descriptor, &missing_catalog, 3, 3);
     let rejected = apply_runtime(RuntimeWork::Invoke {
+        context: RuntimeExecutionContext::Direct,
         state: installed.clone(),
         invocation: Box::new(missing_catalog),
         authorization: Box::new(InvocationAuthorization::AuthorityReceipt(missing_authority)),
@@ -784,6 +786,7 @@ fn bundled_runtime_installs_exact_catalog_executes_retries_and_acknowledges() {
     let mut forged = authority.clone();
     forged.signature[0] ^= 1;
     let rejected = apply_runtime(RuntimeWork::Invoke {
+        context: RuntimeExecutionContext::Direct,
         state: installed.clone(),
         invocation: Box::new(work.clone()),
         authorization: Box::new(InvocationAuthorization::AuthorityReceipt(forged)),
@@ -799,6 +802,7 @@ fn bundled_runtime_installs_exact_catalog_executes_retries_and_acknowledges() {
     wrong_route.agent = AgentId([0xe1; 32]);
     let wrong_route_authority = invocation_receipt(&descriptor, &wrong_route, 3, 3);
     let rejected = apply_runtime(RuntimeWork::Invoke {
+        context: RuntimeExecutionContext::Direct,
         state: installed.clone(),
         invocation: Box::new(wrong_route),
         authorization: Box::new(InvocationAuthorization::AuthorityReceipt(
@@ -813,6 +817,7 @@ fn bundled_runtime_installs_exact_catalog_executes_retries_and_acknowledges() {
     assert_eq!(rejected.state, installed);
 
     let completed = apply_runtime(RuntimeWork::Invoke {
+        context: RuntimeExecutionContext::Direct,
         state: installed.clone(),
         invocation: Box::new(work.clone()),
         authorization: Box::new(InvocationAuthorization::AuthorityReceipt(authority.clone())),
@@ -835,6 +840,7 @@ fn bundled_runtime_installs_exact_catalog_executes_retries_and_acknowledges() {
 
     let restarted = restart(&completed);
     let retried = apply_runtime(RuntimeWork::Invoke {
+        context: RuntimeExecutionContext::Direct,
         state: restarted.state,
         invocation: Box::new(work.clone()),
         authorization: Box::new(InvocationAuthorization::AuthorityReceipt(authority.clone())),
@@ -846,6 +852,7 @@ fn bundled_runtime_installs_exact_catalog_executes_retries_and_acknowledges() {
     divergent.message.push(0xff);
     let divergent_authority = invocation_receipt(&descriptor, &divergent, 3, 100);
     let rejected = apply_runtime(RuntimeWork::Invoke {
+        context: RuntimeExecutionContext::Direct,
         state: retried.state.clone(),
         invocation: Box::new(divergent),
         authorization: Box::new(InvocationAuthorization::AuthorityReceipt(
@@ -862,6 +869,7 @@ fn bundled_runtime_installs_exact_catalog_executes_retries_and_acknowledges() {
     let mut forged_ack = authority.clone();
     forged_ack.signature[0] ^= 1;
     let rejected = apply_runtime(RuntimeWork::Acknowledge {
+        context: RuntimeExecutionContext::Direct,
         state: retried.state.clone(),
         invocation: Box::new(work.clone()),
         authorization: Box::new(InvocationAuthorization::AuthorityReceipt(forged_ack)),
@@ -876,6 +884,7 @@ fn bundled_runtime_installs_exact_catalog_executes_retries_and_acknowledges() {
     wrong_actor.actor = ActorId([0xe2; 32]);
     let wrong_actor_authority = invocation_receipt(&descriptor, &wrong_actor, 3, 3);
     let rejected = apply_runtime(RuntimeWork::Acknowledge {
+        context: RuntimeExecutionContext::Direct,
         state: retried.state.clone(),
         invocation: Box::new(wrong_actor),
         authorization: Box::new(InvocationAuthorization::AuthorityReceipt(
@@ -889,6 +898,7 @@ fn bundled_runtime_installs_exact_catalog_executes_retries_and_acknowledges() {
     assert_eq!(rejected.state, retried.state);
 
     let acknowledged = apply_runtime(RuntimeWork::Acknowledge {
+        context: RuntimeExecutionContext::Direct,
         state: retried.state,
         invocation: Box::new(work.clone()),
         authorization: Box::new(InvocationAuthorization::AuthorityReceipt(authority.clone())),
@@ -909,6 +919,7 @@ fn bundled_runtime_installs_exact_catalog_executes_retries_and_acknowledges() {
 
     let restarted = restart(&acknowledged);
     let missing = apply_runtime(RuntimeWork::Acknowledge {
+        context: RuntimeExecutionContext::Direct,
         state: restarted.state.clone(),
         invocation: Box::new(work.clone()),
         authorization: Box::new(InvocationAuthorization::AuthorityReceipt(authority.clone())),
@@ -920,6 +931,7 @@ fn bundled_runtime_installs_exact_catalog_executes_retries_and_acknowledges() {
     assert_eq!(missing.state, restarted.state);
 
     let expired = apply_runtime(RuntimeWork::Invoke {
+        context: RuntimeExecutionContext::Direct,
         state: restarted.state.clone(),
         invocation: Box::new(work),
         authorization: Box::new(InvocationAuthorization::AuthorityReceipt(authority)),
@@ -942,6 +954,7 @@ fn bundled_runtime_persists_and_resumes_fifo_continuations() {
     let authority = invocation_receipt(&descriptor, &work, 3, 3);
 
     let first_transition = apply_runtime(RuntimeWork::Invoke {
+        context: RuntimeExecutionContext::Direct,
         state: installed,
         invocation: Box::new(work.clone()),
         authorization: Box::new(InvocationAuthorization::AuthorityReceipt(authority.clone())),
@@ -954,6 +967,7 @@ fn bundled_runtime_persists_and_resumes_fifo_continuations() {
     assert_eq!(first.ready_sequence, 1);
 
     let retried = apply_runtime(RuntimeWork::Invoke {
+        context: RuntimeExecutionContext::Direct,
         state: restart(&first_transition).state,
         invocation: Box::new(work.clone()),
         authorization: Box::new(InvocationAuthorization::AuthorityReceipt(authority)),
@@ -964,6 +978,7 @@ fn bundled_runtime_persists_and_resumes_fifo_continuations() {
     let mut wrong_sequence = resume_work(first, work.availability.clone());
     wrong_sequence.ready_sequence += 1;
     let rejected = apply_runtime(RuntimeWork::Resume {
+        context: RuntimeExecutionContext::Direct,
         state: retried.state.clone(),
         resume: Box::new(wrong_sequence),
     });
@@ -974,6 +989,7 @@ fn bundled_runtime_persists_and_resumes_fifo_continuations() {
     assert_eq!(rejected.state, retried.state);
 
     let second_transition = apply_runtime(RuntimeWork::Resume {
+        context: RuntimeExecutionContext::Direct,
         state: retried.state,
         resume: Box::new(resume_work(first, work.availability.clone())),
     });
@@ -984,6 +1000,7 @@ fn bundled_runtime_persists_and_resumes_fifo_continuations() {
     assert_eq!(second.ready_sequence, 2);
 
     let completed = apply_runtime(RuntimeWork::Resume {
+        context: RuntimeExecutionContext::Direct,
         state: restart(&second_transition).state,
         resume: Box::new(resume_work(second, work.availability)),
     });

@@ -466,6 +466,31 @@ pub struct RuntimeResourceUsage {
     pub schedules: u32,
     pub proof_artifacts: u32,
     pub state_bytes: u32,
+    pub artifact_references: u32,
+    pub artifact_referenced_bytes: u64,
+    pub proof_material_bytes: u64,
+}
+
+/// Authenticated execution mode carried by every runtime work item.
+/// Current executors admit only [`Self::Direct`]; Attested is reserved for a
+/// proof-host adapter which must explicitly select and validate its system.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeExecutionContext {
+    Direct,
+    Attested { proof_system: Hash },
+}
+
+impl RuntimeExecutionContext {
+    pub fn is_valid(self) -> bool {
+        match self {
+            Self::Direct => true,
+            Self::Attested { proof_system } => proof_system.0 != Hash::ZERO.0,
+        }
+    }
+
+    pub const fn is_direct(self) -> bool {
+        matches!(self, Self::Direct)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -503,6 +528,7 @@ pub enum ManagementError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeWork {
     Manage {
+        context: RuntimeExecutionContext,
         space: SpaceId,
         agent: crate::AgentId,
         runtime_deployment: DeploymentId,
@@ -517,12 +543,14 @@ pub enum RuntimeWork {
     /// may carry a later current observation only when guest state already
     /// retains the exact original authorization and result/continuation.
     Invoke {
+        context: RuntimeExecutionContext,
         state: RuntimeState,
         invocation: Box<InvocationWork>,
         authorization: Box<InvocationAuthorization>,
         observed_slot: u64,
     },
     Resume {
+        context: RuntimeExecutionContext,
         state: RuntimeState,
         resume: Box<ResumeWork>,
     },
@@ -530,10 +558,22 @@ pub enum RuntimeWork {
     /// its exact authorization are resupplied so the guest can authenticate
     /// the retained result without trusting a host-created shorthand.
     Acknowledge {
+        context: RuntimeExecutionContext,
         state: RuntimeState,
         invocation: Box<InvocationWork>,
         authorization: Box<InvocationAuthorization>,
     },
+}
+
+impl RuntimeWork {
+    pub const fn execution_context(&self) -> RuntimeExecutionContext {
+        match self {
+            Self::Manage { context, .. }
+            | Self::Invoke { context, .. }
+            | Self::Resume { context, .. }
+            | Self::Acknowledge { context, .. } => *context,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -775,9 +815,7 @@ impl RuntimeTransition {
     pub fn validate(&self) -> bool {
         self.state.validate()
             && match &self.outcome {
-                RuntimeOutcome::Management(Ok(ManagementReply::Actors(page))) => {
-                    page.validate().is_ok()
-                }
+                RuntimeOutcome::Management(Ok(reply)) => crate::wire::management_reply_valid(reply),
                 RuntimeOutcome::Completed(Ok(reply)) => {
                     reply.invocation != InvocationId::ZERO
                         && reply.actor != ActorId::ZERO

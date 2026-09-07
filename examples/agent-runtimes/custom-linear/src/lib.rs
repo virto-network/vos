@@ -26,8 +26,9 @@ use vos_agent_sdk::{
     ActorDirectoryPage, ActorDirectoryRecord, ActorId, AgentDescriptor, AgentProfile, AgentRuntime,
     Hash, InstallActor, InvocationAcknowledgement, InvocationAuthorization, InvocationError,
     InvocationReply, InvocationStatus, InvocationWork, LaneSet, ManagementError, ManagementReply,
-    ManagementRequest, MethodMode, ProofSystemSet, RuntimeCapabilities, RuntimeOutcome,
-    RuntimeResourceUsage, RuntimeState, RuntimeTransition, RuntimeWork, ScheduleId, StateLane,
+    ManagementRequest, MethodMode, ProofSystemSet, RuntimeCapabilities, RuntimeExecutionContext,
+    RuntimeOutcome, RuntimeResourceUsage, RuntimeState, RuntimeTransition, RuntimeWork, ScheduleId,
+    StateLane,
 };
 
 const CONTROL_MAGIC: [u8; 8] = *b"VCLCTL01";
@@ -55,6 +56,26 @@ impl AgentRuntime for CustomLinearRuntime {
     }
 
     fn apply(&mut self, work: RuntimeWork) -> RuntimeTransition {
+        if !work.execution_context().is_direct() {
+            let state = match &work {
+                RuntimeWork::Manage { state, .. }
+                | RuntimeWork::Invoke { state, .. }
+                | RuntimeWork::Resume { state, .. }
+                | RuntimeWork::Acknowledge { state, .. } => state.clone(),
+            };
+            let outcome = match work {
+                RuntimeWork::Manage { .. } => {
+                    RuntimeOutcome::Management(Err(ManagementError::InvalidRequest))
+                }
+                RuntimeWork::Invoke { .. } | RuntimeWork::Resume { .. } => {
+                    RuntimeOutcome::Completed(Err(InvocationError::InvalidAuthorization))
+                }
+                RuntimeWork::Acknowledge { .. } => {
+                    RuntimeOutcome::Acknowledged(Err(InvocationError::InvalidAuthorization))
+                }
+            };
+            return transition(state, outcome);
+        }
         match work {
             RuntimeWork::Manage {
                 space,
@@ -64,6 +85,7 @@ impl AgentRuntime for CustomLinearRuntime {
                 request,
                 authority,
                 observed_slot,
+                ..
             } => apply_management(
                 space,
                 agent,
@@ -78,6 +100,7 @@ impl AgentRuntime for CustomLinearRuntime {
                 invocation,
                 authorization,
                 observed_slot,
+                ..
             } => apply_invoke(state, *invocation, *authorization, observed_slot),
             RuntimeWork::Resume { state, .. } => transition(
                 state,
@@ -87,6 +110,7 @@ impl AgentRuntime for CustomLinearRuntime {
                 state,
                 invocation,
                 authorization,
+                ..
             } => apply_acknowledge(state, *invocation, *authorization),
         }
     }
@@ -316,8 +340,11 @@ impl CustomState {
     }
 
     fn descriptor(&self) -> Option<AgentDescriptor> {
-        let RuntimeWork::Manage { request, .. } =
-            RuntimeWork::decode(&self.control.create_work).ok()?
+        let RuntimeWork::Manage {
+            context: RuntimeExecutionContext::Direct,
+            request,
+            ..
+        } = RuntimeWork::decode(&self.control.create_work).ok()?
         else {
             return None;
         };
@@ -329,7 +356,12 @@ impl CustomState {
 
     fn install(&self) -> Option<InstallActor> {
         let bytes = self.control.install_work.as_ref()?;
-        let RuntimeWork::Manage { request, .. } = RuntimeWork::decode(bytes).ok()? else {
+        let RuntimeWork::Manage {
+            context: RuntimeExecutionContext::Direct,
+            request,
+            ..
+        } = RuntimeWork::decode(bytes).ok()?
+        else {
             return None;
         };
         let ManagementRequest::Install(install) = *request else {
@@ -935,6 +967,7 @@ fn stored_management_work(
     observed_slot: u64,
 ) -> Option<Vec<u8>> {
     let work = RuntimeWork::Manage {
+        context: RuntimeExecutionContext::Direct,
         space,
         agent,
         runtime_deployment,
@@ -953,6 +986,7 @@ fn stored_invoke_work(
     observed_slot: u64,
 ) -> Option<Vec<u8>> {
     let work = RuntimeWork::Invoke {
+        context: RuntimeExecutionContext::Direct,
         state: RuntimeState::default(),
         invocation: Box::new(invocation.clone()),
         authorization: Box::new(authorization.clone()),
@@ -973,6 +1007,7 @@ fn stored_management_matches(
     matches!(
         RuntimeWork::decode(bytes),
         Ok(RuntimeWork::Manage {
+            context: RuntimeExecutionContext::Direct,
             space: stored_space,
             agent: stored_agent,
             runtime_deployment: stored_runtime,
@@ -997,6 +1032,7 @@ fn stored_invoke_matches(
     matches!(
         RuntimeWork::decode(bytes),
         Ok(RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
             state,
             invocation,
             authorization: stored_authorization,
@@ -1010,6 +1046,7 @@ fn stored_invoke_matches(
 fn validate_stored_create(bytes: &[u8]) -> Result<(), DecodeError> {
     match RuntimeWork::decode(bytes).map_err(|_| DecodeError::NonCanonical)? {
         RuntimeWork::Manage {
+            context: RuntimeExecutionContext::Direct,
             state,
             request,
             authority: Some(_),
@@ -1026,6 +1063,7 @@ fn validate_stored_create(bytes: &[u8]) -> Result<(), DecodeError> {
 fn validate_stored_install(bytes: &[u8]) -> Result<(), DecodeError> {
     match RuntimeWork::decode(bytes).map_err(|_| DecodeError::NonCanonical)? {
         RuntimeWork::Manage {
+            context: RuntimeExecutionContext::Direct,
             state,
             request,
             authority: Some(_),
@@ -1041,7 +1079,11 @@ fn validate_stored_install(bytes: &[u8]) -> Result<(), DecodeError> {
 
 fn validate_stored_invoke(bytes: &[u8]) -> Result<(), DecodeError> {
     match RuntimeWork::decode(bytes).map_err(|_| DecodeError::NonCanonical)? {
-        RuntimeWork::Invoke { state, .. } if state == RuntimeState::default() => Ok(()),
+        RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
+            state,
+            ..
+        } if state == RuntimeState::default() => Ok(()),
         _ => Err(DecodeError::NonCanonical),
     }
 }
@@ -1181,6 +1223,7 @@ mod tests {
         fn create(&self, state: RuntimeState, observed_slot: u64) -> RuntimeWork {
             let request = ManagementRequest::Create(Box::new(self.descriptor.clone()));
             RuntimeWork::Manage {
+                context: RuntimeExecutionContext::Direct,
                 space: self.descriptor.identity.space,
                 agent: self.descriptor.identity.agent,
                 runtime_deployment: self.descriptor.identity.runtime_deployment,
@@ -1235,6 +1278,7 @@ mod tests {
         fn install_work(&self, state: RuntimeState, install: InstallActor) -> RuntimeWork {
             let request = ManagementRequest::Install(Box::new(install));
             RuntimeWork::Manage {
+                context: RuntimeExecutionContext::Direct,
                 space: self.descriptor.identity.space,
                 agent: self.descriptor.identity.agent,
                 runtime_deployment: self.descriptor.identity.runtime_deployment,
@@ -1329,6 +1373,7 @@ mod tests {
         let install = fixture.install();
         let installed = dispatch(fixture.install_work(created.state, install.clone()));
         let inspected = dispatch(RuntimeWork::Manage {
+            context: RuntimeExecutionContext::Direct,
             space: fixture.descriptor.identity.space,
             agent: fixture.descriptor.identity.agent,
             runtime_deployment: fixture.descriptor.identity.runtime_deployment,
@@ -1351,6 +1396,32 @@ mod tests {
     }
 
     #[test]
+    fn direct_custom_executor_fails_closed_on_attested_work_without_state_change() {
+        let fixture = Fixture::new();
+        let state = RuntimeState {
+            control: vec![0xa1],
+            linear: vec![0xa2],
+            merge: Vec::new(),
+            local: Vec::new(),
+        };
+        let mut work = fixture.create(state.clone(), 5);
+        let RuntimeWork::Manage { context, .. } = &mut work else {
+            unreachable!()
+        };
+        *context = RuntimeExecutionContext::Attested {
+            proof_system: Hash([0xa3; 32]),
+        };
+
+        let mut runtime = CustomLinearRuntime;
+        let rejected = runtime.apply(work);
+        assert_eq!(rejected.state, state);
+        assert_eq!(
+            rejected.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::InvalidRequest))
+        );
+    }
+
+    #[test]
     fn custom_linear_result_survives_restart_retry_and_requires_acknowledgement() {
         let fixture = Fixture::new();
         let (install, initial) = created_and_installed(&fixture);
@@ -1358,6 +1429,7 @@ mod tests {
         let authorization =
             InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&work, 7));
         let applied = dispatch(RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
             state: initial,
             invocation: Box::new(work.clone()),
             authorization: Box::new(authorization.clone()),
@@ -1368,6 +1440,7 @@ mod tests {
         // `dispatch` constructs no process state. Supplying the returned
         // state to another invocation therefore models a fresh guest/restart.
         let retried = dispatch(RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
             state: applied.state.clone(),
             invocation: Box::new(work.clone()),
             authorization: Box::new(authorization.clone()),
@@ -1379,6 +1452,7 @@ mod tests {
         let second_authorization =
             InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&second, 8));
         let blocked = dispatch(RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
             state: applied.state.clone(),
             invocation: Box::new(second.clone()),
             authorization: Box::new(second_authorization.clone()),
@@ -1391,6 +1465,7 @@ mod tests {
         assert_eq!(blocked.state, applied.state);
 
         let acknowledged = dispatch(RuntimeWork::Acknowledge {
+            context: RuntimeExecutionContext::Direct,
             state: applied.state,
             invocation: Box::new(work),
             authorization: Box::new(authorization),
@@ -1400,6 +1475,7 @@ mod tests {
             RuntimeOutcome::Acknowledged(Ok(_))
         ));
         let next = dispatch(RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
             state: acknowledged.state,
             invocation: Box::new(second),
             authorization: Box::new(second_authorization),
@@ -1419,6 +1495,7 @@ mod tests {
         let mut receipt = fixture.receipt(&request, 1, 10);
         receipt.signature[0] ^= 1;
         let rejected = dispatch(RuntimeWork::Manage {
+            context: RuntimeExecutionContext::Direct,
             space: fixture.descriptor.identity.space,
             agent: fixture.descriptor.identity.agent,
             runtime_deployment: fixture.descriptor.identity.runtime_deployment,
@@ -1439,6 +1516,7 @@ mod tests {
         let authorization =
             InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&work, 9));
         let rejected = dispatch(RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
             state: state.clone(),
             invocation: Box::new(work),
             authorization: Box::new(authorization),
@@ -1480,6 +1558,7 @@ mod tests {
                 hostile.control.push(1);
             }
             let rejected = dispatch(RuntimeWork::Invoke {
+                context: RuntimeExecutionContext::Direct,
                 state: hostile.clone(),
                 invocation: Box::new(work.clone()),
                 authorization: Box::new(authorization.clone()),
@@ -1505,6 +1584,7 @@ mod tests {
         let schedule_authorization =
             InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&schedule_work, 5));
         let scheduled = dispatch(RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
             state: initial,
             invocation: Box::new(schedule_work.clone()),
             authorization: Box::new(schedule_authorization.clone()),
@@ -1515,6 +1595,7 @@ mod tests {
         assert_eq!(scheduled_model.linear.scheduler.entries()[0].due_slot, 10);
 
         let acknowledged = dispatch(RuntimeWork::Acknowledge {
+            context: RuntimeExecutionContext::Direct,
             state: scheduled.state,
             invocation: Box::new(schedule_work),
             authorization: Box::new(schedule_authorization),
@@ -1523,6 +1604,7 @@ mod tests {
         let tick_authorization =
             InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&tick, 17));
         let fired = dispatch(RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
             state: acknowledged.state,
             invocation: Box::new(tick.clone()),
             authorization: Box::new(tick_authorization.clone()),
@@ -1536,6 +1618,7 @@ mod tests {
         // A fresh guest receives the same state and exact work. Even an
         // expired observation cannot duplicate the already retained fires.
         let retried = dispatch(RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
             state: fired.state.clone(),
             invocation: Box::new(tick.clone()),
             authorization: Box::new(tick_authorization.clone()),
@@ -1544,6 +1627,7 @@ mod tests {
         assert_eq!(retried, fired);
 
         let acknowledged = dispatch(RuntimeWork::Acknowledge {
+            context: RuntimeExecutionContext::Direct,
             state: fired.state,
             invocation: Box::new(tick),
             authorization: Box::new(tick_authorization),
@@ -1552,6 +1636,7 @@ mod tests {
         let regressed_authorization =
             InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&regressed, 16));
         let rejected = dispatch(RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
             state: acknowledged.state.clone(),
             invocation: Box::new(regressed),
             authorization: Box::new(regressed_authorization),

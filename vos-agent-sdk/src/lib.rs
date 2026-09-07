@@ -37,7 +37,7 @@ pub use vos_protocol::{
 };
 
 /// Stable clean-generation management/runtime ABI identity.
-pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-260906-r11");
+pub const RUNTIME_ABI_ID: Hash = Hash(*b"vos-agent-runtime-abi-260907-r12");
 
 /// Maximum bytes named by one content-addressed artifact reference.
 pub const MAX_CATALOG_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
@@ -54,6 +54,10 @@ pub const MAX_CATALOG_ARTIFACT_REFERENCES: u32 = 1 + 4 * STANDARD_MAX_ACTORS;
 pub const MAX_CATALOG_ARTIFACT_REFERENCED_BYTES: u64 = 64 * 1024 * 1024;
 /// Maximum opaque runtime image accepted by the canonical ABI.
 pub const MAX_RUNTIME_STATE_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum aggregate canonical nested transition-proof material retained or
+/// supplied for one runtime. Signed package limits and mutable RRP1 policy may
+/// narrow this ceiling.
+pub const MAX_TRANSITION_PROOF_MATERIAL_BYTES: u64 = 64 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {

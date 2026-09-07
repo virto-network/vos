@@ -2623,6 +2623,7 @@ mod tests {
             outcome: RuntimeOutcome,
         ) -> ScriptedRuntimeCase {
             let input = RuntimeWork::Manage {
+                context: crate::agent::sdk::RuntimeExecutionContext::Direct,
                 space: descriptor.identity.space,
                 agent: descriptor.identity.agent,
                 runtime_deployment: receipt
@@ -2691,6 +2692,7 @@ mod tests {
                 crate::agent::sdk::PublicPreflight::for_work(&work, LOGICAL_SLOT),
             );
             let input = RuntimeWork::Invoke {
+                context: crate::agent::sdk::RuntimeExecutionContext::Direct,
                 state,
                 invocation: Box::new(work.clone()),
                 authorization: Box::new(authorization),
@@ -3007,6 +3009,7 @@ mod tests {
                 Some(approval_value(&catalog_approval)),
             );
             let authority_input = RuntimeWork::Manage {
+                context: crate::agent::sdk::RuntimeExecutionContext::Direct,
                 space: descriptor.identity.space,
                 agent: descriptor.identity.agent,
                 runtime_deployment: descriptor.identity.runtime_deployment,

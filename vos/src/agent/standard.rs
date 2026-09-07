@@ -3546,7 +3546,7 @@ impl StandardAgentRuntime {
     ) -> Result<crate::agent_sdk::RuntimeResourceUsage, crate::agent_sdk::ManagementError> {
         use crate::agent_sdk::ManagementError;
 
-        self.created().map_err(legacy_management_error)?;
+        let config = self.created().map_err(legacy_management_error)?;
         let mut usage = crate::agent_sdk::RuntimeResourceUsage {
             actors: u32::try_from(self.actors.len()).map_err(|_| ManagementError::ResourceLimit)?,
             // Management executes between scheduler slices; persisted
@@ -3556,6 +3556,17 @@ impl StandardAgentRuntime {
                 .map_err(|_| ManagementError::ResourceLimit)?,
             ..crate::agent_sdk::RuntimeResourceUsage::default()
         };
+        let mut artifact_usage = ArtifactResourceUsage::default();
+        for reference in core::iter::once(&config.runtime_package)
+            .chain(self.actors.values().flat_map(actor_artifact_references))
+        {
+            artifact_usage
+                .insert(reference, config.runtime_contract.resources)
+                .map_err(legacy_management_error)?;
+        }
+        usage.artifact_references = u32::try_from(artifact_usage.lengths.len())
+            .map_err(|_| ManagementError::ResourceLimit)?;
+        usage.artifact_referenced_bytes = artifact_usage.referenced_bytes;
         for actor in self.actors.keys().copied() {
             let debt = self
                 .lifecycle_debt(actor)

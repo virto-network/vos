@@ -25,7 +25,7 @@ use crate::catalog::{
 };
 use crate::contract::{
     ActorAbiRange, ActorPackageContract, RuntimeMigrationPolicy, RuntimePackageContract,
-    RuntimeResourceLimits,
+    RuntimeResourceLimits, RuntimeResourcePolicy,
 };
 use crate::*;
 
@@ -52,6 +52,7 @@ pub const MAX_RUNTIME_WORK_WIRE_BYTES: usize =
     HEADER_BYTES + MAX_RUNTIME_STATE_BYTES + MAX_RUNTIME_AVAILABILITY_BYTES + 512 * 1024;
 pub const MAX_RUNTIME_TRANSITION_WIRE_BYTES: usize =
     HEADER_BYTES + MAX_RUNTIME_STATE_BYTES + MAX_DIRECTORY_PAGE_WIRE_BYTES + 64 * 1024;
+pub const MAX_RUNTIME_RESOURCE_POLICY_WIRE_BYTES: usize = HEADER_BYTES + 4 + 4 + 4 + 8 + 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WireError {
@@ -256,6 +257,7 @@ fn encode_runtime_contract(encoder: &mut Encoder<'_>, value: RuntimePackageContr
     encoder.u32(value.resources.max_runtime_state_bytes);
     encoder.u32(value.resources.max_artifact_references);
     encoder.u64(value.resources.max_artifact_referenced_bytes);
+    encoder.u64(value.resources.max_proof_material_bytes);
     encoder.u8(value.migration as u8);
 }
 
@@ -273,6 +275,7 @@ fn decode_runtime_contract(
             max_runtime_state_bytes: decoder.u32()?,
             max_artifact_references: decoder.u32()?,
             max_artifact_referenced_bytes: decoder.u64()?,
+            max_proof_material_bytes: decoder.u64()?,
         },
         migration: match decoder.u8()? {
             0 => RuntimeMigrationPolicy::None,
@@ -283,6 +286,47 @@ fn decode_runtime_contract(
         .is_valid()
         .then_some(value)
         .ok_or(DecodeError::NonCanonical)
+}
+
+fn encode_runtime_resource_policy(encoder: &mut Encoder<'_>, value: RuntimeResourcePolicy) {
+    encoder.u32(value.max_actors);
+    encoder.u32(value.max_runtime_state_bytes);
+    encoder.u32(value.max_artifact_references);
+    encoder.u64(value.max_artifact_referenced_bytes);
+    encoder.u64(value.max_proof_material_bytes);
+}
+
+fn decode_runtime_resource_policy(
+    decoder: &mut Decoder<'_>,
+) -> Result<RuntimeResourcePolicy, DecodeError> {
+    let value = RuntimeResourcePolicy {
+        max_actors: decoder.u32()?,
+        max_runtime_state_bytes: decoder.u32()?,
+        max_artifact_references: decoder.u32()?,
+        max_artifact_referenced_bytes: decoder.u64()?,
+        max_proof_material_bytes: decoder.u64()?,
+    };
+    value
+        .is_valid()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+impl CanonicalWire for RuntimeResourcePolicy {
+    const MAGIC: [u8; 4] = *b"RRP1";
+    const MAX_ENCODED_BYTES: usize = MAX_RUNTIME_RESOURCE_POLICY_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.is_valid()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_runtime_resource_policy(encoder, *self);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        decode_runtime_resource_policy(decoder)
+    }
 }
 
 fn encode_package_kind(encoder: &mut Encoder<'_>, value: PackageKind) {
@@ -2554,9 +2598,36 @@ fn decode_resume_work(decoder: &mut Decoder<'_>) -> Result<ResumeWork, DecodeErr
         .ok_or(DecodeError::NonCanonical)
 }
 
+fn encode_runtime_execution_context(encoder: &mut Encoder<'_>, value: RuntimeExecutionContext) {
+    match value {
+        RuntimeExecutionContext::Direct => encoder.u8(0),
+        RuntimeExecutionContext::Attested { proof_system } => {
+            encoder.u8(1);
+            encoder.fixed(proof_system.as_bytes());
+        }
+    }
+}
+
+fn decode_runtime_execution_context(
+    decoder: &mut Decoder<'_>,
+) -> Result<RuntimeExecutionContext, DecodeError> {
+    let value = match decoder.u8()? {
+        0 => RuntimeExecutionContext::Direct,
+        1 => RuntimeExecutionContext::Attested {
+            proof_system: Hash(decoder.fixed()?),
+        },
+        _ => return Err(DecodeError::InvalidTag),
+    };
+    value
+        .is_valid()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
 fn runtime_work_valid(value: &RuntimeWork) -> bool {
     match value {
         RuntimeWork::Manage {
+            context,
             space,
             agent,
             runtime_deployment,
@@ -2565,7 +2636,8 @@ fn runtime_work_valid(value: &RuntimeWork) -> bool {
             authority,
             observed_slot,
         } => {
-            if *space == SpaceId::ZERO
+            if !context.is_valid()
+                || *space == SpaceId::ZERO
                 || *agent == AgentId::ZERO
                 || *runtime_deployment == DeploymentId::ZERO
                 || !state.validate()
@@ -2599,22 +2671,30 @@ fn runtime_work_valid(value: &RuntimeWork) -> bool {
             }
         }
         RuntimeWork::Invoke {
+            context,
             state,
             invocation,
             authorization,
             observed_slot,
         } => {
-            state.validate()
+            context.is_valid()
+                && state.validate()
                 && invocation.validate()
                 && authorization.matches_invoke(invocation, *observed_slot)
         }
-        RuntimeWork::Resume { state, resume } => state.validate() && resume.validate(),
+        RuntimeWork::Resume {
+            context,
+            state,
+            resume,
+        } => context.is_valid() && state.validate() && resume.validate(),
         RuntimeWork::Acknowledge {
+            context,
             state,
             invocation,
             authorization,
         } => {
-            state.validate()
+            context.is_valid()
+                && state.validate()
                 && invocation.validate()
                 && authorization.matches_acknowledgement(invocation)
         }
@@ -2632,6 +2712,7 @@ impl CanonicalWire for RuntimeWork {
     fn encode_body(&self, encoder: &mut Encoder<'_>) {
         match self {
             RuntimeWork::Manage {
+                context,
                 space,
                 agent,
                 runtime_deployment,
@@ -2641,6 +2722,7 @@ impl CanonicalWire for RuntimeWork {
                 observed_slot,
             } => {
                 encoder.u8(0);
+                encode_runtime_execution_context(encoder, *context);
                 encoder.fixed(space.as_bytes());
                 encoder.fixed(agent.as_bytes());
                 encoder.fixed(runtime_deployment.as_bytes());
@@ -2652,28 +2734,37 @@ impl CanonicalWire for RuntimeWork {
                 encoder.u64(*observed_slot);
             }
             RuntimeWork::Invoke {
+                context,
                 state,
                 invocation,
                 authorization,
                 observed_slot,
             } => {
                 encoder.u8(1);
+                encode_runtime_execution_context(encoder, *context);
                 encode_runtime_state(encoder, state);
                 encode_invocation_work(encoder, invocation);
                 encode_invocation_authorization(encoder, authorization);
                 encoder.u64(*observed_slot);
             }
-            RuntimeWork::Resume { state, resume } => {
+            RuntimeWork::Resume {
+                context,
+                state,
+                resume,
+            } => {
                 encoder.u8(2);
+                encode_runtime_execution_context(encoder, *context);
                 encode_runtime_state(encoder, state);
                 encode_resume_work(encoder, resume);
             }
             RuntimeWork::Acknowledge {
+                context,
                 state,
                 invocation,
                 authorization,
             } => {
                 encoder.u8(3);
+                encode_runtime_execution_context(encoder, *context);
                 encode_runtime_state(encoder, state);
                 encode_invocation_work(encoder, invocation);
                 encode_invocation_authorization(encoder, authorization);
@@ -2684,6 +2775,7 @@ impl CanonicalWire for RuntimeWork {
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let value = match decoder.u8()? {
             0 => RuntimeWork::Manage {
+                context: decode_runtime_execution_context(decoder)?,
                 space: SpaceId(decoder.fixed()?),
                 agent: AgentId(decoder.fixed()?),
                 runtime_deployment: DeploymentId(decoder.fixed()?),
@@ -2695,16 +2787,19 @@ impl CanonicalWire for RuntimeWork {
                 observed_slot: decoder.u64()?,
             },
             1 => RuntimeWork::Invoke {
+                context: decode_runtime_execution_context(decoder)?,
                 state: decode_runtime_state(decoder)?,
                 invocation: alloc::boxed::Box::new(decode_invocation_work(decoder)?),
                 authorization: alloc::boxed::Box::new(decode_invocation_authorization(decoder)?),
                 observed_slot: decoder.u64()?,
             },
             2 => RuntimeWork::Resume {
+                context: decode_runtime_execution_context(decoder)?,
                 state: decode_runtime_state(decoder)?,
                 resume: alloc::boxed::Box::new(decode_resume_work(decoder)?),
             },
             3 => RuntimeWork::Acknowledge {
+                context: decode_runtime_execution_context(decoder)?,
                 state: decode_runtime_state(decoder)?,
                 invocation: alloc::boxed::Box::new(decode_invocation_work(decoder)?),
                 authorization: alloc::boxed::Box::new(decode_invocation_authorization(decoder)?),
@@ -2748,6 +2843,9 @@ fn encode_resource_usage(encoder: &mut Encoder<'_>, value: RuntimeResourceUsage)
     encoder.u32(value.schedules);
     encoder.u32(value.proof_artifacts);
     encoder.u32(value.state_bytes);
+    encoder.u32(value.artifact_references);
+    encoder.u64(value.artifact_referenced_bytes);
+    encoder.u64(value.proof_material_bytes);
 }
 
 fn decode_resource_usage(decoder: &mut Decoder<'_>) -> Result<RuntimeResourceUsage, DecodeError> {
@@ -2760,10 +2858,16 @@ fn decode_resource_usage(decoder: &mut Decoder<'_>) -> Result<RuntimeResourceUsa
         schedules: decoder.u32()?,
         proof_artifacts: decoder.u32()?,
         state_bytes: decoder.u32()?,
+        artifact_references: decoder.u32()?,
+        artifact_referenced_bytes: decoder.u64()?,
+        proof_material_bytes: decoder.u64()?,
     };
     if value.actors > STANDARD_MAX_ACTORS
         || value.active_machines > 63
         || value.state_bytes as usize > MAX_RUNTIME_STATE_BYTES
+        || value.artifact_references > MAX_CATALOG_ARTIFACT_REFERENCES
+        || value.artifact_referenced_bytes > MAX_CATALOG_ARTIFACT_REFERENCED_BYTES
+        || value.proof_material_bytes > MAX_TRANSITION_PROOF_MATERIAL_BYTES
     {
         return Err(DecodeError::NonCanonical);
     }
@@ -2789,6 +2893,9 @@ pub(crate) fn management_reply_valid(value: &ManagementReply) -> bool {
             usage.actors <= STANDARD_MAX_ACTORS
                 && usage.active_machines <= 63
                 && usage.state_bytes as usize <= MAX_RUNTIME_STATE_BYTES
+                && usage.artifact_references <= MAX_CATALOG_ARTIFACT_REFERENCES
+                && usage.artifact_referenced_bytes <= MAX_CATALOG_ARTIFACT_REFERENCED_BYTES
+                && usage.proof_material_bytes <= MAX_TRANSITION_PROOF_MATERIAL_BYTES
         }
         ManagementReply::Installed(entry)
         | ManagementReply::Upgraded(entry)
@@ -4010,8 +4117,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/acc2-golden", &[&call_bytes]).0,
             [
-                157, 1, 165, 154, 229, 190, 129, 247, 238, 36, 66, 185, 21, 77, 210, 57, 244, 68,
-                63, 76, 139, 210, 67, 179, 32, 8, 82, 168, 193, 120, 230, 103,
+                82, 186, 95, 78, 102, 242, 30, 224, 144, 190, 97, 145, 207, 98, 160, 253, 81, 146,
+                114, 79, 199, 221, 132, 187, 160, 52, 151, 35, 214, 72, 102, 77,
             ]
         );
 
@@ -4023,8 +4130,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/map1-golden", &[&approval_bytes]).0,
             [
-                255, 18, 10, 207, 200, 132, 129, 241, 174, 44, 38, 42, 99, 58, 127, 99, 128, 5, 73,
-                237, 102, 76, 15, 165, 199, 215, 101, 74, 171, 110, 202, 212,
+                195, 188, 61, 10, 113, 59, 218, 65, 135, 106, 142, 142, 135, 180, 96, 208, 74, 159,
+                251, 106, 0, 245, 59, 239, 82, 119, 225, 241, 23, 250, 19, 98,
             ]
         );
 
@@ -4039,8 +4146,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/maa2-golden", &[&acknowledgement_bytes]).0,
             [
-                79, 200, 2, 107, 50, 228, 135, 116, 171, 81, 53, 158, 89, 40, 144, 74, 38, 142, 17,
-                44, 0, 66, 89, 228, 248, 246, 34, 230, 137, 127, 85, 137,
+                212, 192, 160, 157, 26, 58, 253, 190, 175, 69, 90, 235, 22, 107, 88, 137, 61, 239,
+                70, 208, 45, 200, 29, 86, 99, 55, 30, 219, 76, 191, 93, 155,
             ]
         );
     }
@@ -4055,8 +4162,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/aad3-golden", &[&bytes]).0,
             [
-                160, 28, 25, 211, 156, 22, 173, 80, 222, 203, 124, 175, 208, 28, 11, 10, 108, 59,
-                9, 116, 1, 119, 112, 183, 152, 82, 17, 140, 245, 177, 250, 129,
+                146, 212, 1, 91, 225, 115, 226, 158, 137, 197, 13, 205, 22, 147, 213, 74, 147, 237,
+                76, 231, 168, 152, 26, 187, 209, 229, 227, 190, 194, 69, 115, 143,
             ]
         );
 
@@ -4071,8 +4178,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/aar3-golden", &[&result_bytes]).0,
             [
-                137, 253, 52, 73, 229, 10, 191, 228, 2, 73, 158, 172, 84, 159, 96, 238, 163, 198,
-                93, 216, 65, 13, 250, 33, 222, 112, 198, 191, 242, 71, 239, 110,
+                210, 186, 61, 44, 35, 166, 253, 109, 142, 161, 158, 93, 85, 18, 67, 180, 189, 76,
+                214, 100, 91, 212, 225, 191, 174, 186, 210, 181, 205, 132, 176, 252,
             ]
         );
         assert_ne!(call.commitment(), result.commitment());
@@ -4597,8 +4704,8 @@ mod tests {
         assert_eq!(
             golden.0,
             [
-                251, 151, 144, 114, 20, 117, 255, 63, 245, 140, 235, 200, 78, 172, 156, 96, 242,
-                12, 73, 23, 215, 104, 129, 25, 64, 57, 139, 26, 80, 193, 87, 68,
+                203, 224, 101, 213, 71, 135, 230, 219, 120, 191, 189, 133, 230, 14, 33, 80, 250,
+                52, 204, 200, 179, 237, 200, 166, 4, 14, 169, 168, 98, 10, 22, 84,
             ]
         );
 
@@ -4730,6 +4837,7 @@ mod tests {
     fn invoke_work_round_trip_binds_receipt_to_exact_request() {
         let invocation = invocation();
         let work = RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
             state: RuntimeState::default(),
             authorization: alloc::boxed::Box::new(InvocationAuthorization::AuthorityReceipt(
                 receipt_for(&invocation),
@@ -4750,6 +4858,7 @@ mod tests {
         );
 
         let RuntimeWork::Invoke {
+            context,
             mut authorization,
             state,
             invocation,
@@ -4763,6 +4872,7 @@ mod tests {
         };
         authority.selector.request = Hash([99; 32]);
         let mismatched = RuntimeWork::Invoke {
+            context,
             state,
             invocation,
             authorization,
@@ -4779,6 +4889,7 @@ mod tests {
         let authorization =
             InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&invocation, 45));
         let work = RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
             state: RuntimeState::default(),
             invocation: alloc::boxed::Box::new(invocation.clone()),
             authorization: alloc::boxed::Box::new(authorization.clone()),
@@ -4825,6 +4936,7 @@ mod tests {
         let mut claimed_role = invocation.clone();
         claimed_role.roles.space = Some(RoleId([0x92; 32]));
         let claimed = RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
             state: RuntimeState::default(),
             authorization: alloc::boxed::Box::new(InvocationAuthorization::PublicPreflight(
                 PublicPreflight::for_work(&claimed_role, 45),
@@ -4835,6 +4947,7 @@ mod tests {
         assert_eq!(claimed.encode(), Err(WireError::InvalidValue));
 
         let acknowledgement = RuntimeWork::Acknowledge {
+            context: RuntimeExecutionContext::Direct,
             state: RuntimeState::default(),
             invocation: alloc::boxed::Box::new(invocation),
             authorization: alloc::boxed::Box::new(authorization),
@@ -4850,6 +4963,7 @@ mod tests {
         let invocation = invocation();
         let authority = receipt_for(&invocation);
         let work = RuntimeWork::Acknowledge {
+            context: RuntimeExecutionContext::Direct,
             state: RuntimeState::default(),
             invocation: alloc::boxed::Box::new(invocation.clone()),
             authorization: alloc::boxed::Box::new(InvocationAuthorization::AuthorityReceipt(
@@ -4922,6 +5036,7 @@ mod tests {
     fn read_only_management_has_one_authority_representation() {
         let invocation = invocation();
         let read = RuntimeWork::Manage {
+            context: RuntimeExecutionContext::Direct,
             space: invocation.space,
             agent: invocation.agent,
             runtime_deployment: invocation.runtime_deployment,
@@ -4934,6 +5049,7 @@ mod tests {
         assert_eq!(RuntimeWork::decode(&encoded), Ok(read));
 
         let with_receipt = RuntimeWork::Manage {
+            context: RuntimeExecutionContext::Direct,
             space: invocation.space,
             agent: invocation.agent,
             runtime_deployment: invocation.runtime_deployment,
@@ -4943,6 +5059,118 @@ mod tests {
             observed_slot: 45,
         };
         assert_eq!(with_receipt.encode(), Err(WireError::InvalidValue));
+    }
+
+    #[test]
+    fn runtime_execution_context_is_explicit_and_fail_closed_on_wire() {
+        let invocation = invocation();
+        let direct = RuntimeWork::Manage {
+            context: RuntimeExecutionContext::Direct,
+            space: invocation.space,
+            agent: invocation.agent,
+            runtime_deployment: invocation.runtime_deployment,
+            state: RuntimeState::default(),
+            request: alloc::boxed::Box::new(ManagementRequest::InspectResources),
+            authority: None,
+            observed_slot: 45,
+        };
+        let encoded = direct.encode().unwrap();
+        assert_eq!(RuntimeWork::decode(&encoded), Ok(direct.clone()));
+
+        let mut unknown = encoded;
+        unknown[HEADER_BYTES + 1] = 2;
+        assert_eq!(
+            RuntimeWork::decode(&unknown),
+            Err(WireError::Decode(DecodeError::InvalidTag))
+        );
+
+        let mut attested = direct.clone();
+        let RuntimeWork::Manage { context, .. } = &mut attested else {
+            unreachable!()
+        };
+        *context = RuntimeExecutionContext::Attested {
+            proof_system: Hash([0x71; 32]),
+        };
+        let encoded = attested.encode().unwrap();
+        assert_eq!(RuntimeWork::decode(&encoded), Ok(attested.clone()));
+
+        let RuntimeWork::Manage { context, .. } = &mut attested else {
+            unreachable!()
+        };
+        *context = RuntimeExecutionContext::Attested {
+            proof_system: Hash::ZERO,
+        };
+        assert_eq!(attested.encode(), Err(WireError::InvalidValue));
+    }
+
+    #[test]
+    fn rrp1_and_all_resource_usage_fields_have_one_bounded_wire() {
+        let policy = RuntimeResourcePolicy::standard();
+        let encoded = policy.encode().unwrap();
+        assert_eq!(encoded.len(), MAX_RUNTIME_RESOURCE_POLICY_WIRE_BYTES);
+        assert_eq!(RuntimeResourcePolicy::decode(&encoded), Ok(policy));
+
+        let mut old_magic = encoded.clone();
+        old_magic[..4].copy_from_slice(b"RRP0");
+        assert_eq!(
+            RuntimeResourcePolicy::decode(&old_magic),
+            Err(WireError::Decode(DecodeError::InvalidTag))
+        );
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(
+            RuntimeResourcePolicy::decode(&trailing),
+            Err(WireError::LimitExceeded),
+            "RRP1 has a fixed maximum-width wire, so trailing data exceeds its bound"
+        );
+        let mut over_ceiling = encoded;
+        over_ceiling[HEADER_BYTES + 20..HEADER_BYTES + 28]
+            .copy_from_slice(&(MAX_TRANSITION_PROOF_MATERIAL_BYTES + 1).to_le_bytes());
+        assert_eq!(
+            RuntimeResourcePolicy::decode(&over_ceiling),
+            Err(WireError::Decode(DecodeError::NonCanonical))
+        );
+
+        let usage = RuntimeResourceUsage {
+            actors: 1,
+            active_machines: 2,
+            continuations: 3,
+            inbox: 4,
+            outbox: 5,
+            schedules: 6,
+            proof_artifacts: 7,
+            state_bytes: 8,
+            artifact_references: 9,
+            artifact_referenced_bytes: 10,
+            proof_material_bytes: 11,
+        };
+        let transition = RuntimeTransition {
+            state: RuntimeState::default(),
+            outcome: RuntimeOutcome::Management(Ok(ManagementReply::Resources(usage))),
+        };
+        let encoded = transition.encode().unwrap();
+        assert_eq!(RuntimeTransition::decode(&encoded), Ok(transition));
+
+        for invalid_usage in [
+            RuntimeResourceUsage {
+                artifact_references: MAX_CATALOG_ARTIFACT_REFERENCES + 1,
+                ..usage
+            },
+            RuntimeResourceUsage {
+                artifact_referenced_bytes: MAX_CATALOG_ARTIFACT_REFERENCED_BYTES + 1,
+                ..usage
+            },
+            RuntimeResourceUsage {
+                proof_material_bytes: MAX_TRANSITION_PROOF_MATERIAL_BYTES + 1,
+                ..usage
+            },
+        ] {
+            let invalid = RuntimeTransition {
+                state: RuntimeState::default(),
+                outcome: RuntimeOutcome::Management(Ok(ManagementReply::Resources(invalid_usage))),
+            };
+            assert_eq!(invalid.encode(), Err(WireError::InvalidValue));
+        }
     }
 
     #[test]
@@ -4995,6 +5223,7 @@ mod tests {
         let request = ManagementRequest::Create(alloc::boxed::Box::new(descriptor));
         authority.selector.request = request.commitment();
         let work = RuntimeWork::Manage {
+            context: RuntimeExecutionContext::Direct,
             space,
             agent,
             runtime_deployment,

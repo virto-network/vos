@@ -1558,6 +1558,9 @@ pub fn validate_private_actor_schema(
 }
 
 pub fn validate_private_runtime_work(work: &RuntimeWork) -> Result<(), PrivateSyncError> {
+    if !work.execution_context().is_direct() {
+        return Err(PrivateSyncError::InvalidRequest);
+    }
     let state = match work {
         RuntimeWork::Manage { state, request, .. } => {
             match request.as_ref() {
@@ -1601,7 +1604,7 @@ pub fn validate_private_runtime_work(work: &RuntimeWork) -> Result<(), PrivateSy
             }
             state
         }
-        RuntimeWork::Resume { state, resume } => {
+        RuntimeWork::Resume { state, resume, .. } => {
             if matches!(
                 resume.mode,
                 MethodMode::Linear | MethodMode::LinearizableQuery
@@ -3409,10 +3412,26 @@ mod tests {
             input: None,
         };
         let mut work = RuntimeWork::Resume {
+            context: vos_agent_sdk::RuntimeExecutionContext::Direct,
             state: RuntimeState::default(),
             resume: Box::new(resume()),
         };
         assert_eq!(validate_private_runtime_work(&work), Ok(()));
+        let RuntimeWork::Resume { context, .. } = &mut work else {
+            unreachable!()
+        };
+        *context = vos_agent_sdk::RuntimeExecutionContext::Attested {
+            proof_system: Hash([0x0c; 32]),
+        };
+        assert_eq!(
+            validate_private_runtime_work(&work),
+            Err(PrivateSyncError::InvalidRequest),
+            "the current Private executor must fail closed on attested work"
+        );
+        let RuntimeWork::Resume { context, .. } = &mut work else {
+            unreachable!()
+        };
+        *context = vos_agent_sdk::RuntimeExecutionContext::Direct;
         let RuntimeWork::Resume {
             resume: resume_work,
             ..
@@ -3428,6 +3447,7 @@ mod tests {
         let mut linear_state = RuntimeState::default();
         linear_state.linear.push(1);
         let work = RuntimeWork::Resume {
+            context: vos_agent_sdk::RuntimeExecutionContext::Direct,
             state: linear_state,
             resume: Box::new(resume()),
         };

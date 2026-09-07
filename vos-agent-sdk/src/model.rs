@@ -419,6 +419,14 @@ pub enum ModelError {
 }
 
 impl AgentDescriptor {
+    /// Initial mutable RRP1 policy fixed by this descriptor's signed ceilings.
+    pub const fn initial_resource_policy(&self) -> crate::contract::RuntimeResourcePolicy {
+        crate::contract::RuntimeResourcePolicy::initial(
+            self.capabilities,
+            self.runtime_contract.resources,
+        )
+    }
+
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.identity.space == SpaceId::ZERO
             || self.identity.agent == AgentId::ZERO

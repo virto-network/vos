@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow, bail, ensure};
 use vos::agent::sdk::wire::CanonicalWire as _;
 use vos::agent::sdk::{
-    AgentId, DeploymentId, ManagementError, ManagementRequest, ProgramId, RuntimeOutcome,
-    RuntimeState, RuntimeTransition, RuntimeWork, SpaceId,
+    AgentId, DeploymentId, ManagementError, ManagementRequest, ProgramId, RuntimeExecutionContext,
+    RuntimeOutcome, RuntimeState, RuntimeTransition, RuntimeWork, SpaceId,
 };
 use vos_pvm::ExitReason;
 use vos_pvm::refine_host::RefineContext;
@@ -56,6 +56,7 @@ fn canonical_agent_runtime_pvm(elf: &[u8]) -> anyhow::Result<Vec<u8>> {
 
 fn validate_agent_runtime_pvm(pvm: &[u8]) -> anyhow::Result<()> {
     let probe = RuntimeWork::Manage {
+        context: RuntimeExecutionContext::Direct,
         space: SpaceId([1; 32]),
         agent: AgentId([2; 32]),
         runtime_deployment: DeploymentId([3; 32]),
