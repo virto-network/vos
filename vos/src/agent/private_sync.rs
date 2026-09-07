@@ -1992,7 +1992,8 @@ mod tests {
             control_previous: control.previous,
             epoch: store.binding().epoch,
             post_member_set,
-            reopened_control_state: Hash([0x81; 32]),
+            reopened_runtime_state: Hash([0x81; 32]),
+            stable_projection: Hash([0x82; 32]),
             reopened_control_head: control.commitment(),
             applied_at,
         };

@@ -6,10 +6,10 @@
 //! application slot before asking the configured Private runtime to apply it.
 //! Only an authenticated result which echoes every request field and asserts a
 //! durable apply *and* durable reopen can supply the application fact pledged
-//! and signed by the issuer as PCA1. Finally, PCA1 is sent to the exact
+//! and signed by the issuer as PCA2. Finally, PCA2 is sent to the exact
 //! system-authority actor under its derived third Linear invocation and the
 //! exact acknowledgement is committed locally. Only then does the coordinator
-//! ask the runtime to attach the retained canonical AOI1+PCA1 envelope to the
+//! ask the runtime to attach the retained canonical AOI1+PCA2 envelope to the
 //! applied PCTL; a final local marker makes lost-result attachment retry exact.
 //!
 //! Records remain bounded and are never compacted. An affirmative actor reply
@@ -32,12 +32,16 @@ use crate::agent::sdk::authority::{
 use crate::agent::sdk::authority_operation::PrivateRecoveryAuthorityProof;
 use crate::agent::sdk::authority_operation::{
     AuthorityOperationIntent, PrivateControlApplicationAck, PrivateControlApplicationFact,
+    PrivateControlApplicationRetirementAck,
 };
 use crate::agent::sdk::private::PrivateControlRecord;
-use crate::agent::sdk::wire::{CanonicalWire, MAX_PRIVATE_CONTROL_WIRE_BYTES};
+use crate::agent::sdk::wire::{
+    CanonicalWire, MAX_PRIVATE_CONTROL_WIRE_BYTES, MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES,
+};
 use crate::agent::sdk::{
     ActorId, AgentId, DeploymentId, Hash, InvocationContext, InvocationId, InvocationOrigin,
-    InvocationRoleClaims, MethodMode, PrincipalId, ProducerId, ProgramId, SpaceId,
+    InvocationRoleClaims, ManagementRequest, MethodMode, PrincipalId, PrivateRuntimeMutation,
+    ProducerId, ProgramId, SpaceId,
 };
 use vos_protocol::wire::{DecodeError, Decoder, Encoder};
 
@@ -45,8 +49,8 @@ pub(crate) const MAX_PRIVATE_CONTROL_APPLICATION_COORDINATOR_RECORDS: usize =
     super::authority_operation_issuer::MAX_AUTHORITY_OPERATION_ISSUER_RECORDS;
 pub(crate) const MAX_PRIVATE_CONTROL_APPLICATION_COORDINATOR_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const MAX_PRIVATE_CONTROL_APPLICATION_FACT_WIRE_BYTES: usize = 512;
-const PRIVATE_CONTROL_APPLICATION_COORDINATOR_MAGIC: [u8; 4] = *b"PAJ3";
-const PRIVATE_CONTROL_APPLICATION_FACT_MAGIC: [u8; 4] = *b"PCAF";
+const PRIVATE_CONTROL_APPLICATION_COORDINATOR_MAGIC: [u8; 4] = *b"PAJ4";
+const PRIVATE_CONTROL_APPLICATION_FACT_MAGIC: [u8; 5] = *b"PCAF2";
 
 /// Exact request to the trusted Private-runtime application boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,6 +58,7 @@ pub(crate) struct PrivateControlRuntimeApplicationRequest {
     pub(crate) route: ManagedAgentTarget,
     pub(crate) authority: AuthorityActorTarget,
     pub(crate) control: Vec<u8>,
+    pub(crate) mutation: Option<Vec<u8>>,
     pub(crate) receipt: Vec<u8>,
     pub(crate) issuance_ack: Vec<u8>,
     pub(crate) applied_at: u64,
@@ -65,19 +70,110 @@ pub(crate) struct PrivateControlRuntimeApplicationResult {
     pub(crate) route: ManagedAgentTarget,
     pub(crate) authority: AuthorityActorTarget,
     pub(crate) control: Vec<u8>,
+    pub(crate) mutation: Option<Vec<u8>>,
     pub(crate) receipt: Vec<u8>,
     pub(crate) issuance_ack: Vec<u8>,
     pub(crate) applied_at: u64,
     pub(crate) authenticated: bool,
     pub(crate) durably_applied: bool,
     pub(crate) durably_reopened: bool,
-    /// Canonical host-local PCAF frame, independently decoded below.
+    /// Exact commitment of the durably reopened PCRS2 aggregate.
+    pub(crate) reopened_runtime_state: Hash,
+    /// Exact commitment of the successor PSP1 stable projection.
+    pub(crate) stable_projection: Hash,
+    /// Canonical host-local PCAF2 frame, independently decoded below.
     pub(crate) application_fact: Vec<u8>,
+}
+
+/// Echoed result of an authenticated deterministic denial which durably
+/// reopened the byte-identical predecessor. This deliberately has no field in
+/// which a guest error, successor, or application fact could be retained.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PrivateControlRuntimeRetirementResult {
+    pub(crate) route: ManagedAgentTarget,
+    pub(crate) authority: AuthorityActorTarget,
+    pub(crate) control: Vec<u8>,
+    pub(crate) mutation: Option<Vec<u8>>,
+    pub(crate) receipt: Vec<u8>,
+    pub(crate) issuance_ack: Vec<u8>,
+    pub(crate) resolved_at: u64,
+    pub(crate) authenticated: bool,
+    pub(crate) predecessor_unchanged: bool,
+    pub(crate) durably_reopened: bool,
+}
+
+/// The only two trusted outcomes which may cross the Private runtime boundary.
+/// Adapter errors (including traps, exhaustion, I/O, malformed output, or a
+/// changed predecessor) remain errors and cannot be relabelled as retirement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PrivateControlRuntimeApplicationResolution {
+    Applied(PrivateControlRuntimeApplicationResult),
+    RetiredUnapplied(PrivateControlRuntimeRetirementResult),
+}
+
+/// Canonical terminal acknowledgement retained for one coordinator lineage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PrivateControlApplicationResolution {
+    Applied(PrivateControlApplicationAck),
+    RetiredUnapplied(PrivateControlApplicationRetirementAck),
+}
+
+impl PrivateControlApplicationResolution {
+    fn invocation(&self) -> InvocationId {
+        match self {
+            Self::Applied(acknowledgement) => acknowledgement.application_invocation,
+            Self::RetiredUnapplied(acknowledgement) => acknowledgement.application_invocation,
+        }
+    }
+
+    fn resolved_at(&self) -> u64 {
+        match self {
+            Self::Applied(acknowledgement) => acknowledgement.application.applied_at,
+            Self::RetiredUnapplied(acknowledgement) => acknowledgement.resolved_at,
+        }
+    }
+
+    fn commitment(&self) -> Hash {
+        match self {
+            Self::Applied(acknowledgement) => acknowledgement.commitment(),
+            Self::RetiredUnapplied(acknowledgement) => acknowledgement.commitment(),
+        }
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, crate::agent::sdk::wire::WireError> {
+        match self {
+            Self::Applied(acknowledgement) => acknowledgement.encode(),
+            Self::RetiredUnapplied(acknowledgement) => acknowledgement.encode(),
+        }
+    }
+
+    fn matches_invocation_context(&self, context: &InvocationContext) -> bool {
+        match self {
+            Self::Applied(acknowledgement) => acknowledgement.matches_invocation_context(context),
+            Self::RetiredUnapplied(acknowledgement) => {
+                acknowledgement.matches_invocation_context(context)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn verify_with<V: AuthorityVerifier>(
+        &self,
+        authority: AgentAuthorityBinding,
+        verifier: &V,
+    ) -> Result<(), crate::agent::sdk::authority_operation::AuthorityOperationProtocolError> {
+        match self {
+            Self::Applied(acknowledgement) => acknowledgement.verify_with(authority, verifier),
+            Self::RetiredUnapplied(acknowledgement) => {
+                acknowledgement.verify_with(authority, verifier)
+            }
+        }
+    }
 }
 
 /// Exact post-completion evidence attachment request. This request is emitted
 /// only after the coordinator has durably recorded authority consumption of
-/// PCA1; it never asks the runtime to regenerate or re-sign either proof.
+/// PCA2; it never asks the runtime to regenerate or re-sign either proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PrivateControlRuntimeEvidenceRequest {
     pub(crate) route: ManagedAgentTarget,
@@ -112,7 +208,7 @@ pub(crate) struct PrivateControlRuntimeEvidenceResult {
 /// that transition, and reopening the resulting state. Echo fields are an
 /// integration guard; they do not turn a dishonest adapter into a capability.
 /// `persist_completed_evidence` is called only with coordinator-retained AOI1
-/// and PCA1 bytes after durable authority consumption and must atomically
+/// and PCA2 bytes after durable authority consumption and must atomically
 /// attach, reopen, and echo that exact envelope.
 pub(crate) trait PrivateControlRuntimeApplicationAdapter {
     type Error;
@@ -120,7 +216,7 @@ pub(crate) trait PrivateControlRuntimeApplicationAdapter {
     fn apply(
         &mut self,
         request: &PrivateControlRuntimeApplicationRequest,
-    ) -> Result<PrivateControlRuntimeApplicationResult, Self::Error>;
+    ) -> Result<PrivateControlRuntimeApplicationResolution, Self::Error>;
 
     fn persist_completed_evidence(
         &mut self,
@@ -131,7 +227,7 @@ pub(crate) trait PrivateControlRuntimeApplicationAdapter {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum PrivateApplicationAuthorityMethod {
-    AcknowledgePrivateApplication = 0,
+    ResolvePrivateApplication = 0,
     /// Cannot be emitted by the coordinator; retained to let adapters report
     /// an accidentally substituted method as data which is then rejected.
     Unexpected = 1,
@@ -140,7 +236,7 @@ pub(crate) enum PrivateApplicationAuthorityMethod {
 impl PrivateApplicationAuthorityMethod {
     pub(crate) const fn name(self) -> &'static str {
         match self {
-            Self::AcknowledgePrivateApplication => "acknowledge_private_application",
+            Self::ResolvePrivateApplication => "resolve_private_application",
             Self::Unexpected => "unexpected_private_application_method",
         }
     }
@@ -166,7 +262,7 @@ pub(crate) struct PrivateApplicationAuthorityResult {
     pub(crate) reply: Vec<u8>,
 }
 
-/// Trusted exact-route dispatcher for the system-authority PCA1 method.
+/// Trusted exact-route dispatcher for the system-authority PCA2/PAR1 method.
 pub(crate) trait PrivateApplicationAuthorityDispatcher {
     type Error;
 
@@ -268,19 +364,47 @@ where
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum ApplicationRecordResolution {
+    Pending,
+    Applied {
+        application_ack: Hash,
+        actor_consumed: bool,
+        persisted_authority_evidence: Option<Hash>,
+    },
+    RetiredUnapplied {
+        retirement_ack: Hash,
+        actor_consumed: bool,
+    },
+}
+
+impl ApplicationRecordResolution {
+    const fn is_fully_terminal(&self) -> bool {
+        match self {
+            Self::Pending => false,
+            Self::Applied {
+                actor_consumed,
+                persisted_authority_evidence,
+                ..
+            } => *actor_consumed && persisted_authority_evidence.is_some(),
+            Self::RetiredUnapplied { actor_consumed, .. } => *actor_consumed,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ApplicationRecord {
     authorization_invocation: InvocationId,
     application_invocation: InvocationId,
     control: Vec<u8>,
-    applied_at: u64,
-    consumed_application_ack: Option<Hash>,
-    persisted_authority_evidence: Option<Hash>,
+    mutation: Option<Vec<u8>>,
+    resolved_at: u64,
+    resolution: ApplicationRecordResolution,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PrivateControlApplicationCoordinatorImage {
     authority: AuthorityActorTarget,
-    application_slot_high_water: Option<u64>,
+    resolution_slot_high_water: Option<u64>,
     records: Vec<ApplicationRecord>,
 }
 
@@ -288,7 +412,7 @@ impl PrivateControlApplicationCoordinatorImage {
     fn empty(authority: AuthorityActorTarget) -> Self {
         Self {
             authority,
-            application_slot_high_water: None,
+            resolution_slot_high_water: None,
             records: Vec::new(),
         }
     }
@@ -296,24 +420,36 @@ impl PrivateControlApplicationCoordinatorImage {
     fn has_valid_envelope(&self) -> bool {
         self.authority.is_valid()
             && self.records.len() <= MAX_PRIVATE_CONTROL_APPLICATION_COORDINATOR_RECORDS
-            && (self.records.is_empty() == self.application_slot_high_water.is_none())
-            && self.records.last().map(|record| record.applied_at)
-                == self.application_slot_high_water
+            && (self.records.is_empty() == self.resolution_slot_high_water.is_none())
+            && self.records.last().map(|record| record.resolved_at)
+                == self.resolution_slot_high_water
             && self.records.iter().all(|record| {
                 record.control.len() <= MAX_PRIVATE_CONTROL_WIRE_BYTES
+                    && record.mutation.as_ref().is_none_or(|mutation| {
+                        mutation.len() <= MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES
+                    })
                     && record.authorization_invocation != InvocationId::ZERO
                     && record.application_invocation != InvocationId::ZERO
                     && record.authorization_invocation != record.application_invocation
-                    && record.consumed_application_ack != Some(Hash::ZERO)
-                    && record.persisted_authority_evidence != Some(Hash::ZERO)
+                    && match &record.resolution {
+                        ApplicationRecordResolution::Pending => true,
+                        ApplicationRecordResolution::Applied {
+                            application_ack,
+                            actor_consumed,
+                            persisted_authority_evidence,
+                        } => {
+                            *application_ack != Hash::ZERO
+                                && persisted_authority_evidence != &Some(Hash::ZERO)
+                                && (persisted_authority_evidence.is_none() || *actor_consumed)
+                        }
+                        ApplicationRecordResolution::RetiredUnapplied {
+                            retirement_ack, ..
+                        } => *retirement_ack != Hash::ZERO,
+                    }
             })
             && self.records.iter().enumerate().all(|(index, record)| {
                 let is_last = index + 1 == self.records.len();
-                (record.persisted_authority_evidence.is_none()
-                    || record.consumed_application_ack.is_some())
-                    && (is_last
-                        || (record.consumed_application_ack.is_some()
-                            && record.persisted_authority_evidence.is_some()))
+                is_last || record.resolution.is_fully_terminal()
             })
     }
 
@@ -329,14 +465,15 @@ impl PrivateControlApplicationCoordinatorImage {
             };
             if control.encode().ok().as_deref() != Some(record.control.as_slice())
                 || !verify_private_control_signature(&control)
+                || !private_mutation_matches_control(&control, record.mutation.as_deref())
                 || control.space != self.authority.space
-                || prior_slot.is_some_and(|prior| prior > record.applied_at)
+                || prior_slot.is_some_and(|prior| prior > record.resolved_at)
                 || !push_unique(&mut invocations, record.authorization_invocation)
                 || !push_unique(&mut invocations, record.application_invocation)
             {
                 return false;
             }
-            prior_slot = Some(record.applied_at);
+            prior_slot = Some(record.resolved_at);
         }
         true
     }
@@ -347,21 +484,40 @@ impl PrivateControlApplicationCoordinatorImage {
         let mut encoder = Encoder(&mut bytes);
         encoder.fixed(crate::agent::sdk::RUNTIME_ABI_ID.as_bytes());
         encode_authority_target(&mut encoder, self.authority);
-        encoder.option(&self.application_slot_high_water, |encoder, slot| {
+        encoder.option(&self.resolution_slot_high_water, |encoder, slot| {
             encoder.u64(*slot)
         });
         encoder.list(&self.records, |encoder, record| {
             encoder.fixed(record.authorization_invocation.as_bytes());
             encoder.fixed(record.application_invocation.as_bytes());
             encoder.bytes(&record.control);
-            encoder.u64(record.applied_at);
-            encoder.option(
-                &record.consumed_application_ack,
-                |encoder, acknowledgement| encoder.fixed(acknowledgement.as_bytes()),
-            );
-            encoder.option(&record.persisted_authority_evidence, |encoder, evidence| {
-                encoder.fixed(evidence.as_bytes())
+            encoder.option(&record.mutation, |encoder, mutation| {
+                encoder.bytes(mutation)
             });
+            encoder.u64(record.resolved_at);
+            match &record.resolution {
+                ApplicationRecordResolution::Pending => encoder.u8(0),
+                ApplicationRecordResolution::Applied {
+                    application_ack,
+                    actor_consumed,
+                    persisted_authority_evidence,
+                } => {
+                    encoder.u8(1);
+                    encoder.fixed(application_ack.as_bytes());
+                    encoder.u8(u8::from(*actor_consumed));
+                    encoder.option(persisted_authority_evidence, |encoder, evidence| {
+                        encoder.fixed(evidence.as_bytes())
+                    });
+                }
+                ApplicationRecordResolution::RetiredUnapplied {
+                    retirement_ack,
+                    actor_consumed,
+                } => {
+                    encoder.u8(2);
+                    encoder.fixed(retirement_ack.as_bytes());
+                    encoder.u8(u8::from(*actor_consumed));
+                }
+            }
         });
         bytes
     }
@@ -380,7 +536,7 @@ impl PrivateControlApplicationCoordinatorImage {
             return Err(DecodeError::InvalidPlatform);
         }
         let authority = decode_authority_target(&mut decoder)?;
-        let application_slot_high_water = decoder.option(Decoder::u64)?;
+        let resolution_slot_high_water = decoder.option(Decoder::u64)?;
         let count = decoder.u32()? as usize;
         if count > MAX_PRIVATE_CONTROL_APPLICATION_COORDINATOR_RECORDS {
             return Err(DecodeError::LimitExceeded);
@@ -390,19 +546,38 @@ impl PrivateControlApplicationCoordinatorImage {
             .try_reserve(count)
             .map_err(|_| DecodeError::LimitExceeded)?;
         for _ in 0..count {
+            let authorization_invocation = InvocationId(decoder.fixed()?);
+            let application_invocation = InvocationId(decoder.fixed()?);
+            let control = decoder.bytes_bounded(MAX_PRIVATE_CONTROL_WIRE_BYTES)?;
+            let mutation = decoder
+                .option(|decoder| decoder.bytes_bounded(MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES))?;
+            let resolved_at = decoder.u64()?;
+            let resolution = match decoder.u8()? {
+                0 => ApplicationRecordResolution::Pending,
+                1 => ApplicationRecordResolution::Applied {
+                    application_ack: Hash(decoder.fixed()?),
+                    actor_consumed: decode_bool(&mut decoder)?,
+                    persisted_authority_evidence: decoder
+                        .option(|decoder| Ok(Hash(decoder.fixed()?)))?,
+                },
+                2 => ApplicationRecordResolution::RetiredUnapplied {
+                    retirement_ack: Hash(decoder.fixed()?),
+                    actor_consumed: decode_bool(&mut decoder)?,
+                },
+                _ => return Err(DecodeError::InvalidTag),
+            };
             records.push(ApplicationRecord {
-                authorization_invocation: InvocationId(decoder.fixed()?),
-                application_invocation: InvocationId(decoder.fixed()?),
-                control: decoder.bytes_bounded(MAX_PRIVATE_CONTROL_WIRE_BYTES)?,
-                applied_at: decoder.u64()?,
-                consumed_application_ack: decoder.option(|decoder| Ok(Hash(decoder.fixed()?)))?,
-                persisted_authority_evidence: decoder
-                    .option(|decoder| Ok(Hash(decoder.fixed()?)))?,
+                authorization_invocation,
+                application_invocation,
+                control,
+                mutation,
+                resolved_at,
+                resolution,
             });
         }
         let image = Self {
             authority,
-            application_slot_high_water,
+            resolution_slot_high_water,
             records,
         };
         if !decoder.exhausted() || !image.is_valid() || image.encode() != bytes {
@@ -482,17 +657,18 @@ where
     }
 
     pub(crate) fn has_pending_application(&self) -> bool {
-        self.image.records.iter().any(|record| {
-            record.consumed_application_ack.is_none()
-                || record.persisted_authority_evidence.is_none()
-        })
+        self.image
+            .records
+            .iter()
+            .any(|record| !record.resolution.is_fully_terminal())
     }
 
     pub(crate) fn into_parts(self) -> (C, R, A, DurableAuthorityOperationIssuer<I>) {
         (self.store, self.runtime, self.dispatcher, self.issuer)
     }
 
-    /// Apply one exact PCTL and complete its PCA1 acknowledgement pipeline.
+    /// Resolve one exact PCTL to either its PCA2 applied or PAR1
+    /// retired-unapplied acknowledgement pipeline.
     ///
     /// Raw wire and trusted adapter assertions stay crate-private: neither is
     /// an independently authenticated signing capability.
@@ -500,10 +676,11 @@ where
         &mut self,
         authorization_invocation: InvocationId,
         control_wire: &[u8],
+        mutation_wire: Option<&[u8]>,
         applied_at: u64,
         signer: &mut S,
     ) -> Result<
-        PrivateControlApplicationAck,
+        PrivateControlApplicationResolution,
         PrivateControlApplicationCoordinatorError<C::Error, I::Error, R::Error, A::Error, S::Error>,
     > {
         self.ensure_live()?;
@@ -523,6 +700,11 @@ where
         if !verify_private_control_signature(&control) {
             return Err(Self::rejected(
                 PrivateControlApplicationCoordinatorRejection::InvalidControlSignature,
+            ));
+        }
+        if !private_mutation_matches_control(&control, mutation_wire) {
+            return Err(Self::rejected(
+                PrivateControlApplicationCoordinatorRejection::InvalidControl,
             ));
         }
         let retained = self
@@ -571,7 +753,8 @@ where
             let record = &self.image.records[index];
             if record.application_invocation != application_invocation
                 || record.control != control_wire
-                || record.applied_at != applied_at
+                || record.mutation.as_deref() != mutation_wire
+                || record.resolved_at != applied_at
             {
                 return Err(Self::rejected(
                     PrivateControlApplicationCoordinatorRejection::DivergentRetry,
@@ -591,7 +774,7 @@ where
             }
             if self
                 .image
-                .application_slot_high_water
+                .resolution_slot_high_water
                 .is_some_and(|slot| applied_at < slot)
             {
                 return Err(Self::rejected(
@@ -613,113 +796,210 @@ where
                 ));
             }
             let mut pledged = self.image.clone();
-            pledged.application_slot_high_water = Some(applied_at);
+            pledged.resolution_slot_high_water = Some(applied_at);
             pledged.records.push(ApplicationRecord {
                 authorization_invocation,
                 application_invocation,
                 control: control_wire.to_vec(),
-                applied_at,
-                consumed_application_ack: None,
-                persisted_authority_evidence: None,
+                mutation: mutation_wire.map(<[u8]>::to_vec),
+                resolved_at: applied_at,
+                resolution: ApplicationRecordResolution::Pending,
             });
             self.commit_candidate::<S::Error>(pledged)?;
             self.image.records.len() - 1
         };
 
-        if retained.is_retired_unapplied() {
-            return Err(PrivateControlApplicationCoordinatorError::InvalidState);
-        }
-        if retained.application().is_none()
-            && signer.public_key() != self.authority.binding.public_key
-        {
-            return Err(Self::rejected(
-                PrivateControlApplicationCoordinatorRejection::WrongSigner,
-            ));
-        }
-
-        let application = match retained.application() {
-            Some(application) => {
+        let runtime_resolution = match &retained.private_resolution {
+            Some(super::authority_operation_issuer::RetainedPrivateResolution::Applied {
+                application,
+                ..
+            }) => {
                 if application.applied_at != applied_at
-                    || !private_intent_matches_application(&retained.call.intent, application)
                     || application.control != control.commitment()
+                    || !private_intent_matches_application(&retained.call.intent, application)
                 {
                     return Err(PrivateControlApplicationCoordinatorError::InvalidState);
                 }
-                *application
+                Some(*application)
             }
-            None => {
-                self.apply_runtime_exact::<S::Error>(&control, control_wire, applied_at, &retained)?
+            Some(
+                super::authority_operation_issuer::RetainedPrivateResolution::RetiredUnapplied {
+                    resolved_at,
+                    ..
+                },
+            ) => {
+                if *resolved_at != applied_at {
+                    return Err(PrivateControlApplicationCoordinatorError::InvalidState);
+                }
+                None
             }
+            Some(super::authority_operation_issuer::RetainedPrivateResolution::Pending) => {
+                if signer.public_key() != self.authority.binding.public_key {
+                    return Err(Self::rejected(
+                        PrivateControlApplicationCoordinatorRejection::WrongSigner,
+                    ));
+                }
+                self.apply_runtime_exact::<S::Error>(
+                    &control,
+                    control_wire,
+                    mutation_wire,
+                    applied_at,
+                    &retained,
+                )?
+            }
+            None => return Err(PrivateControlApplicationCoordinatorError::InvalidState),
         };
-        let issued = self
-            .issuer
-            .issue_private_application(authorization_invocation, &application, signer)
-            .map_err(PrivateControlApplicationCoordinatorError::Issuer)?;
-        let acknowledgement = issued.application_ack;
-        if acknowledgement.application_invocation != application_invocation
-            || !acknowledgement.matches_pending(
-                &retained.call,
-                &retained.approval,
-                issuance,
-                &application,
-            )
-            || acknowledgement
-                .verify_pending_with(
+
+        let terminal = if let Some(application) = runtime_resolution {
+            let issued = self
+                .issuer
+                .issue_private_application(authorization_invocation, &application, signer)
+                .map_err(PrivateControlApplicationCoordinatorError::Issuer)?;
+            let acknowledgement = issued.application_ack;
+            if acknowledgement.application_invocation != application_invocation
+                || !acknowledgement.matches_pending(
                     &retained.call,
                     &retained.approval,
                     issuance,
                     &application,
-                    self.authority.binding,
-                    &RawEd25519Verifier,
                 )
-                .is_err()
-        {
-            return Err(PrivateControlApplicationCoordinatorError::InvalidState);
-        }
-        if let Some(consumed) = self.image.records[record_index].consumed_application_ack {
-            if consumed != acknowledgement.commitment() {
+                || acknowledgement
+                    .verify_pending_with(
+                        &retained.call,
+                        &retained.approval,
+                        issuance,
+                        &application,
+                        self.authority.binding,
+                        &RawEd25519Verifier,
+                    )
+                    .is_err()
+            {
                 return Err(PrivateControlApplicationCoordinatorError::InvalidState);
             }
-            self.persist_runtime_evidence_exact::<S::Error>(
-                record_index,
-                &retained,
-                &acknowledgement,
-            )?;
-            return Ok(acknowledgement);
-        }
-
-        let context = application_context(&acknowledgement);
-        if !acknowledgement.matches_invocation_context(&context) {
+            PrivateControlApplicationResolution::Applied(acknowledgement)
+        } else {
+            let issued = self
+                .issuer
+                .retire_private_application(authorization_invocation, applied_at, signer)
+                .map_err(PrivateControlApplicationCoordinatorError::Issuer)?;
+            let acknowledgement = issued.retirement_ack;
+            if acknowledgement.application_invocation != application_invocation
+                || acknowledgement.resolved_at != applied_at
+                || !acknowledgement.matches_pending(&retained.call, &retained.approval, issuance)
+                || acknowledgement
+                    .verify_pending_with(
+                        &retained.call,
+                        &retained.approval,
+                        issuance,
+                        self.authority.binding,
+                        &RawEd25519Verifier,
+                    )
+                    .is_err()
+            {
+                return Err(PrivateControlApplicationCoordinatorError::InvalidState);
+            }
+            PrivateControlApplicationResolution::RetiredUnapplied(acknowledgement)
+        };
+        if terminal.invocation() != application_invocation || terminal.resolved_at() != applied_at {
             return Err(PrivateControlApplicationCoordinatorError::InvalidState);
         }
-        let acknowledgement_bytes = acknowledgement
-            .encode()
-            .map_err(|_| PrivateControlApplicationCoordinatorError::InvalidState)?;
-        let request = PrivateApplicationAuthorityDispatch {
-            target: self.authority,
-            method: PrivateApplicationAuthorityMethod::AcknowledgePrivateApplication,
-            context,
-            request: acknowledgement_bytes,
-        };
-        match self.dispatch_authority_exact::<S::Error>(&request)? {
-            crate::value::Value::Bool(true) => {}
-            crate::value::Value::Bool(false) => {
-                return Err(Self::rejected(
-                    PrivateControlApplicationCoordinatorRejection::AcknowledgementRejected,
-                ));
+
+        let terminal_commitment = terminal.commitment();
+        match (&self.image.records[record_index].resolution, &terminal) {
+            (ApplicationRecordResolution::Pending, terminal) => {
+                let mut selected = self.image.clone();
+                selected.records[record_index].resolution = match terminal {
+                    PrivateControlApplicationResolution::Applied(_) => {
+                        ApplicationRecordResolution::Applied {
+                            application_ack: terminal_commitment,
+                            actor_consumed: false,
+                            persisted_authority_evidence: None,
+                        }
+                    }
+                    PrivateControlApplicationResolution::RetiredUnapplied(_) => {
+                        ApplicationRecordResolution::RetiredUnapplied {
+                            retirement_ack: terminal_commitment,
+                            actor_consumed: false,
+                        }
+                    }
+                };
+                self.commit_candidate::<S::Error>(selected)?;
             }
-            _ => {
-                return Err(Self::rejected(
-                    PrivateControlApplicationCoordinatorRejection::InvalidAuthorityResult,
-                ));
-            }
+            (
+                ApplicationRecordResolution::Applied {
+                    application_ack, ..
+                },
+                PrivateControlApplicationResolution::Applied(_),
+            ) if *application_ack == terminal_commitment => {}
+            (
+                ApplicationRecordResolution::RetiredUnapplied { retirement_ack, .. },
+                PrivateControlApplicationResolution::RetiredUnapplied(_),
+            ) if *retirement_ack == terminal_commitment => {}
+            _ => return Err(PrivateControlApplicationCoordinatorError::InvalidState),
         }
-        let mut completed = self.image.clone();
-        completed.records[record_index].consumed_application_ack =
-            Some(acknowledgement.commitment());
-        self.commit_candidate::<S::Error>(completed)?;
-        self.persist_runtime_evidence_exact::<S::Error>(record_index, &retained, &acknowledgement)?;
-        Ok(acknowledgement)
+
+        let actor_consumed = match &self.image.records[record_index].resolution {
+            ApplicationRecordResolution::Applied { actor_consumed, .. }
+            | ApplicationRecordResolution::RetiredUnapplied { actor_consumed, .. } => {
+                *actor_consumed
+            }
+            ApplicationRecordResolution::Pending => {
+                return Err(PrivateControlApplicationCoordinatorError::InvalidState);
+            }
+        };
+        if !actor_consumed {
+            let context = resolution_context(&terminal);
+            if !terminal.matches_invocation_context(&context) {
+                return Err(PrivateControlApplicationCoordinatorError::InvalidState);
+            }
+            let acknowledgement_bytes = terminal
+                .encode()
+                .map_err(|_| PrivateControlApplicationCoordinatorError::InvalidState)?;
+            let request = PrivateApplicationAuthorityDispatch {
+                target: self.authority,
+                method: PrivateApplicationAuthorityMethod::ResolvePrivateApplication,
+                context,
+                request: acknowledgement_bytes,
+            };
+            match self.dispatch_authority_exact::<S::Error>(&request)? {
+                crate::value::Value::Bool(true) => {}
+                crate::value::Value::Bool(false) => {
+                    return Err(Self::rejected(
+                        PrivateControlApplicationCoordinatorRejection::AcknowledgementRejected,
+                    ));
+                }
+                _ => {
+                    return Err(Self::rejected(
+                        PrivateControlApplicationCoordinatorRejection::InvalidAuthorityResult,
+                    ));
+                }
+            }
+            let mut completed = self.image.clone();
+            match &mut completed.records[record_index].resolution {
+                ApplicationRecordResolution::Applied { actor_consumed, .. }
+                | ApplicationRecordResolution::RetiredUnapplied { actor_consumed, .. } => {
+                    *actor_consumed = true;
+                }
+                ApplicationRecordResolution::Pending => {
+                    return Err(PrivateControlApplicationCoordinatorError::InvalidState);
+                }
+            }
+            self.commit_candidate::<S::Error>(completed)?;
+        }
+
+        if let PrivateControlApplicationResolution::Applied(acknowledgement) = &terminal {
+            let refreshed = self
+                .issuer
+                .recover_retained(authorization_invocation)
+                .map_err(|_| PrivateControlApplicationCoordinatorError::InvalidState)?
+                .ok_or(PrivateControlApplicationCoordinatorError::InvalidState)?;
+            self.persist_runtime_evidence_exact::<S::Error>(
+                record_index,
+                &refreshed,
+                acknowledgement,
+            )?;
+        }
+        Ok(terminal)
     }
 
     fn persist_runtime_evidence_exact<SignerError>(
@@ -782,7 +1062,15 @@ where
         if expected == Hash::ZERO {
             return Err(PrivateControlApplicationCoordinatorError::InvalidState);
         }
-        if let Some(commitment) = self.image.records[record_index].persisted_authority_evidence {
+        let persisted = match &self.image.records[record_index].resolution {
+            ApplicationRecordResolution::Applied {
+                application_ack,
+                actor_consumed: true,
+                persisted_authority_evidence,
+            } if *application_ack == acknowledgement.commitment() => *persisted_authority_evidence,
+            _ => return Err(PrivateControlApplicationCoordinatorError::InvalidState),
+        };
+        if let Some(commitment) = persisted {
             return if commitment == expected {
                 Ok(())
             } else {
@@ -808,12 +1096,16 @@ where
                 PrivateControlApplicationCoordinatorRejection::InvalidEvidenceResult,
             ));
         }
-        if self.image.records[record_index]
-            .persisted_authority_evidence
-            .is_none()
-        {
+        if persisted.is_none() {
             let mut completed = self.image.clone();
-            completed.records[record_index].persisted_authority_evidence = Some(expected);
+            let ApplicationRecordResolution::Applied {
+                persisted_authority_evidence,
+                ..
+            } = &mut completed.records[record_index].resolution
+            else {
+                return Err(PrivateControlApplicationCoordinatorError::InvalidState);
+            };
+            *persisted_authority_evidence = Some(expected);
             self.commit_candidate::<SignerError>(completed)?;
         }
         Ok(())
@@ -823,10 +1115,11 @@ where
         &mut self,
         control: &PrivateControlRecord,
         control_wire: &[u8],
+        mutation_wire: Option<&[u8]>,
         applied_at: u64,
         retained: &super::authority_operation_issuer::RetainedAuthorityOperation,
     ) -> Result<
-        PrivateControlApplicationFact,
+        Option<PrivateControlApplicationFact>,
         PrivateControlApplicationCoordinatorError<
             C::Error,
             I::Error,
@@ -850,6 +1143,7 @@ where
             route: retained.call.intent.managed(),
             authority: self.authority,
             control: control_wire.to_vec(),
+            mutation: mutation_wire.map(<[u8]>::to_vec),
             receipt,
             issuance_ack,
             applied_at,
@@ -858,35 +1152,65 @@ where
             .runtime
             .apply(&request)
             .map_err(PrivateControlApplicationCoordinatorError::Runtime)?;
-        if result.route != request.route
-            || result.authority != request.authority
-            || result.control != request.control
-            || result.receipt != request.receipt
-            || result.issuance_ack != request.issuance_ack
-            || result.applied_at != request.applied_at
-            || !result.authenticated
-            || !result.durably_applied
-            || !result.durably_reopened
-            || result.application_fact.len() > MAX_PRIVATE_CONTROL_APPLICATION_FACT_WIRE_BYTES
-        {
-            return Err(Self::rejected(
-                PrivateControlApplicationCoordinatorRejection::InvalidRuntimeResult,
-            ));
+        match result {
+            PrivateControlRuntimeApplicationResolution::Applied(result) => {
+                if result.route != request.route
+                    || result.authority != request.authority
+                    || result.control != request.control
+                    || result.mutation != request.mutation
+                    || result.receipt != request.receipt
+                    || result.issuance_ack != request.issuance_ack
+                    || result.applied_at != request.applied_at
+                    || !result.authenticated
+                    || !result.durably_applied
+                    || !result.durably_reopened
+                    || result.reopened_runtime_state == Hash::ZERO
+                    || result.stable_projection == Hash::ZERO
+                    || result.application_fact.len()
+                        > MAX_PRIVATE_CONTROL_APPLICATION_FACT_WIRE_BYTES
+                {
+                    return Err(Self::rejected(
+                        PrivateControlApplicationCoordinatorRejection::InvalidRuntimeResult,
+                    ));
+                }
+                let application = decode_private_application_fact(&result.application_fact)
+                    .map_err(|_| {
+                        Self::rejected(
+                            PrivateControlApplicationCoordinatorRejection::InvalidRuntimeResult,
+                        )
+                    })?;
+                if encode_private_application_fact(&application) != result.application_fact
+                    || application.applied_at != applied_at
+                    || application.control != control.commitment()
+                    || application.reopened_runtime_state != result.reopened_runtime_state
+                    || application.stable_projection != result.stable_projection
+                    || !private_intent_matches_application(&retained.call.intent, &application)
+                {
+                    return Err(Self::rejected(
+                        PrivateControlApplicationCoordinatorRejection::ApplicationRejected,
+                    ));
+                }
+                Ok(Some(application))
+            }
+            PrivateControlRuntimeApplicationResolution::RetiredUnapplied(result) => {
+                if result.route != request.route
+                    || result.authority != request.authority
+                    || result.control != request.control
+                    || result.mutation != request.mutation
+                    || result.receipt != request.receipt
+                    || result.issuance_ack != request.issuance_ack
+                    || result.resolved_at != request.applied_at
+                    || !result.authenticated
+                    || !result.predecessor_unchanged
+                    || !result.durably_reopened
+                {
+                    return Err(Self::rejected(
+                        PrivateControlApplicationCoordinatorRejection::InvalidRuntimeResult,
+                    ));
+                }
+                Ok(None)
+            }
         }
-        let application =
-            decode_private_application_fact(&result.application_fact).map_err(|_| {
-                Self::rejected(PrivateControlApplicationCoordinatorRejection::InvalidRuntimeResult)
-            })?;
-        if encode_private_application_fact(&application) != result.application_fact
-            || application.applied_at != applied_at
-            || application.control != control.commitment()
-            || !private_intent_matches_application(&retained.call.intent, &application)
-        {
-            return Err(Self::rejected(
-                PrivateControlApplicationCoordinatorRejection::ApplicationRejected,
-            ));
-        }
-        Ok(application)
     }
 
     fn dispatch_authority_exact<SignerError>(
@@ -1002,6 +1326,7 @@ fn coordinator_matches_issuer<I: AuthorityOperationIssuerStore>(
     issuer: &DurableAuthorityOperationIssuer<I>,
 ) -> bool {
     let mut issuer_applications = 0usize;
+    let mut issuer_retirements = 0usize;
     let verifier = RawEd25519Verifier;
     for record in &image.records {
         let Ok(Some(retained)) = issuer.recover_retained(record.authorization_invocation) else {
@@ -1017,62 +1342,164 @@ fn coordinator_matches_issuer<I: AuthorityOperationIssuerStore>(
             || retained.call.authority != image.authority
             || record.application_invocation
                 != PrivateControlApplicationAck::derive_application_invocation(issuance)
-            || record.applied_at < issuance.issued_at
-            || !issuance.receipt.selector.is_live_at(record.applied_at)
+            || record.resolved_at < issuance.issued_at
+            || !issuance.receipt.selector.is_live_at(record.resolved_at)
             || issuance
                 .verify_with(image.authority.binding, &verifier)
                 .is_err()
         {
             return false;
         }
-        if let Some(application) = retained.application() {
-            issuer_applications += 1;
-            if application.applied_at != record.applied_at
-                || application.control != control.commitment()
-                || !private_intent_matches_application(&retained.call.intent, application)
-            {
-                return false;
+        match (&record.resolution, &retained.private_resolution) {
+            (
+                ApplicationRecordResolution::Pending,
+                Some(super::authority_operation_issuer::RetainedPrivateResolution::Pending),
+            ) => {}
+            (
+                ApplicationRecordResolution::Pending,
+                Some(super::authority_operation_issuer::RetainedPrivateResolution::Applied {
+                    application,
+                    ..
+                }),
+            ) => {
+                issuer_applications += 1;
+                if !application_matches_record(&retained.call.intent, &control, record, application)
+                {
+                    return false;
+                }
             }
-        }
-        if let Some(consumed) = record.consumed_application_ack {
-            if retained
-                .application_ack()
-                .is_none_or(|acknowledgement| acknowledgement.commitment() != consumed)
-            {
-                return false;
+            (
+                ApplicationRecordResolution::Pending,
+                Some(
+                    super::authority_operation_issuer::RetainedPrivateResolution::RetiredUnapplied {
+                        resolved_at, ..
+                    },
+                ),
+            ) => {
+                issuer_retirements += 1;
+                if *resolved_at != record.resolved_at {
+                    return false;
+                }
             }
-        }
-        if let Some(persisted) = record.persisted_authority_evidence {
-            let Some(acknowledgement) = retained.application_ack() else {
-                return false;
-            };
-            let recovery_proof = match &retained.call.intent {
-                AuthorityOperationIntent::RecoverPrivateAgent { proof } => Some(proof),
-                _ => None,
-            };
-            let Ok(evidence) = PrivateControlAuthorityEvidence::from_acknowledgements(
-                issuance,
-                acknowledgement,
-                recovery_proof,
-            ) else {
-                return false;
-            };
-            if evidence.commitment().ok() != Some(persisted) {
-                return false;
+            (
+                ApplicationRecordResolution::Applied {
+                    application_ack,
+                    persisted_authority_evidence,
+                    ..
+                },
+                Some(super::authority_operation_issuer::RetainedPrivateResolution::Applied {
+                    application,
+                    application_ack: Some(acknowledgement),
+                }),
+            ) => {
+                issuer_applications += 1;
+                if *application_ack != acknowledgement.commitment()
+                    || !application_matches_record(
+                        &retained.call.intent,
+                        &control,
+                        record,
+                        application,
+                    )
+                    || !acknowledgement.matches_pending(
+                        &retained.call,
+                        &retained.approval,
+                        issuance,
+                        application,
+                    )
+                    || acknowledgement
+                        .verify_pending_with(
+                            &retained.call,
+                            &retained.approval,
+                            issuance,
+                            application,
+                            image.authority.binding,
+                            &verifier,
+                        )
+                        .is_err()
+                {
+                    return false;
+                }
+                if let Some(persisted) = persisted_authority_evidence {
+                    let recovery_proof = match &retained.call.intent {
+                        AuthorityOperationIntent::RecoverPrivateAgent { proof } => Some(proof),
+                        _ => None,
+                    };
+                    let Ok(evidence) = PrivateControlAuthorityEvidence::from_acknowledgements(
+                        issuance,
+                        acknowledgement,
+                        recovery_proof,
+                    ) else {
+                        return false;
+                    };
+                    if evidence.commitment().ok() != Some(*persisted) {
+                        return false;
+                    }
+                }
             }
+            (
+                ApplicationRecordResolution::RetiredUnapplied { retirement_ack, .. },
+                Some(
+                    super::authority_operation_issuer::RetainedPrivateResolution::RetiredUnapplied {
+                        resolved_at,
+                        retirement_ack: Some(acknowledgement),
+                    },
+                ),
+            ) => {
+                issuer_retirements += 1;
+                if *resolved_at != record.resolved_at
+                    || *retirement_ack != acknowledgement.commitment()
+                    || acknowledgement.resolved_at != record.resolved_at
+                    || !acknowledgement.matches_pending(
+                        &retained.call,
+                        &retained.approval,
+                        issuance,
+                    )
+                    || acknowledgement
+                        .verify_pending_with(
+                            &retained.call,
+                            &retained.approval,
+                            issuance,
+                            image.authority.binding,
+                            &verifier,
+                        )
+                        .is_err()
+                {
+                    return false;
+                }
+            }
+            _ => return false,
         }
     }
     issuer_applications == issuer.retained_private_applications()
+        && issuer_retirements == issuer.retained_private_retirements()
 }
 
-fn application_context(acknowledgement: &PrivateControlApplicationAck) -> InvocationContext {
+fn application_matches_record(
+    intent: &AuthorityOperationIntent,
+    control: &PrivateControlRecord,
+    record: &ApplicationRecord,
+    application: &PrivateControlApplicationFact,
+) -> bool {
+    application.applied_at == record.resolved_at
+        && application.control == control.commitment()
+        && private_intent_matches_application(intent, application)
+}
+
+fn resolution_context(acknowledgement: &PrivateControlApplicationResolution) -> InvocationContext {
     InvocationContext {
-        invocation: acknowledgement.application_invocation,
-        actor: acknowledgement.authority.binding.issuer.actor,
+        invocation: acknowledgement.invocation(),
+        actor: match acknowledgement {
+            PrivateControlApplicationResolution::Applied(acknowledgement) => {
+                acknowledgement.authority.binding.issuer.actor
+            }
+            PrivateControlApplicationResolution::RetiredUnapplied(acknowledgement) => {
+                acknowledgement.authority.binding.issuer.actor
+            }
+        },
         mode: MethodMode::Linear,
         origin: InvocationOrigin::anonymous(),
         roles: InvocationRoleClaims::none(),
-        observed_slot: acknowledgement.application.applied_at,
+        observed_slot: acknowledgement.resolved_at(),
     }
 }
 
@@ -1085,12 +1512,51 @@ fn verify_private_control_signature(control: &PrivateControlRecord) -> bool {
         )
 }
 
+fn private_mutation_matches_control(
+    control: &PrivateControlRecord,
+    mutation_wire: Option<&[u8]>,
+) -> bool {
+    match &control.operation {
+        crate::agent::sdk::private::PrivateControlOperation::SetResourcePolicy { .. }
+        | crate::agent::sdk::private::PrivateControlOperation::ActorLifecycle { .. } => {
+            let Some(mutation_wire) = mutation_wire else {
+                return false;
+            };
+            if mutation_wire.len() > MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES {
+                return false;
+            }
+            let Ok(mutation) = PrivateRuntimeMutation::decode(mutation_wire) else {
+                return false;
+            };
+            let request = ManagementRequest::PrivateControl {
+                control: Box::new(control.clone()),
+                mutation: Box::new(mutation.clone()),
+            };
+            mutation.encode().ok().as_deref() == Some(mutation_wire) && request.is_valid()
+        }
+        crate::agent::sdk::private::PrivateControlOperation::Invite { .. }
+        | crate::agent::sdk::private::PrivateControlOperation::Revoke { .. }
+        | crate::agent::sdk::private::PrivateControlOperation::RotateKeys { .. }
+        | crate::agent::sdk::private::PrivateControlOperation::Recover { .. } => {
+            mutation_wire.is_none()
+        }
+    }
+}
+
 fn push_unique(invocations: &mut Vec<InvocationId>, invocation: InvocationId) -> bool {
     if invocation == InvocationId::ZERO || invocations.contains(&invocation) {
         return false;
     }
     invocations.push(invocation);
     true
+}
+
+fn decode_bool(decoder: &mut Decoder<'_>) -> Result<bool, DecodeError> {
+    match decoder.u8()? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(DecodeError::InvalidTag),
+    }
 }
 
 pub(crate) fn encode_private_application_fact(
@@ -1109,7 +1575,8 @@ pub(crate) fn encode_private_application_fact(
     });
     encoder.u64(application.epoch);
     encoder.fixed(application.post_member_set.as_bytes());
-    encoder.fixed(application.reopened_control_state.as_bytes());
+    encoder.fixed(application.reopened_runtime_state.as_bytes());
+    encoder.fixed(application.stable_projection.as_bytes());
     encoder.fixed(application.reopened_control_head.as_bytes());
     encoder.u64(application.applied_at);
     bytes
@@ -1182,7 +1649,8 @@ pub(crate) fn decode_private_application_fact(
         control_previous: decoder.option(|decoder| Ok(Hash(decoder.fixed()?)))?,
         epoch: decoder.u64()?,
         post_member_set: Hash(decoder.fixed()?),
-        reopened_control_state: Hash(decoder.fixed()?),
+        reopened_runtime_state: Hash(decoder.fixed()?),
+        stable_projection: Hash(decoder.fixed()?),
         reopened_control_head: Hash(decoder.fixed()?),
         applied_at: decoder.u64()?,
     };
@@ -1298,12 +1766,13 @@ mod tests {
     use crate::agent::sdk::authority_operation::{
         AuthorityOperationApproval, AuthorityOperationCall, AuthorityOperationIssuanceAck,
     };
+    use crate::agent::sdk::contract::RuntimeResourcePolicy;
     use crate::agent::sdk::private::{
         EncryptedObjectKind, EncryptedPrivateObject, PRIVATE_SIGNATURE_BYTES,
         PrivateControlOperation, PrivateControlSigner, PrivateKeyEpoch, PrivateNodeIdentity,
         PrivateRecoveryKeyringGrant, SealedPrivateKey, SealedRecoveryKey,
     };
-    use crate::agent::sdk::{CredentialId, NodeId};
+    use crate::agent::sdk::{BlobRef, CredentialId, NodeId};
 
     #[derive(Clone, Debug, Default)]
     struct MemoryImageStore {
@@ -1412,8 +1881,11 @@ mod tests {
         receipt_calls: usize,
         issuance_calls: usize,
         application_calls: usize,
+        retirement_calls: usize,
         fail_application: bool,
+        fail_retirement: bool,
         corrupt_application: bool,
+        corrupt_retirement: bool,
     }
 
     impl CountingSigner {
@@ -1423,8 +1895,11 @@ mod tests {
                 receipt_calls: 0,
                 issuance_calls: 0,
                 application_calls: 0,
+                retirement_calls: 0,
                 fail_application: false,
+                fail_retirement: false,
                 corrupt_application: false,
+                corrupt_retirement: false,
             }
         }
 
@@ -1478,7 +1953,16 @@ mod tests {
             &mut self,
             message: &[u8],
         ) -> Result<[u8; 64], Self::Error> {
-            Ok(self.key.sign(message).to_bytes())
+            self.retirement_calls += 1;
+            if self.fail_retirement {
+                self.fail_retirement = false;
+                return Err(TestError);
+            }
+            let mut signature = self.key.sign(message).to_bytes();
+            if self.corrupt_retirement {
+                signature[0] ^= 1;
+            }
+            Ok(signature)
         }
     }
 
@@ -1487,12 +1971,16 @@ mod tests {
         Route,
         Authority,
         Control,
+        Mutation,
         Receipt,
         Issuance,
         Slot,
         Unauthenticated,
         NotApplied,
+        ChangedPredecessor,
         NotReopened,
+        ReopenedRuntimeState,
+        StableProjection,
         MalformedFact,
         NonCanonicalFact,
         OversizeFact,
@@ -1526,10 +2014,13 @@ mod tests {
         evidence_calls: usize,
         retained_evidence: Vec<(PrivateControlRuntimeEvidenceRequest, Hash)>,
         retained: Vec<(PrivateControlRuntimeApplicationRequest, Vec<u8>)>,
+        retained_denials: Vec<PrivateControlRuntimeApplicationRequest>,
         mutation: Option<RuntimeMutation>,
         evidence_mutation: Option<EvidenceMutation>,
         lose_result_after_apply: bool,
         lose_result_after_evidence: bool,
+        deny_next: bool,
+        denial_detail: Vec<u8>,
     }
 
     impl FakeRuntime {
@@ -1539,6 +2030,20 @@ mod tests {
 
         fn transitions(&self) -> usize {
             self.inner.lock().unwrap().transitions
+        }
+
+        fn denials(&self) -> usize {
+            self.inner.lock().unwrap().retained_denials.len()
+        }
+
+        fn deny_next(&self) {
+            self.inner.lock().unwrap().deny_next = true;
+        }
+
+        fn deny_next_with_detail(&self, detail: &[u8]) {
+            let mut state = self.inner.lock().unwrap();
+            state.deny_next = true;
+            state.denial_detail = detail.to_vec();
         }
 
         fn mutate_once(&self, mutation: RuntimeMutation) {
@@ -1568,9 +2073,64 @@ mod tests {
         fn apply(
             &mut self,
             request: &PrivateControlRuntimeApplicationRequest,
-        ) -> Result<PrivateControlRuntimeApplicationResult, Self::Error> {
+        ) -> Result<PrivateControlRuntimeApplicationResolution, Self::Error> {
             let mut state = self.inner.lock().unwrap();
             state.calls += 1;
+            let denied = if state.retained_denials.contains(request) {
+                true
+            } else if state.deny_next {
+                state.deny_next = false;
+                state.retained_denials.push(request.clone());
+                true
+            } else {
+                false
+            };
+            if denied {
+                if state.lose_result_after_apply {
+                    state.lose_result_after_apply = false;
+                    return Err(TestError);
+                }
+                let mut result = PrivateControlRuntimeRetirementResult {
+                    route: request.route,
+                    authority: request.authority,
+                    control: request.control.clone(),
+                    mutation: request.mutation.clone(),
+                    receipt: request.receipt.clone(),
+                    issuance_ack: request.issuance_ack.clone(),
+                    resolved_at: request.applied_at,
+                    authenticated: true,
+                    predecessor_unchanged: true,
+                    durably_reopened: true,
+                };
+                match state.mutation.take() {
+                    None => {}
+                    Some(RuntimeMutation::Route) => result.route.agent = AgentId(id(0xd1, 1)),
+                    Some(RuntimeMutation::Authority) => {
+                        result.authority.system_agent = AgentId(id(0xd2, 1))
+                    }
+                    Some(RuntimeMutation::Control) => result.control.push(0),
+                    Some(RuntimeMutation::Mutation) => result.mutation = Some(vec![0]),
+                    Some(RuntimeMutation::Receipt) => result.receipt.push(0),
+                    Some(RuntimeMutation::Issuance) => result.issuance_ack.push(0),
+                    Some(RuntimeMutation::Slot) => result.resolved_at += 1,
+                    Some(RuntimeMutation::Unauthenticated) => result.authenticated = false,
+                    Some(RuntimeMutation::ChangedPredecessor | RuntimeMutation::NotApplied) => {
+                        result.predecessor_unchanged = false
+                    }
+                    Some(RuntimeMutation::NotReopened) => result.durably_reopened = false,
+                    Some(
+                        RuntimeMutation::MalformedFact
+                        | RuntimeMutation::NonCanonicalFact
+                        | RuntimeMutation::OversizeFact
+                        | RuntimeMutation::FactRoute
+                        | RuntimeMutation::FactControl
+                        | RuntimeMutation::FactSlot
+                        | RuntimeMutation::ReopenedRuntimeState
+                        | RuntimeMutation::StableProjection,
+                    ) => return Err(TestError),
+                }
+                return Ok(PrivateControlRuntimeApplicationResolution::RetiredUnapplied(result));
+            }
             let fact = if let Some((_, fact)) = state
                 .retained
                 .iter()
@@ -1590,16 +2150,20 @@ mod tests {
                 state.lose_result_after_apply = false;
                 return Err(TestError);
             }
+            let application = decode_private_application_fact(&fact).map_err(|_| TestError)?;
             let mut result = PrivateControlRuntimeApplicationResult {
                 route: request.route,
                 authority: request.authority,
                 control: request.control.clone(),
+                mutation: request.mutation.clone(),
                 receipt: request.receipt.clone(),
                 issuance_ack: request.issuance_ack.clone(),
                 applied_at: request.applied_at,
                 authenticated: true,
                 durably_applied: true,
                 durably_reopened: true,
+                reopened_runtime_state: application.reopened_runtime_state,
+                stable_projection: application.stable_projection,
                 application_fact: fact,
             };
             match state.mutation.take() {
@@ -1609,12 +2173,20 @@ mod tests {
                     result.authority.system_agent = AgentId(id(0xd2, 1))
                 }
                 Some(RuntimeMutation::Control) => result.control.push(0),
+                Some(RuntimeMutation::Mutation) => result.mutation = Some(vec![0]),
                 Some(RuntimeMutation::Receipt) => result.receipt.push(0),
                 Some(RuntimeMutation::Issuance) => result.issuance_ack.push(0),
                 Some(RuntimeMutation::Slot) => result.applied_at += 1,
                 Some(RuntimeMutation::Unauthenticated) => result.authenticated = false,
                 Some(RuntimeMutation::NotApplied) => result.durably_applied = false,
+                Some(RuntimeMutation::ChangedPredecessor) => result.durably_applied = false,
                 Some(RuntimeMutation::NotReopened) => result.durably_reopened = false,
+                Some(RuntimeMutation::ReopenedRuntimeState) => {
+                    result.reopened_runtime_state = Hash(id(0xd5, 1))
+                }
+                Some(RuntimeMutation::StableProjection) => {
+                    result.stable_projection = Hash(id(0xd6, 1))
+                }
                 Some(RuntimeMutation::MalformedFact) => result.application_fact = vec![1, 2, 3],
                 Some(RuntimeMutation::NonCanonicalFact) => result.application_fact.push(0),
                 Some(RuntimeMutation::OversizeFact) => {
@@ -1641,7 +2213,7 @@ mod tests {
                     result.application_fact = encode_private_application_fact(&fact);
                 }
             }
-            Ok(result)
+            Ok(PrivateControlRuntimeApplicationResolution::Applied(result))
         }
 
         fn persist_completed_evidence(
@@ -1718,6 +2290,7 @@ mod tests {
         Method,
         Context,
         Request,
+        AckType,
         Unauthenticated,
         NotDurable,
         False,
@@ -1797,26 +2370,47 @@ mod tests {
             let mut state = self.inner.lock().unwrap();
             state.calls += 1;
             let mut accepted = false;
-            if request.method == PrivateApplicationAuthorityMethod::AcknowledgePrivateApplication {
+            if request.method == PrivateApplicationAuthorityMethod::ResolvePrivateApplication {
                 if state.tombstones.contains(&request.request) {
                     accepted = true;
-                } else if let Ok(acknowledgement) =
-                    PrivateControlApplicationAck::decode(&request.request)
-                {
-                    if let Some(index) = state.pending.iter().position(|pending| {
-                        acknowledgement.authorization_invocation == pending.call.invocation
-                            && acknowledgement.matches_invocation_context(&request.context)
-                            && acknowledgement
-                                .verify_pending_with(
-                                    &pending.call,
-                                    &pending.approval,
-                                    &pending.issuance,
-                                    &acknowledgement.application,
-                                    request.target.binding,
-                                    &RawEd25519Verifier,
-                                )
-                                .is_ok()
-                    }) {
+                } else {
+                    let index = if let Ok(acknowledgement) =
+                        PrivateControlApplicationAck::decode(&request.request)
+                    {
+                        state.pending.iter().position(|pending| {
+                            acknowledgement.authorization_invocation == pending.call.invocation
+                                && acknowledgement.matches_invocation_context(&request.context)
+                                && acknowledgement
+                                    .verify_pending_with(
+                                        &pending.call,
+                                        &pending.approval,
+                                        &pending.issuance,
+                                        &acknowledgement.application,
+                                        request.target.binding,
+                                        &RawEd25519Verifier,
+                                    )
+                                    .is_ok()
+                        })
+                    } else if let Ok(acknowledgement) =
+                        PrivateControlApplicationRetirementAck::decode(&request.request)
+                    {
+                        state.pending.iter().position(|pending| {
+                            acknowledgement.authorization_invocation == pending.call.invocation
+                                && acknowledgement.matches_invocation_context(&request.context)
+                                && acknowledgement
+                                    .verify_pending_with(
+                                        &pending.call,
+                                        &pending.approval,
+                                        &pending.issuance,
+                                        request.target.binding,
+                                        &RawEd25519Verifier,
+                                    )
+                                    .is_ok()
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(index) = index {
                         state.pending.remove(index);
                         state.tombstones.push(request.request.clone());
                         accepted = true;
@@ -1844,6 +2438,13 @@ mod tests {
                 }
                 Some(ActorMutation::Context) => result.context.observed_slot += 1,
                 Some(ActorMutation::Request) => result.request.push(0),
+                Some(ActorMutation::AckType) => {
+                    if result.request.starts_with(b"PAR1") {
+                        result.request[..4].copy_from_slice(b"PCA1");
+                    } else {
+                        result.request[..4].copy_from_slice(b"PAR1");
+                    }
+                }
                 Some(ActorMutation::Unauthenticated) => result.authenticated = false,
                 Some(ActorMutation::NotDurable) => result.durable = false,
                 Some(ActorMutation::False) => {
@@ -1995,6 +2596,31 @@ mod tests {
             call,
             control,
         }
+    }
+
+    fn prepare_policy(discriminator: u64) -> (Prepared, PrivateRuntimeMutation) {
+        let mut signer = CountingSigner::new(0x19);
+        let fixture = Fixture::new(&signer);
+        let (control, mutation) = private_policy_control(&fixture, discriminator);
+        let (call, approval) = fixture.approved(discriminator, discriminator, &control);
+        let issuer_store = MemoryImageStore::default();
+        let mut issuer =
+            DurableAuthorityOperationIssuer::open(issuer_store.clone(), fixture.authority).unwrap();
+        let issued = issuer.issue(&call, &approval, 20, &mut signer).unwrap();
+        let actor = FakeAuthorityActor::default();
+        actor.register(call.clone(), approval, issued.issuance_ack);
+        (
+            Prepared {
+                fixture,
+                signer,
+                issuer_store,
+                issuer,
+                actor,
+                call,
+                control,
+            },
+            mutation,
+        )
     }
 
     fn prepare_recovery(discriminator: u64) -> Prepared {
@@ -2170,6 +2796,21 @@ mod tests {
         (control, recovery_key)
     }
 
+    fn private_policy_control(
+        fixture: &Fixture,
+        discriminator: u64,
+    ) -> (PrivateControlRecord, PrivateRuntimeMutation) {
+        let policy = RuntimeResourcePolicy::standard();
+        let mut control = fixture.control(discriminator);
+        control.operation = PrivateControlOperation::SetResourcePolicy {
+            policy: BlobRef::of_bytes(&policy.encode().unwrap()),
+        };
+        let key = SigningKey::from_bytes(&id(0x49, discriminator));
+        control.signature = key.sign(&control.signing_bytes()).to_bytes();
+        assert!(control.validate_shape());
+        (control, PrivateRuntimeMutation::SetResourcePolicy(policy))
+    }
+
     fn application_fact(
         route: ManagedAgentTarget,
         control: &PrivateControlRecord,
@@ -2196,6 +2837,22 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            PrivateControlOperation::SetResourcePolicy { .. } => (
+                AuthorityOperationKind::SetPrivateResourcePolicy,
+                2,
+                Hash::digest(
+                    b"vos/test/private-post-member-set/v1",
+                    &[control.commitment().as_bytes()],
+                ),
+            ),
+            PrivateControlOperation::ActorLifecycle { .. } => (
+                AuthorityOperationKind::PrivateActorLifecycle,
+                2,
+                Hash::digest(
+                    b"vos/test/private-post-member-set/v1",
+                    &[control.commitment().as_bytes()],
+                ),
+            ),
             _ => panic!("private coordinator fixture"),
         };
         PrivateControlApplicationFact {
@@ -2206,8 +2863,12 @@ mod tests {
             control_previous: control.previous,
             epoch,
             post_member_set,
-            reopened_control_state: Hash::digest(
+            reopened_runtime_state: Hash::digest(
                 b"vos/test/private-reopened-state/v1",
+                &[control.commitment().as_bytes(), &applied_at.to_le_bytes()],
+            ),
+            stable_projection: Hash::digest(
+                b"vos/test/private-stable-projection/v1",
                 &[control.commitment().as_bytes(), &applied_at.to_le_bytes()],
             ),
             reopened_control_head: control.commitment(),
@@ -2217,6 +2878,33 @@ mod tests {
 
     fn control_wire(prepared: &Prepared) -> Vec<u8> {
         prepared.control.encode().unwrap()
+    }
+
+    #[test]
+    fn pcaf2_roundtrips_both_runtime_commitments_and_rejects_old_or_trailing_frames() {
+        let prepared = prepare(1);
+        let fact = application_fact(prepared.call.intent.managed(), &prepared.control, 24);
+        let wire = encode_private_application_fact(&fact);
+        assert_eq!(
+            &wire[..PRIVATE_CONTROL_APPLICATION_FACT_MAGIC.len()],
+            b"PCAF2"
+        );
+        assert_eq!(decode_private_application_fact(&wire), Ok(fact));
+
+        let mut old_frame = wire.clone();
+        old_frame.remove(PRIVATE_CONTROL_APPLICATION_FACT_MAGIC.len() - 1);
+        assert_eq!(&old_frame[..4], b"PCAF");
+        assert!(matches!(
+            decode_private_application_fact(&old_frame),
+            Err(DecodeError::InvalidTag)
+        ));
+
+        let mut trailing = wire;
+        trailing.push(0);
+        assert!(matches!(
+            decode_private_application_fact(&trailing),
+            Err(DecodeError::NonCanonical)
+        ));
     }
 
     #[test]
@@ -2235,14 +2923,20 @@ mod tests {
             authority,
         );
         assert_eq!(
-            PrivateApplicationAuthorityMethod::AcknowledgePrivateApplication.name(),
-            "acknowledge_private_application"
+            PrivateApplicationAuthorityMethod::ResolvePrivateApplication.name(),
+            "resolve_private_application"
         );
         let acknowledgement = coordinator
-            .apply(prepared.call.invocation, &wire, 24, &mut prepared.signer)
+            .apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer,
+            )
             .unwrap();
         let acknowledgement_wire = acknowledgement.encode().unwrap();
-        assert_eq!(coordinator_store.commits(), 3);
+        assert_eq!(coordinator_store.commits(), 4);
         assert_eq!(prepared.issuer_store.commits(), 5);
         assert_eq!(
             (
@@ -2262,7 +2956,7 @@ mod tests {
         unusable.fail_application = true;
         assert_eq!(
             coordinator
-                .apply(prepared.call.invocation, &wire, 24, &mut unusable)
+                .apply(prepared.call.invocation, &wire, None, 24, &mut unusable)
                 .unwrap()
                 .encode()
                 .unwrap(),
@@ -2277,7 +2971,7 @@ mod tests {
         let mut coordinator = restart(coordinator, authority);
         assert_eq!(
             coordinator
-                .apply(prepared.call.invocation, &wire, 24, &mut unusable)
+                .apply(prepared.call.invocation, &wire, None, 24, &mut unusable)
                 .unwrap()
                 .encode()
                 .unwrap(),
@@ -2290,6 +2984,190 @@ mod tests {
         );
         assert_eq!(coordinator.retained_applications(), 1);
         assert!(!coordinator.has_pending_application());
+    }
+
+    #[test]
+    fn deterministic_denial_retires_to_exact_par_without_guest_detail_or_positive_evidence() {
+        let mut prepared = prepare(41);
+        let coordinator_store = MemoryImageStore::default();
+        let runtime = FakeRuntime::default();
+        let detail = b"private guest denial detail must remain memory-only";
+        runtime.deny_next_with_detail(detail);
+        let actor = prepared.actor.clone();
+        let authority = prepared.fixture.authority;
+        let wire = control_wire(&prepared);
+        let mut coordinator = open_coordinator(
+            coordinator_store.clone(),
+            runtime.clone(),
+            actor.clone(),
+            prepared.issuer,
+            authority,
+        );
+
+        let retirement = match coordinator
+            .apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer,
+            )
+            .unwrap()
+        {
+            PrivateControlApplicationResolution::RetiredUnapplied(acknowledgement) => {
+                acknowledgement
+            }
+            PrivateControlApplicationResolution::Applied(_) => panic!("denial became PCA"),
+        };
+        let retirement_wire = retirement.encode().unwrap();
+        assert_eq!(&retirement_wire[..4], b"PAR1");
+        assert!(
+            retirement
+                .verify_with(authority.binding, &RawEd25519Verifier)
+                .is_ok()
+        );
+        assert_eq!(coordinator_store.commits(), 3);
+        assert_eq!(
+            (
+                runtime.calls(),
+                runtime.denials(),
+                runtime.transitions(),
+                runtime.evidence_calls(),
+                actor.calls(),
+                prepared.signer.application_calls,
+                prepared.signer.retirement_calls,
+            ),
+            (1, 1, 0, 0, 1, 0, 1)
+        );
+        assert!(!coordinator.has_pending_application());
+        assert!(
+            !coordinator_store
+                .image()
+                .unwrap()
+                .windows(detail.len())
+                .any(|window| window == detail)
+        );
+        assert!(
+            !prepared
+                .issuer_store
+                .image()
+                .unwrap()
+                .windows(detail.len())
+                .any(|window| window == detail)
+        );
+        assert_eq!(runtime.inner.lock().unwrap().denial_detail, detail);
+
+        let mut unusable = CountingSigner::new(0x72);
+        unusable.fail_retirement = true;
+        let retry = coordinator
+            .apply(prepared.call.invocation, &wire, None, 24, &mut unusable)
+            .unwrap();
+        assert_eq!(retry.encode().unwrap(), retirement_wire);
+        assert_eq!(unusable.retirement_calls, 0);
+        assert_eq!(
+            (runtime.calls(), runtime.evidence_calls(), actor.calls()),
+            (1, 0, 1)
+        );
+
+        let mut coordinator = restart(coordinator, authority);
+        assert_eq!(
+            coordinator
+                .apply(prepared.call.invocation, &wire, None, 24, &mut unusable)
+                .unwrap()
+                .encode()
+                .unwrap(),
+            retirement_wire
+        );
+        assert_eq!(unusable.retirement_calls, 0);
+        assert_eq!(
+            (runtime.calls(), runtime.evidence_calls(), actor.calls()),
+            (1, 0, 1)
+        );
+    }
+
+    #[test]
+    fn canonical_private_mutation_is_bound_in_pledge_retry_and_runtime_echo() {
+        let (mut prepared, mutation) = prepare_policy(42);
+        let mutation_wire = mutation.encode().unwrap();
+        let runtime = FakeRuntime::default();
+        let actor = prepared.actor.clone();
+        let authority = prepared.fixture.authority;
+        let policy_control_wire = control_wire(&prepared);
+        let mut coordinator = open_coordinator(
+            MemoryImageStore::default(),
+            runtime.clone(),
+            actor.clone(),
+            prepared.issuer,
+            authority,
+        );
+
+        for invalid in [None, Some(&[1, 2, 3][..])] {
+            assert!(matches!(
+                coordinator.apply(
+                    prepared.call.invocation,
+                    &policy_control_wire,
+                    invalid,
+                    24,
+                    &mut prepared.signer,
+                ),
+                Err(PrivateControlApplicationCoordinatorError::Rejected(
+                    PrivateControlApplicationCoordinatorRejection::InvalidControl
+                ))
+            ));
+        }
+        assert_eq!(runtime.calls(), 0);
+
+        runtime.mutate_once(RuntimeMutation::Mutation);
+        assert!(matches!(
+            coordinator.apply(
+                prepared.call.invocation,
+                &policy_control_wire,
+                Some(&mutation_wire),
+                24,
+                &mut prepared.signer,
+            ),
+            Err(PrivateControlApplicationCoordinatorError::Rejected(
+                PrivateControlApplicationCoordinatorRejection::InvalidRuntimeResult
+            ))
+        ));
+        assert_eq!(prepared.signer.application_calls, 0);
+        coordinator
+            .apply(
+                prepared.call.invocation,
+                &policy_control_wire,
+                Some(&mutation_wire),
+                24,
+                &mut prepared.signer,
+            )
+            .unwrap();
+        assert_eq!(
+            (runtime.calls(), runtime.transitions(), actor.calls()),
+            (2, 1, 1)
+        );
+
+        let mut control_only = prepare(43);
+        let control_only_wire = control_wire(&control_only);
+        let control_only_runtime = FakeRuntime::default();
+        let mut control_only_coordinator = open_coordinator(
+            MemoryImageStore::default(),
+            control_only_runtime.clone(),
+            control_only.actor.clone(),
+            control_only.issuer,
+            control_only.fixture.authority,
+        );
+        assert!(matches!(
+            control_only_coordinator.apply(
+                control_only.call.invocation,
+                &control_only_wire,
+                Some(&mutation_wire),
+                24,
+                &mut control_only.signer,
+            ),
+            Err(PrivateControlApplicationCoordinatorError::Rejected(
+                PrivateControlApplicationCoordinatorRejection::InvalidControl
+            ))
+        ));
+        assert_eq!(control_only_runtime.calls(), 0);
     }
 
     #[test]
@@ -2313,7 +3191,13 @@ mod tests {
         );
 
         let acknowledgement = coordinator
-            .apply(prepared.call.invocation, &wire, 24, &mut prepared.signer)
+            .apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer,
+            )
             .unwrap();
         assert_eq!(
             (
@@ -2331,7 +3215,13 @@ mod tests {
 
         let mut coordinator = restart(coordinator, authority);
         let retry = coordinator
-            .apply(prepared.call.invocation, &wire, 24, &mut prepared.signer)
+            .apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer,
+            )
             .unwrap();
         assert_eq!(retry, acknowledgement);
         assert_eq!(
@@ -2361,7 +3251,13 @@ mod tests {
             authority,
         );
         assert!(matches!(
-            coordinator.apply(prepared.call.invocation, &wire, 24, &mut prepared.signer),
+            coordinator.apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer
+            ),
             Err(PrivateControlApplicationCoordinatorError::Runtime(
                 TestError
             ))
@@ -2372,10 +3268,133 @@ mod tests {
 
         let mut coordinator = restart(coordinator, authority);
         coordinator
-            .apply(prepared.call.invocation, &wire, 24, &mut prepared.signer)
+            .apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer,
+            )
             .unwrap();
         assert_eq!((runtime.calls(), runtime.transitions()), (2, 1));
         assert_eq!((prepared.signer.application_calls, actor.calls()), (1, 1));
+    }
+
+    #[test]
+    fn lost_denial_and_actor_results_resume_exact_par_without_application_artifacts() {
+        let mut prepared = prepare(44);
+        let runtime = FakeRuntime::default();
+        runtime.deny_next();
+        runtime.lose_result_after_apply_once();
+        let actor = prepared.actor.clone();
+        let authority = prepared.fixture.authority;
+        let wire = control_wire(&prepared);
+        let mut coordinator = open_coordinator(
+            MemoryImageStore::default(),
+            runtime.clone(),
+            actor.clone(),
+            prepared.issuer,
+            authority,
+        );
+        assert!(matches!(
+            coordinator.apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer
+            ),
+            Err(PrivateControlApplicationCoordinatorError::Runtime(
+                TestError
+            ))
+        ));
+        assert_eq!((runtime.calls(), runtime.denials()), (1, 1));
+        assert_eq!(
+            (
+                prepared.signer.application_calls,
+                prepared.signer.retirement_calls
+            ),
+            (0, 0)
+        );
+
+        let mut coordinator = restart(coordinator, authority);
+        assert!(matches!(
+            coordinator
+                .apply(
+                    prepared.call.invocation,
+                    &wire,
+                    None,
+                    24,
+                    &mut prepared.signer
+                )
+                .unwrap(),
+            PrivateControlApplicationResolution::RetiredUnapplied(_)
+        ));
+        assert_eq!(
+            (runtime.calls(), runtime.denials(), runtime.transitions()),
+            (2, 1, 0)
+        );
+        assert_eq!(
+            (
+                prepared.signer.application_calls,
+                prepared.signer.retirement_calls
+            ),
+            (0, 1)
+        );
+        assert_eq!((runtime.evidence_calls(), actor.calls()), (0, 1));
+
+        let mut prepared = prepare(45);
+        let runtime = FakeRuntime::default();
+        runtime.deny_next();
+        let actor = prepared.actor.clone();
+        actor.lose_result_after_consume_once();
+        let authority = prepared.fixture.authority;
+        let wire = control_wire(&prepared);
+        let mut coordinator = open_coordinator(
+            MemoryImageStore::default(),
+            runtime.clone(),
+            actor.clone(),
+            prepared.issuer,
+            authority,
+        );
+        assert!(matches!(
+            coordinator.apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer
+            ),
+            Err(PrivateControlApplicationCoordinatorError::Dispatch(
+                TestError
+            ))
+        ));
+        assert_eq!((actor.pending(), actor.tombstones()), (0, 1));
+        let mut coordinator = restart(coordinator, authority);
+        assert!(matches!(
+            coordinator
+                .apply(
+                    prepared.call.invocation,
+                    &wire,
+                    None,
+                    24,
+                    &mut prepared.signer
+                )
+                .unwrap(),
+            PrivateControlApplicationResolution::RetiredUnapplied(_)
+        ));
+        assert_eq!((runtime.calls(), runtime.evidence_calls()), (1, 0));
+        assert_eq!(
+            (
+                prepared.signer.application_calls,
+                prepared.signer.retirement_calls
+            ),
+            (0, 1)
+        );
+        assert_eq!(
+            (actor.calls(), actor.pending(), actor.tombstones()),
+            (2, 0, 1)
+        );
     }
 
     #[test]
@@ -2395,7 +3414,13 @@ mod tests {
             authority,
         );
         assert!(matches!(
-            coordinator.apply(prepared.call.invocation, &wire, 24, &mut prepared.signer),
+            coordinator.apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer
+            ),
             Err(PrivateControlApplicationCoordinatorError::Dispatch(
                 TestError
             ))
@@ -2406,7 +3431,13 @@ mod tests {
 
         let mut coordinator = restart(coordinator, authority);
         let acknowledgement = coordinator
-            .apply(prepared.call.invocation, &wire, 24, &mut prepared.signer)
+            .apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer,
+            )
             .unwrap();
         assert!(
             acknowledgement
@@ -2437,7 +3468,13 @@ mod tests {
             authority,
         );
         assert!(matches!(
-            coordinator.apply(prepared.call.invocation, &wire, 24, &mut prepared.signer),
+            coordinator.apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer
+            ),
             Err(PrivateControlApplicationCoordinatorError::Runtime(
                 TestError
             ))
@@ -2458,7 +3495,13 @@ mod tests {
 
         let mut coordinator = restart(coordinator, authority);
         let acknowledgement = coordinator
-            .apply(prepared.call.invocation, &wire, 24, &mut prepared.signer)
+            .apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer,
+            )
             .unwrap();
         assert!(
             acknowledgement
@@ -2477,10 +3520,16 @@ mod tests {
         );
         assert!(!coordinator.has_pending_application());
 
-        // A fully committed retry returns the exact retained PCA1 without
+        // A fully committed retry returns the exact retained PCA2 without
         // touching the runtime, actor, or signer again.
         coordinator
-            .apply(prepared.call.invocation, &wire, 24, &mut prepared.signer)
+            .apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer,
+            )
             .unwrap();
         assert_eq!((runtime.evidence_calls(), actor.calls()), (2, 1));
         assert_eq!(prepared.signer.application_calls, 1);
@@ -2517,7 +3566,13 @@ mod tests {
                 authority,
             );
             assert!(matches!(
-                coordinator.apply(prepared.call.invocation, &wire, 24, &mut prepared.signer),
+                coordinator.apply(
+                    prepared.call.invocation,
+                    &wire,
+                    None,
+                    24,
+                    &mut prepared.signer
+                ),
                 Err(PrivateControlApplicationCoordinatorError::Rejected(
                     PrivateControlApplicationCoordinatorRejection::InvalidEvidenceResult
                 ))
@@ -2555,7 +3610,13 @@ mod tests {
             let mut coordinator =
                 open_coordinator(store, runtime.clone(), actor, prepared.issuer, authority);
             assert!(matches!(
-                coordinator.apply(prepared.call.invocation, &wire, 24, &mut prepared.signer),
+                coordinator.apply(
+                    prepared.call.invocation,
+                    &wire,
+                    None,
+                    24,
+                    &mut prepared.signer
+                ),
                 Err(PrivateControlApplicationCoordinatorError::Storage(
                     TestError
                 ))
@@ -2564,7 +3625,13 @@ mod tests {
             assert_eq!((runtime.calls(), prepared.signer.application_calls), (0, 0));
             let mut coordinator = restart(coordinator, authority);
             coordinator
-                .apply(prepared.call.invocation, &wire, 24, &mut prepared.signer)
+                .apply(
+                    prepared.call.invocation,
+                    &wire,
+                    None,
+                    24,
+                    &mut prepared.signer,
+                )
                 .unwrap();
             assert_eq!((runtime.calls(), prepared.signer.application_calls), (1, 1));
         }
@@ -2589,33 +3656,47 @@ mod tests {
                 authority,
             );
             assert!(matches!(
-                coordinator.apply(prepared.call.invocation, &wire, 24, &mut prepared.signer),
+                coordinator.apply(
+                    prepared.call.invocation,
+                    &wire,
+                    None,
+                    24,
+                    &mut prepared.signer
+                ),
                 Err(PrivateControlApplicationCoordinatorError::Storage(
                     TestError
                 ))
             ));
             assert!(coordinator.is_poisoned());
             assert_eq!((runtime.calls(), prepared.signer.application_calls), (1, 1));
-            assert_eq!(actor.calls(), 1);
+            assert_eq!(actor.calls(), 0);
             let mut coordinator = restart(coordinator, authority);
             coordinator
-                .apply(prepared.call.invocation, &wire, 24, &mut prepared.signer)
+                .apply(
+                    prepared.call.invocation,
+                    &wire,
+                    None,
+                    24,
+                    &mut prepared.signer,
+                )
                 .unwrap();
             assert_eq!((runtime.calls(), prepared.signer.application_calls), (1, 1));
-            assert_eq!(actor.calls(), if fail_after { 1 } else { 2 });
+            assert_eq!(actor.calls(), 1);
         }
 
-        // The third coordinator commit records that the exact PSE2 was
-        // durably attached and reopened. Before/after ambiguity must poison
-        // the current handle; restart either re-drives the exact callback or
-        // trusts the already committed marker without re-signing.
-        for fail_after in [false, true] {
+        // The third commit records actor consumption and the fourth records
+        // exact PSE2 attachment. Every before/after ambiguity poisons the live
+        // handle and restart resumes from the durable side of that boundary.
+        for (boundary, fail_after) in [3usize, 4]
+            .into_iter()
+            .flat_map(|boundary| [false, true].map(move |fail_after| (boundary, fail_after)))
+        {
             let mut prepared = prepare(1);
             let store = MemoryImageStore::default();
             if fail_after {
-                store.fail_after_commit(3);
+                store.fail_after_commit(boundary);
             } else {
-                store.fail_before_commit(3);
+                store.fail_before_commit(boundary);
             }
             let runtime = FakeRuntime::default();
             let actor = prepared.actor.clone();
@@ -2629,7 +3710,13 @@ mod tests {
                 authority,
             );
             assert!(matches!(
-                coordinator.apply(prepared.call.invocation, &wire, 24, &mut prepared.signer),
+                coordinator.apply(
+                    prepared.call.invocation,
+                    &wire,
+                    None,
+                    24,
+                    &mut prepared.signer
+                ),
                 Err(PrivateControlApplicationCoordinatorError::Storage(
                     TestError
                 ))
@@ -2643,16 +3730,325 @@ mod tests {
                     actor.calls(),
                     prepared.signer.application_calls,
                 ),
-                (1, 1, 1, 1, 1)
+                (1, 1, usize::from(boundary == 4), 1, 1)
             );
             let mut coordinator = restart(coordinator, authority);
             coordinator
-                .apply(prepared.call.invocation, &wire, 24, &mut prepared.signer)
+                .apply(
+                    prepared.call.invocation,
+                    &wire,
+                    None,
+                    24,
+                    &mut prepared.signer,
+                )
                 .unwrap();
-            assert_eq!(runtime.evidence_calls(), if fail_after { 1 } else { 2 });
-            assert_eq!((runtime.calls(), actor.calls()), (1, 1));
+            assert_eq!(
+                runtime.evidence_calls(),
+                if boundary == 4 && !fail_after { 2 } else { 1 }
+            );
+            assert_eq!(
+                (runtime.calls(), actor.calls()),
+                (1, if boundary == 3 && !fail_after { 2 } else { 1 })
+            );
             assert_eq!(prepared.signer.application_calls, 1);
         }
+    }
+
+    #[test]
+    fn retirement_coordinator_pledge_selection_and_dispatch_commits_resume_exactly() {
+        for boundary in [1usize, 2, 3] {
+            for fail_after in [false, true] {
+                let mut prepared = prepare(46 + boundary as u64);
+                let store = MemoryImageStore::default();
+                if fail_after {
+                    store.fail_after_commit(boundary);
+                } else {
+                    store.fail_before_commit(boundary);
+                }
+                let runtime = FakeRuntime::default();
+                runtime.deny_next();
+                let actor = prepared.actor.clone();
+                let authority = prepared.fixture.authority;
+                let wire = control_wire(&prepared);
+                let mut coordinator = open_coordinator(
+                    store,
+                    runtime.clone(),
+                    actor.clone(),
+                    prepared.issuer,
+                    authority,
+                );
+                assert!(matches!(
+                    coordinator.apply(
+                        prepared.call.invocation,
+                        &wire,
+                        None,
+                        24,
+                        &mut prepared.signer,
+                    ),
+                    Err(PrivateControlApplicationCoordinatorError::Storage(
+                        TestError
+                    ))
+                ));
+                assert!(coordinator.is_poisoned());
+                assert_eq!(runtime.calls(), usize::from(boundary != 1));
+                let calls = runtime.calls();
+                let signs = prepared.signer.retirement_calls;
+                let actor_calls = actor.calls();
+
+                let mut coordinator = restart(coordinator, authority);
+                let retirement = coordinator
+                    .apply(
+                        prepared.call.invocation,
+                        &wire,
+                        None,
+                        24,
+                        &mut prepared.signer,
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    retirement,
+                    PrivateControlApplicationResolution::RetiredUnapplied(_)
+                ));
+                assert_eq!(
+                    runtime.calls(),
+                    calls + usize::from(boundary == 1),
+                    "boundary {boundary} after {fail_after}"
+                );
+                assert_eq!(
+                    prepared.signer.retirement_calls,
+                    signs + usize::from(boundary == 1),
+                    "boundary {boundary} after {fail_after}"
+                );
+                assert_eq!(
+                    actor.calls(),
+                    actor_calls + usize::from(boundary != 3 || !fail_after),
+                    "boundary {boundary} after {fail_after}"
+                );
+                assert_eq!(runtime.evidence_calls(), 0);
+                assert!(!coordinator.has_pending_application());
+            }
+        }
+    }
+
+    #[test]
+    fn retirement_issuer_pledge_sign_and_commit_failpoints_never_reapply_runtime() {
+        for boundary in [1usize, 2] {
+            for fail_after in [false, true] {
+                let mut prepared = prepare(52 + boundary as u64);
+                if fail_after {
+                    prepared.issuer_store.fail_after_commit(boundary);
+                } else {
+                    prepared.issuer_store.fail_before_commit(boundary);
+                }
+                let runtime = FakeRuntime::default();
+                runtime.deny_next();
+                let actor = prepared.actor.clone();
+                let authority = prepared.fixture.authority;
+                let wire = control_wire(&prepared);
+                let mut coordinator = open_coordinator(
+                    MemoryImageStore::default(),
+                    runtime.clone(),
+                    actor.clone(),
+                    prepared.issuer,
+                    authority,
+                );
+                assert!(matches!(
+                    coordinator.apply(
+                        prepared.call.invocation,
+                        &wire,
+                        None,
+                        24,
+                        &mut prepared.signer,
+                    ),
+                    Err(PrivateControlApplicationCoordinatorError::Issuer(
+                        AuthorityOperationIssuerError::Storage(TestError)
+                    ))
+                ));
+                let calls = runtime.calls();
+                let signs = prepared.signer.retirement_calls;
+                let mut coordinator = restart(coordinator, authority);
+                assert!(matches!(
+                    coordinator
+                        .apply(
+                            prepared.call.invocation,
+                            &wire,
+                            None,
+                            24,
+                            &mut prepared.signer,
+                        )
+                        .unwrap(),
+                    PrivateControlApplicationResolution::RetiredUnapplied(_)
+                ));
+                assert_eq!(
+                    runtime.calls(),
+                    calls + usize::from(boundary == 1 && !fail_after)
+                );
+                assert_eq!(
+                    prepared.signer.retirement_calls,
+                    signs + usize::from(boundary == 1 || (boundary == 2 && !fail_after))
+                );
+                assert_eq!((actor.calls(), runtime.evidence_calls()), (1, 0));
+            }
+        }
+
+        let mut prepared = prepare(55);
+        prepared.signer.fail_retirement = true;
+        let runtime = FakeRuntime::default();
+        runtime.deny_next();
+        let actor = prepared.actor.clone();
+        let authority = prepared.fixture.authority;
+        let wire = control_wire(&prepared);
+        let mut coordinator = open_coordinator(
+            MemoryImageStore::default(),
+            runtime.clone(),
+            actor.clone(),
+            prepared.issuer,
+            authority,
+        );
+        assert!(matches!(
+            coordinator.apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer,
+            ),
+            Err(PrivateControlApplicationCoordinatorError::Issuer(
+                AuthorityOperationIssuerError::Signer(TestError)
+            ))
+        ));
+        assert_eq!((runtime.calls(), prepared.signer.retirement_calls), (1, 1));
+        coordinator
+            .apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer,
+            )
+            .unwrap();
+        assert_eq!((runtime.calls(), prepared.signer.retirement_calls), (1, 2));
+        assert_eq!((actor.calls(), runtime.evidence_calls()), (1, 0));
+    }
+
+    #[test]
+    fn issuer_one_step_ahead_resumes_winning_apply_or_retire_branch_and_loses_opposite_race() {
+        let mut prepared = prepare(56);
+        let store = MemoryImageStore::default();
+        store.fail_after_commit(1);
+        let runtime = FakeRuntime::default();
+        let actor = prepared.actor.clone();
+        let authority = prepared.fixture.authority;
+        let wire = control_wire(&prepared);
+        let mut coordinator = open_coordinator(
+            store,
+            runtime.clone(),
+            actor.clone(),
+            prepared.issuer,
+            authority,
+        );
+        assert!(matches!(
+            coordinator.apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer,
+            ),
+            Err(PrivateControlApplicationCoordinatorError::Storage(
+                TestError
+            ))
+        ));
+        let (store, runtime, actor, mut issuer) = coordinator.into_parts();
+        let application = application_fact(prepared.call.intent.managed(), &prepared.control, 24);
+        issuer
+            .issue_private_application(prepared.call.invocation, &application, &mut prepared.signer)
+            .unwrap();
+        runtime.deny_next();
+        let mut coordinator = open_coordinator(store, runtime.clone(), actor, issuer, authority);
+        assert!(matches!(
+            coordinator
+                .apply(
+                    prepared.call.invocation,
+                    &wire,
+                    None,
+                    24,
+                    &mut prepared.signer
+                )
+                .unwrap(),
+            PrivateControlApplicationResolution::Applied(_)
+        ));
+        assert_eq!(
+            (runtime.calls(), runtime.transitions(), runtime.denials()),
+            (0, 0, 0)
+        );
+        let (_, _, _, mut issuer) = coordinator.into_parts();
+        assert!(matches!(
+            issuer.retire_private_application(prepared.call.invocation, 24, &mut prepared.signer),
+            Err(AuthorityOperationIssuerError::Rejected(
+                AuthorityOperationIssuerRejection::DivergentRetry
+            ))
+        ));
+
+        let mut prepared = prepare(57);
+        let store = MemoryImageStore::default();
+        store.fail_after_commit(1);
+        let runtime = FakeRuntime::default();
+        let actor = prepared.actor.clone();
+        let authority = prepared.fixture.authority;
+        let wire = control_wire(&prepared);
+        let mut coordinator = open_coordinator(
+            store,
+            runtime.clone(),
+            actor.clone(),
+            prepared.issuer,
+            authority,
+        );
+        assert!(matches!(
+            coordinator.apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer,
+            ),
+            Err(PrivateControlApplicationCoordinatorError::Storage(
+                TestError
+            ))
+        ));
+        let (store, runtime, actor, mut issuer) = coordinator.into_parts();
+        issuer
+            .retire_private_application(prepared.call.invocation, 24, &mut prepared.signer)
+            .unwrap();
+        let mut coordinator = open_coordinator(store, runtime.clone(), actor, issuer, authority);
+        assert!(matches!(
+            coordinator
+                .apply(
+                    prepared.call.invocation,
+                    &wire,
+                    None,
+                    24,
+                    &mut prepared.signer
+                )
+                .unwrap(),
+            PrivateControlApplicationResolution::RetiredUnapplied(_)
+        ));
+        assert_eq!(
+            (runtime.calls(), runtime.transitions(), runtime.denials()),
+            (0, 0, 0)
+        );
+        let (_, _, _, mut issuer) = coordinator.into_parts();
+        let application = application_fact(prepared.call.intent.managed(), &prepared.control, 24);
+        assert!(matches!(
+            issuer.issue_private_application(
+                prepared.call.invocation,
+                &application,
+                &mut prepared.signer
+            ),
+            Err(AuthorityOperationIssuerError::Rejected(
+                AuthorityOperationIssuerRejection::DivergentRetry
+            ))
+        ));
     }
 
     #[test]
@@ -2678,7 +4074,13 @@ mod tests {
                     authority,
                 );
                 assert!(matches!(
-                    coordinator.apply(prepared.call.invocation, &wire, 24, &mut prepared.signer),
+                    coordinator.apply(
+                        prepared.call.invocation,
+                        &wire,
+                        None,
+                        24,
+                        &mut prepared.signer
+                    ),
                     Err(PrivateControlApplicationCoordinatorError::Issuer(
                         AuthorityOperationIssuerError::Storage(TestError)
                     ))
@@ -2689,7 +4091,13 @@ mod tests {
                 let signs_before = prepared.signer.application_calls;
                 let mut coordinator = restart(coordinator, authority);
                 coordinator
-                    .apply(prepared.call.invocation, &wire, 24, &mut prepared.signer)
+                    .apply(
+                        prepared.call.invocation,
+                        &wire,
+                        None,
+                        24,
+                        &mut prepared.signer,
+                    )
                     .unwrap();
                 let expected_runtime_calls = if boundary == 1 && !fail_after {
                     calls_before + 1
@@ -2723,14 +4131,26 @@ mod tests {
             authority,
         );
         assert!(matches!(
-            coordinator.apply(prepared.call.invocation, &wire, 24, &mut prepared.signer),
+            coordinator.apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer
+            ),
             Err(PrivateControlApplicationCoordinatorError::Issuer(
                 AuthorityOperationIssuerError::Signer(TestError)
             ))
         ));
         assert!(!coordinator.is_poisoned());
         coordinator
-            .apply(prepared.call.invocation, &wire, 24, &mut prepared.signer)
+            .apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer,
+            )
             .unwrap();
         assert_eq!((runtime.calls(), runtime.transitions()), (1, 1));
         assert_eq!((prepared.signer.application_calls, actor.calls()), (2, 1));
@@ -2749,7 +4169,13 @@ mod tests {
             authority,
         );
         assert!(matches!(
-            coordinator.apply(prepared.call.invocation, &wire, 24, &mut prepared.signer),
+            coordinator.apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer
+            ),
             Err(PrivateControlApplicationCoordinatorError::Issuer(
                 AuthorityOperationIssuerError::Rejected(
                     AuthorityOperationIssuerRejection::WrongSigner
@@ -2763,7 +4189,13 @@ mod tests {
         );
         prepared.signer.corrupt_application = false;
         coordinator
-            .apply(prepared.call.invocation, &wire, 24, &mut prepared.signer)
+            .apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer,
+            )
             .unwrap();
         assert_eq!((prepared.signer.application_calls, actor.calls()), (2, 1));
     }
@@ -2774,12 +4206,16 @@ mod tests {
             RuntimeMutation::Route,
             RuntimeMutation::Authority,
             RuntimeMutation::Control,
+            RuntimeMutation::Mutation,
             RuntimeMutation::Receipt,
             RuntimeMutation::Issuance,
             RuntimeMutation::Slot,
             RuntimeMutation::Unauthenticated,
             RuntimeMutation::NotApplied,
+            RuntimeMutation::ChangedPredecessor,
             RuntimeMutation::NotReopened,
+            RuntimeMutation::ReopenedRuntimeState,
+            RuntimeMutation::StableProjection,
             RuntimeMutation::MalformedFact,
             RuntimeMutation::NonCanonicalFact,
             RuntimeMutation::OversizeFact,
@@ -2803,7 +4239,13 @@ mod tests {
             );
             assert!(
                 matches!(
-                    coordinator.apply(prepared.call.invocation, &wire, 24, &mut prepared.signer),
+                    coordinator.apply(
+                        prepared.call.invocation,
+                        &wire,
+                        None,
+                        24,
+                        &mut prepared.signer
+                    ),
                     Err(PrivateControlApplicationCoordinatorError::Rejected(
                         PrivateControlApplicationCoordinatorRejection::InvalidRuntimeResult
                             | PrivateControlApplicationCoordinatorRejection::ApplicationRejected
@@ -2815,7 +4257,13 @@ mod tests {
             // The trusted adapter's exact retry returns its durable unmodified
             // fact and can safely continue from the already pledged intent.
             coordinator
-                .apply(prepared.call.invocation, &wire, 24, &mut prepared.signer)
+                .apply(
+                    prepared.call.invocation,
+                    &wire,
+                    None,
+                    24,
+                    &mut prepared.signer,
+                )
                 .unwrap();
             assert_eq!(
                 (runtime.transitions(), prepared.signer.application_calls),
@@ -2831,6 +4279,7 @@ mod tests {
             ActorMutation::Method,
             ActorMutation::Context,
             ActorMutation::Request,
+            ActorMutation::AckType,
             ActorMutation::Unauthenticated,
             ActorMutation::NotDurable,
             ActorMutation::False,
@@ -2855,7 +4304,7 @@ mod tests {
             );
             assert!(
                 matches!(
-                coordinator.apply(prepared.call.invocation, &wire, 24, &mut prepared.signer),
+            coordinator.apply(prepared.call.invocation, &wire, None, 24, &mut prepared.signer),
                 Err(PrivateControlApplicationCoordinatorError::Rejected(
                     PrivateControlApplicationCoordinatorRejection::InvalidAuthorityResult
                         | PrivateControlApplicationCoordinatorRejection::AcknowledgementRejected
@@ -2868,11 +4317,148 @@ mod tests {
             // The fake deliberately no longer has pending AOC/AOP/AOI
             // preimages. Exact PCA tombstone retry is therefore required.
             coordinator
-                .apply(prepared.call.invocation, &wire, 24, &mut prepared.signer)
+                .apply(
+                    prepared.call.invocation,
+                    &wire,
+                    None,
+                    24,
+                    &mut prepared.signer,
+                )
                 .unwrap();
             assert_eq!((runtime.calls(), prepared.signer.application_calls), (1, 1));
             assert_eq!(actor.calls(), 2);
         }
+    }
+
+    #[test]
+    fn hostile_retirement_echoes_unchanged_proof_and_unified_dispatch_are_rejected() {
+        for mutation in [
+            RuntimeMutation::Route,
+            RuntimeMutation::Authority,
+            RuntimeMutation::Control,
+            RuntimeMutation::Mutation,
+            RuntimeMutation::Receipt,
+            RuntimeMutation::Issuance,
+            RuntimeMutation::Slot,
+            RuntimeMutation::Unauthenticated,
+            RuntimeMutation::ChangedPredecessor,
+            RuntimeMutation::NotReopened,
+        ] {
+            let mut prepared = prepare(60);
+            let runtime = FakeRuntime::default();
+            runtime.deny_next();
+            runtime.mutate_once(mutation);
+            let actor = prepared.actor.clone();
+            let authority = prepared.fixture.authority;
+            let wire = control_wire(&prepared);
+            let mut coordinator = open_coordinator(
+                MemoryImageStore::default(),
+                runtime.clone(),
+                actor.clone(),
+                prepared.issuer,
+                authority,
+            );
+            assert!(matches!(
+                coordinator.apply(
+                    prepared.call.invocation,
+                    &wire,
+                    None,
+                    24,
+                    &mut prepared.signer,
+                ),
+                Err(PrivateControlApplicationCoordinatorError::Rejected(
+                    PrivateControlApplicationCoordinatorRejection::InvalidRuntimeResult
+                ))
+            ));
+            assert_eq!(
+                (
+                    prepared.signer.application_calls,
+                    prepared.signer.retirement_calls,
+                    actor.calls(),
+                    runtime.evidence_calls(),
+                ),
+                (0, 0, 0, 0),
+                "retirement runtime mutation {mutation:?}"
+            );
+        }
+
+        for mutation in [
+            ActorMutation::Target,
+            ActorMutation::Method,
+            ActorMutation::Context,
+            ActorMutation::Request,
+            ActorMutation::AckType,
+            ActorMutation::Unauthenticated,
+            ActorMutation::NotDurable,
+        ] {
+            let mut prepared = prepare(61);
+            let runtime = FakeRuntime::default();
+            runtime.deny_next();
+            let actor = prepared.actor.clone();
+            actor.mutate_once(mutation);
+            let authority = prepared.fixture.authority;
+            let wire = control_wire(&prepared);
+            let mut coordinator = open_coordinator(
+                MemoryImageStore::default(),
+                runtime.clone(),
+                actor.clone(),
+                prepared.issuer,
+                authority,
+            );
+            assert!(matches!(
+                coordinator.apply(
+                    prepared.call.invocation,
+                    &wire,
+                    None,
+                    24,
+                    &mut prepared.signer,
+                ),
+                Err(PrivateControlApplicationCoordinatorError::Rejected(
+                    PrivateControlApplicationCoordinatorRejection::InvalidAuthorityResult
+                ))
+            ));
+            assert_eq!(
+                (
+                    prepared.signer.application_calls,
+                    prepared.signer.retirement_calls
+                ),
+                (0, 1)
+            );
+            assert_eq!((runtime.evidence_calls(), actor.calls()), (0, 1));
+        }
+
+        let mut prepared = prepare(62);
+        prepared.signer.corrupt_retirement = true;
+        let runtime = FakeRuntime::default();
+        runtime.deny_next();
+        let actor = prepared.actor.clone();
+        let authority = prepared.fixture.authority;
+        let wire = control_wire(&prepared);
+        let mut coordinator = open_coordinator(
+            MemoryImageStore::default(),
+            runtime.clone(),
+            actor.clone(),
+            prepared.issuer,
+            authority,
+        );
+        assert!(matches!(
+            coordinator.apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer,
+            ),
+            Err(PrivateControlApplicationCoordinatorError::Issuer(
+                AuthorityOperationIssuerError::Rejected(
+                    AuthorityOperationIssuerRejection::WrongSigner
+                )
+            ))
+        ));
+        assert_eq!(
+            (runtime.calls(), actor.calls(), runtime.evidence_calls()),
+            (1, 0, 0)
+        );
     }
 
     #[test]
@@ -2896,6 +4482,7 @@ mod tests {
             coordinator.apply(
                 prepared.call.invocation,
                 &noncanonical,
+                None,
                 24,
                 &mut prepared.signer
             ),
@@ -2908,6 +4495,7 @@ mod tests {
             coordinator.apply(
                 prepared.call.invocation,
                 &oversized,
+                None,
                 24,
                 &mut prepared.signer
             ),
@@ -2922,6 +4510,7 @@ mod tests {
             coordinator.apply(
                 prepared.call.invocation,
                 &bad_signature.encode().unwrap(),
+                None,
                 24,
                 &mut prepared.signer
             ),
@@ -2934,6 +4523,7 @@ mod tests {
             coordinator.apply(
                 prepared.call.invocation,
                 &substituted,
+                None,
                 24,
                 &mut prepared.signer
             ),
@@ -2949,6 +4539,7 @@ mod tests {
             coordinator.apply(
                 prepared.call.invocation,
                 &wrong_route.encode().unwrap(),
+                None,
                 24,
                 &mut prepared.signer
             ),
@@ -2958,7 +4549,13 @@ mod tests {
         ));
         for slot in [19, 39] {
             assert!(matches!(
-                coordinator.apply(prepared.call.invocation, &wire, slot, &mut prepared.signer),
+                coordinator.apply(
+                    prepared.call.invocation,
+                    &wire,
+                    None,
+                    slot,
+                    &mut prepared.signer
+                ),
                 Err(PrivateControlApplicationCoordinatorError::Rejected(
                     PrivateControlApplicationCoordinatorRejection::InvalidApplicationSlot
                 ))
@@ -2966,7 +4563,7 @@ mod tests {
         }
         let mut wrong_signer = CountingSigner::new(0x72);
         assert!(matches!(
-            coordinator.apply(prepared.call.invocation, &wire, 24, &mut wrong_signer),
+            coordinator.apply(prepared.call.invocation, &wire, None, 24, &mut wrong_signer),
             Err(PrivateControlApplicationCoordinatorError::Rejected(
                 PrivateControlApplicationCoordinatorRejection::WrongSigner
             ))
@@ -2989,6 +4586,7 @@ mod tests {
             second_issued.issuance_ack,
         );
         let runtime = FakeRuntime::default();
+        runtime.deny_next();
         let actor = prepared.actor.clone();
         let authority = prepared.fixture.authority;
         let first_wire = control_wire(&prepared);
@@ -3004,6 +4602,7 @@ mod tests {
             .apply(
                 prepared.call.invocation,
                 &first_wire,
+                None,
                 25,
                 &mut prepared.signer,
             )
@@ -3012,6 +4611,7 @@ mod tests {
             coordinator.apply(
                 second_call.invocation,
                 &second_wire,
+                None,
                 24,
                 &mut prepared.signer
             ),
@@ -3024,6 +4624,7 @@ mod tests {
             coordinator.apply(
                 second_call.invocation,
                 &second_wire,
+                None,
                 24,
                 &mut prepared.signer
             ),
@@ -3035,6 +4636,7 @@ mod tests {
             .apply(
                 second_call.invocation,
                 &second_wire,
+                None,
                 25,
                 &mut prepared.signer,
             )
@@ -3043,6 +4645,7 @@ mod tests {
             coordinator.apply(
                 prepared.call.invocation,
                 &first_wire,
+                None,
                 26,
                 &mut prepared.signer
             ),
@@ -3063,7 +4666,13 @@ mod tests {
             third.fixture.authority,
         );
         assert!(matches!(
-            pending.apply(third.call.invocation, &third_wire, 24, &mut third.signer),
+            pending.apply(
+                third.call.invocation,
+                &third_wire,
+                None,
+                24,
+                &mut third.signer
+            ),
             Err(PrivateControlApplicationCoordinatorError::Runtime(
                 TestError
             ))
@@ -3073,6 +4682,7 @@ mod tests {
             pending.apply(
                 InvocationId(id(0xfa, 1)),
                 &third_wire,
+                None,
                 24,
                 &mut third.signer
             ),
@@ -3093,14 +4703,20 @@ mod tests {
         let mut coordinator =
             open_coordinator(store.clone(), runtime, actor, prepared.issuer, authority);
         coordinator
-            .apply(prepared.call.invocation, &wire, 24, &mut prepared.signer)
+            .apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer,
+            )
             .unwrap();
         let (coordinator_store, runtime, actor, issuer) = coordinator.into_parts();
         let issuer_store = issuer.into_store();
         let valid = coordinator_store.image().unwrap();
 
         let mut old_magic = valid.clone();
-        old_magic[..4].copy_from_slice(b"PAJ2");
+        old_magic[..4].copy_from_slice(b"PAJ3");
         coordinator_store.replace_image(old_magic);
         let reopened_issuer =
             DurableAuthorityOperationIssuer::open(issuer_store.clone(), authority).unwrap();
@@ -3148,7 +4764,13 @@ mod tests {
         ));
 
         let mut image = PrivateControlApplicationCoordinatorImage::decode(&valid).unwrap();
-        image.records[0].consumed_application_ack = Some(Hash(id(0xfb, 1)));
+        let ApplicationRecordResolution::Applied {
+            application_ack, ..
+        } = &mut image.records[0].resolution
+        else {
+            panic!("positive fixture must retain an applied terminal")
+        };
+        *application_ack = Hash(id(0xfb, 1));
         coordinator_store.replace_image(image.encode());
         let reopened_issuer =
             DurableAuthorityOperationIssuer::open(issuer_store.clone(), authority).unwrap();
@@ -3197,6 +4819,107 @@ mod tests {
     }
 
     #[test]
+    fn retired_image_rejects_invalid_terminal_tag_branch_substitution_and_issuer_divergence() {
+        let mut prepared = prepare(63);
+        let store = MemoryImageStore::default();
+        let runtime = FakeRuntime::default();
+        runtime.deny_next();
+        let actor = prepared.actor.clone();
+        let authority = prepared.fixture.authority;
+        let wire = control_wire(&prepared);
+        let mut coordinator = open_coordinator(
+            store.clone(),
+            runtime.clone(),
+            actor.clone(),
+            prepared.issuer,
+            authority,
+        );
+        coordinator
+            .apply(
+                prepared.call.invocation,
+                &wire,
+                None,
+                24,
+                &mut prepared.signer,
+            )
+            .unwrap();
+        let (store, runtime, actor, issuer) = coordinator.into_parts();
+        let issuer_store = issuer.into_store();
+        let valid = store.image().unwrap();
+        let image = PrivateControlApplicationCoordinatorImage::decode(&valid).unwrap();
+        let ApplicationRecordResolution::RetiredUnapplied { retirement_ack, .. } =
+            &image.records[0].resolution
+        else {
+            panic!("denial did not select retirement")
+        };
+        let retirement_ack = *retirement_ack;
+
+        let offsets: Vec<usize> = valid
+            .windows(retirement_ack.as_bytes().len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == retirement_ack.as_bytes()).then_some(offset))
+            .collect();
+        assert_eq!(offsets.len(), 1);
+        let mut invalid_tag = valid.clone();
+        invalid_tag[offsets[0] - 1] = 9;
+        store.replace_image(invalid_tag);
+        let reopened_issuer =
+            DurableAuthorityOperationIssuer::open(issuer_store.clone(), authority).unwrap();
+        assert!(matches!(
+            DurablePrivateControlApplicationCoordinator::open(
+                store.clone(),
+                authority,
+                runtime.clone(),
+                actor.clone(),
+                reopened_issuer,
+            ),
+            Err(PrivateControlApplicationCoordinatorError::InvalidState)
+        ));
+
+        let mut substituted = image.clone();
+        substituted.records[0].resolution = ApplicationRecordResolution::Applied {
+            application_ack: retirement_ack,
+            actor_consumed: true,
+            persisted_authority_evidence: Some(Hash(id(0xfc, 1))),
+        };
+        assert!(substituted.is_valid());
+        store.replace_image(substituted.encode());
+        let reopened_issuer =
+            DurableAuthorityOperationIssuer::open(issuer_store.clone(), authority).unwrap();
+        assert!(matches!(
+            DurablePrivateControlApplicationCoordinator::open(
+                store.clone(),
+                authority,
+                runtime.clone(),
+                actor.clone(),
+                reopened_issuer,
+            ),
+            Err(PrivateControlApplicationCoordinatorError::InvalidState)
+        ));
+
+        let mut divergent = image;
+        let ApplicationRecordResolution::RetiredUnapplied { retirement_ack, .. } =
+            &mut divergent.records[0].resolution
+        else {
+            unreachable!()
+        };
+        *retirement_ack = Hash(id(0xfd, 1));
+        store.replace_image(divergent.encode());
+        let reopened_issuer =
+            DurableAuthorityOperationIssuer::open(issuer_store, authority).unwrap();
+        assert!(matches!(
+            DurablePrivateControlApplicationCoordinator::open(
+                store,
+                authority,
+                runtime,
+                actor,
+                reopened_issuer,
+            ),
+            Err(PrivateControlApplicationCoordinatorError::InvalidState)
+        ));
+    }
+
+    #[test]
     fn image_capacity_and_invocation_collisions_fail_closed() {
         let prepared = prepare(1);
         let control = control_wire(&prepared);
@@ -3207,20 +4930,34 @@ mod tests {
                 authorization_invocation: InvocationId(id(0xc1, index + 1)),
                 application_invocation: InvocationId(id(0xc2, index + 1)),
                 control: control.clone(),
-                applied_at: 24,
-                consumed_application_ack: Some(Hash(id(0xc3, index + 1))),
-                persisted_authority_evidence: Some(Hash(id(0xc4, index + 1))),
+                mutation: None,
+                resolved_at: 24,
+                resolution: if index % 2 == 0 {
+                    ApplicationRecordResolution::Applied {
+                        application_ack: Hash(id(0xc3, index + 1)),
+                        actor_consumed: true,
+                        persisted_authority_evidence: Some(Hash(id(0xc4, index + 1))),
+                    }
+                } else {
+                    ApplicationRecordResolution::RetiredUnapplied {
+                        retirement_ack: Hash(id(0xc3, index + 1)),
+                        actor_consumed: true,
+                    }
+                },
             });
         }
-        image.application_slot_high_water = Some(24);
+        image.resolution_slot_high_water = Some(24);
         assert!(image.is_valid());
         image.records.push(ApplicationRecord {
             authorization_invocation: InvocationId(id(0xc1, 10_000)),
             application_invocation: InvocationId(id(0xc2, 10_000)),
             control: control.clone(),
-            applied_at: 24,
-            consumed_application_ack: Some(Hash(id(0xc3, 10_000))),
-            persisted_authority_evidence: Some(Hash(id(0xc4, 10_000))),
+            mutation: None,
+            resolved_at: 24,
+            resolution: ApplicationRecordResolution::RetiredUnapplied {
+                retirement_ack: Hash(id(0xc3, 10_000)),
+                actor_consumed: true,
+            },
         });
         assert!(!image.has_valid_envelope());
         image.records.pop();

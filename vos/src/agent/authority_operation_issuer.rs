@@ -4,11 +4,11 @@
 //! module owns the narrower crash-consistency boundary between that actor's
 //! exact approval and the authority signatures which leave the host: the
 //! operation receipt, AOI1 issuance acknowledgement, and (for Private
-//! controls) one mutually exclusive PCA1 applied or PAR1 retired-unapplied
+//! controls) one mutually exclusive PCA2 applied or PAR1 retired-unapplied
 //! terminal acknowledgement.
 //!
 //! Records are intentionally never compacted here. AOI1 proves that the host
-//! durably issued one receipt. PCA1 proves that a Private runtime durably
+//! durably issued one receipt. PCA2 proves that a Private runtime durably
 //! reopened one control; PAR1 proves only that the unused capability was
 //! retired, without retaining a guest denial. Neither proves that the
 //! authority actor durably consumed the acknowledgement. Until separately
@@ -75,7 +75,7 @@ pub trait AuthorityOperationEvidenceSigner {
 /// for an exact message after a crash or ambiguous commit. Keeping this method
 /// distinct prevents an AOI1 or receipt preimage from being relabelled as a
 /// Private terminal acknowledgement by a signer adapter. The methods remain
-/// separate so PCA1 and PAR1 signing authority cannot be accidentally
+/// separate so PCA2 and PAR1 signing authority cannot be accidentally
 /// relabelled by an adapter even though they share the same invocation.
 pub trait PrivateControlApplicationEvidenceSigner {
     type Error;
@@ -694,6 +694,19 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
             .count()
     }
 
+    pub(crate) fn retained_private_retirements(&self) -> usize {
+        self.image
+            .records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    &record.private_resolution,
+                    Some(RetainedPrivateResolutionBytes::RetiredUnapplied { .. })
+                )
+            })
+            .count()
+    }
+
     pub(crate) fn retained_private_resolutions(&self) -> usize {
         self.image
             .records
@@ -1006,14 +1019,14 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
         })
     }
 
-    /// Sign PCA1 only from an exact Private application observation which was
+    /// Sign PCA2 only from an exact Private application observation which was
     /// pledged after this issuer had durably retained the complete AOI1.
     ///
     /// This raw fact entrypoint is crate-private. A fact is not authenticated
     /// merely because its fields match an AOC4; only the trusted Private
     /// runtime coordinator may pass the exact echoed result of a durable
     /// apply-and-reopen transition. Exact completed retries return retained
-    /// PCA1 without consulting the signer.
+    /// PCA2 without consulting the signer.
     pub(crate) fn issue_private_application<S: PrivateControlApplicationEvidenceSigner>(
         &mut self,
         authorization_invocation: InvocationId,
@@ -1210,7 +1223,7 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
     ///
     /// The pledge carries no guest result or error. A signer failure leaves
     /// that exact preimage retryable; a completed retry returns the retained
-    /// byte-identical PAR1 without consulting the signer. PCA1 and PAR1 use
+    /// byte-identical PAR1 without consulting the signer. PCA2 and PAR1 use
     /// one tagged lineage, so neither a pending nor completed branch can be
     /// replaced by the other.
     pub(crate) fn retire_private_application<S: PrivateControlApplicationEvidenceSigner>(
@@ -1582,7 +1595,8 @@ fn encode_application_fact(encoder: &mut Encoder<'_>, application: &PrivateContr
     });
     encoder.u64(application.epoch);
     encoder.fixed(application.post_member_set.as_bytes());
-    encoder.fixed(application.reopened_control_state.as_bytes());
+    encoder.fixed(application.reopened_runtime_state.as_bytes());
+    encoder.fixed(application.stable_projection.as_bytes());
     encoder.fixed(application.reopened_control_head.as_bytes());
     encoder.u64(application.applied_at);
 }
@@ -1664,7 +1678,8 @@ fn decode_application_fact(
         control_previous: decoder.option(|decoder| Ok(Hash(decoder.fixed()?)))?,
         epoch: decoder.u64()?,
         post_member_set: Hash(decoder.fixed()?),
-        reopened_control_state: Hash(decoder.fixed()?),
+        reopened_runtime_state: Hash(decoder.fixed()?),
+        stable_projection: Hash(decoder.fixed()?),
         reopened_control_head: Hash(decoder.fixed()?),
         applied_at: decoder.u64()?,
     };
@@ -2357,7 +2372,8 @@ mod tests {
             control_previous,
             epoch,
             post_member_set,
-            reopened_control_state: Hash(id(0x91, discriminator)),
+            reopened_runtime_state: Hash(id(0x91, discriminator)),
+            stable_projection: Hash(id(0x92, discriminator)),
             reopened_control_head: control,
             applied_at,
         };
@@ -3065,7 +3081,7 @@ mod tests {
         ));
 
         let mut substituted = first_application;
-        substituted.reopened_control_state = Hash(id(0x92, 1));
+        substituted.reopened_runtime_state = Hash(id(0x93, 1));
         assert!(matches!(
             issuer.issue_private_application(first.invocation, &substituted, &mut signer),
             Err(AuthorityOperationIssuerError::Rejected(
@@ -3109,6 +3125,7 @@ mod tests {
         assert_eq!(signer.retirement_calls, 1);
         assert_eq!(issuer.retained_private_resolutions(), 1);
         assert_eq!(issuer.retained_private_applications(), 0);
+        assert_eq!(issuer.retained_private_retirements(), 1);
         assert!(!issuer.has_pending_private_resolution());
         assert_eq!(
             retired.retirement_ack.application_invocation,

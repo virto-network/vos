@@ -22,13 +22,15 @@ use vos_agent_sdk::authority::{
     AgentAuthorityBinding, AuthorityActorTarget, AuthorityIssuer, AuthorityOperationKind,
     AuthorityReceipt, AuthorityVerifier, ManagedAgentTarget,
 };
+#[cfg(test)]
+use vos_agent_sdk::authority_operation::PrivateControlApplicationFact;
 use vos_agent_sdk::authority_operation::{
     AuthorityOperationIntent, AuthorityOperationIssuanceAck,
     MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES,
     MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES,
     MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES, PrivateControlApplicationAck,
-    PrivateControlApplicationFact, PrivateRecoveryAuthorityProof,
-    PrivateRecoveryAuthorityProofVerifier, private_member_set_commitment,
+    PrivateRecoveryAuthorityProof, PrivateRecoveryAuthorityProofVerifier,
+    private_member_set_commitment,
 };
 use vos_agent_sdk::contract::{
     ActorAbiRange, RuntimeMigrationPolicy, RuntimePackageContract, RuntimeResourceLimits,
@@ -43,13 +45,13 @@ use vos_agent_sdk::private::{PrivateActorLifecycleKind, PrivateKeyEpoch};
 use vos_agent_sdk::protocol::wire::{DecodeError, Decoder, Encoder};
 use vos_agent_sdk::wire::{
     CanonicalWire, MAX_PRIVATE_CONTROL_WIRE_BYTES, MAX_PRIVATE_NODE_IDENTITY_WIRE_BYTES,
-    MAX_PRIVATE_OBJECT_WIRE_BYTES,
+    MAX_PRIVATE_OBJECT_WIRE_BYTES, MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES,
 };
 use vos_agent_sdk::{
     ActorDescriptor, ActorId, AgentDescriptor, AgentId, AgentIdentity, AgentProfile, AgentReplica,
-    BlobRef, CredentialId, DeploymentId, Hash, LaneSet, NodeId, PrincipalId,
-    PrivateRecoveryBinding, ProducerId, ProgramId, ProofSystemSet, ReplicaRole,
-    RuntimeCapabilities, RuntimeWork, SpaceId, StorageFieldDescriptor,
+    BlobRef, CredentialId, DeploymentId, Hash, LaneSet, ManagementRequest, NodeId, PrincipalId,
+    PrivateRecoveryBinding, PrivateRuntimeMutation, ProducerId, ProgramId, ProofSystemSet,
+    ReplicaRole, RuntimeCapabilities, RuntimeWork, SpaceId, StorageFieldDescriptor,
 };
 use zeroize::Zeroizing;
 
@@ -59,8 +61,12 @@ use super::package_admission::{AdmittedRuntimePackage, admit_runtime_package};
 use super::private_control_application_coordinator::decode_private_application_fact;
 use super::private_control_application_coordinator::{
     PrivateControlRuntimeApplicationAdapter, PrivateControlRuntimeApplicationRequest,
-    PrivateControlRuntimeApplicationResult, PrivateControlRuntimeEvidenceRequest,
-    PrivateControlRuntimeEvidenceResult, encode_private_application_fact,
+    PrivateControlRuntimeApplicationResolution, PrivateControlRuntimeEvidenceRequest,
+    PrivateControlRuntimeEvidenceResult,
+};
+#[cfg(test)]
+use super::private_control_application_coordinator::{
+    PrivateControlRuntimeApplicationResult, encode_private_application_fact,
 };
 #[cfg(test)]
 use super::private_crypto::{
@@ -104,7 +110,6 @@ const RECOVERY_PLAN_HASH_DOMAIN: &[u8] = b"vos/private/recovery-plan-bytes/v3";
 const RECOVERY_SOURCE_ARCHIVE_HASH_DOMAIN: &[u8] = b"vos/private/recovery-source-archive/v2";
 const RECOVERY_SOURCE_SET_HASH_DOMAIN: &[u8] = b"vos/private/recovery-source-set/v2";
 const RECOVERY_REPLACEMENTS_DOMAIN: &[u8] = b"vos/private/recovery-replacements/v1";
-const PRIVATE_REOPENED_CONTROL_STATE_DOMAIN: &[u8] = b"vos/private/reopened-control-state/v1";
 
 const ROOT_SCOPE_FILE: &str = "scope";
 const ROOT_LOCK_FILE: &str = "lock";
@@ -337,15 +342,30 @@ pub struct PrivateAgentHost {
     agents: BTreeMap<AgentId, HostedPrivateAgent>,
 }
 
-/// Concrete ciphertext-only runtime half of the Private authority pipeline.
+/// Placeholder for the physical Private-runtime half of the authority pipeline.
 ///
 /// Construction is crate-private because the caller must pair this adapter
 /// with the durable operation issuer/coordinator and an exact system-authority
 /// dispatcher. It accepts only the externally signed PCTL carried by the
 /// coordinator request; it has no key-generation or control-signing API.
-/// Every accepted mutation is projected from the exact signed PCTL into an
-/// authority intent before it can reach the physical store.
+/// The ciphertext/control-only host cannot yet construct PCRS2 or the
+/// successor PSP1. Its production `apply` path therefore validates the exact
+/// canonical request and fails closed before any Store write. The physical
+/// runtime-lifecycle owner will replace that rejection with a real reopened
+/// proof boundary.
 pub(crate) struct PrivateAgentRuntimeApplication<'host, V> {
+    host: &'host mut PrivateAgentHost,
+    authority: AuthorityActorTarget,
+    node_authority: &'host V,
+    stop: PrivateRuntimeApplicationStop,
+}
+
+/// Test-only bridge for the pre-PCRS Store failpoint/recovery coverage.
+///
+/// This never exists in production and its synthetic proof bindings must not
+/// be confused with evidence from a physical Private runtime lifecycle.
+#[cfg(test)]
+struct SyntheticLegacyPrivateRuntimeApplicationForTest<'host, V> {
     host: &'host mut PrivateAgentHost,
     authority: AuthorityActorTarget,
     node_authority: &'host V,
@@ -583,6 +603,27 @@ impl PrivateAgentHost {
             return Err(PrivateAgentHostError::InvalidScope);
         }
         Ok(PrivateAgentRuntimeApplication {
+            host: self,
+            authority,
+            node_authority,
+            stop: PrivateRuntimeApplicationStop::Never,
+        })
+    }
+
+    #[cfg(test)]
+    fn synthetic_legacy_runtime_application_adapter_for_test<'host, V>(
+        &'host mut self,
+        authority: AuthorityActorTarget,
+        node_authority: &'host V,
+    ) -> Result<SyntheticLegacyPrivateRuntimeApplicationForTest<'host, V>, PrivateAgentHostError>
+    where
+        V: PrivateNodeAuthorityVerifier,
+    {
+        self.verify_root_scope()?;
+        if !authority.is_valid() || authority.space != self.scope.space {
+            return Err(PrivateAgentHostError::InvalidScope);
+        }
+        Ok(SyntheticLegacyPrivateRuntimeApplicationForTest {
             host: self,
             authority,
             node_authority,
@@ -1612,7 +1653,7 @@ impl PrivateAgentHost {
     }
 
     /// Apply one exact authenticated, authority-evidenced sync page. Every
-    /// PCTL is bound to canonical AOI1+PCA1 under the independently configured
+    /// PCTL is bound to canonical AOI1+PCA2 under the independently configured
     /// authority before any epoch sidecar or store artifact is staged.
     pub fn apply_sync_page<A, T>(
         &mut self,
@@ -1688,7 +1729,44 @@ impl PrivateAgentHost {
         }
     }
 
-    fn apply_authorized_private_control<V>(
+    fn reject_unwired_private_runtime_application<V>(
+        &self,
+        authority: AuthorityActorTarget,
+        node_authority: &V,
+        request: &PrivateControlRuntimeApplicationRequest,
+    ) -> Result<PrivateControlRuntimeApplicationResolution, PrivateAgentHostError>
+    where
+        V: PrivateNodeAuthorityVerifier,
+    {
+        self.verify_root_scope()?;
+        let control = PrivateControlRecord::decode(&request.control)
+            .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
+        if control.encode().ok().as_deref() != Some(request.control.as_slice()) {
+            return Err(PrivateAgentHostError::InvalidArtifact);
+        }
+        validate_private_runtime_application_mutation(&control, request.mutation.as_deref())?;
+
+        // Validate as much of the currently supported envelope as the legacy
+        // ciphertext/control host can authenticate, but never enter its Store
+        // mutation path. A future physical runtime lifecycle must produce the
+        // PCRS2 and successor PSP1 commitments before this can return Applied.
+        if self.agents.contains_key(&request.route.agent) {
+            match prepare_private_application(
+                self.hosted(request.route.agent)?,
+                &self.scope.local_node,
+                authority,
+                node_authority,
+                request,
+            ) {
+                Ok(_) | Err(PrivateAgentHostError::UnsupportedOperation) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(PrivateAgentHostError::UnsupportedOperation)
+    }
+
+    #[cfg(test)]
+    fn apply_synthetic_legacy_private_control_for_test<V>(
         &mut self,
         authority: AuthorityActorTarget,
         node_authority: &V,
@@ -1703,7 +1781,12 @@ impl PrivateAgentHost {
         if !self.agents.contains_key(&agent)
             && fs::symlink_metadata(self.creating_path(agent).join(RECOVERY_PLAN_FILE)).is_ok()
         {
-            return self.apply_authorized_staged_recovery(authority, node_authority, request, stop);
+            return self.apply_synthetic_legacy_staged_recovery_for_test(
+                authority,
+                node_authority,
+                request,
+                stop,
+            );
         }
         if self.agents.contains_key(&agent) {
             let control = PrivateControlRecord::decode(&request.control)
@@ -1778,7 +1861,8 @@ impl PrivateAgentHost {
             &self.node_key,
             node_authority,
         )?;
-        let fact = reopened_private_application_fact(&reopened, request, &prepared)?;
+        let fact =
+            synthetic_legacy_private_application_fact_for_test(&reopened, request, &prepared)?;
         if self.agents.insert(agent, reopened).is_some() {
             return Err(PrivateAgentHostError::Alias);
         }
@@ -1790,17 +1874,21 @@ impl PrivateAgentHost {
             route: request.route,
             authority: request.authority,
             control: request.control.clone(),
+            mutation: request.mutation.clone(),
             receipt: request.receipt.clone(),
             issuance_ack: request.issuance_ack.clone(),
             applied_at: request.applied_at,
             authenticated: true,
             durably_applied: true,
             durably_reopened: true,
+            reopened_runtime_state: fact.reopened_runtime_state,
+            stable_projection: fact.stable_projection,
             application_fact: encode_private_application_fact(&fact),
         })
     }
 
-    fn apply_authorized_staged_recovery<V>(
+    #[cfg(test)]
+    fn apply_synthetic_legacy_staged_recovery_for_test<V>(
         &mut self,
         authority: AuthorityActorTarget,
         node_authority: &V,
@@ -1831,18 +1919,21 @@ impl PrivateAgentHost {
         {
             return Err(PrivateAgentHostError::Corrupt);
         }
-        let fact = reopened_private_application_fact(&hosted, request, &prepared)?;
+        let fact = synthetic_legacy_private_application_fact_for_test(&hosted, request, &prepared)?;
         drop(hosted);
         Ok(PrivateControlRuntimeApplicationResult {
             route: request.route,
             authority: request.authority,
             control: request.control.clone(),
+            mutation: request.mutation.clone(),
             receipt: request.receipt.clone(),
             issuance_ack: request.issuance_ack.clone(),
             applied_at: request.applied_at,
             authenticated: true,
             durably_applied: true,
             durably_reopened: true,
+            reopened_runtime_state: fact.reopened_runtime_state,
+            stable_projection: fact.stable_projection,
             application_fact: encode_private_application_fact(&fact),
         })
     }
@@ -2557,12 +2648,11 @@ where
     fn apply(
         &mut self,
         request: &PrivateControlRuntimeApplicationRequest,
-    ) -> Result<PrivateControlRuntimeApplicationResult, Self::Error> {
-        self.host.apply_authorized_private_control(
+    ) -> Result<PrivateControlRuntimeApplicationResolution, Self::Error> {
+        self.host.reject_unwired_private_runtime_application(
             self.authority,
             self.node_authority,
             request,
-            self.stop,
         )
     }
 
@@ -2580,7 +2670,42 @@ where
 }
 
 #[cfg(test)]
-impl<V> PrivateAgentRuntimeApplication<'_, V> {
+impl<V> PrivateControlRuntimeApplicationAdapter
+    for SyntheticLegacyPrivateRuntimeApplicationForTest<'_, V>
+where
+    V: PrivateNodeAuthorityVerifier,
+{
+    type Error = PrivateAgentHostError;
+
+    fn apply(
+        &mut self,
+        request: &PrivateControlRuntimeApplicationRequest,
+    ) -> Result<PrivateControlRuntimeApplicationResolution, Self::Error> {
+        self.host
+            .apply_synthetic_legacy_private_control_for_test(
+                self.authority,
+                self.node_authority,
+                request,
+                self.stop,
+            )
+            .map(PrivateControlRuntimeApplicationResolution::Applied)
+    }
+
+    fn persist_completed_evidence(
+        &mut self,
+        request: &PrivateControlRuntimeEvidenceRequest,
+    ) -> Result<PrivateControlRuntimeEvidenceResult, Self::Error> {
+        self.host.persist_completed_private_control_evidence(
+            self.authority,
+            self.node_authority,
+            request,
+            self.stop,
+        )
+    }
+}
+
+#[cfg(test)]
+impl<V> SyntheticLegacyPrivateRuntimeApplicationForTest<'_, V> {
     fn stop_after(&mut self, stop: PrivateRuntimeApplicationStop) {
         self.stop = stop;
     }
@@ -2599,7 +2724,10 @@ fn validate_staged_recovery_application_request(
         return Err(PrivateAgentHostError::InvalidScope);
     }
     let (_control, proof) = validate_recovery_plan_material(plan)?;
-    if request.control != plan.control_wire || proof.managed != request.route {
+    if request.control != plan.control_wire
+        || request.mutation.is_some()
+        || proof.managed != request.route
+    {
         return Err(PrivateAgentHostError::InvalidArtifact);
     }
     let receipt = AuthorityReceipt::decode(&request.receipt)
@@ -2689,6 +2817,7 @@ where
         return Err(PrivateAgentHostError::InvalidArtifact);
     }
     verify_control_record_signature(&control)?;
+    validate_private_runtime_application_mutation(&control, request.mutation.as_deref())?;
     if matches!(
         &control.operation,
         PrivateControlOperation::SetResourcePolicy { .. }
@@ -2804,6 +2933,39 @@ where
         expected_members,
         already_applied,
     })
+}
+
+fn validate_private_runtime_application_mutation(
+    control: &PrivateControlRecord,
+    mutation_wire: Option<&[u8]>,
+) -> Result<(), PrivateAgentHostError> {
+    match &control.operation {
+        PrivateControlOperation::SetResourcePolicy { .. }
+        | PrivateControlOperation::ActorLifecycle { .. } => {
+            let mutation_wire = mutation_wire.ok_or(PrivateAgentHostError::InvalidArtifact)?;
+            if mutation_wire.len() > MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES {
+                return Err(PrivateAgentHostError::LimitExceeded);
+            }
+            let mutation = PrivateRuntimeMutation::decode(mutation_wire)
+                .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
+            let request = ManagementRequest::PrivateControl {
+                control: Box::new(control.clone()),
+                mutation: Box::new(mutation.clone()),
+            };
+            if mutation.encode().ok().as_deref() != Some(mutation_wire) || !request.is_valid() {
+                return Err(PrivateAgentHostError::InvalidArtifact);
+            }
+        }
+        PrivateControlOperation::Invite { .. }
+        | PrivateControlOperation::Revoke { .. }
+        | PrivateControlOperation::RotateKeys { .. }
+        | PrivateControlOperation::Recover { .. } => {
+            if mutation_wire.is_some() {
+                return Err(PrivateAgentHostError::InvalidArtifact);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_new_private_application_position(
@@ -3040,7 +3202,8 @@ where
     Ok(())
 }
 
-fn reopened_private_application_fact(
+#[cfg(test)]
+fn synthetic_legacy_private_application_fact_for_test(
     hosted: &HostedPrivateAgent,
     request: &PrivateControlRuntimeApplicationRequest,
     prepared: &PreparedPrivateApplication,
@@ -3080,42 +3243,16 @@ fn reopened_private_application_fact(
         control_previous: prepared.control.previous,
         epoch: prepared.expected_epoch,
         post_member_set,
-        reopened_control_state: reopened_control_state(hosted, request.route, post_member_set)?,
+        // These values are deliberately synthetic and exist only to preserve
+        // pre-PCRS Store transaction tests. Production never calls this path.
+        reopened_runtime_state: Hash([0xf1; 32]),
+        stable_projection: Hash([0xf2; 32]),
         reopened_control_head: prepared.control.commitment(),
         applied_at: request.applied_at,
     };
     fact.validate_shape()
         .map_err(|_| PrivateAgentHostError::Corrupt)?;
     Ok(fact)
-}
-
-fn reopened_control_state(
-    hosted: &HostedPrivateAgent,
-    route: ManagedAgentTarget,
-    member_set: Hash,
-) -> Result<Hash, PrivateAgentHostError> {
-    let binding = hosted.store.binding();
-    let head = binding.control_head.ok_or(PrivateAgentHostError::Corrupt)?;
-    let epoch = hosted.store.key_epoch();
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"PCRS");
-    bytes.extend_from_slice(vos_agent_sdk::RUNTIME_ABI_ID.as_bytes());
-    let mut encoder = Encoder(&mut bytes);
-    encoder.fixed(route.space.as_bytes());
-    encoder.fixed(route.agent.as_bytes());
-    encoder.fixed(route.runtime_deployment.as_bytes());
-    encoder.fixed(binding.owner.as_bytes());
-    encoder.u64(binding.epoch);
-    encoder.fixed(head.as_bytes());
-    encoder.u64(binding.next_sequence);
-    encoder.fixed(member_set.as_bytes());
-    encoder.fixed(epoch.owner_key_commitment.as_bytes());
-    encoder.fixed(epoch.data_key_commitment.as_bytes());
-    encoder.fixed(epoch.recovery_key_commitment.as_bytes());
-    Ok(Hash::digest(
-        PRIVATE_REOPENED_CONTROL_STATE_DOMAIN,
-        &[&bytes],
-    ))
 }
 
 fn stage_metadata_for_application(
@@ -4950,7 +5087,7 @@ fn validate_recovery_plan_host(
 /// A planless staging slot is normally an ordinary create that stopped after
 /// its own authenticated files were complete. Recovery has a stronger gate:
 /// PVRP3 is retired immediately before publication, so the exact Recover head
-/// must already carry a self-contained PSE2 with PRA1+AOI1+PCA1. This check
+/// must already carry a self-contained PSE2 with PRA1+AOI1+PCA2. This check
 /// prevents a nonempty, planless partial recovery from being mistaken for an
 /// ordinary completed create.
 fn validate_planless_staged_recovery(
@@ -5264,7 +5401,7 @@ fn verify_completed_recovery_evidence(
 
 /// Verify recovery completion against the exact retained PRA1 rather than
 /// attempting the normal private-control intent reconstruction (which
-/// deliberately rejects Recover). Neither AOI1 nor PCA1 is accepted as a
+/// deliberately rejects Recover). Neither AOI1 nor PCA2 is accepted as a
 /// substitute for possession of the independently signed recovery proof.
 fn verify_recovery_authority_evidence(
     evidence: &PrivateControlAuthorityEvidence,
@@ -6209,6 +6346,7 @@ mod tests {
                 route,
                 authority,
                 control: control.encode().unwrap(),
+                mutation: None,
                 receipt: receipt.encode().unwrap(),
                 issuance_ack: issuance.encode().unwrap(),
                 applied_at,
@@ -6234,9 +6372,27 @@ mod tests {
         authority: AuthorityActorTarget,
         request: &PrivateControlRuntimeApplicationRequest,
     ) -> Result<PrivateControlRuntimeApplicationResult, PrivateAgentHostError> {
-        host.runtime_application_adapter(authority, &TestAuthority)
+        let resolution = host
+            .synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
             .unwrap()
-            .apply(request)
+            .apply(request)?;
+        match resolution {
+            PrivateControlRuntimeApplicationResolution::Applied(result) => Ok(result),
+            PrivateControlRuntimeApplicationResolution::RetiredUnapplied(_) => {
+                Err(PrivateAgentHostError::Corrupt)
+            }
+        }
+    }
+
+    fn require_applied_runtime_result(
+        resolution: PrivateControlRuntimeApplicationResolution,
+    ) -> PrivateControlRuntimeApplicationResult {
+        match resolution {
+            PrivateControlRuntimeApplicationResolution::Applied(result) => result,
+            PrivateControlRuntimeApplicationResolution::RetiredUnapplied(_) => {
+                panic!("physical Private host unexpectedly retired an application")
+            }
+        }
     }
 
     fn apply_and_attach_test_authority_evidence(
@@ -6255,7 +6411,7 @@ mod tests {
         let application = signed_test_application_ack(fixture, &request, &result);
         let evidence_request = test_evidence_request(&request, &application);
         let evidence = host
-            .runtime_application_adapter(authority, &TestAuthority)
+            .synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
             .unwrap()
             .persist_completed_evidence(&evidence_request)
             .unwrap();
@@ -6301,19 +6457,25 @@ mod tests {
             expected_members,
             already_applied: true,
         };
-        let application_fact =
-            reopened_private_application_fact(&host.agents[&control.agent], &request, &prepared)
-                .unwrap();
+        let application_fact = synthetic_legacy_private_application_fact_for_test(
+            &host.agents[&control.agent],
+            &request,
+            &prepared,
+        )
+        .unwrap();
         let result = PrivateControlRuntimeApplicationResult {
             route: request.route,
             authority: request.authority,
             control: request.control.clone(),
+            mutation: request.mutation.clone(),
             receipt: request.receipt.clone(),
             issuance_ack: request.issuance_ack.clone(),
             applied_at: request.applied_at,
             authenticated: true,
             durably_applied: true,
             durably_reopened: true,
+            reopened_runtime_state: application_fact.reopened_runtime_state,
+            stable_projection: application_fact.stable_projection,
             application_fact: encode_private_application_fact(&application_fact),
         };
         let application = signed_test_application_ack(fixture, &request, &result);
@@ -6402,7 +6564,7 @@ mod tests {
         let application = signed_test_application_ack(fixture, &request, &result);
         let evidence_request =
             test_recovery_evidence_request(&request, &application, &prepared.proof);
-        host.runtime_application_adapter(authority, &TestAuthority)?
+        host.synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)?
             .persist_completed_evidence(&evidence_request)
     }
 
@@ -6472,6 +6634,35 @@ mod tests {
     }
 
     #[test]
+    fn production_runtime_adapter_fails_unsupported_before_any_store_write() {
+        let fixture = fixture(64);
+        let mut host = create_host(&fixture, 0, "unwired-runtime-application");
+        let agent = create_agent(&mut host, &fixture);
+        let revoked = fixture.nodes[1].identity.node;
+        let control = signed_revoke_control(&host, agent, revoked);
+        let (authority, request) = runtime_application_request(&fixture, &control, 40, 44);
+        let binding = host.binding(agent).unwrap();
+        let sidecars = canonical_sidecars(&host, agent);
+
+        let result = host
+            .runtime_application_adapter(authority, &TestAuthority)
+            .unwrap()
+            .apply(&request);
+        assert!(matches!(
+            result,
+            Err(PrivateAgentHostError::UnsupportedOperation)
+        ));
+        assert_eq!(host.binding(agent).unwrap(), binding);
+        assert_eq!(canonical_sidecars(&host, agent), sidecars);
+        assert!(
+            !host.agents[&agent]
+                .store
+                .control_is_exact(control.commitment(), &request.control)
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn authorized_runtime_application_reopens_and_exact_retry_is_byte_identical() {
         let fixture = fixture(2);
         let mut host = create_host(&fixture, 0, "authorized-application");
@@ -6482,9 +6673,9 @@ mod tests {
 
         let first = {
             let mut runtime = host
-                .runtime_application_adapter(authority, &TestAuthority)
+                .synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
                 .unwrap();
-            runtime.apply(&request).unwrap()
+            require_applied_runtime_result(runtime.apply(&request).unwrap())
         };
         assert!(first.authenticated && first.durably_applied && first.durably_reopened);
         assert_eq!(first.control, request.control);
@@ -6503,9 +6694,9 @@ mod tests {
         let sidecars = canonical_sidecars(&host, agent);
         let retry = {
             let mut runtime = host
-                .runtime_application_adapter(authority, &TestAuthority)
+                .synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
                 .unwrap();
-            runtime.apply(&request).unwrap()
+            require_applied_runtime_result(runtime.apply(&request).unwrap())
         };
         assert_eq!(retry, first);
         assert_eq!(canonical_sidecars(&host, agent), sidecars);
@@ -6514,9 +6705,9 @@ mod tests {
         let mut reopened = reopen_host(&fixture, 0, "authorized-application");
         let restart_retry = {
             let mut runtime = reopened
-                .runtime_application_adapter(authority, &TestAuthority)
+                .synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
                 .unwrap();
-            runtime.apply(&request).unwrap()
+            require_applied_runtime_result(runtime.apply(&request).unwrap())
         };
         assert_eq!(restart_retry, first);
         assert_eq!(canonical_sidecars(&reopened, agent), sidecars);
@@ -6553,7 +6744,10 @@ mod tests {
                 let (authority, request) = runtime_application_request(&fixture, &control, 50, 55);
                 let interrupted = {
                     let mut runtime = host
-                        .runtime_application_adapter(authority, &TestAuthority)
+                        .synthetic_legacy_runtime_application_adapter_for_test(
+                            authority,
+                            &TestAuthority,
+                        )
                         .unwrap();
                     runtime.stop_after(boundary);
                     runtime.apply(&request)
@@ -6568,9 +6762,12 @@ mod tests {
                 let mut reopened = reopen_host(&fixture, 0, &name);
                 let result = {
                     let mut runtime = reopened
-                        .runtime_application_adapter(authority, &TestAuthority)
+                        .synthetic_legacy_runtime_application_adapter_for_test(
+                            authority,
+                            &TestAuthority,
+                        )
                         .unwrap();
-                    runtime.apply(&request).unwrap()
+                    require_applied_runtime_result(runtime.apply(&request).unwrap())
                 };
                 assert!(result.authenticated && result.durably_applied && result.durably_reopened);
                 let binding = reopened.binding(agent).unwrap();
@@ -6623,7 +6820,10 @@ mod tests {
             let expected_commitment = expected.commitment().unwrap();
             let interrupted = {
                 let mut runtime = host
-                    .runtime_application_adapter(authority, &TestAuthority)
+                    .synthetic_legacy_runtime_application_adapter_for_test(
+                        authority,
+                        &TestAuthority,
+                    )
                     .unwrap();
                 runtime.stop_after(boundary);
                 runtime.persist_completed_evidence(&evidence_request)
@@ -6643,7 +6843,7 @@ mod tests {
                 Some(control.commitment())
             );
             let result = reopened
-                .runtime_application_adapter(authority, &TestAuthority)
+                .synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
                 .unwrap()
                 .persist_completed_evidence(&evidence_request)
                 .unwrap();
@@ -6665,7 +6865,7 @@ mod tests {
                 "boundary {boundary:?}"
             );
             let retry = reopened
-                .runtime_application_adapter(authority, &TestAuthority)
+                .synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
                 .unwrap()
                 .persist_completed_evidence(&evidence_request)
                 .unwrap();
@@ -6755,10 +6955,13 @@ mod tests {
 
         for (label, candidate) in cases {
             assert!(
-                host.runtime_application_adapter(authority, &TestAuthority)
-                    .unwrap()
-                    .persist_completed_evidence(&candidate)
-                    .is_err(),
+                host.synthetic_legacy_runtime_application_adapter_for_test(
+                    authority,
+                    &TestAuthority
+                )
+                .unwrap()
+                .persist_completed_evidence(&candidate)
+                .is_err(),
                 "{label}"
             );
             let entry = &host.agents[&agent].store.indexed_controls()[0];
@@ -6787,7 +6990,7 @@ mod tests {
             );
         }
 
-        host.runtime_application_adapter(authority, &TestAuthority)
+        host.synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
             .unwrap()
             .persist_completed_evidence(&exact)
             .unwrap();
@@ -7100,16 +7303,33 @@ mod tests {
 
         // A resource-policy PCTL cannot be reported as applied until the host
         // has a durable policy application/reopen implementation.
+        let policy = vos_agent_sdk::contract::RuntimeResourcePolicy::standard();
+        let policy_mutation = PrivateRuntimeMutation::SetResourcePolicy(policy);
         let mut resource = unsigned_owner_record(
             host.hosted(agent).unwrap(),
             PrivateControlOperation::SetResourcePolicy {
-                policy: BlobRef::of_bytes(b"private-resource-policy-v1"),
+                policy: BlobRef::of_bytes(&policy.encode().unwrap()),
             },
         );
         sign_owner_control_record(&mut resource, &host.hosted(agent).unwrap().owner_key).unwrap();
-        let (_, resource_request) = runtime_application_request(&fixture, &resource, 50, 54);
+        let (_, mut resource_request) = runtime_application_request(&fixture, &resource, 50, 54);
         let before_resource = host.binding(agent).unwrap();
         let before_resource_sidecars = canonical_sidecars(&host, agent);
+        assert_eq!(
+            apply_runtime_request(&mut host, authority, &resource_request),
+            Err(PrivateAgentHostError::InvalidArtifact)
+        );
+        resource_request.mutation = Some(vec![1, 2, 3]);
+        assert_eq!(
+            apply_runtime_request(&mut host, authority, &resource_request),
+            Err(PrivateAgentHostError::InvalidArtifact)
+        );
+        resource_request.mutation = Some(vec![0; MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES + 1]);
+        assert_eq!(
+            apply_runtime_request(&mut host, authority, &resource_request),
+            Err(PrivateAgentHostError::LimitExceeded)
+        );
+        resource_request.mutation = Some(policy_mutation.encode().unwrap());
         assert_eq!(
             apply_runtime_request(&mut host, authority, &resource_request),
             Err(PrivateAgentHostError::UnsupportedOperation)
@@ -7121,17 +7341,21 @@ mod tests {
         // mutate or reopen an actor forest without the exact request bytes and
         // a durable runtime image.
         let actor = ActorId([0xb7; 32]);
-        let lifecycle_request_hash = Hash([0xb8; 32]);
+        let lifecycle_mutation = PrivateRuntimeMutation::Suspend {
+            actor,
+            expected_deployment: DeploymentId([0xb8; 32]),
+        };
+        let lifecycle_request_hash = lifecycle_mutation.commitment();
         let mut lifecycle = unsigned_owner_record(
             host.hosted(agent).unwrap(),
             PrivateControlOperation::ActorLifecycle {
                 actor,
-                operation: PrivateActorLifecycleKind::Install,
+                operation: PrivateActorLifecycleKind::Suspend,
                 request: lifecycle_request_hash,
             },
         );
         sign_owner_control_record(&mut lifecycle, &host.hosted(agent).unwrap().owner_key).unwrap();
-        let (_, lifecycle_request) = runtime_application_request(&fixture, &lifecycle, 60, 64);
+        let (_, mut lifecycle_request) = runtime_application_request(&fixture, &lifecycle, 60, 64);
         let lifecycle_receipt = AuthorityReceipt::decode(&lifecycle_request.receipt).unwrap();
         assert_eq!(
             lifecycle_receipt.selector.operation,
@@ -7142,6 +7366,11 @@ mod tests {
 
         let before_lifecycle = host.binding(agent).unwrap();
         let before_lifecycle_sidecars = canonical_sidecars(&host, agent);
+        assert_eq!(
+            apply_runtime_request(&mut host, authority, &lifecycle_request),
+            Err(PrivateAgentHostError::InvalidArtifact)
+        );
+        lifecycle_request.mutation = Some(lifecycle_mutation.encode().unwrap());
         assert_eq!(
             apply_runtime_request(&mut host, authority, &lifecycle_request),
             Err(PrivateAgentHostError::UnsupportedOperation)
@@ -7358,7 +7587,7 @@ mod tests {
             Err(PrivateAgentHostError::Corrupt)
         ));
 
-        // Completion is a typed AOI1/PCA1/PSE2 closure. Merely placing
+        // Completion is a typed AOI1/PCA2/PSE2 closure. Merely placing
         // nonempty bounded payloads in its canonical frame is insufficient.
         let mut noncanonical_completion = decode_recovery_plan(&exact, &target.node_key).unwrap();
         noncanonical_completion.completion = Some(RecoveryPlanCompletion {
@@ -7519,7 +7748,7 @@ mod tests {
             test_recovery_evidence_request(&request, &application, &prepared.proof);
         {
             let mut runtime = target
-                .runtime_application_adapter(authority, &TestAuthority)
+                .synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
                 .unwrap();
             runtime.stop_after(PrivateRuntimeApplicationStop::AfterRecoveryPlanRetired);
             assert_eq!(
@@ -7535,7 +7764,7 @@ mod tests {
         divergent.application_ack[last] ^= 1;
         assert!(
             target
-                .runtime_application_adapter(authority, &TestAuthority)
+                .synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
                 .unwrap()
                 .persist_completed_evidence(&divergent)
                 .is_err()
@@ -7543,7 +7772,7 @@ mod tests {
         assert!(target.creating_path(agent).exists());
         assert!(!target.agent_path(agent).exists());
         target
-            .runtime_application_adapter(authority, &TestAuthority)
+            .synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
             .unwrap()
             .persist_completed_evidence(&evidence_request)
             .unwrap();
@@ -7564,7 +7793,7 @@ mod tests {
         fs::create_dir(empty.creating_path(agent)).unwrap();
         assert!(
             empty
-                .runtime_application_adapter(authority, &TestAuthority)
+                .synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
                 .unwrap()
                 .persist_completed_evidence(&evidence_request)
                 .is_err()
@@ -9162,7 +9391,10 @@ mod tests {
             let (authority, request) = prepared_recovery_runtime_request(&fixture, &prepared);
             let interrupted = {
                 let mut runtime = host
-                    .runtime_application_adapter(authority, &TestAuthority)
+                    .synthetic_legacy_runtime_application_adapter_for_test(
+                        authority,
+                        &TestAuthority,
+                    )
                     .unwrap();
                 runtime.stop_after(stop);
                 runtime.apply(&request)
@@ -9241,7 +9473,10 @@ mod tests {
                 test_recovery_evidence_request(&request, &application, &prepared.proof);
             let interrupted = {
                 let mut runtime = host
-                    .runtime_application_adapter(authority, &TestAuthority)
+                    .synthetic_legacy_runtime_application_adapter_for_test(
+                        authority,
+                        &TestAuthority,
+                    )
                     .unwrap();
                 runtime.stop_after(stop);
                 runtime.persist_completed_evidence(&evidence_request)
@@ -9261,10 +9496,13 @@ mod tests {
                     | PrivateRuntimeApplicationStop::AfterRecoveryPublished
             )
             .then(|| {
-                host.runtime_application_adapter(authority, &TestAuthority)
-                    .unwrap()
-                    .persist_completed_evidence(&evidence_request)
-                    .unwrap()
+                host.synthetic_legacy_runtime_application_adapter_for_test(
+                    authority,
+                    &TestAuthority,
+                )
+                .unwrap()
+                .persist_completed_evidence(&evidence_request)
+                .unwrap()
             });
             drop(host);
 
@@ -9282,7 +9520,7 @@ mod tests {
                 .get(&agent)
                 .map(|hosted| hosted.store.control_count());
             let result = reopened
-                .runtime_application_adapter(authority, &TestAuthority)
+                .synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
                 .unwrap()
                 .persist_completed_evidence(&evidence_request)
                 .unwrap();
@@ -9299,7 +9537,7 @@ mod tests {
                 );
             }
             let retry = reopened
-                .runtime_application_adapter(authority, &TestAuthority)
+                .synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
                 .unwrap()
                 .persist_completed_evidence(&evidence_request)
                 .unwrap();
