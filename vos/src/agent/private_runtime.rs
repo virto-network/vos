@@ -1140,6 +1140,91 @@ impl PrivateRuntimeImage {
         Ok(value)
     }
 
+    /// Rebind an unchanged runtime image to an exact Store position after a
+    /// ciphertext-object insertion. Control, PKEY, and runtime projections
+    /// must remain byte-for-byte identical; this cannot advance PCTL state.
+    pub(crate) fn rebind_store_objects(
+        &self,
+        store: PrivateStoreCorePosition,
+    ) -> Result<Self, PrivateRuntimeEvidenceError> {
+        self.validate()?;
+        store.validate()?;
+        if store.space != self.store.space
+            || store.agent != self.store.agent
+            || store.owner != self.store.owner
+            || store.epoch != self.store.epoch
+            || store.control_head != self.store.control_head
+            || store.next_sequence != self.store.next_sequence
+            || store.control_count != self.store.control_count
+            || store.control_root != self.store.control_root
+            || store.key_epoch_root != self.store.key_epoch_root
+            || store.object_count < self.store.object_count
+            || (store.object_count == self.store.object_count
+                && store.object_root != self.store.object_root)
+        {
+            return Err(PrivateRuntimeEvidenceError::InvalidStorePosition);
+        }
+        let mut value = self.clone();
+        value.store = store;
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Test-only bridge for legacy host helpers which historically appended
+    /// control-only PCTLs without an authority-operation/PAPL envelope.
+    /// Production callers cannot construct runtime evidence through this
+    /// seam; physical application must use [`PrivateRuntimeApplication`].
+    #[cfg(test)]
+    pub(crate) fn synthetic_control_only_successor_for_host_test(
+        predecessor: &Self,
+        control: &PrivateControlRecord,
+        store: PrivateStoreCorePosition,
+        key_epochs: Vec<PrivateKeyEpochCommitment>,
+        applied_at: u64,
+    ) -> Result<Self, PrivateRuntimeEvidenceError> {
+        predecessor.validate()?;
+        if !store_transition_matches(predecessor.store, store, control) {
+            return Err(PrivateRuntimeEvidenceError::InvalidStorePosition);
+        }
+        validate_key_epoch_transition(&predecessor.key_epochs, &key_epochs, control)?;
+        let full_replay = Hash::digest(
+            b"vos/test/private-host-synthetic-control-replay/v1",
+            &[
+                predecessor.commitment().as_bytes(),
+                control.commitment().as_bytes(),
+            ],
+        );
+        let stable_projection = PrivateRuntimeStableProjection::successor(
+            &predecessor.stable_projection,
+            control,
+            full_replay,
+            &PrivateRuntimeSuccess::ControlOnly,
+            predecessor.active_resource_policy,
+            &predecessor.state.control,
+        )?;
+        let value = Self {
+            managed: predecessor.managed,
+            node: predecessor.node,
+            owner: predecessor.owner,
+            descriptor: predecessor.descriptor,
+            runtime_package: predecessor.runtime_package.clone(),
+            creation_receipt: predecessor.creation_receipt.clone(),
+            created_at: predecessor.created_at,
+            runtime_deployment: predecessor.runtime_deployment,
+            state: predecessor.state.clone(),
+            active_resource_policy: predecessor.active_resource_policy,
+            active_resource_policy_commitment: predecessor.active_resource_policy_commitment,
+            store,
+            key_epochs,
+            runtime_control: predecessor.runtime_control,
+            last_full_replay: Some(full_replay),
+            stable_projection,
+            applied_at,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
     /// Build the successor image selected by a pending PAPL1 and positive
     /// disposition. Completion is a separate step because PAPL1 records the
     /// resulting image commitment while PVRI1 never points back to PAPL1.
