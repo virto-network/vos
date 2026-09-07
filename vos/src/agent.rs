@@ -68,6 +68,8 @@ pub mod private_store;
 #[cfg(feature = "private-agent-store")]
 pub mod private_sync;
 pub(crate) mod replay;
+#[cfg(feature = "std")]
+pub(crate) mod runtime_pvm;
 pub mod schema;
 pub mod shared_commit;
 #[cfg(all(feature = "std", feature = "storage", target_os = "linux"))]

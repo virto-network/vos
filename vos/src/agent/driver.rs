@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::string::String;
 use std::sync::Arc;
 
-use vos_pvm::refine_host::RefineContext;
 use vos_pvm::{ExitReason, Gas};
 
 use crate::agent_sdk::wire::CanonicalWire as AgentCanonicalWire;
@@ -24,6 +23,7 @@ use super::execution::{
     RuntimeExecutionCall, RuntimeExecutionReturn,
 };
 use super::package::{Package, PackageError};
+use super::runtime_pvm::{RuntimePvmExecutionError, execute_canonical_wire, execute_service_wire};
 use super::wire::{RuntimeCall, RuntimeReturn, RuntimeState};
 use super::{
     ActorDirectoryRecord, ActorEntry, AgentConfig, AgentConfigError, AgentIdentity, AgentProfile,
@@ -1980,6 +1980,18 @@ impl From<AgentStoreError> for AgentDriverError {
 impl From<AuthorityError> for AgentDriverError {
     fn from(error: AuthorityError) -> Self {
         Self::Authority(error)
+    }
+}
+
+impl From<RuntimePvmExecutionError> for AgentDriverError {
+    fn from(error: RuntimePvmExecutionError) -> Self {
+        match error {
+            RuntimePvmExecutionError::Load => Self::InvalidRuntime,
+            RuntimePvmExecutionError::Exit { reason, pc } => Self::RuntimeExit { reason, pc },
+            RuntimePvmExecutionError::MissingOutput | RuntimePvmExecutionError::Decode => {
+                Self::RuntimeOutput
+            }
+        }
     }
 }
 
@@ -4519,17 +4531,7 @@ fn execute_runtime_wire<T: ServiceWire>(
     gas: Gas,
     input: &[u8],
 ) -> Result<T, AgentDriverError> {
-    let invocation = RefineContext::load(runtime_pvm, input, gas)
-        .map_err(|_| AgentDriverError::InvalidRuntime)?
-        .run();
-    if invocation.exit != ExitReason::Halt {
-        return Err(AgentDriverError::RuntimeExit {
-            reason: invocation.exit,
-            pc: invocation.pc,
-        });
-    }
-    let output = invocation.output().ok_or(AgentDriverError::RuntimeOutput)?;
-    T::decode(&output).map_err(|_| AgentDriverError::RuntimeOutput)
+    execute_service_wire(runtime_pvm, gas, input).map_err(Into::into)
 }
 
 fn execute_runtime_canonical<T: AgentCanonicalWire>(
@@ -4537,17 +4539,7 @@ fn execute_runtime_canonical<T: AgentCanonicalWire>(
     gas: Gas,
     input: &[u8],
 ) -> Result<T, AgentDriverError> {
-    let invocation = RefineContext::load(runtime_pvm, input, gas)
-        .map_err(|_| AgentDriverError::InvalidRuntime)?
-        .run();
-    if invocation.exit != ExitReason::Halt {
-        return Err(AgentDriverError::RuntimeExit {
-            reason: invocation.exit,
-            pc: invocation.pc,
-        });
-    }
-    let output = invocation.output().ok_or(AgentDriverError::RuntimeOutput)?;
-    T::decode(&output).map_err(|_| AgentDriverError::RuntimeOutput)
+    execute_canonical_wire(runtime_pvm, gas, input).map_err(Into::into)
 }
 
 fn legacy_state_as_sdk(state: &RuntimeState) -> crate::agent_sdk::RuntimeState {
@@ -4585,6 +4577,33 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn runtime_pvm_failures_preserve_the_driver_error_contract() {
+        assert_eq!(
+            AgentDriverError::from(RuntimePvmExecutionError::Load),
+            AgentDriverError::InvalidRuntime
+        );
+        assert_eq!(
+            AgentDriverError::from(RuntimePvmExecutionError::Exit {
+                reason: ExitReason::OutOfGas,
+                pc: 41,
+            }),
+            AgentDriverError::RuntimeExit {
+                reason: ExitReason::OutOfGas,
+                pc: 41,
+            }
+        );
+        for error in [
+            RuntimePvmExecutionError::MissingOutput,
+            RuntimePvmExecutionError::Decode,
+        ] {
+            assert_eq!(
+                AgentDriverError::from(error),
+                AgentDriverError::RuntimeOutput
+            );
+        }
+    }
 
     struct AnchorTrust {
         space: crate::service::SpaceId,
