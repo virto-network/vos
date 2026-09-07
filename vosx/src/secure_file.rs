@@ -1,8 +1,104 @@
 //! Small helpers for node-local secret files.
 
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
+
+/// Read a bounded node-local secret without following aliases.
+///
+/// Existing secret files are accepted only when the named entry and opened
+/// inode are the same owner-only regular file.  Returning `None` is reserved
+/// for an absent path so create-on-first-use callers can distinguish absence
+/// from an unsafe or malformed existing identity.
+pub fn read_owner_only_optional(path: &Path, max_bytes: u64) -> anyhow::Result<Option<Vec<u8>>> {
+    if max_bytes == 0 {
+        anyhow::bail!("secret read bound must be nonzero");
+    }
+    let named = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "inspect secret {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    validate_secret_metadata(path, &named, max_bytes)?;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| anyhow::anyhow!("open secret {}: {error}", path.display()))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| anyhow::anyhow!("inspect opened secret {}: {error}", path.display()))?;
+    validate_secret_metadata(path, &opened, max_bytes)?;
+    if !same_file(&named, &opened) {
+        anyhow::bail!("secret changed while opening: {}", path.display());
+    }
+
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("read secret {}: {error}", path.display()))?;
+    if bytes.len() as u64 != opened.len() || bytes.len() as u64 > max_bytes {
+        anyhow::bail!("secret changed while reading: {}", path.display());
+    }
+    Ok(Some(bytes))
+}
+
+fn validate_secret_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+    max_bytes: u64,
+) -> anyhow::Result<()> {
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > max_bytes
+    {
+        anyhow::bail!(
+            "secret must be a bounded real regular file: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if metadata.permissions().mode() & 0o077 != 0 {
+            anyhow::bail!("secret permissions must be owner-only: {}", path.display());
+        }
+        if metadata.nlink() != 1 {
+            anyhow::bail!("secret must not have hard-link aliases: {}", path.display());
+        }
+        // SAFETY: geteuid has no preconditions and reads process credentials.
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            anyhow::bail!(
+                "secret must be owned by the current user: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    left.dev() == right.dev() && left.ino() == right.ino() && left.len() == right.len()
+}
+
+#[cfg(not(unix))]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.len() == right.len()
+}
 
 /// Atomically replace `path` with an owner-readable/writable file.
 pub fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
@@ -82,6 +178,10 @@ mod tests {
         write_owner_only_atomic(&path, b"first").unwrap();
         write_owner_only_atomic(&path, b"second").unwrap();
         assert_eq!(read_optional(&path).unwrap(), Some(b"second".to_vec()));
+        assert_eq!(
+            read_owner_only_optional(&path, 16).unwrap(),
+            Some(b"second".to_vec())
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -93,5 +193,38 @@ mod tests {
         remove_if_exists(&path).unwrap();
         assert_eq!(read_optional(&path).unwrap(), None);
         let _ = fs::remove_dir(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_only_reader_rejects_permission_and_link_aliases() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let dir = std::env::temp_dir().join(format!(
+            "vosx-secure-file-hostile-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test"),
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("identity");
+        write_owner_only_atomic(&path, b"secret").unwrap();
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(read_owner_only_optional(&path, 16).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let hard = dir.join("hard-alias");
+        fs::hard_link(&path, &hard).unwrap();
+        assert!(read_owner_only_optional(&path, 16).is_err());
+        fs::remove_file(&hard).unwrap();
+
+        let symbolic = dir.join("symbolic-alias");
+        symlink(&path, &symbolic).unwrap();
+        assert!(read_owner_only_optional(&symbolic, 16).is_err());
+        assert_eq!(
+            read_owner_only_optional(&dir.join("absent"), 16).unwrap(),
+            None
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

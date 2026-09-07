@@ -18,9 +18,11 @@
 
 use std::path::Path;
 
-use libp2p::identity::Keypair;
+use libp2p::identity::{KeyType, Keypair};
 
 use crate::paths;
+
+const MAX_IDENTITY_KEY_BYTES: u64 = 4 * 1024;
 
 /// Load the operator's persistent client keypair, creating it
 /// on first use. Idempotent — every `vosx` command can call
@@ -38,17 +40,29 @@ pub fn load_or_create_at(path: &Path) -> anyhow::Result<Keypair> {
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow::anyhow!("create {} for identity: {e}", parent.display()))?;
     }
-    match std::fs::read(path) {
-        Ok(bytes) => Keypair::from_protobuf_encoding(&bytes)
-            .map_err(|e| anyhow::anyhow!("decode identity at {}: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => create_at(path),
-        Err(e) => Err(anyhow::anyhow!("read {}: {e}", path.display())),
+    match crate::secure_file::read_owner_only_optional(path, MAX_IDENTITY_KEY_BYTES)? {
+        Some(bytes) => decode_canonical_ed25519(path, &bytes),
+        None => create_at(path),
     }
 }
 
-/// Always-create variant. Overwrites any existing file at
-/// `path` — use sparingly; the typical entry point is
-/// [`load_or_create`].
+fn decode_canonical_ed25519(path: &Path, bytes: &[u8]) -> anyhow::Result<Keypair> {
+    let keypair = Keypair::from_protobuf_encoding(bytes)
+        .map_err(|e| anyhow::anyhow!("decode identity at {}: {e}", path.display()))?;
+    if keypair.key_type() != KeyType::Ed25519 {
+        anyhow::bail!("identity at {} must be Ed25519", path.display());
+    }
+    let canonical = keypair
+        .to_protobuf_encoding()
+        .map_err(|e| anyhow::anyhow!("canonicalize identity at {}: {e}", path.display()))?;
+    if canonical != bytes {
+        anyhow::bail!("identity at {} is not canonically encoded", path.display());
+    }
+    Ok(keypair)
+}
+
+/// Always-create variant. Existing paths are rejected; the typical entry
+/// point is [`load_or_create`].
 fn create_at(path: &Path) -> anyhow::Result<Keypair> {
     let kp = Keypair::generate_ed25519();
     let bytes = kp
@@ -154,11 +168,29 @@ mod tests {
         std::fs::create_dir_all(&tmp.0).unwrap();
         let path = tmp.0.join("identity.key");
         std::fs::write(&path, b"not a protobuf").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let err = load_or_create_at(&path).expect_err("corrupt file should error");
         let msg = format!("{err}");
         assert!(
             msg.contains("decode identity"),
             "error should mention decode, got: {msg}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_identity_with_shared_permissions_is_rejected() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempPath::new("shared-permissions");
+        let path = tmp.0.join("identity.key");
+        let _ = load_or_create_at(&path).expect("create");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let error = load_or_create_at(&path).expect_err("shared secret must fail closed");
+        assert!(error.to_string().contains("permissions must be owner-only"));
     }
 }

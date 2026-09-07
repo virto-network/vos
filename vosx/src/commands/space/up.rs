@@ -368,10 +368,20 @@ fn reject_agent_host_residue_without_authority(
 
 fn load_daemon_keypair(data_dir: &Path) -> anyhow::Result<libp2p::identity::Keypair> {
     let key_path = data_dir.join("node.key");
-    let key_bytes = std::fs::read(&key_path)
-        .map_err(|error| anyhow::anyhow!("read {}: {error}", key_path.display()))?;
-    libp2p::identity::Keypair::from_protobuf_encoding(&key_bytes)
-        .map_err(|error| anyhow::anyhow!("decode {}: {error}", key_path.display()))
+    let key_bytes = crate::secure_file::read_owner_only_optional(&key_path, 4 * 1024)?
+        .ok_or_else(|| anyhow::anyhow!("node identity does not exist: {}", key_path.display()))?;
+    let keypair = libp2p::identity::Keypair::from_protobuf_encoding(&key_bytes)
+        .map_err(|error| anyhow::anyhow!("decode {}: {error}", key_path.display()))?;
+    if keypair.key_type() != libp2p::identity::KeyType::Ed25519 {
+        anyhow::bail!("node identity must be Ed25519: {}", key_path.display());
+    }
+    let canonical = keypair
+        .to_protobuf_encoding()
+        .map_err(|error| anyhow::anyhow!("canonicalize {}: {error}", key_path.display()))?;
+    if canonical != key_bytes {
+        anyhow::bail!("node identity is not canonical: {}", key_path.display());
+    }
+    Ok(keypair)
 }
 
 fn preflight_agent_genesis_archive(
@@ -4959,9 +4969,9 @@ mod tests {
         let directory = agent_test_directory("node-key");
         std::fs::create_dir_all(&directory).unwrap();
         let original = libp2p::identity::Keypair::generate_ed25519();
-        std::fs::write(
-            directory.join("node.key"),
-            original.to_protobuf_encoding().unwrap(),
+        crate::secure_file::write_owner_only_atomic(
+            &directory.join("node.key"),
+            &original.to_protobuf_encoding().unwrap(),
         )
         .unwrap();
         let loaded = load_daemon_keypair(&directory).unwrap();
