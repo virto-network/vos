@@ -1470,7 +1470,7 @@ fn join_scaffold(payload: &crate::token::InvitePayload) -> anyhow::Result<()> {
         let key_bytes = keypair
             .to_protobuf_encoding()
             .map_err(|e| anyhow::anyhow!("encode keypair: {e}"))?;
-        std::fs::write(space_dir.join("node.key"), key_bytes)?;
+        crate::secure_file::write_owner_only_atomic(&space_dir.join("node.key"), &key_bytes)?;
     }
     spaces_index::upsert(&mut index, entry);
     index.save()?;
