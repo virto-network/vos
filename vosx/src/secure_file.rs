@@ -14,6 +14,9 @@ pub fn read_owner_only_optional(path: &Path, max_bytes: u64) -> anyhow::Result<O
     if max_bytes == 0 {
         anyhow::bail!("secret read bound must be nonzero");
     }
+    let read_limit = max_bytes
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("secret read bound is too large"))?;
     let named = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -45,7 +48,7 @@ pub fn read_owner_only_optional(path: &Path, max_bytes: u64) -> anyhow::Result<O
     }
 
     let mut bytes = Vec::new();
-    file.take(max_bytes + 1)
+    file.take(read_limit)
         .read_to_end(&mut bytes)
         .map_err(|error| anyhow::anyhow!("read secret {}: {error}", path.display()))?;
     if bytes.len() as u64 != opened.len() || bytes.len() as u64 > max_bytes {
