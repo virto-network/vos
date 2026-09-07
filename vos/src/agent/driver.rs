@@ -4259,6 +4259,9 @@ fn validate_standard_sdk_invoke_preflight(
     prior: &RuntimeState,
     invocation: &crate::agent_sdk::InvocationWork,
 ) -> Result<(), AgentDriverError> {
+    if !invocation.validate() {
+        return Err(AgentDriverError::InvalidRuntime);
+    }
     let state = super::wire::decode_standard_runtime_state(prior)
         .map_err(|_| AgentDriverError::InvalidRuntime)?;
     let runtime = super::standard::StandardAgentRuntime::restore(state)
@@ -5450,15 +5453,26 @@ mod tests {
         else {
             unreachable!()
         };
-        let mut unsupported_origin = (**clean).clone();
-        unsupported_origin.origin.actor = Some(crate::agent_sdk::ActorId([0x38; 32]));
+        let mut actor_origin = (**clean).clone();
+        actor_origin.origin.actor = Some(crate::agent_sdk::ActorId([0x38; 32]));
+        assert!(actor_origin.validate());
+        assert_eq!(
+            validate_standard_sdk_invoke_preflight(&prior, &actor_origin),
+            Ok(()),
+            "actor provenance is a valid independently authenticated origin field"
+        );
+
+        let mut malformed_origin = (**clean).clone();
+        malformed_origin.origin.principal = None;
+        malformed_origin.origin.credential = Some(crate::agent_sdk::CredentialId([0x39; 32]));
+        assert!(!malformed_origin.validate());
         let unchanged = prior.clone();
         assert_eq!(
-            validate_standard_sdk_invoke_preflight(&prior, &unsupported_origin),
+            validate_standard_sdk_invoke_preflight(&prior, &malformed_origin),
             Err(AgentDriverError::InvalidRuntime)
         );
         assert_eq!(
-            validate_standard_sdk_invoke_preflight(&prior, &unsupported_origin),
+            validate_standard_sdk_invoke_preflight(&prior, &malformed_origin),
             Err(AgentDriverError::InvalidRuntime),
             "an exact retry is the same nonterminal host rejection"
         );
