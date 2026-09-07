@@ -505,6 +505,32 @@ impl AgentDescriptor {
     pub fn replica_generation(&self) -> Hash {
         replica_set_generation(&self.identity, self.creation_nonce, &self.replicas)
     }
+
+    /// Commitment of the complete canonical descriptor, including every
+    /// replica principal. Compact authority plans carry this value while the
+    /// authority reconstructs the omitted principals from exact enrollments.
+    pub fn commitment(&self) -> Hash {
+        crate::wire::agent_descriptor_commitment(self)
+    }
+}
+
+/// Domain-separated commitment of one complete ordered replica roster.
+///
+/// Compact replica-change plans carry nodes and roles directly; the authority
+/// reconstructs each principal from its exact enrollment and compares this
+/// commitment before authorizing the full target.
+pub fn replica_roster_commitment(replicas: &[AgentReplica]) -> Hash {
+    let mut bytes = Vec::with_capacity(4 + replicas.len() * 65);
+    bytes.extend_from_slice(&(replicas.len() as u32).to_le_bytes());
+    for replica in replicas {
+        bytes.extend_from_slice(replica.node.as_bytes());
+        bytes.extend_from_slice(replica.principal.as_bytes());
+        bytes.push(replica.role as u8);
+    }
+    Hash::digest(
+        b"vos/agent/replica-roster/v1",
+        &[crate::RUNTIME_ABI_ID.as_bytes(), &bytes],
+    )
 }
 
 /// Domain-separated commitment of one canonical replica roster.

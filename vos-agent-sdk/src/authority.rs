@@ -2,13 +2,17 @@
 
 use core::num::NonZeroU64;
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+use crate::contract::{ActorPackageContract, RuntimePackageContract};
 use crate::private::NodeEncryptionEnrollment;
 use crate::{
-    ActorId, AgentId, BlobRef, CredentialId, DeploymentId, Hash, InvocationContext, InvocationId,
-    InvocationRoleClaims, ManagementReply, ManagementRequest, MethodMode, NodeId, PrincipalId,
-    ProducerId, ProgramId, SpaceId,
+    ActorEntry, ActorId, AgentDescriptor, AgentId, AgentIdentity, BlobRef, CredentialId,
+    DeploymentId, Hash, InstallationId, InvocationContext, InvocationId, InvocationRoleClaims,
+    ManagementReply, ManagementRequest, MethodMode, NodeId, PrincipalId, PrivateRecoveryBinding,
+    ProducerId, ProgramId, ReplicaRole, RuntimeCapabilities, RuntimeRequirements, RuntimeUpgrade,
+    SpaceId, UpgradeActor,
 };
 
 pub const AUTHORITY_PUBLIC_KEY_BYTES: usize = 32;
@@ -51,6 +55,300 @@ impl ManagedAgentTarget {
         self.space != SpaceId::ZERO
             && self.agent != AgentId::ZERO
             && self.runtime_deployment != DeploymentId::ZERO
+    }
+}
+
+/// Replica facts retained directly by a bounded authorization plan. The
+/// principal is reconstructed from the authority's exact Node enrollment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompactReplicaSlot {
+    pub node: NodeId,
+    pub role: ReplicaRole,
+}
+
+impl CompactReplicaSlot {
+    pub fn is_valid(self) -> bool {
+        self.node.0 != NodeId::ZERO.0
+    }
+}
+
+/// Descriptor fields other than replica principals. Create authorization
+/// reconstructs those principals from enrollments and then verifies the full
+/// descriptor commitment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactAgentDescriptor {
+    pub identity: AgentIdentity,
+    pub creation_nonce: Hash,
+    pub authority: AgentAuthorityBinding,
+    pub private_recovery: Option<PrivateRecoveryBinding>,
+    pub runtime_package: BlobRef,
+    pub runtime_contract: RuntimePackageContract,
+    pub capabilities: RuntimeCapabilities,
+}
+
+impl CompactAgentDescriptor {
+    fn from_descriptor(descriptor: &AgentDescriptor) -> Self {
+        Self {
+            identity: descriptor.identity.clone(),
+            creation_nonce: descriptor.creation_nonce,
+            authority: descriptor.authority,
+            private_recovery: descriptor.private_recovery,
+            runtime_package: descriptor.runtime_package.clone(),
+            runtime_contract: descriptor.runtime_contract,
+            capabilities: descriptor.capabilities,
+        }
+    }
+
+    pub fn with_replicas(&self, replicas: alloc::vec::Vec<crate::AgentReplica>) -> AgentDescriptor {
+        AgentDescriptor {
+            identity: self.identity.clone(),
+            creation_nonce: self.creation_nonce,
+            authority: self.authority,
+            private_recovery: self.private_recovery,
+            runtime_package: self.runtime_package.clone(),
+            runtime_contract: self.runtime_contract,
+            capabilities: self.capabilities,
+            replicas,
+        }
+    }
+}
+
+/// Install policy facts with constructor bytes represented only by their
+/// content-addressed [`BlobRef`] in `entry.installation_data`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactInstallActor {
+    pub installation_id: InstallationId,
+    pub registry_reservation: Hash,
+    pub entry: ActorEntry,
+    pub producer: ProducerId,
+    pub contract: ActorPackageContract,
+    pub requirements: RuntimeRequirements,
+}
+
+impl CompactInstallActor {
+    fn from_install(value: &crate::InstallActor) -> Self {
+        Self {
+            installation_id: value.installation_id,
+            registry_reservation: value.registry_reservation,
+            entry: value.entry.clone(),
+            producer: value.producer,
+            contract: value.contract,
+            requirements: value.requirements,
+        }
+    }
+
+    pub fn matches_install(&self, value: &crate::InstallActor) -> bool {
+        ManagementRequest::Install(Box::new(value.clone())).is_valid()
+            && self.installation_id == value.installation_id
+            && self.registry_reservation == value.registry_reservation
+            && self.entry == value.entry
+            && self.producer == value.producer
+            && self.contract == value.contract
+            && self.requirements == value.requirements
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.installation_id != InstallationId::ZERO
+            && self.registry_reservation != Hash::ZERO
+            && self.entry.validate().is_ok()
+            && self.producer != ProducerId::ZERO
+            && self.contract.is_valid()
+            && self.requirements.lanes == self.entry.lanes
+    }
+}
+
+/// Bounded policy input carried by ACC3 and MAP2. A host or guest holding the
+/// full management request must derive this exact plan and compare it before
+/// applying the resulting receipt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ManagementAuthorizationPlan {
+    Create {
+        descriptor: Box<CompactAgentDescriptor>,
+        replicas: Vec<CompactReplicaSlot>,
+        descriptor_commitment: Hash,
+    },
+    Install(Box<CompactInstallActor>),
+    UpgradeActor(Box<UpgradeActor>),
+    Suspend {
+        actor: ActorId,
+        expected_deployment: DeploymentId,
+    },
+    Resume {
+        actor: ActorId,
+        expected_deployment: DeploymentId,
+    },
+    RemoveLeaf {
+        actor: ActorId,
+        expected_deployment: DeploymentId,
+    },
+    UpgradeRuntime(Box<RuntimeUpgrade>),
+    ChangeReplicas {
+        expected_generation: Hash,
+        replicas: Vec<CompactReplicaSlot>,
+        replica_roster_commitment: Hash,
+    },
+}
+
+impl ManagementAuthorizationPlan {
+    pub fn from_request(request: &ManagementRequest) -> Option<Self> {
+        if !request.is_valid() {
+            return None;
+        }
+        Some(match request {
+            ManagementRequest::Create(descriptor) => Self::Create {
+                descriptor: Box::new(CompactAgentDescriptor::from_descriptor(descriptor)),
+                replicas: descriptor
+                    .replicas
+                    .iter()
+                    .map(|replica| CompactReplicaSlot {
+                        node: replica.node,
+                        role: replica.role,
+                    })
+                    .collect(),
+                descriptor_commitment: descriptor.commitment(),
+            },
+            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => {
+                return None;
+            }
+            ManagementRequest::Install(value) => {
+                Self::Install(Box::new(CompactInstallActor::from_install(value)))
+            }
+            ManagementRequest::UpgradeActor(value) => Self::UpgradeActor(value.clone()),
+            ManagementRequest::Suspend {
+                actor,
+                expected_deployment,
+            } => Self::Suspend {
+                actor: *actor,
+                expected_deployment: *expected_deployment,
+            },
+            ManagementRequest::Resume {
+                actor,
+                expected_deployment,
+            } => Self::Resume {
+                actor: *actor,
+                expected_deployment: *expected_deployment,
+            },
+            ManagementRequest::RemoveLeaf {
+                actor,
+                expected_deployment,
+            } => Self::RemoveLeaf {
+                actor: *actor,
+                expected_deployment: *expected_deployment,
+            },
+            ManagementRequest::UpgradeRuntime(value) => Self::UpgradeRuntime(value.clone()),
+            ManagementRequest::ChangeReplicas {
+                expected_generation,
+                replicas,
+            } => Self::ChangeReplicas {
+                expected_generation: *expected_generation,
+                replicas: replicas
+                    .iter()
+                    .map(|replica| CompactReplicaSlot {
+                        node: replica.node,
+                        role: replica.role,
+                    })
+                    .collect(),
+                replica_roster_commitment: crate::replica_roster_commitment(replicas),
+            },
+        })
+    }
+
+    pub fn is_valid(&self) -> bool {
+        let slots_valid = |replicas: &[CompactReplicaSlot]| {
+            !replicas.is_empty()
+                && replicas.len() <= crate::MAX_AGENT_REPLICAS
+                && replicas.iter().all(|replica| replica.is_valid())
+                && replicas.windows(2).all(|pair| pair[0].node < pair[1].node)
+        };
+        match self {
+            Self::Create {
+                descriptor,
+                replicas,
+                descriptor_commitment,
+            } => {
+                if *descriptor_commitment == Hash::ZERO || !slots_valid(replicas) {
+                    return false;
+                }
+                let reconstructed = descriptor.with_replicas(
+                    replicas
+                        .iter()
+                        .map(|slot| crate::AgentReplica {
+                            node: slot.node,
+                            principal: descriptor.identity.owner,
+                            role: slot.role,
+                        })
+                        .collect(),
+                );
+                reconstructed.validate().is_ok()
+            }
+            Self::Install(value) => value.is_valid(),
+            Self::UpgradeActor(value) => ManagementRequest::UpgradeActor(value.clone()).is_valid(),
+            Self::Suspend {
+                actor,
+                expected_deployment,
+            }
+            | Self::Resume {
+                actor,
+                expected_deployment,
+            }
+            | Self::RemoveLeaf {
+                actor,
+                expected_deployment,
+            } => *actor != ActorId::ZERO && *expected_deployment != DeploymentId::ZERO,
+            Self::UpgradeRuntime(value) => {
+                ManagementRequest::UpgradeRuntime(value.clone()).is_valid()
+            }
+            Self::ChangeReplicas {
+                expected_generation,
+                replicas,
+                replica_roster_commitment,
+            } => {
+                *expected_generation != Hash::ZERO
+                    && *replica_roster_commitment != Hash::ZERO
+                    && slots_valid(replicas)
+            }
+        }
+    }
+
+    pub fn matches_request(&self, request: &ManagementRequest) -> bool {
+        Self::from_request(request).as_ref() == Some(self)
+    }
+
+    pub fn commitment(&self) -> Hash {
+        crate::wire::management_authorization_plan_commitment(self)
+    }
+
+    pub const fn authority_operation(&self) -> AuthorityOperationKind {
+        match self {
+            Self::Create { .. } => AuthorityOperationKind::CreateAgent,
+            Self::Install(_) => AuthorityOperationKind::InstallActor,
+            Self::UpgradeActor(_) => AuthorityOperationKind::UpgradeActor,
+            Self::Suspend { .. } => AuthorityOperationKind::SuspendActor,
+            Self::Resume { .. } => AuthorityOperationKind::ResumeActor,
+            Self::RemoveLeaf { .. } => AuthorityOperationKind::RemoveActor,
+            Self::UpgradeRuntime(_) => AuthorityOperationKind::UpgradeRuntime,
+            Self::ChangeReplicas { .. } => AuthorityOperationKind::ChangeReplicaSet,
+        }
+    }
+
+    pub fn authority_actor(&self) -> Option<(ActorId, DeploymentId)> {
+        match self {
+            Self::Install(value) => Some((value.entry.actor, value.entry.deployment)),
+            Self::UpgradeActor(value) => Some((value.actor, value.to_deployment)),
+            Self::Suspend {
+                actor,
+                expected_deployment,
+            }
+            | Self::Resume {
+                actor,
+                expected_deployment,
+            }
+            | Self::RemoveLeaf {
+                actor,
+                expected_deployment,
+            } => Some((*actor, *expected_deployment)),
+            Self::Create { .. } | Self::UpgradeRuntime(_) | Self::ChangeReplicas { .. } => None,
+        }
     }
 }
 
@@ -150,8 +448,8 @@ impl AuthorityIssuer {
 }
 
 /// One directly authenticated credential request to the system authority
-/// actor. The signature covers every preceding field and the complete
-/// canonical [`ManagementRequest`] bytes; it never covers itself.
+/// actor. The signature covers every preceding field and the complete bounded
+/// canonical [`ManagementAuthorizationPlan`]; it never covers itself.
 ///
 /// This call is deliberately self-authenticating and carries no role or
 /// capability grant. It can therefore enter the authority actor through a
@@ -171,7 +469,7 @@ pub struct AuthorityCredentialCall {
     pub authenticated_node: Option<NodeId>,
     pub requested_valid_from: u64,
     pub requested_expires_at: u64,
-    pub request: ManagementRequest,
+    pub plan: ManagementAuthorizationPlan,
     pub signature: [u8; CREDENTIAL_SIGNATURE_BYTES],
 }
 
@@ -191,7 +489,7 @@ impl AuthorityCredentialCall {
     ) -> InvocationId {
         InvocationId(
             Hash::digest(
-                b"vos/agent/authority-management-invocation/v2",
+                b"vos/agent/authority-management-invocation/v3",
                 &[
                     crate::RUNTIME_ABI_ID.as_bytes(),
                     credential.as_bytes(),
@@ -219,7 +517,7 @@ impl AuthorityCredentialCall {
     /// Commitment of the complete signed call, including its signature.
     pub fn commitment(&self) -> Hash {
         Hash::digest(
-            b"vos/agent/authority-credential-call/v1",
+            b"vos/agent/authority-credential-call/v2",
             &[&self.signing_bytes(), &self.signature],
         )
     }
@@ -243,7 +541,7 @@ impl AuthorityCredentialCall {
         if self.requested_valid_from > self.requested_expires_at {
             return Err(AuthorityActorProtocolError::InvalidValidity);
         }
-        if !mutating_request_matches_targets(&self.authority, &self.managed, &self.request) {
+        if !mutating_plan_matches_targets(&self.authority, &self.managed, &self.plan) {
             return Err(AuthorityActorProtocolError::InvalidRequest);
         }
         if self.invocation != self.expected_invocation() {
@@ -614,8 +912,8 @@ pub struct ManagementApproval {
     pub epoch: u64,
     pub valid_from: u64,
     pub expires_at: u64,
-    pub request: ManagementRequest,
-    pub request_commitment: Hash,
+    pub plan: ManagementAuthorizationPlan,
+    pub plan_commitment: Hash,
 }
 
 impl ManagementApproval {
@@ -663,8 +961,8 @@ impl ManagementApproval {
             epoch,
             valid_from,
             expires_at,
-            request: call.request.clone(),
-            request_commitment: call.request.commitment(),
+            plan: call.plan.clone(),
+            plan_commitment: call.plan.commitment(),
         };
         value.validate_shape()?;
         if !value.matches_call(call) {
@@ -695,9 +993,9 @@ impl ManagementApproval {
         }
         if !self.evidence.is_valid()
             || !self.lane_roots.is_valid()
-            || !mutating_request_matches_targets(&self.authority, &self.managed, &self.request)
-            || self.request_commitment == Hash::ZERO
-            || self.request_commitment != self.request.commitment()
+            || !mutating_plan_matches_targets(&self.authority, &self.managed, &self.plan)
+            || self.plan_commitment == Hash::ZERO
+            || self.plan_commitment != self.plan.commitment()
         {
             return Err(AuthorityActorProtocolError::InvalidRequest);
         }
@@ -723,8 +1021,8 @@ impl ManagementApproval {
             && self.authenticated_node == call.authenticated_node
             && self.valid_from >= call.requested_valid_from
             && self.expires_at <= call.requested_expires_at
-            && self.request == call.request
-            && self.request_commitment == call.request.commitment()
+            && self.plan == call.plan
+            && self.plan_commitment == call.plan.commitment()
     }
 
     pub fn commitment(&self) -> Hash {
@@ -738,7 +1036,7 @@ impl ManagementApproval {
 /// Authorization and acknowledgement are distinct actor invocations. Reusing
 /// the authorization invocation identifier for a different acknowledgement
 /// message would violate the runtime's exact-retry contract, so both IDs are
-/// explicit and must differ. The actor retains the ACC2 and MAP1 preimages;
+/// explicit and must differ. The actor retains the ACC3 and MAP2 preimages;
 /// this bounded message carries their commitments rather than embedding them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManagementApplicationAck {
@@ -848,7 +1146,7 @@ impl ManagementApplicationAck {
             && self.credential_call == approval.credential_call
             && self.approval == approval.commitment()
             && self.authorization_sequence == approval.authorization_sequence
-            && self.request == approval.request_commitment
+            && self.request == approval.plan_commitment
             && management_application_reply_shape_matches(call, &self.application)
             && receipt_matches_approval(&self.receipt, approval)
     }
@@ -868,24 +1166,24 @@ impl ManagementApplicationAck {
     }
 }
 
-/// Match application facts using only fields present in ACC2. Every variant is
+/// Match application facts using only fields present in ACC3. Every variant is
 /// exact against the call except `ReplicasChanged`: its generation also binds
-/// the Agent creation nonce, which ACC2 intentionally does not duplicate. The
-/// authority actor must compare that value with its projected replica
-/// transition before accepting MAA2; this SDK boundary only rejects zero or a
-/// reply of the wrong variant.
+/// the Agent creation nonce. The authority actor compares that value with the
+/// generation of its exact enrollment-reconstructed target before accepting
+/// MAA2; this SDK boundary only rejects zero or a reply of the wrong variant.
 fn management_application_reply_shape_matches(
     call: &AuthorityCredentialCall,
     application: &ManagementReply,
 ) -> bool {
-    match (&call.request, application) {
-        (ManagementRequest::Create(descriptor), ManagementReply::Created(identity)) => {
-            *identity == descriptor.identity
-        }
-        (ManagementRequest::Install(install), ManagementReply::Installed(entry)) => {
+    match (&call.plan, application) {
+        (
+            ManagementAuthorizationPlan::Create { descriptor, .. },
+            ManagementReply::Created(identity),
+        ) => *identity == descriptor.identity,
+        (ManagementAuthorizationPlan::Install(install), ManagementReply::Installed(entry)) => {
             *entry == install.entry
         }
-        (ManagementRequest::UpgradeActor(upgrade), ManagementReply::Upgraded(entry)) => {
+        (ManagementAuthorizationPlan::UpgradeActor(upgrade), ManagementReply::Upgraded(entry)) => {
             entry.actor == upgrade.actor
                 && entry.deployment == upgrade.to_deployment
                 && entry.program == upgrade.to_program
@@ -897,24 +1195,25 @@ fn management_application_reply_shape_matches(
                 && entry.lanes == upgrade.requirements.lanes
         }
         (
-            ManagementRequest::Suspend {
+            ManagementAuthorizationPlan::Suspend {
                 actor,
                 expected_deployment,
             },
             ManagementReply::Suspended(entry),
         ) => entry.actor == *actor && entry.deployment == *expected_deployment && entry.suspended,
         (
-            ManagementRequest::Resume {
+            ManagementAuthorizationPlan::Resume {
                 actor,
                 expected_deployment,
             },
             ManagementReply::Resumed(entry),
         ) => entry.actor == *actor && entry.deployment == *expected_deployment && !entry.suspended,
-        (ManagementRequest::RemoveLeaf { actor, .. }, ManagementReply::Removed(removed)) => {
-            actor == removed
-        }
         (
-            ManagementRequest::UpgradeRuntime(upgrade),
+            ManagementAuthorizationPlan::RemoveLeaf { actor, .. },
+            ManagementReply::Removed(removed),
+        ) => actor == removed,
+        (
+            ManagementAuthorizationPlan::UpgradeRuntime(upgrade),
             ManagementReply::RuntimeUpgraded(identity),
         ) => {
             identity.space == call.managed.space
@@ -924,12 +1223,10 @@ fn management_application_reply_shape_matches(
                 && identity.runtime_producer == upgrade.producer
         }
         (
-            ManagementRequest::ChangeReplicas { .. },
+            ManagementAuthorizationPlan::ChangeReplicas { .. },
             ManagementReply::ReplicasChanged { generation },
         ) => *generation != Hash::ZERO,
-        (ManagementRequest::InspectActors { .. }, _)
-        | (ManagementRequest::InspectResources, _)
-        | (_, ManagementReply::Actors(_))
+        (_, ManagementReply::Actors(_))
         | (_, ManagementReply::Resources(_))
         | (_, ManagementReply::Created(_))
         | (_, ManagementReply::Installed(_))
@@ -944,12 +1241,12 @@ fn management_application_reply_shape_matches(
 
 fn receipt_matches_approval(receipt: &AuthorityReceipt, approval: &ManagementApproval) -> bool {
     let selector = &receipt.selector;
-    let actor = approval.request.authority_actor();
+    let actor = approval.plan.authority_actor();
     selector.policy == approval.authority.binding.policy
         && selector.issuer == approval.authority.binding.issuer
         && selector.space == approval.managed.space
         && selector.agent == approval.managed.agent
-        && Some(selector.operation) == approval.request.authority_operation()
+        && selector.operation == approval.plan.authority_operation()
         && selector.runtime_deployment == approval.managed.runtime_deployment
         && selector.actor == actor.map(|(actor, _)| actor)
         && selector.actor_deployment == actor.map(|(_, deployment)| deployment)
@@ -958,25 +1255,25 @@ fn receipt_matches_approval(receipt: &AuthorityReceipt, approval: &ManagementApp
         && selector.epoch == approval.epoch
         && selector.valid_from == approval.valid_from
         && selector.expires_at == approval.expires_at
-        && selector.request == approval.request_commitment
+        && selector.request == approval.plan_commitment
 }
 
-fn mutating_request_matches_targets(
+fn mutating_plan_matches_targets(
     authority: &AuthorityActorTarget,
     managed: &ManagedAgentTarget,
-    request: &ManagementRequest,
+    plan: &ManagementAuthorizationPlan,
 ) -> bool {
-    if !request.is_valid() || request.authority_operation().is_none() {
+    if !plan.is_valid() {
         return false;
     }
-    match request {
-        ManagementRequest::Create(descriptor) => {
+    match plan {
+        ManagementAuthorizationPlan::Create { descriptor, .. } => {
             descriptor.identity.space == managed.space
                 && descriptor.identity.agent == managed.agent
                 && descriptor.identity.runtime_deployment == managed.runtime_deployment
                 && descriptor.authority == authority.binding
         }
-        ManagementRequest::UpgradeRuntime(upgrade) => {
+        ManagementAuthorizationPlan::UpgradeRuntime(upgrade) => {
             upgrade.from_deployment == managed.runtime_deployment
         }
         _ => true,
@@ -1315,6 +1612,7 @@ mod tests {
 
     fn credential_call(request: ManagementRequest) -> AuthorityCredentialCall {
         let public_key = [33; CREDENTIAL_PUBLIC_KEY_BYTES];
+        let plan = request.authorization_plan().unwrap();
         let mut call = AuthorityCredentialCall {
             invocation: InvocationId::ZERO,
             authority: authority_target(),
@@ -1326,7 +1624,7 @@ mod tests {
             authenticated_node: Some(NodeId([36; 32])),
             requested_valid_from: 100,
             requested_expires_at: 120,
-            request,
+            plan,
             signature: [1; CREDENTIAL_SIGNATURE_BYTES],
         };
         call.invocation = call.expected_invocation();
@@ -1391,8 +1689,8 @@ mod tests {
         call: &AuthorityCredentialCall,
         approval: &ManagementApproval,
     ) -> ManagementApplicationAck {
-        let (actor, deployment) = match call.request {
-            ManagementRequest::Suspend {
+        let (actor, deployment) = match call.plan {
+            ManagementAuthorizationPlan::Suspend {
                 actor,
                 expected_deployment,
             } => (actor, expected_deployment),
@@ -1413,14 +1711,14 @@ mod tests {
             lanes: crate::LaneSet::NONE,
             suspended: true,
         });
-        let actor = approval.request.authority_actor();
+        let actor = approval.plan.authority_actor();
         let mut receipt = AuthorityReceipt {
             selector: AuthorityReceiptSelector {
                 policy: approval.authority.binding.policy,
                 issuer: approval.authority.binding.issuer,
                 space: approval.managed.space,
                 agent: approval.managed.agent,
-                operation: approval.request.authority_operation().unwrap(),
+                operation: approval.plan.authority_operation(),
                 runtime_deployment: approval.managed.runtime_deployment,
                 actor: actor.map(|(actor, _)| actor),
                 actor_deployment: actor.map(|(_, deployment)| deployment),
@@ -1431,7 +1729,7 @@ mod tests {
                 acknowledged_through: 0,
                 valid_from: approval.valid_from,
                 expires_at: approval.expires_at,
-                request: approval.request_commitment,
+                request: approval.plan_commitment,
             },
             public_key: approval.authority.binding.public_key,
             signature: [1; AUTHORITY_SIGNATURE_BYTES],
@@ -1445,7 +1743,7 @@ mod tests {
             credential_call: call.commitment(),
             approval: approval.commitment(),
             authorization_sequence: approval.authorization_sequence,
-            request: approval.request_commitment,
+            request: approval.plan_commitment,
             application,
             receipt,
             reopened_state: Hash([44; 32]),
@@ -1654,10 +1952,7 @@ mod tests {
                 limit: 1,
             },
         ] {
-            assert_eq!(
-                credential_call(request).validate_shape(),
-                Err(AuthorityActorProtocolError::InvalidRequest)
-            );
+            assert!(request.authorization_plan().is_none());
         }
     }
 
@@ -1725,7 +2020,7 @@ mod tests {
         assert_eq!(wrong_acknowledgement.validate_shape(), Ok(()));
         assert!(!wrong_acknowledgement.matches_call(&call));
         let mut wrong_request = value;
-        wrong_request.request_commitment = Hash([45; 32]);
+        wrong_request.plan_commitment = Hash([45; 32]);
         assert_eq!(
             wrong_request.validate_shape(),
             Err(AuthorityActorProtocolError::InvalidRequest)
@@ -1855,7 +2150,9 @@ mod tests {
         let mut wrong_issuer = descriptor.clone();
         wrong_issuer.authority.issuer.principal = PrincipalId([55; 32]);
         let mut wrong_issuer_call = create.clone();
-        wrong_issuer_call.request = ManagementRequest::Create(alloc::boxed::Box::new(wrong_issuer));
+        wrong_issuer_call.plan = ManagementRequest::Create(alloc::boxed::Box::new(wrong_issuer))
+            .authorization_plan()
+            .unwrap();
         resign(&mut wrong_issuer_call);
         assert_eq!(
             wrong_issuer_call.validate_shape(),
@@ -1868,7 +2165,9 @@ mod tests {
             ProducerId::of_public_key(&wrong_issuer.authority.public_key);
         assert!(wrong_issuer.validate().is_ok());
         let mut wrong_issuer_call = create.clone();
-        wrong_issuer_call.request = ManagementRequest::Create(alloc::boxed::Box::new(wrong_issuer));
+        wrong_issuer_call.plan = ManagementRequest::Create(alloc::boxed::Box::new(wrong_issuer))
+            .authorization_plan()
+            .unwrap();
         resign(&mut wrong_issuer_call);
         assert_eq!(
             wrong_issuer_call.validate_shape(),
@@ -1905,8 +2204,9 @@ mod tests {
 
         let mut wrong_from = upgrade;
         wrong_from.from_deployment = DeploymentId([61; 32]);
-        upgrade_call.request =
-            ManagementRequest::UpgradeRuntime(alloc::boxed::Box::new(wrong_from));
+        upgrade_call.plan = ManagementRequest::UpgradeRuntime(alloc::boxed::Box::new(wrong_from))
+            .authorization_plan()
+            .unwrap();
         resign(&mut upgrade_call);
         assert_eq!(
             upgrade_call.validate_shape(),

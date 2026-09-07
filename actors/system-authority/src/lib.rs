@@ -1,6 +1,6 @@
 //! Clean, portable policy actor for standard Agent management.
 //!
-//! The actor accepts canonical `ACC2` management calls, canonical `AOC4`
+//! The actor accepts canonical `ACC3` management calls, canonical `AOC4`
 //! general-operation calls, and self-authenticating `AAD3` identity-admin calls
 //! delivered with an exact clean `AIC1` invocation context. It performs policy,
 //! credential, and Admin-accessibility checks inside the guest and retains exact
@@ -21,8 +21,9 @@ use vos::agent_sdk::authority::{
     AgentAuthorityBinding, AuthorityActorTarget, AuthorityAdminCall, AuthorityAdminOperation,
     AuthorityAdminResult, AuthorityBuiltinRole, AuthorityCredentialCall,
     AuthorityCredentialEnrollment, AuthorityCredentialVerifier, AuthorityEvidence, AuthorityIssuer,
-    AuthorityLaneRoots, AuthorityOperationKind, AuthorityVerifier, ManagedAgentTarget,
-    ManagementApplicationAck, ManagementApproval,
+    AuthorityLaneRoots, AuthorityOperationKind, AuthorityVerifier, CompactAgentDescriptor,
+    CompactInstallActor, CompactReplicaSlot, ManagedAgentTarget, ManagementApplicationAck,
+    ManagementApproval, ManagementAuthorizationPlan,
 };
 use vos::agent_sdk::authority_operation::{
     AuthorityOperationApproval, AuthorityOperationCall, AuthorityOperationIntent,
@@ -41,10 +42,13 @@ use vos::agent_sdk::{
     ActorId, AgentId, AgentIdentity, AgentProfile, AgentReplica, CredentialId, DeploymentId, Hash,
     InvocationContext, InvocationId, InvocationRoleClaims, MAX_AGENT_REPLICAS,
     MAX_INVOCATION_MESSAGE_BYTES, MAX_INVOCATION_REPLY_BYTES, MAX_RUNTIME_STATE_BYTES,
-    ManagementReply, ManagementRequest, PrincipalId, ProducerId, ProgramId, RUNTIME_ABI_ID,
-    ReplicaRole, SpaceId, replica_set_generation,
+    ManagementReply, PrincipalId, ProducerId, ProgramId, RUNTIME_ABI_ID, ReplicaRole, SpaceId,
+    replica_roster_commitment, replica_set_generation,
 };
 use vos::prelude::*;
+
+#[cfg(test)]
+use vos::agent_sdk::ManagementRequest;
 
 /// Fixed installation-data wire for [`SystemAuthorityConfiguration`].
 pub const SYSTEM_AUTHORITY_CONFIGURATION_MAGIC: [u8; 4] = *b"SAC3";
@@ -84,7 +88,7 @@ pub const MAX_PRIVATE_APPLICATION_RECORDS: usize = 4_096;
 /// The lower independent cap keeps that variable state below 768 KiB; the
 /// exact serialized-state ceiling remains authoritative for all row metadata.
 pub const MAX_PRIVATE_RECOVERY_APPLICATION_RECORDS: usize = 64;
-/// Worst-case canonical ACC2/AOC4/AAD3 calls plus MAP1/AOP4/AAR3 results and
+/// Worst-case canonical ACC3/AOC4/AAD3 calls plus MAP2/AOP4/AAR3 results and
 /// MAA2/AOI1 acknowledgements retained by the bounded exact-retry tables. This
 /// leaves over one MiB of the standard state ceiling for row metadata and
 /// actor framing.
@@ -425,7 +429,7 @@ pub struct CredentialRow {
     pub kind: u8,
     pub public_key: [u8; 32],
     pub status: CredentialStatus,
-    /// Highest admitted ACC2 request sequence for this credential. Revocation
+    /// Highest admitted ACC3 request sequence for this credential. Revocation
     /// never erases this replay boundary.
     pub management_request_high_water: u64,
     /// Reserved for the clean-break sequenced AOC generation. Keeping it in
@@ -587,7 +591,7 @@ pub struct ManagedActorRow {
     pub root_provenance: bool,
     pub suspended: bool,
     // Runtime-selected incarnation and lifecycle debt are deliberately absent:
-    // neither is carried by ACC2/MAP1/MAA2, so the authority cannot prove them
+    // neither is carried by ACC3/MAP2/MAA2, so the authority cannot prove them
     // from the signed durable-reopen protocol.
     pub installation_id: [u8; 32],
     pub registry_reservation: [u8; 32],
@@ -713,7 +717,7 @@ pub enum PendingManagementEffect {
 #[rkyv(crate = vos::rkyv)]
 pub struct ExactRetryRecord {
     pub invocation: [u8; 32],
-    /// Deterministic MAA2 invocation reserved atomically with this ACC2.
+    /// Deterministic MAA2 invocation reserved atomically with this ACC3.
     pub acknowledgement_invocation: [u8; 32],
     pub credential: [u8; 32],
     pub request_sequence: u64,
@@ -725,9 +729,9 @@ pub struct ExactRetryRecord {
     pub effect: PendingManagementEffect,
 }
 
-/// The newest finalized management application for one credential. The ACC2
+/// The newest finalized management application for one credential. The ACC3
 /// and MAA2 preimages are retained so the credential/request-sequence binding
-/// and acknowledgement signature remain independently checkable, but MAP1 is
+/// and acknowledgement signature remain independently checkable, but MAP2 is
 /// never synthesized after finalization. Older calls are rejected by the
 /// credential high-water mark.
 #[derive(
@@ -1094,7 +1098,7 @@ impl SystemAuthority {
         }
     }
 
-    /// Verify and authorize one exact ACC2 call. Refusal is represented by an
+    /// Verify and authorize one exact ACC3 call. Refusal is represented by an
     /// empty byte string and never mutates Linear state.
     #[msg(linear)]
     fn authorize(&mut self, call: Vec<u8>, ctx: &mut Context<Self>) -> Vec<u8> {
@@ -2011,7 +2015,7 @@ fn finalize_application(
 
     // Only the newest completed application for a credential remains
     // exact-retryable. Older MAA2 values are rejected by the credential
-    // request high-water rather than reconstructed from discarded MAP1 bytes.
+    // request high-water rather than reconstructed from discarded MAP2 bytes.
     if let Some(record) = state
         .latest_management_acks
         .iter()
@@ -2768,7 +2772,7 @@ fn advance_operation_retirement_floor(state: &mut AuthorityLinearState) -> bool 
         if next > state.authorization_sequence {
             return true;
         }
-        // Pending ACC2/MAP1 or the credential-bounded latest MAA2 row proves
+        // Pending ACC3/MAP2 or the credential-bounded latest MAA2 row proves
         // that this shared authorization position contains no AOC material.
         // A credential cannot advance again while its completed management
         // position remains ahead of this floor, so this pass-through set is
@@ -2914,9 +2918,20 @@ fn application_plan(
                 .managed_agents
                 .binary_search_by(|existing| existing.agent.cmp(&row.agent))
                 .err()?;
-            let ManagementRequest::Create(descriptor) = &call.request else {
+            let ManagementAuthorizationPlan::Create {
+                descriptor,
+                replicas,
+                descriptor_commitment,
+            } = &call.plan
+            else {
                 return None;
             };
+            let descriptor = reconstructed_create_descriptor(
+                state,
+                descriptor,
+                replicas,
+                *descriptor_commitment,
+            )?;
             if acknowledgement.application != ManagementReply::Created(descriptor.identity.clone())
             {
                 return None;
@@ -2967,19 +2982,25 @@ fn application_plan(
             to_generation,
             replicas,
         } => {
-            let ManagementRequest::ChangeReplicas {
+            let ManagementAuthorizationPlan::ChangeReplicas {
                 expected_generation,
-                replicas: requested,
-            } = &call.request
+                replicas: slots,
+                replica_roster_commitment,
+            } = &call.plan
             else {
                 return None;
             };
+            let requested = reconstructed_replica_roster(
+                state,
+                slots,
+                *replica_roster_commitment,
+            )?;
             let index = managed_agent(state, call.managed.agent).ok()?;
             let row = &state.managed_agents[index];
             if row.agent != *agent
                 || row.replica_generation != *from_generation
                 || expected_generation.0 != *from_generation
-                || managed_replica_rows(requested) != *replicas
+                || managed_replica_rows(&requested) != *replicas
                 || acknowledgement.application
                     != (ManagementReply::ReplicasChanged {
                         generation: Hash(*to_generation),
@@ -2994,7 +3015,7 @@ fn application_plan(
             })
         }
         PendingManagementEffect::InstallActor { .. } => {
-            let ManagementRequest::Install(install) = &call.request else {
+            let ManagementAuthorizationPlan::Install(install) = &call.plan else {
                 return None;
             };
             let root_provenance = call.managed.agent.0 == configuration.system_agent
@@ -3002,7 +3023,12 @@ fn application_plan(
                     == configuration
                         .bootstrap_authorization_high_water
                         .checked_add(1)?;
-            let row = installed_actor_row(call.managed.agent, install, root_provenance);
+            let row = installed_actor_row(
+                call.managed.agent,
+                install,
+                call.plan.commitment(),
+                root_provenance,
+            );
             if acknowledgement.application != ManagementReply::Installed(install.entry.clone()) {
                 return None;
             }
@@ -3010,7 +3036,7 @@ fn application_plan(
             Some(ApplicationPlan::InstallActor { index, row })
         }
         PendingManagementEffect::UpgradeActor { .. } => {
-            let ManagementRequest::UpgradeActor(upgrade) = &call.request else {
+            let ManagementAuthorizationPlan::UpgradeActor(upgrade) = &call.plan else {
                 return None;
             };
             let index = managed_actor(state, call.managed.agent, upgrade.actor).ok()?;
@@ -3022,12 +3048,12 @@ fn application_plan(
             Some(ApplicationPlan::ReplaceActor { index, row })
         }
         PendingManagementEffect::SetActorSuspended { suspended, .. } => {
-            let (actor, expected_deployment, requested_suspended) = match &call.request {
-                ManagementRequest::Suspend {
+            let (actor, expected_deployment, requested_suspended) = match &call.plan {
+                ManagementAuthorizationPlan::Suspend {
                     actor,
                     expected_deployment,
                 } => (*actor, *expected_deployment, true),
-                ManagementRequest::Resume {
+                ManagementAuthorizationPlan::Resume {
                     actor,
                     expected_deployment,
                 } => (*actor, *expected_deployment, false),
@@ -3053,10 +3079,10 @@ fn application_plan(
             Some(ApplicationPlan::ReplaceActor { index, row })
         }
         PendingManagementEffect::RemoveActor { .. } => {
-            let ManagementRequest::RemoveLeaf {
+            let ManagementAuthorizationPlan::RemoveLeaf {
                 actor,
                 expected_deployment,
-            } = &call.request
+            } = &call.plan
             else {
                 return None;
             };
@@ -3393,6 +3419,45 @@ fn replicas_are_enrolled(state: &AuthorityLinearState, replicas: &[AgentReplica]
     })
 }
 
+fn enrolled_replicas_for_slots(
+    state: &AuthorityLinearState,
+    slots: &[CompactReplicaSlot],
+) -> Option<Vec<AgentReplica>> {
+    slots
+        .iter()
+        .map(|slot| {
+            let enrollment = enrolled_node(state, slot.node)?;
+            Some(AgentReplica {
+                node: slot.node,
+                principal: PrincipalId(enrollment.owner),
+                role: slot.role,
+            })
+        })
+        .collect()
+}
+
+fn reconstructed_create_descriptor(
+    state: &AuthorityLinearState,
+    descriptor: &CompactAgentDescriptor,
+    slots: &[CompactReplicaSlot],
+    descriptor_commitment: Hash,
+) -> Option<vos::agent_sdk::AgentDescriptor> {
+    let descriptor = descriptor.with_replicas(enrolled_replicas_for_slots(state, slots)?);
+    (descriptor.validate().is_ok()
+        && descriptor.commitment() == descriptor_commitment
+        && descriptor_replicas_are_enrolled(state, &descriptor))
+    .then_some(descriptor)
+}
+
+fn reconstructed_replica_roster(
+    state: &AuthorityLinearState,
+    slots: &[CompactReplicaSlot],
+    roster_commitment: Hash,
+) -> Option<Vec<AgentReplica>> {
+    let replicas = enrolled_replicas_for_slots(state, slots)?;
+    (replica_roster_commitment(&replicas) == roster_commitment).then_some(replicas)
+}
+
 fn descriptor_replicas_are_enrolled(
     state: &AuthorityLinearState,
     descriptor: &vos::agent_sdk::AgentDescriptor,
@@ -3459,8 +3524,18 @@ fn policy_effect(
     call: &AuthorityCredentialCall,
     role: BuiltinPrincipalRole,
 ) -> Option<PendingManagementEffect> {
-    match &call.request {
-        ManagementRequest::Create(descriptor) => {
+    match &call.plan {
+        ManagementAuthorizationPlan::Create {
+            descriptor,
+            replicas,
+            descriptor_commitment,
+        } => {
+            let descriptor = reconstructed_create_descriptor(
+                state,
+                descriptor,
+                replicas,
+                *descriptor_commitment,
+            )?;
             if descriptor.authority != configuration.binding.sdk()
                 || !profile_allowed(role, descriptor.identity.profile)
                 || (role != BuiltinPrincipalRole::Admin
@@ -3469,7 +3544,6 @@ fn policy_effect(
                     .roles
                     .binary_search_by(|row| row.principal.cmp(&descriptor.identity.owner.0))
                     .is_err()
-                || !descriptor_replicas_are_enrolled(state, descriptor)
                 || managed_agent(state, call.managed.agent).is_ok()
                 || pending_create_exists(state, call.managed.agent)
                 || live_and_pending_agent_count(state) >= MAX_MANAGED_AGENTS
@@ -3477,15 +3551,14 @@ fn policy_effect(
                 return None;
             }
             Some(PendingManagementEffect::Create(
-                managed_agent_row_from_descriptor(configuration, descriptor)?,
+                managed_agent_row_from_descriptor(configuration, &descriptor)?,
             ))
         }
-        ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => None,
-        ManagementRequest::Install(_)
-        | ManagementRequest::UpgradeActor(_)
-        | ManagementRequest::Suspend { .. }
-        | ManagementRequest::Resume { .. }
-        | ManagementRequest::RemoveLeaf { .. } => {
+        ManagementAuthorizationPlan::Install(_)
+        | ManagementAuthorizationPlan::UpgradeActor(_)
+        | ManagementAuthorizationPlan::Suspend { .. }
+        | ManagementAuthorizationPlan::Resume { .. }
+        | ManagementAuthorizationPlan::RemoveLeaf { .. } => {
             lifecycle_owner(configuration, state, call, role)?;
             if pending_runtime_transition_conflicts(state, call)
                 || pending_actor_effect_conflicts(state, call)
@@ -3494,9 +3567,10 @@ fn policy_effect(
             }
             projected_actor_effect(configuration, state, call)
         }
-        ManagementRequest::ChangeReplicas {
+        ManagementAuthorizationPlan::ChangeReplicas {
             expected_generation,
-            replicas,
+            replicas: slots,
+            replica_roster_commitment,
         } => {
             let row = lifecycle_owner(configuration, state, call, role)?;
             if pending_runtime_transition_conflicts(state, call)
@@ -3504,9 +3578,14 @@ fn policy_effect(
             {
                 return None;
             }
-            replica_change_effect(configuration, state, row, *expected_generation, replicas)
+            let replicas = reconstructed_replica_roster(
+                state,
+                slots,
+                *replica_roster_commitment,
+            )?;
+            replica_change_effect(configuration, state, row, *expected_generation, &replicas)
         }
-        ManagementRequest::UpgradeRuntime(upgrade) => {
+        ManagementAuthorizationPlan::UpgradeRuntime(upgrade) => {
             let row = lifecycle_owner(configuration, state, call, role)?;
             if pending_runtime_transition_conflicts(state, call) {
                 return None;
@@ -3927,8 +4006,8 @@ fn pending_actor_effect_conflicts(
     state: &AuthorityLinearState,
     call: &AuthorityCredentialCall,
 ) -> bool {
-    let (actor, installation, parent, disrupts_children) = match &call.request {
-        ManagementRequest::Install(install) => {
+    let (actor, installation, parent, disrupts_children) = match &call.plan {
+        ManagementAuthorizationPlan::Install(install) => {
             if state.managed_actors.len()
                 + state
                     .retries
@@ -3949,11 +4028,12 @@ fn pending_actor_effect_conflicts(
                 false,
             )
         }
-        ManagementRequest::UpgradeActor(upgrade) => (upgrade.actor, None, None, false),
-        ManagementRequest::Suspend { actor, .. } | ManagementRequest::RemoveLeaf { actor, .. } => {
+        ManagementAuthorizationPlan::UpgradeActor(upgrade) => (upgrade.actor, None, None, false),
+        ManagementAuthorizationPlan::Suspend { actor, .. }
+        | ManagementAuthorizationPlan::RemoveLeaf { actor, .. } => {
             (*actor, None, None, true)
         }
-        ManagementRequest::Resume { actor, .. } => (*actor, None, None, false),
+        ManagementAuthorizationPlan::Resume { actor, .. } => (*actor, None, None, false),
         _ => return false,
     };
     state.retries.iter().any(|record| {
@@ -4004,7 +4084,10 @@ fn pending_runtime_transition_conflicts(
     state: &AuthorityLinearState,
     call: &AuthorityCredentialCall,
 ) -> bool {
-    let incoming_runtime_upgrade = matches!(&call.request, ManagementRequest::UpgradeRuntime(_));
+    let incoming_runtime_upgrade = matches!(
+        &call.plan,
+        ManagementAuthorizationPlan::UpgradeRuntime(_)
+    );
     state.retries.iter().any(|record| {
         if record.invocation == call.invocation.0 {
             return false;
@@ -4044,11 +4127,12 @@ fn projected_actor_effect(
     let agent = call.managed.agent;
     let managed = &state.managed_agents[managed_agent(state, agent).ok()?];
     let profile = agent_profile(managed.profile)?;
-    match &call.request {
-        ManagementRequest::Install(install) => {
+    match &call.plan {
+        ManagementAuthorizationPlan::Install(install) => {
             if protected_authority_actor(configuration, install.entry.actor)
                 || install.entry.suspended
-                || install.validate_for_profile(profile).is_err()
+                || install.entry.validate_for_profile(profile).is_err()
+                || !install.requirements.supported_by(profile)
                 || state.managed_actors.len() >= MAX_MANAGED_ACTORS
                 || state
                     .managed_actors
@@ -4081,7 +4165,7 @@ fn projected_actor_effect(
                 installation_id: install.installation_id.0,
             })
         }
-        ManagementRequest::UpgradeActor(upgrade) => {
+        ManagementAuthorizationPlan::UpgradeActor(upgrade) => {
             if protected_authority_actor(configuration, upgrade.actor)
                 || !upgrade.requirements.supported_by(profile)
             {
@@ -4113,11 +4197,11 @@ fn projected_actor_effect(
                 to_deployment: upgrade.to_deployment.0,
             })
         }
-        ManagementRequest::Suspend {
+        ManagementAuthorizationPlan::Suspend {
             actor,
             expected_deployment,
         }
-        | ManagementRequest::Resume {
+        | ManagementAuthorizationPlan::Resume {
             actor,
             expected_deployment,
         } => {
@@ -4125,7 +4209,7 @@ fn projected_actor_effect(
                 return None;
             }
             let row = &state.managed_actors[managed_actor(state, agent, *actor).ok()?];
-            let suspended = matches!(&call.request, ManagementRequest::Suspend { .. });
+            let suspended = matches!(&call.plan, ManagementAuthorizationPlan::Suspend { .. });
             if row.root_provenance
                 || row.deployment != expected_deployment.0
                 || row.suspended == suspended
@@ -4139,7 +4223,7 @@ fn projected_actor_effect(
                 suspended,
             })
         }
-        ManagementRequest::RemoveLeaf {
+        ManagementAuthorizationPlan::RemoveLeaf {
             actor,
             expected_deployment,
         } => {
@@ -4234,10 +4318,10 @@ fn managed_actor_entry(row: &ManagedActorRow) -> Option<vos::agent_sdk::ActorEnt
 
 fn installed_actor_row(
     agent: AgentId,
-    install: &vos::agent_sdk::InstallActor,
+    install: &CompactInstallActor,
+    plan_commitment: Hash,
     root_provenance: bool,
 ) -> ManagedActorRow {
-    let request = ManagementRequest::Install(Box::new(install.clone()));
     ManagedActorRow {
         agent: agent.0,
         actor: install.entry.actor.0,
@@ -4246,15 +4330,16 @@ fn installed_actor_row(
         deployment: install.entry.deployment.0,
         program: install.entry.program.0,
         producer: install.producer.0,
-        package: authority_blob(&install.package),
-        agent_schema: authority_blob(&install.agent_schema),
-        method_policy: authority_blob(&install.method_policy),
-        constructor_abi: install.constructor_abi.0,
+        package: authority_blob(&install.entry.package),
+        agent_schema: authority_blob(&install.entry.agent_schema),
+        method_policy: authority_blob(&install.entry.method_policy),
+        constructor_abi: install.entry.constructor_abi.0,
         installation_data: install
+            .entry
             .installation_data
             .as_ref()
-            .map(|data| authority_blob(&data.reference)),
-        state_layout: install.state_layout.0,
+            .map(authority_blob),
+        state_layout: install.entry.state_layout.0,
         lanes: install.requirements.lanes.bits(),
         scheduling: install.requirements.scheduling,
         proof_systems: install
@@ -4269,7 +4354,7 @@ fn installed_actor_row(
         suspended: false,
         installation_id: install.installation_id.0,
         registry_reservation: install.registry_reservation.0,
-        install_request: request.commitment().0,
+        install_request: plan_commitment.0,
     }
 }
 
@@ -5589,7 +5674,7 @@ fn latest_management_ack_is_valid(
         && ack.credential_call.0 == record.credential_call
         && ack.approval.0 == record.approval
         && ack.request.0 == record.request
-        && ack.request == call.request.commitment()
+        && ack.request == call.plan.commitment()
         && vos::agent_sdk::wire::management_reply_commitment(&ack.application).0
             == record.application
         && ack.commitment().0 == record.acknowledgement
@@ -5691,10 +5776,19 @@ fn reconstruction_effect(
     state: &AuthorityLinearState,
     call: &AuthorityCredentialCall,
 ) -> Option<PendingManagementEffect> {
-    match &call.request {
-        ManagementRequest::Create(descriptor) => {
+    match &call.plan {
+        ManagementAuthorizationPlan::Create {
+            descriptor,
+            replicas,
+            descriptor_commitment,
+        } => {
+            let descriptor = reconstructed_create_descriptor(
+                state,
+                descriptor,
+                replicas,
+                *descriptor_commitment,
+            )?;
             if descriptor.authority != configuration.binding.sdk()
-                || !descriptor_replicas_are_enrolled(state, descriptor)
                 || managed_agent(state, descriptor.identity.agent).is_ok()
                 || state.retries.iter().any(|record| {
                     record.invocation != call.invocation.0
@@ -5718,15 +5812,14 @@ fn reconstruction_effect(
                 return None;
             }
             Some(PendingManagementEffect::Create(
-                managed_agent_row_from_descriptor(configuration, descriptor)?,
+                managed_agent_row_from_descriptor(configuration, &descriptor)?,
             ))
         }
-        ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => None,
-        ManagementRequest::Install(_)
-        | ManagementRequest::UpgradeActor(_)
-        | ManagementRequest::Suspend { .. }
-        | ManagementRequest::Resume { .. }
-        | ManagementRequest::RemoveLeaf { .. } => {
+        ManagementAuthorizationPlan::Install(_)
+        | ManagementAuthorizationPlan::UpgradeActor(_)
+        | ManagementAuthorizationPlan::Suspend { .. }
+        | ManagementAuthorizationPlan::Resume { .. }
+        | ManagementAuthorizationPlan::RemoveLeaf { .. } => {
             reconstruction_lifecycle_row(configuration, state, call)?;
             if pending_runtime_transition_conflicts(state, call)
                 || pending_actor_effect_conflicts(state, call)
@@ -5735,9 +5828,10 @@ fn reconstruction_effect(
             }
             projected_actor_effect(configuration, state, call)
         }
-        ManagementRequest::ChangeReplicas {
+        ManagementAuthorizationPlan::ChangeReplicas {
             expected_generation,
-            replicas,
+            replicas: slots,
+            replica_roster_commitment,
         } => {
             let row = reconstruction_lifecycle_row(configuration, state, call)?;
             if pending_runtime_transition_conflicts(state, call)
@@ -5745,9 +5839,14 @@ fn reconstruction_effect(
             {
                 return None;
             }
-            replica_change_effect(configuration, state, row, *expected_generation, replicas)
+            let replicas = reconstructed_replica_roster(
+                state,
+                slots,
+                *replica_roster_commitment,
+            )?;
+            replica_change_effect(configuration, state, row, *expected_generation, &replicas)
         }
-        ManagementRequest::UpgradeRuntime(upgrade) => {
+        ManagementAuthorizationPlan::UpgradeRuntime(upgrade) => {
             let row = reconstruction_lifecycle_row(configuration, state, call)?;
             if pending_runtime_transition_conflicts(state, call) {
                 return None;
@@ -6456,6 +6555,9 @@ mod tests {
         request: ManagementRequest,
     ) -> AuthorityCredentialCall {
         let public_key = key.verifying_key().to_bytes();
+        let plan = request
+            .authorization_plan()
+            .expect("management credential fixtures must be mutating");
         let mut call = AuthorityCredentialCall {
             invocation: InvocationId::ZERO,
             authority: authority_target(config),
@@ -6467,7 +6569,7 @@ mod tests {
             authenticated_node: node,
             requested_valid_from: 1,
             requested_expires_at: 10_000,
-            request,
+            plan,
             signature: [1; 64],
         };
         let _ = invocation_byte;
@@ -6561,7 +6663,7 @@ mod tests {
     fn dispatch(actor: &mut SystemAuthority, call: &AuthorityCredentialCall) -> Vec<u8> {
         dispatch_bytes(
             actor,
-            call.encode().expect("valid ACC2 fixture"),
+            call.encode().expect("valid ACC3 fixture"),
             Some(context(call)),
         )
     }
@@ -6952,17 +7054,14 @@ mod tests {
         approval: &ManagementApproval,
         decision_sequence: u64,
     ) -> AuthorityReceipt {
-        let actor = approval.request.authority_actor();
+        let actor = approval.plan.authority_actor();
         let mut receipt = AuthorityReceipt {
             selector: AuthorityReceiptSelector {
                 policy: approval.authority.binding.policy,
                 issuer: approval.authority.binding.issuer,
                 space: approval.managed.space,
                 agent: approval.managed.agent,
-                operation: approval
-                    .request
-                    .authority_operation()
-                    .expect("approval always carries a mutating request"),
+                operation: approval.plan.authority_operation(),
                 runtime_deployment: approval.managed.runtime_deployment,
                 actor: actor.map(|(actor, _)| actor),
                 actor_deployment: actor.map(|(_, deployment)| deployment),
@@ -6973,7 +7072,7 @@ mod tests {
                 acknowledged_through: decision_sequence - 1,
                 valid_from: approval.valid_from,
                 expires_at: approval.expires_at,
-                request: approval.request_commitment,
+                request: approval.plan_commitment,
             },
             public_key: config.binding.public_key,
             signature: [1; 64],
@@ -6988,14 +7087,14 @@ mod tests {
         call: &AuthorityCredentialCall,
         approval: &ManagementApproval,
     ) -> ManagementApplicationAck {
-        let application = match &call.request {
-            ManagementRequest::Create(descriptor) => {
+        let application = match &call.plan {
+            ManagementAuthorizationPlan::Create { descriptor, .. } => {
                 ManagementReply::Created(descriptor.identity.clone())
             }
-            ManagementRequest::Install(install) => {
+            ManagementAuthorizationPlan::Install(install) => {
                 ManagementReply::Installed(install.entry.clone())
             }
-            ManagementRequest::UpgradeActor(upgrade) => {
+            ManagementAuthorizationPlan::UpgradeActor(upgrade) => {
                 let index = managed_actor(state, call.managed.agent, upgrade.actor)
                     .expect("upgrade fixture actor must be installed");
                 let row = upgraded_actor_row(&state.managed_actors[index], upgrade)
@@ -7004,11 +7103,11 @@ mod tests {
                     managed_actor_entry(&row).expect("upgrade fixture entry must be valid"),
                 )
             }
-            ManagementRequest::Suspend {
+            ManagementAuthorizationPlan::Suspend {
                 actor,
                 expected_deployment,
             }
-            | ManagementRequest::Resume {
+            | ManagementAuthorizationPlan::Resume {
                 actor,
                 expected_deployment,
             } => {
@@ -7016,7 +7115,7 @@ mod tests {
                     .expect("suspension fixture actor must be installed");
                 let mut row = state.managed_actors[index].clone();
                 assert_eq!(row.deployment, expected_deployment.0);
-                row.suspended = matches!(&call.request, ManagementRequest::Suspend { .. });
+                row.suspended = matches!(&call.plan, ManagementAuthorizationPlan::Suspend { .. });
                 let entry = managed_actor_entry(&row).expect("suspension fixture entry is valid");
                 if row.suspended {
                     ManagementReply::Suspended(entry)
@@ -7024,8 +7123,10 @@ mod tests {
                     ManagementReply::Resumed(entry)
                 }
             }
-            ManagementRequest::RemoveLeaf { actor, .. } => ManagementReply::Removed(*actor),
-            ManagementRequest::UpgradeRuntime(_) => {
+            ManagementAuthorizationPlan::RemoveLeaf { actor, .. } => {
+                ManagementReply::Removed(*actor)
+            }
+            ManagementAuthorizationPlan::UpgradeRuntime(_) => {
                 let effect = reconstruction_effect(&config, state, call)
                     .expect("runtime-upgrade fixture must be permitted");
                 let PendingManagementEffect::UpgradeRuntime {
@@ -7051,7 +7152,7 @@ mod tests {
                         .expect("runtime-upgrade fixture identity must be valid"),
                 )
             }
-            ManagementRequest::ChangeReplicas { .. } => {
+            ManagementAuthorizationPlan::ChangeReplicas { .. } => {
                 let effect = reconstruction_effect(&config, state, call)
                     .expect("replica-change fixture must be permitted");
                 let PendingManagementEffect::ChangeReplicas { to_generation, .. } = effect else {
@@ -7060,9 +7161,6 @@ mod tests {
                 ManagementReply::ReplicasChanged {
                     generation: Hash(to_generation),
                 }
-            }
-            ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => {
-                panic!("read-only requests never receive management application acknowledgements")
             }
         };
         let mut ack = ManagementApplicationAck {
@@ -7073,7 +7171,7 @@ mod tests {
             credential_call: call.commitment(),
             approval: approval.commitment(),
             authorization_sequence: approval.authorization_sequence,
-            request: approval.request_commitment,
+            request: approval.plan_commitment,
             application,
             receipt: receipt_for(config, approval, approval.authorization_sequence.get()),
             reopened_state: Hash([0x73; 32]),
@@ -7752,7 +7850,19 @@ mod tests {
         assert!(authority_state_is_valid(&config, &actor.state));
 
         let ack = application_ack(config, &actor.state, &call, &approval);
-        let expected_actor = installed_actor_row(AgentId(config.system_agent), &install, true);
+        let install_plan = ManagementAuthorizationPlan::from_request(
+            &ManagementRequest::Install(Box::new(install.clone())),
+        )
+        .expect("install fixture has a compact authorization plan");
+        let ManagementAuthorizationPlan::Install(compact_install) = &install_plan else {
+            unreachable!()
+        };
+        let expected_actor = installed_actor_row(
+            AgentId(config.system_agent),
+            compact_install,
+            install_plan.commitment(),
+            true,
+        );
         assert!(dispatch_ack(&mut actor, &ack));
         assert_eq!(actor.state.managed_actors, vec![expected_actor.clone()]);
         assert_installed_projection(
@@ -7834,7 +7944,7 @@ mod tests {
         assert!(authority_state_is_valid(&config, &restarted.state));
         assert!(
             dispatch(&mut restarted, &call).is_empty(),
-            "a finalized ACC2 older than the credential high-water is not synthesized"
+            "a finalized ACC3 older than the credential high-water is not synthesized"
         );
         let finalized = restarted.state.clone();
         assert!(dispatch_ack(&mut restarted, &ack));
@@ -7879,7 +7989,19 @@ mod tests {
         assert_eq!(actor.state, pending);
 
         let install_ack = application_ack(config, &actor.state, &install_call, &install_approval);
-        let installed = installed_actor_row(managed.agent, &install, false);
+        let install_plan = ManagementAuthorizationPlan::from_request(
+            &ManagementRequest::Install(Box::new(install.clone())),
+        )
+        .expect("install fixture has a compact authorization plan");
+        let ManagementAuthorizationPlan::Install(compact_install) = &install_plan else {
+            unreachable!()
+        };
+        let installed = installed_actor_row(
+            managed.agent,
+            compact_install,
+            install_plan.commitment(),
+            false,
+        );
         assert!(dispatch_ack(&mut actor, &install_ack));
         assert_eq!(actor.state.managed_actors, vec![installed.clone()]);
         assert_installed_projection(
@@ -8221,6 +8343,139 @@ mod tests {
         )
         .expect("exact replica projection restarts");
         assert_eq!(restarted.state, actor.state);
+    }
+
+    #[test]
+    fn acc3_authorizes_full_replica_limit_and_rejects_principal_substitution() {
+        let config = configuration();
+        let key = signing(0x21);
+        let mut actor = actor();
+
+        for ordinal in 0_u64..(MAX_AGENT_REPLICAS as u64 - 1) {
+            let mut seed = [0xa5; 32];
+            seed[..8].copy_from_slice(&ordinal.to_le_bytes());
+            let transport_key = SigningKey::from_bytes(&seed);
+            let mut enrollment = NodeEncryptionEnrollment::from_keys(
+                SpaceId(config.space),
+                ADMIN_PRINCIPAL,
+                transport_key.verifying_key().to_bytes(),
+                [0x42; 32],
+                [1; PRIVATE_SIGNATURE_BYTES],
+            );
+            resign_node_enrollment(&mut enrollment, &transport_key);
+            assert!(enrolled_node(&actor.state, enrollment.node).is_none());
+            actor
+                .state
+                .nodes
+                .push(NodeOwnerRow::from_enrollment(enrollment));
+        }
+        actor.state.nodes.sort_by_key(|row| row.node);
+        assert_eq!(actor.state.nodes.len(), MAX_AGENT_REPLICAS);
+        assert!(refresh_state_integrity_commitment(
+            &config,
+            &mut actor.state
+        ));
+        assert!(authority_state_is_valid(&config, &actor.state));
+
+        let mut descriptor = descriptor(config, ADMIN_PRINCIPAL, AgentProfile::Shared, 0xa6);
+        descriptor.replicas = actor
+            .state
+            .nodes
+            .iter()
+            .map(|row| AgentReplica {
+                node: NodeId(row.node),
+                principal: ADMIN_PRINCIPAL,
+                role: ReplicaRole::Voter,
+            })
+            .collect();
+        assert_eq!(descriptor.replicas.len(), MAX_AGENT_REPLICAS);
+        assert_eq!(descriptor.validate(), Ok(()));
+        let managed = target_for(&descriptor);
+
+        let mut substituted_descriptor = descriptor.clone();
+        substituted_descriptor.replicas[0].principal = PrincipalId([0xa7; 32]);
+        let substituted_create = credential_call(
+            config,
+            &key,
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0xa8,
+            managed,
+            ManagementRequest::Create(Box::new(substituted_descriptor)),
+        );
+        assert!(substituted_create.encode().unwrap().len() <= MAX_INVOCATION_MESSAGE_BYTES);
+        let before_substituted_create = actor.state.clone();
+        assert!(dispatch(&mut actor, &substituted_create).is_empty());
+        assert_eq!(actor.state, before_substituted_create);
+
+        let create = credential_call(
+            config,
+            &key,
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0xa9,
+            managed,
+            ManagementRequest::Create(Box::new(descriptor.clone())),
+        );
+        assert!(create.encode().unwrap().len() <= MAX_INVOCATION_MESSAGE_BYTES);
+        let create_approval = ManagementApproval::decode(&dispatch(&mut actor, &create))
+            .expect("a full 256-replica Create must fit and authorize");
+        assert!(dispatch_application_ack(
+            &mut actor,
+            &create,
+            &create_approval,
+        ));
+
+        let managed_index = managed_agent(&actor.state, managed.agent).unwrap();
+        let expected_generation = Hash(actor.state.managed_agents[managed_index].replica_generation);
+        let mut replacement = descriptor.replicas.clone();
+        replacement[MAX_AGENT_REPLICAS - 1].role = ReplicaRole::Observer;
+        let mut substituted_replacement = replacement.clone();
+        substituted_replacement[0].principal = PrincipalId([0xaa; 32]);
+        let mut substituted_change = credential_call(
+            config,
+            &key,
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0xab,
+            managed,
+            ManagementRequest::ChangeReplicas {
+                expected_generation,
+                replicas: substituted_replacement,
+            },
+        );
+        prepare_management_call(&actor, &mut substituted_change, &key);
+        assert!(substituted_change.encode().unwrap().len() <= MAX_INVOCATION_MESSAGE_BYTES);
+        let before_substituted_change = actor.state.clone();
+        assert!(dispatch(&mut actor, &substituted_change).is_empty());
+        assert_eq!(actor.state, before_substituted_change);
+
+        let mut change = credential_call(
+            config,
+            &key,
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0xac,
+            managed,
+            ManagementRequest::ChangeReplicas {
+                expected_generation,
+                replicas: replacement.clone(),
+            },
+        );
+        prepare_management_call(&actor, &mut change, &key);
+        assert!(change.encode().unwrap().len() <= MAX_INVOCATION_MESSAGE_BYTES);
+        let change_approval = ManagementApproval::decode(&dispatch(&mut actor, &change))
+            .expect("a full 256-replica ChangeReplicas must fit and authorize");
+        assert!(dispatch_application_ack(
+            &mut actor,
+            &change,
+            &change_approval,
+        ));
+        assert_eq!(
+            actor.state.managed_agents[managed_index].replicas,
+            managed_replica_rows(&replacement)
+        );
+        assert!(authority_state_is_valid(&config, &actor.state));
     }
 
     #[test]
@@ -8622,7 +8877,7 @@ mod tests {
     }
 
     #[test]
-    fn acc2_requires_exact_aic1_and_never_falls_back() {
+    fn acc3_requires_exact_wire_and_aic1_and_never_falls_back() {
         let config = configuration();
         let key = signing(0x21);
         let call = create_call(
@@ -8637,26 +8892,25 @@ mod tests {
 
         let mut actor = actor();
         let before = actor.state.clone();
-        assert!(
-            dispatch_bytes(
-                &mut actor,
-                b"legacy authority call".to_vec(),
-                Some(context(&call))
-            )
-            .is_empty()
-        );
+        let encoded = call.encode().unwrap();
+        let mut old_magic = encoded.clone();
+        old_magic[..4].copy_from_slice(b"ACC2");
+        assert!(dispatch_bytes(&mut actor, old_magic, Some(context(&call))).is_empty());
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(dispatch_bytes(&mut actor, trailing, Some(context(&call))).is_empty());
         assert_eq!(actor.state, before);
-        assert!(dispatch_bytes(&mut actor, call.encode().unwrap(), None).is_empty());
+        assert!(dispatch_bytes(&mut actor, encoded.clone(), None).is_empty());
         assert_eq!(actor.state, before);
 
         let mut wrong_mode = context(&call);
         wrong_mode.mode = MethodMode::Merge;
-        assert!(dispatch_bytes(&mut actor, call.encode().unwrap(), Some(wrong_mode)).is_empty());
+        assert!(dispatch_bytes(&mut actor, encoded.clone(), Some(wrong_mode)).is_empty());
         assert_eq!(actor.state, before);
 
         let mut claimed_role = context(&call);
         claimed_role.roles.space = Some(RoleId([0x99; 32]));
-        assert!(dispatch_bytes(&mut actor, call.encode().unwrap(), Some(claimed_role)).is_empty());
+        assert!(dispatch_bytes(&mut actor, encoded, Some(claimed_role)).is_empty());
         assert_eq!(actor.state, before);
     }
 
@@ -11061,10 +11315,27 @@ mod tests {
             0xb2,
         );
         call.authority.binding.policy = Hash([0xb3; 32]);
-        let ManagementRequest::Create(descriptor) = &mut call.request else {
+        let ManagementAuthorizationPlan::Create {
+            descriptor,
+            replicas,
+            descriptor_commitment,
+        } = &mut call.plan
+        else {
             unreachable!()
         };
         descriptor.authority = call.authority.binding;
+        *descriptor_commitment = descriptor
+            .with_replicas(
+                replicas
+                    .iter()
+                    .map(|slot| AgentReplica {
+                        node: slot.node,
+                        principal: descriptor.identity.owner,
+                        role: slot.role,
+                    })
+                    .collect(),
+            )
+            .commitment();
         refresh_management_call(&mut call, &key);
         assert_eq!(call.validate_shape(), Ok(()));
 
@@ -11439,8 +11710,8 @@ mod tests {
         let approval_bytes = dispatch(&mut actor, &call);
         let approval = ManagementApproval::decode(&approval_bytes).unwrap();
         assert_eq!(
-            approval.request.authority_operation(),
-            Some(AuthorityOperationKind::CreateAgent)
+            approval.plan.authority_operation(),
+            AuthorityOperationKind::CreateAgent
         );
         assert_eq!(actor.state.managed_agents, vec![root_managed_agent(config)]);
 
@@ -11582,7 +11853,7 @@ mod tests {
         );
         let candidate_ack = ManagementApproval::derive_acknowledgement_invocation(&candidate);
 
-        // ACC2 authorization IDs are credential/sequence/payload-derived and
+        // ACC3 authorization IDs are credential/sequence/payload-derived and
         // cannot canonically claim the separately derived MAA2 domain.
         let blocker = create_call(
             config,
@@ -12643,10 +12914,9 @@ mod tests {
 
         // Keep 512 exact owner enrollments at once: a maximum old membership
         // plus a fully disjoint maximum replacement. The extra authority row
-        // is the bootstrap Node, proving the 2*N+1 table boundary. ACC2's
-        // ambient 16-KiB framing cannot yet admit a 256-replica descriptor;
-        // this test therefore starts from the valid persisted projection and
-        // keeps that separate creation-framing seam explicit.
+        // is the bootstrap Node, proving the 2*N+1 table boundary. This test
+        // starts from a valid persisted projection so it isolates retained
+        // recovery-state sizing from the separately covered ACC3 Create path.
         for ordinal in 0_u64..511 {
             let mut seed = [0x5a; 32];
             seed[..8].copy_from_slice(&ordinal.to_le_bytes());
@@ -12812,24 +13082,30 @@ mod tests {
     }
 
     #[test]
-    fn read_only_management_has_no_acc2_actor_message() {
+    fn read_only_management_has_no_acc3_actor_message() {
         let config = configuration();
-        let descriptor = descriptor(config, ADMIN_PRINCIPAL, AgentProfile::Local, 0x61);
-        let managed = target_for(&descriptor);
-        let call = credential_call(
+        let request = ManagementRequest::InspectResources;
+        assert!(request.authorization_plan().is_none());
+        let context_call = create_call(
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
             Some(ADMIN_NODE),
             0x62,
-            managed,
-            ManagementRequest::InspectResources,
+            AgentProfile::Local,
+            0x61,
         );
-        assert!(call.encode().is_err());
 
         let mut actor = actor();
         let before = actor.state.clone();
-        assert!(dispatch_bytes(&mut actor, call.signing_bytes(), Some(context(&call))).is_empty());
+        assert!(
+            dispatch_bytes(
+                &mut actor,
+                request.commitment().0.to_vec(),
+                Some(context(&context_call)),
+            )
+            .is_empty()
+        );
         assert_eq!(actor.state, before);
     }
 

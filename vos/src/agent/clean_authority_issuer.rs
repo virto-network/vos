@@ -105,7 +105,7 @@ impl AuthorizedCleanManagementDecision {
     /// the only general management value accepted by the durable issuer.
     ///
     /// This constructor and [`DurableCleanManagementIssuer::issue`] are
-    /// crate-private so an SDK caller cannot synthesize MAP1 with the public
+    /// crate-private so an SDK caller cannot synthesize MAP2 with the public
     /// actor helper and reach the signer. The eventual coordinator must call
     /// this only for the exact result of the configured actor's authenticated
     /// Linear transition. The credential signature is reverified, the
@@ -116,6 +116,7 @@ impl AuthorizedCleanManagementDecision {
     pub(crate) fn from_approval<V: AuthorityCredentialVerifier>(
         expected_authority: AuthorityActorTarget,
         expected_managed: ManagedAgentTarget,
+        request: &ManagementRequest,
         call: &AuthorityCredentialCall,
         approval: &ManagementApproval,
         credential_verifier: &V,
@@ -125,14 +126,16 @@ impl AuthorizedCleanManagementDecision {
         let binding = expected_authority.binding;
         if !expected_authority.is_valid()
             || !expected_managed.is_valid()
+            || !request.is_valid()
             || !approval.matches_call(call)
+            || !approval.plan.matches_request(request)
             || call.authority != expected_authority
             || approval.authority != expected_authority
             || call.managed != expected_managed
             || approval.managed != expected_managed
             || approval.epoch < binding.initial_epoch
             || matches!(
-                &approval.request,
+                request,
                 ManagementRequest::Create(descriptor) if descriptor.authority != binding
             )
         {
@@ -150,7 +153,7 @@ impl AuthorizedCleanManagementDecision {
                 valid_from: approval.valid_from,
                 expires_at: approval.expires_at,
             },
-            &approval.request,
+            request,
             Some(CleanManagementApplicationContext {
                 authorization_invocation: call.invocation,
                 acknowledgement_invocation: approval.acknowledgement_invocation,
@@ -160,7 +163,7 @@ impl AuthorizedCleanManagementDecision {
                 approval: approval.commitment(),
             }),
         )?;
-        (decision.request == approval.request_commitment)
+        (decision.request == approval.plan_commitment)
             .then_some(decision)
             .ok_or(CleanManagementDecisionError::InvalidApproval)
     }
@@ -2043,7 +2046,7 @@ mod tests {
     fn approved_call(
         fixture: &Fixture,
         authorization_sequence: u64,
-        request: ManagementRequest,
+        request: &ManagementRequest,
     ) -> (AuthorityCredentialCall, ManagementApproval) {
         let credential_key = SigningKey::from_bytes(&[0x29; 32]);
         let credential_public_key = credential_key.verifying_key().to_bytes();
@@ -2067,7 +2070,7 @@ mod tests {
             authenticated_node: Some(crate::agent::sdk::NodeId([0x25; 32])),
             requested_valid_from: 1,
             requested_expires_at: 20_000,
-            request,
+            plan: request.authorization_plan().unwrap(),
             signature: [0; 64],
         };
         call.invocation = call.expected_invocation();
@@ -2091,10 +2094,11 @@ mod tests {
         let mut signer = CountingSigner::new(0x28);
         let fixture = fixture(&signer);
         let request = request(0x2a);
-        let (call, approval) = approved_call(&fixture, 1, request.clone());
+        let (call, approval) = approved_call(&fixture, 1, &request);
         let decision = AuthorizedCleanManagementDecision::from_approval(
             call.authority,
             call.managed,
+            &request,
             &call,
             &approval,
             &TestCredentialVerifier,
@@ -2102,6 +2106,25 @@ mod tests {
         .unwrap();
         assert_eq!(decision.authorization_id(), approval.authorization_sequence);
         assert_eq!(decision.request(), request.commitment());
+
+        let mut substituted_request = request.clone();
+        let ManagementRequest::RemoveLeaf { actor, .. } = &mut substituted_request else {
+            unreachable!()
+        };
+        *actor = ActorId([0x2b; 32]);
+        assert_eq!(substituted_request.is_valid(), true);
+        assert_ne!(substituted_request.commitment(), request.commitment());
+        assert_eq!(
+            AuthorizedCleanManagementDecision::from_approval(
+                call.authority,
+                call.managed,
+                &substituted_request,
+                &call,
+                &approval,
+                &TestCredentialVerifier,
+            ),
+            Err(CleanManagementDecisionError::InvalidApproval)
+        );
 
         let receipt = open(store, &fixture).issue(&decision, &mut signer).unwrap();
         assert!(decision.matches_receipt(fixture.binding, &receipt));
@@ -2112,6 +2135,7 @@ mod tests {
             AuthorizedCleanManagementDecision::from_approval(
                 call.authority,
                 call.managed,
+                &request,
                 &forged_call,
                 &approval,
                 &TestCredentialVerifier,
@@ -2127,6 +2151,7 @@ mod tests {
             AuthorizedCleanManagementDecision::from_approval(
                 wrong_authority,
                 call.managed,
+                &request,
                 &call,
                 &approval,
                 &TestCredentialVerifier,
@@ -2140,6 +2165,7 @@ mod tests {
             AuthorizedCleanManagementDecision::from_approval(
                 wrong_authority_route,
                 call.managed,
+                &request,
                 &call,
                 &approval,
                 &TestCredentialVerifier,
@@ -2152,6 +2178,7 @@ mod tests {
             AuthorizedCleanManagementDecision::from_approval(
                 call.authority,
                 wrong_managed_route,
+                &request,
                 &call,
                 &approval,
                 &TestCredentialVerifier,
@@ -2167,6 +2194,7 @@ mod tests {
             AuthorizedCleanManagementDecision::from_approval(
                 wrong_authority,
                 call.managed,
+                &request,
                 &call,
                 &approval,
                 &TestCredentialVerifier,
@@ -2184,6 +2212,7 @@ mod tests {
             AuthorizedCleanManagementDecision::from_approval(
                 wrong_authority,
                 call.managed,
+                &request,
                 &call,
                 &approval,
                 &TestCredentialVerifier,
@@ -2198,6 +2227,7 @@ mod tests {
             AuthorizedCleanManagementDecision::from_approval(
                 wrong_authority,
                 call.managed,
+                &request,
                 &call,
                 &approval,
                 &TestCredentialVerifier,
@@ -2212,6 +2242,7 @@ mod tests {
             AuthorizedCleanManagementDecision::from_approval(
                 call.authority,
                 call.managed,
+                &request,
                 &call,
                 &regressed_epoch,
                 &TestCredentialVerifier,
@@ -2227,10 +2258,11 @@ mod tests {
         let fixture = fixture(&signer);
         let management_request = request(0x2c);
         let application = application(&management_request);
-        let (call, approval) = approved_call(&fixture, 1, management_request);
+        let (call, approval) = approved_call(&fixture, 1, &management_request);
         let approved_decision = AuthorizedCleanManagementDecision::from_approval(
             call.authority,
             call.managed,
+            &management_request,
             &call,
             &approval,
             &TestCredentialVerifier,
@@ -2239,10 +2271,12 @@ mod tests {
         let mut issuer = open(store.clone(), &fixture);
         let receipt = issuer.issue(&approved_decision, &mut signer).unwrap();
 
-        let (second_call, second_approval) = approved_call(&fixture, 2, request(0x2f));
+        let second_request = request(0x2f);
+        let (second_call, second_approval) = approved_call(&fixture, 2, &second_request);
         let second_decision = AuthorizedCleanManagementDecision::from_approval(
             second_call.authority,
             second_call.managed,
+            &second_request,
             &second_call,
             &second_approval,
             &TestCredentialVerifier,
@@ -2458,10 +2492,11 @@ mod tests {
         let fixture = fixture(&signer);
         let management_request = request(0x35);
         let application = application(&management_request);
-        let (call, approval) = approved_call(&fixture, 1, management_request);
+        let (call, approval) = approved_call(&fixture, 1, &management_request);
         let decision = AuthorizedCleanManagementDecision::from_approval(
             call.authority,
             call.managed,
+            &management_request,
             &call,
             &approval,
             &TestCredentialVerifier,

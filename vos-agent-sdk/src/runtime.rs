@@ -433,6 +433,12 @@ impl ManagementRequest {
         crate::wire::management_request_commitment(self)
     }
 
+    /// Bounded authority policy projection for a mutating request. Read-only
+    /// inspection has no authorization plan and cannot enter ACC3.
+    pub fn authorization_plan(&self) -> Option<crate::authority::ManagementAuthorizationPlan> {
+        crate::authority::ManagementAuthorizationPlan::from_request(self)
+    }
+
     /// Signed authority operation required for a mutating management request.
     /// Read-only inspection deliberately has no authority operation.
     pub fn authority_operation(&self) -> Option<crate::authority::AuthorityOperationKind> {

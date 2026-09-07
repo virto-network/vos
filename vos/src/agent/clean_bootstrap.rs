@@ -395,7 +395,10 @@ impl AuthorizedCleanSystemAgentBootstrap {
             || self.catalog_call.request_sequence.get() != 1
             || self.catalog_call.requested_valid_from > self.pins.observed_slot
             || self.catalog_call.requested_expires_at < self.pins.observed_slot
-            || self.catalog_call.request != self.catalog_request
+            || !self
+                .catalog_call
+                .plan
+                .matches_request(&self.catalog_request)
             || !RawCredentialVerifier.verify(
                 &self.catalog_call.credential_public_key,
                 &self.catalog_call.signing_bytes(),
@@ -987,6 +990,7 @@ where
         let catalog_decision = AuthorizedCleanManagementDecision::from_approval(
             plan.authority_target(),
             plan.managed_target(),
+            &plan.catalog_request,
             &plan.catalog_call,
             &approval,
             &RawCredentialVerifier,
@@ -1298,6 +1302,7 @@ fn validate_record_against_plan(
         let decision = AuthorizedCleanManagementDecision::from_approval(
             plan.authority_target(),
             plan.managed_target(),
+            &plan.catalog_request,
             &plan.catalog_call,
             approval,
             &RawCredentialVerifier,
@@ -2556,7 +2561,7 @@ mod tests {
                 authenticated_node: Some(descriptor.replicas[0].node),
                 requested_valid_from: 10,
                 requested_expires_at: 30,
-                request: request.clone(),
+                plan: request.authorization_plan().unwrap(),
                 signature: [0; 64],
             };
             call.invocation = call.expected_invocation();
@@ -3148,7 +3153,16 @@ mod tests {
 
         fn physical_fixture() -> PhysicalFixture {
             let runtime = runtime_fixture();
-            assert_eq!(runtime.catalog_approval.request, runtime.catalog_request);
+            assert!(
+                runtime
+                    .catalog_approval
+                    .plan
+                    .matches_request(&runtime.catalog_request)
+            );
+            assert_eq!(
+                runtime.catalog_approval.plan_commitment,
+                runtime.catalog_request.commitment()
+            );
             let create_request = ManagementRequest::Create(Box::new(runtime.descriptor.clone()));
             let create_decision = decision(&runtime.descriptor, &create_request, 1, 0x71);
             let authority_decision =

@@ -1,6 +1,6 @@
 //! Self-authenticating authority calls for non-management operation domains.
 //!
-//! Management keeps its ACC2/MAP1/MAA2 replay protocol. This sibling family
+//! Management keeps its ACC3/MAP2/MAA2 replay protocol. This sibling family
 //! covers invocation, catalog, and Private-Agent controls without widening or
 //! accepting those older wire generations. A call authenticates the complete
 //! requested intent with a credential signature; an approval materializes the
