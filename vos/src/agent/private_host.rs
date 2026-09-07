@@ -128,6 +128,9 @@ pub enum PrivateAgentHostError {
     InvalidMembership,
     InvalidArtifact,
     Unauthorized,
+    /// The signed control names a transition for which this host has no
+    /// durable application/reopen implementation yet.
+    UnsupportedOperation,
     Alias,
     LimitExceeded,
     LinearUnsupported,
@@ -195,6 +198,7 @@ impl From<PrivateSyncError> for PrivateAgentHostError {
             PrivateSyncError::LimitExceeded | PrivateSyncError::LimitTooSmall => {
                 Self::LimitExceeded
             }
+            PrivateSyncError::UnsupportedOperation => Self::UnsupportedOperation,
             other => Self::Sync(other),
         }
     }
@@ -1992,6 +1996,18 @@ where
         return Err(PrivateAgentHostError::InvalidArtifact);
     }
     verify_control_record_signature(&control)?;
+    if matches!(
+        &control.operation,
+        PrivateControlOperation::SetResourcePolicy { .. }
+            | PrivateControlOperation::ActorLifecycle { .. }
+    ) {
+        // A control-chain append is not application of either operation. In
+        // particular, this request carries only the lifecycle request hash and
+        // HostedPrivateAgent has no durably reopenable runtime image. Refuse
+        // before inspecting or mutating the store until a real runtime bridge
+        // can commit and reopen the selected policy/actor-forest transition.
+        return Err(PrivateAgentHostError::UnsupportedOperation);
+    }
     let intent =
         AuthorityOperationIntent::private_control(request.route.runtime_deployment, &control)
             .map_err(|_| PrivateAgentHostError::Unauthorized)?;
@@ -5480,7 +5496,7 @@ mod tests {
     }
 
     #[test]
-    fn authorized_rotation_resource_and_lifecycle_are_exact_and_restartable() {
+    fn authorized_rotation_is_restartable_and_unimplemented_controls_fail_closed() {
         let fixture = fixture(2);
         let mut host = create_host(&fixture, 0, "authorized-private-controls");
         let agent = create_agent(&mut host, &fixture);
@@ -5546,8 +5562,8 @@ mod tests {
             rotate_result
         );
 
-        // Resource policy details stay bound to the exact PCTL commitment,
-        // while epoch, members, and encrypted sidecars remain unchanged.
+        // A resource-policy PCTL cannot be reported as applied until the host
+        // has a durable policy application/reopen implementation.
         let mut resource = unsigned_owner_record(
             host.hosted(agent).unwrap(),
             PrivateControlOperation::SetResourcePolicy {
@@ -5556,54 +5572,18 @@ mod tests {
         );
         sign_owner_control_record(&mut resource, &host.hosted(agent).unwrap().owner_key).unwrap();
         let (_, resource_request) = runtime_application_request(&fixture, &resource, 50, 54);
-        let mut alternate_resource = resource.clone();
-        alternate_resource.operation = PrivateControlOperation::SetResourcePolicy {
-            policy: BlobRef::of_bytes(b"private-resource-policy-v2"),
-        };
-        sign_owner_control_record(
-            &mut alternate_resource,
-            &host.hosted(agent).unwrap().owner_key,
-        )
-        .unwrap();
-        let mut substituted_resource = resource_request.clone();
-        substituted_resource.control = alternate_resource.encode().unwrap();
         let before_resource = host.binding(agent).unwrap();
         let before_resource_sidecars = canonical_sidecars(&host, agent);
-        assert!(apply_runtime_request(&mut host, authority, &substituted_resource).is_err());
+        assert_eq!(
+            apply_runtime_request(&mut host, authority, &resource_request),
+            Err(PrivateAgentHostError::UnsupportedOperation)
+        );
         assert_eq!(host.binding(agent).unwrap(), before_resource);
-
-        let resource_result =
-            apply_runtime_request(&mut host, authority, &resource_request).unwrap();
-        let resource_fact =
-            decode_private_application_fact(&resource_result.application_fact).unwrap();
-        assert_eq!(
-            resource_fact.operation,
-            AuthorityOperationKind::SetPrivateResourcePolicy
-        );
-        assert_eq!(resource_fact.control, resource.commitment());
-        assert_eq!(resource_fact.epoch, before_resource.epoch);
-        assert_eq!(resource_fact.post_member_set, rotated_member_set);
-        assert_eq!(host.binding(agent).unwrap().epoch, before_resource.epoch);
-        assert_eq!(
-            host.agents[&agent].store.authorized_nodes(),
-            initial_members
-        );
-        assert_eq!(host.agents[&agent].store.key_epochs().len(), 2);
         assert_eq!(canonical_sidecars(&host, agent), before_resource_sidecars);
-        assert_eq!(
-            apply_runtime_request(&mut host, authority, &resource_request).unwrap(),
-            resource_result
-        );
 
-        drop(host);
-        let mut host = reopen_host(&fixture, 0, "authorized-private-controls");
-        assert_eq!(
-            apply_runtime_request(&mut host, authority, &resource_request).unwrap(),
-            resource_result
-        );
-
-        // Lifecycle authority selects the logical Actor but never a runtime
-        // deployment. Both selector slots are authenticated by receipt and AOI.
+        // A lifecycle PCTL carries only the committed request hash. It cannot
+        // mutate or reopen an actor forest without the exact request bytes and
+        // a durable runtime image.
         let actor = ActorId([0xb7; 32]);
         let lifecycle_request_hash = Hash([0xb8; 32]);
         let mut lifecycle = unsigned_owner_record(
@@ -5624,82 +5604,33 @@ mod tests {
         assert_eq!(lifecycle_receipt.selector.actor, Some(actor));
         assert_eq!(lifecycle_receipt.selector.actor_deployment, None);
 
-        let (_, authority_key) = authority_target(&fixture);
-        let mut substituted = lifecycle_request.clone();
-        let mut receipt = AuthorityReceipt::decode(&substituted.receipt).unwrap();
-        receipt.selector.actor = Some(ActorId([0xb9; 32]));
-        receipt.signature = [0; 64];
-        receipt.signature = authority_key.sign(&receipt.signing_bytes()).to_bytes();
-        let mut issuance =
-            AuthorityOperationIssuanceAck::decode(&substituted.issuance_ack).unwrap();
-        issuance.receipt = receipt.clone();
-        issuance.signature = [0; 64];
-        issuance.signature = authority_key.sign(&issuance.signing_bytes()).to_bytes();
-        substituted.receipt = receipt.encode().unwrap();
-        substituted.issuance_ack = issuance.encode().unwrap();
-        let before = host.binding(agent).unwrap();
-        assert!(apply_runtime_request(&mut host, authority, &substituted).is_err());
-        assert_eq!(host.binding(agent).unwrap(), before);
-
-        let mut invalid_deployment_receipt = lifecycle_receipt.clone();
-        invalid_deployment_receipt.selector.actor_deployment = Some(DeploymentId([0xba; 32]));
-        invalid_deployment_receipt.signature = [0; 64];
-        invalid_deployment_receipt.signature = authority_key
-            .sign(&invalid_deployment_receipt.signing_bytes())
-            .to_bytes();
-        assert!(invalid_deployment_receipt.encode().is_err());
-
-        let mut alternate_lifecycle = lifecycle.clone();
-        let PrivateControlOperation::ActorLifecycle { request, .. } =
-            &mut alternate_lifecycle.operation
-        else {
-            unreachable!()
-        };
-        *request = Hash([0xbb; 32]);
-        sign_owner_control_record(
-            &mut alternate_lifecycle,
-            &host.hosted(agent).unwrap().owner_key,
-        )
-        .unwrap();
-        let mut substituted_lifecycle = lifecycle_request.clone();
-        substituted_lifecycle.control = alternate_lifecycle.encode().unwrap();
-        assert!(apply_runtime_request(&mut host, authority, &substituted_lifecycle).is_err());
-
         let before_lifecycle = host.binding(agent).unwrap();
         let before_lifecycle_sidecars = canonical_sidecars(&host, agent);
-        let lifecycle_result =
-            apply_runtime_request(&mut host, authority, &lifecycle_request).unwrap();
-        let lifecycle_fact =
-            decode_private_application_fact(&lifecycle_result.application_fact).unwrap();
         assert_eq!(
-            lifecycle_fact.operation,
-            AuthorityOperationKind::PrivateActorLifecycle
+            apply_runtime_request(&mut host, authority, &lifecycle_request),
+            Err(PrivateAgentHostError::UnsupportedOperation)
         );
-        assert_eq!(lifecycle_fact.control, lifecycle.commitment());
-        assert_eq!(lifecycle_fact.epoch, before_lifecycle.epoch);
-        assert_eq!(lifecycle_fact.post_member_set, rotated_member_set);
-        assert_eq!(host.binding(agent).unwrap().epoch, before_lifecycle.epoch);
-        assert_eq!(
-            host.agents[&agent].store.authorized_nodes(),
-            initial_members
-        );
-        assert_eq!(host.agents[&agent].store.key_epochs().len(), 2);
+        assert_eq!(host.binding(agent).unwrap(), before_lifecycle);
         assert_eq!(canonical_sidecars(&host, agent), before_lifecycle_sidecars);
-        assert_eq!(
-            apply_runtime_request(&mut host, authority, &lifecycle_request).unwrap(),
-            lifecycle_result
-        );
 
         drop(host);
         let mut reopened = reopen_host(&fixture, 0, "authorized-private-controls");
         assert_eq!(
-            apply_runtime_request(&mut reopened, authority, &lifecycle_request).unwrap(),
-            lifecycle_result
+            apply_runtime_request(&mut reopened, authority, &resource_request),
+            Err(PrivateAgentHostError::UnsupportedOperation)
         );
-        assert_eq!(reopened.binding(agent).unwrap().epoch, 1);
+        assert_eq!(
+            apply_runtime_request(&mut reopened, authority, &lifecycle_request),
+            Err(PrivateAgentHostError::UnsupportedOperation)
+        );
+        assert_eq!(reopened.binding(agent).unwrap(), before_lifecycle);
         assert_eq!(
             reopened.agents[&agent].store.authorized_nodes(),
             initial_members
+        );
+        assert_eq!(
+            canonical_sidecars(&reopened, agent),
+            before_lifecycle_sidecars
         );
     }
 

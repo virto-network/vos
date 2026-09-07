@@ -65,6 +65,9 @@ pub enum PrivateSyncError {
     Tampered,
     MissingEvidence,
     LinearUnsupported,
+    /// The evidence selects a control for which this receiver has no durable
+    /// application/reopen implementation yet.
+    UnsupportedOperation,
     Store(PrivateStoreError),
     Crypto(PrivateCryptoError),
 }
@@ -1379,6 +1382,16 @@ pub(crate) fn verify_private_control_page_authority_evidence(
             return Err(PrivateSyncError::InvalidFrame);
         };
         let record = PrivateControlRecord::decode(wire).map_err(|_| PrivateSyncError::Tampered)?;
+        if matches!(
+            &record.operation,
+            PrivateControlOperation::SetResourcePolicy { .. }
+                | PrivateControlOperation::ActorLifecycle { .. }
+        ) {
+            // Completed authority evidence proves what the sender applied; it
+            // cannot substitute for applying and reopening that transition on
+            // this receiving runtime. Refuse before prevalidation or writes.
+            return Err(PrivateSyncError::UnsupportedOperation);
+        }
         let actual_epoch = match &record.operation {
             PrivateControlOperation::Revoke { next_epoch, .. }
             | PrivateControlOperation::RotateKeys { next_epoch }
@@ -2622,6 +2635,99 @@ mod tests {
             substituted.verify_for(&control, store.binding().epoch, route, authority),
             Err(PrivateSyncError::Tampered)
         );
+    }
+
+    #[test]
+    fn completed_unimplemented_controls_do_not_advance_sync_receiver() {
+        let directory = TestDirectory::new("unsupported-completed-controls");
+        let fixture = fixture();
+        let operations = [
+            PrivateControlOperation::SetResourcePolicy {
+                policy: BlobRef::of_bytes(b"private-resource-policy"),
+            },
+            PrivateControlOperation::ActorLifecycle {
+                actor: ActorId([0x98; 32]),
+                operation: PrivateActorLifecycleKind::Install,
+                request: Hash([0x99; 32]),
+            },
+        ];
+
+        for (index, operation) in operations.into_iter().enumerate() {
+            let server_path = directory.child(&format!("server-{index}"));
+            let client_path = directory.child(&format!("client-{index}"));
+            let mut server = create_store(&server_path, &fixture);
+            let mut client = create_store(&client_path, &fixture);
+            let mut control = PrivateControlRecord {
+                space: fixture.space,
+                agent: fixture.agent,
+                sequence: 0,
+                previous: None,
+                operation,
+                signer: PrivateControlSigner::Owner,
+                signer_public_key: [0; 32],
+                signature: [0; 64],
+            };
+            sign_owner_control_record(&mut control, &fixture.owner_key).unwrap();
+            server.append_control(&control, &TestAuthority).unwrap();
+            attach_signed_evidence(&mut server, &control);
+
+            let request = request_for(&client, 4, MAX_PRIVATE_SYNC_PAGE_BYTES as u32);
+            let page = serve_private_sync_page(
+                &server,
+                &fixture.recipients[0].identity,
+                &request,
+                &TestTransport,
+            )
+            .unwrap();
+            assert_eq!(page.items.len(), 1);
+
+            let before_binding = client.binding();
+            let before_counts = (client.control_count(), client.object_count());
+            let before_image = directory_image(&client_path);
+            assert_eq!(
+                apply_private_sync_page(
+                    &mut client,
+                    &fixture.recipients[0].identity,
+                    &page,
+                    &TestAuthority,
+                    &TestTransport,
+                ),
+                Err(PrivateSyncError::UnsupportedOperation)
+            );
+            assert_eq!(client.binding(), before_binding);
+            assert_eq!(
+                (client.control_count(), client.object_count()),
+                before_counts
+            );
+            assert_eq!(directory_image(&client_path), before_image);
+
+            drop(client);
+            let mut reopened =
+                PrivateStore::open(&client_path, fixture.space, fixture.agent, &TestAuthority)
+                    .unwrap();
+            assert_eq!(reopened.binding(), before_binding);
+            assert_eq!(
+                (reopened.control_count(), reopened.object_count()),
+                before_counts
+            );
+            assert_eq!(directory_image(&client_path), before_image);
+            assert_eq!(
+                apply_private_sync_page(
+                    &mut reopened,
+                    &fixture.recipients[0].identity,
+                    &page,
+                    &TestAuthority,
+                    &TestTransport,
+                ),
+                Err(PrivateSyncError::UnsupportedOperation)
+            );
+            assert_eq!(reopened.binding(), before_binding);
+            assert_eq!(
+                (reopened.control_count(), reopened.object_count()),
+                before_counts
+            );
+            assert_eq!(directory_image(&client_path), before_image);
+        }
     }
 
     #[test]
