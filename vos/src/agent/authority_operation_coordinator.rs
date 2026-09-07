@@ -536,7 +536,7 @@ where
             pledged.issuance_slot_high_water = Some(issued_at);
             pledged.records.push(CoordinatorRecord {
                 call: call_bytes.clone(),
-                authorization_context: context_bytes,
+                authorization_context: context_bytes.clone(),
                 issued_at,
                 consumed_issuance_ack: None,
             });
@@ -577,7 +577,23 @@ where
                         AuthorityOperationCoordinatorRejection::WrongSigner,
                     ));
                 }
-                self.authorize_exact::<S::Error>(call, authorization_context, &call_bytes)?
+                match self.authorize_exact::<S::Error>(call, authorization_context, &call_bytes) {
+                    Ok(approval) => approval,
+                    Err(AuthorityOperationCoordinatorError::Rejected(
+                        AuthorityOperationCoordinatorRejection::AuthorizationDenied,
+                    )) => {
+                        self.retire_denied_unissued_pledge::<S::Error>(
+                            record_index,
+                            &call_bytes,
+                            &context_bytes,
+                            issued_at,
+                        )?;
+                        return Err(AuthorityOperationCoordinatorError::Rejected(
+                            AuthorityOperationCoordinatorRejection::AuthorizationDenied,
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         };
 
@@ -670,6 +686,58 @@ where
             ));
         }
         Ok(approval)
+    }
+
+    fn retire_denied_unissued_pledge<SignerError>(
+        &mut self,
+        record_index: usize,
+        call_bytes: &[u8],
+        authorization_context: &[u8],
+        issued_at: u64,
+    ) -> Result<(), AuthorityOperationCoordinatorError<C::Error, I::Error, D::Error, SignerError>>
+    {
+        let exact_current_pledge = self.image.records.get(record_index).is_some_and(|record| {
+            record_index + 1 == self.image.records.len()
+                && record.consumed_issuance_ack.is_none()
+                && record.call == call_bytes
+                && record.authorization_context == authorization_context
+                && record.issued_at == issued_at
+        });
+        if !exact_current_pledge {
+            self.poisoned = true;
+            return Err(AuthorityOperationCoordinatorError::InvalidState);
+        }
+
+        let mut retired = self.image.clone();
+        retired
+            .records
+            .pop()
+            .expect("the exact current pledge was checked above");
+        match retired.records.last() {
+            Some(record) => {
+                let context = match InvocationContext::decode(&record.authorization_context) {
+                    Ok(context) => context,
+                    Err(_) => {
+                        self.poisoned = true;
+                        return Err(AuthorityOperationCoordinatorError::InvalidState);
+                    }
+                };
+                retired.authorization_slot_high_water = Some(context.observed_slot);
+                retired.issuance_slot_high_water = Some(record.issued_at);
+            }
+            None => {
+                retired.authorization_slot_high_water = None;
+                retired.issuance_slot_high_water = None;
+            }
+        }
+        // Full validation recomputes invocation uniqueness from the surviving
+        // records. The cross-image check additionally proves that this
+        // coordinator-only retirement neither hides nor mutates issuer state.
+        if !retired.is_valid() || !coordinator_matches_issuer(&retired, &self.issuer) {
+            self.poisoned = true;
+            return Err(AuthorityOperationCoordinatorError::InvalidState);
+        }
+        self.commit_candidate::<SignerError>(retired)
     }
 
     fn dispatch_exact<SignerError>(
@@ -1096,6 +1164,7 @@ mod tests {
         authorization_sequence: u64,
         pending: Vec<PendingActorOperation>,
         retired: Vec<RetiredActorOperation>,
+        denied_authorizations: Vec<InvocationId>,
         authorization_calls: usize,
         acknowledgement_calls: usize,
         fail_after_authorize: bool,
@@ -1148,6 +1217,21 @@ mod tests {
                 Some((AuthorityOperationActorMethod::AcknowledgeIssuance, fault));
         }
 
+        fn deny(&self, invocation: InvocationId) {
+            let mut state = self.state.lock().unwrap();
+            if !state.denied_authorizations.contains(&invocation) {
+                state.denied_authorizations.push(invocation);
+            }
+        }
+
+        fn allow(&self, invocation: InvocationId) {
+            self.state
+                .lock()
+                .unwrap()
+                .denied_authorizations
+                .retain(|denied| *denied != invocation);
+        }
+
         fn correct_reply(
             &self,
             request: &AuthorityOperationActorDispatch,
@@ -1173,6 +1257,9 @@ mod tests {
                         || !call.matches_invocation_context(&request.context)
                         || call.verify_with(&RawEd25519Verifier).is_err()
                     {
+                        return crate::value::Value::Bytes(Vec::new());
+                    }
+                    if state.denied_authorizations.contains(&call.invocation) {
                         return crate::value::Value::Bytes(Vec::new());
                     }
                     if let Some(record) = state
@@ -1574,6 +1661,252 @@ mod tests {
         );
         assert_eq!(dispatcher.counts(), (1, 1));
         assert_eq!((signer.receipt_calls, signer.acknowledgement_calls), (1, 1));
+    }
+
+    #[test]
+    fn canonical_denial_retires_the_first_pledge_and_exact_retry_is_fresh() {
+        let coordinator_store = MemoryImageStore::default();
+        let issuer_store = MemoryImageStore::default();
+        let mut signer = CountingSigner::new(0x19);
+        let fixture = Fixture::new(&signer);
+        let dispatcher = FakeDispatcher::new(fixture.authority);
+        let call = fixture.call(1);
+        let context = fixture.context(&call, 20);
+        dispatcher.deny(call.invocation);
+        let mut coordinator = open(
+            coordinator_store.clone(),
+            issuer_store.clone(),
+            dispatcher.clone(),
+            &fixture,
+        );
+
+        assert!(matches!(
+            coordinator.coordinate(&call, context, 20, &mut signer),
+            Err(AuthorityOperationCoordinatorError::Rejected(
+                AuthorityOperationCoordinatorRejection::AuthorizationDenied
+            ))
+        ));
+        assert!(!coordinator.has_pending_operation());
+        assert_eq!(coordinator.retained_operations(), 0);
+        assert_eq!(
+            (coordinator_store.commits(), issuer_store.commits()),
+            (2, 0)
+        );
+        assert_eq!((signer.receipt_calls, signer.acknowledgement_calls), (0, 0));
+        let retired = AuthorityOperationCoordinatorImage::decode(
+            &coordinator_store.image().expect("retired empty image"),
+        )
+        .unwrap();
+        assert!(retired.records.is_empty());
+        assert_eq!(retired.authorization_slot_high_water, None);
+        assert_eq!(retired.issuance_slot_high_water, None);
+
+        let mut reopened = open(
+            coordinator_store.clone(),
+            issuer_store.clone(),
+            dispatcher.clone(),
+            &fixture,
+        );
+        assert!(matches!(
+            reopened.coordinate(&call, context, 20, &mut signer),
+            Err(AuthorityOperationCoordinatorError::Rejected(
+                AuthorityOperationCoordinatorRejection::AuthorizationDenied
+            ))
+        ));
+        assert!(!reopened.has_pending_operation());
+        assert_eq!(reopened.retained_operations(), 0);
+        assert_eq!(dispatcher.counts(), (2, 0));
+        assert_eq!(
+            (coordinator_store.commits(), issuer_store.commits()),
+            (4, 0)
+        );
+
+        // A later policy change may admit the exact invocation. The denied
+        // pledge must not remain in the coordinator's uniqueness projection.
+        dispatcher.allow(call.invocation);
+        reopened
+            .coordinate(&call, context, 20, &mut signer)
+            .unwrap();
+        assert_eq!(reopened.retained_operations(), 1);
+        assert!(!reopened.has_pending_operation());
+        assert_eq!(dispatcher.counts(), (3, 1));
+        assert_eq!((signer.receipt_calls, signer.acknowledgement_calls), (1, 1));
+    }
+
+    #[test]
+    fn denial_after_completion_preserves_history_and_recomputes_slot_high_waters() {
+        let coordinator_store = MemoryImageStore::default();
+        let issuer_store = MemoryImageStore::default();
+        let mut signer = CountingSigner::new(0x19);
+        let fixture = Fixture::new(&signer);
+        let dispatcher = FakeDispatcher::new(fixture.authority);
+        let first = fixture.call(1);
+        let first_context = fixture.context(&first, 30);
+        let mut coordinator = open(
+            coordinator_store.clone(),
+            issuer_store.clone(),
+            dispatcher.clone(),
+            &fixture,
+        );
+        let first_issued = coordinator
+            .coordinate(&first, first_context, 40, &mut signer)
+            .unwrap();
+
+        let denied = fixture.call(2);
+        dispatcher.deny(denied.invocation);
+        assert!(matches!(
+            coordinator.coordinate(&denied, fixture.context(&denied, 80), 90, &mut signer),
+            Err(AuthorityOperationCoordinatorError::Rejected(
+                AuthorityOperationCoordinatorRejection::AuthorizationDenied
+            ))
+        ));
+        assert_eq!(coordinator.retained_operations(), 1);
+        assert!(!coordinator.has_pending_operation());
+        assert_eq!(issuer_store.commits(), 3);
+        let retired = AuthorityOperationCoordinatorImage::decode(
+            &coordinator_store.image().expect("retired prior image"),
+        )
+        .unwrap();
+        assert_eq!(retired.records.len(), 1);
+        assert_eq!(retired.authorization_slot_high_water, Some(30));
+        assert_eq!(retired.issuance_slot_high_water, Some(40));
+
+        let before = dispatcher.counts();
+        assert_eq!(
+            coordinator
+                .coordinate(&first, first_context, 40, &mut signer)
+                .unwrap(),
+            first_issued
+        );
+        assert_eq!(dispatcher.counts(), before);
+
+        // These slots are above the surviving completed record but below the
+        // denied pledge. They prove both high-water projections were rolled
+        // back to durable history rather than left at the rejected request.
+        let next = fixture.call(3);
+        coordinator
+            .coordinate(&next, fixture.context(&next, 31), 41, &mut signer)
+            .unwrap();
+        assert_eq!(coordinator.retained_operations(), 2);
+        assert_eq!(dispatcher.counts(), (3, 2));
+    }
+
+    #[test]
+    fn only_canonical_denial_retires_a_pledge_or_unblocks_unrelated_work() {
+        let coordinator_store = MemoryImageStore::default();
+        let issuer_store = MemoryImageStore::default();
+        let mut signer = CountingSigner::new(0x19);
+        let fixture = Fixture::new(&signer);
+        let dispatcher = FakeDispatcher::new(fixture.authority);
+        let call = fixture.call(1);
+        let context = fixture.context(&call, 20);
+        dispatcher.fault_next(DispatchFault::MalformedApproval);
+        let mut coordinator = open(
+            coordinator_store.clone(),
+            issuer_store.clone(),
+            dispatcher.clone(),
+            &fixture,
+        );
+        assert!(matches!(
+            coordinator.coordinate(&call, context, 20, &mut signer),
+            Err(AuthorityOperationCoordinatorError::Rejected(
+                AuthorityOperationCoordinatorRejection::InvalidApproval
+            ))
+        ));
+        assert!(coordinator.has_pending_operation());
+        assert_eq!(coordinator.retained_operations(), 1);
+        assert_eq!(
+            (coordinator_store.commits(), issuer_store.commits()),
+            (1, 0)
+        );
+
+        let unrelated = fixture.call(2);
+        assert!(matches!(
+            coordinator.coordinate(&unrelated, fixture.context(&unrelated, 20), 20, &mut signer),
+            Err(AuthorityOperationCoordinatorError::Rejected(
+                AuthorityOperationCoordinatorRejection::PendingOperation
+            ))
+        ));
+        assert!(matches!(
+            coordinator.coordinate(&call, fixture.context(&call, 21), 21, &mut signer),
+            Err(AuthorityOperationCoordinatorError::Rejected(
+                AuthorityOperationCoordinatorRejection::DivergentRetry
+            ))
+        ));
+        assert_eq!(
+            (coordinator_store.commits(), issuer_store.commits()),
+            (1, 0)
+        );
+
+        coordinator
+            .coordinate(&call, context, 20, &mut signer)
+            .unwrap();
+        assert!(!coordinator.has_pending_operation());
+        assert_eq!(coordinator.retained_operations(), 1);
+    }
+
+    #[test]
+    fn denial_retirement_commit_failures_poison_and_reopen_at_either_boundary() {
+        for fail_after in [false, true] {
+            let coordinator_store = MemoryImageStore::default();
+            let issuer_store = MemoryImageStore::default();
+            let mut signer = CountingSigner::new(0x19);
+            let fixture = Fixture::new(&signer);
+            let dispatcher = FakeDispatcher::new(fixture.authority);
+            let call = fixture.call(1);
+            let context = fixture.context(&call, 20);
+            dispatcher.deny(call.invocation);
+            if fail_after {
+                coordinator_store.fail_after_commit(2);
+            } else {
+                coordinator_store.fail_before_commit(2);
+            }
+            let mut coordinator = open(
+                coordinator_store.clone(),
+                issuer_store.clone(),
+                dispatcher.clone(),
+                &fixture,
+            );
+            assert!(matches!(
+                coordinator.coordinate(&call, context, 20, &mut signer),
+                Err(AuthorityOperationCoordinatorError::Storage(
+                    MemoryStoreError
+                ))
+            ));
+            assert!(coordinator.is_poisoned());
+            assert!(coordinator.has_pending_operation());
+            assert_eq!(issuer_store.commits(), 0);
+            assert_eq!((signer.receipt_calls, signer.acknowledgement_calls), (0, 0));
+
+            let durable = AuthorityOperationCoordinatorImage::decode(
+                &coordinator_store
+                    .image()
+                    .expect("one atomic coordinator image"),
+            )
+            .unwrap();
+            assert_eq!(durable.records.len(), usize::from(!fail_after));
+
+            let mut reopened = open(
+                coordinator_store.clone(),
+                issuer_store.clone(),
+                dispatcher.clone(),
+                &fixture,
+            );
+            assert!(matches!(
+                reopened.coordinate(&call, context, 20, &mut signer),
+                Err(AuthorityOperationCoordinatorError::Rejected(
+                    AuthorityOperationCoordinatorRejection::AuthorizationDenied
+                ))
+            ));
+            assert!(!reopened.has_pending_operation());
+            assert_eq!(reopened.retained_operations(), 0);
+            assert_eq!(issuer_store.commits(), 0);
+            let retired = AuthorityOperationCoordinatorImage::decode(
+                &coordinator_store.image().expect("reconciled retired image"),
+            )
+            .unwrap();
+            assert!(retired.records.is_empty());
+        }
     }
 
     #[test]
