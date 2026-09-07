@@ -648,6 +648,9 @@ fn decode_authority_operation(
         10 => Ok(AuthorityOperationKind::RevokePrivateNode),
         11 => Ok(AuthorityOperationKind::RecoverPrivateAgent),
         12 => Ok(AuthorityOperationKind::PublishCatalog),
+        13 => Ok(AuthorityOperationKind::RotatePrivateKeys),
+        14 => Ok(AuthorityOperationKind::SetPrivateResourcePolicy),
+        15 => Ok(AuthorityOperationKind::PrivateActorLifecycle),
         _ => Err(DecodeError::InvalidTag),
     }
 }

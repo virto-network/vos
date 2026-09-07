@@ -72,10 +72,33 @@ pub enum AuthorityOperationKind {
     RevokePrivateNode = 10,
     RecoverPrivateAgent = 11,
     PublishCatalog = 12,
+    /// Rotate a Private Agent's owner/data epoch without changing members.
+    RotatePrivateKeys = 13,
+    /// Select a new content-addressed resource policy for a Private Agent.
+    SetPrivateResourcePolicy = 14,
+    /// Apply one owner-signed Private actor lifecycle control. The exact
+    /// lifecycle request is committed by the PCTL and the actor is exposed in
+    /// the receipt selector; Private controls do not expose a deployment.
+    PrivateActorLifecycle = 15,
 }
 
 impl AuthorityOperationKind {
     pub const fn requires_actor(self) -> bool {
+        matches!(
+            self,
+            Self::InstallActor
+                | Self::UpgradeActor
+                | Self::SuspendActor
+                | Self::ResumeActor
+                | Self::RemoveActor
+                | Self::InvokeActor
+                | Self::PrivateActorLifecycle
+        )
+    }
+
+    /// Private lifecycle controls bind an actor but deliberately keep its
+    /// encrypted deployment details inside the signed PCTL request.
+    pub const fn requires_actor_deployment(self) -> bool {
         matches!(
             self,
             Self::InstallActor
@@ -1137,14 +1160,17 @@ impl AuthorityReceiptSelector {
         {
             return Err(AuthorityReceiptError::InvalidSelector);
         }
+        match (self.operation.requires_actor(), self.actor) {
+            (true, Some(actor)) if actor != ActorId::ZERO => {}
+            (false, None) => {}
+            _ => return Err(AuthorityReceiptError::InvalidSelector),
+        }
         match (
-            self.operation.requires_actor(),
-            self.actor,
+            self.operation.requires_actor_deployment(),
             self.actor_deployment,
         ) {
-            (true, Some(actor), Some(deployment))
-                if actor != ActorId::ZERO && deployment != DeploymentId::ZERO => {}
-            (false, None, None) => {}
+            (true, Some(deployment)) if deployment != DeploymentId::ZERO => {}
+            (false, None) => {}
             _ => return Err(AuthorityReceiptError::InvalidSelector),
         }
         Ok(())

@@ -23,11 +23,12 @@ use crate::catalog::{
     CatalogPublication,
 };
 use crate::private::{
-    MAX_PRIVATE_NODES, PrivateControlOperation, PrivateControlRecord, PrivateNodeIdentity,
+    MAX_PRIVATE_NODES, PrivateActorLifecycleKind, PrivateControlOperation, PrivateControlRecord,
+    PrivateNodeIdentity,
 };
 use crate::wire::CanonicalWire;
 use crate::{
-    ActorId, AgentId, CredentialId, DeploymentId, Hash, InvocationContext, InvocationId,
+    ActorId, AgentId, BlobRef, CredentialId, DeploymentId, Hash, InvocationContext, InvocationId,
     InvocationOrigin, InvocationRoleClaims, InvocationWork, MethodMode, NodeId, PrincipalId,
     SpaceId,
 };
@@ -98,6 +99,30 @@ pub enum AuthorityOperationIntent {
         epoch: u64,
         member_set: Hash,
         recovery_evidence: Hash,
+    },
+    RotatePrivateKeys {
+        managed: ManagedAgentTarget,
+        control: Hash,
+        control_sequence: u64,
+        control_previous: Option<Hash>,
+        epoch: u64,
+        member_set: Hash,
+    },
+    SetPrivateResourcePolicy {
+        managed: ManagedAgentTarget,
+        control: Hash,
+        control_sequence: u64,
+        control_previous: Option<Hash>,
+        policy: BlobRef,
+    },
+    PrivateActorLifecycle {
+        managed: ManagedAgentTarget,
+        control: Hash,
+        control_sequence: u64,
+        control_previous: Option<Hash>,
+        actor: ActorId,
+        lifecycle: PrivateActorLifecycleKind,
+        request: Hash,
     },
 }
 
@@ -201,11 +226,39 @@ impl AuthorityOperationIntent {
                 recovery_evidence: private_recovery_evidence_commitment(control)
                     .ok_or(AuthorityOperationProtocolError::InvalidIntent)?,
             },
-            PrivateControlOperation::RotateKeys { .. }
-            | PrivateControlOperation::SetResourcePolicy { .. }
-            | PrivateControlOperation::ActorLifecycle { .. } => {
-                return Err(AuthorityOperationProtocolError::UnsupportedIntent);
+            PrivateControlOperation::RotateKeys { next_epoch } => Self::RotatePrivateKeys {
+                managed,
+                control: commitment,
+                control_sequence: control.sequence,
+                control_previous: control.previous,
+                epoch: next_epoch.epoch,
+                member_set: private_member_set_commitment(
+                    next_epoch.sealed_owner_keys.iter().map(|key| key.node),
+                )
+                .ok_or(AuthorityOperationProtocolError::InvalidIntent)?,
+            },
+            PrivateControlOperation::SetResourcePolicy { policy } => {
+                Self::SetPrivateResourcePolicy {
+                    managed,
+                    control: commitment,
+                    control_sequence: control.sequence,
+                    control_previous: control.previous,
+                    policy: policy.clone(),
+                }
             }
+            PrivateControlOperation::ActorLifecycle {
+                actor,
+                operation,
+                request,
+            } => Self::PrivateActorLifecycle {
+                managed,
+                control: commitment,
+                control_sequence: control.sequence,
+                control_previous: control.previous,
+                actor: *actor,
+                lifecycle: *operation,
+                request: *request,
+            },
         };
         value.validate_shape()?;
         Ok(value)
@@ -218,6 +271,11 @@ impl AuthorityOperationIntent {
             Self::InvitePrivateNode { .. } => AuthorityOperationKind::InvitePrivateNode,
             Self::RevokePrivateNode { .. } => AuthorityOperationKind::RevokePrivateNode,
             Self::RecoverPrivateAgent { .. } => AuthorityOperationKind::RecoverPrivateAgent,
+            Self::RotatePrivateKeys { .. } => AuthorityOperationKind::RotatePrivateKeys,
+            Self::SetPrivateResourcePolicy { .. } => {
+                AuthorityOperationKind::SetPrivateResourcePolicy
+            }
+            Self::PrivateActorLifecycle { .. } => AuthorityOperationKind::PrivateActorLifecycle,
         }
     }
 
@@ -227,7 +285,10 @@ impl AuthorityOperationIntent {
             | Self::Catalog { managed, .. }
             | Self::InvitePrivateNode { managed, .. }
             | Self::RevokePrivateNode { managed, .. }
-            | Self::RecoverPrivateAgent { managed, .. } => *managed,
+            | Self::RecoverPrivateAgent { managed, .. }
+            | Self::RotatePrivateKeys { managed, .. }
+            | Self::SetPrivateResourcePolicy { managed, .. }
+            | Self::PrivateActorLifecycle { managed, .. } => *managed,
         }
     }
 
@@ -314,6 +375,47 @@ impl AuthorityOperationIntent {
                     && *member_set != Hash::ZERO
                     && *recovery_evidence != Hash::ZERO
             }
+            Self::RotatePrivateKeys {
+                managed,
+                control,
+                control_sequence,
+                control_previous,
+                epoch,
+                member_set,
+            } => {
+                managed.is_valid()
+                    && *control != Hash::ZERO
+                    && valid_owner_control_position(*control_sequence, *control_previous)
+                    && *epoch != 0
+                    && *member_set != Hash::ZERO
+            }
+            Self::SetPrivateResourcePolicy {
+                managed,
+                control,
+                control_sequence,
+                control_previous,
+                policy,
+            } => {
+                managed.is_valid()
+                    && *control != Hash::ZERO
+                    && valid_owner_control_position(*control_sequence, *control_previous)
+                    && valid_private_blob(policy)
+            }
+            Self::PrivateActorLifecycle {
+                managed,
+                control,
+                control_sequence,
+                control_previous,
+                actor,
+                request,
+                ..
+            } => {
+                managed.is_valid()
+                    && *control != Hash::ZERO
+                    && valid_owner_control_position(*control_sequence, *control_previous)
+                    && *actor != ActorId::ZERO
+                    && *request != Hash::ZERO
+            }
         };
         valid
             .then_some(())
@@ -334,7 +436,10 @@ impl AuthorityOperationIntent {
                 .map(|request| request.commitment()),
             Self::InvitePrivateNode { control, .. }
             | Self::RevokePrivateNode { control, .. }
-            | Self::RecoverPrivateAgent { control, .. } => Some(*control),
+            | Self::RecoverPrivateAgent { control, .. }
+            | Self::RotatePrivateKeys { control, .. }
+            | Self::SetPrivateResourcePolicy { control, .. }
+            | Self::PrivateActorLifecycle { control, .. } => Some(*control),
         }
     }
 
@@ -426,6 +531,7 @@ impl AuthorityOperationIntent {
                 actor_deployment,
                 ..
             } => (Some(*actor), Some(*actor_deployment)),
+            Self::PrivateActorLifecycle { actor, .. } => (Some(*actor), None),
             _ => (None, None),
         }
     }
@@ -468,6 +574,10 @@ fn valid_owner_control_position(sequence: u64, previous: Option<Hash>) -> bool {
         (0, Some(_)) | (_, None) => false,
         (_, Some(previous)) => previous != Hash::ZERO,
     }
+}
+
+fn valid_private_blob(value: &BlobRef) -> bool {
+    value.hash != Hash::ZERO && value.len != 0 && value.len <= crate::MAX_CATALOG_ARTIFACT_BYTES
 }
 
 fn valid_recovery_control_position(sequence: u64, previous: Option<Hash>) -> bool {
@@ -1117,7 +1227,10 @@ impl PrivateControlApplicationFact {
     pub fn validate_shape(&self) -> Result<(), AuthorityOperationProtocolError> {
         let valid_position = match self.operation {
             AuthorityOperationKind::InvitePrivateNode
-            | AuthorityOperationKind::RevokePrivateNode => {
+            | AuthorityOperationKind::RevokePrivateNode
+            | AuthorityOperationKind::RotatePrivateKeys
+            | AuthorityOperationKind::SetPrivateResourcePolicy
+            | AuthorityOperationKind::PrivateActorLifecycle => {
                 valid_owner_control_position(self.control_sequence, self.control_previous)
             }
             AuthorityOperationKind::RecoverPrivateAgent => {
@@ -1194,6 +1307,42 @@ impl PrivateControlApplicationFact {
                     && self.control_previous == *control_previous
                     && self.epoch == *epoch
                     && self.post_member_set == *member_set
+            }
+            AuthorityOperationIntent::RotatePrivateKeys {
+                managed,
+                control,
+                control_sequence,
+                control_previous,
+                epoch,
+                member_set,
+            } => {
+                self.managed == *managed
+                    && self.operation == AuthorityOperationKind::RotatePrivateKeys
+                    && self.control == *control
+                    && self.control_sequence == *control_sequence
+                    && self.control_previous == *control_previous
+                    && self.epoch == *epoch
+                    && self.post_member_set == *member_set
+            }
+            AuthorityOperationIntent::SetPrivateResourcePolicy {
+                managed,
+                control,
+                control_sequence,
+                control_previous,
+                ..
+            }
+            | AuthorityOperationIntent::PrivateActorLifecycle {
+                managed,
+                control,
+                control_sequence,
+                control_previous,
+                ..
+            } => {
+                self.managed == *managed
+                    && self.operation == intent.operation()
+                    && self.control == *control
+                    && self.control_sequence == *control_sequence
+                    && self.control_previous == *control_previous
             }
             AuthorityOperationIntent::InvokeActor { .. }
             | AuthorityOperationIntent::Catalog { .. } => false,
@@ -1710,6 +1859,63 @@ fn encode_intent(encoder: &mut Encoder<'_>, value: &AuthorityOperationIntent) {
             encoder.fixed(member_set.as_bytes());
             encoder.fixed(recovery_evidence.as_bytes());
         }
+        AuthorityOperationIntent::RotatePrivateKeys {
+            managed,
+            control,
+            control_sequence,
+            control_previous,
+            epoch,
+            member_set,
+        } => {
+            encoder.u8(5);
+            encode_managed(encoder, *managed);
+            encode_private_control_common(
+                encoder,
+                *control,
+                *control_sequence,
+                *control_previous,
+                *epoch,
+            );
+            encoder.fixed(member_set.as_bytes());
+        }
+        AuthorityOperationIntent::SetPrivateResourcePolicy {
+            managed,
+            control,
+            control_sequence,
+            control_previous,
+            policy,
+        } => {
+            encoder.u8(6);
+            encode_managed(encoder, *managed);
+            encode_private_control_position(
+                encoder,
+                *control,
+                *control_sequence,
+                *control_previous,
+            );
+            encode_private_blob(encoder, policy);
+        }
+        AuthorityOperationIntent::PrivateActorLifecycle {
+            managed,
+            control,
+            control_sequence,
+            control_previous,
+            actor,
+            lifecycle,
+            request,
+        } => {
+            encoder.u8(7);
+            encode_managed(encoder, *managed);
+            encode_private_control_position(
+                encoder,
+                *control,
+                *control_sequence,
+                *control_previous,
+            );
+            encoder.fixed(actor.as_bytes());
+            encoder.u8(*lifecycle as u8);
+            encoder.fixed(request.as_bytes());
+        }
     }
 }
 
@@ -1783,6 +1989,45 @@ fn decode_intent(decoder: &mut Decoder<'_>) -> Result<AuthorityOperationIntent, 
                 recovery_evidence: Hash(decoder.fixed()?),
             }
         }
+        5 => {
+            let managed = decode_managed(decoder)?;
+            let (control, control_sequence, control_previous, epoch) =
+                decode_private_control_common(decoder)?;
+            AuthorityOperationIntent::RotatePrivateKeys {
+                managed,
+                control,
+                control_sequence,
+                control_previous,
+                epoch,
+                member_set: Hash(decoder.fixed()?),
+            }
+        }
+        6 => {
+            let managed = decode_managed(decoder)?;
+            let (control, control_sequence, control_previous) =
+                decode_private_control_position(decoder)?;
+            AuthorityOperationIntent::SetPrivateResourcePolicy {
+                managed,
+                control,
+                control_sequence,
+                control_previous,
+                policy: decode_private_blob(decoder)?,
+            }
+        }
+        7 => {
+            let managed = decode_managed(decoder)?;
+            let (control, control_sequence, control_previous) =
+                decode_private_control_position(decoder)?;
+            AuthorityOperationIntent::PrivateActorLifecycle {
+                managed,
+                control,
+                control_sequence,
+                control_previous,
+                actor: ActorId(decoder.fixed()?),
+                lifecycle: decode_private_lifecycle(decoder)?,
+                request: Hash(decoder.fixed()?),
+            }
+        }
         _ => return Err(DecodeError::InvalidTag),
     };
     value
@@ -1799,23 +2044,63 @@ fn encode_private_control_common(
     previous: Option<Hash>,
     epoch: u64,
 ) {
+    encode_private_control_position(encoder, control, sequence, previous);
+    encoder.u64(epoch);
+}
+
+fn encode_private_control_position(
+    encoder: &mut Encoder<'_>,
+    control: Hash,
+    sequence: u64,
+    previous: Option<Hash>,
+) {
     encoder.fixed(control.as_bytes());
     encoder.u64(sequence);
     encoder.option(&previous, |encoder, previous| {
         encoder.fixed(previous.as_bytes())
     });
-    encoder.u64(epoch);
 }
 
 fn decode_private_control_common(
     decoder: &mut Decoder<'_>,
 ) -> Result<(Hash, u64, Option<Hash>, u64), DecodeError> {
+    let (control, sequence, previous) = decode_private_control_position(decoder)?;
+    Ok((control, sequence, previous, decoder.u64()?))
+}
+
+fn decode_private_control_position(
+    decoder: &mut Decoder<'_>,
+) -> Result<(Hash, u64, Option<Hash>), DecodeError> {
     Ok((
         Hash(decoder.fixed()?),
         decoder.u64()?,
         decoder.option(|decoder| Ok(Hash(decoder.fixed()?)))?,
-        decoder.u64()?,
     ))
+}
+
+fn encode_private_blob(encoder: &mut Encoder<'_>, value: &BlobRef) {
+    encoder.fixed(value.hash.as_bytes());
+    encoder.u64(value.len);
+}
+
+fn decode_private_blob(decoder: &mut Decoder<'_>) -> Result<BlobRef, DecodeError> {
+    Ok(BlobRef {
+        hash: Hash(decoder.fixed()?),
+        len: decoder.u64()?,
+    })
+}
+
+fn decode_private_lifecycle(
+    decoder: &mut Decoder<'_>,
+) -> Result<PrivateActorLifecycleKind, DecodeError> {
+    match decoder.u8()? {
+        0 => Ok(PrivateActorLifecycleKind::Install),
+        1 => Ok(PrivateActorLifecycleKind::Upgrade),
+        2 => Ok(PrivateActorLifecycleKind::Suspend),
+        3 => Ok(PrivateActorLifecycleKind::Resume),
+        4 => Ok(PrivateActorLifecycleKind::Remove),
+        _ => Err(DecodeError::InvalidTag),
+    }
 }
 
 fn encode_call_unsigned(encoder: &mut Encoder<'_>, value: &AuthorityOperationCall) {
@@ -2064,6 +2349,15 @@ fn decode_private_control_operation(
         }
         value if value == AuthorityOperationKind::RecoverPrivateAgent as u8 => {
             Ok(AuthorityOperationKind::RecoverPrivateAgent)
+        }
+        value if value == AuthorityOperationKind::RotatePrivateKeys as u8 => {
+            Ok(AuthorityOperationKind::RotatePrivateKeys)
+        }
+        value if value == AuthorityOperationKind::SetPrivateResourcePolicy as u8 => {
+            Ok(AuthorityOperationKind::SetPrivateResourcePolicy)
+        }
+        value if value == AuthorityOperationKind::PrivateActorLifecycle as u8 => {
+            Ok(AuthorityOperationKind::PrivateActorLifecycle)
         }
         _ => Err(DecodeError::InvalidTag),
     }
@@ -2520,7 +2814,7 @@ mod tests {
         }
     }
 
-    fn private_controls() -> [PrivateControlRecord; 3] {
+    fn private_controls() -> Vec<PrivateControlRecord> {
         let space = authority_target().space;
         let agent = AgentId([0x68; 32]);
         let node = private_node(0x69);
@@ -2581,10 +2875,51 @@ mod tests {
             signer_public_key: [0x77; 32],
             signature: [0x78; PRIVATE_SIGNATURE_BYTES],
         };
+        let rotate = PrivateControlRecord {
+            space,
+            agent,
+            sequence: 3,
+            previous: Some(revoke.commitment()),
+            operation: PrivateControlOperation::RotateKeys {
+                next_epoch: private_epoch(space, agent, &node, 4),
+            },
+            signer: PrivateControlSigner::Owner,
+            signer_public_key: [0x79; 32],
+            signature: [0x7a; PRIVATE_SIGNATURE_BYTES],
+        };
+        let resource = PrivateControlRecord {
+            space,
+            agent,
+            sequence: 4,
+            previous: Some(rotate.commitment()),
+            operation: PrivateControlOperation::SetResourcePolicy {
+                policy: BlobRef::of_bytes(b"private-resource-policy"),
+            },
+            signer: PrivateControlSigner::Owner,
+            signer_public_key: [0x7b; 32],
+            signature: [0x7c; PRIVATE_SIGNATURE_BYTES],
+        };
+        let lifecycle = PrivateControlRecord {
+            space,
+            agent,
+            sequence: 5,
+            previous: Some(resource.commitment()),
+            operation: PrivateControlOperation::ActorLifecycle {
+                actor: ActorId([0x7d; 32]),
+                operation: PrivateActorLifecycleKind::Upgrade,
+                request: Hash([0x7e; 32]),
+            },
+            signer: PrivateControlSigner::Owner,
+            signer_public_key: [0x7f; 32],
+            signature: [0x80; PRIVATE_SIGNATURE_BYTES],
+        };
         assert!(invite.validate_shape());
         assert!(revoke.validate_shape());
         assert!(recover.validate_shape());
-        [invite, revoke, recover]
+        assert!(rotate.validate_shape());
+        assert!(resource.validate_shape());
+        assert!(lifecycle.validate_shape());
+        vec![invite, revoke, recover, rotate, resource, lifecycle]
     }
 
     fn private_call(control: &PrivateControlRecord, discriminator: u8) -> AuthorityOperationCall {
@@ -2632,6 +2967,38 @@ mod tests {
                     *control_previous,
                     *epoch,
                     *member_set,
+                ),
+                AuthorityOperationIntent::RotatePrivateKeys {
+                    control,
+                    control_sequence,
+                    control_previous,
+                    epoch,
+                    member_set,
+                    ..
+                } => (
+                    *control,
+                    *control_sequence,
+                    *control_previous,
+                    *epoch,
+                    *member_set,
+                ),
+                AuthorityOperationIntent::SetPrivateResourcePolicy {
+                    control,
+                    control_sequence,
+                    control_previous,
+                    ..
+                }
+                | AuthorityOperationIntent::PrivateActorLifecycle {
+                    control,
+                    control_sequence,
+                    control_previous,
+                    ..
+                } => (
+                    *control,
+                    *control_sequence,
+                    *control_previous,
+                    3,
+                    Hash([0x90; 32]),
                 ),
                 AuthorityOperationIntent::InvokeActor { .. }
                 | AuthorityOperationIntent::Catalog { .. } => unreachable!(),
@@ -3509,6 +3876,9 @@ mod tests {
             AuthorityOperationKind::InvitePrivateNode,
             AuthorityOperationKind::RevokePrivateNode,
             AuthorityOperationKind::RecoverPrivateAgent,
+            AuthorityOperationKind::RotatePrivateKeys,
+            AuthorityOperationKind::SetPrivateResourcePolicy,
+            AuthorityOperationKind::PrivateActorLifecycle,
         ];
         for (index, (control, operation)) in controls.iter().zip(expected_operations).enumerate() {
             let intent = AuthorityOperationIntent::private_control(runtime, control).unwrap();
@@ -3520,6 +3890,17 @@ mod tests {
             assert_eq!(approval.selector.request, control.commitment());
             assert_eq!(approval.selector.decision_sequence, 0);
             assert_eq!(approval.selector.acknowledged_through, 0);
+            if operation == AuthorityOperationKind::PrivateActorLifecycle {
+                let PrivateControlOperation::ActorLifecycle { actor, .. } = &control.operation
+                else {
+                    unreachable!()
+                };
+                assert_eq!(approval.selector.actor, Some(*actor));
+                assert_eq!(approval.selector.actor_deployment, None);
+            } else {
+                assert_eq!(approval.selector.actor, None);
+                assert_eq!(approval.selector.actor_deployment, None);
+            }
         }
 
         let invite_intent =
@@ -3582,19 +3963,53 @@ mod tests {
         historical_keyring.sealed_keys[0] = sealed(&replacement, 0x8f);
         assert!(changed_recovery_members.validate_shape());
         assert!(!recovery_intent.matches_private_control(&changed_recovery_members));
+
+        let rotate_intent =
+            AuthorityOperationIntent::private_control(runtime, &controls[3]).unwrap();
+        let mut changed_rotate = controls[3].clone();
+        let PrivateControlOperation::RotateKeys { next_epoch } = &mut changed_rotate.operation
+        else {
+            unreachable!()
+        };
+        next_epoch.sealed_owner_keys[0].sealed[0] ^= 1;
+        assert!(!rotate_intent.matches_private_control(&changed_rotate));
+
+        let resource_intent =
+            AuthorityOperationIntent::private_control(runtime, &controls[4]).unwrap();
+        let mut changed_resource = controls[4].clone();
+        let PrivateControlOperation::SetResourcePolicy { policy } = &mut changed_resource.operation
+        else {
+            unreachable!()
+        };
+        policy.hash.0[0] ^= 1;
+        assert!(!resource_intent.matches_private_control(&changed_resource));
+
+        let lifecycle_intent =
+            AuthorityOperationIntent::private_control(runtime, &controls[5]).unwrap();
+        let mut changed_lifecycle = controls[5].clone();
+        let PrivateControlOperation::ActorLifecycle { request, .. } =
+            &mut changed_lifecycle.operation
+        else {
+            unreachable!()
+        };
+        request.0[0] ^= 1;
+        assert!(!lifecycle_intent.matches_private_control(&changed_lifecycle));
     }
 
     #[test]
     fn every_intent_roundtrips_but_old_unknown_trailing_and_oversize_wires_fail_closed() {
         let runtime = DeploymentId([0x84; 32]);
         let controls = private_controls();
-        let intents = [
+        let intents = vec![
             AuthorityOperationIntent::invoke(&invocation_work()).unwrap(),
             catalog_intent(CatalogMutationKind::Publish),
             catalog_intent(CatalogMutationKind::Withdraw),
             AuthorityOperationIntent::private_control(runtime, &controls[0]).unwrap(),
             AuthorityOperationIntent::private_control(runtime, &controls[1]).unwrap(),
             AuthorityOperationIntent::private_control(runtime, &controls[2]).unwrap(),
+            AuthorityOperationIntent::private_control(runtime, &controls[3]).unwrap(),
+            AuthorityOperationIntent::private_control(runtime, &controls[4]).unwrap(),
+            AuthorityOperationIntent::private_control(runtime, &controls[5]).unwrap(),
         ];
         for (index, intent) in intents.into_iter().enumerate() {
             let call = call_with_intent(intent, 0x85 + index as u8);
