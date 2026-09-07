@@ -34,14 +34,14 @@ use crate::{
 
 const HEADER_BYTES: usize = 4 + 32;
 
-/// AOC1 is intentionally small even though the generic invocation message
+/// AOC2 is intentionally small even though the generic invocation message
 /// ceiling is larger. Private ciphertext and actor messages are represented
 /// only by exact commitments here.
 pub const MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES: usize = 4 * 1024;
-/// AOP1 repeats the call's identity tuple and one complete receipt selector.
+/// AOP2 repeats the call's identity tuple and one complete receipt selector.
 pub const MAX_AUTHORITY_OPERATION_APPROVAL_WIRE_BYTES: usize = 4 * 1024;
 /// AOI1 contains one complete receipt and fixed-size retained-preimage
-/// commitments; it never embeds the AOC1 or AOP1 bytes themselves.
+/// commitments; it never embeds the AOC2 or AOP2 bytes themselves.
 pub const MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES: usize = 4 * 1024;
 /// PCA1 is a fixed-size acknowledgement of one durably reopened Private
 /// control application. It carries commitments and the resulting projection,
@@ -66,15 +66,11 @@ pub enum AuthorityOperationIntent {
     },
     Catalog {
         managed: ManagedAgentTarget,
-        operation_invocation: InvocationId,
         catalog: CatalogActorTarget,
         alias: CatalogAlias,
         kind: CatalogMutationKind,
         publication: CatalogPublication,
         publication_commitment: Hash,
-        /// Zero denotes no current entry. The authority deterministically
-        /// allocates `expected_current_generation + 1`.
-        expected_current_generation: u64,
     },
     InvitePrivateNode {
         managed: ManagedAgentTarget,
@@ -128,14 +124,12 @@ impl AuthorityOperationIntent {
     }
 
     /// Construct the exact catalog request template. The authority allocates
-    /// the next generation; no caller-selected next generation is accepted.
+    /// both the invocation and generation; neither is caller-selected.
     pub fn catalog(
-        operation_invocation: InvocationId,
         catalog: CatalogActorTarget,
         alias: CatalogAlias,
         kind: CatalogMutationKind,
         publication: CatalogPublication,
-        expected_current_generation: u64,
     ) -> Result<Self, AuthorityOperationProtocolError> {
         let value = Self::Catalog {
             managed: ManagedAgentTarget {
@@ -143,13 +137,11 @@ impl AuthorityOperationIntent {
                 agent: publication.identity.agent,
                 runtime_deployment: publication.identity.runtime_deployment,
             },
-            operation_invocation,
             catalog,
             alias,
             kind,
             publication_commitment: catalog_publication_commitment(&publication),
             publication,
-            expected_current_generation,
         };
         value.validate_shape()?;
         Ok(value)
@@ -260,16 +252,13 @@ impl AuthorityOperationIntent {
             }
             Self::Catalog {
                 managed,
-                operation_invocation,
                 catalog,
                 alias,
                 publication,
                 publication_commitment,
-                expected_current_generation,
                 ..
             } => {
                 managed.is_valid()
-                    && *operation_invocation != InvocationId::ZERO
                     && catalog.is_valid()
                     && alias.is_valid()
                     && publication.is_valid()
@@ -279,8 +268,6 @@ impl AuthorityOperationIntent {
                     && catalog.space == managed.space
                     && *publication_commitment != Hash::ZERO
                     && *publication_commitment == catalog_publication_commitment(publication)
-                    && expected_current_generation.checked_add(1).is_some()
-                    && self.catalog_request_unchecked().is_some()
             }
             Self::InvitePrivateNode {
                 managed,
@@ -334,12 +321,16 @@ impl AuthorityOperationIntent {
     }
 
     /// The exact hash placed in the resulting authority receipt selector.
-    pub fn request_commitment(&self) -> Option<Hash> {
+    pub fn request_commitment(
+        &self,
+        authorization_sequence: NonZeroU64,
+        operation_call: Hash,
+    ) -> Option<Hash> {
         self.validate_shape().ok()?;
         match self {
             Self::InvokeActor { work, .. } => Some(*work),
             Self::Catalog { .. } => self
-                .catalog_request_unchecked()
+                .catalog_request_unchecked(authorization_sequence, operation_call)
                 .map(|request| request.commitment()),
             Self::InvitePrivateNode { control, .. }
             | Self::RevokePrivateNode { control, .. }
@@ -347,33 +338,52 @@ impl AuthorityOperationIntent {
         }
     }
 
-    /// Materialize the catalog operation after allocating the next generation.
-    pub fn catalog_request(&self) -> Option<CatalogMutationRequest> {
+    /// Materialize the catalog operation from the authority actor's exact
+    /// global decision sequence. Callers never select a generation, so an
+    /// otherwise-authorized stale or extreme value cannot freeze an alias.
+    pub fn catalog_request(
+        &self,
+        authorization_sequence: NonZeroU64,
+        operation_call: Hash,
+    ) -> Option<CatalogMutationRequest> {
         self.validate_shape().ok()?;
-        self.catalog_request_unchecked()
+        self.catalog_request_unchecked(authorization_sequence, operation_call)
     }
 
-    fn catalog_request_unchecked(&self) -> Option<CatalogMutationRequest> {
+    fn catalog_request_unchecked(
+        &self,
+        authorization_sequence: NonZeroU64,
+        operation_call: Hash,
+    ) -> Option<CatalogMutationRequest> {
         let Self::Catalog {
-            operation_invocation,
             catalog,
             alias,
             kind,
             publication,
-            expected_current_generation,
             ..
         } = self
         else {
             return None;
         };
-        let generation = expected_current_generation
-            .checked_add(1)
-            .and_then(NonZeroU64::new)?;
+        if operation_call == Hash::ZERO {
+            return None;
+        }
+        let sequence = authorization_sequence.get().to_le_bytes();
         let request = CatalogMutationRequest {
-            invocation: *operation_invocation,
+            invocation: InvocationId(
+                Hash::digest(
+                    b"vos/agent/authority-catalog-mutation-invocation/v1",
+                    &[
+                        crate::RUNTIME_ABI_ID.as_bytes(),
+                        operation_call.as_bytes(),
+                        &sequence,
+                    ],
+                )
+                .0,
+            ),
             catalog: *catalog,
             alias: alias.clone(),
-            generation,
+            generation: authorization_sequence,
             kind: *kind,
             publication: publication.clone(),
         };
@@ -390,8 +400,17 @@ impl AuthorityOperationIntent {
         self == &expected
     }
 
-    pub fn matches_catalog_request(&self, request: &CatalogMutationRequest) -> bool {
-        self.validate_shape().is_ok() && self.catalog_request_unchecked().as_ref() == Some(request)
+    pub fn matches_catalog_request(
+        &self,
+        authorization_sequence: NonZeroU64,
+        operation_call: Hash,
+        request: &CatalogMutationRequest,
+    ) -> bool {
+        self.validate_shape().is_ok()
+            && self
+                .catalog_request_unchecked(authorization_sequence, operation_call)
+                .as_ref()
+                == Some(request)
     }
 
     pub fn matches_private_control(&self, control: &PrivateControlRecord) -> bool {
@@ -478,7 +497,7 @@ fn private_node_identity_commitment(node: &PrivateNodeIdentity) -> Hash {
 }
 
 /// Commit one canonically sorted, unique, nonempty post-application Private
-/// Node set without embedding that list in AOC1 or PCA1.
+/// Node set without embedding that list in AOC2 or PCA1.
 pub fn private_member_set_commitment(nodes: impl Iterator<Item = NodeId>) -> Option<Hash> {
     let nodes: Vec<NodeId> = nodes.collect();
     if nodes.is_empty()
@@ -546,7 +565,7 @@ impl AuthorityOperationCall {
 
     pub fn commitment(&self) -> Hash {
         Hash::digest(
-            b"vos/agent/authority-operation-call/v1",
+            b"vos/agent/authority-operation-call/v2",
             &[&self.signing_bytes(), &self.signature],
         )
     }
@@ -621,10 +640,13 @@ impl AuthorityOperationCall {
 /// Deterministic policy output for one non-management operation call.
 ///
 /// `authorization_sequence` is the authority actor's own exact-retry clock.
+/// For catalog operations it is also the only source of the mutation
+/// generation; the credential-signed intent contains no caller-selected
+/// generation.
 /// It is intentionally distinct from the selector's management decision
 /// clock, which must remain zero for every operation in this protocol.
 /// Shape validation alone cannot reconstruct `operation_call`: before signing
-/// a receipt, a consumer must reopen the retained AOC1 preimage and require
+/// a receipt, a consumer must reopen the retained AOC2 preimage and require
 /// [`AuthorityOperationApproval::matches_call`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorityOperationApproval {
@@ -632,7 +654,7 @@ pub struct AuthorityOperationApproval {
     pub authorization_sequence: NonZeroU64,
     pub invocation: InvocationId,
     /// Distinct Linear invocation reserved for acknowledging durable receipt
-    /// issuance. Its derivation commits the complete signed AOC1 preimage.
+    /// issuance. Its derivation commits the complete signed AOC2 preimage.
     pub acknowledgement_invocation: InvocationId,
     pub authority: AuthorityActorTarget,
     pub principal: PrincipalId,
@@ -664,7 +686,7 @@ impl AuthorityOperationApproval {
 
     #[allow(clippy::too_many_arguments)]
     /// Build an approval directly from its retained call preimage. Code which
-    /// decodes an AOP1 instead must make the equivalent `matches_call` check
+    /// decodes an AOP2 instead must make the equivalent `matches_call` check
     /// before signing the materialized selector.
     pub fn from_call(
         call: &AuthorityOperationCall,
@@ -683,12 +705,13 @@ impl AuthorityOperationApproval {
             return Err(AuthorityOperationProtocolError::InvalidValidity);
         }
         let (actor, actor_deployment) = call.intent.selector_actor();
+        let operation_call = call.commitment();
         let request = call
             .intent
-            .request_commitment()
+            .request_commitment(authorization_sequence, operation_call)
             .ok_or(AuthorityOperationProtocolError::InvalidIntent)?;
         let value = Self {
-            operation_call: call.commitment(),
+            operation_call,
             authorization_sequence,
             invocation: call.invocation,
             acknowledgement_invocation: Self::derive_acknowledgement_invocation(call),
@@ -763,7 +786,10 @@ impl AuthorityOperationApproval {
             || self.selector.epoch < self.authority.binding.initial_epoch
             || self.selector.decision_sequence != 0
             || self.selector.acknowledged_through != 0
-            || self.intent.request_commitment() != Some(self.selector.request)
+            || self
+                .intent
+                .request_commitment(self.authorization_sequence, self.operation_call)
+                != Some(self.selector.request)
         {
             return Err(AuthorityOperationProtocolError::InvalidApproval);
         }
@@ -827,8 +853,20 @@ impl AuthorityOperationApproval {
 
     pub fn matches_catalog_request(&self, request: &CatalogMutationRequest) -> bool {
         self.validate_shape().is_ok()
-            && self.intent.matches_catalog_request(request)
+            && self.intent.matches_catalog_request(
+                self.authorization_sequence,
+                self.operation_call,
+                request,
+            )
             && self.selector.request == request.commitment()
+    }
+
+    /// Materialize the exact catalog request authorized by this approval.
+    /// Its generation is the approval's authority-assigned decision sequence.
+    pub fn catalog_request(&self) -> Option<CatalogMutationRequest> {
+        self.validate_shape().ok()?;
+        self.intent
+            .catalog_request(self.authorization_sequence, self.operation_call)
     }
 
     pub fn matches_private_control(&self, control: &PrivateControlRecord) -> bool {
@@ -840,7 +878,7 @@ impl AuthorityOperationApproval {
 
 /// Authority-signed proof that one exact non-management receipt was issued.
 ///
-/// The actor retains the AOC1 and AOP1 preimages until this AOI1 verifies and
+/// The actor retains the AOC2 and AOP2 preimages until this AOI1 verifies and
 /// matches both. Only then may its authorization sequence become a retirement
 /// fact. Receipt issuance and acknowledgement use distinct Linear invocation
 /// IDs so exact retries can never reinterpret one message as the other.
@@ -929,7 +967,7 @@ impl AuthorityOperationIssuanceAck {
         Ok(())
     }
 
-    /// Match the exact actor-retained AOC1 and AOP1 preimages. A valid AOI1
+    /// Match the exact actor-retained AOC2 and AOP2 preimages. A valid AOI1
     /// must not retire anything unless this check and `verify_with` both pass.
     pub fn matches_pending(
         &self,
@@ -1102,8 +1140,8 @@ impl PrivateControlApplicationFact {
 /// and reopened after its non-management receipt had been issued.
 ///
 /// PCA1 is distinct from AOI1: issuance alone never proves application. Its
-/// three invocation IDs reserve independent exact-retry domains for AOC1,
-/// AOI1, and PCA1. The AOC1/AOP1 commitments are repeated for auditability;
+/// three invocation IDs reserve independent exact-retry domains for AOC2,
+/// AOI1, and PCA1. The AOC2/AOP2 commitments are repeated for auditability;
 /// the invocation pair, authorization sequence, and AOI1 commitment are also
 /// sufficient to match an issuance tombstone after those preimages retire.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1249,7 +1287,7 @@ impl PrivateControlApplicationAck {
         Ok(())
     }
 
-    /// Match all retained AOC1/AOP1/AOI1 preimages and the exact runtime
+    /// Match all retained AOC2/AOP2/AOI1 preimages and the exact runtime
     /// application observation. Verification remains a separate explicit step.
     pub fn matches_pending(
         &self,
@@ -1302,7 +1340,7 @@ impl PrivateControlApplicationAck {
         self.verify_with(authority, verifier)
     }
 
-    /// Match the compact issuance tuple retained after AOC1/AOP1/AOI1
+    /// Match the compact issuance tuple retained after AOC2/AOP2/AOI1
     /// preimages have retired. The PCA1 signature still must be independently
     /// verified; this method deliberately does not reconstruct discarded data.
     pub fn matches_issuance_tombstone(
@@ -1370,7 +1408,7 @@ impl PrivateControlApplicationAck {
 
 /// Verified issuance evidence for exactly one authorization sequence.
 /// Fields are private so callers cannot manufacture a retirement capability
-/// without reopening the retained AOC1/AOP1 and verifying AOI1.
+/// without reopening the retained AOC2/AOP2 and verifying AOI1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuthorityOperationRetirementFact {
     authority: AuthorityActorTarget,
@@ -1396,7 +1434,7 @@ impl AuthorityOperationRetirementFact {
 ///
 /// Out-of-order verified facts must remain pending. The actor may advance this
 /// floor only one sequence at a time, durably committing the new floor before
-/// discarding the corresponding AOC1/AOP1/AOI1 preimages. On restart it
+/// discarding the corresponding AOC2/AOP2/AOI1 preimages. On restart it
 /// reopens this value from its own authenticated Linear state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuthorityOperationRetirementFloor {
@@ -1530,23 +1568,19 @@ fn encode_intent(encoder: &mut Encoder<'_>, value: &AuthorityOperationIntent) {
         }
         AuthorityOperationIntent::Catalog {
             managed,
-            operation_invocation,
             catalog,
             alias,
             kind,
             publication,
             publication_commitment,
-            expected_current_generation,
         } => {
             encoder.u8(1);
             encode_managed(encoder, *managed);
-            encoder.fixed(operation_invocation.as_bytes());
             crate::wire::encode_catalog_actor_target(encoder, *catalog);
             crate::wire::encode_catalog_alias(encoder, alias);
             crate::wire::encode_catalog_mutation_kind(encoder, *kind);
             crate::wire::encode_catalog_publication(encoder, publication);
             encoder.fixed(publication_commitment.as_bytes());
-            encoder.u64(*expected_current_generation);
         }
         AuthorityOperationIntent::InvitePrivateNode {
             managed,
@@ -1636,13 +1670,11 @@ fn decode_intent(decoder: &mut Decoder<'_>) -> Result<AuthorityOperationIntent, 
         }
         1 => AuthorityOperationIntent::Catalog {
             managed: decode_managed(decoder)?,
-            operation_invocation: InvocationId(decoder.fixed()?),
             catalog: crate::wire::decode_catalog_actor_target(decoder)?,
             alias: crate::wire::decode_catalog_alias(decoder)?,
             kind: crate::wire::decode_catalog_mutation_kind(decoder)?,
             publication: crate::wire::decode_catalog_publication(decoder)?,
             publication_commitment: Hash(decoder.fixed()?),
-            expected_current_generation: decoder.u64()?,
         },
         2 => {
             let managed = decode_managed(decoder)?;
@@ -1738,7 +1770,7 @@ fn encode_call_unsigned(encoder: &mut Encoder<'_>, value: &AuthorityOperationCal
 
 fn authority_operation_call_signing_bytes(value: &AuthorityOperationCall) -> Vec<u8> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"AOCS");
+    bytes.extend_from_slice(b"AO2S");
     bytes.extend_from_slice(crate::RUNTIME_ABI_ID.as_bytes());
     encode_call_unsigned(&mut Encoder(&mut bytes), value);
     bytes
@@ -1753,7 +1785,7 @@ fn authority_operation_call_encoded_len(value: &AuthorityOperationCall) -> usize
 }
 
 impl CanonicalWire for AuthorityOperationCall {
-    const MAGIC: [u8; 4] = *b"AOC1";
+    const MAGIC: [u8; 4] = *b"AOC2";
     const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES;
 
     fn validate_wire(&self) -> bool {
@@ -1818,14 +1850,14 @@ fn authority_operation_approval_encoded_len(value: &AuthorityOperationApproval) 
 
 fn authority_operation_approval_commitment(value: &AuthorityOperationApproval) -> Hash {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"AOPC");
+    bytes.extend_from_slice(b"AO2C");
     bytes.extend_from_slice(crate::RUNTIME_ABI_ID.as_bytes());
     encode_approval_body(&mut Encoder(&mut bytes), value);
-    Hash::digest(b"vos/agent/authority-operation-approval/v1", &[&bytes])
+    Hash::digest(b"vos/agent/authority-operation-approval/v2", &[&bytes])
 }
 
 impl CanonicalWire for AuthorityOperationApproval {
-    const MAGIC: [u8; 4] = *b"AOP1";
+    const MAGIC: [u8; 4] = *b"AOP2";
     const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_OPERATION_APPROVAL_WIRE_BYTES;
 
     fn validate_wire(&self) -> bool {
@@ -2348,7 +2380,6 @@ mod tests {
 
     fn catalog_intent(kind: CatalogMutationKind) -> AuthorityOperationIntent {
         AuthorityOperationIntent::catalog(
-            InvocationId([0x5d; 32]),
             catalog_target(),
             CatalogAlias {
                 namespace: "examples".to_string(),
@@ -2356,7 +2387,6 @@ mod tests {
             },
             kind,
             catalog_publication(),
-            4,
         )
         .unwrap()
     }
@@ -2572,26 +2602,26 @@ mod tests {
     }
 
     #[test]
-    fn aoc1_aop1_and_aoi1_are_distinct_bounded_canonical_golden_wires() {
+    fn aoc2_aop2_and_aoi1_are_distinct_bounded_canonical_golden_wires() {
         let call = invoke_call();
         let call_bytes = call.encode().unwrap();
-        assert_eq!(call_bytes.get(..4), Some(b"AOC1".as_slice()));
+        assert_eq!(call_bytes.get(..4), Some(b"AOC2".as_slice()));
         assert!(call_bytes.len() <= MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES);
         assert_eq!(
             AuthorityOperationCall::decode(&call_bytes),
             Ok(call.clone())
         );
         assert_eq!(
-            Hash::digest(b"vos/test/aoc1-golden", &[&call_bytes]).0,
+            Hash::digest(b"vos/test/aoc2-golden", &[&call_bytes]).0,
             [
-                229, 185, 59, 51, 254, 104, 91, 8, 11, 89, 10, 7, 219, 61, 154, 143, 186, 44, 101,
-                155, 71, 34, 92, 241, 65, 175, 127, 61, 160, 191, 220, 78,
+                121, 201, 55, 162, 212, 121, 212, 45, 107, 120, 106, 41, 114, 47, 46, 93, 249, 65,
+                142, 84, 34, 175, 35, 4, 153, 63, 208, 0, 194, 71, 215, 149,
             ]
         );
 
         let approval = approval(&call);
         let approval_bytes = approval.encode().unwrap();
-        assert_eq!(approval_bytes.get(..4), Some(b"AOP1".as_slice()));
+        assert_eq!(approval_bytes.get(..4), Some(b"AOP2".as_slice()));
         assert!(approval_bytes.len() <= MAX_AUTHORITY_OPERATION_APPROVAL_WIRE_BYTES);
         assert_eq!(
             AuthorityOperationApproval::decode(&approval_bytes),
@@ -2599,10 +2629,10 @@ mod tests {
         );
         assert_ne!(call.commitment(), approval.commitment());
         assert_eq!(
-            Hash::digest(b"vos/test/aop1-golden", &[&approval_bytes]).0,
+            Hash::digest(b"vos/test/aop2-golden", &[&approval_bytes]).0,
             [
-                43, 208, 97, 30, 14, 1, 105, 251, 187, 173, 47, 199, 138, 151, 155, 105, 54, 107,
-                254, 58, 120, 94, 19, 74, 205, 48, 26, 232, 236, 16, 86, 155,
+                8, 188, 176, 82, 207, 212, 8, 44, 103, 219, 159, 207, 243, 249, 73, 150, 58, 217,
+                155, 69, 84, 171, 154, 216, 60, 86, 218, 132, 193, 133, 50, 53,
             ]
         );
 
@@ -2617,8 +2647,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/aoi1-golden", &[&acknowledgement_bytes]).0,
             [
-                173, 120, 104, 168, 19, 218, 12, 142, 49, 130, 28, 88, 222, 27, 65, 2, 240, 207,
-                166, 118, 110, 208, 66, 167, 129, 42, 163, 111, 141, 240, 34, 51,
+                174, 23, 74, 116, 63, 80, 102, 189, 66, 78, 8, 44, 93, 95, 102, 97, 250, 131, 129,
+                35, 27, 146, 40, 130, 245, 105, 219, 193, 21, 129, 105, 15,
             ]
         );
     }
@@ -2642,8 +2672,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/pca1-golden", &[&encoded]).0,
             [
-                67, 129, 104, 146, 125, 202, 138, 18, 242, 53, 99, 44, 150, 149, 120, 140, 161,
-                185, 56, 160, 145, 90, 93, 148, 100, 0, 92, 210, 223, 180, 132, 152,
+                11, 60, 161, 182, 140, 253, 102, 182, 226, 191, 72, 225, 102, 169, 31, 213, 81,
+                202, 84, 89, 194, 111, 105, 144, 142, 119, 116, 67, 68, 113, 203, 52,
             ]
         );
         assert_ne!(application.commitment(), Hash::ZERO);
@@ -3263,7 +3293,7 @@ mod tests {
         assert_eq!(approval.selector.acknowledged_through, 0);
         assert_eq!(approval.selector.request, work.commitment());
 
-        // AOP1 cannot reconstruct its retained AOC1 preimage. A substituted
+        // AOP2 cannot reconstruct its retained AOC2 preimage. A substituted
         // nonzero commitment is structurally canonical, so a signer must
         // reopen the call and require `matches_call` before issuing a receipt.
         let mut detached = approval.clone();
@@ -3305,14 +3335,18 @@ mod tests {
     }
 
     #[test]
-    fn catalog_intent_allocates_next_generation_and_rejects_every_substitution() {
+    fn catalog_approval_owns_generation_and_rejects_every_substitution() {
         for kind in [CatalogMutationKind::Publish, CatalogMutationKind::Withdraw] {
             let intent = catalog_intent(kind);
-            let request = intent.catalog_request().unwrap();
-            assert_eq!(request.generation, NonZeroU64::new(5).unwrap());
-            assert!(intent.matches_catalog_request(&request));
             let call = call_with_intent(intent.clone(), 0x7f);
             let approval = approval(&call);
+            let request = approval.catalog_request().unwrap();
+            assert_eq!(request.generation, approval.authorization_sequence);
+            assert!(intent.matches_catalog_request(
+                approval.authorization_sequence,
+                approval.operation_call,
+                &request,
+            ));
             assert!(approval.matches_catalog_request(&request));
             assert_eq!(approval.selector.request, request.commitment());
             assert_eq!(
@@ -3335,9 +3369,25 @@ mod tests {
             changed = request.clone();
             changed.publication.content.hash = Hash([0x80; 32]);
             assert!(!approval.matches_catalog_request(&changed));
-            changed = request;
+            changed = request.clone();
             changed.generation = NonZeroU64::new(6).unwrap();
             assert!(!approval.matches_catalog_request(&changed));
+
+            let next = approval_with_sequence(&call, 8);
+            let next_request = next.catalog_request().unwrap();
+            assert_eq!(next_request.generation, NonZeroU64::new(8).unwrap());
+            assert_ne!(next_request.invocation, request.invocation);
+            assert_ne!(next.selector.request, approval.selector.request);
+            assert!(!approval.matches_catalog_request(&next_request));
+
+            let distinct_call = call_with_intent(intent.clone(), 0x80);
+            let distinct = approval_with_sequence(&distinct_call, 7);
+            let distinct_request = distinct.catalog_request().unwrap();
+            assert_eq!(distinct_request.generation, request.generation);
+            assert_ne!(distinct.operation_call, approval.operation_call);
+            assert_ne!(distinct_request.invocation, request.invocation);
+            assert_ne!(distinct_request.commitment(), request.commitment());
+            assert_eq!(approval.catalog_request(), Some(request.clone()));
 
             let mut mismatched = intent;
             if let AuthorityOperationIntent::Catalog { publication, .. } = &mut mismatched {
@@ -3460,8 +3510,11 @@ mod tests {
         let call = invoke_call();
         let bytes = call.encode().unwrap();
         let mut old = bytes.clone();
-        old[..4].copy_from_slice(b"ACC1");
+        old[..4].copy_from_slice(b"AOC1");
         assert!(AuthorityOperationCall::decode(&old).is_err());
+        let mut wrong_family = bytes.clone();
+        wrong_family[..4].copy_from_slice(b"ACC1");
+        assert!(AuthorityOperationCall::decode(&wrong_family).is_err());
         let mut old_abi = bytes.clone();
         old_abi[4] ^= 1;
         assert!(AuthorityOperationCall::decode(&old_abi).is_err());
@@ -3475,8 +3528,11 @@ mod tests {
 
         let approved = approval(&call);
         let mut old = approved.encode().unwrap();
-        old[..4].copy_from_slice(b"MAP1");
+        old[..4].copy_from_slice(b"AOP1");
         assert!(AuthorityOperationApproval::decode(&old).is_err());
+        let mut wrong_family = approved.encode().unwrap();
+        wrong_family[..4].copy_from_slice(b"MAP1");
+        assert!(AuthorityOperationApproval::decode(&wrong_family).is_err());
         let mut trailing = approved.encode().unwrap();
         trailing.push(0);
         assert!(AuthorityOperationApproval::decode(&trailing).is_err());

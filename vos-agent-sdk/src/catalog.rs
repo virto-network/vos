@@ -117,6 +117,10 @@ pub enum CatalogMutationKind {
 }
 
 /// Canonical request authorized by a `PublishCatalog` authority receipt.
+///
+/// Both `invocation` and `generation` are materialized from the authority's
+/// signed operation decision. They are public protocol fields so every guest
+/// can verify and order the mutation, but they are never caller-selected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CatalogMutationRequest {
     pub invocation: InvocationId,

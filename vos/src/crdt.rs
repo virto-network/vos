@@ -779,6 +779,133 @@ impl<K: Ord + Clone, V: Clone + PartialEq> Map<K, V> {
     }
 }
 
+/// Compact state-based maximum register per key.
+///
+/// Unlike [`Map`], this type deliberately forgets superseded values and has
+/// no remove operation. It is suitable only when the value's [`Ord`] is a
+/// protocol-authenticated monotone precedence: once a value loses, no future
+/// merge may make it visible again. Deletion must therefore be represented by
+/// an ordered tombstone value. The compact representation bounds state by the
+/// number of distinct keys rather than the number of mutations.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone)]
+#[rkyv(crate = rkyv)]
+pub struct MaxMap<K, V> {
+    entries: BTreeMap<K, MaxMapValue<V>>,
+    #[rkyv(with = rkyv::with::Skip)]
+    field: crate::service::Hash,
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone)]
+#[rkyv(crate = rkyv)]
+struct MaxMapValue<V> {
+    operation: OpId,
+    value: V,
+}
+
+impl<K, V> Default for MaxMap<K, V> {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            field: crate::service::Hash::ZERO,
+        }
+    }
+}
+
+impl<K, V> Field for MaxMap<K, V> {
+    fn __vos_init(&mut self, actor: &str, field: &str) {
+        self.field = field_tag(actor, field);
+    }
+}
+
+impl<K: Ord + Clone + PartialEq, V: Ord + Clone + PartialEq> MaxMap<K, V> {
+    /// Join one authenticated candidate into this key's maximum register and
+    /// record the concrete field operation for the enclosing actor slice.
+    pub fn insert(&mut self, key: K, value: V) -> Result<bool, Error>
+    where
+        K: crate::Encode,
+        V: crate::Encode,
+    {
+        let id = next_operation()?;
+        let encoded_key = crate::Encode::encode(&key);
+        let encoded_value = crate::Encode::encode(&value);
+        let changed = self.insert_with_id(id, key, value)?;
+        record_operation(
+            self.field,
+            id,
+            operation_payload(10, &[&encoded_key, &encoded_value]),
+        )?;
+        Ok(changed)
+    }
+
+    /// Deterministic operation-ID seam used by replay and convergence tests.
+    #[doc(hidden)]
+    pub fn insert_with_id(&mut self, id: OpId, key: K, value: V) -> Result<bool, Error> {
+        if self
+            .entries
+            .iter()
+            .any(|(existing_key, existing)| existing.operation == id && existing_key != &key)
+        {
+            return Err(Error::DivergentOperation(id));
+        }
+        match self.entries.get_mut(&key) {
+            Some(current) if current.operation == id && current.value != value => {
+                Err(Error::DivergentOperation(id))
+            }
+            Some(current)
+                if current.value > value || current.value == value && current.operation >= id =>
+            {
+                Ok(false)
+            }
+            Some(current) => {
+                *current = MaxMapValue {
+                    operation: id,
+                    value,
+                };
+                Ok(true)
+            }
+            None => {
+                self.entries.insert(
+                    key,
+                    MaxMapValue {
+                        operation: id,
+                        value,
+                    },
+                );
+                Ok(true)
+            }
+        }
+    }
+
+    /// Join another compact materialization. Equal values use the operation ID
+    /// only to make the archived representation converge byte-for-byte.
+    pub fn merge(&mut self, other: &Self) -> Result<(), Error> {
+        let mut staged = self.clone();
+        for (key, incoming) in &other.entries {
+            staged.insert_with_id(incoming.operation, key.clone(), incoming.value.clone())?;
+        }
+        *self = staged;
+        Ok(())
+    }
+}
+
+impl<K: Ord, V> MaxMap<K, V> {
+    pub fn get(&self, key: &K) -> Option<&V> {
+        self.entries.get(key).map(|entry| &entry.value)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.entries.iter().map(|(key, entry)| (key, &entry.value))
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 /// Add-wins observed-remove set.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone)]
 #[rkyv(crate = rkyv)]
@@ -1700,6 +1827,66 @@ mod tests {
         b.merge(&a).unwrap();
         assert_eq!(a.get(&"title"), b.get(&"title"));
         assert_eq!(a.conflicts(&"title").count(), 1);
+    }
+
+    #[test]
+    fn max_map_compacts_churn_and_converges_on_authenticated_precedence() {
+        let mut left: MaxMap<String, u64> = MaxMap::default();
+        let mut right: MaxMap<String, u64> = MaxMap::default();
+        left.insert_with_id(change(1).operation(0), String::from("editor"), 4_u64)
+            .unwrap();
+        right
+            .insert_with_id(change(2).operation(0), String::from("editor"), 7_u64)
+            .unwrap();
+        right
+            .insert_with_id(change(3).operation(0), String::from("viewer"), 3_u64)
+            .unwrap();
+
+        let mut left_first = left.clone();
+        left_first.merge(&right).unwrap();
+        let mut right_first = right.clone();
+        right_first.merge(&left).unwrap();
+        assert_eq!(left_first.get(&String::from("editor")), Some(&7));
+        assert_eq!(right_first.get(&String::from("editor")), Some(&7));
+        assert_eq!(left_first.get(&String::from("viewer")), Some(&3));
+        assert_eq!(
+            crate::Encode::encode(&left_first),
+            crate::Encode::encode(&right_first)
+        );
+
+        let one_key_bytes = crate::Encode::encode(&left);
+        for generation in 5..=50_000_u64 {
+            let mut change_bytes = [0; 32];
+            change_bytes[..8].copy_from_slice(&generation.to_le_bytes());
+            left.insert_with_id(
+                ChangeId(change_bytes).operation(0),
+                String::from("editor"),
+                generation,
+            )
+            .unwrap();
+        }
+        assert_eq!(left.len(), 1);
+        assert_eq!(left.get(&String::from("editor")), Some(&50_000));
+        assert_eq!(crate::Encode::encode(&left).len(), one_key_bytes.len());
+    }
+
+    #[test]
+    fn max_map_rejects_visible_operation_id_aliases() {
+        let id = change(9).operation(0);
+        let mut values: MaxMap<String, u64> = MaxMap::default();
+        values
+            .insert_with_id(id, String::from("left"), 1_u64)
+            .unwrap();
+        assert_eq!(
+            values.insert_with_id(id, String::from("left"), 2),
+            Err(Error::DivergentOperation(id))
+        );
+        assert_eq!(
+            values.insert_with_id(id, String::from("right"), 1),
+            Err(Error::DivergentOperation(id))
+        );
+        assert_eq!(values.get(&String::from("left")), Some(&1));
+        assert_eq!(values.get(&String::from("right")), None);
     }
 
     #[test]

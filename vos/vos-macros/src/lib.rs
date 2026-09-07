@@ -3454,7 +3454,7 @@ fn prepare_state_fields(input: &mut ItemStruct, is_crdt: bool) -> syn::Result<St
             return Err(syn::Error::new_spanned(
                 &field.ty,
                 format!(
-                    "plain mutable field `{name}` has no convergent merge rule; use crdt::Counter for additive changes, crdt::Value<T> when one assignment should be visible, crdt::Map for independently editable keys, crdt::Set for membership, crdt::List/crdt::Text for sequences, or mark derived data #[crdt(skip)]",
+                    "plain mutable field `{name}` has no convergent merge rule; use crdt::Counter for additive changes, crdt::Value<T> when one assignment should be visible, crdt::Map for independently editable keys, crdt::MaxMap for compact authenticated maximum registers, crdt::Set for membership, crdt::List/crdt::Text for sequences, or mark derived data #[crdt(skip)]",
                 ),
             ));
         }
@@ -3493,7 +3493,7 @@ fn is_crdt_field_type(ty: &syn::Type) -> bool {
     };
     let is_known = matches!(
         kind.ident.to_string().as_str(),
-        "Value" | "Map" | "Set" | "List" | "Text" | "Counter"
+        "Value" | "Map" | "MaxMap" | "Set" | "List" | "Text" | "Counter"
     );
     is_known
         && segments
@@ -3524,9 +3524,12 @@ mod agent_schema_tests {
     #[test]
     fn only_qualified_crdt_types_are_inferred_as_merge_state() {
         let qualified: syn::Type = syn::parse_quote!(some::crdt::Counter);
+        let compact_max_map: syn::Type =
+            syn::parse_quote!(some::crdt::MaxMap<String, CatalogOperation>);
         let direct: syn::Type = syn::parse_quote!(Counter);
         let unrelated: syn::Type = syn::parse_quote!(other::Counter);
         assert!(is_crdt_field_type(&qualified));
+        assert!(is_crdt_field_type(&compact_max_map));
         assert!(!is_crdt_field_type(&direct));
         assert!(!is_crdt_field_type(&unrelated));
     }

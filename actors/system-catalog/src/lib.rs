@@ -1,12 +1,11 @@
 //! Clean portable system catalog for Shared Agents.
 //!
 //! Mutations accept only canonical CMC1 calls with guest-verified authority
-//! receipts. State is a bounded grow-only operation set; visible aliases are
-//! a deterministic projection and therefore converge under any delivery order.
+//! receipts. State retains one bounded maximum-register value per alias;
+//! superseded mutations are compacted while withdrawals remain tombstones, so
+//! visible aliases converge under any delivery order without a churn ceiling.
 
 #![cfg_attr(target_arch = "riscv64", no_std)]
-
-use alloc::collections::BTreeMap;
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use vos::agent_sdk::authority::{AgentAuthorityBinding, AuthorityIssuer, AuthorityVerifier};
@@ -23,9 +22,13 @@ use vos::agent_sdk::{
 use vos::prelude::*;
 
 pub const SYSTEM_CATALOG_CONFIGURATION_MAGIC: [u8; 4] = *b"SCC1";
-pub const MAX_CATALOG_OPERATIONS: usize = 256;
-pub const MAX_RETAINED_CATALOG_WIRE_BYTES: usize = MAX_CATALOG_OPERATIONS
-    * (MAX_INVOCATION_MESSAGE_BYTES + MAX_CATALOG_MUTATION_RESULT_WIRE_BYTES);
+pub const MAX_CATALOG_ALIASES: usize = 256;
+pub const MAX_RETAINED_CATALOG_WIRE_BYTES: usize = MAX_CATALOG_ALIASES
+    * (MAX_INVOCATION_MESSAGE_BYTES
+        + MAX_CATALOG_MUTATION_RESULT_WIRE_BYTES
+        + vos::agent_sdk::catalog::MAX_CATALOG_NAMESPACE_BYTES
+        + vos::agent_sdk::catalog::MAX_CATALOG_ALIAS_BYTES
+        + 256);
 
 const CONFIG_FIXED_FIELDS: usize = 13;
 const CONFIG_ENCODED_BYTES: usize =
@@ -205,23 +208,62 @@ fn take_fixed(bytes: &[u8], cursor: &mut usize) -> Option<[u8; 32]> {
 }
 
 #[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+    vos::rkyv::Archive,
+    vos::rkyv::Serialize,
+    vos::rkyv::Deserialize,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
 )]
 #[rkyv(crate = vos::rkyv)]
+#[rkyv(derive(Debug, PartialEq, Eq, PartialOrd, Ord))]
+pub struct CatalogAliasState {
+    pub namespace: alloc::string::String,
+    pub name: alloc::string::String,
+}
+
+impl CatalogAliasState {
+    fn from_call(call: &CatalogMutationCall) -> Self {
+        Self {
+            namespace: call.request.alias.namespace.clone(),
+            name: call.request.alias.name.clone(),
+        }
+    }
+}
+
+#[derive(
+    vos::rkyv::Archive,
+    vos::rkyv::Serialize,
+    vos::rkyv::Deserialize,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+)]
+#[rkyv(crate = vos::rkyv)]
+#[rkyv(derive(Debug, PartialEq, Eq, PartialOrd, Ord))]
 pub struct CatalogOperationState {
-    pub invocation: [u8; 32],
-    pub request: [u8; 32],
+    /// Authenticated maximum-register precedence. These fields come first so
+    /// the derived total order is exactly the catalog conflict rule.
+    pub generation: u64,
     pub mutation: [u8; 32],
     pub call: [u8; 32],
+    pub invocation: [u8; 32],
+    pub request: [u8; 32],
     pub call_bytes: Vec<u8>,
     pub reply_bytes: Vec<u8>,
 }
 
-#[actor(agent, state_version = 1)]
+#[actor(agent, state_version = 2)]
 pub struct SystemCatalog {
     #[state(const)]
     configuration: SystemCatalogConfiguration,
-    operations: crdt::Map<[u8; 32], CatalogOperationState>,
+    winners: crdt::MaxMap<CatalogAliasState, CatalogOperationState>,
 }
 
 #[messages(agent)]
@@ -230,12 +272,12 @@ impl SystemCatalog {
         let Some(configuration) = SystemCatalogConfiguration::decode(configuration) else {
             return Self {
                 configuration: SystemCatalogConfiguration::default(),
-                operations: crdt::Map::default(),
+                winners: crdt::MaxMap::default(),
             };
         };
         Self {
             configuration,
-            operations: crdt::Map::default(),
+            winners: crdt::MaxMap::default(),
         }
     }
 
@@ -246,14 +288,14 @@ impl SystemCatalog {
         let Some(context) = ctx.agent_invocation_context().copied() else {
             return Vec::new();
         };
-        apply_catalog_mutation(&self.configuration, &mut self.operations, &call, &context)
+        apply_catalog_mutation(&self.configuration, &mut self.winners, &call, &context)
     }
 
     /// Return one stable alias-name page. Invalid requests or state fail
     /// closed with an empty byte string.
     #[msg(query)]
     fn page(&self, request: Vec<u8>) -> Vec<u8> {
-        catalog_page(&self.configuration, &self.operations, &request)
+        catalog_page(&self.configuration, &self.winners, &request)
     }
 }
 
@@ -275,13 +317,13 @@ impl AuthorityVerifier for Ed25519AuthorityVerifier {
 
 fn apply_catalog_mutation(
     configuration: &SystemCatalogConfiguration,
-    operations: &mut crdt::Map<[u8; 32], CatalogOperationState>,
+    winners: &mut crdt::MaxMap<CatalogAliasState, CatalogOperationState>,
     encoded_call: &[u8],
     context: &InvocationContext,
 ) -> Vec<u8> {
     if encoded_call.is_empty()
         || encoded_call.len() > MAX_INVOCATION_MESSAGE_BYTES
-        || !catalog_state_is_valid(configuration, operations)
+        || !catalog_state_is_valid(configuration, winners)
     {
         return Vec::new();
     }
@@ -292,17 +334,17 @@ fn apply_catalog_mutation(
     if call.request.catalog != target || !call.matches_invocation_context(context) {
         return Vec::new();
     }
-    let key = call.request.invocation.0;
-    if let Some(record) = operations.get(&key) {
-        return if operations.conflicts(&key).next().is_none()
-            && record.call_bytes.as_slice() == encoded_call
-        {
-            record.reply_bytes.clone()
-        } else {
-            Vec::new()
-        };
+    let invocation = call.request.invocation.0;
+    if let Some((_, record)) = winners
+        .iter()
+        .find(|(_, record)| record.invocation == invocation)
+    {
+        return (record.call_bytes.as_slice() == encoded_call)
+            .then(|| record.reply_bytes.clone())
+            .unwrap_or_default();
     }
-    if operations.len() >= MAX_CATALOG_OPERATIONS
+    let alias = CatalogAliasState::from_call(&call);
+    if winners.get(&alias).is_none() && winners.len() >= MAX_CATALOG_ALIASES
         || call
             .verify_at(target, context.observed_slot, &Ed25519AuthorityVerifier)
             .is_err()
@@ -319,14 +361,15 @@ fn apply_catalog_mutation(
         return Vec::new();
     }
     let record = CatalogOperationState {
-        invocation: key,
-        request: result.request.0,
+        generation: call.request.generation.get(),
         mutation: result.mutation.0,
         call: result.call.0,
+        invocation,
+        request: result.request.0,
         call_bytes: encoded_call.to_vec(),
         reply_bytes: reply_bytes.clone(),
     };
-    if operations.insert(key, record).is_err() {
+    if winners.insert(alias, record).is_err() {
         return Vec::new();
     }
     reply_bytes
@@ -334,14 +377,13 @@ fn apply_catalog_mutation(
 
 fn catalog_state_is_valid(
     configuration: &SystemCatalogConfiguration,
-    operations: &crdt::Map<[u8; 32], CatalogOperationState>,
+    winners: &crdt::MaxMap<CatalogAliasState, CatalogOperationState>,
 ) -> bool {
     configuration.is_valid()
-        && operations.len() <= MAX_CATALOG_OPERATIONS
-        && operations.iter().all(|(key, record)| {
-            if *key == [0; 32]
-                || operations.conflicts(key).next().is_some()
-                || record.invocation != *key
+        && winners.len() <= MAX_CATALOG_ALIASES
+        && winners.iter().all(|(alias, record)| {
+            if record.generation == 0
+                || record.invocation == [0; 32]
                 || record.request == [0; 32]
                 || record.mutation == [0; 32]
                 || record.call == [0; 32]
@@ -358,7 +400,10 @@ fn catalog_state_is_valid(
             let Ok(result) = CatalogMutationResult::decode(&record.reply_bytes) else {
                 return false;
             };
-            call.request.invocation.0 == *key
+            call.request.invocation.0 == record.invocation
+                && call.request.generation.get() == record.generation
+                && call.request.alias.namespace == alias.namespace
+                && call.request.alias.name == alias.name
                 && call.request.catalog == configuration.sdk()
                 && result.matches_call(&call)
                 && record.request == result.request.0
@@ -376,16 +421,14 @@ fn catalog_state_is_valid(
         })
 }
 
-type CatalogPrecedence = (u64, [u8; 32], [u8; 32]);
-
 fn catalog_page(
     configuration: &SystemCatalogConfiguration,
-    operations: &crdt::Map<[u8; 32], CatalogOperationState>,
+    winners: &crdt::MaxMap<CatalogAliasState, CatalogOperationState>,
     encoded_request: &[u8],
 ) -> Vec<u8> {
     if encoded_request.is_empty()
         || encoded_request.len() > MAX_INVOCATION_MESSAGE_BYTES
-        || !catalog_state_is_valid(configuration, operations)
+        || !catalog_state_is_valid(configuration, winners)
     {
         return Vec::new();
     }
@@ -397,35 +440,22 @@ fn catalog_page(
         return Vec::new();
     }
 
-    let mut winners: BTreeMap<String, (CatalogPrecedence, CatalogMutationCall)> = BTreeMap::new();
-    for (_, record) in operations.iter() {
-        let Ok(call) = CatalogMutationCall::decode(&record.call_bytes) else {
-            return Vec::new();
-        };
-        if call.request.alias.namespace != request.namespace {
-            continue;
-        }
-        let precedence = (
-            call.request.generation.get(),
-            call.request.mutation_commitment().0,
-            call.commitment().0,
-        );
-        let alias = call.request.alias.name.clone();
-        let replace = winners
-            .get(&alias)
-            .is_none_or(|(current, _)| precedence > *current);
-        if replace {
-            winners.insert(alias, (precedence, call));
-        }
-    }
-
     let limit = usize::from(request.limit).min(MAX_CATALOG_PAGE_ENTRIES);
     let mut entries = Vec::with_capacity(limit);
     let mut has_more = false;
-    for (alias, (_, call)) in winners {
-        if request.after.as_ref().is_some_and(|after| alias <= *after)
-            || call.request.kind == CatalogMutationKind::Withdraw
+    for (alias, record) in winners.iter() {
+        if alias.namespace != request.namespace
+            || request
+                .after
+                .as_ref()
+                .is_some_and(|after| alias.name.as_str() <= after.as_str())
         {
+            continue;
+        }
+        let Ok(call) = CatalogMutationCall::decode(&record.call_bytes) else {
+            return Vec::new();
+        };
+        if call.request.kind == CatalogMutationKind::Withdraw {
             continue;
         }
         if entries.len() == limit {
@@ -674,7 +704,7 @@ mod tests {
         };
         let bytes = catalog_page(
             &actor.configuration,
-            &actor.operations,
+            &actor.winners,
             &request.encode().unwrap(),
         );
         CatalogPage::decode(&bytes).expect("valid CAP1 reply")
@@ -683,10 +713,11 @@ mod tests {
     fn operation_state(call: &CatalogMutationCall) -> CatalogOperationState {
         let result = CatalogMutationResult::from_call(call).unwrap();
         CatalogOperationState {
-            invocation: call.request.invocation.0,
-            request: result.request.0,
+            generation: call.request.generation.get(),
             mutation: result.mutation.0,
             call: result.call.0,
+            invocation: call.request.invocation.0,
+            request: result.request.0,
             call_bytes: call.encode().unwrap(),
             reply_bytes: result.encode().unwrap(),
         }
@@ -815,7 +846,7 @@ mod tests {
             )
             .is_empty()
         );
-        assert!(actor.operations.is_empty());
+        assert!(actor.winners.is_empty());
     }
 
     #[test]
@@ -972,7 +1003,7 @@ mod tests {
         let right_reply = dispatch(&mut right, &call);
         assert_eq!(left_reply, right_reply);
         <SystemCatalog as vos::Actor>::__merge_crdt(&mut left, &right).unwrap();
-        assert_eq!(left.operations.len(), 1);
+        assert_eq!(left.winners.len(), 1);
         assert_eq!(query(&left, "apps", None, 4).entries.len(), 1);
         assert_eq!(dispatch(&mut left, &call), left_reply);
     }
@@ -1020,9 +1051,38 @@ mod tests {
     }
 
     #[test]
-    fn operation_and_state_bounds_fail_closed() {
+    fn alias_and_state_bounds_fail_closed_while_existing_alias_churn_compacts() {
+        let mut churn = actor();
+        for generation in 1..=(MAX_CATALOG_ALIASES as u64 * 4) {
+            let update = call(
+                invocation(20_000 + generation),
+                "bounded",
+                "stable-alias",
+                generation,
+                if generation % 2 == 0 {
+                    CatalogMutationKind::Withdraw
+                } else {
+                    CatalogMutationKind::Publish
+                },
+                (generation % 200 + 1) as u8,
+            );
+            assert!(!dispatch(&mut churn, &update).is_empty());
+        }
+        assert_eq!(churn.winners.len(), 1);
+        assert_eq!(
+            churn
+                .winners
+                .get(&CatalogAliasState {
+                    namespace: "bounded".into(),
+                    name: "stable-alias".into(),
+                })
+                .map(|winner| winner.generation),
+            Some(MAX_CATALOG_ALIASES as u64 * 4)
+        );
+        assert!(query(&churn, "bounded", None, 1).entries.is_empty());
+
         let mut actor = actor();
-        for index in 0..MAX_CATALOG_OPERATIONS {
+        for index in 0..MAX_CATALOG_ALIASES {
             let call = call(
                 invocation(1_000 + index as u64),
                 "bounded",
@@ -1032,18 +1092,15 @@ mod tests {
                 (index % 200 + 1) as u8,
             );
             actor
-                .operations
+                .winners
                 .insert_with_id(
                     crdt::ChangeId(call.request.invocation.0).operation(0),
-                    call.request.invocation.0,
+                    CatalogAliasState::from_call(&call),
                     operation_state(&call),
                 )
                 .unwrap();
         }
-        assert!(catalog_state_is_valid(
-            &actor.configuration,
-            &actor.operations
-        ));
+        assert!(catalog_state_is_valid(&actor.configuration, &actor.winners));
         assert!(
             <SystemCatalog as vos::Actor>::__save_agent_lane(&actor, StateLane::Merge).len()
                 <= MAX_RUNTIME_STATE_BYTES
@@ -1062,16 +1119,16 @@ mod tests {
         assert_eq!(actor.encode(), before);
 
         actor
-            .operations
+            .winners
             .insert_with_id(
                 crdt::ChangeId(overflow.request.invocation.0).operation(0),
-                overflow.request.invocation.0,
+                CatalogAliasState::from_call(&overflow),
                 operation_state(&overflow),
             )
             .unwrap();
         assert!(!catalog_state_is_valid(
             &actor.configuration,
-            &actor.operations
+            &actor.winners
         ));
         let request = CatalogPageRequest {
             catalog: configuration().sdk(),
@@ -1082,7 +1139,7 @@ mod tests {
         assert!(
             catalog_page(
                 &actor.configuration,
-                &actor.operations,
+                &actor.winners,
                 &request.encode().unwrap()
             )
             .is_empty()
