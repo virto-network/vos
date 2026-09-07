@@ -1,15 +1,22 @@
-//! Verified offline backup and recoverable restore for one complete space.
+//! Verified offline registry backup and recoverable restore for one space.
 //!
 //! The archive is a directory rather than an opaque tarball so operators can
-//! inspect and copy it with ordinary tools. `manifest.json` binds every byte
-//! under `data/` (redb files, service images, proof/private-input/record side
-//! stores, node identity and local policy) and `blobs/` (the content-addressed
-//! program cache). Restore verifies the complete archive before touching the
-//! destination and renames replaced state aside instead of deleting it.
+//! inspect and copy it with ordinary tools. `manifest.json` binds every
+//! portable byte under `data/` and every content-addressed program under
+//! `blobs/`. Node identity, bearer credentials, device signing keys, and
+//! plaintext Private ingress/producer records never enter the archive.
+//! Restore requires the exact node key through a separate explicit path,
+//! verifies its public identity before mutation, then installs it only into
+//! the unpublished restore staging directory.
+//!
+//! This clean-break format is intentionally registry-only today: it rejects
+//! every live Agent/service generation until those runtimes provide an
+//! authenticated portable export. That refusal closes the former recursive
+//! plaintext leak, but is not the final saga-wide backup protocol.
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -19,19 +26,39 @@ use crate::commands::space::{endpoint, space_lock::SpaceDataLock};
 use crate::spaces_index::{self, SpaceEntry};
 
 const MANIFEST_FILE: &str = "manifest.json";
-const ARCHIVE_FORMAT: &str = "VOS-BACKUP";
+// Clean break from the recursive VOS-BACKUP layout, which embedded node.key
+// and arbitrary plaintext node-local side stores.
+const ARCHIVE_FORMAT: &str = "VOS-BACKUP-CIPHERTEXT-2";
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ARCHIVE_FILES: usize = 100_000;
-const NODE_KEY_WIRE: &str = "data/node.key";
+const MAX_NODE_KEY_BYTES: u64 = 4 * 1024;
+const NODE_KEY_FILE: &str = "node.key";
+const ENDPOINT_FILE: &str = ".endpoint";
+const PENDING_INVITE_FILE: &str = ".pending-invite.token";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BackupManifest {
     format: String,
     space: SpaceEntry,
+    recovery: BackupRecoveryMetadata,
     files: Vec<BackupFile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupRecoveryMetadata {
+    /// Canonical libp2p identity authenticated by the separately retained
+    /// node key required at restore time.
+    node_peer_id: String,
+    /// Raw Ed25519 public key, encoded as canonical lowercase hexadecimal.
+    /// Binding both representations makes a future PeerId encoding change
+    /// fail closed rather than silently accepting another identity shape.
+    node_public_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BackupFile {
     /// Slash-separated path rooted at `data/` or `blobs/`.
     path: String,
@@ -39,6 +66,19 @@ struct BackupFile {
     blake2b_256: String,
     /// Unix permission bits. `None` on non-Unix producers.
     mode: Option<u32>,
+}
+
+struct RecoveryNodeKey {
+    bytes: Vec<u8>,
+    peer_id: String,
+    public_key: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DataEntryDisposition {
+    Copy,
+    Descend,
+    Skip,
 }
 
 struct PartialDirectory {
@@ -93,6 +133,7 @@ pub fn run_backup(query: &str, output: &Path) -> anyhow::Result<()> {
 
 pub fn run_restore(
     archive: &Path,
+    node_key: &Path,
     data_dir: Option<&Path>,
     replace: bool,
     name: Option<&str>,
@@ -101,6 +142,8 @@ pub fn run_restore(
     // verifies again while copying, so corruption between these phases still
     // fails before activation.
     let manifest = verify_archive(archive)?;
+    let recovery_node_key = read_recovery_node_key(node_key)?;
+    require_manifest_node_identity(&manifest, &recovery_node_key)?;
     let expected_manifest = hash_file(&archive.join(MANIFEST_FILE))?;
     let space_id = manifest
         .space
@@ -114,6 +157,7 @@ pub fn run_restore(
     refuse_live_daemon(&destination)?;
     let replaced = restore_archive(
         archive,
+        node_key,
         &destination,
         &blob_store::cache_dir(),
         &crate::paths::spaces_index_path(),
@@ -167,6 +211,7 @@ fn create_archive(entry: &SpaceEntry, output: &Path, cache_dir: &Path) -> anyhow
             data_dir.display()
         );
     }
+    let node_key = read_recovery_node_key(&data_dir.join(NODE_KEY_FILE))?;
     reject_nested_output(output, &data_dir, cache_dir)?;
     let parent = usable_parent(output);
     fs::create_dir_all(parent)
@@ -178,8 +223,13 @@ fn create_archive(entry: &SpaceEntry, output: &Path, cache_dir: &Path) -> anyhow
     let mut partial = PartialDirectory::new(stage.clone());
 
     let mut files = Vec::new();
-    copy_tree_into_archive(&data_dir, &stage, "data", true, &mut files)?;
-    copy_cache_into_archive(cache_dir, &stage, &mut files)?;
+    copy_data_tree_into_archive(&data_dir, &stage, &mut files)?;
+    let registry_hash = BlobHash::from_hex(&entry.registry_hash)
+        .map_err(|_| anyhow::anyhow!("space index contains an invalid registry blob hash"))?;
+    if registry_hash.to_hex() != entry.registry_hash {
+        anyhow::bail!("space index registry blob hash is not canonical lowercase hexadecimal");
+    }
+    copy_cache_into_archive(cache_dir, &stage, &[registry_hash], &mut files)?;
     files.sort_by(|left, right| left.path.cmp(&right.path));
     let registry_path = format!("blobs/{}", entry.registry_hash);
     if !files.iter().any(|file| file.path == registry_path) {
@@ -188,10 +238,23 @@ fn create_archive(entry: &SpaceEntry, output: &Path, cache_dir: &Path) -> anyhow
             entry.registry_hash,
         );
     }
+    let retained_node_key = read_recovery_node_key(&data_dir.join(NODE_KEY_FILE))?;
+    if retained_node_key.bytes != node_key.bytes
+        || retained_node_key.peer_id != node_key.peer_id
+        || retained_node_key.public_key != node_key.public_key
+    {
+        anyhow::bail!("external node key changed while backup was being created");
+    }
 
+    let mut portable_entry = entry.clone();
+    portable_entry.data_dir.clear();
     let manifest = BackupManifest {
         format: ARCHIVE_FORMAT.into(),
-        space: entry.clone(),
+        space: portable_entry,
+        recovery: BackupRecoveryMetadata {
+            node_peer_id: node_key.peer_id,
+            node_public_key: node_key.public_key,
+        },
         files,
     };
     let bytes = serde_json::to_vec_pretty(&manifest)
@@ -240,11 +303,9 @@ fn reject_nested_output(output: &Path, data_dir: &Path, cache_dir: &Path) -> any
     Ok(())
 }
 
-fn copy_tree_into_archive(
+fn copy_data_tree_into_archive(
     source_root: &Path,
     archive_root: &Path,
-    prefix: &str,
-    skip_endpoint: bool,
     files: &mut Vec<BackupFile>,
 ) -> anyhow::Result<()> {
     let mut pending = vec![PathBuf::new()];
@@ -257,9 +318,6 @@ fn copy_tree_into_archive(
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries.into_iter().rev() {
             let child_relative = relative.join(entry.file_name());
-            if skip_endpoint && child_relative == Path::new(".endpoint") {
-                continue;
-            }
             let metadata = fs::symlink_metadata(entry.path())
                 .map_err(|error| anyhow::anyhow!("inspect {}: {error}", entry.path().display()))?;
             if metadata.file_type().is_symlink() {
@@ -268,22 +326,167 @@ fn copy_tree_into_archive(
                     entry.path().display(),
                 );
             }
-            if metadata.is_dir() {
-                pending.push(child_relative);
-            } else if metadata.is_file() {
-                let wire = wire_path(prefix, &child_relative)?;
-                copy_one_file(&entry.path(), archive_root, &wire, files, false)?;
-            } else {
+            if !metadata.is_dir() && !metadata.is_file() {
                 anyhow::bail!("backup refuses special file {}", entry.path().display());
+            }
+            match classify_data_entry(&child_relative, &metadata, &entry.path())? {
+                DataEntryDisposition::Copy => {
+                    let wire = wire_path("data", &child_relative)?;
+                    copy_one_file(&entry.path(), archive_root, &wire, files, false)?;
+                }
+                DataEntryDisposition::Descend => pending.push(child_relative),
+                DataEntryDisposition::Skip => {}
             }
         }
     }
     Ok(())
 }
 
+fn classify_data_entry(
+    relative: &Path,
+    metadata: &fs::Metadata,
+    physical_path: &Path,
+) -> anyhow::Result<DataEntryDisposition> {
+    let components = canonical_relative_components(relative)?;
+    let last = components
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("backup encountered an empty data path"))?;
+
+    if components
+        .iter()
+        .any(|component| is_plaintext_private_directory(component))
+    {
+        if metadata.is_dir() && directory_is_empty(physical_path)? {
+            return Ok(DataEntryDisposition::Skip);
+        }
+        anyhow::bail!(
+            "backup refuses live plaintext Private state {}; finish or retire the private ingress/producer record first",
+            physical_path.display(),
+        );
+    }
+
+    if is_node_local_secret_name(last) {
+        if components.as_slice() == [NODE_KEY_FILE] && metadata.is_file() {
+            // The exact key was authenticated before traversal and is carried
+            // separately by the operator. It never enters the archive.
+            return Ok(DataEntryDisposition::Skip);
+        }
+        anyhow::bail!(
+            "backup refuses node-local secret {}; retain it separately",
+            physical_path.display(),
+        );
+    }
+
+    let disposition = match components.as_slice() {
+        [ENDPOINT_FILE | "local.toml"] if metadata.is_file() => DataEntryDisposition::Skip,
+        ["agents"] if metadata.is_dir() => DataEntryDisposition::Descend,
+        ["services"] if metadata.is_dir() && directory_is_empty(physical_path)? => {
+            DataEntryDisposition::Skip
+        }
+        ["services"] if metadata.is_dir() => DataEntryDisposition::Descend,
+        ["services", ..] if metadata.is_dir() => DataEntryDisposition::Descend,
+        ["trash"] if metadata.is_dir() && directory_is_empty(physical_path)? => {
+            DataEntryDisposition::Skip
+        }
+        ["trash"] if metadata.is_dir() => DataEntryDisposition::Descend,
+        ["agents", name] if metadata.is_file() && is_registry_database(name) => {
+            DataEntryDisposition::Copy
+        }
+        ["trash", ..] if metadata.is_dir() => DataEntryDisposition::Descend,
+        ["trash", ..] if metadata.is_file() => DataEntryDisposition::Skip,
+        _ => {
+            anyhow::bail!(
+                "backup refuses unclassified data path {}; portable backup is allowlist-only",
+                physical_path.display(),
+            )
+        }
+    };
+    Ok(disposition)
+}
+
+fn validate_archived_data_file(relative: &Path) -> anyhow::Result<()> {
+    let components = canonical_relative_components(relative)?;
+    let portable = match components.as_slice() {
+        ["agents", name] => is_registry_database(name),
+        _ => false,
+    };
+    if !portable {
+        anyhow::bail!(
+            "backup manifest contains forbidden or unclassified data path {}",
+            relative.display(),
+        );
+    }
+    Ok(())
+}
+
+fn canonical_relative_components(path: &Path) -> anyhow::Result<Vec<&str>> {
+    let mut components = Vec::new();
+    for component in path.components() {
+        let Component::Normal(component) = component else {
+            anyhow::bail!("non-canonical archive source path: {}", path.display());
+        };
+        let component = component
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("backup paths must be valid UTF-8"))?;
+        if component.is_empty() || component.contains('/') || component.contains('\\') {
+            anyhow::bail!("non-canonical archive path component");
+        }
+        components.push(component);
+    }
+    Ok(components)
+}
+
+fn directory_is_empty(path: &Path) -> anyhow::Result<bool> {
+    let mut entries =
+        fs::read_dir(path).map_err(|error| anyhow::anyhow!("read {}: {error}", path.display()))?;
+    match entries.next() {
+        None => Ok(true),
+        Some(Ok(_)) => Ok(false),
+        Some(Err(error)) => Err(anyhow::anyhow!("read {}: {error}", path.display())),
+    }
+}
+
+fn is_plaintext_private_directory(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.ends_with(".private-inputs") || name.ends_with(".records")
+}
+
+fn is_node_local_secret_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == NODE_KEY_FILE
+        || name == PENDING_INVITE_FILE
+        || name == "host_ed25519"
+        || name == "id_ed25519"
+        || name == "id_rsa"
+        || name.ends_with(".device-seed")
+        || name.ends_with(".device-seed.next")
+        || name.ends_with(".key")
+        || name.ends_with(".seed")
+        || name.ends_with(".token")
+        || name.ends_with(".pem")
+        || name.ends_with(".p12")
+        || name.ends_with(".pfx")
+        || name.ends_with("-key")
+        || name.ends_with("_key")
+        || name.ends_with("-seed")
+        || name.ends_with("_seed")
+}
+
+fn is_registry_database(name: &str) -> bool {
+    registry_db_wire().strip_prefix("data/agents/") == Some(name)
+}
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn copy_cache_into_archive(
     cache_dir: &Path,
     archive_root: &Path,
+    required: &[BlobHash],
     files: &mut Vec<BackupFile>,
 ) -> anyhow::Result<()> {
     let cache_metadata = fs::symlink_metadata(cache_dir)
@@ -294,30 +497,22 @@ fn copy_cache_into_archive(
             cache_dir.display(),
         );
     }
-    let entries = match fs::read_dir(cache_dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            anyhow::bail!("blob cache does not exist: {}", cache_dir.display())
-        }
-        Err(error) => return Err(anyhow::anyhow!("read {}: {error}", cache_dir.display())),
-    };
-    let mut entries = entries
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| anyhow::anyhow!("read {}: {error}", cache_dir.display()))?;
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name.len() != 64 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            continue;
-        }
-        let hash = BlobHash::from_hex(name)
-            .map_err(|_| anyhow::anyhow!("invalid canonical blob-cache name {name}"))?;
-        let metadata = fs::symlink_metadata(entry.path())?;
+    let mut required = required.to_vec();
+    required.sort_by_key(|hash| hash.to_hex());
+    required.dedup();
+    for hash in required {
+        let name = hash.to_hex();
+        let source = cache_dir.join(&name);
+        let metadata = fs::symlink_metadata(&source).map_err(|error| {
+            anyhow::anyhow!(
+                "inspect required blob-cache entry {}: {error}",
+                source.display()
+            )
+        })?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             anyhow::bail!("canonical blob-cache entry {name} is not a regular file");
         }
-        let actual = BlobHash(hash_file(&entry.path())?);
+        let actual = BlobHash(hash_file(&source)?);
         if actual != hash {
             anyhow::bail!("corrupt blob cache entry {name}: computed {actual}");
         }
@@ -327,13 +522,7 @@ fn copy_cache_into_archive(
         // deliberately not a hard link: later corruption of the live cache
         // must not mutate the archived inode too. Unsupported/cross-filesystem
         // destinations transparently fall back to a byte copy.
-        copy_one_file(
-            &entry.path(),
-            archive_root,
-            &format!("blobs/{name}"),
-            files,
-            true,
-        )?;
+        copy_one_file(&source, archive_root, &format!("blobs/{name}"), files, true)?;
     }
     Ok(())
 }
@@ -345,23 +534,40 @@ fn copy_one_file(
     files: &mut Vec<BackupFile>,
     allow_reflink: bool,
 ) -> anyhow::Result<()> {
+    let mut source_file = open_regular_file_nofollow(source)?;
+    let source_metadata = source_file.metadata()?;
     let destination = wire_to_path(archive_root, wire)?;
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| anyhow::anyhow!("create {}: {error}", parent.display()))?;
     }
-    let cloned = allow_reflink && try_reflink(source, &destination)?;
+    let cloned = allow_reflink && try_reflink(&source_file, &destination)?;
     if !cloned {
-        fs::copy(source, &destination).map_err(|error| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        }
+        let mut destination_file = options.open(&destination).map_err(|error| {
+            anyhow::anyhow!(
+                "create archive file {} from {}: {error}",
+                destination.display(),
+                source.display(),
+            )
+        })?;
+        std::io::copy(&mut source_file, &mut destination_file).map_err(|error| {
             anyhow::anyhow!(
                 "copy {} -> {}: {error}",
                 source.display(),
                 destination.display(),
             )
         })?;
+        destination_file.sync_all()?;
     }
     let metadata = fs::metadata(&destination)?;
-    let mode = file_mode(source)?;
+    let mode = file_mode(&source_metadata);
     set_file_mode(&destination, mode)?;
     fs::File::open(&destination)?.sync_all()?;
     files.push(BackupFile {
@@ -374,14 +580,13 @@ fn copy_one_file(
 }
 
 #[cfg(target_os = "linux")]
-fn try_reflink(source: &Path, destination: &Path) -> anyhow::Result<bool> {
+fn try_reflink(source: &fs::File, destination: &Path) -> anyhow::Result<bool> {
     use std::os::fd::AsRawFd;
 
     // Linux FICLONE creates a distinct copy-on-write inode. Failure is an
     // expected capability/filesystem result, not a backup error; remove the
     // empty target and let the caller perform a conventional copy.
     const FICLONE: libc::c_ulong = 0x4004_9409;
-    let source = fs::File::open(source)?;
     let destination_file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -398,8 +603,149 @@ fn try_reflink(source: &Path, destination: &Path) -> anyhow::Result<bool> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn try_reflink(_source: &Path, _destination: &Path) -> anyhow::Result<bool> {
+fn try_reflink(_source: &fs::File, _destination: &Path) -> anyhow::Result<bool> {
     Ok(false)
+}
+
+fn read_recovery_node_key(path: &Path) -> anyhow::Result<RecoveryNodeKey> {
+    let named = fs::symlink_metadata(path).map_err(|error| {
+        anyhow::anyhow!("inspect external node key {}: {error}", path.display())
+    })?;
+    if named.file_type().is_symlink()
+        || !named.is_file()
+        || named.len() == 0
+        || named.len() > MAX_NODE_KEY_BYTES
+    {
+        anyhow::bail!(
+            "external node key must be a bounded real regular file: {}",
+            path.display(),
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if named.permissions().mode() & 0o077 != 0 {
+            anyhow::bail!(
+                "external node key must not be readable or writable by group/other: {}",
+                path.display(),
+            );
+        }
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| anyhow::anyhow!("open external node key {}: {error}", path.display()))?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.len() != named.len() {
+        anyhow::bail!(
+            "external node key changed while opening: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if opened.permissions().mode() & 0o077 != 0 {
+            anyhow::bail!(
+                "external node key permissions changed while opening: {}",
+                path.display(),
+            );
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_NODE_KEY_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != named.len() || bytes.len() as u64 > MAX_NODE_KEY_BYTES {
+        anyhow::bail!(
+            "external node key changed while reading: {}",
+            path.display()
+        );
+    }
+    let keypair = libp2p::identity::Keypair::from_protobuf_encoding(&bytes)
+        .map_err(|error| anyhow::anyhow!("decode external node key {}: {error}", path.display()))?;
+    if keypair.key_type() != libp2p::identity::KeyType::Ed25519 {
+        anyhow::bail!("external node key must be Ed25519: {}", path.display());
+    }
+    let canonical = keypair
+        .to_protobuf_encoding()
+        .map_err(|error| anyhow::anyhow!("canonicalize external node key: {error}"))?;
+    if canonical != bytes {
+        anyhow::bail!("external node key is not canonical: {}", path.display());
+    }
+    let public_key = keypair
+        .public()
+        .try_into_ed25519()
+        .map_err(|_| anyhow::anyhow!("external node key is not Ed25519"))?
+        .to_bytes();
+    Ok(RecoveryNodeKey {
+        bytes,
+        peer_id: libp2p::PeerId::from(keypair.public()).to_string(),
+        public_key: hex::encode(public_key),
+    })
+}
+
+fn validate_manifest_recovery_metadata(metadata: &BackupRecoveryMetadata) -> anyhow::Result<()> {
+    let peer = metadata
+        .node_peer_id
+        .parse::<libp2p::PeerId>()
+        .map_err(|error| {
+            anyhow::anyhow!("backup manifest contains invalid node PeerId: {error}")
+        })?;
+    if peer.to_string() != metadata.node_peer_id {
+        anyhow::bail!("backup manifest node PeerId is not canonical");
+    }
+    if !is_lower_hex(&metadata.node_public_key, 64)
+        || metadata.node_public_key.bytes().all(|byte| byte == b'0')
+    {
+        anyhow::bail!("backup manifest node public key is not canonical Ed25519 hexadecimal");
+    }
+    Ok(())
+}
+
+fn require_manifest_node_identity(
+    manifest: &BackupManifest,
+    key: &RecoveryNodeKey,
+) -> anyhow::Result<()> {
+    validate_manifest_recovery_metadata(&manifest.recovery)?;
+    if manifest.recovery.node_peer_id != key.peer_id
+        || manifest.recovery.node_public_key != key.public_key
+    {
+        anyhow::bail!(
+            "external node key does not match backup recovery identity {}",
+            manifest.recovery.node_peer_id,
+        );
+    }
+    Ok(())
+}
+
+fn write_staged_node_key(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| anyhow::anyhow!("stage external node key {}: {error}", path.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if file.metadata()?.permissions().mode() & 0o777 != 0o600 {
+            anyhow::bail!("staged node key permissions are not owner-only");
+        }
+    }
+    Ok(())
 }
 
 fn verify_archive(archive: &Path) -> anyhow::Result<BackupManifest> {
@@ -424,6 +770,7 @@ fn verify_archive(archive: &Path) -> anyhow::Result<BackupManifest> {
     if manifest.format != ARCHIVE_FORMAT {
         anyhow::bail!("unsupported backup format {}", manifest.format);
     }
+    validate_manifest_recovery_metadata(&manifest.recovery)?;
     if manifest.files.len() > MAX_ARCHIVE_FILES {
         anyhow::bail!("backup manifest contains too many files");
     }
@@ -431,11 +778,18 @@ fn verify_archive(archive: &Path) -> anyhow::Result<BackupManifest> {
         .space
         .id_bytes()
         .ok_or_else(|| anyhow::anyhow!("backup manifest contains an invalid space id"))?;
+    if !manifest.space.data_dir.is_empty() {
+        anyhow::bail!("backup manifest contains a node-local source data directory");
+    }
+    if !manifest.space.pending_recipe.is_empty() {
+        anyhow::bail!("backup manifest contains an external pending recipe reference");
+    }
     let registry_hash = BlobHash::from_hex(&manifest.space.registry_hash)
         .map_err(|_| anyhow::anyhow!("backup manifest contains an invalid registry blob hash"))?;
     if registry_hash.to_hex() != manifest.space.registry_hash {
         anyhow::bail!("backup manifest registry blob hash is not canonical lowercase hex");
     }
+    let registry_blob = format!("blobs/{}", manifest.space.registry_hash);
     let mut previous: Option<&str> = None;
     let mut expected = BTreeSet::new();
     for file in &manifest.files {
@@ -447,6 +801,18 @@ fn verify_archive(archive: &Path) -> anyhow::Result<BackupManifest> {
         }
         previous = Some(&file.path);
         let path = wire_to_path(archive, &file.path)?;
+        if let Some(relative) = file.path.strip_prefix("data/") {
+            validate_archived_data_file(Path::new(relative))?;
+        } else if file.path.starts_with("blobs/") {
+            if file.path != registry_blob {
+                anyhow::bail!(
+                    "registry-only backup contains an unrelated blob: {}",
+                    file.path,
+                );
+            }
+        } else {
+            anyhow::bail!("backup entry has no supported root: {}", file.path);
+        }
         let metadata = fs::symlink_metadata(&path)
             .map_err(|error| anyhow::anyhow!("inspect {}: {error}", path.display()))?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -468,8 +834,7 @@ fn verify_archive(archive: &Path) -> anyhow::Result<BackupManifest> {
         anyhow::bail!("backup contains files absent from its integrity manifest");
     }
     let registry_db = registry_db_wire();
-    let registry_blob = format!("blobs/{}", manifest.space.registry_hash);
-    for required in [NODE_KEY_WIRE, registry_db.as_str(), registry_blob.as_str()] {
+    for required in [registry_db.as_str(), registry_blob.as_str()] {
         if !expected.contains(required) {
             anyhow::bail!("backup is structurally incomplete: missing {required}");
         }
@@ -544,6 +909,7 @@ fn collect_wire_files(root: &Path, prefix: &str, files: &mut Vec<String>) -> any
 
 fn restore_archive(
     archive: &Path,
+    node_key_path: &Path,
     destination: &Path,
     cache_dir: &Path,
     index_path: &Path,
@@ -553,6 +919,12 @@ fn restore_archive(
 ) -> anyhow::Result<Option<PathBuf>> {
     let destination = spaces_index::normalize_data_directory(destination)?;
     let manifest = verify_archive(archive)?;
+    // Re-read after the command-level preflight. The retained bytes below are
+    // the only bytes installed, closing a change-between-check-and-copy race.
+    // This authentication precedes the destination, blob cache, and spaces
+    // index mutations performed below.
+    let node_key = read_recovery_node_key(node_key_path)?;
+    require_manifest_node_identity(&manifest, &node_key)?;
     if let Some(expected) = expected_manifest
         && hash_file(&archive.join(MANIFEST_FILE))? != expected
     {
@@ -592,6 +964,7 @@ fn restore_archive(
         .map_err(|error| anyhow::anyhow!("create {}: {error}", stage.display()))?;
     set_directory_private(&stage)?;
     let mut partial = PartialDirectory::new(stage.clone());
+    write_staged_node_key(&stage.join(NODE_KEY_FILE), &node_key.bytes)?;
 
     for file in &manifest.files {
         let source = wire_to_path(archive, &file.path)?;
@@ -792,7 +1165,7 @@ fn reject_restore_overlap(archive: &Path, destination: &Path) -> anyhow::Result<
 }
 
 fn hash_file(path: &Path) -> anyhow::Result<[u8; 32]> {
-    let mut file = fs::File::open(path)?;
+    let mut file = open_regular_file_nofollow(path)?;
     let mut state = blake2b_simd::Params::new().hash_length(32).to_state();
     let mut buffer = [0u8; 64 * 1024];
     loop {
@@ -807,6 +1180,36 @@ fn hash_file(path: &Path) -> anyhow::Result<[u8; 32]> {
         .as_bytes()
         .try_into()
         .expect("32-byte digest"))
+}
+
+fn open_regular_file_nofollow(path: &Path) -> anyhow::Result<fs::File> {
+    let named = fs::symlink_metadata(path)
+        .map_err(|error| anyhow::anyhow!("inspect regular file {}: {error}", path.display()))?;
+    if named.file_type().is_symlink() || !named.is_file() {
+        anyhow::bail!("path is not a real regular file: {}", path.display());
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| anyhow::anyhow!("open regular file {}: {error}", path.display()))?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.len() != named.len() {
+        anyhow::bail!("regular file changed while opening: {}", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if opened.dev() != named.dev() || opened.ino() != named.ino() {
+            anyhow::bail!("regular file changed while opening: {}", path.display());
+        }
+    }
+    Ok(file)
 }
 
 fn sync_tree_directories(root: &Path) -> anyhow::Result<()> {
@@ -900,14 +1303,14 @@ fn wire_to_path(root: &Path, wire: &str) -> anyhow::Result<PathBuf> {
 }
 
 #[cfg(unix)]
-fn file_mode(path: &Path) -> anyhow::Result<Option<u32>> {
+fn file_mode(metadata: &fs::Metadata) -> Option<u32> {
     use std::os::unix::fs::PermissionsExt;
-    Ok(Some(fs::metadata(path)?.permissions().mode() & 0o7777))
+    Some(metadata.permissions().mode() & 0o7777)
 }
 
 #[cfg(not(unix))]
-fn file_mode(_path: &Path) -> anyhow::Result<Option<u32>> {
-    Ok(None)
+fn file_mode(_metadata: &fs::Metadata) -> Option<u32> {
+    None
 }
 
 #[cfg(unix)]
@@ -965,14 +1368,68 @@ mod tests {
         }
     }
 
+    fn archive_contains_bytes(root: &Path, needle: &[u8]) -> bool {
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                pending.extend(
+                    fs::read_dir(path)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path()),
+                );
+            } else {
+                let bytes = fs::read(path).unwrap();
+                if !needle.is_empty() && bytes.windows(needle.len()).any(|window| window == needle)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn write_node_key(path: &Path, seed: u8) -> Vec<u8> {
+        let key = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
+        let bytes = key.to_protobuf_encoding().unwrap();
+        fs::write(path, &bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        bytes
+    }
+
+    fn collect_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
+        if !root.exists() {
+            return Vec::new();
+        }
+        let mut pending = vec![(PathBuf::new(), root.to_path_buf())];
+        let mut files = Vec::new();
+        while let Some((relative, path)) = pending.pop() {
+            if path.is_dir() {
+                for entry in fs::read_dir(path).unwrap() {
+                    let entry = entry.unwrap();
+                    pending.push((relative.join(entry.file_name()), entry.path()));
+                }
+            } else {
+                files.push((
+                    relative.to_string_lossy().into_owned(),
+                    fs::read(path).unwrap(),
+                ));
+            }
+        }
+        files.sort();
+        files
+    }
+
     fn fixture(root: &Path) -> (SpaceEntry, PathBuf, PathBuf) {
         let data = root.join("source");
         let cache = root.join("cache");
         fs::create_dir_all(data.join("agents")).unwrap();
-        fs::create_dir_all(data.join("services/root.image.proofs")).unwrap();
-        fs::create_dir_all(data.join("services/root.image.records")).unwrap();
+        fs::create_dir_all(data.join("services")).unwrap();
         fs::create_dir_all(&cache).unwrap();
-        fs::write(data.join("node.key"), b"secret-node-key").unwrap();
+        write_node_key(&data.join(NODE_KEY_FILE), 0x51);
         fs::write(
             data.join(
                 registry_db_wire()
@@ -982,18 +1439,8 @@ mod tests {
             b"registry-redb",
         )
         .unwrap();
-        fs::write(data.join("services/root.image"), b"committed-service-image").unwrap();
-        fs::write(
-            data.join("services/root.image.proofs/proof"),
-            b"proof-side-cas",
-        )
-        .unwrap();
-        fs::write(
-            data.join("services/root.image.records/record"),
-            b"producer-private-record",
-        )
-        .unwrap();
-        fs::write(data.join(".endpoint"), b"ephemeral").unwrap();
+        fs::write(data.join(ENDPOINT_FILE), b"ephemeral").unwrap();
+        fs::write(data.join("local.toml"), b"subscriptions = []\n").unwrap();
         let blob = b"signed-package";
         let hash = BlobHash::of(blob);
         fs::write(cache.join(hash.to_hex()), blob).unwrap();
@@ -1011,36 +1458,42 @@ mod tests {
     }
 
     #[test]
-    fn archive_roundtrip_covers_private_side_stores_and_cache() {
+    fn archive_roundtrip_requires_external_exact_node_key_and_leaks_no_secret() {
         let temp = TempDir::new("roundtrip");
-        let (entry, _data, cache) = fixture(&temp.0);
+        let (entry, data, cache) = fixture(&temp.0);
+        let node_key_path = data.join(NODE_KEY_FILE);
+        let node_key = fs::read(&node_key_path).unwrap();
+        let unrelated_cache_secret = b"UNRELATED-CACHE-SECRET-SENTINEL";
+        let unrelated_hash = BlobHash::of(unrelated_cache_secret);
+        fs::write(cache.join(unrelated_hash.to_hex()), unrelated_cache_secret).unwrap();
         let archive = temp.0.join("backup");
         create_archive(&entry, &archive, &cache).unwrap();
         let manifest = verify_archive(&archive).unwrap();
         assert!(
-            manifest
+            !manifest
                 .files
                 .iter()
-                .any(|file| file.path.ends_with("root.image.proofs/proof"))
+                .any(|file| file.path == "data/.endpoint" || file.path == "data/node.key")
         );
-        assert!(
-            manifest
-                .files
-                .iter()
-                .any(|file| file.path.ends_with("root.image.records/record"))
-        );
+        assert!(!archive_contains_bytes(&archive, &node_key));
+        assert!(!archive_contains_bytes(&archive, unrelated_cache_secret));
         assert!(
             !manifest
                 .files
                 .iter()
-                .any(|file| file.path == "data/.endpoint")
+                .any(|file| file.path == format!("blobs/{unrelated_hash}"))
         );
+        let expected_key = read_recovery_node_key(&node_key_path).unwrap();
+        assert_eq!(manifest.recovery.node_peer_id, expected_key.peer_id);
+        assert_eq!(manifest.recovery.node_public_key, expected_key.public_key);
+        assert!(manifest.space.data_dir.is_empty());
 
         let destination = temp.0.join("restored");
         let restored_cache = temp.0.join("restored-cache");
         let index = temp.0.join("spaces.toml");
         restore_archive(
             &archive,
+            &node_key_path,
             &destination,
             &restored_cache,
             &index,
@@ -1049,33 +1502,381 @@ mod tests {
             Some("restored-name"),
         )
         .unwrap();
-        assert_eq!(
-            fs::read(destination.join("node.key")).unwrap(),
-            b"secret-node-key"
-        );
-        assert_eq!(
-            fs::read(destination.join("services/root.image.records/record")).unwrap(),
-            b"producer-private-record",
-        );
+        assert_eq!(fs::read(destination.join(NODE_KEY_FILE)).unwrap(), node_key);
+        let reopened = read_recovery_node_key(&destination.join(NODE_KEY_FILE)).unwrap();
+        assert_eq!(reopened.peer_id, manifest.recovery.node_peer_id);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(destination.join(NODE_KEY_FILE))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+            );
+        }
         let restored_index = spaces_index::load_from(&index).unwrap();
         assert_eq!(restored_index.spaces[0].name, "restored-name");
         assert_eq!(
             restored_index.spaces[0].data_dir,
             destination.to_string_lossy()
         );
-        assert_eq!(fs::read_dir(restored_cache).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&restored_cache).unwrap().count(), 1);
+
+        // An exact retry revalidates the external identity and rebuilds the
+        // same portable bytes. Replacement remains recoverable by rename.
+        let first_restore = collect_tree(&destination);
+        let replaced = restore_archive(
+            &archive,
+            &node_key_path,
+            &destination,
+            &restored_cache,
+            &index,
+            None,
+            true,
+            Some("restored-name"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(collect_tree(&destination), first_restore);
+        assert_eq!(collect_tree(&replaced), first_restore);
     }
 
     #[test]
-    fn restore_rejects_tampering_before_touching_destination() {
+    fn backup_refuses_plaintext_private_residue_and_legacy_service_images() {
+        let service = hex::encode([0x61; 32]);
+        let private_cases = [
+            format!(
+                "services/{service}.image.private-inputs/{}.private",
+                "71".repeat(32)
+            ),
+            format!("services/{service}.image.records/{}", "72".repeat(64)),
+            format!(
+                "trash/services/{service}.image.private-inputs/{}.private",
+                "73".repeat(32)
+            ),
+            format!("trash/services/{service}.image.records/{}", "74".repeat(64)),
+        ];
+        for (index, relative) in private_cases.iter().enumerate() {
+            let temp = TempDir::new(&format!("private-residue-{index}"));
+            let (entry, data, cache) = fixture(&temp.0);
+            let path = data.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"PRIVATE-PLAINTEXT-SENTINEL").unwrap();
+            let archive = temp.0.join("backup");
+            let error = create_archive(&entry, &archive, &cache).unwrap_err();
+            assert!(
+                error.to_string().contains("live plaintext Private state"),
+                "{relative}: {error:#}",
+            );
+            assert!(!archive.exists());
+        }
+
+        for suffix in [".image", ".image.next", ".raft.redb"] {
+            let temp = TempDir::new(&format!("legacy-service-{suffix}"));
+            let (entry, data, cache) = fixture(&temp.0);
+            fs::write(
+                data.join("services").join(format!("{service}{suffix}")),
+                b"PRIVATE-PLAINTEXT-SENTINEL",
+            )
+            .unwrap();
+            let archive = temp.0.join("backup");
+            let error = create_archive(&entry, &archive, &cache).unwrap_err();
+            assert!(error.to_string().contains("allowlist-only"), "{error:#}");
+            assert!(!archive.exists());
+        }
+    }
+
+    #[test]
+    fn local_policy_and_harmless_trash_are_omitted_but_secret_aliases_fail() {
+        let temp = TempDir::new("local-omission");
+        let (entry, data, cache) = fixture(&temp.0);
+        let local_sentinel = b"LOCAL-POLICY-SENTINEL";
+        let trash_sentinel = b"TRASH-PLAINTEXT-SENTINEL";
+        fs::write(data.join("local.toml"), local_sentinel).unwrap();
+        fs::create_dir_all(data.join("trash/deep/retired")).unwrap();
+        fs::write(data.join("trash/deep/retired/state"), trash_sentinel).unwrap();
+        let archive = temp.0.join("backup");
+        create_archive(&entry, &archive, &cache).unwrap();
+        let manifest = verify_archive(&archive).unwrap();
+        assert!(!manifest.files.iter().any(|file| {
+            file.path == "data/local.toml" || file.path.starts_with("data/trash/")
+        }));
+        assert!(!archive_contains_bytes(&archive, local_sentinel));
+        assert!(!archive_contains_bytes(&archive, trash_sentinel));
+
+        let service = hex::encode([0x62; 32]);
+        for (index, relative) in [
+            PENDING_INVITE_FILE.to_owned(),
+            format!("services/{service}.device-seed"),
+            "services/private/ssh/space-shell/host_ed25519".to_owned(),
+            "trash/deep/node.key".to_owned(),
+            "trash/deep/owner.key".to_owned(),
+            "trash/deep/recovery_seed".to_owned(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let temp = TempDir::new(&format!("secret-alias-{index}"));
+            let (entry, data, cache) = fixture(&temp.0);
+            let path = data.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"SECRET-SENTINEL").unwrap();
+            let archive = temp.0.join("backup");
+            let error = create_archive(&entry, &archive, &cache).unwrap_err();
+            assert!(error.to_string().contains("node-local secret"), "{error:#}");
+            assert!(!archive.exists());
+        }
+    }
+
+    #[test]
+    fn wrong_or_missing_external_node_key_is_side_effect_free() {
+        let temp = TempDir::new("wrong-node-key");
+        let (entry, data, cache) = fixture(&temp.0);
+        let archive = temp.0.join("backup");
+        create_archive(&entry, &archive, &cache).unwrap();
+        let wrong_key = temp.0.join("wrong.key.material");
+        write_node_key(&wrong_key, 0x52);
+
+        let destination = temp.0.join("destination");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("keep"), b"exact-old-state").unwrap();
+        let before = collect_tree(&destination);
+        let restored_cache = temp.0.join("restored-cache");
+        let index = temp.0.join("spaces.toml");
+        let error = restore_archive(
+            &archive,
+            &wrong_key,
+            &destination,
+            &restored_cache,
+            &index,
+            None,
+            true,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not match"), "{error:#}");
+        assert_eq!(collect_tree(&destination), before);
+        assert!(!restored_cache.exists());
+        assert!(!index.exists());
+
+        let missing = temp.0.join("missing-node.key");
+        let error = restore_archive(
+            &archive,
+            &missing,
+            &destination,
+            &restored_cache,
+            &index,
+            None,
+            true,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("external node key"), "{error:#}");
+        assert_eq!(collect_tree(&destination), before);
+        assert!(!restored_cache.exists());
+        assert!(!index.exists());
+
+        // The correct external key remains usable after both failed attempts.
+        restore_archive(
+            &archive,
+            &data.join(NODE_KEY_FILE),
+            &destination,
+            &restored_cache,
+            &index,
+            None,
+            true,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn insecure_node_key_permissions_fail_before_archive_or_restore_mutation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let source = TempDir::new("insecure-source-key");
+        let (source_entry, source_data, source_cache) = fixture(&source.0);
+        fs::set_permissions(
+            source_data.join(NODE_KEY_FILE),
+            fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        let refused_archive = source.0.join("refused-backup");
+        let error = create_archive(&source_entry, &refused_archive, &source_cache).unwrap_err();
+        assert!(error.to_string().contains("group/other"), "{error:#}");
+        assert!(!refused_archive.exists());
+
+        let restore = TempDir::new("insecure-restore-key");
+        let (entry, data, cache) = fixture(&restore.0);
+        let archive = restore.0.join("backup");
+        create_archive(&entry, &archive, &cache).unwrap();
+        let key = data.join(NODE_KEY_FILE);
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o604)).unwrap();
+        let destination = restore.0.join("destination");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("keep"), b"exact-old-state").unwrap();
+        let before = collect_tree(&destination);
+        let restored_cache = restore.0.join("restored-cache");
+        let index = restore.0.join("spaces.toml");
+        let error = restore_archive(
+            &archive,
+            &key,
+            &destination,
+            &restored_cache,
+            &index,
+            None,
+            true,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("group/other"), "{error:#}");
+        assert_eq!(collect_tree(&destination), before);
+        assert!(!restored_cache.exists());
+        assert!(!index.exists());
+    }
+
+    #[test]
+    fn manifest_identity_substitution_and_legacy_format_fail_closed() {
+        let temp = TempDir::new("identity-substitution");
+        let (entry, data, cache) = fixture(&temp.0);
+        let archive = temp.0.join("backup");
+        create_archive(&entry, &archive, &cache).unwrap();
+        let original_manifest = fs::read(archive.join(MANIFEST_FILE)).unwrap();
+
+        let mut manifest = verify_archive(&archive).unwrap();
+        let wrong_path = temp.0.join("wrong-node-key");
+        write_node_key(&wrong_path, 0x53);
+        let wrong = read_recovery_node_key(&wrong_path).unwrap();
+        manifest.recovery.node_peer_id = wrong.peer_id;
+        manifest.recovery.node_public_key = wrong.public_key;
+        fs::write(
+            archive.join(MANIFEST_FILE),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let destination = temp.0.join("destination");
+        let restored_cache = temp.0.join("restored-cache");
+        let index = temp.0.join("spaces.toml");
+        let error = restore_archive(
+            &archive,
+            &data.join(NODE_KEY_FILE),
+            &destination,
+            &restored_cache,
+            &index,
+            None,
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not match"), "{error:#}");
+        assert!(!destination.exists());
+        assert!(!restored_cache.exists());
+        assert!(!index.exists());
+
+        fs::write(archive.join(MANIFEST_FILE), &original_manifest).unwrap();
+        let mut manifest = verify_archive(&archive).unwrap();
+        manifest.format = "VOS-BACKUP".into();
+        fs::write(
+            archive.join(MANIFEST_FILE),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let error = verify_archive(&archive).unwrap_err();
+        assert!(error.to_string().contains("unsupported backup format"));
+    }
+
+    #[test]
+    fn fully_manifested_service_state_and_unrelated_blobs_are_rejected() {
+        for (index, wire) in [
+            "data/node.key".to_owned(),
+            "data/local.toml".to_owned(),
+            "data/trash/retired/state".to_owned(),
+            format!("data/services/{}.image", "81".repeat(32)),
+            format!("blobs/{}", BlobHash::of(b"unrelated-secret-blob")),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let temp = TempDir::new(&format!("manifested-forbidden-{index}"));
+            let (entry, _data, cache) = fixture(&temp.0);
+            let archive = temp.0.join("backup");
+            create_archive(&entry, &archive, &cache).unwrap();
+            let source = temp.0.join("forbidden-source");
+            fs::write(&source, b"PRIVATE-PLAINTEXT-SENTINEL").unwrap();
+            let mut manifest = verify_archive(&archive).unwrap();
+            copy_one_file(&source, &archive, wire, &mut manifest.files, false).unwrap();
+            manifest
+                .files
+                .sort_by(|left, right| left.path.cmp(&right.path));
+            fs::write(
+                archive.join(MANIFEST_FILE),
+                serde_json::to_vec_pretty(&manifest).unwrap(),
+            )
+            .unwrap();
+            let error = verify_archive(&archive).unwrap_err();
+            assert!(
+                error.to_string().contains("forbidden or unclassified")
+                    || error.to_string().contains("unrelated blob"),
+                "{wire}: {error:#}",
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_external_node_keys_fail_before_archive_or_restore_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new("node-key-symlink");
+        let (entry, data, cache) = fixture(&temp.0);
+        let real = data.join(NODE_KEY_FILE);
+        let alias = temp.0.join("node-key-alias");
+        symlink(&real, &alias).unwrap();
+
+        let archive = temp.0.join("backup");
+        create_archive(&entry, &archive, &cache).unwrap();
+        let destination = temp.0.join("destination");
+        let restored_cache = temp.0.join("restored-cache");
+        let index = temp.0.join("spaces.toml");
+        let error = restore_archive(
+            &archive,
+            &alias,
+            &destination,
+            &restored_cache,
+            &index,
+            None,
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("bounded real regular file"));
+        assert!(!destination.exists());
+        assert!(!restored_cache.exists());
+        assert!(!index.exists());
+
+        fs::remove_file(&real).unwrap();
+        symlink(&alias, &real).unwrap();
+        let second_archive = temp.0.join("backup-from-alias");
+        let error = create_archive(&entry, &second_archive, &cache).unwrap_err();
+        assert!(error.to_string().contains("bounded real regular file"));
+        assert!(!second_archive.exists());
+    }
+
+    #[test]
+    fn restore_rejects_forbidden_archived_node_key_before_touching_destination() {
         let temp = TempDir::new("tamper");
-        let (entry, _data, cache) = fixture(&temp.0);
+        let (entry, data, cache) = fixture(&temp.0);
         let archive = temp.0.join("backup");
         create_archive(&entry, &archive, &cache).unwrap();
         fs::write(archive.join("data/node.key"), b"tampered").unwrap();
         let destination = temp.0.join("restored");
         let error = restore_archive(
             &archive,
+            &data.join(NODE_KEY_FILE),
             &destination,
             &temp.0.join("restored-cache"),
             &temp.0.join("spaces.toml"),
@@ -1084,7 +1885,11 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("integrity mismatch"));
+        assert!(
+            error
+                .to_string()
+                .contains("absent from its integrity manifest")
+        );
         assert!(!destination.exists());
     }
 
@@ -1109,7 +1914,7 @@ mod tests {
     #[test]
     fn restore_rejects_traversal_and_preserves_replaced_state() {
         let temp = TempDir::new("replace");
-        let (entry, _data, cache) = fixture(&temp.0);
+        let (entry, data, cache) = fixture(&temp.0);
         let archive = temp.0.join("backup");
         create_archive(&entry, &archive, &cache).unwrap();
         let mut manifest = verify_archive(&archive).unwrap();
@@ -1130,6 +1935,7 @@ mod tests {
         fs::write(destination.join("old"), b"recover me").unwrap();
         let replaced = restore_archive(
             &archive,
+            &data.join(NODE_KEY_FILE),
             &destination,
             &temp.0.join("restored-cache"),
             &temp.0.join("spaces.toml"),
@@ -1141,15 +1947,15 @@ mod tests {
         .unwrap();
         assert_eq!(fs::read(replaced.join("old")).unwrap(), b"recover me");
         assert_eq!(
-            fs::read(destination.join("node.key")).unwrap(),
-            b"secret-node-key"
+            fs::read(destination.join(NODE_KEY_FILE)).unwrap(),
+            fs::read(data.join(NODE_KEY_FILE)).unwrap(),
         );
     }
 
     #[test]
     fn restore_refuses_a_directory_owned_by_another_indexed_space() {
         let temp = TempDir::new("owned-destination");
-        let (entry, _data, cache) = fixture(&temp.0);
+        let (entry, data, cache) = fixture(&temp.0);
         let archive = temp.0.join("backup");
         create_archive(&entry, &archive, &cache).unwrap();
 
@@ -1177,6 +1983,7 @@ mod tests {
 
         let error = restore_archive(
             &archive,
+            &data.join(NODE_KEY_FILE),
             &destination,
             &temp.0.join("restored-cache"),
             &index_path,
@@ -1195,7 +2002,7 @@ mod tests {
     #[test]
     fn restore_refuses_ancestor_and_descendant_of_an_indexed_data_directory() {
         let temp = TempDir::new("nested-destination");
-        let (entry, _data, cache) = fixture(&temp.0);
+        let (entry, data, cache) = fixture(&temp.0);
         let archive = temp.0.join("backup");
         create_archive(&entry, &archive, &cache).unwrap();
 
@@ -1225,6 +2032,7 @@ mod tests {
         for destination in [owned.join("nested-a"), owned_parent.clone()] {
             let error = restore_archive(
                 &archive,
+                &data.join(NODE_KEY_FILE),
                 &destination,
                 &temp.0.join("restored-cache"),
                 &index_path,
@@ -1241,8 +2049,8 @@ mod tests {
     #[test]
     fn concurrent_restores_preserve_both_index_entries() {
         let temp = TempDir::new("concurrent-index");
-        let (first, _first_data, first_cache) = fixture(&temp.0.join("first"));
-        let (mut second, _second_data, second_cache) = fixture(&temp.0.join("second"));
+        let (first, first_data, first_cache) = fixture(&temp.0.join("first"));
+        let (mut second, second_data, second_cache) = fixture(&temp.0.join("second"));
         second.id = hex::encode([0x74; 32]);
         second.name = "second-backup".into();
         let first_archive = temp.0.join("first-backup");
@@ -1260,6 +2068,7 @@ mod tests {
         let first_join = std::thread::spawn(move || {
             restore_archive(
                 &first_archive,
+                &first_data.join(NODE_KEY_FILE),
                 &first_destination,
                 &first_cache,
                 &first_index,
@@ -1271,6 +2080,7 @@ mod tests {
         let second_join = std::thread::spawn(move || {
             restore_archive(
                 &second_archive,
+                &second_data.join(NODE_KEY_FILE),
                 &second_destination,
                 &second_cache,
                 &second_index,
@@ -1291,7 +2101,9 @@ mod tests {
     #[test]
     fn structurally_incomplete_archive_is_rejected() {
         let temp = TempDir::new("incomplete");
-        let (entry, _data, _cache) = fixture(&temp.0);
+        let (mut entry, data, _cache) = fixture(&temp.0);
+        entry.data_dir.clear();
+        let key = read_recovery_node_key(&data.join(NODE_KEY_FILE)).unwrap();
         let archive = temp.0.join("backup");
         fs::create_dir_all(archive.join("data")).unwrap();
         fs::create_dir_all(archive.join("blobs")).unwrap();
@@ -1300,6 +2112,10 @@ mod tests {
             serde_json::to_vec_pretty(&BackupManifest {
                 format: ARCHIVE_FORMAT.into(),
                 space: entry,
+                recovery: BackupRecoveryMetadata {
+                    node_peer_id: key.peer_id,
+                    node_public_key: key.public_key,
+                },
                 files: Vec::new(),
             })
             .unwrap(),
@@ -1307,6 +2123,23 @@ mod tests {
         .unwrap();
         let error = verify_archive(&archive).unwrap_err();
         assert!(error.to_string().contains("structurally incomplete"));
+    }
+
+    #[test]
+    fn hostile_manifest_cannot_restore_an_external_pending_recipe() {
+        let temp = TempDir::new("pending-recipe");
+        let (entry, _data, cache) = fixture(&temp.0);
+        let archive = temp.0.join("backup");
+        create_archive(&entry, &archive, &cache).unwrap();
+        let mut manifest = verify_archive(&archive).unwrap();
+        manifest.space.pending_recipe = "/outside/operator-secret.toml".into();
+        fs::write(
+            archive.join(MANIFEST_FILE),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let error = verify_archive(&archive).unwrap_err();
+        assert!(error.to_string().contains("external pending recipe"));
     }
 
     #[cfg(unix)]

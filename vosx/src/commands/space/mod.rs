@@ -206,10 +206,11 @@ pub enum SpaceCommand {
         #[arg(long, default_value_t = 5)]
         grace: u64,
     },
-    /// Create a verified, self-contained offline backup of one space.
-    /// The daemon must be stopped; active state, private side stores, node
-    /// identity, local policy, and the content-addressed program cache are
-    /// copied under one integrity manifest.
+    /// Create a verified offline backup of one space.
+    /// The current clean-break format is registry-only and refuses live
+    /// Agent/service generations until their authenticated portable exporters
+    /// exist. Node secret material is never archived and must be retained
+    /// separately.
     Backup {
         /// Space id or name from the local spaces index.
         space: String,
@@ -221,6 +222,10 @@ pub enum SpaceCommand {
     Restore {
         /// Backup directory containing `manifest.json`.
         backup: PathBuf,
+        /// Separately retained per-space node key. Its canonical PeerId must
+        /// exactly match the public recovery identity in the manifest.
+        #[arg(long, value_name = "FILE", required = true)]
+        node_key: PathBuf,
         /// Destination data directory. Defaults to the normal XDG path for
         /// the archived space id, not the source machine's absolute path.
         #[arg(long, value_name = "DIR")]
@@ -454,10 +459,17 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
         SpaceCommand::Backup { space, output } => backup::run_backup(&space, &output),
         SpaceCommand::Restore {
             backup: archive,
+            node_key,
             data_dir,
             replace,
             name,
-        } => backup::run_restore(&archive, data_dir.as_deref(), replace, name.as_deref()),
+        } => backup::run_restore(
+            &archive,
+            &node_key,
+            data_dir.as_deref(),
+            replace,
+            name.as_deref(),
+        ),
         SpaceCommand::Export { space } => export::run(export::Args { query: space }),
         SpaceCommand::Apply {
             space,
