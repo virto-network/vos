@@ -8,7 +8,7 @@
 //! separately signed exact durable-application acknowledgements are observed;
 //! general-operation approvals remain exact-retryable until a signed `AOI1`
 //! issuance acknowledgement advances their contiguous retirement floor. A
-//! distinct signed `PCA1` acknowledgement is required before Private control
+//! distinct signed `PCA2` acknowledgement is required before Private control
 //! state or membership becomes policy-visible. A mutually exclusive signed
 //! `PAR1` acknowledgement retires an unapplied Private capability without
 //! making a guest denial or synthetic control transition policy-visible.
@@ -84,7 +84,7 @@ pub const MAX_RETIRED_ACTOR_INSTALLATIONS: usize =
 /// Completed results compact to one exact latest acknowledgement per credential.
 pub const MAX_EXACT_RETRY_RECORDS: usize = 128;
 /// One Private Agent may consume the runtime's complete bounded resolution
-/// ceiling. Compact rows preserve exact PCA1/PAR1 retry and invocation
+/// ceiling. Compact rows preserve exact PCA2/PAR1 retry and invocation
 /// collision identity after a later control supersedes the current projection.
 pub const MAX_PRIVATE_APPLICATION_RECORDS: usize = 4_096;
 /// Recovery applications retain one complete canonical PRA1 for exact replay.
@@ -112,7 +112,7 @@ const CONFIG_ENCODED_BYTES: usize = SYSTEM_AUTHORITY_CONFIGURATION_MAGIC.len()
     + PRIVATE_SIGNATURE_BYTES;
 const EVIDENCE_DOMAIN: &[u8] = b"vos/system-authority/policy-evidence/v1";
 const OPERATION_EVIDENCE_DOMAIN: &[u8] = b"vos/system-authority/operation-evidence/v1";
-const STATE_INTEGRITY_DOMAIN: &[u8] = b"vos/system-authority/state-integrity/v13";
+const STATE_INTEGRITY_DOMAIN: &[u8] = b"vos/system-authority/state-integrity/v14";
 
 const _: () = assert!(MAX_RETAINED_EXACT_WIRE_BYTES < MAX_RUNTIME_STATE_BYTES);
 
@@ -784,7 +784,7 @@ pub struct AuthorityOperationRetryRecord {
     pub issuance_ack: Option<[u8; 32]>,
     pub issuance_ack_bytes: Option<Vec<u8>>,
     pub issued_at: Option<u64>,
-    /// Deterministic PCA1 invocation reserved atomically with a Private AOI1.
+    /// Deterministic PCA2 invocation reserved atomically with a Private AOI1.
     pub private_application_invocation: Option<[u8; 32]>,
 }
 
@@ -812,7 +812,7 @@ pub struct LatestOperationAckRow {
 }
 
 /// Exact Private-control intent fields which remain after the AOC4/AOP4/AOI1
-/// preimages retire. They let PCA1 prove the original operation without
+/// preimages retire. They let PCA2 prove the original operation without
 /// reconstructing or relabeling discarded bytes.
 #[derive(
     vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
@@ -834,7 +834,7 @@ pub struct RetiredPrivateOperationRow {
     /// enrollment projection can bind this retained value before admission.
     pub node_identity: Option<[u8; 32]>,
     /// Revoke and Rotate fix the complete post-apply set in AOC4. Invite fixes
-    /// the invited Node identity, while only PCA1 can report the resulting set.
+    /// the invited Node identity, while only PCA2 can report the resulting set.
     pub post_member_set: Option<[u8; 32]>,
     /// Exact canonical PRA1 bytes, present only for Recover. Keeping the proof
     /// makes issuance retirement, PCA retry, and state replay independently
@@ -851,7 +851,7 @@ struct PrivateApplicationSource {
 }
 
 /// Current policy-visible Private control projection. Creation supplies the
-/// genesis membership; only exact PCA1 application facts advance the head.
+/// genesis membership; only exact PCA2 application facts advance the head.
 #[derive(
     vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
 )]
@@ -872,16 +872,19 @@ pub struct PrivateAgentProjectionRow {
     /// redundant by design so reconstruction can reject either field drifting.
     pub members: Vec<[u8; 32]>,
     pub member_set: [u8; 32],
-    pub reopened_control_state: Option<[u8; 32]>,
+    /// Commitment of the latest node-local PCRS2 reopened-state proof.
+    pub reopened_runtime_state: Option<[u8; 32]>,
+    /// Commitment of the latest successor replica-stable runtime projection.
+    pub stable_projection: Option<[u8; 32]>,
     pub applied_at: Option<u64>,
     pub application_invocation: Option<[u8; 32]>,
     pub application_ack: Option<[u8; 32]>,
-    /// The latest exact PCA1 remains available for signed reconstruction.
+    /// The latest exact PCA2 remains available for signed reconstruction.
     pub application_ack_bytes: Option<Vec<u8>>,
 }
 
-/// Compact, append-only PCA1 audit record. A cryptographic chain protects the
-/// transition history while retaining every application invocation and PCA1
+/// Compact, append-only PCA2 audit record. A cryptographic chain protects the
+/// transition history while retaining every application invocation and PCA2
 /// commitment for collision rejection and exact retry.
 #[derive(
     vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
@@ -913,7 +916,8 @@ pub struct PrivateApplicationRecord {
     /// Exact canonical PRA1 bytes for Recover; absent for every other control.
     pub recovery_proof_bytes: Option<Vec<u8>>,
     pub member_set: [u8; 32],
-    pub reopened_control_state: [u8; 32],
+    pub reopened_runtime_state: [u8; 32],
+    pub stable_projection: [u8; 32],
     pub issued_at: u64,
     pub applied_at: u64,
 }
@@ -1107,7 +1111,7 @@ fn refresh_state_integrity_commitment(
 }
 
 /// Linear policy state for one Space's built-in system Agent.
-#[actor(agent, state_version = 13)]
+#[actor(agent, state_version = 14)]
 pub struct SystemAuthority {
     #[state(const)]
     configuration: SystemAuthorityConfiguration,
@@ -1173,7 +1177,7 @@ impl SystemAuthority {
     }
 
     /// Resolve one issued Private capability after its exact AOI1 chain is
-    /// known. PCA1 advances the Private policy projection; PAR1 only retires
+    /// known. PCA2 advances the Private policy projection; PAR1 only retires
     /// the unused capability. Both share one invocation and are mutually
     /// exclusive exact-retry results.
     #[msg(linear)]
@@ -1207,7 +1211,7 @@ fn resolve_private_application(
     encoded_ack: &[u8],
     context: &InvocationContext,
 ) -> bool {
-    if encoded_ack.starts_with(b"PCA1") {
+    if encoded_ack.starts_with(b"PCA2") {
         acknowledge_private_control_application(configuration, state, encoded_ack, context)
     } else if encoded_ack.starts_with(b"PAR1") {
         retire_private_control_application(configuration, state, encoded_ack, context)
@@ -2386,7 +2390,8 @@ fn acknowledge_private_control_application(
         node_identity: source.private.node_identity,
         recovery_proof_bytes: source.private.recovery_proof_bytes.clone(),
         member_set: ack.application.post_member_set.0,
-        reopened_control_state: ack.application.reopened_control_state.0,
+        reopened_runtime_state: ack.application.reopened_runtime_state.0,
+        stable_projection: ack.application.stable_projection.0,
         issued_at: ack.issued_at,
         applied_at: ack.application.applied_at,
     };
@@ -2961,7 +2966,8 @@ fn apply_private_application_transition(
         projection.epoch = record.epoch;
         projection.members = proof.replacement_nodes.iter().map(|node| node.0).collect();
         projection.member_set = record.member_set;
-        projection.reopened_control_state = Some(record.reopened_control_state);
+        projection.reopened_runtime_state = Some(record.reopened_runtime_state);
+        projection.stable_projection = Some(record.stable_projection);
         projection.applied_at = Some(record.applied_at);
         projection.application_invocation = Some(record.application_invocation);
         projection.application_ack = Some(record.application_ack);
@@ -3026,7 +3032,8 @@ fn apply_private_application_transition(
     projection.epoch = record.epoch;
     projection.members = members;
     projection.member_set = record.member_set;
-    projection.reopened_control_state = Some(record.reopened_control_state);
+    projection.reopened_runtime_state = Some(record.reopened_runtime_state);
+    projection.stable_projection = Some(record.stable_projection);
     projection.applied_at = Some(record.applied_at);
     projection.application_invocation = Some(record.application_invocation);
     projection.application_ack = Some(record.application_ack);
@@ -3229,7 +3236,8 @@ fn application_plan(
                         epoch: 0,
                         members,
                         member_set: member_set.0,
-                        reopened_control_state: None,
+                        reopened_runtime_state: None,
+                        stable_projection: None,
                         applied_at: None,
                         application_invocation: None,
                         application_ack: None,
@@ -4985,7 +4993,7 @@ fn encode_optional_bytes(bytes: &mut Vec<u8>, value: Option<&[u8]>) {
 
 fn initial_private_application_commitment(configuration: SystemAuthorityConfiguration) -> Hash {
     Hash::digest(
-        b"vos/system-authority/private-application-root/v4",
+        b"vos/system-authority/private-application-root/v5",
         &[RUNTIME_ABI_ID.as_bytes(), &configuration.encode()],
     )
 }
@@ -5015,11 +5023,12 @@ fn private_application_commitment(previous: Hash, record: &PrivateApplicationRec
     encode_optional_hash(&mut bytes, record.node_identity);
     encode_optional_bytes(&mut bytes, record.recovery_proof_bytes.as_deref());
     bytes.extend_from_slice(&record.member_set);
-    bytes.extend_from_slice(&record.reopened_control_state);
+    bytes.extend_from_slice(&record.reopened_runtime_state);
+    bytes.extend_from_slice(&record.stable_projection);
     bytes.extend_from_slice(&record.issued_at.to_le_bytes());
     bytes.extend_from_slice(&record.applied_at.to_le_bytes());
     Hash::digest(
-        b"vos/system-authority/private-application/v4",
+        b"vos/system-authority/private-application/v5",
         &[previous.as_bytes(), &bytes],
     )
 }
@@ -5247,7 +5256,8 @@ fn private_application_fact(
         control_previous: record.control_previous.map(Hash),
         epoch: record.epoch,
         post_member_set: Hash(record.member_set),
-        reopened_control_state: Hash(record.reopened_control_state),
+        reopened_runtime_state: Hash(record.reopened_runtime_state),
+        stable_projection: Hash(record.stable_projection),
         reopened_control_head: Hash(record.control),
         applied_at: record.applied_at,
     };
@@ -5469,7 +5479,8 @@ fn private_genesis_projection(
         epoch: 0,
         members,
         member_set: member_set.0,
-        reopened_control_state: None,
+        reopened_runtime_state: None,
+        stable_projection: None,
         applied_at: None,
         application_invocation: None,
         application_ack: None,
@@ -5491,7 +5502,8 @@ fn private_projection_fields_match(
         && left.epoch == right.epoch
         && left.members == right.members
         && left.member_set == right.member_set
-        && left.reopened_control_state == right.reopened_control_state
+        && left.reopened_runtime_state == right.reopened_runtime_state
+        && left.stable_projection == right.stable_projection
         && left.applied_at == right.applied_at
         && left.application_invocation == right.application_invocation
         && left.application_ack == right.application_ack
@@ -5524,14 +5536,16 @@ fn private_projection_is_valid(
         let managed = &state.managed_agents[managed_index];
         let genesis = row.control_head.is_none()
             && row.control_sequence.is_none()
-            && row.reopened_control_state.is_none()
+            && row.reopened_runtime_state.is_none()
+            && row.stable_projection.is_none()
             && row.applied_at.is_none()
             && row.application_invocation.is_none()
             && row.application_ack.is_none()
             && row.application_ack_bytes.is_none();
         let applied = row.control_head.is_some()
             && row.control_sequence.is_some()
-            && row.reopened_control_state.is_some()
+            && row.reopened_runtime_state.is_some()
+            && row.stable_projection.is_some()
             && row.applied_at.is_some()
             && row.application_invocation.is_some()
             && row.application_ack.is_some()
@@ -5566,7 +5580,8 @@ fn private_projection_is_valid(
             || (!genesis && !applied)
             || (genesis && row.epoch != 0)
             || row.control_head == Some([0; 32])
-            || row.reopened_control_state == Some([0; 32])
+            || row.reopened_runtime_state == Some([0; 32])
+            || row.stable_projection == Some([0; 32])
             || row.application_invocation == Some([0; 32])
             || row.application_ack == Some([0; 32])
         {
@@ -7341,7 +7356,7 @@ mod tests {
     fn private_application_fact(
         call: &AuthorityOperationCall,
         post_member_set: Hash,
-        reopened_control_state: Hash,
+        reopened_runtime_state: Hash,
         applied_at: u64,
     ) -> PrivateControlApplicationFact {
         let (operation, control, control_sequence, control_previous, epoch) = match &call.intent {
@@ -7428,7 +7443,11 @@ mod tests {
             control_previous,
             epoch,
             post_member_set,
-            reopened_control_state,
+            reopened_runtime_state,
+            stable_projection: Hash::digest(
+                b"vos/test/private-runtime-stable-projection",
+                &[reopened_runtime_state.as_bytes()],
+            ),
             reopened_control_head: control,
             applied_at,
         }
@@ -7550,7 +7569,7 @@ mod tests {
     ) -> bool {
         dispatch_private_application_bytes(
             actor,
-            ack.encode().expect("valid PCA1 fixture"),
+            ack.encode().expect("valid PCA2 fixture"),
             Some(private_application_context(ack)),
         )
     }
@@ -8231,8 +8250,8 @@ mod tests {
         assert_eq!(SystemAuthorityConfiguration::decode(&encoded), Some(config));
         assert_eq!(
             <SystemAuthority as vos::Actor>::STATE_SCHEMA_VERSION,
-            13,
-            "retained Private terminal-resolution state is a clean Linear state generation",
+            14,
+            "PCA2 proof commitments are a clean Linear state generation",
         );
 
         let mut old_generation = encoded.clone();
@@ -10241,7 +10260,7 @@ mod tests {
     }
 
     #[test]
-    fn tombstoned_pca1_advances_only_the_exact_private_projection_and_restarts() {
+    fn tombstoned_pca2_advances_only_the_exact_private_projection_and_restarts() {
         let config = configuration();
         let owner = PrincipalId([0xc1; 32]);
         let owner_node = node_for_principal(config, owner);
@@ -10347,21 +10366,39 @@ mod tests {
         expected_members.sort_unstable();
         assert_eq!(projected.members, expected_members);
         assert_eq!(projected.member_set, invited_member_set.0);
-        assert_eq!(projected.reopened_control_state, Some([0xc8; 32]));
+        assert_eq!(projected.reopened_runtime_state, Some([0xc8; 32]));
+        assert_eq!(
+            projected.stable_projection,
+            Some(invite_pca.application.stable_projection.0)
+        );
         assert_eq!(projected.applied_at, Some(OBSERVED_SLOT + 1));
         assert_eq!(
             projected.application_invocation,
             Some(invite_pca.application_invocation.0)
         );
         assert_eq!(projected.application_ack, Some(invite_pca.commitment().0));
+        let applied = &actor.state.private_applications[0];
+        assert_eq!(applied.reopened_runtime_state, [0xc8; 32]);
+        assert_eq!(
+            applied.stable_projection,
+            invite_pca.application.stable_projection.0
+        );
 
         let after_invite = actor.state.clone();
         assert!(dispatch_private_application(&mut actor, &invite_pca));
         assert_eq!(actor.state, after_invite);
         let mut divergent_retry = invite_pca.clone();
-        divergent_retry.application.reopened_control_state = Hash([0xc9; 32]);
+        divergent_retry.application.reopened_runtime_state = Hash([0xc9; 32]);
         resign_private_application_ack(&mut divergent_retry);
         assert!(!dispatch_private_application(&mut actor, &divergent_retry));
+        assert_eq!(actor.state, after_invite);
+        let mut divergent_projection = invite_pca.clone();
+        divergent_projection.application.stable_projection = Hash([0xc9; 32]);
+        resign_private_application_ack(&mut divergent_projection);
+        assert!(!dispatch_private_application(
+            &mut actor,
+            &divergent_projection,
+        ));
         assert_eq!(actor.state, after_invite);
 
         let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
@@ -10371,7 +10408,7 @@ mod tests {
             None,
             None,
         )
-        .expect("PCA1 projection restarts");
+        .expect("PCA2 projection restarts");
         assert_eq!(restarted.state, actor.state);
         assert!(dispatch_private_application(&mut restarted, &invite_pca));
 
@@ -10421,7 +10458,7 @@ mod tests {
     }
 
     #[test]
-    fn par1_retires_without_projecting_and_is_exclusive_with_pca1() {
+    fn par1_retires_without_projecting_and_is_exclusive_with_pca2() {
         let config = configuration();
         let owner = PrincipalId([0x39; 32]);
         let owner_key = signing(0x3a);
@@ -10579,7 +10616,7 @@ mod tests {
         .is_ok());
 
         // Whichever terminal resolution commits first owns the shared third
-        // invocation: the reverse PCA1-then-PAR1 race also fails closed.
+        // invocation: the reverse PCA2-then-PAR1 race also fails closed.
         let mut applied_actor = SystemAuthority {
             configuration: config,
             state: unresolved_state,
@@ -10696,7 +10733,7 @@ mod tests {
         assert_eq!(rotate_approval.selector.actor, None);
         assert_eq!(rotate_approval.selector.actor_deployment, None);
 
-        // Until the exact PCA1 arrives no second control position can be
+        // Until the exact PCA2 arrives no second control position can be
         // authorized, even though it points at the pending PCTL.
         let mut pending_resource = operation_call(
             config,
@@ -10815,7 +10852,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_pca1_source_remains_valid_when_aoi_floor_later_compacts_it() {
+    fn pending_pca2_source_remains_valid_when_aoi_floor_later_compacts_it() {
         let config = configuration();
         let owner = PrincipalId([0xd1; 32]);
         let owner_node = node_for_principal(config, owner);
@@ -11055,7 +11092,7 @@ mod tests {
     }
 
     #[test]
-    fn delayed_old_runtime_pca1_is_authenticated_by_its_source_after_upgrade() {
+    fn delayed_old_runtime_pca2_is_authenticated_by_its_source_after_upgrade() {
         let config = configuration();
         let owner = PrincipalId([0xe1; 32]);
         let owner_node = node_for_principal(config, owner);
@@ -11154,7 +11191,7 @@ mod tests {
     }
 
     #[test]
-    fn pca1_rejects_missing_issuance_substitution_and_cross_domain_collisions() {
+    fn pca2_rejects_missing_issuance_substitution_and_cross_domain_collisions() {
         let config = configuration();
         let owner = PrincipalId([0xa1; 32]);
         let owner_node = node_for_principal(config, owner);
@@ -11214,9 +11251,42 @@ mod tests {
         ));
         assert_eq!(actor.state, baseline);
 
+        let mut old_pca1 = pca.encode().unwrap();
+        old_pca1[..4].copy_from_slice(b"PCA1");
+        assert!(!dispatch_private_application_bytes(
+            &mut actor,
+            old_pca1,
+            Some(private_application_context(&pca)),
+        ));
+        let stable_projection = pca.application.stable_projection.0;
+        let mut old_layout = pca.encode().unwrap();
+        let stable_offset = old_layout
+            .windows(stable_projection.len())
+            .position(|window| window == stable_projection)
+            .expect("fixture stable projection has one canonical preimage");
+        old_layout.drain(stable_offset..stable_offset + stable_projection.len());
+        assert!(!dispatch_private_application_bytes(
+            &mut actor,
+            old_layout,
+            Some(private_application_context(&pca)),
+        ));
+
         let mut bad_signature = pca.clone();
         bad_signature.signature[0] ^= 1;
         assert!(!dispatch_private_application(&mut actor, &bad_signature));
+        let mut substituted_runtime_state = pca.clone();
+        substituted_runtime_state.application.reopened_runtime_state = Hash([0xb4; 32]);
+        assert!(!dispatch_private_application(
+            &mut actor,
+            &substituted_runtime_state,
+        ));
+        let mut substituted_stable_projection = pca.clone();
+        substituted_stable_projection.application.stable_projection = Hash([0xb5; 32]);
+        assert!(!dispatch_private_application(
+            &mut actor,
+            &substituted_stable_projection,
+        ));
+        assert_eq!(actor.state, baseline);
 
         let mut wrong_call = pca.clone();
         wrong_call.operation_call = Hash([0xa9; 32]);
@@ -13818,7 +13888,8 @@ mod tests {
             epoch: 0,
             members: old_nodes.iter().map(|node| node.0).collect(),
             member_set: genesis_member_set.0,
-            reopened_control_state: None,
+            reopened_runtime_state: None,
+            stable_projection: None,
             applied_at: None,
             application_invocation: None,
             application_ack: None,
