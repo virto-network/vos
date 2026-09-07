@@ -97,6 +97,10 @@ pub struct TransitionProofStatement {
     pub work: Hash,
     /// Domain-separated digest of the exact canonical RuntimeTransition bytes.
     pub transition: Hash,
+    /// Commitment of the complete nested standard Refine trace. This is the
+    /// transcript commitment authenticated by the physical proof, not a
+    /// producer-private witness or a legacy service attestation.
+    pub refine_trace: Hash,
     /// Public I/O commitment carried by the physical proof.
     pub public_io: Hash,
     /// Identity of the proof system/verifier parameters.
@@ -111,6 +115,7 @@ impl TransitionProofStatement {
             || !self.before.same_shape(self.after)
             || self.work == Hash::ZERO
             || self.transition == Hash::ZERO
+            || self.refine_trace == Hash::ZERO
             || self.public_io == Hash::ZERO
             || self.proof_system == Hash::ZERO
         {
@@ -150,6 +155,32 @@ impl TransitionProofStatement {
             b"vos/agent/proof/runtime-transition",
             &[canonical_transition],
         )
+    }
+
+    /// Match every public execution binding while independently recomputing
+    /// the commitments of the exact canonical work and transition bytes.
+    /// Shared followers can use this without the producer-private witness.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matches_execution(
+        &self,
+        subject: &TransitionProofSubject,
+        before: ProofLaneRoots,
+        after: ProofLaneRoots,
+        canonical_work: &[u8],
+        canonical_transition: &[u8],
+        refine_trace: Hash,
+        public_io: Hash,
+        proof_system: Hash,
+    ) -> bool {
+        self.validate()
+            && &self.subject == subject
+            && self.before == before
+            && self.after == after
+            && self.work == Self::work_commitment(canonical_work)
+            && self.transition == Self::transition_commitment(canonical_transition)
+            && self.refine_trace == refine_trace
+            && self.public_io == public_io
+            && self.proof_system == proof_system
     }
 }
 
@@ -249,6 +280,43 @@ impl TransitionProofRecord {
         }
         Ok(())
     }
+
+    /// Verify both the public proof record and its exact clean Agent
+    /// execution binding. This is the follower-facing verification path: it
+    /// needs canonical work, canonical transition, and public proof bytes,
+    /// but never the producer-private witness.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_exact<V: TransitionProofVerifier>(
+        &self,
+        proof_bytes: &[u8],
+        subject: &TransitionProofSubject,
+        before: ProofLaneRoots,
+        after: ProofLaneRoots,
+        canonical_work: &[u8],
+        canonical_transition: &[u8],
+        refine_trace: Hash,
+        public_io: Hash,
+        proof_system: Hash,
+        producer: ProducerId,
+        verifier: &V,
+    ) -> Result<(), ProofRecordError> {
+        if !self.statement.matches_execution(
+            subject,
+            before,
+            after,
+            canonical_work,
+            canonical_transition,
+            refine_trace,
+            public_io,
+            proof_system,
+        ) {
+            return Err(ProofRecordError::WrongStatement);
+        }
+        if self.producer != producer {
+            return Err(ProofRecordError::WrongProducer);
+        }
+        self.verify(proof_bytes, verifier)
+    }
 }
 
 impl CanonicalWire for TransitionProofRecord {
@@ -288,6 +356,14 @@ impl CanonicalWire for TransitionProofRecord {
     }
 }
 
+/// Independent verifier for one public transition-proof record.
+///
+/// `verify_transition` must validate the complete physical proof for the
+/// statement's exact `proof_system`. For the standard nested Refine backend,
+/// accepting child proofs alone is insufficient: verification must perform
+/// the required deterministic boundary replay and bind its transcript
+/// commitment to `statement.refine_trace`, as well as the statement's public
+/// I/O and state roots.
 pub trait TransitionProofVerifier {
     fn verify_producer(
         &self,
@@ -302,6 +378,8 @@ pub trait TransitionProofVerifier {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProofRecordError {
     InvalidRecord,
+    WrongStatement,
+    WrongProducer,
     WrongProof,
     InvalidProducerSignature,
     InvalidProof,
@@ -418,6 +496,7 @@ fn encode_statement(encoder: &mut Encoder<'_>, statement: &TransitionProofStatem
     encode_roots(encoder, statement.after);
     encoder.fixed(statement.work.as_bytes());
     encoder.fixed(statement.transition.as_bytes());
+    encoder.fixed(statement.refine_trace.as_bytes());
     encoder.fixed(statement.public_io.as_bytes());
     encoder.fixed(statement.proof_system.as_bytes());
 }
@@ -429,6 +508,7 @@ fn decode_statement(decoder: &mut Decoder<'_>) -> Result<TransitionProofStatemen
         after: decode_roots(decoder)?,
         work: Hash(decoder.fixed()?),
         transition: Hash(decoder.fixed()?),
+        refine_trace: Hash(decoder.fixed()?),
         public_io: Hash(decoder.fixed()?),
         proof_system: Hash(decoder.fixed()?),
     };
@@ -483,6 +563,7 @@ mod tests {
             after: roots(14, 12, 13),
             work: TransitionProofStatement::work_commitment(b"canonical work"),
             transition: TransitionProofStatement::transition_commitment(b"canonical transition"),
+            refine_trace: Hash([20; 32]),
             public_io: Hash([15; 32]),
             proof_system: Hash([16; 32]),
         }
@@ -537,8 +618,11 @@ mod tests {
         let mut changed = statement.clone();
         changed.after.linear = Some(Hash([98; 32]));
         assert_ne!(changed.commitment().unwrap(), commitment);
-        let mut changed = statement;
+        let mut changed = statement.clone();
         changed.transition = Hash([97; 32]);
+        assert_ne!(changed.commitment().unwrap(), commitment);
+        let mut changed = statement;
+        changed.refine_trace = Hash([96; 32]);
         assert_ne!(changed.commitment().unwrap(), commitment);
     }
 
@@ -608,6 +692,150 @@ mod tests {
     }
 
     #[test]
+    fn follower_exact_verification_rejects_every_external_binding_substitution() {
+        let record = record(b"physical proof");
+        let statement = &record.statement;
+        let verify = |subject: &TransitionProofSubject,
+                      before: ProofLaneRoots,
+                      after: ProofLaneRoots,
+                      work: &[u8],
+                      transition: &[u8],
+                      refine_trace: Hash,
+                      public_io: Hash,
+                      proof_system: Hash,
+                      producer: ProducerId| {
+            record.verify_exact(
+                b"physical proof",
+                subject,
+                before,
+                after,
+                work,
+                transition,
+                refine_trace,
+                public_io,
+                proof_system,
+                producer,
+                &AcceptExact,
+            )
+        };
+        assert!(
+            verify(
+                &statement.subject,
+                statement.before,
+                statement.after,
+                b"canonical work",
+                b"canonical transition",
+                statement.refine_trace,
+                statement.public_io,
+                statement.proof_system,
+                record.producer,
+            )
+            .is_ok()
+        );
+
+        let mut wrong_subject = statement.subject.clone();
+        wrong_subject.actor = ActorId([99; 32]);
+        let cases = [
+            verify(
+                &wrong_subject,
+                statement.before,
+                statement.after,
+                b"canonical work",
+                b"canonical transition",
+                statement.refine_trace,
+                statement.public_io,
+                statement.proof_system,
+                record.producer,
+            ),
+            verify(
+                &statement.subject,
+                roots(99, 12, 13),
+                statement.after,
+                b"canonical work",
+                b"canonical transition",
+                statement.refine_trace,
+                statement.public_io,
+                statement.proof_system,
+                record.producer,
+            ),
+            verify(
+                &statement.subject,
+                statement.before,
+                statement.after,
+                b"substituted work",
+                b"canonical transition",
+                statement.refine_trace,
+                statement.public_io,
+                statement.proof_system,
+                record.producer,
+            ),
+            verify(
+                &statement.subject,
+                statement.before,
+                statement.after,
+                b"canonical work",
+                b"substituted transition",
+                statement.refine_trace,
+                statement.public_io,
+                statement.proof_system,
+                record.producer,
+            ),
+            verify(
+                &statement.subject,
+                statement.before,
+                statement.after,
+                b"canonical work",
+                b"canonical transition",
+                Hash([98; 32]),
+                statement.public_io,
+                statement.proof_system,
+                record.producer,
+            ),
+            verify(
+                &statement.subject,
+                statement.before,
+                statement.after,
+                b"canonical work",
+                b"canonical transition",
+                statement.refine_trace,
+                Hash([97; 32]),
+                statement.proof_system,
+                record.producer,
+            ),
+            verify(
+                &statement.subject,
+                statement.before,
+                statement.after,
+                b"canonical work",
+                b"canonical transition",
+                statement.refine_trace,
+                statement.public_io,
+                Hash([96; 32]),
+                record.producer,
+            ),
+        ];
+        assert!(
+            cases
+                .into_iter()
+                .all(|result| result == Err(ProofRecordError::WrongStatement))
+        );
+        assert_eq!(
+            verify(
+                &statement.subject,
+                statement.before,
+                statement.after,
+                b"canonical work",
+                b"canonical transition",
+                statement.refine_trace,
+                statement.public_io,
+                statement.proof_system,
+                ProducerId([95; 32]),
+            ),
+            Err(ProofRecordError::WrongProducer)
+        );
+    }
+
+    #[test]
     fn proof_wire_rejects_trailing_unknown_and_previous_generation_headers() {
         let record = record(b"physical proof");
         let mut trailing = record.encode().unwrap();
@@ -632,6 +860,23 @@ mod tests {
             TransitionProofStatement::decode(&unknown_mode),
             Err(WireError::Decode(DecodeError::InvalidTag))
         ));
+
+        // The pre-Refine layout is not normalized into the current
+        // statement. There is one clean wire shape and no compatibility
+        // decoder which could silently reinterpret public I/O as a trace.
+        let statement = statement();
+        let mut previous_layout = Vec::new();
+        previous_layout.extend_from_slice(&TransitionProofStatement::MAGIC);
+        previous_layout.extend_from_slice(crate::RUNTIME_ABI_ID.as_bytes());
+        let mut encoder = Encoder(&mut previous_layout);
+        encode_subject(&mut encoder, &statement.subject);
+        encode_roots(&mut encoder, statement.before);
+        encode_roots(&mut encoder, statement.after);
+        encoder.fixed(statement.work.as_bytes());
+        encoder.fixed(statement.transition.as_bytes());
+        encoder.fixed(statement.public_io.as_bytes());
+        encoder.fixed(statement.proof_system.as_bytes());
+        assert!(TransitionProofStatement::decode(&previous_layout).is_err());
     }
 
     #[test]
