@@ -7,9 +7,11 @@
 //! credential-only entry point.
 //!
 //! Genesis is the absence of a PCTL and therefore has no fabricated authority
-//! evidence. Every post-genesis control item must instead carry its exact
-//! canonical AOI1+PCA1 envelope; a locally applied control whose attachment is
-//! still crash-pending may reopen, but it cannot be served to another node.
+//! evidence. Every post-genesis control item instead carries its exact PCTL,
+//! optional PRM1, canonical AOI1+PCA2 envelope, and replica-stable successor
+//! projection commitment. The receiving physical host must execute each
+//! verified control through its own PVM; this module never installs a received
+//! control through the low-level Store transition path.
 
 use alloc::vec::Vec;
 use core::fmt;
@@ -24,12 +26,13 @@ use vos_agent_sdk::authority_operation::{
 use vos_agent_sdk::private::{
     EncryptedPrivateObject, PrivateControlOperation, PrivateControlRecord, PrivateNodeIdentity,
 };
+use vos_agent_sdk::wire::MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES;
 use vos_agent_sdk::wire::{
     CanonicalWire, MAX_PRIVATE_CONTROL_WIRE_BYTES, MAX_PRIVATE_OBJECT_WIRE_BYTES,
 };
 use vos_agent_sdk::{
     ActorDescriptor, AgentId, AgentProfile, Hash, ManagementRequest, MethodMode, ModelError,
-    RuntimeWork, SpaceId, StateLane, StorageFieldDescriptor,
+    PrivateRuntimeMutation, RuntimeWork, SpaceId, StateLane, StorageFieldDescriptor,
 };
 
 use super::authority_operation_issuer::private_intent_matches_application;
@@ -42,9 +45,14 @@ use super::private_store::{
 pub const MAX_PRIVATE_SYNC_ITEMS: usize = 64;
 pub const MAX_PRIVATE_SYNC_PAGE_BYTES: usize = MAX_PRIVATE_OBJECT_WIRE_BYTES + 16 * 1024;
 pub const MAX_PRIVATE_SYNC_FRAME_BYTES: usize = MAX_PRIVATE_SYNC_PAGE_BYTES + 32 * 1024;
-// v2 makes authority evidence mandatory on every control item. A clean break
-// prevents a v1 raw-control frame from being interpreted under the new layout.
-const FORMAT_VERSION: u16 = 2;
+// v3 adds the exact optional PRM1 and successor PSP commitment to every
+// control item. A clean break prevents v2's PCTL+PSE-only layout from being
+// interpreted as runtime-complete synchronization evidence.
+const SYNC_FORMAT_VERSION: u16 = 3;
+// PSE2 is an independently persisted envelope, not part of the sync-frame
+// layout. Keep its established wire version while its nested canonical PCA2
+// decoder rejects the incompatible PCA1 payload.
+const EVIDENCE_FORMAT_VERSION: u16 = 2;
 const REQUEST_MAGIC: &[u8; 4] = b"PSRQ";
 const PAGE_MAGIC: &[u8; 4] = b"PSPG";
 const EVIDENCE_MAGIC: &[u8; 4] = b"PSE2";
@@ -67,8 +75,8 @@ pub enum PrivateSyncError {
     Tampered,
     MissingEvidence,
     LinearUnsupported,
-    /// The evidence selects a control for which this receiver has no durable
-    /// application/reopen implementation yet.
+    /// A received controls page requires physical-host PVM execution and may
+    /// not be installed through the low-level ciphertext Store path.
     UnsupportedOperation,
     Store(PrivateStoreError),
     Crypto(PrivateCryptoError),
@@ -110,6 +118,13 @@ pub(crate) struct PrivateControlAuthorityEvidence {
     /// a live retry and another replacement Node independent of the retired
     /// host-local PVRP3 staging plan.
     pub(crate) recovery_proof: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifiedPrivateControlAuthorityEvidence {
+    issuance: AuthorityOperationIssuanceAck,
+    application: PrivateControlApplicationAck,
+    recovery_proof: Option<PrivateRecoveryAuthorityProof>,
 }
 
 impl PrivateControlAuthorityEvidence {
@@ -159,7 +174,7 @@ impl PrivateControlAuthorityEvidence {
         {
             return Err(PrivateSyncError::InvalidFrame);
         }
-        let mut encoder = Encoder::new(EVIDENCE_MAGIC);
+        let mut encoder = Encoder::new(EVIDENCE_MAGIC, EVIDENCE_FORMAT_VERSION);
         encoder.bytes(&self.issuance_ack)?;
         encoder.bytes(&self.application_ack)?;
         match &self.recovery_proof {
@@ -176,6 +191,7 @@ impl PrivateControlAuthorityEvidence {
         let mut decoder = Decoder::new(
             bytes,
             EVIDENCE_MAGIC,
+            EVIDENCE_FORMAT_VERSION,
             MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES,
         )?;
         let evidence = Self {
@@ -207,6 +223,44 @@ impl PrivateControlAuthorityEvidence {
         route: ManagedAgentTarget,
         authority: AuthorityActorTarget,
     ) -> Result<(), PrivateSyncError> {
+        let application = PrivateControlApplicationAck::decode(&self.application_ack)
+            .map_err(|_| PrivateSyncError::Tampered)?;
+        self.verify_material_for(
+            control,
+            resulting_epoch,
+            application.application.stable_projection,
+            route,
+            authority,
+        )
+        .map(|_| ())
+    }
+
+    pub(crate) fn verify_for_stable_projection(
+        &self,
+        control: &PrivateControlRecord,
+        resulting_epoch: u64,
+        stable_projection: Hash,
+        route: ManagedAgentTarget,
+        authority: AuthorityActorTarget,
+    ) -> Result<(), PrivateSyncError> {
+        self.verify_material_for(
+            control,
+            resulting_epoch,
+            stable_projection,
+            route,
+            authority,
+        )
+        .map(|_| ())
+    }
+
+    fn verify_material_for(
+        &self,
+        control: &PrivateControlRecord,
+        resulting_epoch: u64,
+        stable_projection: Hash,
+        route: ManagedAgentTarget,
+        authority: AuthorityActorTarget,
+    ) -> Result<VerifiedPrivateControlAuthorityEvidence, PrivateSyncError> {
         if !route.is_valid()
             || !authority.is_valid()
             || route.space != authority.space
@@ -214,6 +268,9 @@ impl PrivateControlAuthorityEvidence {
             || control.agent != route.agent
         {
             return Err(PrivateSyncError::InvalidScope);
+        }
+        if stable_projection == Hash::ZERO {
+            return Err(PrivateSyncError::Tampered);
         }
         let issuance = AuthorityOperationIssuanceAck::decode(&self.issuance_ack)
             .map_err(|_| PrivateSyncError::Tampered)?;
@@ -224,7 +281,7 @@ impl PrivateControlAuthorityEvidence {
         {
             return Err(PrivateSyncError::Tampered);
         }
-        let intent = match (&control.operation, self.recovery_proof.as_deref()) {
+        let (intent, recovery_proof) = match (&control.operation, self.recovery_proof.as_deref()) {
             (PrivateControlOperation::Recover { .. }, Some(bytes)) => {
                 let proof = PrivateRecoveryAuthorityProof::decode(bytes)
                     .map_err(|_| PrivateSyncError::Tampered)?;
@@ -235,15 +292,21 @@ impl PrivateControlAuthorityEvidence {
                 {
                     return Err(PrivateSyncError::Tampered);
                 }
-                AuthorityOperationIntent::RecoverPrivateAgent { proof }
+                (
+                    AuthorityOperationIntent::RecoverPrivateAgent {
+                        proof: proof.clone(),
+                    },
+                    Some(proof),
+                )
             }
             (PrivateControlOperation::Recover { .. }, None) | (_, Some(_)) => {
                 return Err(PrivateSyncError::Tampered);
             }
-            (_, None) => {
+            (_, None) => (
                 AuthorityOperationIntent::private_control(route.runtime_deployment, control)
-                    .map_err(|_| PrivateSyncError::Tampered)?
-            }
+                    .map_err(|_| PrivateSyncError::Tampered)?,
+                None,
+            ),
         };
         let expected_actor = match &intent {
             AuthorityOperationIntent::PrivateActorLifecycle { actor, .. } => Some(*actor),
@@ -269,6 +332,7 @@ impl PrivateControlAuthorityEvidence {
             || application.issued_at != issuance.issued_at
             || !private_intent_matches_application(&intent, &application.application)
             || application.application.epoch != resulting_epoch
+            || application.application.stable_projection != stable_projection
             || intent.request_commitment(issuance.authorization_sequence, issuance.operation_call)
                 != Some(issuance.receipt.selector.request)
             || issuance.receipt.selector.operation != intent.operation()
@@ -280,7 +344,11 @@ impl PrivateControlAuthorityEvidence {
         {
             return Err(PrivateSyncError::Tampered);
         }
-        Ok(())
+        Ok(VerifiedPrivateControlAuthorityEvidence {
+            issuance,
+            application,
+            recovery_proof,
+        })
     }
 }
 
@@ -395,13 +463,18 @@ impl PrivateSyncRequest {
 
     pub fn encode(&self) -> Result<Vec<u8>, PrivateSyncError> {
         self.validate()?;
-        let mut encoder = Encoder::new(REQUEST_MAGIC);
+        let mut encoder = Encoder::new(REQUEST_MAGIC, SYNC_FORMAT_VERSION);
         encode_request_body(&mut encoder, self)?;
         encoder.finish(MAX_PRIVATE_SYNC_FRAME_BYTES)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, PrivateSyncError> {
-        let mut decoder = Decoder::new(bytes, REQUEST_MAGIC, MAX_PRIVATE_SYNC_FRAME_BYTES)?;
+        let mut decoder = Decoder::new(
+            bytes,
+            REQUEST_MAGIC,
+            SYNC_FORMAT_VERSION,
+            MAX_PRIVATE_SYNC_FRAME_BYTES,
+        )?;
         let request = decode_request_body(&mut decoder)?;
         decoder.finish()?;
         request.validate()?;
@@ -422,10 +495,17 @@ pub enum PrivateSyncItem {
         sequence: u64,
         commitment: Hash,
         resulting_epoch: u64,
+        /// Exact canonical PCTL wire selected by the signed evidence.
         wire: Vec<u8>,
-        /// Exact canonical PSE2 envelope for this PCTL. A control item without
-        /// AOI1+PCA1 evidence is never a valid synchronization item.
+        /// Exact canonical PRM1 wire for policy/lifecycle controls. Membership,
+        /// key, and recovery controls must carry `None`.
+        mutation: Option<Vec<u8>>,
+        /// Exact canonical source PSE2 envelope for this PCTL. A control item
+        /// without AOI1+PCA2 evidence is never a valid synchronization item.
         evidence: Vec<u8>,
+        /// Commitment of the source PAPL's successor replica-stable PSP.
+        /// The signed PCA2 repeats this exact value.
+        stable_projection: Hash,
     },
     Object {
         key: PrivateObjectKey,
@@ -437,13 +517,23 @@ pub enum PrivateSyncItem {
 impl PrivateSyncItem {
     fn encoded_payload_len(&self) -> Result<usize, PrivateSyncError> {
         let wire_len = match self {
-            Self::Control { wire, evidence, .. } => {
+            Self::Control {
+                wire,
+                mutation,
+                evidence,
+                ..
+            } => {
                 if wire.len() > MAX_PRIVATE_CONTROL_WIRE_BYTES
+                    || mutation
+                        .as_ref()
+                        .is_some_and(|wire| wire.len() > MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES)
                     || evidence.len() > MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES
                 {
                     return Err(PrivateSyncError::LimitExceeded);
                 }
                 wire.len()
+                    .checked_add(mutation.as_ref().map_or(0, Vec::len))
+                    .ok_or(PrivateSyncError::LimitExceeded)?
                     .checked_add(evidence.len())
                     .ok_or(PrivateSyncError::LimitExceeded)?
             }
@@ -457,6 +547,59 @@ impl PrivateSyncItem {
         wire_len
             .checked_add(96)
             .ok_or(PrivateSyncError::LimitExceeded)
+    }
+}
+
+/// Fully authenticated control material returned to the physical receiver.
+///
+/// Construction is private to [`verify_private_sync_control_page`]:
+/// callers cannot obtain this value without exact canonical PCTL/PRM1/PSE2
+/// correspondence, an independently verified PCA2 signature, and equality
+/// between the page's PSP commitment and the signed application fact. The
+/// receiver still must execute the control through its own PVM and compare its
+/// locally produced successor PSP to [`Self::source_stable_projection`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VerifiedPrivateSyncControl {
+    control: PrivateControlRecord,
+    mutation: Option<PrivateRuntimeMutation>,
+    evidence_wire: Vec<u8>,
+    issuance: AuthorityOperationIssuanceAck,
+    source_application: PrivateControlApplicationAck,
+    recovery_proof: Option<PrivateRecoveryAuthorityProof>,
+    source_stable_projection: Hash,
+}
+
+impl VerifiedPrivateSyncControl {
+    pub(crate) const fn control(&self) -> &PrivateControlRecord {
+        &self.control
+    }
+
+    pub(crate) const fn mutation(&self) -> Option<&PrivateRuntimeMutation> {
+        self.mutation.as_ref()
+    }
+
+    pub(crate) fn evidence_wire(&self) -> &[u8] {
+        &self.evidence_wire
+    }
+
+    pub(crate) const fn issuance(&self) -> &AuthorityOperationIssuanceAck {
+        &self.issuance
+    }
+
+    /// Source-node PCA2 retained for envelope audit. Its
+    /// `reopened_runtime_state` selects the source's node-local PCRS2 and may
+    /// never be adopted as the receiver's PCRS2; only the separately exposed
+    /// stable projection is a cross-node convergence target.
+    pub(crate) const fn source_application(&self) -> &PrivateControlApplicationAck {
+        &self.source_application
+    }
+
+    pub(crate) const fn recovery_proof(&self) -> Option<&PrivateRecoveryAuthorityProof> {
+        self.recovery_proof.as_ref()
+    }
+
+    pub(crate) const fn source_stable_projection(&self) -> Hash {
+        self.source_stable_projection
     }
 }
 
@@ -500,7 +643,12 @@ impl PrivateSyncPage {
                 {
                     return Err(PrivateSyncError::InvalidFrame);
                 }
-                validate_control_item_order(&self.items)?;
+                validate_control_item_order(
+                    &self.items,
+                    self.request.cursor.space,
+                    self.request.cursor.agent,
+                    self.request.cursor.local,
+                )?;
             }
             PrivateSyncPhase::Objects => {
                 if self.request.cursor.local != self.target {
@@ -557,7 +705,7 @@ impl PrivateSyncPage {
 
     pub fn encode(&self) -> Result<Vec<u8>, PrivateSyncError> {
         self.validate_shape()?;
-        let mut encoder = Encoder::new(PAGE_MAGIC);
+        let mut encoder = Encoder::new(PAGE_MAGIC, SYNC_FORMAT_VERSION);
         encode_request_body(&mut encoder, &self.request)?;
         encode_head(&mut encoder, self.target);
         encoder.u8(self.phase as u8);
@@ -569,14 +717,24 @@ impl PrivateSyncPage {
                     commitment,
                     resulting_epoch,
                     wire,
+                    mutation,
                     evidence,
+                    stable_projection,
                 } => {
                     encoder.u8(0);
                     encoder.u64(*sequence);
                     encoder.fixed(commitment.as_bytes());
                     encoder.u64(*resulting_epoch);
                     encoder.bytes(wire)?;
+                    match mutation {
+                        Some(wire) => {
+                            encoder.u8(1);
+                            encoder.bytes(wire)?;
+                        }
+                        None => encoder.u8(0),
+                    }
                     encoder.bytes(evidence)?;
+                    encoder.fixed(stable_projection.as_bytes());
                 }
                 PrivateSyncItem::Object {
                     key,
@@ -595,7 +753,12 @@ impl PrivateSyncPage {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, PrivateSyncError> {
-        let mut decoder = Decoder::new(bytes, PAGE_MAGIC, MAX_PRIVATE_SYNC_FRAME_BYTES)?;
+        let mut decoder = Decoder::new(
+            bytes,
+            PAGE_MAGIC,
+            SYNC_FORMAT_VERSION,
+            MAX_PRIVATE_SYNC_FRAME_BYTES,
+        )?;
         let request = decode_request_body(&mut decoder)?;
         let target = decode_head(&mut decoder)?;
         let phase = match decoder.u8()? {
@@ -618,7 +781,13 @@ impl PrivateSyncPage {
                     commitment: Hash(decoder.fixed()?),
                     resulting_epoch: decoder.u64()?,
                     wire: decoder.bytes(MAX_PRIVATE_CONTROL_WIRE_BYTES)?,
+                    mutation: match decoder.u8()? {
+                        0 => None,
+                        1 => Some(decoder.bytes(MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES)?),
+                        _ => return Err(PrivateSyncError::InvalidFrame),
+                    },
                     evidence: decoder.bytes(MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES)?,
+                    stable_projection: Hash(decoder.fixed()?),
                 },
                 1 => PrivateSyncItem::Object {
                     key: decode_key(&mut decoder)?,
@@ -665,10 +834,10 @@ pub trait PrivateTransportAuthVerifier {
 struct Encoder(Vec<u8>);
 
 impl Encoder {
-    fn new(magic: &[u8; 4]) -> Self {
+    fn new(magic: &[u8; 4], version: u16) -> Self {
         let mut bytes = Vec::with_capacity(512);
         bytes.extend_from_slice(magic);
-        bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&version.to_le_bytes());
         Self(bytes)
     }
 
@@ -722,7 +891,12 @@ struct Decoder<'a> {
 }
 
 impl<'a> Decoder<'a> {
-    fn new(bytes: &'a [u8], magic: &[u8; 4], max: usize) -> Result<Self, PrivateSyncError> {
+    fn new(
+        bytes: &'a [u8],
+        magic: &[u8; 4],
+        expected_version: u16,
+        max: usize,
+    ) -> Result<Self, PrivateSyncError> {
         if bytes.len() > max || bytes.len() < 6 || bytes.get(..4) != Some(magic) {
             return Err(PrivateSyncError::InvalidFrame);
         }
@@ -731,7 +905,7 @@ impl<'a> Decoder<'a> {
                 .try_into()
                 .map_err(|_| PrivateSyncError::InvalidFrame)?,
         );
-        if version != FORMAT_VERSION {
+        if version != expected_version {
             return Err(PrivateSyncError::InvalidFrame);
         }
         Ok(Self { bytes, offset: 6 })
@@ -939,9 +1113,14 @@ fn decode_request_body(decoder: &mut Decoder<'_>) -> Result<PrivateSyncRequest, 
     Ok(request)
 }
 
-fn validate_control_item_order(items: &[PrivateSyncItem]) -> Result<(), PrivateSyncError> {
+fn validate_control_item_order(
+    items: &[PrivateSyncItem],
+    space: SpaceId,
+    agent: AgentId,
+    local: PrivateSyncHead,
+) -> Result<(), PrivateSyncError> {
     let mut previous_sequence = None;
-    let mut previous_epoch = None;
+    let mut current = local;
     let mut commitments = Vec::new();
     commitments
         .try_reserve(items.len())
@@ -952,20 +1131,72 @@ fn validate_control_item_order(items: &[PrivateSyncItem]) -> Result<(), PrivateS
             commitment,
             resulting_epoch,
             wire,
+            mutation,
+            evidence,
+            stable_projection,
             ..
         } = item
         else {
             return Err(PrivateSyncError::InvalidFrame);
         };
         if *commitment == Hash::ZERO
+            || *stable_projection == Hash::ZERO
             || wire.is_empty()
             || wire.len() > MAX_PRIVATE_CONTROL_WIRE_BYTES
         {
             return Err(PrivateSyncError::InvalidFrame);
         }
-        if previous_sequence.is_some_and(|previous| previous >= *sequence)
-            || previous_epoch.is_some_and(|previous| previous > *resulting_epoch)
+        if evidence.is_empty() {
+            return Err(PrivateSyncError::MissingEvidence);
+        }
+        let (record, _) = decode_exact_private_control_material(wire, mutation.as_deref())?;
+        if record.space != space
+            || record.agent != agent
+            || record.sequence != *sequence
+            || record.commitment() != *commitment
         {
+            return Err(PrivateSyncError::InvalidFrame);
+        }
+        let links_current = record.previous == current.control_head
+            || matches!(
+                &record.operation,
+                PrivateControlOperation::Recover {
+                    superseded_heads,
+                    ..
+                } if current.control_head.is_some_and(|head| {
+                    superseded_heads.binary_search(&head).is_ok()
+                })
+            );
+        if !links_current {
+            return Err(PrivateSyncError::OutOfOrder);
+        }
+        let expected_epoch = match &record.operation {
+            PrivateControlOperation::Invite { epoch, .. } if *epoch == current.epoch => *epoch,
+            PrivateControlOperation::Revoke { next_epoch, .. }
+            | PrivateControlOperation::RotateKeys { next_epoch }
+                if current.epoch.checked_add(1) == Some(next_epoch.epoch) =>
+            {
+                next_epoch.epoch
+            }
+            PrivateControlOperation::Recover { next_epoch, .. }
+                if next_epoch.epoch > current.epoch =>
+            {
+                next_epoch.epoch
+            }
+            PrivateControlOperation::SetResourcePolicy { .. }
+            | PrivateControlOperation::ActorLifecycle { .. } => current.epoch,
+            _ => return Err(PrivateSyncError::InvalidFrame),
+        };
+        if expected_epoch != *resulting_epoch {
+            return Err(PrivateSyncError::InvalidFrame);
+        }
+        let envelope = PrivateControlAuthorityEvidence::decode(evidence)?;
+        let application = PrivateControlApplicationAck::decode(&envelope.application_ack)
+            .map_err(|_| PrivateSyncError::InvalidFrame)?;
+        if application.application.stable_projection != *stable_projection {
+            return Err(PrivateSyncError::InvalidFrame);
+        }
+        if previous_sequence.is_some_and(|previous| previous >= *sequence) {
             return Err(PrivateSyncError::OutOfOrder);
         }
         if commitments.contains(commitment) {
@@ -973,9 +1204,57 @@ fn validate_control_item_order(items: &[PrivateSyncItem]) -> Result<(), PrivateS
         }
         commitments.push(*commitment);
         previous_sequence = Some(*sequence);
-        previous_epoch = Some(*resulting_epoch);
+        current = PrivateSyncHead {
+            epoch: *resulting_epoch,
+            control_head: Some(*commitment),
+        };
     }
     Ok(())
+}
+
+fn decode_exact_private_control_material(
+    control_wire: &[u8],
+    mutation_wire: Option<&[u8]>,
+) -> Result<(PrivateControlRecord, Option<PrivateRuntimeMutation>), PrivateSyncError> {
+    let control =
+        PrivateControlRecord::decode(control_wire).map_err(|_| PrivateSyncError::InvalidFrame)?;
+    if control.encode().ok().as_deref() != Some(control_wire) {
+        return Err(PrivateSyncError::InvalidFrame);
+    }
+    let mutation = mutation_wire
+        .map(|wire| {
+            let mutation =
+                PrivateRuntimeMutation::decode(wire).map_err(|_| PrivateSyncError::InvalidFrame)?;
+            if mutation.encode().ok().as_deref() != Some(wire) {
+                return Err(PrivateSyncError::InvalidFrame);
+            }
+            Ok(mutation)
+        })
+        .transpose()?;
+    match (&control.operation, &mutation) {
+        (
+            PrivateControlOperation::SetResourcePolicy { .. }
+            | PrivateControlOperation::ActorLifecycle { .. },
+            Some(mutation),
+        ) => {
+            let request = ManagementRequest::PrivateControl {
+                control: alloc::boxed::Box::new(control.clone()),
+                mutation: alloc::boxed::Box::new(mutation.clone()),
+            };
+            if !request.is_valid() {
+                return Err(PrivateSyncError::InvalidFrame);
+            }
+        }
+        (
+            PrivateControlOperation::Invite { .. }
+            | PrivateControlOperation::Revoke { .. }
+            | PrivateControlOperation::RotateKeys { .. }
+            | PrivateControlOperation::Recover { .. },
+            None,
+        ) => {}
+        _ => return Err(PrivateSyncError::InvalidFrame),
+    }
+    Ok((control, mutation))
 }
 
 fn validate_object_item_order(items: &[PrivateSyncItem]) -> Result<(), PrivateSyncError> {
@@ -1157,17 +1436,55 @@ fn serve_control_page(
             return Err(PrivateSyncError::Diverged);
         }
         let wire = store.read_control_wire(entry)?;
+        let runtime_application = store
+            .read_runtime_application(entry.commitment)?
+            .ok_or(PrivateSyncError::MissingEvidence)?;
         let evidence = store
             .read_control_authority_evidence(entry)?
             .ok_or(PrivateSyncError::MissingEvidence)?;
         let record = PrivateControlRecord::decode(&wire).map_err(|_| PrivateSyncError::Tampered)?;
         let envelope = PrivateControlAuthorityEvidence::decode(&evidence)?;
-        envelope.verify_for(&record, entry.resulting_epoch, route, authority)?;
-        let item_len = wire
-            .len()
-            .checked_add(evidence.len())
-            .and_then(|length| length.checked_add(96))
-            .ok_or(PrivateSyncError::LimitExceeded)?;
+        let stable_projection = runtime_application
+            .successor_stable_projection()
+            .ok_or(PrivateSyncError::Tampered)?
+            .commitment();
+        if stable_projection == Hash::ZERO
+            || runtime_application.managed() != route
+            || runtime_application.control() != &record
+        {
+            return Err(PrivateSyncError::Tampered);
+        }
+        let verified = envelope.verify_material_for(
+            &record,
+            entry.resulting_epoch,
+            stable_projection,
+            route,
+            authority,
+        )?;
+        if runtime_application.issuance() != &verified.issuance
+            || runtime_application.receipt() != &verified.issuance.receipt
+            || runtime_application.applied_at() != verified.application.application.applied_at
+            || runtime_application.recovery_authority_proof() != verified.recovery_proof.as_ref()
+        {
+            return Err(PrivateSyncError::Tampered);
+        }
+        let mutation = runtime_application
+            .mutation()
+            .map(CanonicalWire::encode)
+            .transpose()
+            .map_err(|_| PrivateSyncError::Tampered)?;
+        let item = PrivateSyncItem::Control {
+            sequence: entry.sequence,
+            commitment: entry.commitment,
+            resulting_epoch: entry.resulting_epoch,
+            wire,
+            mutation,
+            evidence,
+            stable_projection,
+        };
+        // Account from the exact item representation so PRM1 bytes can never
+        // evade either the request quota or the encoded-page bound.
+        let item_len = item.encoded_payload_len()?;
         if items.len() >= usize::from(request.max_items)
             || bytes
                 .checked_add(item_len)
@@ -1179,13 +1496,7 @@ fn serve_control_page(
             }
             break;
         }
-        items.push(PrivateSyncItem::Control {
-            sequence: entry.sequence,
-            commitment: entry.commitment,
-            resulting_epoch: entry.resulting_epoch,
-            wire,
-            evidence,
-        });
+        items.push(item);
         bytes += item_len;
         current = PrivateSyncHead {
             epoch: entry.resulting_epoch,
@@ -1291,15 +1602,11 @@ fn serve_object_page(
     Ok(page)
 }
 
-/// Apply one page received over an authenticated transport. The sender must
-/// be an exact member of the receiver's current verified control view before
-/// any persisted artifact is opened or changed.
-/// Low-level page application for already-authorized host wiring.
-///
-/// This remains crate-private until the production sync envelope binds every
-/// carried control to its exact authority issuance and PCA acknowledgement;
-/// transport authentication and a valid PCTL signature alone are not policy
-/// authorization.
+/// Apply one object page received over an authenticated transport. Control
+/// pages must first pass receiver-local PVM execution and the physical host's
+/// durable application path, so this low-level entry fails closed for them.
+/// The sender must be an exact member of the receiver's current verified
+/// control view before any persisted artifact is opened or changed.
 pub(crate) fn apply_private_sync_page<
     A: PrivateNodeAuthorityVerifier,
     T: PrivateTransportAuthVerifier,
@@ -1307,7 +1614,7 @@ pub(crate) fn apply_private_sync_page<
     store: &mut PrivateStore,
     peer: &PrivateNodeIdentity,
     page: &PrivateSyncPage,
-    node_authority: &A,
+    _node_authority: &A,
     transport: &T,
     route: ManagedAgentTarget,
     authority: AuthorityActorTarget,
@@ -1327,116 +1634,34 @@ pub(crate) fn apply_private_sync_page<
     }
     match page.phase {
         PrivateSyncPhase::Controls => {
-            apply_control_page(store, page, node_authority, route, authority)
+            // Authentication and complete page verification are useful to the
+            // physical coordinator, but this low-level Store API must never
+            // bypass the receiver's own PVM/PVRI/PCRS/PAPL transaction.
+            verify_private_sync_control_page(page, route, authority)?;
+            Err(PrivateSyncError::UnsupportedOperation)
         }
         PrivateSyncPhase::Objects => apply_object_page(store, page),
     }
 }
 
-fn apply_control_page<V: PrivateNodeAuthorityVerifier>(
-    store: &mut PrivateStore,
-    page: &PrivateSyncPage,
-    node_authority: &V,
-    route: ManagedAgentTarget,
-    authority: AuthorityActorTarget,
-) -> Result<PrivateSyncApplyDisposition, PrivateSyncError> {
-    let records = verify_private_control_page_authority_evidence(page, route, authority)?;
-    let start = store.binding();
-    let expected_start = page.request.cursor.local;
-    let mut skip = 0usize;
-    if start.epoch != expected_start.epoch || start.control_head != expected_start.control_head {
-        let Some(position) = page.items.iter().position(|item| {
-            matches!(
-                item,
-                PrivateSyncItem::Control {
-                    commitment,
-                    resulting_epoch,
-                    ..
-                } if start.control_head == Some(*commitment) && start.epoch == *resulting_epoch
-            )
-        }) else {
-            return Err(PrivateSyncError::Diverged);
-        };
-        skip = position
-            .checked_add(1)
-            .ok_or(PrivateSyncError::LimitExceeded)?;
-        for item in &page.items[..skip] {
-            let PrivateSyncItem::Control {
-                commitment, wire, ..
-            } = item
-            else {
-                return Err(PrivateSyncError::InvalidFrame);
-            };
-            if !store.control_is_exact(*commitment, wire)? {
-                return Err(PrivateSyncError::Diverged);
-            }
-        }
-    }
-    let expected_epochs = store.prevalidate_controls(&records[skip..], node_authority)?;
-    for (expected, item) in expected_epochs.iter().zip(&page.items[skip..]) {
-        let PrivateSyncItem::Control {
-            resulting_epoch, ..
-        } = item
-        else {
-            return Err(PrivateSyncError::InvalidFrame);
-        };
-        if expected != resulting_epoch {
-            return Err(PrivateSyncError::Tampered);
-        }
-    }
-    let mut inserted = false;
-    for (record, item) in records[..skip].iter().zip(&page.items[..skip]) {
-        let PrivateSyncItem::Control { evidence, .. } = item else {
-            return Err(PrivateSyncError::InvalidFrame);
-        };
-        inserted |= store.persist_control_authority_evidence(record.commitment(), evidence)?
-            == PutDisposition::Inserted;
-    }
-    for (record, item) in records[skip..].iter().zip(&page.items[skip..]) {
-        let PrivateSyncItem::Control { evidence, .. } = item else {
-            return Err(PrivateSyncError::InvalidFrame);
-        };
-        inserted |= store.append_control(record, node_authority)? == PutDisposition::Inserted;
-        inserted |= store.persist_control_authority_evidence(record.commitment(), evidence)?
-            == PutDisposition::Inserted;
-    }
-    let result = store.binding();
-    let expected_result = match page.items.last() {
-        Some(PrivateSyncItem::Control {
-            commitment,
-            resulting_epoch,
-            ..
-        }) => PrivateSyncHead {
-            epoch: *resulting_epoch,
-            control_head: Some(*commitment),
-        },
-        _ => return Err(PrivateSyncError::InvalidFrame),
-    };
-    if result.epoch != expected_result.epoch || result.control_head != expected_result.control_head
-    {
-        return Err(PrivateSyncError::Tampered);
-    }
-    Ok(if inserted {
-        PrivateSyncApplyDisposition::Applied
-    } else {
-        PrivateSyncApplyDisposition::AlreadyApplied
-    })
-}
-
-/// Verify the complete authority-evidence correspondence for a controls page
-/// without reading or mutating local artifacts. The host calls this before it
-/// stages any decrypted epoch sidecar; `apply_control_page` calls it again
-/// immediately before cumulative chain prevalidation and persistence.
-pub(crate) fn verify_private_control_page_authority_evidence(
+/// Verify the complete control/evidence/projection correspondence without
+/// reading or mutating local artifacts.
+///
+/// The returned values are the only control-page input intended for the
+/// physical host. It must apply them in order through its own PVM, construct a
+/// node-local PVRI/PCRS, and require the resulting PSP commitment to equal
+/// [`VerifiedPrivateSyncControl::source_stable_projection`] before committing.
+pub(crate) fn verify_private_sync_control_page(
     page: &PrivateSyncPage,
     route: ManagedAgentTarget,
     authority: AuthorityActorTarget,
-) -> Result<Vec<PrivateControlRecord>, PrivateSyncError> {
+) -> Result<Vec<VerifiedPrivateSyncControl>, PrivateSyncError> {
+    page.validate_shape()?;
     if page.phase != PrivateSyncPhase::Controls {
         return Ok(Vec::new());
     }
-    let mut records = Vec::new();
-    records
+    let mut controls = Vec::new();
+    controls
         .try_reserve(page.items.len())
         .map_err(|_| PrivateSyncError::LimitExceeded)?;
     for item in &page.items {
@@ -1445,22 +1670,15 @@ pub(crate) fn verify_private_control_page_authority_evidence(
             commitment,
             resulting_epoch,
             wire,
+            mutation,
             evidence,
+            stable_projection,
         } = item
         else {
             return Err(PrivateSyncError::InvalidFrame);
         };
-        let record = PrivateControlRecord::decode(wire).map_err(|_| PrivateSyncError::Tampered)?;
-        if matches!(
-            &record.operation,
-            PrivateControlOperation::SetResourcePolicy { .. }
-                | PrivateControlOperation::ActorLifecycle { .. }
-        ) {
-            // Completed authority evidence proves what the sender applied; it
-            // cannot substitute for applying and reopening that transition on
-            // this receiving runtime. Refuse before prevalidation or writes.
-            return Err(PrivateSyncError::UnsupportedOperation);
-        }
+        let (record, mutation) = decode_exact_private_control_material(wire, mutation.as_deref())
+            .map_err(|_| PrivateSyncError::Tampered)?;
         let actual_epoch = match &record.operation {
             PrivateControlOperation::Revoke { next_epoch, .. }
             | PrivateControlOperation::RotateKeys { next_epoch }
@@ -1481,10 +1699,42 @@ pub(crate) fn verify_private_control_page_authority_evidence(
             return Err(PrivateSyncError::MissingEvidence);
         }
         let envelope = PrivateControlAuthorityEvidence::decode(evidence)?;
-        envelope.verify_for(&record, *resulting_epoch, route, authority)?;
-        records.push(record);
+        let verified = envelope.verify_material_for(
+            &record,
+            *resulting_epoch,
+            *stable_projection,
+            route,
+            authority,
+        )?;
+        controls.push(VerifiedPrivateSyncControl {
+            control: record,
+            mutation,
+            evidence_wire: evidence.clone(),
+            issuance: verified.issuance,
+            source_application: verified.application,
+            recovery_proof: verified.recovery_proof,
+            source_stable_projection: *stable_projection,
+        });
     }
-    Ok(records)
+    Ok(controls)
+}
+
+/// Fail-closed compatibility entry point for the legacy physical-host path.
+///
+/// That path stages epoch metadata before reaching the low-level Store apply
+/// call, so returning verified controls to it would still create pre-PVM
+/// artifacts. The physical-host v3 path must instead call
+/// [`verify_private_sync_control_page`] and consume its values as PVM input.
+pub(crate) fn verify_private_control_page_authority_evidence(
+    page: &PrivateSyncPage,
+    route: ManagedAgentTarget,
+    authority: AuthorityActorTarget,
+) -> Result<Vec<VerifiedPrivateSyncControl>, PrivateSyncError> {
+    let controls = verify_private_sync_control_page(page, route, authority)?;
+    if page.phase == PrivateSyncPhase::Controls {
+        return Err(PrivateSyncError::UnsupportedOperation);
+    }
+    Ok(controls)
 }
 
 fn apply_object_page(
@@ -1646,6 +1896,10 @@ mod tests {
         seal_owner_key_for_node, sign_owner_control_record, sign_recovery_control_record,
         unwrap_data_key, unwrap_owner_key,
     };
+    use crate::agent::private_runtime::{
+        PrivateControlReopenedState, PrivateKeyEpochCommitment, PrivateRuntimeApplication,
+        PrivateRuntimeImage, PrivateRuntimeSuccess,
+    };
     use ed25519_dalek::{Signer as _, SigningKey};
     use vos_agent_sdk::authority::{
         AgentAuthorityBinding, AuthorityEvidence, AuthorityIssuer, AuthorityLaneRoots,
@@ -1654,12 +1908,15 @@ mod tests {
     use vos_agent_sdk::authority_operation::{
         PrivateControlApplicationFact, private_member_set_commitment,
     };
+    use vos_agent_sdk::contract::{RuntimePackageContract, RuntimeResourcePolicy};
     use vos_agent_sdk::private::{
         EncryptedObjectKind, PrivateActorLifecycleKind, PrivateControlSigner,
+        recovery_signing_public_key_commitment,
     };
     use vos_agent_sdk::{
-        ActorId, BlobRef, DeploymentId, InvocationId, LaneSet, PrincipalId, ProducerId, ProgramId,
-        ResumeWork, RuntimeState,
+        ActorId, AgentDescriptor, AgentIdentity, AgentReplica, BlobRef, DeploymentId, InvocationId,
+        LaneSet, PrincipalId, PrivateRecoveryBinding, ProducerId, ProgramId, ReplicaRole,
+        ResumeWork, RuntimeCapabilities, RuntimeState,
     };
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -1770,6 +2027,7 @@ mod tests {
         nodes: Vec<PrivateNodeIdentity>,
         epoch: GeneratedPrivateEpoch,
         owner_key: OwnerSigningKey,
+        descriptor: AgentDescriptor,
     }
 
     fn recipient(space: SpaceId, agent: AgentId, owner: PrincipalId, label: u8) -> Recipient {
@@ -1789,8 +2047,9 @@ mod tests {
 
     fn fixture() -> Fixture {
         let space = SpaceId([11; 32]);
-        let agent = AgentId([12; 32]);
+        let creation_nonce = Hash([12; 32]);
         let owner = PrincipalId([13; 32]);
+        let agent = AgentId::derive(space, owner, creation_nonce.as_bytes());
         let recovery = RecoverySigningKey::from_seed([14; 32]).unwrap();
         let recovery_encryption = OfflineRecoveryDecryptionKey::from_bytes([19; 32]).unwrap();
         let mut recipients = vec![
@@ -1814,6 +2073,50 @@ mod tests {
         )
         .unwrap();
         let owner_key = unwrap_owner_key(&epoch.record, &nodes[0], &recipients[0].key).unwrap();
+        let authority_key = SigningKey::from_bytes(&[0x71; 32]);
+        let authority = AgentAuthorityBinding {
+            policy: Hash([0x74; 32]),
+            issuer: AuthorityIssuer {
+                principal: PrincipalId([0x75; 32]),
+                actor: ActorId([0x76; 32]),
+                deployment: DeploymentId([0x77; 32]),
+                program: ProgramId([0x78; 32]),
+                producer: ProducerId::of_public_key(&authority_key.verifying_key().to_bytes()),
+            },
+            public_key: authority_key.verifying_key().to_bytes(),
+            initial_epoch: 1,
+        };
+        let descriptor = AgentDescriptor {
+            identity: AgentIdentity {
+                space,
+                agent,
+                owner,
+                profile: AgentProfile::Private,
+                runtime_deployment: DeploymentId([0x79; 32]),
+                runtime_program: ProgramId([0x7a; 32]),
+                runtime_producer: ProducerId([0x7b; 32]),
+            },
+            creation_nonce,
+            authority,
+            private_recovery: Some(PrivateRecoveryBinding {
+                signing_key_commitment: recovery_signing_public_key_commitment(
+                    &recovery.verifying_key(),
+                ),
+                encryption_public_key: recovery_encryption.public_key(),
+            }),
+            runtime_package: BlobRef::of_bytes(b"private-sync-runtime-package"),
+            runtime_contract: RuntimePackageContract::canonical(),
+            capabilities: RuntimeCapabilities::standard(),
+            replicas: nodes
+                .iter()
+                .map(|node| AgentReplica {
+                    node: node.node,
+                    principal: owner,
+                    role: ReplicaRole::Observer,
+                })
+                .collect(),
+        };
+        descriptor.validate().unwrap();
         Fixture {
             space,
             agent,
@@ -1824,6 +2127,7 @@ mod tests {
             nodes,
             epoch,
             owner_key,
+            descriptor,
         }
     }
 
@@ -1873,6 +2177,58 @@ mod tests {
         }
     }
 
+    fn creation_receipt(fixture: &Fixture) -> AuthorityReceipt {
+        let key = SigningKey::from_bytes(&[0x71; 32]);
+        let request = ManagementRequest::Create(Box::new(fixture.descriptor.clone()));
+        let mut receipt = AuthorityReceipt {
+            selector: AuthorityReceiptSelector {
+                policy: fixture.descriptor.authority.policy,
+                issuer: fixture.descriptor.authority.issuer,
+                space: fixture.space,
+                agent: fixture.agent,
+                operation: vos_agent_sdk::authority::AuthorityOperationKind::CreateAgent,
+                runtime_deployment: fixture.descriptor.identity.runtime_deployment,
+                actor: None,
+                actor_deployment: None,
+                evidence: AuthorityEvidence {
+                    package: None,
+                    proof: None,
+                    commitment: Hash([0x7e; 32]),
+                },
+                lane_roots: AuthorityLaneRoots::default(),
+                epoch: fixture.descriptor.authority.initial_epoch,
+                decision_sequence: 1,
+                acknowledged_through: 0,
+                valid_from: 1,
+                expires_at: 100,
+                request: request.commitment(),
+            },
+            public_key: fixture.descriptor.authority.public_key,
+            signature: [0; 64],
+        };
+        receipt.signature = key.sign(&receipt.signing_bytes()).to_bytes();
+        receipt
+    }
+
+    fn genesis_runtime_image(store: &PrivateStore, fixture: &Fixture) -> PrivateRuntimeImage {
+        PrivateRuntimeImage::genesis(
+            &fixture.descriptor,
+            fixture.recipients[0].identity.node,
+            RuntimeState {
+                control: vec![0x21],
+                linear: Vec::new(),
+                merge: vec![0x22],
+                local: vec![0x23],
+            },
+            store.core_position().unwrap(),
+            vec![PrivateKeyEpochCommitment::from_epoch(&fixture.epoch.record).unwrap()],
+            creation_receipt(fixture),
+            3,
+            &RawAuthorityVerifier,
+        )
+        .unwrap()
+    }
+
     fn signed_evidence(
         store: &PrivateStore,
         control: &PrivateControlRecord,
@@ -1913,6 +2269,24 @@ mod tests {
         intent: AuthorityOperationIntent,
         recovery_proof: Option<&PrivateRecoveryAuthorityProof>,
     ) -> PrivateControlAuthorityEvidence {
+        signed_evidence_for_intent_with_projection(
+            store,
+            control,
+            intent,
+            recovery_proof,
+            Hash([0x81; 32]),
+            Hash([0x82; 32]),
+        )
+    }
+
+    fn signed_evidence_for_intent_with_projection(
+        store: &PrivateStore,
+        control: &PrivateControlRecord,
+        intent: AuthorityOperationIntent,
+        recovery_proof: Option<&PrivateRecoveryAuthorityProof>,
+        reopened_runtime_state: Hash,
+        stable_projection: Hash,
+    ) -> PrivateControlAuthorityEvidence {
         let authority = test_authority_target(store);
         let route = test_route(store);
         assert_eq!(intent.managed(), route);
@@ -1923,6 +2297,14 @@ mod tests {
         };
         let issued_at = control.sequence.saturating_add(20);
         let applied_at = issued_at.saturating_add(1);
+        let resulting_epoch = match &control.operation {
+            PrivateControlOperation::Invite { epoch, .. } => *epoch,
+            PrivateControlOperation::Revoke { next_epoch, .. }
+            | PrivateControlOperation::RotateKeys { next_epoch }
+            | PrivateControlOperation::Recover { next_epoch, .. } => next_epoch.epoch,
+            PrivateControlOperation::SetResourcePolicy { .. }
+            | PrivateControlOperation::ActorLifecycle { .. } => store.binding().epoch,
+        };
         let authorization_sequence = NonZeroU64::new(control.sequence + 1).unwrap();
         let operation_call = Hash::digest(
             b"vos/test/private-sync-operation-call/v1",
@@ -1990,10 +2372,10 @@ mod tests {
             control: control.commitment(),
             control_sequence: control.sequence,
             control_previous: control.previous,
-            epoch: store.binding().epoch,
+            epoch: resulting_epoch,
             post_member_set,
-            reopened_runtime_state: Hash([0x81; 32]),
-            stable_projection: Hash([0x82; 32]),
+            reopened_runtime_state,
+            stable_projection,
             reopened_control_head: control.commitment(),
             applied_at,
         };
@@ -2021,7 +2403,13 @@ mod tests {
         )
         .unwrap();
         evidence
-            .verify_for(control, store.binding().epoch, route, authority)
+            .verify_for_stable_projection(
+                control,
+                resulting_epoch,
+                application.application.stable_projection,
+                route,
+                authority,
+            )
             .unwrap();
         evidence
     }
@@ -2033,19 +2421,166 @@ mod tests {
             .unwrap();
     }
 
-    fn attach_signed_recovery_evidence(
+    fn append_completed_runtime_application(
+        store: &mut PrivateStore,
+        fixture: &Fixture,
+        predecessor: &PrivateRuntimeImage,
+        control: &PrivateControlRecord,
+        mutation: Option<&PrivateRuntimeMutation>,
+        recovery_proof: Option<&PrivateRecoveryAuthorityProof>,
+        success: PrivateRuntimeSuccess,
+    ) -> (
+        PrivateRuntimeImage,
+        PrivateRuntimeApplication,
+        PrivateControlReopenedState,
+        PrivateControlAuthorityEvidence,
+    ) {
+        let provisional = match recovery_proof {
+            Some(proof) => signed_evidence_for_intent(
+                store,
+                control,
+                AuthorityOperationIntent::RecoverPrivateAgent {
+                    proof: proof.clone(),
+                },
+                Some(proof),
+            ),
+            None => signed_evidence(store, control),
+        };
+        let issuance = AuthorityOperationIssuanceAck::decode(&provisional.issuance_ack).unwrap();
+        let application =
+            PrivateControlApplicationAck::decode(&provisional.application_ack).unwrap();
+        let preview = store
+            .preview_control_position(control, &TestAuthority)
+            .unwrap();
+        assert_eq!(preview.disposition(), PutDisposition::Inserted);
+        let pending = PrivateRuntimeApplication::pending(
+            &fixture.descriptor,
+            predecessor,
+            control.clone(),
+            mutation.cloned(),
+            recovery_proof.cloned(),
+            issuance.receipt.clone(),
+            issuance.clone(),
+            application.application.applied_at,
+            preview.position(),
+            &RawAuthorityVerifier,
+            &RawRecoveryProofVerifier,
+        )
+        .unwrap();
+        let mut successor_key_epochs = predecessor.key_epochs().to_vec();
+        match &control.operation {
+            PrivateControlOperation::Invite {
+                node,
+                epoch,
+                sealed_owner_key,
+                sealed_data_key,
+                ..
+            } => {
+                let mut next_epoch = store.key_epoch().clone();
+                assert_eq!(next_epoch.epoch, *epoch);
+                let position = next_epoch
+                    .sealed_owner_keys
+                    .binary_search_by_key(&node.node, |sealed| sealed.node)
+                    .unwrap_err();
+                next_epoch
+                    .sealed_owner_keys
+                    .insert(position, sealed_owner_key.clone());
+                next_epoch
+                    .sealed_data_keys
+                    .insert(position, sealed_data_key.clone());
+                *successor_key_epochs.last_mut().unwrap() =
+                    PrivateKeyEpochCommitment::from_epoch(&next_epoch).unwrap();
+            }
+            PrivateControlOperation::Revoke { next_epoch, .. }
+            | PrivateControlOperation::RotateKeys { next_epoch }
+            | PrivateControlOperation::Recover { next_epoch, .. } => successor_key_epochs
+                .push(PrivateKeyEpochCommitment::from_epoch(next_epoch).unwrap()),
+            PrivateControlOperation::SetResourcePolicy { .. }
+            | PrivateControlOperation::ActorLifecycle { .. } => {}
+        }
+        let successor = PrivateRuntimeImage::successor(
+            &fixture.descriptor,
+            predecessor,
+            &pending,
+            &success,
+            predecessor.state().clone(),
+            successor_key_epochs,
+            &RawAuthorityVerifier,
+            &RawRecoveryProofVerifier,
+        )
+        .unwrap();
+        let completed = pending
+            .complete(
+                &fixture.descriptor,
+                predecessor,
+                &successor,
+                success.clone(),
+                &RawAuthorityVerifier,
+                &RawRecoveryProofVerifier,
+            )
+            .unwrap();
+        let stable_projection = completed
+            .successor_stable_projection()
+            .unwrap()
+            .commitment();
+        let reopened = PrivateControlReopenedState::new(
+            completed.clone(),
+            preview.position(),
+            successor.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .append_control_with_runtime_application(control, &completed, &TestAuthority)
+                .unwrap(),
+            PutDisposition::Inserted
+        );
+        let intent = match recovery_proof {
+            Some(proof) => AuthorityOperationIntent::RecoverPrivateAgent {
+                proof: proof.clone(),
+            },
+            None => AuthorityOperationIntent::private_control(
+                test_route(store).runtime_deployment,
+                control,
+            )
+            .unwrap(),
+        };
+        let evidence = signed_evidence_for_intent_with_projection(
+            store,
+            control,
+            intent,
+            recovery_proof,
+            reopened.commitment(),
+            stable_projection,
+        );
+        assert_eq!(
+            AuthorityOperationIssuanceAck::decode(&evidence.issuance_ack).unwrap(),
+            issuance
+        );
+        assert_eq!(
+            store
+                .read_runtime_application(control.commitment())
+                .unwrap()
+                .as_ref(),
+            Some(&completed)
+        );
+        (successor, completed, reopened, evidence)
+    }
+
+    fn persist_exact_evidence(
         store: &mut PrivateStore,
         control: &PrivateControlRecord,
-        recovery: &RecoverySigningKey,
-        superseded_authority_head: Option<Hash>,
+        evidence: &PrivateControlAuthorityEvidence,
     ) {
-        let evidence =
-            signed_recovery_evidence(store, control, recovery, superseded_authority_head)
-                .encode()
-                .unwrap();
-        store
-            .persist_control_authority_evidence(control.commitment(), &evidence)
-            .unwrap();
+        assert_eq!(
+            store
+                .persist_control_authority_evidence(
+                    control.commitment(),
+                    &evidence.encode().unwrap(),
+                )
+                .unwrap(),
+            PutDisposition::Inserted
+        );
     }
 
     fn invite_record(store: &PrivateStore, fixture: &Fixture, label: u8) -> PrivateControlRecord {
@@ -2182,6 +2717,55 @@ mod tests {
         }
     }
 
+    fn verified_control_page(
+        receiver: &PrivateStore,
+        source: &PrivateStore,
+        control: &PrivateControlRecord,
+        mutation: Option<&PrivateRuntimeMutation>,
+        evidence: &PrivateControlAuthorityEvidence,
+    ) -> PrivateSyncPage {
+        let source_binding = source.binding();
+        let application = PrivateControlApplicationAck::decode(&evidence.application_ack).unwrap();
+        let page = PrivateSyncPage {
+            request: request_for(receiver, 4, MAX_PRIVATE_SYNC_PAGE_BYTES as u32),
+            target: PrivateSyncHead {
+                epoch: source_binding.epoch,
+                control_head: Some(control.commitment()),
+            },
+            phase: PrivateSyncPhase::Controls,
+            items: vec![PrivateSyncItem::Control {
+                sequence: control.sequence,
+                commitment: control.commitment(),
+                resulting_epoch: source_binding.epoch,
+                wire: control.encode().unwrap(),
+                mutation: mutation.map(|value| value.encode().unwrap()),
+                evidence: evidence.encode().unwrap(),
+                stable_projection: application.application.stable_projection,
+            }],
+            next: None,
+        };
+        page.validate_shape().unwrap();
+        page
+    }
+
+    fn control_item(
+        control: &PrivateControlRecord,
+        resulting_epoch: u64,
+        mutation: Option<&PrivateRuntimeMutation>,
+        evidence: &PrivateControlAuthorityEvidence,
+    ) -> PrivateSyncItem {
+        let application = PrivateControlApplicationAck::decode(&evidence.application_ack).unwrap();
+        PrivateSyncItem::Control {
+            sequence: control.sequence,
+            commitment: control.commitment(),
+            resulting_epoch,
+            wire: control.encode().unwrap(),
+            mutation: mutation.map(|value| value.encode().unwrap()),
+            evidence: evidence.encode().unwrap(),
+            stable_projection: application.application.stable_projection,
+        }
+    }
+
     fn converge(
         server: &PrivateStore,
         client: &mut PrivateStore,
@@ -2249,6 +2833,10 @@ mod tests {
         sign_owner_control_record(&mut record, &fixture.owner_key).unwrap();
         server.append_control(&record, &TestAuthority).unwrap();
         attach_signed_evidence(&mut server, &record);
+        // Control reception is owned by the physical PVM coordinator. Once
+        // that coordinator has advanced the target head, ciphertext objects
+        // remain safe to apply through this low-level sync path.
+        client.append_control(&record, &TestAuthority).unwrap();
         let sentinel = b"PRIVATE-FRAME-SENTINEL-8d21";
         for kind in [
             EncryptedObjectKind::Package,
@@ -2277,7 +2865,7 @@ mod tests {
             &fixture.recipients[0].identity,
             sentinel,
         );
-        assert!(frames.len() >= 4);
+        assert!(frames.len() >= 3);
         assert_eq!(client.binding(), server.binding());
         assert_eq!(client.object_count(), 5);
         assert_eq!(client.control_count(), 1);
@@ -2375,7 +2963,10 @@ mod tests {
             max_items: 4,
             max_bytes: MAX_PRIVATE_SYNC_PAGE_BYTES as u32,
         };
-        serve_private_sync_page(&server, &survivor, &survivor_request, &TestTransport).unwrap();
+        assert_eq!(
+            serve_private_sync_page(&server, &survivor, &survivor_request, &TestTransport),
+            Err(PrivateSyncError::MissingEvidence)
+        );
         assert!(server.artifact_read_spy() > 0);
     }
 
@@ -2451,45 +3042,20 @@ mod tests {
         );
 
         attach_signed_evidence(&mut server, &control);
-        let page = serve_private_sync_page(
-            &server,
-            &fixture.recipients[0].identity,
-            &request,
-            &TestTransport,
-        )
-        .unwrap();
-        let item_bytes = page.items[0].encoded_payload_len().unwrap();
-        let too_small = PrivateSyncRequest {
-            cursor: request.cursor.clone(),
-            max_items: 1,
-            max_bytes: u32::try_from(item_bytes - 1).unwrap(),
-        };
+        // A loose PSE2 beside a legacy PCTL is not exportable in v3. Serving
+        // requires the Store's exact completed PAPL attachment.
         assert_eq!(
             serve_private_sync_page(
                 &server,
                 &fixture.recipients[0].identity,
-                &too_small,
+                &request,
                 &TestTransport,
             ),
-            Err(PrivateSyncError::LimitTooSmall)
+            Err(PrivateSyncError::MissingEvidence)
         );
-        let exact = PrivateSyncRequest {
-            cursor: request.cursor,
-            max_items: 1,
-            max_bytes: u32::try_from(item_bytes).unwrap(),
-        };
-        assert_eq!(
-            serve_private_sync_page(
-                &server,
-                &fixture.recipients[0].identity,
-                &exact,
-                &TestTransport,
-            )
-            .unwrap()
-            .items
-            .len(),
-            1
-        );
+
+        let evidence = signed_evidence(&server, &control);
+        let page = verified_control_page(&client, &server, &control, None, &evidence);
 
         let mut oversized = page.clone();
         let oversized_evidence = vec![0; MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES + 1];
@@ -2525,7 +3091,446 @@ mod tests {
     }
 
     #[test]
-    fn retained_exact_page_attaches_evidence_to_a_crash_visible_control_prefix() {
+    fn serving_uses_only_completed_papl_and_exports_exact_v3_control_material() {
+        let directory = TestDirectory::new("completed-papl-sync");
+        let fixture = fixture();
+        let mut source = create_store(&directory.child("source"), &fixture);
+        let receiver = create_store(&directory.child("receiver"), &fixture);
+        let genesis = genesis_runtime_image(&source, &fixture);
+
+        let mut policy = RuntimeResourcePolicy::standard();
+        policy.max_actors -= 1;
+        let policy_mutation = PrivateRuntimeMutation::SetResourcePolicy(policy);
+        let mut policy_control = PrivateControlRecord {
+            space: fixture.space,
+            agent: fixture.agent,
+            sequence: 0,
+            previous: None,
+            operation: PrivateControlOperation::SetResourcePolicy {
+                policy: BlobRef::of_bytes(&policy.encode().unwrap()),
+            },
+            signer: PrivateControlSigner::Owner,
+            signer_public_key: [0; 32],
+            signature: [0; 64],
+        };
+        sign_owner_control_record(&mut policy_control, &fixture.owner_key).unwrap();
+        let (policy_successor, policy_application, policy_reopened, policy_evidence) =
+            append_completed_runtime_application(
+                &mut source,
+                &fixture,
+                &genesis,
+                &policy_control,
+                Some(&policy_mutation),
+                None,
+                PrivateRuntimeSuccess::ResourcePolicySet(policy),
+            );
+        persist_exact_evidence(&mut source, &policy_control, &policy_evidence);
+
+        let invite = invite_record(&source, &fixture, 0xa8);
+        let (invite_successor, invite_application, invite_reopened, invite_evidence) =
+            append_completed_runtime_application(
+                &mut source,
+                &fixture,
+                &policy_successor,
+                &invite,
+                None,
+                None,
+                PrivateRuntimeSuccess::ControlOnly,
+            );
+        persist_exact_evidence(&mut source, &invite, &invite_evidence);
+
+        let request = request_for(&receiver, 4, MAX_PRIVATE_SYNC_PAGE_BYTES as u32);
+        let page = serve_private_sync_page(
+            &source,
+            &fixture.recipients[0].identity,
+            &request,
+            &TestTransport,
+        )
+        .unwrap();
+        assert_eq!(page.phase, PrivateSyncPhase::Controls);
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.next, None);
+
+        let policy_wire = policy_control.encode().unwrap();
+        let mutation_wire = policy_mutation.encode().unwrap();
+        let policy_evidence_wire = policy_evidence.encode().unwrap();
+        let invite_wire = invite.encode().unwrap();
+        let invite_evidence_wire = invite_evidence.encode().unwrap();
+        let PrivateSyncItem::Control {
+            wire,
+            mutation,
+            evidence,
+            stable_projection,
+            ..
+        } = &page.items[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(wire, &policy_wire);
+        assert_eq!(mutation.as_deref(), Some(mutation_wire.as_slice()));
+        assert_eq!(evidence, &policy_evidence_wire);
+        assert_eq!(
+            *stable_projection,
+            policy_application
+                .successor_stable_projection()
+                .unwrap()
+                .commitment()
+        );
+        let PrivateSyncItem::Control {
+            wire,
+            mutation,
+            evidence,
+            stable_projection,
+            ..
+        } = &page.items[1]
+        else {
+            unreachable!()
+        };
+        assert_eq!(wire, &invite_wire);
+        assert_eq!(mutation, &None);
+        assert_eq!(evidence, &invite_evidence_wire);
+        assert_eq!(
+            *stable_projection,
+            invite_application
+                .successor_stable_projection()
+                .unwrap()
+                .commitment()
+        );
+
+        let verified = verify_private_sync_control_page(
+            &page,
+            test_route(&receiver),
+            test_authority_target(&receiver),
+        )
+        .unwrap();
+        assert_eq!(verified.len(), 2);
+        assert_eq!(verified[0].control(), &policy_control);
+        assert_eq!(verified[0].mutation(), Some(&policy_mutation));
+        assert_eq!(verified[1].control(), &invite);
+        assert_eq!(verified[1].mutation(), None);
+
+        let frame = page.encode().unwrap();
+        for required_magic in [b"PCTL", b"PRM1", b"PSE2", b"PCA2"] {
+            assert!(
+                frame
+                    .windows(required_magic.len())
+                    .any(|window| window == required_magic)
+            );
+        }
+        for forbidden_magic in [b"PAP1", b"PVI1", b"PCR2", b"PSP1"] {
+            assert!(
+                !frame
+                    .windows(forbidden_magic.len())
+                    .any(|window| window == forbidden_magic)
+            );
+        }
+        let hidden_wires = [
+            policy_application.encode().unwrap(),
+            invite_application.encode().unwrap(),
+            genesis.encode().unwrap(),
+            policy_successor.encode().unwrap(),
+            invite_successor.encode().unwrap(),
+            policy_reopened.encode().unwrap(),
+            invite_reopened.encode().unwrap(),
+            policy_application
+                .successor_stable_projection()
+                .unwrap()
+                .encode()
+                .unwrap(),
+            invite_application
+                .successor_stable_projection()
+                .unwrap()
+                .encode()
+                .unwrap(),
+        ];
+        for hidden in hidden_wires {
+            assert!(!frame.windows(hidden.len()).any(|window| window == hidden));
+        }
+
+        let first_item_len = page.items[0].encoded_payload_len().unwrap();
+        assert!(first_item_len > mutation_wire.len());
+        let constrained = PrivateSyncRequest {
+            cursor: request.cursor,
+            max_items: 1,
+            max_bytes: u32::try_from(first_item_len - 1).unwrap(),
+        };
+        assert_eq!(
+            serve_private_sync_page(
+                &source,
+                &fixture.recipients[0].identity,
+                &constrained,
+                &TestTransport,
+            ),
+            Err(PrivateSyncError::LimitTooSmall)
+        );
+    }
+
+    #[test]
+    fn serving_rejects_signed_papl_pse_receipt_applied_and_psp_substitution() {
+        let directory = TestDirectory::new("papl-pse-substitution");
+        let fixture = fixture();
+        let authority_key = SigningKey::from_bytes(&[0x71; 32]);
+
+        for case in 0..3u8 {
+            let source_path = directory.child(&format!("source-{case}"));
+            let receiver_path = directory.child(&format!("receiver-{case}"));
+            let mut source = create_store(&source_path, &fixture);
+            let receiver = create_store(&receiver_path, &fixture);
+            let predecessor = genesis_runtime_image(&source, &fixture);
+            let mut policy = RuntimeResourcePolicy::standard();
+            policy.max_actors -= u32::from(case) + 1;
+            let mutation = PrivateRuntimeMutation::SetResourcePolicy(policy);
+            let mut control = PrivateControlRecord {
+                space: fixture.space,
+                agent: fixture.agent,
+                sequence: 0,
+                previous: None,
+                operation: PrivateControlOperation::SetResourcePolicy {
+                    policy: BlobRef::of_bytes(&policy.encode().unwrap()),
+                },
+                signer: PrivateControlSigner::Owner,
+                signer_public_key: [0; 32],
+                signature: [0; 64],
+            };
+            sign_owner_control_record(&mut control, &fixture.owner_key).unwrap();
+            let (_, application, _, mut evidence) = append_completed_runtime_application(
+                &mut source,
+                &fixture,
+                &predecessor,
+                &control,
+                Some(&mutation),
+                None,
+                PrivateRuntimeSuccess::ResourcePolicySet(policy),
+            );
+
+            let mut issuance =
+                AuthorityOperationIssuanceAck::decode(&evidence.issuance_ack).unwrap();
+            let mut acknowledgement =
+                PrivateControlApplicationAck::decode(&evidence.application_ack).unwrap();
+            match case {
+                0 => {
+                    // Keep the envelope independently well signed while
+                    // substituting the receipt retained in the public PAPL.
+                    issuance.receipt.selector.evidence.commitment = Hash([0xd1; 32]);
+                    issuance.receipt.signature = [0; 64];
+                    issuance.receipt.signature = authority_key
+                        .sign(&issuance.receipt.signing_bytes())
+                        .to_bytes();
+                    issuance.signature = [0; 64];
+                    issuance.signature = authority_key.sign(&issuance.signing_bytes()).to_bytes();
+                    acknowledgement.receipt = issuance.receipt.clone();
+                    acknowledgement.issuance_ack = issuance.commitment();
+                    acknowledgement.application_invocation =
+                        PrivateControlApplicationAck::derive_application_invocation(&issuance);
+                }
+                1 => {
+                    acknowledgement.application.applied_at += 1;
+                }
+                2 => {
+                    acknowledgement.application.stable_projection = Hash([0xd2; 32]);
+                }
+                _ => unreachable!(),
+            }
+            acknowledgement.signature = [0; 64];
+            acknowledgement.signature = authority_key
+                .sign(&acknowledgement.signing_bytes())
+                .to_bytes();
+            evidence = PrivateControlAuthorityEvidence::from_acknowledgements(
+                &issuance,
+                &acknowledgement,
+                None,
+            )
+            .unwrap();
+            evidence
+                .verify_for_stable_projection(
+                    &control,
+                    source.binding().epoch,
+                    acknowledgement.application.stable_projection,
+                    test_route(&source),
+                    test_authority_target(&source),
+                )
+                .unwrap();
+            if case == 0 {
+                assert_ne!(application.issuance(), &issuance);
+                assert_ne!(application.receipt(), &issuance.receipt);
+            } else {
+                assert_eq!(application.issuance(), &issuance);
+            }
+            persist_exact_evidence(&mut source, &control, &evidence);
+
+            let source_before = directory_image(&source_path);
+            let receiver_before = directory_image(&receiver_path);
+            assert_eq!(
+                serve_private_sync_page(
+                    &source,
+                    &fixture.recipients[0].identity,
+                    &request_for(&receiver, 4, MAX_PRIVATE_SYNC_PAGE_BYTES as u32),
+                    &TestTransport,
+                ),
+                Err(PrivateSyncError::Tampered)
+            );
+            assert_eq!(directory_image(&source_path), source_before);
+            assert_eq!(directory_image(&receiver_path), receiver_before);
+        }
+    }
+
+    #[test]
+    fn serving_rejects_signed_papl_pse_recovery_proof_substitution() {
+        let directory = TestDirectory::new("papl-pse-recovery-substitution");
+        let fixture = fixture();
+        let source_path = directory.child("source");
+        let receiver_path = directory.child("receiver");
+        let mut source = create_store(&source_path, &fixture);
+        let receiver = create_store(&receiver_path, &fixture);
+        let genesis = genesis_runtime_image(&source, &fixture);
+
+        let mut policy = RuntimeResourcePolicy::standard();
+        policy.max_actors -= 1;
+        let mutation = PrivateRuntimeMutation::SetResourcePolicy(policy);
+        let mut policy_control = PrivateControlRecord {
+            space: fixture.space,
+            agent: fixture.agent,
+            sequence: 0,
+            previous: None,
+            operation: PrivateControlOperation::SetResourcePolicy {
+                policy: BlobRef::of_bytes(&policy.encode().unwrap()),
+            },
+            signer: PrivateControlSigner::Owner,
+            signer_public_key: [0; 32],
+            signature: [0; 64],
+        };
+        sign_owner_control_record(&mut policy_control, &fixture.owner_key).unwrap();
+        let (policy_successor, _, _, policy_evidence) = append_completed_runtime_application(
+            &mut source,
+            &fixture,
+            &genesis,
+            &policy_control,
+            Some(&mutation),
+            None,
+            PrivateRuntimeSuccess::ResourcePolicySet(policy),
+        );
+        persist_exact_evidence(&mut source, &policy_control, &policy_evidence);
+
+        let successor_epoch = generate_fresh_private_epoch(
+            fixture.space,
+            fixture.agent,
+            1,
+            fixture.owner,
+            &fixture.nodes,
+            fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        let historical_keys = BTreeMap::from([(
+            fixture.epoch.record.epoch,
+            unwrap_data_key(
+                &fixture.epoch.record,
+                &fixture.recipients[0].identity,
+                &fixture.recipients[0].key,
+            )
+            .unwrap(),
+        )]);
+        let historical_keyring = build_recovery_keyring_grant(
+            core::slice::from_ref(&fixture.epoch.record),
+            &historical_keys,
+            &successor_epoch.record,
+            &fixture.nodes,
+        )
+        .unwrap();
+        let selected_head = policy_control.commitment();
+        let alternate_head = Hash([0xe9; 32]);
+        let mut superseded_heads = vec![selected_head, alternate_head];
+        superseded_heads.sort();
+        let mut recovery = PrivateControlRecord {
+            space: fixture.space,
+            agent: fixture.agent,
+            sequence: 1,
+            previous: Some(selected_head),
+            operation: PrivateControlOperation::Recover {
+                superseded_heads,
+                next_epoch: successor_epoch.record,
+                replacement_nodes: fixture.nodes.clone(),
+                historical_keyring,
+            },
+            signer: PrivateControlSigner::Recovery,
+            signer_public_key: [0; 32],
+            signature: [0; 64],
+        };
+        sign_recovery_control_record(&mut recovery, &fixture.recovery).unwrap();
+
+        let route = test_route(&source);
+        let retained_proof = PrivateRecoveryAuthorityProof::from_control(
+            route.runtime_deployment,
+            &recovery,
+            Some(selected_head),
+            &fixture.recovery,
+        )
+        .unwrap();
+        let (_, application, reopened, _) = append_completed_runtime_application(
+            &mut source,
+            &fixture,
+            &policy_successor,
+            &recovery,
+            None,
+            Some(&retained_proof),
+            PrivateRuntimeSuccess::ControlOnly,
+        );
+        assert_eq!(
+            application.recovery_authority_proof(),
+            Some(&retained_proof)
+        );
+
+        let substituted_proof = PrivateRecoveryAuthorityProof::from_control(
+            route.runtime_deployment,
+            &recovery,
+            Some(alternate_head),
+            &fixture.recovery,
+        )
+        .unwrap();
+        assert_ne!(retained_proof, substituted_proof);
+        let stable_projection = application
+            .successor_stable_projection()
+            .unwrap()
+            .commitment();
+        let substituted_evidence = signed_evidence_for_intent_with_projection(
+            &source,
+            &recovery,
+            AuthorityOperationIntent::RecoverPrivateAgent {
+                proof: substituted_proof.clone(),
+            },
+            Some(&substituted_proof),
+            reopened.commitment(),
+            stable_projection,
+        );
+        substituted_evidence
+            .verify_for_stable_projection(
+                &recovery,
+                source.binding().epoch,
+                stable_projection,
+                route,
+                test_authority_target(&source),
+            )
+            .unwrap();
+        persist_exact_evidence(&mut source, &recovery, &substituted_evidence);
+
+        let source_before = directory_image(&source_path);
+        let receiver_before = directory_image(&receiver_path);
+        assert_eq!(
+            serve_private_sync_page(
+                &source,
+                &fixture.recipients[0].identity,
+                &request_for(&receiver, 4, MAX_PRIVATE_SYNC_PAGE_BYTES as u32),
+                &TestTransport,
+            ),
+            Err(PrivateSyncError::Tampered)
+        );
+        assert_eq!(directory_image(&source_path), source_before);
+        assert_eq!(directory_image(&receiver_path), receiver_before);
+    }
+
+    #[test]
+    fn retained_page_cannot_attach_evidence_to_a_low_level_control_prefix() {
         let directory = TestDirectory::new("retry-evidence-prefix");
         let fixture = fixture();
         let mut server = create_store(&directory.child("server"), &fixture);
@@ -2533,24 +3538,12 @@ mod tests {
         let mut client = create_store(&client_path, &fixture);
         let control = invite_record(&server, &fixture, 50);
         server.append_control(&control, &TestAuthority).unwrap();
-        attach_signed_evidence(&mut server, &control);
-        let request = PrivateSyncRequest {
-            cursor: PrivateSyncCursor::start(fixture.space, fixture.agent, 0, None).unwrap(),
-            max_items: 1,
-            max_bytes: MAX_PRIVATE_SYNC_PAGE_BYTES as u32,
-        };
-        let page = serve_private_sync_page(
-            &server,
-            &fixture.recipients[0].identity,
-            &request,
-            &TestTransport,
-        )
-        .unwrap();
+        let evidence = signed_evidence(&server, &control);
+        let page = verified_control_page(&client, &server, &control, None, &evidence);
 
-        // Model process loss after the PCTL index became visible but before
-        // its PSE2 transaction began. Reopen must preserve this state, and an
-        // exact retained page retry attaches evidence without appending the
-        // control a second time.
+        // Model a legacy process loss after a naked PCTL became visible. Even
+        // an exact retained v3 page may not bless that prefix or attach source
+        // evidence without the receiver's own PVM/PAPL transaction.
         client.append_control(&control, &TestAuthority).unwrap();
         drop(client);
         let mut client =
@@ -2569,19 +3562,15 @@ mod tests {
                 &TestAuthority,
                 &TestTransport,
             ),
-            Ok(PrivateSyncApplyDisposition::Applied)
+            Err(PrivateSyncError::UnsupportedOperation)
         );
         assert_eq!(client.control_count(), 1);
-        let expected = match &page.items[0] {
-            PrivateSyncItem::Control { evidence, .. } => evidence.as_slice(),
-            PrivateSyncItem::Object { .. } => unreachable!(),
-        };
         assert_eq!(
             client
                 .read_control_authority_evidence(&client.indexed_controls()[0])
                 .unwrap()
                 .as_deref(),
-            Some(expected)
+            None
         );
         drop(client);
         let reopened =
@@ -2591,7 +3580,7 @@ mod tests {
                 .read_control_authority_evidence(&reopened.indexed_controls()[0])
                 .unwrap()
                 .as_deref(),
-            Some(expected)
+            None
         );
     }
 
@@ -2606,13 +3595,35 @@ mod tests {
         let authority = test_authority_target(&store);
         let evidence = signed_evidence(&store, &control);
         evidence
-            .verify_for(&control, store.binding().epoch, route, authority)
+            .verify_for_stable_projection(
+                &control,
+                store.binding().epoch,
+                Hash([0x82; 32]),
+                route,
+                authority,
+            )
             .unwrap();
+        assert_eq!(
+            evidence.verify_for_stable_projection(
+                &control,
+                store.binding().epoch,
+                Hash([0x83; 32]),
+                route,
+                authority,
+            ),
+            Err(PrivateSyncError::Tampered)
+        );
         let key = SigningKey::from_bytes(&[0x71; 32]);
 
         let reject = |candidate: PrivateControlAuthorityEvidence| {
             assert_eq!(
-                candidate.verify_for(&control, store.binding().epoch, route, authority),
+                candidate.verify_for_stable_projection(
+                    &control,
+                    store.binding().epoch,
+                    Hash([0x82; 32]),
+                    route,
+                    authority,
+                ),
                 Err(PrivateSyncError::Tampered)
             );
         };
@@ -2785,20 +3796,25 @@ mod tests {
         );
         let first_wire = first.encode().unwrap();
         assert_eq!(
+            first_wire.get(4..6),
+            Some(EVIDENCE_FORMAT_VERSION.to_le_bytes().as_slice())
+        );
+        assert_eq!(
             PrivateControlAuthorityEvidence::decode(&first_wire),
             Ok(first.clone())
         );
         first
-            .verify_for(
+            .verify_for_stable_projection(
                 &recovery,
                 store.binding().epoch,
+                Hash([0x82; 32]),
                 test_route(&store),
                 test_authority_target(&store),
             )
             .unwrap();
         assert_ne!(first.recovery_proof, second.recovery_proof);
 
-        // AOI1 and PCA1 were signed for the first PRA1 selector. A second,
+        // AOI1 and PCA2 were signed for the first PRA1 selector. A second,
         // independently valid PRA1 for the same PCTL but another authority
         // projection head cannot be substituted into the retained envelope.
         let mixed = PrivateControlAuthorityEvidence {
@@ -2807,9 +3823,10 @@ mod tests {
             recovery_proof: second.recovery_proof.clone(),
         };
         assert_eq!(
-            mixed.verify_for(
+            mixed.verify_for_stable_projection(
                 &recovery,
                 store.binding().epoch,
+                Hash([0x82; 32]),
                 test_route(&store),
                 test_authority_target(&store),
             ),
@@ -2924,30 +3941,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            substituted.verify_for(&control, store.binding().epoch, route, authority),
+            substituted.verify_for_stable_projection(
+                &control,
+                store.binding().epoch,
+                Hash([0x82; 32]),
+                route,
+                authority,
+            ),
             Err(PrivateSyncError::Tampered)
         );
     }
 
     #[test]
-    fn completed_unimplemented_controls_do_not_advance_sync_receiver() {
-        let directory = TestDirectory::new("unsupported-completed-controls");
+    fn runtime_controls_return_verified_pvm_input_and_low_level_apply_is_no_write() {
+        let directory = TestDirectory::new("verified-runtime-controls");
         let fixture = fixture();
-        let operations = [
-            PrivateControlOperation::SetResourcePolicy {
-                policy: BlobRef::of_bytes(b"private-resource-policy"),
-            },
-            PrivateControlOperation::ActorLifecycle {
-                actor: ActorId([0x98; 32]),
-                operation: PrivateActorLifecycleKind::Install,
-                request: Hash([0x99; 32]),
+        let policy = RuntimeResourcePolicy::standard();
+        let actor = ActorId([0x98; 32]);
+        let deployment = DeploymentId([0x99; 32]);
+        let mutations = [
+            PrivateRuntimeMutation::SetResourcePolicy(policy),
+            PrivateRuntimeMutation::Suspend {
+                actor,
+                expected_deployment: deployment,
             },
         ];
 
-        for (index, operation) in operations.into_iter().enumerate() {
-            let server_path = directory.child(&format!("server-{index}"));
+        for (index, mutation) in mutations.into_iter().enumerate() {
+            let operation = match &mutation {
+                PrivateRuntimeMutation::SetResourcePolicy(policy) => {
+                    PrivateControlOperation::SetResourcePolicy {
+                        policy: BlobRef::of_bytes(&policy.encode().unwrap()),
+                    }
+                }
+                PrivateRuntimeMutation::Suspend { actor, .. } => {
+                    PrivateControlOperation::ActorLifecycle {
+                        actor: *actor,
+                        operation: PrivateActorLifecycleKind::Suspend,
+                        request: mutation.commitment(),
+                    }
+                }
+                _ => unreachable!(),
+            };
+            let mut source = create_store(&directory.child(&format!("source-{index}")), &fixture);
             let client_path = directory.child(&format!("client-{index}"));
-            let mut server = create_store(&server_path, &fixture);
             let mut client = create_store(&client_path, &fixture);
             let mut control = PrivateControlRecord {
                 space: fixture.space,
@@ -2960,22 +3997,42 @@ mod tests {
                 signature: [0; 64],
             };
             sign_owner_control_record(&mut control, &fixture.owner_key).unwrap();
-            server.append_control(&control, &TestAuthority).unwrap();
-            attach_signed_evidence(&mut server, &control);
+            source.append_control(&control, &TestAuthority).unwrap();
+            let evidence = signed_evidence(&source, &control);
+            let page =
+                verified_control_page(&client, &source, &control, Some(&mutation), &evidence);
+            assert_eq!(
+                PrivateSyncPage::decode(&page.encode().unwrap()),
+                Ok(page.clone())
+            );
 
-            let request = request_for(&client, 4, MAX_PRIVATE_SYNC_PAGE_BYTES as u32);
-            let page = serve_private_sync_page(
-                &server,
-                &fixture.recipients[0].identity,
-                &request,
-                &TestTransport,
+            let verified = verify_private_sync_control_page(
+                &page,
+                test_route(&client),
+                test_authority_target(&client),
             )
             .unwrap();
-            assert_eq!(page.items.len(), 1);
+            assert_eq!(verified.len(), 1);
+            assert_eq!(verified[0].control(), &control);
+            assert_eq!(verified[0].mutation(), Some(&mutation));
+            assert_eq!(verified[0].evidence_wire(), evidence.encode().unwrap());
+            assert_eq!(verified[0].recovery_proof(), None);
+            assert_eq!(
+                verified[0].source_stable_projection(),
+                verified[0]
+                    .source_application()
+                    .application
+                    .stable_projection
+            );
+            assert_eq!(
+                verified[0].issuance(),
+                &AuthorityOperationIssuanceAck::decode(&evidence.issuance_ack).unwrap()
+            );
 
             let before_binding = client.binding();
             let before_counts = (client.control_count(), client.object_count());
             let before_image = directory_image(&client_path);
+            client.reset_artifact_read_spy();
             assert_eq!(
                 apply_private_sync_page(
                     &mut client,
@@ -2986,40 +4043,172 @@ mod tests {
                 ),
                 Err(PrivateSyncError::UnsupportedOperation)
             );
+            assert_eq!(client.artifact_read_spy(), 0);
             assert_eq!(client.binding(), before_binding);
             assert_eq!(
                 (client.control_count(), client.object_count()),
                 before_counts
             );
             assert_eq!(directory_image(&client_path), before_image);
+        }
+    }
 
-            drop(client);
-            let mut reopened =
-                PrivateStore::open(&client_path, fixture.space, fixture.agent, &TestAuthority)
-                    .unwrap();
-            assert_eq!(reopened.binding(), before_binding);
-            assert_eq!(
-                (reopened.control_count(), reopened.object_count()),
-                before_counts
-            );
-            assert_eq!(directory_image(&client_path), before_image);
+    #[test]
+    fn v3_rejects_v2_prm_psp_and_pca_substitution_without_store_writes() {
+        let directory = TestDirectory::new("v3-hostile-substitution");
+        let fixture = fixture();
+        let mut source = create_store(&directory.child("source"), &fixture);
+        let client_path = directory.child("client");
+        let mut client = create_store(&client_path, &fixture);
+        let policy = RuntimeResourcePolicy::standard();
+        let mutation = PrivateRuntimeMutation::SetResourcePolicy(policy);
+        let mut control = PrivateControlRecord {
+            space: fixture.space,
+            agent: fixture.agent,
+            sequence: 0,
+            previous: None,
+            operation: PrivateControlOperation::SetResourcePolicy {
+                policy: BlobRef::of_bytes(&policy.encode().unwrap()),
+            },
+            signer: PrivateControlSigner::Owner,
+            signer_public_key: [0; 32],
+            signature: [0; 64],
+        };
+        sign_owner_control_record(&mut control, &fixture.owner_key).unwrap();
+        source.append_control(&control, &TestAuthority).unwrap();
+        let evidence = signed_evidence(&source, &control);
+        let page = verified_control_page(&client, &source, &control, Some(&mutation), &evidence);
+
+        let mut v2_request = page.request.encode().unwrap();
+        assert_eq!(
+            v2_request.get(4..6),
+            Some(SYNC_FORMAT_VERSION.to_le_bytes().as_slice())
+        );
+        v2_request[4..6].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(
+            PrivateSyncRequest::decode(&v2_request),
+            Err(PrivateSyncError::InvalidFrame)
+        );
+        let mut v2_page = page.encode().unwrap();
+        v2_page[4..6].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(
+            PrivateSyncPage::decode(&v2_page),
+            Err(PrivateSyncError::InvalidFrame)
+        );
+
+        let assert_no_write = |candidate: &PrivateSyncPage, client: &mut PrivateStore, expected| {
+            let before_binding = client.binding();
+            let before_counts = (client.control_count(), client.object_count());
+            let before_image = directory_image(&client_path);
+            client.reset_artifact_read_spy();
             assert_eq!(
                 apply_private_sync_page(
-                    &mut reopened,
+                    client,
                     &fixture.recipients[0].identity,
-                    &page,
+                    candidate,
                     &TestAuthority,
                     &TestTransport,
                 ),
-                Err(PrivateSyncError::UnsupportedOperation)
+                Err(expected)
             );
-            assert_eq!(reopened.binding(), before_binding);
+            assert_eq!(client.artifact_read_spy(), 0);
+            assert_eq!(client.binding(), before_binding);
             assert_eq!(
-                (reopened.control_count(), reopened.object_count()),
+                (client.control_count(), client.object_count()),
                 before_counts
             );
             assert_eq!(directory_image(&client_path), before_image);
-        }
+        };
+
+        let mut missing_prm = page.clone();
+        let PrivateSyncItem::Control { mutation, .. } = &mut missing_prm.items[0] else {
+            unreachable!()
+        };
+        *mutation = None;
+        assert_no_write(&missing_prm, &mut client, PrivateSyncError::InvalidFrame);
+
+        let mut alternate_policy = RuntimeResourcePolicy::standard();
+        alternate_policy.max_actors -= 1;
+        let mut substituted_prm = page.clone();
+        let PrivateSyncItem::Control { mutation, .. } = &mut substituted_prm.items[0] else {
+            unreachable!()
+        };
+        *mutation = Some(
+            PrivateRuntimeMutation::SetResourcePolicy(alternate_policy)
+                .encode()
+                .unwrap(),
+        );
+        assert_no_write(
+            &substituted_prm,
+            &mut client,
+            PrivateSyncError::InvalidFrame,
+        );
+
+        let mut substituted_psp = page.clone();
+        let PrivateSyncItem::Control {
+            stable_projection, ..
+        } = &mut substituted_psp.items[0]
+        else {
+            unreachable!()
+        };
+        *stable_projection = Hash([0x83; 32]);
+        assert_no_write(
+            &substituted_psp,
+            &mut client,
+            PrivateSyncError::InvalidFrame,
+        );
+
+        let mut bad_signature = page.clone();
+        let PrivateSyncItem::Control { evidence, .. } = &mut bad_signature.items[0] else {
+            unreachable!()
+        };
+        let mut envelope = PrivateControlAuthorityEvidence::decode(evidence).unwrap();
+        let mut application =
+            PrivateControlApplicationAck::decode(&envelope.application_ack).unwrap();
+        application.signature[0] ^= 1;
+        envelope.application_ack = application.encode().unwrap();
+        *evidence = envelope.encode().unwrap();
+        bad_signature.validate_shape().unwrap();
+        assert_no_write(&bad_signature, &mut client, PrivateSyncError::Tampered);
+
+        let mut alternate_source = create_store(&directory.child("alternate-source"), &fixture);
+        let alternate_control = invite_record(&alternate_source, &fixture, 0xa4);
+        alternate_source
+            .append_control(&alternate_control, &TestAuthority)
+            .unwrap();
+        let alternate_evidence = signed_evidence(&alternate_source, &alternate_control);
+        let mut substituted_pca = page.clone();
+        let PrivateSyncItem::Control { evidence, .. } = &mut substituted_pca.items[0] else {
+            unreachable!()
+        };
+        *evidence = alternate_evidence.encode().unwrap();
+        substituted_pca.validate_shape().unwrap();
+        assert_no_write(&substituted_pca, &mut client, PrivateSyncError::Tampered);
+
+        let control_only_page = verified_control_page(
+            &client,
+            &alternate_source,
+            &alternate_control,
+            None,
+            &alternate_evidence,
+        );
+        let verified = verify_private_sync_control_page(
+            &control_only_page,
+            test_route(&client),
+            test_authority_target(&client),
+        )
+        .unwrap();
+        assert_eq!(verified[0].mutation(), None);
+        let mut smuggled_prm = control_only_page;
+        let PrivateSyncItem::Control { mutation, .. } = &mut smuggled_prm.items[0] else {
+            unreachable!()
+        };
+        *mutation = Some(
+            PrivateRuntimeMutation::SetResourcePolicy(policy)
+                .encode()
+                .unwrap(),
+        );
+        assert_no_write(&smuggled_prm, &mut client, PrivateSyncError::InvalidFrame);
     }
 
     #[test]
@@ -3029,20 +4218,27 @@ mod tests {
         let mut server = create_store(&directory.child("server"), &fixture);
         let first = invite_record(&server, &fixture, 50);
         server.append_control(&first, &TestAuthority).unwrap();
-        attach_signed_evidence(&mut server, &first);
+        let first_evidence = signed_evidence(&server, &first);
         let second = invite_record(&server, &fixture, 51);
         server.append_control(&second, &TestAuthority).unwrap();
-        attach_signed_evidence(&mut server, &second);
+        let second_evidence = signed_evidence(&server, &second);
 
         let make_page = |client: &PrivateStore| {
-            let request = request_for(client, 4, MAX_PRIVATE_SYNC_PAGE_BYTES as u32);
-            serve_private_sync_page(
-                &server,
-                &fixture.recipients[0].identity,
-                &request,
-                &TestTransport,
-            )
-            .unwrap()
+            let page = PrivateSyncPage {
+                request: request_for(client, 4, MAX_PRIVATE_SYNC_PAGE_BYTES as u32),
+                target: PrivateSyncHead {
+                    epoch: server.binding().epoch,
+                    control_head: Some(second.commitment()),
+                },
+                phase: PrivateSyncPhase::Controls,
+                items: vec![
+                    control_item(&first, 0, None, &first_evidence),
+                    control_item(&second, 0, None, &second_evidence),
+                ],
+                next: None,
+            };
+            page.validate_shape().unwrap();
+            page
         };
 
         let first_client_path = directory.child("invalid-pse-client");
@@ -3102,18 +4298,21 @@ mod tests {
             next.local.control_head = Some(alternate_commitment);
             next.target = Some(invalid_chain.target);
         }
-        invalid_chain.validate_shape().unwrap();
+        assert_eq!(
+            invalid_chain.validate_shape(),
+            Err(PrivateSyncError::OutOfOrder)
+        );
         let before = directory_image(&second_client_path);
         second_client.reset_artifact_read_spy();
-        assert!(
+        assert_eq!(
             apply_private_sync_page(
                 &mut second_client,
                 &fixture.recipients[0].identity,
                 &invalid_chain,
                 &TestAuthority,
                 &TestTransport,
-            )
-            .is_err()
+            ),
+            Err(PrivateSyncError::OutOfOrder)
         );
         assert_eq!(second_client.artifact_read_spy(), 0);
         assert_eq!(directory_image(&second_client_path), before);
@@ -3124,7 +4323,7 @@ mod tests {
     }
 
     #[test]
-    fn offline_recovery_converges_an_explicitly_superseded_control_fork() {
+    fn offline_recovery_page_verifies_superseded_fork_without_low_level_apply() {
         let directory = TestDirectory::new("recovery-fork");
         let fixture = fixture();
         let mut server = create_store(&directory.child("server"), &fixture);
@@ -3179,18 +4378,25 @@ mod tests {
         };
         sign_recovery_control_record(&mut recovery, &fixture.recovery).unwrap();
         server.append_control(&recovery, &TestAuthority).unwrap();
-        attach_signed_recovery_evidence(&mut server, &recovery, &fixture.recovery, None);
-
-        let request = request_for(&client, 4, MAX_PRIVATE_SYNC_PAGE_BYTES as u32);
-        let page = serve_private_sync_page(
-            &server,
-            &fixture.recipients[0].identity,
-            &request,
-            &TestTransport,
-        )
-        .unwrap();
+        let evidence = signed_recovery_evidence(&server, &recovery, &fixture.recovery, None);
+        let page = verified_control_page(&client, &server, &recovery, None, &evidence);
         assert_eq!(page.phase, PrivateSyncPhase::Controls);
         assert_eq!(page.items.len(), 1);
+        let verified = verify_private_sync_control_page(
+            &page,
+            test_route(&client),
+            test_authority_target(&client),
+        )
+        .unwrap();
+        assert_eq!(verified.len(), 1);
+        assert_eq!(verified[0].control(), &recovery);
+        assert!(
+            verified[0]
+                .recovery_proof()
+                .is_some_and(|proof| proof.matches_control(&recovery))
+        );
+        let before = client.binding();
+        let before_image = directory_image(&directory.child("client"));
         assert_eq!(
             apply_private_sync_page(
                 &mut client,
@@ -3199,24 +4405,10 @@ mod tests {
                 &TestAuthority,
                 &TestTransport,
             ),
-            Ok(PrivateSyncApplyDisposition::Applied)
+            Err(PrivateSyncError::UnsupportedOperation)
         );
-        assert_eq!(client.binding(), server.binding());
-        assert_eq!(
-            apply_private_sync_page(
-                &mut client,
-                &fixture.recipients[0].identity,
-                &page,
-                &TestAuthority,
-                &TestTransport,
-            ),
-            Ok(PrivateSyncApplyDisposition::AlreadyApplied)
-        );
-        let path = directory.child("client");
-        drop(client);
-        let reopened =
-            PrivateStore::open(&path, fixture.space, fixture.agent, &TestAuthority).unwrap();
-        assert_eq!(reopened.binding(), server.binding());
+        assert_eq!(client.binding(), before);
+        assert_eq!(directory_image(&directory.child("client")), before_image);
     }
 
     #[test]
