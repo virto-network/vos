@@ -8,9 +8,9 @@ actor invocation.
 flowchart LR
     Client[HTTP client] --> Listener[Built-in HTTP ingress]
     Listener --> Authority[Space authority]
-    Authority -->|member + capabilities| Listener
-    Listener --> Service[Root service]
-    Service --> Actor[Actor method]
+    Authority -->|Principal + capabilities| Listener
+    Listener --> Runtime[Selected AgentRuntime]
+    Runtime --> Actor[Actor method]
 ```
 
 ## Configure a listener
@@ -70,11 +70,11 @@ recovers the original durable result; reusing it for different work is
 rejected. Result recovery is stored independently from publication delivery,
 so acknowledgement can retire outbox, proof, attestation, and exported-blob
 transport state without losing the caller response or redriving its effects.
-For Local and Raft roots, the recovery window is deliberately finite: each
-root retains at most 256 keyed results and 16 MiB of response artifacts,
+For Local and Shared Linear Agents, the recovery window is deliberately finite:
+each Agent retains at most 256 keyed results and 16 MiB of response artifacts,
 selecting the greatest canonical receipt sequence and invocation IDs. CRDT
-roots recover from their causal history instead. The fixed-size linear index
-lives in the service image; response and proof bytes remain in a
+Agents recover from their causal history instead. The fixed-size Linear index
+lives in AgentRuntime state; response and proof bytes remain in a
 content-addressed side store and travel separately during snapshot catch-up.
 Authentication, queries, and calls without an idempotency key do not consume
 this budget.
@@ -84,6 +84,6 @@ removed from memory, disk, and subsequent backups.
 Clients should reconcile old evicted operations through application state
 rather than submit them under a new key.
 The schema and OpenAPI endpoints describe the installed packages that the
-listener can route locally. An attested method returns an object with the
-decoded `reply` and `attestation_wire`, the hex form of the canonical committed
-`RootTreeAttestedResult` wire.
+listener can route locally. An attested method returns the decoded reply plus
+the canonical public transition-proof record and its content-addressed proof;
+producer-private witness bytes never cross ingress.
