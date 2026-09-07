@@ -301,9 +301,8 @@ pub struct PrivateAgentHost {
 /// with the durable operation issuer/coordinator and an exact system-authority
 /// dispatcher. It accepts only the externally signed PCTL carried by the
 /// coordinator request; it has no key-generation or control-signing API.
-/// The SDK currently projects only Invite, Revoke, and offline Recover into
-/// authority intents. RotateKeys, SetResourcePolicy, and ActorLifecycle stay
-/// explicitly unavailable rather than being mistaken for authorized work.
+/// Every accepted mutation is projected from the exact signed PCTL into an
+/// authority intent before it can reach the physical store.
 pub(crate) struct PrivateAgentRuntimeApplication<'host, V> {
     host: &'host mut PrivateAgentHost,
     authority: AuthorityActorTarget,
@@ -1997,6 +1996,10 @@ where
         AuthorityOperationIntent::private_control(request.route.runtime_deployment, &control)
             .map_err(|_| PrivateAgentHostError::Unauthorized)?;
     let operation = intent.operation();
+    let expected_actor = match &intent {
+        AuthorityOperationIntent::PrivateActorLifecycle { actor, .. } => Some(*actor),
+        _ => None,
+    };
 
     let receipt = AuthorityReceipt::decode(&request.receipt)
         .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
@@ -2012,7 +2015,7 @@ where
         || selector.agent != request.route.agent
         || selector.runtime_deployment != request.route.runtime_deployment
         || selector.operation != operation
-        || selector.actor.is_some()
+        || selector.actor != expected_actor
         || selector.actor_deployment.is_some()
         || selector.request != control.commitment()
         || issuance
@@ -2048,12 +2051,10 @@ where
     let expected_epoch = match &control.operation {
         PrivateControlOperation::Invite { epoch, .. } => *epoch,
         PrivateControlOperation::Revoke { next_epoch, .. }
+        | PrivateControlOperation::RotateKeys { next_epoch }
         | PrivateControlOperation::Recover { next_epoch, .. } => next_epoch.epoch,
-        PrivateControlOperation::RotateKeys { .. }
-        | PrivateControlOperation::SetResourcePolicy { .. }
-        | PrivateControlOperation::ActorLifecycle { .. } => {
-            return Err(PrivateAgentHostError::Unauthorized);
-        }
+        PrivateControlOperation::SetResourcePolicy { .. }
+        | PrivateControlOperation::ActorLifecycle { .. } => binding.epoch,
     };
     let expected_members = if already_applied {
         hosted
@@ -2073,6 +2074,10 @@ where
             ..
         }
         | AuthorityOperationIntent::RecoverPrivateAgent {
+            member_set: expected,
+            ..
+        }
+        | AuthorityOperationIntent::RotatePrivateKeys {
             member_set: expected,
             ..
         } if *expected != member_set => {
@@ -2125,6 +2130,15 @@ fn validate_new_private_application_position(
                 return Err(PrivateAgentHostError::Unauthorized);
             }
         }
+        PrivateControlOperation::RotateKeys { next_epoch } => {
+            if control.previous != binding.control_head
+                || binding.epoch.checked_add(1) != Some(next_epoch.epoch)
+                || control.signer != PrivateControlSigner::Owner
+                || control.signer_public_key != hosted.owner_key.verifying_key()
+            {
+                return Err(PrivateAgentHostError::Unauthorized);
+            }
+        }
         PrivateControlOperation::Recover {
             superseded_heads,
             next_epoch,
@@ -2149,10 +2163,14 @@ fn validate_new_private_application_position(
                 return Err(PrivateAgentHostError::Unauthorized);
             }
         }
-        PrivateControlOperation::RotateKeys { .. }
-        | PrivateControlOperation::SetResourcePolicy { .. }
+        PrivateControlOperation::SetResourcePolicy { .. }
         | PrivateControlOperation::ActorLifecycle { .. } => {
-            return Err(PrivateAgentHostError::Unauthorized);
+            if control.previous != binding.control_head
+                || control.signer != PrivateControlSigner::Owner
+                || control.signer_public_key != hosted.owner_key.verifying_key()
+            {
+                return Err(PrivateAgentHostError::Unauthorized);
+            }
         }
     }
     Ok(())
@@ -2189,9 +2207,7 @@ fn expected_private_members(
         }
         PrivateControlOperation::RotateKeys { .. }
         | PrivateControlOperation::SetResourcePolicy { .. }
-        | PrivateControlOperation::ActorLifecycle { .. } => {
-            return Err(PrivateAgentHostError::Unauthorized);
-        }
+        | PrivateControlOperation::ActorLifecycle { .. } => {}
     }
     Ok(members)
 }
@@ -2213,7 +2229,8 @@ where
     }
     let successor_data = match &prepared.control.operation {
         PrivateControlOperation::Invite { .. } => None,
-        PrivateControlOperation::Revoke { next_epoch, .. } => {
+        PrivateControlOperation::Revoke { next_epoch, .. }
+        | PrivateControlOperation::RotateKeys { next_epoch } => {
             let owner = unwrap_owner_key(next_epoch, local_node, node_key)?;
             let data = unwrap_data_key(next_epoch, local_node, node_key)?;
             if owner.verifying_key() == hosted.owner_key.verifying_key()
@@ -2250,11 +2267,8 @@ where
             )?;
             Some(data)
         }
-        PrivateControlOperation::RotateKeys { .. }
-        | PrivateControlOperation::SetResourcePolicy { .. }
-        | PrivateControlOperation::ActorLifecycle { .. } => {
-            return Err(PrivateAgentHostError::Unauthorized);
-        }
+        PrivateControlOperation::SetResourcePolicy { .. }
+        | PrivateControlOperation::ActorLifecycle { .. } => None,
     };
     if let Some(data) = successor_data.as_ref() {
         stage_metadata_for_application(slot, prepared.expected_epoch, data, hosted, stop)?;
@@ -4600,6 +4614,45 @@ mod tests {
         control
     }
 
+    fn signed_rotate_control_for(
+        host: &PrivateAgentHost,
+        agent: AgentId,
+        nodes: &[PrivateNodeIdentity],
+        next_epoch: u64,
+    ) -> PrivateControlRecord {
+        let hosted = host.hosted(agent).unwrap();
+        let binding = hosted.store.binding();
+        let generated = generate_fresh_private_epoch(
+            binding.space,
+            binding.agent,
+            next_epoch,
+            binding.owner,
+            nodes,
+            hosted.store.recovery_public_key(),
+            hosted.store.recovery_encryption_public_key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        let mut control = unsigned_owner_record(
+            hosted,
+            PrivateControlOperation::RotateKeys {
+                next_epoch: generated.record,
+            },
+        );
+        sign_owner_control_record(&mut control, &hosted.owner_key).unwrap();
+        control
+    }
+
+    fn signed_rotate_control(host: &PrivateAgentHost, agent: AgentId) -> PrivateControlRecord {
+        let hosted = host.hosted(agent).unwrap();
+        signed_rotate_control_for(
+            host,
+            agent,
+            hosted.store.authorized_nodes(),
+            hosted.store.binding().epoch + 1,
+        )
+    }
+
     fn signed_invite_control(
         host: &PrivateAgentHost,
         agent: AgentId,
@@ -4708,10 +4761,13 @@ mod tests {
             agent: control.agent,
             runtime_deployment: fixture.descriptor.identity.runtime_deployment,
         };
-        let operation =
-            AuthorityOperationIntent::private_control(route.runtime_deployment, control)
-                .unwrap()
-                .operation();
+        let intent =
+            AuthorityOperationIntent::private_control(route.runtime_deployment, control).unwrap();
+        let operation = intent.operation();
+        let actor = match intent {
+            AuthorityOperationIntent::PrivateActorLifecycle { actor, .. } => Some(actor),
+            _ => None,
+        };
         let mut receipt = AuthorityReceipt {
             selector: AuthorityReceiptSelector {
                 policy: authority.binding.policy,
@@ -4720,7 +4776,7 @@ mod tests {
                 agent: route.agent,
                 operation,
                 runtime_deployment: route.runtime_deployment,
-                actor: None,
+                actor,
                 actor_deployment: None,
                 evidence: AuthorityEvidence {
                     package: None,
@@ -4933,46 +4989,57 @@ mod tests {
             PrivateRuntimeApplicationStop::AfterReopen,
         ];
         let fixture = fixture(2);
-        for (index, boundary) in boundaries.into_iter().enumerate() {
-            let name = format!("authorized-boundary-{index}");
-            let mut host = create_host(&fixture, 0, &name);
-            let agent = create_agent(&mut host, &fixture);
-            let control = signed_revoke_control(&host, agent, fixture.nodes[1].identity.node);
-            let (authority, request) = runtime_application_request(&fixture, &control, 50, 55);
-            let interrupted = {
-                let mut runtime = host
-                    .runtime_application_adapter(authority, &TestAuthority)
-                    .unwrap();
-                runtime.stop_after(boundary);
-                runtime.apply(&request)
-            };
-            assert_eq!(
-                interrupted,
-                Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted)),
-                "boundary {boundary:?}"
-            );
-            drop(host);
+        for rotate in [false, true] {
+            for (index, boundary) in boundaries.into_iter().enumerate() {
+                let name = format!("authorized-boundary-{rotate}-{index}");
+                let mut host = create_host(&fixture, 0, &name);
+                let agent = create_agent(&mut host, &fixture);
+                let control = if rotate {
+                    signed_rotate_control(&host, agent)
+                } else {
+                    signed_revoke_control(&host, agent, fixture.nodes[1].identity.node)
+                };
+                let (authority, request) = runtime_application_request(&fixture, &control, 50, 55);
+                let interrupted = {
+                    let mut runtime = host
+                        .runtime_application_adapter(authority, &TestAuthority)
+                        .unwrap();
+                    runtime.stop_after(boundary);
+                    runtime.apply(&request)
+                };
+                assert_eq!(
+                    interrupted,
+                    Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted)),
+                    "rotate {rotate}, boundary {boundary:?}"
+                );
+                drop(host);
 
-            let mut reopened = reopen_host(&fixture, 0, &name);
-            let result = {
-                let mut runtime = reopened
-                    .runtime_application_adapter(authority, &TestAuthority)
-                    .unwrap();
-                runtime.apply(&request).unwrap()
-            };
-            assert!(result.authenticated && result.durably_applied && result.durably_reopened);
-            let binding = reopened.binding(agent).unwrap();
-            assert_eq!(binding.epoch, 1, "boundary {boundary:?}");
-            assert_eq!(
-                binding.control_head,
-                Some(control.commitment()),
-                "boundary {boundary:?}"
-            );
-            assert_eq!(
-                reopened.agents[&agent].store.authorized_nodes(),
-                core::slice::from_ref(&fixture.nodes[0].identity),
-                "boundary {boundary:?}"
-            );
+                let mut reopened = reopen_host(&fixture, 0, &name);
+                let result = {
+                    let mut runtime = reopened
+                        .runtime_application_adapter(authority, &TestAuthority)
+                        .unwrap();
+                    runtime.apply(&request).unwrap()
+                };
+                assert!(result.authenticated && result.durably_applied && result.durably_reopened);
+                let binding = reopened.binding(agent).unwrap();
+                assert_eq!(binding.epoch, 1, "rotate {rotate}, boundary {boundary:?}");
+                assert_eq!(
+                    binding.control_head,
+                    Some(control.commitment()),
+                    "rotate {rotate}, boundary {boundary:?}"
+                );
+                let expected_members = if rotate {
+                    identities(&fixture)
+                } else {
+                    vec![fixture.nodes[0].identity.clone()]
+                };
+                assert_eq!(
+                    reopened.agents[&agent].store.authorized_nodes(),
+                    expected_members,
+                    "rotate {rotate}, boundary {boundary:?}"
+                );
+            }
         }
     }
 
@@ -5352,7 +5419,7 @@ mod tests {
                 .unwrap();
             let mut candidate = request.clone();
             candidate.control = control.encode().unwrap();
-            cases.push(("unsupported control", candidate));
+            cases.push(("cross-operation control", candidate));
         }
 
         for (label, candidate) in cases {
@@ -5410,6 +5477,230 @@ mod tests {
 
         let result = apply_runtime_request(&mut host, authority, &request).unwrap();
         assert!(result.authenticated && result.durably_applied && result.durably_reopened);
+    }
+
+    #[test]
+    fn authorized_rotation_resource_and_lifecycle_are_exact_and_restartable() {
+        let fixture = fixture(2);
+        let mut host = create_host(&fixture, 0, "authorized-private-controls");
+        let agent = create_agent(&mut host, &fixture);
+        let initial_binding = host.binding(agent).unwrap();
+        let initial_members = host.agents[&agent].store.authorized_nodes().to_vec();
+        let initial_sidecars = canonical_sidecars(&host, agent);
+
+        // Rotation is exactly the next epoch and may not rewrite membership.
+        let skipped_epoch = signed_rotate_control_for(&host, agent, &initial_members, 2);
+        let (authority, skipped_epoch_request) =
+            runtime_application_request(&fixture, &skipped_epoch, 40, 44);
+        assert!(apply_runtime_request(&mut host, authority, &skipped_epoch_request).is_err());
+        let wrong_members = vec![fixture.nodes[0].identity.clone()];
+        let changed_members = signed_rotate_control_for(&host, agent, &wrong_members, 1);
+        let (_, changed_members_request) =
+            runtime_application_request(&fixture, &changed_members, 40, 44);
+        assert!(apply_runtime_request(&mut host, authority, &changed_members_request).is_err());
+        assert_eq!(host.binding(agent).unwrap(), initial_binding);
+        assert_eq!(
+            host.agents[&agent].store.authorized_nodes(),
+            initial_members
+        );
+        assert_eq!(canonical_sidecars(&host, agent), initial_sidecars);
+
+        let rotate = signed_rotate_control(&host, agent);
+        let (_, rotate_request) = runtime_application_request(&fixture, &rotate, 40, 44);
+        let rotate_receipt = AuthorityReceipt::decode(&rotate_request.receipt).unwrap();
+        assert_eq!(
+            rotate_receipt.selector.operation,
+            AuthorityOperationKind::RotatePrivateKeys
+        );
+        assert_eq!(rotate_receipt.selector.actor, None);
+        assert_eq!(rotate_receipt.selector.actor_deployment, None);
+        let rotate_result = apply_runtime_request(&mut host, authority, &rotate_request).unwrap();
+        let rotate_fact = decode_private_application_fact(&rotate_result.application_fact).unwrap();
+        let rotated_member_set =
+            private_member_set_commitment(initial_members.iter().map(|node| node.node)).unwrap();
+        assert_eq!(
+            rotate_fact.operation,
+            AuthorityOperationKind::RotatePrivateKeys
+        );
+        assert_eq!(rotate_fact.control, rotate.commitment());
+        assert_eq!(rotate_fact.epoch, 1);
+        assert_eq!(rotate_fact.post_member_set, rotated_member_set);
+        assert_eq!(host.binding(agent).unwrap().epoch, 1);
+        assert_eq!(
+            host.agents[&agent].store.authorized_nodes(),
+            initial_members
+        );
+        assert_eq!(host.agents[&agent].store.key_epochs().len(), 2);
+        let rotated_sidecars = canonical_sidecars(&host, agent);
+        assert_ne!(rotated_sidecars, initial_sidecars);
+        assert_eq!(
+            apply_runtime_request(&mut host, authority, &rotate_request).unwrap(),
+            rotate_result
+        );
+        assert_eq!(canonical_sidecars(&host, agent), rotated_sidecars);
+
+        drop(host);
+        let mut host = reopen_host(&fixture, 0, "authorized-private-controls");
+        assert_eq!(
+            apply_runtime_request(&mut host, authority, &rotate_request).unwrap(),
+            rotate_result
+        );
+
+        // Resource policy details stay bound to the exact PCTL commitment,
+        // while epoch, members, and encrypted sidecars remain unchanged.
+        let mut resource = unsigned_owner_record(
+            host.hosted(agent).unwrap(),
+            PrivateControlOperation::SetResourcePolicy {
+                policy: BlobRef::of_bytes(b"private-resource-policy-v1"),
+            },
+        );
+        sign_owner_control_record(&mut resource, &host.hosted(agent).unwrap().owner_key).unwrap();
+        let (_, resource_request) = runtime_application_request(&fixture, &resource, 50, 54);
+        let mut alternate_resource = resource.clone();
+        alternate_resource.operation = PrivateControlOperation::SetResourcePolicy {
+            policy: BlobRef::of_bytes(b"private-resource-policy-v2"),
+        };
+        sign_owner_control_record(
+            &mut alternate_resource,
+            &host.hosted(agent).unwrap().owner_key,
+        )
+        .unwrap();
+        let mut substituted_resource = resource_request.clone();
+        substituted_resource.control = alternate_resource.encode().unwrap();
+        let before_resource = host.binding(agent).unwrap();
+        let before_resource_sidecars = canonical_sidecars(&host, agent);
+        assert!(apply_runtime_request(&mut host, authority, &substituted_resource).is_err());
+        assert_eq!(host.binding(agent).unwrap(), before_resource);
+
+        let resource_result =
+            apply_runtime_request(&mut host, authority, &resource_request).unwrap();
+        let resource_fact =
+            decode_private_application_fact(&resource_result.application_fact).unwrap();
+        assert_eq!(
+            resource_fact.operation,
+            AuthorityOperationKind::SetPrivateResourcePolicy
+        );
+        assert_eq!(resource_fact.control, resource.commitment());
+        assert_eq!(resource_fact.epoch, before_resource.epoch);
+        assert_eq!(resource_fact.post_member_set, rotated_member_set);
+        assert_eq!(host.binding(agent).unwrap().epoch, before_resource.epoch);
+        assert_eq!(
+            host.agents[&agent].store.authorized_nodes(),
+            initial_members
+        );
+        assert_eq!(host.agents[&agent].store.key_epochs().len(), 2);
+        assert_eq!(canonical_sidecars(&host, agent), before_resource_sidecars);
+        assert_eq!(
+            apply_runtime_request(&mut host, authority, &resource_request).unwrap(),
+            resource_result
+        );
+
+        drop(host);
+        let mut host = reopen_host(&fixture, 0, "authorized-private-controls");
+        assert_eq!(
+            apply_runtime_request(&mut host, authority, &resource_request).unwrap(),
+            resource_result
+        );
+
+        // Lifecycle authority selects the logical Actor but never a runtime
+        // deployment. Both selector slots are authenticated by receipt and AOI.
+        let actor = ActorId([0xb7; 32]);
+        let lifecycle_request_hash = Hash([0xb8; 32]);
+        let mut lifecycle = unsigned_owner_record(
+            host.hosted(agent).unwrap(),
+            PrivateControlOperation::ActorLifecycle {
+                actor,
+                operation: PrivateActorLifecycleKind::Install,
+                request: lifecycle_request_hash,
+            },
+        );
+        sign_owner_control_record(&mut lifecycle, &host.hosted(agent).unwrap().owner_key).unwrap();
+        let (_, lifecycle_request) = runtime_application_request(&fixture, &lifecycle, 60, 64);
+        let lifecycle_receipt = AuthorityReceipt::decode(&lifecycle_request.receipt).unwrap();
+        assert_eq!(
+            lifecycle_receipt.selector.operation,
+            AuthorityOperationKind::PrivateActorLifecycle
+        );
+        assert_eq!(lifecycle_receipt.selector.actor, Some(actor));
+        assert_eq!(lifecycle_receipt.selector.actor_deployment, None);
+
+        let (_, authority_key) = authority_target(&fixture);
+        let mut substituted = lifecycle_request.clone();
+        let mut receipt = AuthorityReceipt::decode(&substituted.receipt).unwrap();
+        receipt.selector.actor = Some(ActorId([0xb9; 32]));
+        receipt.signature = [0; 64];
+        receipt.signature = authority_key.sign(&receipt.signing_bytes()).to_bytes();
+        let mut issuance =
+            AuthorityOperationIssuanceAck::decode(&substituted.issuance_ack).unwrap();
+        issuance.receipt = receipt.clone();
+        issuance.signature = [0; 64];
+        issuance.signature = authority_key.sign(&issuance.signing_bytes()).to_bytes();
+        substituted.receipt = receipt.encode().unwrap();
+        substituted.issuance_ack = issuance.encode().unwrap();
+        let before = host.binding(agent).unwrap();
+        assert!(apply_runtime_request(&mut host, authority, &substituted).is_err());
+        assert_eq!(host.binding(agent).unwrap(), before);
+
+        let mut invalid_deployment_receipt = lifecycle_receipt.clone();
+        invalid_deployment_receipt.selector.actor_deployment = Some(DeploymentId([0xba; 32]));
+        invalid_deployment_receipt.signature = [0; 64];
+        invalid_deployment_receipt.signature = authority_key
+            .sign(&invalid_deployment_receipt.signing_bytes())
+            .to_bytes();
+        assert!(invalid_deployment_receipt.encode().is_err());
+
+        let mut alternate_lifecycle = lifecycle.clone();
+        let PrivateControlOperation::ActorLifecycle { request, .. } =
+            &mut alternate_lifecycle.operation
+        else {
+            unreachable!()
+        };
+        *request = Hash([0xbb; 32]);
+        sign_owner_control_record(
+            &mut alternate_lifecycle,
+            &host.hosted(agent).unwrap().owner_key,
+        )
+        .unwrap();
+        let mut substituted_lifecycle = lifecycle_request.clone();
+        substituted_lifecycle.control = alternate_lifecycle.encode().unwrap();
+        assert!(apply_runtime_request(&mut host, authority, &substituted_lifecycle).is_err());
+
+        let before_lifecycle = host.binding(agent).unwrap();
+        let before_lifecycle_sidecars = canonical_sidecars(&host, agent);
+        let lifecycle_result =
+            apply_runtime_request(&mut host, authority, &lifecycle_request).unwrap();
+        let lifecycle_fact =
+            decode_private_application_fact(&lifecycle_result.application_fact).unwrap();
+        assert_eq!(
+            lifecycle_fact.operation,
+            AuthorityOperationKind::PrivateActorLifecycle
+        );
+        assert_eq!(lifecycle_fact.control, lifecycle.commitment());
+        assert_eq!(lifecycle_fact.epoch, before_lifecycle.epoch);
+        assert_eq!(lifecycle_fact.post_member_set, rotated_member_set);
+        assert_eq!(host.binding(agent).unwrap().epoch, before_lifecycle.epoch);
+        assert_eq!(
+            host.agents[&agent].store.authorized_nodes(),
+            initial_members
+        );
+        assert_eq!(host.agents[&agent].store.key_epochs().len(), 2);
+        assert_eq!(canonical_sidecars(&host, agent), before_lifecycle_sidecars);
+        assert_eq!(
+            apply_runtime_request(&mut host, authority, &lifecycle_request).unwrap(),
+            lifecycle_result
+        );
+
+        drop(host);
+        let mut reopened = reopen_host(&fixture, 0, "authorized-private-controls");
+        assert_eq!(
+            apply_runtime_request(&mut reopened, authority, &lifecycle_request).unwrap(),
+            lifecycle_result
+        );
+        assert_eq!(reopened.binding(agent).unwrap().epoch, 1);
+        assert_eq!(
+            reopened.agents[&agent].store.authorized_nodes(),
+            initial_members
+        );
     }
 
     #[test]

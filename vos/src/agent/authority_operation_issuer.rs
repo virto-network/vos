@@ -1054,6 +1054,9 @@ fn is_private_intent(intent: &AuthorityOperationIntent) -> bool {
         AuthorityOperationIntent::InvitePrivateNode { .. }
             | AuthorityOperationIntent::RevokePrivateNode { .. }
             | AuthorityOperationIntent::RecoverPrivateAgent { .. }
+            | AuthorityOperationIntent::RotatePrivateKeys { .. }
+            | AuthorityOperationIntent::SetPrivateResourcePolicy { .. }
+            | AuthorityOperationIntent::PrivateActorLifecycle { .. }
     )
 }
 
@@ -1105,6 +1108,42 @@ pub(crate) fn private_intent_matches_application(
                 && application.control_previous == *control_previous
                 && application.epoch == *epoch
                 && application.post_member_set == *member_set
+        }
+        AuthorityOperationIntent::RotatePrivateKeys {
+            managed,
+            control,
+            control_sequence,
+            control_previous,
+            epoch,
+            member_set,
+        } => {
+            application.managed == *managed
+                && application.operation == AuthorityOperationKind::RotatePrivateKeys
+                && application.control == *control
+                && application.control_sequence == *control_sequence
+                && application.control_previous == *control_previous
+                && application.epoch == *epoch
+                && application.post_member_set == *member_set
+        }
+        AuthorityOperationIntent::SetPrivateResourcePolicy {
+            managed,
+            control,
+            control_sequence,
+            control_previous,
+            ..
+        }
+        | AuthorityOperationIntent::PrivateActorLifecycle {
+            managed,
+            control,
+            control_sequence,
+            control_previous,
+            ..
+        } => {
+            application.managed == *managed
+                && application.operation == intent.operation()
+                && application.control == *control
+                && application.control_sequence == *control_sequence
+                && application.control_previous == *control_previous
         }
         AuthorityOperationIntent::InvokeActor { .. } | AuthorityOperationIntent::Catalog { .. } => {
             false

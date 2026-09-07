@@ -813,14 +813,14 @@ pub struct RetiredPrivateOperationRow {
     pub control_sequence: u64,
     pub control_previous: Option<[u8; 32]>,
     pub epoch: u64,
-    /// Exact membership target retained from AOC3. Recover has no single
-    /// target and is not authorizable in this generation.
+    /// Exact Invite/Revoke membership target retained from AOC3. The other
+    /// Private operations do not select one Node.
     pub node: Option<[u8; 32]>,
     /// Invite's exact transport/encryption identity commitment. A separate
     /// enrollment projection can bind this retained value before admission.
     pub node_identity: Option<[u8; 32]>,
-    /// Revoke fixes the complete post-apply set in AOC3. Invite fixes the
-    /// invited Node identity, while only PCA1 can report the resulting set.
+    /// Revoke and Rotate fix the complete post-apply set in AOC3. Invite fixes
+    /// the invited Node identity, while only PCA1 can report the resulting set.
     pub post_member_set: Option<[u8; 32]>,
 }
 
@@ -896,7 +896,8 @@ pub struct PrivateApplicationRecord {
     pub control_sequence: u64,
     pub control_previous: Option<[u8; 32]>,
     pub epoch: u64,
-    pub node: [u8; 32],
+    /// Present only when the applied operation selects an Invite/Revoke Node.
+    pub node: Option<[u8; 32]>,
     pub node_identity: Option<[u8; 32]>,
     pub member_set: [u8; 32],
     pub reopened_control_state: [u8; 32],
@@ -1842,7 +1843,7 @@ fn node_is_in_use(
         || state
             .private_applications
             .iter()
-            .any(|application| application.node == node.0)
+            .any(|application| application.node == Some(node.0))
         || state.latest_operation_acks.iter().any(|record| {
             record
                 .private_operation
@@ -1878,7 +1879,10 @@ fn node_is_in_use(
                     | AuthorityOperationIntent::RevokePrivateNode { node, .. } => Some(node),
                     AuthorityOperationIntent::InvokeActor { .. }
                     | AuthorityOperationIntent::Catalog { .. }
-                    | AuthorityOperationIntent::RecoverPrivateAgent { .. } => None,
+                    | AuthorityOperationIntent::RecoverPrivateAgent { .. }
+                    | AuthorityOperationIntent::RotatePrivateKeys { .. }
+                    | AuthorityOperationIntent::SetPrivateResourcePolicy { .. }
+                    | AuthorityOperationIntent::PrivateActorLifecycle { .. } => None,
                 }
             })
             == Some(node)
@@ -2232,9 +2236,6 @@ fn acknowledge_private_control_application(
     if ack.application.operation == AuthorityOperationKind::RecoverPrivateAgent {
         return false;
     }
-    let Some(node) = source.private.node else {
-        return false;
-    };
     let Ok(private_index) = private_agent(state, target.agent) else {
         return false;
     };
@@ -2258,7 +2259,7 @@ fn acknowledge_private_control_application(
         control_sequence: ack.application.control_sequence,
         control_previous: ack.application.control_previous.map(|previous| previous.0),
         epoch: ack.application.epoch,
-        node,
+        node: source.private.node,
         node_identity: source.private.node_identity,
         member_set: ack.application.post_member_set.0,
         reopened_control_state: ack.application.reopened_control_state.0,
@@ -2455,6 +2456,53 @@ fn retained_private_operation(call: &AuthorityOperationCall) -> Option<RetiredPr
             None,
             Some(*member_set),
         ),
+        AuthorityOperationIntent::RotatePrivateKeys {
+            control,
+            control_sequence,
+            control_previous,
+            epoch,
+            member_set,
+            ..
+        } => (
+            AuthorityOperationKind::RotatePrivateKeys,
+            *control,
+            *control_sequence,
+            *control_previous,
+            *epoch,
+            None,
+            None,
+            Some(*member_set),
+        ),
+        AuthorityOperationIntent::SetPrivateResourcePolicy {
+            control,
+            control_sequence,
+            control_previous,
+            ..
+        } => (
+            AuthorityOperationKind::SetPrivateResourcePolicy,
+            *control,
+            *control_sequence,
+            *control_previous,
+            0,
+            None,
+            None,
+            None,
+        ),
+        AuthorityOperationIntent::PrivateActorLifecycle {
+            control,
+            control_sequence,
+            control_previous,
+            ..
+        } => (
+            AuthorityOperationKind::PrivateActorLifecycle,
+            *control,
+            *control_sequence,
+            *control_previous,
+            0,
+            None,
+            None,
+            None,
+        ),
         AuthorityOperationIntent::InvokeActor { .. } | AuthorityOperationIntent::Catalog { .. } => {
             return None;
         }
@@ -2478,16 +2526,37 @@ fn retired_private_operation_matches_application(
     source: &RetiredPrivateOperationRow,
     application: &PrivateControlApplicationFact,
 ) -> bool {
+    let operation_fields_match =
+        if source.operation == AuthorityOperationKind::InvitePrivateNode as u8 {
+            source.epoch == application.epoch && source.post_member_set.is_none()
+        } else if matches!(
+            private_operation_kind(source.operation),
+            Some(
+                AuthorityOperationKind::RevokePrivateNode
+                    | AuthorityOperationKind::RecoverPrivateAgent
+                    | AuthorityOperationKind::RotatePrivateKeys
+            )
+        ) {
+            source.epoch == application.epoch
+                && source.post_member_set == Some(application.post_member_set.0)
+        } else if matches!(
+            private_operation_kind(source.operation),
+            Some(
+                AuthorityOperationKind::SetPrivateResourcePolicy
+                    | AuthorityOperationKind::PrivateActorLifecycle
+            )
+        ) {
+            source.epoch == 0 && source.post_member_set.is_none()
+        } else {
+            false
+        };
     source.agent == application.managed.agent.0
         && source.runtime_deployment == application.managed.runtime_deployment.0
         && source.operation == application.operation as u8
         && source.control == application.control.0
         && source.control_sequence == application.control_sequence
         && source.control_previous == application.control_previous.map(|previous| previous.0)
-        && source.epoch == application.epoch
-        && source
-            .post_member_set
-            .is_none_or(|member_set| member_set == application.post_member_set.0)
+        && operation_fields_match
 }
 
 fn member_set_commitment(members: &[[u8; 32]]) -> Option<Hash> {
@@ -2497,8 +2566,9 @@ fn member_set_commitment(members: &[[u8; 32]]) -> Option<Hash> {
 fn next_private_members(
     projection: &PrivateAgentProjectionRow,
     operation: u8,
-    node: [u8; 32],
+    node: Option<[u8; 32]>,
 ) -> Option<(Vec<[u8; 32]>, Hash)> {
+    let node = node?;
     if node == [0; 32]
         || projection.members.is_empty()
         || projection.members.len() > MAX_PRIVATE_NODES
@@ -2545,17 +2615,42 @@ fn apply_private_application_transition(
         None => Some(0),
     };
     let expected_previous = projection.control_head;
-    let valid_epoch = if record.operation == AuthorityOperationKind::InvitePrivateNode as u8 {
-        record.epoch == projection.epoch
-    } else if record.operation == AuthorityOperationKind::RevokePrivateNode as u8 {
-        projection.epoch.checked_add(1) == Some(record.epoch)
-    } else {
-        false
-    };
-    let Some((members, member_set)) =
-        next_private_members(projection, record.operation, record.node)
-    else {
-        return false;
+    let (members, member_set, valid_epoch) = match private_operation_kind(record.operation) {
+        Some(AuthorityOperationKind::InvitePrivateNode) => {
+            let Some((members, member_set)) =
+                next_private_members(projection, record.operation, record.node)
+            else {
+                return false;
+            };
+            (members, member_set, record.epoch == projection.epoch)
+        }
+        Some(AuthorityOperationKind::RevokePrivateNode) => {
+            let Some((members, member_set)) =
+                next_private_members(projection, record.operation, record.node)
+            else {
+                return false;
+            };
+            (
+                members,
+                member_set,
+                projection.epoch.checked_add(1) == Some(record.epoch),
+            )
+        }
+        Some(AuthorityOperationKind::RotatePrivateKeys) => (
+            projection.members.clone(),
+            Hash(projection.member_set),
+            projection.epoch.checked_add(1) == Some(record.epoch),
+        ),
+        Some(
+            AuthorityOperationKind::SetPrivateResourcePolicy
+            | AuthorityOperationKind::PrivateActorLifecycle,
+        ) => (
+            projection.members.clone(),
+            Hash(projection.member_set),
+            record.epoch == projection.epoch,
+        ),
+        Some(AuthorityOperationKind::RecoverPrivateAgent) | None => return false,
+        Some(_) => return false,
     };
     if projection.agent != record.agent
         || projection.owner != record.owner
@@ -3452,7 +3547,7 @@ fn operation_policy_allows(
                 && next_private_members(
                     projection,
                     AuthorityOperationKind::InvitePrivateNode as u8,
-                    node.0,
+                    Some(node.0),
                 )
                 .is_some()
         }
@@ -3471,7 +3566,7 @@ fn operation_policy_allows(
             let next_members = next_private_members(
                 projection,
                 AuthorityOperationKind::RevokePrivateNode as u8,
-                node.0,
+                Some(node.0),
             );
             managed.profile == AgentProfile::Private as u8
                 && managed.owner == call.principal.0
@@ -3486,6 +3581,57 @@ fn operation_policy_allows(
                 )
                 && projection.epoch.checked_add(1) == Some(*epoch)
                 && next_members.is_some_and(|(_, expected)| expected == *member_set)
+        }
+        AuthorityOperationIntent::RotatePrivateKeys {
+            control_sequence,
+            control_previous,
+            epoch,
+            member_set,
+            ..
+        } => {
+            let Ok(index) = private_agent(state, target.agent) else {
+                return false;
+            };
+            let projection = &state.private_agents[index];
+            managed.profile == AgentProfile::Private as u8
+                && managed.owner == call.principal.0
+                && projection.owner == managed.owner
+                && projection.runtime_deployment == managed.runtime_deployment
+                && state.private_applications.len() < MAX_PRIVATE_APPLICATION_RECORDS
+                && !outstanding_private_operation_exists(state, target.agent)
+                && private_control_position_is_next(
+                    projection,
+                    *control_sequence,
+                    *control_previous,
+                )
+                && projection.epoch.checked_add(1) == Some(*epoch)
+                && *member_set == Hash(projection.member_set)
+        }
+        AuthorityOperationIntent::SetPrivateResourcePolicy {
+            control_sequence,
+            control_previous,
+            ..
+        }
+        | AuthorityOperationIntent::PrivateActorLifecycle {
+            control_sequence,
+            control_previous,
+            ..
+        } => {
+            let Ok(index) = private_agent(state, target.agent) else {
+                return false;
+            };
+            let projection = &state.private_agents[index];
+            managed.profile == AgentProfile::Private as u8
+                && managed.owner == call.principal.0
+                && projection.owner == managed.owner
+                && projection.runtime_deployment == managed.runtime_deployment
+                && state.private_applications.len() < MAX_PRIVATE_APPLICATION_RECORDS
+                && !outstanding_private_operation_exists(state, target.agent)
+                && private_control_position_is_next(
+                    projection,
+                    *control_sequence,
+                    *control_previous,
+                )
         }
         // The AOC3 projection commits recovery evidence but does not prove a
         // recovery kit or the current private control-chain head. Until an
@@ -4291,7 +4437,7 @@ fn private_application_commitment(previous: Hash, record: &PrivateApplicationRec
     bytes.extend_from_slice(&record.control_sequence.to_le_bytes());
     encode_optional_hash(&mut bytes, record.control_previous);
     bytes.extend_from_slice(&record.epoch.to_le_bytes());
-    bytes.extend_from_slice(&record.node);
+    encode_optional_hash(&mut bytes, record.node);
     encode_optional_hash(&mut bytes, record.node_identity);
     bytes.extend_from_slice(&record.member_set);
     bytes.extend_from_slice(&record.reopened_control_state);
@@ -4325,6 +4471,15 @@ fn private_operation_kind(tag: u8) -> Option<AuthorityOperationKind> {
         value if value == AuthorityOperationKind::RecoverPrivateAgent as u8 => {
             Some(AuthorityOperationKind::RecoverPrivateAgent)
         }
+        value if value == AuthorityOperationKind::RotatePrivateKeys as u8 => {
+            Some(AuthorityOperationKind::RotatePrivateKeys)
+        }
+        value if value == AuthorityOperationKind::SetPrivateResourcePolicy as u8 => {
+            Some(AuthorityOperationKind::SetPrivateResourcePolicy)
+        }
+        value if value == AuthorityOperationKind::PrivateActorLifecycle as u8 => {
+            Some(AuthorityOperationKind::PrivateActorLifecycle)
+        }
         _ => None,
     }
 }
@@ -4347,6 +4502,24 @@ fn retired_private_operation_is_valid(row: RetiredPrivateOperationRow) -> bool {
             && row
                 .post_member_set
                 .is_some_and(|member_set| member_set != [0; 32])
+    } else if row.operation == AuthorityOperationKind::RotatePrivateKeys as u8 {
+        row.epoch != 0
+            && row.node.is_none()
+            && row.node_identity.is_none()
+            && row
+                .post_member_set
+                .is_some_and(|member_set| member_set != [0; 32])
+    } else if matches!(
+        private_operation_kind(row.operation),
+        Some(
+            AuthorityOperationKind::SetPrivateResourcePolicy
+                | AuthorityOperationKind::PrivateActorLifecycle
+        )
+    ) {
+        row.epoch == 0
+            && row.node.is_none()
+            && row.node_identity.is_none()
+            && row.post_member_set.is_none()
     } else {
         // Recovery AOC3 remains un-authorizable until an offline recovery
         // proof policy exists, so a retired Recover tombstone is unbacked.
@@ -4420,11 +4593,28 @@ fn private_application_record_source(
         control: record.control,
         control_sequence: record.control_sequence,
         control_previous: record.control_previous,
-        epoch: record.epoch,
-        node: Some(record.node),
+        epoch: if matches!(
+            private_operation_kind(record.operation),
+            Some(
+                AuthorityOperationKind::SetPrivateResourcePolicy
+                    | AuthorityOperationKind::PrivateActorLifecycle
+            )
+        ) {
+            0
+        } else {
+            record.epoch
+        },
+        node: record.node,
         node_identity: record.node_identity,
-        post_member_set: (record.operation == AuthorityOperationKind::RevokePrivateNode as u8)
-            .then_some(record.member_set),
+        post_member_set: matches!(
+            private_operation_kind(record.operation),
+            Some(
+                AuthorityOperationKind::RevokePrivateNode
+                    | AuthorityOperationKind::RecoverPrivateAgent
+                    | AuthorityOperationKind::RotatePrivateKeys
+            )
+        )
+        .then_some(record.member_set),
     };
     if let Some(active) = state.operation_retries.iter().find(|source| {
         source.invocation == record.authorization_invocation
@@ -4634,15 +4824,26 @@ fn private_projection_is_valid(
         };
         let valid_node_identity =
             if record.operation == AuthorityOperationKind::InvitePrivateNode as u8 {
-                record.node_identity.is_some_and(|identity| {
-                    enrolled_private_identity_commitment(
-                        state,
-                        vos::agent_sdk::NodeId(record.node),
-                        PrincipalId(record.owner),
-                    ) == Some(Hash(identity))
+                record.node.is_some_and(|node| {
+                    record.node_identity.is_some_and(|identity| {
+                        enrolled_private_identity_commitment(
+                            state,
+                            vos::agent_sdk::NodeId(node),
+                            PrincipalId(record.owner),
+                        ) == Some(Hash(identity))
+                    })
                 })
             } else if record.operation == AuthorityOperationKind::RevokePrivateNode as u8 {
-                record.node_identity.is_none()
+                record.node.is_some_and(|node| node != [0; 32]) && record.node_identity.is_none()
+            } else if matches!(
+                private_operation_kind(record.operation),
+                Some(
+                    AuthorityOperationKind::RotatePrivateKeys
+                        | AuthorityOperationKind::SetPrivateResourcePolicy
+                        | AuthorityOperationKind::PrivateActorLifecycle
+                )
+            ) {
+                record.node.is_none() && record.node_identity.is_none()
             } else {
                 false
             };
@@ -4657,7 +4858,6 @@ fn private_projection_is_valid(
             || record.approval == [0; 32]
             || record.issuance_ack == [0; 32]
             || record.owner == [0; 32]
-            || record.node == [0; 32]
             || !valid_node_identity
             || record.issued_at > record.applied_at
             || PrivateControlApplicationAck::derive_application_invocation_from_issuance(
@@ -5649,6 +5849,7 @@ mod tests {
         CatalogActorTarget, CatalogAlias, CatalogMutationKind, CatalogPublication,
     };
     use vos::agent_sdk::contract::{ActorPackageContract, RuntimePackageContract};
+    use vos::agent_sdk::private::PrivateActorLifecycleKind;
     use vos::agent_sdk::{
         ActorEntry, AgentDescriptor, AgentIdentity, AgentReplica, BlobRef, InstallActor,
         InstallationData, InstallationId, InvocationOrigin, InvocationRoleClaims, LaneSet,
@@ -6302,6 +6503,43 @@ mod tests {
                 *control_sequence,
                 *control_previous,
                 *epoch,
+            ),
+            AuthorityOperationIntent::RotatePrivateKeys {
+                control,
+                control_sequence,
+                control_previous,
+                epoch,
+                ..
+            } => (
+                AuthorityOperationKind::RotatePrivateKeys,
+                *control,
+                *control_sequence,
+                *control_previous,
+                *epoch,
+            ),
+            AuthorityOperationIntent::SetPrivateResourcePolicy {
+                control,
+                control_sequence,
+                control_previous,
+                ..
+            } => (
+                AuthorityOperationKind::SetPrivateResourcePolicy,
+                *control,
+                *control_sequence,
+                *control_previous,
+                0,
+            ),
+            AuthorityOperationIntent::PrivateActorLifecycle {
+                control,
+                control_sequence,
+                control_previous,
+                ..
+            } => (
+                AuthorityOperationKind::PrivateActorLifecycle,
+                *control,
+                *control_sequence,
+                *control_previous,
+                0,
             ),
             AuthorityOperationIntent::InvokeActor { .. }
             | AuthorityOperationIntent::Catalog { .. } => {
@@ -8801,6 +9039,312 @@ mod tests {
         let after_revoke = restarted.state.clone();
         assert!(dispatch_private_application(&mut restarted, &invite_pca));
         assert_eq!(restarted.state, after_revoke);
+        assert!(authority_state_is_valid(&config, &restarted.state));
+    }
+
+    #[test]
+    fn private_rotation_resource_and_lifecycle_are_exact_owner_only_and_restartable() {
+        let config = configuration();
+        let owner = PrincipalId([0x41; 32]);
+        let owner_node = node_for_principal(config, owner);
+        let owner_key = signing(0x43);
+        let mut actor = actor();
+        enroll(
+            &mut actor,
+            &owner_key,
+            owner,
+            owner_node,
+            BuiltinPrincipalRole::Member,
+        );
+        let descriptor = descriptor(config, owner, AgentProfile::Private, 0x44);
+        let managed = target_for(&descriptor);
+        insert_live(&mut actor, &descriptor);
+        let member_set = fixture_member_set(descriptor.replicas.iter().map(|replica| replica.node));
+
+        let rotate_control = Hash([0x45; 32]);
+        let rotate = AuthorityOperationIntent::RotatePrivateKeys {
+            managed,
+            control: rotate_control,
+            control_sequence: 0,
+            control_previous: None,
+            epoch: 1,
+            member_set,
+        };
+        let resource = AuthorityOperationIntent::SetPrivateResourcePolicy {
+            managed,
+            control: Hash([0x46; 32]),
+            control_sequence: 0,
+            control_previous: None,
+            policy: BlobRef::of_bytes(b"private-resource-policy"),
+        };
+        let lifecycle = AuthorityOperationIntent::PrivateActorLifecycle {
+            managed,
+            control: Hash([0x47; 32]),
+            control_sequence: 0,
+            control_previous: None,
+            actor: ActorId([0x48; 32]),
+            lifecycle: PrivateActorLifecycleKind::Install,
+            request: Hash([0x49; 32]),
+        };
+
+        // Administrator status never substitutes for the Private owner key.
+        for intent in [rotate.clone(), resource.clone(), lifecycle.clone()] {
+            let call = operation_call(
+                config,
+                &signing(0x21),
+                ADMIN_PRINCIPAL,
+                Some(ADMIN_NODE),
+                0x4a,
+                intent,
+            );
+            let before = actor.state.clone();
+            assert!(dispatch_operation(&mut actor, &call).is_empty());
+            assert_eq!(actor.state, before);
+        }
+
+        let mut wrong_rotate_epoch = rotate.clone();
+        let AuthorityOperationIntent::RotatePrivateKeys { epoch, .. } = &mut wrong_rotate_epoch
+        else {
+            unreachable!()
+        };
+        *epoch = 2;
+        let mut wrong_rotate_members = rotate.clone();
+        let AuthorityOperationIntent::RotatePrivateKeys {
+            member_set: wrong_member_set_field,
+            ..
+        } = &mut wrong_rotate_members
+        else {
+            unreachable!()
+        };
+        *wrong_member_set_field = Hash([0x4b; 32]);
+        for invalid in [wrong_rotate_epoch, wrong_rotate_members] {
+            let call = operation_call(config, &owner_key, owner, None, 0x4c, invalid);
+            let before = actor.state.clone();
+            assert!(dispatch_operation(&mut actor, &call).is_empty());
+            assert_eq!(actor.state, before);
+        }
+
+        let rotate_call = operation_call(config, &owner_key, owner, None, 0x4d, rotate);
+        let rotate_approval_bytes = dispatch_operation(&mut actor, &rotate_call);
+        let rotate_approval = AuthorityOperationApproval::decode(&rotate_approval_bytes).unwrap();
+        assert_eq!(
+            dispatch_operation(&mut actor, &rotate_call),
+            rotate_approval_bytes
+        );
+        let rotate_issuance = operation_issuance_ack(config, &rotate_call, &rotate_approval);
+        assert!(dispatch_operation_ack(&mut actor, &rotate_issuance));
+        assert_eq!(rotate_approval.selector.request, rotate_control);
+        assert_eq!(
+            rotate_approval.selector.operation,
+            AuthorityOperationKind::RotatePrivateKeys
+        );
+        assert_eq!(rotate_approval.selector.actor, None);
+        assert_eq!(rotate_approval.selector.actor_deployment, None);
+
+        // Until the exact PCA1 arrives no second control position can be
+        // authorized, even though it points at the pending PCTL.
+        let mut pending_resource = operation_call(
+            config,
+            &owner_key,
+            owner,
+            None,
+            0x4e,
+            AuthorityOperationIntent::SetPrivateResourcePolicy {
+                managed,
+                control: Hash([0x4f; 32]),
+                control_sequence: 1,
+                control_previous: Some(rotate_control),
+                policy: BlobRef::of_bytes(b"pending-resource-policy"),
+            },
+        );
+        prepare_operation_call(&actor, &mut pending_resource, &owner_key);
+        let before_pending = actor.state.clone();
+        assert!(dispatch_operation(&mut actor, &pending_resource).is_empty());
+        assert_eq!(actor.state, before_pending);
+
+        let rotate_application = private_application_fact(
+            &rotate_call,
+            member_set,
+            Hash([0x50; 32]),
+            OBSERVED_SLOT + 1,
+        );
+        let mut wrong_epoch = private_application_ack(
+            &rotate_call,
+            &rotate_approval,
+            &rotate_issuance,
+            rotate_application,
+        );
+        wrong_epoch.application.epoch = 2;
+        resign_private_application_ack(&mut wrong_epoch);
+        let before_application = actor.state.clone();
+        assert!(!dispatch_private_application(&mut actor, &wrong_epoch));
+        assert_eq!(actor.state, before_application);
+        let mut wrong_members = wrong_epoch.clone();
+        wrong_members.application.epoch = 1;
+        wrong_members.application.post_member_set = Hash([0x51; 32]);
+        resign_private_application_ack(&mut wrong_members);
+        assert!(!dispatch_private_application(&mut actor, &wrong_members));
+        assert_eq!(actor.state, before_application);
+
+        let rotate_pca = private_application_ack(
+            &rotate_call,
+            &rotate_approval,
+            &rotate_issuance,
+            rotate_application,
+        );
+        assert!(dispatch_private_application(&mut actor, &rotate_pca));
+        assert!(dispatch_private_application(&mut actor, &rotate_pca));
+        assert_eq!(actor.state.private_agents[0].epoch, 1);
+        assert_eq!(actor.state.private_agents[0].member_set, member_set.0);
+        assert_eq!(actor.state.private_agents[0].members.len(), 1);
+
+        let resource_control = Hash([0x52; 32]);
+        let mut resource_call = operation_call(
+            config,
+            &owner_key,
+            owner,
+            None,
+            0x53,
+            AuthorityOperationIntent::SetPrivateResourcePolicy {
+                managed,
+                control: resource_control,
+                control_sequence: 1,
+                control_previous: Some(rotate_control),
+                policy: BlobRef::of_bytes(b"private-resource-policy"),
+            },
+        );
+        prepare_operation_call(&actor, &mut resource_call, &owner_key);
+        let (resource_approval, resource_issuance) =
+            authorize_and_issue_operation(&mut actor, &resource_call);
+        assert_eq!(resource_approval.selector.request, resource_control);
+        assert_eq!(
+            resource_approval.selector.operation,
+            AuthorityOperationKind::SetPrivateResourcePolicy
+        );
+        let mut resource_application = private_application_fact(
+            &resource_call,
+            member_set,
+            Hash([0x54; 32]),
+            OBSERVED_SLOT + 2,
+        );
+        resource_application.epoch = 1;
+        let mut wrong_resource_epoch = private_application_ack(
+            &resource_call,
+            &resource_approval,
+            &resource_issuance,
+            resource_application,
+        );
+        wrong_resource_epoch.application.epoch = 0;
+        resign_private_application_ack(&mut wrong_resource_epoch);
+        let before_resource = actor.state.clone();
+        assert!(!dispatch_private_application(
+            &mut actor,
+            &wrong_resource_epoch
+        ));
+        assert_eq!(actor.state, before_resource);
+        let mut wrong_resource_members = wrong_resource_epoch.clone();
+        wrong_resource_members.application.epoch = 1;
+        wrong_resource_members.application.post_member_set = Hash([0x5b; 32]);
+        resign_private_application_ack(&mut wrong_resource_members);
+        assert!(!dispatch_private_application(
+            &mut actor,
+            &wrong_resource_members
+        ));
+        assert_eq!(actor.state, before_resource);
+        let resource_pca = private_application_ack(
+            &resource_call,
+            &resource_approval,
+            &resource_issuance,
+            resource_application,
+        );
+        assert!(dispatch_private_application(&mut actor, &resource_pca));
+        assert_eq!(actor.state.private_agents[0].epoch, 1);
+        assert_eq!(actor.state.private_agents[0].member_set, member_set.0);
+
+        let actor_id = ActorId([0x55; 32]);
+        let lifecycle_control = Hash([0x56; 32]);
+        let mut lifecycle_call = operation_call(
+            config,
+            &owner_key,
+            owner,
+            None,
+            0x57,
+            AuthorityOperationIntent::PrivateActorLifecycle {
+                managed,
+                control: lifecycle_control,
+                control_sequence: 2,
+                control_previous: Some(resource_control),
+                actor: actor_id,
+                lifecycle: PrivateActorLifecycleKind::Upgrade,
+                request: Hash([0x58; 32]),
+            },
+        );
+        prepare_operation_call(&actor, &mut lifecycle_call, &owner_key);
+        let (lifecycle_approval, lifecycle_issuance) =
+            authorize_and_issue_operation(&mut actor, &lifecycle_call);
+        assert_eq!(lifecycle_approval.selector.request, lifecycle_control);
+        assert_eq!(
+            lifecycle_approval.selector.operation,
+            AuthorityOperationKind::PrivateActorLifecycle
+        );
+        assert_eq!(lifecycle_approval.selector.actor, Some(actor_id));
+        assert_eq!(lifecycle_approval.selector.actor_deployment, None);
+        let mut lifecycle_application = private_application_fact(
+            &lifecycle_call,
+            member_set,
+            Hash([0x59; 32]),
+            OBSERVED_SLOT + 3,
+        );
+        lifecycle_application.epoch = 1;
+        let mut wrong_lifecycle_members = private_application_ack(
+            &lifecycle_call,
+            &lifecycle_approval,
+            &lifecycle_issuance,
+            lifecycle_application,
+        );
+        wrong_lifecycle_members.application.post_member_set = Hash([0x5a; 32]);
+        resign_private_application_ack(&mut wrong_lifecycle_members);
+        let before_lifecycle = actor.state.clone();
+        assert!(!dispatch_private_application(
+            &mut actor,
+            &wrong_lifecycle_members
+        ));
+        assert_eq!(actor.state, before_lifecycle);
+        let mut wrong_lifecycle_epoch = wrong_lifecycle_members.clone();
+        wrong_lifecycle_epoch.application.epoch = 2;
+        wrong_lifecycle_epoch.application.post_member_set = member_set;
+        resign_private_application_ack(&mut wrong_lifecycle_epoch);
+        assert!(!dispatch_private_application(
+            &mut actor,
+            &wrong_lifecycle_epoch
+        ));
+        assert_eq!(actor.state, before_lifecycle);
+        let lifecycle_pca = private_application_ack(
+            &lifecycle_call,
+            &lifecycle_approval,
+            &lifecycle_issuance,
+            lifecycle_application,
+        );
+        assert!(dispatch_private_application(&mut actor, &lifecycle_pca));
+        assert_eq!(
+            actor.state.private_agents[0].control_head,
+            Some(lifecycle_control.0)
+        );
+        assert_eq!(actor.state.private_agents[0].control_sequence, Some(2));
+        assert_eq!(actor.state.private_agents[0].epoch, 1);
+        assert_eq!(actor.state.private_agents[0].member_set, member_set.0);
+
+        let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
+        let mut restarted = <SystemAuthority as vos::Actor>::__load_agent_state(
+            Some(&config.encode()),
+            Some(&linear),
+            None,
+            None,
+        )
+        .expect("all Private owner controls restart from exact state");
+        assert_eq!(restarted.state, actor.state);
+        assert!(dispatch_private_application(&mut restarted, &lifecycle_pca));
+        assert_eq!(restarted.state, actor.state);
         assert!(authority_state_is_valid(&config, &restarted.state));
     }
 

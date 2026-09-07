@@ -187,6 +187,10 @@ impl PrivateControlAuthorityEvidence {
         }
         let intent = AuthorityOperationIntent::private_control(route.runtime_deployment, control)
             .map_err(|_| PrivateSyncError::Tampered)?;
+        let expected_actor = match &intent {
+            AuthorityOperationIntent::PrivateActorLifecycle { actor, .. } => Some(*actor),
+            _ => None,
+        };
         let verifier = RawAuthorityVerifier;
         if issuance.authority != authority
             || application.authority != authority
@@ -209,6 +213,8 @@ impl PrivateControlAuthorityEvidence {
             || application.application.epoch != resulting_epoch
             || issuance.receipt.selector.request != control.commitment()
             || issuance.receipt.selector.operation != intent.operation()
+            || issuance.receipt.selector.actor != expected_actor
+            || issuance.receipt.selector.actor_deployment.is_some()
             || issuance.receipt.selector.space != route.space
             || issuance.receipt.selector.agent != route.agent
             || issuance.receipt.selector.runtime_deployment != route.runtime_deployment
@@ -1563,7 +1569,9 @@ mod tests {
     use vos_agent_sdk::authority_operation::{
         PrivateControlApplicationFact, private_member_set_commitment,
     };
-    use vos_agent_sdk::private::{EncryptedObjectKind, PrivateControlSigner};
+    use vos_agent_sdk::private::{
+        EncryptedObjectKind, PrivateActorLifecycleKind, PrivateControlSigner,
+    };
     use vos_agent_sdk::{
         ActorId, BlobRef, DeploymentId, InvocationId, LaneSet, PrincipalId, ProducerId, ProgramId,
         ResumeWork, RuntimeState,
@@ -1789,6 +1797,10 @@ mod tests {
         let key = SigningKey::from_bytes(&[0x71; 32]);
         let intent =
             AuthorityOperationIntent::private_control(route.runtime_deployment, control).unwrap();
+        let selector_actor = match &intent {
+            AuthorityOperationIntent::PrivateActorLifecycle { actor, .. } => Some(*actor),
+            _ => None,
+        };
         let issued_at = control.sequence.saturating_add(20);
         let applied_at = issued_at.saturating_add(1);
         let mut receipt = AuthorityReceipt {
@@ -1799,7 +1811,7 @@ mod tests {
                 agent: route.agent,
                 operation: intent.operation(),
                 runtime_deployment: route.runtime_deployment,
-                actor: None,
+                actor: selector_actor,
                 actor_deployment: None,
                 evidence: AuthorityEvidence {
                     package: None,
@@ -2550,6 +2562,65 @@ mod tests {
         assert_eq!(
             PrivateControlAuthorityEvidence::decode(&noncanonical),
             Err(PrivateSyncError::InvalidFrame)
+        );
+    }
+
+    #[test]
+    fn lifecycle_evidence_binds_the_exact_actor_selector() {
+        let directory = TestDirectory::new("lifecycle-evidence-selector");
+        let fixture = fixture();
+        let mut store = create_store(&directory.child("store"), &fixture);
+        let actor = ActorId([0x95; 32]);
+        let mut control = PrivateControlRecord {
+            space: fixture.space,
+            agent: fixture.agent,
+            sequence: 0,
+            previous: None,
+            operation: PrivateControlOperation::ActorLifecycle {
+                actor,
+                operation: PrivateActorLifecycleKind::Install,
+                request: Hash([0x96; 32]),
+            },
+            signer: PrivateControlSigner::Owner,
+            signer_public_key: [0; 32],
+            signature: [0; 64],
+        };
+        sign_owner_control_record(&mut control, &fixture.owner_key).unwrap();
+        store.append_control(&control, &TestAuthority).unwrap();
+        let route = test_route(&store);
+        let authority = test_authority_target(&store);
+        let evidence = signed_evidence(&store, &control);
+        let issuance = AuthorityOperationIssuanceAck::decode(&evidence.issuance_ack).unwrap();
+        assert_eq!(issuance.receipt.selector.actor, Some(actor));
+        assert_eq!(issuance.receipt.selector.actor_deployment, None);
+
+        let key = SigningKey::from_bytes(&[0x71; 32]);
+        let mut substituted_issuance = issuance;
+        substituted_issuance.receipt.selector.actor = Some(ActorId([0x97; 32]));
+        substituted_issuance.receipt.signature = [0; 64];
+        substituted_issuance.receipt.signature = key
+            .sign(&substituted_issuance.receipt.signing_bytes())
+            .to_bytes();
+        substituted_issuance.signature = [0; 64];
+        substituted_issuance.signature = key.sign(&substituted_issuance.signing_bytes()).to_bytes();
+        let mut substituted_application =
+            PrivateControlApplicationAck::decode(&evidence.application_ack).unwrap();
+        substituted_application.receipt = substituted_issuance.receipt.clone();
+        substituted_application.issuance_ack = substituted_issuance.commitment();
+        substituted_application.application_invocation =
+            PrivateControlApplicationAck::derive_application_invocation(&substituted_issuance);
+        substituted_application.signature = [0; 64];
+        substituted_application.signature = key
+            .sign(&substituted_application.signing_bytes())
+            .to_bytes();
+        let substituted = PrivateControlAuthorityEvidence::from_acknowledgements(
+            &substituted_issuance,
+            &substituted_application,
+        )
+        .unwrap();
+        assert_eq!(
+            substituted.verify_for(&control, store.binding().epoch, route, authority),
+            Err(PrivateSyncError::Tampered)
         );
     }
 

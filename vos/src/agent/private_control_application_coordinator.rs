@@ -1138,6 +1138,27 @@ pub(crate) fn decode_private_application_fact(
             {
                 crate::agent::sdk::authority::AuthorityOperationKind::RecoverPrivateAgent
             }
+            value
+                if value
+                    == crate::agent::sdk::authority::AuthorityOperationKind::RotatePrivateKeys
+                        as u8 =>
+            {
+                crate::agent::sdk::authority::AuthorityOperationKind::RotatePrivateKeys
+            }
+            value
+                if value
+                    == crate::agent::sdk::authority::AuthorityOperationKind::SetPrivateResourcePolicy
+                        as u8 =>
+            {
+                crate::agent::sdk::authority::AuthorityOperationKind::SetPrivateResourcePolicy
+            }
+            value
+                if value
+                    == crate::agent::sdk::authority::AuthorityOperationKind::PrivateActorLifecycle
+                        as u8 =>
+            {
+                crate::agent::sdk::authority::AuthorityOperationKind::PrivateActorLifecycle
+            }
             _ => return Err(DecodeError::InvalidTag),
         },
         control: Hash(decoder.fixed()?),
