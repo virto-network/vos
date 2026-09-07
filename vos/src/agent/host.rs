@@ -28,13 +28,12 @@ pub use super::local_journal_driver::{
 use super::authority::{
     ActorInvocationReceipt, AgentAuthorityBinding, AgentAuthorityReceipt, AuthorityError,
 };
+#[cfg(all(feature = "storage", target_os = "linux"))]
+use super::bootstrap::validate_prepared_system_agent_genesis_root;
 use super::bootstrap::{
     SystemAgentGenesisBootstrapError, SystemAgentGenesisLocator, SystemAgentGenesisProposal,
     SystemAgentGenesisProvider, SystemAgentGenesisProviderError,
-};
-#[cfg(all(feature = "storage", target_os = "linux"))]
-use super::bootstrap::{
-    seal_prepared_system_agent_genesis, validate_prepared_system_agent_genesis_root,
+    seal_prepared_system_agent_genesis,
 };
 use super::committee::RootAnchorPins;
 use super::driver::{AgentTrustProvider, SdkManagementArtifacts};
