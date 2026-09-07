@@ -185,7 +185,9 @@ impl TransitionProofStatement {
 }
 
 impl CanonicalWire for TransitionProofStatement {
-    const MAGIC: [u8; 4] = *b"APST";
+    // Generation 2 adds the nested Refine transcript commitment. The old
+    // unversioned APST shape is deliberately not decoded as this statement.
+    const MAGIC: [u8; 4] = *b"APS2";
     const MAX_ENCODED_BYTES: usize = 1_024;
 
     fn validate_wire(&self) -> bool {
@@ -236,7 +238,7 @@ impl TransitionProofRecord {
             return Err(WireError::InvalidValue);
         }
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"vos/agent/transition-proof-record/v1");
+        bytes.extend_from_slice(b"vos/agent/transition-proof-record/v2");
         bytes.extend_from_slice(crate::RUNTIME_ABI_ID.as_bytes());
         let statement = self.statement.encode()?;
         let mut encoder = Encoder(&mut bytes);
@@ -320,7 +322,9 @@ impl TransitionProofRecord {
 }
 
 impl CanonicalWire for TransitionProofRecord {
-    const MAGIC: [u8; 4] = *b"APRF";
+    // Generation 2 signs a statement that commits the complete nested
+    // Refine transcript. No legacy record is upgraded implicitly.
+    const MAGIC: [u8; 4] = *b"APR2";
     const MAX_ENCODED_BYTES: usize = MAX_TRANSITION_PROOF_RECORD_BYTES;
 
     fn validate_wire(&self) -> bool {
@@ -589,7 +593,7 @@ mod tests {
             message: &[u8],
             signature: &[u8; 64],
         ) -> bool {
-            message.starts_with(b"vos/agent/transition-proof-record/v1") && *signature == [18; 64]
+            message.starts_with(b"vos/agent/transition-proof-record/v2") && *signature == [18; 64]
         }
 
         fn verify_transition(
@@ -845,12 +849,14 @@ mod tests {
             Err(WireError::Decode(DecodeError::TrailingBytes))
         ));
 
-        let mut old = record.encode().unwrap();
-        old[..4].copy_from_slice(b"PRF1");
-        assert!(matches!(
-            TransitionProofRecord::decode(&old),
-            Err(WireError::Decode(DecodeError::InvalidTag))
-        ));
+        for magic in [*b"APRF", *b"PRF1"] {
+            let mut old = record.encode().unwrap();
+            old[..4].copy_from_slice(&magic);
+            assert!(matches!(
+                TransitionProofRecord::decode(&old),
+                Err(WireError::Decode(DecodeError::InvalidTag))
+            ));
+        }
 
         let mut unknown_mode = record.statement.encode().unwrap();
         // Header + nine fixed identities + method length + method bytes.
@@ -866,7 +872,7 @@ mod tests {
         // decoder which could silently reinterpret public I/O as a trace.
         let statement = statement();
         let mut previous_layout = Vec::new();
-        previous_layout.extend_from_slice(&TransitionProofStatement::MAGIC);
+        previous_layout.extend_from_slice(b"APST");
         previous_layout.extend_from_slice(crate::RUNTIME_ABI_ID.as_bytes());
         let mut encoder = Encoder(&mut previous_layout);
         encode_subject(&mut encoder, &statement.subject);
@@ -876,7 +882,18 @@ mod tests {
         encoder.fixed(statement.transition.as_bytes());
         encoder.fixed(statement.public_io.as_bytes());
         encoder.fixed(statement.proof_system.as_bytes());
-        assert!(TransitionProofStatement::decode(&previous_layout).is_err());
+        assert!(matches!(
+            TransitionProofStatement::decode(&previous_layout),
+            Err(WireError::Decode(DecodeError::InvalidTag))
+        ));
+
+        let mut previous_signing_domain = record.signing_bytes().unwrap();
+        previous_signing_domain[b"vos/agent/transition-proof-record/v".len()] = b'1';
+        assert!(!AcceptExact.verify_producer(
+            &record.producer_public_key,
+            &previous_signing_domain,
+            &record.producer_signature,
+        ));
     }
 
     #[test]
