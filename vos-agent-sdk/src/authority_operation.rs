@@ -5,7 +5,7 @@
 //! accepting those older wire generations. A call authenticates the complete
 //! requested intent with a credential signature; an approval materializes the
 //! exact selector which an authority signer may turn into an [`AuthorityReceipt`].
-//! AOI1 proves only durable receipt issuance; the separate PCA1 protocol proves
+//! AOI1 proves only durable receipt issuance; the separate PCA2 protocol proves
 //! that a Private runtime later applied and reopened an exact PCTL control.
 //! PAR1 is the mutually exclusive terminal proof that the issued capability
 //! was retired after an unchanged, nondurable guest denial.
@@ -49,7 +49,7 @@ pub const MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES: usize = 12 * 1024;
 /// AOI1 contains one complete receipt and fixed-size retained-preimage
 /// commitments; it never embeds the AOC4 or AOP4 bytes themselves.
 pub const MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES: usize = 4 * 1024;
-/// PCA1 is a fixed-size acknowledgement of one durably reopened Private
+/// PCA2 is a fixed-size acknowledgement of one durably reopened Private
 /// control application. It carries commitments and the resulting projection,
 /// never the variable-size PCTL ciphertext or Node list.
 pub const MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES: usize = 4 * 1024;
@@ -797,7 +797,7 @@ fn private_node_identity_commitment(node: &PrivateNodeIdentity) -> Hash {
 }
 
 /// Commit one canonically sorted, unique, nonempty post-application Private
-/// Node set without embedding that list in AOC4 or PCA1.
+/// Node set without embedding that list in AOC4 or PCA2.
 pub fn private_member_set_commitment(nodes: impl Iterator<Item = NodeId>) -> Option<Hash> {
     let nodes: Vec<NodeId> = nodes.collect();
     if nodes.is_empty()
@@ -1435,8 +1435,13 @@ pub struct PrivateControlApplicationFact {
     pub control_previous: Option<Hash>,
     pub epoch: u64,
     pub post_member_set: Hash,
-    /// Commitment of the complete durably reopened Private control state.
-    pub reopened_control_state: Hash,
+    /// Exact commitment of the complete node-local PCRS2 value constructed
+    /// from the durably reopened Store position and Private runtime image.
+    pub reopened_runtime_state: Hash,
+    /// Exact commitment of the successor replica-stable Private runtime
+    /// projection. Unlike PCRS2, this projection can be carried and checked by
+    /// another replica without disclosing its node-local runtime image.
+    pub stable_projection: Hash,
     /// Exact reopened control head. A valid application makes the authorized
     /// PCTL control the new head, so this must equal `control`.
     pub reopened_control_head: Hash,
@@ -1461,7 +1466,8 @@ impl PrivateControlApplicationFact {
         if !self.managed.is_valid()
             || self.control == Hash::ZERO
             || self.post_member_set == Hash::ZERO
-            || self.reopened_control_state == Hash::ZERO
+            || self.reopened_runtime_state == Hash::ZERO
+            || self.stable_projection == Hash::ZERO
             || self.reopened_control_head != self.control
             || !valid_position
         {
@@ -1565,9 +1571,9 @@ impl PrivateControlApplicationFact {
 /// Authority-signed proof that one exact Private control was durably applied
 /// and reopened after its non-management receipt had been issued.
 ///
-/// PCA1 is distinct from AOI1: issuance alone never proves application. Its
+/// PCA2 is distinct from AOI1: issuance alone never proves application. Its
 /// three invocation IDs reserve independent exact-retry domains for AOC4,
-/// AOI1, and PCA1. The AOC4/AOP4 commitments are repeated for auditability;
+/// AOI1, and PCA2. The AOC4/AOP4 commitments are repeated for auditability;
 /// the invocation pair, authorization sequence, and AOI1 commitment are also
 /// sufficient to match an issuance tombstone after those preimages retire.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1581,7 +1587,7 @@ pub struct PrivateControlApplicationAck {
     pub issuance_ack: Hash,
     pub authorization_sequence: NonZeroU64,
     pub receipt: AuthorityReceipt,
-    /// Exact AOI1 issuance slot, repeated under the PCA1 signature so a PCA1
+    /// Exact AOI1 issuance slot, repeated under the PCA2 signature so a PCA2
     /// reopened after AOI1 compaction still proves application ordering.
     pub issued_at: u64,
     pub application: PrivateControlApplicationFact,
@@ -1589,7 +1595,7 @@ pub struct PrivateControlApplicationAck {
 }
 
 impl PrivateControlApplicationAck {
-    /// Derive PCA1's third invocation from the exact verified AOI1.
+    /// Derive PCA2's third invocation from the exact verified AOI1.
     pub fn derive_application_invocation(issuance: &AuthorityOperationIssuanceAck) -> InvocationId {
         Self::derive_application_invocation_from_issuance(
             issuance.authority,
@@ -1600,7 +1606,7 @@ impl PrivateControlApplicationAck {
         )
     }
 
-    /// Derive the PCA1 invocation from the fixed-size AOI1 tombstone tuple.
+    /// Derive the PCA2 invocation from the fixed-size AOI1 tombstone tuple.
     /// Callers must authenticate that tuple from durable authority state; this
     /// deterministic helper does not make ambient values trustworthy.
     pub fn derive_application_invocation_from_issuance(
@@ -1625,7 +1631,7 @@ impl PrivateControlApplicationAck {
 
     pub fn commitment(&self) -> Hash {
         Hash::digest(
-            b"vos/agent/private-control-application-ack/v1",
+            b"vos/agent/private-control-application-ack/v2",
             &[&self.signing_bytes(), &self.signature],
         )
     }
@@ -1687,7 +1693,7 @@ impl PrivateControlApplicationAck {
         Ok(())
     }
 
-    /// Verify the receipt and PCA1 signature with an independently selected
+    /// Verify the receipt and PCA2 signature with an independently selected
     /// authority binding. The encoded target is never its own trust anchor.
     pub fn verify_with<V: AuthorityVerifier>(
         &self,
@@ -1768,7 +1774,7 @@ impl PrivateControlApplicationAck {
     }
 
     /// Match the compact issuance tuple retained after AOC4/AOP4/AOI1
-    /// preimages have retired. The PCA1 signature still must be independently
+    /// preimages have retired. The PCA2 signature still must be independently
     /// verified; this method deliberately does not reconstruct discarded data.
     pub fn matches_issuance_tombstone(
         &self,
@@ -1794,7 +1800,7 @@ impl PrivateControlApplicationAck {
                 )
     }
 
-    /// Verify a PCA1 after issuance preimages have compacted, using the exact
+    /// Verify a PCA2 after issuance preimages have compacted, using the exact
     /// authenticated tombstone tuple and an independently selected binding.
     pub fn verify_issuance_tombstone_with<V: AuthorityVerifier>(
         &self,
@@ -1817,7 +1823,7 @@ impl PrivateControlApplicationAck {
         self.verify_with(authority.binding, verifier)
     }
 
-    /// Bind PCA1 to its third exact Linear authority-actor invocation. As with
+    /// Bind PCA2 to its third exact Linear authority-actor invocation. As with
     /// AOI1, relay identity is not authority; the signature authenticates the
     /// message and the observed slot must equal the signed application slot.
     pub fn matches_invocation_context(&self, context: &InvocationContext) -> bool {
@@ -1839,7 +1845,7 @@ impl PrivateControlApplicationAck {
 /// PAR1 deliberately contains no guest outcome, error, successor state, or
 /// application fact. The trusted host may request it only after an exact
 /// runtime attempt returned a deterministic management denial and reopened
-/// the byte-identical predecessor. It shares PCA1's third invocation because
+/// the byte-identical predecessor. It shares PCA2's third invocation because
 /// application and unapplied retirement are mutually exclusive resolutions
 /// of the same issued capability.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1861,7 +1867,7 @@ pub struct PrivateControlApplicationRetirementAck {
 }
 
 impl PrivateControlApplicationRetirementAck {
-    /// Derive the shared PCA1/PAR1 terminal-resolution invocation.
+    /// Derive the shared PCA2/PAR1 terminal-resolution invocation.
     pub fn derive_application_invocation(issuance: &AuthorityOperationIssuanceAck) -> InvocationId {
         PrivateControlApplicationAck::derive_application_invocation(issuance)
     }
@@ -2911,7 +2917,8 @@ fn encode_private_control_application_fact(
     });
     encoder.u64(value.epoch);
     encoder.fixed(value.post_member_set.as_bytes());
-    encoder.fixed(value.reopened_control_state.as_bytes());
+    encoder.fixed(value.reopened_runtime_state.as_bytes());
+    encoder.fixed(value.stable_projection.as_bytes());
     encoder.fixed(value.reopened_control_head.as_bytes());
     encoder.u64(value.applied_at);
 }
@@ -2927,7 +2934,8 @@ fn decode_private_control_application_fact(
         control_previous: decoder.option(|decoder| Ok(Hash(decoder.fixed()?)))?,
         epoch: decoder.u64()?,
         post_member_set: Hash(decoder.fixed()?),
-        reopened_control_state: Hash(decoder.fixed()?),
+        reopened_runtime_state: Hash(decoder.fixed()?),
+        stable_projection: Hash(decoder.fixed()?),
         reopened_control_head: Hash(decoder.fixed()?),
         applied_at: decoder.u64()?,
     };
@@ -2940,10 +2948,10 @@ fn decode_private_control_application_fact(
 
 fn private_control_application_fact_commitment(value: &PrivateControlApplicationFact) -> Hash {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"PCAF");
+    bytes.extend_from_slice(b"PCAF2");
     bytes.extend_from_slice(crate::RUNTIME_ABI_ID.as_bytes());
     encode_private_control_application_fact(&mut Encoder(&mut bytes), value);
-    Hash::digest(b"vos/agent/private-control-application-fact/v1", &[&bytes])
+    Hash::digest(b"vos/agent/private-control-application-fact/v2", &[&bytes])
 }
 
 fn private_control_application_invocation(
@@ -2989,7 +2997,7 @@ fn encode_private_control_application_ack_unsigned(
 
 fn private_control_application_ack_signing_bytes(value: &PrivateControlApplicationAck) -> Vec<u8> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"PCAS");
+    bytes.extend_from_slice(b"PCAS2");
     bytes.extend_from_slice(crate::RUNTIME_ABI_ID.as_bytes());
     encode_private_control_application_ack_unsigned(&mut Encoder(&mut bytes), value);
     bytes
@@ -3004,7 +3012,7 @@ fn private_control_application_ack_encoded_len(value: &PrivateControlApplication
 }
 
 impl CanonicalWire for PrivateControlApplicationAck {
-    const MAGIC: [u8; 4] = *b"PCA1";
+    const MAGIC: [u8; 4] = *b"PCA2";
     const MAX_ENCODED_BYTES: usize = MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES;
 
     fn validate_wire(&self) -> bool {
@@ -3663,7 +3671,8 @@ mod tests {
             control_previous,
             epoch,
             post_member_set,
-            reopened_control_state: Hash([0x7b; 32]),
+            reopened_runtime_state: Hash([0x7b; 32]),
+            stable_projection: Hash([0x7c; 32]),
             reopened_control_head: control,
             applied_at: 24,
         };
@@ -3797,7 +3806,7 @@ mod tests {
     }
 
     #[test]
-    fn pca1_is_a_distinct_canonical_tombstone_checkable_application_proof() {
+    fn pca2_is_a_distinct_canonical_tombstone_checkable_application_proof() {
         let controls = private_controls();
         let call = private_call(&controls[0], 0x7c);
         let approved = approval_with_sequence(&call, 8);
@@ -3806,17 +3815,17 @@ mod tests {
         let acknowledgement = private_application_ack(&call, &approved, &issuance, application);
 
         let encoded = acknowledgement.encode().unwrap();
-        assert_eq!(encoded.get(..4), Some(b"PCA1".as_slice()));
+        assert_eq!(encoded.get(..4), Some(b"PCA2".as_slice()));
         assert!(encoded.len() <= MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES);
         assert_eq!(
             PrivateControlApplicationAck::decode(&encoded),
             Ok(acknowledgement.clone())
         );
         assert_eq!(
-            Hash::digest(b"vos/test/pca1-golden", &[&encoded]).0,
+            Hash::digest(b"vos/test/pca2-golden", &[&encoded]).0,
             [
-                64, 155, 243, 70, 36, 62, 86, 204, 220, 76, 70, 17, 20, 185, 145, 49, 250, 126,
-                138, 222, 230, 12, 157, 170, 18, 127, 227, 117, 235, 27, 218, 68,
+                192, 175, 210, 200, 71, 227, 62, 172, 113, 38, 82, 190, 250, 212, 245, 223, 159,
+                56, 162, 110, 204, 177, 211, 214, 214, 18, 46, 41, 18, 97, 59, 87,
             ]
         );
         assert_ne!(application.commitment(), Hash::ZERO);
@@ -4053,7 +4062,7 @@ mod tests {
         let encoded = retirement.encode().unwrap();
 
         let mut old = encoded.clone();
-        old[..4].copy_from_slice(b"PCA1");
+        old[..4].copy_from_slice(b"PCA2");
         assert!(PrivateControlApplicationRetirementAck::decode(&old).is_err());
         let mut old_abi = encoded.clone();
         old_abi[4] ^= 1;
@@ -4079,7 +4088,7 @@ mod tests {
     }
 
     #[test]
-    fn pca1_rejects_substitution_bad_ordering_and_unverified_signatures() {
+    fn pca2_rejects_substitution_bad_ordering_and_unverified_signatures() {
         let controls = private_controls();
         let call = private_call(&controls[0], 0x7e);
         let approved = approval(&call);
@@ -4119,10 +4128,17 @@ mod tests {
             Err(AuthorityOperationProtocolError::InvalidApplication)
         );
         let mut missing_state = acknowledgement.clone();
-        missing_state.application.reopened_control_state = Hash::ZERO;
+        missing_state.application.reopened_runtime_state = Hash::ZERO;
         resign_private_application_ack(&mut missing_state);
         assert_eq!(
             missing_state.validate_shape(),
+            Err(AuthorityOperationProtocolError::InvalidApplication)
+        );
+        let mut missing_projection = acknowledgement.clone();
+        missing_projection.application.stable_projection = Hash::ZERO;
+        resign_private_application_ack(&mut missing_projection);
+        assert_eq!(
+            missing_projection.validate_shape(),
             Err(AuthorityOperationProtocolError::InvalidApplication)
         );
         let mut missing_members = acknowledgement.clone();
@@ -4180,6 +4196,28 @@ mod tests {
         assert_eq!(bad_signature.validate_shape(), Ok(()));
         assert_eq!(
             bad_signature.verify_with(call.authority.binding, &TestVerifier),
+            Err(AuthorityOperationProtocolError::InvalidSignature)
+        );
+        let mut substituted_runtime_state = acknowledgement.clone();
+        substituted_runtime_state.application.reopened_runtime_state = Hash([0x87; 32]);
+        assert_eq!(substituted_runtime_state.validate_shape(), Ok(()));
+        assert_ne!(
+            substituted_runtime_state.application.commitment(),
+            application.commitment()
+        );
+        assert_eq!(
+            substituted_runtime_state.verify_with(call.authority.binding, &TestVerifier),
+            Err(AuthorityOperationProtocolError::InvalidSignature)
+        );
+        let mut substituted_stable_projection = acknowledgement.clone();
+        substituted_stable_projection.application.stable_projection = Hash([0x88; 32]);
+        assert_eq!(substituted_stable_projection.validate_shape(), Ok(()));
+        assert_ne!(
+            substituted_stable_projection.application.commitment(),
+            application.commitment()
+        );
+        assert_eq!(
+            substituted_stable_projection.verify_with(call.authority.binding, &TestVerifier),
             Err(AuthorityOperationProtocolError::InvalidSignature)
         );
         let mut bad_receipt = acknowledgement.clone();
@@ -4240,7 +4278,7 @@ mod tests {
     }
 
     #[test]
-    fn pca1_old_truncated_trailing_and_oversize_wires_fail_closed() {
+    fn pca2_rejects_pca1_old_layout_truncated_trailing_and_oversize_wires() {
         let controls = private_controls();
         let call = private_call(&controls[2], 0x85);
         let approved = approval(&call);
@@ -4249,9 +4287,19 @@ mod tests {
         let acknowledgement = private_application_ack(&call, &approved, &issuance, application);
         let encoded = acknowledgement.encode().unwrap();
 
-        let mut old = encoded.clone();
-        old[..4].copy_from_slice(b"AOI1");
-        assert!(PrivateControlApplicationAck::decode(&old).is_err());
+        let mut old_pca1 = encoded.clone();
+        old_pca1[..4].copy_from_slice(b"PCA1");
+        assert!(PrivateControlApplicationAck::decode(&old_pca1).is_err());
+        let stable_projection = acknowledgement.application.stable_projection.0;
+        let stable_offset = encoded
+            .windows(stable_projection.len())
+            .position(|window| window == stable_projection)
+            .expect("fixture stable projection has one canonical preimage");
+        let mut old_layout = encoded.clone();
+        old_layout.drain(stable_offset..stable_offset + stable_projection.len());
+        assert!(PrivateControlApplicationAck::decode(&old_layout).is_err());
+        old_layout[..4].copy_from_slice(b"PCA1");
+        assert!(PrivateControlApplicationAck::decode(&old_layout).is_err());
         let mut old_abi = encoded.clone();
         old_abi[4] ^= 1;
         assert!(PrivateControlApplicationAck::decode(&old_abi).is_err());
