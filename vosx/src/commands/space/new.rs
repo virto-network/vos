@@ -243,9 +243,18 @@ pub(crate) fn scaffold(
         }
     }
 
-    // 9. Move temp dir to the canonical location. Disarm the
-    //    guard once the rename succeeds — the destination dir
-    //    is now legitimate state, not a temp leftover.
+    // 9. Persist the node identity inside the unpublished staging
+    //    directory. Creating it owner-only before publication makes a key
+    //    write failure leave no half-created, publicly named space and does
+    //    not rely on the process umask to protect the secret.
+    let key_bytes = keypair
+        .to_protobuf_encoding()
+        .map_err(|e| anyhow::anyhow!("encode keypair: {e}"))?;
+    crate::secure_file::write_owner_only_atomic(&temp_dir.join("node.key"), &key_bytes)?;
+
+    // 10. Move the complete staged directory to the canonical location.
+    //     Disarm the guard once the rename succeeds — the destination dir
+    //     is now legitimate state, not a temp leftover.
     let final_dir = data_dir.unwrap_or_else(|| paths::space_dir(&space_id));
     let final_dir = spaces_index::normalize_data_directory(&final_dir)?;
     let mut index = spaces_index::LockedSpacesIndex::acquire()?;
@@ -267,12 +276,9 @@ pub(crate) fn scaffold(
     })?;
     temp_guard.disarm();
 
-    // 10. Persist the keypair under the final dir.
+    // The key moved with the complete directory and retains its owner-only
+    // mode; expose the final path in the command result.
     let key_path = final_dir.join("node.key");
-    let key_bytes = keypair
-        .to_protobuf_encoding()
-        .map_err(|e| anyhow::anyhow!("encode keypair: {e}"))?;
-    std::fs::write(&key_path, key_bytes)?;
 
     // 11. Append to the spaces index.
     spaces_index::upsert(&mut index, entry.clone());
