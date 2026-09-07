@@ -26,13 +26,12 @@ build-wasm:
 # Build the service and the actors used by examples and integration tests.
 build-pvm: verify-agent-runtime-release build-vos-service build-examples build-registry-fixtures
 
-# Build the public PVM examples. The native age-gate verifier is covered by
-# `test-examples` instead of being compiled as an actor.
+# Build the small maintained public Agent example set.
 build-examples:
     cd examples/actors; cargo +nightly actor -p counter
-    cd examples/actors; cargo +nightly actor -p workflow
-    cd examples/actors; cargo +nightly actor -p private-age
     cd examples/actors; cargo +nightly actor -p shared-board
+    cd examples/actors; cargo +nightly actor -p private-notes
+    cd examples/actors; cargo +nightly actor -p local-signer
     cd examples/agent-runtimes/custom-linear; cargo actor
 
 # Build only programs consumed by package/registry integration tests.
@@ -180,9 +179,9 @@ test: build-test-artifacts
 test-examples:
     cd examples/actors; cargo test --workspace
     cd examples/actors; cargo +nightly actor -p counter
-    cd examples/actors; cargo +nightly actor -p workflow
-    cd examples/actors; cargo +nightly actor -p private-age
     cd examples/actors; cargo +nightly actor -p shared-board
+    cd examples/actors; cargo +nightly actor -p private-notes
+    cd examples/actors; cargo +nightly actor -p local-signer
     cd services/agent-runtime-guest; cargo test
     cd examples/agent-runtimes/custom-linear; cargo test
     cd examples/agent-runtimes/custom-linear; cargo actor

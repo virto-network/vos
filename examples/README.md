@@ -1,17 +1,16 @@
 # Examples
 
-The examples cover both portable AgentActors hosted by the standard Agent and
-the established service runtime. `vosx actor build` packages a portable
-AgentActor as signed `VOS3`; the legacy service examples remain runtime and
-integration fixtures during the production cutover.
+These examples use the public Agent SDK and the standard runtime embedded in
+`vosx`. Actor builds produce the single signed `VOS3` package format; none of
+the examples depends on a node-specific execution or signing hostcall.
 
-| Example | Runtime | Demonstrates |
+| Example | Profile / lane | Demonstrates |
 | --- | --- | --- |
-| `counter` | Agent-hosted | minimal state and query handlers |
-| `shared-board` | Agent-hosted | linear and convergent state in one actor |
-| `workflow` | service | durable actor calls and suspension |
-| `private-age` | service | private input and attested claims |
-| `age-gate` | native verifier | verification of the attested age claim |
+| `counter` | Local or Shared / Linear | minimal durable state and queries |
+| `shared-board` | Shared / Linear + Merge | one hybrid collaborative actor |
+| `private-notes` | Private / Merge | personal multi-node convergent notes |
+| `local-signer` | Local / Local + const | explicit two-step signing workflow |
+| `custom-linear` | Local or Shared / Linear | deterministic scheduled runtime |
 
 Build all examples:
 
@@ -25,5 +24,7 @@ Package one example:
 cargo run -p vosx -- actor build examples/actors/counter --name counter
 ```
 
-`actor` is the portable authoring namespace. `agent` remains reserved for
-operations and does not expose `new` or `build` authoring aliases.
+The scheduled runtime lives in `examples/agent-runtimes/custom-linear`; it
+implements the mandatory management ABI and declares scheduling explicitly.
+`actor` is the portable authoring namespace, while `agent` is reserved for
+operations on durable Agent instances.

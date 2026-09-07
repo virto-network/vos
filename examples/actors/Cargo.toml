@@ -1,13 +1,10 @@
 [workspace]
 resolver = "3"
 members = [
-    "age-gate",
     "counter",
     "local-signer",
-    "private-age",
     "private-notes",
     "shared-board",
-    "workflow",
 ]
 
 [workspace.package]
