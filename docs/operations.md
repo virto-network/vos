@@ -4,217 +4,185 @@
 
 ```bash
 vosx space new team
-vosx space up team \
-  --service-pvm services/vos-service/vos-service.pvm \
-  --production-trust-socket /run/vos/trust.sock
+vosx space up team
 vosx space info team
+vosx space down team
 ```
 
-Production roots also require a configured trust provider. Route publication
-happens only after the local service has caught up, validated its trust policy,
-and—when applicable—proved committed final Raft membership.
+The standard AgentRuntime and system actors are embedded and protocol-pinned;
+`space up` accepts no external execution-program selection. Startup opens the
+full Ed25519 node identity once and uses it for both transport and Agent
+provenance. Symlinks, hard-link aliases, noncanonical encodings, non-Ed25519
+keys, wrong owners, and group/other-readable key files are rejected.
 
-### Local system Agent host
+Route publication happens only after durable Agent state, authority evidence,
+profile membership, and replication cursors have been reconciled. A corrupt,
+foreign, rolled-back, or partially published generation fails before ingress
+is exposed.
 
-Enable the Agent-native Local journal host only with both independent inputs:
+## Identity and credentials
 
-```bash
-vosx space up team \
-  --agent-root-pins /etc/vos/spaces/team.root-pins \
-  --agent-authority-socket /run/vos/agent-authority.sock
-```
-
-The pins file is the bounded canonical `RootAnchorPins` wire, not TOML or hex.
-Pass its absolute canonical path; it must be a regular non-symlink file outside
-the space data directory and its embedded space must exactly match the space
-being booted. Provision it independently of the socket authority. In
-particular, never generate the configured pins from the archive response being
-verified.
-
-The socket authority owns the durable, provider-first system-genesis archive.
-It must remain available for every daemon restart once a native Agent
-generation exists. Back up and restore that external archive under the
-authority operator's procedure; it is intentionally not copied into a VOS
-space backup. An unavailable, conflicting, corrupt, or mismatched archive
-aborts startup before the Local Agent journal is opened. A configured authority
-may report no archive only while no native `.agent`, external `.agent-lock`,
-authority ledger, or retired `.agent-image` generation exists; exact
-empty-host scope/lock metadata alone is allowed before the first
-provider-first Create.
-
-Native journals live at
-`<space-data>/agents/<full-agent-id>.agent`. Their stable lock and system
-authority ledger do not: they live in a closed per-lease namespace beside the
-outer host lease, named
-`.<commitment-of-root-space-node>.agent-authority/`. That directory contains
-the exact `<full-agent-id>.agent-lock` and
-`<full-agent-id>.system-authority-ledger.redb` files; a `.next` ledger name is
-used only for crash-safe first publication. The outer host lease is
-`$XDG_CONFIG_HOME/vosx/locks/<space-id>.agent-host.lock` (or the corresponding
-home-directory fallback). Its `.next` sibling is used only while publishing a
-brand-new Binding record without replacement; the canonical lease is extended
-with an Arm record only after the journal and authority state have been
-validated together. The ledger's permanent exposure marker is committed only
-after that Arm is durable. Both layers stay outside the replaceable space
-tree. Never delete or recreate either record to force startup past a mismatch.
-The full Ed25519 identity decoded once from `<space-data>/node.key`
-binds both libp2p networking and Local Merge records. Non-Ed25519 node keys are
-rejected whenever this host is enabled.
-
-This is a clean generation cutover. `.agent-image` files are retired and are
-never opened or migrated. An `.agent-lock` or authority-ledger sidecar inside
-the journal root is also an obsolete layout and is never moved implicitly. If
-the two Agent flags are absent, `space up` keeps the legacy Service behavior
-only when no `.agent`, obsolete sidecar, `.agent-image`, Agent-host scope, or
-external host-lease residue is present; finding any such state fails closed
-and requires explicit operator configuration or removal after an independent
-archival decision.
-
-## Built-in ingress
-
-HTTP listeners are configured per node in `<space-data>/local.toml`. Issue and
-revoke their protocol-neutral credentials through the canonical authority:
+Nodes, Principals, and Credentials have separate lifecycles. Use full IDs for
+security decisions; prefixes are display conveniences only.
 
 ```bash
+vosx whoami
 vosx space access team issue --expires 24h
 vosx space access team issue-ssh ~/.ssh/id_ed25519.pub --expires 30d
 vosx space access team list
-vosx space access team revoke <full-credential-id>
+vosx space access team revoke <full-CredentialId>
 ```
 
-The authority binds each credential to a stable member. Owners can revoke a
-credential by its full ID; prefix lookup and listing require
-credential-management authority. Add `--subject <hex>`
-only when an administrator is adding a device for someone else. HTTP actor
-calls and SSH shell actions both pass the actor's signed method policy and the
-member's live capability decision. See [HTTP ingress](http-ingress.md) and the
-[SSH space shell](ssh-ingress.md).
+Each credential is bound to one Principal by the system authority. Revoking a
+credential does not remove a replica Node, and adding an SSH key never admits
+that client as a replica. Node enrollment authenticates the full transport
+identity and, for Private Agents, the separately signed X25519 key.
 
-Each member may have 32 live credentials and may issue 256 credential
-identities over the lifetime of one authority installation. Revoked identities
-remain as bounded tombstones so an old bearer can never be activated again.
+## Agent inventory and lifecycle
+
+```bash
+vosx agent list team
+vosx agent create team board --profile shared
+vosx agent create team companion --profile private
+vosx agent create team scratch --profile local
+vosx agent show team/board
+```
+
+Profiles are immutable. Names may change and can be ambiguous across profile
+directories; use the full `AgentId` whenever a name is not unique. The system
+Agent is listed as `system`, but cannot be removed or incompatibly replaced.
+
+Shared replica-set changes preserve one membership definition for every lane.
+Prepare and catch up a new replica before promotion. During voter replacement,
+retain the departing voter until the joint configuration and final
+configuration are durably committed. A replica is ready only when its applied
+cursor reaches the current commit and no unresolved joint membership remains.
+
+## Actor and runtime upgrades
+
+```bash
+vosx actor install team/board board.vos --name board
+vosx actor upgrade team/board/board board-new.vos
+vosx actor suspend team/board/board
+vosx actor resume team/board/board
+vosx actor remove team/board/board
+```
+
+An upgrade is a signed Agent transition. Distribute and verify the complete
+replacement package before proposing it. Exact retries recover the already
+committed result; they never execute a second upgrade. Catalog alias updates
+occur only after the Agent transition is final.
+
+Runtime upgrades use the mandatory management ABI and an explicit migration
+policy. Pause new work, drain or persist continuations, verify every replica
+has applied through the same committed boundary, and only then activate the
+replacement. A runtime with a different state-machine identity rejects an
+entry before execution rather than attempting mixed-version interpretation.
+
+The current generation provides no migration decoder for older packages,
+state images, snapshots, proof records, or backup formats. Rebuild packages
+and recreate development Agents from authenticated application exports.
+
+## Private membership and recovery
+
+```bash
+vosx agent invite-node team/companion --node <full-NodeId>
+vosx agent revoke-node team/companion --node <full-NodeId>
+vosx agent recover team/companion --recovery-kit /safe/companion.recovery
+```
+
+Invitation requires an authority binding between the owner Principal, exact
+Node transport identity, and that Node's signed X25519 public key. Owner and
+data keys are sealed independently to the admitted Node.
+
+Revocation removes one exact Node and commits a fresh owner/data epoch before
+later writes are accepted. It protects future state; it cannot erase data the
+Node already observed. Keep the offline recovery signing and encryption halves
+outside every active Node. Recovery validates all source archives before
+mutation, deterministically reconciles compatible ciphertext, supersedes old
+control heads, rotates both keys, and admits the replacement Nodes.
+
+Private synchronization rejects an unknown or revoked peer before reading or
+transmitting state. Transfer is bounded and chunked, and every object remains
+authenticated ciphertext on disk, in frames, snapshots, and backups.
 
 ## Backup and restore
 
-Stop the local daemon before backup:
+Stop the node before taking or restoring an offline backup:
 
 ```bash
+vosx space down team
 vosx space backup team /safe/team-backup
-vosx space restore /safe/team-backup --data-dir /srv/vos/team
+vosx space restore /safe/team-backup \
+  --node-key /safe/team.node-key \
+  --data-dir /srv/vos/team
 ```
 
-The backup is a self-contained directory for the space-owned state, with a
-signed-content manifest, service images, local databases, private side stores,
-node identity, and the required blob cache. Restore verifies every file before
-replacing anything. A configured system-Agent genesis archive, its independent
-root-pins file, the outer Agent-host lease, and its per-lease authority
-namespace are external inputs and are not part of that replaceable tree.
+The node key is never placed in the archive. Retain it separately with mode
+`0600`; restore requires the exact key whose public identity appears in the
+manifest. Never activate one node identity on two machines at the same time.
 
-Treat the external Agent files as one monotonic freshness/high-water domain.
-Back them up separately while the daemon is stopped, but never replace or roll
-them back as part of restoring `<space-data>`. Startup compares replayed Local
-Agent authority state with the surviving ledger before exposing a driver. A
-journal backup that predates that ledger therefore fails closed; restore a
-journal containing the matching latest authority history rather than deleting,
-reinitializing, or downgrading the external files.
+The clean backup format contains authenticated portable profile exports,
+content-addressed packages, encrypted Private material, and public recovery
+metadata. It excludes active unwrapped keys, plaintext Private state,
+credentials, endpoint files, and node-local policy. Creation and restore use
+unpublished sibling directories; every manifest entry is bounded and verified
+before activation. Existing state is replaced only with `--replace` and is
+renamed aside rather than deleted.
 
-A restored replicated node may be behind. This is expected: keep the same node
-identity and replication incarnation, reconnect it, and wait until its durable
-applied cursor reaches the current cluster commit before relying on local
-reads. Never restore one identity onto two live machines.
+A restored Shared replica may be behind. Reconnect it under the same exact
+Node identity and wait for its durable applied cursor to catch up before using
+local reads. A Private restore additionally correlates the recovered control
+head with fresh authority evidence before synchronization.
 
-## Raft membership
+## Ingress
 
-Add a prepared replica before promoting it. Remove a voter only through the
-replacement workflow; the retiring replica stays available until the final
-configuration and retirement acknowledgement are durable. Status is steady
-only when the active configuration index is committed and no joint membership
-remains.
+HTTP routes use:
 
-## Upgrades
+```text
+/<agent>/<actor>/<method>
+```
 
-An upgrade is a signed actor transition, not a catalog rewrite. Stage the full
-replacement package on every voter, propose the upgrade, wait for application,
-then update the catalog with compare-and-swap. Exact retries recover the
-already committed result.
+SSH navigation follows Space → Agents → Actors → Methods. Both surfaces show
+the profile, method lane, observation freshness, attestation policy, and
+idempotency requirement. They authenticate a Credential into a Principal and
+carry Node provenance separately when forwarding. Both submit the same
+canonical Agent invocation; neither owns a private execution path.
 
-Host state-machine changes use a separate identity in every new Raft
-application entry and applied snapshot. Before replacing binaries, pause
-ingress and transport acknowledgement and verify `last_applied ==
-commit_index` on every voter. Replace the complete voter set, then resume
-traffic. A host with a different state-machine identity cannot apply a new-format entry: it rejects the
-entry before guest execution and leaves its applied cursor unchanged. This
-turns a mixed deployment into an explicit unavailable replica instead of two
-replicas silently committing different service images.
+For retried mutations, retain and reuse the invocation/idempotency key until a
+terminal result is acknowledged. A timeout is not evidence that execution did
+not commit. Queries report the Linear revision, Merge frontier, and Local
+revision observed.
 
-The role authority's replication incarnation is fixed when a space is
-created. Rebuilding or upgrading its signed package does not derive a new
-incarnation.
+## Proof production
 
-Platform identities are clean compatibility boundaries. This repository is
-not released yet, so the capability-role and SSH-shell cutover deliberately
-does not retain a decoder or conversion bridge for earlier development spaces.
-Recreate those spaces from packages and application exports.
+Attested execution is tentative until the nested execution transcript has
+been proved, producer-signed, and independently verified. Publication commits
+the proof record and its exact transition atomically. A crash before that point
+cannot expose the state; an exact retry reproduces the same proof identity.
 
-The standard Agent execution profile uses the same fail-closed rule. Agent
-Actor and AgentRuntime packages from the retired `standard-gas-r01` and
-`standard-gas-r02` generations cannot be opened by an `r04` host. Generation
-`r02` introduced the full v0.8 reorder-buffer scheduler, full-Ψ deblob/entry
-failures, and sign-extended 64-bit `ecalli` identifiers. Generation `r03`
-additionally binds exact durable terminal and execution-error outcomes to the
-authenticated invocation ownership and acknowledgement protocol. Rebuild
-those packages and recreate local development Agent images. The related
-lifecycle wire first moved from
-`vos-agent-runtime-abi-20260829r1` to `vos-agent-runtime-abi-20260829r2`, then
-to `vos-agent-runtime-abi-20260831r3`, `vos-agent-runtime-abi-20260831r4`,
-`vos-agent-runtime-abi-20260831r5`, `vos-agent-runtime-abi-20260831r6`, and now
-`vos-agent-runtime-abi-20260904r7`. Generation r3 binds Suspend and Resume
-authority to the actor's exact expected deployment, so a receipt prepared
-before an actor upgrade cannot mutate its replacement. Generation r4 makes
-the three actor-state lanes independently sparse, binds their entries to a
-per-install state generation, and scopes retained invocation results and
-acknowledgements to Ordered, Merge, or replica-local execution. Invocation
-authorization, AGEX/AGIR messages, replies, and retained results all bind the
-same nonzero incarnation. Callers obtain that guest-derived value from
-`AgentDriver::inspect_actor` or a validated paged directory inspection; it
-must not be inferred from deployment metadata. Generation r5 signs aggregate
-catalog resource ceilings into the runtime package and enforces them over the
-deduplicated runtime-package plus actor package/schema/policy closure. Every
-reference is capped at 8 MiB, the Standard closure at 12,289 unique references
-and 64 MiB of referenced content, and a hash presented with inconsistent
-lengths is rejected. Generation r6 adds the replay-authenticated journal
-generation/admission context and the root-pinned live system-authority Control
-state. Finalize and committee-rotation commands execute deterministically in
-the guest, but only independently authenticated replay may persist their
-history plans or mint post-publication authority. Generation r7 makes the
-nonzero catalog `InstallationId` and finality-backed registry reservation
-commitment part of the signed install request, durable actor record, and
-inspected directory record. The runtime retains an immutable commitment to the
-original install request, so an exact fresh-sequence retry remains idempotent
-after suspension, actor upgrade, and Agent reopen; later mutable deployment
-state cannot redefine the accepted install preimage. Removed installation IDs
-become grow-only durable tombstones, preventing an old install request from
-resurrecting after `RemoveLeaf`; reinstalling the same actor name requires a
-fresh installation ID and registry reservation and creates a new incarnation.
-Identifier reuse, altered install fields, and reservation drift are rejected.
-An r7 host deliberately rejects r1/r2/r3/r4/r5/r6 runtime packages and
-persisted Agent images; rebuild the runtime and actor packages and recreate
-those images. The actor ABI itself remains unchanged. This cutover does not
-change the frozen Service execution identity or artifacts.
-
-Portable invocation continuations now use kernel snapshot version 5, which
-preserves sparse IPC DATA mappings exactly. Before upgrading a host, let every
-in-flight version-4 continuation drain; any remainder must be restarted from
-its durable invocation input. Version-5 hosts deliberately reject version-4
-snapshots and provide no compatibility decoder.
+Producer-private witnesses belong in a protected node-local sidecar. They must
+not appear in Agent state, Raft entries, Merge frames, public proofs, logs, or
+backups. Followers verify the public proof, runtime and actor identities,
+method and mode, work and transition, and before/after lane commitments without
+access to the witness.
 
 ## Release artifacts
 
 ```bash
 just package-production-release
-cargo run -p vosx -- release verify target/production-release
+vosx release verify target/production-release
 ```
 
-Release verification rejects symlinks, special files, extra files, digest
-mismatches, and non-reproducible PVM output. The bundle contains the consensus
-service, canonical space authority, and standard multi-actor runtime.
+The release directory contains exactly the standard AgentRuntime, authority
+actor, catalog actor, and strict manifest embedded by the checked `vosx`
+binary. Bundling accepts no external program path. Verification rejects the
+previous release generation, symlinks, special files, unexpected entries,
+digest or program-identity mismatches, and any artifact that differs from the
+binary's protocol pins.
+
+Before distribution, run the workspace checks, Clippy, formatting, docs,
+examples, all feature combinations, standard-program conformance and parity,
+hostcall allowlist inspection, reproducibility tests under clean homes and
+target directories, profile restart/failover/recovery suites, and physical
+HTTP and SSH idempotency tests.

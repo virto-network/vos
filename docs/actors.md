@@ -1,100 +1,152 @@
 # Actors and packages
 
-Actors are deterministic Rust state machines. A handler reads its own state,
-receives an authenticated origin, and returns a reply plus durable effects.
+An actor is a deterministic program installed into an Agent. It receives an
+authenticated Principal origin with separate Node provenance, reads only the
+state views allowed by its method mode, and returns a reply plus proposed
+effects. The AgentRuntime validates those effects before anything becomes
+durable.
 
-## Package contents
+## One package envelope
 
-A `.vos` package always contains:
+Every deployable `.vos` file is a canonical signed `VOS3` envelope with one
+explicit kind:
 
-- the actor PVM;
-- typed method schemas;
-- authorization/method policies;
-- optional Task dependencies;
-- a deployment signature.
+- `Actor`
+- `AgentRuntime`
 
-A legacy service package (`VOSP`) additionally binds the generic service
-program and is accepted by `space publish`. A portable AgentActor package
-(`VOS3`) signs an exact closure containing the actor PVM, AAS2 state and
-constructor contract, AMP2 method policy, AAI1 introspection, ATD1 Task set,
-and every referenced Task PVM. It uses a raw Ed25519 producer key/signature and
-derives its deployment identity from those signing bytes. The two envelopes
-cannot be cross-packaged; host publication of `VOS3` remains a separate
-cutover.
+An Actor package commits to its standard actor program, actor ABI requirement,
+state-lane schemas, method metadata and policies, Task dependencies, required
+optional runtime capabilities, producer identity, and Ed25519 signature. It
+does not pin a particular AgentRuntime.
 
-The package is the installation unit. Raw ELFs and PVMs are build inputs, not
-deployable applications.
+An AgentRuntime package commits to its outer standard program, mandatory
+management ABI, supported actor ABI range, lanes and optional capabilities,
+control-schema identity, limits, migration policy, producer, and signature.
+The host rejects noncanonical encodings, omitted artifacts, duplicate content
+aliases, signer/producer mismatches, unknown fields, and every earlier package
+generation.
 
-## Portable AgentActors
+Raw ELF and PVM files are build inputs, not installation units.
 
-Portable AgentActors opt into the lane-aware source ABI on both macros and run
-inside an Agent:
+## Lane-aware state
 
 ```rust,ignore
+use vos::prelude::*;
+
 #[actor(agent)]
 pub struct Board {
-    title: String,              // Linear
-    edits: crdt::Counter,       // Merge
-    #[state(local)] draft: String,
+    title: String,                 // Linear
+    edits: crdt::Counter,          // Merge
+    #[state(local)] draft: String, // Local
+    #[state(const)] board_id: u64, // immutable
+    #[state(skip)] cached: usize,  // derived
 }
 
 #[messages(agent)]
 impl Board {
     #[msg(linear)]
-    pub fn rename(&mut self, title: String) { self.title = title; }
+    fn rename(&mut self, title: String) {
+        self.title = title;
+    }
 
     #[msg(merge)]
-    pub fn record_edit(&mut self) {
-        self.edits.increment(1).expect("one stable operation per slice");
+    fn record_edit(&mut self) {
+        self.edits.increment(1).expect("one stable operation");
+    }
+
+    #[msg(local)]
+    fn save_draft(&mut self, draft: String) {
+        self.draft = draft;
     }
 
     #[msg]
-    pub fn title(&self) -> String { self.title.clone() }
+    fn title(&self) -> String {
+        self.title.clone()
+    }
 }
 ```
 
-The generated method view exposes only the lanes permitted by its mode. The
-runtime independently projects the same lanes before execution and rejects a
-transition that changes any other lane. Service actors continue to use plain
-`#[actor]` and `#[messages]`.
+Ordinary persisted fields default to Linear, `crdt::*` fields imply Merge,
+and ordinary `#[storage]` is Linear unless explicitly typed or marked
+otherwise. The macros generate a mode-specific view, so a forbidden lane
+access is a compile error. The runtime also compares lane commitments before
+and after execution and rejects cross-lane mutation independently.
 
-An Agent method that names an actor or Space role also supplies its portable,
-nonzero role identity; packages are not bound to the destination Space:
+Queries return observation metadata containing the Linear revision, Merge
+frontier, and Local revision used. `#[msg(linearizable)]` first obtains a
+Linear read barrier. A Linear method may emit an `after_commit_merge` message;
+delivery is durable and exactly once, but deliberately occurs after the Linear
+commit rather than in one cross-lane transaction.
 
-```rust,ignore
-#[msg(
-    query,
-    space_role = SpaceRole::Member,
-    space_role_id = "3131313131313131313131313131313131313131313131313131313131313131"
-)]
-pub fn status(&self) -> Status { /* ... */ }
+## Actor forest and lifecycle
+
+An Agent starts with an empty forest. Managers install top-level actors;
+actors may spawn package-authorized owned children. Stable actor identity is
+separate from its mutable name and current deployment.
+
+```bash
+vosx actor install demo/notes board.vos --name board
+vosx actor upgrade demo/notes/board board-new.vos
+vosx actor suspend demo/notes/board
+vosx actor resume demo/notes/board
+vosx actor remove demo/notes/board
 ```
 
-`vosx actor build --scheduling` explicitly signs scheduler requirements.
-Attested methods or provable Task dependencies require one exact nonzero
-`--proof-system <64-lowercase-hex>` identity; supplying it when unused is an
-error. The `agent` namespace is reserved for Agent operations, not actor
-authoring.
+Upgrade preserves identity while changing the exact deployment under a signed
+lifecycle transition. Removal is rejected unless the actor is a leaf and has
+no continuation, inbox, outbox, scheduled work, unacknowledged result, retained
+proof, or other debt. A fresh install after removal receives a new incarnation
+and installation identity; an old request cannot resurrect the removed actor.
 
-## Actor trees
+An Agent directory can contain far more actors than one execution slice. The
+runtime keeps at most 63 inner machines live simultaneously. If an inline call
+chain would exceed the limit, it records a continuation and resumes in a later
+slice.
 
-A root actor may spawn package-authorized children. Calls use bound handles,
-so both the destination service and actor identity remain authenticated.
-Child state stays private to the service and is exposed only to the child that
-owns it.
+## Calls and exactly-once results
 
-## Tasks and proofs
+```bash
+vosx call demo/notes/board add-task --id 1 --text "Ship it"
+```
 
-A Task is a package-pinned computation used by an actor. A recorded Task can
-produce a public claim and producer-private witness material. The witness is
-kept outside replicated state; a proof producer later turns it into a portable
-proof. See [Authority and privacy](security.md).
+Calls bind the full Space, Agent, actor incarnation and deployment, method,
+mode, authenticated Principal, Node provenance, and invocation identity. An
+exact retry returns the retained terminal result without executing again.
+Result acknowledgement is itself durable. Same-Agent calls may run inline;
+cross-Agent calls always use durable await, timeout, retry, and late-reply
+records.
 
-## Examples
+## Roles and authority
 
-- `examples/actors/counter`: smallest portable AgentActor.
-- `examples/actors/shared-board`: linear and convergent state in one
-  portable AgentActor.
-- `examples/actors/workflow`: service actor with durable calls and suspension.
-- `examples/actors/private-age`: service actor with private input and an
-  attested result; `age-gate` is its native verifier.
+Method policies use portable nonzero role identities. A Space may map its
+built-in roles to actor roles without changing the signed package. Management
+and invocation evidence binds the exact request and deployment context, and is
+verified by every runtime replica before mutation.
+
+There is no ambient signing ability. The maintained `local-signer` example
+stores an installation secret in an explicit Local actor. A Shared workflow
+first calls that actor to obtain a context-bound signature, then submits the
+signature as visible input to a second operation.
+
+## Tasks, proofs, and scheduling
+
+A Task is a package-pinned computation. An attested method or provable Task
+declares one exact proof-system identity. Public proof records bind the outer
+runtime, inner actor, method and mode, exact work and transition, and lane
+commitments. Producer-private witnesses are never encoded into replicated
+state or a proof record.
+
+Scheduling is optional runtime behavior. The maintained custom runtime orders
+ready work deterministically by `(due_slot, priority, schedule_id)`. Local
+work receives a durable monotonic observation; Shared work commits the
+leader's observation. Repeating schedules advance from their previous due
+slot, avoiding drift and duplicate execution across restart or leadership
+transfer.
+
+## Maintained examples
+
+- `examples/actors/counter`: Linear counter.
+- `examples/actors/shared-board`: hybrid Linear and Merge board.
+- `examples/actors/private-notes`: Merge-only Private companion.
+- `examples/actors/local-signer`: explicit Local signer.
+- `examples/agent-runtimes/custom-linear`: signed scheduled runtime.
