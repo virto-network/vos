@@ -172,6 +172,47 @@ fn valid_runtime_package(value: &BlobRef) -> bool {
     value.hash != Hash::ZERO && value.len != 0 && value.len <= MAX_CATALOG_ARTIFACT_BYTES
 }
 
+fn creation_receipt_matches_image(
+    managed: ManagedAgentTarget,
+    receipt: &AuthorityReceipt,
+    created_at: u64,
+) -> bool {
+    let selector = &receipt.selector;
+    receipt.validate_shape().is_ok()
+        && selector.operation == AuthorityOperationKind::CreateAgent
+        && selector.space == managed.space
+        && selector.agent == managed.agent
+        && selector.runtime_deployment == managed.runtime_deployment
+        && selector.actor.is_none()
+        && selector.actor_deployment.is_none()
+        && selector.is_live_at(created_at)
+}
+
+fn verify_creation_receipt<V: AuthorityVerifier>(
+    descriptor: &AgentDescriptor,
+    receipt: &AuthorityReceipt,
+    created_at: u64,
+    verifier: &V,
+) -> Result<(), PrivateRuntimeEvidenceError> {
+    let managed = ManagedAgentTarget {
+        space: descriptor.identity.space,
+        agent: descriptor.identity.agent,
+        runtime_deployment: descriptor.identity.runtime_deployment,
+    };
+    let request = ManagementRequest::Create(Box::new(descriptor.clone()));
+    if descriptor.validate().is_err()
+        || descriptor.identity.profile != AgentProfile::Private
+        || !request.is_valid()
+        || !creation_receipt_matches_image(managed, receipt, created_at)
+        || !descriptor.authority.accepts(receipt)
+        || receipt.selector.request != request.commitment()
+        || receipt.verify_at(created_at, verifier).is_err()
+    {
+        return Err(PrivateRuntimeEvidenceError::InvalidAuthority);
+    }
+    Ok(())
+}
+
 fn encode_nested<T: CanonicalWire>(encoder: &mut Encoder<'_>, value: &T) {
     encoder.bytes(
         &value
@@ -628,14 +669,16 @@ impl CanonicalWire for PrivateRuntimeSuccess {
 /// Replica-stable projection of the Private control application chain.
 ///
 /// It deliberately excludes NodeId, applied slot, Store roots, raw runtime
-/// state, and Merge/Local bytes. Every successor commits the exact previous
-/// projection, full application replay, positive disposition, and active
-/// RRP1 value.
+/// state, and Merge/Local bytes. The shared creation-receipt commitment anchors
+/// the initial runtime transition without importing each replica's observation
+/// slot. Every successor commits the exact previous projection, full
+/// application replay, positive disposition, and active RRP1 value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrivateRuntimeStableProjection {
     managed: ManagedAgentTarget,
     descriptor: Hash,
     runtime_package: BlobRef,
+    creation_receipt: Hash,
     generation: u64,
     previous: Option<Hash>,
     control_head: Option<Hash>,
@@ -652,6 +695,7 @@ impl PrivateRuntimeStableProjection {
         managed: ManagedAgentTarget,
         descriptor: Hash,
         runtime_package: BlobRef,
+        creation_receipt: Hash,
         active_resource_policy: RuntimeResourcePolicy,
         control_state: &[u8],
     ) -> Result<Self, PrivateRuntimeEvidenceError> {
@@ -659,6 +703,7 @@ impl PrivateRuntimeStableProjection {
             managed,
             descriptor,
             runtime_package,
+            creation_receipt,
             generation: 0,
             previous: None,
             control_head: None,
@@ -707,6 +752,7 @@ impl PrivateRuntimeStableProjection {
             managed: previous.managed,
             descriptor: previous.descriptor,
             runtime_package: previous.runtime_package.clone(),
+            creation_receipt: previous.creation_receipt,
             generation: previous
                 .generation
                 .checked_add(1)
@@ -732,6 +778,9 @@ impl PrivateRuntimeStableProjection {
     }
     pub fn runtime_package(&self) -> &BlobRef {
         &self.runtime_package
+    }
+    pub const fn creation_receipt(&self) -> Hash {
+        self.creation_receipt
     }
     pub const fn generation(&self) -> u64 {
         self.generation
@@ -772,6 +821,7 @@ impl PrivateRuntimeStableProjection {
         if !self.managed.is_valid()
             || self.descriptor == Hash::ZERO
             || !valid_runtime_package(&self.runtime_package)
+            || self.creation_receipt == Hash::ZERO
             || self.control_state == Hash::ZERO
             || !self.active_resource_policy.is_valid()
             || resource_policy_commitment(self.active_resource_policy)?
@@ -815,6 +865,7 @@ impl CanonicalWire for PrivateRuntimeStableProjection {
         encode_managed(encoder, self.managed);
         encoder.fixed(self.descriptor.as_bytes());
         encode_blob(encoder, &self.runtime_package);
+        encoder.fixed(self.creation_receipt.as_bytes());
         encoder.u64(self.generation);
         encode_optional_hash(encoder, self.previous);
         encode_optional_hash(encoder, self.control_head);
@@ -831,6 +882,7 @@ impl CanonicalWire for PrivateRuntimeStableProjection {
             managed: decode_managed(decoder)?,
             descriptor: Hash(decoder.fixed()?),
             runtime_package: decode_blob(decoder)?,
+            creation_receipt: Hash(decoder.fixed()?),
             generation: decoder.u64()?,
             previous: decode_optional_hash(decoder)?,
             control_head: decode_optional_hash(decoder)?,
@@ -869,6 +921,8 @@ pub struct PrivateRuntimeImage {
     owner: PrincipalId,
     descriptor: Hash,
     runtime_package: BlobRef,
+    creation_receipt: AuthorityReceipt,
+    created_at: u64,
     runtime_deployment: DeploymentId,
     state: RuntimeState,
     active_resource_policy: RuntimeResourcePolicy,
@@ -884,13 +938,15 @@ pub struct PrivateRuntimeImage {
 impl PrivateRuntimeImage {
     /// Construct the first image only from a valid immutable Private
     /// descriptor and the exact post-Create runtime state.
-    pub fn genesis(
+    pub fn genesis<V: AuthorityVerifier>(
         descriptor: &AgentDescriptor,
         node: NodeId,
         state: RuntimeState,
         store: PrivateStoreCorePosition,
         key_epochs: Vec<PrivateKeyEpochCommitment>,
-        applied_at: u64,
+        creation_receipt: AuthorityReceipt,
+        created_at: u64,
+        authority_verifier: &V,
     ) -> Result<Self, PrivateRuntimeEvidenceError> {
         if descriptor.validate().is_err()
             || descriptor.identity.profile != AgentProfile::Private
@@ -906,6 +962,12 @@ impl PrivateRuntimeImage {
             agent: descriptor.identity.agent,
             runtime_deployment: descriptor.identity.runtime_deployment,
         };
+        verify_creation_receipt(
+            descriptor,
+            &creation_receipt,
+            created_at,
+            authority_verifier,
+        )?;
         if store.space != managed.space
             || store.agent != managed.agent
             || store.owner != descriptor.identity.owner
@@ -920,6 +982,7 @@ impl PrivateRuntimeImage {
             managed,
             descriptor.commitment(),
             descriptor.runtime_package.clone(),
+            creation_receipt.commitment(),
             active_resource_policy,
             &state.control,
         )?;
@@ -929,6 +992,8 @@ impl PrivateRuntimeImage {
             owner: descriptor.identity.owner,
             descriptor: descriptor.commitment(),
             runtime_package: descriptor.runtime_package.clone(),
+            creation_receipt,
+            created_at,
             runtime_deployment: descriptor.identity.runtime_deployment,
             state,
             active_resource_policy,
@@ -938,13 +1003,13 @@ impl PrivateRuntimeImage {
             runtime_control: None,
             last_full_replay: None,
             stable_projection,
-            applied_at,
+            applied_at: created_at,
         };
         value.validate()?;
-        if value
-            .state
-            .encoded_len()
-            .is_none_or(|length| length > active_resource_policy.max_runtime_state_bytes as usize)
+        if value.state.is_empty()
+            || value.state.encoded_len().is_none_or(|length| {
+                length > active_resource_policy.max_runtime_state_bytes as usize
+            })
         {
             return Err(PrivateRuntimeEvidenceError::InvalidState);
         }
@@ -966,6 +1031,7 @@ impl PrivateRuntimeImage {
         recovery_verifier: &R,
     ) -> Result<Self, PrivateRuntimeEvidenceError> {
         predecessor.validate()?;
+        predecessor.reopen_with(descriptor, authority_verifier)?;
         application.verify_with(descriptor, authority_verifier, recovery_verifier)?;
         if application.completion.is_some()
             || !application.matches_predecessor(predecessor)
@@ -1004,6 +1070,8 @@ impl PrivateRuntimeImage {
             owner: predecessor.owner,
             descriptor: predecessor.descriptor,
             runtime_package: predecessor.runtime_package.clone(),
+            creation_receipt: predecessor.creation_receipt.clone(),
+            created_at: predecessor.created_at,
             runtime_deployment: predecessor.runtime_deployment,
             state,
             active_resource_policy,
@@ -1040,6 +1108,12 @@ impl PrivateRuntimeImage {
     }
     pub fn runtime_package(&self) -> &BlobRef {
         &self.runtime_package
+    }
+    pub const fn creation_receipt(&self) -> &AuthorityReceipt {
+        &self.creation_receipt
+    }
+    pub const fn created_at(&self) -> u64 {
+        self.created_at
     }
     pub const fn runtime_deployment(&self) -> DeploymentId {
         self.runtime_deployment
@@ -1079,6 +1153,34 @@ impl PrivateRuntimeImage {
         )
     }
 
+    /// Reauthenticate the encrypted node-local image against the independently
+    /// selected immutable descriptor. Shape validation alone never treats the
+    /// receipt embedded in PVRI as its own trust root.
+    pub fn reopen_with<V: AuthorityVerifier>(
+        &self,
+        descriptor: &AgentDescriptor,
+        authority_verifier: &V,
+    ) -> Result<(), PrivateRuntimeEvidenceError> {
+        self.validate()?;
+        if descriptor.validate().is_err()
+            || descriptor.identity.profile != AgentProfile::Private
+            || descriptor.commitment() != self.descriptor
+            || descriptor.identity.space != self.managed.space
+            || descriptor.identity.agent != self.managed.agent
+            || descriptor.identity.owner != self.owner
+            || descriptor.identity.runtime_deployment != self.runtime_deployment
+            || descriptor.runtime_package != self.runtime_package
+        {
+            return Err(PrivateRuntimeEvidenceError::InvalidDescriptor);
+        }
+        verify_creation_receipt(
+            descriptor,
+            &self.creation_receipt,
+            self.created_at,
+            authority_verifier,
+        )
+    }
+
     pub fn validate(&self) -> Result<(), PrivateRuntimeEvidenceError> {
         self.store.validate()?;
         validate_key_epochs(&self.key_epochs)?;
@@ -1088,12 +1190,18 @@ impl PrivateRuntimeImage {
             || self.owner == PrincipalId::ZERO
             || self.descriptor == Hash::ZERO
             || !valid_runtime_package(&self.runtime_package)
+            || !creation_receipt_matches_image(
+                self.managed,
+                &self.creation_receipt,
+                self.created_at,
+            )
             || self.runtime_deployment == DeploymentId::ZERO
             || self.managed.runtime_deployment != self.runtime_deployment
             || self.store.space != self.managed.space
             || self.store.agent != self.managed.agent
             || self.store.owner != self.owner
             || !self.state.validate()
+            || self.state.is_empty()
             || !self.state.linear.is_empty()
             || !self.active_resource_policy.is_valid()
             || resource_policy_commitment(self.active_resource_policy)?
@@ -1104,6 +1212,7 @@ impl PrivateRuntimeImage {
             || self.stable_projection.managed != self.managed
             || self.stable_projection.descriptor != self.descriptor
             || self.stable_projection.runtime_package != self.runtime_package
+            || self.stable_projection.creation_receipt != self.creation_receipt.commitment()
             || self.stable_projection.control_state != control_state_commitment(&self.state.control)
             || private_key_epoch_root(&self.key_epochs)? != self.store.key_epoch_root
             || self.key_epochs.last().map(|value| value.epoch) != Some(self.store.epoch)
@@ -1127,6 +1236,7 @@ impl PrivateRuntimeImage {
             || self.state.encoded_len().is_none_or(|length| {
                 length > self.active_resource_policy.max_runtime_state_bytes as usize
             })
+            || self.created_at > self.applied_at
         {
             return Err(PrivateRuntimeEvidenceError::InvalidState);
         }
@@ -1148,6 +1258,8 @@ impl CanonicalWire for PrivateRuntimeImage {
         encoder.fixed(self.owner.as_bytes());
         encoder.fixed(self.descriptor.as_bytes());
         encode_blob(encoder, &self.runtime_package);
+        encode_nested(encoder, &self.creation_receipt);
+        encoder.u64(self.created_at);
         encoder.fixed(self.runtime_deployment.as_bytes());
         encode_runtime_state(encoder, &self.state);
         encode_nested(encoder, &self.active_resource_policy);
@@ -1170,6 +1282,8 @@ impl CanonicalWire for PrivateRuntimeImage {
             owner: PrincipalId(decoder.fixed()?),
             descriptor: Hash(decoder.fixed()?),
             runtime_package: decode_blob(decoder)?,
+            creation_receipt: decode_nested(decoder, MAX_AUTHORITY_RECEIPT_WIRE_BYTES)?,
+            created_at: decoder.u64()?,
             runtime_deployment: DeploymentId(decoder.fixed()?),
             state: decode_runtime_state(decoder)?,
             active_resource_policy: decode_nested(
@@ -1513,6 +1627,7 @@ impl PrivateRuntimeApplication {
         authority_verifier: &V,
         recovery_verifier: &R,
     ) -> Result<Self, PrivateRuntimeEvidenceError> {
+        predecessor.reopen_with(descriptor, authority_verifier)?;
         let value = Self::pending_unverified(
             predecessor,
             control,
@@ -1580,6 +1695,7 @@ impl PrivateRuntimeApplication {
         authority_verifier: &V,
         recovery_verifier: &R,
     ) -> Result<Self, PrivateRuntimeEvidenceError> {
+        predecessor.reopen_with(descriptor, authority_verifier)?;
         self.verify_with(descriptor, authority_verifier, recovery_verifier)?;
         if self.completion.is_some()
             || !self.matches_predecessor(predecessor)
@@ -1587,7 +1703,7 @@ impl PrivateRuntimeApplication {
         {
             return Err(PrivateRuntimeEvidenceError::InvalidApplication);
         }
-        successor.validate()?;
+        successor.reopen_with(descriptor, authority_verifier)?;
         validate_key_epoch_transition(
             &predecessor.key_epochs,
             &successor.key_epochs,
@@ -2100,7 +2216,9 @@ impl PrivateControlReopenedState {
     ) -> Result<(), PrivateRuntimeEvidenceError> {
         self.validate()?;
         self.application
-            .verify_with(descriptor, authority_verifier, recovery_verifier)
+            .verify_with(descriptor, authority_verifier, recovery_verifier)?;
+        self.runtime_image
+            .reopen_with(descriptor, authority_verifier)
     }
 }
 
@@ -2272,6 +2390,7 @@ mod tests {
                 ],
             };
             descriptor.validate().unwrap();
+            let creation_receipt = Self::creation_receipt_for(&descriptor);
             let genesis_epoch = key_epoch(space, agent, 0, node_a, 20);
             let epoch_commitment = PrivateKeyEpochCommitment::from_epoch(&genesis_epoch).unwrap();
             let key_epochs = vec![epoch_commitment];
@@ -2287,7 +2406,9 @@ mod tests {
                 },
                 store,
                 key_epochs,
+                creation_receipt,
                 3,
+                &AllowVerifier,
             )
             .unwrap();
             Self {
@@ -2295,6 +2416,36 @@ mod tests {
                 node_a,
                 node_b,
                 predecessor,
+            }
+        }
+
+        fn creation_receipt_for(descriptor: &AgentDescriptor) -> AuthorityReceipt {
+            let request = ManagementRequest::Create(Box::new(descriptor.clone()));
+            AuthorityReceipt {
+                selector: AuthorityReceiptSelector {
+                    policy: descriptor.authority.policy,
+                    issuer: descriptor.authority.issuer,
+                    space: descriptor.identity.space,
+                    agent: descriptor.identity.agent,
+                    operation: AuthorityOperationKind::CreateAgent,
+                    runtime_deployment: descriptor.identity.runtime_deployment,
+                    actor: None,
+                    actor_deployment: None,
+                    evidence: AuthorityEvidence {
+                        package: None,
+                        proof: None,
+                        commitment: hash(0x17),
+                    },
+                    lane_roots: AuthorityLaneRoots::default(),
+                    epoch: descriptor.authority.initial_epoch,
+                    decision_sequence: 1,
+                    acknowledged_through: 0,
+                    valid_from: 1,
+                    expires_at: 40,
+                    request: request.commitment(),
+                },
+                public_key: descriptor.authority.public_key,
+                signature: [0x18; 64],
             }
         }
 
@@ -2788,6 +2939,52 @@ mod tests {
         assert!(T::decode(&trailing).is_err());
     }
 
+    fn legacy_stable_projection_wire(value: &PrivateRuntimeStableProjection) -> Vec<u8> {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(b"PSP1");
+        wire.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+        let mut encoder = Encoder(&mut wire);
+        encode_managed(&mut encoder, value.managed);
+        encoder.fixed(value.descriptor.as_bytes());
+        encode_blob(&mut encoder, &value.runtime_package);
+        encoder.u64(value.generation);
+        encode_optional_hash(&mut encoder, value.previous);
+        encode_optional_hash(&mut encoder, value.control_head);
+        encode_optional_u64(&mut encoder, value.control_sequence);
+        encode_optional_hash(&mut encoder, value.full_replay);
+        encode_optional_hash(&mut encoder, value.disposition);
+        encoder.fixed(value.control_state.as_bytes());
+        encode_nested(&mut encoder, &value.active_resource_policy);
+        encoder.fixed(value.active_resource_policy_commitment.as_bytes());
+        wire
+    }
+
+    fn legacy_runtime_image_wire(value: &PrivateRuntimeImage) -> Vec<u8> {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(b"PVI1");
+        wire.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+        let mut encoder = Encoder(&mut wire);
+        encode_managed(&mut encoder, value.managed);
+        encoder.fixed(value.node.as_bytes());
+        encoder.fixed(value.owner.as_bytes());
+        encoder.fixed(value.descriptor.as_bytes());
+        encode_blob(&mut encoder, &value.runtime_package);
+        encoder.fixed(value.runtime_deployment.as_bytes());
+        encode_runtime_state(&mut encoder, &value.state);
+        encode_nested(&mut encoder, &value.active_resource_policy);
+        encoder.fixed(value.active_resource_policy_commitment.as_bytes());
+        encode_nested(&mut encoder, &value.store);
+        encoder.list(&value.key_epochs, encode_nested);
+        encoder.option(&value.runtime_control, |encoder, position| {
+            encoder.fixed(position.control.as_bytes());
+            encoder.u64(position.sequence);
+        });
+        encode_optional_hash(&mut encoder, value.last_full_replay);
+        encoder.bytes(&legacy_stable_projection_wire(&value.stable_projection));
+        encoder.u64(value.applied_at);
+        wire
+    }
+
     #[test]
     fn canonical_formats_round_trip_and_reopen_only_with_anchored_authority() {
         let fixture = Fixture::new();
@@ -2805,6 +3002,20 @@ mod tests {
         assert_round_trip(&reopened);
 
         assert_eq!(&fixture.predecessor.encode().unwrap()[..4], b"PVI1");
+        assert_eq!(
+            fixture.predecessor.stable_projection.creation_receipt(),
+            fixture.predecessor.creation_receipt().commitment()
+        );
+        fixture
+            .predecessor
+            .reopen_with(&fixture.descriptor, &AllowVerifier)
+            .unwrap();
+        assert!(
+            fixture
+                .predecessor
+                .reopen_with(&fixture.descriptor, &DenyVerifier)
+                .is_err()
+        );
         assert_eq!(&pending.encode().unwrap()[..4], b"PAP1");
         assert_eq!(&reopened.encode().unwrap()[..4], b"PCR2");
         reopened
@@ -2833,8 +3044,77 @@ mod tests {
         assert_clean_break(&successor);
         assert_clean_break(&reopened);
 
+        assert!(
+            PrivateRuntimeStableProjection::decode(&legacy_stable_projection_wire(
+                &fixture.predecessor.stable_projection,
+            ))
+            .is_err()
+        );
+        assert!(
+            PrivateRuntimeImage::decode(&legacy_runtime_image_wire(&fixture.predecessor)).is_err()
+        );
+
         let oversized = vec![0; MAX_PRIVATE_RUNTIME_APPLICATION_WIRE_BYTES + 1];
         assert!(PrivateRuntimeApplication::decode(&oversized).is_err());
+    }
+
+    #[test]
+    fn genesis_requires_exact_verified_creation_receipt_and_nonempty_state() {
+        struct DynamicVerifier<'a>(&'a dyn AuthorityVerifier);
+        impl AuthorityVerifier for DynamicVerifier<'_> {
+            fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+                self.0.verify(public_key, message, signature)
+            }
+        }
+
+        let fixture = Fixture::new();
+        let construct = |state: RuntimeState,
+                         receipt: AuthorityReceipt,
+                         created_at: u64,
+                         verifier: &dyn AuthorityVerifier| {
+            PrivateRuntimeImage::genesis(
+                &fixture.descriptor,
+                fixture.node_a,
+                state,
+                fixture.predecessor.store,
+                fixture.predecessor.key_epochs.clone(),
+                receipt,
+                created_at,
+                &DynamicVerifier(verifier),
+            )
+        };
+        let state = fixture.predecessor.state.clone();
+        let receipt = Fixture::creation_receipt_for(&fixture.descriptor);
+        assert!(construct(state.clone(), receipt.clone(), 3, &AllowVerifier).is_ok());
+        assert!(construct(RuntimeState::default(), receipt.clone(), 3, &AllowVerifier).is_err());
+        assert!(construct(state.clone(), receipt.clone(), 41, &AllowVerifier).is_err());
+        assert!(construct(state.clone(), receipt.clone(), 3, &DenyVerifier).is_err());
+
+        let mut wrong_request = receipt.clone();
+        wrong_request.selector.request = hash(0xa1);
+        assert!(construct(state.clone(), wrong_request, 3, &AllowVerifier).is_err());
+
+        let mut wrong_route = receipt;
+        wrong_route.selector.agent = AgentId([0xa2; 32]);
+        assert!(construct(state, wrong_route, 3, &AllowVerifier).is_err());
+    }
+
+    #[test]
+    fn embedded_creation_receipt_never_selects_its_own_trust_root() {
+        let fixture = Fixture::new();
+        let mut substituted = fixture.predecessor.clone();
+        substituted.creation_receipt.selector.request = hash(0xa3);
+        substituted.stable_projection.creation_receipt = substituted.creation_receipt.commitment();
+        assert!(substituted.validate().is_ok());
+        assert!(
+            substituted
+                .reopen_with(&fixture.descriptor, &AllowVerifier)
+                .is_err()
+        );
+
+        let mut unbound = fixture.predecessor.clone();
+        unbound.creation_receipt.signature[0] ^= 1;
+        assert!(unbound.validate().is_err());
     }
 
     #[test]
@@ -2954,7 +3234,9 @@ mod tests {
             fixture.predecessor.state.clone(),
             narrow_store,
             key_epochs,
+            Fixture::creation_receipt_for(&narrow_descriptor),
             3,
+            &AllowVerifier,
         )
         .unwrap();
         let over_ceiling = RuntimeResourcePolicy {
@@ -3190,7 +3472,9 @@ mod tests {
             },
             fixture.predecessor.store,
             fixture.predecessor.key_epochs.clone(),
+            fixture.predecessor.creation_receipt.clone(),
             9,
+            &AllowVerifier,
         )
         .unwrap();
         assert_eq!(
@@ -3226,7 +3510,9 @@ mod tests {
                 fixture.predecessor.state.clone(),
                 fixture.predecessor.store,
                 fixture.predecessor.key_epochs.clone(),
+                fixture.predecessor.creation_receipt.clone(),
                 3,
+                &AllowVerifier,
             )
             .is_err()
         );
@@ -3567,7 +3853,9 @@ mod tests {
             fixture.predecessor.state.clone(),
             fixture.predecessor.store,
             fixture.predecessor.key_epochs.clone(),
+            Fixture::creation_receipt_for(&wrong_descriptor),
             fixture.predecessor.applied_at,
+            &AllowVerifier,
         )
         .unwrap();
         assert_ne!(
@@ -3604,7 +3892,9 @@ mod tests {
             fixture.predecessor.state.clone(),
             route_store,
             route_epochs,
+            Fixture::creation_receipt_for(&other_route),
             fixture.predecessor.applied_at,
+            &AllowVerifier,
         )
         .unwrap();
         assert_ne!(
