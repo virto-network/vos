@@ -29,11 +29,14 @@ use vos_agent_sdk::wire::{
     CanonicalWire, MAX_PRIVATE_CONTROL_WIRE_BYTES, MAX_PRIVATE_KEY_EPOCH_WIRE_BYTES,
     MAX_PRIVATE_NODE_IDENTITY_WIRE_BYTES, MAX_PRIVATE_OBJECT_WIRE_BYTES,
 };
-use vos_agent_sdk::{AgentId, Hash, PrincipalId, SpaceId};
+use vos_agent_sdk::{AgentId, Hash, PrincipalId, RUNTIME_ABI_ID, SpaceId};
 
 use super::private_crypto::{
     MAX_PRIVATE_CONTROL_RECORDS, PrivateControlChainVerifier, PrivateCryptoError,
     PrivateNodeAuthorityVerifier,
+};
+use super::private_runtime::{
+    PrivateKeyEpochCommitment, PrivateStoreCorePosition, private_key_epoch_root,
 };
 
 pub const MAX_PRIVATE_STORE_OBJECTS: usize = 16_384;
@@ -67,6 +70,10 @@ const SNAPSHOT_MAGIC: &[u8; 4] = b"PVSS";
 // produce an ambiguous parse.
 const BACKUP_MAGIC: &[u8; 4] = b"PVB2";
 const RAW_WIRE_DOMAIN: &[u8] = b"vos/private/stored-wire/v1";
+const OBJECT_INDEX_ENTRY_DOMAIN: &[u8] = b"vos/agent/private-store/object-index-entry/v1";
+const OBJECT_INDEX_ROOT_DOMAIN: &[u8] = b"vos/agent/private-store/object-index-root/v1";
+const CONTROL_INDEX_ENTRY_DOMAIN: &[u8] = b"vos/agent/private-store/control-index-entry/v1";
+const CONTROL_INDEX_ROOT_DOMAIN: &[u8] = b"vos/agent/private-store/control-index-root/v1";
 const RECOVERY_FILE: &str = "recovery.meta";
 const INDEX_FILE: &str = "index";
 const LOCK_FILE: &str = "lock";
@@ -117,6 +124,26 @@ impl From<PrivateCryptoError> for PrivateStoreError {
 pub enum PutDisposition {
     Inserted,
     AlreadyPresent,
+}
+
+/// Filesystem-independent result of planning one exact Private control.
+///
+/// An exact retry projects the current position with `AlreadyPresent`; a new
+/// control projects the position that the durable append will publish.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PrivateControlPositionPreview {
+    disposition: PutDisposition,
+    position: PrivateStoreCorePosition,
+}
+
+impl PrivateControlPositionPreview {
+    pub(crate) const fn disposition(self) -> PutDisposition {
+        self.disposition
+    }
+
+    pub(crate) const fn position(self) -> PrivateStoreCorePosition {
+        self.position
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -269,6 +296,31 @@ pub(crate) enum ControlEvidenceCommitStop {
     AfterPublished,
     #[cfg(test)]
     AfterRetired,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlPlanMode {
+    /// Append/preview semantics accept an exact already-present control before
+    /// checking the capacity limit.
+    Append,
+    /// Preserve the legacy `validate_next_control` contract: only a genuinely
+    /// new sequence is accepted, with the capacity check taking precedence.
+    ValidateNew,
+}
+
+enum ControlTransitionPlan {
+    AlreadyPresent { index: usize, wire: Vec<u8> },
+    Insert(PlannedControlTransition),
+}
+
+struct PlannedControlTransition {
+    commitment: Hash,
+    wire: Vec<u8>,
+    next_chain: PrivateControlChainVerifier,
+    next_key_epochs: Vec<PrivateKeyEpoch>,
+    next_recovery_keyring: Option<PrivateRecoveryKeyringGrant>,
+    next_index: StoreIndex,
+    successor: PrivateStoreCorePosition,
 }
 
 struct Encoder(Vec<u8>);
@@ -460,6 +512,145 @@ fn raw_wire_hash(bytes: &[u8]) -> Hash {
     Hash::digest(RAW_WIRE_DOMAIN, &[bytes])
 }
 
+fn framed_index_root(domain: &[u8], entries: &[Hash]) -> Result<Option<Hash>, PrivateStoreError> {
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let count = u32::try_from(entries.len()).map_err(|_| PrivateStoreError::LimitExceeded)?;
+    let capacity = entries
+        .len()
+        .checked_mul(4 + 32)
+        .and_then(|bytes| bytes.checked_add(4))
+        .ok_or(PrivateStoreError::LimitExceeded)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| PrivateStoreError::LimitExceeded)?;
+    let mut encoder = Encoder(bytes);
+    encoder.u32(count);
+    for entry in entries {
+        encoder.bytes(entry.as_bytes())?;
+    }
+    Ok(Some(Hash::digest(
+        domain,
+        &[RUNTIME_ABI_ID.as_bytes(), &encoder.0],
+    )))
+}
+
+fn object_index_root(entries: &[StoredObjectIndex]) -> Result<Option<Hash>, PrivateStoreError> {
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let mut commitments = Vec::new();
+    commitments
+        .try_reserve_exact(entries.len())
+        .map_err(|_| PrivateStoreError::LimitExceeded)?;
+    for entry in entries {
+        let mut encoder = Encoder(Vec::with_capacity(8 + 1 + 32 + 32 + 4));
+        encode_object_key(&mut encoder, entry.key);
+        encoder.fixed(entry.wire_hash.as_bytes());
+        encoder.u32(entry.wire_len);
+        commitments.push(Hash::digest(
+            OBJECT_INDEX_ENTRY_DOMAIN,
+            &[RUNTIME_ABI_ID.as_bytes(), &encoder.0],
+        ));
+    }
+    framed_index_root(OBJECT_INDEX_ROOT_DOMAIN, &commitments)
+}
+
+fn control_index_root(entries: &[StoredControlIndex]) -> Result<Option<Hash>, PrivateStoreError> {
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let mut commitments = Vec::new();
+    commitments
+        .try_reserve_exact(entries.len())
+        .map_err(|_| PrivateStoreError::LimitExceeded)?;
+    for entry in entries {
+        let superseded_count = u32::try_from(entry.superseded_heads.len())
+            .map_err(|_| PrivateStoreError::LimitExceeded)?;
+        let capacity = entry
+            .superseded_heads
+            .len()
+            .checked_mul(32)
+            .and_then(|bytes| bytes.checked_add(8 + 1 + 32 + 8 + 4 + 32 + 32 + 4))
+            .ok_or(PrivateStoreError::LimitExceeded)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(|_| PrivateStoreError::LimitExceeded)?;
+        let mut encoder = Encoder(bytes);
+        encoder.u64(entry.sequence);
+        encoder.fixed(entry.commitment.as_bytes());
+        encoder.optional_hash(entry.previous);
+        encoder.u64(entry.resulting_epoch);
+        encoder.u32(superseded_count);
+        for head in &entry.superseded_heads {
+            encoder.fixed(head.as_bytes());
+        }
+        encoder.fixed(entry.wire_hash.as_bytes());
+        encoder.u32(entry.wire_len);
+        commitments.push(Hash::digest(
+            CONTROL_INDEX_ENTRY_DOMAIN,
+            &[RUNTIME_ABI_ID.as_bytes(), &encoder.0],
+        ));
+    }
+    framed_index_root(CONTROL_INDEX_ROOT_DOMAIN, &commitments)
+}
+
+fn store_core_position(
+    metadata: &RecoveryMetadata,
+    index: &StoreIndex,
+    key_epochs: &[PrivateKeyEpoch],
+) -> Result<PrivateStoreCorePosition, PrivateStoreError> {
+    validate_index_shape(index)?;
+    if metadata.space != index.space
+        || metadata.agent != index.agent
+        || key_epochs.is_empty()
+        || key_epochs.first().map(|epoch| epoch.epoch) != Some(0)
+        || key_epochs.last().map(|epoch| epoch.epoch) != Some(index.epoch)
+        || (index.controls.is_empty()
+            && key_epochs != core::slice::from_ref(&metadata.genesis_epoch))
+        || key_epochs.iter().any(|epoch| {
+            !epoch.validate() || epoch.space != metadata.space || epoch.agent != metadata.agent
+        })
+        || key_epochs
+            .windows(2)
+            .any(|pair| pair[0].epoch >= pair[1].epoch)
+    {
+        return Err(PrivateStoreError::Corrupt);
+    }
+    let object_count =
+        u32::try_from(index.objects.len()).map_err(|_| PrivateStoreError::LimitExceeded)?;
+    let control_count =
+        u32::try_from(index.controls.len()).map_err(|_| PrivateStoreError::LimitExceeded)?;
+    let mut key_commitments = Vec::new();
+    key_commitments
+        .try_reserve_exact(key_epochs.len())
+        .map_err(|_| PrivateStoreError::LimitExceeded)?;
+    for epoch in key_epochs {
+        key_commitments.push(
+            PrivateKeyEpochCommitment::from_epoch(epoch).map_err(|_| PrivateStoreError::Corrupt)?,
+        );
+    }
+    let key_epoch_root =
+        private_key_epoch_root(&key_commitments).map_err(|_| PrivateStoreError::Corrupt)?;
+    PrivateStoreCorePosition::new(
+        index.space,
+        index.agent,
+        metadata.owner,
+        index.epoch,
+        index.control_head,
+        index.next_sequence,
+        object_count,
+        object_index_root(&index.objects)?,
+        control_count,
+        control_index_root(&index.controls)?,
+        key_epoch_root,
+    )
+    .map_err(|_| PrivateStoreError::Corrupt)
+}
+
 fn encode_recovery(metadata: &RecoveryMetadata) -> Result<Vec<u8>, PrivateStoreError> {
     let epoch = metadata
         .genesis_epoch
@@ -593,10 +784,7 @@ fn decode_index(bytes: &[u8]) -> Result<StoreIndex, PrivateStoreError> {
             wire_hash: Hash(decoder.fixed()?),
             wire_len: decoder.u32()?,
         };
-        if entry.wire_hash == Hash::ZERO
-            || entry.wire_len == 0
-            || entry.wire_len as usize > MAX_PRIVATE_OBJECT_WIRE_BYTES
-        {
+        if !stored_object_index_shape_is_valid(&entry) {
             return Err(PrivateStoreError::Corrupt);
         }
         objects.push(entry);
@@ -638,15 +826,7 @@ fn decode_index(bytes: &[u8]) -> Result<StoreIndex, PrivateStoreError> {
             wire_hash: Hash(decoder.fixed()?),
             wire_len: decoder.u32()?,
         };
-        if entry.commitment == Hash::ZERO
-            || entry.wire_hash == Hash::ZERO
-            || entry.wire_len == 0
-            || entry.wire_len as usize > MAX_PRIVATE_CONTROL_WIRE_BYTES
-            || entry
-                .superseded_heads
-                .windows(2)
-                .any(|pair| pair[0] >= pair[1])
-        {
+        if !stored_control_index_shape_is_valid(&entry) {
             return Err(PrivateStoreError::Corrupt);
         }
         controls.push(entry);
@@ -665,6 +845,29 @@ fn decode_index(bytes: &[u8]) -> Result<StoreIndex, PrivateStoreError> {
     Ok(index)
 }
 
+fn stored_object_index_shape_is_valid(entry: &StoredObjectIndex) -> bool {
+    entry.key.validate()
+        && entry.wire_hash != Hash::ZERO
+        && entry.wire_len != 0
+        && entry.wire_len as usize <= MAX_PRIVATE_OBJECT_WIRE_BYTES
+}
+
+fn stored_control_index_shape_is_valid(entry: &StoredControlIndex) -> bool {
+    entry.commitment != Hash::ZERO
+        && entry.previous != Some(Hash::ZERO)
+        && entry.wire_hash != Hash::ZERO
+        && entry.wire_len != 0
+        && entry.wire_len as usize <= MAX_PRIVATE_CONTROL_WIRE_BYTES
+        && entry
+            .superseded_heads
+            .iter()
+            .all(|head| *head != Hash::ZERO)
+        && !entry
+            .superseded_heads
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+}
+
 fn validate_index_shape(index: &StoreIndex) -> Result<(), PrivateStoreError> {
     let artifact_bytes = index
         .objects
@@ -678,6 +881,14 @@ fn validate_index_shape(index: &StoreIndex) -> Result<(), PrivateStoreError> {
         || index.objects.len() > MAX_PRIVATE_STORE_OBJECTS
         || index.controls.len() > MAX_PRIVATE_STORE_CONTROLS
         || artifact_bytes > MAX_PRIVATE_STORE_ARTIFACT_BYTES
+        || index
+            .objects
+            .iter()
+            .any(|entry| !stored_object_index_shape_is_valid(entry))
+        || index
+            .controls
+            .iter()
+            .any(|entry| !stored_control_index_shape_is_valid(entry))
         || index
             .objects
             .windows(2)
@@ -2030,6 +2241,23 @@ impl PrivateStore {
         }
     }
 
+    /// Deterministic cycle-free commitment to the exact authenticated Store
+    /// index and full canonical PKEY history held in memory.
+    ///
+    /// Authority/application evidence and runtime sidecars are deliberately
+    /// outside this position, so downstream acknowledgements cannot form a
+    /// commitment cycle back into their Store predecessor.
+    pub fn core_position(&self) -> Result<PrivateStoreCorePosition, PrivateStoreError> {
+        if self.chain.epoch().epoch != self.index.epoch
+            || self.chain.head() != self.index.control_head
+            || self.chain.next_sequence() != self.index.next_sequence
+            || self.key_epochs.last() != Some(self.chain.epoch())
+        {
+            return Err(PrivateStoreError::Corrupt);
+        }
+        store_core_position(&self.metadata, &self.index, &self.key_epochs)
+    }
+
     pub fn authorized_nodes(&self) -> &[PrivateNodeIdentity] {
         self.chain.nodes()
     }
@@ -2190,25 +2418,98 @@ impl PrivateStore {
         authority: &V,
         stop: CommitStop,
     ) -> Result<PutDisposition, PrivateStoreError> {
+        match self.plan_control_transition(record, authority, ControlPlanMode::Append)? {
+            ControlTransitionPlan::AlreadyPresent { index, wire } => {
+                let existing = self
+                    .index
+                    .controls
+                    .get(index)
+                    .ok_or(PrivateStoreError::Corrupt)?;
+                if self.read_control_wire(existing)? != wire {
+                    return Err(PrivateStoreError::Corrupt);
+                }
+                Ok(PutDisposition::AlreadyPresent)
+            }
+            ControlTransitionPlan::Insert(plan) => {
+                let index_bytes = encode_index(&plan.next_index)?;
+                self.commit_transaction(
+                    PendingArtifact::Control(plan.commitment),
+                    &plan.wire,
+                    &index_bytes,
+                    stop,
+                )?;
+                self.chain = plan.next_chain;
+                self.key_epochs = plan.next_key_epochs;
+                self.latest_recovery_keyring = plan.next_recovery_keyring;
+                self.index = plan.next_index;
+                debug_assert_eq!(self.core_position().ok(), Some(plan.successor));
+                Ok(PutDisposition::Inserted)
+            }
+        }
+    }
+
+    /// Project the exact PSC1 produced by appending `record` without reading
+    /// or writing any Store path. Exact retries are represented explicitly and
+    /// project the current position.
+    pub(crate) fn preview_control_position<V: PrivateNodeAuthorityVerifier>(
+        &self,
+        record: &PrivateControlRecord,
+        authority: &V,
+    ) -> Result<PrivateControlPositionPreview, PrivateStoreError> {
+        match self.plan_control_transition(record, authority, ControlPlanMode::Append)? {
+            ControlTransitionPlan::AlreadyPresent { .. } => Ok(PrivateControlPositionPreview {
+                disposition: PutDisposition::AlreadyPresent,
+                position: self.core_position()?,
+            }),
+            ControlTransitionPlan::Insert(plan) => Ok(PrivateControlPositionPreview {
+                disposition: PutDisposition::Inserted,
+                position: plan.successor,
+            }),
+        }
+    }
+
+    /// Validate the complete next signed control transition without touching
+    /// the filesystem. The authoritative Private-application adapter uses
+    /// this before staging epoch sidecars, so an invalid PCTL cannot leave
+    /// attacker-selected ciphertext in a crash-recovery slot.
+    pub(crate) fn validate_next_control<V: PrivateNodeAuthorityVerifier>(
+        &self,
+        record: &PrivateControlRecord,
+        authority: &V,
+    ) -> Result<(), PrivateStoreError> {
+        match self.plan_control_transition(record, authority, ControlPlanMode::ValidateNew)? {
+            ControlTransitionPlan::Insert(_) => Ok(()),
+            ControlTransitionPlan::AlreadyPresent { .. } => Err(PrivateStoreError::Alias),
+        }
+    }
+
+    fn plan_control_transition<V: PrivateNodeAuthorityVerifier>(
+        &self,
+        record: &PrivateControlRecord,
+        authority: &V,
+        mode: ControlPlanMode,
+    ) -> Result<ControlTransitionPlan, PrivateStoreError> {
         let commitment = record.commitment();
-        let wire = record
-            .encode()
-            .map_err(|_| PrivateStoreError::InvalidRecord)?;
-        if let Some(existing) = self
-            .index
-            .controls
-            .iter()
-            .find(|entry| entry.commitment == commitment)
-        {
-            if existing.wire_hash != raw_wire_hash(&wire)
-                || existing.wire_len as usize != wire.len()
+        let mut append_wire = None;
+        if mode == ControlPlanMode::Append {
+            let wire = record
+                .encode()
+                .map_err(|_| PrivateStoreError::InvalidRecord)?;
+            if let Some((index, existing)) = self
+                .index
+                .controls
+                .iter()
+                .enumerate()
+                .find(|(_, entry)| entry.commitment == commitment)
             {
-                return Err(PrivateStoreError::Alias);
+                if existing.wire_hash != raw_wire_hash(&wire)
+                    || existing.wire_len as usize != wire.len()
+                {
+                    return Err(PrivateStoreError::Alias);
+                }
+                return Ok(ControlTransitionPlan::AlreadyPresent { index, wire });
             }
-            if self.read_control_wire(existing)? != wire {
-                return Err(PrivateStoreError::Corrupt);
-            }
-            return Ok(PutDisposition::AlreadyPresent);
+            append_wire = Some(wire);
         }
         if self.index.controls.len() >= MAX_PRIVATE_STORE_CONTROLS {
             return Err(PrivateStoreError::LimitExceeded);
@@ -2221,8 +2522,15 @@ impl PrivateStore {
         {
             return Err(PrivateStoreError::Alias);
         }
+
         let mut next_chain = self.chain.clone();
         apply_control_transition(&mut next_chain, record, authority)?;
+        let wire = match append_wire {
+            Some(wire) => wire,
+            None => record
+                .encode()
+                .map_err(|_| PrivateStoreError::InvalidRecord)?,
+        };
         let mut next_key_epochs = self.key_epochs.clone();
         advance_key_epochs(&mut next_key_epochs, record)?;
         let mut next_recovery_keyring = self.latest_recovery_keyring.clone();
@@ -2232,7 +2540,14 @@ impl PrivateStore {
         {
             next_recovery_keyring = Some(historical_keyring.clone());
         }
-        if next_key_epochs.last() != Some(next_chain.epoch()) {
+        if next_key_epochs.last() != Some(next_chain.epoch())
+            || next_chain.head() != Some(commitment)
+            || next_chain.next_sequence()
+                != record
+                    .sequence
+                    .checked_add(1)
+                    .ok_or(PrivateStoreError::LimitExceeded)?
+        {
             return Err(PrivateStoreError::Corrupt);
         }
         let superseded_heads = match &record.operation {
@@ -2250,61 +2565,22 @@ impl PrivateStore {
             wire_hash: raw_wire_hash(&wire),
             wire_len: u32::try_from(wire.len()).map_err(|_| PrivateStoreError::LimitExceeded)?,
         };
-        let mut next = self.index.clone();
-        next.controls.push(entry);
-        next.epoch = next_chain.epoch().epoch;
-        next.control_head = next_chain.head();
-        next.next_sequence = next_chain.next_sequence();
-        validate_index_shape(&next)?;
-        let index_bytes = encode_index(&next)?;
-        self.commit_transaction(
-            PendingArtifact::Control(commitment),
-            &wire,
-            &index_bytes,
-            stop,
-        )?;
-        self.chain = next_chain;
-        self.key_epochs = next_key_epochs;
-        self.latest_recovery_keyring = next_recovery_keyring;
-        self.index = next;
-        Ok(PutDisposition::Inserted)
-    }
-
-    /// Validate the complete next signed control transition without touching
-    /// the filesystem. The authoritative Private-application adapter uses
-    /// this before staging epoch sidecars, so an invalid PCTL cannot leave
-    /// attacker-selected ciphertext in a crash-recovery slot.
-    pub(crate) fn validate_next_control<V: PrivateNodeAuthorityVerifier>(
-        &self,
-        record: &PrivateControlRecord,
-        authority: &V,
-    ) -> Result<(), PrivateStoreError> {
-        if self.index.controls.len() >= MAX_PRIVATE_STORE_CONTROLS {
-            return Err(PrivateStoreError::LimitExceeded);
-        }
-        if self
-            .index
-            .controls
-            .iter()
-            .any(|entry| entry.sequence == record.sequence)
-        {
-            return Err(PrivateStoreError::Alias);
-        }
-        let mut next_chain = self.chain.clone();
-        apply_control_transition(&mut next_chain, record, authority)?;
-        let mut next_key_epochs = self.key_epochs.clone();
-        advance_key_epochs(&mut next_key_epochs, record)?;
-        if next_key_epochs.last() != Some(next_chain.epoch())
-            || next_chain.head() != Some(record.commitment())
-            || next_chain.next_sequence()
-                != record
-                    .sequence
-                    .checked_add(1)
-                    .ok_or(PrivateStoreError::LimitExceeded)?
-        {
-            return Err(PrivateStoreError::Corrupt);
-        }
-        Ok(())
+        let mut next_index = self.index.clone();
+        next_index.controls.push(entry);
+        next_index.epoch = next_chain.epoch().epoch;
+        next_index.control_head = next_chain.head();
+        next_index.next_sequence = next_chain.next_sequence();
+        validate_index_shape(&next_index)?;
+        let successor = store_core_position(&self.metadata, &next_index, &next_key_epochs)?;
+        Ok(ControlTransitionPlan::Insert(PlannedControlTransition {
+            commitment,
+            wire,
+            next_chain,
+            next_key_epochs,
+            next_recovery_keyring,
+            next_index,
+            successor,
+        }))
     }
 
     pub fn get_object(
@@ -2867,8 +3143,9 @@ mod tests {
     use crate::agent::private_crypto::{
         GeneratedPrivateEpoch, OfflineRecoveryDecryptionKey, OwnerSigningKey,
         PrivateNodeDecryptionKey, RecoverySigningKey, build_recovery_keyring_grant,
-        encrypt_private_object, generate_fresh_private_epoch, sign_owner_control_record,
-        sign_recovery_control_record, unwrap_recovery_data_key,
+        encrypt_private_object, generate_fresh_private_epoch, seal_data_key_for_node,
+        seal_owner_key_for_node, sign_owner_control_record, sign_recovery_control_record,
+        unwrap_recovery_data_key,
     };
     use vos_agent_sdk::{BlobRef, NodeId};
 
@@ -3025,6 +3302,106 @@ mod tests {
         record
     }
 
+    fn recipient(fixture: &Fixture, label: u8) -> PrivateNodeIdentity {
+        let key = PrivateNodeDecryptionKey::from_bytes([label; 32]).unwrap();
+        let transport_identity = vec![label.wrapping_add(20); 48];
+        let mut node = PrivateNodeIdentity {
+            node: NodeId::of_authenticated_peer(&transport_identity),
+            principal: fixture.owner,
+            transport_identity,
+            encryption_public_key: key.public_key(),
+            authority_binding: Hash::ZERO,
+            transport_signature: [label.wrapping_add(40); 64],
+        };
+        node.authority_binding =
+            TestAuthority::binding(fixture.space, fixture.agent, fixture.owner, &node);
+        node
+    }
+
+    fn invite_control(
+        store: &PrivateStore,
+        fixture: &Fixture,
+        node: PrivateNodeIdentity,
+    ) -> PrivateControlRecord {
+        let binding = store.binding();
+        let mut record = PrivateControlRecord {
+            space: fixture.space,
+            agent: fixture.agent,
+            sequence: binding.next_sequence,
+            previous: binding.control_head,
+            operation: PrivateControlOperation::Invite {
+                sealed_owner_key: seal_owner_key_for_node(
+                    fixture.space,
+                    fixture.agent,
+                    binding.epoch,
+                    &fixture.owner_key,
+                    &node,
+                )
+                .unwrap(),
+                sealed_data_key: seal_data_key_for_node(
+                    fixture.space,
+                    fixture.agent,
+                    binding.epoch,
+                    &fixture.epoch.data_key,
+                    &node,
+                )
+                .unwrap(),
+                node,
+                epoch: binding.epoch,
+                historical_grants: Vec::new(),
+            },
+            signer: PrivateControlSigner::Owner,
+            signer_public_key: [0; 32],
+            signature: [0; 64],
+        };
+        sign_owner_control_record(&mut record, &fixture.owner_key).unwrap();
+        record
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct DiskEntry {
+        path: PathBuf,
+        directory: bool,
+        readonly: bool,
+        len: u64,
+        modified: Option<std::time::SystemTime>,
+        bytes: Vec<u8>,
+    }
+
+    fn directory_image(root: &Path) -> Vec<DiskEntry> {
+        fn visit(root: &Path, directory: &Path, image: &mut Vec<DiskEntry>) {
+            let mut entries: Vec<_> = fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                let directory = metadata.is_dir();
+                image.push(DiskEntry {
+                    path: path.strip_prefix(root).unwrap().to_path_buf(),
+                    directory,
+                    readonly: metadata.permissions().readonly(),
+                    len: metadata.len(),
+                    modified: metadata.modified().ok(),
+                    bytes: if directory {
+                        Vec::new()
+                    } else {
+                        fs::read(&path).unwrap()
+                    },
+                });
+                if directory {
+                    visit(root, &path, image);
+                }
+            }
+        }
+
+        let mut image = Vec::new();
+        visit(root, root, &mut image);
+        image
+    }
+
     fn collect_files(path: &Path, output: &mut Vec<u8>) {
         for entry in fs::read_dir(path).unwrap() {
             let entry = entry.unwrap();
@@ -3071,6 +3448,513 @@ mod tests {
                 .unwrap();
         }
         encoder.finish(MAX_PRIVATE_BACKUP_BYTES).unwrap()
+    }
+
+    #[test]
+    fn core_position_is_deterministic_initial_populated_and_reopened() {
+        let directory = TestDirectory::new("core-position-reopen");
+        let fixture = fixture();
+        let path = directory.store();
+        let store = create_store(&path, &fixture);
+        let initial = store.core_position().unwrap();
+        assert_eq!(initial.object_count(), 0);
+        assert_eq!(initial.object_root(), None);
+        assert_eq!(initial.control_count(), 0);
+        assert_eq!(initial.control_root(), None);
+        drop(store);
+
+        let mut store =
+            PrivateStore::open(&path, fixture.space, fixture.agent, &TestAuthority).unwrap();
+        assert_eq!(store.core_position().unwrap(), initial);
+        let record = control(&fixture, 0, None);
+        store.append_control(&record, &TestAuthority).unwrap();
+        let object = encrypt_private_object(
+            &fixture.epoch.data_key,
+            fixture.space,
+            fixture.agent,
+            0,
+            EncryptedObjectKind::Index,
+            b"core-position-reopen-object",
+        )
+        .unwrap();
+        store.put_object(&object).unwrap();
+        let populated = store.core_position().unwrap();
+        assert_eq!(populated.object_count(), 1);
+        assert!(populated.object_root().is_some());
+        assert_eq!(populated.control_count(), 1);
+        assert!(populated.control_root().is_some());
+        drop(store);
+
+        let reopened =
+            PrivateStore::open(&path, fixture.space, fixture.agent, &TestAuthority).unwrap();
+        assert_eq!(reopened.core_position().unwrap(), populated);
+    }
+
+    #[test]
+    fn core_position_rejects_internal_chain_key_and_entry_drift() {
+        let directory = TestDirectory::new("core-position-drift");
+        let fixture = fixture();
+        let mut store = create_store(&directory.store(), &fixture);
+
+        store.index.next_sequence = 1;
+        assert_eq!(store.core_position(), Err(PrivateStoreError::Corrupt));
+        store.index.next_sequence = 0;
+
+        let alternate = generate_fresh_private_epoch(
+            fixture.space,
+            fixture.agent,
+            0,
+            fixture.owner,
+            &fixture.nodes,
+            fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
+            &TestAuthority,
+        )
+        .unwrap()
+        .record;
+        let original_epoch = store.key_epochs[0].clone();
+        store.key_epochs[0] = alternate.clone();
+        assert_eq!(store.core_position(), Err(PrivateStoreError::Corrupt));
+        store.key_epochs[0] = original_epoch;
+
+        let original_genesis = store.metadata.genesis_epoch.clone();
+        store.metadata.genesis_epoch = alternate;
+        assert_eq!(store.core_position(), Err(PrivateStoreError::Corrupt));
+        store.metadata.genesis_epoch = original_genesis;
+
+        store.index.objects.push(StoredObjectIndex {
+            key: PrivateObjectKey {
+                epoch: 0,
+                kind: encrypted_kind_tag(EncryptedObjectKind::Blob),
+                content: Hash([0x91; 32]),
+            },
+            wire_hash: Hash::ZERO,
+            wire_len: 1,
+        });
+        assert_eq!(store.core_position(), Err(PrivateStoreError::Corrupt));
+        store.index.objects.clear();
+
+        let record = control(&fixture, 0, None);
+        store.append_control(&record, &TestAuthority).unwrap();
+        store.index.controls[0].wire_hash = Hash::ZERO;
+        assert_eq!(store.core_position(), Err(PrivateStoreError::Corrupt));
+    }
+
+    #[test]
+    fn control_preview_is_no_io_exact_and_retry_aware() {
+        let directory = TestDirectory::new("control-preview");
+        let fixture = fixture();
+        let path = directory.store();
+        let mut store = create_store(&path, &fixture);
+        let predecessor = store.core_position().unwrap();
+        let record = control(&fixture, 0, None);
+        let disk_before = directory_image(&path);
+        let reads_before = store.artifact_reads.get();
+
+        let preview = store
+            .preview_control_position(&record, &TestAuthority)
+            .unwrap();
+        assert_eq!(preview.disposition(), PutDisposition::Inserted);
+        assert_ne!(preview.position(), predecessor);
+        assert_eq!(store.artifact_reads.get(), reads_before);
+        assert_eq!(directory_image(&path), disk_before);
+        assert_eq!(store.validate_next_control(&record, &TestAuthority), Ok(()));
+
+        assert_eq!(
+            store.append_control(&record, &TestAuthority),
+            Ok(PutDisposition::Inserted)
+        );
+        assert_eq!(store.core_position().unwrap(), preview.position());
+        let reads_after_insert = store.artifact_reads.get();
+        let retry = store
+            .preview_control_position(&record, &TestAuthority)
+            .unwrap();
+        assert_eq!(retry.disposition(), PutDisposition::AlreadyPresent);
+        assert_eq!(retry.position(), preview.position());
+        assert_eq!(store.artifact_reads.get(), reads_after_insert);
+        assert_eq!(
+            store.validate_next_control(&record, &TestAuthority),
+            Err(PrivateStoreError::Alias)
+        );
+        assert_eq!(
+            store.append_control(&record, &TestAuthority),
+            Ok(PutDisposition::AlreadyPresent)
+        );
+        assert_eq!(store.artifact_reads.get(), reads_after_insert + 1);
+
+        let mut alias = record.clone();
+        alias.operation = PrivateControlOperation::SetResourcePolicy {
+            policy: BlobRef::of_bytes(b"same-sequence-different-control"),
+        };
+        sign_owner_control_record(&mut alias, &fixture.owner_key).unwrap();
+        assert_eq!(
+            store.preview_control_position(&alias, &TestAuthority),
+            Err(PrivateStoreError::Alias)
+        );
+        assert_eq!(
+            store.validate_next_control(&alias, &TestAuthority),
+            Err(PrivateStoreError::Alias)
+        );
+        assert_eq!(
+            store.append_control(&alias, &TestAuthority),
+            Err(PrivateStoreError::Alias)
+        );
+    }
+
+    #[test]
+    fn roots_commit_every_exact_index_field_and_order() {
+        assert_eq!(object_index_root(&[]), Ok(None));
+        assert_eq!(control_index_root(&[]), Ok(None));
+
+        let object = StoredObjectIndex {
+            key: PrivateObjectKey {
+                epoch: 3,
+                kind: encrypted_kind_tag(EncryptedObjectKind::Package),
+                content: Hash([1; 32]),
+            },
+            wire_hash: Hash([2; 32]),
+            wire_len: 123,
+        };
+        let object_root = object_index_root(core::slice::from_ref(&object)).unwrap();
+        let mut object_variants = Vec::new();
+        let mut changed = object.clone();
+        changed.key.epoch += 1;
+        object_variants.push(changed);
+        let mut changed = object.clone();
+        changed.key.kind = encrypted_kind_tag(EncryptedObjectKind::Blob);
+        object_variants.push(changed);
+        let mut changed = object.clone();
+        changed.key.content = Hash([3; 32]);
+        object_variants.push(changed);
+        let mut changed = object.clone();
+        changed.wire_hash = Hash([4; 32]);
+        object_variants.push(changed);
+        let mut changed = object.clone();
+        changed.wire_len += 1;
+        object_variants.push(changed);
+        for changed in object_variants {
+            assert_ne!(
+                object_index_root(core::slice::from_ref(&changed)).unwrap(),
+                object_root
+            );
+        }
+
+        let control = StoredControlIndex {
+            sequence: 5,
+            commitment: Hash([5; 32]),
+            previous: Some(Hash([6; 32])),
+            resulting_epoch: 7,
+            superseded_heads: vec![Hash([8; 32]), Hash([9; 32])],
+            wire_hash: Hash([10; 32]),
+            wire_len: 456,
+        };
+        let control_root = control_index_root(core::slice::from_ref(&control)).unwrap();
+        let mut control_variants = Vec::new();
+        let mut changed = control.clone();
+        changed.sequence += 1;
+        control_variants.push(changed);
+        let mut changed = control.clone();
+        changed.commitment = Hash([11; 32]);
+        control_variants.push(changed);
+        let mut changed = control.clone();
+        changed.previous = None;
+        control_variants.push(changed);
+        let mut changed = control.clone();
+        changed.resulting_epoch += 1;
+        control_variants.push(changed);
+        let mut changed = control.clone();
+        changed.superseded_heads[1] = Hash([12; 32]);
+        control_variants.push(changed);
+        let mut changed = control.clone();
+        changed.wire_hash = Hash([13; 32]);
+        control_variants.push(changed);
+        let mut changed = control.clone();
+        changed.wire_len += 1;
+        control_variants.push(changed);
+        for changed in control_variants {
+            assert_ne!(
+                control_index_root(core::slice::from_ref(&changed)).unwrap(),
+                control_root
+            );
+        }
+        let mut reordered = control;
+        reordered.superseded_heads.reverse();
+        assert_ne!(
+            control_index_root(core::slice::from_ref(&reordered)).unwrap(),
+            control_root
+        );
+        assert!(!stored_control_index_shape_is_valid(&reordered));
+    }
+
+    #[test]
+    fn object_insert_changes_only_object_count_and_root() {
+        let directory = TestDirectory::new("object-core-position");
+        let fixture = fixture();
+        let mut store = create_store(&directory.store(), &fixture);
+        let predecessor = store.core_position().unwrap();
+        let object = encrypt_private_object(
+            &fixture.epoch.data_key,
+            fixture.space,
+            fixture.agent,
+            0,
+            EncryptedObjectKind::Snapshot,
+            b"object-only-core-transition",
+        )
+        .unwrap();
+        store.put_object(&object).unwrap();
+        let successor = store.core_position().unwrap();
+        assert_eq!(successor.space(), predecessor.space());
+        assert_eq!(successor.agent(), predecessor.agent());
+        assert_eq!(successor.owner(), predecessor.owner());
+        assert_eq!(successor.epoch(), predecessor.epoch());
+        assert_eq!(successor.control_head(), predecessor.control_head());
+        assert_eq!(successor.next_sequence(), predecessor.next_sequence());
+        assert_eq!(successor.control_count(), predecessor.control_count());
+        assert_eq!(successor.control_root(), predecessor.control_root());
+        assert_eq!(successor.key_epoch_root(), predecessor.key_epoch_root());
+        assert_eq!(successor.object_count(), predecessor.object_count() + 1);
+        assert_ne!(successor.object_root(), predecessor.object_root());
+    }
+
+    #[test]
+    fn invite_changes_exact_key_root_without_advancing_epoch() {
+        let directory = TestDirectory::new("invite-key-root");
+        let fixture = fixture();
+        let mut store = create_store(&directory.store(), &fixture);
+        let predecessor = store.core_position().unwrap();
+        let invite = invite_control(&store, &fixture, recipient(&fixture, 31));
+        let preview = store
+            .preview_control_position(&invite, &TestAuthority)
+            .unwrap();
+        assert_eq!(preview.disposition(), PutDisposition::Inserted);
+        assert_eq!(preview.position().epoch(), predecessor.epoch());
+        assert_ne!(
+            preview.position().key_epoch_root(),
+            predecessor.key_epoch_root()
+        );
+        assert_eq!(store.key_epochs.len(), 1);
+        store.append_control(&invite, &TestAuthority).unwrap();
+        assert_eq!(store.core_position().unwrap(), preview.position());
+        assert_eq!(store.key_epochs.len(), 1);
+    }
+
+    #[test]
+    fn revoke_rotate_and_recovery_jump_project_exact_successors() {
+        let fixture = fixture();
+
+        let rotate_directory = TestDirectory::new("rotate-preview");
+        let mut rotate_store = create_store(&rotate_directory.store(), &fixture);
+        let rotate_predecessor = rotate_store.core_position().unwrap();
+        let rotated_epoch = generate_fresh_private_epoch(
+            fixture.space,
+            fixture.agent,
+            rotate_predecessor.epoch() + 1,
+            fixture.owner,
+            rotate_store.authorized_nodes(),
+            fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        let mut rotate = PrivateControlRecord {
+            space: fixture.space,
+            agent: fixture.agent,
+            sequence: rotate_predecessor.next_sequence(),
+            previous: rotate_predecessor.control_head(),
+            operation: PrivateControlOperation::RotateKeys {
+                next_epoch: rotated_epoch.record,
+            },
+            signer: PrivateControlSigner::Owner,
+            signer_public_key: [0; 32],
+            signature: [0; 64],
+        };
+        sign_owner_control_record(&mut rotate, &fixture.owner_key).unwrap();
+        let rotate_preview = rotate_store
+            .preview_control_position(&rotate, &TestAuthority)
+            .unwrap();
+        assert_eq!(
+            rotate_preview.position().epoch(),
+            rotate_predecessor.epoch() + 1
+        );
+        assert_eq!(
+            rotate_preview.position().next_sequence(),
+            rotate_predecessor.next_sequence() + 1
+        );
+        rotate_store
+            .append_control(&rotate, &TestAuthority)
+            .unwrap();
+        assert_eq!(
+            rotate_store.core_position().unwrap(),
+            rotate_preview.position()
+        );
+
+        let revoke_directory = TestDirectory::new("revoke-preview");
+        let mut revoke_store = create_store(&revoke_directory.store(), &fixture);
+        let invited = recipient(&fixture, 32);
+        let invite = invite_control(&revoke_store, &fixture, invited.clone());
+        revoke_store
+            .append_control(&invite, &TestAuthority)
+            .unwrap();
+        let revoke_predecessor = revoke_store.core_position().unwrap();
+        let revoked_epoch = generate_fresh_private_epoch(
+            fixture.space,
+            fixture.agent,
+            revoke_predecessor.epoch() + 1,
+            fixture.owner,
+            &fixture.nodes,
+            fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        let mut revoke = PrivateControlRecord {
+            space: fixture.space,
+            agent: fixture.agent,
+            sequence: revoke_predecessor.next_sequence(),
+            previous: revoke_predecessor.control_head(),
+            operation: PrivateControlOperation::Revoke {
+                node: invited.node,
+                next_epoch: revoked_epoch.record,
+            },
+            signer: PrivateControlSigner::Owner,
+            signer_public_key: [0; 32],
+            signature: [0; 64],
+        };
+        sign_owner_control_record(&mut revoke, &fixture.owner_key).unwrap();
+        let revoke_preview = revoke_store
+            .preview_control_position(&revoke, &TestAuthority)
+            .unwrap();
+        assert_eq!(
+            revoke_preview.position().epoch(),
+            revoke_predecessor.epoch() + 1
+        );
+        assert_eq!(
+            revoke_preview.position().next_sequence(),
+            revoke_predecessor.next_sequence() + 1
+        );
+        revoke_store
+            .append_control(&revoke, &TestAuthority)
+            .unwrap();
+        assert_eq!(
+            revoke_store.core_position().unwrap(),
+            revoke_preview.position()
+        );
+
+        let recovery_directory = TestDirectory::new("recovery-jump-preview");
+        let mut recovery_store = create_store(&recovery_directory.store(), &fixture);
+        let recovery_predecessor = recovery_store.core_position().unwrap();
+        let recovered_epoch = generate_fresh_private_epoch(
+            fixture.space,
+            fixture.agent,
+            4,
+            fixture.owner,
+            &fixture.nodes,
+            fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        let historical = alloc::collections::BTreeMap::from([(
+            0,
+            unwrap_recovery_data_key(&fixture.epoch.record, &fixture.recovery_encryption).unwrap(),
+        )]);
+        let historical_keyring = build_recovery_keyring_grant(
+            core::slice::from_ref(&fixture.epoch.record),
+            &historical,
+            &recovered_epoch.record,
+            &fixture.nodes,
+        )
+        .unwrap();
+        let mut recovery = PrivateControlRecord {
+            space: fixture.space,
+            agent: fixture.agent,
+            sequence: 7,
+            previous: None,
+            operation: PrivateControlOperation::Recover {
+                superseded_heads: Vec::new(),
+                next_epoch: recovered_epoch.record,
+                replacement_nodes: fixture.nodes.clone(),
+                historical_keyring,
+            },
+            signer: PrivateControlSigner::Recovery,
+            signer_public_key: [0; 32],
+            signature: [0; 64],
+        };
+        sign_recovery_control_record(&mut recovery, &fixture.recovery).unwrap();
+        let recovery_preview = recovery_store
+            .preview_control_position(&recovery, &TestAuthority)
+            .unwrap();
+        assert_eq!(recovery_preview.position().epoch(), 4);
+        assert_eq!(recovery_preview.position().next_sequence(), 8);
+        assert_eq!(recovery_preview.position().control_count(), 1);
+        assert_ne!(
+            recovery_preview.position().key_epoch_root(),
+            recovery_predecessor.key_epoch_root()
+        );
+        recovery_store
+            .apply_offline_recovery(None, &recovery, &TestAuthority)
+            .unwrap();
+        assert_eq!(
+            recovery_store.core_position().unwrap(),
+            recovery_preview.position()
+        );
+    }
+
+    #[test]
+    fn planner_preserves_capacity_retry_alias_and_validation_precedence() {
+        let directory = TestDirectory::new("planner-errors");
+        let fixture = fixture();
+        let mut store = create_store(&directory.store(), &fixture);
+        let record = control(&fixture, 0, None);
+        store.append_control(&record, &TestAuthority).unwrap();
+
+        let mut alias = record.clone();
+        alias.operation = PrivateControlOperation::SetResourcePolicy {
+            policy: BlobRef::of_bytes(b"nonfull-alias"),
+        };
+        sign_owner_control_record(&mut alias, &fixture.owner_key).unwrap();
+        assert_eq!(
+            store.append_control(&alias, &TestAuthority),
+            Err(PrivateStoreError::Alias)
+        );
+        assert_eq!(
+            store.validate_next_control(&record, &TestAuthority),
+            Err(PrivateStoreError::Alias)
+        );
+
+        let prototype = store.index.controls[0].clone();
+        while store.index.controls.len() < MAX_PRIVATE_STORE_CONTROLS {
+            let sequence = store.index.controls.len() as u64;
+            let mut entry = prototype.clone();
+            entry.sequence = sequence;
+            entry.commitment = Hash::digest(
+                b"vos/test/private-store-capacity-entry/v1",
+                &[&sequence.to_le_bytes()],
+            );
+            store.index.controls.push(entry);
+        }
+        assert_eq!(
+            store.append_control(&record, &TestAuthority),
+            Ok(PutDisposition::AlreadyPresent)
+        );
+        assert_eq!(
+            store.validate_next_control(&record, &TestAuthority),
+            Err(PrivateStoreError::LimitExceeded)
+        );
+        assert_eq!(
+            store.append_control(&alias, &TestAuthority),
+            Err(PrivateStoreError::LimitExceeded)
+        );
+        let mut malformed = alias;
+        malformed.signature = [0; 64];
+        assert_eq!(
+            store.append_control(&malformed, &TestAuthority),
+            Err(PrivateStoreError::InvalidRecord)
+        );
+        assert_eq!(
+            store.validate_next_control(&malformed, &TestAuthority),
+            Err(PrivateStoreError::LimitExceeded)
+        );
     }
 
     #[test]
