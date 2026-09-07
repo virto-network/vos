@@ -608,64 +608,9 @@ fn try_reflink(_source: &fs::File, _destination: &Path) -> anyhow::Result<bool> 
 }
 
 fn read_recovery_node_key(path: &Path) -> anyhow::Result<RecoveryNodeKey> {
-    let named = fs::symlink_metadata(path).map_err(|error| {
-        anyhow::anyhow!("inspect external node key {}: {error}", path.display())
-    })?;
-    if named.file_type().is_symlink()
-        || !named.is_file()
-        || named.len() == 0
-        || named.len() > MAX_NODE_KEY_BYTES
-    {
-        anyhow::bail!(
-            "external node key must be a bounded real regular file: {}",
-            path.display(),
-        );
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        if named.permissions().mode() & 0o077 != 0 {
-            anyhow::bail!(
-                "external node key must not be readable or writable by group/other: {}",
-                path.display(),
-            );
-        }
-    }
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = options
-        .open(path)
-        .map_err(|error| anyhow::anyhow!("open external node key {}: {error}", path.display()))?;
-    let opened = file.metadata()?;
-    if !opened.is_file() || opened.len() != named.len() {
-        anyhow::bail!(
-            "external node key changed while opening: {}",
-            path.display()
-        );
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        if opened.permissions().mode() & 0o077 != 0 {
-            anyhow::bail!(
-                "external node key permissions changed while opening: {}",
-                path.display(),
-            );
-        }
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_NODE_KEY_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 != named.len() || bytes.len() as u64 > MAX_NODE_KEY_BYTES {
-        anyhow::bail!(
-            "external node key changed while reading: {}",
-            path.display()
-        );
-    }
+    let bytes = crate::secure_file::read_owner_only_optional(path, MAX_NODE_KEY_BYTES)
+        .map_err(|error| anyhow::anyhow!("read external node key {}: {error}", path.display()))?
+        .ok_or_else(|| anyhow::anyhow!("external node key is absent: {}", path.display()))?;
     let keypair = libp2p::identity::Keypair::from_protobuf_encoding(&bytes)
         .map_err(|error| anyhow::anyhow!("decode external node key {}: {error}", path.display()))?;
     if keypair.key_type() != libp2p::identity::KeyType::Ed25519 {
@@ -1707,7 +1652,7 @@ mod tests {
         .unwrap();
         let refused_archive = source.0.join("refused-backup");
         let error = create_archive(&source_entry, &refused_archive, &source_cache).unwrap_err();
-        assert!(error.to_string().contains("group/other"), "{error:#}");
+        assert!(error.to_string().contains("owner-only"), "{error:#}");
         assert!(!refused_archive.exists());
 
         let restore = TempDir::new("insecure-restore-key");
@@ -1733,7 +1678,7 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("group/other"), "{error:#}");
+        assert!(error.to_string().contains("owner-only"), "{error:#}");
         assert_eq!(collect_tree(&destination), before);
         assert!(!restored_cache.exists());
         assert!(!index.exists());
@@ -1864,6 +1809,48 @@ mod tests {
         let error = create_archive(&entry, &second_archive, &cache).unwrap_err();
         assert!(error.to_string().contains("bounded real regular file"));
         assert!(!second_archive.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_external_node_keys_fail_before_archive_or_restore_mutation() {
+        let restore = TempDir::new("node-key-hard-link-restore");
+        let (entry, data, cache) = fixture(&restore.0);
+        let archive = restore.0.join("backup");
+        create_archive(&entry, &archive, &cache).unwrap();
+        let key = data.join(NODE_KEY_FILE);
+        let alias = restore.0.join("node-key-hard-alias");
+        fs::hard_link(&key, &alias).unwrap();
+        let destination = restore.0.join("destination");
+        let restored_cache = restore.0.join("restored-cache");
+        let index = restore.0.join("spaces.toml");
+        let error = restore_archive(
+            &archive,
+            &key,
+            &destination,
+            &restored_cache,
+            &index,
+            None,
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("hard-link aliases"), "{error:#}");
+        assert!(!destination.exists());
+        assert!(!restored_cache.exists());
+        assert!(!index.exists());
+
+        let backup = TempDir::new("node-key-hard-link-backup");
+        let (entry, data, cache) = fixture(&backup.0);
+        fs::hard_link(
+            data.join(NODE_KEY_FILE),
+            backup.0.join("node-key-hard-alias"),
+        )
+        .unwrap();
+        let refused_archive = backup.0.join("refused-backup");
+        let error = create_archive(&entry, &refused_archive, &cache).unwrap_err();
+        assert!(error.to_string().contains("hard-link aliases"), "{error:#}");
+        assert!(!refused_archive.exists());
     }
 
     #[test]
