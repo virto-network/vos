@@ -272,9 +272,12 @@ struct PendingControlEvidence {
     evidence_len: u32,
 }
 
-/// Fully authenticated, bounded ciphertext archive held only while an
+/// Control-chain-authenticated, bounded ciphertext archive held only while an
 /// offline recovery ceremony prepares its exact successor. It deliberately
 /// exposes sealed epoch metadata but no API for plaintext or unwrapped keys.
+/// Public PAPL rows are canonical and PSC-bound at this layer; a physical host
+/// must still authenticate their descriptor authority, PVRI, and node/PKEY
+/// correspondence before consuming them.
 pub(crate) struct VerifiedEncryptedBackup {
     metadata: RecoveryMetadata,
     index: StoreIndex,
@@ -1120,10 +1123,11 @@ fn decode_pending_control_evidence(
     Ok(pending)
 }
 
-/// Fully decode and authenticate an encrypted archive without touching the
-/// destination filesystem. The caller-supplied binding is the external trust
-/// anchor; archive metadata is never allowed to select its own owner or
-/// recovery key.
+/// Fully decode an encrypted archive, authenticate its signed control chain,
+/// and bind it to caller-selected recovery metadata without touching the
+/// destination filesystem. Public PAPL rows are only canonical and
+/// PSC-bound here; their authority/PVRI/PKEY proof is a physical-host gate.
+/// Archive metadata is never allowed to select its own owner or recovery key.
 pub(crate) fn verify_encrypted_backup<V: PrivateNodeAuthorityVerifier>(
     bytes: &[u8],
     expected_space: SpaceId,
@@ -1316,9 +1320,12 @@ pub(crate) fn reconcile_encrypted_backups(
     }
 
     // A sound recovered store must be able to reconstruct every historical
-    // epoch from its retained control path after restart. Select only a path
-    // whose authenticated epoch history covers all contributors, then break
-    // ties solely from authenticated control state rather than caller order.
+    // epoch from its retained control path after restart. Authenticated
+    // control state is the primary order. Equal control paths can still carry
+    // distinct node-local PAPL/PVRI values, so their complete canonical
+    // indexed identities are the final deterministic ordering key. This
+    // orders bases only; it never requires PAPL equality or merges one
+    // replica's PAPL into another.
     let selected_position = backups
         .iter()
         .enumerate()
@@ -1351,7 +1358,9 @@ pub(crate) fn reconcile_encrypted_backups(
         selected.merge_compatible_control_evidence(source)?;
         // PAPL/PVRI identity is node-local even when two replicas apply the
         // same PCTL to the same stable PSP. Retain only the selected archive's
-        // exact attachment; never copy or compare it across replica backups.
+        // exact attachment; never copy, merge, or require equality across
+        // replica backups. The base-ordering identity above is the only
+        // cross-replica observation.
         selected.merge_compatible_objects(source)?;
     }
     if (selected.chain.head().is_none()) != superseded_heads.is_empty() {
@@ -1404,6 +1413,29 @@ fn compare_recovery_base(
                 .map(|entry| entry.commitment)
                 .cmp(right.index.controls.iter().map(|entry| entry.commitment))
         })
+        .then_with(|| compare_node_local_runtime_application_base(left, right))
+}
+
+fn compare_node_local_runtime_application_base(
+    left: &VerifiedEncryptedBackup,
+    right: &VerifiedEncryptedBackup,
+) -> core::cmp::Ordering {
+    let identity = |entry: &StoredControlIndex| {
+        entry.runtime_application.map(|application| {
+            (
+                application.application,
+                application.wire_hash,
+                application.wire_len,
+                application.successor_runtime_image,
+                application.successor_stable_projection,
+            )
+        })
+    };
+    left.index
+        .controls
+        .iter()
+        .map(identity)
+        .cmp(right.index.controls.iter().map(identity))
 }
 
 impl VerifiedEncryptedBackup {
@@ -1453,6 +1485,8 @@ impl VerifiedEncryptedBackup {
             Option<&PrivateRuntimeApplication>,
         ),
     > {
+        // These values passed canonical and exact Store-position checks only.
+        // Callers must not treat them as authority- or PVRI-authenticated.
         self.index
             .controls
             .iter()
@@ -2018,25 +2052,34 @@ fn publish_runtime_application(
     Ok(())
 }
 
-fn verify_transaction_copy(
+fn verify_transaction_copies_if_present(
     staged: &Path,
     published: &Path,
     expected_hash: Hash,
     expected_len: u32,
     max: usize,
 ) -> Result<(), PrivateStoreError> {
-    let mut found = false;
     for path in [staged, published] {
-        match fs::symlink_metadata(path) {
-            Ok(_) => {
-                verify_file_identity(path, expected_hash, expected_len, max)?;
-                found = true;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(PrivateStoreError::Io),
-        }
+        verify_file_identity_if_present(path, expected_hash, expected_len, max)?;
     }
-    found.then_some(()).ok_or(PrivateStoreError::Corrupt)
+    // With the old index still authoritative, every suffix copy is optional:
+    // an earlier rollback attempt may already have retired it before a second
+    // crash. Any copy which remains must still match the pending transaction
+    // exactly, but absence is the idempotent rolled-back state.
+    Ok(())
+}
+
+fn verify_file_identity_if_present(
+    path: &Path,
+    expected_hash: Hash,
+    expected_len: u32,
+    max: usize,
+) -> Result<(), PrivateStoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => verify_file_identity(path, expected_hash, expected_len, max).map(|_| ()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(PrivateStoreError::Io),
+    }
 }
 
 fn retire_published_copy(
@@ -2086,14 +2129,14 @@ fn reconcile_pending(root: &Path) -> Result<(), PrivateStoreError> {
             PendingArtifact::Object(_) => MAX_PRIVATE_OBJECT_WIRE_BYTES,
             PendingArtifact::Control(_) => MAX_PRIVATE_CONTROL_WIRE_BYTES,
         };
-        verify_transaction_copy(
+        verify_transaction_copies_if_present(
             &staged_artifact,
             &published_artifact,
             pending.artifact_hash,
             pending.artifact_len,
             artifact_max,
         )?;
-        verify_file_identity(
+        verify_file_identity_if_present(
             &stage_dir.join(STAGED_INDEX),
             pending.next_index_hash,
             pending.next_index_len,
@@ -2104,7 +2147,7 @@ fn reconcile_pending(root: &Path) -> Result<(), PrivateStoreError> {
             let published = root
                 .join(RUNTIME_APPLICATIONS_DIR)
                 .join(runtime_application_file_name(application.control));
-            verify_transaction_copy(
+            verify_transaction_copies_if_present(
                 &staged,
                 &published,
                 application.wire_hash,
@@ -6182,6 +6225,95 @@ mod tests {
     }
 
     #[test]
+    fn old_index_rollback_is_idempotent_after_suffix_retirement() {
+        // AfterRuntimeApplication leaves the old index authoritative while
+        // both final suffix files and the durable pending marker exist. These
+        // cases model a second crash after retiring the PAPL, after retiring
+        // the PCTL too, and after all three uncommitted suffixes are gone.
+        for (case, (retire_control, retire_index)) in [(false, false), (true, false), (true, true)]
+            .into_iter()
+            .enumerate()
+        {
+            let directory = TestDirectory::new(&format!("runtime-rollback-retry-{case}"));
+            let path = directory.store();
+            let (mut store, fixture) = runtime_store_fixture(&path);
+            let control = invite_control(
+                &store,
+                &fixture.store_fixture,
+                recipient(&fixture.store_fixture, 0xc3),
+            );
+            let (_, _, application) = completed_runtime_application(
+                &store,
+                &fixture,
+                &fixture.predecessor,
+                &control,
+                0xc4,
+            );
+            assert_eq!(
+                store.append_control_with_runtime_application_with_stop_for_runtime(
+                    &control,
+                    &application,
+                    &TestAuthority,
+                    CommitStop::AfterRuntimeApplication,
+                ),
+                Err(PrivateStoreError::Interrupted)
+            );
+            drop(store);
+
+            fs::remove_file(
+                path.join(RUNTIME_APPLICATIONS_DIR)
+                    .join(runtime_application_file_name(control.commitment())),
+            )
+            .unwrap();
+            sync_directory(&path.join(RUNTIME_APPLICATIONS_DIR)).unwrap();
+            if retire_control {
+                fs::remove_file(
+                    path.join(CONTROLS_DIR)
+                        .join(control_file_name(control.commitment())),
+                )
+                .unwrap();
+                sync_directory(&path.join(CONTROLS_DIR)).unwrap();
+            }
+            if retire_index {
+                fs::remove_file(path.join(STAGE_DIR).join(STAGED_INDEX)).unwrap();
+                sync_directory(&path.join(STAGE_DIR)).unwrap();
+            }
+
+            let reopened = PrivateStore::open(
+                &path,
+                fixture.store_fixture.space,
+                fixture.store_fixture.agent,
+                &TestAuthority,
+            )
+            .unwrap();
+            assert_eq!(reopened.control_count(), 0);
+            assert_eq!(
+                reopened.runtime_application_binding(control.commitment()),
+                Err(PrivateStoreError::NotFound)
+            );
+            assert_eq!(fs::read_dir(path.join(CONTROLS_DIR)).unwrap().count(), 0);
+            assert_eq!(
+                fs::read_dir(path.join(RUNTIME_APPLICATIONS_DIR))
+                    .unwrap()
+                    .count(),
+                0
+            );
+            assert_eq!(fs::read_dir(path.join(STAGE_DIR)).unwrap().count(), 0);
+            drop(reopened);
+
+            // A completed rollback is itself exactly reopenable.
+            let reopened = PrivateStore::open(
+                &path,
+                fixture.store_fixture.space,
+                fixture.store_fixture.agent,
+                &TestAuthority,
+            )
+            .unwrap();
+            assert_eq!(reopened.control_count(), 0);
+        }
+    }
+
+    #[test]
     fn published_index_requires_exact_papl_or_completes_from_exact_stage() {
         for mode in 0..4 {
             let directory = TestDirectory::new(&format!("runtime-new-index-{mode}"));
@@ -6418,10 +6550,23 @@ mod tests {
             )
             .unwrap()
         };
-        let (selected, _, _) =
+        let (selected_forward, forward_heads, forward_sequence) =
             reconcile_encrypted_backups(vec![verify(&first_backup), verify(&second_backup)])
                 .unwrap();
-        let selected_application = selected
+        let (selected_reverse, reverse_heads, reverse_sequence) =
+            reconcile_encrypted_backups(vec![verify(&second_backup), verify(&first_backup)])
+                .unwrap();
+        assert_eq!(forward_heads, reverse_heads);
+        assert_eq!(forward_sequence, reverse_sequence);
+        assert_eq!(
+            selected_forward
+                .encode_backup(MAX_PRIVATE_BACKUP_BYTES)
+                .unwrap(),
+            selected_reverse
+                .encode_backup(MAX_PRIVATE_BACKUP_BYTES)
+                .unwrap()
+        );
+        let selected_application = selected_forward
             .controls_with_runtime_applications()
             .next()
             .unwrap()
