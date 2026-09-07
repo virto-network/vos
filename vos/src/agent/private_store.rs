@@ -35,6 +35,7 @@ pub const MAX_PRIVATE_STORE_OBJECTS: usize = 16_384;
 pub const MAX_PRIVATE_STORE_CONTROLS: usize = MAX_PRIVATE_CONTROL_RECORDS as usize;
 pub const MAX_PRIVATE_STORE_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_PRIVATE_STORE_INDEX_BYTES: usize = 48 * 1024 * 1024;
+pub const MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES: usize = 9 * 1024;
 pub const MAX_PRIVATE_RECOVERY_METADATA_BYTES: usize = MAX_PRIVATE_KEY_EPOCH_WIRE_BYTES
     + MAX_PRIVATE_NODES * MAX_PRIVATE_NODE_IDENTITY_WIRE_BYTES
     + 512;
@@ -45,17 +46,24 @@ const RECOVERY_MAGIC: &[u8; 4] = b"PVRM";
 const INDEX_MAGIC: &[u8; 4] = b"PVIX";
 const TRANSACTION_MAGIC: &[u8; 4] = b"PVTX";
 const SNAPSHOT_MAGIC: &[u8; 4] = b"PVSS";
-const BACKUP_MAGIC: &[u8; 4] = b"PVBK";
+// PVB2 cleanly rejects the former control-only archive layout. Treating the
+// first bytes of a legacy following control as an evidence tag could otherwise
+// produce an ambiguous parse.
+const BACKUP_MAGIC: &[u8; 4] = b"PVB2";
 const RAW_WIRE_DOMAIN: &[u8] = b"vos/private/stored-wire/v1";
 const RECOVERY_FILE: &str = "recovery.meta";
 const INDEX_FILE: &str = "index";
 const LOCK_FILE: &str = "lock";
 const OBJECTS_DIR: &str = "objects";
 const CONTROLS_DIR: &str = "controls";
+const CONTROL_EVIDENCE_DIR: &str = "control-authority-evidence";
 const STAGE_DIR: &str = "stage";
 const STAGED_ARTIFACT: &str = "artifact.next";
 const STAGED_INDEX: &str = "index.next";
 const PENDING_FILE: &str = "pending";
+const STAGED_CONTROL_EVIDENCE: &str = "control-authority-evidence.next";
+const PENDING_CONTROL_EVIDENCE: &str = "control-authority-evidence.pending";
+const CONTROL_EVIDENCE_PENDING_MAGIC: &[u8; 4] = b"PVEP";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrivateStoreError {
@@ -194,6 +202,13 @@ struct PendingTransaction {
     index_len: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingControlEvidence {
+    control: Hash,
+    evidence_hash: Hash,
+    evidence_len: u32,
+}
+
 /// Fully authenticated, bounded ciphertext archive held only while an
 /// offline recovery ceremony prepares its exact successor. It deliberately
 /// exposes sealed epoch metadata but no API for plaintext or unwrapped keys.
@@ -201,6 +216,10 @@ pub(crate) struct VerifiedEncryptedBackup {
     metadata: RecoveryMetadata,
     index: StoreIndex,
     controls: Vec<PrivateControlRecord>,
+    /// One exact PSE1 envelope per control when coordinator attachment had
+    /// completed. `None` is a crash-valid intermediate state and is retained
+    /// so recovery never fabricates authority evidence.
+    control_evidence: Vec<Option<Vec<u8>>>,
     objects: Vec<EncryptedPrivateObject>,
     key_epochs: Vec<PrivateKeyEpoch>,
     chain: PrivateControlChainVerifier,
@@ -221,6 +240,19 @@ pub(crate) enum CommitStop {
     AfterArtifact,
     #[cfg(test)]
     AfterIndex,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ControlEvidenceCommitStop {
+    Never,
+    #[cfg(test)]
+    AfterStaged,
+    #[cfg(test)]
+    AfterPending,
+    #[cfg(test)]
+    AfterPublished,
+    #[cfg(test)]
+    AfterRetired,
 }
 
 struct Encoder(Vec<u8>);
@@ -712,6 +744,39 @@ fn decode_pending(bytes: &[u8]) -> Result<PendingTransaction, PrivateStoreError>
     Ok(pending)
 }
 
+fn encode_pending_control_evidence(
+    pending: PendingControlEvidence,
+) -> Result<Vec<u8>, PrivateStoreError> {
+    if pending.control == Hash::ZERO
+        || pending.evidence_hash == Hash::ZERO
+        || pending.evidence_len == 0
+        || pending.evidence_len as usize > MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES
+    {
+        return Err(PrivateStoreError::Corrupt);
+    }
+    let mut encoder = Encoder::new(CONTROL_EVIDENCE_PENDING_MAGIC);
+    encoder.fixed(pending.control.as_bytes());
+    encoder.fixed(pending.evidence_hash.as_bytes());
+    encoder.u32(pending.evidence_len);
+    encoder.finish(128)
+}
+
+fn decode_pending_control_evidence(
+    bytes: &[u8],
+) -> Result<PendingControlEvidence, PrivateStoreError> {
+    let mut decoder = Decoder::new(bytes, CONTROL_EVIDENCE_PENDING_MAGIC, 128)?;
+    let pending = PendingControlEvidence {
+        control: Hash(decoder.fixed()?),
+        evidence_hash: Hash(decoder.fixed()?),
+        evidence_len: decoder.u32()?,
+    };
+    decoder.finish()?;
+    if encode_pending_control_evidence(pending)?.as_slice() != bytes {
+        return Err(PrivateStoreError::Corrupt);
+    }
+    Ok(pending)
+}
+
 /// Fully decode and authenticate an encrypted archive without touching the
 /// destination filesystem. The caller-supplied binding is the external trust
 /// anchor; archive metadata is never allowed to select its own owner or
@@ -770,6 +835,10 @@ pub(crate) fn verify_encrypted_backup<V: PrivateNodeAuthorityVerifier>(
     controls
         .try_reserve(control_count)
         .map_err(|_| PrivateStoreError::LimitExceeded)?;
+    let mut control_evidence = Vec::new();
+    control_evidence
+        .try_reserve(control_count)
+        .map_err(|_| PrivateStoreError::LimitExceeded)?;
     for entry in &index.controls {
         let commitment = Hash(decoder.fixed()?);
         let wire = decoder.bytes(MAX_PRIVATE_CONTROL_WIRE_BYTES)?;
@@ -801,7 +870,19 @@ pub(crate) fn verify_encrypted_backup<V: PrivateNodeAuthorityVerifier>(
         {
             return Err(PrivateStoreError::Corrupt);
         }
+        let evidence = match decoder.u8()? {
+            0 => None,
+            1 => {
+                let bytes = decoder.bytes(MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES)?;
+                if bytes.is_empty() {
+                    return Err(PrivateStoreError::Corrupt);
+                }
+                Some(bytes)
+            }
+            _ => return Err(PrivateStoreError::Corrupt),
+        };
         controls.push(record);
+        control_evidence.push(evidence);
     }
 
     let object_count =
@@ -847,6 +928,7 @@ pub(crate) fn verify_encrypted_backup<V: PrivateNodeAuthorityVerifier>(
         metadata,
         index,
         controls,
+        control_evidence,
         objects,
         key_epochs,
         chain,
@@ -905,6 +987,7 @@ pub(crate) fn reconcile_encrypted_backups(
 
     let mut selected = backups.swap_remove(selected_position);
     for source in &backups {
+        selected.merge_compatible_control_evidence(source)?;
         selected.merge_compatible_objects(source)?;
     }
     if (selected.chain.head().is_none()) != superseded_heads.is_empty() {
@@ -980,6 +1063,44 @@ impl VerifiedEncryptedBackup {
     /// exact archived epoch keys before it can publish a successor.
     pub(crate) fn objects(&self) -> &[EncryptedPrivateObject] {
         &self.objects
+    }
+
+    fn merge_compatible_control_evidence(
+        &mut self,
+        source: &VerifiedEncryptedBackup,
+    ) -> Result<(), PrivateStoreError> {
+        if self.control_evidence.len() != self.index.controls.len()
+            || source.control_evidence.len() != source.index.controls.len()
+        {
+            return Err(PrivateStoreError::Corrupt);
+        }
+        for (source_entry, source_evidence) in
+            source.index.controls.iter().zip(&source.control_evidence)
+        {
+            let Some(source_evidence) = source_evidence else {
+                continue;
+            };
+            let Some(position) = self
+                .index
+                .controls
+                .iter()
+                .position(|entry| entry.commitment == source_entry.commitment)
+            else {
+                continue;
+            };
+            let selected = self
+                .control_evidence
+                .get_mut(position)
+                .ok_or(PrivateStoreError::Corrupt)?;
+            match selected {
+                Some(existing) if existing != source_evidence => {
+                    return Err(PrivateStoreError::Alias);
+                }
+                Some(_) => {}
+                None => *selected = Some(source_evidence.clone()),
+            }
+        }
+        Ok(())
     }
 
     fn merge_compatible_objects(
@@ -1130,6 +1251,7 @@ impl VerifiedEncryptedBackup {
         self.index.next_sequence = next_chain.next_sequence();
         validate_index_shape(&self.index)?;
         self.controls.push(record.clone());
+        self.control_evidence.push(None);
         self.key_epochs = next_key_epochs;
         self.chain = next_chain;
         Ok(())
@@ -1138,6 +1260,7 @@ impl VerifiedEncryptedBackup {
     pub(crate) fn encode_backup(&self, max_bytes: usize) -> Result<Vec<u8>, PrivateStoreError> {
         let maximum = max_bytes.min(MAX_PRIVATE_BACKUP_BYTES);
         if self.controls.len() != self.index.controls.len()
+            || self.control_evidence.len() != self.index.controls.len()
             || self.objects.len() != self.index.objects.len()
         {
             return Err(PrivateStoreError::Corrupt);
@@ -1149,7 +1272,13 @@ impl VerifiedEncryptedBackup {
         encoder.bytes(&index)?;
         encoder
             .u32(u32::try_from(self.controls.len()).map_err(|_| PrivateStoreError::LimitExceeded)?);
-        for (entry, record) in self.index.controls.iter().zip(&self.controls) {
+        for ((entry, record), evidence) in self
+            .index
+            .controls
+            .iter()
+            .zip(&self.controls)
+            .zip(&self.control_evidence)
+        {
             let wire = record
                 .encode()
                 .map_err(|_| PrivateStoreError::InvalidRecord)?;
@@ -1161,6 +1290,18 @@ impl VerifiedEncryptedBackup {
             }
             encoder.fixed(entry.commitment.as_bytes());
             encoder.bytes(&wire)?;
+            match evidence {
+                None => encoder.u8(0),
+                Some(evidence) => {
+                    if evidence.is_empty()
+                        || evidence.len() > MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES
+                    {
+                        return Err(PrivateStoreError::Corrupt);
+                    }
+                    encoder.u8(1);
+                    encoder.bytes(evidence)?;
+                }
+            }
             if encoder.0.len() > maximum {
                 return Err(PrivateStoreError::LimitExceeded);
             }
@@ -1326,6 +1467,12 @@ fn control_file_name(commitment: Hash) -> String {
     name
 }
 
+fn control_evidence_file_name(commitment: Hash) -> String {
+    let mut name = hash_name(commitment);
+    name.push_str(".pse");
+    name
+}
+
 fn artifact_path(root: &Path, artifact: &PendingArtifact) -> PathBuf {
     match artifact {
         PendingArtifact::Object(key) => root.join(OBJECTS_DIR).join(object_file_name(*key)),
@@ -1412,6 +1559,51 @@ fn reconcile_pending(root: &Path) -> Result<(), PrivateStoreError> {
     sync_directory(&stage_dir)
 }
 
+fn publish_control_evidence(
+    root: &Path,
+    pending: PendingControlEvidence,
+) -> Result<(), PrivateStoreError> {
+    let staged = root.join(STAGE_DIR).join(STAGED_CONTROL_EVIDENCE);
+    let target = root
+        .join(CONTROL_EVIDENCE_DIR)
+        .join(control_evidence_file_name(pending.control));
+    if target.exists() {
+        verify_file_identity(
+            &target,
+            pending.evidence_hash,
+            pending.evidence_len,
+            MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES,
+        )?;
+        remove_file_if_present(&staged)?;
+    } else {
+        verify_file_identity(
+            &staged,
+            pending.evidence_hash,
+            pending.evidence_len,
+            MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES,
+        )?;
+        fs::rename(&staged, &target).map_err(map_io)?;
+        sync_directory(&root.join(CONTROL_EVIDENCE_DIR))?;
+    }
+    Ok(())
+}
+
+fn reconcile_pending_control_evidence(root: &Path) -> Result<(), PrivateStoreError> {
+    let stage_dir = root.join(STAGE_DIR);
+    let pending_path = stage_dir.join(PENDING_CONTROL_EVIDENCE);
+    if !pending_path.exists() {
+        remove_file_if_present(&stage_dir.join(STAGED_CONTROL_EVIDENCE))?;
+        sync_directory(&stage_dir)?;
+        return Ok(());
+    }
+    let bytes = read_bounded_file(&pending_path, 128)?;
+    let pending = decode_pending_control_evidence(&bytes)?;
+    publish_control_evidence(root, pending)?;
+    remove_file_if_present(&pending_path)?;
+    remove_file_if_present(&stage_dir.join(STAGED_CONTROL_EVIDENCE))?;
+    sync_directory(&stage_dir)
+}
+
 fn write_initial_file(
     root: &Path,
     temporary_name: &str,
@@ -1478,6 +1670,7 @@ impl PrivateStore {
         }
         fs::create_dir(root.join(OBJECTS_DIR)).map_err(map_io)?;
         fs::create_dir(root.join(CONTROLS_DIR)).map_err(map_io)?;
+        fs::create_dir(root.join(CONTROL_EVIDENCE_DIR)).map_err(map_io)?;
         fs::create_dir(root.join(STAGE_DIR)).map_err(map_io)?;
         sync_directory(&root)?;
         let chain = PrivateControlChainVerifier::new_genesis(
@@ -1540,7 +1733,7 @@ impl PrivateStore {
         if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
             return Err(PrivateStoreError::Corrupt);
         }
-        for directory in [OBJECTS_DIR, CONTROLS_DIR, STAGE_DIR] {
+        for directory in [OBJECTS_DIR, CONTROLS_DIR, CONTROL_EVIDENCE_DIR, STAGE_DIR] {
             let metadata = fs::symlink_metadata(root.join(directory)).map_err(map_io)?;
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 return Err(PrivateStoreError::Corrupt);
@@ -1548,6 +1741,7 @@ impl PrivateStore {
         }
         let lock = open_lock(&root)?;
         reconcile_pending(&root)?;
+        reconcile_pending_control_evidence(&root)?;
         let recovery_bytes = read_bounded_file(
             &root.join(RECOVERY_FILE),
             MAX_PRIVATE_RECOVERY_METADATA_BYTES,
@@ -1696,9 +1890,27 @@ impl PrivateStore {
             return Err(PrivateStoreError::Diverged);
         }
         validate_restore_prefix(&store.index, &backup.index)?;
-        let changed = created || store.index != backup.index;
+        let mut changed = created || store.index != backup.index;
+        // Reject a conflicting evidence attachment anywhere in the existing
+        // prefix before appending even the first new control. Missing local
+        // evidence remains recoverable from an exact archive attachment.
+        for (entry, incoming) in store.index.controls.iter().zip(&backup.control_evidence) {
+            if let (Some(existing), Some(incoming)) =
+                (store.read_control_authority_evidence(entry)?, incoming)
+                && existing != *incoming
+            {
+                return Err(PrivateStoreError::Alias);
+            }
+        }
         for record in backup.controls.iter().skip(store.index.controls.len()) {
             store.append_control(record, authority)?;
+        }
+        for (record, evidence) in backup.controls.iter().zip(&backup.control_evidence) {
+            if let Some(evidence) = evidence {
+                changed |= store
+                    .persist_control_authority_evidence(record.commitment(), evidence)?
+                    == PutDisposition::Inserted;
+            }
         }
         for object in &backup.objects {
             store.put_object(object)?;
@@ -2137,6 +2349,144 @@ impl PrivateStore {
         Ok(bytes)
     }
 
+    /// Read the immutable authority-evidence envelope for one exact indexed
+    /// control. Absence is a valid crash-intermediate state; callers deciding
+    /// whether to export or synchronize must fail closed on `None`.
+    pub(crate) fn read_control_authority_evidence(
+        &self,
+        entry: &StoredControlIndex,
+    ) -> Result<Option<Vec<u8>>, PrivateStoreError> {
+        #[cfg(test)]
+        self.artifact_reads.set(self.artifact_reads.get() + 1);
+        if !self
+            .index
+            .controls
+            .iter()
+            .any(|candidate| candidate == entry)
+        {
+            return Err(PrivateStoreError::InvalidRecord);
+        }
+        let path = self
+            .root
+            .join(CONTROL_EVIDENCE_DIR)
+            .join(control_evidence_file_name(entry.commitment));
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                Err(PrivateStoreError::Corrupt)
+            }
+            Ok(_) => Ok(Some(read_bounded_file(
+                &path,
+                MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES,
+            )?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(PrivateStoreError::Io),
+        }
+    }
+
+    /// Attach the exact post-coordinator PSE1 bytes to an existing PCTL.
+    ///
+    /// The store intentionally treats the bytes as opaque. The host adapter
+    /// independently verifies their AOI1/PCA1 signatures and exact route and
+    /// control bindings before calling this crate-private persistence seam.
+    pub(crate) fn persist_control_authority_evidence(
+        &mut self,
+        control: Hash,
+        evidence: &[u8],
+    ) -> Result<PutDisposition, PrivateStoreError> {
+        self.persist_control_authority_evidence_inner(
+            control,
+            evidence,
+            ControlEvidenceCommitStop::Never,
+        )
+    }
+
+    pub(crate) fn persist_control_authority_evidence_with_stop_for_runtime(
+        &mut self,
+        control: Hash,
+        evidence: &[u8],
+        stop: ControlEvidenceCommitStop,
+    ) -> Result<PutDisposition, PrivateStoreError> {
+        self.persist_control_authority_evidence_inner(control, evidence, stop)
+    }
+
+    fn persist_control_authority_evidence_inner(
+        &mut self,
+        control: Hash,
+        evidence: &[u8],
+        stop: ControlEvidenceCommitStop,
+    ) -> Result<PutDisposition, PrivateStoreError> {
+        #[cfg(not(test))]
+        let _ = stop;
+        if control == Hash::ZERO
+            || evidence.is_empty()
+            || evidence.len() > MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES
+            || !self
+                .index
+                .controls
+                .iter()
+                .any(|entry| entry.commitment == control)
+        {
+            return Err(PrivateStoreError::InvalidRecord);
+        }
+        reconcile_pending_control_evidence(&self.root)?;
+        let target = self
+            .root
+            .join(CONTROL_EVIDENCE_DIR)
+            .join(control_evidence_file_name(control));
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(PrivateStoreError::Corrupt);
+            }
+            Ok(_) => {
+                let existing =
+                    read_bounded_file(&target, MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES)?;
+                return if existing == evidence {
+                    Ok(PutDisposition::AlreadyPresent)
+                } else {
+                    Err(PrivateStoreError::Alias)
+                };
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(PrivateStoreError::Io),
+        }
+
+        let stage_dir = self.root.join(STAGE_DIR);
+        let staged = stage_dir.join(STAGED_CONTROL_EVIDENCE);
+        let pending_path = stage_dir.join(PENDING_CONTROL_EVIDENCE);
+        if staged.exists() || pending_path.exists() {
+            return Err(PrivateStoreError::Corrupt);
+        }
+        write_new_synced(&staged, evidence)?;
+        #[cfg(test)]
+        if stop == ControlEvidenceCommitStop::AfterStaged {
+            return Err(PrivateStoreError::Interrupted);
+        }
+        let pending = PendingControlEvidence {
+            control,
+            evidence_hash: raw_wire_hash(evidence),
+            evidence_len: u32::try_from(evidence.len())
+                .map_err(|_| PrivateStoreError::LimitExceeded)?,
+        };
+        write_new_synced(&pending_path, &encode_pending_control_evidence(pending)?)?;
+        sync_directory(&stage_dir)?;
+        #[cfg(test)]
+        if stop == ControlEvidenceCommitStop::AfterPending {
+            return Err(PrivateStoreError::Interrupted);
+        }
+        publish_control_evidence(&self.root, pending)?;
+        #[cfg(test)]
+        if stop == ControlEvidenceCommitStop::AfterPublished {
+            return Err(PrivateStoreError::Interrupted);
+        }
+        remove_file_if_present(&pending_path)?;
+        #[cfg(test)]
+        if stop == ControlEvidenceCommitStop::AfterRetired {
+            return Err(PrivateStoreError::Interrupted);
+        }
+        sync_directory(&stage_dir)?;
+        Ok(PutDisposition::Inserted)
+    }
+
     pub(crate) fn prevalidate_controls<V: PrivateNodeAuthorityVerifier>(
         &self,
         records: &[PrivateControlRecord],
@@ -2287,6 +2637,13 @@ impl PrivateStore {
         for entry in &self.index.controls {
             encoder.fixed(entry.commitment.as_bytes());
             encoder.bytes(&self.read_control_wire(entry)?)?;
+            match self.read_control_authority_evidence(entry)? {
+                None => encoder.u8(0),
+                Some(evidence) => {
+                    encoder.u8(1);
+                    encoder.bytes(&evidence)?;
+                }
+            }
             if encoder.0.len() > maximum {
                 return Err(PrivateStoreError::LimitExceeded);
             }
@@ -2666,6 +3023,13 @@ mod tests {
             encoder
                 .bytes(&store.read_control_wire(entry).unwrap())
                 .unwrap();
+            match store.read_control_authority_evidence(entry).unwrap() {
+                None => encoder.u8(0),
+                Some(evidence) => {
+                    encoder.u8(1);
+                    encoder.bytes(&evidence).unwrap();
+                }
+            }
         }
         encoder.u32(u32::try_from(object_order.len()).unwrap());
         for position in object_order {
@@ -2749,6 +3113,144 @@ mod tests {
                     .any(|window| window == sentinel)
             );
         }
+    }
+
+    #[test]
+    fn evidence_attachment_reconciles_every_write_boundary_and_rejects_aliases() {
+        let fixture = fixture();
+        for (index, stop) in [
+            ControlEvidenceCommitStop::AfterStaged,
+            ControlEvidenceCommitStop::AfterPending,
+            ControlEvidenceCommitStop::AfterPublished,
+            ControlEvidenceCommitStop::AfterRetired,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let directory = TestDirectory::new(&format!("evidence-stop-{index}"));
+            let path = directory.store();
+            let mut store = create_store(&path, &fixture);
+            let record = control(&fixture, 0, None);
+            store.append_control(&record, &TestAuthority).unwrap();
+            let mut evidence = b"PSE1-exact-authority-evidence-".to_vec();
+            evidence.push(index as u8);
+            assert_eq!(
+                store.persist_control_authority_evidence_inner(
+                    record.commitment(),
+                    &evidence,
+                    stop,
+                ),
+                Err(PrivateStoreError::Interrupted)
+            );
+            drop(store);
+
+            let mut reopened =
+                PrivateStore::open(&path, fixture.space, fixture.agent, &TestAuthority).unwrap();
+            let entry = &reopened.indexed_controls()[0];
+            let recovered = reopened.read_control_authority_evidence(entry).unwrap();
+            if stop == ControlEvidenceCommitStop::AfterStaged {
+                assert_eq!(recovered, None);
+            } else {
+                assert_eq!(recovered.as_deref(), Some(evidence.as_slice()));
+            }
+            assert!(
+                !path.join(STAGE_DIR).join(STAGED_CONTROL_EVIDENCE).exists()
+                    && !path.join(STAGE_DIR).join(PENDING_CONTROL_EVIDENCE).exists()
+            );
+            assert!(matches!(
+                reopened.persist_control_authority_evidence(record.commitment(), &evidence),
+                Ok(PutDisposition::Inserted | PutDisposition::AlreadyPresent)
+            ));
+            let mut alias = evidence.clone();
+            alias.push(0xff);
+            assert_eq!(
+                reopened.persist_control_authority_evidence(record.commitment(), &alias),
+                Err(PrivateStoreError::Alias)
+            );
+        }
+    }
+
+    #[test]
+    fn encrypted_backup_preserves_present_and_pending_evidence_exactly() {
+        let fixture = fixture();
+        let directory = TestDirectory::new("backup-evidence");
+        let path = directory.store();
+        let mut store = create_store(&path, &fixture);
+        let record = control(&fixture, 0, None);
+        store.append_control(&record, &TestAuthority).unwrap();
+
+        // A crash-valid local control may temporarily have no attached PSE1.
+        let pending_backup = store
+            .export_encrypted_backup(MAX_PRIVATE_BACKUP_BYTES)
+            .unwrap();
+        let pending = verify_encrypted_backup(
+            &pending_backup,
+            fixture.space,
+            fixture.agent,
+            fixture.owner,
+            fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(pending.control_evidence, vec![None]);
+
+        let evidence = b"PSE1-canonical-bytes-preserved-byte-for-byte".to_vec();
+        store
+            .persist_control_authority_evidence(record.commitment(), &evidence)
+            .unwrap();
+        let complete_backup = store
+            .export_encrypted_backup(MAX_PRIVATE_BACKUP_BYTES)
+            .unwrap();
+        let verified = verify_encrypted_backup(
+            &complete_backup,
+            fixture.space,
+            fixture.agent,
+            fixture.owner,
+            fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(verified.control_evidence, vec![Some(evidence.clone())]);
+
+        let restored_path = directory.0.join("restored");
+        let (restored, _) = PrivateStore::restore_encrypted_backup(
+            &restored_path,
+            fixture.space,
+            fixture.agent,
+            fixture.owner,
+            fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
+            &complete_backup,
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(
+            restored
+                .read_control_authority_evidence(&restored.indexed_controls()[0])
+                .unwrap(),
+            Some(evidence)
+        );
+
+        let pending_path = directory.0.join("pending-restored");
+        let (pending_restored, _) = PrivateStore::restore_encrypted_backup(
+            &pending_path,
+            fixture.space,
+            fixture.agent,
+            fixture.owner,
+            fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
+            &pending_backup,
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(
+            pending_restored
+                .read_control_authority_evidence(&pending_restored.indexed_controls()[0])
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

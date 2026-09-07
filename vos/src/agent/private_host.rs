@@ -23,8 +23,8 @@ use vos_agent_sdk::authority::{
     AuthorityReceipt, AuthorityVerifier, ManagedAgentTarget,
 };
 use vos_agent_sdk::authority_operation::{
-    AuthorityOperationIntent, AuthorityOperationIssuanceAck, PrivateControlApplicationFact,
-    private_member_set_commitment,
+    AuthorityOperationIntent, AuthorityOperationIssuanceAck, PrivateControlApplicationAck,
+    PrivateControlApplicationFact, private_member_set_commitment,
 };
 use vos_agent_sdk::contract::{
     ActorAbiRange, RuntimeMigrationPolicy, RuntimePackageContract, RuntimeResourceLimits,
@@ -48,9 +48,12 @@ use vos_agent_sdk::{
 use zeroize::Zeroizing;
 
 use super::package_admission::{AdmittedRuntimePackage, admit_runtime_package};
+#[cfg(test)]
+use super::private_control_application_coordinator::decode_private_application_fact;
 use super::private_control_application_coordinator::{
     PrivateControlRuntimeApplicationAdapter, PrivateControlRuntimeApplicationRequest,
-    PrivateControlRuntimeApplicationResult, encode_private_application_fact,
+    PrivateControlRuntimeApplicationResult, PrivateControlRuntimeEvidenceRequest,
+    PrivateControlRuntimeEvidenceResult, encode_private_application_fact,
 };
 #[cfg(test)]
 use super::private_crypto::{
@@ -66,13 +69,15 @@ use super::private_crypto::{
     verify_control_record_signature,
 };
 use super::private_store::{
-    MAX_PRIVATE_BACKUP_BYTES, PrivateObjectKey, PrivateStore, PrivateStoreError, PutDisposition,
-    RestoreDisposition, reconcile_encrypted_backups, verify_encrypted_backup,
+    ControlEvidenceCommitStop, MAX_PRIVATE_BACKUP_BYTES, PrivateObjectKey, PrivateStore,
+    PrivateStoreError, PutDisposition, RestoreDisposition, reconcile_encrypted_backups,
+    verify_encrypted_backup,
 };
 use super::private_sync::{
-    PrivateSyncApplyDisposition, PrivateSyncError, PrivateSyncPage, PrivateSyncPhase,
-    PrivateSyncRequest, PrivateTransportAuthVerifier, apply_private_sync_page,
-    serve_private_sync_page, validate_private_actor_schema, validate_private_runtime_work,
+    PrivateControlAuthorityEvidence, PrivateSyncApplyDisposition, PrivateSyncError,
+    PrivateSyncPage, PrivateSyncPhase, PrivateSyncRequest, PrivateTransportAuthVerifier,
+    apply_private_sync_page, serve_private_sync_page, validate_private_actor_schema,
+    validate_private_runtime_work, verify_private_control_page_authority_evidence,
 };
 
 pub const MAX_PRIVATE_HOST_AGENTS: usize = 4_096;
@@ -322,6 +327,16 @@ enum PrivateRuntimeApplicationStop {
     AfterRuntimePromoted,
     AfterBootstrapPromoted,
     AfterReopen,
+    #[cfg(test)]
+    AfterEvidenceStaged,
+    #[cfg(test)]
+    AfterEvidencePending,
+    #[cfg(test)]
+    AfterEvidencePublished,
+    #[cfg(test)]
+    AfterEvidenceRetired,
+    #[cfg(test)]
+    AfterEvidenceReopen,
 }
 
 struct PreparedPrivateApplication {
@@ -1432,25 +1447,36 @@ impl PrivateAgentHost {
         agent: AgentId,
         peer: PrivatePeerIdentity<'_>,
         request_bytes: &[u8],
+        authority: AuthorityActorTarget,
         transport: &T,
     ) -> Result<Vec<u8>, PrivateAgentHostError> {
         let hosted = self.hosted(agent)?;
         let peer = authenticate_peer_identity(hosted, peer, transport)?;
         let request = PrivateSyncRequest::decode(request_bytes)?;
-        Ok(serve_private_sync_page(&hosted.store, peer, &request, transport)?.encode()?)
+        let route = ManagedAgentTarget {
+            space: hosted.descriptor.identity.space,
+            agent: hosted.descriptor.identity.agent,
+            runtime_deployment: hosted.descriptor.identity.runtime_deployment,
+        };
+        if authority.binding != hosted.descriptor.authority {
+            return Err(PrivateAgentHostError::Unauthorized);
+        }
+        Ok(
+            serve_private_sync_page(&hosted.store, peer, &request, transport, route, authority)?
+                .encode()?,
+        )
     }
 
-    /// Apply one exact authenticated sync page. This low-level primitive is
-    /// crate-local until sync frames carry evidence correlating every control
-    /// with its exact authority issuance and PCA acknowledgement. If a trusted
-    /// caller supplies such a page and it carries a key epoch, new encrypted
-    /// sidecars are durably staged before the control head is advanced.
-    pub(crate) fn apply_sync_page<A, T>(
+    /// Apply one exact authenticated, authority-evidenced sync page. Every
+    /// PCTL is bound to canonical AOI1+PCA1 under the independently configured
+    /// authority before any epoch sidecar or store artifact is staged.
+    pub fn apply_sync_page<A, T>(
         &mut self,
         agent: AgentId,
         peer: PrivatePeerIdentity<'_>,
         page_bytes: &[u8],
-        authority: &A,
+        authority: AuthorityActorTarget,
+        node_authority: &A,
         transport: &T,
     ) -> Result<PrivateSyncApplyDisposition, PrivateAgentHostError>
     where
@@ -1466,6 +1492,15 @@ impl PrivateAgentHost {
             .ok_or(PrivateAgentHostError::NotFound)?;
         let peer = authenticate_peer_identity(hosted, peer, transport)?;
         let page = PrivateSyncPage::decode(page_bytes)?;
+        let route = ManagedAgentTarget {
+            space: hosted.descriptor.identity.space,
+            agent: hosted.descriptor.identity.agent,
+            runtime_deployment: hosted.descriptor.identity.runtime_deployment,
+        };
+        if authority.binding != hosted.descriptor.authority {
+            return Err(PrivateAgentHostError::Unauthorized);
+        }
+        verify_private_control_page_authority_evidence(&page, route, authority)?;
         let starting_epoch = hosted.store.binding().epoch;
         // Validate the complete signed control suffix before encrypting any
         // host plaintext to a page-supplied epoch key. This prevents a valid
@@ -1476,12 +1511,20 @@ impl PrivateAgentHost {
             &page,
             &local_node,
             node_key,
-            authority,
+            node_authority,
         )?;
         for candidate in &staged_keys {
             stage_metadata(&slot, candidate.epoch, &candidate.data, hosted)?;
         }
-        let result = apply_private_sync_page(&mut hosted.store, peer, &page, authority, transport);
+        let result = apply_private_sync_page(
+            &mut hosted.store,
+            peer,
+            &page,
+            node_authority,
+            transport,
+            route,
+            authority,
+        );
         match result {
             Ok(disposition) => {
                 reconcile_staged_sync_keys(&slot, hosted, starting_epoch, staged_keys, false)?;
@@ -1593,6 +1636,166 @@ impl PrivateAgentHost {
             durably_applied: true,
             durably_reopened: true,
             application_fact: encode_private_application_fact(&fact),
+        })
+    }
+
+    fn persist_completed_private_control_evidence<V>(
+        &mut self,
+        authority: AuthorityActorTarget,
+        node_authority: &V,
+        request: &PrivateControlRuntimeEvidenceRequest,
+        stop: PrivateRuntimeApplicationStop,
+    ) -> Result<PrivateControlRuntimeEvidenceResult, PrivateAgentHostError>
+    where
+        V: PrivateNodeAuthorityVerifier,
+    {
+        self.verify_root_scope()?;
+        if request.authority != authority || !request.route.is_valid() {
+            return Err(PrivateAgentHostError::InvalidScope);
+        }
+        let control = PrivateControlRecord::decode(&request.control)
+            .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
+        if control.encode().ok().as_deref() != Some(request.control.as_slice()) {
+            return Err(PrivateAgentHostError::InvalidArtifact);
+        }
+        verify_control_record_signature(&control)?;
+        let issuance = AuthorityOperationIssuanceAck::decode(&request.issuance_ack)
+            .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
+        let application = PrivateControlApplicationAck::decode(&request.application_ack)
+            .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
+        if issuance.encode().ok().as_deref() != Some(request.issuance_ack.as_slice())
+            || application.encode().ok().as_deref() != Some(request.application_ack.as_slice())
+        {
+            return Err(PrivateAgentHostError::InvalidArtifact);
+        }
+        let evidence =
+            PrivateControlAuthorityEvidence::from_acknowledgements(&issuance, &application)?;
+        evidence.verify_for(
+            &control,
+            application.application.epoch,
+            request.route,
+            authority,
+        )?;
+        let evidence_wire = evidence.encode()?;
+        let evidence_commitment = evidence.commitment()?;
+        let agent = request.route.agent;
+        let hosted = self.hosted(agent)?;
+        let binding = hosted.store.binding();
+        if request.route.space != binding.space
+            || request.route.agent != binding.agent
+            || request.route.runtime_deployment != hosted.descriptor.identity.runtime_deployment
+            || authority.space != binding.space
+            || authority.binding != hosted.descriptor.authority
+            || application.application.epoch
+                != hosted
+                    .store
+                    .indexed_controls()
+                    .iter()
+                    .find(|entry| entry.commitment == control.commitment())
+                    .ok_or(PrivateAgentHostError::InvalidArtifact)?
+                    .resulting_epoch
+            || !hosted
+                .store
+                .control_is_exact(control.commitment(), &request.control)?
+        {
+            return Err(PrivateAgentHostError::InvalidScope);
+        }
+
+        #[cfg(test)]
+        let evidence_stop = match stop {
+            PrivateRuntimeApplicationStop::AfterEvidenceStaged => {
+                ControlEvidenceCommitStop::AfterStaged
+            }
+            PrivateRuntimeApplicationStop::AfterEvidencePending => {
+                ControlEvidenceCommitStop::AfterPending
+            }
+            PrivateRuntimeApplicationStop::AfterEvidencePublished => {
+                ControlEvidenceCommitStop::AfterPublished
+            }
+            PrivateRuntimeApplicationStop::AfterEvidenceRetired => {
+                ControlEvidenceCommitStop::AfterRetired
+            }
+            _ => ControlEvidenceCommitStop::Never,
+        };
+        #[cfg(not(test))]
+        let evidence_stop = ControlEvidenceCommitStop::Never;
+        let persistence = self
+            .hosted_mut(agent)?
+            .store
+            .persist_control_authority_evidence_with_stop_for_runtime(
+                control.commitment(),
+                &evidence_wire,
+                evidence_stop,
+            );
+        if let Err(error) = persistence {
+            if stop == PrivateRuntimeApplicationStop::Never {
+                let slot = self.agent_path(agent);
+                let previous = self
+                    .agents
+                    .remove(&agent)
+                    .ok_or(PrivateAgentHostError::NotFound)?;
+                drop(previous);
+                let reopened = open_hosted_agent(
+                    &slot,
+                    self.scope.space,
+                    self.scope.owner,
+                    &self.scope.local_node,
+                    &self.node_key,
+                    node_authority,
+                )
+                .map_err(|_| PrivateAgentHostError::Corrupt)?;
+                if self.agents.insert(agent, reopened).is_some() {
+                    return Err(PrivateAgentHostError::Alias);
+                }
+            }
+            return Err(error.into());
+        }
+
+        let slot = self.agent_path(agent);
+        let previous = self
+            .agents
+            .remove(&agent)
+            .ok_or(PrivateAgentHostError::NotFound)?;
+        drop(previous);
+        let reopened = open_hosted_agent(
+            &slot,
+            self.scope.space,
+            self.scope.owner,
+            &self.scope.local_node,
+            &self.node_key,
+            node_authority,
+        )?;
+        let entry = reopened
+            .store
+            .indexed_controls()
+            .iter()
+            .find(|entry| entry.commitment == control.commitment())
+            .ok_or(PrivateAgentHostError::Corrupt)?;
+        if reopened
+            .store
+            .read_control_authority_evidence(entry)?
+            .as_deref()
+            != Some(evidence_wire.as_slice())
+        {
+            return Err(PrivateAgentHostError::Corrupt);
+        }
+        if self.agents.insert(agent, reopened).is_some() {
+            return Err(PrivateAgentHostError::Alias);
+        }
+        #[cfg(test)]
+        if stop == PrivateRuntimeApplicationStop::AfterEvidenceReopen {
+            return Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted));
+        }
+        Ok(PrivateControlRuntimeEvidenceResult {
+            route: request.route,
+            authority: request.authority,
+            control: request.control.clone(),
+            issuance_ack: request.issuance_ack.clone(),
+            application_ack: request.application_ack.clone(),
+            evidence_commitment,
+            authenticated: true,
+            durably_persisted: true,
+            durably_reopened: true,
         })
     }
 
@@ -1732,6 +1935,18 @@ where
         request: &PrivateControlRuntimeApplicationRequest,
     ) -> Result<PrivateControlRuntimeApplicationResult, Self::Error> {
         self.host.apply_authorized_private_control(
+            self.authority,
+            self.node_authority,
+            request,
+            self.stop,
+        )
+    }
+
+    fn persist_completed_evidence(
+        &mut self,
+        request: &PrivateControlRuntimeEvidenceRequest,
+    ) -> Result<PrivateControlRuntimeEvidenceResult, Self::Error> {
+        self.host.persist_completed_private_control_evidence(
             self.authority,
             self.node_authority,
             request,
@@ -2464,6 +2679,7 @@ fn validated_candidate_keys_from_page<V: PrivateNodeAuthorityVerifier>(
             commitment,
             resulting_epoch,
             wire,
+            ..
         } = item
         else {
             return Err(PrivateAgentHostError::Sync(PrivateSyncError::InvalidFrame));
@@ -4528,13 +4744,23 @@ mod tests {
             signature: [0; 64],
         };
         receipt.signature = key.sign(&receipt.signing_bytes()).to_bytes();
+        let mut authorization_invocation = [0xa5; 32];
+        authorization_invocation[24..].copy_from_slice(&control.sequence.to_le_bytes());
+        let mut acknowledgement_invocation = [0xa6; 32];
+        acknowledgement_invocation[24..].copy_from_slice(&control.sequence.to_le_bytes());
         let mut issuance = AuthorityOperationIssuanceAck {
-            authorization_invocation: InvocationId([0xa5; 32]),
-            acknowledgement_invocation: InvocationId([0xa6; 32]),
+            authorization_invocation: InvocationId(authorization_invocation),
+            acknowledgement_invocation: InvocationId(acknowledgement_invocation),
             authority,
-            operation_call: Hash([0xa7; 32]),
-            approval: Hash([0xa8; 32]),
-            authorization_sequence: NonZeroU64::new(9).unwrap(),
+            operation_call: Hash::digest(
+                b"vos/test/private-operation-call/v1",
+                &[control.commitment().as_bytes()],
+            ),
+            approval: Hash::digest(
+                b"vos/test/private-operation-approval/v1",
+                &[control.commitment().as_bytes()],
+            ),
+            authorization_sequence: NonZeroU64::new(control.sequence + 1).unwrap(),
             receipt: receipt.clone(),
             issued_at,
             signature: [0; 64],
@@ -4571,6 +4797,71 @@ mod tests {
         host.runtime_application_adapter(authority, &TestAuthority)
             .unwrap()
             .apply(request)
+    }
+
+    fn apply_and_attach_test_authority_evidence(
+        host: &mut PrivateAgentHost,
+        fixture: &Fixture,
+        control: &PrivateControlRecord,
+        issued_at: u64,
+        applied_at: u64,
+    ) -> (
+        PrivateControlRuntimeApplicationResult,
+        PrivateControlApplicationAck,
+    ) {
+        let (authority, request) =
+            runtime_application_request(fixture, control, issued_at, applied_at);
+        let result = apply_runtime_request(host, authority, &request).unwrap();
+        let application = signed_test_application_ack(fixture, &request, &result);
+        let evidence_request = test_evidence_request(&request, &application);
+        let evidence = host
+            .runtime_application_adapter(authority, &TestAuthority)
+            .unwrap()
+            .persist_completed_evidence(&evidence_request)
+            .unwrap();
+        assert!(evidence.authenticated && evidence.durably_persisted && evidence.durably_reopened);
+        (result, application)
+    }
+
+    fn signed_test_application_ack(
+        fixture: &Fixture,
+        request: &PrivateControlRuntimeApplicationRequest,
+        result: &PrivateControlRuntimeApplicationResult,
+    ) -> PrivateControlApplicationAck {
+        let issuance = AuthorityOperationIssuanceAck::decode(&request.issuance_ack).unwrap();
+        let application_fact = decode_private_application_fact(&result.application_fact).unwrap();
+        let (authority, key) = authority_target(fixture);
+        let mut application = PrivateControlApplicationAck {
+            authorization_invocation: issuance.authorization_invocation,
+            issuance_invocation: issuance.acknowledgement_invocation,
+            application_invocation: PrivateControlApplicationAck::derive_application_invocation(
+                &issuance,
+            ),
+            authority,
+            operation_call: issuance.operation_call,
+            approval: issuance.approval,
+            issuance_ack: issuance.commitment(),
+            authorization_sequence: issuance.authorization_sequence,
+            receipt: issuance.receipt.clone(),
+            issued_at: issuance.issued_at,
+            application: application_fact,
+            signature: [0; 64],
+        };
+        application.signature = key.sign(&application.signing_bytes()).to_bytes();
+        application
+    }
+
+    fn test_evidence_request(
+        request: &PrivateControlRuntimeApplicationRequest,
+        application: &PrivateControlApplicationAck,
+    ) -> PrivateControlRuntimeEvidenceRequest {
+        PrivateControlRuntimeEvidenceRequest {
+            route: request.route,
+            authority: request.authority,
+            control: request.control.clone(),
+            issuance_ack: request.issuance_ack.clone(),
+            application_ack: application.encode().unwrap(),
+        }
     }
 
     #[test]
@@ -4683,6 +4974,265 @@ mod tests {
                 "boundary {boundary:?}"
             );
         }
+    }
+
+    #[test]
+    fn completed_evidence_attachment_recovers_every_physical_write_boundary() {
+        let boundaries = [
+            PrivateRuntimeApplicationStop::AfterEvidenceStaged,
+            PrivateRuntimeApplicationStop::AfterEvidencePending,
+            PrivateRuntimeApplicationStop::AfterEvidencePublished,
+            PrivateRuntimeApplicationStop::AfterEvidenceRetired,
+            PrivateRuntimeApplicationStop::AfterEvidenceReopen,
+        ];
+        let fixture = fixture(2);
+        for (index, boundary) in boundaries.into_iter().enumerate() {
+            let name = format!("evidence-boundary-{index}");
+            let mut host = create_host(&fixture, 0, &name);
+            let agent = create_agent(&mut host, &fixture);
+            let control = signed_revoke_control(&host, agent, fixture.nodes[1].identity.node);
+            let (authority, request) = runtime_application_request(&fixture, &control, 60, 64);
+            let application_result = apply_runtime_request(&mut host, authority, &request).unwrap();
+            let application = signed_test_application_ack(&fixture, &request, &application_result);
+            let evidence_request = test_evidence_request(&request, &application);
+            let expected = PrivateControlAuthorityEvidence::from_acknowledgements(
+                &AuthorityOperationIssuanceAck::decode(&request.issuance_ack).unwrap(),
+                &application,
+            )
+            .unwrap();
+            let expected_wire = expected.encode().unwrap();
+            let expected_commitment = expected.commitment().unwrap();
+            let interrupted = {
+                let mut runtime = host
+                    .runtime_application_adapter(authority, &TestAuthority)
+                    .unwrap();
+                runtime.stop_after(boundary);
+                runtime.persist_completed_evidence(&evidence_request)
+            };
+            assert_eq!(
+                interrupted,
+                Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted)),
+                "boundary {boundary:?}"
+            );
+            drop(host);
+
+            // Physical reopen accepts the crash-valid missing-evidence state
+            // and reconciles any transaction whose intent was durable.
+            let mut reopened = reopen_host(&fixture, 0, &name);
+            assert_eq!(
+                reopened.binding(agent).unwrap().control_head,
+                Some(control.commitment())
+            );
+            let result = reopened
+                .runtime_application_adapter(authority, &TestAuthority)
+                .unwrap()
+                .persist_completed_evidence(&evidence_request)
+                .unwrap();
+            assert!(result.authenticated && result.durably_persisted && result.durably_reopened);
+            assert_eq!(result.evidence_commitment, expected_commitment);
+            let entry = reopened.agents[&agent]
+                .store
+                .indexed_controls()
+                .iter()
+                .find(|entry| entry.commitment == control.commitment())
+                .unwrap();
+            assert_eq!(
+                reopened.agents[&agent]
+                    .store
+                    .read_control_authority_evidence(entry)
+                    .unwrap()
+                    .as_deref(),
+                Some(expected_wire.as_slice()),
+                "boundary {boundary:?}"
+            );
+            let retry = reopened
+                .runtime_application_adapter(authority, &TestAuthority)
+                .unwrap()
+                .persist_completed_evidence(&evidence_request)
+                .unwrap();
+            assert_eq!(retry, result);
+        }
+    }
+
+    #[test]
+    fn evidence_callback_rejects_every_exact_echo_and_signed_fact_substitution() {
+        let fixture = fixture(2);
+        let mut host = create_host(&fixture, 0, "evidence-substitutions");
+        let agent = create_agent(&mut host, &fixture);
+        let control = signed_revoke_control(&host, agent, fixture.nodes[1].identity.node);
+        let (authority, request) = runtime_application_request(&fixture, &control, 70, 74);
+        let application_result = apply_runtime_request(&mut host, authority, &request).unwrap();
+        let application = signed_test_application_ack(&fixture, &request, &application_result);
+        let exact = test_evidence_request(&request, &application);
+        let (_, key) = authority_target(&fixture);
+        let applied_binding = host.binding(agent).unwrap();
+        let applied_sidecars = canonical_sidecars(&host, agent);
+
+        let mut cases = Vec::new();
+        let mut candidate = exact.clone();
+        candidate.route.runtime_deployment = DeploymentId([0xc1; 32]);
+        cases.push(("route", candidate));
+        let mut candidate = exact.clone();
+        candidate.authority.system_agent = AgentId([0xc2; 32]);
+        cases.push(("authority", candidate));
+        let mut candidate = exact.clone();
+        candidate.control.push(0);
+        cases.push(("control frame", candidate));
+        let mut candidate = exact.clone();
+        let mut issuance = AuthorityOperationIssuanceAck::decode(&candidate.issuance_ack).unwrap();
+        issuance.signature[0] ^= 1;
+        candidate.issuance_ack = issuance.encode().unwrap();
+        cases.push(("issuance signature", candidate));
+        let mut candidate = exact.clone();
+        let mut application =
+            PrivateControlApplicationAck::decode(&candidate.application_ack).unwrap();
+        application.signature[0] ^= 1;
+        candidate.application_ack = application.encode().unwrap();
+        cases.push(("application signature", candidate));
+        for (label, mutate) in [
+            ("application control", 0u8),
+            ("application sequence", 1),
+            ("application epoch", 2),
+            ("application route", 3),
+            ("application member set", 4),
+        ] {
+            let mut candidate = exact.clone();
+            let mut issuance =
+                AuthorityOperationIssuanceAck::decode(&candidate.issuance_ack).unwrap();
+            let mut application =
+                PrivateControlApplicationAck::decode(&candidate.application_ack).unwrap();
+            match mutate {
+                0 => {
+                    application.application.control = Hash([0xc0; 32]);
+                    application.application.reopened_control_head = application.application.control;
+                    issuance.receipt.selector.request = application.application.control;
+                }
+                1 => {
+                    application.application.control_sequence += 1;
+                    application.application.control_previous = Some(Hash([0xc5; 32]));
+                }
+                2 => application.application.epoch += 1,
+                3 => {
+                    application.application.managed.runtime_deployment = DeploymentId([0xc3; 32]);
+                    issuance.receipt.selector.runtime_deployment =
+                        application.application.managed.runtime_deployment;
+                }
+                4 => application.application.post_member_set = Hash([0xc4; 32]),
+                _ => unreachable!(),
+            }
+            if matches!(mutate, 0 | 3) {
+                issuance.receipt.signature = key.sign(&issuance.receipt.signing_bytes()).to_bytes();
+                issuance.signature = key.sign(&issuance.signing_bytes()).to_bytes();
+                candidate.issuance_ack = issuance.encode().unwrap();
+                application.receipt = issuance.receipt.clone();
+                application.issuance_ack = issuance.commitment();
+                application.application_invocation =
+                    PrivateControlApplicationAck::derive_application_invocation(&issuance);
+            }
+            application.signature = key.sign(&application.signing_bytes()).to_bytes();
+            candidate.application_ack = application.encode().unwrap();
+            cases.push((label, candidate));
+        }
+
+        for (label, candidate) in cases {
+            assert!(
+                host.runtime_application_adapter(authority, &TestAuthority)
+                    .unwrap()
+                    .persist_completed_evidence(&candidate)
+                    .is_err(),
+                "{label}"
+            );
+            let entry = &host.agents[&agent].store.indexed_controls()[0];
+            assert_eq!(
+                host.agents[&agent]
+                    .store
+                    .read_control_authority_evidence(entry)
+                    .unwrap(),
+                None,
+                "{label}"
+            );
+            assert_eq!(host.binding(agent).unwrap(), applied_binding, "{label}");
+            assert_eq!(
+                canonical_sidecars(&host, agent),
+                applied_sidecars,
+                "{label}"
+            );
+            let stage = host.agent_path(agent).join(STORE_DIRECTORY).join("stage");
+            assert!(
+                fs::read_dir(stage).unwrap().all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("control-authority-evidence")),
+                "{label}"
+            );
+        }
+
+        host.runtime_application_adapter(authority, &TestAuthority)
+            .unwrap()
+            .persist_completed_evidence(&exact)
+            .unwrap();
+    }
+
+    #[test]
+    fn authority_evidence_survives_encrypted_backup_restore_and_sync_restart() {
+        let fixture = fixture(2);
+        let mut source = create_host(&fixture, 0, "evidence-backup-source");
+        let agent = create_agent(&mut source, &fixture);
+        let control = signed_revoke_control(&source, agent, fixture.nodes[1].identity.node);
+        apply_and_attach_test_authority_evidence(&mut source, &fixture, &control, 80, 84);
+        let backup = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        assert!(!contains(&backup, SENTINEL));
+
+        let mut restored = create_host(&fixture, 0, "evidence-backup-restored");
+        restored
+            .restore_encrypted_backup(
+                agent,
+                DurableRecoveryRecipient::from_durable_keystore(
+                    fixture.recovery.verifying_key(),
+                    fixture.recovery_encryption.public_key(),
+                )
+                .unwrap(),
+                &backup,
+                &TestAuthority,
+            )
+            .unwrap();
+        drop(restored);
+        let restored = reopen_host(&fixture, 0, "evidence-backup-restored");
+        let request = PrivateSyncRequest {
+            cursor: PrivateSyncCursor::start(fixture.space, agent, 0, None).unwrap(),
+            max_items: MAX_PRIVATE_SYNC_ITEMS as u16,
+            max_bytes: MAX_PRIVATE_SYNC_PAGE_BYTES as u32,
+        };
+        let page = restored
+            .serve_sync_page(
+                agent,
+                PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
+                &request.encode().unwrap(),
+                authority_target(&fixture).0,
+                &TestTransport,
+            )
+            .unwrap();
+        assert!(!contains(&page, SENTINEL));
+        let page = PrivateSyncPage::decode(&page).unwrap();
+        let PrivateSyncItem::Control { evidence, .. } = &page.items[0] else {
+            unreachable!()
+        };
+        let decoded = PrivateControlAuthorityEvidence::decode(evidence).unwrap();
+        decoded
+            .verify_for(
+                &control,
+                1,
+                ManagedAgentTarget {
+                    space: fixture.space,
+                    agent,
+                    runtime_deployment: fixture.descriptor.identity.runtime_deployment,
+                },
+                authority_target(&fixture).0,
+            )
+            .unwrap();
     }
 
     #[test]
@@ -5025,6 +5575,7 @@ mod tests {
                     agent,
                     PrivatePeerIdentity::Node(&fixture.nodes[1].identity),
                     &request_bytes,
+                    authority_target(&fixture).0,
                     &TestTransport,
                 )
                 .unwrap();
@@ -5034,6 +5585,7 @@ mod tests {
                 agent,
                 PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
                 &page_bytes,
+                authority_target(&fixture).0,
                 &TestAuthority,
                 &TestTransport,
             )
@@ -5114,6 +5666,7 @@ mod tests {
                 agent,
                 PrivatePeerIdentity::Node(&fixture.nodes[1].identity),
                 malformed,
+                authority_target(&fixture).0,
                 &TestTransport,
             ),
             Err(PrivateAgentHostError::Unauthorized)
@@ -5124,6 +5677,7 @@ mod tests {
                 agent,
                 PrivatePeerIdentity::Node(&fixture.nodes[1].identity),
                 malformed,
+                authority_target(&fixture).0,
                 &TestAuthority,
                 &TestTransport,
             ),
@@ -5135,6 +5689,7 @@ mod tests {
                 agent,
                 PrivatePeerIdentity::Principal(fixture.owner),
                 malformed,
+                authority_target(&fixture).0,
                 &TestTransport,
             ),
             Err(PrivateAgentHostError::Unauthorized)
@@ -5144,6 +5699,7 @@ mod tests {
                 agent,
                 PrivatePeerIdentity::Credential(CredentialId([77; 32])),
                 malformed,
+                authority_target(&fixture).0,
                 &TestTransport,
             ),
             Err(PrivateAgentHostError::Unauthorized)
@@ -5157,6 +5713,7 @@ mod tests {
                 agent,
                 PrivatePeerIdentity::Node(&altered),
                 malformed,
+                authority_target(&fixture).0,
                 &TestTransport,
             ),
             Err(PrivateAgentHostError::Unauthorized)
@@ -5170,6 +5727,7 @@ mod tests {
                 agent,
                 PrivatePeerIdentity::Node(&wrong_principal),
                 malformed,
+                authority_target(&fixture).0,
                 &TestTransport,
             ),
             Err(PrivateAgentHostError::Unauthorized)
@@ -5197,6 +5755,7 @@ mod tests {
                 agent,
                 PrivatePeerIdentity::Node(&fixture.nodes[1].identity),
                 &request.encode().unwrap(),
+                authority_target(&fixture).0,
                 &TestTransport,
             ),
             Err(PrivateAgentHostError::Unauthorized)
@@ -5402,6 +5961,7 @@ mod tests {
                     agent,
                     PrivatePeerIdentity::Node(&invited.identity),
                     &request.encode().unwrap(),
+                    authority_target(&fixture).0,
                     &TestTransport,
                 )
                 .unwrap();
@@ -5411,6 +5971,7 @@ mod tests {
                     agent,
                     PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
                     &page_bytes,
+                    authority_target(&fixture).0,
                     &TestAuthority,
                     &TestTransport,
                 )
@@ -5476,8 +6037,12 @@ mod tests {
         let base_backup = source
             .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
             .unwrap();
-        source.rotate_keys(agent, &TestAuthority).unwrap();
-        source.rotate_keys(agent, &TestAuthority).unwrap();
+        let first =
+            signed_recovery_control(&source, agent, &identities(&fixture), &fixture.recovery);
+        apply_and_attach_test_authority_evidence(&mut source, &fixture, &first, 40, 41);
+        let second =
+            signed_recovery_control(&source, agent, &identities(&fixture), &fixture.recovery);
+        apply_and_attach_test_authority_evidence(&mut source, &fixture, &second, 42, 43);
 
         let request = PrivateSyncRequest {
             cursor: PrivateSyncCursor::start(fixture.space, agent, 0, None).unwrap(),
@@ -5489,6 +6054,7 @@ mod tests {
                 agent,
                 PrivatePeerIdentity::Node(&fixture.nodes[1].identity),
                 &request.encode().unwrap(),
+                authority_target(&fixture).0,
                 &TestTransport,
             )
             .unwrap();
@@ -5619,7 +6185,9 @@ mod tests {
         let base_backup = source
             .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
             .unwrap();
-        source.rotate_keys(agent, &TestAuthority).unwrap();
+        let recovery =
+            signed_recovery_control(&source, agent, &identities(&fixture), &fixture.recovery);
+        apply_and_attach_test_authority_evidence(&mut source, &fixture, &recovery, 40, 41);
 
         let request = PrivateSyncRequest {
             cursor: PrivateSyncCursor::start(fixture.space, agent, 0, None).unwrap(),
@@ -5631,6 +6199,7 @@ mod tests {
                 agent,
                 PrivatePeerIdentity::Node(&fixture.nodes[1].identity),
                 &request.encode().unwrap(),
+                authority_target(&fixture).0,
                 &TestTransport,
             )
             .unwrap();
@@ -5676,6 +6245,7 @@ mod tests {
                 agent,
                 PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
                 &page.encode().unwrap(),
+                authority_target(&fixture).0,
                 &TestAuthority,
                 &TestTransport,
             )

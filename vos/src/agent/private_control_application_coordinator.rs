@@ -8,7 +8,9 @@
 //! durable apply *and* durable reopen can supply the application fact pledged
 //! and signed by the issuer as PCA1. Finally, PCA1 is sent to the exact
 //! system-authority actor under its derived third Linear invocation and the
-//! exact acknowledgement is committed locally.
+//! exact acknowledgement is committed locally. Only then does the coordinator
+//! ask the runtime to attach the retained canonical AOI1+PCA1 envelope to the
+//! applied PCTL; a final local marker makes lost-result attachment retry exact.
 //!
 //! Records remain bounded and are never compacted. An affirmative actor reply
 //! is durable at the trusted dispatch boundary, but this slice has no separate
@@ -21,6 +23,7 @@ use super::authority_operation_issuer::{
     AuthorityOperationIssuerError, AuthorityOperationIssuerStore, DurableAuthorityOperationIssuer,
     PrivateControlApplicationEvidenceSigner, private_intent_matches_application,
 };
+use super::private_sync::PrivateControlAuthorityEvidence;
 use crate::agent::sdk::authority::{
     AgentAuthorityBinding, AuthorityActorTarget, AuthorityIssuer, AuthorityVerifier,
     ManagedAgentTarget,
@@ -40,7 +43,7 @@ pub(crate) const MAX_PRIVATE_CONTROL_APPLICATION_COORDINATOR_RECORDS: usize =
     super::authority_operation_issuer::MAX_AUTHORITY_OPERATION_ISSUER_RECORDS;
 pub(crate) const MAX_PRIVATE_CONTROL_APPLICATION_COORDINATOR_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const MAX_PRIVATE_CONTROL_APPLICATION_FACT_WIRE_BYTES: usize = 512;
-const PRIVATE_CONTROL_APPLICATION_COORDINATOR_MAGIC: [u8; 4] = *b"PAJ1";
+const PRIVATE_CONTROL_APPLICATION_COORDINATOR_MAGIC: [u8; 4] = *b"PAJ2";
 const PRIVATE_CONTROL_APPLICATION_FACT_MAGIC: [u8; 4] = *b"PCAF";
 
 /// Exact request to the trusted Private-runtime application boundary.
@@ -70,12 +73,42 @@ pub(crate) struct PrivateControlRuntimeApplicationResult {
     pub(crate) application_fact: Vec<u8>,
 }
 
+/// Exact post-completion evidence attachment request. This request is emitted
+/// only after the coordinator has durably recorded authority consumption of
+/// PCA1; it never asks the runtime to regenerate or re-sign either proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PrivateControlRuntimeEvidenceRequest {
+    pub(crate) route: ManagedAgentTarget,
+    pub(crate) authority: AuthorityActorTarget,
+    pub(crate) control: Vec<u8>,
+    pub(crate) issuance_ack: Vec<u8>,
+    pub(crate) application_ack: Vec<u8>,
+}
+
+/// Echoed proof that the exact evidence envelope was durably attached and
+/// physically reopened by the configured Private runtime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PrivateControlRuntimeEvidenceResult {
+    pub(crate) route: ManagedAgentTarget,
+    pub(crate) authority: AuthorityActorTarget,
+    pub(crate) control: Vec<u8>,
+    pub(crate) issuance_ack: Vec<u8>,
+    pub(crate) application_ack: Vec<u8>,
+    pub(crate) evidence_commitment: Hash,
+    pub(crate) authenticated: bool,
+    pub(crate) durably_persisted: bool,
+    pub(crate) durably_reopened: bool,
+}
+
 /// Trusted adapter to the exact installed Private runtime.
 ///
 /// Implementations may assert success only after authenticating `route`,
 /// applying the exact PCTL under the exact issued evidence, durably committing
 /// that transition, and reopening the resulting state. Echo fields are an
 /// integration guard; they do not turn a dishonest adapter into a capability.
+/// `persist_completed_evidence` is called only with coordinator-retained AOI1
+/// and PCA1 bytes after durable authority consumption and must atomically
+/// attach, reopen, and echo that exact envelope.
 pub(crate) trait PrivateControlRuntimeApplicationAdapter {
     type Error;
 
@@ -83,6 +116,11 @@ pub(crate) trait PrivateControlRuntimeApplicationAdapter {
         &mut self,
         request: &PrivateControlRuntimeApplicationRequest,
     ) -> Result<PrivateControlRuntimeApplicationResult, Self::Error>;
+
+    fn persist_completed_evidence(
+        &mut self,
+        request: &PrivateControlRuntimeEvidenceRequest,
+    ) -> Result<PrivateControlRuntimeEvidenceResult, Self::Error>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +194,7 @@ pub(crate) enum PrivateControlApplicationCoordinatorRejection {
     JournalFull,
     WrongSigner,
     InvalidRuntimeResult,
+    InvalidEvidenceResult,
     ApplicationRejected,
     InvalidAuthorityResult,
     AcknowledgementRejected,
@@ -230,6 +269,7 @@ struct ApplicationRecord {
     control: Vec<u8>,
     applied_at: u64,
     consumed_application_ack: Option<Hash>,
+    persisted_authority_evidence: Option<Hash>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -260,9 +300,15 @@ impl PrivateControlApplicationCoordinatorImage {
                     && record.application_invocation != InvocationId::ZERO
                     && record.authorization_invocation != record.application_invocation
                     && record.consumed_application_ack != Some(Hash::ZERO)
+                    && record.persisted_authority_evidence != Some(Hash::ZERO)
             })
             && self.records.iter().enumerate().all(|(index, record)| {
-                record.consumed_application_ack.is_some() || index + 1 == self.records.len()
+                let is_last = index + 1 == self.records.len();
+                (record.persisted_authority_evidence.is_none()
+                    || record.consumed_application_ack.is_some())
+                    && (is_last
+                        || (record.consumed_application_ack.is_some()
+                            && record.persisted_authority_evidence.is_some()))
             })
     }
 
@@ -308,6 +354,9 @@ impl PrivateControlApplicationCoordinatorImage {
                 &record.consumed_application_ack,
                 |encoder, acknowledgement| encoder.fixed(acknowledgement.as_bytes()),
             );
+            encoder.option(&record.persisted_authority_evidence, |encoder, evidence| {
+                encoder.fixed(evidence.as_bytes())
+            });
         });
         bytes
     }
@@ -342,6 +391,8 @@ impl PrivateControlApplicationCoordinatorImage {
                 control: decoder.bytes_bounded(MAX_PRIVATE_CONTROL_WIRE_BYTES)?,
                 applied_at: decoder.u64()?,
                 consumed_application_ack: decoder.option(|decoder| Ok(Hash(decoder.fixed()?)))?,
+                persisted_authority_evidence: decoder
+                    .option(|decoder| Ok(Hash(decoder.fixed()?)))?,
             });
         }
         let image = Self {
@@ -426,10 +477,10 @@ where
     }
 
     pub(crate) fn has_pending_application(&self) -> bool {
-        self.image
-            .records
-            .last()
-            .is_some_and(|record| record.consumed_application_ack.is_none())
+        self.image.records.iter().any(|record| {
+            record.consumed_application_ack.is_none()
+                || record.persisted_authority_evidence.is_none()
+        })
     }
 
     pub(crate) fn into_parts(self) -> (C, R, A, DurableAuthorityOperationIssuer<I>) {
@@ -571,6 +622,7 @@ where
                 control: control_wire.to_vec(),
                 applied_at,
                 consumed_application_ack: None,
+                persisted_authority_evidence: None,
             });
             self.commit_candidate::<S::Error>(pledged)?;
             self.image.records.len() - 1
@@ -627,6 +679,11 @@ where
             if consumed != acknowledgement.commitment() {
                 return Err(PrivateControlApplicationCoordinatorError::InvalidState);
             }
+            self.persist_runtime_evidence_exact::<S::Error>(
+                record_index,
+                &retained,
+                &acknowledgement,
+            )?;
             return Ok(acknowledgement);
         }
 
@@ -660,7 +717,89 @@ where
         completed.records[record_index].consumed_application_ack =
             Some(acknowledgement.commitment());
         self.commit_candidate::<S::Error>(completed)?;
+        self.persist_runtime_evidence_exact::<S::Error>(record_index, &retained, &acknowledgement)?;
         Ok(acknowledgement)
+    }
+
+    fn persist_runtime_evidence_exact<SignerError>(
+        &mut self,
+        record_index: usize,
+        retained: &super::authority_operation_issuer::RetainedAuthorityOperation,
+        acknowledgement: &PrivateControlApplicationAck,
+    ) -> Result<
+        (),
+        PrivateControlApplicationCoordinatorError<
+            C::Error,
+            I::Error,
+            R::Error,
+            A::Error,
+            SignerError,
+        >,
+    > {
+        let issuance = retained
+            .issuance_ack
+            .as_ref()
+            .ok_or(PrivateControlApplicationCoordinatorError::InvalidState)?;
+        let issuance_ack = issuance
+            .encode()
+            .map_err(|_| PrivateControlApplicationCoordinatorError::InvalidState)?;
+        let application_ack = acknowledgement
+            .encode()
+            .map_err(|_| PrivateControlApplicationCoordinatorError::InvalidState)?;
+        let request = PrivateControlRuntimeEvidenceRequest {
+            route: retained.call.intent.managed(),
+            authority: self.authority,
+            control: self
+                .image
+                .records
+                .get(record_index)
+                .ok_or(PrivateControlApplicationCoordinatorError::InvalidState)?
+                .control
+                .clone(),
+            issuance_ack,
+            application_ack,
+        };
+        let expected =
+            PrivateControlAuthorityEvidence::from_acknowledgements(issuance, acknowledgement)
+                .and_then(|evidence| evidence.commitment())
+                .map_err(|_| PrivateControlApplicationCoordinatorError::InvalidState)?;
+        if expected == Hash::ZERO {
+            return Err(PrivateControlApplicationCoordinatorError::InvalidState);
+        }
+        if let Some(commitment) = self.image.records[record_index].persisted_authority_evidence {
+            return if commitment == expected {
+                Ok(())
+            } else {
+                Err(PrivateControlApplicationCoordinatorError::InvalidState)
+            };
+        }
+        let result = self
+            .runtime
+            .persist_completed_evidence(&request)
+            .map_err(PrivateControlApplicationCoordinatorError::Runtime)?;
+        if result.route != request.route
+            || result.authority != request.authority
+            || result.control != request.control
+            || result.issuance_ack != request.issuance_ack
+            || result.application_ack != request.application_ack
+            || result.evidence_commitment != expected
+            || !result.authenticated
+            || !result.durably_persisted
+            || !result.durably_reopened
+        {
+            return Err(Self::rejected(
+                PrivateControlApplicationCoordinatorRejection::InvalidEvidenceResult,
+            ));
+        }
+        if self.image.records[record_index]
+            .persisted_authority_evidence
+            .is_none()
+        {
+            let mut completed = self.image.clone();
+            completed.records[record_index].persisted_authority_evidence = Some(expected);
+            self.commit_candidate::<SignerError>(completed)?;
+        }
+        Ok(())
     }
 
     fn apply_runtime_exact<SignerError>(
@@ -893,6 +1032,19 @@ fn coordinator_matches_issuer<I: AuthorityOperationIssuerStore>(
                 return false;
             }
         }
+        if let Some(persisted) = record.persisted_authority_evidence {
+            let Some(acknowledgement) = retained.application_ack.as_ref() else {
+                return false;
+            };
+            let Ok(evidence) =
+                PrivateControlAuthorityEvidence::from_acknowledgements(issuance, acknowledgement)
+            else {
+                return false;
+            };
+            if evidence.commitment().ok() != Some(persisted) {
+                return false;
+            }
+        }
     }
     issuer_applications == issuer.retained_private_applications()
 }
@@ -947,7 +1099,7 @@ pub(crate) fn encode_private_application_fact(
     bytes
 }
 
-fn decode_private_application_fact(
+pub(crate) fn decode_private_application_fact(
     bytes: &[u8],
 ) -> Result<PrivateControlApplicationFact, DecodeError> {
     if bytes.len() > MAX_PRIVATE_CONTROL_APPLICATION_FACT_WIRE_BYTES {
@@ -1303,6 +1455,19 @@ mod tests {
         FactSlot,
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum EvidenceMutation {
+        Route,
+        Authority,
+        Control,
+        Issuance,
+        Application,
+        Commitment,
+        Unauthenticated,
+        NotPersisted,
+        NotReopened,
+    }
+
     #[derive(Clone, Debug, Default)]
     struct FakeRuntime {
         inner: Arc<Mutex<FakeRuntimeState>>,
@@ -1312,9 +1477,13 @@ mod tests {
     struct FakeRuntimeState {
         calls: usize,
         transitions: usize,
+        evidence_calls: usize,
+        retained_evidence: Vec<(PrivateControlRuntimeEvidenceRequest, Hash)>,
         retained: Vec<(PrivateControlRuntimeApplicationRequest, Vec<u8>)>,
         mutation: Option<RuntimeMutation>,
+        evidence_mutation: Option<EvidenceMutation>,
         lose_result_after_apply: bool,
+        lose_result_after_evidence: bool,
     }
 
     impl FakeRuntime {
@@ -1332,6 +1501,18 @@ mod tests {
 
         fn lose_result_after_apply_once(&self) {
             self.inner.lock().unwrap().lose_result_after_apply = true;
+        }
+
+        fn evidence_calls(&self) -> usize {
+            self.inner.lock().unwrap().evidence_calls
+        }
+
+        fn lose_result_after_evidence_once(&self) {
+            self.inner.lock().unwrap().lose_result_after_evidence = true;
+        }
+
+        fn mutate_evidence_once(&self, mutation: EvidenceMutation) {
+            self.inner.lock().unwrap().evidence_mutation = Some(mutation);
         }
     }
 
@@ -1413,6 +1594,63 @@ mod tests {
                     fact.applied_at += 1;
                     result.application_fact = encode_private_application_fact(&fact);
                 }
+            }
+            Ok(result)
+        }
+
+        fn persist_completed_evidence(
+            &mut self,
+            request: &PrivateControlRuntimeEvidenceRequest,
+        ) -> Result<PrivateControlRuntimeEvidenceResult, Self::Error> {
+            let mut state = self.inner.lock().unwrap();
+            state.evidence_calls += 1;
+            let issuance = AuthorityOperationIssuanceAck::decode(&request.issuance_ack)
+                .map_err(|_| TestError)?;
+            let application = PrivateControlApplicationAck::decode(&request.application_ack)
+                .map_err(|_| TestError)?;
+            let commitment =
+                PrivateControlAuthorityEvidence::from_acknowledgements(&issuance, &application)
+                    .and_then(|evidence| evidence.commitment())
+                    .map_err(|_| TestError)?;
+            match state
+                .retained_evidence
+                .iter()
+                .find(|(retained, _)| retained == request)
+            {
+                Some((_, retained)) if *retained != commitment => return Err(TestError),
+                Some(_) => {}
+                None => state.retained_evidence.push((request.clone(), commitment)),
+            }
+            if state.lose_result_after_evidence {
+                state.lose_result_after_evidence = false;
+                return Err(TestError);
+            }
+            let mut result = PrivateControlRuntimeEvidenceResult {
+                route: request.route,
+                authority: request.authority,
+                control: request.control.clone(),
+                issuance_ack: request.issuance_ack.clone(),
+                application_ack: request.application_ack.clone(),
+                evidence_commitment: commitment,
+                authenticated: true,
+                durably_persisted: true,
+                durably_reopened: true,
+            };
+            match state.evidence_mutation.take() {
+                None => {}
+                Some(EvidenceMutation::Route) => result.route.agent = AgentId(id(0xd5, 1)),
+                Some(EvidenceMutation::Authority) => {
+                    result.authority.system_agent = AgentId(id(0xd6, 1))
+                }
+                Some(EvidenceMutation::Control) => result.control.push(0),
+                Some(EvidenceMutation::Issuance) => result.issuance_ack.push(0),
+                Some(EvidenceMutation::Application) => result.application_ack.push(0),
+                Some(EvidenceMutation::Commitment) => {
+                    result.evidence_commitment = Hash(id(0xd7, 1))
+                }
+                Some(EvidenceMutation::Unauthenticated) => result.authenticated = false,
+                Some(EvidenceMutation::NotPersisted) => result.durably_persisted = false,
+                Some(EvidenceMutation::NotReopened) => result.durably_reopened = false,
             }
             Ok(result)
         }
@@ -1816,9 +2054,16 @@ mod tests {
             .apply(prepared.call.invocation, &wire, 24, &mut prepared.signer)
             .unwrap();
         let acknowledgement_wire = acknowledgement.encode().unwrap();
-        assert_eq!(coordinator_store.commits(), 2);
+        assert_eq!(coordinator_store.commits(), 3);
         assert_eq!(prepared.issuer_store.commits(), 5);
-        assert_eq!((runtime.calls(), runtime.transitions()), (1, 1));
+        assert_eq!(
+            (
+                runtime.calls(),
+                runtime.transitions(),
+                runtime.evidence_calls()
+            ),
+            (1, 1, 1)
+        );
         assert_eq!(
             (actor.calls(), actor.pending(), actor.tombstones()),
             (1, 0, 1)
@@ -1836,7 +2081,10 @@ mod tests {
             acknowledgement_wire
         );
         assert_eq!(unusable.application_calls, 0);
-        assert_eq!((runtime.calls(), actor.calls()), (1, 1));
+        assert_eq!(
+            (runtime.calls(), runtime.evidence_calls(), actor.calls()),
+            (1, 1, 1)
+        );
 
         let mut coordinator = restart(coordinator, authority);
         assert_eq!(
@@ -1848,7 +2096,10 @@ mod tests {
             acknowledgement_wire
         );
         assert_eq!(unusable.application_calls, 0);
-        assert_eq!((runtime.calls(), actor.calls()), (1, 1));
+        assert_eq!(
+            (runtime.calls(), runtime.evidence_calls(), actor.calls()),
+            (1, 1, 1)
+        );
         assert_eq!(coordinator.retained_applications(), 1);
         assert!(!coordinator.has_pending_application());
     }
@@ -1930,6 +2181,124 @@ mod tests {
     }
 
     #[test]
+    fn lost_evidence_attachment_result_is_exactly_redispatched_after_restart() {
+        let mut prepared = prepare(1);
+        let store = MemoryImageStore::default();
+        let runtime = FakeRuntime::default();
+        runtime.lose_result_after_evidence_once();
+        let actor = prepared.actor.clone();
+        let authority = prepared.fixture.authority;
+        let wire = control_wire(&prepared);
+        let mut coordinator = open_coordinator(
+            store,
+            runtime.clone(),
+            actor.clone(),
+            prepared.issuer,
+            authority,
+        );
+        assert!(matches!(
+            coordinator.apply(prepared.call.invocation, &wire, 24, &mut prepared.signer),
+            Err(PrivateControlApplicationCoordinatorError::Runtime(
+                TestError
+            ))
+        ));
+        assert!(!coordinator.is_poisoned());
+        assert!(coordinator.has_pending_application());
+        assert_eq!(
+            (
+                runtime.calls(),
+                runtime.transitions(),
+                runtime.evidence_calls(),
+                actor.calls(),
+                actor.tombstones(),
+                prepared.signer.application_calls,
+            ),
+            (1, 1, 1, 1, 1, 1)
+        );
+
+        let mut coordinator = restart(coordinator, authority);
+        let acknowledgement = coordinator
+            .apply(prepared.call.invocation, &wire, 24, &mut prepared.signer)
+            .unwrap();
+        assert!(
+            acknowledgement
+                .verify_with(authority.binding, &RawEd25519Verifier)
+                .is_ok()
+        );
+        assert_eq!(
+            (
+                runtime.calls(),
+                runtime.transitions(),
+                runtime.evidence_calls(),
+                actor.calls(),
+                prepared.signer.application_calls,
+            ),
+            (1, 1, 2, 1, 1)
+        );
+        assert!(!coordinator.has_pending_application());
+
+        // A fully committed retry returns the exact retained PCA1 without
+        // touching the runtime, actor, or signer again.
+        coordinator
+            .apply(prepared.call.invocation, &wire, 24, &mut prepared.signer)
+            .unwrap();
+        assert_eq!((runtime.evidence_calls(), actor.calls()), (2, 1));
+        assert_eq!(prepared.signer.application_calls, 1);
+    }
+
+    #[test]
+    fn hostile_evidence_attachment_echoes_and_durability_flags_are_rejected() {
+        for (index, mutation) in [
+            EvidenceMutation::Route,
+            EvidenceMutation::Authority,
+            EvidenceMutation::Control,
+            EvidenceMutation::Issuance,
+            EvidenceMutation::Application,
+            EvidenceMutation::Commitment,
+            EvidenceMutation::Unauthenticated,
+            EvidenceMutation::NotPersisted,
+            EvidenceMutation::NotReopened,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut prepared = prepare(index as u64 + 1);
+            let store = MemoryImageStore::default();
+            let runtime = FakeRuntime::default();
+            runtime.mutate_evidence_once(mutation);
+            let actor = prepared.actor.clone();
+            let authority = prepared.fixture.authority;
+            let wire = control_wire(&prepared);
+            let mut coordinator = open_coordinator(
+                store,
+                runtime.clone(),
+                actor.clone(),
+                prepared.issuer,
+                authority,
+            );
+            assert!(matches!(
+                coordinator.apply(prepared.call.invocation, &wire, 24, &mut prepared.signer),
+                Err(PrivateControlApplicationCoordinatorError::Rejected(
+                    PrivateControlApplicationCoordinatorRejection::InvalidEvidenceResult
+                ))
+            ));
+            assert!(coordinator.has_pending_application());
+            assert_eq!(
+                (
+                    runtime.calls(),
+                    runtime.transitions(),
+                    runtime.evidence_calls(),
+                    actor.calls(),
+                    actor.tombstones(),
+                    prepared.signer.application_calls,
+                ),
+                (1, 1, 1, 1, 1, 1),
+                "mutation {mutation:?}"
+            );
+        }
+    }
+
+    #[test]
     fn coordinator_commit_failpoints_poison_and_reconcile_before_or_after() {
         for fail_after in [false, true] {
             let mut prepared = prepare(1);
@@ -1994,6 +2363,55 @@ mod tests {
                 .unwrap();
             assert_eq!((runtime.calls(), prepared.signer.application_calls), (1, 1));
             assert_eq!(actor.calls(), if fail_after { 1 } else { 2 });
+        }
+
+        // The third coordinator commit records that the exact PSE1 was
+        // durably attached and reopened. Before/after ambiguity must poison
+        // the current handle; restart either re-drives the exact callback or
+        // trusts the already committed marker without re-signing.
+        for fail_after in [false, true] {
+            let mut prepared = prepare(1);
+            let store = MemoryImageStore::default();
+            if fail_after {
+                store.fail_after_commit(3);
+            } else {
+                store.fail_before_commit(3);
+            }
+            let runtime = FakeRuntime::default();
+            let actor = prepared.actor.clone();
+            let authority = prepared.fixture.authority;
+            let wire = control_wire(&prepared);
+            let mut coordinator = open_coordinator(
+                store,
+                runtime.clone(),
+                actor.clone(),
+                prepared.issuer,
+                authority,
+            );
+            assert!(matches!(
+                coordinator.apply(prepared.call.invocation, &wire, 24, &mut prepared.signer),
+                Err(PrivateControlApplicationCoordinatorError::Storage(
+                    TestError
+                ))
+            ));
+            assert!(coordinator.is_poisoned());
+            assert_eq!(
+                (
+                    runtime.calls(),
+                    runtime.transitions(),
+                    runtime.evidence_calls(),
+                    actor.calls(),
+                    prepared.signer.application_calls,
+                ),
+                (1, 1, 1, 1, 1)
+            );
+            let mut coordinator = restart(coordinator, authority);
+            coordinator
+                .apply(prepared.call.invocation, &wire, 24, &mut prepared.signer)
+                .unwrap();
+            assert_eq!(runtime.evidence_calls(), if fail_after { 1 } else { 2 });
+            assert_eq!((runtime.calls(), actor.calls()), (1, 1));
+            assert_eq!(prepared.signer.application_calls, 1);
         }
     }
 
@@ -2535,6 +2953,7 @@ mod tests {
                 control: control.clone(),
                 applied_at: 24,
                 consumed_application_ack: Some(Hash(id(0xc3, index + 1))),
+                persisted_authority_evidence: Some(Hash(id(0xc4, index + 1))),
             });
         }
         image.application_slot_high_water = Some(24);
@@ -2545,6 +2964,7 @@ mod tests {
             control: control.clone(),
             applied_at: 24,
             consumed_application_ack: Some(Hash(id(0xc3, 10_000))),
+            persisted_authority_evidence: Some(Hash(id(0xc4, 10_000))),
         });
         assert!(!image.has_valid_envelope());
         image.records.pop();

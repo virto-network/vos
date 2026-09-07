@@ -5,10 +5,20 @@
 //! must also match the current verified membership before any artifact read or
 //! response allocation occurs. There is no NodeId-, Principal-, SSH-, or
 //! credential-only entry point.
+//!
+//! Genesis is the absence of a PCTL and therefore has no fabricated authority
+//! evidence. Every post-genesis control item must instead carry its exact
+//! canonical AOI1+PCA1 envelope; a locally applied control whose attachment is
+//! still crash-pending may reopen, but it cannot be served to another node.
 
 use alloc::vec::Vec;
 use core::fmt;
 
+use vos_agent_sdk::authority::{AuthorityActorTarget, AuthorityVerifier, ManagedAgentTarget};
+use vos_agent_sdk::authority_operation::{
+    AuthorityOperationIntent, AuthorityOperationIssuanceAck,
+    MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES, PrivateControlApplicationAck,
+};
 use vos_agent_sdk::private::{
     EncryptedPrivateObject, PrivateControlOperation, PrivateControlRecord, PrivateNodeIdentity,
 };
@@ -20,19 +30,24 @@ use vos_agent_sdk::{
     RuntimeWork, SpaceId, StateLane, StorageFieldDescriptor,
 };
 
+use super::authority_operation_issuer::private_intent_matches_application;
 use super::private_crypto::{PrivateCryptoError, PrivateNodeAuthorityVerifier};
 use super::private_store::{
-    PrivateObjectKey, PrivateStore, PrivateStoreError, PutDisposition, StoredControlIndex,
+    MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES, PrivateObjectKey, PrivateStore,
+    PrivateStoreError, PutDisposition, StoredControlIndex,
 };
 
 pub const MAX_PRIVATE_SYNC_ITEMS: usize = 64;
 pub const MAX_PRIVATE_SYNC_PAGE_BYTES: usize = MAX_PRIVATE_OBJECT_WIRE_BYTES + 16 * 1024;
 pub const MAX_PRIVATE_SYNC_FRAME_BYTES: usize = MAX_PRIVATE_SYNC_PAGE_BYTES + 32 * 1024;
-
-const FORMAT_VERSION: u16 = 1;
+// v2 makes authority evidence mandatory on every control item. A clean break
+// prevents a v1 raw-control frame from being interpreted under the new layout.
+const FORMAT_VERSION: u16 = 2;
 const REQUEST_MAGIC: &[u8; 4] = b"PSRQ";
 const PAGE_MAGIC: &[u8; 4] = b"PSPG";
+const EVIDENCE_MAGIC: &[u8; 4] = b"PSE1";
 const SYNC_WIRE_DOMAIN: &[u8] = b"vos/private/stored-wire/v1";
+const EVIDENCE_WIRE_DOMAIN: &[u8] = b"vos/private/control-authority-evidence/v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrivateSyncError {
@@ -48,6 +63,7 @@ pub enum PrivateSyncError {
     OutOfOrder,
     Alias,
     Tampered,
+    MissingEvidence,
     LinearUnsupported,
     Store(PrivateStoreError),
     Crypto(PrivateCryptoError),
@@ -73,6 +89,141 @@ impl From<PrivateStoreError> for PrivateSyncError {
 impl From<PrivateCryptoError> for PrivateSyncError {
     fn from(error: PrivateCryptoError) -> Self {
         Self::Crypto(error)
+    }
+}
+
+/// Canonical authority evidence for one exact signed Private control.
+///
+/// The envelope adds no ambient authority of its own. Verification always
+/// uses the independently configured descriptor authority and runtime route;
+/// neither acknowledgement may select its own trust anchor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PrivateControlAuthorityEvidence {
+    pub(crate) issuance_ack: Vec<u8>,
+    pub(crate) application_ack: Vec<u8>,
+}
+
+impl PrivateControlAuthorityEvidence {
+    pub(crate) fn from_acknowledgements(
+        issuance: &AuthorityOperationIssuanceAck,
+        application: &PrivateControlApplicationAck,
+    ) -> Result<Self, PrivateSyncError> {
+        let evidence = Self {
+            issuance_ack: issuance
+                .encode()
+                .map_err(|_| PrivateSyncError::InvalidFrame)?,
+            application_ack: application
+                .encode()
+                .map_err(|_| PrivateSyncError::InvalidFrame)?,
+        };
+        // Encoding supplies the common bound and catches an unexpectedly
+        // enlarged SDK acknowledgement before it reaches persistent storage.
+        evidence.encode()?;
+        Ok(evidence)
+    }
+
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, PrivateSyncError> {
+        let issuance = AuthorityOperationIssuanceAck::decode(&self.issuance_ack)
+            .map_err(|_| PrivateSyncError::InvalidFrame)?;
+        let application = PrivateControlApplicationAck::decode(&self.application_ack)
+            .map_err(|_| PrivateSyncError::InvalidFrame)?;
+        if issuance.encode().ok().as_deref() != Some(self.issuance_ack.as_slice())
+            || application.encode().ok().as_deref() != Some(self.application_ack.as_slice())
+        {
+            return Err(PrivateSyncError::InvalidFrame);
+        }
+        let mut encoder = Encoder::new(EVIDENCE_MAGIC);
+        encoder.bytes(&self.issuance_ack)?;
+        encoder.bytes(&self.application_ack)?;
+        encoder.finish(MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES)
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, PrivateSyncError> {
+        let mut decoder = Decoder::new(
+            bytes,
+            EVIDENCE_MAGIC,
+            MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES,
+        )?;
+        let evidence = Self {
+            issuance_ack: decoder.bytes(
+                vos_agent_sdk::authority_operation::MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES,
+            )?,
+            application_ack: decoder.bytes(MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES)?,
+        };
+        decoder.finish()?;
+        if evidence.encode()?.as_slice() != bytes {
+            return Err(PrivateSyncError::InvalidFrame);
+        }
+        Ok(evidence)
+    }
+
+    pub(crate) fn commitment(&self) -> Result<Hash, PrivateSyncError> {
+        Ok(Hash::digest(EVIDENCE_WIRE_DOMAIN, &[&self.encode()?]))
+    }
+
+    pub(crate) fn verify_for(
+        &self,
+        control: &PrivateControlRecord,
+        resulting_epoch: u64,
+        route: ManagedAgentTarget,
+        authority: AuthorityActorTarget,
+    ) -> Result<(), PrivateSyncError> {
+        if !route.is_valid()
+            || !authority.is_valid()
+            || route.space != authority.space
+            || control.space != route.space
+            || control.agent != route.agent
+        {
+            return Err(PrivateSyncError::InvalidScope);
+        }
+        let issuance = AuthorityOperationIssuanceAck::decode(&self.issuance_ack)
+            .map_err(|_| PrivateSyncError::Tampered)?;
+        let application = PrivateControlApplicationAck::decode(&self.application_ack)
+            .map_err(|_| PrivateSyncError::Tampered)?;
+        if issuance.encode().ok().as_deref() != Some(self.issuance_ack.as_slice())
+            || application.encode().ok().as_deref() != Some(self.application_ack.as_slice())
+        {
+            return Err(PrivateSyncError::Tampered);
+        }
+        let intent = AuthorityOperationIntent::private_control(route.runtime_deployment, control)
+            .map_err(|_| PrivateSyncError::Tampered)?;
+        let verifier = RawAuthorityVerifier;
+        if issuance.authority != authority
+            || application.authority != authority
+            || issuance.verify_with(authority.binding, &verifier).is_err()
+            || application
+                .verify_issuance_tombstone_with(
+                    authority,
+                    issuance.authorization_invocation,
+                    issuance.acknowledgement_invocation,
+                    issuance.authorization_sequence,
+                    issuance.commitment(),
+                    &verifier,
+                )
+                .is_err()
+            || application.operation_call != issuance.operation_call
+            || application.approval != issuance.approval
+            || application.receipt != issuance.receipt
+            || application.issued_at != issuance.issued_at
+            || !private_intent_matches_application(&intent, &application.application)
+            || application.application.epoch != resulting_epoch
+            || issuance.receipt.selector.request != control.commitment()
+            || issuance.receipt.selector.operation != intent.operation()
+            || issuance.receipt.selector.space != route.space
+            || issuance.receipt.selector.agent != route.agent
+            || issuance.receipt.selector.runtime_deployment != route.runtime_deployment
+        {
+            return Err(PrivateSyncError::Tampered);
+        }
+        Ok(())
+    }
+}
+
+struct RawAuthorityVerifier;
+
+impl AuthorityVerifier for RawAuthorityVerifier {
+    fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+        crate::agent::authority::verify_raw_ed25519(public_key, message, signature)
     }
 }
 
@@ -194,6 +345,9 @@ pub enum PrivateSyncItem {
         commitment: Hash,
         resulting_epoch: u64,
         wire: Vec<u8>,
+        /// Exact canonical PSE1 envelope for this PCTL. A control item without
+        /// AOI1+PCA1 evidence is never a valid synchronization item.
+        evidence: Vec<u8>,
     },
     Object {
         key: PrivateObjectKey,
@@ -205,7 +359,22 @@ pub enum PrivateSyncItem {
 impl PrivateSyncItem {
     fn encoded_payload_len(&self) -> Result<usize, PrivateSyncError> {
         let wire_len = match self {
-            Self::Control { wire, .. } | Self::Object { wire, .. } => wire.len(),
+            Self::Control { wire, evidence, .. } => {
+                if wire.len() > MAX_PRIVATE_CONTROL_WIRE_BYTES
+                    || evidence.len() > MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES
+                {
+                    return Err(PrivateSyncError::LimitExceeded);
+                }
+                wire.len()
+                    .checked_add(evidence.len())
+                    .ok_or(PrivateSyncError::LimitExceeded)?
+            }
+            Self::Object { wire, .. } => {
+                if wire.len() > MAX_PRIVATE_OBJECT_WIRE_BYTES {
+                    return Err(PrivateSyncError::LimitExceeded);
+                }
+                wire.len()
+            }
         };
         wire_len
             .checked_add(96)
@@ -322,12 +491,14 @@ impl PrivateSyncPage {
                     commitment,
                     resulting_epoch,
                     wire,
+                    evidence,
                 } => {
                     encoder.u8(0);
                     encoder.u64(*sequence);
                     encoder.fixed(commitment.as_bytes());
                     encoder.u64(*resulting_epoch);
                     encoder.bytes(wire)?;
+                    encoder.bytes(evidence)?;
                 }
                 PrivateSyncItem::Object {
                     key,
@@ -369,6 +540,7 @@ impl PrivateSyncPage {
                     commitment: Hash(decoder.fixed()?),
                     resulting_epoch: decoder.u64()?,
                     wire: decoder.bytes(MAX_PRIVATE_CONTROL_WIRE_BYTES)?,
+                    evidence: decoder.bytes(MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES)?,
                 },
                 1 => PrivateSyncItem::Object {
                     key: decode_key(&mut decoder)?,
@@ -702,6 +874,7 @@ fn validate_control_item_order(items: &[PrivateSyncItem]) -> Result<(), PrivateS
             commitment,
             resulting_epoch,
             wire,
+            ..
         } = item
         else {
             return Err(PrivateSyncError::InvalidFrame);
@@ -794,16 +967,25 @@ fn authenticate_peer<V: PrivateTransportAuthVerifier>(
 /// Serve one authenticated page. Membership and live transport identity are
 /// checked entirely from the in-memory verified control view before any
 /// ciphertext/control file is opened.
-pub fn serve_private_sync_page<V: PrivateTransportAuthVerifier>(
+pub(crate) fn serve_private_sync_page<V: PrivateTransportAuthVerifier>(
     store: &PrivateStore,
     peer: &PrivateNodeIdentity,
     request: &PrivateSyncRequest,
     transport: &V,
+    route: ManagedAgentTarget,
+    authority: AuthorityActorTarget,
 ) -> Result<PrivateSyncPage, PrivateSyncError> {
     authenticate_peer(store, peer, transport)?;
     request.validate()?;
     let binding = store.binding();
-    if request.cursor.space != binding.space || request.cursor.agent != binding.agent {
+    if request.cursor.space != binding.space
+        || request.cursor.agent != binding.agent
+        || route.space != binding.space
+        || route.agent != binding.agent
+        || authority.space != binding.space
+        || !route.is_valid()
+        || !authority.is_valid()
+    {
         return Err(PrivateSyncError::InvalidScope);
     }
     let target = PrivateSyncHead {
@@ -823,7 +1005,7 @@ pub fn serve_private_sync_page<V: PrivateTransportAuthVerifier>(
     if request.cursor.after_object.is_some() {
         return Err(PrivateSyncError::InvalidRequest);
     }
-    serve_control_page(store, request, target)
+    serve_control_page(store, request, target, route, authority)
 }
 
 fn control_base_position(
@@ -879,6 +1061,8 @@ fn serve_control_page(
     store: &PrivateStore,
     request: &PrivateSyncRequest,
     target: PrivateSyncHead,
+    route: ManagedAgentTarget,
+    authority: AuthorityActorTarget,
 ) -> Result<PrivateSyncPage, PrivateSyncError> {
     let controls = store.indexed_controls();
     let mut position = control_base_position(controls, request.cursor.local)?;
@@ -894,8 +1078,17 @@ fn serve_control_page(
         if entry.resulting_epoch < current.epoch || entry.resulting_epoch > target.epoch {
             return Err(PrivateSyncError::Diverged);
         }
-        let item_len = (entry.wire_len as usize)
-            .checked_add(96)
+        let wire = store.read_control_wire(entry)?;
+        let evidence = store
+            .read_control_authority_evidence(entry)?
+            .ok_or(PrivateSyncError::MissingEvidence)?;
+        let record = PrivateControlRecord::decode(&wire).map_err(|_| PrivateSyncError::Tampered)?;
+        let envelope = PrivateControlAuthorityEvidence::decode(&evidence)?;
+        envelope.verify_for(&record, entry.resulting_epoch, route, authority)?;
+        let item_len = wire
+            .len()
+            .checked_add(evidence.len())
+            .and_then(|length| length.checked_add(96))
             .ok_or(PrivateSyncError::LimitExceeded)?;
         if items.len() >= usize::from(request.max_items)
             || bytes
@@ -908,12 +1101,12 @@ fn serve_control_page(
             }
             break;
         }
-        let wire = store.read_control_wire(entry)?;
         items.push(PrivateSyncItem::Control {
             sequence: entry.sequence,
             commitment: entry.commitment,
             resulting_epoch: entry.resulting_epoch,
             wire,
+            evidence,
         });
         bytes += item_len;
         current = PrivateSyncHead {
@@ -1036,17 +1229,28 @@ pub(crate) fn apply_private_sync_page<
     store: &mut PrivateStore,
     peer: &PrivateNodeIdentity,
     page: &PrivateSyncPage,
-    authority: &A,
+    node_authority: &A,
     transport: &T,
+    route: ManagedAgentTarget,
+    authority: AuthorityActorTarget,
 ) -> Result<PrivateSyncApplyDisposition, PrivateSyncError> {
     authenticate_peer(store, peer, transport)?;
     page.validate_shape()?;
     let binding = store.binding();
-    if page.request.cursor.space != binding.space || page.request.cursor.agent != binding.agent {
+    if page.request.cursor.space != binding.space
+        || page.request.cursor.agent != binding.agent
+        || route.space != binding.space
+        || route.agent != binding.agent
+        || authority.space != binding.space
+        || !route.is_valid()
+        || !authority.is_valid()
+    {
         return Err(PrivateSyncError::InvalidScope);
     }
     match page.phase {
-        PrivateSyncPhase::Controls => apply_control_page(store, page, authority),
+        PrivateSyncPhase::Controls => {
+            apply_control_page(store, page, node_authority, route, authority)
+        }
         PrivateSyncPhase::Objects => apply_object_page(store, page),
     }
 }
@@ -1054,39 +1258,11 @@ pub(crate) fn apply_private_sync_page<
 fn apply_control_page<V: PrivateNodeAuthorityVerifier>(
     store: &mut PrivateStore,
     page: &PrivateSyncPage,
-    authority: &V,
+    node_authority: &V,
+    route: ManagedAgentTarget,
+    authority: AuthorityActorTarget,
 ) -> Result<PrivateSyncApplyDisposition, PrivateSyncError> {
-    let mut records = Vec::new();
-    records
-        .try_reserve(page.items.len())
-        .map_err(|_| PrivateSyncError::LimitExceeded)?;
-    for item in &page.items {
-        let PrivateSyncItem::Control {
-            sequence,
-            commitment,
-            resulting_epoch,
-            wire,
-        } = item
-        else {
-            return Err(PrivateSyncError::InvalidFrame);
-        };
-        let record = PrivateControlRecord::decode(wire).map_err(|_| PrivateSyncError::Tampered)?;
-        let actual_epoch = match &record.operation {
-            PrivateControlOperation::Revoke { next_epoch, .. }
-            | PrivateControlOperation::RotateKeys { next_epoch }
-            | PrivateControlOperation::Recover { next_epoch, .. } => Some(next_epoch.epoch),
-            _ => None,
-        };
-        if record.space != page.request.cursor.space
-            || record.agent != page.request.cursor.agent
-            || record.sequence != *sequence
-            || record.commitment() != *commitment
-            || actual_epoch.is_some_and(|epoch| epoch != *resulting_epoch)
-        {
-            return Err(PrivateSyncError::Tampered);
-        }
-        records.push(record);
-    }
+    let records = verify_private_control_page_authority_evidence(page, route, authority)?;
     let start = store.binding();
     let expected_start = page.request.cursor.local;
     let mut skip = 0usize;
@@ -1117,11 +1293,8 @@ fn apply_control_page<V: PrivateNodeAuthorityVerifier>(
                 return Err(PrivateSyncError::Diverged);
             }
         }
-        if skip == records.len() {
-            return Ok(PrivateSyncApplyDisposition::AlreadyApplied);
-        }
     }
-    let expected_epochs = store.prevalidate_controls(&records[skip..], authority)?;
+    let expected_epochs = store.prevalidate_controls(&records[skip..], node_authority)?;
     for (expected, item) in expected_epochs.iter().zip(&page.items[skip..]) {
         let PrivateSyncItem::Control {
             resulting_epoch, ..
@@ -1134,8 +1307,20 @@ fn apply_control_page<V: PrivateNodeAuthorityVerifier>(
         }
     }
     let mut inserted = false;
-    for record in &records[skip..] {
-        inserted |= store.append_control(record, authority)? == PutDisposition::Inserted;
+    for (record, item) in records[..skip].iter().zip(&page.items[..skip]) {
+        let PrivateSyncItem::Control { evidence, .. } = item else {
+            return Err(PrivateSyncError::InvalidFrame);
+        };
+        inserted |= store.persist_control_authority_evidence(record.commitment(), evidence)?
+            == PutDisposition::Inserted;
+    }
+    for (record, item) in records[skip..].iter().zip(&page.items[skip..]) {
+        let PrivateSyncItem::Control { evidence, .. } = item else {
+            return Err(PrivateSyncError::InvalidFrame);
+        };
+        inserted |= store.append_control(record, node_authority)? == PutDisposition::Inserted;
+        inserted |= store.persist_control_authority_evidence(record.commitment(), evidence)?
+            == PutDisposition::Inserted;
     }
     let result = store.binding();
     let expected_result = match page.items.last() {
@@ -1158,6 +1343,60 @@ fn apply_control_page<V: PrivateNodeAuthorityVerifier>(
     } else {
         PrivateSyncApplyDisposition::AlreadyApplied
     })
+}
+
+/// Verify the complete authority-evidence correspondence for a controls page
+/// without reading or mutating local artifacts. The host calls this before it
+/// stages any decrypted epoch sidecar; `apply_control_page` calls it again
+/// immediately before cumulative chain prevalidation and persistence.
+pub(crate) fn verify_private_control_page_authority_evidence(
+    page: &PrivateSyncPage,
+    route: ManagedAgentTarget,
+    authority: AuthorityActorTarget,
+) -> Result<Vec<PrivateControlRecord>, PrivateSyncError> {
+    if page.phase != PrivateSyncPhase::Controls {
+        return Ok(Vec::new());
+    }
+    let mut records = Vec::new();
+    records
+        .try_reserve(page.items.len())
+        .map_err(|_| PrivateSyncError::LimitExceeded)?;
+    for item in &page.items {
+        let PrivateSyncItem::Control {
+            sequence,
+            commitment,
+            resulting_epoch,
+            wire,
+            evidence,
+        } = item
+        else {
+            return Err(PrivateSyncError::InvalidFrame);
+        };
+        let record = PrivateControlRecord::decode(wire).map_err(|_| PrivateSyncError::Tampered)?;
+        let actual_epoch = match &record.operation {
+            PrivateControlOperation::Revoke { next_epoch, .. }
+            | PrivateControlOperation::RotateKeys { next_epoch }
+            | PrivateControlOperation::Recover { next_epoch, .. } => Some(next_epoch.epoch),
+            PrivateControlOperation::Invite { epoch, .. } => Some(*epoch),
+            PrivateControlOperation::SetResourcePolicy { .. }
+            | PrivateControlOperation::ActorLifecycle { .. } => None,
+        };
+        if record.space != page.request.cursor.space
+            || record.agent != page.request.cursor.agent
+            || record.sequence != *sequence
+            || record.commitment() != *commitment
+            || actual_epoch.is_some_and(|epoch| epoch != *resulting_epoch)
+        {
+            return Err(PrivateSyncError::Tampered);
+        }
+        if evidence.is_empty() {
+            return Err(PrivateSyncError::MissingEvidence);
+        }
+        let envelope = PrivateControlAuthorityEvidence::decode(evidence)?;
+        envelope.verify_for(&record, *resulting_epoch, route, authority)?;
+        records.push(record);
+    }
+    Ok(records)
 }
 
 fn apply_object_page(
@@ -1304,6 +1543,7 @@ mod tests {
     use alloc::boxed::Box;
     use alloc::collections::BTreeMap;
     use alloc::vec;
+    use core::num::NonZeroU64;
     use core::sync::atomic::{AtomicU64, Ordering};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1311,13 +1551,22 @@ mod tests {
     use crate::agent::private_crypto::{
         GeneratedPrivateEpoch, OfflineRecoveryDecryptionKey, OwnerSigningKey,
         PrivateNodeDecryptionKey, RecoverySigningKey, build_recovery_keyring_grant,
-        encrypt_private_object, generate_fresh_private_epoch, sign_owner_control_record,
-        sign_recovery_control_record, unwrap_data_key, unwrap_owner_key,
+        encrypt_private_object, generate_fresh_private_epoch, seal_data_key_for_node,
+        seal_owner_key_for_node, sign_owner_control_record, sign_recovery_control_record,
+        unwrap_data_key, unwrap_owner_key,
+    };
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use vos_agent_sdk::authority::{
+        AgentAuthorityBinding, AuthorityEvidence, AuthorityIssuer, AuthorityLaneRoots,
+        AuthorityReceipt, AuthorityReceiptSelector,
+    };
+    use vos_agent_sdk::authority_operation::{
+        PrivateControlApplicationFact, private_member_set_commitment,
     };
     use vos_agent_sdk::private::{EncryptedObjectKind, PrivateControlSigner};
     use vos_agent_sdk::{
-        ActorId, BlobRef, DeploymentId, InvocationId, LaneSet, PrincipalId, ProgramId, ResumeWork,
-        RuntimeState,
+        ActorId, BlobRef, DeploymentId, InvocationId, LaneSet, PrincipalId, ProducerId, ProgramId,
+        ResumeWork, RuntimeState,
     };
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -1500,6 +1749,244 @@ mod tests {
         .unwrap()
     }
 
+    fn test_authority_target(store: &PrivateStore) -> AuthorityActorTarget {
+        let key = SigningKey::from_bytes(&[0x71; 32]);
+        let binding = store.binding();
+        AuthorityActorTarget {
+            space: binding.space,
+            system_agent: AgentId([0x72; 32]),
+            system_runtime_deployment: DeploymentId([0x73; 32]),
+            binding: AgentAuthorityBinding {
+                policy: Hash([0x74; 32]),
+                issuer: AuthorityIssuer {
+                    principal: PrincipalId([0x75; 32]),
+                    actor: ActorId([0x76; 32]),
+                    deployment: DeploymentId([0x77; 32]),
+                    program: ProgramId([0x78; 32]),
+                    producer: ProducerId::of_public_key(&key.verifying_key().to_bytes()),
+                },
+                public_key: key.verifying_key().to_bytes(),
+                initial_epoch: 1,
+            },
+        }
+    }
+
+    fn test_route(store: &PrivateStore) -> ManagedAgentTarget {
+        let binding = store.binding();
+        ManagedAgentTarget {
+            space: binding.space,
+            agent: binding.agent,
+            runtime_deployment: DeploymentId([0x79; 32]),
+        }
+    }
+
+    fn signed_evidence(
+        store: &PrivateStore,
+        control: &PrivateControlRecord,
+    ) -> PrivateControlAuthorityEvidence {
+        let authority = test_authority_target(store);
+        let route = test_route(store);
+        let key = SigningKey::from_bytes(&[0x71; 32]);
+        let intent =
+            AuthorityOperationIntent::private_control(route.runtime_deployment, control).unwrap();
+        let issued_at = control.sequence.saturating_add(20);
+        let applied_at = issued_at.saturating_add(1);
+        let mut receipt = AuthorityReceipt {
+            selector: AuthorityReceiptSelector {
+                policy: authority.binding.policy,
+                issuer: authority.binding.issuer,
+                space: route.space,
+                agent: route.agent,
+                operation: intent.operation(),
+                runtime_deployment: route.runtime_deployment,
+                actor: None,
+                actor_deployment: None,
+                evidence: AuthorityEvidence {
+                    package: None,
+                    proof: None,
+                    commitment: Hash([0x7a; 32]),
+                },
+                lane_roots: AuthorityLaneRoots {
+                    control: None,
+                    linear: Some(Hash([0x7b; 32])),
+                    merge: None,
+                    local: None,
+                },
+                epoch: authority.binding.initial_epoch,
+                decision_sequence: 0,
+                acknowledged_through: 0,
+                valid_from: issued_at,
+                expires_at: applied_at + 100,
+                request: control.commitment(),
+            },
+            public_key: authority.binding.public_key,
+            signature: [0; 64],
+        };
+        receipt.signature = key.sign(&receipt.signing_bytes()).to_bytes();
+        let mut authorization = [0x7c; 32];
+        authorization[31] = control.sequence as u8;
+        let mut issuance_invocation = [0x7d; 32];
+        issuance_invocation[31] = control.sequence as u8;
+        let mut issuance = AuthorityOperationIssuanceAck {
+            authorization_invocation: InvocationId(authorization),
+            acknowledgement_invocation: InvocationId(issuance_invocation),
+            authority,
+            operation_call: Hash::digest(
+                b"vos/test/private-sync-operation-call/v1",
+                &[control.commitment().as_bytes()],
+            ),
+            approval: Hash::digest(
+                b"vos/test/private-sync-operation-approval/v1",
+                &[control.commitment().as_bytes()],
+            ),
+            authorization_sequence: NonZeroU64::new(control.sequence + 1).unwrap(),
+            receipt: receipt.clone(),
+            issued_at,
+            signature: [0; 64],
+        };
+        issuance.signature = key.sign(&issuance.signing_bytes()).to_bytes();
+        let post_member_set =
+            private_member_set_commitment(store.authorized_nodes().iter().map(|node| node.node))
+                .unwrap();
+        let application_fact = PrivateControlApplicationFact {
+            managed: route,
+            operation: intent.operation(),
+            control: control.commitment(),
+            control_sequence: control.sequence,
+            control_previous: control.previous,
+            epoch: store.binding().epoch,
+            post_member_set,
+            reopened_control_state: Hash([0x81; 32]),
+            reopened_control_head: control.commitment(),
+            applied_at,
+        };
+        let mut application = PrivateControlApplicationAck {
+            authorization_invocation: issuance.authorization_invocation,
+            issuance_invocation: issuance.acknowledgement_invocation,
+            application_invocation: PrivateControlApplicationAck::derive_application_invocation(
+                &issuance,
+            ),
+            authority,
+            operation_call: issuance.operation_call,
+            approval: issuance.approval,
+            issuance_ack: issuance.commitment(),
+            authorization_sequence: issuance.authorization_sequence,
+            receipt,
+            issued_at,
+            application: application_fact,
+            signature: [0; 64],
+        };
+        application.signature = key.sign(&application.signing_bytes()).to_bytes();
+        let evidence =
+            PrivateControlAuthorityEvidence::from_acknowledgements(&issuance, &application)
+                .unwrap();
+        evidence
+            .verify_for(control, store.binding().epoch, route, authority)
+            .unwrap();
+        evidence
+    }
+
+    fn attach_signed_evidence(store: &mut PrivateStore, control: &PrivateControlRecord) {
+        let evidence = signed_evidence(store, control).encode().unwrap();
+        store
+            .persist_control_authority_evidence(control.commitment(), &evidence)
+            .unwrap();
+    }
+
+    fn invite_record(store: &PrivateStore, fixture: &Fixture, label: u8) -> PrivateControlRecord {
+        let node = recipient(fixture.space, fixture.agent, fixture.owner, label).identity;
+        let binding = store.binding();
+        let mut record = PrivateControlRecord {
+            space: fixture.space,
+            agent: fixture.agent,
+            sequence: binding.next_sequence,
+            previous: binding.control_head,
+            operation: PrivateControlOperation::Invite {
+                sealed_owner_key: seal_owner_key_for_node(
+                    fixture.space,
+                    fixture.agent,
+                    binding.epoch,
+                    &fixture.owner_key,
+                    &node,
+                )
+                .unwrap(),
+                sealed_data_key: seal_data_key_for_node(
+                    fixture.space,
+                    fixture.agent,
+                    binding.epoch,
+                    &fixture.epoch.data_key,
+                    &node,
+                )
+                .unwrap(),
+                node,
+                epoch: binding.epoch,
+                historical_grants: Vec::new(),
+            },
+            signer: PrivateControlSigner::Owner,
+            signer_public_key: [0; 32],
+            signature: [0; 64],
+        };
+        sign_owner_control_record(&mut record, &fixture.owner_key).unwrap();
+        record
+    }
+
+    fn directory_image(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+        fn visit(root: &Path, path: &Path, image: &mut Vec<(String, Option<Vec<u8>>)>) {
+            let mut entries: Vec<_> = fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                if metadata.is_dir() {
+                    image.push((relative, None));
+                    visit(root, &path, image);
+                } else {
+                    image.push((relative, Some(fs::read(path).unwrap())));
+                }
+            }
+        }
+
+        let mut image = Vec::new();
+        visit(root, root, &mut image);
+        image
+    }
+
+    fn serve_private_sync_page<V: PrivateTransportAuthVerifier>(
+        store: &PrivateStore,
+        peer: &PrivateNodeIdentity,
+        request: &PrivateSyncRequest,
+        transport: &V,
+    ) -> Result<PrivateSyncPage, PrivateSyncError> {
+        super::serve_private_sync_page(
+            store,
+            peer,
+            request,
+            transport,
+            test_route(store),
+            test_authority_target(store),
+        )
+    }
+
+    fn apply_private_sync_page<A: PrivateNodeAuthorityVerifier, T: PrivateTransportAuthVerifier>(
+        store: &mut PrivateStore,
+        peer: &PrivateNodeIdentity,
+        page: &PrivateSyncPage,
+        authority: &A,
+        transport: &T,
+    ) -> Result<PrivateSyncApplyDisposition, PrivateSyncError> {
+        let route = test_route(store);
+        let target = test_authority_target(store);
+        super::apply_private_sync_page(store, peer, page, authority, transport, route, target)
+    }
+
     fn policy_record(
         fixture: &Fixture,
         sequence: u64,
@@ -1580,8 +2067,33 @@ mod tests {
         let fixture = fixture();
         let mut server = create_store(&directory.child("server"), &fixture);
         let mut client = create_store(&directory.child("client"), &fixture);
-        let record = policy_record(&fixture, 0, None, 31);
+        let successor = generate_fresh_private_epoch(
+            fixture.space,
+            fixture.agent,
+            1,
+            fixture.owner,
+            core::slice::from_ref(&fixture.recipients[0].identity),
+            fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        let mut record = PrivateControlRecord {
+            space: fixture.space,
+            agent: fixture.agent,
+            sequence: 0,
+            previous: None,
+            operation: PrivateControlOperation::Revoke {
+                node: fixture.recipients[1].identity.node,
+                next_epoch: successor.record,
+            },
+            signer: PrivateControlSigner::Owner,
+            signer_public_key: [0; 32],
+            signature: [0; 64],
+        };
+        sign_owner_control_record(&mut record, &fixture.owner_key).unwrap();
         server.append_control(&record, &TestAuthority).unwrap();
+        attach_signed_evidence(&mut server, &record);
         let sentinel = b"PRIVATE-FRAME-SENTINEL-8d21";
         for kind in [
             EncryptedObjectKind::Package,
@@ -1606,7 +2118,7 @@ mod tests {
         let frames = converge(
             &server,
             &mut client,
-            &fixture.recipients[1].identity,
+            &fixture.recipients[0].identity,
             &fixture.recipients[0].identity,
             sentinel,
         );
@@ -1655,6 +2167,7 @@ mod tests {
         };
         sign_owner_control_record(&mut revoke, &fixture.owner_key).unwrap();
         server.append_control(&revoke, &TestAuthority).unwrap();
+        attach_signed_evidence(&mut server, &revoke);
         let future = encrypt_private_object(
             &successor.data_key,
             fixture.space,
@@ -1764,6 +2277,384 @@ mod tests {
     }
 
     #[test]
+    fn controls_without_exact_evidence_are_neither_served_nor_applied() {
+        let directory = TestDirectory::new("missing-evidence");
+        let fixture = fixture();
+        let mut server = create_store(&directory.child("server"), &fixture);
+        let mut client = create_store(&directory.child("client"), &fixture);
+        let control = invite_record(&server, &fixture, 50);
+        server.append_control(&control, &TestAuthority).unwrap();
+        let request = request_for(&client, 4, MAX_PRIVATE_SYNC_PAGE_BYTES as u32);
+        assert_eq!(
+            serve_private_sync_page(
+                &server,
+                &fixture.recipients[0].identity,
+                &request,
+                &TestTransport,
+            ),
+            Err(PrivateSyncError::MissingEvidence)
+        );
+
+        attach_signed_evidence(&mut server, &control);
+        let page = serve_private_sync_page(
+            &server,
+            &fixture.recipients[0].identity,
+            &request,
+            &TestTransport,
+        )
+        .unwrap();
+        let item_bytes = page.items[0].encoded_payload_len().unwrap();
+        let too_small = PrivateSyncRequest {
+            cursor: request.cursor.clone(),
+            max_items: 1,
+            max_bytes: u32::try_from(item_bytes - 1).unwrap(),
+        };
+        assert_eq!(
+            serve_private_sync_page(
+                &server,
+                &fixture.recipients[0].identity,
+                &too_small,
+                &TestTransport,
+            ),
+            Err(PrivateSyncError::LimitTooSmall)
+        );
+        let exact = PrivateSyncRequest {
+            cursor: request.cursor,
+            max_items: 1,
+            max_bytes: u32::try_from(item_bytes).unwrap(),
+        };
+        assert_eq!(
+            serve_private_sync_page(
+                &server,
+                &fixture.recipients[0].identity,
+                &exact,
+                &TestTransport,
+            )
+            .unwrap()
+            .items
+            .len(),
+            1
+        );
+
+        let mut oversized = page.clone();
+        let oversized_evidence = vec![0; MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES + 1];
+        let PrivateSyncItem::Control { evidence, .. } = &mut oversized.items[0] else {
+            unreachable!()
+        };
+        *evidence = oversized_evidence.clone();
+        assert_eq!(oversized.encode(), Err(PrivateSyncError::LimitExceeded));
+        assert_eq!(
+            PrivateControlAuthorityEvidence::decode(&oversized_evidence),
+            Err(PrivateSyncError::InvalidFrame)
+        );
+
+        let mut missing = page;
+        let PrivateSyncItem::Control { evidence, .. } = &mut missing.items[0] else {
+            unreachable!()
+        };
+        evidence.clear();
+        let before = directory_image(&directory.child("client"));
+        client.reset_artifact_read_spy();
+        assert_eq!(
+            apply_private_sync_page(
+                &mut client,
+                &fixture.recipients[0].identity,
+                &missing,
+                &TestAuthority,
+                &TestTransport,
+            ),
+            Err(PrivateSyncError::MissingEvidence)
+        );
+        assert_eq!(client.artifact_read_spy(), 0);
+        assert_eq!(directory_image(&directory.child("client")), before);
+    }
+
+    #[test]
+    fn retained_exact_page_attaches_evidence_to_a_crash_visible_control_prefix() {
+        let directory = TestDirectory::new("retry-evidence-prefix");
+        let fixture = fixture();
+        let mut server = create_store(&directory.child("server"), &fixture);
+        let client_path = directory.child("client");
+        let mut client = create_store(&client_path, &fixture);
+        let control = invite_record(&server, &fixture, 50);
+        server.append_control(&control, &TestAuthority).unwrap();
+        attach_signed_evidence(&mut server, &control);
+        let request = PrivateSyncRequest {
+            cursor: PrivateSyncCursor::start(fixture.space, fixture.agent, 0, None).unwrap(),
+            max_items: 1,
+            max_bytes: MAX_PRIVATE_SYNC_PAGE_BYTES as u32,
+        };
+        let page = serve_private_sync_page(
+            &server,
+            &fixture.recipients[0].identity,
+            &request,
+            &TestTransport,
+        )
+        .unwrap();
+
+        // Model process loss after the PCTL index became visible but before
+        // its PSE1 transaction began. Reopen must preserve this state, and an
+        // exact retained page retry attaches evidence without appending the
+        // control a second time.
+        client.append_control(&control, &TestAuthority).unwrap();
+        drop(client);
+        let mut client =
+            PrivateStore::open(&client_path, fixture.space, fixture.agent, &TestAuthority).unwrap();
+        assert_eq!(
+            client
+                .read_control_authority_evidence(&client.indexed_controls()[0])
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            apply_private_sync_page(
+                &mut client,
+                &fixture.recipients[0].identity,
+                &page,
+                &TestAuthority,
+                &TestTransport,
+            ),
+            Ok(PrivateSyncApplyDisposition::Applied)
+        );
+        assert_eq!(client.control_count(), 1);
+        let expected = match &page.items[0] {
+            PrivateSyncItem::Control { evidence, .. } => evidence.as_slice(),
+            PrivateSyncItem::Object { .. } => unreachable!(),
+        };
+        assert_eq!(
+            client
+                .read_control_authority_evidence(&client.indexed_controls()[0])
+                .unwrap()
+                .as_deref(),
+            Some(expected)
+        );
+        drop(client);
+        let reopened =
+            PrivateStore::open(&client_path, fixture.space, fixture.agent, &TestAuthority).unwrap();
+        assert_eq!(
+            reopened
+                .read_control_authority_evidence(&reopened.indexed_controls()[0])
+                .unwrap()
+                .as_deref(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn signed_evidence_substitutions_are_rejected_by_independent_exact_verification() {
+        let directory = TestDirectory::new("evidence-substitutions");
+        let fixture = fixture();
+        let mut store = create_store(&directory.child("store"), &fixture);
+        let control = invite_record(&store, &fixture, 50);
+        store.append_control(&control, &TestAuthority).unwrap();
+        let route = test_route(&store);
+        let authority = test_authority_target(&store);
+        let evidence = signed_evidence(&store, &control);
+        evidence
+            .verify_for(&control, store.binding().epoch, route, authority)
+            .unwrap();
+        let key = SigningKey::from_bytes(&[0x71; 32]);
+
+        let reject = |candidate: PrivateControlAuthorityEvidence| {
+            assert_eq!(
+                candidate.verify_for(&control, store.binding().epoch, route, authority),
+                Err(PrivateSyncError::Tampered)
+            );
+        };
+
+        let mut issuance = AuthorityOperationIssuanceAck::decode(&evidence.issuance_ack).unwrap();
+        issuance.signature[0] ^= 1;
+        reject(PrivateControlAuthorityEvidence {
+            issuance_ack: issuance.encode().unwrap(),
+            application_ack: evidence.application_ack.clone(),
+        });
+
+        let issuance = AuthorityOperationIssuanceAck::decode(&evidence.issuance_ack).unwrap();
+        let mut application =
+            PrivateControlApplicationAck::decode(&evidence.application_ack).unwrap();
+        application.signature[0] ^= 1;
+        reject(PrivateControlAuthorityEvidence {
+            issuance_ack: evidence.issuance_ack.clone(),
+            application_ack: application.encode().unwrap(),
+        });
+
+        let mut substituted_issuance = issuance.clone();
+        let mut substituted_application =
+            PrivateControlApplicationAck::decode(&evidence.application_ack).unwrap();
+        substituted_issuance.authority.system_agent = AgentId([0x91; 32]);
+        substituted_application.authority = substituted_issuance.authority;
+        substituted_issuance.signature = key.sign(&substituted_issuance.signing_bytes()).to_bytes();
+        substituted_application.issuance_ack = substituted_issuance.commitment();
+        substituted_application.application_invocation =
+            PrivateControlApplicationAck::derive_application_invocation(&substituted_issuance);
+        substituted_application.signature = key
+            .sign(&substituted_application.signing_bytes())
+            .to_bytes();
+        reject(
+            PrivateControlAuthorityEvidence::from_acknowledgements(
+                &substituted_issuance,
+                &substituted_application,
+            )
+            .unwrap(),
+        );
+
+        let mut substituted_issuance = issuance.clone();
+        let mut substituted_application =
+            PrivateControlApplicationAck::decode(&evidence.application_ack).unwrap();
+        substituted_issuance.receipt.selector.runtime_deployment = DeploymentId([0x92; 32]);
+        substituted_issuance.receipt.signature = key
+            .sign(&substituted_issuance.receipt.signing_bytes())
+            .to_bytes();
+        substituted_application.receipt = substituted_issuance.receipt.clone();
+        substituted_application
+            .application
+            .managed
+            .runtime_deployment = DeploymentId([0x92; 32]);
+        substituted_issuance.signature = key.sign(&substituted_issuance.signing_bytes()).to_bytes();
+        substituted_application.issuance_ack = substituted_issuance.commitment();
+        substituted_application.application_invocation =
+            PrivateControlApplicationAck::derive_application_invocation(&substituted_issuance);
+        substituted_application.signature = key
+            .sign(&substituted_application.signing_bytes())
+            .to_bytes();
+        reject(
+            PrivateControlAuthorityEvidence::from_acknowledgements(
+                &substituted_issuance,
+                &substituted_application,
+            )
+            .unwrap(),
+        );
+
+        for mutation in 0..5 {
+            let mut application =
+                PrivateControlApplicationAck::decode(&evidence.application_ack).unwrap();
+            match mutation {
+                0 => application.application.control = Hash([0x93; 32]),
+                1 => application.application.control_sequence += 1,
+                2 => application.application.control_previous = Some(Hash([0x94; 32])),
+                3 => application.application.epoch += 1,
+                4 => application.issued_at += 1,
+                _ => unreachable!(),
+            }
+            application.signature = key.sign(&application.signing_bytes()).to_bytes();
+            match PrivateControlAuthorityEvidence::from_acknowledgements(&issuance, &application) {
+                Ok(candidate) => reject(candidate),
+                Err(error) => assert_eq!(error, PrivateSyncError::InvalidFrame),
+            }
+        }
+
+        let alternate = invite_record(&store, &fixture, 51);
+        reject(signed_evidence(&store, &alternate));
+        let mut noncanonical = evidence.encode().unwrap();
+        noncanonical.push(0);
+        assert_eq!(
+            PrivateControlAuthorityEvidence::decode(&noncanonical),
+            Err(PrivateSyncError::InvalidFrame)
+        );
+    }
+
+    #[test]
+    fn complete_control_page_is_prevalidated_before_any_local_mutation() {
+        let directory = TestDirectory::new("whole-page-prevalidation");
+        let fixture = fixture();
+        let mut server = create_store(&directory.child("server"), &fixture);
+        let first = invite_record(&server, &fixture, 50);
+        server.append_control(&first, &TestAuthority).unwrap();
+        attach_signed_evidence(&mut server, &first);
+        let second = invite_record(&server, &fixture, 51);
+        server.append_control(&second, &TestAuthority).unwrap();
+        attach_signed_evidence(&mut server, &second);
+
+        let make_page = |client: &PrivateStore| {
+            let request = request_for(client, 4, MAX_PRIVATE_SYNC_PAGE_BYTES as u32);
+            serve_private_sync_page(
+                &server,
+                &fixture.recipients[0].identity,
+                &request,
+                &TestTransport,
+            )
+            .unwrap()
+        };
+
+        let first_client_path = directory.child("invalid-pse-client");
+        let mut first_client = create_store(&first_client_path, &fixture);
+        let mut invalid_pse = make_page(&first_client);
+        assert_eq!(invalid_pse.items.len(), 2);
+        let PrivateSyncItem::Control { evidence, .. } = &mut invalid_pse.items[1] else {
+            unreachable!()
+        };
+        let mut decoded = PrivateControlAuthorityEvidence::decode(evidence).unwrap();
+        let mut application =
+            PrivateControlApplicationAck::decode(&decoded.application_ack).unwrap();
+        application.signature[0] ^= 1;
+        decoded.application_ack = application.encode().unwrap();
+        *evidence = decoded.encode().unwrap();
+        let before = directory_image(&first_client_path);
+        first_client.reset_artifact_read_spy();
+        assert_eq!(
+            apply_private_sync_page(
+                &mut first_client,
+                &fixture.recipients[0].identity,
+                &invalid_pse,
+                &TestAuthority,
+                &TestTransport,
+            ),
+            Err(PrivateSyncError::Tampered)
+        );
+        assert_eq!(first_client.artifact_read_spy(), 0);
+        assert_eq!(directory_image(&first_client_path), before);
+        assert_eq!(
+            (first_client.control_count(), first_client.object_count()),
+            (0, 0)
+        );
+
+        let second_client_path = directory.child("invalid-chain-client");
+        let mut second_client = create_store(&second_client_path, &fixture);
+        let mut invalid_chain = make_page(&second_client);
+        let mut alternate = second.clone();
+        alternate.previous = Some(Hash([0x95; 32]));
+        sign_owner_control_record(&mut alternate, &fixture.owner_key).unwrap();
+        let alternate_evidence = signed_evidence(&server, &alternate).encode().unwrap();
+        let alternate_commitment = alternate.commitment();
+        let PrivateSyncItem::Control {
+            commitment,
+            wire,
+            evidence,
+            ..
+        } = &mut invalid_chain.items[1]
+        else {
+            unreachable!()
+        };
+        *commitment = alternate_commitment;
+        *wire = alternate.encode().unwrap();
+        *evidence = alternate_evidence;
+        invalid_chain.target.control_head = Some(alternate_commitment);
+        if let Some(next) = &mut invalid_chain.next {
+            next.local.control_head = Some(alternate_commitment);
+            next.target = Some(invalid_chain.target);
+        }
+        invalid_chain.validate_shape().unwrap();
+        let before = directory_image(&second_client_path);
+        second_client.reset_artifact_read_spy();
+        assert!(
+            apply_private_sync_page(
+                &mut second_client,
+                &fixture.recipients[0].identity,
+                &invalid_chain,
+                &TestAuthority,
+                &TestTransport,
+            )
+            .is_err()
+        );
+        assert_eq!(second_client.artifact_read_spy(), 0);
+        assert_eq!(directory_image(&second_client_path), before);
+        assert_eq!(
+            (second_client.control_count(), second_client.object_count()),
+            (0, 0)
+        );
+    }
+
+    #[test]
     fn offline_recovery_converges_an_explicitly_superseded_control_fork() {
         let directory = TestDirectory::new("recovery-fork");
         let fixture = fixture();
@@ -1819,6 +2710,7 @@ mod tests {
         };
         sign_recovery_control_record(&mut recovery, &fixture.recovery).unwrap();
         server.append_control(&recovery, &TestAuthority).unwrap();
+        attach_signed_evidence(&mut server, &recovery);
 
         let request = request_for(&client, 4, MAX_PRIVATE_SYNC_PAGE_BYTES as u32);
         let page = serve_private_sync_page(
@@ -1884,6 +2776,9 @@ mod tests {
             &TestTransport,
         )
         .unwrap();
+        // Genesis is represented by the empty control chain. Object sync at
+        // that exact head needs no synthetic or fabricated PSE1.
+        assert_eq!(page.phase, PrivateSyncPhase::Objects);
         assert_eq!(page.items.len(), 1);
         assert!(page.next.is_some());
         let request_wire = request.encode().unwrap();
