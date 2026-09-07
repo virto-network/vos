@@ -9,7 +9,8 @@ use super::execution::{
 use super::standard::{
     StandardActorState, StandardAgentRuntime, StandardAuthorityDisposition,
     StandardCleanManagementDisposition, StandardInvocationResult, StandardLaneEntry,
-    StandardLaneState, StandardMachineContinuation, StandardRuntimeState,
+    StandardLaneState, StandardMachineContinuation, StandardPrivateManagementDisposition,
+    StandardRuntimeState,
 };
 use super::{
     ActorDirectoryPage, ActorDirectoryRecord, ActorEntry, ActorLifecycleDebt, AgentConfig,
@@ -525,6 +526,41 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
         encoder.u64(item.observed_slot);
         encoder.bytes(&encode_clean_management_result(&item.result));
     });
+    encoder.option(&state.active_resource_policy, |encoder, policy| {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        encoder.bytes(
+            &policy
+                .encode()
+                .expect("persisted active resource policy is canonical"),
+        );
+    });
+    encoder.option(
+        &state.private_runtime_control_commitment,
+        |encoder, control| encoder.fixed(control.as_bytes()),
+    );
+    encoder.option(
+        &state.private_runtime_control_sequence,
+        |encoder, sequence| encoder.u64(*sequence),
+    );
+    encoder.option(
+        &state.private_authority_epoch_high_water,
+        |encoder, epoch| encoder.u64(*epoch),
+    );
+    encoder.option(&state.private_control_slot_high_water, |encoder, slot| {
+        encoder.u64(*slot)
+    });
+    encoder.list(&state.private_management_dispositions, |encoder, item| {
+        encoder.fixed(item.authority.as_bytes());
+        encoder.fixed(item.control.as_bytes());
+        encoder.fixed(item.request.as_bytes());
+        encoder.u64(item.sequence);
+        encoder.option(&item.previous, |encoder, previous| {
+            encoder.fixed(previous.as_bytes())
+        });
+        encoder.u64(item.epoch);
+        encoder.u64(item.observed_slot);
+        encoder.bytes(&encode_clean_management_result(&item.result));
+    });
     encoder.option(&state.system_authority, |encoder, authority| {
         encoder.bytes(&authority.encode())
     });
@@ -680,6 +716,57 @@ pub fn decode_standard_runtime_state(
                 request,
                 epoch,
                 sequence,
+                observed_slot,
+                result,
+            })
+        },
+    )?;
+    let active_resource_policy = decoder.option(|decoder| {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        let bytes = decoder.bytes_ref()?;
+        if bytes.len() > crate::agent_sdk::wire::MAX_RUNTIME_RESOURCE_POLICY_WIRE_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        crate::agent_sdk::contract::RuntimeResourcePolicy::decode(bytes)
+            .map_err(|_| DecodeError::NonCanonical)
+    })?;
+    let private_runtime_control_commitment = decoder.option(|decoder| {
+        let value = crate::agent_sdk::Hash(decoder.fixed()?);
+        (value != crate::agent_sdk::Hash::ZERO)
+            .then_some(value)
+            .ok_or(DecodeError::NonCanonical)
+    })?;
+    let private_runtime_control_sequence = decoder.option(Decoder::u64)?;
+    let private_authority_epoch_high_water = decoder.option(Decoder::u64)?;
+    let private_control_slot_high_water = decoder.option(Decoder::u64)?;
+    let private_management_dispositions = decode_bounded_list(
+        &mut decoder,
+        super::standard::MAX_AUTHORITY_DISPOSITIONS,
+        |decoder| {
+            let authority = crate::agent_sdk::Hash(decoder.fixed()?);
+            let control = crate::agent_sdk::Hash(decoder.fixed()?);
+            let request = crate::agent_sdk::Hash(decoder.fixed()?);
+            let sequence = decoder.u64()?;
+            let previous = decoder.option(|decoder| {
+                let value = crate::agent_sdk::Hash(decoder.fixed()?);
+                (value != crate::agent_sdk::Hash::ZERO)
+                    .then_some(value)
+                    .ok_or(DecodeError::NonCanonical)
+            })?;
+            let epoch = decoder.u64()?;
+            let observed_slot = decoder.u64()?;
+            let bytes = decoder.bytes_ref()?;
+            if bytes.len() > MAX_CLEAN_MANAGEMENT_RESULT_BYTES {
+                return Err(DecodeError::LimitExceeded);
+            }
+            let result = decode_clean_management_result(bytes)?;
+            Ok(StandardPrivateManagementDisposition {
+                authority,
+                control,
+                request,
+                sequence,
+                previous,
+                epoch,
                 observed_slot,
                 result,
             })
@@ -877,6 +964,12 @@ pub fn decode_standard_runtime_state(
         clean_decision_sequence_high_water,
         clean_acknowledged_through,
         clean_management_dispositions,
+        active_resource_policy,
+        private_runtime_control_commitment,
+        private_runtime_control_sequence,
+        private_authority_epoch_high_water,
+        private_control_slot_high_water,
+        private_management_dispositions,
         system_authority,
         actors,
         retired_installation_ids,
@@ -4347,6 +4440,20 @@ mod tests {
             ManagementRequest::ChangeReplicas { .. } => {
                 (AuthorityOperationKind::ChangeReplicaSet, None, None)
             }
+            ManagementRequest::PrivateControl { control, .. } => match control.operation {
+                crate::agent_sdk::private::PrivateControlOperation::SetResourcePolicy {
+                    ..
+                } => (AuthorityOperationKind::SetPrivateResourcePolicy, None, None),
+                crate::agent_sdk::private::PrivateControlOperation::ActorLifecycle {
+                    actor,
+                    ..
+                } => (
+                    AuthorityOperationKind::PrivateActorLifecycle,
+                    Some(actor),
+                    None,
+                ),
+                _ => panic!("non-runtime Private control has no runtime receipt"),
+            },
             ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => {
                 panic!("read-only management has no authority receipt")
             }
@@ -4539,6 +4646,527 @@ mod tests {
                 proof_systems: crate::agent_sdk::ProofSystemSet::EMPTY,
             },
         }
+    }
+
+    #[cfg(feature = "pvm")]
+    fn private_runtime_management_request(
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+        sequence: u64,
+        previous: Option<crate::agent_sdk::Hash>,
+        mutation: crate::agent_sdk::PrivateRuntimeMutation,
+    ) -> crate::agent_sdk::ManagementRequest {
+        use crate::agent_sdk::private::{
+            PRIVATE_SIGNATURE_BYTES, PrivateControlOperation, PrivateControlRecord,
+            PrivateControlSigner,
+        };
+        use crate::agent_sdk::wire::CanonicalWire as _;
+
+        let operation = match &mutation {
+            crate::agent_sdk::PrivateRuntimeMutation::SetResourcePolicy(policy) => {
+                PrivateControlOperation::SetResourcePolicy {
+                    policy: crate::agent_sdk::BlobRef::of_bytes(&policy.encode().unwrap()),
+                }
+            }
+            mutation => PrivateControlOperation::ActorLifecycle {
+                actor: mutation.actor().unwrap(),
+                operation: mutation.lifecycle_kind().unwrap(),
+                request: mutation.commitment(),
+            },
+        };
+        let request = crate::agent_sdk::ManagementRequest::PrivateControl {
+            control: Box::new(PrivateControlRecord {
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                sequence,
+                previous,
+                operation,
+                signer: PrivateControlSigner::Owner,
+                signer_public_key: [0xa8; 32],
+                signature: [0xa9; PRIVATE_SIGNATURE_BYTES],
+            }),
+            mutation: Box::new(mutation),
+        };
+        assert!(request.is_valid());
+        request
+    }
+
+    #[cfg(feature = "pvm")]
+    fn private_runtime_management_receipt(
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+        request: &crate::agent_sdk::ManagementRequest,
+        epoch: u64,
+        valid_from: u64,
+        expires_at: u64,
+    ) -> crate::agent_sdk::authority::AuthorityReceipt {
+        clean_management_receipt_with_sequence(
+            descriptor, request, epoch, 0, 0, valid_from, expires_at,
+        )
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn standard_private_policy_is_active_restart_safe_and_exactly_replayable() {
+        use crate::agent_sdk::contract::RuntimeResourcePolicy;
+        use crate::agent_sdk::{ManagementError, ManagementReply, RuntimeOutcome};
+
+        let (descriptor, created, _) =
+            create_clean_management_state(crate::agent_sdk::AgentProfile::Private);
+        let initial = descriptor.initial_resource_policy();
+        let decoded = decode_standard_runtime_state(&clean_state_to_legacy(&created)).unwrap();
+        assert_eq!(decoded.active_resource_policy, Some(initial));
+        assert!(decoded.private_management_dispositions.is_empty());
+        let mut forged_initial_policy = decoded.clone();
+        forged_initial_policy.active_resource_policy = Some(RuntimeResourcePolicy {
+            max_actors: initial.max_actors - 1,
+            ..initial
+        });
+        assert!(matches!(
+            StandardAgentRuntime::restore(forged_initial_policy),
+            Err(super::super::LifecycleError::InvalidRequest)
+        ));
+
+        let policy = RuntimeResourcePolicy {
+            max_actors: 2,
+            ..initial
+        };
+        let request = private_runtime_management_request(
+            &descriptor,
+            0,
+            None,
+            crate::agent_sdk::PrivateRuntimeMutation::SetResourcePolicy(policy),
+        );
+        let receipt = private_runtime_management_receipt(&descriptor, &request, 1, 5, 10);
+        let applied = apply_clean_management_test(
+            created.clone(),
+            &descriptor,
+            request.clone(),
+            Some(receipt.clone()),
+            5,
+        );
+        assert_eq!(
+            applied.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::ResourcePolicySet(policy)))
+        );
+        let applied_state = applied.state.clone();
+        let decoded =
+            decode_standard_runtime_state(&clean_state_to_legacy(&applied.state)).unwrap();
+        assert_eq!(decoded.active_resource_policy, Some(policy));
+        assert_eq!(decoded.private_management_dispositions.len(), 1);
+        assert_eq!(decoded.private_runtime_control_sequence, Some(0));
+        assert_eq!(decoded.private_control_slot_high_water, Some(5));
+        assert_eq!(
+            legacy_state_to_clean(encode_standard_runtime_state(&decoded)),
+            applied.state,
+            "the Private runtime disposition must survive exact state reopen"
+        );
+
+        let mut wrong_retained_reply = decoded.clone();
+        wrong_retained_reply.active_resource_policy = Some(initial);
+        wrong_retained_reply.private_management_dispositions[0].result =
+            Ok(ManagementReply::ResourcePolicySet(initial));
+        let wrong_retained_state =
+            legacy_state_to_clean(encode_standard_runtime_state(&wrong_retained_reply));
+        let rejected_retained_reply = apply_clean_management_test(
+            wrong_retained_state.clone(),
+            &descriptor,
+            request.clone(),
+            Some(receipt.clone()),
+            5,
+        );
+        assert_eq!(rejected_retained_reply.state, wrong_retained_state);
+        assert_eq!(
+            rejected_retained_reply.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::AuthoritySequenceConflict))
+        );
+
+        for retry_slot in [5, 10] {
+            let retried = apply_clean_management_test(
+                applied_state.clone(),
+                &descriptor,
+                request.clone(),
+                Some(receipt.clone()),
+                retry_slot,
+            );
+            assert_eq!(retried.state, applied_state);
+            assert_eq!(retried.outcome, applied.outcome);
+        }
+        let regressed = apply_clean_management_test(
+            applied_state.clone(),
+            &descriptor,
+            request,
+            Some(receipt),
+            4,
+        );
+        assert_eq!(regressed.state, applied_state);
+        assert_eq!(
+            regressed.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::AuthoritySlotRegressed))
+        );
+
+        // Controls 1 and 2 may be Invite/Revoke/Rotate operations which never
+        // enter the runtime. The runtime-bearing subsequence therefore need
+        // not have adjacent PCTL predecessors, and distinct controls may share
+        // one authority-observed slot.
+        let widened = RuntimeResourcePolicy {
+            max_actors: 3,
+            ..policy
+        };
+        let interleaved = private_runtime_management_request(
+            &descriptor,
+            3,
+            Some(crate::agent_sdk::Hash([0xaa; 32])),
+            crate::agent_sdk::PrivateRuntimeMutation::SetResourcePolicy(widened),
+        );
+        let interleaved_receipt =
+            private_runtime_management_receipt(&descriptor, &interleaved, 1, 5, 10);
+        let progressed = apply_clean_management_test(
+            applied_state,
+            &descriptor,
+            interleaved,
+            Some(interleaved_receipt),
+            5,
+        );
+        assert_eq!(
+            progressed.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::ResourcePolicySet(widened)))
+        );
+        let decoded =
+            decode_standard_runtime_state(&clean_state_to_legacy(&progressed.state)).unwrap();
+        assert_eq!(decoded.private_runtime_control_sequence, Some(3));
+        assert_eq!(decoded.private_control_slot_high_water, Some(5));
+        assert_eq!(decoded.private_management_dispositions.len(), 2);
+        assert_eq!(
+            decoded.private_management_dispositions[0].observed_slot,
+            decoded.private_management_dispositions[1].observed_slot
+        );
+        StandardAgentRuntime::restore(decoded).unwrap();
+
+        let wrong_adjacent_link = private_runtime_management_request(
+            &descriptor,
+            4,
+            Some(crate::agent_sdk::Hash([0xab; 32])),
+            crate::agent_sdk::PrivateRuntimeMutation::SetResourcePolicy(widened),
+        );
+        let wrong_adjacent_receipt =
+            private_runtime_management_receipt(&descriptor, &wrong_adjacent_link, 1, 5, 10);
+        let rejected_link = apply_clean_management_test(
+            progressed.state.clone(),
+            &descriptor,
+            wrong_adjacent_link,
+            Some(wrong_adjacent_receipt),
+            5,
+        );
+        assert_eq!(rejected_link.state, progressed.state);
+        assert_eq!(
+            rejected_link.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::AuthoritySequenceConflict))
+        );
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn standard_private_management_rejects_non_private_and_denials_do_not_mutate() {
+        use crate::agent_sdk::contract::RuntimeResourcePolicy;
+        use crate::agent_sdk::{ManagementError, RuntimeOutcome};
+
+        for profile in [
+            crate::agent_sdk::AgentProfile::Local,
+            crate::agent_sdk::AgentProfile::Shared,
+        ] {
+            let (descriptor, created, _) = create_clean_management_state(profile);
+            let initial = descriptor.initial_resource_policy();
+            let mut forged_policy =
+                decode_standard_runtime_state(&clean_state_to_legacy(&created)).unwrap();
+            forged_policy.active_resource_policy = Some(RuntimeResourcePolicy {
+                max_actors: initial.max_actors - 1,
+                ..initial
+            });
+            assert!(matches!(
+                StandardAgentRuntime::restore(forged_policy),
+                Err(super::super::LifecycleError::InvalidRequest)
+            ));
+            let request = private_runtime_management_request(
+                &descriptor,
+                0,
+                None,
+                crate::agent_sdk::PrivateRuntimeMutation::SetResourcePolicy(
+                    descriptor.initial_resource_policy(),
+                ),
+            );
+            let receipt = private_runtime_management_receipt(&descriptor, &request, 1, 2, 10);
+            let rejected = apply_clean_management_test(
+                created.clone(),
+                &descriptor,
+                request,
+                Some(receipt),
+                2,
+            );
+            assert_eq!(rejected.state, created);
+            assert_eq!(
+                rejected.outcome,
+                RuntimeOutcome::Management(Err(ManagementError::InvalidRequest))
+            );
+        }
+
+        let (descriptor, created, _) =
+            create_clean_management_state(crate::agent_sdk::AgentProfile::Private);
+        let too_small = RuntimeResourcePolicy {
+            max_runtime_state_bytes: 1,
+            ..descriptor.initial_resource_policy()
+        };
+        let request = private_runtime_management_request(
+            &descriptor,
+            0,
+            None,
+            crate::agent_sdk::PrivateRuntimeMutation::SetResourcePolicy(too_small),
+        );
+        let receipt = private_runtime_management_receipt(&descriptor, &request, 1, 2, 10);
+        let denied =
+            apply_clean_management_test(created.clone(), &descriptor, request, Some(receipt), 2);
+        assert_eq!(denied.state, created);
+        assert_eq!(
+            denied.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::ResourceLimit))
+        );
+        let decoded = decode_standard_runtime_state(&clean_state_to_legacy(&denied.state)).unwrap();
+        assert!(decoded.private_management_dispositions.is_empty());
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn standard_private_policy_bounds_lifecycle_and_disposition_history() {
+        use crate::agent_sdk::contract::RuntimeResourcePolicy;
+        use crate::agent_sdk::{ManagementError, ManagementReply, RuntimeOutcome};
+
+        let (descriptor, created, _) =
+            create_clean_management_state(crate::agent_sdk::AgentProfile::Private);
+        let policy = RuntimeResourcePolicy {
+            max_actors: 1,
+            ..descriptor.initial_resource_policy()
+        };
+        let policy_request = private_runtime_management_request(
+            &descriptor,
+            0,
+            None,
+            crate::agent_sdk::PrivateRuntimeMutation::SetResourcePolicy(policy),
+        );
+        let policy_receipt =
+            private_runtime_management_receipt(&descriptor, &policy_request, 1, 2, 10);
+        let narrowed = apply_clean_management_test(
+            created,
+            &descriptor,
+            policy_request,
+            Some(policy_receipt),
+            2,
+        );
+
+        let first_install = clean_install_request(
+            &descriptor,
+            "private-first",
+            None,
+            0xb1,
+            crate::agent_sdk::LaneSet::of(crate::agent_sdk::StateLane::Merge),
+        );
+        let first_actor = first_install.entry.actor;
+        let first_deployment = first_install.entry.deployment;
+        let first_request = private_runtime_management_request(
+            &descriptor,
+            2,
+            Some(crate::agent_sdk::Hash([0xb2; 32])),
+            crate::agent_sdk::PrivateRuntimeMutation::Install(first_install.clone()),
+        );
+        let first_receipt =
+            private_runtime_management_receipt(&descriptor, &first_request, 1, 3, 10);
+        let installed = apply_clean_management_test(
+            narrowed.state,
+            &descriptor,
+            first_request,
+            Some(first_receipt),
+            3,
+        );
+        assert_eq!(
+            installed.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::Installed(first_install.entry)))
+        );
+
+        let second_install = clean_install_request(
+            &descriptor,
+            "private-second",
+            None,
+            0xb3,
+            crate::agent_sdk::LaneSet::of(crate::agent_sdk::StateLane::Local),
+        );
+        let second_request = private_runtime_management_request(
+            &descriptor,
+            4,
+            Some(crate::agent_sdk::Hash([0xb4; 32])),
+            crate::agent_sdk::PrivateRuntimeMutation::Install(second_install),
+        );
+        let second_receipt =
+            private_runtime_management_receipt(&descriptor, &second_request, 1, 4, 10);
+        let denied = apply_clean_management_test(
+            installed.state.clone(),
+            &descriptor,
+            second_request,
+            Some(second_receipt),
+            4,
+        );
+        assert_eq!(denied.state, installed.state);
+        assert_eq!(
+            denied.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::ResourceLimit))
+        );
+
+        let mut exact_limit =
+            decode_standard_runtime_state(&clean_state_to_legacy(&denied.state)).unwrap();
+        let template = exact_limit.private_management_dispositions[0].clone();
+        exact_limit.private_management_dispositions = (1
+            ..=super::super::standard::MAX_AUTHORITY_DISPOSITIONS)
+            .map(|sequence| {
+                let previous = if sequence == 1 {
+                    crate::agent_sdk::Hash([0xb5; 32])
+                } else {
+                    crate::agent_sdk::Hash::digest(
+                        b"test/private/control",
+                        &[&((sequence - 1) as u64).to_le_bytes()],
+                    )
+                };
+                StandardPrivateManagementDisposition {
+                    authority: crate::agent_sdk::Hash::digest(
+                        b"test/private/authority",
+                        &[&(sequence as u64).to_le_bytes()],
+                    ),
+                    control: crate::agent_sdk::Hash::digest(
+                        b"test/private/control",
+                        &[&(sequence as u64).to_le_bytes()],
+                    ),
+                    request: crate::agent_sdk::Hash::digest(
+                        b"test/private/request",
+                        &[&(sequence as u64).to_le_bytes()],
+                    ),
+                    sequence: sequence as u64,
+                    previous: Some(previous),
+                    epoch: template.epoch,
+                    observed_slot: template.observed_slot,
+                    result: if sequence == 1 {
+                        template.result.clone()
+                    } else {
+                        Ok(ManagementReply::Removed(crate::agent_sdk::ActorId(
+                            crate::agent_sdk::Hash::digest(
+                                b"test/private/removed",
+                                &[&(sequence as u64).to_le_bytes()],
+                            )
+                            .0,
+                        )))
+                    },
+                }
+            })
+            .collect();
+        let last = exact_limit.private_management_dispositions.last().unwrap();
+        exact_limit.private_runtime_control_commitment = Some(last.control);
+        exact_limit.private_runtime_control_sequence = Some(last.sequence);
+        exact_limit.private_authority_epoch_high_water = Some(last.epoch);
+        exact_limit.private_control_slot_high_water = Some(last.observed_slot);
+        StandardAgentRuntime::restore(exact_limit.clone()).unwrap();
+
+        let mut missing_predecessor = exact_limit.clone();
+        missing_predecessor.private_management_dispositions[0].previous = None;
+        assert!(matches!(
+            StandardAgentRuntime::restore(missing_predecessor),
+            Err(super::super::LifecycleError::InvalidRequest)
+        ));
+
+        let mut genesis_with_predecessor = exact_limit.clone();
+        genesis_with_predecessor.private_management_dispositions[0].sequence = 0;
+        assert!(matches!(
+            StandardAgentRuntime::restore(genesis_with_predecessor),
+            Err(super::super::LifecycleError::InvalidRequest)
+        ));
+
+        let mut wrong_adjacent_predecessor = exact_limit.clone();
+        wrong_adjacent_predecessor.private_management_dispositions[1].previous =
+            Some(crate::agent_sdk::Hash([0xba; 32]));
+        assert!(matches!(
+            StandardAgentRuntime::restore(wrong_adjacent_predecessor),
+            Err(super::super::LifecycleError::InvalidRequest)
+        ));
+
+        let mut retained_denial = exact_limit.clone();
+        retained_denial.private_management_dispositions[0].result =
+            Err(ManagementError::InvalidRequest);
+        assert!(matches!(
+            StandardAgentRuntime::restore(retained_denial),
+            Err(super::super::LifecycleError::InvalidRequest)
+        ));
+
+        let mut unsupported_success = exact_limit.clone();
+        unsupported_success.private_management_dispositions[0].result =
+            Ok(ManagementReply::ReplicasChanged {
+                generation: crate::agent_sdk::Hash([0xbb; 32]),
+            });
+        assert!(matches!(
+            StandardAgentRuntime::restore(unsupported_success),
+            Err(super::super::LifecycleError::InvalidRequest)
+        ));
+
+        let retained_policy_control = exact_limit.private_management_dispositions[0].control;
+        let last_control = exact_limit
+            .private_management_dispositions
+            .last()
+            .unwrap()
+            .control;
+        let suspend = private_runtime_management_request(
+            &descriptor,
+            (super::super::standard::MAX_AUTHORITY_DISPOSITIONS + 1) as u64,
+            Some(last_control),
+            crate::agent_sdk::PrivateRuntimeMutation::Suspend {
+                actor: first_actor,
+                expected_deployment: first_deployment,
+            },
+        );
+        let suspend_receipt =
+            private_runtime_management_receipt(&descriptor, &suspend, template.epoch, 5, 10);
+        let compacted = apply_clean_management_test(
+            legacy_state_to_clean(encode_standard_runtime_state(&exact_limit)),
+            &descriptor,
+            suspend,
+            Some(suspend_receipt),
+            5,
+        );
+        assert!(matches!(
+            compacted.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::Suspended(_)))
+        ));
+        let compacted =
+            decode_standard_runtime_state(&clean_state_to_legacy(&compacted.state)).unwrap();
+        assert_eq!(
+            compacted.private_management_dispositions.len(),
+            super::super::standard::MAX_AUTHORITY_DISPOSITIONS
+        );
+        assert!(
+            compacted
+                .private_management_dispositions
+                .iter()
+                .any(|item| item.control == retained_policy_control)
+        );
+        assert_eq!(compacted.active_resource_policy, Some(policy));
+
+        exact_limit
+            .private_management_dispositions
+            .push(StandardPrivateManagementDisposition {
+                authority: crate::agent_sdk::Hash([0xb6; 32]),
+                control: crate::agent_sdk::Hash([0xb7; 32]),
+                request: crate::agent_sdk::Hash([0xb8; 32]),
+                sequence: (super::super::standard::MAX_AUTHORITY_DISPOSITIONS + 1) as u64,
+                previous: Some(last.control),
+                epoch: last.epoch,
+                observed_slot: last.observed_slot,
+                result: template.result,
+            });
+        assert!(matches!(
+            StandardAgentRuntime::restore(exact_limit),
+            Err(super::super::LifecycleError::InvalidRequest)
+        ));
     }
 
     #[cfg(feature = "pvm")]

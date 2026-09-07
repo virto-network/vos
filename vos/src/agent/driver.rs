@@ -98,7 +98,7 @@ fn clean_management_receipt_history(
         .find(|item| item.authority == receipt.commitment())
     {
         return Ok(
-            if disposition.request != request.commitment()
+            if disposition.request != request.replay_commitment()
                 || disposition.epoch != receipt.selector.epoch
                 || disposition.sequence != receipt.selector.decision_sequence
             {
@@ -189,6 +189,9 @@ fn clean_management_operation(
         ManagementRequest::RemoveLeaf { .. } => Some(AuthorityOperationKind::RemoveActor),
         ManagementRequest::UpgradeRuntime(_) => Some(AuthorityOperationKind::UpgradeRuntime),
         ManagementRequest::ChangeReplicas { .. } => Some(AuthorityOperationKind::ChangeReplicaSet),
+        // Private controls have their own retained authority/application
+        // path and are never admitted by a generic Local/Shared driver.
+        ManagementRequest::PrivateControl { .. } => None,
     }
 }
 
@@ -566,6 +569,9 @@ pub(crate) fn sdk_management_reply_matches(
                     current.creation_nonce,
                     replicas,
                 )
+        }
+        (request @ ManagementRequest::PrivateControl { .. }, reply) => {
+            request.private_runtime_reply_matches(reply)
         }
         _ => false,
     }
@@ -4987,13 +4993,14 @@ mod tests {
                     },
                     super::super::standard::StandardCleanManagementDisposition {
                         authority: receipt.commitment(),
-                        request: request.commitment(),
+                        request: request.replay_commitment(),
                         epoch: receipt.selector.epoch,
                         sequence: receipt.selector.decision_sequence,
                         observed_slot: 2,
                         result: Err(crate::agent_sdk::ManagementError::NotFound),
                     },
                 ],
+                active_resource_policy: Some(descriptor.initial_resource_policy()),
                 authority_slot_high_water: Some(2),
                 ..Default::default()
             },
@@ -5002,6 +5009,7 @@ mod tests {
             clean_management_receipt_history(&runtime_state, &request, &receipt),
             Ok(CleanManagementReceiptHistory::Retained)
         );
+        assert_eq!(request.replay_commitment(), request.commitment());
         assert_eq!(
             verify_clean_management_receipt(&descriptor, &request, &receipt, 100, true),
             Ok(()),

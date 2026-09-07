@@ -250,6 +250,9 @@ impl ManagementAuthorizationPlan {
                     .collect(),
                 replica_roster_commitment: crate::replica_roster_commitment(replicas),
             },
+            // Private controls enter through retained AOC/AOP/PCA evidence,
+            // never through the generic ACC3 management plan.
+            ManagementRequest::PrivateControl { .. } => return None,
         })
     }
 
@@ -1235,7 +1238,8 @@ fn management_application_reply_shape_matches(
         | (_, ManagementReply::Resumed(_))
         | (_, ManagementReply::Removed(_))
         | (_, ManagementReply::RuntimeUpgraded(_))
-        | (_, ManagementReply::ReplicasChanged { .. }) => false,
+        | (_, ManagementReply::ReplicasChanged { .. })
+        | (_, ManagementReply::ResourcePolicySet(_)) => false,
     }
 }
 

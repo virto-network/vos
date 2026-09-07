@@ -2995,6 +2995,15 @@ fn validate_clean_management_request(
     authority: &crate::agent_sdk::authority::AuthorityReceipt,
     observed_slot: u64,
 ) -> Result<(), DecodeError> {
+    // Private controls are executed only by the dedicated Private host over
+    // its PCTL/store transaction. Persisting them as generic Ordered/Raft
+    // CleanManage would split guest state from Private control truth.
+    if matches!(
+        request,
+        crate::agent_sdk::ManagementRequest::PrivateControl { .. }
+    ) {
+        return Err(DecodeError::NonCanonical);
+    }
     let selector_deployment = authority.selector.runtime_deployment;
     let current_deployment = selector_deployment.0 == runtime.deployment.0;
     let retained_runtime_upgrade = matches!(
@@ -3939,11 +3948,11 @@ mod tests {
     fn clean_management_input(request: crate::agent_sdk::ManagementRequest) -> ReplayInput {
         let runtime = runtime_binding();
         let public_key = [0x91; 32];
-        let (actor, actor_deployment) = request
-            .authority_actor()
-            .map_or((None, None), |(actor, deployment)| {
-                (Some(actor), Some(deployment))
-            });
+        let (actor, actor_deployment) = request.authority_actor_selector();
+        let operation = request
+            .authority_operation()
+            .expect("fixture request is mutating");
+        let decision_sequence = u64::from(operation.uses_management_decision_journal());
         let authority = crate::agent_sdk::authority::AuthorityReceipt {
             selector: crate::agent_sdk::authority::AuthorityReceiptSelector {
                 policy: crate::agent_sdk::Hash([0x92; 32]),
@@ -3956,9 +3965,7 @@ mod tests {
                 },
                 space: crate::agent_sdk::SpaceId(runtime.space.0),
                 agent: crate::agent_sdk::AgentId(runtime.agent.0),
-                operation: request
-                    .authority_operation()
-                    .expect("fixture request is mutating"),
+                operation,
                 runtime_deployment: crate::agent_sdk::DeploymentId(runtime.deployment.0),
                 actor,
                 actor_deployment,
@@ -3969,7 +3976,7 @@ mod tests {
                 },
                 lane_roots: crate::agent_sdk::authority::AuthorityLaneRoots::default(),
                 epoch: 1,
-                decision_sequence: 1,
+                decision_sequence,
                 acknowledged_through: 0,
                 valid_from: 5,
                 expires_at: 50,
@@ -5026,6 +5033,35 @@ mod tests {
         let mut trailing_inner = canonical_work;
         trailing_inner.push(0);
         assert!(decode_wrapped(&trailing_inner).is_err());
+
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        let policy = crate::agent_sdk::contract::RuntimeResourcePolicy::standard();
+        let policy_reference = crate::agent_sdk::BlobRef::of_bytes(&policy.encode().unwrap());
+        let runtime = runtime_binding();
+        let private_request = crate::agent_sdk::ManagementRequest::PrivateControl {
+            control: Box::new(crate::agent_sdk::private::PrivateControlRecord {
+                space: crate::agent_sdk::SpaceId(runtime.space.0),
+                agent: crate::agent_sdk::AgentId(runtime.agent.0),
+                sequence: 0,
+                previous: None,
+                operation: crate::agent_sdk::private::PrivateControlOperation::SetResourcePolicy {
+                    policy: policy_reference,
+                },
+                signer: crate::agent_sdk::private::PrivateControlSigner::Owner,
+                signer_public_key: [0xa5; 32],
+                signature: [0xa6; crate::agent_sdk::private::PRIVATE_SIGNATURE_BYTES],
+            }),
+            mutation: Box::new(crate::agent_sdk::PrivateRuntimeMutation::SetResourcePolicy(
+                policy,
+            )),
+        };
+        assert!(private_request.is_valid());
+        let private = clean_management_input(private_request);
+        assert_eq!(
+            private.validate(),
+            Err(DecodeError::NonCanonical),
+            "Private runtime controls must never enter generic CleanManage replay"
+        );
 
         let old_runtime_call = RuntimeCall::new(
             RuntimeState::default(),

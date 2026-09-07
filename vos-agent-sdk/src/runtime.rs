@@ -2,7 +2,8 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::authority::{AuthorityOperationKind, AuthorityReceipt};
-use crate::contract::RuntimePackageContract;
+use crate::contract::{RuntimePackageContract, RuntimeResourcePolicy};
+use crate::private::{PrivateActorLifecycleKind, PrivateControlRecord};
 use crate::{
     ActorDirectoryPage, ActorEntry, ActorId, ActorLifecycleDebt, AgentDescriptor, AgentIdentity,
     AgentReplica, BlobRef, CallId, CapabilityId, CredentialId, DeploymentId, Hash, InstallActor,
@@ -420,6 +421,13 @@ pub enum ManagementRequest {
         expected_generation: Hash,
         replicas: Vec<AgentReplica>,
     },
+    /// Apply one exact owner-signed Private control through the admitted
+    /// runtime. The nested mutation is deliberately nonrecursive: a PCTL can
+    /// never smuggle another management envelope or authority selector.
+    PrivateControl {
+        control: Box<PrivateControlRecord>,
+        mutation: Box<PrivateRuntimeMutation>,
+    },
 }
 
 impl ManagementRequest {
@@ -439,6 +447,20 @@ impl ManagementRequest {
         crate::authority::ManagementAuthorizationPlan::from_request(self)
     }
 
+    /// Commitment of the complete canonical request used for durable replay
+    /// equality. For Private controls this is distinct from [`Self::commitment`],
+    /// because the authority selector intentionally commits the PCTL while
+    /// replay must additionally bind its exact runtime mutation preimage.
+    pub fn replay_commitment(&self) -> Hash {
+        crate::wire::management_request_replay_commitment(self)
+    }
+
+    /// Whether an admitted Private runtime reply is the exact result shape
+    /// selected by this request. Non-Private requests always return false.
+    pub fn private_runtime_reply_matches(&self, reply: &ManagementReply) -> bool {
+        crate::wire::private_runtime_reply_matches(self, reply)
+    }
+
     /// Signed authority operation required for a mutating management request.
     /// Read-only inspection deliberately has no authority operation.
     pub fn authority_operation(&self) -> Option<crate::authority::AuthorityOperationKind> {
@@ -448,6 +470,68 @@ impl ManagementRequest {
     /// Exact actor/deployment selector required by this request, when any.
     pub fn authority_actor(&self) -> Option<(ActorId, DeploymentId)> {
         crate::wire::management_actor(self)
+    }
+
+    /// Exact actor fields carried by the authority selector. Private actor
+    /// controls expose the ActorId but keep their deployment inside the
+    /// signed PCTL mutation commitment.
+    pub fn authority_actor_selector(&self) -> (Option<ActorId>, Option<DeploymentId>) {
+        crate::wire::management_actor_selector(self)
+    }
+}
+
+/// Exact runtime mutation selected by a Private control. This type cannot
+/// contain a [`ManagementRequest`], preventing recursive envelopes and
+/// keeping the PCTL-to-runtime binding finite and canonical.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrivateRuntimeMutation {
+    SetResourcePolicy(RuntimeResourcePolicy),
+    Install(InstallActor),
+    UpgradeActor(UpgradeActor),
+    Suspend {
+        actor: ActorId,
+        expected_deployment: DeploymentId,
+    },
+    Resume {
+        actor: ActorId,
+        expected_deployment: DeploymentId,
+    },
+    RemoveLeaf {
+        actor: ActorId,
+        expected_deployment: DeploymentId,
+    },
+}
+
+impl PrivateRuntimeMutation {
+    pub fn is_valid(&self) -> bool {
+        crate::wire::private_runtime_mutation_valid(self)
+    }
+
+    /// Commitment placed in a Private ActorLifecycle PCTL's `request` field.
+    pub fn commitment(&self) -> Hash {
+        crate::wire::private_runtime_mutation_commitment(self)
+    }
+
+    pub const fn lifecycle_kind(&self) -> Option<PrivateActorLifecycleKind> {
+        match self {
+            Self::SetResourcePolicy(_) => None,
+            Self::Install(_) => Some(PrivateActorLifecycleKind::Install),
+            Self::UpgradeActor(_) => Some(PrivateActorLifecycleKind::Upgrade),
+            Self::Suspend { .. } => Some(PrivateActorLifecycleKind::Suspend),
+            Self::Resume { .. } => Some(PrivateActorLifecycleKind::Resume),
+            Self::RemoveLeaf { .. } => Some(PrivateActorLifecycleKind::Remove),
+        }
+    }
+
+    pub const fn actor(&self) -> Option<ActorId> {
+        match self {
+            Self::SetResourcePolicy(_) => None,
+            Self::Install(value) => Some(value.entry.actor),
+            Self::UpgradeActor(value) => Some(value.actor),
+            Self::Suspend { actor, .. }
+            | Self::Resume { actor, .. }
+            | Self::RemoveLeaf { actor, .. } => Some(*actor),
+        }
     }
 }
 
@@ -510,7 +594,12 @@ pub enum ManagementReply {
     Resumed(ActorEntry),
     Removed(ActorId),
     RuntimeUpgraded(AgentIdentity),
-    ReplicasChanged { generation: Hash },
+    ReplicasChanged {
+        generation: Hash,
+    },
+    /// Exact mutable RRP1 policy retained after a Private resource-policy
+    /// control succeeds.
+    ResourcePolicySet(RuntimeResourcePolicy),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

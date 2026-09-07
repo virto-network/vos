@@ -2249,11 +2249,8 @@ mod tests {
             AuthorityEvidence, AuthorityLaneRoots, AuthorityReceipt, AuthorityReceiptSelector,
         };
 
-        let (actor, actor_deployment) = request
-            .authority_actor()
-            .map_or((None, None), |(actor, deployment)| {
-                (Some(actor), Some(deployment))
-            });
+        let operation = request.authority_operation().unwrap();
+        let (actor, actor_deployment) = request.authority_actor_selector();
         let runtime_deployment = match request {
             crate::agent_sdk::ManagementRequest::Create(descriptor) => {
                 descriptor.identity.runtime_deployment
@@ -2267,7 +2264,7 @@ mod tests {
                 issuer: descriptor.authority.issuer,
                 space: descriptor.identity.space,
                 agent: descriptor.identity.agent,
-                operation: request.authority_operation().unwrap(),
+                operation,
                 runtime_deployment,
                 actor,
                 actor_deployment,
@@ -2278,7 +2275,10 @@ mod tests {
                 },
                 lane_roots: AuthorityLaneRoots::default(),
                 epoch: 1,
-                decision_sequence: sequence,
+                decision_sequence: operation
+                    .uses_management_decision_journal()
+                    .then_some(sequence)
+                    .unwrap_or(0),
                 acknowledged_through: 0,
                 valid_from: 10,
                 expires_at: 30,
@@ -3499,6 +3499,40 @@ mod tests {
             },
             "runtime capabilities are not installed-actor lane ownership",
         );
+
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        let policy = crate::agent_sdk::contract::RuntimeResourcePolicy::standard();
+        let policy_bytes = policy.encode().unwrap();
+        let private = crate::agent_sdk::ManagementRequest::PrivateControl {
+            control: Box::new(crate::agent_sdk::private::PrivateControlRecord {
+                space: fixture.descriptor.identity.space,
+                agent: fixture.descriptor.identity.agent,
+                sequence: 0,
+                previous: None,
+                operation: crate::agent_sdk::private::PrivateControlOperation::SetResourcePolicy {
+                    policy: crate::agent_sdk::BlobRef::of_bytes(&policy_bytes),
+                },
+                signer: crate::agent_sdk::private::PrivateControlSigner::Owner,
+                signer_public_key: [0x62; 32],
+                signature: [0x63; crate::agent_sdk::private::PRIVATE_SIGNATURE_BYTES],
+            }),
+            mutation: Box::new(crate::agent_sdk::PrivateRuntimeMutation::SetResourcePolicy(
+                policy,
+            )),
+        };
+        assert!(private.is_valid());
+        let private_receipt =
+            clean_management_receipt(&fixture.descriptor, &private, 2, &fixture.authority_key);
+        assert!(matches!(
+            host.prepare_clean_management(
+                fixture.shared.agent,
+                private,
+                private_receipt,
+                SdkManagementArtifacts::None,
+            ),
+            Err(SharedAgentHostError::CorruptResidue)
+        ));
+        assert_eq!(host.list().unwrap()[0].applied_slots, 0);
 
         let target = &fixture.upgrade_runtime;
         let upgrade = crate::agent_sdk::RuntimeUpgrade {

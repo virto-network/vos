@@ -55,6 +55,26 @@ pub const MAX_RUNTIME_WORK_WIRE_BYTES: usize =
 pub const MAX_RUNTIME_TRANSITION_WIRE_BYTES: usize =
     HEADER_BYTES + MAX_RUNTIME_STATE_BYTES + MAX_DIRECTORY_PAGE_WIRE_BYTES + 64 * 1024;
 pub const MAX_RUNTIME_RESOURCE_POLICY_WIRE_BYTES: usize = HEADER_BYTES + 4 + 4 + 4 + 8 + 8;
+/// Exact largest canonical PCTL admitted by the runtime ABI. Only the fixed
+/// SetResourcePolicy and ActorLifecycle shapes are admitted; the much larger
+/// Invite/Recover control families never enter a guest work item.
+pub const MAX_PRIVATE_RUNTIME_CONTROL_WIRE_BYTES: usize = HEADER_BYTES
+    + 32 // space
+    + 32 // agent
+    + 8 // sequence
+    + 1
+    + 32 // optional previous
+    + 1
+    + 32
+    + 1
+    + 32 // largest ActorLifecycle operation
+    + 1 // signer
+    + 32 // signing key
+    + crate::private::PRIVATE_SIGNATURE_BYTES;
+/// One bounded nonrecursive Private mutation. Install is largest because it
+/// may contain the canonical constructor argument preimage.
+pub const MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES: usize =
+    HEADER_BYTES + crate::MAX_INSTALLATION_DATA_BYTES + 4 * MAX_ACTOR_ENTRY_WIRE_BYTES;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WireError {
@@ -2272,6 +2292,199 @@ fn replica_set_valid(replicas: &[AgentReplica]) -> bool {
         && replicas.windows(2).all(|pair| pair[0].node < pair[1].node)
 }
 
+pub(crate) fn private_runtime_mutation_valid(value: &PrivateRuntimeMutation) -> bool {
+    match value {
+        PrivateRuntimeMutation::SetResourcePolicy(policy) => policy.is_valid(),
+        PrivateRuntimeMutation::Install(install) => {
+            install_valid(install) && install.validate_for_profile(AgentProfile::Private).is_ok()
+        }
+        PrivateRuntimeMutation::UpgradeActor(upgrade) => {
+            upgrade_actor_valid(upgrade) && upgrade.requirements.supported_by(AgentProfile::Private)
+        }
+        PrivateRuntimeMutation::Suspend {
+            actor,
+            expected_deployment,
+        }
+        | PrivateRuntimeMutation::Resume {
+            actor,
+            expected_deployment,
+        }
+        | PrivateRuntimeMutation::RemoveLeaf {
+            actor,
+            expected_deployment,
+        } => *actor != ActorId::ZERO && *expected_deployment != DeploymentId::ZERO,
+    }
+}
+
+fn encode_private_runtime_mutation(encoder: &mut Encoder<'_>, value: &PrivateRuntimeMutation) {
+    match value {
+        PrivateRuntimeMutation::SetResourcePolicy(policy) => {
+            encoder.u8(0);
+            encode_runtime_resource_policy(encoder, *policy);
+        }
+        PrivateRuntimeMutation::Install(install) => {
+            encoder.u8(1);
+            encode_install(encoder, install);
+        }
+        PrivateRuntimeMutation::UpgradeActor(upgrade) => {
+            encoder.u8(2);
+            encode_upgrade_actor(encoder, upgrade);
+        }
+        PrivateRuntimeMutation::Suspend {
+            actor,
+            expected_deployment,
+        } => {
+            encoder.u8(3);
+            encoder.fixed(actor.as_bytes());
+            encoder.fixed(expected_deployment.as_bytes());
+        }
+        PrivateRuntimeMutation::Resume {
+            actor,
+            expected_deployment,
+        } => {
+            encoder.u8(4);
+            encoder.fixed(actor.as_bytes());
+            encoder.fixed(expected_deployment.as_bytes());
+        }
+        PrivateRuntimeMutation::RemoveLeaf {
+            actor,
+            expected_deployment,
+        } => {
+            encoder.u8(5);
+            encoder.fixed(actor.as_bytes());
+            encoder.fixed(expected_deployment.as_bytes());
+        }
+    }
+}
+
+fn decode_private_runtime_mutation(
+    decoder: &mut Decoder<'_>,
+) -> Result<PrivateRuntimeMutation, DecodeError> {
+    let value = match decoder.u8()? {
+        0 => PrivateRuntimeMutation::SetResourcePolicy(decode_runtime_resource_policy(decoder)?),
+        1 => PrivateRuntimeMutation::Install(decode_install(decoder)?),
+        2 => PrivateRuntimeMutation::UpgradeActor(decode_upgrade_actor(decoder)?),
+        3 => PrivateRuntimeMutation::Suspend {
+            actor: ActorId(decoder.fixed()?),
+            expected_deployment: DeploymentId(decoder.fixed()?),
+        },
+        4 => PrivateRuntimeMutation::Resume {
+            actor: ActorId(decoder.fixed()?),
+            expected_deployment: DeploymentId(decoder.fixed()?),
+        },
+        5 => PrivateRuntimeMutation::RemoveLeaf {
+            actor: ActorId(decoder.fixed()?),
+            expected_deployment: DeploymentId(decoder.fixed()?),
+        },
+        _ => return Err(DecodeError::InvalidTag),
+    };
+    private_runtime_mutation_valid(&value)
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+impl CanonicalWire for PrivateRuntimeMutation {
+    const MAGIC: [u8; 4] = *b"PRM1";
+    const MAX_ENCODED_BYTES: usize = MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        private_runtime_mutation_valid(self)
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_private_runtime_mutation(encoder, self);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        decode_private_runtime_mutation(decoder)
+    }
+}
+
+pub(crate) fn private_runtime_mutation_commitment(value: &PrivateRuntimeMutation) -> Hash {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"PRM1");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_private_runtime_mutation(&mut Encoder(&mut bytes), value);
+    Hash::digest(b"vos/agent/private-runtime-mutation/v1", &[&bytes])
+}
+
+fn private_control_request_valid(
+    control: &PrivateControlRecord,
+    mutation: &PrivateRuntimeMutation,
+) -> bool {
+    if !control.validate_shape() || !private_runtime_mutation_valid(mutation) {
+        return false;
+    }
+    match (&control.operation, mutation) {
+        (
+            PrivateControlOperation::SetResourcePolicy { policy: reference },
+            PrivateRuntimeMutation::SetResourcePolicy(policy),
+        ) => policy
+            .encode()
+            .is_ok_and(|bytes| reference.matches(bytes.as_slice())),
+        (
+            PrivateControlOperation::ActorLifecycle {
+                actor,
+                operation,
+                request,
+            },
+            mutation,
+        ) => {
+            mutation.lifecycle_kind() == Some(*operation)
+                && mutation.actor() == Some(*actor)
+                && mutation.commitment() == *request
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn private_runtime_reply_matches(
+    request: &ManagementRequest,
+    reply: &ManagementReply,
+) -> bool {
+    let ManagementRequest::PrivateControl { mutation, .. } = request else {
+        return false;
+    };
+    match (mutation.as_ref(), reply) {
+        (
+            PrivateRuntimeMutation::SetResourcePolicy(expected),
+            ManagementReply::ResourcePolicySet(policy),
+        ) => expected == policy,
+        (PrivateRuntimeMutation::Install(install), ManagementReply::Installed(entry)) => {
+            install.entry == *entry
+        }
+        (PrivateRuntimeMutation::UpgradeActor(upgrade), ManagementReply::Upgraded(entry)) => {
+            entry.actor == upgrade.actor
+                && entry.deployment == upgrade.to_deployment
+                && entry.program == upgrade.to_program
+                && entry.package == upgrade.package
+                && entry.agent_schema == upgrade.agent_schema
+                && entry.method_policy == upgrade.method_policy
+                && entry.constructor_abi == upgrade.constructor_abi
+                && entry.state_layout == upgrade.state_layout
+                && entry.lanes == upgrade.requirements.lanes
+        }
+        (
+            PrivateRuntimeMutation::Suspend {
+                actor,
+                expected_deployment,
+            },
+            ManagementReply::Suspended(entry),
+        ) => entry.actor == *actor && entry.deployment == *expected_deployment && entry.suspended,
+        (
+            PrivateRuntimeMutation::Resume {
+                actor,
+                expected_deployment,
+            },
+            ManagementReply::Resumed(entry),
+        ) => entry.actor == *actor && entry.deployment == *expected_deployment && !entry.suspended,
+        (PrivateRuntimeMutation::RemoveLeaf { actor, .. }, ManagementReply::Removed(removed)) => {
+            actor == removed
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn management_request_valid(value: &ManagementRequest) -> bool {
     match value {
         ManagementRequest::Create(descriptor) => descriptor.validate().is_ok(),
@@ -2300,6 +2513,9 @@ pub(crate) fn management_request_valid(value: &ManagementRequest) -> bool {
             expected_generation,
             replicas,
         } => *expected_generation != Hash::ZERO && replica_set_valid(replicas),
+        ManagementRequest::PrivateControl { control, mutation } => {
+            private_control_request_valid(control, mutation)
+        }
     }
 }
 
@@ -2359,6 +2575,17 @@ fn encode_management_request(encoder: &mut Encoder<'_>, value: &ManagementReques
             encoder.fixed(expected_generation.as_bytes());
             encoder.list(replicas, encode_replica);
         }
+        ManagementRequest::PrivateControl { control, mutation } => {
+            encoder.u8(10);
+            let control = control
+                .encode()
+                .expect("validated Private runtime request has canonical PCTL");
+            let mutation = mutation
+                .encode()
+                .expect("validated Private runtime request has canonical mutation");
+            encoder.bytes(&control);
+            encoder.bytes(&mutation);
+        }
     }
 }
 
@@ -2393,6 +2620,20 @@ fn decode_management_request(decoder: &mut Decoder<'_>) -> Result<ManagementRequ
             expected_generation: Hash(decoder.fixed()?),
             replicas: decoder.list_bounded(MAX_AGENT_REPLICAS, decode_replica)?,
         },
+        10 => {
+            let control = decoder.bytes_bounded(MAX_PRIVATE_RUNTIME_CONTROL_WIRE_BYTES)?;
+            let mutation = decoder.bytes_bounded(MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES)?;
+            ManagementRequest::PrivateControl {
+                control: alloc::boxed::Box::new(
+                    PrivateControlRecord::decode(&control)
+                        .map_err(|_| DecodeError::NonCanonical)?,
+                ),
+                mutation: alloc::boxed::Box::new(
+                    PrivateRuntimeMutation::decode(&mutation)
+                        .map_err(|_| DecodeError::NonCanonical)?,
+                ),
+            }
+        }
         _ => return Err(DecodeError::InvalidTag),
     };
     management_request_valid(&value)
@@ -2401,6 +2642,9 @@ fn decode_management_request(decoder: &mut Decoder<'_>) -> Result<ManagementRequ
 }
 
 pub(crate) fn management_request_commitment(value: &ManagementRequest) -> Hash {
+    if let ManagementRequest::PrivateControl { control, .. } = value {
+        return control.commitment();
+    }
     if let Some(plan) = ManagementAuthorizationPlan::from_request(value) {
         return plan.commitment();
     }
@@ -2417,6 +2661,19 @@ pub(crate) fn management_request_commitment(value: &ManagementRequest) -> Hash {
     }
 }
 
+pub(crate) fn management_request_replay_commitment(value: &ManagementRequest) -> Hash {
+    if !matches!(value, ManagementRequest::PrivateControl { .. }) {
+        return management_request_commitment(value);
+    }
+    Hash::digest(
+        b"vos/agent/management-replay-request/v1",
+        &[
+            RUNTIME_ABI_ID.as_bytes(),
+            &encode_canonical_management_request(value),
+        ],
+    )
+}
+
 pub(crate) fn required_management_operation(
     value: &ManagementRequest,
 ) -> Option<AuthorityOperationKind> {
@@ -2430,6 +2687,15 @@ pub(crate) fn required_management_operation(
         ManagementRequest::RemoveLeaf { .. } => Some(AuthorityOperationKind::RemoveActor),
         ManagementRequest::UpgradeRuntime(_) => Some(AuthorityOperationKind::UpgradeRuntime),
         ManagementRequest::ChangeReplicas { .. } => Some(AuthorityOperationKind::ChangeReplicaSet),
+        ManagementRequest::PrivateControl { control, .. } => match control.operation {
+            PrivateControlOperation::SetResourcePolicy { .. } => {
+                Some(AuthorityOperationKind::SetPrivateResourcePolicy)
+            }
+            PrivateControlOperation::ActorLifecycle { .. } => {
+                Some(AuthorityOperationKind::PrivateActorLifecycle)
+            }
+            _ => None,
+        },
     }
 }
 
@@ -2453,6 +2719,20 @@ pub(crate) fn management_actor(value: &ManagementRequest) -> Option<(ActorId, De
     }
 }
 
+pub(crate) fn management_actor_selector(
+    value: &ManagementRequest,
+) -> (Option<ActorId>, Option<DeploymentId>) {
+    match value {
+        ManagementRequest::PrivateControl { control, .. } => match control.operation {
+            PrivateControlOperation::ActorLifecycle { actor, .. } => (Some(actor), None),
+            _ => (None, None),
+        },
+        _ => management_actor(value)
+            .map(|(actor, deployment)| (Some(actor), Some(deployment)))
+            .unwrap_or((None, None)),
+    }
+}
+
 fn authority_matches_management(
     receipt: &AuthorityReceipt,
     space: SpaceId,
@@ -2461,27 +2741,30 @@ fn authority_matches_management(
     request: &ManagementRequest,
     _observed_slot: u64,
 ) -> bool {
-    let Some(plan) = request.authorization_plan() else {
+    let (operation, request_commitment, actor) = if let Some(plan) = request.authorization_plan() {
+        (
+            plan.authority_operation(),
+            plan.commitment(),
+            plan.authority_actor()
+                .map(|(actor, deployment)| (Some(actor), Some(deployment)))
+                .unwrap_or((None, None)),
+        )
+    } else if matches!(request, ManagementRequest::PrivateControl { .. }) {
+        (
+            required_management_operation(request).unwrap(),
+            management_request_commitment(request),
+            management_actor_selector(request),
+        )
+    } else {
         return false;
     };
-    let actor = plan.authority_actor();
     receipt.validate_shape().is_ok()
         && receipt.selector.space == space
         && receipt.selector.agent == agent
         && receipt.selector.runtime_deployment == runtime_deployment
-        && receipt.selector.operation == plan.authority_operation()
-        && receipt.selector.request == plan.commitment()
-        && match (
-            actor,
-            receipt.selector.actor,
-            receipt.selector.actor_deployment,
-        ) {
-            (Some((actor, deployment)), Some(receipt_actor), Some(receipt_deployment)) => {
-                actor == receipt_actor && deployment == receipt_deployment
-            }
-            (None, None, None) => true,
-            _ => false,
-        }
+        && receipt.selector.operation == operation
+        && receipt.selector.request == request_commitment
+        && actor == (receipt.selector.actor, receipt.selector.actor_deployment)
 }
 
 fn encode_runtime_state(encoder: &mut Encoder<'_>, value: &RuntimeState) {
@@ -2886,6 +3169,11 @@ fn runtime_work_valid(value: &RuntimeWork) -> bool {
                     return false;
                 }
             }
+            if let ManagementRequest::PrivateControl { control, .. } = request.as_ref()
+                && (!context.is_direct() || control.space != *space || control.agent != *agent)
+            {
+                return false;
+            }
             match (required_management_operation(request), authority) {
                 (None, None) => true,
                 (None, Some(_)) => false,
@@ -3133,6 +3421,7 @@ pub(crate) fn management_reply_valid(value: &ManagementReply) -> bool {
         | ManagementReply::Resumed(entry) => entry.validate().is_ok(),
         ManagementReply::Removed(actor) => *actor != ActorId::ZERO,
         ManagementReply::ReplicasChanged { generation } => *generation != Hash::ZERO,
+        ManagementReply::ResourcePolicySet(policy) => policy.is_valid(),
     }
 }
 
@@ -3188,6 +3477,10 @@ fn encode_management_reply(encoder: &mut Encoder<'_>, value: &ManagementReply) {
             encoder.u8(9);
             encoder.fixed(generation.as_bytes());
         }
+        ManagementReply::ResourcePolicySet(policy) => {
+            encoder.u8(10);
+            encode_runtime_resource_policy(encoder, *policy);
+        }
     }
 }
 
@@ -3205,6 +3498,7 @@ fn decode_management_reply(decoder: &mut Decoder<'_>) -> Result<ManagementReply,
         9 => ManagementReply::ReplicasChanged {
             generation: Hash(decoder.fixed()?),
         },
+        10 => ManagementReply::ResourcePolicySet(decode_runtime_resource_policy(decoder)?),
         _ => return Err(DecodeError::InvalidTag),
     };
     management_reply_valid(&value)
@@ -4350,8 +4644,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/acc3-golden", &[&call_bytes]).0,
             [
-                53, 57, 72, 106, 133, 21, 88, 66, 133, 32, 150, 152, 21, 94, 96, 108, 40, 13, 87,
-                140, 209, 211, 188, 125, 112, 73, 168, 107, 5, 253, 146, 33,
+                205, 124, 27, 133, 136, 197, 36, 118, 4, 75, 25, 255, 204, 23, 224, 19, 191, 142,
+                32, 39, 23, 166, 120, 202, 7, 41, 152, 102, 37, 99, 21, 226,
             ]
         );
 
@@ -4363,8 +4657,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/map2-golden", &[&approval_bytes]).0,
             [
-                1, 97, 77, 235, 96, 1, 74, 137, 230, 199, 216, 40, 227, 48, 112, 12, 175, 144, 55,
-                78, 252, 181, 29, 94, 234, 72, 129, 103, 117, 59, 254, 87,
+                159, 180, 28, 190, 114, 149, 62, 194, 180, 161, 193, 192, 225, 96, 31, 26, 121, 82,
+                25, 51, 93, 218, 226, 148, 171, 144, 6, 234, 52, 178, 9, 241,
             ]
         );
 
@@ -4379,8 +4673,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/maa2-golden", &[&acknowledgement_bytes]).0,
             [
-                167, 223, 161, 133, 165, 6, 20, 12, 158, 185, 191, 176, 109, 169, 140, 233, 161,
-                155, 29, 153, 51, 160, 140, 69, 1, 45, 3, 173, 34, 223, 219, 10,
+                17, 168, 152, 131, 216, 243, 34, 26, 25, 241, 103, 52, 66, 81, 144, 89, 81, 246,
+                147, 10, 135, 218, 217, 153, 24, 59, 161, 143, 158, 146, 187, 63,
             ]
         );
     }
@@ -4395,8 +4689,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/aad3-golden", &[&bytes]).0,
             [
-                146, 212, 1, 91, 225, 115, 226, 158, 137, 197, 13, 205, 22, 147, 213, 74, 147, 237,
-                76, 231, 168, 152, 26, 187, 209, 229, 227, 190, 194, 69, 115, 143,
+                226, 206, 76, 92, 176, 194, 61, 82, 23, 103, 31, 120, 189, 193, 225, 56, 207, 196,
+                145, 1, 246, 168, 139, 55, 158, 167, 112, 150, 13, 11, 202, 211,
             ]
         );
 
@@ -4411,8 +4705,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/aar3-golden", &[&result_bytes]).0,
             [
-                210, 186, 61, 44, 35, 166, 253, 109, 142, 161, 158, 93, 85, 18, 67, 180, 189, 76,
-                214, 100, 91, 212, 225, 191, 174, 186, 210, 181, 205, 132, 176, 252,
+                214, 238, 87, 107, 175, 244, 219, 136, 9, 4, 206, 173, 227, 195, 107, 196, 12, 90,
+                162, 75, 127, 212, 69, 232, 254, 64, 40, 125, 219, 20, 61, 118,
             ]
         );
         assert_ne!(call.commitment(), result.commitment());
@@ -5008,8 +5302,8 @@ mod tests {
         assert_eq!(
             golden.0,
             [
-                203, 224, 101, 213, 71, 135, 230, 219, 120, 191, 189, 133, 230, 14, 33, 80, 250,
-                52, 204, 200, 179, 237, 200, 166, 4, 14, 169, 168, 98, 10, 22, 84,
+                44, 49, 179, 82, 16, 78, 105, 5, 222, 246, 226, 29, 8, 166, 116, 141, 145, 19, 13,
+                61, 223, 75, 205, 233, 189, 255, 14, 88, 214, 60, 97, 74,
             ]
         );
 
@@ -5151,6 +5445,7 @@ mod tests {
         };
         let encoded = work.encode().unwrap();
         assert_eq!(RuntimeWork::decode(&encoded), Ok(work.clone()));
+
         let mut later_retry = work.clone();
         let RuntimeWork::Invoke { observed_slot, .. } = &mut later_retry else {
             unreachable!()
@@ -5614,6 +5909,404 @@ mod tests {
             authority_binding: Hash([5; 32]),
             transport_signature: [6; 64],
         }
+    }
+
+    fn private_policy_request(
+        sequence: u64,
+        previous: Option<Hash>,
+        policy: RuntimeResourcePolicy,
+    ) -> ManagementRequest {
+        let policy_bytes = policy.encode().unwrap();
+        ManagementRequest::PrivateControl {
+            control: alloc::boxed::Box::new(PrivateControlRecord {
+                space: SpaceId([0x71; 32]),
+                agent: AgentId([0x72; 32]),
+                sequence,
+                previous,
+                operation: PrivateControlOperation::SetResourcePolicy {
+                    policy: BlobRef::of_bytes(&policy_bytes),
+                },
+                signer: PrivateControlSigner::Owner,
+                signer_public_key: [0x73; 32],
+                signature: [0x74; PRIVATE_SIGNATURE_BYTES],
+            }),
+            mutation: alloc::boxed::Box::new(PrivateRuntimeMutation::SetResourcePolicy(policy)),
+        }
+    }
+
+    fn private_lifecycle_request(
+        sequence: u64,
+        previous: Option<Hash>,
+        mutation: PrivateRuntimeMutation,
+    ) -> ManagementRequest {
+        let actor = mutation.actor().unwrap();
+        let operation = mutation.lifecycle_kind().unwrap();
+        let request = mutation.commitment();
+        ManagementRequest::PrivateControl {
+            control: alloc::boxed::Box::new(PrivateControlRecord {
+                space: SpaceId([0x71; 32]),
+                agent: AgentId([0x72; 32]),
+                sequence,
+                previous,
+                operation: PrivateControlOperation::ActorLifecycle {
+                    actor,
+                    operation,
+                    request,
+                },
+                signer: PrivateControlSigner::Owner,
+                signer_public_key: [0x73; 32],
+                signature: [0x74; PRIVATE_SIGNATURE_BYTES],
+            }),
+            mutation: alloc::boxed::Box::new(mutation),
+        }
+    }
+
+    fn private_management_receipt(
+        request: &ManagementRequest,
+        runtime_deployment: DeploymentId,
+    ) -> AuthorityReceipt {
+        let public_key = [0x75; AUTHORITY_PUBLIC_KEY_BYTES];
+        let (actor, actor_deployment) = request.authority_actor_selector();
+        AuthorityReceipt {
+            selector: AuthorityReceiptSelector {
+                policy: Hash([0x76; 32]),
+                issuer: AuthorityIssuer {
+                    principal: PrincipalId([0x77; 32]),
+                    actor: ActorId([0x78; 32]),
+                    deployment: DeploymentId([0x79; 32]),
+                    program: ProgramId([0x7a; 32]),
+                    producer: ProducerId::of_public_key(&public_key),
+                },
+                space: SpaceId([0x71; 32]),
+                agent: AgentId([0x72; 32]),
+                operation: request.authority_operation().unwrap(),
+                runtime_deployment,
+                actor,
+                actor_deployment,
+                evidence: AuthorityEvidence {
+                    package: None,
+                    proof: None,
+                    commitment: Hash([0x7b; 32]),
+                },
+                lane_roots: AuthorityLaneRoots::default(),
+                epoch: 3,
+                decision_sequence: 0,
+                acknowledged_through: 0,
+                valid_from: 10,
+                expires_at: 20,
+                request: request.commitment(),
+            },
+            public_key,
+            signature: [0x7c; AUTHORITY_SIGNATURE_BYTES],
+        }
+    }
+
+    #[test]
+    fn private_runtime_management_has_distinct_selector_and_exact_replay_commitments() {
+        let policy = RuntimeResourcePolicy {
+            max_actors: 17,
+            ..RuntimeResourcePolicy::standard()
+        };
+        let request = private_policy_request(4, Some(Hash([0x70; 32])), policy);
+        assert!(request.is_valid());
+        let ManagementRequest::PrivateControl { control, mutation } = &request else {
+            unreachable!()
+        };
+        assert_eq!(request.commitment(), control.commitment());
+        assert_ne!(request.replay_commitment(), request.commitment());
+        assert_eq!(
+            request.authority_operation(),
+            Some(AuthorityOperationKind::SetPrivateResourcePolicy)
+        );
+        assert_eq!(request.authority_actor_selector(), (None, None));
+
+        let encoded_mutation = mutation.encode().unwrap();
+        assert_eq!(
+            PrivateRuntimeMutation::decode(&encoded_mutation),
+            Ok((**mutation).clone())
+        );
+
+        let mut substituted = request.clone();
+        let ManagementRequest::PrivateControl { mutation, .. } = &mut substituted else {
+            unreachable!()
+        };
+        **mutation = PrivateRuntimeMutation::SetResourcePolicy(RuntimeResourcePolicy {
+            max_actors: 18,
+            ..policy
+        });
+        assert!(!substituted.is_valid());
+        assert_eq!(substituted.commitment(), request.commitment());
+        assert_ne!(substituted.replay_commitment(), request.replay_commitment());
+
+        assert!(
+            request.authorization_plan().is_none(),
+            "Private PCTLs use retained AOC/AOP/PCA and cannot enter ACC3"
+        );
+
+        let mut old_magic = encoded_mutation.clone();
+        old_magic[..4].copy_from_slice(b"PRM0");
+        assert_eq!(
+            PrivateRuntimeMutation::decode(&old_magic),
+            Err(WireError::Decode(DecodeError::InvalidTag))
+        );
+        let mut old_abi = encoded_mutation.clone();
+        old_abi[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-260907-r12");
+        assert_eq!(
+            PrivateRuntimeMutation::decode(&old_abi),
+            Err(WireError::Decode(DecodeError::InvalidPlatform))
+        );
+        let mut trailing = encoded_mutation;
+        trailing.push(0);
+        assert_eq!(
+            PrivateRuntimeMutation::decode(&trailing),
+            Err(WireError::Decode(DecodeError::TrailingBytes))
+        );
+    }
+
+    #[test]
+    fn private_runtime_work_is_direct_bounded_and_strictly_canonical() {
+        let runtime_deployment = DeploymentId([0x7d; 32]);
+        let request = private_lifecycle_request(
+            9,
+            Some(Hash([0x7e; 32])),
+            PrivateRuntimeMutation::Suspend {
+                actor: ActorId([0x7f; 32]),
+                expected_deployment: DeploymentId([0x80; 32]),
+            },
+        );
+        let ManagementRequest::PrivateControl { control, mutation } = &request else {
+            unreachable!()
+        };
+        assert_eq!(
+            control.encode().unwrap().len(),
+            MAX_PRIVATE_RUNTIME_CONTROL_WIRE_BYTES
+        );
+        assert!(mutation.encode().unwrap().len() <= MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES);
+        assert_eq!(
+            request.authority_operation(),
+            Some(AuthorityOperationKind::PrivateActorLifecycle)
+        );
+        assert_eq!(
+            request.authority_actor_selector(),
+            (Some(ActorId([0x7f; 32])), None)
+        );
+
+        let work = RuntimeWork::Manage {
+            context: RuntimeExecutionContext::Direct,
+            space: SpaceId([0x71; 32]),
+            agent: AgentId([0x72; 32]),
+            runtime_deployment,
+            state: RuntimeState::default(),
+            request: alloc::boxed::Box::new(request.clone()),
+            authority: Some(alloc::boxed::Box::new(private_management_receipt(
+                &request,
+                runtime_deployment,
+            ))),
+            observed_slot: 10,
+        };
+        let encoded = work.encode().unwrap();
+        assert!(encoded.len() <= MAX_RUNTIME_WORK_WIRE_BYTES);
+        assert!(encoded.len() < 32 * 1024 * 1024);
+        assert_eq!(RuntimeWork::decode(&encoded), Ok(work.clone()));
+
+        let mut attested = work.clone();
+        let RuntimeWork::Manage { context, .. } = &mut attested else {
+            unreachable!()
+        };
+        *context = RuntimeExecutionContext::Attested {
+            proof_system: Hash([0x81; 32]),
+        };
+        assert_eq!(attested.encode(), Err(WireError::InvalidValue));
+
+        let mut wrong_route = work.clone();
+        let RuntimeWork::Manage { space, .. } = &mut wrong_route else {
+            unreachable!()
+        };
+        *space = SpaceId([0x82; 32]);
+        assert_eq!(wrong_route.encode(), Err(WireError::InvalidValue));
+
+        let mut substituted_deployment = work.clone();
+        let RuntimeWork::Manage { request, .. } = &mut substituted_deployment else {
+            unreachable!()
+        };
+        let ManagementRequest::PrivateControl { mutation, .. } = request.as_mut() else {
+            unreachable!()
+        };
+        **mutation = PrivateRuntimeMutation::Suspend {
+            actor: ActorId([0x7f; 32]),
+            expected_deployment: DeploymentId([0x8a; 32]),
+        };
+        assert!(mutation.is_valid());
+        assert!(!request.is_valid());
+        assert_eq!(
+            substituted_deployment.encode(),
+            Err(WireError::InvalidValue)
+        );
+
+        let mut selected_deployment = work.clone();
+        let RuntimeWork::Manage {
+            authority: Some(authority),
+            ..
+        } = &mut selected_deployment
+        else {
+            unreachable!()
+        };
+        authority.selector.actor_deployment = Some(DeploymentId([0x8b; 32]));
+        assert_eq!(selected_deployment.encode(), Err(WireError::InvalidValue));
+
+        let mut old_abi = encoded.clone();
+        old_abi[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-260907-r12");
+        assert_eq!(
+            RuntimeWork::decode(&old_abi),
+            Err(WireError::Decode(DecodeError::InvalidPlatform))
+        );
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert_eq!(
+            RuntimeWork::decode(&trailing),
+            Err(WireError::Decode(DecodeError::TrailingBytes))
+        );
+
+        let valid_policy = private_policy_request(0, None, RuntimeResourcePolicy::standard());
+        let RuntimeWork::Manage {
+            authority: valid_authority,
+            ..
+        } = work.clone()
+        else {
+            unreachable!()
+        };
+        let make_unsupported = |operation| {
+            let mut request = valid_policy.clone();
+            let ManagementRequest::PrivateControl { control, .. } = &mut request else {
+                unreachable!()
+            };
+            control.operation = operation;
+            assert!(control.validate_shape());
+            let space = control.space;
+            let agent = control.agent;
+            assert!(!request.is_valid());
+            let work = RuntimeWork::Manage {
+                context: RuntimeExecutionContext::Direct,
+                space,
+                agent,
+                runtime_deployment,
+                state: RuntimeState::default(),
+                request: alloc::boxed::Box::new(request),
+                authority: valid_authority.clone(),
+                observed_slot: 10,
+            };
+            assert_eq!(work.encode(), Err(WireError::InvalidValue));
+        };
+        let epoch = PrivateKeyEpoch {
+            space: SpaceId([0x71; 32]),
+            agent: AgentId([0x72; 32]),
+            epoch: 1,
+            owner_key_commitment: Hash([0x8c; 32]),
+            data_key_commitment: Hash([0x8d; 32]),
+            recovery_key_commitment: Hash([0x8e; 32]),
+            recovery_encryption_public_key: [0x8f; 32],
+            sealed_recovery_data_key: SealedRecoveryKey {
+                recipient_key: [0x8f; 32],
+                sealed: alloc::vec![0x90; 48],
+            },
+            sealed_owner_keys: alloc::vec![SealedPrivateKey {
+                node: NodeId([0x91; 32]),
+                recipient_key: [0x92; 32],
+                sealed: alloc::vec![0x93; 48],
+            }],
+            sealed_data_keys: alloc::vec![SealedPrivateKey {
+                node: NodeId([0x91; 32]),
+                recipient_key: [0x92; 32],
+                sealed: alloc::vec![0x94; 48],
+            }],
+        };
+        assert!(epoch.validate());
+        make_unsupported(PrivateControlOperation::RotateKeys {
+            next_epoch: epoch.clone(),
+        });
+        make_unsupported(PrivateControlOperation::Revoke {
+            node: NodeId([0x95; 32]),
+            next_epoch: epoch,
+        });
+        let node = private_node();
+        make_unsupported(PrivateControlOperation::Invite {
+            node: node.clone(),
+            epoch: 0,
+            sealed_owner_key: SealedPrivateKey {
+                node: node.node,
+                recipient_key: node.encryption_public_key,
+                sealed: alloc::vec![0x96; 48],
+            },
+            sealed_data_key: SealedPrivateKey {
+                node: node.node,
+                recipient_key: node.encryption_public_key,
+                sealed: alloc::vec![0x97; 48],
+            },
+            historical_grants: Vec::new(),
+        });
+    }
+
+    #[test]
+    fn maximum_private_install_mutation_fits_runtime_work_and_guest_heap_bounds() {
+        let mut entry = actor(0x83);
+        entry.lanes = LaneSet::of(StateLane::Merge);
+        let bytes = alloc::vec![0x84; crate::MAX_INSTALLATION_DATA_BYTES];
+        let reference = BlobRef::of_bytes(&bytes);
+        entry.installation_data = Some(reference.clone());
+        let install = InstallActor {
+            installation_id: InstallationId([0x85; 32]),
+            registry_reservation: Hash([0x86; 32]),
+            producer: ProducerId([0x87; 32]),
+            package: entry.package.clone(),
+            agent_schema: entry.agent_schema.clone(),
+            method_policy: entry.method_policy.clone(),
+            constructor_abi: entry.constructor_abi,
+            installation_data: Some(InstallationData { reference, bytes }),
+            state_layout: entry.state_layout,
+            contract: ActorPackageContract::canonical(),
+            requirements: RuntimeRequirements {
+                lanes: entry.lanes,
+                scheduling: false,
+                proof_systems: ProofSystemSet::EMPTY,
+            },
+            entry,
+        };
+        let request = private_lifecycle_request(
+            1,
+            Some(Hash([0x88; 32])),
+            PrivateRuntimeMutation::Install(install),
+        );
+        assert!(request.is_valid());
+        let mut substituted_package = request.clone();
+        let ManagementRequest::PrivateControl { mutation, .. } = &mut substituted_package else {
+            unreachable!()
+        };
+        let PrivateRuntimeMutation::Install(install) = mutation.as_mut() else {
+            unreachable!()
+        };
+        let replacement = BlobRef::of_bytes(b"substituted package preimage");
+        install.package = replacement.clone();
+        install.entry.package = replacement;
+        assert!(mutation.is_valid());
+        assert!(!substituted_package.is_valid());
+        let runtime_deployment = DeploymentId([0x89; 32]);
+        let work = RuntimeWork::Manage {
+            context: RuntimeExecutionContext::Direct,
+            space: SpaceId([0x71; 32]),
+            agent: AgentId([0x72; 32]),
+            runtime_deployment,
+            state: RuntimeState::default(),
+            request: alloc::boxed::Box::new(request.clone()),
+            authority: Some(alloc::boxed::Box::new(private_management_receipt(
+                &request,
+                runtime_deployment,
+            ))),
+            observed_slot: 10,
+        };
+        let encoded = work.encode().unwrap();
+        assert!(encoded.len() <= MAX_RUNTIME_WORK_WIRE_BYTES);
+        assert!(encoded.len() < 32 * 1024 * 1024);
+        assert_eq!(RuntimeWork::decode(&encoded), Ok(work));
     }
 
     #[test]

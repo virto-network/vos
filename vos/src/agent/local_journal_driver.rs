@@ -1267,6 +1267,9 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => {
                 return Err(LocalReplayExecutorError::InvalidRequest);
             }
+            ManagementRequest::PrivateControl { .. } => {
+                return Err(LocalReplayExecutorError::InvalidRequest);
+            }
         }
         Ok(())
     }
@@ -4418,6 +4421,7 @@ where
                 | crate::agent_sdk::ManagementRequest::InspectActors { .. }
                 | crate::agent_sdk::ManagementRequest::InspectResources
                 | crate::agent_sdk::ManagementRequest::ChangeReplicas { .. }
+                | crate::agent_sdk::ManagementRequest::PrivateControl { .. }
         ) {
             return Err(LocalReplayExecutorError::InvalidRequest.into());
         }
@@ -5877,35 +5881,17 @@ mod tests {
         authority_key: &SigningKey,
     ) -> crate::agent_sdk::authority::AuthorityReceipt {
         use crate::agent_sdk::authority::{
-            AuthorityEvidence, AuthorityLaneRoots, AuthorityOperationKind, AuthorityReceipt,
-            AuthorityReceiptSelector,
+            AuthorityEvidence, AuthorityLaneRoots, AuthorityReceipt, AuthorityReceiptSelector,
         };
 
-        let (operation, actor, actor_deployment) = match request {
-            crate::agent_sdk::ManagementRequest::Create(_) => {
-                (AuthorityOperationKind::CreateAgent, None, None)
-            }
-            crate::agent_sdk::ManagementRequest::Suspend {
-                actor,
-                expected_deployment,
-            } => (
-                AuthorityOperationKind::SuspendActor,
-                Some(*actor),
-                Some(*expected_deployment),
-            ),
-            crate::agent_sdk::ManagementRequest::Resume {
-                actor,
-                expected_deployment,
-            } => (
-                AuthorityOperationKind::ResumeActor,
-                Some(*actor),
-                Some(*expected_deployment),
-            ),
-            crate::agent_sdk::ManagementRequest::ChangeReplicas { .. } => {
-                (AuthorityOperationKind::ChangeReplicaSet, None, None)
-            }
-            _ => panic!("unsupported clean local test request"),
-        };
+        let operation = request
+            .authority_operation()
+            .expect("mutating clean local test request");
+        let (actor, actor_deployment) = request.authority_actor_selector();
+        let decision_sequence = operation
+            .uses_management_decision_journal()
+            .then_some(sequence)
+            .unwrap_or(0);
         let mut receipt = AuthorityReceipt {
             selector: AuthorityReceiptSelector {
                 policy: descriptor.authority.policy,
@@ -5923,7 +5909,7 @@ mod tests {
                 },
                 lane_roots: AuthorityLaneRoots::default(),
                 epoch: 1,
-                decision_sequence: sequence,
+                decision_sequence,
                 acknowledged_through: 0,
                 valid_from: 1,
                 expires_at: 100,
@@ -6259,6 +6245,35 @@ mod tests {
             .clean_manage(success, success_receipt, SdkManagementArtifacts::None)
             .unwrap();
         assert_eq!(retained.outcome, first.outcome);
+        assert_eq!(driver.core.materialization.heads().ordered_index, 1);
+
+        let policy = crate::agent_sdk::contract::RuntimeResourcePolicy::standard();
+        let policy_bytes = policy.encode().unwrap();
+        let private = crate::agent_sdk::ManagementRequest::PrivateControl {
+            control: Box::new(crate::agent_sdk::private::PrivateControlRecord {
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                sequence: 0,
+                previous: None,
+                operation: crate::agent_sdk::private::PrivateControlOperation::SetResourcePolicy {
+                    policy: crate::agent_sdk::BlobRef::of_bytes(&policy_bytes),
+                },
+                signer: crate::agent_sdk::private::PrivateControlSigner::Owner,
+                signer_public_key: [0x52; 32],
+                signature: [0x53; crate::agent_sdk::private::PRIVATE_SIGNATURE_BYTES],
+            }),
+            mutation: Box::new(crate::agent_sdk::PrivateRuntimeMutation::SetResourcePolicy(
+                policy,
+            )),
+        };
+        assert!(private.is_valid());
+        let private_receipt = clean_test_receipt(&descriptor, &private, 3, &authority_key);
+        assert!(matches!(
+            driver.clean_manage(private, private_receipt, SdkManagementArtifacts::None),
+            Err(LocalJournalDriverError::Executor(
+                LocalReplayExecutorError::InvalidRequest
+            ))
+        ));
         assert_eq!(driver.core.materialization.heads().ordered_index, 1);
 
         slot.store(23, Ordering::SeqCst);

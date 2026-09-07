@@ -564,6 +564,9 @@ fn apply_management(
                 RuntimeOutcome::Management(Ok(ManagementReply::Installed(install.entry.clone()))),
             )
         }
+        ManagementRequest::PrivateControl { .. } => {
+            management_error(prior, ManagementError::UnsupportedRuntime)
+        }
         _ => management_error(prior, ManagementError::UnsupportedRuntime),
     }
 }
@@ -1185,18 +1188,15 @@ mod tests {
             sequence: u64,
             expires_at: u64,
         ) -> AuthorityReceipt {
-            let (actor, actor_deployment) = request
-                .authority_actor()
-                .map_or((None, None), |(actor, deployment)| {
-                    (Some(actor), Some(deployment))
-                });
+            let operation = request.authority_operation().unwrap();
+            let (actor, actor_deployment) = request.authority_actor_selector();
             let mut receipt = AuthorityReceipt {
                 selector: AuthorityReceiptSelector {
                     policy: self.descriptor.authority.policy,
                     issuer: self.descriptor.authority.issuer,
                     space: self.descriptor.identity.space,
                     agent: self.descriptor.identity.agent,
-                    operation: request.authority_operation().unwrap(),
+                    operation,
                     runtime_deployment: self.descriptor.identity.runtime_deployment,
                     actor,
                     actor_deployment,
@@ -1207,8 +1207,14 @@ mod tests {
                     },
                     lane_roots: AuthorityLaneRoots::default(),
                     epoch: 1,
-                    decision_sequence: sequence,
-                    acknowledged_through: sequence.saturating_sub(1),
+                    decision_sequence: operation
+                        .uses_management_decision_journal()
+                        .then_some(sequence)
+                        .unwrap_or(0),
+                    acknowledged_through: operation
+                        .uses_management_decision_journal()
+                        .then_some(sequence.saturating_sub(1))
+                        .unwrap_or(0),
                     valid_from: 1,
                     expires_at,
                     request: request.commitment(),
@@ -1418,6 +1424,48 @@ mod tests {
         assert_eq!(
             rejected.outcome,
             RuntimeOutcome::Management(Err(ManagementError::InvalidRequest))
+        );
+    }
+
+    #[test]
+    fn custom_linear_explicitly_rejects_private_runtime_control_without_state_change() {
+        let fixture = Fixture::new();
+        let created = dispatch(fixture.create(RuntimeState::default(), 5));
+        let policy = vos_agent_sdk::contract::RuntimeResourcePolicy::standard();
+        let policy_bytes = policy.encode().unwrap();
+        let request = ManagementRequest::PrivateControl {
+            control: Box::new(vos_agent_sdk::private::PrivateControlRecord {
+                space: fixture.descriptor.identity.space,
+                agent: fixture.descriptor.identity.agent,
+                sequence: 0,
+                previous: None,
+                operation: vos_agent_sdk::private::PrivateControlOperation::SetResourcePolicy {
+                    policy: BlobRef::of_bytes(&policy_bytes),
+                },
+                signer: vos_agent_sdk::private::PrivateControlSigner::Owner,
+                signer_public_key: [0xa4; 32],
+                signature: [0xa5; vos_agent_sdk::private::PRIVATE_SIGNATURE_BYTES],
+            }),
+            mutation: Box::new(vos_agent_sdk::PrivateRuntimeMutation::SetResourcePolicy(
+                policy,
+            )),
+        };
+        assert!(request.is_valid());
+        let receipt = fixture.receipt(&request, 2, 20);
+        let rejected = dispatch(RuntimeWork::Manage {
+            context: RuntimeExecutionContext::Direct,
+            space: fixture.descriptor.identity.space,
+            agent: fixture.descriptor.identity.agent,
+            runtime_deployment: fixture.descriptor.identity.runtime_deployment,
+            state: created.state.clone(),
+            request: Box::new(request),
+            authority: Some(Box::new(receipt)),
+            observed_slot: 6,
+        });
+        assert_eq!(rejected.state, created.state);
+        assert_eq!(
+            rejected.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::UnsupportedRuntime))
         );
     }
 

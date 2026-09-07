@@ -1163,6 +1163,7 @@ where
                 | crate::agent_sdk::ManagementRequest::InspectActors { .. }
                 | crate::agent_sdk::ManagementRequest::InspectResources
                 | crate::agent_sdk::ManagementRequest::ChangeReplicas { .. }
+                | crate::agent_sdk::ManagementRequest::PrivateControl { .. }
         ) {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
@@ -2136,7 +2137,8 @@ fn clean_management_artifact_references(operation: &ReplayOperation) -> Option<V
         | crate::agent_sdk::ManagementRequest::Suspend { .. }
         | crate::agent_sdk::ManagementRequest::Resume { .. }
         | crate::agent_sdk::ManagementRequest::RemoveLeaf { .. }
-        | crate::agent_sdk::ManagementRequest::ChangeReplicas { .. } => Vec::new(),
+        | crate::agent_sdk::ManagementRequest::ChangeReplicas { .. }
+        | crate::agent_sdk::ManagementRequest::PrivateControl { .. } => Vec::new(),
     };
     artifacts.sort_by_key(|artifact| artifact.hash);
     artifacts.dedup();

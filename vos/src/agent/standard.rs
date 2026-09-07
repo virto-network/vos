@@ -147,6 +147,12 @@ pub struct StandardAgentRuntime {
     clean_decision_sequence_high_water: Option<u64>,
     clean_acknowledged_through: u64,
     clean_management_dispositions: Vec<StandardCleanManagementDisposition>,
+    active_resource_policy: Option<crate::agent_sdk::contract::RuntimeResourcePolicy>,
+    private_runtime_control_commitment: Option<crate::agent_sdk::Hash>,
+    private_runtime_control_sequence: Option<u64>,
+    private_authority_epoch_high_water: Option<u64>,
+    private_control_slot_high_water: Option<u64>,
+    private_management_dispositions: Vec<StandardPrivateManagementDisposition>,
     system_authority: Option<super::system_authority::SystemAuthorityState>,
     actors: BTreeMap<ActorId, ManagedActor>,
     /// Installation identities remain consumed after their actor leaves the
@@ -177,6 +183,12 @@ pub struct StandardRuntimeState {
     pub clean_decision_sequence_high_water: Option<u64>,
     pub clean_acknowledged_through: u64,
     pub clean_management_dispositions: Vec<StandardCleanManagementDisposition>,
+    pub active_resource_policy: Option<crate::agent_sdk::contract::RuntimeResourcePolicy>,
+    pub private_runtime_control_commitment: Option<crate::agent_sdk::Hash>,
+    pub private_runtime_control_sequence: Option<u64>,
+    pub private_authority_epoch_high_water: Option<u64>,
+    pub private_control_slot_high_water: Option<u64>,
+    pub private_management_dispositions: Vec<StandardPrivateManagementDisposition>,
     pub system_authority: Option<super::system_authority::SystemAuthorityState>,
     pub actors: Vec<StandardActorState>,
     /// Strictly ordered grow-only tombstones for removed installations.
@@ -253,6 +265,21 @@ pub struct StandardCleanManagementDisposition {
     pub request: crate::agent_sdk::Hash,
     pub epoch: u64,
     pub sequence: u64,
+    pub observed_slot: u64,
+    pub result: Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>,
+}
+
+/// Bounded exact-result record for owner-signed Private runtime controls.
+/// Private receipts deliberately do not use the general management decision
+/// clock, so the signed PCTL chain supplies this replay domain instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandardPrivateManagementDisposition {
+    pub authority: crate::agent_sdk::Hash,
+    pub control: crate::agent_sdk::Hash,
+    pub request: crate::agent_sdk::Hash,
+    pub sequence: u64,
+    pub previous: Option<crate::agent_sdk::Hash>,
+    pub epoch: u64,
     pub observed_slot: u64,
     pub result: Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>,
 }
@@ -992,6 +1019,12 @@ impl StandardAgentRuntime {
             clean_decision_sequence_high_water: None,
             clean_acknowledged_through: 0,
             clean_management_dispositions: Vec::new(),
+            active_resource_policy: None,
+            private_runtime_control_commitment: None,
+            private_runtime_control_sequence: None,
+            private_authority_epoch_high_water: None,
+            private_control_slot_high_water: None,
+            private_management_dispositions: Vec::new(),
             system_authority: None,
             actors: BTreeMap::new(),
             retired_installation_ids: BTreeSet::new(),
@@ -1056,6 +1089,12 @@ impl StandardAgentRuntime {
             clean_decision_sequence_high_water: self.clean_decision_sequence_high_water,
             clean_acknowledged_through: self.clean_acknowledged_through,
             clean_management_dispositions: self.clean_management_dispositions.clone(),
+            active_resource_policy: self.active_resource_policy,
+            private_runtime_control_commitment: self.private_runtime_control_commitment,
+            private_runtime_control_sequence: self.private_runtime_control_sequence,
+            private_authority_epoch_high_water: self.private_authority_epoch_high_water,
+            private_control_slot_high_water: self.private_control_slot_high_water,
+            private_management_dispositions: self.private_management_dispositions.clone(),
             system_authority: self.system_authority.clone(),
             actors: self
                 .actors
@@ -1103,6 +1142,12 @@ impl StandardAgentRuntime {
         let clean_decision_sequence_high_water = state.clean_decision_sequence_high_water;
         let clean_acknowledged_through = state.clean_acknowledged_through;
         let clean_management_dispositions = state.clean_management_dispositions.clone();
+        let active_resource_policy = state.active_resource_policy;
+        let private_runtime_control_commitment = state.private_runtime_control_commitment;
+        let private_runtime_control_sequence = state.private_runtime_control_sequence;
+        let private_authority_epoch_high_water = state.private_authority_epoch_high_water;
+        let private_control_slot_high_water = state.private_control_slot_high_water;
+        let private_management_dispositions = state.private_management_dispositions.clone();
         let Some(config) = state.config else {
             return if state.actors.is_empty()
                 && state.clean_creation_descriptor.is_none()
@@ -1111,6 +1156,12 @@ impl StandardAgentRuntime {
                 && state.clean_decision_sequence_high_water.is_none()
                 && state.clean_acknowledged_through == 0
                 && state.clean_management_dispositions.is_empty()
+                && state.active_resource_policy.is_none()
+                && state.private_runtime_control_commitment.is_none()
+                && state.private_runtime_control_sequence.is_none()
+                && state.private_authority_epoch_high_water.is_none()
+                && state.private_control_slot_high_water.is_none()
+                && state.private_management_dispositions.is_empty()
                 && state.retired_installation_ids.is_empty()
                 && state.system_authority.is_none()
                 && state.lane_state == StandardLaneState::default()
@@ -1241,6 +1292,105 @@ impl StandardAgentRuntime {
             _ => return Err(LifecycleError::InvalidRequest),
         }
 
+        match (&clean_descriptor, active_resource_policy) {
+            (None, None)
+                if private_runtime_control_commitment.is_none()
+                    && private_runtime_control_sequence.is_none()
+                    && private_authority_epoch_high_water.is_none()
+                    && private_control_slot_high_water.is_none()
+                    && private_management_dispositions.is_empty() => {}
+            (Some(descriptor), Some(policy))
+                if policy.is_within(
+                    descriptor.capabilities,
+                    descriptor.runtime_contract.resources,
+                ) && match descriptor.identity.profile {
+                    crate::agent_sdk::AgentProfile::Private => {
+                        let retained_policy = private_management_dispositions
+                            .iter()
+                            .rev()
+                            .find_map(|item| match item.result.as_ref() {
+                                Ok(crate::agent_sdk::ManagementReply::ResourcePolicySet(
+                                    policy,
+                                )) => Some(*policy),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| descriptor.initial_resource_policy());
+                        if private_management_dispositions.is_empty() {
+                            policy == descriptor.initial_resource_policy()
+                                && private_runtime_control_commitment.is_none()
+                                && private_runtime_control_sequence.is_none()
+                                && private_authority_epoch_high_water.is_none()
+                                && private_control_slot_high_water.is_none()
+                        } else {
+                            policy == retained_policy
+                                && private_management_dispositions.len()
+                                    <= MAX_AUTHORITY_DISPOSITIONS
+                                && private_runtime_control_commitment.is_some()
+                                && private_runtime_control_sequence.is_some()
+                                && private_authority_epoch_high_water.is_some()
+                                && private_control_slot_high_water.is_some()
+                                && private_management_dispositions.iter().all(|item| {
+                                    item.authority != crate::agent_sdk::Hash::ZERO
+                                        && item.control != crate::agent_sdk::Hash::ZERO
+                                        && item.request != crate::agent_sdk::Hash::ZERO
+                                        && (item.sequence == 0) == item.previous.is_none()
+                                        && item.previous.is_none_or(|previous| {
+                                            previous != crate::agent_sdk::Hash::ZERO
+                                        })
+                                        && item.epoch >= descriptor.authority.initial_epoch
+                                        && matches!(
+                                            &item.result,
+                                            Ok(
+                                                crate::agent_sdk::ManagementReply::ResourcePolicySet(
+                                                    _
+                                                ) | crate::agent_sdk::ManagementReply::Installed(_)
+                                                    | crate::agent_sdk::ManagementReply::Upgraded(_)
+                                                    | crate::agent_sdk::ManagementReply::Suspended(_)
+                                                    | crate::agent_sdk::ManagementReply::Resumed(_)
+                                                    | crate::agent_sdk::ManagementReply::Removed(_)
+                                            )
+                                        )
+                                })
+                                && private_management_dispositions.windows(2).all(|pair| {
+                                    pair[0].sequence < pair[1].sequence
+                                        && pair[0].epoch <= pair[1].epoch
+                                        && pair[0].observed_slot <= pair[1].observed_slot
+                                        && (pair[0].sequence.checked_add(1)
+                                            != Some(pair[1].sequence)
+                                            || pair[1].previous == Some(pair[0].control))
+                                })
+                                && private_management_dispositions.iter().enumerate().all(
+                                    |(index, item)| {
+                                        private_management_dispositions[index + 1..].iter().all(
+                                            |other| {
+                                                item.authority != other.authority
+                                                    && item.control != other.control
+                                            },
+                                        )
+                                    },
+                                )
+                                && private_management_dispositions.last().is_some_and(|item| {
+                                    private_runtime_control_commitment == Some(item.control)
+                                        && private_runtime_control_sequence == Some(item.sequence)
+                                        && private_authority_epoch_high_water == Some(item.epoch)
+                                        && private_control_slot_high_water
+                                            == Some(item.observed_slot)
+                                })
+                        }
+                    }
+                    crate::agent_sdk::AgentProfile::Local
+                    | crate::agent_sdk::AgentProfile::Shared => {
+                        policy == descriptor.initial_resource_policy()
+                            && private_runtime_control_commitment.is_none()
+                            && private_runtime_control_sequence.is_none()
+                            && private_authority_epoch_high_water.is_none()
+                            && private_control_slot_high_water.is_none()
+                            && private_management_dispositions.is_empty()
+                    }
+                } => {}
+            _ => return Err(LifecycleError::InvalidRequest),
+        }
+
         let mut runtime = Self::new();
         if clean_descriptor.is_some() {
             // A clean state has already been validated against its exact SDK
@@ -1256,6 +1406,12 @@ impl StandardAgentRuntime {
         runtime.clean_decision_sequence_high_water = clean_decision_sequence_high_water;
         runtime.clean_acknowledged_through = clean_acknowledged_through;
         runtime.clean_management_dispositions = clean_management_dispositions;
+        runtime.active_resource_policy = active_resource_policy;
+        runtime.private_runtime_control_commitment = private_runtime_control_commitment;
+        runtime.private_runtime_control_sequence = private_runtime_control_sequence;
+        runtime.private_authority_epoch_high_water = private_authority_epoch_high_water;
+        runtime.private_control_slot_high_water = private_control_slot_high_water;
+        runtime.private_management_dispositions = private_management_dispositions;
         match (
             runtime
                 .config
@@ -1529,16 +1685,26 @@ impl StandardAgentRuntime {
     }
 
     fn validate_signed_state_resource(&self) -> Result<(), LifecycleError> {
-        let limit = self
-            .created()?
-            .runtime_contract
-            .resources
-            .max_runtime_state_bytes as usize;
+        let config = self.created()?;
+        let limit = config.runtime_contract.resources.max_runtime_state_bytes as usize;
         let state = super::wire::encode_standard_runtime_state(&self.snapshot());
         if state.encoded_len().is_none_or(|bytes| bytes > limit) {
-            Err(LifecycleError::ResourceLimit)
-        } else {
-            Ok(())
+            return Err(LifecycleError::ResourceLimit);
+        }
+        match (&self.clean_descriptor, self.active_resource_policy) {
+            (None, None) => Ok(()),
+            (Some(descriptor), Some(policy))
+                if policy.is_within(
+                    descriptor.capabilities,
+                    descriptor.runtime_contract.resources,
+                ) && self
+                    .clean_resource_usage()
+                    .is_ok_and(|usage| policy.admits_usage(usage)) =>
+            {
+                Ok(())
+            }
+            (Some(_), Some(_)) => Err(LifecycleError::ResourceLimit),
+            _ => Err(LifecycleError::InvalidRequest),
         }
     }
 
@@ -1574,6 +1740,7 @@ impl StandardAgentRuntime {
         self.authority_slot_high_water
             .into_iter()
             .chain(self.control_authority_slot)
+            .chain(self.private_control_slot_high_water)
             .chain(self.lane_revisions.authority_slot_high_water())
             .max()
     }
@@ -3654,7 +3821,8 @@ impl StandardAgentRuntime {
                 AuthorityOperationKind::ChangeReplicaSet
             }
             crate::agent_sdk::ManagementRequest::InspectActors { .. }
-            | crate::agent_sdk::ManagementRequest::InspectResources => {
+            | crate::agent_sdk::ManagementRequest::InspectResources
+            | crate::agent_sdk::ManagementRequest::PrivateControl { .. } => {
                 return Err(ManagementError::InvalidRequest);
             }
         };
@@ -3751,6 +3919,7 @@ impl StandardAgentRuntime {
                 self.config = Some(config);
                 self.clean_creation_descriptor = Some((**descriptor).clone());
                 self.clean_descriptor = Some((**descriptor).clone());
+                self.active_resource_policy = Some(descriptor.initial_resource_policy());
                 Ok(ManagementReply::Created(descriptor.identity.clone()))
             }
             ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => {
@@ -3858,6 +4027,11 @@ impl StandardAgentRuntime {
                 if upgrade.capabilities.proof_systems.len() != 0 {
                     return Err(ManagementError::UnsupportedRuntime);
                 }
+                if self.active_resource_policy.is_none_or(|policy| {
+                    !policy.is_within(upgrade.capabilities, upgrade.contract.resources)
+                }) {
+                    return Err(ManagementError::ResourceLimit);
+                }
                 let legacy_capabilities = clean_capabilities_to_legacy(
                     upgrade.capabilities,
                     self.clean_descriptor
@@ -3910,7 +4084,313 @@ impl StandardAgentRuntime {
                 self.clean_descriptor = Some(next);
                 Ok(ManagementReply::ReplicasChanged { generation })
             }
+            ManagementRequest::PrivateControl { .. } => Err(ManagementError::InvalidRequest),
         }
+    }
+
+    fn verify_private_management_authority(
+        &self,
+        space: crate::agent_sdk::SpaceId,
+        agent: crate::agent_sdk::AgentId,
+        runtime_deployment: crate::agent_sdk::DeploymentId,
+        request: &crate::agent_sdk::ManagementRequest,
+        authority: &crate::agent_sdk::authority::AuthorityReceipt,
+        allow_historical_runtime: bool,
+    ) -> Result<(), crate::agent_sdk::ManagementError> {
+        use crate::agent_sdk::{AgentProfile, ManagementError, ManagementRequest};
+
+        let descriptor = self
+            .clean_descriptor
+            .as_ref()
+            .ok_or(ManagementError::NotCreated)?;
+        let ManagementRequest::PrivateControl { control, .. } = request else {
+            return Err(ManagementError::InvalidRequest);
+        };
+        let selector = &authority.selector;
+        if descriptor.identity.profile != AgentProfile::Private
+            || !request.is_valid()
+            || control.space != space
+            || control.agent != agent
+            || descriptor.identity.space != space
+            || descriptor.identity.agent != agent
+            || (!allow_historical_runtime
+                && descriptor.identity.runtime_deployment != runtime_deployment)
+            || !descriptor.authority.accepts(authority)
+            || authority.validate_shape().is_err()
+            || selector.space != space
+            || selector.agent != agent
+            || selector.runtime_deployment != runtime_deployment
+            || Some(selector.operation) != request.authority_operation()
+            || (selector.actor, selector.actor_deployment) != request.authority_actor_selector()
+            || selector.request != request.commitment()
+            || !super::authority::verify_raw_ed25519(
+                &authority.public_key,
+                &authority.signing_bytes(),
+                &authority.signature,
+            )
+        {
+            return Err(ManagementError::InvalidRequest);
+        }
+        Ok(())
+    }
+
+    fn private_management_mutation(
+        &mut self,
+        mutation: &crate::agent_sdk::PrivateRuntimeMutation,
+        control: crate::agent_sdk::Hash,
+        request: crate::agent_sdk::Hash,
+        observed_slot: u64,
+    ) -> Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError> {
+        use crate::agent_sdk::{ManagementError, ManagementReply, PrivateRuntimeMutation};
+
+        let descriptor = self
+            .clean_descriptor
+            .as_ref()
+            .ok_or(ManagementError::NotCreated)?
+            .clone();
+        match mutation {
+            PrivateRuntimeMutation::SetResourcePolicy(policy) => {
+                if !policy.is_within(
+                    descriptor.capabilities,
+                    descriptor.runtime_contract.resources,
+                ) || !self
+                    .clean_resource_usage()
+                    .is_ok_and(|usage| policy.admits_usage(usage))
+                {
+                    return Err(ManagementError::ResourceLimit);
+                }
+                self.active_resource_policy = Some(*policy);
+                Ok(ManagementReply::ResourcePolicySet(*policy))
+            }
+            PrivateRuntimeMutation::Install(install) => {
+                install
+                    .validate_for_profile(crate::agent_sdk::AgentProfile::Private)
+                    .map_err(|error| match error {
+                        crate::agent_sdk::ModelError::InvalidProfile => {
+                            ManagementError::UnsupportedLane
+                        }
+                        _ => ManagementError::InvalidRequest,
+                    })?;
+                if !descriptor.runtime_contract.supports(install.contract)
+                    || !descriptor.capabilities.satisfies(install.requirements)
+                {
+                    return Err(ManagementError::UnsupportedRuntime);
+                }
+                let actor = crate::service::ActorId(install.entry.actor.0);
+                let generation =
+                    derive_state_generation(Hash(control.0), observed_slot, Hash(request.0), actor);
+                match self.install(clean_install_to_legacy(install), generation) {
+                    Ok(LifecycleReply::Installed(entry)) => {
+                        Ok(ManagementReply::Installed(legacy_entry_to_clean(&entry)))
+                    }
+                    Ok(_) => Err(ManagementError::InvalidRequest),
+                    Err(error) => Err(legacy_management_error(error)),
+                }
+            }
+            PrivateRuntimeMutation::UpgradeActor(upgrade) => {
+                if !upgrade
+                    .requirements
+                    .supported_by(crate::agent_sdk::AgentProfile::Private)
+                {
+                    return Err(ManagementError::UnsupportedLane);
+                }
+                if !descriptor.runtime_contract.supports(upgrade.contract)
+                    || !descriptor.capabilities.satisfies(upgrade.requirements)
+                {
+                    return Err(ManagementError::UnsupportedRuntime);
+                }
+                match self.upgrade_actor(clean_upgrade_to_legacy(upgrade)) {
+                    Ok(LifecycleReply::Upgraded(entry)) => {
+                        Ok(ManagementReply::Upgraded(legacy_entry_to_clean(&entry)))
+                    }
+                    Ok(_) => Err(ManagementError::InvalidRequest),
+                    Err(error) => Err(legacy_management_error(error)),
+                }
+            }
+            PrivateRuntimeMutation::Suspend {
+                actor,
+                expected_deployment,
+            } => match self.set_suspended(
+                crate::service::ActorId(actor.0),
+                crate::service::DeploymentId(expected_deployment.0),
+                true,
+            ) {
+                Ok(LifecycleReply::Suspended(entry)) => {
+                    Ok(ManagementReply::Suspended(legacy_entry_to_clean(&entry)))
+                }
+                Ok(_) => Err(ManagementError::InvalidRequest),
+                Err(error) => Err(legacy_management_error(error)),
+            },
+            PrivateRuntimeMutation::Resume {
+                actor,
+                expected_deployment,
+            } => match self.set_suspended(
+                crate::service::ActorId(actor.0),
+                crate::service::DeploymentId(expected_deployment.0),
+                false,
+            ) {
+                Ok(LifecycleReply::Resumed(entry)) => {
+                    Ok(ManagementReply::Resumed(legacy_entry_to_clean(&entry)))
+                }
+                Ok(_) => Err(ManagementError::InvalidRequest),
+                Err(error) => Err(legacy_management_error(error)),
+            },
+            PrivateRuntimeMutation::RemoveLeaf {
+                actor,
+                expected_deployment,
+            } => match self.remove_leaf(
+                crate::service::ActorId(actor.0),
+                crate::service::DeploymentId(expected_deployment.0),
+            ) {
+                Ok(LifecycleReply::Removed(actor)) => {
+                    Ok(ManagementReply::Removed(crate::agent_sdk::ActorId(actor.0)))
+                }
+                Ok(_) => Err(ManagementError::InvalidRequest),
+                Err(error) => Err(legacy_management_error(error)),
+            },
+        }
+    }
+
+    fn apply_private_management(
+        &mut self,
+        space: crate::agent_sdk::SpaceId,
+        agent: crate::agent_sdk::AgentId,
+        runtime_deployment: crate::agent_sdk::DeploymentId,
+        request: crate::agent_sdk::ManagementRequest,
+        authority: Option<crate::agent_sdk::authority::AuthorityReceipt>,
+        observed_slot: u64,
+    ) -> Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError> {
+        use crate::agent_sdk::{ManagementError, ManagementRequest};
+
+        let authority = authority.ok_or(ManagementError::InvalidRequest)?;
+        self.verify_private_management_authority(
+            space,
+            agent,
+            runtime_deployment,
+            &request,
+            &authority,
+            true,
+        )?;
+        let ManagementRequest::PrivateControl { control, mutation } = &request else {
+            return Err(ManagementError::InvalidRequest);
+        };
+        let authority_id = authority.commitment();
+        let control_id = control.commitment();
+        let request_id = request.replay_commitment();
+        if let Some(disposition) = self
+            .private_management_dispositions
+            .iter()
+            .find(|item| item.authority == authority_id || item.control == control_id)
+        {
+            if disposition.authority != authority_id
+                || disposition.control != control_id
+                || disposition.request != request_id
+                || disposition.sequence != control.sequence
+                || disposition.previous != control.previous
+                || disposition.epoch != authority.selector.epoch
+                || !disposition
+                    .result
+                    .as_ref()
+                    .is_ok_and(|reply| request.private_runtime_reply_matches(reply))
+            {
+                return Err(ManagementError::AuthoritySequenceConflict);
+            }
+            if observed_slot < disposition.observed_slot {
+                return Err(ManagementError::AuthoritySlotRegressed);
+            }
+            return disposition.result.clone();
+        }
+
+        self.verify_private_management_authority(
+            space,
+            agent,
+            runtime_deployment,
+            &request,
+            &authority,
+            false,
+        )?;
+        if !authority.selector.is_live_at(observed_slot) {
+            return Err(ManagementError::InvalidRequest);
+        }
+        if self
+            .private_runtime_control_sequence
+            .is_some_and(|sequence| control.sequence <= sequence)
+        {
+            return Err(ManagementError::AuthoritySequenceRegressed);
+        }
+        if self
+            .private_runtime_control_sequence
+            .is_some_and(|sequence| {
+                sequence.checked_add(1) == Some(control.sequence)
+                    && control.previous != self.private_runtime_control_commitment
+            })
+        {
+            return Err(ManagementError::AuthoritySequenceConflict);
+        }
+        if self
+            .private_authority_epoch_high_water
+            .is_some_and(|epoch| authority.selector.epoch < epoch)
+        {
+            return Err(ManagementError::AuthoritySequenceRegressed);
+        }
+        if self
+            .logical_slot_high_water()
+            .is_some_and(|slot| observed_slot < slot)
+        {
+            return Err(ManagementError::AuthoritySlotRegressed);
+        }
+
+        let before = self.clone();
+        let mut candidate = before.clone();
+        let result =
+            candidate.private_management_mutation(mutation, control_id, request_id, observed_slot);
+        let Ok(reply) = result else {
+            return result;
+        };
+        candidate.private_runtime_control_commitment = Some(control_id);
+        candidate.private_runtime_control_sequence = Some(control.sequence);
+        candidate.private_authority_epoch_high_water = Some(authority.selector.epoch);
+        candidate.private_control_slot_high_water = Some(observed_slot);
+        if candidate.private_management_dispositions.len() == MAX_AUTHORITY_DISPOSITIONS {
+            let incoming_sets_policy = matches!(
+                &reply,
+                crate::agent_sdk::ManagementReply::ResourcePolicySet(_)
+            );
+            let retained_policy = if incoming_sets_policy {
+                None
+            } else {
+                candidate
+                    .private_management_dispositions
+                    .iter()
+                    .rposition(|item| {
+                        matches!(
+                            &item.result,
+                            Ok(crate::agent_sdk::ManagementReply::ResourcePolicySet(_))
+                        )
+                    })
+            };
+            let remove_index = usize::from(retained_policy == Some(0));
+            candidate
+                .private_management_dispositions
+                .remove(remove_index);
+        }
+        candidate
+            .private_management_dispositions
+            .push(StandardPrivateManagementDisposition {
+                authority: authority_id,
+                control: control_id,
+                request: request_id,
+                sequence: control.sequence,
+                previous: control.previous,
+                epoch: authority.selector.epoch,
+                observed_slot,
+                result: Ok(reply.clone()),
+            });
+        if candidate.validate_signed_state_resource().is_err() {
+            return Err(ManagementError::ResourceLimit);
+        }
+        *self = candidate;
+        Ok(reply)
     }
 
     /// Apply one clean-generation management operation. Authentication is
@@ -3927,6 +4407,17 @@ impl StandardAgentRuntime {
         pristine_input: bool,
     ) -> Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError> {
         use crate::agent_sdk::{ManagementError, ManagementReply, ManagementRequest};
+
+        if matches!(request, ManagementRequest::PrivateControl { .. }) {
+            return self.apply_private_management(
+                space,
+                agent,
+                runtime_deployment,
+                request,
+                authority,
+                observed_slot,
+            );
+        }
 
         if matches!(
             request,
@@ -3996,7 +4487,7 @@ impl StandardAgentRuntime {
             true,
         )?;
         let authority_id = authority.commitment();
-        let request_id = request.commitment();
+        let request_id = request.replay_commitment();
         if let Some(disposition) = self
             .clean_management_dispositions
             .iter()

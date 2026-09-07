@@ -187,6 +187,9 @@ fn operation_for(
         ManagementRequest::ChangeReplicas { .. } => {
             (AuthorityOperationKind::ChangeReplicaSet, None, None)
         }
+        ManagementRequest::PrivateControl { .. } => {
+            panic!("private control is not a generic Local/Shared management request")
+        }
         ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => {
             panic!("read-only management does not carry authority")
         }

@@ -1558,6 +1558,9 @@ mod tests {
             ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources => {
                 panic!("read-only management has no receipt")
             }
+            ManagementRequest::PrivateControl { .. } => {
+                panic!("generic Local SDK host does not authorize Private controls")
+            }
         }
     }
 
