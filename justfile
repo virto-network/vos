@@ -196,7 +196,7 @@ test-extensions: build-extensions build-workflow-fixture
 test-pvm: build-test-artifacts
     cargo test -p vos --test service_pvm -- --nocapture --test-threads=1
 
-# Run the checked-in Gray Paper v0.8 semantic and ROB-gas corpus on both
+# Run the checked-in v0.8 semantic and ROB-gas corpus on both
 # runtime backends. This is intentionally an integration test, so workspace
 # `--lib` checks do not cover it implicitly.
 test-pvm-vectors:
