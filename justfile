@@ -144,17 +144,22 @@ build-authority-upgrade-candidate:
 build-authority-release:
     scripts/build-production-artifacts.sh authority
 
+# Reproduce the canonical system-catalog actor source artifact. `vosx release
+# bundle` deterministically links these checked ELF bytes into the standard
+# program included in the release directory.
+build-catalog-release:
+    scripts/build-production-artifacts.sh registry
+
 # Reproduce the standard agent runtime from its separately pinned source
 # revision and require exact identity with the committed release artifact.
 build-agent-runtime-release:
     scripts/build-production-artifacts.sh agent-runtime
 
-# Assemble the three protocol-pinned production PVMs with a strict manifest.
-# The command refuses to replace an existing directory so a release operator
-# cannot silently mutate an artifact set that has already been distributed.
-package-production-release out="target/production-release": build-authority-release build-agent-runtime-release verify-voucher-check-release
-    cargo run -p vosx -- release bundle \
-      --service-pvm services/vos-service/vos-service.pvm --out "{{out}}"
+# Assemble the standard AgentRuntime and both system actors embedded in vosx.
+# The command refuses external program paths and never replaces an existing
+# directory, so a release cannot silently select or mutate a different pin.
+package-production-release out="target/production-release": build-authority-release build-catalog-release build-agent-runtime-release verify-voucher-check-release
+    cargo run -p vosx -- release bundle --out "{{out}}"
     cargo run -p vosx -- release verify "{{out}}"
 
 # Build the settlement-verifier ELF for the VOS PVM target.
