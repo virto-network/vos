@@ -4,14 +4,16 @@
 //! module owns the narrower crash-consistency boundary between that actor's
 //! exact approval and the authority signatures which leave the host: the
 //! operation receipt, AOI1 issuance acknowledgement, and (for Private
-//! controls) PCA1 durable-application acknowledgement.
+//! controls) one mutually exclusive PCA1 applied or PAR1 retired-unapplied
+//! terminal acknowledgement.
 //!
 //! Records are intentionally never compacted here. AOI1 proves that the host
-//! durably issued one receipt and PCA1 proves that a Private runtime durably
-//! reopened one control, but neither proves that the authority actor durably
-//! consumed the acknowledgement. Until separately reopenable authenticated
-//! consumption evidence is available, deleting retained preimages would make
-//! exact retry and collision checks unsafe.
+//! durably issued one receipt. PCA1 proves that a Private runtime durably
+//! reopened one control; PAR1 proves only that the unused capability was
+//! retired, without retaining a guest denial. Neither proves that the
+//! authority actor durably consumed the acknowledgement. Until separately
+//! reopenable authenticated consumption evidence is available, deleting
+//! retained preimages would make exact retry and collision checks unsafe.
 
 use core::{convert::Infallible, fmt};
 
@@ -23,8 +25,9 @@ use crate::agent::sdk::authority_operation::{
     AuthorityOperationApproval, AuthorityOperationCall, AuthorityOperationIntent,
     AuthorityOperationIssuanceAck, MAX_AUTHORITY_OPERATION_APPROVAL_WIRE_BYTES,
     MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES, MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES,
-    MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES, PrivateControlApplicationAck,
-    PrivateControlApplicationFact,
+    MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES,
+    MAX_PRIVATE_CONTROL_APPLICATION_RETIREMENT_ACK_WIRE_BYTES, PrivateControlApplicationAck,
+    PrivateControlApplicationFact, PrivateControlApplicationRetirementAck,
 };
 use crate::agent::sdk::wire::{CanonicalWire, MAX_AUTHORITY_RECEIPT_WIRE_BYTES};
 use crate::agent::sdk::{
@@ -36,7 +39,7 @@ use vos_protocol::wire::{DecodeError, Decoder, Encoder};
 pub const MAX_AUTHORITY_OPERATION_ISSUER_RECORDS: usize = 256;
 /// Maximum complete canonical whole-image commit accepted from storage.
 pub const MAX_AUTHORITY_OPERATION_ISSUER_IMAGE_BYTES: usize = 4 * 1024 * 1024;
-const AUTHORITY_OPERATION_ISSUER_MAGIC: [u8; 4] = *b"AOJ3";
+const AUTHORITY_OPERATION_ISSUER_MAGIC: [u8; 4] = *b"AOJ4";
 
 /// Minimal durable whole-image boundary for operation evidence issuance.
 ///
@@ -66,18 +69,25 @@ pub trait AuthorityOperationEvidenceSigner {
     fn sign_issuance_ack(&mut self, message: &[u8]) -> Result<[u8; 64], Self::Error>;
 }
 
-/// Distinct signer method for the post-application PCA1 boundary.
+/// Distinct signer methods for the Private terminal-resolution boundary.
 ///
 /// Like the issuance signer, implementations must return the same signature
 /// for an exact message after a crash or ambiguous commit. Keeping this method
 /// distinct prevents an AOI1 or receipt preimage from being relabelled as a
-/// Private application acknowledgement by a signer adapter.
+/// Private terminal acknowledgement by a signer adapter. The methods remain
+/// separate so PCA1 and PAR1 signing authority cannot be accidentally
+/// relabelled by an adapter even though they share the same invocation.
 pub trait PrivateControlApplicationEvidenceSigner {
     type Error;
 
     fn public_key(&self) -> [u8; 32];
 
     fn sign_private_application_ack(&mut self, message: &[u8]) -> Result<[u8; 64], Self::Error>;
+
+    fn sign_private_application_retirement_ack(
+        &mut self,
+        message: &[u8],
+    ) -> Result<[u8; 64], Self::Error>;
 }
 
 /// Complete evidence returned for one exact authorized operation.
@@ -93,6 +103,30 @@ pub struct IssuedPrivateControlApplication {
     pub application_ack: PrivateControlApplicationAck,
 }
 
+/// Complete authority evidence retiring one issued but unapplied Private
+/// capability. It deliberately carries no guest error or application fact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssuedPrivateControlApplicationRetirement {
+    pub retirement_ack: PrivateControlApplicationRetirementAck,
+}
+
+/// Reopened Private terminal-resolution lineage. `Pending` is the durable
+/// unresolved capability created with Private issuance. An acknowledgement
+/// absent from either chosen terminal branch is the exact durable pre-signing
+/// pledge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RetainedPrivateResolution {
+    Pending,
+    Applied {
+        application: PrivateControlApplicationFact,
+        application_ack: Option<PrivateControlApplicationAck>,
+    },
+    RetiredUnapplied {
+        resolved_at: u64,
+        retirement_ack: Option<PrivateControlApplicationRetirementAck>,
+    },
+}
+
 /// Exact durable issuer material reopened by the trusted actor coordinator.
 ///
 /// This stays crate-private: an AOP4 is unsigned actor output and must never
@@ -104,13 +138,39 @@ pub(crate) struct RetainedAuthorityOperation {
     pub(crate) issued_at: u64,
     pub(crate) receipt: Option<AuthorityReceipt>,
     pub(crate) issuance_ack: Option<AuthorityOperationIssuanceAck>,
-    pub(crate) application: Option<PrivateControlApplicationFact>,
-    pub(crate) application_ack: Option<PrivateControlApplicationAck>,
+    pub(crate) private_resolution: Option<RetainedPrivateResolution>,
 }
 
 impl RetainedAuthorityOperation {
     pub(crate) const fn is_complete(&self) -> bool {
         self.issuance_ack.is_some()
+    }
+
+    pub(crate) const fn application(&self) -> Option<&PrivateControlApplicationFact> {
+        match &self.private_resolution {
+            Some(RetainedPrivateResolution::Applied { application, .. }) => Some(application),
+            None
+            | Some(RetainedPrivateResolution::Pending)
+            | Some(RetainedPrivateResolution::RetiredUnapplied { .. }) => None,
+        }
+    }
+
+    pub(crate) const fn application_ack(&self) -> Option<&PrivateControlApplicationAck> {
+        match &self.private_resolution {
+            Some(RetainedPrivateResolution::Applied {
+                application_ack, ..
+            }) => application_ack.as_ref(),
+            None
+            | Some(RetainedPrivateResolution::Pending)
+            | Some(RetainedPrivateResolution::RetiredUnapplied { .. }) => None,
+        }
+    }
+
+    pub(crate) const fn is_retired_unapplied(&self) -> bool {
+        matches!(
+            &self.private_resolution,
+            Some(RetainedPrivateResolution::RetiredUnapplied { .. })
+        )
     }
 }
 
@@ -175,8 +235,40 @@ struct RetainedOperation {
     issued_at: u64,
     receipt: Option<Vec<u8>>,
     issuance_ack: Option<Vec<u8>>,
-    application: Option<PrivateControlApplicationFact>,
-    application_ack: Option<Vec<u8>>,
+    private_resolution: Option<RetainedPrivateResolutionBytes>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RetainedPrivateResolutionBytes {
+    Pending,
+    Applied {
+        application: PrivateControlApplicationFact,
+        application_ack: Option<Vec<u8>>,
+    },
+    RetiredUnapplied {
+        resolved_at: u64,
+        retirement_ack: Option<Vec<u8>>,
+    },
+}
+
+impl RetainedPrivateResolutionBytes {
+    const fn slot(&self) -> Option<u64> {
+        match self {
+            Self::Pending => None,
+            Self::Applied { application, .. } => Some(application.applied_at),
+            Self::RetiredUnapplied { resolved_at, .. } => Some(*resolved_at),
+        }
+    }
+
+    const fn has_pending_ack(&self) -> bool {
+        match self {
+            Self::Pending => false,
+            Self::Applied {
+                application_ack, ..
+            } => application_ack.is_none(),
+            Self::RetiredUnapplied { retirement_ack, .. } => retirement_ack.is_none(),
+        }
+    }
 }
 
 impl RetainedOperation {
@@ -185,6 +277,22 @@ impl RetainedOperation {
     }
 
     fn has_valid_envelope(&self) -> bool {
+        let valid_resolution =
+            self.private_resolution
+                .as_ref()
+                .is_none_or(|resolution| match resolution {
+                    RetainedPrivateResolutionBytes::Pending => true,
+                    RetainedPrivateResolutionBytes::Applied {
+                        application_ack, ..
+                    } => application_ack.as_ref().is_none_or(|bytes| {
+                        bytes.len() <= MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES
+                    }),
+                    RetainedPrivateResolutionBytes::RetiredUnapplied { retirement_ack, .. } => {
+                        retirement_ack.as_ref().is_none_or(|bytes| {
+                            bytes.len() <= MAX_PRIVATE_CONTROL_APPLICATION_RETIREMENT_ACK_WIRE_BYTES
+                        })
+                    }
+                });
         self.call.len() <= MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES
             && self.approval.len() <= MAX_AUTHORITY_OPERATION_APPROVAL_WIRE_BYTES
             && self
@@ -195,13 +303,12 @@ impl RetainedOperation {
                 .issuance_ack
                 .as_ref()
                 .is_none_or(|bytes| bytes.len() <= MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES)
-            && self
-                .application_ack
-                .as_ref()
-                .is_none_or(|bytes| bytes.len() <= MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES)
+            && valid_resolution
             && (self.issuance_ack.is_none() || self.receipt.is_some())
-            && (self.application.is_none() || self.issuance_ack.is_some())
-            && (self.application_ack.is_none() || self.application.is_some())
+            && (matches!(
+                self.private_resolution,
+                Some(RetainedPrivateResolutionBytes::Pending) | None
+            ) || self.issuance_ack.is_some())
     }
 }
 
@@ -209,7 +316,7 @@ impl RetainedOperation {
 struct AuthorityOperationIssuerImage {
     authority: AuthorityActorTarget,
     issuance_slot_high_water: Option<u64>,
-    application_slot_high_water: Option<u64>,
+    resolution_slot_high_water: Option<u64>,
     records: Vec<RetainedOperation>,
 }
 
@@ -218,23 +325,23 @@ impl AuthorityOperationIssuerImage {
         Self {
             authority,
             issuance_slot_high_water: None,
-            application_slot_high_water: None,
+            resolution_slot_high_water: None,
             records: Vec::new(),
         }
     }
 
     fn has_valid_envelope(&self) -> bool {
-        let application_slot_high_water = self
+        let resolution_slot_high_water = self
             .records
             .iter()
-            .filter_map(|record| record.application.as_ref())
-            .map(|application| application.applied_at)
+            .filter_map(|record| record.private_resolution.as_ref())
+            .filter_map(RetainedPrivateResolutionBytes::slot)
             .max();
         if !self.authority.is_valid()
             || self.records.len() > MAX_AUTHORITY_OPERATION_ISSUER_RECORDS
             || (self.records.is_empty() != self.issuance_slot_high_water.is_none())
             || self.records.last().map(|record| record.issued_at) != self.issuance_slot_high_water
-            || self.application_slot_high_water != application_slot_high_water
+            || self.resolution_slot_high_water != resolution_slot_high_water
             || self
                 .records
                 .iter()
@@ -242,7 +349,12 @@ impl AuthorityOperationIssuerImage {
             || self
                 .records
                 .iter()
-                .filter(|record| record.application.is_some() && record.application_ack.is_none())
+                .filter(|record| {
+                    record
+                        .private_resolution
+                        .as_ref()
+                        .is_some_and(RetainedPrivateResolutionBytes::has_pending_ack)
+                })
                 .count()
                 > 1
         {
@@ -332,13 +444,17 @@ impl AuthorityOperationIssuerImage {
                     return false;
                 }
             }
-            match (
-                &record.application,
-                &record.application_ack,
-                issuance.as_ref(),
-            ) {
-                (None, None, _) => {}
-                (Some(application), None, Some(issuance)) => {
+            match (&record.private_resolution, issuance.as_ref()) {
+                (None, _) if !is_private_intent(&call.intent) => {}
+                (Some(RetainedPrivateResolutionBytes::Pending), _)
+                    if is_private_intent(&call.intent) => {}
+                (
+                    Some(RetainedPrivateResolutionBytes::Applied {
+                        application,
+                        application_ack: None,
+                    }),
+                    Some(issuance),
+                ) => {
                     if !private_intent_matches_application(&call.intent, application)
                         || application.applied_at < issuance.issued_at
                         || !issuance.receipt.selector.is_live_at(application.applied_at)
@@ -346,7 +462,13 @@ impl AuthorityOperationIssuerImage {
                         return false;
                     }
                 }
-                (Some(application), Some(bytes), Some(issuance)) => {
+                (
+                    Some(RetainedPrivateResolutionBytes::Applied {
+                        application,
+                        application_ack: Some(bytes),
+                    }),
+                    Some(issuance),
+                ) => {
                     let Ok(ack) = PrivateControlApplicationAck::decode(bytes) else {
                         return false;
                     };
@@ -366,6 +488,40 @@ impl AuthorityOperationIssuerImage {
                         return false;
                     }
                 }
+                (
+                    Some(RetainedPrivateResolutionBytes::RetiredUnapplied {
+                        resolved_at,
+                        retirement_ack,
+                    }),
+                    Some(issuance),
+                ) => {
+                    if !is_private_intent(&call.intent)
+                        || *resolved_at < issuance.issued_at
+                        || !issuance.receipt.selector.is_live_at(*resolved_at)
+                    {
+                        return false;
+                    }
+                    if let Some(bytes) = retirement_ack {
+                        let Ok(ack) = PrivateControlApplicationRetirementAck::decode(bytes) else {
+                            return false;
+                        };
+                        if ack.encode().ok().as_deref() != Some(bytes.as_slice())
+                            || ack.resolved_at != *resolved_at
+                            || !ack.matches_pending(&call, &approval, issuance)
+                            || ack
+                                .verify_pending_with(
+                                    &call,
+                                    &approval,
+                                    issuance,
+                                    self.authority.binding,
+                                    &verifier,
+                                )
+                                .is_err()
+                        {
+                            return false;
+                        }
+                    }
+                }
                 _ => return false,
             }
         }
@@ -381,7 +537,7 @@ impl AuthorityOperationIssuerImage {
         encoder.option(&self.issuance_slot_high_water, |encoder, slot| {
             encoder.u64(*slot)
         });
-        encoder.option(&self.application_slot_high_water, |encoder, slot| {
+        encoder.option(&self.resolution_slot_high_water, |encoder, slot| {
             encoder.u64(*slot)
         });
         encoder.list(&self.records, |encoder, record| {
@@ -390,10 +546,7 @@ impl AuthorityOperationIssuerImage {
             encoder.u64(record.issued_at);
             encoder.option(&record.receipt, |encoder, value| encoder.bytes(value));
             encoder.option(&record.issuance_ack, |encoder, value| encoder.bytes(value));
-            encoder.option(&record.application, encode_application_fact);
-            encoder.option(&record.application_ack, |encoder, value| {
-                encoder.bytes(value)
-            });
+            encoder.option(&record.private_resolution, encode_private_resolution);
         });
         bytes
     }
@@ -412,7 +565,7 @@ impl AuthorityOperationIssuerImage {
         }
         let authority = decode_authority_target(&mut decoder)?;
         let issuance_slot_high_water = decoder.option(Decoder::u64)?;
-        let application_slot_high_water = decoder.option(Decoder::u64)?;
+        let resolution_slot_high_water = decoder.option(Decoder::u64)?;
         let record_count = decoder.u32()? as usize;
         if record_count > MAX_AUTHORITY_OPERATION_ISSUER_RECORDS {
             return Err(DecodeError::LimitExceeded);
@@ -431,16 +584,13 @@ impl AuthorityOperationIssuerImage {
                 issuance_ack: decoder.option(|decoder| {
                     decoder.bytes_bounded(MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES)
                 })?,
-                application: decoder.option(decode_application_fact)?,
-                application_ack: decoder.option(|decoder| {
-                    decoder.bytes_bounded(MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES)
-                })?,
+                private_resolution: decoder.option(decode_private_resolution)?,
             });
         }
         let image = Self {
             authority,
             issuance_slot_high_water,
-            application_slot_high_water,
+            resolution_slot_high_water,
             records,
         };
         if !decoder.exhausted() || !image.is_valid() {
@@ -511,17 +661,44 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
     }
 
     pub fn has_pending_application(&self) -> bool {
-        self.image
-            .records
-            .iter()
-            .any(|record| record.application.is_some() && record.application_ack.is_none())
+        self.image.records.iter().any(|record| {
+            matches!(
+                &record.private_resolution,
+                Some(RetainedPrivateResolutionBytes::Applied {
+                    application_ack: None,
+                    ..
+                })
+            )
+        })
+    }
+
+    pub fn has_pending_private_resolution(&self) -> bool {
+        self.image.records.iter().any(|record| {
+            record
+                .private_resolution
+                .as_ref()
+                .is_some_and(RetainedPrivateResolutionBytes::has_pending_ack)
+        })
     }
 
     pub(crate) fn retained_private_applications(&self) -> usize {
         self.image
             .records
             .iter()
-            .filter(|record| record.application.is_some())
+            .filter(|record| {
+                matches!(
+                    &record.private_resolution,
+                    Some(RetainedPrivateResolutionBytes::Applied { .. })
+                )
+            })
+            .count()
+    }
+
+    pub(crate) fn retained_private_resolutions(&self) -> usize {
+        self.image
+            .records
+            .iter()
+            .filter(|record| record.private_resolution.is_some())
             .count()
     }
 
@@ -559,20 +736,41 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
             .map(|bytes| AuthorityOperationIssuanceAck::decode(bytes))
             .transpose()
             .map_err(|_| AuthorityOperationIssuerError::InvalidState)?;
-        let application_ack = record
-            .application_ack
-            .as_ref()
-            .map(|bytes| PrivateControlApplicationAck::decode(bytes))
-            .transpose()
-            .map_err(|_| AuthorityOperationIssuerError::InvalidState)?;
+        let private_resolution = match &record.private_resolution {
+            None => None,
+            Some(RetainedPrivateResolutionBytes::Pending) => {
+                Some(RetainedPrivateResolution::Pending)
+            }
+            Some(RetainedPrivateResolutionBytes::Applied {
+                application,
+                application_ack,
+            }) => Some(RetainedPrivateResolution::Applied {
+                application: *application,
+                application_ack: application_ack
+                    .as_ref()
+                    .map(|bytes| PrivateControlApplicationAck::decode(bytes))
+                    .transpose()
+                    .map_err(|_| AuthorityOperationIssuerError::InvalidState)?,
+            }),
+            Some(RetainedPrivateResolutionBytes::RetiredUnapplied {
+                resolved_at,
+                retirement_ack,
+            }) => Some(RetainedPrivateResolution::RetiredUnapplied {
+                resolved_at: *resolved_at,
+                retirement_ack: retirement_ack
+                    .as_ref()
+                    .map(|bytes| PrivateControlApplicationRetirementAck::decode(bytes))
+                    .transpose()
+                    .map_err(|_| AuthorityOperationIssuerError::InvalidState)?,
+            }),
+        };
         Ok(Some(RetainedAuthorityOperation {
             call,
             approval,
             issued_at: record.issued_at,
             receipt,
             issuance_ack,
-            application: record.application,
-            application_ack,
+            private_resolution,
         }))
     }
 
@@ -692,8 +890,8 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
                 issued_at,
                 receipt: None,
                 issuance_ack: None,
-                application: None,
-                application_ack: None,
+                private_resolution: is_private_intent(&call.intent)
+                    .then_some(RetainedPrivateResolutionBytes::Pending),
             });
             self.commit_candidate::<S::Error>(pledged)?;
             self.image.records.len() - 1
@@ -893,28 +1091,38 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
             ));
         }
 
-        match self.image.records[record_index].application.as_ref() {
-            Some(retained) if retained != application => {
+        match self.image.records[record_index].private_resolution.as_ref() {
+            Some(RetainedPrivateResolutionBytes::Applied {
+                application: retained,
+                ..
+            }) if retained != application => {
                 return Err(AuthorityOperationIssuerError::Rejected(
                     AuthorityOperationIssuerRejection::DivergentRetry,
                 ));
             }
-            Some(_) => {
-                if let Some(bytes) = self.image.records[record_index].application_ack.as_ref() {
+            Some(RetainedPrivateResolutionBytes::Applied {
+                application_ack, ..
+            }) => {
+                if let Some(bytes) = application_ack {
                     let application_ack = PrivateControlApplicationAck::decode(bytes)
                         .map_err(|_| AuthorityOperationIssuerError::InvalidState)?;
                     return Ok(IssuedPrivateControlApplication { application_ack });
                 }
             }
-            None => {
-                if self.has_pending_application() {
+            Some(RetainedPrivateResolutionBytes::RetiredUnapplied { .. }) => {
+                return Err(AuthorityOperationIssuerError::Rejected(
+                    AuthorityOperationIssuerRejection::DivergentRetry,
+                ));
+            }
+            Some(RetainedPrivateResolutionBytes::Pending) => {
+                if self.has_pending_private_resolution() {
                     return Err(AuthorityOperationIssuerError::Rejected(
                         AuthorityOperationIssuerRejection::PendingApplication,
                     ));
                 }
                 if self
                     .image
-                    .application_slot_high_water
+                    .resolution_slot_high_water
                     .is_some_and(|slot| application.applied_at < slot)
                 {
                     return Err(AuthorityOperationIssuerError::Rejected(
@@ -927,9 +1135,17 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
                     ));
                 }
                 let mut pledged = self.image.clone();
-                pledged.application_slot_high_water = Some(application.applied_at);
-                pledged.records[record_index].application = Some(*application);
+                pledged.resolution_slot_high_water = Some(application.applied_at);
+                pledged.records[record_index].private_resolution =
+                    Some(RetainedPrivateResolutionBytes::Applied {
+                        application: *application,
+                        application_ack: None,
+                    });
                 self.commit_candidate::<S::Error>(pledged)?;
+            }
+            None => {
+                self.poisoned = true;
+                return Err(AuthorityOperationIssuerError::InvalidState);
             }
         }
 
@@ -976,9 +1192,214 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
             .encode()
             .map_err(|_| AuthorityOperationIssuerError::InvalidState)?;
         let mut completed = self.image.clone();
-        completed.records[record_index].application_ack = Some(application_ack_bytes);
+        let Some(RetainedPrivateResolutionBytes::Applied {
+            application_ack: retained,
+            ..
+        }) = completed.records[record_index].private_resolution.as_mut()
+        else {
+            self.poisoned = true;
+            return Err(AuthorityOperationIssuerError::InvalidState);
+        };
+        *retained = Some(application_ack_bytes);
         self.commit_candidate::<S::Error>(completed)?;
         Ok(IssuedPrivateControlApplication { application_ack })
+    }
+
+    /// Sign PAR1 only after durably pledging the exact terminal-resolution
+    /// invocation and logical attempt slot for an issued Private capability.
+    ///
+    /// The pledge carries no guest result or error. A signer failure leaves
+    /// that exact preimage retryable; a completed retry returns the retained
+    /// byte-identical PAR1 without consulting the signer. PCA1 and PAR1 use
+    /// one tagged lineage, so neither a pending nor completed branch can be
+    /// replaced by the other.
+    pub(crate) fn retire_private_application<S: PrivateControlApplicationEvidenceSigner>(
+        &mut self,
+        authorization_invocation: InvocationId,
+        resolved_at: u64,
+        signer: &mut S,
+    ) -> Result<
+        IssuedPrivateControlApplicationRetirement,
+        AuthorityOperationIssuerError<B::Error, S::Error>,
+    > {
+        self.ensure_live()?;
+        let Some(record_index) = self.image.records.iter().position(|record| {
+            AuthorityOperationCall::decode(&record.call)
+                .is_ok_and(|call| call.invocation == authorization_invocation)
+        }) else {
+            return Err(AuthorityOperationIssuerError::Rejected(
+                AuthorityOperationIssuerRejection::MissingIssuance,
+            ));
+        };
+        let record = &self.image.records[record_index];
+        let call = AuthorityOperationCall::decode(&record.call)
+            .map_err(|_| AuthorityOperationIssuerError::InvalidState)?;
+        let approval = AuthorityOperationApproval::decode(&record.approval)
+            .map_err(|_| AuthorityOperationIssuerError::InvalidState)?;
+        let issuance = record
+            .issuance_ack
+            .as_ref()
+            .ok_or(AuthorityOperationIssuerError::Rejected(
+                AuthorityOperationIssuerRejection::MissingIssuance,
+            ))
+            .and_then(|bytes| {
+                AuthorityOperationIssuanceAck::decode(bytes)
+                    .map_err(|_| AuthorityOperationIssuerError::InvalidState)
+            })?;
+        let verifier = RawEd25519Verifier;
+        if call.authority != self.image.authority
+            || approval.authority != self.image.authority
+            || issuance.authority != self.image.authority
+        {
+            return Err(AuthorityOperationIssuerError::Rejected(
+                AuthorityOperationIssuerRejection::WrongRoute,
+            ));
+        }
+        if call.verify_with(&verifier).is_err()
+            || !issuance.matches_pending(&call, &approval)
+            || issuance
+                .verify_with(self.image.authority.binding, &verifier)
+                .is_err()
+        {
+            return Err(AuthorityOperationIssuerError::InvalidState);
+        }
+        if !is_private_intent(&call.intent)
+            || resolved_at < issuance.issued_at
+            || !issuance.receipt.selector.is_live_at(resolved_at)
+        {
+            return Err(AuthorityOperationIssuerError::Rejected(
+                AuthorityOperationIssuerRejection::InvalidApplication,
+            ));
+        }
+        let application_invocation =
+            PrivateControlApplicationRetirementAck::derive_application_invocation(&issuance);
+        if application_invocation == call.invocation
+            || application_invocation == issuance.acknowledgement_invocation
+            || self
+                .image
+                .records
+                .iter()
+                .enumerate()
+                .any(|(index, record)| {
+                    index != record_index
+                        && retained_invocations(record)
+                            .is_none_or(|invocations| invocations.contains(&application_invocation))
+                })
+        {
+            return Err(AuthorityOperationIssuerError::Rejected(
+                AuthorityOperationIssuerRejection::InvocationCollision,
+            ));
+        }
+
+        match self.image.records[record_index].private_resolution.as_ref() {
+            Some(RetainedPrivateResolutionBytes::RetiredUnapplied {
+                resolved_at: retained,
+                ..
+            }) if *retained != resolved_at => {
+                return Err(AuthorityOperationIssuerError::Rejected(
+                    AuthorityOperationIssuerRejection::DivergentRetry,
+                ));
+            }
+            Some(RetainedPrivateResolutionBytes::RetiredUnapplied { retirement_ack, .. }) => {
+                if let Some(bytes) = retirement_ack {
+                    let retirement_ack = PrivateControlApplicationRetirementAck::decode(bytes)
+                        .map_err(|_| AuthorityOperationIssuerError::InvalidState)?;
+                    return Ok(IssuedPrivateControlApplicationRetirement { retirement_ack });
+                }
+            }
+            Some(RetainedPrivateResolutionBytes::Applied { .. }) => {
+                return Err(AuthorityOperationIssuerError::Rejected(
+                    AuthorityOperationIssuerRejection::DivergentRetry,
+                ));
+            }
+            Some(RetainedPrivateResolutionBytes::Pending) => {
+                if self.has_pending_private_resolution() {
+                    return Err(AuthorityOperationIssuerError::Rejected(
+                        AuthorityOperationIssuerRejection::PendingApplication,
+                    ));
+                }
+                if self
+                    .image
+                    .resolution_slot_high_water
+                    .is_some_and(|slot| resolved_at < slot)
+                {
+                    return Err(AuthorityOperationIssuerError::Rejected(
+                        AuthorityOperationIssuerRejection::ApplicationSlotRegressed,
+                    ));
+                }
+                if signer.public_key() != self.image.authority.binding.public_key {
+                    return Err(AuthorityOperationIssuerError::Rejected(
+                        AuthorityOperationIssuerRejection::WrongSigner,
+                    ));
+                }
+                let mut pledged = self.image.clone();
+                pledged.resolution_slot_high_water = Some(resolved_at);
+                pledged.records[record_index].private_resolution =
+                    Some(RetainedPrivateResolutionBytes::RetiredUnapplied {
+                        resolved_at,
+                        retirement_ack: None,
+                    });
+                self.commit_candidate::<S::Error>(pledged)?;
+            }
+            None => {
+                self.poisoned = true;
+                return Err(AuthorityOperationIssuerError::InvalidState);
+            }
+        }
+
+        if signer.public_key() != self.image.authority.binding.public_key {
+            return Err(AuthorityOperationIssuerError::Rejected(
+                AuthorityOperationIssuerRejection::WrongSigner,
+            ));
+        }
+        let mut retirement_ack = PrivateControlApplicationRetirementAck {
+            authorization_invocation: call.invocation,
+            issuance_invocation: issuance.acknowledgement_invocation,
+            application_invocation,
+            authority: self.image.authority,
+            operation_call: call.commitment(),
+            approval: approval.commitment(),
+            issuance_ack: issuance.commitment(),
+            authorization_sequence: approval.authorization_sequence,
+            receipt: issuance.receipt.clone(),
+            issued_at: issuance.issued_at,
+            resolved_at,
+            signature: [0; 64],
+        };
+        let message = retirement_ack.signing_bytes();
+        retirement_ack.signature = signer
+            .sign_private_application_retirement_ack(&message)
+            .map_err(AuthorityOperationIssuerError::Signer)?;
+        if !retirement_ack.matches_pending(&call, &approval, &issuance)
+            || retirement_ack
+                .verify_pending_with(
+                    &call,
+                    &approval,
+                    &issuance,
+                    self.image.authority.binding,
+                    &verifier,
+                )
+                .is_err()
+        {
+            return Err(AuthorityOperationIssuerError::Rejected(
+                AuthorityOperationIssuerRejection::WrongSigner,
+            ));
+        }
+        let retirement_ack_bytes = retirement_ack
+            .encode()
+            .map_err(|_| AuthorityOperationIssuerError::InvalidState)?;
+        let mut completed = self.image.clone();
+        let Some(RetainedPrivateResolutionBytes::RetiredUnapplied {
+            retirement_ack: retained,
+            ..
+        }) = completed.records[record_index].private_resolution.as_mut()
+        else {
+            self.poisoned = true;
+            return Err(AuthorityOperationIssuerError::InvalidState);
+        };
+        *retained = Some(retirement_ack_bytes);
+        self.commit_candidate::<S::Error>(completed)?;
+        Ok(IssuedPrivateControlApplicationRetirement { retirement_ack })
     }
 
     fn ensure_live<SignerError>(
@@ -997,7 +1418,7 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
         &mut self,
         candidate: AuthorityOperationIssuerImage,
     ) -> Result<(), AuthorityOperationIssuerError<B::Error, SignerError>> {
-        if !candidate.has_valid_envelope() {
+        if !candidate.is_valid() {
             self.poisoned = true;
             return Err(AuthorityOperationIssuerError::InvalidState);
         }
@@ -1166,6 +1587,52 @@ fn encode_application_fact(encoder: &mut Encoder<'_>, application: &PrivateContr
     encoder.u64(application.applied_at);
 }
 
+fn encode_private_resolution(
+    encoder: &mut Encoder<'_>,
+    resolution: &RetainedPrivateResolutionBytes,
+) {
+    match resolution {
+        RetainedPrivateResolutionBytes::Pending => encoder.u8(0),
+        RetainedPrivateResolutionBytes::Applied {
+            application,
+            application_ack,
+        } => {
+            encoder.u8(1);
+            encode_application_fact(encoder, application);
+            encoder.option(application_ack, |encoder, bytes| encoder.bytes(bytes));
+        }
+        RetainedPrivateResolutionBytes::RetiredUnapplied {
+            resolved_at,
+            retirement_ack,
+        } => {
+            encoder.u8(2);
+            encoder.u64(*resolved_at);
+            encoder.option(retirement_ack, |encoder, bytes| encoder.bytes(bytes));
+        }
+    }
+}
+
+fn decode_private_resolution(
+    decoder: &mut Decoder<'_>,
+) -> Result<RetainedPrivateResolutionBytes, DecodeError> {
+    match decoder.u8()? {
+        0 => Ok(RetainedPrivateResolutionBytes::Pending),
+        1 => Ok(RetainedPrivateResolutionBytes::Applied {
+            application: decode_application_fact(decoder)?,
+            application_ack: decoder.option(|decoder| {
+                decoder.bytes_bounded(MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES)
+            })?,
+        }),
+        2 => Ok(RetainedPrivateResolutionBytes::RetiredUnapplied {
+            resolved_at: decoder.u64()?,
+            retirement_ack: decoder.option(|decoder| {
+                decoder.bytes_bounded(MAX_PRIVATE_CONTROL_APPLICATION_RETIREMENT_ACK_WIRE_BYTES)
+            })?,
+        }),
+        _ => Err(DecodeError::InvalidTag),
+    }
+}
+
 fn decode_application_fact(
     decoder: &mut Decoder<'_>,
 ) -> Result<PrivateControlApplicationFact, DecodeError> {
@@ -1180,6 +1647,15 @@ fn decode_application_fact(
             }
             value if value == AuthorityOperationKind::RecoverPrivateAgent as u8 => {
                 AuthorityOperationKind::RecoverPrivateAgent
+            }
+            value if value == AuthorityOperationKind::RotatePrivateKeys as u8 => {
+                AuthorityOperationKind::RotatePrivateKeys
+            }
+            value if value == AuthorityOperationKind::SetPrivateResourcePolicy as u8 => {
+                AuthorityOperationKind::SetPrivateResourcePolicy
+            }
+            value if value == AuthorityOperationKind::PrivateActorLifecycle as u8 => {
+                AuthorityOperationKind::PrivateActorLifecycle
             }
             _ => return Err(DecodeError::InvalidTag),
         },
@@ -1313,12 +1789,12 @@ mod tests {
     };
     use crate::agent::sdk::authority_operation::AuthorityOperationIntent;
     use crate::agent::sdk::private::{
-        PRIVATE_SIGNATURE_BYTES, PrivateControlOperation, PrivateControlRecord,
-        PrivateControlSigner, PrivateNodeIdentity, SealedPrivateKey,
+        PRIVATE_SIGNATURE_BYTES, PrivateActorLifecycleKind, PrivateControlOperation,
+        PrivateControlRecord, PrivateControlSigner, PrivateNodeIdentity, SealedPrivateKey,
     };
     use crate::agent::sdk::{
-        CredentialId, InvocationOrigin, InvocationRoleClaims, InvocationWork, MethodMode, NodeId,
-        RuntimeBlob,
+        BlobRef, CredentialId, InvocationOrigin, InvocationRoleClaims, InvocationWork, MethodMode,
+        NodeId, RuntimeBlob,
     };
 
     #[derive(Clone, Debug, Default)]
@@ -1419,12 +1895,15 @@ mod tests {
         receipt_calls: usize,
         acknowledgement_calls: usize,
         application_calls: usize,
+        retirement_calls: usize,
         fail_receipt: bool,
         fail_acknowledgement: bool,
         corrupt_receipt: bool,
         corrupt_acknowledgement: bool,
         fail_application: bool,
         corrupt_application: bool,
+        fail_retirement: bool,
+        corrupt_retirement: bool,
     }
 
     impl CountingSigner {
@@ -1434,12 +1913,15 @@ mod tests {
                 receipt_calls: 0,
                 acknowledgement_calls: 0,
                 application_calls: 0,
+                retirement_calls: 0,
                 fail_receipt: false,
                 fail_acknowledgement: false,
                 corrupt_receipt: false,
                 corrupt_acknowledgement: false,
                 fail_application: false,
                 corrupt_application: false,
+                fail_retirement: false,
+                corrupt_retirement: false,
             }
         }
     }
@@ -1496,6 +1978,22 @@ mod tests {
             }
             let mut signature = self.key.sign(message).to_bytes();
             if self.corrupt_application {
+                signature[0] ^= 1;
+            }
+            Ok(signature)
+        }
+
+        fn sign_private_application_retirement_ack(
+            &mut self,
+            message: &[u8],
+        ) -> Result<[u8; 64], Self::Error> {
+            self.retirement_calls += 1;
+            if self.fail_retirement {
+                self.fail_retirement = false;
+                return Err(TestSignerError);
+            }
+            let mut signature = self.key.sign(message).to_bytes();
+            if self.corrupt_retirement {
                 signature[0] ^= 1;
             }
             Ok(signature)
@@ -1619,6 +2117,21 @@ mod tests {
             authorization_sequence: u64,
             control: &PrivateControlRecord,
         ) -> (AuthorityOperationCall, AuthorityOperationApproval) {
+            let intent = AuthorityOperationIntent::private_control(
+                DeploymentId(id(0x82, discriminator)),
+                control,
+            )
+            .unwrap();
+            self.approved_private_intent(discriminator, authorization_sequence, intent)
+        }
+
+        fn approved_private_intent(
+            &self,
+            discriminator: u64,
+            authorization_sequence: u64,
+            intent: AuthorityOperationIntent,
+        ) -> (AuthorityOperationCall, AuthorityOperationApproval) {
+            assert!(is_private_intent(&intent));
             let credential_public_key = self.credential_key.verifying_key().to_bytes();
             let principal = PrincipalId(id(0x22, 1));
             let credential = CredentialId::of_public_key(&credential_public_key);
@@ -1633,11 +2146,7 @@ mod tests {
                 authenticated_node: Some(node),
                 requested_valid_from: 10,
                 requested_expires_at: 40,
-                intent: AuthorityOperationIntent::private_control(
-                    DeploymentId(id(0x82, discriminator)),
-                    control,
-                )
-                .unwrap(),
+                intent,
                 signature: [0; CREDENTIAL_SIGNATURE_BYTES],
             };
             call.invocation = call.expected_invocation();
@@ -1714,33 +2223,149 @@ mod tests {
         control
     }
 
+    fn newer_private_intent(
+        fixture: &Fixture,
+        discriminator: u64,
+        operation: AuthorityOperationKind,
+    ) -> AuthorityOperationIntent {
+        let managed = ManagedAgentTarget {
+            space: fixture.authority.space,
+            agent: AgentId(id(0x8a, discriminator)),
+            runtime_deployment: DeploymentId(id(0x82, discriminator)),
+        };
+        let control = Hash(id(0x8b, discriminator));
+        let control_sequence = discriminator;
+        let control_previous = Some(Hash(id(0x8c, discriminator)));
+        let intent = match operation {
+            AuthorityOperationKind::RotatePrivateKeys => {
+                AuthorityOperationIntent::RotatePrivateKeys {
+                    managed,
+                    control,
+                    control_sequence,
+                    control_previous,
+                    epoch: 3,
+                    member_set: Hash(id(0x8d, discriminator)),
+                }
+            }
+            AuthorityOperationKind::SetPrivateResourcePolicy => {
+                AuthorityOperationIntent::SetPrivateResourcePolicy {
+                    managed,
+                    control,
+                    control_sequence,
+                    control_previous,
+                    policy: BlobRef::of_bytes(b"issuer-private-resource-policy"),
+                }
+            }
+            AuthorityOperationKind::PrivateActorLifecycle => {
+                AuthorityOperationIntent::PrivateActorLifecycle {
+                    managed,
+                    control,
+                    control_sequence,
+                    control_previous,
+                    actor: ActorId(id(0x8e, discriminator)),
+                    lifecycle: PrivateActorLifecycleKind::Upgrade,
+                    request: Hash(id(0x8f, discriminator)),
+                }
+            }
+            _ => panic!("newer Private operation fixture"),
+        };
+        assert!(intent.validate_shape().is_ok());
+        intent
+    }
+
     fn private_application(
         call: &AuthorityOperationCall,
         applied_at: u64,
         discriminator: u64,
     ) -> PrivateControlApplicationFact {
-        let AuthorityOperationIntent::InvitePrivateNode {
+        let (control, control_sequence, control_previous, epoch, post_member_set) =
+            match &call.intent {
+                AuthorityOperationIntent::InvitePrivateNode {
+                    control,
+                    control_sequence,
+                    control_previous,
+                    epoch,
+                    ..
+                } => (
+                    *control,
+                    *control_sequence,
+                    *control_previous,
+                    *epoch,
+                    Hash(id(0x90, discriminator)),
+                ),
+                AuthorityOperationIntent::RevokePrivateNode {
+                    control,
+                    control_sequence,
+                    control_previous,
+                    epoch,
+                    member_set,
+                    ..
+                } => (
+                    *control,
+                    *control_sequence,
+                    *control_previous,
+                    *epoch,
+                    *member_set,
+                ),
+                AuthorityOperationIntent::RecoverPrivateAgent { proof } => (
+                    proof.control,
+                    proof.control_sequence,
+                    proof.control_previous,
+                    proof.next_epoch,
+                    proof.replacement_member_set,
+                ),
+                AuthorityOperationIntent::RotatePrivateKeys {
+                    control,
+                    control_sequence,
+                    control_previous,
+                    epoch,
+                    member_set,
+                    ..
+                } => (
+                    *control,
+                    *control_sequence,
+                    *control_previous,
+                    *epoch,
+                    *member_set,
+                ),
+                AuthorityOperationIntent::SetPrivateResourcePolicy {
+                    control,
+                    control_sequence,
+                    control_previous,
+                    ..
+                }
+                | AuthorityOperationIntent::PrivateActorLifecycle {
+                    control,
+                    control_sequence,
+                    control_previous,
+                    ..
+                } => (
+                    *control,
+                    *control_sequence,
+                    *control_previous,
+                    2,
+                    Hash(id(0x90, discriminator)),
+                ),
+                AuthorityOperationIntent::InvokeActor { .. }
+                | AuthorityOperationIntent::Catalog { .. } => panic!("Private fixture"),
+            };
+        let application = PrivateControlApplicationFact {
+            managed: call.intent.managed(),
+            operation: call.intent.operation(),
             control,
             control_sequence,
             control_previous,
             epoch,
-            ..
-        } = &call.intent
-        else {
-            panic!("Private Invite fixture")
-        };
-        PrivateControlApplicationFact {
-            managed: call.intent.managed(),
-            operation: call.intent.operation(),
-            control: *control,
-            control_sequence: *control_sequence,
-            control_previous: *control_previous,
-            epoch: *epoch,
-            post_member_set: Hash(id(0x90, discriminator)),
+            post_member_set,
             reopened_control_state: Hash(id(0x91, discriminator)),
-            reopened_control_head: *control,
+            reopened_control_head: control,
             applied_at,
-        }
+        };
+        assert!(private_intent_matches_application(
+            &call.intent,
+            &application
+        ));
+        application
     }
 
     fn open(
@@ -2179,7 +2804,7 @@ mod tests {
             Err(AuthorityOperationIssuerError::InvalidState)
         ));
 
-        for magic in [b"AOJ2", b"AOJ0"] {
+        for magic in [b"AOJ3", b"AOJ2", b"AOJ0"] {
             let mut old_magic = valid.clone();
             old_magic[..4].copy_from_slice(magic);
             store.replace_image(old_magic);
@@ -2209,11 +2834,33 @@ mod tests {
         let store = MemoryImageStore::default();
         let mut signer = CountingSigner::new(0x19);
         let fixture = Fixture::new(&signer);
-        let mut issuer = open(store.clone(), &fixture);
+        let mut records = Vec::with_capacity(MAX_AUTHORITY_OPERATION_ISSUER_RECORDS);
         for sequence in 1..=MAX_AUTHORITY_OPERATION_ISSUER_RECORDS as u64 {
             let (call, approval) = fixture.approved(sequence, sequence);
-            issuer.issue(&call, &approval, 20, &mut signer).unwrap();
+            // Materialize each fully signed record against a one-record image.
+            // Production candidate commits deliberately validate the complete
+            // image; driving all 256 records through that boundary here would
+            // turn this ceiling test into an avoidable O(n^2) crypto loop.
+            let one_record_store = MemoryImageStore::default();
+            let mut one_record_issuer = open(one_record_store.clone(), &fixture);
+            one_record_issuer
+                .issue(&call, &approval, 20, &mut signer)
+                .unwrap();
+            let mut one_record_image = AuthorityOperationIssuerImage::decode(
+                &one_record_store.image().expect("one retained record"),
+            )
+            .unwrap();
+            records.push(one_record_image.records.pop().unwrap());
         }
+        let image = AuthorityOperationIssuerImage {
+            authority: fixture.authority,
+            issuance_slot_high_water: Some(20),
+            resolution_slot_high_water: None,
+            records,
+        };
+        assert!(image.is_valid());
+        store.replace_image(image.encode());
+        let mut issuer = open(store.clone(), &fixture);
         assert_eq!(
             issuer.retained_operations(),
             MAX_AUTHORITY_OPERATION_ISSUER_RECORDS
@@ -2428,7 +3075,484 @@ mod tests {
 
         let valid = store.image().unwrap();
         let mut image = AuthorityOperationIssuerImage::decode(&valid).unwrap();
-        image.application_slot_high_water = Some(24);
+        image.resolution_slot_high_water = Some(24);
+        store.replace_image(image.encode());
+        assert!(matches!(
+            DurableAuthorityOperationIssuer::open(store, fixture.authority),
+            Err(AuthorityOperationIssuerError::InvalidState)
+        ));
+    }
+
+    #[test]
+    fn private_retirement_exact_retry_restart_and_reverse_races_are_exclusive() {
+        let store = MemoryImageStore::default();
+        let mut signer = CountingSigner::new(0x19);
+        let fixture = Fixture::new(&signer);
+        let control = private_control(&fixture, 1);
+        let (call, approval) = fixture.approved_private(1, 1, &control);
+        let application = private_application(&call, 24, 1);
+        let mut issuer = open(store.clone(), &fixture);
+        let issuance = issuer.issue(&call, &approval, 20, &mut signer).unwrap();
+        assert!(matches!(
+            issuer
+                .recover_retained(call.invocation)
+                .unwrap()
+                .unwrap()
+                .private_resolution,
+            Some(RetainedPrivateResolution::Pending)
+        ));
+
+        let retired = issuer
+            .retire_private_application(call.invocation, 24, &mut signer)
+            .unwrap();
+        assert_eq!(store.commits(), 5);
+        assert_eq!(signer.retirement_calls, 1);
+        assert_eq!(issuer.retained_private_resolutions(), 1);
+        assert_eq!(issuer.retained_private_applications(), 0);
+        assert!(!issuer.has_pending_private_resolution());
+        assert_eq!(
+            retired.retirement_ack.application_invocation,
+            PrivateControlApplicationAck::derive_application_invocation(&issuance.issuance_ack)
+        );
+        assert!(
+            retired
+                .retirement_ack
+                .verify_pending_with(
+                    &call,
+                    &approval,
+                    &issuance.issuance_ack,
+                    fixture.authority.binding,
+                    &RawEd25519Verifier,
+                )
+                .is_ok()
+        );
+        let recovered = issuer.recover_retained(call.invocation).unwrap().unwrap();
+        assert_eq!(recovered.application(), None);
+        assert!(matches!(
+            recovered.private_resolution,
+            Some(RetainedPrivateResolution::RetiredUnapplied {
+                resolved_at: 24,
+                retirement_ack: Some(ref acknowledgement),
+            }) if acknowledgement == &retired.retirement_ack
+        ));
+
+        let completed_image = store.image().unwrap();
+        let mut unusable = CountingSigner::new(0x72);
+        unusable.fail_retirement = true;
+        assert_eq!(
+            issuer
+                .retire_private_application(call.invocation, 24, &mut unusable)
+                .unwrap(),
+            retired
+        );
+        assert_eq!(unusable.retirement_calls, 0);
+        assert!(matches!(
+            issuer.issue_private_application(call.invocation, &application, &mut signer),
+            Err(AuthorityOperationIssuerError::Rejected(
+                AuthorityOperationIssuerRejection::DivergentRetry
+            ))
+        ));
+        assert_eq!(store.image().as_deref(), Some(completed_image.as_slice()));
+
+        let mut reopened = open(store.clone(), &fixture);
+        assert_eq!(
+            reopened
+                .retire_private_application(call.invocation, 24, &mut unusable)
+                .unwrap(),
+            retired
+        );
+        assert_eq!(unusable.retirement_calls, 0);
+
+        let second_control = private_control(&fixture, 2);
+        let (second, second_approval) = fixture.approved_private(2, 2, &second_control);
+        let second_application = private_application(&second, 25, 2);
+        reopened
+            .issue(&second, &second_approval, 20, &mut signer)
+            .unwrap();
+        reopened
+            .issue_private_application(second.invocation, &second_application, &mut signer)
+            .unwrap();
+        let applied_image = store.image().unwrap();
+        assert!(matches!(
+            reopened.retire_private_application(second.invocation, 25, &mut signer),
+            Err(AuthorityOperationIssuerError::Rejected(
+                AuthorityOperationIssuerRejection::DivergentRetry
+            ))
+        ));
+        assert_eq!(store.image().as_deref(), Some(applied_image.as_slice()));
+    }
+
+    #[test]
+    fn private_retirement_failpoints_preserve_exact_pledge_or_poison() {
+        let store = MemoryImageStore::default();
+        let mut signer = CountingSigner::new(0x19);
+        let fixture = Fixture::new(&signer);
+        let control = private_control(&fixture, 1);
+        let (call, approval) = fixture.approved_private(1, 1, &control);
+        let mut issuer = open(store.clone(), &fixture);
+        issuer.issue(&call, &approval, 20, &mut signer).unwrap();
+        signer.fail_retirement = true;
+        assert!(matches!(
+            issuer.retire_private_application(call.invocation, 24, &mut signer),
+            Err(AuthorityOperationIssuerError::Signer(TestSignerError))
+        ));
+        assert!(!issuer.is_poisoned());
+        assert!(issuer.has_pending_private_resolution());
+        assert_eq!(store.commits(), 4);
+        assert!(matches!(
+            issuer
+                .recover_retained(call.invocation)
+                .unwrap()
+                .unwrap()
+                .private_resolution,
+            Some(RetainedPrivateResolution::RetiredUnapplied {
+                resolved_at: 24,
+                retirement_ack: None,
+            })
+        ));
+        issuer
+            .retire_private_application(call.invocation, 24, &mut signer)
+            .unwrap();
+        assert_eq!(signer.retirement_calls, 2);
+
+        for fail_after in [false, true] {
+            let store = MemoryImageStore::default();
+            let mut signer = CountingSigner::new(0x19);
+            let fixture = Fixture::new(&signer);
+            let control = private_control(&fixture, 2);
+            let (call, approval) = fixture.approved_private(2, 2, &control);
+            let mut issuer = open(store.clone(), &fixture);
+            issuer.issue(&call, &approval, 20, &mut signer).unwrap();
+            if fail_after {
+                store.fail_after_commit(1);
+            } else {
+                store.fail_before_commit(1);
+            }
+            assert!(matches!(
+                issuer.retire_private_application(call.invocation, 24, &mut signer),
+                Err(AuthorityOperationIssuerError::Storage(MemoryStoreError))
+            ));
+            assert!(issuer.is_poisoned());
+            assert_eq!(signer.retirement_calls, 0);
+            let mut reopened = open(store, &fixture);
+            reopened
+                .retire_private_application(call.invocation, 24, &mut signer)
+                .unwrap();
+            assert_eq!(signer.retirement_calls, 1);
+        }
+
+        for fail_after in [false, true] {
+            let store = MemoryImageStore::default();
+            let mut signer = CountingSigner::new(0x19);
+            let fixture = Fixture::new(&signer);
+            let control = private_control(&fixture, 3);
+            let (call, approval) = fixture.approved_private(3, 3, &control);
+            let mut issuer = open(store.clone(), &fixture);
+            issuer.issue(&call, &approval, 20, &mut signer).unwrap();
+            if fail_after {
+                store.fail_after_commit(2);
+            } else {
+                store.fail_before_commit(2);
+            }
+            assert!(matches!(
+                issuer.retire_private_application(call.invocation, 24, &mut signer),
+                Err(AuthorityOperationIssuerError::Storage(MemoryStoreError))
+            ));
+            assert!(issuer.is_poisoned());
+            assert_eq!(signer.retirement_calls, 1);
+            let mut reopened = open(store, &fixture);
+            reopened
+                .retire_private_application(call.invocation, 24, &mut signer)
+                .unwrap();
+            assert_eq!(signer.retirement_calls, if fail_after { 1 } else { 2 });
+        }
+
+        let store = MemoryImageStore::default();
+        let mut signer = CountingSigner::new(0x19);
+        let fixture = Fixture::new(&signer);
+        let control = private_control(&fixture, 4);
+        let (call, approval) = fixture.approved_private(4, 4, &control);
+        let mut issuer = open(store, &fixture);
+        issuer.issue(&call, &approval, 20, &mut signer).unwrap();
+        signer.corrupt_retirement = true;
+        assert!(matches!(
+            issuer.retire_private_application(call.invocation, 24, &mut signer),
+            Err(AuthorityOperationIssuerError::Rejected(
+                AuthorityOperationIssuerRejection::WrongSigner
+            ))
+        ));
+        assert!(!issuer.is_poisoned());
+        assert!(issuer.has_pending_private_resolution());
+        signer.corrupt_retirement = false;
+        issuer
+            .retire_private_application(call.invocation, 24, &mut signer)
+            .unwrap();
+    }
+
+    #[test]
+    fn private_retirement_rejects_bad_route_time_kind_retry_and_cross_lineage_regression() {
+        let store = MemoryImageStore::default();
+        let mut signer = CountingSigner::new(0x19);
+        let fixture = Fixture::new(&signer);
+        let control = private_control(&fixture, 1);
+        let (call, approval) = fixture.approved_private(1, 1, &control);
+        let mut issuer = open(store.clone(), &fixture);
+        issuer.issue(&call, &approval, 20, &mut signer).unwrap();
+        let before_rejections = store.image().unwrap();
+
+        let mut wrong = CountingSigner::new(0x72);
+        assert!(matches!(
+            issuer.retire_private_application(call.invocation, 24, &mut wrong),
+            Err(AuthorityOperationIssuerError::Rejected(
+                AuthorityOperationIssuerRejection::WrongSigner
+            ))
+        ));
+        assert_eq!(wrong.retirement_calls, 0);
+        for resolved_at in [19, 39] {
+            assert!(matches!(
+                issuer.retire_private_application(call.invocation, resolved_at, &mut signer),
+                Err(AuthorityOperationIssuerError::Rejected(
+                    AuthorityOperationIssuerRejection::InvalidApplication
+                ))
+            ));
+        }
+        assert_eq!(store.image().as_deref(), Some(before_rejections.as_slice()));
+
+        signer.fail_retirement = true;
+        assert!(matches!(
+            issuer.retire_private_application(call.invocation, 24, &mut signer),
+            Err(AuthorityOperationIssuerError::Signer(TestSignerError))
+        ));
+        let exact_pledge = store.image().unwrap();
+        assert!(matches!(
+            issuer.retire_private_application(call.invocation, 25, &mut signer),
+            Err(AuthorityOperationIssuerError::Rejected(
+                AuthorityOperationIssuerRejection::DivergentRetry
+            ))
+        ));
+        assert_eq!(store.image().as_deref(), Some(exact_pledge.as_slice()));
+        issuer
+            .retire_private_application(call.invocation, 24, &mut signer)
+            .unwrap();
+
+        let standard_store = MemoryImageStore::default();
+        let (standard, standard_approval) = fixture.approved(2, 2);
+        let mut standard_issuer = open(standard_store.clone(), &fixture);
+        standard_issuer
+            .issue(&standard, &standard_approval, 20, &mut signer)
+            .unwrap();
+        let standard_image = standard_store.image().unwrap();
+        assert!(matches!(
+            standard_issuer.retire_private_application(standard.invocation, 24, &mut signer),
+            Err(AuthorityOperationIssuerError::Rejected(
+                AuthorityOperationIssuerRejection::InvalidApplication
+            ))
+        ));
+        assert_eq!(
+            standard_store.image().as_deref(),
+            Some(standard_image.as_slice())
+        );
+
+        let store = MemoryImageStore::default();
+        let mut issuer = open(store, &fixture);
+        let first_control = private_control(&fixture, 3);
+        let second_control = private_control(&fixture, 4);
+        let (first, first_approval) = fixture.approved_private(3, 3, &first_control);
+        let (second, second_approval) = fixture.approved_private(4, 4, &second_control);
+        issuer
+            .issue(&first, &first_approval, 20, &mut signer)
+            .unwrap();
+        issuer
+            .retire_private_application(first.invocation, 25, &mut signer)
+            .unwrap();
+        issuer
+            .issue(&second, &second_approval, 20, &mut signer)
+            .unwrap();
+        let second_application = private_application(&second, 24, 4);
+        assert!(matches!(
+            issuer.issue_private_application(second.invocation, &second_application, &mut signer),
+            Err(AuthorityOperationIssuerError::Rejected(
+                AuthorityOperationIssuerRejection::ApplicationSlotRegressed
+            ))
+        ));
+
+        let store = MemoryImageStore::default();
+        let mut issuer = open(store, &fixture);
+        let first_control = private_control(&fixture, 5);
+        let second_control = private_control(&fixture, 6);
+        let (first, first_approval) = fixture.approved_private(5, 5, &first_control);
+        let (second, second_approval) = fixture.approved_private(6, 6, &second_control);
+        let first_application = private_application(&first, 25, 5);
+        issuer
+            .issue(&first, &first_approval, 20, &mut signer)
+            .unwrap();
+        issuer
+            .issue_private_application(first.invocation, &first_application, &mut signer)
+            .unwrap();
+        issuer
+            .issue(&second, &second_approval, 20, &mut signer)
+            .unwrap();
+        assert!(matches!(
+            issuer.retire_private_application(second.invocation, 24, &mut signer),
+            Err(AuthorityOperationIssuerError::Rejected(
+                AuthorityOperationIssuerRejection::ApplicationSlotRegressed
+            ))
+        ));
+    }
+
+    #[test]
+    fn aoj4_restarts_applied_newer_private_operation_kinds() {
+        let store = MemoryImageStore::default();
+        let mut signer = CountingSigner::new(0x19);
+        let fixture = Fixture::new(&signer);
+        let mut issuer = open(store.clone(), &fixture);
+        for (offset, operation) in [
+            AuthorityOperationKind::RotatePrivateKeys,
+            AuthorityOperationKind::SetPrivateResourcePolicy,
+            AuthorityOperationKind::PrivateActorLifecycle,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let discriminator = offset as u64 + 1;
+            let intent = newer_private_intent(&fixture, discriminator, operation);
+            let (call, approval) =
+                fixture.approved_private_intent(discriminator, discriminator, intent);
+            let applied_at = 24 + offset as u64;
+            let application = private_application(&call, applied_at, discriminator);
+            issuer.issue(&call, &approval, 20, &mut signer).unwrap();
+            assert!(matches!(
+                issuer
+                    .recover_retained(call.invocation)
+                    .unwrap()
+                    .unwrap()
+                    .private_resolution,
+                Some(RetainedPrivateResolution::Pending)
+            ));
+            let issued = issuer
+                .issue_private_application(call.invocation, &application, &mut signer)
+                .unwrap();
+
+            issuer = open(store.clone(), &fixture);
+            let recovered = issuer.recover_retained(call.invocation).unwrap().unwrap();
+            assert_eq!(recovered.application(), Some(&application));
+            assert_eq!(recovered.application_ack(), Some(&issued.application_ack));
+            assert_eq!(
+                issuer
+                    .issue_private_application(call.invocation, &application, &mut signer)
+                    .unwrap(),
+                issued
+            );
+        }
+        assert_eq!(signer.application_calls, 3);
+        assert_eq!(issuer.retained_private_resolutions(), 3);
+    }
+
+    #[test]
+    fn aoj4_hostile_tags_state_aliases_and_semantic_candidate_fail_closed() {
+        let mut signer = CountingSigner::new(0x19);
+        let fixture = Fixture::new(&signer);
+        let private_control = private_control(&fixture, 1);
+        let (private_call, private_approval) = fixture.approved_private(1, 1, &private_control);
+        let (standard_call, standard_approval) = fixture.approved(2, 2);
+        let store = MemoryImageStore::default();
+        let mut issuer = open(store.clone(), &fixture);
+        issuer
+            .issue(&private_call, &private_approval, 20, &mut signer)
+            .unwrap();
+        issuer
+            .issue(&standard_call, &standard_approval, 20, &mut signer)
+            .unwrap();
+        let valid = store.image().unwrap();
+        let valid_image = AuthorityOperationIssuerImage::decode(&valid).unwrap();
+
+        let private_index = valid_image
+            .records
+            .iter()
+            .position(|record| {
+                AuthorityOperationCall::decode(&record.call)
+                    .is_ok_and(|call| call.invocation == private_call.invocation)
+            })
+            .unwrap();
+        let standard_index = valid_image
+            .records
+            .iter()
+            .position(|record| {
+                AuthorityOperationCall::decode(&record.call)
+                    .is_ok_and(|call| call.invocation == standard_call.invocation)
+            })
+            .unwrap();
+
+        let commits = store.commits();
+        let mut invalid_candidate = valid_image.clone();
+        invalid_candidate.records[private_index].private_resolution = None;
+        assert!(invalid_candidate.has_valid_envelope());
+        assert!(matches!(
+            issuer.commit_candidate::<TestSignerError>(invalid_candidate),
+            Err(AuthorityOperationIssuerError::InvalidState)
+        ));
+        assert!(issuer.is_poisoned());
+        assert_eq!(store.commits(), commits);
+        assert_eq!(store.image().as_deref(), Some(valid.as_slice()));
+
+        let mut missing_private_lineage = valid_image.clone();
+        missing_private_lineage.records[private_index].private_resolution = None;
+        store.replace_image(missing_private_lineage.encode());
+        assert!(matches!(
+            DurableAuthorityOperationIssuer::open(store.clone(), fixture.authority),
+            Err(AuthorityOperationIssuerError::InvalidState)
+        ));
+
+        let mut false_private_lineage = valid_image.clone();
+        false_private_lineage.records[standard_index].private_resolution =
+            Some(RetainedPrivateResolutionBytes::Pending);
+        store.replace_image(false_private_lineage.encode());
+        assert!(matches!(
+            DurableAuthorityOperationIssuer::open(store.clone(), fixture.authority),
+            Err(AuthorityOperationIssuerError::InvalidState)
+        ));
+
+        let application = private_application(&private_call, 24, 1);
+        let mut application_bytes = Vec::new();
+        encode_application_fact(&mut Encoder(&mut application_bytes), &application);
+        assert_eq!(
+            application_bytes[96],
+            AuthorityOperationKind::InvitePrivateNode as u8
+        );
+        for hostile_operation in [AuthorityOperationKind::InvokeActor as u8, u8::MAX] {
+            let mut hostile = application_bytes.clone();
+            hostile[96] = hostile_operation;
+            assert!(matches!(
+                decode_application_fact(&mut Decoder::new(&hostile)),
+                Err(DecodeError::InvalidTag)
+            ));
+        }
+        assert!(matches!(
+            decode_private_resolution(&mut Decoder::new(&[u8::MAX])),
+            Err(DecodeError::InvalidTag)
+        ));
+    }
+
+    #[test]
+    fn aoj4_rejects_retirement_ack_state_divergence() {
+        let store = MemoryImageStore::default();
+        let mut signer = CountingSigner::new(0x19);
+        let fixture = Fixture::new(&signer);
+        let control = private_control(&fixture, 1);
+        let (call, approval) = fixture.approved_private(1, 1, &control);
+        let mut issuer = open(store.clone(), &fixture);
+        issuer.issue(&call, &approval, 20, &mut signer).unwrap();
+        issuer
+            .retire_private_application(call.invocation, 24, &mut signer)
+            .unwrap();
+        let mut image = AuthorityOperationIssuerImage::decode(&store.image().unwrap()).unwrap();
+        let Some(RetainedPrivateResolutionBytes::RetiredUnapplied { resolved_at, .. }) =
+            image.records[0].private_resolution.as_mut()
+        else {
+            panic!("retirement state")
+        };
+        *resolved_at = 25;
+        image.resolution_slot_high_water = Some(25);
         store.replace_image(image.encode());
         assert!(matches!(
             DurableAuthorityOperationIssuer::open(store, fixture.authority),

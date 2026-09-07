@@ -626,7 +626,10 @@ where
             self.image.records.len() - 1
         };
 
-        if retained.application.is_none()
+        if retained.is_retired_unapplied() {
+            return Err(PrivateControlApplicationCoordinatorError::InvalidState);
+        }
+        if retained.application().is_none()
             && signer.public_key() != self.authority.binding.public_key
         {
             return Err(Self::rejected(
@@ -634,7 +637,7 @@ where
             ));
         }
 
-        let application = match retained.application.as_ref() {
+        let application = match retained.application() {
             Some(application) => {
                 if application.applied_at != applied_at
                     || !private_intent_matches_application(&retained.call.intent, application)
@@ -1022,7 +1025,7 @@ fn coordinator_matches_issuer<I: AuthorityOperationIssuerStore>(
         {
             return false;
         }
-        if let Some(application) = retained.application.as_ref() {
+        if let Some(application) = retained.application() {
             issuer_applications += 1;
             if application.applied_at != record.applied_at
                 || application.control != control.commitment()
@@ -1033,15 +1036,14 @@ fn coordinator_matches_issuer<I: AuthorityOperationIssuerStore>(
         }
         if let Some(consumed) = record.consumed_application_ack {
             if retained
-                .application_ack
-                .as_ref()
+                .application_ack()
                 .is_none_or(|acknowledgement| acknowledgement.commitment() != consumed)
             {
                 return false;
             }
         }
         if let Some(persisted) = record.persisted_authority_evidence {
-            let Some(acknowledgement) = retained.application_ack.as_ref() else {
+            let Some(acknowledgement) = retained.application_ack() else {
                 return false;
             };
             let recovery_proof = match &retained.call.intent {
@@ -1470,6 +1472,13 @@ mod tests {
                 signature[0] ^= 1;
             }
             Ok(signature)
+        }
+
+        fn sign_private_application_retirement_ack(
+            &mut self,
+            message: &[u8],
+        ) -> Result<[u8; 64], Self::Error> {
+            Ok(self.key.sign(message).to_bytes())
         }
     }
 
