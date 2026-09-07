@@ -614,7 +614,12 @@ impl AuthorityOperationIntent {
             | Self::RotatePrivateKeys { control, .. }
             | Self::SetPrivateResourcePolicy { control, .. }
             | Self::PrivateActorLifecycle { control, .. } => Some(*control),
-            Self::RecoverPrivateAgent { proof } => Some(proof.control),
+            // Recover is authorized by the exact recovery-key-signed PRA1,
+            // not merely by the PCTL it projects. Multiple valid PRA1 values
+            // can name the same control while selecting different authority
+            // projection heads; the receipt must therefore bind the complete
+            // proof commitment so those values cannot be mixed after issuance.
+            Self::RecoverPrivateAgent { proof } => Some(proof.commitment()),
         }
     }
 
@@ -1254,7 +1259,10 @@ impl AuthorityOperationApproval {
     pub fn matches_private_control(&self, control: &PrivateControlRecord) -> bool {
         self.validate_shape().is_ok()
             && self.intent.matches_private_control(control)
-            && self.selector.request == control.commitment()
+            && self
+                .intent
+                .request_commitment(self.authorization_sequence, self.operation_call)
+                == Some(self.selector.request)
     }
 }
 
@@ -1659,7 +1667,8 @@ impl PrivateControlApplicationAck {
             || selector.operation.uses_management_decision_journal()
             || selector.decision_sequence != 0
             || selector.acknowledged_through != 0
-            || selector.request != self.application.control
+            || (selector.operation != AuthorityOperationKind::RecoverPrivateAgent
+                && selector.request != self.application.control)
             || !selector.is_live_at(self.issued_at)
             || !selector.is_live_at(self.application.applied_at)
         {
@@ -4196,7 +4205,11 @@ mod tests {
             let call = call_with_intent(intent, 0x83 + index as u8);
             let approval = approval(&call);
             assert!(approval.matches_private_control(control));
-            assert_eq!(approval.selector.request, control.commitment());
+            let expected_request = match &call.intent {
+                AuthorityOperationIntent::RecoverPrivateAgent { proof } => proof.commitment(),
+                _ => control.commitment(),
+            };
+            assert_eq!(approval.selector.request, expected_request);
             assert_eq!(approval.selector.decision_sequence, 0);
             assert_eq!(approval.selector.acknowledged_through, 0);
             if operation == AuthorityOperationKind::PrivateActorLifecycle {
@@ -4306,6 +4319,63 @@ mod tests {
         };
         request.0[0] ^= 1;
         assert!(!lifecycle_intent.matches_private_control(&changed_lifecycle));
+    }
+
+    #[test]
+    fn recover_receipt_selector_binds_the_exact_pra1_not_only_its_pctl() {
+        let runtime = DeploymentId([0x90; 32]);
+        let mut control = private_controls()[2].clone();
+        let first_head = Hash([0x91; 32]);
+        let second_head = Hash([0x92; 32]);
+        let PrivateControlOperation::Recover {
+            superseded_heads, ..
+        } = &mut control.operation
+        else {
+            unreachable!()
+        };
+        *superseded_heads = vec![first_head, second_head];
+        control.previous = Some(first_head);
+        let signer = TestRecoverySigner(control.signer_public_key);
+        let first = PrivateRecoveryAuthorityProof::from_control(
+            runtime,
+            &control,
+            Some(first_head),
+            &signer,
+        )
+        .unwrap();
+        let second = PrivateRecoveryAuthorityProof::from_control(
+            runtime,
+            &control,
+            Some(second_head),
+            &signer,
+        )
+        .unwrap();
+        assert!(first.matches_control(&control));
+        assert!(second.matches_control(&control));
+        assert_ne!(first.commitment(), second.commitment());
+
+        let first_call = call_with_intent(
+            AuthorityOperationIntent::RecoverPrivateAgent {
+                proof: first.clone(),
+            },
+            0x93,
+        );
+        let second_call = call_with_intent(
+            AuthorityOperationIntent::RecoverPrivateAgent {
+                proof: second.clone(),
+            },
+            0x94,
+        );
+        let first_approval = approval(&first_call);
+        let second_approval = approval(&second_call);
+        assert_eq!(first_approval.selector.request, first.commitment());
+        assert_eq!(second_approval.selector.request, second.commitment());
+        assert_ne!(
+            first_approval.selector.request,
+            second_approval.selector.request
+        );
+        assert!(!first_approval.matches_call(&second_call));
+        assert!(!second_approval.matches_call(&first_call));
     }
 
     #[test]
