@@ -9,7 +9,9 @@
 //! general-operation approvals remain exact-retryable until a signed `AOI1`
 //! issuance acknowledgement advances their contiguous retirement floor. A
 //! distinct signed `PCA1` acknowledgement is required before Private control
-//! state or membership becomes policy-visible.
+//! state or membership becomes policy-visible. A mutually exclusive signed
+//! `PAR1` acknowledgement retires an unapplied Private capability without
+//! making a guest denial or synthetic control transition policy-visible.
 
 #![cfg_attr(target_arch = "riscv64", no_std)]
 
@@ -28,7 +30,8 @@ use vos::agent_sdk::authority::{
 use vos::agent_sdk::authority_operation::{
     AuthorityOperationApproval, AuthorityOperationCall, AuthorityOperationIntent,
     AuthorityOperationIssuanceAck, MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES,
-    PrivateControlApplicationAck, PrivateControlApplicationFact, PrivateRecoveryAuthorityProof,
+    PrivateControlApplicationAck, PrivateControlApplicationFact,
+    PrivateControlApplicationRetirementAck, PrivateRecoveryAuthorityProof,
     PrivateRecoveryAuthorityProofVerifier, private_member_set_commitment,
     private_node_identity_set_commitment,
 };
@@ -80,9 +83,9 @@ pub const MAX_RETIRED_ACTOR_INSTALLATIONS: usize =
 /// each credential may have at most one application-bearing request in flight.
 /// Completed results compact to one exact latest acknowledgement per credential.
 pub const MAX_EXACT_RETRY_RECORDS: usize = 128;
-/// One Private Agent may consume the runtime's complete bounded control-chain
-/// ceiling. Compact rows preserve exact PCA1 retry and invocation collision
-/// identity after a later control supersedes the current projection.
+/// One Private Agent may consume the runtime's complete bounded resolution
+/// ceiling. Compact rows preserve exact PCA1/PAR1 retry and invocation
+/// collision identity after a later control supersedes the current projection.
 pub const MAX_PRIVATE_APPLICATION_RECORDS: usize = 4_096;
 /// Recovery applications retain one complete canonical PRA1 for exact replay.
 /// The lower independent cap keeps that variable state below 768 KiB; the
@@ -109,7 +112,7 @@ const CONFIG_ENCODED_BYTES: usize = SYSTEM_AUTHORITY_CONFIGURATION_MAGIC.len()
     + PRIVATE_SIGNATURE_BYTES;
 const EVIDENCE_DOMAIN: &[u8] = b"vos/system-authority/policy-evidence/v1";
 const OPERATION_EVIDENCE_DOMAIN: &[u8] = b"vos/system-authority/operation-evidence/v1";
-const STATE_INTEGRITY_DOMAIN: &[u8] = b"vos/system-authority/state-integrity/v12";
+const STATE_INTEGRITY_DOMAIN: &[u8] = b"vos/system-authority/state-integrity/v13";
 
 const _: () = assert!(MAX_RETAINED_EXACT_WIRE_BYTES < MAX_RUNTIME_STATE_BYTES);
 
@@ -915,6 +918,31 @@ pub struct PrivateApplicationRecord {
     pub applied_at: u64,
 }
 
+/// Compact, append-only PAR1 terminal-resolution record. It retains the exact
+/// issued Private capability for collision rejection and idempotent retry but
+/// carries no guest outcome and never participates in the applied-control
+/// projection or its commitment chain.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct PrivateApplicationRetirementRecord {
+    pub credential: [u8; 32],
+    pub request_sequence: u64,
+    pub invocation_payload: [u8; 32],
+    pub authorization_invocation: [u8; 32],
+    pub issuance_invocation: [u8; 32],
+    pub application_invocation: [u8; 32],
+    pub authorization_sequence: u64,
+    pub operation_call: [u8; 32],
+    pub approval: [u8; 32],
+    pub issuance_ack: [u8; 32],
+    pub retirement_ack: [u8; 32],
+    pub private_operation: RetiredPrivateOperationRow,
+    pub issued_at: u64,
+    pub resolved_at: u64,
+}
+
 #[derive(
     vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
 )]
@@ -952,6 +980,7 @@ pub struct AuthorityLinearState {
     latest_operation_acks: Vec<LatestOperationAckRow>,
     private_agents: Vec<PrivateAgentProjectionRow>,
     private_applications: Vec<PrivateApplicationRecord>,
+    private_application_retirements: Vec<PrivateApplicationRetirementRecord>,
     private_application_commitment: [u8; 32],
     admin_retries: Vec<AdminRetryRecord>,
     /// Redundant digest of the exact clean-generation state image with this
@@ -981,6 +1010,7 @@ impl AuthorityLinearState {
             latest_operation_acks: Vec::new(),
             private_agents: Vec::new(),
             private_applications: Vec::new(),
+            private_application_retirements: Vec::new(),
             private_application_commitment: [0; 32],
             admin_retries: Vec::new(),
             state_integrity_commitment: [0; 32],
@@ -1029,6 +1059,7 @@ impl AuthorityLinearState {
             latest_operation_acks: Vec::new(),
             private_agents: Vec::new(),
             private_applications: Vec::new(),
+            private_application_retirements: Vec::new(),
             private_application_commitment: initial_private_application_commitment(config).0,
             admin_retries: Vec::new(),
             state_integrity_commitment: [0; 32],
@@ -1076,7 +1107,7 @@ fn refresh_state_integrity_commitment(
 }
 
 /// Linear policy state for one Space's built-in system Agent.
-#[actor(agent, state_version = 12)]
+#[actor(agent, state_version = 13)]
 pub struct SystemAuthority {
     #[state(const)]
     configuration: SystemAuthorityConfiguration,
@@ -1141,15 +1172,16 @@ impl SystemAuthority {
         acknowledge_operation_issuance(&self.configuration, &mut self.state, &ack, &context)
     }
 
-    /// Consume one authority-signed PCA1 only after its exact AOI1 chain is
-    /// known. This advances the Private policy projection, never the global
-    /// authorization clock or the management/catalog projections.
+    /// Resolve one issued Private capability after its exact AOI1 chain is
+    /// known. PCA1 advances the Private policy projection; PAR1 only retires
+    /// the unused capability. Both share one invocation and are mutually
+    /// exclusive exact-retry results.
     #[msg(linear)]
-    fn acknowledge_private_application(&mut self, ack: Vec<u8>, ctx: &mut Context<Self>) -> bool {
+    fn resolve_private_application(&mut self, ack: Vec<u8>, ctx: &mut Context<Self>) -> bool {
         let Some(context) = ctx.agent_invocation_context().copied() else {
             return false;
         };
-        acknowledge_private_control_application(
+        resolve_private_application(
             &self.configuration,
             &mut self.state,
             &ack,
@@ -1166,6 +1198,21 @@ impl SystemAuthority {
             return Vec::new();
         };
         administer_call(&self.configuration, &mut self.state, &call, &context)
+    }
+}
+
+fn resolve_private_application(
+    configuration: &SystemAuthorityConfiguration,
+    state: &mut AuthorityLinearState,
+    encoded_ack: &[u8],
+    context: &InvocationContext,
+) -> bool {
+    if encoded_ack.starts_with(b"PCA1") {
+        acknowledge_private_control_application(configuration, state, encoded_ack, context)
+    } else if encoded_ack.starts_with(b"PAR1") {
+        retire_private_control_application(configuration, state, encoded_ack, context)
+    } else {
+        false
     }
 }
 
@@ -1246,7 +1293,7 @@ fn credential_has_pending_application(
             record.credential == credential.0
                 && (record.authorization_sequence > state.operation_retirement_floor
                     || (record.private_operation.is_some()
-                        && !private_operation_source_is_applied(
+                        && !private_operation_source_is_resolved(
                             state,
                             record.authorization_invocation,
                             record.acknowledgement_invocation,
@@ -1873,9 +1920,14 @@ fn node_is_in_use(
         })
         || state.latest_operation_acks.iter().any(|record| {
             record.private_operation.as_ref().is_some_and(|operation| {
-                operation.node == Some(node.0)
+                !private_operation_source_is_retired(
+                    state,
+                    record.authorization_invocation,
+                    record.acknowledgement_invocation,
+                    record.authorization_sequence,
+                ) && (operation.node == Some(node.0)
                     || recovery_proof_from_retired(operation)
-                        .is_some_and(|proof| proof.replacement_nodes.contains(&node))
+                        .is_some_and(|proof| proof.replacement_nodes.contains(&node)))
             })
         })
     {
@@ -1903,14 +1955,24 @@ fn node_is_in_use(
                 if call.authenticated_node == Some(node) {
                     return Some(node);
                 }
+                let retired = private_operation_source_is_retired(
+                    state,
+                    record.invocation,
+                    record.acknowledgement_invocation,
+                    record.authorization_sequence,
+                );
                 match call.intent {
                     AuthorityOperationIntent::InvitePrivateNode { node, .. }
-                    | AuthorityOperationIntent::RevokePrivateNode { node, .. } => Some(node),
-                    AuthorityOperationIntent::RecoverPrivateAgent { proof } => {
+                    | AuthorityOperationIntent::RevokePrivateNode { node, .. }
+                        if !retired => Some(node),
+                    AuthorityOperationIntent::RecoverPrivateAgent { proof } if !retired => {
                         proof.replacement_nodes.contains(&node).then_some(node)
                     }
                     AuthorityOperationIntent::InvokeActor { .. }
                     | AuthorityOperationIntent::Catalog { .. }
+                    | AuthorityOperationIntent::InvitePrivateNode { .. }
+                    | AuthorityOperationIntent::RevokePrivateNode { .. }
+                    | AuthorityOperationIntent::RecoverPrivateAgent { .. }
                     | AuthorityOperationIntent::RotatePrivateKeys { .. }
                     | AuthorityOperationIntent::SetPrivateResourcePolicy { .. }
                     | AuthorityOperationIntent::PrivateActorLifecycle { .. } => None,
@@ -1989,6 +2051,14 @@ fn admin_invocation_is_available(state: &AuthorityLinearState, invocation: Invoc
                 && record.issuance_invocation != invocation.0
                 && record.application_invocation != invocation.0
         })
+        && state
+            .private_application_retirements
+            .iter()
+            .all(|record| {
+                record.authorization_invocation != invocation.0
+                    && record.issuance_invocation != invocation.0
+                    && record.application_invocation != invocation.0
+            })
 }
 
 fn finalize_application(
@@ -2237,7 +2307,13 @@ fn acknowledge_private_control_application(
             && record.authorization_sequence == ack.authorization_sequence.get()
             && record.application_ack == ack_commitment.0;
     }
-    if state.private_applications.len() >= MAX_PRIVATE_APPLICATION_RECORDS
+    if private_application_resolution_count(state) >= MAX_PRIVATE_APPLICATION_RECORDS
+        || state.private_application_retirements.iter().any(|record| {
+            record.authorization_invocation == ack.authorization_invocation.0
+                || record.issuance_invocation == ack.issuance_invocation.0
+                || record.application_invocation == ack.application_invocation.0
+                || record.authorization_sequence == ack.authorization_sequence.get()
+        })
         || state.private_applications.iter().any(|record| {
             record.authorization_invocation == ack.authorization_invocation.0
                 || record.issuance_invocation == ack.issuance_invocation.0
@@ -2335,6 +2411,103 @@ fn acknowledge_private_control_application(
     true
 }
 
+fn retire_private_control_application(
+    configuration: &SystemAuthorityConfiguration,
+    state: &mut AuthorityLinearState,
+    encoded_ack: &[u8],
+    context: &InvocationContext,
+) -> bool {
+    if encoded_ack.len() > MAX_INVOCATION_MESSAGE_BYTES
+        || !authority_state_is_valid(configuration, state)
+    {
+        return false;
+    }
+    let Ok(ack) = PrivateControlApplicationRetirementAck::decode(encoded_ack) else {
+        return false;
+    };
+    if !ack.matches_invocation_context(context)
+        || !authority_target_matches(configuration, &ack.authority)
+        || ack
+            .verify_with(configuration.binding.sdk(), &Ed25519CredentialVerifier)
+            .is_err()
+    {
+        return false;
+    }
+    let ack_commitment = ack.commitment();
+
+    if let Some(record) = state
+        .private_application_retirements
+        .iter()
+        .find(|record| record.application_invocation == ack.application_invocation.0)
+    {
+        return record.authorization_invocation == ack.authorization_invocation.0
+            && record.issuance_invocation == ack.issuance_invocation.0
+            && record.authorization_sequence == ack.authorization_sequence.get()
+            && record.retirement_ack == ack_commitment.0
+            && record.resolved_at == ack.resolved_at;
+    }
+    if private_application_resolution_count(state) >= MAX_PRIVATE_APPLICATION_RECORDS
+        || state.private_applications.iter().any(|record| {
+            record.authorization_invocation == ack.authorization_invocation.0
+                || record.issuance_invocation == ack.issuance_invocation.0
+                || record.application_invocation == ack.application_invocation.0
+                || record.authorization_sequence == ack.authorization_sequence.get()
+        })
+        || state
+            .private_application_retirements
+            .iter()
+            .any(|record| {
+                record.authorization_invocation == ack.authorization_invocation.0
+                    || record.issuance_invocation == ack.issuance_invocation.0
+                    || record.authorization_sequence == ack.authorization_sequence.get()
+            })
+    {
+        return false;
+    }
+
+    let Some(source) = private_application_retirement_source(configuration, state, &ack) else {
+        return false;
+    };
+    let private = &source.private;
+    let Ok(managed_index) = managed_agent(state, AgentId(private.agent)) else {
+        return false;
+    };
+    let managed = &state.managed_agents[managed_index];
+    if managed.profile != AgentProfile::Private as u8
+        || managed.owner != private.principal
+        || managed.authority != configuration.binding
+        || !retired_private_operation_matches_retirement(private, &ack)
+    {
+        return false;
+    }
+    let record = PrivateApplicationRetirementRecord {
+        credential: source.credential,
+        request_sequence: source.request_sequence,
+        invocation_payload: source.invocation_payload,
+        authorization_invocation: ack.authorization_invocation.0,
+        issuance_invocation: ack.issuance_invocation.0,
+        application_invocation: ack.application_invocation.0,
+        authorization_sequence: ack.authorization_sequence.get(),
+        operation_call: ack.operation_call.0,
+        approval: ack.approval.0,
+        issuance_ack: ack.issuance_ack.0,
+        retirement_ack: ack_commitment.0,
+        private_operation: source.private,
+        issued_at: ack.issued_at,
+        resolved_at: ack.resolved_at,
+    };
+
+    let mut candidate = state.clone();
+    candidate.private_application_retirements.push(record);
+    if !refresh_state_integrity_commitment(configuration, &mut candidate)
+        || !authority_state_is_valid(configuration, &candidate)
+    {
+        return false;
+    }
+    *state = candidate;
+    true
+}
+
 fn synchronize_private_managed_replicas(
     configuration: &SystemAuthorityConfiguration,
     state: &mut AuthorityLinearState,
@@ -2418,6 +2591,82 @@ fn private_application_source(
         || retired.issuance_ack != ack.issuance_ack.0
         || retired.issued_at != ack.issued_at
         || retired.private_application_invocation != Some(ack.application_invocation.0)
+        || ack
+            .verify_issuance_tombstone_with(
+                configured_authority_target(configuration),
+                InvocationId(retired.authorization_invocation),
+                InvocationId(retired.acknowledgement_invocation),
+                sequence,
+                Hash(retired.issuance_ack),
+                &Ed25519CredentialVerifier,
+            )
+            .is_err()
+    {
+        return None;
+    }
+    Some(PrivateApplicationSource {
+        credential: retired.credential,
+        request_sequence: retired.request_sequence,
+        invocation_payload: retired.invocation_payload,
+        private: retired.private_operation.clone()?,
+    })
+}
+
+fn private_application_retirement_source(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+    ack: &PrivateControlApplicationRetirementAck,
+) -> Option<PrivateApplicationSource> {
+    if let Some(record) = state.operation_retries.iter().find(|record| {
+        record.acknowledgement_invocation == ack.issuance_invocation.0
+            && record.invocation == ack.authorization_invocation.0
+    }) {
+        if record.operation_call != ack.operation_call.0
+            || record.approval_commitment != ack.approval.0
+            || record.issuance_ack != Some(ack.issuance_ack.0)
+            || record.authorization_sequence != ack.authorization_sequence.get()
+            || record.issued_at != Some(ack.issued_at)
+            || record.private_application_invocation != Some(ack.application_invocation.0)
+        {
+            return None;
+        }
+        let call = AuthorityOperationCall::decode(&record.operation_call_bytes).ok()?;
+        let approval = AuthorityOperationApproval::decode(&record.approval).ok()?;
+        let issuance =
+            AuthorityOperationIssuanceAck::decode(record.issuance_ack_bytes.as_deref()?).ok()?;
+        if ack
+            .verify_pending_with(
+                &call,
+                &approval,
+                &issuance,
+                configuration.binding.sdk(),
+                &Ed25519CredentialVerifier,
+            )
+            .is_err()
+        {
+            return None;
+        }
+        return Some(PrivateApplicationSource {
+            credential: record.credential,
+            request_sequence: record.request_sequence,
+            invocation_payload: record.invocation_payload,
+            private: retained_private_operation(&call)?,
+        });
+    }
+
+    let retired = state.latest_operation_acks.iter().find(|record| {
+        record.acknowledgement_invocation == ack.issuance_invocation.0
+            && record.authorization_invocation == ack.authorization_invocation.0
+    })?;
+    let sequence = NonZeroU64::new(retired.authorization_sequence)?;
+    let issuance = AuthorityOperationIssuanceAck::decode(&retired.issuance_ack_bytes).ok()?;
+    if retired.operation_call != ack.operation_call.0
+        || retired.approval != ack.approval.0
+        || retired.issuance_ack != ack.issuance_ack.0
+        || retired.issued_at != ack.issued_at
+        || retired.private_application_invocation != Some(ack.application_invocation.0)
+        || issuance.receipt != ack.receipt
+        || issuance.issued_at != ack.issued_at
         || ack
             .verify_issuance_tombstone_with(
                 configured_authority_target(configuration),
@@ -2606,6 +2855,26 @@ fn retired_private_operation_matches_application(
         && source.control_sequence == application.control_sequence
         && source.control_previous == application.control_previous.map(|previous| previous.0)
         && operation_fields_match
+}
+
+fn retired_private_operation_matches_retirement(
+    source: &RetiredPrivateOperationRow,
+    retirement: &PrivateControlApplicationRetirementAck,
+) -> bool {
+    let selector = &retirement.receipt.selector;
+    let expected_request = if source.operation == AuthorityOperationKind::RecoverPrivateAgent as u8
+    {
+        let Some(proof) = recovery_proof_from_retired(source) else {
+            return false;
+        };
+        proof.commitment()
+    } else {
+        Hash(source.control)
+    };
+    selector.agent == AgentId(source.agent)
+        && selector.runtime_deployment == DeploymentId(source.runtime_deployment)
+        && private_operation_kind(source.operation) == Some(selector.operation)
+        && selector.request == expected_request
 }
 
 fn member_set_commitment(members: &[[u8; 32]]) -> Option<Hash> {
@@ -2836,7 +3105,7 @@ fn advance_operation_retirement_floor(state: &mut AuthorityLinearState) -> bool 
                 let previous = &state.latest_operation_acks[latest_index];
                 if previous.request_sequence.checked_add(1) != Some(latest.request_sequence)
                     || (previous.private_operation.is_some()
-                        && !private_operation_source_is_applied(
+                        && !private_operation_source_is_resolved(
                             state,
                             previous.authorization_invocation,
                             previous.acknowledgement_invocation,
@@ -3279,6 +3548,17 @@ fn invocation_pair_is_available(
                 && record.application_invocation != authorization.0
                 && record.application_invocation != acknowledgement.0
         })
+        && state
+            .private_application_retirements
+            .iter()
+            .all(|record| {
+                record.authorization_invocation != authorization.0
+                    && record.authorization_invocation != acknowledgement.0
+                    && record.issuance_invocation != authorization.0
+                    && record.issuance_invocation != acknowledgement.0
+                    && record.application_invocation != authorization.0
+                    && record.application_invocation != acknowledgement.0
+            })
 }
 
 fn private_application_invocation_is_unreserved(
@@ -3312,6 +3592,14 @@ fn private_application_invocation_is_unreserved(
                 && record.issuance_invocation != application.0
                 && record.application_invocation != application.0
         })
+        && state
+            .private_application_retirements
+            .iter()
+            .all(|record| {
+                record.authorization_invocation != application.0
+                    && record.issuance_invocation != application.0
+                    && record.application_invocation != application.0
+            })
 }
 
 fn authenticated_role(
@@ -3702,7 +3990,7 @@ fn operation_policy_allows(
                 && projection.runtime_deployment == managed.runtime_deployment
                 && enrolled_private_identity_commitment(state, *node, PrincipalId(managed.owner))
                     == Some(*node_identity)
-                && state.private_applications.len() < MAX_PRIVATE_APPLICATION_RECORDS
+                && private_application_resolution_count(state) < MAX_PRIVATE_APPLICATION_RECORDS
                 && !outstanding_private_operation_exists(state, target.agent)
                 && private_control_position_is_next(
                     projection,
@@ -3738,7 +4026,7 @@ fn operation_policy_allows(
                 && managed.owner == call.principal.0
                 && projection.owner == managed.owner
                 && projection.runtime_deployment == managed.runtime_deployment
-                && state.private_applications.len() < MAX_PRIVATE_APPLICATION_RECORDS
+                && private_application_resolution_count(state) < MAX_PRIVATE_APPLICATION_RECORDS
                 && !outstanding_private_operation_exists(state, target.agent)
                 && private_control_position_is_next(
                     projection,
@@ -3763,7 +4051,7 @@ fn operation_policy_allows(
                 && managed.owner == call.principal.0
                 && projection.owner == managed.owner
                 && projection.runtime_deployment == managed.runtime_deployment
-                && state.private_applications.len() < MAX_PRIVATE_APPLICATION_RECORDS
+                && private_application_resolution_count(state) < MAX_PRIVATE_APPLICATION_RECORDS
                 && !outstanding_private_operation_exists(state, target.agent)
                 && private_control_position_is_next(
                     projection,
@@ -3792,7 +4080,7 @@ fn operation_policy_allows(
             managed.owner == call.principal.0
                 && projection.owner == managed.owner
                 && projection.runtime_deployment == managed.runtime_deployment
-                && state.private_applications.len() < MAX_PRIVATE_APPLICATION_RECORDS
+                && private_application_resolution_count(state) < MAX_PRIVATE_APPLICATION_RECORDS
                 && recovery_authorization_capacity_available(state)
                 && !outstanding_private_operation_exists(state, target.agent)
                 && recovery_proof_matches_managed_state(configuration, state, managed, proof)
@@ -3814,6 +4102,48 @@ fn private_operation_source_is_applied(
     })
 }
 
+fn private_operation_source_is_retired(
+    state: &AuthorityLinearState,
+    authorization_invocation: [u8; 32],
+    issuance_invocation: [u8; 32],
+    authorization_sequence: u64,
+) -> bool {
+    state
+        .private_application_retirements
+        .iter()
+        .any(|record| {
+            record.authorization_invocation == authorization_invocation
+                && record.issuance_invocation == issuance_invocation
+                && record.authorization_sequence == authorization_sequence
+        })
+}
+
+fn private_operation_source_is_resolved(
+    state: &AuthorityLinearState,
+    authorization_invocation: [u8; 32],
+    issuance_invocation: [u8; 32],
+    authorization_sequence: u64,
+) -> bool {
+    private_operation_source_is_applied(
+        state,
+        authorization_invocation,
+        issuance_invocation,
+        authorization_sequence,
+    ) || private_operation_source_is_retired(
+        state,
+        authorization_invocation,
+        issuance_invocation,
+        authorization_sequence,
+    )
+}
+
+fn private_application_resolution_count(state: &AuthorityLinearState) -> usize {
+    state
+        .private_applications
+        .len()
+        .saturating_add(state.private_application_retirements.len())
+}
+
 fn outstanding_private_operation_exists(state: &AuthorityLinearState, agent: AgentId) -> bool {
     state.operation_retries.iter().any(|record| {
         AuthorityOperationCall::decode(&record.operation_call_bytes)
@@ -3821,7 +4151,7 @@ fn outstanding_private_operation_exists(state: &AuthorityLinearState, agent: Age
             .and_then(|call| retained_private_operation(&call))
             .is_some_and(|private| {
                 private.agent == agent.0
-                    && !private_operation_source_is_applied(
+                    && !private_operation_source_is_resolved(
                         state,
                         record.invocation,
                         record.acknowledgement_invocation,
@@ -3831,7 +4161,7 @@ fn outstanding_private_operation_exists(state: &AuthorityLinearState, agent: Age
     }) || state.latest_operation_acks.iter().any(|record| {
         record.private_operation.as_ref().is_some_and(|private| {
             private.agent == agent.0
-                && !private_operation_source_is_applied(
+                && !private_operation_source_is_resolved(
                     state,
                     record.authorization_invocation,
                     record.acknowledgement_invocation,
@@ -3852,7 +4182,7 @@ fn retained_recovery_application_count(state: &AuthorityLinearState) -> usize {
                 .and_then(|call| retained_private_operation(&call))
                 .is_some_and(|private| {
                     private.operation == AuthorityOperationKind::RecoverPrivateAgent as u8
-                        && !private_operation_source_is_applied(
+                        && !private_operation_source_is_resolved(
                             state,
                             record.invocation,
                             record.acknowledgement_invocation,
@@ -3867,7 +4197,7 @@ fn retained_recovery_application_count(state: &AuthorityLinearState) -> usize {
         .filter(|record| {
             record.private_operation.as_ref().is_some_and(|private| {
                 private.operation == AuthorityOperationKind::RecoverPrivateAgent as u8
-                    && !private_operation_source_is_applied(
+                    && !private_operation_source_is_resolved(
                         state,
                         record.authorization_invocation,
                         record.acknowledgement_invocation,
@@ -3880,11 +4210,20 @@ fn retained_recovery_application_count(state: &AuthorityLinearState) -> usize {
 }
 
 fn completed_recovery_application_count(state: &AuthorityLinearState) -> usize {
-    state
+    let applied = state
         .private_applications
         .iter()
         .filter(|record| record.operation == AuthorityOperationKind::RecoverPrivateAgent as u8)
-        .count()
+        .count();
+    let retired = state
+        .private_application_retirements
+        .iter()
+        .filter(|record| {
+            record.private_operation.operation
+                == AuthorityOperationKind::RecoverPrivateAgent as u8
+        })
+        .count();
+    applied.saturating_add(retired)
 }
 
 fn recovery_authorization_capacity_available(state: &AuthorityLinearState) -> bool {
@@ -4820,16 +5159,16 @@ fn retained_recovery_source_is_valid(
     if row.operation != AuthorityOperationKind::RecoverPrivateAgent as u8 {
         return true;
     }
-    if !retired_recovery_matches_managed_state(configuration, state, row) {
-        return false;
-    }
-    if private_operation_source_is_applied(
+    if private_operation_source_is_resolved(
         state,
         authorization_invocation,
         issuance_invocation,
         authorization_sequence,
     ) {
-        return true;
+        return recovery_proof_from_retired(row).is_some();
+    }
+    if !retired_recovery_matches_managed_state(configuration, state, row) {
+        return false;
     }
     let Some(proof) = recovery_proof_from_retired(row) else {
         return false;
@@ -5022,6 +5361,90 @@ fn private_application_record_source(
     })
 }
 
+fn private_application_retirement_record_source(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+    record: &PrivateApplicationRetirementRecord,
+) -> Option<PrivateApplicationSource> {
+    let request_sequence = NonZeroU64::new(record.request_sequence)?;
+    let authorization_sequence = NonZeroU64::new(record.authorization_sequence)?;
+    let authorization_invocation = AuthorityOperationCall::derive_invocation(
+        CredentialId(record.credential),
+        request_sequence,
+        Hash(record.invocation_payload),
+    );
+    let issuance_invocation =
+        AuthorityOperationApproval::derive_acknowledgement_invocation_from_call_parts(
+            CredentialId(record.credential),
+            request_sequence,
+            authorization_invocation,
+            Hash(record.invocation_payload),
+            Hash(record.operation_call),
+        );
+    let credential =
+        &state.credentials[credential_index(state, CredentialId(record.credential)).ok()?];
+    let private = &record.private_operation;
+    let managed = &state.managed_agents[managed_agent(state, AgentId(private.agent)).ok()?];
+    if credential.principal != private.principal
+        || credential.operation_request_high_water < record.request_sequence
+        || managed.profile != AgentProfile::Private as u8
+        || managed.owner != private.principal
+        || managed.authority != configuration.binding
+        || authorization_invocation.0 != record.authorization_invocation
+        || issuance_invocation.0 != record.issuance_invocation
+        || PrivateControlApplicationRetirementAck::derive_application_invocation_from_issuance(
+            configured_authority_target(configuration),
+            authorization_invocation,
+            issuance_invocation,
+            authorization_sequence,
+            Hash(record.issuance_ack),
+        )
+        .0 != record.application_invocation
+    {
+        return None;
+    }
+    if let Some(active) = state.operation_retries.iter().find(|source| {
+        source.invocation == record.authorization_invocation
+            && source.acknowledgement_invocation == record.issuance_invocation
+    }) {
+        let call = AuthorityOperationCall::decode(&active.operation_call_bytes).ok()?;
+        if active.credential != record.credential
+            || active.request_sequence != record.request_sequence
+            || active.invocation_payload != record.invocation_payload
+            || active.authorization_sequence != record.authorization_sequence
+            || active.operation_call != record.operation_call
+            || active.approval_commitment != record.approval
+            || active.issuance_ack != Some(record.issuance_ack)
+            || active.issued_at != Some(record.issued_at)
+            || active.private_application_invocation != Some(record.application_invocation)
+            || retained_private_operation(&call).as_ref() != Some(private)
+        {
+            return None;
+        }
+    } else if let Some(latest) = state.latest_operation_acks.iter().find(|source| {
+        source.authorization_invocation == record.authorization_invocation
+            && source.acknowledgement_invocation == record.issuance_invocation
+    }) && (latest.credential != record.credential
+        || latest.request_sequence != record.request_sequence
+        || latest.invocation_payload != record.invocation_payload
+        || latest.authorization_sequence != record.authorization_sequence
+        || latest.operation_call != record.operation_call
+        || latest.approval != record.approval
+        || latest.issuance_ack != record.issuance_ack
+        || latest.issued_at != record.issued_at
+        || latest.private_application_invocation != Some(record.application_invocation)
+        || latest.private_operation.as_ref() != Some(private))
+    {
+        return None;
+    }
+    retired_private_operation_is_valid(private).then_some(PrivateApplicationSource {
+        credential: record.credential,
+        request_sequence: record.request_sequence,
+        invocation_payload: record.invocation_payload,
+        private: private.clone(),
+    })
+}
+
 fn private_genesis_projection(
     state: &AuthorityLinearState,
     managed: &ManagedAgentRow,
@@ -5085,7 +5508,7 @@ fn private_projection_is_valid(
         .count();
     if state.private_agents.len() != private_managed_count
         || state.private_agents.len() > MAX_MANAGED_AGENTS
-        || state.private_applications.len() > MAX_PRIVATE_APPLICATION_RECORDS
+        || private_application_resolution_count(state) > MAX_PRIVATE_APPLICATION_RECORDS
         || retained_recovery_application_count(state) > MAX_PRIVATE_RECOVERY_APPLICATION_RECORDS
         || state.private_application_commitment == [0; 32]
         || !sorted_unique_by(&state.private_agents, |row| row.agent)
@@ -5156,6 +5579,12 @@ fn private_projection_is_valid(
         .iter()
         .map(|record| record.application_invocation)
         .collect::<Vec<_>>();
+    application_ids.extend(
+        state
+            .private_application_retirements
+            .iter()
+            .map(|record| record.application_invocation),
+    );
     application_ids.sort_unstable();
     if application_ids.windows(2).any(|pair| pair[0] == pair[1]) {
         return false;
@@ -5165,6 +5594,12 @@ fn private_projection_is_valid(
         .iter()
         .map(|record| record.authorization_sequence)
         .collect::<Vec<_>>();
+    source_sequences.extend(
+        state
+            .private_application_retirements
+            .iter()
+            .map(|record| record.authorization_sequence),
+    );
     source_sequences.sort_unstable();
     if source_sequences.windows(2).any(|pair| pair[0] == pair[1]) {
         return false;
@@ -5246,6 +5681,23 @@ fn private_projection_is_valid(
             return false;
         }
     }
+    for record in &state.private_application_retirements {
+        if record.credential == [0; 32]
+            || record.request_sequence == 0
+            || record.invocation_payload == [0; 32]
+            || record.authorization_invocation == [0; 32]
+            || record.issuance_invocation == [0; 32]
+            || record.application_invocation == [0; 32]
+            || record.operation_call == [0; 32]
+            || record.approval == [0; 32]
+            || record.issuance_ack == [0; 32]
+            || record.retirement_ack == [0; 32]
+            || record.issued_at > record.resolved_at
+            || private_application_retirement_record_source(configuration, state, record).is_none()
+        {
+            return false;
+        }
+    }
     if replay.len() != state.private_agents.len()
         || !replay
             .iter()
@@ -5324,7 +5776,7 @@ fn authority_state_is_valid(
         && state.latest_management_acks.len() <= state.credentials.len()
         && state.latest_operation_acks.len() <= state.credentials.len()
         && state.private_agents.len() <= MAX_MANAGED_AGENTS
-        && state.private_applications.len() <= MAX_PRIVATE_APPLICATION_RECORDS
+        && private_application_resolution_count(state) <= MAX_PRIVATE_APPLICATION_RECORDS
         && state.operation_retirement_floor >= configuration.bootstrap_authorization_high_water
         && state.operation_retirement_floor <= state.authorization_sequence
         && state.private_application_commitment != [0; 32]
@@ -5514,7 +5966,7 @@ fn authorization_history_reconstructs_policy(
                     || latest.is_some_and(|latest| {
                         latest.request_sequence.checked_add(1) != Some(high_water)
                             || (latest.private_operation.is_some()
-                                && !private_operation_source_is_applied(
+                                && !private_operation_source_is_resolved(
                                     state,
                                     latest.authorization_invocation,
                                     latest.acknowledgement_invocation,
@@ -5532,7 +5984,7 @@ fn authorization_history_reconstructs_policy(
         let latest_operation_is_unsettled = operation_latest.is_some_and(|latest| {
             latest.authorization_sequence > state.operation_retirement_floor
                 || (latest.private_operation.is_some()
-                    && !private_operation_source_is_applied(
+                    && !private_operation_source_is_resolved(
                         state,
                         latest.authorization_invocation,
                         latest.acknowledgement_invocation,
@@ -6166,7 +6618,13 @@ fn all_invocation_identifiers_are_unique(state: &AuthorityLinearState) -> bool {
             .saturating_add(state.operation_retries.len().saturating_mul(3))
             .saturating_add(state.latest_operation_acks.len().saturating_mul(3))
             .saturating_add(state.admin_retries.len())
-            .saturating_add(state.private_applications.len().saturating_mul(3)),
+            .saturating_add(state.private_applications.len().saturating_mul(3))
+            .saturating_add(
+                state
+                    .private_application_retirements
+                    .len()
+                    .saturating_mul(3),
+            ),
     );
     for record in &state.retries {
         identifiers.push(record.invocation);
@@ -6177,14 +6635,14 @@ fn all_invocation_identifiers_are_unique(state: &AuthorityLinearState) -> bool {
         identifiers.push(record.acknowledgement_invocation);
     }
     for record in &state.operation_retries {
-        let applied = record.private_application_invocation.is_some()
-            && private_operation_source_is_applied(
+        let resolved = record.private_application_invocation.is_some()
+            && private_operation_source_is_resolved(
                 state,
                 record.invocation,
                 record.acknowledgement_invocation,
                 record.authorization_sequence,
             );
-        if !applied {
+        if !resolved {
             identifiers.push(record.invocation);
             identifiers.push(record.acknowledgement_invocation);
             if let Some(application_invocation) = record.private_application_invocation {
@@ -6193,14 +6651,14 @@ fn all_invocation_identifiers_are_unique(state: &AuthorityLinearState) -> bool {
         }
     }
     for record in &state.latest_operation_acks {
-        let applied = record.private_application_invocation.is_some()
-            && private_operation_source_is_applied(
+        let resolved = record.private_application_invocation.is_some()
+            && private_operation_source_is_resolved(
                 state,
                 record.authorization_invocation,
                 record.acknowledgement_invocation,
                 record.authorization_sequence,
             );
-        if !applied {
+        if !resolved {
             identifiers.push(record.authorization_invocation);
             identifiers.push(record.acknowledgement_invocation);
             if let Some(application_invocation) = record.private_application_invocation {
@@ -6210,6 +6668,11 @@ fn all_invocation_identifiers_are_unique(state: &AuthorityLinearState) -> bool {
     }
     identifiers.extend(state.admin_retries.iter().map(|record| record.invocation));
     for record in &state.private_applications {
+        identifiers.push(record.authorization_invocation);
+        identifiers.push(record.issuance_invocation);
+        identifiers.push(record.application_invocation);
+    }
+    for record in &state.private_application_retirements {
         identifiers.push(record.authorization_invocation);
         identifiers.push(record.issuance_invocation);
         identifiers.push(record.application_invocation);
@@ -7009,6 +7472,38 @@ mod tests {
         ack.signature = signing(0x71).sign(&ack.signing_bytes()).to_bytes();
     }
 
+    fn private_application_retirement_ack(
+        call: &AuthorityOperationCall,
+        approval: &AuthorityOperationApproval,
+        issuance: &AuthorityOperationIssuanceAck,
+        resolved_at: u64,
+    ) -> PrivateControlApplicationRetirementAck {
+        let mut ack = PrivateControlApplicationRetirementAck {
+            authorization_invocation: call.invocation,
+            issuance_invocation: approval.acknowledgement_invocation,
+            application_invocation:
+                PrivateControlApplicationRetirementAck::derive_application_invocation(issuance),
+            authority: call.authority,
+            operation_call: call.commitment(),
+            approval: approval.commitment(),
+            issuance_ack: issuance.commitment(),
+            authorization_sequence: approval.authorization_sequence,
+            receipt: issuance.receipt.clone(),
+            issued_at: issuance.issued_at,
+            resolved_at,
+            signature: [1; 64],
+        };
+        resign_private_application_retirement_ack(&mut ack);
+        ack
+    }
+
+    fn resign_private_application_retirement_ack(
+        ack: &mut PrivateControlApplicationRetirementAck,
+    ) {
+        ack.signature = [1; 64];
+        ack.signature = signing(0x71).sign(&ack.signing_bytes()).to_bytes();
+    }
+
     fn private_application_context(ack: &PrivateControlApplicationAck) -> InvocationContext {
         InvocationContext {
             invocation: ack.application_invocation,
@@ -7017,6 +7512,19 @@ mod tests {
             origin: InvocationOrigin::anonymous(),
             roles: InvocationRoleClaims::none(),
             observed_slot: ack.application.applied_at,
+        }
+    }
+
+    fn private_application_retirement_context(
+        ack: &PrivateControlApplicationRetirementAck,
+    ) -> InvocationContext {
+        InvocationContext {
+            invocation: ack.application_invocation,
+            actor: ack.authority.binding.issuer.actor,
+            mode: MethodMode::Linear,
+            origin: InvocationOrigin::anonymous(),
+            roles: InvocationRoleClaims::none(),
+            observed_slot: ack.resolved_at,
         }
     }
 
@@ -7029,11 +7537,9 @@ mod tests {
         if let Some(invocation_context) = invocation_context {
             ctx.__set_agent_invocation_context(invocation_context);
         }
-        block_on(<SystemAuthority as Message<
-            AcknowledgePrivateApplication,
-        >>::handle(
+        block_on(<SystemAuthority as Message<ResolvePrivateApplication>>::handle(
             actor,
-            AcknowledgePrivateApplication { ack: bytes },
+            ResolvePrivateApplication { ack: bytes },
             &mut ctx,
         ))
     }
@@ -7046,6 +7552,17 @@ mod tests {
             actor,
             ack.encode().expect("valid PCA1 fixture"),
             Some(private_application_context(ack)),
+        )
+    }
+
+    fn dispatch_private_application_retirement(
+        actor: &mut SystemAuthority,
+        ack: &PrivateControlApplicationRetirementAck,
+    ) -> bool {
+        dispatch_private_application_bytes(
+            actor,
+            ack.encode().expect("valid PAR1 fixture"),
+            Some(private_application_retirement_context(ack)),
         )
     }
 
@@ -7714,8 +8231,8 @@ mod tests {
         assert_eq!(SystemAuthorityConfiguration::decode(&encoded), Some(config));
         assert_eq!(
             <SystemAuthority as vos::Actor>::STATE_SCHEMA_VERSION,
-            12,
-            "retained Private recovery proof state is a clean Linear state generation",
+            13,
+            "retained Private terminal-resolution state is a clean Linear state generation",
         );
 
         let mut old_generation = encoded.clone();
@@ -9904,6 +10421,183 @@ mod tests {
     }
 
     #[test]
+    fn par1_retires_without_projecting_and_is_exclusive_with_pca1() {
+        let config = configuration();
+        let owner = PrincipalId([0x39; 32]);
+        let owner_key = signing(0x3a);
+        let mut actor = actor();
+        enroll(
+            &mut actor,
+            &owner_key,
+            owner,
+            node_for_principal(config, owner),
+            BuiltinPrincipalRole::Member,
+        );
+        let descriptor = descriptor(config, owner, AgentProfile::Private, 0x34);
+        let managed = target_for(&descriptor);
+        insert_live(&mut actor, &descriptor);
+        let invited_node = enroll_additional_node(&mut actor, owner, 0xe0);
+        let invited_identity = enrolled_identity_commitment(&actor, invited_node, owner);
+        let intent = AuthorityOperationIntent::InvitePrivateNode {
+            managed,
+            control: Hash([0x35; 32]),
+            control_sequence: 0,
+            control_previous: None,
+            epoch: 0,
+            node: invited_node,
+            node_identity: invited_identity,
+        };
+        let call = operation_call(config, &owner_key, owner, None, 0x36, intent.clone());
+        let (approval, issuance) = authorize_and_issue_operation(&mut actor, &call);
+        assert!(actor.state.operation_retries.is_empty());
+        assert_eq!(actor.state.latest_operation_acks.len(), 1);
+        let unresolved_state = actor.state.clone();
+        let private_agents = actor.state.private_agents.clone();
+        let managed_agents = actor.state.managed_agents.clone();
+        let managed_actors = actor.state.managed_actors.clone();
+        let applications = actor.state.private_applications.clone();
+        let application_commitment = actor.state.private_application_commitment;
+        let retirement = private_application_retirement_ack(
+            &call,
+            &approval,
+            &issuance,
+            OBSERVED_SLOT + 1,
+        );
+
+        assert!(dispatch_private_application_retirement(
+            &mut actor,
+            &retirement
+        ));
+        assert_eq!(actor.state.private_application_retirements.len(), 1);
+        assert_eq!(actor.state.private_agents, private_agents);
+        assert_eq!(actor.state.managed_agents, managed_agents);
+        assert_eq!(actor.state.managed_actors, managed_actors);
+        assert_eq!(actor.state.private_applications, applications);
+        assert_eq!(
+            actor.state.private_application_commitment,
+            application_commitment
+        );
+        assert!(authority_state_is_valid(&config, &actor.state));
+
+        let after_retirement = actor.state.clone();
+        assert!(dispatch_private_application_retirement(
+            &mut actor,
+            &retirement
+        ));
+        assert_eq!(actor.state, after_retirement);
+
+        let member_set = fixture_member_set([descriptor.replicas[0].node, invited_node]);
+        let application = private_application_ack(
+            &call,
+            &approval,
+            &issuance,
+            private_application_fact(
+                &call,
+                member_set,
+                Hash([0x37; 32]),
+                OBSERVED_SLOT + 1,
+            ),
+        );
+        assert!(!dispatch_private_application(&mut actor, &application));
+        assert_eq!(actor.state, after_retirement);
+
+        let mut divergent_retirement = retirement.clone();
+        divergent_retirement.resolved_at += 1;
+        resign_private_application_retirement_ack(&mut divergent_retirement);
+        assert!(!dispatch_private_application_retirement(
+            &mut actor,
+            &divergent_retirement
+        ));
+        assert_eq!(actor.state, after_retirement);
+        let mut bad_signature = retirement.clone();
+        bad_signature.signature[0] ^= 1;
+        assert!(!dispatch_private_application_retirement(
+            &mut actor,
+            &bad_signature
+        ));
+        assert_eq!(actor.state, after_retirement);
+        let mut wrong_context = private_application_retirement_context(&retirement);
+        wrong_context.observed_slot += 1;
+        assert!(!dispatch_private_application_bytes(
+            &mut actor,
+            retirement.encode().unwrap(),
+            Some(wrong_context),
+        ));
+        assert_eq!(actor.state, after_retirement);
+
+        let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
+        let mut restarted = <SystemAuthority as vos::Actor>::__load_agent_state(
+            Some(&config.encode()),
+            Some(&linear),
+            None,
+            None,
+        )
+        .expect("PAR1 retirement restarts");
+        assert_eq!(restarted.state, actor.state);
+        assert!(dispatch_private_application_retirement(
+            &mut restarted,
+            &retirement
+        ));
+        assert_eq!(restarted.state, actor.state);
+
+        // A retired invite did not add this node to any policy projection and
+        // must not keep the otherwise-unused enrollment pinned.
+        dispatch_fixture_admin(
+            &mut restarted,
+            InvocationId([0x45; 32]),
+            AuthorityAdminOperation::UnbindNodeOwner {
+                node: invited_node,
+                owner,
+            },
+        );
+        assert!(restarted
+            .state
+            .nodes
+            .binary_search_by(|row| row.node.cmp(&invited_node.0))
+            .is_err());
+
+        // Retirement resolves the pending capability without advancing its
+        // PCTL position, so a fresh credential request may retry that same
+        // predecessor position.
+        let retry_node = enroll_additional_node(&mut restarted, owner, 0xe3);
+        let retry_intent = AuthorityOperationIntent::InvitePrivateNode {
+            managed,
+            control: Hash([0x38; 32]),
+            control_sequence: 0,
+            control_previous: None,
+            epoch: 0,
+            node: retry_node,
+            node_identity: enrolled_identity_commitment(&restarted, retry_node, owner),
+        };
+        let mut retry_call =
+            operation_call(config, &owner_key, owner, None, 0x39, retry_intent);
+        prepare_operation_call(&restarted, &mut retry_call, &owner_key);
+        assert!(AuthorityOperationApproval::decode(&dispatch_operation(
+            &mut restarted,
+            &retry_call,
+        ))
+        .is_ok());
+
+        // Whichever terminal resolution commits first owns the shared third
+        // invocation: the reverse PCA1-then-PAR1 race also fails closed.
+        let mut applied_actor = SystemAuthority {
+            configuration: config,
+            state: unresolved_state,
+        };
+        assert!(dispatch_private_application(
+            &mut applied_actor,
+            &application
+        ));
+        let after_application = applied_actor.state.clone();
+        assert!(!dispatch_private_application_retirement(
+            &mut applied_actor,
+            &retirement
+        ));
+        assert_eq!(applied_actor.state, after_application);
+        assert!(authority_state_is_valid(&config, &applied_actor.state));
+    }
+
+    #[test]
     fn private_rotation_is_restartable_and_unimplemented_controls_fail_closed() {
         let config = configuration();
         let owner = PrincipalId([0x41; 32]);
@@ -10220,6 +10914,144 @@ mod tests {
         assert!(dispatch_private_application(&mut actor, &pca));
         assert_eq!(actor.state, after_compaction);
         assert!(authority_state_is_valid(&config, &actor.state));
+    }
+
+    #[test]
+    fn par1_resolves_an_active_aoi_source_before_its_gap_compacts() {
+        let config = configuration();
+        let owner = PrincipalId([0x2a; 32]);
+        let owner_key = signing(0x2b);
+        let gap_key = signing(0x2c);
+        let mut actor = actor();
+        enroll(
+            &mut actor,
+            &owner_key,
+            owner,
+            node_for_principal(config, owner),
+            BuiltinPrincipalRole::Member,
+        );
+        dispatch_fixture_admin(
+            &mut actor,
+            InvocationId([0x2d; 32]),
+            AuthorityAdminOperation::AddCredential {
+                principal: owner,
+                credential: enrollment(&gap_key, AuthorityCredentialKind::Api),
+            },
+        );
+        let gap_descriptor = descriptor(config, owner, AgentProfile::Private, 0x2e);
+        let target_descriptor = descriptor(config, owner, AgentProfile::Private, 0x2f);
+        let gap_managed = target_for(&gap_descriptor);
+        let target_managed = target_for(&target_descriptor);
+        insert_live(&mut actor, &gap_descriptor);
+        insert_live(&mut actor, &target_descriptor);
+        let gap_node = enroll_additional_node(&mut actor, owner, 0xe1);
+        let target_node = enroll_additional_node(&mut actor, owner, 0xe2);
+
+        let gap_call = operation_call(
+            config,
+            &gap_key,
+            owner,
+            None,
+            0x40,
+            AuthorityOperationIntent::InvitePrivateNode {
+                managed: gap_managed,
+                control: Hash([0x41; 32]),
+                control_sequence: 0,
+                control_previous: None,
+                epoch: 0,
+                node: gap_node,
+                node_identity: enrolled_identity_commitment(&actor, gap_node, owner),
+            },
+        );
+        let gap_approval =
+            AuthorityOperationApproval::decode(&dispatch_operation(&mut actor, &gap_call))
+                .unwrap();
+        let gap_issuance = operation_issuance_ack(config, &gap_call, &gap_approval);
+
+        let target_call = operation_call(
+            config,
+            &owner_key,
+            owner,
+            None,
+            0x42,
+            AuthorityOperationIntent::InvitePrivateNode {
+                managed: target_managed,
+                control: Hash([0x43; 32]),
+                control_sequence: 0,
+                control_previous: None,
+                epoch: 0,
+                node: target_node,
+                node_identity: enrolled_identity_commitment(&actor, target_node, owner),
+            },
+        );
+        let (target_approval, target_issuance) =
+            authorize_and_issue_operation(&mut actor, &target_call);
+        assert_eq!(actor.state.operation_retries.len(), 2);
+        assert!(actor.state.latest_operation_acks.is_empty());
+        assert!(outstanding_private_operation_exists(
+            &actor.state,
+            target_managed.agent
+        ));
+        let projections = actor.state.private_agents.clone();
+        let retirement = private_application_retirement_ack(
+            &target_call,
+            &target_approval,
+            &target_issuance,
+            OBSERVED_SLOT + 1,
+        );
+
+        assert!(dispatch_private_application_retirement(
+            &mut actor,
+            &retirement
+        ));
+        assert_eq!(actor.state.operation_retries.len(), 2);
+        assert!(actor.state.latest_operation_acks.is_empty());
+        assert!(!outstanding_private_operation_exists(
+            &actor.state,
+            target_managed.agent
+        ));
+        assert_eq!(actor.state.private_agents, projections);
+        assert_eq!(actor.state.private_applications.len(), 0);
+
+        assert!(dispatch_operation_ack(&mut actor, &gap_issuance));
+        assert!(actor.state.operation_retries.is_empty());
+        assert_eq!(actor.state.latest_operation_acks.len(), 2);
+        assert!(authority_state_is_valid(&config, &actor.state));
+        let after_compaction = actor.state.clone();
+        assert!(dispatch_private_application_retirement(
+            &mut actor,
+            &retirement
+        ));
+        assert_eq!(actor.state, after_compaction);
+
+        let member_set = fixture_member_set([target_descriptor.replicas[0].node, target_node]);
+        let application = private_application_ack(
+            &target_call,
+            &target_approval,
+            &target_issuance,
+            private_application_fact(
+                &target_call,
+                member_set,
+                Hash([0x44; 32]),
+                OBSERVED_SLOT + 1,
+            ),
+        );
+        assert!(!dispatch_private_application(&mut actor, &application));
+        assert_eq!(actor.state, after_compaction);
+
+        let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
+        let mut restarted = <SystemAuthority as vos::Actor>::__load_agent_state(
+            Some(&config.encode()),
+            Some(&linear),
+            None,
+            None,
+        )
+        .expect("active-source PAR1 compaction restarts");
+        assert!(dispatch_private_application_retirement(
+            &mut restarted,
+            &retirement
+        ));
+        assert_eq!(restarted.state, actor.state);
     }
 
     #[test]
@@ -13167,7 +13999,7 @@ mod tests {
         assert_eq!(method[3].name, "acknowledge_issuance");
         assert_eq!(method[3].mode, vos::agent_sdk::schema::MethodMode::Linear);
         assert!(method[3].explicit);
-        assert_eq!(method[4].name, "acknowledge_private_application");
+        assert_eq!(method[4].name, "resolve_private_application");
         assert_eq!(method[4].mode, vos::agent_sdk::schema::MethodMode::Linear);
         assert!(method[4].explicit);
         assert_eq!(method[5].name, "administer");
