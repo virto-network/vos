@@ -1,6 +1,6 @@
 //! Durable host-side issuance for non-management authority operations.
 //!
-//! AOC1/AOP1 policy evaluation happens in the system-authority actor. This
+//! AOC4/AOP4 policy evaluation happens in the system-authority actor. This
 //! module owns the narrower crash-consistency boundary between that actor's
 //! exact approval and the authority signatures which leave the host: the
 //! operation receipt, AOI1 issuance acknowledgement, and (for Private
@@ -36,7 +36,7 @@ use vos_protocol::wire::{DecodeError, Decoder, Encoder};
 pub const MAX_AUTHORITY_OPERATION_ISSUER_RECORDS: usize = 256;
 /// Maximum complete canonical whole-image commit accepted from storage.
 pub const MAX_AUTHORITY_OPERATION_ISSUER_IMAGE_BYTES: usize = 4 * 1024 * 1024;
-const AUTHORITY_OPERATION_ISSUER_MAGIC: [u8; 4] = *b"AOJ2";
+const AUTHORITY_OPERATION_ISSUER_MAGIC: [u8; 4] = *b"AOJ3";
 
 /// Minimal durable whole-image boundary for operation evidence issuance.
 ///
@@ -95,7 +95,7 @@ pub struct IssuedPrivateControlApplication {
 
 /// Exact durable issuer material reopened by the trusted actor coordinator.
 ///
-/// This stays crate-private: an AOP1 is unsigned actor output and must never
+/// This stays crate-private: an AOP4 is unsigned actor output and must never
 /// become a public capability for reaching the authority signer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RetainedAuthorityOperation {
@@ -450,7 +450,7 @@ impl AuthorityOperationIssuerImage {
     }
 }
 
-/// Durable issuer for the AOC1 -> AOP1 -> receipt -> AOI1 boundary.
+/// Durable issuer for the AOC4 -> AOP4 -> receipt -> AOI1 boundary.
 ///
 /// One image belongs to exactly one independently configured authority actor
 /// target. The route encoded by caller-controlled protocol values is never
@@ -532,7 +532,7 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
     /// Reopen exact retained preimages before a coordinator considers calling
     /// the authority actor again. In particular, a completed record must
     /// drive an AOI1 retry directly because the actor intentionally cannot
-    /// reconstruct AOP1 after consuming that acknowledgement.
+    /// reconstruct AOP4 after consuming that acknowledgement.
     pub(crate) fn recover_retained(
         &self,
         authorization_invocation: InvocationId,
@@ -579,12 +579,12 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
     /// Issue and retain exact receipt evidence for one actor-approved call.
     ///
     /// The caller supplies the logical issuance slot; it is pledged with the
-    /// exact AOC1/AOP1 before any signature callback. The receipt is then
+    /// exact AOC4/AOP4 before any signature callback. The receipt is then
     /// committed before AOI1 is constructed or signed. A completed exact
     /// retry returns the retained values without inspecting `signer`.
-    /// This entrypoint is crate-private because AOP1 is deliberately unsigned:
+    /// This entrypoint is crate-private because AOP4 is deliberately unsigned:
     /// only the trusted local actor-dispatch coordinator may pass the exact
-    /// AOP1 returned by the configured authority actor transition. Shape and
+    /// AOP4 returned by the configured authority actor transition. Shape and
     /// call matching are necessary substitution checks, not policy proof.
     pub(crate) fn issue<S: AuthorityOperationEvidenceSigner>(
         &mut self,
@@ -812,7 +812,7 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
     /// pledged after this issuer had durably retained the complete AOI1.
     ///
     /// This raw fact entrypoint is crate-private. A fact is not authenticated
-    /// merely because its fields match an AOC1; only the trusted Private
+    /// merely because its fields match an AOC4; only the trusted Private
     /// runtime coordinator may pass the exact echoed result of a durable
     /// apply-and-reopen transition. Exact completed retries return retained
     /// PCA1 without consulting the signer.
@@ -1091,15 +1091,6 @@ pub(crate) fn private_intent_matches_application(
             epoch,
             member_set,
             ..
-        }
-        | AuthorityOperationIntent::RecoverPrivateAgent {
-            managed,
-            control,
-            control_sequence,
-            control_previous,
-            epoch,
-            member_set,
-            ..
         } => {
             application.managed == *managed
                 && application.operation == intent.operation()
@@ -1108,6 +1099,15 @@ pub(crate) fn private_intent_matches_application(
                 && application.control_previous == *control_previous
                 && application.epoch == *epoch
                 && application.post_member_set == *member_set
+        }
+        AuthorityOperationIntent::RecoverPrivateAgent { proof } => {
+            application.managed == proof.managed
+                && application.operation == AuthorityOperationKind::RecoverPrivateAgent
+                && application.control == proof.control
+                && application.control_sequence == proof.control_sequence
+                && application.control_previous == proof.control_previous
+                && application.epoch == proof.next_epoch
+                && application.post_member_set == proof.replacement_member_set
         }
         AuthorityOperationIntent::RotatePrivateKeys {
             managed,
@@ -2179,13 +2179,15 @@ mod tests {
             Err(AuthorityOperationIssuerError::InvalidState)
         ));
 
-        let mut old_magic = valid.clone();
-        old_magic[..4].copy_from_slice(b"AOJ0");
-        store.replace_image(old_magic);
-        assert!(matches!(
-            DurableAuthorityOperationIssuer::open(store.clone(), fixture.authority),
-            Err(AuthorityOperationIssuerError::InvalidState)
-        ));
+        for magic in [b"AOJ2", b"AOJ0"] {
+            let mut old_magic = valid.clone();
+            old_magic[..4].copy_from_slice(magic);
+            store.replace_image(old_magic);
+            assert!(matches!(
+                DurableAuthorityOperationIssuer::open(store.clone(), fixture.authority),
+                Err(AuthorityOperationIssuerError::InvalidState)
+            ));
+        }
 
         store.replace_image(valid);
         let other_signer = CountingSigner::new(0x72);

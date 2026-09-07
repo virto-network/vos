@@ -1,7 +1,7 @@
 //! Crash-safe host coordination for applying authority-approved Private controls.
 //!
 //! AOI1 proves receipt issuance, not application. This module first reopens the
-//! exact issuer-retained AOC1/AOP1/AOI1 chain and reconstructs that AOC1 intent
+//! exact issuer-retained AOC4/AOP4/AOI1 chain and reconstructs that AOC4 intent
 //! from the supplied canonical PCTL. It then pledges the exact PCTL and logical
 //! application slot before asking the configured Private runtime to apply it.
 //! Only an authenticated result which echoes every request field and asserts a
@@ -43,7 +43,7 @@ pub(crate) const MAX_PRIVATE_CONTROL_APPLICATION_COORDINATOR_RECORDS: usize =
     super::authority_operation_issuer::MAX_AUTHORITY_OPERATION_ISSUER_RECORDS;
 pub(crate) const MAX_PRIVATE_CONTROL_APPLICATION_COORDINATOR_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const MAX_PRIVATE_CONTROL_APPLICATION_FACT_WIRE_BYTES: usize = 512;
-const PRIVATE_CONTROL_APPLICATION_COORDINATOR_MAGIC: [u8; 4] = *b"PAJ2";
+const PRIVATE_CONTROL_APPLICATION_COORDINATOR_MAGIC: [u8; 4] = *b"PAJ3";
 const PRIVATE_CONTROL_APPLICATION_FACT_MAGIC: [u8; 4] = *b"PCAF";
 
 /// Exact request to the trusted Private-runtime application boundary.
@@ -2881,6 +2881,22 @@ mod tests {
         let (coordinator_store, runtime, actor, issuer) = coordinator.into_parts();
         let issuer_store = issuer.into_store();
         let valid = coordinator_store.image().unwrap();
+
+        let mut old_magic = valid.clone();
+        old_magic[..4].copy_from_slice(b"PAJ2");
+        coordinator_store.replace_image(old_magic);
+        let reopened_issuer =
+            DurableAuthorityOperationIssuer::open(issuer_store.clone(), authority).unwrap();
+        assert!(matches!(
+            DurablePrivateControlApplicationCoordinator::open(
+                coordinator_store.clone(),
+                authority,
+                runtime.clone(),
+                actor.clone(),
+                reopened_issuer
+            ),
+            Err(PrivateControlApplicationCoordinatorError::InvalidState)
+        ));
 
         let mut noncanonical = valid.clone();
         noncanonical.push(0);

@@ -2,8 +2,8 @@
 //!
 //! The system-authority actor owns policy and its global authorization clock;
 //! [`super::authority_operation_issuer`] owns the two authority signatures.
-//! This module joins those durable boundaries without treating unsigned AOP1
-//! bytes as public authority. It pledges the exact AOC1, authorization
+//! This module joins those durable boundaries without treating unsigned AOP4
+//! bytes as public authority. It pledges the exact AOC4, authorization
 //! [`InvocationContext`], and issuance slot before the first actor dispatch.
 //! After that point, retained issuer preimages always take precedence over
 //! asking the actor to authorize again.
@@ -421,7 +421,7 @@ where
     /// Execute one exact credential-authenticated operation through policy,
     /// durable evidence issuance, and durable AOI1 consumption.
     ///
-    /// This method is crate-private so callers cannot pair an arbitrary AOP1
+    /// This method is crate-private so callers cannot pair an arbitrary AOP4
     /// with the signer. Only this coordinator may pass the exact canonical
     /// result of its trusted `authorize_operation` dispatch to the issuer.
     pub(crate) fn coordinate<S: AuthorityOperationEvidenceSigner>(
@@ -1642,7 +1642,7 @@ mod tests {
         assert_eq!(issuer_store.commits(), 3);
 
         // The actor's retirement tombstone deliberately cannot reconstruct
-        // unsigned AOP1. Recovery therefore has to consult the issuer first.
+        // unsigned AOP4. Recovery therefore has to consult the issuer first.
         let authorization = AuthorityOperationActorDispatch {
             target: fixture.authority,
             method: AuthorityOperationActorMethod::AuthorizeOperation,
@@ -1781,7 +1781,7 @@ mod tests {
         ));
         assert_eq!(issuer_store.commits(), 1);
 
-        // This alternate AOP1 remains well-shaped and matches the AOC1, but
+        // This alternate AOP4 remains well-shaped and matches the AOC4, but
         // it is not the exact actor result retained before the failed sign.
         dispatcher.fault_next(DispatchFault::DifferentMatchingApproval);
         assert!(matches!(

@@ -10,8 +10,8 @@ use crate::{
     SpaceId, StateLane, UpgradeActor,
 };
 
-pub const MAX_INVOCATION_MESSAGE_BYTES: usize = 8 * 1024;
-pub const MAX_INVOCATION_REPLY_BYTES: usize = 8 * 1024;
+pub const MAX_INVOCATION_MESSAGE_BYTES: usize = 16 * 1024;
+pub const MAX_INVOCATION_REPLY_BYTES: usize = 16 * 1024;
 pub const MAX_RESUME_INPUT_BYTES: usize = 8 * 1024;
 pub const MAX_RUNTIME_AVAILABILITY_ITEMS: usize = 16;
 /// Caller-selected actor inputs retained across one invocation. This matches

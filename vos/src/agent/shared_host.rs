@@ -2503,7 +2503,7 @@ mod tests {
         let authority_key = key(0x41);
 
         // The committed standard blob is intentionally still r7 while the
-        // SDK is moving through r10. Build a small current-ABI custom runtime
+        // SDK is moving through r11. Build a small current-ABI custom runtime
         // which is physically interpreted as PVM bytecode; no native Standard
         // oracle participates in this generic journal/host test.
         let placeholder = admitted_standard_runtime_for_test("script-shape-only", 0x60);

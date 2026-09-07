@@ -35,19 +35,216 @@ use crate::{
 
 const HEADER_BYTES: usize = 4 + 32;
 
-/// AOC3 is intentionally small even though the generic invocation message
-/// ceiling is larger. Private ciphertext and actor messages are represented
-/// only by exact commitments here.
-pub const MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES: usize = 4 * 1024;
-/// AOP3 repeats the call's identity tuple and one complete receipt selector.
-pub const MAX_AUTHORITY_OPERATION_APPROVAL_WIRE_BYTES: usize = 4 * 1024;
+/// AOC4 remains bounded while carrying the complete 256-member NodeId list
+/// authenticated by an offline recovery proof. Private ciphertext and actor
+/// messages are still represented only by exact commitments here.
+pub const MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES: usize = 16 * 1024;
+/// AOP4 repeats the call's identity tuple and one complete receipt selector.
+pub const MAX_AUTHORITY_OPERATION_APPROVAL_WIRE_BYTES: usize = 16 * 1024;
+/// Standalone PRA1 proof ceiling. Its only variable field is a canonical list
+/// containing at most every Node supported by a Private agent.
+pub const MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES: usize = 12 * 1024;
 /// AOI1 contains one complete receipt and fixed-size retained-preimage
-/// commitments; it never embeds the AOC3 or AOP3 bytes themselves.
+/// commitments; it never embeds the AOC4 or AOP4 bytes themselves.
 pub const MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES: usize = 4 * 1024;
 /// PCA1 is a fixed-size acknowledgement of one durably reopened Private
 /// control application. It carries commitments and the resulting projection,
 /// never the variable-size PCTL ciphertext or Node list.
 pub const MAX_PRIVATE_CONTROL_APPLICATION_ACK_WIRE_BYTES: usize = 4 * 1024;
+
+/// Offline signer used only to authenticate one compact authority recovery
+/// proof. It is intentionally separate from Principal credentials and from
+/// the authority actor's receipt-signing key.
+pub trait PrivateRecoveryAuthorityProofSigner {
+    fn recovery_public_key(&self) -> [u8; 32];
+    fn sign_private_recovery_authority_proof(&self, message: &[u8]) -> [u8; 64];
+}
+
+pub trait PrivateRecoveryAuthorityProofVerifier {
+    fn verify_private_recovery_authority_proof(
+        &self,
+        public_key: &[u8; 32],
+        message: &[u8],
+        signature: &[u8; 64],
+    ) -> bool;
+}
+
+/// Compact proof of recovery-key possession for one exact PCTL Recover.
+///
+/// The authority can verify this bounded object without receiving the PCTL's
+/// potentially large encrypted historical keyring. The full PCTL recovery
+/// evidence is committed by `recovery_evidence`; the exact replacement NodeId
+/// list remains visible so policy can validate every enrolled owner identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrivateRecoveryAuthorityProof {
+    pub managed: ManagedAgentTarget,
+    pub control: Hash,
+    pub control_sequence: u64,
+    pub control_previous: Option<Hash>,
+    pub next_epoch: u64,
+    pub superseded_authority_head: Option<Hash>,
+    pub replacement_nodes: Vec<NodeId>,
+    pub replacement_member_set: Hash,
+    pub replacement_identity_set: Hash,
+    pub recovery_evidence: Hash,
+    pub recovery_public_key: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+impl PrivateRecoveryAuthorityProof {
+    /// Derive and sign the unique compact proof for one exact recovery PCTL.
+    /// The signer must be the same recovery key named by that PCTL.
+    pub fn from_control<S: PrivateRecoveryAuthorityProofSigner>(
+        runtime_deployment: DeploymentId,
+        control: &PrivateControlRecord,
+        superseded_authority_head: Option<Hash>,
+        signer: &S,
+    ) -> Result<Self, AuthorityOperationProtocolError> {
+        let PrivateControlOperation::Recover {
+            superseded_heads,
+            next_epoch,
+            replacement_nodes,
+            ..
+        } = &control.operation
+        else {
+            return Err(AuthorityOperationProtocolError::InvalidIntent);
+        };
+        let recovery_public_key = signer.recovery_public_key();
+        if runtime_deployment == DeploymentId::ZERO
+            || !control.validate_shape()
+            || control.signer != crate::private::PrivateControlSigner::Recovery
+            || control.signer_public_key != recovery_public_key
+            || superseded_authority_head == Some(Hash::ZERO)
+            || superseded_authority_head
+                .is_some_and(|head| superseded_heads.binary_search(&head).is_err())
+        {
+            return Err(AuthorityOperationProtocolError::InvalidIntent);
+        }
+        let replacement_node_ids: Vec<NodeId> =
+            replacement_nodes.iter().map(|node| node.node).collect();
+        let mut value = Self {
+            managed: ManagedAgentTarget {
+                space: control.space,
+                agent: control.agent,
+                runtime_deployment,
+            },
+            control: control.commitment(),
+            control_sequence: control.sequence,
+            control_previous: control.previous,
+            next_epoch: next_epoch.epoch,
+            superseded_authority_head,
+            replacement_member_set: private_member_set_commitment(
+                replacement_node_ids.iter().copied(),
+            )
+            .ok_or(AuthorityOperationProtocolError::InvalidIntent)?,
+            replacement_identity_set: private_node_identity_set_commitment(
+                replacement_nodes.iter(),
+            )
+            .ok_or(AuthorityOperationProtocolError::InvalidIntent)?,
+            replacement_nodes: replacement_node_ids,
+            recovery_evidence: private_recovery_evidence_commitment(control)
+                .ok_or(AuthorityOperationProtocolError::InvalidIntent)?,
+            recovery_public_key,
+            signature: [0; 64],
+        };
+        value.signature = signer.sign_private_recovery_authority_proof(&value.signing_bytes());
+        value.validate_shape()?;
+        if !value.matches_control(control) {
+            return Err(AuthorityOperationProtocolError::MismatchedCall);
+        }
+        Ok(value)
+    }
+
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        private_recovery_authority_proof_signing_bytes(self)
+    }
+
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(
+            b"vos/agent/private-recovery-authority-proof/v1",
+            &[&self.signing_bytes(), &self.signature],
+        )
+    }
+
+    pub fn validate_shape(&self) -> Result<(), AuthorityOperationProtocolError> {
+        if !self.managed.is_valid()
+            || self.control == Hash::ZERO
+            || !valid_recovery_control_position(self.control_sequence, self.control_previous)
+            || self.next_epoch == 0
+            || self.superseded_authority_head == Some(Hash::ZERO)
+            || self.replacement_nodes.is_empty()
+            || self.replacement_nodes.len() > MAX_PRIVATE_NODES
+            || self
+                .replacement_nodes
+                .iter()
+                .any(|node| *node == NodeId::ZERO)
+            || !self
+                .replacement_nodes
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            || private_member_set_commitment(self.replacement_nodes.iter().copied())
+                != Some(self.replacement_member_set)
+            || self.replacement_identity_set == Hash::ZERO
+            || self.recovery_evidence == Hash::ZERO
+            || self.recovery_public_key == [0; 32]
+            || self.signature == [0; 64]
+            || private_recovery_authority_proof_encoded_len(self)
+                > MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES
+        {
+            return Err(AuthorityOperationProtocolError::InvalidIntent);
+        }
+        Ok(())
+    }
+
+    pub fn verify_with<V: PrivateRecoveryAuthorityProofVerifier>(
+        &self,
+        verifier: &V,
+    ) -> Result<(), AuthorityOperationProtocolError> {
+        self.validate_shape()?;
+        if !verifier.verify_private_recovery_authority_proof(
+            &self.recovery_public_key,
+            &self.signing_bytes(),
+            &self.signature,
+        ) {
+            return Err(AuthorityOperationProtocolError::InvalidSignature);
+        }
+        Ok(())
+    }
+
+    pub fn matches_control(&self, control: &PrivateControlRecord) -> bool {
+        let PrivateControlOperation::Recover {
+            superseded_heads,
+            next_epoch,
+            replacement_nodes,
+            ..
+        } = &control.operation
+        else {
+            return false;
+        };
+        self.validate_shape().is_ok()
+            && control.validate_shape()
+            && control.signer == crate::private::PrivateControlSigner::Recovery
+            && control.signer_public_key == self.recovery_public_key
+            && control.space == self.managed.space
+            && control.agent == self.managed.agent
+            && control.commitment() == self.control
+            && control.sequence == self.control_sequence
+            && control.previous == self.control_previous
+            && next_epoch.epoch == self.next_epoch
+            && replacement_nodes
+                .iter()
+                .map(|node| node.node)
+                .eq(self.replacement_nodes.iter().copied())
+            && private_member_set_commitment(replacement_nodes.iter().map(|node| node.node))
+                == Some(self.replacement_member_set)
+            && private_node_identity_set_commitment(replacement_nodes.iter())
+                == Some(self.replacement_identity_set)
+            && private_recovery_evidence_commitment(control) == Some(self.recovery_evidence)
+            && self
+                .superseded_authority_head
+                .is_none_or(|head| superseded_heads.binary_search(&head).is_ok())
+    }
+}
 
 /// Typed non-management authority intent.
 ///
@@ -92,13 +289,7 @@ pub enum AuthorityOperationIntent {
         member_set: Hash,
     },
     RecoverPrivateAgent {
-        managed: ManagedAgentTarget,
-        control: Hash,
-        control_sequence: u64,
-        control_previous: Option<Hash>,
-        epoch: u64,
-        member_set: Hash,
-        recovery_evidence: Hash,
+        proof: PrivateRecoveryAuthorityProof,
     },
     RotatePrivateKeys {
         managed: ManagedAgentTarget,
@@ -172,8 +363,9 @@ impl AuthorityOperationIntent {
         Ok(value)
     }
 
-    /// Project an exact signed PCTL record into the authority policy fields
-    /// relevant to Invite, Revoke, or offline Recover.
+    /// Project an exact owner-signed PCTL record into the authority policy
+    /// fields. Offline Recover requires a separate recovery-key-signed PRA1
+    /// and is intentionally rejected by this constructor.
     pub fn private_control(
         runtime_deployment: DeploymentId,
         control: &PrivateControlRecord,
@@ -209,23 +401,9 @@ impl AuthorityOperationIntent {
                 )
                 .ok_or(AuthorityOperationProtocolError::InvalidIntent)?,
             },
-            PrivateControlOperation::Recover {
-                replacement_nodes,
-                next_epoch,
-                ..
-            } => Self::RecoverPrivateAgent {
-                managed,
-                control: commitment,
-                control_sequence: control.sequence,
-                control_previous: control.previous,
-                epoch: next_epoch.epoch,
-                member_set: private_member_set_commitment(
-                    replacement_nodes.iter().map(|node| node.node),
-                )
-                .ok_or(AuthorityOperationProtocolError::InvalidIntent)?,
-                recovery_evidence: private_recovery_evidence_commitment(control)
-                    .ok_or(AuthorityOperationProtocolError::InvalidIntent)?,
-            },
+            PrivateControlOperation::Recover { .. } => {
+                return Err(AuthorityOperationProtocolError::InvalidIntent);
+            }
             PrivateControlOperation::RotateKeys { next_epoch } => Self::RotatePrivateKeys {
                 managed,
                 control: commitment,
@@ -264,6 +442,17 @@ impl AuthorityOperationIntent {
         Ok(value)
     }
 
+    /// Admit one already-signed compact proof for offline recovery. Building
+    /// the proof from a PCTL is kept on [`PrivateRecoveryAuthorityProof`] so a
+    /// normal Principal or Admin credential can never stand in for recovery
+    /// key possession.
+    pub fn private_recovery_control(
+        proof: PrivateRecoveryAuthorityProof,
+    ) -> Result<Self, AuthorityOperationProtocolError> {
+        proof.validate_shape()?;
+        Ok(Self::RecoverPrivateAgent { proof })
+    }
+
     pub fn operation(&self) -> AuthorityOperationKind {
         match self {
             Self::InvokeActor { .. } => AuthorityOperationKind::InvokeActor,
@@ -285,10 +474,10 @@ impl AuthorityOperationIntent {
             | Self::Catalog { managed, .. }
             | Self::InvitePrivateNode { managed, .. }
             | Self::RevokePrivateNode { managed, .. }
-            | Self::RecoverPrivateAgent { managed, .. }
             | Self::RotatePrivateKeys { managed, .. }
             | Self::SetPrivateResourcePolicy { managed, .. }
             | Self::PrivateActorLifecycle { managed, .. } => *managed,
+            Self::RecoverPrivateAgent { proof } => proof.managed,
         }
     }
 
@@ -360,21 +549,7 @@ impl AuthorityOperationIntent {
                     && *node != NodeId::ZERO
                     && *member_set != Hash::ZERO
             }
-            Self::RecoverPrivateAgent {
-                managed,
-                control,
-                control_sequence,
-                control_previous,
-                member_set,
-                recovery_evidence,
-                ..
-            } => {
-                managed.is_valid()
-                    && *control != Hash::ZERO
-                    && valid_recovery_control_position(*control_sequence, *control_previous)
-                    && *member_set != Hash::ZERO
-                    && *recovery_evidence != Hash::ZERO
-            }
+            Self::RecoverPrivateAgent { proof } => proof.validate_shape().is_ok(),
             Self::RotatePrivateKeys {
                 managed,
                 control,
@@ -436,10 +611,10 @@ impl AuthorityOperationIntent {
                 .map(|request| request.commitment()),
             Self::InvitePrivateNode { control, .. }
             | Self::RevokePrivateNode { control, .. }
-            | Self::RecoverPrivateAgent { control, .. }
             | Self::RotatePrivateKeys { control, .. }
             | Self::SetPrivateResourcePolicy { control, .. }
             | Self::PrivateActorLifecycle { control, .. } => Some(*control),
+            Self::RecoverPrivateAgent { proof } => Some(proof.control),
         }
     }
 
@@ -519,9 +694,14 @@ impl AuthorityOperationIntent {
     }
 
     pub fn matches_private_control(&self, control: &PrivateControlRecord) -> bool {
-        self.validate_shape().is_ok()
-            && Self::private_control(self.managed().runtime_deployment, control)
-                .is_ok_and(|expected| self == &expected)
+        if self.validate_shape().is_err() {
+            return false;
+        }
+        match self {
+            Self::RecoverPrivateAgent { proof } => proof.matches_control(control),
+            _ => Self::private_control(self.managed().runtime_deployment, control)
+                .is_ok_and(|expected| self == &expected),
+        }
     }
 
     fn selector_actor(&self) -> (Option<ActorId>, Option<DeploymentId>) {
@@ -607,7 +787,7 @@ fn private_node_identity_commitment(node: &PrivateNodeIdentity) -> Hash {
 }
 
 /// Commit one canonically sorted, unique, nonempty post-application Private
-/// Node set without embedding that list in AOC3 or PCA1.
+/// Node set without embedding that list in AOC4 or PCA1.
 pub fn private_member_set_commitment(nodes: impl Iterator<Item = NodeId>) -> Option<Hash> {
     let nodes: Vec<NodeId> = nodes.collect();
     if nodes.is_empty()
@@ -623,6 +803,33 @@ pub fn private_member_set_commitment(nodes: impl Iterator<Item = NodeId>) -> Opt
     Encoder(&mut bytes).list(&nodes, |encoder, node| encoder.fixed(node.as_bytes()));
     Some(Hash::digest(
         b"vos/agent/authority-private-member-set/v1",
+        &[&bytes],
+    ))
+}
+
+/// Commit the exact canonical full identities behind a replacement NodeId
+/// list. The authority recomputes this from its enrollment rows, preventing a
+/// caller from substituting another transport or encryption identity for the
+/// same NodeId.
+pub fn private_node_identity_set_commitment<'a>(
+    nodes: impl Iterator<Item = &'a PrivateNodeIdentity>,
+) -> Option<Hash> {
+    let nodes: Vec<&PrivateNodeIdentity> = nodes.collect();
+    if nodes.is_empty()
+        || nodes.len() > MAX_PRIVATE_NODES
+        || nodes.iter().any(|node| !node.validate())
+        || !nodes.windows(2).all(|pair| pair[0].node < pair[1].node)
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"APIS");
+    bytes.extend_from_slice(crate::RUNTIME_ABI_ID.as_bytes());
+    Encoder(&mut bytes).list(&nodes, |encoder, node| {
+        crate::wire::encode_private_node(encoder, node)
+    });
+    Some(Hash::digest(
+        b"vos/agent/authority-private-node-identity-set/v1",
         &[&bytes],
     ))
 }
@@ -687,7 +894,7 @@ impl AuthorityOperationCall {
     ) -> InvocationId {
         InvocationId(
             Hash::digest(
-                b"vos/agent/authority-operation-authorization-invocation/v3",
+                b"vos/agent/authority-operation-authorization-invocation/v4",
                 &[
                     crate::RUNTIME_ABI_ID.as_bytes(),
                     credential.as_bytes(),
@@ -713,7 +920,7 @@ impl AuthorityOperationCall {
 
     pub fn commitment(&self) -> Hash {
         Hash::digest(
-            b"vos/agent/authority-operation-call/v3",
+            b"vos/agent/authority-operation-call/v4",
             &[&self.signing_bytes(), &self.signature],
         )
     }
@@ -797,7 +1004,7 @@ impl AuthorityOperationCall {
 /// It is intentionally distinct from the selector's management decision
 /// clock, which must remain zero for every operation in this protocol.
 /// Shape validation alone cannot reconstruct `operation_call`: before signing
-/// a receipt, a consumer must reopen the retained AOC3 preimage and require
+/// a receipt, a consumer must reopen the retained AOC4 preimage and require
 /// [`AuthorityOperationApproval::matches_call`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorityOperationApproval {
@@ -805,7 +1012,7 @@ pub struct AuthorityOperationApproval {
     pub authorization_sequence: NonZeroU64,
     pub invocation: InvocationId,
     /// Distinct Linear invocation reserved for acknowledging durable receipt
-    /// issuance. Its derivation commits the complete signed AOC3 preimage.
+    /// issuance. Its derivation commits the complete signed AOC4 preimage.
     pub acknowledgement_invocation: InvocationId,
     pub authority: AuthorityActorTarget,
     pub principal: PrincipalId,
@@ -832,7 +1039,7 @@ impl AuthorityOperationApproval {
         )
     }
 
-    /// Recompute the AOI1 invocation after the AOC3 preimage has compacted.
+    /// Recompute the AOI1 invocation after the AOC4 preimage has compacted.
     /// Every input is retained in the credential-bounded latest-result row.
     pub fn derive_acknowledgement_invocation_from_call_parts(
         credential: CredentialId,
@@ -843,7 +1050,7 @@ impl AuthorityOperationApproval {
     ) -> InvocationId {
         InvocationId(
             Hash::digest(
-                b"vos/agent/authority-operation-issuance-acknowledgement-invocation/v3",
+                b"vos/agent/authority-operation-issuance-acknowledgement-invocation/v4",
                 &[
                     crate::RUNTIME_ABI_ID.as_bytes(),
                     credential.as_bytes(),
@@ -859,7 +1066,7 @@ impl AuthorityOperationApproval {
 
     #[allow(clippy::too_many_arguments)]
     /// Build an approval directly from its retained call preimage. Code which
-    /// decodes an AOP3 instead must make the equivalent `matches_call` check
+    /// decodes an AOP4 instead must make the equivalent `matches_call` check
     /// before signing the materialized selector.
     pub fn from_call(
         call: &AuthorityOperationCall,
@@ -1053,7 +1260,7 @@ impl AuthorityOperationApproval {
 
 /// Authority-signed proof that one exact non-management receipt was issued.
 ///
-/// The actor retains the AOC3 and AOP3 preimages until this AOI1 verifies and
+/// The actor retains the AOC4 and AOP4 preimages until this AOI1 verifies and
 /// matches both. Only then may its authorization sequence become a retirement
 /// fact. Receipt issuance and acknowledgement use distinct Linear invocation
 /// IDs so exact retries can never reinterpret one message as the other.
@@ -1142,7 +1349,7 @@ impl AuthorityOperationIssuanceAck {
         Ok(())
     }
 
-    /// Match the exact actor-retained AOC3 and AOP3 preimages. A valid AOI1
+    /// Match the exact actor-retained AOC4 and AOP4 preimages. A valid AOI1
     /// must not retire anything unless this check and `verify_with` both pass.
     pub fn matches_pending(
         &self,
@@ -1291,22 +1498,14 @@ impl PrivateControlApplicationFact {
                     && self.epoch == *epoch
                     && self.post_member_set == *member_set
             }
-            AuthorityOperationIntent::RecoverPrivateAgent {
-                managed,
-                control,
-                control_sequence,
-                control_previous,
-                epoch,
-                member_set,
-                ..
-            } => {
-                self.managed == *managed
+            AuthorityOperationIntent::RecoverPrivateAgent { proof } => {
+                self.managed == proof.managed
                     && self.operation == AuthorityOperationKind::RecoverPrivateAgent
-                    && self.control == *control
-                    && self.control_sequence == *control_sequence
-                    && self.control_previous == *control_previous
-                    && self.epoch == *epoch
-                    && self.post_member_set == *member_set
+                    && self.control == proof.control
+                    && self.control_sequence == proof.control_sequence
+                    && self.control_previous == proof.control_previous
+                    && self.epoch == proof.next_epoch
+                    && self.post_member_set == proof.replacement_member_set
             }
             AuthorityOperationIntent::RotatePrivateKeys {
                 managed,
@@ -1354,8 +1553,8 @@ impl PrivateControlApplicationFact {
 /// and reopened after its non-management receipt had been issued.
 ///
 /// PCA1 is distinct from AOI1: issuance alone never proves application. Its
-/// three invocation IDs reserve independent exact-retry domains for AOC3,
-/// AOI1, and PCA1. The AOC3/AOP3 commitments are repeated for auditability;
+/// three invocation IDs reserve independent exact-retry domains for AOC4,
+/// AOI1, and PCA1. The AOC4/AOP4 commitments are repeated for auditability;
 /// the invocation pair, authorization sequence, and AOI1 commitment are also
 /// sufficient to match an issuance tombstone after those preimages retire.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1501,7 +1700,7 @@ impl PrivateControlApplicationAck {
         Ok(())
     }
 
-    /// Match all retained AOC3/AOP3/AOI1 preimages and the exact runtime
+    /// Match all retained AOC4/AOP4/AOI1 preimages and the exact runtime
     /// application observation. Verification remains a separate explicit step.
     pub fn matches_pending(
         &self,
@@ -1554,7 +1753,7 @@ impl PrivateControlApplicationAck {
         self.verify_with(authority, verifier)
     }
 
-    /// Match the compact issuance tuple retained after AOC3/AOP3/AOI1
+    /// Match the compact issuance tuple retained after AOC4/AOP4/AOI1
     /// preimages have retired. The PCA1 signature still must be independently
     /// verified; this method deliberately does not reconstruct discarded data.
     pub fn matches_issuance_tombstone(
@@ -1622,7 +1821,7 @@ impl PrivateControlApplicationAck {
 
 /// Verified issuance evidence for exactly one authorization sequence.
 /// Fields are private so callers cannot manufacture a retirement capability
-/// without reopening the retained AOC3/AOP3 and verifying AOI1.
+/// without reopening the retained AOC4/AOP4 and verifying AOI1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuthorityOperationRetirementFact {
     authority: AuthorityActorTarget,
@@ -1648,7 +1847,7 @@ impl AuthorityOperationRetirementFact {
 ///
 /// Out-of-order verified facts must remain pending. The actor may advance this
 /// floor only one sequence at a time, durably committing the new floor before
-/// discarding the corresponding AOC3/AOP3/AOI1 preimages. On restart it
+/// discarding the corresponding AOC4/AOP4/AOI1 preimages. On restart it
 /// reopens this value from its own authenticated Linear state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuthorityOperationRetirementFloor {
@@ -1760,6 +1959,101 @@ fn decode_managed(decoder: &mut Decoder<'_>) -> Result<ManagedAgentTarget, Decod
         .ok_or(DecodeError::NonCanonical)
 }
 
+fn encode_private_recovery_authority_proof_unsigned(
+    encoder: &mut Encoder<'_>,
+    value: &PrivateRecoveryAuthorityProof,
+) {
+    encode_managed(encoder, value.managed);
+    encode_private_control_position(
+        encoder,
+        value.control,
+        value.control_sequence,
+        value.control_previous,
+    );
+    encoder.u64(value.next_epoch);
+    encoder.option(&value.superseded_authority_head, |encoder, head| {
+        encoder.fixed(head.as_bytes())
+    });
+    encoder.list(&value.replacement_nodes, |encoder, node| {
+        encoder.fixed(node.as_bytes())
+    });
+    encoder.fixed(value.replacement_member_set.as_bytes());
+    encoder.fixed(value.replacement_identity_set.as_bytes());
+    encoder.fixed(value.recovery_evidence.as_bytes());
+    encoder.fixed(&value.recovery_public_key);
+}
+
+fn encode_private_recovery_authority_proof(
+    encoder: &mut Encoder<'_>,
+    value: &PrivateRecoveryAuthorityProof,
+) {
+    encode_private_recovery_authority_proof_unsigned(encoder, value);
+    encoder.0.extend_from_slice(&value.signature);
+}
+
+fn decode_private_recovery_authority_proof(
+    decoder: &mut Decoder<'_>,
+) -> Result<PrivateRecoveryAuthorityProof, DecodeError> {
+    let managed = decode_managed(decoder)?;
+    let (control, control_sequence, control_previous) = decode_private_control_position(decoder)?;
+    let value = PrivateRecoveryAuthorityProof {
+        managed,
+        control,
+        control_sequence,
+        control_previous,
+        next_epoch: decoder.u64()?,
+        superseded_authority_head: decoder.option(|decoder| Ok(Hash(decoder.fixed()?)))?,
+        replacement_nodes: decoder
+            .list_bounded(MAX_PRIVATE_NODES, |decoder| Ok(NodeId(decoder.fixed()?)))?,
+        replacement_member_set: Hash(decoder.fixed()?),
+        replacement_identity_set: Hash(decoder.fixed()?),
+        recovery_evidence: Hash(decoder.fixed()?),
+        recovery_public_key: decoder.fixed()?,
+        signature: decoder
+            .take(64)?
+            .try_into()
+            .map_err(|_| DecodeError::Truncated)?,
+    };
+    value
+        .validate_shape()
+        .is_ok()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn private_recovery_authority_proof_signing_bytes(
+    value: &PrivateRecoveryAuthorityProof,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"PRAS");
+    bytes.extend_from_slice(crate::RUNTIME_ABI_ID.as_bytes());
+    encode_private_recovery_authority_proof_unsigned(&mut Encoder(&mut bytes), value);
+    bytes
+}
+
+fn private_recovery_authority_proof_encoded_len(value: &PrivateRecoveryAuthorityProof) -> usize {
+    let mut body = Vec::new();
+    encode_private_recovery_authority_proof(&mut Encoder(&mut body), value);
+    HEADER_BYTES.saturating_add(body.len())
+}
+
+impl CanonicalWire for PrivateRecoveryAuthorityProof {
+    const MAGIC: [u8; 4] = *b"PRA1";
+    const MAX_ENCODED_BYTES: usize = MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_shape().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_private_recovery_authority_proof(encoder, self);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        decode_private_recovery_authority_proof(decoder)
+    }
+}
+
 fn encode_intent(encoder: &mut Encoder<'_>, value: &AuthorityOperationIntent) {
     match value {
         AuthorityOperationIntent::InvokeActor {
@@ -1838,26 +2132,9 @@ fn encode_intent(encoder: &mut Encoder<'_>, value: &AuthorityOperationIntent) {
             encoder.fixed(node.as_bytes());
             encoder.fixed(member_set.as_bytes());
         }
-        AuthorityOperationIntent::RecoverPrivateAgent {
-            managed,
-            control,
-            control_sequence,
-            control_previous,
-            epoch,
-            member_set,
-            recovery_evidence,
-        } => {
+        AuthorityOperationIntent::RecoverPrivateAgent { proof } => {
             encoder.u8(4);
-            encode_managed(encoder, *managed);
-            encode_private_control_common(
-                encoder,
-                *control,
-                *control_sequence,
-                *control_previous,
-                *epoch,
-            );
-            encoder.fixed(member_set.as_bytes());
-            encoder.fixed(recovery_evidence.as_bytes());
+            encode_private_recovery_authority_proof(encoder, proof);
         }
         AuthorityOperationIntent::RotatePrivateKeys {
             managed,
@@ -1975,20 +2252,9 @@ fn decode_intent(decoder: &mut Decoder<'_>) -> Result<AuthorityOperationIntent, 
                 member_set: Hash(decoder.fixed()?),
             }
         }
-        4 => {
-            let managed = decode_managed(decoder)?;
-            let (control, control_sequence, control_previous, epoch) =
-                decode_private_control_common(decoder)?;
-            AuthorityOperationIntent::RecoverPrivateAgent {
-                managed,
-                control,
-                control_sequence,
-                control_previous,
-                epoch,
-                member_set: Hash(decoder.fixed()?),
-                recovery_evidence: Hash(decoder.fixed()?),
-            }
-        }
+        4 => AuthorityOperationIntent::RecoverPrivateAgent {
+            proof: decode_private_recovery_authority_proof(decoder)?,
+        },
         5 => {
             let managed = decode_managed(decoder)?;
             let (control, control_sequence, control_previous, epoch) =
@@ -2125,18 +2391,18 @@ fn encode_call_invocation_payload(encoder: &mut Encoder<'_>, value: &AuthorityOp
 
 fn authority_operation_call_invocation_payload_commitment(value: &AuthorityOperationCall) -> Hash {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"OCP3");
+    bytes.extend_from_slice(b"OCP4");
     bytes.extend_from_slice(crate::RUNTIME_ABI_ID.as_bytes());
     encode_call_invocation_payload(&mut Encoder(&mut bytes), value);
     Hash::digest(
-        b"vos/agent/authority-operation-invocation-payload/v3",
+        b"vos/agent/authority-operation-invocation-payload/v4",
         &[&bytes],
     )
 }
 
 fn authority_operation_call_signing_bytes(value: &AuthorityOperationCall) -> Vec<u8> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"AO3S");
+    bytes.extend_from_slice(b"AO4S");
     bytes.extend_from_slice(crate::RUNTIME_ABI_ID.as_bytes());
     encode_call_unsigned(&mut Encoder(&mut bytes), value);
     bytes
@@ -2151,7 +2417,7 @@ fn authority_operation_call_encoded_len(value: &AuthorityOperationCall) -> usize
 }
 
 impl CanonicalWire for AuthorityOperationCall {
-    const MAGIC: [u8; 4] = *b"AOC3";
+    const MAGIC: [u8; 4] = *b"AOC4";
     const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES;
 
     fn validate_wire(&self) -> bool {
@@ -2218,14 +2484,14 @@ fn authority_operation_approval_encoded_len(value: &AuthorityOperationApproval) 
 
 fn authority_operation_approval_commitment(value: &AuthorityOperationApproval) -> Hash {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"AO3C");
+    bytes.extend_from_slice(b"AO4C");
     bytes.extend_from_slice(crate::RUNTIME_ABI_ID.as_bytes());
     encode_approval_body(&mut Encoder(&mut bytes), value);
-    Hash::digest(b"vos/agent/authority-operation-approval/v3", &[&bytes])
+    Hash::digest(b"vos/agent/authority-operation-approval/v4", &[&bytes])
 }
 
 impl CanonicalWire for AuthorityOperationApproval {
-    const MAGIC: [u8; 4] = *b"AOP3";
+    const MAGIC: [u8; 4] = *b"AOP4";
     const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_OPERATION_APPROVAL_WIRE_BYTES;
 
     fn validate_wire(&self) -> bool {
@@ -2549,6 +2815,29 @@ mod tests {
     impl AuthorityVerifier for TestVerifier {
         fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
             *signature == test_signature(public_key, message)
+        }
+    }
+
+    impl PrivateRecoveryAuthorityProofVerifier for TestVerifier {
+        fn verify_private_recovery_authority_proof(
+            &self,
+            public_key: &[u8; 32],
+            message: &[u8],
+            signature: &[u8; 64],
+        ) -> bool {
+            *signature == test_signature(public_key, message)
+        }
+    }
+
+    struct TestRecoverySigner([u8; 32]);
+
+    impl PrivateRecoveryAuthorityProofSigner for TestRecoverySigner {
+        fn recovery_public_key(&self) -> [u8; 32] {
+            self.0
+        }
+
+        fn sign_private_recovery_authority_proof(&self, message: &[u8]) -> [u8; 64] {
+            test_signature(&self.0, message)
         }
     }
 
@@ -2922,9 +3211,27 @@ mod tests {
         vec![invite, revoke, recover, rotate, resource, lifecycle]
     }
 
+    fn private_intent(
+        runtime: DeploymentId,
+        control: &PrivateControlRecord,
+    ) -> AuthorityOperationIntent {
+        if matches!(control.operation, PrivateControlOperation::Recover { .. }) {
+            let proof = PrivateRecoveryAuthorityProof::from_control(
+                runtime,
+                control,
+                None,
+                &TestRecoverySigner(control.signer_public_key),
+            )
+            .unwrap();
+            AuthorityOperationIntent::private_recovery_control(proof).unwrap()
+        } else {
+            AuthorityOperationIntent::private_control(runtime, control).unwrap()
+        }
+    }
+
     fn private_call(control: &PrivateControlRecord, discriminator: u8) -> AuthorityOperationCall {
         call_with_intent(
-            AuthorityOperationIntent::private_control(DeploymentId([0x79; 32]), control).unwrap(),
+            private_intent(DeploymentId([0x79; 32]), control),
             discriminator,
         )
     }
@@ -2953,20 +3260,19 @@ mod tests {
                     epoch,
                     member_set,
                     ..
-                }
-                | AuthorityOperationIntent::RecoverPrivateAgent {
-                    control,
-                    control_sequence,
-                    control_previous,
-                    epoch,
-                    member_set,
-                    ..
                 } => (
                     *control,
                     *control_sequence,
                     *control_previous,
                     *epoch,
                     *member_set,
+                ),
+                AuthorityOperationIntent::RecoverPrivateAgent { proof } => (
+                    proof.control,
+                    proof.control_sequence,
+                    proof.control_previous,
+                    proof.next_epoch,
+                    proof.replacement_member_set,
                 ),
                 AuthorityOperationIntent::RotatePrivateKeys {
                     control,
@@ -3055,37 +3361,40 @@ mod tests {
     }
 
     #[test]
-    fn aoc3_aop3_and_aoi1_are_distinct_bounded_canonical_golden_wires() {
+    fn aoc4_aop4_and_aoi1_are_distinct_bounded_canonical_golden_wires() {
         let call = invoke_call();
         let call_bytes = call.encode().unwrap();
-        assert_eq!(call_bytes.get(..4), Some(b"AOC3".as_slice()));
+        assert_eq!(call_bytes.get(..4), Some(b"AOC4".as_slice()));
         assert!(call_bytes.len() <= MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES);
         assert_eq!(
             AuthorityOperationCall::decode(&call_bytes),
             Ok(call.clone())
         );
         assert_eq!(
-            Hash::digest(b"vos/test/aoc3-golden", &[&call_bytes]).0,
+            Hash::digest(b"vos/test/aoc4-golden", &[&call_bytes]).0,
             [
-                253, 99, 119, 122, 117, 95, 211, 240, 53, 9, 140, 171, 245, 6, 16, 211, 38, 251,
-                87, 128, 209, 3, 98, 60, 94, 186, 106, 18, 36, 100, 245, 102,
+                252, 233, 99, 197, 19, 207, 88, 199, 154, 145, 180, 138, 233, 209, 41, 56, 127,
+                127, 83, 47, 40, 7, 70, 184, 147, 142, 178, 241, 237, 123, 182, 136,
             ]
         );
 
         let approval = approval(&call);
         let approval_bytes = approval.encode().unwrap();
-        assert_eq!(approval_bytes.get(..4), Some(b"AOP3".as_slice()));
+        assert_eq!(approval_bytes.get(..4), Some(b"AOP4".as_slice()));
         assert!(approval_bytes.len() <= MAX_AUTHORITY_OPERATION_APPROVAL_WIRE_BYTES);
         assert_eq!(
             AuthorityOperationApproval::decode(&approval_bytes),
             Ok(approval.clone())
         );
+        let mut old_approval = approval_bytes.clone();
+        old_approval[..4].copy_from_slice(b"AOP3");
+        assert!(AuthorityOperationApproval::decode(&old_approval).is_err());
         assert_ne!(call.commitment(), approval.commitment());
         assert_eq!(
-            Hash::digest(b"vos/test/aop3-golden", &[&approval_bytes]).0,
+            Hash::digest(b"vos/test/aop4-golden", &[&approval_bytes]).0,
             [
-                157, 208, 130, 32, 56, 135, 223, 31, 209, 214, 33, 243, 128, 124, 201, 172, 174, 9,
-                9, 175, 159, 207, 201, 48, 147, 240, 212, 6, 144, 173, 59, 241,
+                225, 148, 253, 224, 223, 96, 37, 85, 147, 23, 189, 182, 196, 11, 84, 126, 109, 221,
+                144, 162, 168, 108, 89, 66, 88, 10, 243, 38, 212, 202, 247, 196,
             ]
         );
 
@@ -3100,8 +3409,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/aoi1-golden", &[&acknowledgement_bytes]).0,
             [
-                154, 98, 170, 195, 138, 191, 62, 130, 135, 31, 148, 78, 180, 19, 252, 60, 209, 25,
-                217, 195, 191, 27, 196, 110, 62, 1, 68, 105, 23, 95, 157, 142,
+                227, 9, 119, 219, 231, 197, 157, 71, 61, 6, 39, 95, 195, 93, 138, 119, 30, 32, 188,
+                42, 72, 255, 211, 98, 223, 90, 227, 13, 174, 71, 99, 138,
             ]
         );
     }
@@ -3125,8 +3434,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/pca1-golden", &[&encoded]).0,
             [
-                102, 164, 249, 242, 154, 94, 14, 77, 3, 253, 254, 27, 155, 245, 170, 80, 248, 194,
-                204, 157, 68, 127, 244, 220, 130, 27, 180, 40, 106, 206, 183, 35,
+                17, 210, 25, 80, 74, 79, 217, 162, 151, 92, 162, 144, 33, 209, 169, 64, 105, 96,
+                167, 239, 132, 213, 217, 0, 132, 218, 225, 21, 120, 18, 192, 9,
             ]
         );
         assert_ne!(application.commitment(), Hash::ZERO);
@@ -3761,7 +4070,7 @@ mod tests {
         assert_eq!(approval.selector.acknowledged_through, 0);
         assert_eq!(approval.selector.request, work.commitment());
 
-        // AOP3 cannot reconstruct its retained AOC3 preimage. A substituted
+        // AOP4 cannot reconstruct its retained AOC4 preimage. A substituted
         // nonzero commitment is structurally canonical, so a signer must
         // reopen the call and require `matches_call` before issuing a receipt.
         let mut detached = approval.clone();
@@ -3881,7 +4190,7 @@ mod tests {
             AuthorityOperationKind::PrivateActorLifecycle,
         ];
         for (index, (control, operation)) in controls.iter().zip(expected_operations).enumerate() {
-            let intent = AuthorityOperationIntent::private_control(runtime, control).unwrap();
+            let intent = private_intent(runtime, control);
             assert_eq!(intent.operation(), operation);
             assert!(intent.matches_private_control(control));
             let call = call_with_intent(intent, 0x83 + index as u8);
@@ -3934,8 +4243,11 @@ mod tests {
         assert!(changed_revoke_members.validate_shape());
         assert!(!revoke_intent.matches_private_control(&changed_revoke_members));
 
-        let recovery_intent =
-            AuthorityOperationIntent::private_control(runtime, &controls[2]).unwrap();
+        assert_eq!(
+            AuthorityOperationIntent::private_control(runtime, &controls[2]),
+            Err(AuthorityOperationProtocolError::InvalidIntent)
+        );
+        let recovery_intent = private_intent(runtime, &controls[2]);
         let mut changed_recovery = controls[2].clone();
         let PrivateControlOperation::Recover {
             historical_keyring, ..
@@ -3997,6 +4309,130 @@ mod tests {
     }
 
     #[test]
+    fn pra1_binds_every_recovery_field_and_supports_the_full_private_node_limit() {
+        let runtime = DeploymentId([0x93; 32]);
+        let mut control = private_controls()[2].clone();
+        let authority_head = Hash([0x94; 32]);
+        let PrivateControlOperation::Recover {
+            superseded_heads, ..
+        } = &mut control.operation
+        else {
+            unreachable!()
+        };
+        superseded_heads.push(authority_head);
+        control.previous = Some(authority_head);
+        let signer = TestRecoverySigner(control.signer_public_key);
+        let proof = PrivateRecoveryAuthorityProof::from_control(
+            runtime,
+            &control,
+            Some(authority_head),
+            &signer,
+        )
+        .unwrap();
+        assert_eq!(proof.verify_with(&TestVerifier), Ok(()));
+        assert!(proof.matches_control(&control));
+        let encoded = proof.encode().unwrap();
+        assert_eq!(encoded.get(..4), Some(b"PRA1".as_slice()));
+        assert_eq!(
+            PrivateRecoveryAuthorityProof::decode(&encoded),
+            Ok(proof.clone())
+        );
+        let mut old = encoded;
+        old[..4].copy_from_slice(b"PRA0");
+        assert!(PrivateRecoveryAuthorityProof::decode(&old).is_err());
+
+        let mut substitutions = Vec::new();
+        let mut changed = proof.clone();
+        changed.managed.runtime_deployment = DeploymentId([0x95; 32]);
+        substitutions.push(changed);
+        let mut changed = proof.clone();
+        changed.control = Hash([0x96; 32]);
+        substitutions.push(changed);
+        let mut changed = proof.clone();
+        changed.control_sequence += 1;
+        substitutions.push(changed);
+        let mut changed = proof.clone();
+        changed.control_previous = Some(Hash([0x97; 32]));
+        substitutions.push(changed);
+        let mut changed = proof.clone();
+        changed.next_epoch += 1;
+        substitutions.push(changed);
+        let mut changed = proof.clone();
+        changed.superseded_authority_head = Some(Hash([0x98; 32]));
+        substitutions.push(changed);
+        let mut changed = proof.clone();
+        changed.replacement_nodes[0] = NodeId([0x99; 32]);
+        changed.replacement_member_set =
+            private_member_set_commitment(changed.replacement_nodes.iter().copied()).unwrap();
+        substitutions.push(changed);
+        let mut changed = proof.clone();
+        changed.replacement_member_set = Hash([0x9a; 32]);
+        substitutions.push(changed);
+        let mut changed = proof.clone();
+        changed.replacement_identity_set = Hash([0x9b; 32]);
+        substitutions.push(changed);
+        let mut changed = proof.clone();
+        changed.recovery_evidence = Hash([0x9c; 32]);
+        substitutions.push(changed);
+        let mut changed = proof.clone();
+        changed.recovery_public_key = [0x9d; 32];
+        substitutions.push(changed);
+        let mut changed = proof.clone();
+        changed.signature[0] ^= 1;
+        substitutions.push(changed);
+        for changed in substitutions {
+            assert_ne!(changed.verify_with(&TestVerifier), Ok(()));
+        }
+
+        let mut relabeled_pctl_signature = proof.clone();
+        relabeled_pctl_signature.signature = control.signature;
+        assert_eq!(
+            relabeled_pctl_signature.verify_with(&TestVerifier),
+            Err(AuthorityOperationProtocolError::InvalidSignature)
+        );
+
+        let replacement_nodes: Vec<NodeId> = (1..=MAX_PRIVATE_NODES)
+            .map(|index| {
+                let mut bytes = [0; 32];
+                bytes[30..].copy_from_slice(&(index as u16).to_be_bytes());
+                NodeId(bytes)
+            })
+            .collect();
+        let mut maximum = PrivateRecoveryAuthorityProof {
+            managed: proof.managed,
+            control: Hash([0xa0; 32]),
+            control_sequence: 4_096,
+            control_previous: Some(Hash([0xa1; 32])),
+            next_epoch: 4_097,
+            superseded_authority_head: Some(Hash([0xa2; 32])),
+            replacement_member_set: private_member_set_commitment(
+                replacement_nodes.iter().copied(),
+            )
+            .unwrap(),
+            replacement_nodes,
+            replacement_identity_set: Hash([0xa3; 32]),
+            recovery_evidence: Hash([0xa4; 32]),
+            recovery_public_key: signer.recovery_public_key(),
+            signature: [0; 64],
+        };
+        maximum.signature = signer.sign_private_recovery_authority_proof(&maximum.signing_bytes());
+        assert_eq!(maximum.verify_with(&TestVerifier), Ok(()));
+        let maximum_proof_wire = maximum.encode().unwrap();
+        assert!(maximum_proof_wire.len() <= MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES);
+        let maximum_call = call_with_intent(
+            AuthorityOperationIntent::private_recovery_control(maximum).unwrap(),
+            0xa5,
+        );
+        let maximum_call_wire = maximum_call.encode().unwrap();
+        let maximum_approval_wire = approval(&maximum_call).encode().unwrap();
+        assert_eq!(maximum_proof_wire.len(), 8_634);
+        assert_eq!(maximum_call_wire.len(), 9_212);
+        assert_eq!(maximum_approval_wire.len(), 9_709);
+        assert!(maximum_call_wire.len() <= MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES);
+        assert!(maximum_approval_wire.len() <= MAX_AUTHORITY_OPERATION_APPROVAL_WIRE_BYTES);
+    }
+
+    #[test]
     fn every_intent_roundtrips_but_old_unknown_trailing_and_oversize_wires_fail_closed() {
         let runtime = DeploymentId([0x84; 32]);
         let controls = private_controls();
@@ -4004,12 +4440,12 @@ mod tests {
             AuthorityOperationIntent::invoke(&invocation_work()).unwrap(),
             catalog_intent(CatalogMutationKind::Publish),
             catalog_intent(CatalogMutationKind::Withdraw),
-            AuthorityOperationIntent::private_control(runtime, &controls[0]).unwrap(),
-            AuthorityOperationIntent::private_control(runtime, &controls[1]).unwrap(),
-            AuthorityOperationIntent::private_control(runtime, &controls[2]).unwrap(),
-            AuthorityOperationIntent::private_control(runtime, &controls[3]).unwrap(),
-            AuthorityOperationIntent::private_control(runtime, &controls[4]).unwrap(),
-            AuthorityOperationIntent::private_control(runtime, &controls[5]).unwrap(),
+            private_intent(runtime, &controls[0]),
+            private_intent(runtime, &controls[1]),
+            private_intent(runtime, &controls[2]),
+            private_intent(runtime, &controls[3]),
+            private_intent(runtime, &controls[4]),
+            private_intent(runtime, &controls[5]),
         ];
         for (index, intent) in intents.into_iter().enumerate() {
             let call = call_with_intent(intent, 0x85 + index as u8);
@@ -4026,7 +4462,7 @@ mod tests {
         let call = invoke_call();
         let bytes = call.encode().unwrap();
         let mut old = bytes.clone();
-        old[..4].copy_from_slice(b"AOC1");
+        old[..4].copy_from_slice(b"AOC3");
         assert!(AuthorityOperationCall::decode(&old).is_err());
         let mut old = bytes.clone();
         old[..4].copy_from_slice(b"AOC2");
@@ -4046,6 +4482,9 @@ mod tests {
         );
 
         let approved = approval(&call);
+        let mut old = approved.encode().unwrap();
+        old[..4].copy_from_slice(b"AOP3");
+        assert!(AuthorityOperationApproval::decode(&old).is_err());
         let mut old = approved.encode().unwrap();
         old[..4].copy_from_slice(b"AOP1");
         assert!(AuthorityOperationApproval::decode(&old).is_err());

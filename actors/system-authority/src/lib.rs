@@ -1,6 +1,6 @@
 //! Clean, portable policy actor for standard Agent management.
 //!
-//! The actor accepts canonical `ACC2` management calls, canonical `AOC3`
+//! The actor accepts canonical `ACC2` management calls, canonical `AOC4`
 //! general-operation calls, and self-authenticating `AAD3` identity-admin calls
 //! delivered with an exact clean `AIC1` invocation context. It performs policy,
 //! credential, and Admin-accessibility checks inside the guest and retains exact
@@ -29,6 +29,8 @@ use vos::agent_sdk::authority_operation::{
     AuthorityOperationIssuanceAck, PrivateControlApplicationAck, PrivateControlApplicationFact,
     private_member_set_commitment,
 };
+#[cfg(test)]
+use vos::agent_sdk::authority_operation::PrivateRecoveryAuthorityProof;
 use vos::agent_sdk::private::{
     ED25519_TRANSPORT_PEER_ID_BYTES, MAX_PRIVATE_NODES, NodeEncryptionEnrollment,
     NodeEncryptionEnrollmentVerifier, PRIVATE_SIGNATURE_BYTES, PrivateNodeIdentity,
@@ -74,11 +76,11 @@ pub const MAX_EXACT_RETRY_RECORDS: usize = 128;
 /// ceiling. Compact rows preserve exact PCA1 retry and invocation collision
 /// identity after a later control supersedes the current projection.
 pub const MAX_PRIVATE_APPLICATION_RECORDS: usize = 4_096;
-/// Worst-case canonical ACC2/AOC3/AAD3 calls plus MAP1/AOP3/AAR3 results and
+/// Worst-case canonical ACC2/AOC4/AAD3 calls plus MAP1/AOP4/AAR3 results and
 /// MAA2/AOI1 acknowledgements retained by the bounded exact-retry tables. This
 /// leaves over one MiB of the standard state ceiling for row metadata and
 /// actor framing.
-pub const MAX_RETAINED_EXACT_WIRE_BYTES: usize = MAX_EXACT_RETRY_RECORDS
+pub const MAX_RETAINED_EXACT_WIRE_BYTES: usize = MAX_AUTHORITY_CREDENTIALS
     * (MAX_INVOCATION_MESSAGE_BYTES + MAX_INVOCATION_REPLY_BYTES + MAX_INVOCATION_MESSAGE_BYTES);
 /// Policy will never authorize farther than this many logical slots after the
 /// slot at which unseen work was accepted.
@@ -737,7 +739,7 @@ pub struct LatestManagementAckRow {
     pub applied_at: u64,
 }
 
-/// Exact retained AOC3/AOP3 pair and, once observed, its exact AOI1. An
+/// Exact retained AOC4/AOP4 pair and, once observed, its exact AOI1. An
 /// out-of-order acknowledgement remains here until every earlier global
 /// authorization position is safe to cross.
 #[derive(
@@ -749,7 +751,7 @@ pub struct AuthorityOperationRetryRecord {
     pub acknowledgement_invocation: [u8; 32],
     pub credential: [u8; 32],
     pub request_sequence: u64,
-    /// Commitment of every caller-selected AOC3 field except the derived
+    /// Commitment of every caller-selected AOC4 field except the derived
     /// invocation and signature. This permits exact ID reconstruction after
     /// the full call preimage compacts.
     pub invocation_payload: [u8; 32],
@@ -768,7 +770,7 @@ pub struct AuthorityOperationRetryRecord {
 }
 
 /// The newest durably issued operation for one credential. Exact AOI1 bytes
-/// remain retryable, while the AOC3/AOP3 preimages are intentionally absent.
+/// remain retryable, while the AOC4/AOP4 preimages are intentionally absent.
 /// Older requests are rejected by the credential's monotonic high-water.
 #[derive(
     vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
@@ -790,7 +792,7 @@ pub struct LatestOperationAckRow {
     pub private_operation: Option<RetiredPrivateOperationRow>,
 }
 
-/// Exact Private-control intent fields which remain after the AOC3/AOP3/AOI1
+/// Exact Private-control intent fields which remain after the AOC4/AOP4/AOI1
 /// preimages retire. They let PCA1 prove the original operation without
 /// reconstructing or relabeling discarded bytes.
 #[derive(
@@ -813,13 +815,13 @@ pub struct RetiredPrivateOperationRow {
     pub control_sequence: u64,
     pub control_previous: Option<[u8; 32]>,
     pub epoch: u64,
-    /// Exact Invite/Revoke membership target retained from AOC3. The other
+    /// Exact Invite/Revoke membership target retained from AOC4. The other
     /// Private operations do not select one Node.
     pub node: Option<[u8; 32]>,
     /// Invite's exact transport/encryption identity commitment. A separate
     /// enrollment projection can bind this retained value before admission.
     pub node_identity: Option<[u8; 32]>,
-    /// Revoke and Rotate fix the complete post-apply set in AOC3. Invite fixes
+    /// Revoke and Rotate fix the complete post-apply set in AOC4. Invite fixes
     /// the invited Node identity, while only PCA1 can report the resulting set.
     pub post_member_set: Option<[u8; 32]>,
 }
@@ -1106,7 +1108,7 @@ impl SystemAuthority {
         finalize_application(&self.configuration, &mut self.state, &ack, &context)
     }
 
-    /// Verify one exact credential-signed AOC3 and return its canonical AOP3.
+    /// Verify one exact credential-signed AOC4 and return its canonical AOP4.
     /// The approval shares the management authorization clock and remains
     /// retained until its exact signed AOI1 is consumed.
     #[msg(linear)]
@@ -1441,9 +1443,9 @@ fn authorize_operation_call(
             let Ok(caller_index) = credential_index(state, call.credential) else {
                 return Vec::new();
             };
-            // Once AOI1 has advanced the floor, AOP3 bytes are intentionally
+            // Once AOI1 has advanced the floor, AOP4 bytes are intentionally
             // gone. The signed per-credential sequence rejects every retired
-            // AOC3 without synthesizing a result from commitments.
+            // AOC4 without synthesizing a result from commitments.
             if exact_retry_count(state) >= MAX_EXACT_RETRY_RECORDS
                 || state.credentials[caller_index]
                     .operation_request_high_water
@@ -2098,8 +2100,8 @@ fn acknowledge_operation_issuance(
     let ack_commitment = ack.commitment();
 
     // The credential-bounded latest result makes an exact AOI1 retry
-    // idempotent after its AOC3/AOP3 preimages compact. It deliberately cannot
-    // answer an AOC3 retry.
+    // idempotent after its AOC4/AOP4 preimages compact. It deliberately cannot
+    // answer an AOC4 retry.
     if let Some(latest) = state
         .latest_operation_acks
         .iter()
@@ -2446,22 +2448,15 @@ fn retained_private_operation(call: &AuthorityOperationCall) -> Option<RetiredPr
             None,
             Some(*member_set),
         ),
-        AuthorityOperationIntent::RecoverPrivateAgent {
-            control,
-            control_sequence,
-            control_previous,
-            epoch,
-            member_set,
-            ..
-        } => (
+        AuthorityOperationIntent::RecoverPrivateAgent { proof } => (
             AuthorityOperationKind::RecoverPrivateAgent,
-            *control,
-            *control_sequence,
-            *control_previous,
-            *epoch,
+            proof.control,
+            proof.control_sequence,
+            proof.control_previous,
+            proof.next_epoch,
             None,
             None,
-            Some(*member_set),
+            Some(proof.replacement_member_set),
         ),
         AuthorityOperationIntent::RotatePrivateKeys {
             control,
@@ -2743,7 +2738,7 @@ fn advance_operation_retirement_floor(state: &mut AuthorityLinearState) -> bool 
             private_application_invocation: record.private_application_invocation,
             private_operation: retained_private_operation(&call),
         };
-        // The durable floor is advanced before the retireable AOC3/AOP3
+        // The durable floor is advanced before the retireable AOC4/AOP4
         // buffers are removed. Actor state commits atomically, while this
         // ordering preserves the protocol's reopen rule explicitly.
         state.operation_retirement_floor = next;
@@ -3621,8 +3616,8 @@ fn operation_policy_allows(
         // mistaken for application until that runtime bridge exists.
         AuthorityOperationIntent::SetPrivateResourcePolicy { .. }
         | AuthorityOperationIntent::PrivateActorLifecycle { .. } => false,
-        // The AOC3 projection commits recovery evidence but does not prove a
-        // recovery kit or the current private control-chain head. Until an
+        // AOC4 carries PRA1, but this protocol-only cut deliberately does not
+        // verify it or the current private control-chain head. Until an
         // authenticated application fact supplies those checks, recovery is
         // not authorizable here; Admin credentials never substitute for keys.
         AuthorityOperationIntent::RecoverPrivateAgent { .. } => false,
@@ -4509,7 +4504,7 @@ fn retired_private_operation_is_valid(row: RetiredPrivateOperationRow) -> bool {
             && row.node_identity.is_none()
             && row.post_member_set.is_none()
     } else {
-        // Recovery AOC3 remains un-authorizable until an offline recovery
+        // Recovery AOC4 remains un-authorizable until an offline recovery
         // proof policy exists, so a retired Recover tombstone is unbacked.
         false
     };
@@ -5974,7 +5969,10 @@ mod tests {
             private_recovery: (profile == AgentProfile::Private).then_some(
                 vos::agent_sdk::PrivateRecoveryBinding {
                     signing_key_commitment: Hash([nonce_byte.wrapping_add(4); 32]),
-                    encryption_public_key: [nonce_byte.wrapping_add(5); 32],
+                    // Keep every marker-derived descriptor fixture on a
+                    // canonical X25519 public key, including marker bytes with
+                    // the high bit set.
+                    encryption_public_key: [0x42; 32],
                 },
             ),
             runtime_package: BlobRef::of_bytes(&[nonce_byte]),
@@ -6367,7 +6365,7 @@ mod tests {
     fn dispatch_operation(actor: &mut SystemAuthority, call: &AuthorityOperationCall) -> Vec<u8> {
         dispatch_operation_bytes(
             actor,
-            call.encode().expect("valid AOC3 fixture"),
+            call.encode().expect("valid AOC4 fixture"),
             Some(operation_context(call)),
         )
     }
@@ -6485,18 +6483,12 @@ mod tests {
                 *control_previous,
                 *epoch,
             ),
-            AuthorityOperationIntent::RecoverPrivateAgent {
-                control,
-                control_sequence,
-                control_previous,
-                epoch,
-                ..
-            } => (
+            AuthorityOperationIntent::RecoverPrivateAgent { proof } => (
                 AuthorityOperationKind::RecoverPrivateAgent,
-                *control,
-                *control_sequence,
-                *control_previous,
-                *epoch,
+                proof.control,
+                proof.control_sequence,
+                proof.control_previous,
+                proof.next_epoch,
             ),
             AuthorityOperationIntent::RotatePrivateKeys {
                 control,
@@ -8355,7 +8347,7 @@ mod tests {
     }
 
     #[test]
-    fn aoc3_none_node_exact_retry_restart_and_compaction_are_explicit() {
+    fn aoc4_none_node_exact_retry_restart_and_compaction_are_explicit() {
         let config = configuration();
         let mut actor = actor();
         let catalog = install_catalog_projection(&mut actor);
@@ -8399,7 +8391,7 @@ mod tests {
             None,
             None,
         )
-        .expect("pending AOC3/AOP3 must restart");
+        .expect("pending AOC4/AOP4 must restart");
         assert_eq!(dispatch_operation(&mut restarted, &call), approval_bytes);
 
         let ack = operation_issuance_ack(config, &call, &approval);
@@ -8410,7 +8402,7 @@ mod tests {
         assert!(dispatch_operation_ack(&mut restarted, &ack));
 
         // Compaction deliberately ends AOC exact retry: the high-water and
-        // latest AOI cannot be used to invent AOP3 bytes.
+        // latest AOI cannot be used to invent AOP4 bytes.
         let retired_state = restarted.state.clone();
         assert!(dispatch_operation(&mut restarted, &call).is_empty());
         assert_eq!(restarted.state, retired_state);
@@ -8836,14 +8828,25 @@ mod tests {
                 .is_ok()
         );
 
+        let replacement = node_for_principal(config, owner);
         let recover = AuthorityOperationIntent::RecoverPrivateAgent {
-            managed,
-            control: Hash([0xbe; 32]),
-            control_sequence: 2,
-            control_previous: Some(Hash([0xb8; 32])),
-            epoch: 3,
-            member_set: Hash([0xbf; 32]),
-            recovery_evidence: Hash([0xc0; 32]),
+            proof: PrivateRecoveryAuthorityProof {
+                managed,
+                control: Hash([0xbe; 32]),
+                control_sequence: 2,
+                control_previous: Some(Hash([0xb8; 32])),
+                next_epoch: 3,
+                superseded_authority_head: Some(Hash([0xb8; 32])),
+                replacement_nodes: vec![replacement],
+                replacement_member_set: private_member_set_commitment(core::iter::once(
+                    replacement,
+                ))
+                .unwrap(),
+                replacement_identity_set: Hash([0xbf; 32]),
+                recovery_evidence: Hash([0xc0; 32]),
+                recovery_public_key: signing(0xc1).verifying_key().to_bytes(),
+                signature: [0xc2; 64],
+            },
         };
         for (byte, key, principal, node) in [
             (0xc1, &owner_key, owner, None),
@@ -11382,7 +11385,7 @@ mod tests {
         );
         let approval =
             AuthorityOperationApproval::decode(&dispatch_operation(&mut actor, &pending_call))
-                .expect("the secondary credential must retain one pending AOC3/AOP3");
+                .expect("the secondary credential must retain one pending AOC4/AOP4");
 
         for (invocation, operation) in [
             (

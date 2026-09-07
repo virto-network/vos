@@ -2090,14 +2090,15 @@ where
             member_set: expected,
             ..
         }
-        | AuthorityOperationIntent::RecoverPrivateAgent {
-            member_set: expected,
-            ..
-        }
         | AuthorityOperationIntent::RotatePrivateKeys {
             member_set: expected,
             ..
         } if *expected != member_set => {
+            return Err(PrivateAgentHostError::InvalidMembership);
+        }
+        AuthorityOperationIntent::RecoverPrivateAgent { proof }
+            if proof.replacement_member_set != member_set =>
+        {
             return Err(PrivateAgentHostError::InvalidMembership);
         }
         _ => {}

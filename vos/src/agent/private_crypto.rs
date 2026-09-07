@@ -18,14 +18,15 @@ use sha2::Sha256;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
+use vos_agent_sdk::authority_operation::PrivateRecoveryAuthorityProofSigner;
 use vos_agent_sdk::private::{
     EncryptedObjectKind, EncryptedPrivateObject, MAX_PRIVATE_CIPHERTEXT_BYTES,
     MAX_PRIVATE_INVITE_HISTORY_EPOCHS, MAX_PRIVATE_NODES,
     MAX_PRIVATE_RECOVERY_KEYRING_CIPHERTEXT_BYTES, MAX_PRIVATE_RECOVERY_KEYRING_EPOCHS,
     NodeEncryptionEnrollmentVerifier, PRIVATE_INVITE_HISTORY_SEALED_KEY_BYTES, PRIVATE_NONCE_BYTES,
-    PrivateControlOperation, PrivateControlRecord, PrivateControlSigner, PrivateInviteHistoryGrant,
-    PrivateKeyEpoch, PrivateNodeIdentity, PrivateRecoveryKeyringGrant, SealedPrivateKey,
-    SealedRecoveryKey, recovery_signing_public_key_commitment,
+    PRIVATE_SIGNATURE_BYTES, PrivateControlOperation, PrivateControlRecord, PrivateControlSigner,
+    PrivateInviteHistoryGrant, PrivateKeyEpoch, PrivateNodeIdentity, PrivateRecoveryKeyringGrant,
+    SealedPrivateKey, SealedRecoveryKey, recovery_signing_public_key_commitment,
     valid_x25519_public_key as sdk_valid_x25519_public_key,
 };
 use vos_agent_sdk::{AgentId, Hash, NodeId, PrincipalId, SpaceId};
@@ -188,6 +189,21 @@ impl RecoverySigningKey {
 
     pub fn commitment(&self) -> Hash {
         recovery_public_key_commitment(&self.verifying_key())
+    }
+}
+
+impl PrivateRecoveryAuthorityProofSigner for RecoverySigningKey {
+    fn recovery_public_key(&self) -> [u8; SECRET_BYTES] {
+        self.verifying_key()
+    }
+
+    fn sign_private_recovery_authority_proof(
+        &self,
+        message: &[u8],
+    ) -> [u8; PRIVATE_SIGNATURE_BYTES] {
+        SigningKey::from_bytes(self.0.bytes())
+            .sign(message)
+            .to_bytes()
     }
 }
 
