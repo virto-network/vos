@@ -64,6 +64,8 @@ pub mod private_crypto;
 #[cfg(feature = "private-agent-store")]
 pub mod private_host;
 #[cfg(feature = "private-agent-store")]
+pub mod private_runtime;
+#[cfg(feature = "private-agent-store")]
 pub mod private_store;
 #[cfg(feature = "private-agent-store")]
 pub mod private_sync;

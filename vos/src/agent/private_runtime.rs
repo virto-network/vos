@@ -1,0 +1,3662 @@
+//! Canonical node-local evidence for Private Agent runtime state.
+//!
+//! This module owns three clean-generation formats:
+//!
+//! - `PVRI1` is the exact node-local runtime image paired with one immutable
+//!   Private Store core position.
+//! - `PAPL1` is the pending/completed application of one exact PCTL. It keeps
+//!   the receipt and AOI1 preimages but can represent only a positive result.
+//! - `PCRS2` reopens the exact completed application, Store position, and
+//!   successor runtime image before downstream PCAF/PCA1/PSE2 evidence exists.
+//!
+//! The Store position deliberately excludes PVRI/PAPL/PCRS and every
+//! authority acknowledgement derived from them. This preserves the acyclic
+//! commitment order `AOI1 -> PAPL1 -> (PVRI1, Store) -> PCRS2/PCAF -> PCA1 ->
+//! PSE2`. Runtime images and applications include the local NodeId and are
+//! never suitable as cross-replica equality claims; only
+//! [`PrivateRuntimeStableProjection`] is replica-stable.
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::fmt;
+
+use vos_agent_sdk::authority::{
+    AuthorityOperationKind, AuthorityReceipt, AuthorityVerifier, ManagedAgentTarget,
+};
+use vos_agent_sdk::authority_operation::{
+    AuthorityOperationIssuanceAck, MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES,
+    MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES, PrivateRecoveryAuthorityProof,
+    PrivateRecoveryAuthorityProofVerifier,
+};
+use vos_agent_sdk::contract::RuntimeResourcePolicy;
+use vos_agent_sdk::private::{
+    MAX_PRIVATE_RECOVERY_KEYRING_EPOCHS, PrivateControlOperation, PrivateControlRecord,
+    PrivateKeyEpoch, recovery_signing_public_key_commitment,
+};
+use vos_agent_sdk::wire::{
+    CanonicalWire, MAX_ACTOR_ENTRY_WIRE_BYTES, MAX_AUTHORITY_RECEIPT_WIRE_BYTES,
+    MAX_PRIVATE_CONTROL_WIRE_BYTES, MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES,
+};
+use vos_agent_sdk::{
+    ActorEntry, ActorId, AgentDescriptor, AgentId, AgentProfile, BlobRef, DeploymentId, Hash,
+    MAX_CATALOG_ARTIFACT_BYTES, MAX_RUNTIME_STATE_BYTES, ManagementReply, ManagementRequest,
+    NodeId, PrincipalId, PrivateRuntimeMutation, RUNTIME_ABI_ID, RuntimeOutcome, RuntimeState,
+    RuntimeTransition, SpaceId,
+};
+use vos_protocol::wire::{DecodeError, Decoder, Encoder};
+
+use super::private_store::{MAX_PRIVATE_STORE_CONTROLS, MAX_PRIVATE_STORE_OBJECTS};
+
+const HEADER_BYTES: usize = 4 + 32;
+const PRIVATE_CONTROL_ONLY_REPLAY_DOMAIN: &[u8] = b"vos/agent/private-control-only-replay/v1";
+const PRIVATE_KEY_EPOCH_WIRE_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/private-key-epoch-wire/v1";
+const PRIVATE_KEY_EPOCH_ROOT_DOMAIN: &[u8] = b"vos/agent/private-key-epoch-root/v1";
+const PRIVATE_STORE_CORE_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/private-store-core/v1";
+const PRIVATE_RUNTIME_POLICY_COMMITMENT_DOMAIN: &[u8] =
+    b"vos/agent/private-runtime-resource-policy/v1";
+const PRIVATE_RUNTIME_SUCCESS_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/private-runtime-success/v1";
+const PRIVATE_RUNTIME_STABLE_PROJECTION_COMMITMENT_DOMAIN: &[u8] =
+    b"vos/agent/private-runtime-stable-projection/v1";
+const PRIVATE_RUNTIME_CONTROL_STATE_COMMITMENT_DOMAIN: &[u8] =
+    b"vos/agent/private-runtime-control-state/v1";
+const PRIVATE_RUNTIME_IMAGE_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/private-runtime-image/v1";
+const PRIVATE_RUNTIME_APPLICATION_COMMITMENT_DOMAIN: &[u8] =
+    b"vos/agent/private-runtime-application/v1";
+const PRIVATE_CONTROL_REOPENED_STATE_COMMITMENT_DOMAIN: &[u8] =
+    b"vos/agent/private-control-reopened-state/v2";
+
+/// One genesis epoch plus one successor for every admitted PCTL.
+pub const MAX_PRIVATE_RUNTIME_KEY_EPOCHS: usize = MAX_PRIVATE_RECOVERY_KEYRING_EPOCHS + 1;
+/// A success is either `ControlOnly` or one bounded Private management reply.
+pub const MAX_PRIVATE_RUNTIME_SUCCESS_WIRE_BYTES: usize =
+    HEADER_BYTES + 1 + 4 + HEADER_BYTES + 32 + MAX_ACTOR_ENTRY_WIRE_BYTES;
+/// Fixed-size exact commitment to one canonical PKEY preimage.
+pub const PRIVATE_KEY_EPOCH_COMMITMENT_WIRE_BYTES: usize = HEADER_BYTES + 8 + 32;
+/// Maximum exact node-local PVRI1 image.
+pub const MAX_PRIVATE_RUNTIME_IMAGE_WIRE_BYTES: usize = MAX_RUNTIME_STATE_BYTES
+    + MAX_PRIVATE_RUNTIME_KEY_EPOCHS * (4 + PRIVATE_KEY_EPOCH_COMMITMENT_WIRE_BYTES)
+    + 16 * 1024;
+/// Maximum pending/completed PAPL1 application.
+pub const MAX_PRIVATE_RUNTIME_APPLICATION_WIRE_BYTES: usize = MAX_PRIVATE_CONTROL_WIRE_BYTES
+    + MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES
+    + MAX_AUTHORITY_RECEIPT_WIRE_BYTES
+    + MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES
+    + MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES
+    + MAX_PRIVATE_RUNTIME_SUCCESS_WIRE_BYTES
+    + 32 * 1024;
+/// Maximum reopened PCRS2 aggregate.
+pub const MAX_PRIVATE_CONTROL_REOPENED_STATE_WIRE_BYTES: usize =
+    MAX_PRIVATE_RUNTIME_APPLICATION_WIRE_BYTES + MAX_PRIVATE_RUNTIME_IMAGE_WIRE_BYTES + 16 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivateRuntimeEvidenceError {
+    InvalidDescriptor,
+    InvalidState,
+    InvalidStorePosition,
+    InvalidKeyEpochs,
+    InvalidControl,
+    InvalidAuthority,
+    InvalidApplication,
+    InvalidSuccess,
+    InvalidProjection,
+    LimitExceeded,
+}
+
+impl fmt::Display for PrivateRuntimeEvidenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid Private runtime evidence: {self:?}")
+    }
+}
+
+impl core::error::Error for PrivateRuntimeEvidenceError {}
+
+fn nonzero_option(value: Option<Hash>) -> bool {
+    value.is_none_or(|value| value != Hash::ZERO)
+}
+
+fn encode_optional_hash(encoder: &mut Encoder<'_>, value: Option<Hash>) {
+    encoder.option(&value, |encoder, value| encoder.fixed(value.as_bytes()));
+}
+
+fn decode_optional_hash(decoder: &mut Decoder<'_>) -> Result<Option<Hash>, DecodeError> {
+    decoder.option(|decoder| {
+        let value = Hash(decoder.fixed()?);
+        (value != Hash::ZERO)
+            .then_some(value)
+            .ok_or(DecodeError::NonCanonical)
+    })
+}
+
+fn encode_optional_u64(encoder: &mut Encoder<'_>, value: Option<u64>) {
+    encoder.option(&value, |encoder, value| encoder.u64(*value));
+}
+
+fn decode_optional_u64(decoder: &mut Decoder<'_>) -> Result<Option<u64>, DecodeError> {
+    decoder.option(Decoder::u64)
+}
+
+fn encode_managed(encoder: &mut Encoder<'_>, managed: ManagedAgentTarget) {
+    encoder.fixed(managed.space.as_bytes());
+    encoder.fixed(managed.agent.as_bytes());
+    encoder.fixed(managed.runtime_deployment.as_bytes());
+}
+
+fn decode_managed(decoder: &mut Decoder<'_>) -> Result<ManagedAgentTarget, DecodeError> {
+    let managed = ManagedAgentTarget {
+        space: SpaceId(decoder.fixed()?),
+        agent: AgentId(decoder.fixed()?),
+        runtime_deployment: DeploymentId(decoder.fixed()?),
+    };
+    managed
+        .is_valid()
+        .then_some(managed)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn encode_blob(encoder: &mut Encoder<'_>, value: &BlobRef) {
+    encoder.fixed(value.hash.as_bytes());
+    encoder.u64(value.len);
+}
+
+fn decode_blob(decoder: &mut Decoder<'_>) -> Result<BlobRef, DecodeError> {
+    let value = BlobRef {
+        hash: Hash(decoder.fixed()?),
+        len: decoder.u64()?,
+    };
+    valid_runtime_package(&value)
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn valid_runtime_package(value: &BlobRef) -> bool {
+    value.hash != Hash::ZERO && value.len != 0 && value.len <= MAX_CATALOG_ARTIFACT_BYTES
+}
+
+fn encode_nested<T: CanonicalWire>(encoder: &mut Encoder<'_>, value: &T) {
+    encoder.bytes(
+        &value
+            .encode()
+            .expect("validated Private runtime evidence nested wire"),
+    );
+}
+
+fn decode_nested<T: CanonicalWire>(
+    decoder: &mut Decoder<'_>,
+    maximum: usize,
+) -> Result<T, DecodeError> {
+    let bytes = decoder.bytes_ref_bounded(maximum)?;
+    let value = T::decode(bytes).map_err(|_| DecodeError::NonCanonical)?;
+    if value
+        .encode()
+        .map_or(true, |canonical| canonical.as_slice() != bytes)
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(value)
+}
+
+fn encode_runtime_state(encoder: &mut Encoder<'_>, state: &RuntimeState) {
+    encoder.bytes(&state.control);
+    encoder.bytes(&state.linear);
+    encoder.bytes(&state.merge);
+    encoder.bytes(&state.local);
+}
+
+fn decode_runtime_state(decoder: &mut Decoder<'_>) -> Result<RuntimeState, DecodeError> {
+    let control = decoder.bytes_bounded(MAX_RUNTIME_STATE_BYTES)?;
+    let mut remaining = MAX_RUNTIME_STATE_BYTES.saturating_sub(control.len());
+    let linear = decoder.bytes_bounded(remaining)?;
+    remaining = remaining.saturating_sub(linear.len());
+    let merge = decoder.bytes_bounded(remaining)?;
+    remaining = remaining.saturating_sub(merge.len());
+    let local = decoder.bytes_bounded(remaining)?;
+    let state = RuntimeState {
+        control,
+        linear,
+        merge,
+        local,
+    };
+    (state.validate() && state.linear.is_empty())
+        .then_some(state)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn resource_policy_commitment(
+    policy: RuntimeResourcePolicy,
+) -> Result<Hash, PrivateRuntimeEvidenceError> {
+    let bytes = policy
+        .encode()
+        .map_err(|_| PrivateRuntimeEvidenceError::InvalidProjection)?;
+    Ok(Hash::digest(
+        PRIVATE_RUNTIME_POLICY_COMMITMENT_DOMAIN,
+        &[RUNTIME_ABI_ID.as_bytes(), &bytes],
+    ))
+}
+
+fn control_state_commitment(control: &[u8]) -> Hash {
+    Hash::digest(
+        PRIVATE_RUNTIME_CONTROL_STATE_COMMITMENT_DOMAIN,
+        &[RUNTIME_ABI_ID.as_bytes(), control],
+    )
+}
+
+/// Exact identity of one canonical PKEY preimage without retaining its sealed
+/// envelopes in every runtime image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrivateKeyEpochCommitment {
+    epoch: u64,
+    exact_wire: Hash,
+}
+
+impl PrivateKeyEpochCommitment {
+    pub fn from_epoch(epoch: &PrivateKeyEpoch) -> Result<Self, PrivateRuntimeEvidenceError> {
+        let wire = epoch
+            .encode()
+            .map_err(|_| PrivateRuntimeEvidenceError::InvalidKeyEpochs)?;
+        let value = Self {
+            epoch: epoch.epoch,
+            exact_wire: Hash::digest(
+                PRIVATE_KEY_EPOCH_WIRE_COMMITMENT_DOMAIN,
+                &[RUNTIME_ABI_ID.as_bytes(), &wire],
+            ),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub const fn exact_wire(&self) -> Hash {
+        self.exact_wire
+    }
+
+    pub fn validate(&self) -> Result<(), PrivateRuntimeEvidenceError> {
+        if self.exact_wire == Hash::ZERO {
+            return Err(PrivateRuntimeEvidenceError::InvalidKeyEpochs);
+        }
+        Ok(())
+    }
+}
+
+impl CanonicalWire for PrivateKeyEpochCommitment {
+    const MAGIC: [u8; 4] = *b"PKE1";
+    const MAX_ENCODED_BYTES: usize = PRIVATE_KEY_EPOCH_COMMITMENT_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encoder.u64(self.epoch);
+        encoder.fixed(self.exact_wire.as_bytes());
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            epoch: decoder.u64()?,
+            exact_wire: Hash(decoder.fixed()?),
+        };
+        value.validate().map_err(|_| DecodeError::NonCanonical)?;
+        Ok(value)
+    }
+}
+
+fn validate_key_epochs(
+    values: &[PrivateKeyEpochCommitment],
+) -> Result<(), PrivateRuntimeEvidenceError> {
+    if values.is_empty()
+        || values.len() > MAX_PRIVATE_RUNTIME_KEY_EPOCHS
+        || values[0].epoch != 0
+        || values.iter().any(|value| value.validate().is_err())
+        || !values.windows(2).all(|pair| pair[0].epoch < pair[1].epoch)
+    {
+        return Err(PrivateRuntimeEvidenceError::InvalidKeyEpochs);
+    }
+    Ok(())
+}
+
+pub fn private_key_epoch_root(
+    values: &[PrivateKeyEpochCommitment],
+) -> Result<Hash, PrivateRuntimeEvidenceError> {
+    validate_key_epochs(values)?;
+    let mut bytes = Vec::with_capacity(4 + values.len() * 40);
+    let mut encoder = Encoder(&mut bytes);
+    encoder.u32(values.len() as u32);
+    for value in values {
+        encoder.u64(value.epoch);
+        encoder.fixed(value.exact_wire.as_bytes());
+    }
+    Ok(Hash::digest(
+        PRIVATE_KEY_EPOCH_ROOT_DOMAIN,
+        &[RUNTIME_ABI_ID.as_bytes(), &bytes],
+    ))
+}
+
+/// Cycle-free position in the ciphertext/control Store.
+///
+/// `object_root`, `control_root`, and `key_epoch_root` commit only Store core
+/// indices. In particular they must never include PVRI, PAPL, PCRS, PCAF,
+/// PCA1, or PSE2 bytes. A later Store row may attach those values alongside
+/// this immutable core position without changing its commitment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrivateStoreCorePosition {
+    space: SpaceId,
+    agent: AgentId,
+    owner: PrincipalId,
+    epoch: u64,
+    control_head: Option<Hash>,
+    next_sequence: u64,
+    object_count: u32,
+    object_root: Option<Hash>,
+    control_count: u32,
+    control_root: Option<Hash>,
+    key_epoch_root: Hash,
+}
+
+impl PrivateStoreCorePosition {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        space: SpaceId,
+        agent: AgentId,
+        owner: PrincipalId,
+        epoch: u64,
+        control_head: Option<Hash>,
+        next_sequence: u64,
+        object_count: u32,
+        object_root: Option<Hash>,
+        control_count: u32,
+        control_root: Option<Hash>,
+        key_epoch_root: Hash,
+    ) -> Result<Self, PrivateRuntimeEvidenceError> {
+        let value = Self {
+            space,
+            agent,
+            owner,
+            epoch,
+            control_head,
+            next_sequence,
+            object_count,
+            object_root,
+            control_count,
+            control_root,
+            key_epoch_root,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub const fn space(&self) -> SpaceId {
+        self.space
+    }
+    pub const fn agent(&self) -> AgentId {
+        self.agent
+    }
+    pub const fn owner(&self) -> PrincipalId {
+        self.owner
+    }
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+    pub const fn control_head(&self) -> Option<Hash> {
+        self.control_head
+    }
+    pub const fn next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+    pub const fn object_count(&self) -> u32 {
+        self.object_count
+    }
+    pub const fn object_root(&self) -> Option<Hash> {
+        self.object_root
+    }
+    pub const fn control_count(&self) -> u32 {
+        self.control_count
+    }
+    pub const fn control_root(&self) -> Option<Hash> {
+        self.control_root
+    }
+    pub const fn key_epoch_root(&self) -> Hash {
+        self.key_epoch_root
+    }
+
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(
+            PRIVATE_STORE_CORE_COMMITMENT_DOMAIN,
+            &[&self.encode().expect("valid PSC1")],
+        )
+    }
+
+    pub fn validate(&self) -> Result<(), PrivateRuntimeEvidenceError> {
+        let object_shape = match (self.object_count, self.object_root) {
+            (0, None) => true,
+            (count, Some(root)) => count > 0 && root != Hash::ZERO,
+            _ => false,
+        };
+        let control_shape = match (
+            self.control_count,
+            self.control_head,
+            self.control_root,
+            self.next_sequence,
+        ) {
+            (0, None, None, 0) => true,
+            (count, Some(head), Some(root), next) => {
+                count > 0 && head != Hash::ZERO && root != Hash::ZERO && next > 0
+            }
+            _ => false,
+        };
+        if self.space == SpaceId::ZERO
+            || self.agent == AgentId::ZERO
+            || self.owner == PrincipalId::ZERO
+            || self.object_count as usize > MAX_PRIVATE_STORE_OBJECTS
+            || self.control_count as usize > MAX_PRIVATE_STORE_CONTROLS
+            || self.key_epoch_root == Hash::ZERO
+            || !object_shape
+            || !control_shape
+        {
+            return Err(PrivateRuntimeEvidenceError::InvalidStorePosition);
+        }
+        Ok(())
+    }
+}
+
+impl CanonicalWire for PrivateStoreCorePosition {
+    const MAGIC: [u8; 4] = *b"PSC1";
+    const MAX_ENCODED_BYTES: usize = HEADER_BYTES + 32 * 8 + 64;
+
+    fn validate_wire(&self) -> bool {
+        self.validate().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encoder.fixed(self.space.as_bytes());
+        encoder.fixed(self.agent.as_bytes());
+        encoder.fixed(self.owner.as_bytes());
+        encoder.u64(self.epoch);
+        encode_optional_hash(encoder, self.control_head);
+        encoder.u64(self.next_sequence);
+        encoder.u32(self.object_count);
+        encode_optional_hash(encoder, self.object_root);
+        encoder.u32(self.control_count);
+        encode_optional_hash(encoder, self.control_root);
+        encoder.fixed(self.key_epoch_root.as_bytes());
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            space: SpaceId(decoder.fixed()?),
+            agent: AgentId(decoder.fixed()?),
+            owner: PrincipalId(decoder.fixed()?),
+            epoch: decoder.u64()?,
+            control_head: decode_optional_hash(decoder)?,
+            next_sequence: decoder.u64()?,
+            object_count: decoder.u32()?,
+            object_root: decode_optional_hash(decoder)?,
+            control_count: decoder.u32()?,
+            control_root: decode_optional_hash(decoder)?,
+            key_epoch_root: Hash(decoder.fixed()?),
+        };
+        value.validate().map_err(|_| DecodeError::NonCanonical)?;
+        Ok(value)
+    }
+}
+
+/// Exact positive disposition of one PCTL application.
+///
+/// This type has no error or denial variant. A guest rejection is local and
+/// must not enter PAPL/PCRS or any downstream authority evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrivateRuntimeSuccess {
+    /// Invite, Revoke, RotateKeys, and Recover change Store policy only and
+    /// never enter the guest runtime ABI.
+    ControlOnly,
+    ResourcePolicySet(RuntimeResourcePolicy),
+    Installed(ActorEntry),
+    Upgraded(ActorEntry),
+    Suspended(ActorEntry),
+    Resumed(ActorEntry),
+    Removed(ActorId),
+}
+
+impl PrivateRuntimeSuccess {
+    fn tag(&self) -> u8 {
+        match self {
+            Self::ControlOnly => 0,
+            Self::ResourcePolicySet(_) => 1,
+            Self::Installed(_) => 2,
+            Self::Upgraded(_) => 3,
+            Self::Suspended(_) => 4,
+            Self::Resumed(_) => 5,
+            Self::Removed(_) => 6,
+        }
+    }
+
+    pub fn management_reply(&self) -> Option<ManagementReply> {
+        match self {
+            Self::ControlOnly => None,
+            Self::ResourcePolicySet(value) => Some(ManagementReply::ResourcePolicySet(*value)),
+            Self::Installed(value) => Some(ManagementReply::Installed(value.clone())),
+            Self::Upgraded(value) => Some(ManagementReply::Upgraded(value.clone())),
+            Self::Suspended(value) => Some(ManagementReply::Suspended(value.clone())),
+            Self::Resumed(value) => Some(ManagementReply::Resumed(value.clone())),
+            Self::Removed(value) => Some(ManagementReply::Removed(*value)),
+        }
+    }
+
+    fn transition_wire(&self) -> Result<Option<Vec<u8>>, PrivateRuntimeEvidenceError> {
+        let Some(reply) = self.management_reply() else {
+            return Ok(None);
+        };
+        let transition = RuntimeTransition {
+            state: RuntimeState::default(),
+            outcome: RuntimeOutcome::Management(Ok(reply)),
+        };
+        let bytes = transition
+            .encode()
+            .map_err(|_| PrivateRuntimeEvidenceError::InvalidSuccess)?;
+        if bytes.len() > MAX_PRIVATE_RUNTIME_SUCCESS_WIRE_BYTES {
+            return Err(PrivateRuntimeEvidenceError::LimitExceeded);
+        }
+        Ok(Some(bytes))
+    }
+
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(
+            PRIVATE_RUNTIME_SUCCESS_COMMITMENT_DOMAIN,
+            &[&self.encode().expect("valid PSD1")],
+        )
+    }
+
+    pub fn validate(&self) -> Result<(), PrivateRuntimeEvidenceError> {
+        if matches!(self, Self::ControlOnly) {
+            return Ok(());
+        }
+        self.transition_wire().map(|_| ())
+    }
+}
+
+impl CanonicalWire for PrivateRuntimeSuccess {
+    const MAGIC: [u8; 4] = *b"PSD1";
+    const MAX_ENCODED_BYTES: usize = MAX_PRIVATE_RUNTIME_SUCCESS_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encoder.u8(self.tag());
+        if let Some(bytes) = self
+            .transition_wire()
+            .expect("validated Private runtime success")
+        {
+            encoder.bytes(&bytes);
+        }
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let tag = decoder.u8()?;
+        if tag == 0 {
+            return Ok(Self::ControlOnly);
+        }
+        let bytes = decoder.bytes_ref_bounded(MAX_PRIVATE_RUNTIME_SUCCESS_WIRE_BYTES)?;
+        let transition = RuntimeTransition::decode(bytes).map_err(|_| DecodeError::NonCanonical)?;
+        if transition
+            .encode()
+            .map_or(true, |canonical| canonical.as_slice() != bytes)
+            || !transition.state.is_empty()
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        let RuntimeOutcome::Management(Ok(reply)) = transition.outcome else {
+            return Err(DecodeError::NonCanonical);
+        };
+        let value = match (tag, reply) {
+            (1, ManagementReply::ResourcePolicySet(value)) => Self::ResourcePolicySet(value),
+            (2, ManagementReply::Installed(value)) => Self::Installed(value),
+            (3, ManagementReply::Upgraded(value)) => Self::Upgraded(value),
+            (4, ManagementReply::Suspended(value)) => Self::Suspended(value),
+            (5, ManagementReply::Resumed(value)) => Self::Resumed(value),
+            (6, ManagementReply::Removed(value)) => Self::Removed(value),
+            _ => return Err(DecodeError::NonCanonical),
+        };
+        value.validate().map_err(|_| DecodeError::NonCanonical)?;
+        Ok(value)
+    }
+}
+
+/// Replica-stable projection of the Private control application chain.
+///
+/// It deliberately excludes NodeId, applied slot, Store roots, raw runtime
+/// state, and Merge/Local bytes. Every successor commits the exact previous
+/// projection, full application replay, positive disposition, and active
+/// RRP1 value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrivateRuntimeStableProjection {
+    managed: ManagedAgentTarget,
+    descriptor: Hash,
+    runtime_package: BlobRef,
+    generation: u64,
+    previous: Option<Hash>,
+    control_head: Option<Hash>,
+    control_sequence: Option<u64>,
+    full_replay: Option<Hash>,
+    disposition: Option<Hash>,
+    control_state: Hash,
+    active_resource_policy: RuntimeResourcePolicy,
+    active_resource_policy_commitment: Hash,
+}
+
+impl PrivateRuntimeStableProjection {
+    pub fn genesis(
+        managed: ManagedAgentTarget,
+        descriptor: Hash,
+        runtime_package: BlobRef,
+        active_resource_policy: RuntimeResourcePolicy,
+        control_state: &[u8],
+    ) -> Result<Self, PrivateRuntimeEvidenceError> {
+        let value = Self {
+            managed,
+            descriptor,
+            runtime_package,
+            generation: 0,
+            previous: None,
+            control_head: None,
+            control_sequence: None,
+            full_replay: None,
+            disposition: None,
+            control_state: control_state_commitment(control_state),
+            active_resource_policy,
+            active_resource_policy_commitment: resource_policy_commitment(active_resource_policy)?,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn successor(
+        previous: &Self,
+        control: &PrivateControlRecord,
+        full_replay: Hash,
+        success: &PrivateRuntimeSuccess,
+        active_resource_policy: RuntimeResourcePolicy,
+        control_state: &[u8],
+    ) -> Result<Self, PrivateRuntimeEvidenceError> {
+        Self::successor_with_control_commitment(
+            previous,
+            control,
+            full_replay,
+            success,
+            active_resource_policy,
+            control_state_commitment(control_state),
+        )
+    }
+
+    fn successor_with_control_commitment(
+        previous: &Self,
+        control: &PrivateControlRecord,
+        full_replay: Hash,
+        success: &PrivateRuntimeSuccess,
+        active_resource_policy: RuntimeResourcePolicy,
+        control_state: Hash,
+    ) -> Result<Self, PrivateRuntimeEvidenceError> {
+        previous.validate()?;
+        if full_replay == Hash::ZERO || control_state == Hash::ZERO || !control.validate_shape() {
+            return Err(PrivateRuntimeEvidenceError::InvalidProjection);
+        }
+        let value = Self {
+            managed: previous.managed,
+            descriptor: previous.descriptor,
+            runtime_package: previous.runtime_package.clone(),
+            generation: previous
+                .generation
+                .checked_add(1)
+                .ok_or(PrivateRuntimeEvidenceError::LimitExceeded)?,
+            previous: Some(previous.commitment()),
+            control_head: Some(control.commitment()),
+            control_sequence: Some(control.sequence),
+            full_replay: Some(full_replay),
+            disposition: Some(success.commitment()),
+            control_state,
+            active_resource_policy,
+            active_resource_policy_commitment: resource_policy_commitment(active_resource_policy)?,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub const fn managed(&self) -> ManagedAgentTarget {
+        self.managed
+    }
+    pub const fn descriptor(&self) -> Hash {
+        self.descriptor
+    }
+    pub fn runtime_package(&self) -> &BlobRef {
+        &self.runtime_package
+    }
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub const fn previous(&self) -> Option<Hash> {
+        self.previous
+    }
+    pub const fn control_head(&self) -> Option<Hash> {
+        self.control_head
+    }
+    pub const fn control_sequence(&self) -> Option<u64> {
+        self.control_sequence
+    }
+    pub const fn full_replay(&self) -> Option<Hash> {
+        self.full_replay
+    }
+    pub const fn disposition(&self) -> Option<Hash> {
+        self.disposition
+    }
+    pub const fn control_state(&self) -> Hash {
+        self.control_state
+    }
+    pub const fn active_resource_policy(&self) -> RuntimeResourcePolicy {
+        self.active_resource_policy
+    }
+    pub const fn active_resource_policy_commitment(&self) -> Hash {
+        self.active_resource_policy_commitment
+    }
+
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(
+            PRIVATE_RUNTIME_STABLE_PROJECTION_COMMITMENT_DOMAIN,
+            &[&self.encode().expect("valid PSP1")],
+        )
+    }
+
+    pub fn validate(&self) -> Result<(), PrivateRuntimeEvidenceError> {
+        if !self.managed.is_valid()
+            || self.descriptor == Hash::ZERO
+            || !valid_runtime_package(&self.runtime_package)
+            || self.control_state == Hash::ZERO
+            || !self.active_resource_policy.is_valid()
+            || resource_policy_commitment(self.active_resource_policy)?
+                != self.active_resource_policy_commitment
+            || self.active_resource_policy_commitment == Hash::ZERO
+        {
+            return Err(PrivateRuntimeEvidenceError::InvalidProjection);
+        }
+        let genesis = self.generation == 0
+            && self.previous.is_none()
+            && self.control_head.is_none()
+            && self.control_sequence.is_none()
+            && self.full_replay.is_none()
+            && self.disposition.is_none();
+        let successor = self.generation > 0
+            && nonzero_option(self.previous)
+            && self.previous.is_some()
+            && nonzero_option(self.control_head)
+            && self.control_head.is_some()
+            && self.control_sequence.is_some()
+            && nonzero_option(self.full_replay)
+            && self.full_replay.is_some()
+            && nonzero_option(self.disposition)
+            && self.disposition.is_some();
+        if !genesis && !successor {
+            return Err(PrivateRuntimeEvidenceError::InvalidProjection);
+        }
+        Ok(())
+    }
+}
+
+impl CanonicalWire for PrivateRuntimeStableProjection {
+    const MAGIC: [u8; 4] = *b"PSP1";
+    const MAX_ENCODED_BYTES: usize = 1024;
+
+    fn validate_wire(&self) -> bool {
+        self.validate().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_managed(encoder, self.managed);
+        encoder.fixed(self.descriptor.as_bytes());
+        encode_blob(encoder, &self.runtime_package);
+        encoder.u64(self.generation);
+        encode_optional_hash(encoder, self.previous);
+        encode_optional_hash(encoder, self.control_head);
+        encode_optional_u64(encoder, self.control_sequence);
+        encode_optional_hash(encoder, self.full_replay);
+        encode_optional_hash(encoder, self.disposition);
+        encoder.fixed(self.control_state.as_bytes());
+        encode_nested(encoder, &self.active_resource_policy);
+        encoder.fixed(self.active_resource_policy_commitment.as_bytes());
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            managed: decode_managed(decoder)?,
+            descriptor: Hash(decoder.fixed()?),
+            runtime_package: decode_blob(decoder)?,
+            generation: decoder.u64()?,
+            previous: decode_optional_hash(decoder)?,
+            control_head: decode_optional_hash(decoder)?,
+            control_sequence: decode_optional_u64(decoder)?,
+            full_replay: decode_optional_hash(decoder)?,
+            disposition: decode_optional_hash(decoder)?,
+            control_state: Hash(decoder.fixed()?),
+            active_resource_policy: decode_nested(
+                decoder,
+                vos_agent_sdk::wire::MAX_RUNTIME_RESOURCE_POLICY_WIRE_BYTES,
+            )?,
+            active_resource_policy_commitment: Hash(decoder.fixed()?),
+        };
+        value.validate().map_err(|_| DecodeError::NonCanonical)?;
+        Ok(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrivateRuntimeControlPosition {
+    pub control: Hash,
+    pub sequence: u64,
+}
+
+impl PrivateRuntimeControlPosition {
+    fn validate(self) -> bool {
+        self.control != Hash::ZERO
+    }
+}
+
+/// Exact node-local Private runtime image (`PVRI1`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrivateRuntimeImage {
+    managed: ManagedAgentTarget,
+    node: NodeId,
+    owner: PrincipalId,
+    descriptor: Hash,
+    runtime_package: BlobRef,
+    runtime_deployment: DeploymentId,
+    state: RuntimeState,
+    active_resource_policy: RuntimeResourcePolicy,
+    active_resource_policy_commitment: Hash,
+    store: PrivateStoreCorePosition,
+    key_epochs: Vec<PrivateKeyEpochCommitment>,
+    runtime_control: Option<PrivateRuntimeControlPosition>,
+    last_full_replay: Option<Hash>,
+    stable_projection: PrivateRuntimeStableProjection,
+    applied_at: u64,
+}
+
+impl PrivateRuntimeImage {
+    /// Construct the first image only from a valid immutable Private
+    /// descriptor and the exact post-Create runtime state.
+    pub fn genesis(
+        descriptor: &AgentDescriptor,
+        node: NodeId,
+        state: RuntimeState,
+        store: PrivateStoreCorePosition,
+        key_epochs: Vec<PrivateKeyEpochCommitment>,
+        applied_at: u64,
+    ) -> Result<Self, PrivateRuntimeEvidenceError> {
+        if descriptor.validate().is_err()
+            || descriptor.identity.profile != AgentProfile::Private
+            || !descriptor
+                .replicas
+                .iter()
+                .any(|replica| replica.node == node)
+        {
+            return Err(PrivateRuntimeEvidenceError::InvalidDescriptor);
+        }
+        let managed = ManagedAgentTarget {
+            space: descriptor.identity.space,
+            agent: descriptor.identity.agent,
+            runtime_deployment: descriptor.identity.runtime_deployment,
+        };
+        if store.space != managed.space
+            || store.agent != managed.agent
+            || store.owner != descriptor.identity.owner
+            || store.control_count != 0
+            || store.control_head.is_some()
+            || store.next_sequence != 0
+        {
+            return Err(PrivateRuntimeEvidenceError::InvalidStorePosition);
+        }
+        let active_resource_policy = descriptor.initial_resource_policy();
+        let stable_projection = PrivateRuntimeStableProjection::genesis(
+            managed,
+            descriptor.commitment(),
+            descriptor.runtime_package.clone(),
+            active_resource_policy,
+            &state.control,
+        )?;
+        let value = Self {
+            managed,
+            node,
+            owner: descriptor.identity.owner,
+            descriptor: descriptor.commitment(),
+            runtime_package: descriptor.runtime_package.clone(),
+            runtime_deployment: descriptor.identity.runtime_deployment,
+            state,
+            active_resource_policy,
+            active_resource_policy_commitment: resource_policy_commitment(active_resource_policy)?,
+            store,
+            key_epochs,
+            runtime_control: None,
+            last_full_replay: None,
+            stable_projection,
+            applied_at,
+        };
+        value.validate()?;
+        if value
+            .state
+            .encoded_len()
+            .is_none_or(|length| length > active_resource_policy.max_runtime_state_bytes as usize)
+        {
+            return Err(PrivateRuntimeEvidenceError::InvalidState);
+        }
+        Ok(value)
+    }
+
+    /// Build the successor image selected by a pending PAPL1 and positive
+    /// disposition. Completion is a separate step because PAPL1 records the
+    /// resulting image commitment while PVRI1 never points back to PAPL1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn successor<V: AuthorityVerifier, R: PrivateRecoveryAuthorityProofVerifier>(
+        descriptor: &AgentDescriptor,
+        predecessor: &Self,
+        application: &PrivateRuntimeApplication,
+        success: &PrivateRuntimeSuccess,
+        state: RuntimeState,
+        key_epochs: Vec<PrivateKeyEpochCommitment>,
+        authority_verifier: &V,
+        recovery_verifier: &R,
+    ) -> Result<Self, PrivateRuntimeEvidenceError> {
+        predecessor.validate()?;
+        application.verify_with(descriptor, authority_verifier, recovery_verifier)?;
+        if application.completion.is_some()
+            || !application.matches_predecessor(predecessor)
+            || !application.success_matches(success)
+        {
+            return Err(PrivateRuntimeEvidenceError::InvalidApplication);
+        }
+        let active_resource_policy = application.expected_active_policy(success)?;
+        validate_key_epoch_transition(&predecessor.key_epochs, &key_epochs, &application.control)?;
+        if !private_state_transition_matches(
+            &predecessor.state,
+            &state,
+            application.mutation.is_some(),
+        ) {
+            return Err(PrivateRuntimeEvidenceError::InvalidState);
+        }
+        let stable_projection = PrivateRuntimeStableProjection::successor(
+            &predecessor.stable_projection,
+            &application.control,
+            application.full_replay,
+            success,
+            active_resource_policy,
+            &state.control,
+        )?;
+        let runtime_control = if application.mutation.is_some() {
+            Some(PrivateRuntimeControlPosition {
+                control: application.control.commitment(),
+                sequence: application.control.sequence,
+            })
+        } else {
+            predecessor.runtime_control
+        };
+        let value = Self {
+            managed: predecessor.managed,
+            node: predecessor.node,
+            owner: predecessor.owner,
+            descriptor: predecessor.descriptor,
+            runtime_package: predecessor.runtime_package.clone(),
+            runtime_deployment: predecessor.runtime_deployment,
+            state,
+            active_resource_policy,
+            active_resource_policy_commitment: resource_policy_commitment(active_resource_policy)?,
+            store: application.expected_successor_store,
+            key_epochs,
+            runtime_control,
+            last_full_replay: Some(application.full_replay),
+            stable_projection,
+            applied_at: application.applied_at,
+        };
+        value.validate()?;
+        if value
+            .state
+            .encoded_len()
+            .is_none_or(|length| length > active_resource_policy.max_runtime_state_bytes as usize)
+        {
+            return Err(PrivateRuntimeEvidenceError::InvalidState);
+        }
+        Ok(value)
+    }
+
+    pub const fn managed(&self) -> ManagedAgentTarget {
+        self.managed
+    }
+    pub const fn node(&self) -> NodeId {
+        self.node
+    }
+    pub const fn owner(&self) -> PrincipalId {
+        self.owner
+    }
+    pub const fn descriptor(&self) -> Hash {
+        self.descriptor
+    }
+    pub fn runtime_package(&self) -> &BlobRef {
+        &self.runtime_package
+    }
+    pub const fn runtime_deployment(&self) -> DeploymentId {
+        self.runtime_deployment
+    }
+    pub fn state(&self) -> &RuntimeState {
+        &self.state
+    }
+    pub const fn active_resource_policy(&self) -> RuntimeResourcePolicy {
+        self.active_resource_policy
+    }
+    pub const fn active_resource_policy_commitment(&self) -> Hash {
+        self.active_resource_policy_commitment
+    }
+    pub const fn store(&self) -> PrivateStoreCorePosition {
+        self.store
+    }
+    pub fn key_epochs(&self) -> &[PrivateKeyEpochCommitment] {
+        &self.key_epochs
+    }
+    pub const fn runtime_control(&self) -> Option<PrivateRuntimeControlPosition> {
+        self.runtime_control
+    }
+    pub const fn last_full_replay(&self) -> Option<Hash> {
+        self.last_full_replay
+    }
+    pub const fn stable_projection(&self) -> &PrivateRuntimeStableProjection {
+        &self.stable_projection
+    }
+    pub const fn applied_at(&self) -> u64 {
+        self.applied_at
+    }
+
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(
+            PRIVATE_RUNTIME_IMAGE_COMMITMENT_DOMAIN,
+            &[&self.encode().expect("valid PVI1")],
+        )
+    }
+
+    pub fn validate(&self) -> Result<(), PrivateRuntimeEvidenceError> {
+        self.store.validate()?;
+        validate_key_epochs(&self.key_epochs)?;
+        self.stable_projection.validate()?;
+        if !self.managed.is_valid()
+            || self.node == NodeId::ZERO
+            || self.owner == PrincipalId::ZERO
+            || self.descriptor == Hash::ZERO
+            || !valid_runtime_package(&self.runtime_package)
+            || self.runtime_deployment == DeploymentId::ZERO
+            || self.managed.runtime_deployment != self.runtime_deployment
+            || self.store.space != self.managed.space
+            || self.store.agent != self.managed.agent
+            || self.store.owner != self.owner
+            || !self.state.validate()
+            || !self.state.linear.is_empty()
+            || !self.active_resource_policy.is_valid()
+            || resource_policy_commitment(self.active_resource_policy)?
+                != self.active_resource_policy_commitment
+            || self.stable_projection.active_resource_policy != self.active_resource_policy
+            || self.stable_projection.active_resource_policy_commitment
+                != self.active_resource_policy_commitment
+            || self.stable_projection.managed != self.managed
+            || self.stable_projection.descriptor != self.descriptor
+            || self.stable_projection.runtime_package != self.runtime_package
+            || self.stable_projection.control_state != control_state_commitment(&self.state.control)
+            || private_key_epoch_root(&self.key_epochs)? != self.store.key_epoch_root
+            || self.key_epochs.last().map(|value| value.epoch) != Some(self.store.epoch)
+            || !nonzero_option(self.last_full_replay)
+            || self.stable_projection.full_replay != self.last_full_replay
+            || self.stable_projection.generation != u64::from(self.store.control_count)
+            || self.stable_projection.control_head != self.store.control_head
+            || self.stable_projection.control_sequence
+                != self
+                    .store
+                    .control_head
+                    .map(|_| self.store.next_sequence - 1)
+            || self
+                .runtime_control
+                .is_some_and(|position| !position.validate())
+            || self.runtime_control.is_some_and(|position| {
+                self.stable_projection
+                    .control_sequence
+                    .is_none_or(|sequence| position.sequence > sequence)
+            })
+            || self.state.encoded_len().is_none_or(|length| {
+                length > self.active_resource_policy.max_runtime_state_bytes as usize
+            })
+        {
+            return Err(PrivateRuntimeEvidenceError::InvalidState);
+        }
+        Ok(())
+    }
+}
+
+impl CanonicalWire for PrivateRuntimeImage {
+    const MAGIC: [u8; 4] = *b"PVI1";
+    const MAX_ENCODED_BYTES: usize = MAX_PRIVATE_RUNTIME_IMAGE_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_managed(encoder, self.managed);
+        encoder.fixed(self.node.as_bytes());
+        encoder.fixed(self.owner.as_bytes());
+        encoder.fixed(self.descriptor.as_bytes());
+        encode_blob(encoder, &self.runtime_package);
+        encoder.fixed(self.runtime_deployment.as_bytes());
+        encode_runtime_state(encoder, &self.state);
+        encode_nested(encoder, &self.active_resource_policy);
+        encoder.fixed(self.active_resource_policy_commitment.as_bytes());
+        encode_nested(encoder, &self.store);
+        encoder.list(&self.key_epochs, encode_nested);
+        encoder.option(&self.runtime_control, |encoder, value| {
+            encoder.fixed(value.control.as_bytes());
+            encoder.u64(value.sequence);
+        });
+        encode_optional_hash(encoder, self.last_full_replay);
+        encode_nested(encoder, &self.stable_projection);
+        encoder.u64(self.applied_at);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            managed: decode_managed(decoder)?,
+            node: NodeId(decoder.fixed()?),
+            owner: PrincipalId(decoder.fixed()?),
+            descriptor: Hash(decoder.fixed()?),
+            runtime_package: decode_blob(decoder)?,
+            runtime_deployment: DeploymentId(decoder.fixed()?),
+            state: decode_runtime_state(decoder)?,
+            active_resource_policy: decode_nested(
+                decoder,
+                vos_agent_sdk::wire::MAX_RUNTIME_RESOURCE_POLICY_WIRE_BYTES,
+            )?,
+            active_resource_policy_commitment: Hash(decoder.fixed()?),
+            store: decode_nested(decoder, PrivateStoreCorePosition::MAX_ENCODED_BYTES)?,
+            key_epochs: decoder.list_bounded(MAX_PRIVATE_RUNTIME_KEY_EPOCHS, |decoder| {
+                decode_nested(decoder, PrivateKeyEpochCommitment::MAX_ENCODED_BYTES)
+            })?,
+            runtime_control: decoder.option(|decoder| {
+                let value = PrivateRuntimeControlPosition {
+                    control: Hash(decoder.fixed()?),
+                    sequence: decoder.u64()?,
+                };
+                value
+                    .validate()
+                    .then_some(value)
+                    .ok_or(DecodeError::NonCanonical)
+            })?,
+            last_full_replay: decode_optional_hash(decoder)?,
+            stable_projection: decode_nested(
+                decoder,
+                PrivateRuntimeStableProjection::MAX_ENCODED_BYTES,
+            )?,
+            applied_at: decoder.u64()?,
+        };
+        value.validate().map_err(|_| DecodeError::NonCanonical)?;
+        Ok(value)
+    }
+}
+
+fn control_operation_kind(control: &PrivateControlRecord) -> AuthorityOperationKind {
+    match control.operation {
+        PrivateControlOperation::Invite { .. } => AuthorityOperationKind::InvitePrivateNode,
+        PrivateControlOperation::Revoke { .. } => AuthorityOperationKind::RevokePrivateNode,
+        PrivateControlOperation::RotateKeys { .. } => AuthorityOperationKind::RotatePrivateKeys,
+        PrivateControlOperation::SetResourcePolicy { .. } => {
+            AuthorityOperationKind::SetPrivateResourcePolicy
+        }
+        PrivateControlOperation::ActorLifecycle { .. } => {
+            AuthorityOperationKind::PrivateActorLifecycle
+        }
+        PrivateControlOperation::Recover { .. } => AuthorityOperationKind::RecoverPrivateAgent,
+    }
+}
+
+fn full_application_replay(
+    control: &PrivateControlRecord,
+    mutation: Option<&PrivateRuntimeMutation>,
+    recovery_authority_proof: Option<&PrivateRecoveryAuthorityProof>,
+) -> Result<Hash, PrivateRuntimeEvidenceError> {
+    if !control.validate_shape() {
+        return Err(PrivateRuntimeEvidenceError::InvalidControl);
+    }
+    match (&control.operation, mutation) {
+        (
+            PrivateControlOperation::SetResourcePolicy { .. }
+            | PrivateControlOperation::ActorLifecycle { .. },
+            Some(mutation),
+        ) if recovery_authority_proof.is_none() => {
+            let request = ManagementRequest::PrivateControl {
+                control: Box::new(control.clone()),
+                mutation: Box::new(mutation.clone()),
+            };
+            if !request.is_valid() {
+                return Err(PrivateRuntimeEvidenceError::InvalidControl);
+            }
+            let commitment = request.replay_commitment();
+            if commitment == Hash::ZERO {
+                return Err(PrivateRuntimeEvidenceError::InvalidControl);
+            }
+            Ok(commitment)
+        }
+        (
+            PrivateControlOperation::Invite { .. }
+            | PrivateControlOperation::Revoke { .. }
+            | PrivateControlOperation::RotateKeys { .. },
+            None,
+        ) if recovery_authority_proof.is_none() => {
+            let wire = control
+                .encode()
+                .map_err(|_| PrivateRuntimeEvidenceError::InvalidControl)?;
+            Ok(Hash::digest(
+                PRIVATE_CONTROL_ONLY_REPLAY_DOMAIN,
+                &[RUNTIME_ABI_ID.as_bytes(), &wire],
+            ))
+        }
+        (PrivateControlOperation::Recover { .. }, None) => {
+            let proof =
+                recovery_authority_proof.ok_or(PrivateRuntimeEvidenceError::InvalidControl)?;
+            if proof.validate_shape().is_err() || !proof.matches_control(control) {
+                return Err(PrivateRuntimeEvidenceError::InvalidControl);
+            }
+            let control_wire = control
+                .encode()
+                .map_err(|_| PrivateRuntimeEvidenceError::InvalidControl)?;
+            let proof_wire = proof
+                .encode()
+                .map_err(|_| PrivateRuntimeEvidenceError::InvalidControl)?;
+            Ok(Hash::digest(
+                PRIVATE_CONTROL_ONLY_REPLAY_DOMAIN,
+                &[RUNTIME_ABI_ID.as_bytes(), &control_wire, &proof_wire],
+            ))
+        }
+        _ => Err(PrivateRuntimeEvidenceError::InvalidControl),
+    }
+}
+
+fn authority_matches_application(
+    managed: ManagedAgentTarget,
+    control: &PrivateControlRecord,
+    recovery_authority_proof: Option<&PrivateRecoveryAuthorityProof>,
+    receipt: &AuthorityReceipt,
+    issuance: &AuthorityOperationIssuanceAck,
+    applied_at: u64,
+) -> bool {
+    let selector = &receipt.selector;
+    let expected_actor = match control.operation {
+        PrivateControlOperation::ActorLifecycle { actor, .. } => Some(actor),
+        _ => None,
+    };
+    let request_matches = match (&control.operation, recovery_authority_proof) {
+        (PrivateControlOperation::Recover { .. }, Some(proof)) => {
+            proof.validate_shape().is_ok()
+                && proof.managed == managed
+                && proof.matches_control(control)
+                && selector.request == proof.commitment()
+        }
+        (PrivateControlOperation::Recover { .. }, None) => false,
+        (_, None) => selector.request == control.commitment(),
+        (_, Some(_)) => false,
+    };
+    receipt.validate_shape().is_ok()
+        && issuance.validate_shape().is_ok()
+        && issuance.receipt == *receipt
+        && issuance.authority.space == managed.space
+        && selector.space == managed.space
+        && selector.agent == managed.agent
+        && selector.runtime_deployment == managed.runtime_deployment
+        && selector.operation == control_operation_kind(control)
+        && selector.actor == expected_actor
+        && selector.actor_deployment.is_none()
+        && !selector.operation.uses_management_decision_journal()
+        && selector.decision_sequence == 0
+        && selector.acknowledged_through == 0
+        && request_matches
+        && issuance.issued_at <= applied_at
+        && selector.is_live_at(applied_at)
+}
+
+fn store_matches_projection(
+    store: PrivateStoreCorePosition,
+    projection: &PrivateRuntimeStableProjection,
+) -> bool {
+    projection.generation == u64::from(store.control_count)
+        && projection.control_head == store.control_head
+        && projection.control_sequence == store.control_head.map(|_| store.next_sequence - 1)
+}
+
+fn store_transition_matches(
+    predecessor: PrivateStoreCorePosition,
+    successor: PrivateStoreCorePosition,
+    control: &PrivateControlRecord,
+) -> bool {
+    if predecessor.validate().is_err()
+        || successor.validate().is_err()
+        || predecessor.space != successor.space
+        || predecessor.agent != successor.agent
+        || predecessor.owner != successor.owner
+        || control.space != predecessor.space
+        || control.agent != predecessor.agent
+        || successor.object_count != predecessor.object_count
+        || successor.object_root != predecessor.object_root
+        || successor.control_count != predecessor.control_count.checked_add(1).unwrap_or(u32::MAX)
+        || successor.control_head != Some(control.commitment())
+        || successor.next_sequence != control.sequence.checked_add(1).unwrap_or(0)
+        || successor.control_root == predecessor.control_root
+    {
+        return false;
+    }
+    let position_matches = match &control.operation {
+        PrivateControlOperation::Recover {
+            superseded_heads, ..
+        } => {
+            control.sequence >= predecessor.next_sequence
+                && match (predecessor.control_head, control.previous) {
+                    (Some(local), Some(selected)) => {
+                        superseded_heads.binary_search(&local).is_ok()
+                            && superseded_heads.binary_search(&selected).is_ok()
+                    }
+                    (None, None) => superseded_heads.is_empty(),
+                    _ => false,
+                }
+        }
+        _ => {
+            control.sequence == predecessor.next_sequence
+                && control.previous == predecessor.control_head
+        }
+    };
+    let expected_epoch = match &control.operation {
+        PrivateControlOperation::Invite { epoch, .. } if *epoch == predecessor.epoch => *epoch,
+        PrivateControlOperation::Revoke { next_epoch, .. }
+        | PrivateControlOperation::RotateKeys { next_epoch }
+            if predecessor.epoch.checked_add(1) == Some(next_epoch.epoch) =>
+        {
+            next_epoch.epoch
+        }
+        PrivateControlOperation::Recover { next_epoch, .. }
+            if next_epoch.epoch > predecessor.epoch =>
+        {
+            next_epoch.epoch
+        }
+        PrivateControlOperation::SetResourcePolicy { .. }
+        | PrivateControlOperation::ActorLifecycle { .. } => predecessor.epoch,
+        _ => return false,
+    };
+    let key_root_changes = matches!(
+        control.operation,
+        PrivateControlOperation::Invite { .. }
+            | PrivateControlOperation::Revoke { .. }
+            | PrivateControlOperation::RotateKeys { .. }
+            | PrivateControlOperation::Recover { .. }
+    );
+    position_matches
+        && successor.epoch == expected_epoch
+        && ((key_root_changes && successor.key_epoch_root != predecessor.key_epoch_root)
+            || (!key_root_changes && successor.key_epoch_root == predecessor.key_epoch_root))
+}
+
+fn validate_key_epoch_transition(
+    predecessor: &[PrivateKeyEpochCommitment],
+    successor: &[PrivateKeyEpochCommitment],
+    control: &PrivateControlRecord,
+) -> Result<(), PrivateRuntimeEvidenceError> {
+    validate_key_epochs(predecessor)?;
+    validate_key_epochs(successor)?;
+    let valid = match &control.operation {
+        PrivateControlOperation::Invite { epoch, .. } => {
+            predecessor.len() == successor.len()
+                && predecessor[..predecessor.len() - 1] == successor[..successor.len() - 1]
+                && predecessor
+                    .last()
+                    .is_some_and(|value| value.epoch == *epoch)
+                && successor.last().is_some_and(|value| {
+                    value.epoch == *epoch
+                        && Some(value.exact_wire)
+                            != predecessor.last().map(|prior| prior.exact_wire)
+                })
+        }
+        PrivateControlOperation::Revoke { next_epoch, .. }
+        | PrivateControlOperation::RotateKeys { next_epoch }
+        | PrivateControlOperation::Recover { next_epoch, .. } => {
+            successor.len() == predecessor.len() + 1
+                && successor[..predecessor.len()] == *predecessor
+                && PrivateKeyEpochCommitment::from_epoch(next_epoch)
+                    .is_ok_and(|expected| successor.last() == Some(&expected))
+        }
+        PrivateControlOperation::SetResourcePolicy { .. }
+        | PrivateControlOperation::ActorLifecycle { .. } => predecessor == successor,
+    };
+    if !valid {
+        return Err(PrivateRuntimeEvidenceError::InvalidKeyEpochs);
+    }
+    Ok(())
+}
+
+fn private_state_transition_matches(
+    predecessor: &RuntimeState,
+    successor: &RuntimeState,
+    runtime_control: bool,
+) -> bool {
+    successor.linear.is_empty()
+        && if runtime_control {
+            successor.merge == predecessor.merge && successor.local == predecessor.local
+        } else {
+            successor == predecessor
+        }
+}
+
+fn success_is_private(success: &PrivateRuntimeSuccess) -> bool {
+    match success {
+        PrivateRuntimeSuccess::Installed(entry)
+        | PrivateRuntimeSuccess::Upgraded(entry)
+        | PrivateRuntimeSuccess::Suspended(entry)
+        | PrivateRuntimeSuccess::Resumed(entry) => {
+            entry.validate_for_profile(AgentProfile::Private).is_ok()
+        }
+        PrivateRuntimeSuccess::ControlOnly
+        | PrivateRuntimeSuccess::ResourcePolicySet(_)
+        | PrivateRuntimeSuccess::Removed(_) => true,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PrivateRuntimeApplicationCompletion {
+    success: PrivateRuntimeSuccess,
+    stable_projection: PrivateRuntimeStableProjection,
+    successor_runtime_image: Hash,
+}
+
+/// Exact pending or completed application of one PCTL (`PAPL1`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrivateRuntimeApplication {
+    managed: ManagedAgentTarget,
+    node: NodeId,
+    descriptor: Hash,
+    runtime_package: BlobRef,
+    control: PrivateControlRecord,
+    mutation: Option<PrivateRuntimeMutation>,
+    recovery_authority_proof: Option<PrivateRecoveryAuthorityProof>,
+    full_replay: Hash,
+    receipt: AuthorityReceipt,
+    issuance: AuthorityOperationIssuanceAck,
+    applied_at: u64,
+    predecessor_store: PrivateStoreCorePosition,
+    predecessor_runtime_image: Hash,
+    predecessor_stable_projection: PrivateRuntimeStableProjection,
+    predecessor_runtime_control: Option<PrivateRuntimeControlPosition>,
+    expected_successor_store: PrivateStoreCorePosition,
+    completion: Option<PrivateRuntimeApplicationCompletion>,
+}
+
+impl PrivateRuntimeApplication {
+    /// Construct persistence-ready pending evidence only after authenticating
+    /// its descriptor authority and (for Recover) immutable recovery key.
+    /// The predecessor must already have been opened from a Store/PKEY set
+    /// which authorizes its local Node; see [`Self::verify_with`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn pending<V: AuthorityVerifier, R: PrivateRecoveryAuthorityProofVerifier>(
+        descriptor: &AgentDescriptor,
+        predecessor: &PrivateRuntimeImage,
+        control: PrivateControlRecord,
+        mutation: Option<PrivateRuntimeMutation>,
+        recovery_authority_proof: Option<PrivateRecoveryAuthorityProof>,
+        receipt: AuthorityReceipt,
+        issuance: AuthorityOperationIssuanceAck,
+        applied_at: u64,
+        expected_successor_store: PrivateStoreCorePosition,
+        authority_verifier: &V,
+        recovery_verifier: &R,
+    ) -> Result<Self, PrivateRuntimeEvidenceError> {
+        let value = Self::pending_unverified(
+            predecessor,
+            control,
+            mutation,
+            recovery_authority_proof,
+            receipt,
+            issuance,
+            applied_at,
+            expected_successor_store,
+        )?;
+        value.verify_with(descriptor, authority_verifier, recovery_verifier)?;
+        Ok(value)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pending_unverified(
+        predecessor: &PrivateRuntimeImage,
+        control: PrivateControlRecord,
+        mutation: Option<PrivateRuntimeMutation>,
+        recovery_authority_proof: Option<PrivateRecoveryAuthorityProof>,
+        receipt: AuthorityReceipt,
+        issuance: AuthorityOperationIssuanceAck,
+        applied_at: u64,
+        expected_successor_store: PrivateStoreCorePosition,
+    ) -> Result<Self, PrivateRuntimeEvidenceError> {
+        predecessor.validate()?;
+        let full_replay = full_application_replay(
+            &control,
+            mutation.as_ref(),
+            recovery_authority_proof.as_ref(),
+        )?;
+        let value = Self {
+            managed: predecessor.managed,
+            node: predecessor.node,
+            descriptor: predecessor.descriptor,
+            runtime_package: predecessor.runtime_package.clone(),
+            control,
+            mutation,
+            recovery_authority_proof,
+            full_replay,
+            receipt,
+            issuance,
+            applied_at,
+            predecessor_store: predecessor.store,
+            predecessor_runtime_image: predecessor.commitment(),
+            predecessor_stable_projection: predecessor.stable_projection.clone(),
+            predecessor_runtime_control: predecessor.runtime_control,
+            expected_successor_store,
+            completion: None,
+        };
+        value.validate()?;
+        if !value.matches_predecessor(predecessor) {
+            return Err(PrivateRuntimeEvidenceError::InvalidApplication);
+        }
+        Ok(value)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete<V: AuthorityVerifier, R: PrivateRecoveryAuthorityProofVerifier>(
+        mut self,
+        descriptor: &AgentDescriptor,
+        predecessor: &PrivateRuntimeImage,
+        successor: &PrivateRuntimeImage,
+        success: PrivateRuntimeSuccess,
+        authority_verifier: &V,
+        recovery_verifier: &R,
+    ) -> Result<Self, PrivateRuntimeEvidenceError> {
+        self.verify_with(descriptor, authority_verifier, recovery_verifier)?;
+        if self.completion.is_some()
+            || !self.matches_predecessor(predecessor)
+            || !self.success_matches(&success)
+        {
+            return Err(PrivateRuntimeEvidenceError::InvalidApplication);
+        }
+        successor.validate()?;
+        validate_key_epoch_transition(
+            &predecessor.key_epochs,
+            &successor.key_epochs,
+            &self.control,
+        )?;
+        if !private_state_transition_matches(
+            &predecessor.state,
+            &successor.state,
+            self.mutation.is_some(),
+        ) {
+            return Err(PrivateRuntimeEvidenceError::InvalidState);
+        }
+        let active_policy = self.expected_active_policy(&success)?;
+        if successor.active_resource_policy != active_policy {
+            return Err(PrivateRuntimeEvidenceError::InvalidProjection);
+        }
+        let stable_projection = PrivateRuntimeStableProjection::successor(
+            &self.predecessor_stable_projection,
+            &self.control,
+            self.full_replay,
+            &success,
+            active_policy,
+            &successor.state.control,
+        )?;
+        self.completion = Some(PrivateRuntimeApplicationCompletion {
+            success,
+            stable_projection,
+            successor_runtime_image: successor.commitment(),
+        });
+        self.validate()?;
+        if !self.matches_successor(successor) {
+            return Err(PrivateRuntimeEvidenceError::InvalidApplication);
+        }
+        Ok(self)
+    }
+
+    pub const fn managed(&self) -> ManagedAgentTarget {
+        self.managed
+    }
+    pub const fn node(&self) -> NodeId {
+        self.node
+    }
+    pub const fn descriptor(&self) -> Hash {
+        self.descriptor
+    }
+    pub fn runtime_package(&self) -> &BlobRef {
+        &self.runtime_package
+    }
+    pub const fn control(&self) -> &PrivateControlRecord {
+        &self.control
+    }
+    pub const fn mutation(&self) -> Option<&PrivateRuntimeMutation> {
+        self.mutation.as_ref()
+    }
+    pub const fn recovery_authority_proof(&self) -> Option<&PrivateRecoveryAuthorityProof> {
+        self.recovery_authority_proof.as_ref()
+    }
+    pub const fn full_replay(&self) -> Hash {
+        self.full_replay
+    }
+    pub const fn receipt(&self) -> &AuthorityReceipt {
+        &self.receipt
+    }
+    pub const fn issuance(&self) -> &AuthorityOperationIssuanceAck {
+        &self.issuance
+    }
+    pub const fn applied_at(&self) -> u64 {
+        self.applied_at
+    }
+    pub const fn predecessor_store(&self) -> PrivateStoreCorePosition {
+        self.predecessor_store
+    }
+    pub const fn predecessor_runtime_image(&self) -> Hash {
+        self.predecessor_runtime_image
+    }
+    pub const fn predecessor_stable_projection(&self) -> &PrivateRuntimeStableProjection {
+        &self.predecessor_stable_projection
+    }
+    pub const fn predecessor_runtime_control(&self) -> Option<PrivateRuntimeControlPosition> {
+        self.predecessor_runtime_control
+    }
+    pub const fn expected_successor_store(&self) -> PrivateStoreCorePosition {
+        self.expected_successor_store
+    }
+    pub const fn is_complete(&self) -> bool {
+        self.completion.is_some()
+    }
+    pub fn success(&self) -> Option<&PrivateRuntimeSuccess> {
+        self.completion.as_ref().map(|value| &value.success)
+    }
+    pub const fn successor_stable_projection(&self) -> Option<&PrivateRuntimeStableProjection> {
+        match &self.completion {
+            Some(value) => Some(&value.stable_projection),
+            None => None,
+        }
+    }
+    pub const fn successor_runtime_image(&self) -> Option<Hash> {
+        match &self.completion {
+            Some(value) => Some(value.successor_runtime_image),
+            None => None,
+        }
+    }
+
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(
+            PRIVATE_RUNTIME_APPLICATION_COMMITMENT_DOMAIN,
+            &[&self.encode().expect("valid PAP1")],
+        )
+    }
+
+    pub fn matches_predecessor(&self, predecessor: &PrivateRuntimeImage) -> bool {
+        predecessor.validate().is_ok()
+            && self.applied_at >= predecessor.applied_at
+            && self.managed == predecessor.managed
+            && self.node == predecessor.node
+            && self.descriptor == predecessor.descriptor
+            && self.runtime_package == predecessor.runtime_package
+            && self.predecessor_store == predecessor.store
+            && self.predecessor_runtime_image == predecessor.commitment()
+            && self.predecessor_stable_projection == predecessor.stable_projection
+            && self.predecessor_runtime_control == predecessor.runtime_control
+    }
+
+    /// Verify decoded PAPL evidence against the immutable authority selected
+    /// by the exact Private descriptor. Shape validation alone deliberately
+    /// does not trust the public key carried by the receipt/AOI1.
+    ///
+    /// `descriptor.replicas` is the genesis roster and is checked only by
+    /// [`PrivateRuntimeImage::genesis`]. Invite/Recover can replace that
+    /// roster. Before calling this method for a later image, the physical
+    /// Store opener must authenticate the local Node against the exact PKEY
+    /// preimage committed by the predecessor image. This method then binds
+    /// that already-authenticated predecessor by its node-local PVRI identity.
+    pub fn verify_with<V: AuthorityVerifier, R: PrivateRecoveryAuthorityProofVerifier>(
+        &self,
+        descriptor: &AgentDescriptor,
+        authority_verifier: &V,
+        recovery_verifier: &R,
+    ) -> Result<(), PrivateRuntimeEvidenceError> {
+        self.validate()?;
+        if descriptor.validate().is_err()
+            || descriptor.identity.profile != AgentProfile::Private
+            || descriptor.commitment() != self.descriptor
+            || descriptor.identity.space != self.managed.space
+            || descriptor.identity.agent != self.managed.agent
+            || descriptor.identity.owner != self.predecessor_store.owner
+            || descriptor.identity.runtime_deployment != self.managed.runtime_deployment
+            || descriptor.runtime_package != self.runtime_package
+            || !descriptor.authority.accepts(&self.receipt)
+        {
+            return Err(PrivateRuntimeEvidenceError::InvalidDescriptor);
+        }
+        self.validate_descriptor_scope(descriptor)?;
+        self.issuance
+            .verify_with(descriptor.authority, authority_verifier)
+            .map_err(|_| PrivateRuntimeEvidenceError::InvalidAuthority)?;
+        self.receipt
+            .verify_at(self.applied_at, authority_verifier)
+            .map_err(|_| PrivateRuntimeEvidenceError::InvalidAuthority)?;
+        match (&self.control.operation, &self.recovery_authority_proof) {
+            (PrivateControlOperation::Recover { .. }, Some(proof)) => {
+                let Some(recovery) = descriptor.private_recovery else {
+                    return Err(PrivateRuntimeEvidenceError::InvalidDescriptor);
+                };
+                if recovery_signing_public_key_commitment(&proof.recovery_public_key)
+                    != recovery.signing_key_commitment
+                {
+                    return Err(PrivateRuntimeEvidenceError::InvalidAuthority);
+                }
+                proof
+                    .verify_with(recovery_verifier)
+                    .map_err(|_| PrivateRuntimeEvidenceError::InvalidAuthority)
+            }
+            (PrivateControlOperation::Recover { .. }, None) | (_, Some(_)) => {
+                Err(PrivateRuntimeEvidenceError::InvalidAuthority)
+            }
+            (_, None) => Ok(()),
+        }
+    }
+
+    fn validate_descriptor_scope(
+        &self,
+        descriptor: &AgentDescriptor,
+    ) -> Result<(), PrivateRuntimeEvidenceError> {
+        let within_descriptor = |policy: RuntimeResourcePolicy| {
+            policy.is_within(
+                descriptor.capabilities,
+                descriptor.runtime_contract.resources,
+            )
+        };
+        if !within_descriptor(self.predecessor_stable_projection.active_resource_policy)
+            || (self.predecessor_stable_projection.generation == 0
+                && self.predecessor_stable_projection.active_resource_policy
+                    != descriptor.initial_resource_policy())
+            || self.completion.as_ref().is_some_and(|completion| {
+                !within_descriptor(completion.stable_projection.active_resource_policy)
+                    || !success_is_private(&completion.success)
+            })
+        {
+            return Err(PrivateRuntimeEvidenceError::InvalidDescriptor);
+        }
+        let mutation_is_supported = match &self.mutation {
+            Some(PrivateRuntimeMutation::SetResourcePolicy(policy)) => within_descriptor(*policy),
+            Some(PrivateRuntimeMutation::Install(install)) => {
+                install.validate_for_profile(AgentProfile::Private).is_ok()
+                    && descriptor.runtime_contract.supports(install.contract)
+                    && descriptor.capabilities.satisfies(install.requirements)
+            }
+            Some(PrivateRuntimeMutation::UpgradeActor(upgrade)) => {
+                upgrade.requirements.supported_by(AgentProfile::Private)
+                    && descriptor.runtime_contract.supports(upgrade.contract)
+                    && descriptor.capabilities.satisfies(upgrade.requirements)
+            }
+            Some(
+                PrivateRuntimeMutation::Suspend { .. }
+                | PrivateRuntimeMutation::Resume { .. }
+                | PrivateRuntimeMutation::RemoveLeaf { .. },
+            )
+            | None => true,
+        };
+        if !mutation_is_supported {
+            return Err(PrivateRuntimeEvidenceError::InvalidDescriptor);
+        }
+        Ok(())
+    }
+
+    pub fn matches_successor(&self, successor: &PrivateRuntimeImage) -> bool {
+        let Some(completion) = &self.completion else {
+            return false;
+        };
+        successor.validate().is_ok()
+            && successor.managed == self.managed
+            && successor.node == self.node
+            && successor.owner == self.predecessor_store.owner
+            && successor.descriptor == self.descriptor
+            && successor.runtime_package == self.runtime_package
+            && successor.runtime_deployment == self.managed.runtime_deployment
+            && successor.store == self.expected_successor_store
+            && successor.applied_at == self.applied_at
+            && successor.last_full_replay == Some(self.full_replay)
+            && successor.stable_projection == completion.stable_projection
+            && successor.commitment() == completion.successor_runtime_image
+            && successor.runtime_control
+                == if self.mutation.is_some() {
+                    Some(PrivateRuntimeControlPosition {
+                        control: self.control.commitment(),
+                        sequence: self.control.sequence,
+                    })
+                } else {
+                    self.predecessor_runtime_control
+                }
+    }
+
+    fn success_matches(&self, success: &PrivateRuntimeSuccess) -> bool {
+        match (&self.mutation, success.management_reply()) {
+            (None, None) => matches!(success, PrivateRuntimeSuccess::ControlOnly),
+            (Some(mutation), Some(reply)) => {
+                let request = ManagementRequest::PrivateControl {
+                    control: Box::new(self.control.clone()),
+                    mutation: Box::new(mutation.clone()),
+                };
+                request.is_valid() && request.private_runtime_reply_matches(&reply)
+            }
+            _ => false,
+        }
+    }
+
+    fn expected_active_policy(
+        &self,
+        success: &PrivateRuntimeSuccess,
+    ) -> Result<RuntimeResourcePolicy, PrivateRuntimeEvidenceError> {
+        if !self.success_matches(success) {
+            return Err(PrivateRuntimeEvidenceError::InvalidSuccess);
+        }
+        match success {
+            PrivateRuntimeSuccess::ResourcePolicySet(policy) => Ok(*policy),
+            _ => Ok(self.predecessor_stable_projection.active_resource_policy),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), PrivateRuntimeEvidenceError> {
+        self.predecessor_store.validate()?;
+        self.expected_successor_store.validate()?;
+        self.predecessor_stable_projection.validate()?;
+        if !self.managed.is_valid()
+            || self.node == NodeId::ZERO
+            || self.control.space != self.managed.space
+            || self.control.agent != self.managed.agent
+            || self.descriptor == Hash::ZERO
+            || !valid_runtime_package(&self.runtime_package)
+            || full_application_replay(
+                &self.control,
+                self.mutation.as_ref(),
+                self.recovery_authority_proof.as_ref(),
+            )
+            .map_or(true, |value| value != self.full_replay)
+            || self.full_replay == Hash::ZERO
+            || self.predecessor_runtime_image == Hash::ZERO
+            || self.predecessor_store.space != self.managed.space
+            || self.predecessor_store.agent != self.managed.agent
+            || self.expected_successor_store.space != self.managed.space
+            || self.expected_successor_store.agent != self.managed.agent
+            || self.predecessor_store.owner != self.expected_successor_store.owner
+            || self.predecessor_stable_projection.managed != self.managed
+            || self.predecessor_stable_projection.descriptor != self.descriptor
+            || self.predecessor_stable_projection.runtime_package != self.runtime_package
+            || !store_matches_projection(
+                self.predecessor_store,
+                &self.predecessor_stable_projection,
+            )
+            || !store_transition_matches(
+                self.predecessor_store,
+                self.expected_successor_store,
+                &self.control,
+            )
+        {
+            return Err(PrivateRuntimeEvidenceError::InvalidApplication);
+        }
+        if !authority_matches_application(
+            self.managed,
+            &self.control,
+            self.recovery_authority_proof.as_ref(),
+            &self.receipt,
+            &self.issuance,
+            self.applied_at,
+        ) {
+            return Err(PrivateRuntimeEvidenceError::InvalidAuthority);
+        }
+        if let Some(completion) = &self.completion {
+            completion.success.validate()?;
+            completion.stable_projection.validate()?;
+            let active_policy = self.expected_active_policy(&completion.success)?;
+            let expected = PrivateRuntimeStableProjection::successor_with_control_commitment(
+                &self.predecessor_stable_projection,
+                &self.control,
+                self.full_replay,
+                &completion.success,
+                active_policy,
+                completion.stable_projection.control_state,
+            )?;
+            if completion.successor_runtime_image == Hash::ZERO
+                || completion.stable_projection != expected
+            {
+                return Err(PrivateRuntimeEvidenceError::InvalidApplication);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl CanonicalWire for PrivateRuntimeApplication {
+    const MAGIC: [u8; 4] = *b"PAP1";
+    const MAX_ENCODED_BYTES: usize = MAX_PRIVATE_RUNTIME_APPLICATION_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_managed(encoder, self.managed);
+        encoder.fixed(self.node.as_bytes());
+        encoder.fixed(self.descriptor.as_bytes());
+        encode_blob(encoder, &self.runtime_package);
+        encode_nested(encoder, &self.control);
+        encoder.option(&self.mutation, encode_nested);
+        encoder.option(&self.recovery_authority_proof, encode_nested);
+        encoder.fixed(self.full_replay.as_bytes());
+        encode_nested(encoder, &self.receipt);
+        encode_nested(encoder, &self.issuance);
+        encoder.u64(self.applied_at);
+        encode_nested(encoder, &self.predecessor_store);
+        encoder.fixed(self.predecessor_runtime_image.as_bytes());
+        encode_nested(encoder, &self.predecessor_stable_projection);
+        encoder.option(&self.predecessor_runtime_control, |encoder, value| {
+            encoder.fixed(value.control.as_bytes());
+            encoder.u64(value.sequence);
+        });
+        encode_nested(encoder, &self.expected_successor_store);
+        encoder.option(&self.completion, |encoder, value| {
+            encode_nested(encoder, &value.success);
+            encode_nested(encoder, &value.stable_projection);
+            encoder.fixed(value.successor_runtime_image.as_bytes());
+        });
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            managed: decode_managed(decoder)?,
+            node: NodeId(decoder.fixed()?),
+            descriptor: Hash(decoder.fixed()?),
+            runtime_package: decode_blob(decoder)?,
+            control: decode_nested(decoder, MAX_PRIVATE_CONTROL_WIRE_BYTES)?,
+            mutation: decoder.option(|decoder| {
+                decode_nested(decoder, MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES)
+            })?,
+            recovery_authority_proof: decoder.option(|decoder| {
+                decode_nested(decoder, MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES)
+            })?,
+            full_replay: Hash(decoder.fixed()?),
+            receipt: decode_nested(decoder, MAX_AUTHORITY_RECEIPT_WIRE_BYTES)?,
+            issuance: decode_nested(decoder, MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES)?,
+            applied_at: decoder.u64()?,
+            predecessor_store: decode_nested(decoder, PrivateStoreCorePosition::MAX_ENCODED_BYTES)?,
+            predecessor_runtime_image: Hash(decoder.fixed()?),
+            predecessor_stable_projection: decode_nested(
+                decoder,
+                PrivateRuntimeStableProjection::MAX_ENCODED_BYTES,
+            )?,
+            predecessor_runtime_control: decoder.option(|decoder| {
+                let value = PrivateRuntimeControlPosition {
+                    control: Hash(decoder.fixed()?),
+                    sequence: decoder.u64()?,
+                };
+                value
+                    .validate()
+                    .then_some(value)
+                    .ok_or(DecodeError::NonCanonical)
+            })?,
+            expected_successor_store: decode_nested(
+                decoder,
+                PrivateStoreCorePosition::MAX_ENCODED_BYTES,
+            )?,
+            completion: decoder.option(|decoder| {
+                Ok(PrivateRuntimeApplicationCompletion {
+                    success: decode_nested(decoder, PrivateRuntimeSuccess::MAX_ENCODED_BYTES)?,
+                    stable_projection: decode_nested(
+                        decoder,
+                        PrivateRuntimeStableProjection::MAX_ENCODED_BYTES,
+                    )?,
+                    successor_runtime_image: {
+                        let value = Hash(decoder.fixed()?);
+                        if value == Hash::ZERO {
+                            return Err(DecodeError::NonCanonical);
+                        }
+                        value
+                    },
+                })
+            })?,
+        };
+        value.validate().map_err(|_| DecodeError::NonCanonical)?;
+        Ok(value)
+    }
+}
+
+/// Exact reopened Store/runtime/application aggregate (`PCRS2`).
+///
+/// A PCRS2 is intentionally unsigned. Its commitment is the preimage later
+/// bound by PCAF/PCA1/PSE2; callers must still verify those downstream
+/// authority signatures independently.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrivateControlReopenedState {
+    application: PrivateRuntimeApplication,
+    store: PrivateStoreCorePosition,
+    runtime_image: PrivateRuntimeImage,
+}
+
+impl PrivateControlReopenedState {
+    pub fn new(
+        application: PrivateRuntimeApplication,
+        store: PrivateStoreCorePosition,
+        runtime_image: PrivateRuntimeImage,
+    ) -> Result<Self, PrivateRuntimeEvidenceError> {
+        let value = Self {
+            application,
+            store,
+            runtime_image,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub const fn application(&self) -> &PrivateRuntimeApplication {
+        &self.application
+    }
+    pub const fn store(&self) -> PrivateStoreCorePosition {
+        self.store
+    }
+    pub const fn runtime_image(&self) -> &PrivateRuntimeImage {
+        &self.runtime_image
+    }
+
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(
+            PRIVATE_CONTROL_REOPENED_STATE_COMMITMENT_DOMAIN,
+            &[&self.encode().expect("valid PCR2")],
+        )
+    }
+
+    pub fn validate(&self) -> Result<(), PrivateRuntimeEvidenceError> {
+        self.application.validate()?;
+        self.store.validate()?;
+        self.runtime_image.validate()?;
+        if !self.application.is_complete()
+            || self.store != self.application.expected_successor_store
+            || self.store != self.runtime_image.store
+            || !self.application.matches_successor(&self.runtime_image)
+        {
+            return Err(PrivateRuntimeEvidenceError::InvalidApplication);
+        }
+        Ok(())
+    }
+
+    /// Reopen and authenticate the exact transitive evidence against an
+    /// independently selected descriptor authority.
+    pub fn reopen_with<V: AuthorityVerifier, R: PrivateRecoveryAuthorityProofVerifier>(
+        &self,
+        descriptor: &AgentDescriptor,
+        authority_verifier: &V,
+        recovery_verifier: &R,
+    ) -> Result<(), PrivateRuntimeEvidenceError> {
+        self.validate()?;
+        self.application
+            .verify_with(descriptor, authority_verifier, recovery_verifier)
+    }
+}
+
+impl CanonicalWire for PrivateControlReopenedState {
+    const MAGIC: [u8; 4] = *b"PCR2";
+    const MAX_ENCODED_BYTES: usize = MAX_PRIVATE_CONTROL_REOPENED_STATE_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_nested(encoder, &self.application);
+        encode_nested(encoder, &self.store);
+        encode_nested(encoder, &self.runtime_image);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            application: decode_nested(decoder, MAX_PRIVATE_RUNTIME_APPLICATION_WIRE_BYTES)?,
+            store: decode_nested(decoder, PrivateStoreCorePosition::MAX_ENCODED_BYTES)?,
+            runtime_image: decode_nested(decoder, MAX_PRIVATE_RUNTIME_IMAGE_WIRE_BYTES)?,
+        };
+        value.validate().map_err(|_| DecodeError::NonCanonical)?;
+        Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+    use core::num::NonZeroU64;
+
+    use vos_agent_sdk::authority::{
+        AgentAuthorityBinding, AuthorityActorTarget, AuthorityEvidence, AuthorityIssuer,
+        AuthorityLaneRoots, AuthorityReceiptSelector,
+    };
+    use vos_agent_sdk::authority_operation::PrivateRecoveryAuthorityProofSigner;
+    use vos_agent_sdk::contract::{ActorPackageContract, RuntimePackageContract};
+    use vos_agent_sdk::private::{
+        EncryptedObjectKind, EncryptedPrivateObject, PrivateControlSigner, PrivateNodeIdentity,
+        PrivateRecoveryKeyringGrant, SealedPrivateKey, SealedRecoveryKey,
+    };
+    use vos_agent_sdk::{
+        AgentIdentity, AgentReplica, InstallActor, InstallationId, LaneSet, PrivateRecoveryBinding,
+        ProducerId, ProgramId, ReplicaRole, RuntimeCapabilities, RuntimeRequirements, StateLane,
+    };
+
+    const RECOVERY_PUBLIC_KEY: [u8; 32] = [0x81; 32];
+
+    fn hash(marker: u8) -> Hash {
+        Hash([marker; 32])
+    }
+
+    struct AllowVerifier;
+
+    impl AuthorityVerifier for AllowVerifier {
+        fn verify(&self, _public_key: &[u8; 32], _message: &[u8], _signature: &[u8; 64]) -> bool {
+            true
+        }
+    }
+
+    impl PrivateRecoveryAuthorityProofVerifier for AllowVerifier {
+        fn verify_private_recovery_authority_proof(
+            &self,
+            _public_key: &[u8; 32],
+            _message: &[u8],
+            _signature: &[u8; 64],
+        ) -> bool {
+            true
+        }
+    }
+
+    struct DenyVerifier;
+
+    impl AuthorityVerifier for DenyVerifier {
+        fn verify(&self, _public_key: &[u8; 32], _message: &[u8], _signature: &[u8; 64]) -> bool {
+            false
+        }
+    }
+
+    impl PrivateRecoveryAuthorityProofVerifier for DenyVerifier {
+        fn verify_private_recovery_authority_proof(
+            &self,
+            _public_key: &[u8; 32],
+            _message: &[u8],
+            _signature: &[u8; 64],
+        ) -> bool {
+            false
+        }
+    }
+
+    struct RecoverySigner([u8; 32]);
+
+    impl PrivateRecoveryAuthorityProofSigner for RecoverySigner {
+        fn recovery_public_key(&self) -> [u8; 32] {
+            self.0
+        }
+
+        fn sign_private_recovery_authority_proof(&self, _message: &[u8]) -> [u8; 64] {
+            [0x91; 64]
+        }
+    }
+
+    #[derive(Clone)]
+    struct Fixture {
+        descriptor: AgentDescriptor,
+        node_a: NodeId,
+        node_b: NodeId,
+        predecessor: PrivateRuntimeImage,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let space = SpaceId([1; 32]);
+            let owner = PrincipalId([2; 32]);
+            let creation_nonce = hash(3);
+            let agent = AgentId::derive(space, owner, creation_nonce.as_bytes());
+            let node_a = NodeId([4; 32]);
+            let node_b = NodeId([5; 32]);
+            let authority_public_key = [6; 32];
+            let authority_issuer = AuthorityIssuer {
+                principal: PrincipalId([7; 32]),
+                actor: ActorId([8; 32]),
+                deployment: DeploymentId([9; 32]),
+                program: ProgramId([10; 32]),
+                producer: ProducerId::of_public_key(&authority_public_key),
+            };
+            let authority = AgentAuthorityBinding {
+                policy: hash(11),
+                issuer: authority_issuer,
+                public_key: authority_public_key,
+                initial_epoch: 1,
+            };
+            let runtime_package = BlobRef::of_bytes(b"private-runtime-package");
+            let descriptor = AgentDescriptor {
+                identity: AgentIdentity {
+                    space,
+                    agent,
+                    owner,
+                    profile: AgentProfile::Private,
+                    runtime_deployment: DeploymentId([12; 32]),
+                    runtime_program: ProgramId([13; 32]),
+                    runtime_producer: ProducerId([14; 32]),
+                },
+                creation_nonce,
+                authority,
+                private_recovery: Some(PrivateRecoveryBinding {
+                    signing_key_commitment: recovery_signing_public_key_commitment(
+                        &RECOVERY_PUBLIC_KEY,
+                    ),
+                    encryption_public_key: [16; 32],
+                }),
+                runtime_package,
+                runtime_contract: RuntimePackageContract::canonical(),
+                capabilities: RuntimeCapabilities::standard(),
+                replicas: vec![
+                    AgentReplica {
+                        node: node_a,
+                        principal: owner,
+                        role: ReplicaRole::Observer,
+                    },
+                    AgentReplica {
+                        node: node_b,
+                        principal: owner,
+                        role: ReplicaRole::Observer,
+                    },
+                ],
+            };
+            descriptor.validate().unwrap();
+            let genesis_epoch = key_epoch(space, agent, 0, node_a, 20);
+            let epoch_commitment = PrivateKeyEpochCommitment::from_epoch(&genesis_epoch).unwrap();
+            let key_epochs = vec![epoch_commitment];
+            let store = initial_store(&descriptor, private_key_epoch_root(&key_epochs).unwrap());
+            let predecessor = PrivateRuntimeImage::genesis(
+                &descriptor,
+                node_a,
+                RuntimeState {
+                    control: vec![0x21],
+                    linear: Vec::new(),
+                    merge: vec![0x22],
+                    local: vec![0x23],
+                },
+                store,
+                key_epochs,
+                3,
+            )
+            .unwrap();
+            Self {
+                descriptor,
+                node_a,
+                node_b,
+                predecessor,
+            }
+        }
+
+        fn authority_target(&self) -> AuthorityActorTarget {
+            AuthorityActorTarget {
+                space: self.descriptor.identity.space,
+                system_agent: AgentId([0x31; 32]),
+                system_runtime_deployment: DeploymentId([0x32; 32]),
+                binding: self.descriptor.authority,
+            }
+        }
+
+        fn receipt(
+            &self,
+            operation: AuthorityOperationKind,
+            request: Hash,
+            actor: Option<ActorId>,
+        ) -> AuthorityReceipt {
+            AuthorityReceipt {
+                selector: AuthorityReceiptSelector {
+                    policy: self.descriptor.authority.policy,
+                    issuer: self.descriptor.authority.issuer,
+                    space: self.descriptor.identity.space,
+                    agent: self.descriptor.identity.agent,
+                    operation,
+                    runtime_deployment: self.descriptor.identity.runtime_deployment,
+                    actor,
+                    actor_deployment: None,
+                    evidence: AuthorityEvidence {
+                        package: None,
+                        proof: None,
+                        commitment: hash(0x33),
+                    },
+                    lane_roots: AuthorityLaneRoots::default(),
+                    epoch: self.descriptor.authority.initial_epoch,
+                    decision_sequence: 0,
+                    acknowledged_through: 0,
+                    valid_from: 4,
+                    expires_at: 40,
+                    request,
+                },
+                public_key: self.descriptor.authority.public_key,
+                signature: [0x34; 64],
+            }
+        }
+
+        fn issuance(&self, receipt: AuthorityReceipt) -> AuthorityOperationIssuanceAck {
+            AuthorityOperationIssuanceAck {
+                authorization_invocation: vos_agent_sdk::InvocationId([0x35; 32]),
+                acknowledgement_invocation: vos_agent_sdk::InvocationId([0x36; 32]),
+                authority: self.authority_target(),
+                operation_call: hash(0x37),
+                approval: hash(0x38),
+                authorization_sequence: NonZeroU64::new(1).unwrap(),
+                receipt,
+                issued_at: 4,
+                signature: [0x39; 64],
+            }
+        }
+    }
+
+    fn key_epoch(
+        space: SpaceId,
+        agent: AgentId,
+        epoch: u64,
+        node: NodeId,
+        marker: u8,
+    ) -> PrivateKeyEpoch {
+        let recipient_key = [marker.wrapping_add(1); 32];
+        let recovery_recipient = [marker.wrapping_add(2); 32];
+        PrivateKeyEpoch {
+            space,
+            agent,
+            epoch,
+            owner_key_commitment: hash(marker.wrapping_add(3)),
+            data_key_commitment: hash(marker.wrapping_add(4)),
+            recovery_key_commitment: hash(marker.wrapping_add(5)),
+            recovery_encryption_public_key: recovery_recipient,
+            sealed_recovery_data_key: SealedRecoveryKey {
+                recipient_key: recovery_recipient,
+                sealed: vec![marker.wrapping_add(6)],
+            },
+            sealed_owner_keys: vec![SealedPrivateKey {
+                node,
+                recipient_key,
+                sealed: vec![marker.wrapping_add(7)],
+            }],
+            sealed_data_keys: vec![SealedPrivateKey {
+                node,
+                recipient_key,
+                sealed: vec![marker.wrapping_add(8)],
+            }],
+        }
+    }
+
+    fn initial_store(
+        descriptor: &AgentDescriptor,
+        key_epoch_root: Hash,
+    ) -> PrivateStoreCorePosition {
+        PrivateStoreCorePosition::new(
+            descriptor.identity.space,
+            descriptor.identity.agent,
+            descriptor.identity.owner,
+            0,
+            None,
+            0,
+            0,
+            None,
+            0,
+            None,
+            key_epoch_root,
+        )
+        .unwrap()
+    }
+
+    fn successor_store(
+        predecessor: PrivateStoreCorePosition,
+        control: &PrivateControlRecord,
+        key_epoch_root: Hash,
+        marker: u8,
+    ) -> PrivateStoreCorePosition {
+        let epoch = match &control.operation {
+            PrivateControlOperation::Revoke { next_epoch, .. }
+            | PrivateControlOperation::RotateKeys { next_epoch }
+            | PrivateControlOperation::Recover { next_epoch, .. } => next_epoch.epoch,
+            _ => predecessor.epoch,
+        };
+        PrivateStoreCorePosition::new(
+            predecessor.space,
+            predecessor.agent,
+            predecessor.owner,
+            epoch,
+            Some(control.commitment()),
+            control.sequence + 1,
+            predecessor.object_count,
+            predecessor.object_root,
+            predecessor.control_count + 1,
+            Some(hash(marker)),
+            key_epoch_root,
+        )
+        .unwrap()
+    }
+
+    fn narrowed_policy() -> RuntimeResourcePolicy {
+        RuntimeResourcePolicy {
+            max_actors: RuntimeCapabilities::STANDARD_MAX_ACTORS - 1,
+            ..RuntimeResourcePolicy::standard()
+        }
+    }
+
+    fn policy_control(fixture: &Fixture) -> (PrivateControlRecord, PrivateRuntimeMutation) {
+        policy_control_for(fixture, narrowed_policy())
+    }
+
+    fn policy_control_for(
+        fixture: &Fixture,
+        policy: RuntimeResourcePolicy,
+    ) -> (PrivateControlRecord, PrivateRuntimeMutation) {
+        let policy_wire = policy.encode().unwrap();
+        (
+            PrivateControlRecord {
+                space: fixture.descriptor.identity.space,
+                agent: fixture.descriptor.identity.agent,
+                sequence: 0,
+                previous: None,
+                operation: PrivateControlOperation::SetResourcePolicy {
+                    policy: BlobRef::of_bytes(&policy_wire),
+                },
+                signer: PrivateControlSigner::Owner,
+                signer_public_key: [0x41; 32],
+                signature: [0x42; 64],
+            },
+            PrivateRuntimeMutation::SetResourcePolicy(policy),
+        )
+    }
+
+    fn actor(marker: u8, requirements: RuntimeRequirements) -> ActorEntry {
+        let blob = |offset| BlobRef::of_bytes(&[marker.wrapping_add(offset)]);
+        ActorEntry {
+            actor: ActorId([marker; 32]),
+            name: alloc::format!("private-{marker}"),
+            parent: None,
+            deployment: DeploymentId([marker.wrapping_add(1); 32]),
+            program: ProgramId([marker.wrapping_add(2); 32]),
+            package: blob(3),
+            agent_schema: blob(4),
+            method_policy: blob(5),
+            constructor_abi: hash(marker.wrapping_add(6)),
+            installation_data: None,
+            state_layout: hash(marker.wrapping_add(7)),
+            lanes: requirements.lanes,
+            suspended: false,
+        }
+    }
+
+    fn install_mutation(
+        marker: u8,
+        contract: ActorPackageContract,
+        requirements: RuntimeRequirements,
+    ) -> PrivateRuntimeMutation {
+        let entry = actor(marker, requirements);
+        PrivateRuntimeMutation::Install(InstallActor {
+            installation_id: InstallationId([marker.wrapping_add(8); 32]),
+            registry_reservation: hash(marker.wrapping_add(9)),
+            producer: ProducerId([marker.wrapping_add(10); 32]),
+            package: entry.package.clone(),
+            agent_schema: entry.agent_schema.clone(),
+            method_policy: entry.method_policy.clone(),
+            constructor_abi: entry.constructor_abi,
+            installation_data: None,
+            state_layout: entry.state_layout,
+            entry,
+            contract,
+            requirements,
+        })
+    }
+
+    fn lifecycle_pending(
+        fixture: &Fixture,
+        descriptor: &AgentDescriptor,
+        predecessor: &PrivateRuntimeImage,
+        mutation: PrivateRuntimeMutation,
+    ) -> Result<PrivateRuntimeApplication, PrivateRuntimeEvidenceError> {
+        let actor = mutation.actor().unwrap();
+        let control = PrivateControlRecord {
+            space: predecessor.managed.space,
+            agent: predecessor.managed.agent,
+            sequence: predecessor.store.next_sequence,
+            previous: predecessor.store.control_head,
+            operation: PrivateControlOperation::ActorLifecycle {
+                actor,
+                operation: mutation.lifecycle_kind().unwrap(),
+                request: mutation.commitment(),
+            },
+            signer: PrivateControlSigner::Owner,
+            signer_public_key: [0x45; 32],
+            signature: [0x46; 64],
+        };
+        let receipt = fixture.receipt(
+            AuthorityOperationKind::PrivateActorLifecycle,
+            control.commitment(),
+            Some(actor),
+        );
+        let expected_store = successor_store(
+            predecessor.store,
+            &control,
+            predecessor.store.key_epoch_root,
+            0x47,
+        );
+        PrivateRuntimeApplication::pending(
+            descriptor,
+            predecessor,
+            control,
+            Some(mutation),
+            None,
+            receipt.clone(),
+            fixture.issuance(receipt),
+            5,
+            expected_store,
+            &AllowVerifier,
+            &AllowVerifier,
+        )
+    }
+
+    fn policy_application(
+        fixture: &Fixture,
+        predecessor: &PrivateRuntimeImage,
+        applied_at: u64,
+    ) -> (
+        PrivateRuntimeApplication,
+        PrivateRuntimeImage,
+        PrivateRuntimeApplication,
+        PrivateControlReopenedState,
+    ) {
+        let (mut control, mutation) = policy_control(fixture);
+        control.sequence = predecessor.store.next_sequence;
+        control.previous = predecessor.store.control_head;
+        let receipt = fixture.receipt(
+            AuthorityOperationKind::SetPrivateResourcePolicy,
+            control.commitment(),
+            None,
+        );
+        let issuance = fixture.issuance(receipt.clone());
+        let expected_store = successor_store(
+            predecessor.store,
+            &control,
+            predecessor.store.key_epoch_root,
+            0x43,
+        );
+        let pending = PrivateRuntimeApplication::pending(
+            &fixture.descriptor,
+            predecessor,
+            control,
+            Some(mutation),
+            None,
+            receipt,
+            issuance,
+            applied_at,
+            expected_store,
+            &AllowVerifier,
+            &AllowVerifier,
+        )
+        .unwrap();
+        let success = PrivateRuntimeSuccess::ResourcePolicySet(narrowed_policy());
+        let successor = PrivateRuntimeImage::successor(
+            &fixture.descriptor,
+            predecessor,
+            &pending,
+            &success,
+            RuntimeState {
+                control: vec![0x44],
+                linear: Vec::new(),
+                merge: predecessor.state.merge.clone(),
+                local: predecessor.state.local.clone(),
+            },
+            predecessor.key_epochs.clone(),
+            &AllowVerifier,
+            &AllowVerifier,
+        )
+        .unwrap();
+        let completed = pending
+            .clone()
+            .complete(
+                &fixture.descriptor,
+                predecessor,
+                &successor,
+                success,
+                &AllowVerifier,
+                &AllowVerifier,
+            )
+            .unwrap();
+        let reopened =
+            PrivateControlReopenedState::new(completed.clone(), expected_store, successor.clone())
+                .unwrap();
+        (pending, successor, completed, reopened)
+    }
+
+    fn recovery_application(
+        fixture: &Fixture,
+        predecessor: &PrivateRuntimeImage,
+        applied_at: u64,
+    ) -> (
+        PrivateRuntimeApplication,
+        PrivateRuntimeImage,
+        PrivateRuntimeApplication,
+        PrivateControlReopenedState,
+        PrivateRecoveryAuthorityProof,
+    ) {
+        let transport_identity = vec![0x71, 0x72, 0x73];
+        let replacement_node = NodeId::of_authenticated_peer(&transport_identity);
+        let replacement_key = [0x74; 32];
+        let replacement = PrivateNodeIdentity {
+            node: replacement_node,
+            principal: predecessor.owner,
+            transport_identity,
+            encryption_public_key: replacement_key,
+            authority_binding: hash(0x75),
+            transport_signature: [0x76; 64],
+        };
+        assert!(replacement.validate());
+
+        let mut next_epoch = key_epoch(
+            predecessor.managed.space,
+            predecessor.managed.agent,
+            predecessor.store.epoch + 1,
+            replacement_node,
+            0x77,
+        );
+        next_epoch.sealed_owner_keys[0].recipient_key = replacement_key;
+        next_epoch.sealed_data_keys[0].recipient_key = replacement_key;
+        let historical_keyring = PrivateRecoveryKeyringGrant {
+            key_commitment: hash(0x78),
+            sealed_keys: vec![SealedPrivateKey {
+                node: replacement_node,
+                recipient_key: replacement_key,
+                sealed: vec![0x79],
+            }],
+            ciphertext: EncryptedPrivateObject {
+                space: predecessor.managed.space,
+                agent: predecessor.managed.agent,
+                epoch: next_epoch.epoch,
+                kind: EncryptedObjectKind::Control,
+                content: hash(0x7a),
+                nonce: [0x7b; 24],
+                ciphertext: vec![0x7c],
+            },
+        };
+        let control = PrivateControlRecord {
+            space: predecessor.managed.space,
+            agent: predecessor.managed.agent,
+            sequence: predecessor.store.next_sequence,
+            previous: predecessor.store.control_head,
+            operation: PrivateControlOperation::Recover {
+                superseded_heads: predecessor.store.control_head.into_iter().collect(),
+                next_epoch: next_epoch.clone(),
+                replacement_nodes: vec![replacement],
+                historical_keyring,
+            },
+            signer: PrivateControlSigner::Recovery,
+            signer_public_key: RECOVERY_PUBLIC_KEY,
+            signature: [0x7d; 64],
+        };
+        assert!(control.validate_shape());
+        let proof = PrivateRecoveryAuthorityProof::from_control(
+            predecessor.runtime_deployment,
+            &control,
+            None,
+            &RecoverySigner(RECOVERY_PUBLIC_KEY),
+        )
+        .unwrap();
+        let receipt = fixture.receipt(
+            AuthorityOperationKind::RecoverPrivateAgent,
+            proof.commitment(),
+            None,
+        );
+        let issuance = fixture.issuance(receipt.clone());
+        let mut key_epochs = predecessor.key_epochs.clone();
+        key_epochs.push(PrivateKeyEpochCommitment::from_epoch(&next_epoch).unwrap());
+        let expected_store = successor_store(
+            predecessor.store,
+            &control,
+            private_key_epoch_root(&key_epochs).unwrap(),
+            0x7e,
+        );
+        let pending = PrivateRuntimeApplication::pending(
+            &fixture.descriptor,
+            predecessor,
+            control,
+            None,
+            Some(proof.clone()),
+            receipt,
+            issuance,
+            applied_at,
+            expected_store,
+            &AllowVerifier,
+            &AllowVerifier,
+        )
+        .unwrap();
+        let success = PrivateRuntimeSuccess::ControlOnly;
+        let successor = PrivateRuntimeImage::successor(
+            &fixture.descriptor,
+            predecessor,
+            &pending,
+            &success,
+            predecessor.state.clone(),
+            key_epochs,
+            &AllowVerifier,
+            &AllowVerifier,
+        )
+        .unwrap();
+        let completed = pending
+            .clone()
+            .complete(
+                &fixture.descriptor,
+                predecessor,
+                &successor,
+                success,
+                &AllowVerifier,
+                &AllowVerifier,
+            )
+            .unwrap();
+        let reopened =
+            PrivateControlReopenedState::new(completed.clone(), expected_store, successor.clone())
+                .unwrap();
+        (pending, successor, completed, reopened, proof)
+    }
+
+    fn assert_round_trip<T>(value: &T)
+    where
+        T: CanonicalWire + fmt::Debug + PartialEq,
+    {
+        let wire = value.encode().unwrap();
+        let decoded = T::decode(&wire).unwrap();
+        assert_eq!(&decoded, value);
+        assert_eq!(decoded.encode().unwrap(), wire);
+    }
+
+    fn assert_clean_break<T: CanonicalWire>(value: &T) {
+        let wire = value.encode().unwrap();
+
+        let mut old_magic = wire.clone();
+        old_magic[3] ^= 1;
+        assert!(T::decode(&old_magic).is_err());
+
+        let mut wrong_generation = wire.clone();
+        wrong_generation[4] ^= 1;
+        assert!(T::decode(&wrong_generation).is_err());
+
+        let mut trailing = wire;
+        trailing.push(0);
+        assert!(T::decode(&trailing).is_err());
+    }
+
+    #[test]
+    fn canonical_formats_round_trip_and_reopen_only_with_anchored_authority() {
+        let fixture = Fixture::new();
+        let (pending, successor, completed, reopened) =
+            policy_application(&fixture, &fixture.predecessor, 5);
+
+        assert_round_trip(&fixture.predecessor.key_epochs[0]);
+        assert_round_trip(&fixture.predecessor.store);
+        assert_round_trip(&PrivateRuntimeSuccess::ResourcePolicySet(narrowed_policy()));
+        assert_round_trip(&fixture.predecessor.stable_projection);
+        assert_round_trip(&fixture.predecessor);
+        assert_round_trip(&pending);
+        assert_round_trip(&completed);
+        assert_round_trip(&successor);
+        assert_round_trip(&reopened);
+
+        assert_eq!(&fixture.predecessor.encode().unwrap()[..4], b"PVI1");
+        assert_eq!(&pending.encode().unwrap()[..4], b"PAP1");
+        assert_eq!(&reopened.encode().unwrap()[..4], b"PCR2");
+        reopened
+            .reopen_with(&fixture.descriptor, &AllowVerifier, &AllowVerifier)
+            .unwrap();
+        assert!(
+            reopened
+                .reopen_with(&fixture.descriptor, &DenyVerifier, &AllowVerifier)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn clean_break_rejects_old_magic_abi_and_trailing_bytes() {
+        let fixture = Fixture::new();
+        let (pending, successor, completed, reopened) =
+            policy_application(&fixture, &fixture.predecessor, 5);
+
+        assert_clean_break(&fixture.predecessor.key_epochs[0]);
+        assert_clean_break(&fixture.predecessor.store);
+        assert_clean_break(&PrivateRuntimeSuccess::ResourcePolicySet(narrowed_policy()));
+        assert_clean_break(&fixture.predecessor.stable_projection);
+        assert_clean_break(&fixture.predecessor);
+        assert_clean_break(&pending);
+        assert_clean_break(&completed);
+        assert_clean_break(&successor);
+        assert_clean_break(&reopened);
+
+        let oversized = vec![0; MAX_PRIVATE_RUNTIME_APPLICATION_WIRE_BYTES + 1];
+        assert!(PrivateRuntimeApplication::decode(&oversized).is_err());
+    }
+
+    #[test]
+    fn completion_retains_only_an_exact_positive_disposition() {
+        let fixture = Fixture::new();
+        let (_, _, completed, _) = policy_application(&fixture, &fixture.predecessor, 5);
+
+        assert_eq!(
+            completed.success(),
+            Some(&PrivateRuntimeSuccess::ResourcePolicySet(narrowed_policy()))
+        );
+        let mut substituted = completed;
+        substituted.completion.as_mut().unwrap().success =
+            PrivateRuntimeSuccess::ResourcePolicySet(RuntimeResourcePolicy::standard());
+        assert!(substituted.validate().is_err());
+        assert!(substituted.encode().is_err());
+
+        let denial = RuntimeTransition {
+            state: RuntimeState::default(),
+            outcome: RuntimeOutcome::Management(Err(
+                vos_agent_sdk::ManagementError::InvalidRequest,
+            )),
+        }
+        .encode()
+        .unwrap();
+        let mut denial_wire = Vec::new();
+        denial_wire.extend_from_slice(b"PSD1");
+        denial_wire.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+        let mut encoder = Encoder(&mut denial_wire);
+        encoder.u8(1);
+        encoder.bytes(&denial);
+        assert!(PrivateRuntimeSuccess::decode(&denial_wire).is_err());
+    }
+
+    #[test]
+    fn runtime_mutation_and_recovery_proof_presence_are_exact() {
+        let fixture = Fixture::new();
+        let (policy_control, mutation) = policy_control(&fixture);
+        let receipt = fixture.receipt(
+            AuthorityOperationKind::SetPrivateResourcePolicy,
+            policy_control.commitment(),
+            None,
+        );
+        let expected_store = successor_store(
+            fixture.predecessor.store,
+            &policy_control,
+            fixture.predecessor.store.key_epoch_root,
+            0x82,
+        );
+        assert!(
+            PrivateRuntimeApplication::pending(
+                &fixture.descriptor,
+                &fixture.predecessor,
+                policy_control.clone(),
+                None,
+                None,
+                receipt.clone(),
+                fixture.issuance(receipt.clone()),
+                5,
+                expected_store,
+                &AllowVerifier,
+                &AllowVerifier,
+            )
+            .is_err()
+        );
+
+        let (recover_pending, _, _, _, proof) =
+            recovery_application(&fixture, &fixture.predecessor, 5);
+        assert!(
+            PrivateRuntimeApplication::pending(
+                &fixture.descriptor,
+                &fixture.predecessor,
+                policy_control,
+                Some(mutation.clone()),
+                Some(proof),
+                receipt.clone(),
+                fixture.issuance(receipt),
+                5,
+                expected_store,
+                &AllowVerifier,
+                &AllowVerifier,
+            )
+            .is_err()
+        );
+        assert!(
+            PrivateRuntimeApplication::pending(
+                &fixture.descriptor,
+                &fixture.predecessor,
+                recover_pending.control.clone(),
+                Some(mutation),
+                recover_pending.recovery_authority_proof.clone(),
+                recover_pending.receipt.clone(),
+                recover_pending.issuance.clone(),
+                recover_pending.applied_at,
+                recover_pending.expected_successor_store,
+                &AllowVerifier,
+                &AllowVerifier,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn descriptor_scoped_policy_contract_and_capability_limits_fail_closed() {
+        let fixture = Fixture::new();
+        let mut narrow_descriptor = fixture.descriptor.clone();
+        narrow_descriptor.capabilities.max_actors = 1;
+        narrow_descriptor.validate().unwrap();
+        let key_epochs = fixture.predecessor.key_epochs.clone();
+        let narrow_store = initial_store(
+            &narrow_descriptor,
+            private_key_epoch_root(&key_epochs).unwrap(),
+        );
+        let narrow_predecessor = PrivateRuntimeImage::genesis(
+            &narrow_descriptor,
+            fixture.node_a,
+            fixture.predecessor.state.clone(),
+            narrow_store,
+            key_epochs,
+            3,
+        )
+        .unwrap();
+        let over_ceiling = RuntimeResourcePolicy {
+            max_actors: 2,
+            ..narrow_descriptor.initial_resource_policy()
+        };
+        let (control, mutation) = policy_control_for(&fixture, over_ceiling);
+        let receipt = fixture.receipt(
+            AuthorityOperationKind::SetPrivateResourcePolicy,
+            control.commitment(),
+            None,
+        );
+        let expected_store = successor_store(
+            narrow_predecessor.store,
+            &control,
+            narrow_predecessor.store.key_epoch_root,
+            0x93,
+        );
+        assert!(
+            PrivateRuntimeApplication::pending(
+                &narrow_descriptor,
+                &narrow_predecessor,
+                control,
+                Some(mutation),
+                None,
+                receipt.clone(),
+                fixture.issuance(receipt),
+                5,
+                expected_store,
+                &AllowVerifier,
+                &AllowVerifier,
+            )
+            .is_err()
+        );
+
+        let mut hostile_predecessor = narrow_predecessor.clone();
+        hostile_predecessor.active_resource_policy = over_ceiling;
+        hostile_predecessor.active_resource_policy_commitment =
+            resource_policy_commitment(over_ceiling).unwrap();
+        hostile_predecessor.stable_projection.active_resource_policy = over_ceiling;
+        hostile_predecessor
+            .stable_projection
+            .active_resource_policy_commitment = resource_policy_commitment(over_ceiling).unwrap();
+        assert!(hostile_predecessor.validate().is_ok());
+        let (control, mutation) =
+            policy_control_for(&fixture, narrow_descriptor.initial_resource_policy());
+        let receipt = fixture.receipt(
+            AuthorityOperationKind::SetPrivateResourcePolicy,
+            control.commitment(),
+            None,
+        );
+        let expected_store = successor_store(
+            hostile_predecessor.store,
+            &control,
+            hostile_predecessor.store.key_epoch_root,
+            0x95,
+        );
+        assert!(
+            PrivateRuntimeApplication::pending(
+                &narrow_descriptor,
+                &hostile_predecessor,
+                control,
+                Some(mutation),
+                None,
+                receipt.clone(),
+                fixture.issuance(receipt),
+                5,
+                expected_store,
+                &AllowVerifier,
+                &AllowVerifier,
+            )
+            .is_err()
+        );
+
+        let private_requirements = RuntimeRequirements {
+            lanes: LaneSet::of(StateLane::Merge),
+            ..RuntimeRequirements::default()
+        };
+        let unsupported_contract = ActorPackageContract {
+            actor_abi: vos_agent_sdk::contract::ACTOR_ABI + 1,
+        };
+        assert!(
+            lifecycle_pending(
+                &fixture,
+                &fixture.descriptor,
+                &fixture.predecessor,
+                install_mutation(0x94, unsupported_contract, private_requirements),
+            )
+            .is_err()
+        );
+
+        let unsupported_capability = RuntimeRequirements {
+            scheduling: true,
+            ..private_requirements
+        };
+        assert!(
+            lifecycle_pending(
+                &fixture,
+                &fixture.descriptor,
+                &fixture.predecessor,
+                install_mutation(
+                    0xa0,
+                    ActorPackageContract::canonical(),
+                    unsupported_capability,
+                ),
+            )
+            .is_err()
+        );
+
+        let supported = lifecycle_pending(
+            &fixture,
+            &fixture.descriptor,
+            &fixture.predecessor,
+            install_mutation(
+                0xb0,
+                ActorPackageContract::canonical(),
+                private_requirements,
+            ),
+        );
+        assert!(supported.is_ok());
+    }
+
+    #[test]
+    fn recover_binds_exact_proof_preimage_signer_and_receipt_request() {
+        let fixture = Fixture::new();
+        let (pending, _, completed, reopened, _) =
+            recovery_application(&fixture, &fixture.predecessor, 5);
+        assert!(pending.recovery_authority_proof().is_some());
+        reopened
+            .reopen_with(&fixture.descriptor, &AllowVerifier, &AllowVerifier)
+            .unwrap();
+        assert!(
+            reopened
+                .reopen_with(&fixture.descriptor, &AllowVerifier, &DenyVerifier)
+                .is_err()
+        );
+
+        let mut proof_substitution = pending.clone();
+        proof_substitution
+            .recovery_authority_proof
+            .as_mut()
+            .unwrap()
+            .signature[0] ^= 1;
+        proof_substitution.full_replay = full_application_replay(
+            &proof_substitution.control,
+            None,
+            proof_substitution.recovery_authority_proof.as_ref(),
+        )
+        .unwrap();
+        assert!(proof_substitution.validate().is_err());
+
+        let mut wrong_recovery_anchor = fixture.descriptor.clone();
+        wrong_recovery_anchor
+            .private_recovery
+            .as_mut()
+            .unwrap()
+            .signing_key_commitment = hash(0x83);
+        assert!(wrong_recovery_anchor.validate().is_ok());
+        assert!(
+            completed
+                .verify_with(&wrong_recovery_anchor, &AllowVerifier, &AllowVerifier)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn encoded_authority_cannot_be_its_own_trust_root() {
+        let fixture = Fixture::new();
+        let (pending, successor, mut completed, _) =
+            policy_application(&fixture, &fixture.predecessor, 5);
+        let success = PrivateRuntimeSuccess::ResourcePolicySet(narrowed_policy());
+        assert!(
+            PrivateRuntimeImage::successor(
+                &fixture.descriptor,
+                &fixture.predecessor,
+                &pending,
+                &success,
+                successor.state.clone(),
+                fixture.predecessor.key_epochs.clone(),
+                &DenyVerifier,
+                &AllowVerifier,
+            )
+            .is_err()
+        );
+        assert!(
+            pending
+                .clone()
+                .complete(
+                    &fixture.descriptor,
+                    &fixture.predecessor,
+                    &successor,
+                    success,
+                    &DenyVerifier,
+                    &AllowVerifier,
+                )
+                .is_err()
+        );
+        let forged_public_key = [0x84; 32];
+        let forged_producer = ProducerId::of_public_key(&forged_public_key);
+        completed.receipt.public_key = forged_public_key;
+        completed.receipt.selector.issuer.producer = forged_producer;
+        completed.issuance.receipt = completed.receipt.clone();
+        completed.issuance.authority.binding.public_key = forged_public_key;
+        completed.issuance.authority.binding.issuer.producer = forged_producer;
+        assert!(completed.validate().is_ok());
+        assert!(
+            completed
+                .verify_with(&fixture.descriptor, &AllowVerifier, &AllowVerifier)
+                .is_err()
+        );
+        let decoded = PrivateRuntimeApplication::decode(&completed.encode().unwrap()).unwrap();
+        let reopened =
+            PrivateControlReopenedState::new(decoded, successor.store, successor).unwrap();
+        assert!(reopened.validate().is_ok());
+        assert!(
+            reopened
+                .reopen_with(&fixture.descriptor, &AllowVerifier, &AllowVerifier)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn private_images_and_applications_are_replica_local() {
+        let fixture = Fixture::new();
+        let replica_b = PrivateRuntimeImage::genesis(
+            &fixture.descriptor,
+            fixture.node_b,
+            RuntimeState {
+                control: fixture.predecessor.state.control.clone(),
+                linear: Vec::new(),
+                merge: vec![0x85],
+                local: vec![0x86],
+            },
+            fixture.predecessor.store,
+            fixture.predecessor.key_epochs.clone(),
+            9,
+        )
+        .unwrap();
+        assert_eq!(
+            fixture.predecessor.stable_projection,
+            replica_b.stable_projection
+        );
+        assert_ne!(fixture.predecessor.commitment(), replica_b.commitment());
+
+        let (_, successor_a, completed_a, _) =
+            policy_application(&fixture, &fixture.predecessor, 5);
+        let (_, successor_b, completed_b, _) = policy_application(&fixture, &replica_b, 10);
+        assert_eq!(successor_a.stable_projection, successor_b.stable_projection);
+        assert_ne!(successor_a.commitment(), successor_b.commitment());
+        assert_ne!(completed_a.commitment(), completed_b.commitment());
+    }
+
+    #[test]
+    fn descriptor_roster_is_genesis_only_and_store_pkey_authorizes_invited_nodes() {
+        let fixture = Fixture::new();
+        let transport_identity = vec![0xc0, 0xc1, 0xc2];
+        let invited_node = NodeId::of_authenticated_peer(&transport_identity);
+        assert!(
+            !fixture
+                .descriptor
+                .replicas
+                .iter()
+                .any(|replica| replica.node == invited_node)
+        );
+        assert!(
+            PrivateRuntimeImage::genesis(
+                &fixture.descriptor,
+                invited_node,
+                fixture.predecessor.state.clone(),
+                fixture.predecessor.store,
+                fixture.predecessor.key_epochs.clone(),
+                3,
+            )
+            .is_err()
+        );
+
+        let encryption_public_key = [0x43; 32];
+        let invited_identity = PrivateNodeIdentity {
+            node: invited_node,
+            principal: fixture.predecessor.owner,
+            transport_identity,
+            encryption_public_key,
+            authority_binding: hash(0xc4),
+            transport_signature: [0xc5; 64],
+        };
+        let sealed_owner_key = SealedPrivateKey {
+            node: invited_node,
+            recipient_key: encryption_public_key,
+            sealed: vec![0xc6],
+        };
+        let sealed_data_key = SealedPrivateKey {
+            node: invited_node,
+            recipient_key: encryption_public_key,
+            sealed: vec![0xc7],
+        };
+        let mut invited_epoch = key_epoch(
+            fixture.predecessor.managed.space,
+            fixture.predecessor.managed.agent,
+            0,
+            fixture.node_a,
+            20,
+        );
+        invited_epoch
+            .sealed_owner_keys
+            .push(sealed_owner_key.clone());
+        invited_epoch.sealed_data_keys.push(sealed_data_key.clone());
+        invited_epoch
+            .sealed_owner_keys
+            .sort_by_key(|sealed| sealed.node);
+        invited_epoch
+            .sealed_data_keys
+            .sort_by_key(|sealed| sealed.node);
+        assert!(invited_epoch.validate());
+        let invited_epochs = vec![PrivateKeyEpochCommitment::from_epoch(&invited_epoch).unwrap()];
+        let invite = PrivateControlRecord {
+            space: fixture.predecessor.managed.space,
+            agent: fixture.predecessor.managed.agent,
+            sequence: 0,
+            previous: None,
+            operation: PrivateControlOperation::Invite {
+                node: invited_identity,
+                epoch: 0,
+                sealed_owner_key,
+                sealed_data_key,
+                historical_grants: Vec::new(),
+            },
+            signer: PrivateControlSigner::Owner,
+            signer_public_key: [0xc8; 32],
+            signature: [0xc9; 64],
+        };
+        let receipt = fixture.receipt(
+            AuthorityOperationKind::InvitePrivateNode,
+            invite.commitment(),
+            None,
+        );
+        let invited_store = successor_store(
+            fixture.predecessor.store,
+            &invite,
+            private_key_epoch_root(&invited_epochs).unwrap(),
+            0xca,
+        );
+        let pending = PrivateRuntimeApplication::pending(
+            &fixture.descriptor,
+            &fixture.predecessor,
+            invite,
+            None,
+            None,
+            receipt.clone(),
+            fixture.issuance(receipt),
+            5,
+            invited_store,
+            &AllowVerifier,
+            &AllowVerifier,
+        )
+        .unwrap();
+        let local_source = PrivateRuntimeImage::successor(
+            &fixture.descriptor,
+            &fixture.predecessor,
+            &pending,
+            &PrivateRuntimeSuccess::ControlOnly,
+            fixture.predecessor.state.clone(),
+            invited_epochs,
+            &AllowVerifier,
+            &AllowVerifier,
+        )
+        .unwrap();
+
+        // This clone stands in for the physical sync/open path, which must
+        // verify the invited Node against the exact PKEY preimage first.
+        let mut imported = local_source;
+        imported.node = invited_node;
+        imported.applied_at = 6;
+        imported.state.local = vec![0xcb];
+        assert!(imported.validate().is_ok());
+        let (later, _, _, _) = policy_application(&fixture, &imported, 7);
+        assert_eq!(later.node(), invited_node);
+        later
+            .verify_with(&fixture.descriptor, &AllowVerifier, &AllowVerifier)
+            .unwrap();
+    }
+
+    #[test]
+    fn only_control_lane_may_change_and_divergence_changes_projection() {
+        let fixture = Fixture::new();
+        let (pending, successor, _, _) = policy_application(&fixture, &fixture.predecessor, 5);
+        let success = PrivateRuntimeSuccess::ResourcePolicySet(narrowed_policy());
+
+        let divergent_control = PrivateRuntimeImage::successor(
+            &fixture.descriptor,
+            &fixture.predecessor,
+            &pending,
+            &success,
+            RuntimeState {
+                control: vec![0x87],
+                linear: Vec::new(),
+                merge: fixture.predecessor.state.merge.clone(),
+                local: fixture.predecessor.state.local.clone(),
+            },
+            fixture.predecessor.key_epochs.clone(),
+            &AllowVerifier,
+            &AllowVerifier,
+        )
+        .unwrap();
+        assert_ne!(
+            successor.stable_projection,
+            divergent_control.stable_projection
+        );
+
+        for (merge, local) in [(vec![0x88], vec![0x23]), (vec![0x22], vec![0x89])] {
+            assert!(
+                PrivateRuntimeImage::successor(
+                    &fixture.descriptor,
+                    &fixture.predecessor,
+                    &pending,
+                    &success,
+                    RuntimeState {
+                        control: vec![0x44],
+                        linear: Vec::new(),
+                        merge,
+                        local,
+                    },
+                    fixture.predecessor.key_epochs.clone(),
+                    &AllowVerifier,
+                    &AllowVerifier,
+                )
+                .is_err()
+            );
+        }
+
+        let mut merge_tamper = successor.clone();
+        merge_tamper.state.merge[0] ^= 1;
+        assert!(merge_tamper.validate().is_ok());
+        assert!(
+            pending
+                .clone()
+                .complete(
+                    &fixture.descriptor,
+                    &fixture.predecessor,
+                    &merge_tamper,
+                    success.clone(),
+                    &AllowVerifier,
+                    &AllowVerifier,
+                )
+                .is_err()
+        );
+        let mut local_tamper = successor.clone();
+        local_tamper.state.local[0] ^= 1;
+        assert!(local_tamper.validate().is_ok());
+        assert!(
+            pending
+                .clone()
+                .complete(
+                    &fixture.descriptor,
+                    &fixture.predecessor,
+                    &local_tamper,
+                    success,
+                    &AllowVerifier,
+                    &AllowVerifier,
+                )
+                .is_err()
+        );
+
+        let mut state_tamper = successor;
+        state_tamper.state.control[0] ^= 1;
+        assert!(state_tamper.validate().is_err());
+        assert!(state_tamper.encode().is_err());
+    }
+
+    #[test]
+    fn store_key_epoch_and_cycle_positions_fail_closed() {
+        let fixture = Fixture::new();
+        let (control, mutation) = policy_control(&fixture);
+        let receipt = fixture.receipt(
+            AuthorityOperationKind::SetPrivateResourcePolicy,
+            control.commitment(),
+            None,
+        );
+        let mut wrong_store = successor_store(
+            fixture.predecessor.store,
+            &control,
+            fixture.predecessor.store.key_epoch_root,
+            0x8a,
+        );
+        wrong_store.next_sequence += 1;
+        assert!(wrong_store.validate().is_ok());
+        assert!(
+            PrivateRuntimeApplication::pending(
+                &fixture.descriptor,
+                &fixture.predecessor,
+                control,
+                Some(mutation),
+                None,
+                receipt.clone(),
+                fixture.issuance(receipt),
+                5,
+                wrong_store,
+                &AllowVerifier,
+                &AllowVerifier,
+            )
+            .is_err()
+        );
+
+        let mut later_predecessor = fixture.predecessor.clone();
+        later_predecessor.applied_at = 10;
+        assert!(later_predecessor.validate().is_ok());
+        let (control, mutation) = policy_control(&fixture);
+        let receipt = fixture.receipt(
+            AuthorityOperationKind::SetPrivateResourcePolicy,
+            control.commitment(),
+            None,
+        );
+        let expected_store = successor_store(
+            later_predecessor.store,
+            &control,
+            later_predecessor.store.key_epoch_root,
+            0x8c,
+        );
+        assert!(
+            PrivateRuntimeApplication::pending(
+                &fixture.descriptor,
+                &later_predecessor,
+                control,
+                Some(mutation),
+                None,
+                receipt.clone(),
+                fixture.issuance(receipt),
+                5,
+                expected_store,
+                &AllowVerifier,
+                &AllowVerifier,
+            )
+            .is_err()
+        );
+
+        let jumped_epoch = key_epoch(
+            fixture.predecessor.managed.space,
+            fixture.predecessor.managed.agent,
+            2,
+            fixture.node_a,
+            0x8d,
+        );
+        let rotate = PrivateControlRecord {
+            space: fixture.predecessor.managed.space,
+            agent: fixture.predecessor.managed.agent,
+            sequence: 0,
+            previous: None,
+            operation: PrivateControlOperation::RotateKeys {
+                next_epoch: jumped_epoch.clone(),
+            },
+            signer: PrivateControlSigner::Owner,
+            signer_public_key: [0x8e; 32],
+            signature: [0x8f; 64],
+        };
+        let mut jumped_commitments = fixture.predecessor.key_epochs.clone();
+        jumped_commitments.push(PrivateKeyEpochCommitment::from_epoch(&jumped_epoch).unwrap());
+        let jumped_store = successor_store(
+            fixture.predecessor.store,
+            &rotate,
+            private_key_epoch_root(&jumped_commitments).unwrap(),
+            0x90,
+        );
+        let receipt = fixture.receipt(
+            AuthorityOperationKind::RotatePrivateKeys,
+            rotate.commitment(),
+            None,
+        );
+        assert!(
+            PrivateRuntimeApplication::pending(
+                &fixture.descriptor,
+                &fixture.predecessor,
+                rotate,
+                None,
+                None,
+                receipt.clone(),
+                fixture.issuance(receipt),
+                5,
+                jumped_store,
+                &AllowVerifier,
+                &AllowVerifier,
+            )
+            .is_err()
+        );
+
+        let (pending, mut successor, completed, _) =
+            policy_application(&fixture, &fixture.predecessor, 5);
+        successor.key_epochs[0].exact_wire = hash(0x8b);
+        assert!(successor.validate().is_err());
+
+        let stable_store = pending.expected_successor_store.commitment();
+        let stable_image = completed.successor_runtime_image().unwrap();
+        assert_ne!(pending.commitment(), completed.commitment());
+        assert_eq!(
+            stable_store,
+            completed.expected_successor_store.commitment()
+        );
+        assert_eq!(stable_image, completed.successor_runtime_image().unwrap());
+    }
+
+    #[test]
+    fn route_descriptor_and_store_substitution_are_detected() {
+        let fixture = Fixture::new();
+        let (_, successor, completed, _) = policy_application(&fixture, &fixture.predecessor, 5);
+
+        let mut wrong_descriptor = fixture.descriptor.clone();
+        wrong_descriptor.runtime_package = BlobRef::of_bytes(b"different-private-runtime");
+        wrong_descriptor.validate().unwrap();
+        let descriptor_image = PrivateRuntimeImage::genesis(
+            &wrong_descriptor,
+            fixture.node_a,
+            fixture.predecessor.state.clone(),
+            fixture.predecessor.store,
+            fixture.predecessor.key_epochs.clone(),
+            fixture.predecessor.applied_at,
+        )
+        .unwrap();
+        assert_ne!(
+            fixture.predecessor.stable_projection,
+            descriptor_image.stable_projection
+        );
+        assert!(
+            completed
+                .verify_with(&wrong_descriptor, &AllowVerifier, &AllowVerifier)
+                .is_err()
+        );
+
+        let mut other_route = fixture.descriptor.clone();
+        other_route.identity.space = SpaceId([0x8c; 32]);
+        other_route.identity.agent = AgentId::derive(
+            other_route.identity.space,
+            other_route.identity.owner,
+            other_route.creation_nonce.as_bytes(),
+        );
+        other_route.validate().unwrap();
+        let route_epoch = key_epoch(
+            other_route.identity.space,
+            other_route.identity.agent,
+            0,
+            fixture.node_a,
+            0x8d,
+        );
+        let route_epochs = vec![PrivateKeyEpochCommitment::from_epoch(&route_epoch).unwrap()];
+        let route_store =
+            initial_store(&other_route, private_key_epoch_root(&route_epochs).unwrap());
+        let route_image = PrivateRuntimeImage::genesis(
+            &other_route,
+            fixture.node_a,
+            fixture.predecessor.state.clone(),
+            route_store,
+            route_epochs,
+            fixture.predecessor.applied_at,
+        )
+        .unwrap();
+        assert_ne!(
+            fixture.predecessor.stable_projection,
+            route_image.stable_projection
+        );
+
+        let substituted_store = PrivateStoreCorePosition::new(
+            successor.store.space,
+            successor.store.agent,
+            successor.store.owner,
+            successor.store.epoch,
+            successor.store.control_head,
+            successor.store.next_sequence,
+            successor.store.object_count,
+            successor.store.object_root,
+            successor.store.control_count,
+            Some(hash(0x8e)),
+            successor.store.key_epoch_root,
+        )
+        .unwrap();
+        assert!(PrivateControlReopenedState::new(completed, substituted_store, successor).is_err());
+    }
+
+    #[test]
+    fn malformed_state_projection_and_key_order_are_rejected() {
+        let fixture = Fixture::new();
+        let mut non_private_lane = fixture.predecessor.clone();
+        non_private_lane.state.linear.push(1);
+        assert!(non_private_lane.validate().is_err());
+
+        let mut wrong_projection_generation = fixture.predecessor.clone();
+        wrong_projection_generation.stable_projection.generation = 1;
+        wrong_projection_generation.stable_projection.previous = Some(hash(0x8f));
+        wrong_projection_generation.stable_projection.control_head = Some(hash(0x90));
+        wrong_projection_generation
+            .stable_projection
+            .control_sequence = Some(0);
+        wrong_projection_generation.stable_projection.full_replay = Some(hash(0x91));
+        wrong_projection_generation.stable_projection.disposition = Some(hash(0x92));
+        assert!(
+            wrong_projection_generation
+                .stable_projection
+                .validate()
+                .is_ok()
+        );
+        assert!(wrong_projection_generation.validate().is_err());
+
+        let mut duplicate_epoch = fixture.predecessor.clone();
+        duplicate_epoch
+            .key_epochs
+            .push(duplicate_epoch.key_epochs[0]);
+        assert!(duplicate_epoch.validate().is_err());
+    }
+}
