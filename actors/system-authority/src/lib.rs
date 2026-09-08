@@ -2923,6 +2923,9 @@ fn apply_private_application_transition(
     projection: &mut PrivateAgentProjectionRow,
     record: &PrivateApplicationRecord,
 ) -> bool {
+    // `applied_at` is a monotonic observation, not the ordering key. Exact
+    // control sequence and predecessor-head checks order distinct transitions
+    // which legitimately share one authority-observed slot.
     if record.operation == AuthorityOperationKind::RecoverPrivateAgent as u8 {
         let retired = RetiredPrivateOperationRow {
             agent: record.agent,
@@ -2947,7 +2950,7 @@ fn apply_private_application_transition(
             || record.member_set != proof.replacement_member_set.0
             || projection
                 .applied_at
-                .is_some_and(|applied_at| record.applied_at <= applied_at)
+                .is_some_and(|applied_at| record.applied_at < applied_at)
         {
             return false;
         }
@@ -3013,7 +3016,7 @@ fn apply_private_application_transition(
         || record.member_set != member_set.0
         || projection
             .applied_at
-            .is_some_and(|applied_at| record.applied_at <= applied_at)
+            .is_some_and(|applied_at| record.applied_at < applied_at)
     {
         return false;
     }
@@ -10069,6 +10072,8 @@ mod tests {
         let mut recover_call = operation_call(config, &owner_key, owner, None, 0xca, recover);
         prepare_operation_call(&actor, &mut recover_call, &owner_key);
         let (approval, issuance) = authorize_and_issue_operation(&mut actor, &recover_call);
+        // Recovery is likewise ordered by its signed fork position and may
+        // share the superseded Invite application's observation slot.
         let pca = private_application_ack(
             &recover_call,
             &approval,
@@ -10077,7 +10082,7 @@ mod tests {
                 &recover_call,
                 proof.replacement_member_set,
                 Hash([0xc4; 32]),
-                OBSERVED_SLOT + 2,
+                OBSERVED_SLOT + 1,
             ),
         );
         assert!(dispatch_private_application(&mut actor, &pca));
@@ -10904,9 +10909,25 @@ mod tests {
             &lifecycle_call,
             member_set,
             Hash([0x5a; 32]),
-            OBSERVED_SLOT + 3,
+            OBSERVED_SLOT + 2,
         );
         lifecycle_application.epoch = 1;
+        let mut older_lifecycle_application = lifecycle_application;
+        older_lifecycle_application.applied_at = OBSERVED_SLOT + 1;
+        let older_lifecycle_pca = private_application_ack(
+            &lifecycle_call,
+            &lifecycle_approval,
+            &lifecycle_issuance,
+            older_lifecycle_application,
+        );
+        let before_lifecycle_application = actor.state.clone();
+        assert!(!dispatch_private_application(
+            &mut actor,
+            &older_lifecycle_pca
+        ));
+        assert_eq!(actor.state, before_lifecycle_application);
+        // The exact sequence/head chain orders this distinct control even
+        // though it shares the resource application's observed slot.
         let lifecycle_pca = private_application_ack(
             &lifecycle_call,
             &lifecycle_approval,
@@ -10922,6 +10943,10 @@ mod tests {
         assert_eq!(actor.state.private_agents[0].control_sequence, Some(2));
         assert_eq!(actor.state.private_agents[0].epoch, 1);
         assert_eq!(actor.state.private_agents[0].member_set, member_set.0);
+        assert_eq!(
+            actor.state.private_agents[0].applied_at,
+            Some(OBSERVED_SLOT + 2)
+        );
 
         let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
         let mut restarted = <SystemAuthority as vos::Actor>::__load_agent_state(
@@ -11789,7 +11814,7 @@ mod tests {
                 &fourth_call,
                 fourth_member_set,
                 Hash([0x90; 32]),
-                OBSERVED_SLOT + 3,
+                OBSERVED_SLOT + 2,
             ),
         );
         assert!(!dispatch_private_application(&mut actor, &rollback));
