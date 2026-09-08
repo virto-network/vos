@@ -2545,6 +2545,11 @@ impl PrivateAgentHost {
         complete: bool,
     ) -> Result<Vec<u8>, PrivateAgentHostError> {
         let hosted = self.hosted(agent)?;
+        // A newest PAPL without its terminal authority evidence is retained
+        // solely so the exact callback can finish after a crash.  It is not
+        // an authenticated history endpoint and must never escape through an
+        // otherwise complete snapshot or backup.
+        require_resolved_runtime_application_head(&hosted.store)?;
         let slot = self.agent_path(agent);
         let store = if complete {
             hosted.store.export_encrypted_backup(max_bytes)?
@@ -4973,7 +4978,11 @@ fn authenticate_runtime_application_lineage(
                 )?;
                 true
             }
-            None if is_last => false,
+            None if is_last
+                && !matches!(&control.operation, PrivateControlOperation::Recover { .. }) =>
+            {
+                false
+            }
             None => return Err(PrivateAgentHostError::Corrupt),
         };
         let predecessor_count =
@@ -8247,6 +8256,14 @@ mod tests {
             ),
             Err(PrivateAgentHostError::UnsupportedOperation)
         );
+        assert_eq!(
+            host.export_encrypted_snapshot(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES),
+            Err(PrivateAgentHostError::UnsupportedOperation)
+        );
+        assert_eq!(
+            host.export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES),
+            Err(PrivateAgentHostError::UnsupportedOperation)
+        );
 
         let sidecars = canonical_sidecars(&host, agent);
         let retry = {
@@ -8276,6 +8293,14 @@ mod tests {
                 authority,
                 &TestTransport,
             ),
+            Err(PrivateAgentHostError::UnsupportedOperation)
+        );
+        assert_eq!(
+            reopened.export_encrypted_snapshot(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES),
+            Err(PrivateAgentHostError::UnsupportedOperation)
+        );
+        assert_eq!(
+            reopened.export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES),
             Err(PrivateAgentHostError::UnsupportedOperation)
         );
     }
@@ -9229,7 +9254,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_preflight_rejects_missing_historical_pse2_before_staging() {
+    fn archive_export_rejects_missing_historical_pse2_before_staging() {
         let fixture = fixture(1);
         let mut source = create_host(&fixture, 0, "missing-historical-pse-source");
         let agent = create_agent(&mut source, &fixture);
@@ -9238,33 +9263,14 @@ mod tests {
         source
             .apply_recovery_record(agent, recovery.previous, &recovery, &TestAuthority)
             .unwrap();
-        let backup = source
-            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
-            .unwrap();
-        drop(source);
-
-        let replacement = node(fixture.space, fixture.owner, 99);
-        let mut target = PrivateAgentHost::create(
-            fixture.directory.child("missing-historical-pse-target"),
-            fixture.space,
-            fixture.owner,
-            replacement.identity.clone(),
-            replacement.key(),
-        )
-        .unwrap();
         assert_eq!(
-            target.prepare_recovery_from_encrypted_backup(
-                recovery_route(&fixture, agent),
-                None,
-                &recovery_kit(),
-                core::slice::from_ref(&replacement.identity),
-                &backup,
-                &TestAuthority,
-            ),
-            Err(PrivateAgentHostError::Unauthorized)
+            source.export_encrypted_snapshot(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES),
+            Err(PrivateAgentHostError::UnsupportedOperation)
         );
-        assert!(!target.creating_path(agent).exists());
-        assert!(!target.agent_path(agent).exists());
+        assert_eq!(
+            source.export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES),
+            Err(PrivateAgentHostError::UnsupportedOperation)
+        );
     }
 
     #[test]
@@ -10638,7 +10644,8 @@ mod tests {
                 &TestAuthority,
             )
             .unwrap();
-        source.rotate_keys(agent, &TestAuthority).unwrap();
+        let rotate = signed_rotate_control(&source, agent);
+        apply_and_attach_test_authority_evidence(&mut source, &fixture, &rotate, 40, 41);
         assert_eq!(
             source
                 .get_and_decrypt(agent, epoch_zero)
@@ -10669,10 +10676,16 @@ mod tests {
                 &TestAuthority,
             )
             .unwrap();
-        assert!(matches!(
-            complete_prepared_recovery(&mut recovered, &fixture, &prepared),
-            Err(PrivateAgentHostError::Corrupt) | Err(PrivateAgentHostError::UnsupportedOperation)
-        ));
+        let result = complete_prepared_recovery(&mut recovered, &fixture, &prepared);
+        assert!(
+            matches!(
+                &result,
+                Err(PrivateAgentHostError::Corrupt)
+                    | Err(PrivateAgentHostError::InvalidScope)
+                    | Err(PrivateAgentHostError::UnsupportedOperation)
+            ),
+            "unexpected recovery result: {result:?}"
+        );
         assert_eq!(
             recovered.binding(agent),
             Err(PrivateAgentHostError::NotFound)
