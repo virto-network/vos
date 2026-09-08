@@ -298,6 +298,12 @@ struct PendingStableImportCertificate {
     wire_len: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlEvidenceAttachmentMode {
+    Ordinary,
+    AuthenticatedRestore,
+}
+
 /// Control-chain-authenticated, bounded ciphertext archive held only while an
 /// offline recovery ceremony prepares its exact successor. It deliberately
 /// exposes sealed epoch metadata but no API for plaintext or unwrapped keys.
@@ -3036,8 +3042,27 @@ impl PrivateStore {
                 }
             }
         }
-        for (record, evidence) in backup.controls.iter().zip(&backup.control_evidence) {
+        for (position, (record, evidence)) in backup
+            .controls
+            .iter()
+            .zip(&backup.control_evidence)
+            .enumerate()
+        {
             if let Some(evidence) = evidence {
+                let entry = store
+                    .index
+                    .controls
+                    .get(position)
+                    .ok_or(PrivateStoreError::Corrupt)?;
+                if store
+                    .read_control_authority_evidence(entry)?
+                    .is_some_and(|existing| existing == *evidence)
+                {
+                    // In particular, retain an already-reattached node-local
+                    // PSI1. Calling the ordinary evidence seam here would
+                    // correctly reject that asymmetric API request.
+                    continue;
+                }
                 changed |= store
                     .persist_control_authority_evidence(record.commitment(), evidence)?
                     == PutDisposition::Inserted;
@@ -3900,6 +3925,29 @@ impl PrivateStore {
         )
     }
 
+    /// Reattach a PSI1 which was deliberately excluded from a portable PVB3
+    /// and was carried instead by a same-node HostArchive. The physical host
+    /// must authenticate the certificate and every exact PAPL/PSE binding
+    /// before entering this narrowly scoped seam.
+    ///
+    /// Unlike ordinary imported persistence, restoration starts with the PSE2
+    /// already present (it came from PVB3) and PSI1 absent. Keeping this case
+    /// separate preserves the generic local-PSE-to-import rejection.
+    pub(crate) fn reattach_authenticated_stable_import_certificate_after_restore(
+        &mut self,
+        control: Hash,
+        evidence: &[u8],
+        stable_import_certificate: &[u8],
+    ) -> Result<PutDisposition, PrivateStoreError> {
+        self.persist_control_authority_evidence_inner_with_mode(
+            control,
+            evidence,
+            Some(stable_import_certificate),
+            ControlEvidenceCommitStop::Never,
+            ControlEvidenceAttachmentMode::AuthenticatedRestore,
+        )
+    }
+
     pub(crate) fn persist_control_authority_evidence_with_stop_for_runtime(
         &mut self,
         control: Hash,
@@ -3915,6 +3963,23 @@ impl PrivateStore {
         evidence: &[u8],
         stable_import_certificate: Option<&[u8]>,
         stop: ControlEvidenceCommitStop,
+    ) -> Result<PutDisposition, PrivateStoreError> {
+        self.persist_control_authority_evidence_inner_with_mode(
+            control,
+            evidence,
+            stable_import_certificate,
+            stop,
+            ControlEvidenceAttachmentMode::Ordinary,
+        )
+    }
+
+    fn persist_control_authority_evidence_inner_with_mode(
+        &mut self,
+        control: Hash,
+        evidence: &[u8],
+        stable_import_certificate: Option<&[u8]>,
+        stop: ControlEvidenceCommitStop,
+        mode: ControlEvidenceAttachmentMode,
     ) -> Result<PutDisposition, PrivateStoreError> {
         #[cfg(not(test))]
         let _ = stop;
@@ -3958,6 +4023,16 @@ impl PrivateStore {
             }
             (Some(existing), None)
                 if stable_import_certificate.is_none() && existing.as_slice() != evidence =>
+            {
+                return Err(PrivateStoreError::Alias);
+            }
+            (Some(existing), None)
+                if mode == ControlEvidenceAttachmentMode::AuthenticatedRestore
+                    && stable_import_certificate.is_some()
+                    && existing.as_slice() == evidence => {}
+            (Some(_), None)
+                if mode == ControlEvidenceAttachmentMode::AuthenticatedRestore
+                    && stable_import_certificate.is_some() =>
             {
                 return Err(PrivateStoreError::Alias);
             }
@@ -5994,6 +6069,98 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_archive_reattachment_reconciles_every_pve2_boundary() {
+        for (index, stop) in [
+            ControlEvidenceCommitStop::AfterEvidenceStaged,
+            ControlEvidenceCommitStop::AfterStaged,
+            ControlEvidenceCommitStop::AfterPending,
+            ControlEvidenceCommitStop::AfterCertificatePublished,
+            ControlEvidenceCommitStop::AfterPublished,
+            ControlEvidenceCommitStop::AfterRetired,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let directory = TestDirectory::new(&format!("archive-reattach-stop-{index}"));
+            let path = directory.store();
+            let (mut store, fixture, control) =
+                runtime_store_with_completed_control(&path, 0xb0 + index as u8);
+            let mut evidence = b"PSE2-existing-exact-archive-evidence-".to_vec();
+            evidence.push(index as u8);
+            let certificate =
+                vec![0xc0 + index as u8; PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES];
+            store
+                .persist_control_authority_evidence(control.commitment(), &evidence)
+                .unwrap();
+            assert_eq!(
+                store.persist_imported_control_authority_evidence(
+                    control.commitment(),
+                    &evidence,
+                    &certificate,
+                ),
+                Err(PrivateStoreError::Corrupt),
+                "ordinary persistence must not reclassify local evidence"
+            );
+            assert_eq!(
+                store.persist_control_authority_evidence_inner_with_mode(
+                    control.commitment(),
+                    &evidence,
+                    Some(&certificate),
+                    stop,
+                    ControlEvidenceAttachmentMode::AuthenticatedRestore,
+                ),
+                Err(PrivateStoreError::Interrupted)
+            );
+            drop(store);
+
+            let mut reopened = PrivateStore::open(
+                &path,
+                fixture.store_fixture.space,
+                fixture.store_fixture.agent,
+                &TestAuthority,
+            )
+            .unwrap();
+            let entry = &reopened.indexed_controls()[0];
+            assert_eq!(
+                reopened.read_control_authority_evidence(entry).unwrap(),
+                Some(evidence.clone())
+            );
+            let restored_certificate = reopened.read_stable_import_certificate(entry).unwrap();
+            if matches!(
+                stop,
+                ControlEvidenceCommitStop::AfterEvidenceStaged
+                    | ControlEvidenceCommitStop::AfterStaged
+            ) {
+                assert_eq!(restored_certificate, None);
+            } else {
+                assert_eq!(restored_certificate, Some(certificate.clone()));
+            }
+            assert!(matches!(
+                reopened.reattach_authenticated_stable_import_certificate_after_restore(
+                    control.commitment(),
+                    &evidence,
+                    &certificate,
+                ),
+                Ok(PutDisposition::Inserted | PutDisposition::AlreadyPresent)
+            ));
+            assert_eq!(
+                reopened.read_stable_import_certificate(&reopened.indexed_controls()[0]),
+                Ok(Some(certificate.clone()))
+            );
+            let mut alias = evidence.clone();
+            alias.push(0xff);
+            assert_eq!(
+                reopened.reattach_authenticated_stable_import_certificate_after_restore(
+                    control.commitment(),
+                    &alias,
+                    &certificate,
+                ),
+                Err(PrivateStoreError::Alias)
+            );
+        }
+    }
+
+    #[test]
     fn imported_evidence_rejects_aliases_asymmetry_and_missing_local_application() {
         let directory = TestDirectory::new("imported-evidence-alias");
         let path = directory.store();
@@ -6214,6 +6381,24 @@ mod tests {
         .unwrap();
         assert_eq!(verified.control_evidence, vec![Some(evidence.clone())]);
         drop(store);
+
+        let (retried, disposition) = PrivateStore::restore_encrypted_backup(
+            &path,
+            fixture.store_fixture.space,
+            fixture.store_fixture.agent,
+            fixture.store_fixture.owner,
+            fixture.store_fixture.recovery.verifying_key(),
+            fixture.store_fixture.recovery_encryption.public_key(),
+            &backup,
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(disposition, RestoreDisposition::AlreadyPresent);
+        assert_eq!(
+            retried.read_stable_import_certificate(&retried.indexed_controls()[0]),
+            Ok(Some(certificate.clone()))
+        );
+        drop(retried);
 
         let restored_path = directory.0.join("restored");
         let (restored, _) = PrivateStore::restore_encrypted_backup(

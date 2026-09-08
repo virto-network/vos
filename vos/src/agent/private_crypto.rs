@@ -15,6 +15,7 @@ use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use rand_core::{CryptoRng, OsRng, RngCore};
 use sha2::Sha256;
+use subtle::ConstantTimeEq as _;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -187,6 +188,8 @@ impl PrivateStableImportCertificate {
         stable_projection: Hash,
         node_key: &PrivateNodeDecryptionKey,
     ) -> Result<(), PrivateCryptoError> {
+        let expected_authenticator =
+            node_key.stable_import_certificate_authenticator(self.body_commitment())?;
         if !destination.validate()
             || destination.principal != owner
             || destination.encryption_public_key != node_key.public_key()
@@ -200,8 +203,11 @@ impl PrivateStableImportCertificate {
             || self.stable_projection != stable_projection
             || !self.validate_context()
             || self.authenticator == Hash::ZERO
-            || node_key.stable_import_certificate_authenticator(self.body_commitment())?
-                != self.authenticator
+            || !bool::from(
+                expected_authenticator
+                    .as_bytes()
+                    .ct_eq(self.authenticator.as_bytes()),
+            )
         {
             return Err(PrivateCryptoError::InvalidSignature);
         }

@@ -142,3 +142,4 @@ num-traits = "0.2"
 serde = { version = "1", features = ["derive"] }
 rayon = "1.10"
 impl-trait-for-tuples = "0.2.2"
+subtle = { version = "2.6", default-features = false }

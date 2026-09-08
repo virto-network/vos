@@ -45,6 +45,7 @@ use vos_agent_sdk::protocol::wire::{DecodeError, Decoder, Encoder};
 use vos_agent_sdk::wire::{
     CanonicalWire, MAX_PRIVATE_CONTROL_WIRE_BYTES, MAX_PRIVATE_NODE_IDENTITY_WIRE_BYTES,
     MAX_PRIVATE_OBJECT_WIRE_BYTES, MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES,
+    authority_private_node_identity_commitment,
 };
 use vos_agent_sdk::{
     ActorDescriptor, ActorId, AgentDescriptor, AgentId, AgentIdentity, AgentProfile, AgentReplica,
@@ -72,12 +73,13 @@ use super::private_crypto::{
     seal_owner_key_for_node, sign_owner_control_record,
 };
 use super::private_crypto::{
-    OfflineRecoveryKit, OwnerSigningKey, PrivateCryptoError, PrivateDataKey,
-    PrivateNodeAuthorityVerifier, PrivateNodeDecryptionKey, build_recovery_keyring_grant,
-    decrypt_private_object, encrypt_private_object, generate_fresh_private_epoch,
-    sign_recovery_control_record, unwrap_data_key, unwrap_invite_history_grants, unwrap_owner_key,
-    unwrap_recovery_data_key, unwrap_recovery_keyring, valid_x25519_public_key,
-    verify_control_record_signature,
+    MAX_PRIVATE_CONTROL_RECORDS, OfflineRecoveryKit, OwnerSigningKey,
+    PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES, PrivateCryptoError, PrivateDataKey,
+    PrivateNodeAuthorityVerifier, PrivateNodeDecryptionKey, PrivateStableImportCertificate,
+    build_recovery_keyring_grant, decrypt_private_object, encrypt_private_object,
+    generate_fresh_private_epoch, sign_recovery_control_record, unwrap_data_key,
+    unwrap_invite_history_grants, unwrap_owner_key, unwrap_recovery_data_key,
+    unwrap_recovery_keyring, valid_x25519_public_key, verify_control_record_signature,
 };
 use super::private_runtime::{
     MAX_PRIVATE_RUNTIME_IMAGE_WIRE_BYTES, PrivateControlReopenedState, PrivateKeyEpochCommitment,
@@ -103,7 +105,7 @@ pub const MAX_PRIVATE_BOOTSTRAP_METADATA_BYTES: usize = 1024 * 1024;
 pub const MAX_PRIVATE_HOST_ARCHIVE_BYTES: usize = MAX_PRIVATE_BACKUP_BYTES + 32 * 1024 * 1024;
 
 const FORMAT_VERSION: u16 = 2;
-const HOST_ARCHIVE_VERSION: u16 = 3;
+const HOST_ARCHIVE_VERSION: u16 = 4;
 const ROOT_SCOPE_MAGIC: &[u8; 4] = b"PVHR";
 const DESCRIPTOR_MAGIC: &[u8; 4] = b"PVHD";
 const RUNTIME_MAGIC: &[u8; 4] = b"PVHP";
@@ -1244,7 +1246,7 @@ impl PrivateAgentHost {
         let stage = self.creating_path(agent);
         fs::create_dir(&stage).map_err(map_io)?;
         let result = (|| {
-            let (store, disposition) = PrivateStore::restore_encrypted_backup(
+            let (mut store, disposition) = PrivateStore::restore_encrypted_backup(
                 stage.join(STORE_DIRECTORY),
                 self.scope.space,
                 agent,
@@ -1258,6 +1260,13 @@ impl PrivateAgentHost {
             write_new_synced(&stage.join(RUNTIME_FILE), &archive.runtime)?;
             write_new_synced(&stage.join(BOOTSTRAP_FILE), &archive.bootstrap)?;
             write_new_synced(&stage.join(RUNTIME_STATE_FILE), &archive.runtime_state)?;
+            reattach_same_node_archive_stable_import_certificates(
+                &mut store,
+                &archive,
+                self.scope.owner,
+                &self.scope.local_node,
+                &self.node_key,
+            )?;
             drop(store);
             // The files themselves are durable, but their directory entries
             // must also reach disk before the staging directory is published.
@@ -1658,6 +1667,7 @@ impl PrivateAgentHost {
                 runtime: recovered_sidecars.runtime,
                 bootstrap: recovered_sidecars.bootstrap,
                 runtime_state: recovered_runtime_state,
+                stable_import_certificates: Vec::new(),
             },
             true,
             MAX_PRIVATE_HOST_ARCHIVE_BYTES,
@@ -2676,6 +2686,11 @@ impl PrivateAgentHost {
             runtime: read_sidecar_wire(&slot, RUNTIME_FILE)?,
             bootstrap: read_sidecar_wire(&slot, BOOTSTRAP_FILE)?,
             runtime_state: read_sidecar_wire(&slot, RUNTIME_STATE_FILE)?,
+            stable_import_certificates: if complete {
+                collect_stable_import_certificates(&hosted.store)?
+            } else {
+                Vec::new()
+            },
         };
         encode_host_archive(&archive, complete, max_bytes)
     }
@@ -4802,6 +4817,7 @@ fn open_hosted_agent<V: PrivateNodeAuthorityVerifier>(
         &store,
         &plaintext.descriptor,
         local_node,
+        node_key,
         &data_keys,
     )?;
     Ok(HostedPrivateAgent {
@@ -5031,6 +5047,7 @@ fn reconcile_and_open_runtime_image(
     store: &PrivateStore,
     descriptor: &AgentDescriptor,
     local_node: &PrivateNodeIdentity,
+    node_key: &PrivateNodeDecryptionKey,
     data_keys: &BTreeMap<u64, PrivateDataKey>,
 ) -> Result<PrivateRuntimeImage, PrivateAgentHostError> {
     let current_store = store.core_position()?;
@@ -5047,7 +5064,9 @@ fn reconcile_and_open_runtime_image(
     let staged = find_staged_runtime_image(slot)?;
 
     if runtime_image_matches_store(&canonical, current_store, &current_key_epochs) {
-        authenticate_runtime_application_lineage(store, descriptor, &canonical)?;
+        authenticate_runtime_application_lineage(
+            store, descriptor, &canonical, local_node, node_key,
+        )?;
         if let Some((path, _)) = staged {
             // Deliberate deletion-only exception: when Store and canonical
             // PVRI agree, any single strictly named staged ciphertext is an
@@ -5066,7 +5085,9 @@ fn reconcile_and_open_runtime_image(
         let key = data_keys
             .get(&current_store.epoch())
             .ok_or(PrivateAgentHostError::Corrupt)?;
-        authenticate_runtime_application_lineage(store, descriptor, &rebound)?;
+        authenticate_runtime_application_lineage(
+            store, descriptor, &rebound, local_node, node_key,
+        )?;
         replace_regular_file_synced(
             &canonical_path,
             &encrypt_runtime_image_sidecar(key, &rebound)?,
@@ -5095,7 +5116,7 @@ fn reconcile_and_open_runtime_image(
     {
         return Err(PrivateAgentHostError::Corrupt);
     }
-    authenticate_runtime_application_lineage(store, descriptor, &successor)?;
+    authenticate_runtime_application_lineage(store, descriptor, &successor, local_node, node_key)?;
     fs::rename(&staged_path, &canonical_path).map_err(map_io)?;
     sync_directory(slot)?;
     Ok(successor)
@@ -5105,6 +5126,8 @@ fn authenticate_runtime_application_lineage(
     store: &PrivateStore,
     descriptor: &AgentDescriptor,
     runtime_image: &PrivateRuntimeImage,
+    local_node: &PrivateNodeIdentity,
+    node_key: &PrivateNodeDecryptionKey,
 ) -> Result<(), PrivateAgentHostError> {
     let controls = store.indexed_controls();
     if controls.is_empty() {
@@ -5119,7 +5142,10 @@ fn authenticate_runtime_application_lineage(
         return Ok(());
     }
 
-    let mut previous: Option<(PrivateRuntimeApplication, bool)> = None;
+    let mut previous: Option<(
+        PrivateRuntimeApplication,
+        PrivateRuntimeApplicationProvenance,
+    )> = None;
     for (position, indexed) in controls.iter().enumerate() {
         let control_wire = store.read_control_wire(indexed)?;
         let control = PrivateControlRecord::decode(&control_wire)
@@ -5135,23 +5161,25 @@ fn authenticate_runtime_application_lineage(
             )
             .map_err(|_| PrivateAgentHostError::Corrupt)?;
         let is_last = position + 1 == controls.len();
-        let endpoint_authenticated = match store.read_control_authority_evidence(indexed)? {
-            Some(evidence_wire) => {
-                authenticate_local_runtime_application_endpoint(
-                    descriptor,
-                    &control,
-                    indexed.resulting_epoch,
-                    &application,
-                    &evidence_wire,
-                )?;
-                true
-            }
-            None if is_last
-                && !matches!(&control.operation, PrivateControlOperation::Recover { .. }) =>
+        let evidence_wire = store.read_control_authority_evidence(indexed)?;
+        let certificate_wire = store.read_stable_import_certificate(indexed)?;
+        let provenance = match (evidence_wire.as_deref(), certificate_wire.as_deref()) {
+            (Some(evidence_wire), certificate_wire) => authenticate_runtime_application_endpoint(
+                descriptor,
+                &control,
+                indexed.resulting_epoch,
+                &application,
+                evidence_wire,
+                certificate_wire,
+                Some((local_node, node_key)),
+            )?,
+            (None, None)
+                if is_last
+                    && !matches!(&control.operation, PrivateControlOperation::Recover { .. }) =>
             {
-                false
+                PrivateRuntimeApplicationProvenance::Pending
             }
-            None => return Err(PrivateAgentHostError::Corrupt),
+            (None, None) | (None, Some(_)) => return Err(PrivateAgentHostError::Corrupt),
         };
         let predecessor_count =
             u32::try_from(position).map_err(|_| PrivateAgentHostError::LimitExceeded)?;
@@ -5169,7 +5197,7 @@ fn authenticate_runtime_application_lineage(
             return Err(PrivateAgentHostError::Corrupt);
         }
 
-        if let Some((prior, prior_endpoint_authenticated)) = &previous {
+        if let Some((prior, prior_provenance)) = &previous {
             let expected_runtime_control = if prior.mutation().is_some() {
                 Some(PrivateRuntimeControlPosition {
                     control: prior.control().commitment(),
@@ -5186,7 +5214,8 @@ fn authenticate_runtime_application_lineage(
             );
             if (!store_continuity && !object_rebind)
                 || (object_rebind
-                    && (!*prior_endpoint_authenticated || (!endpoint_authenticated && !is_last)))
+                    && (!prior_provenance.is_authenticated()
+                        || (!provenance.is_authenticated() && !is_last)))
                 || (store_continuity
                     && prior.successor_runtime_image()
                         != Some(application.predecessor_runtime_image()))
@@ -5213,13 +5242,13 @@ fn authenticate_runtime_application_lineage(
         {
             return Err(PrivateAgentHostError::Corrupt);
         }
-        previous = Some((application, endpoint_authenticated));
+        previous = Some((application, provenance));
     }
 
-    let (last, last_endpoint_authenticated) = previous.ok_or(PrivateAgentHostError::Corrupt)?;
+    let (last, last_provenance) = previous.ok_or(PrivateAgentHostError::Corrupt)?;
     if last.expected_successor_store().control_count() as usize != controls.len()
         || last.expected_successor_store().control_head() != runtime_image.store().control_head()
-        || if last_endpoint_authenticated {
+        || if last_provenance.is_authenticated() {
             !runtime_image.matches_application_successor_after_object_growth(&last)
         } else {
             // The one crash-valid unresolved state is the exact newest PAPL
@@ -5234,11 +5263,22 @@ fn authenticate_runtime_application_lineage(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrivateRuntimeApplicationProvenance {
+    LocalExact,
+    ImportedStable,
+    Pending,
+}
+
+impl PrivateRuntimeApplicationProvenance {
+    const fn is_authenticated(self) -> bool {
+        matches!(self, Self::LocalExact | Self::ImportedStable)
+    }
+}
+
 /// Authenticate an authority endpoint emitted for this node's own completed
-/// application. Local provenance requires exact PCRS3 equality. A future sync
-/// receiver must use an explicit replica-stable provenance record instead:
-/// raw-verify the source PCA/PRA/AOI, compare only its signed PSP with the
-/// local completed PAPL, and never adopt the source node's PCRS/PVRI.
+/// application. This callback may never silently reclassify a local PSE as an
+/// imported one.
 fn authenticate_local_runtime_application_endpoint(
     descriptor: &AgentDescriptor,
     control: &PrivateControlRecord,
@@ -5246,6 +5286,78 @@ fn authenticate_local_runtime_application_endpoint(
     application: &PrivateRuntimeApplication,
     evidence_wire: &[u8],
 ) -> Result<(), PrivateAgentHostError> {
+    if authenticate_runtime_application_endpoint(
+        descriptor,
+        control,
+        resulting_epoch,
+        application,
+        evidence_wire,
+        None,
+        None,
+    )? != PrivateRuntimeApplicationProvenance::LocalExact
+    {
+        return Err(PrivateAgentHostError::Corrupt);
+    }
+    Ok(())
+}
+
+/// Verify the exact foreign-PSE/local-PAPL/PSI tuple before any caller enters
+/// imported persistence. This is intentionally narrower than the lineage
+/// classifier: it can return only ImportedStable or an error.
+pub(crate) fn authenticate_imported_runtime_application_endpoint(
+    descriptor: &AgentDescriptor,
+    control: &PrivateControlRecord,
+    resulting_epoch: u64,
+    application: &PrivateRuntimeApplication,
+    evidence_wire: &[u8],
+    stable_import_certificate_wire: &[u8],
+    local_node: &PrivateNodeIdentity,
+    node_key: &PrivateNodeDecryptionKey,
+) -> Result<(), PrivateAgentHostError> {
+    application
+        .verify_with(
+            descriptor,
+            &RawAuthorityVerifier,
+            &RawRecoveryAuthorityProofVerifier,
+        )
+        .map_err(|_| PrivateAgentHostError::Corrupt)?;
+    if !application.is_complete()
+        || application.node() != local_node.node
+        || application.control() != control
+        || application.expected_successor_store().control_head() != Some(control.commitment())
+        || application.expected_successor_store().epoch() != resulting_epoch
+    {
+        return Err(PrivateAgentHostError::Corrupt);
+    }
+    if authenticate_runtime_application_endpoint(
+        descriptor,
+        control,
+        resulting_epoch,
+        application,
+        evidence_wire,
+        Some(stable_import_certificate_wire),
+        Some((local_node, node_key)),
+    )? != PrivateRuntimeApplicationProvenance::ImportedStable
+    {
+        return Err(PrivateAgentHostError::Corrupt);
+    }
+    Ok(())
+}
+
+/// Classify exactly one completed PAPL endpoint. The three states are
+/// deliberately exclusive: a local PSE has exact local PCRS3 and no PSI1; an
+/// imported PSE has a foreign PCRS3 plus an exact destination-authenticated
+/// PSI1; and only the newest completed PAPL may be Pending with neither.
+#[allow(clippy::too_many_arguments)]
+fn authenticate_runtime_application_endpoint(
+    descriptor: &AgentDescriptor,
+    control: &PrivateControlRecord,
+    resulting_epoch: u64,
+    application: &PrivateRuntimeApplication,
+    evidence_wire: &[u8],
+    stable_import_certificate_wire: Option<&[u8]>,
+    destination: Option<(&PrivateNodeIdentity, &PrivateNodeDecryptionKey)>,
+) -> Result<PrivateRuntimeApplicationProvenance, PrivateAgentHostError> {
     let evidence = PrivateControlAuthorityEvidence::decode(evidence_wire)?;
     let issuance = AuthorityOperationIssuanceAck::decode(&evidence.issuance_ack)
         .map_err(|_| PrivateAgentHostError::Corrupt)?;
@@ -5259,10 +5371,11 @@ fn authenticate_local_runtime_application_endpoint(
     let reopened_runtime_state =
         PrivateControlReopenedState::commitment_from_application(application)
             .map_err(|_| PrivateAgentHostError::Corrupt)?;
+    let exact_local_reopened_state =
+        application_ack.application.reopened_runtime_state == reopened_runtime_state;
     if authority.space != route.space
         || authority.binding != descriptor.authority
         || application.issuance() != &issuance
-        || application_ack.application.reopened_runtime_state != reopened_runtime_state
         || application_ack.application.stable_projection != successor_projection.commitment()
         || application_ack.application.applied_at != application.applied_at()
     {
@@ -5275,7 +5388,33 @@ fn authenticate_local_runtime_application_endpoint(
         route,
         authority,
     )?;
-    Ok(())
+    match stable_import_certificate_wire {
+        None if exact_local_reopened_state => Ok(PrivateRuntimeApplicationProvenance::LocalExact),
+        None => Err(PrivateAgentHostError::Corrupt),
+        Some(_) if exact_local_reopened_state => Err(PrivateAgentHostError::Corrupt),
+        Some(wire) => {
+            let (local_node, node_key) = destination.ok_or(PrivateAgentHostError::Corrupt)?;
+            if wire.len() != PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES {
+                return Err(PrivateAgentHostError::Corrupt);
+            }
+            let certificate = PrivateStableImportCertificate::decode(wire)
+                .map_err(|_| PrivateAgentHostError::Corrupt)?;
+            certificate
+                .verify_for(
+                    route,
+                    descriptor.identity.owner,
+                    descriptor.commitment(),
+                    local_node,
+                    control.commitment(),
+                    application.commitment(),
+                    evidence.commitment()?,
+                    successor_projection.commitment(),
+                    node_key,
+                )
+                .map_err(|_| PrivateAgentHostError::Corrupt)?;
+            Ok(PrivateRuntimeApplicationProvenance::ImportedStable)
+        }
+    }
 }
 
 fn private_store_is_strict_object_growth(
@@ -5757,6 +5896,9 @@ struct HostArchive {
     runtime: Vec<u8>,
     bootstrap: Vec<u8>,
     runtime_state: Vec<u8>,
+    /// Canonical PSI1 wires, strictly ordered by their bound control hash.
+    /// PVB3/PVS3 remain portable and exclude this node-local material.
+    stable_import_certificates: Vec<Vec<u8>>,
 }
 
 struct RecoveryPlan {
@@ -6294,6 +6436,7 @@ fn reconcile_exact_duplicate_slot<V: PrivateNodeAuthorityVerifier>(
                 runtime: read_sidecar_wire(slot, RUNTIME_FILE)?,
                 bootstrap: read_sidecar_wire(slot, BOOTSTRAP_FILE)?,
                 runtime_state: read_sidecar_wire(slot, RUNTIME_STATE_FILE)?,
+                stable_import_certificates: collect_stable_import_certificates(&hosted.store)?,
             };
             encode_host_archive(&archive, true, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
         };
@@ -6545,6 +6688,12 @@ fn encode_host_archive(
     complete: bool,
     max_bytes: usize,
 ) -> Result<Vec<u8>, PrivateAgentHostError> {
+    validate_host_archive_stable_import_certificates(
+        &archive.stable_import_certificates,
+        complete,
+        archive.space,
+        archive.agent,
+    )?;
     let maximum = max_bytes.min(MAX_PRIVATE_HOST_ARCHIVE_BYTES);
     let mut bytes = Vec::new();
     bytes.extend_from_slice(if complete {
@@ -6562,6 +6711,12 @@ fn encode_host_archive(
     encoder.bytes(&archive.runtime);
     encoder.bytes(&archive.bootstrap);
     encoder.bytes(&archive.runtime_state);
+    encoder.list(
+        &archive.stable_import_certificates,
+        |encoder, certificate| {
+            encoder.bytes(certificate);
+        },
+    );
     if bytes.len() > maximum {
         return Err(PrivateAgentHostError::LimitExceeded);
     }
@@ -6602,11 +6757,166 @@ fn decode_host_archive(bytes: &[u8], complete: bool) -> Result<HostArchive, Priv
         runtime_state: decoder
             .bytes_bounded(MAX_PRIVATE_OBJECT_WIRE_BYTES)
             .map_err(map_decode)?,
+        stable_import_certificates: decoder
+            .list_bounded(MAX_PRIVATE_CONTROL_RECORDS as usize, |decoder| {
+                decoder.bytes_bounded(PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES)
+            })
+            .map_err(map_decode)?,
     };
     if !decoder.exhausted() || archive.space == SpaceId::ZERO || archive.agent == AgentId::ZERO {
         return Err(PrivateAgentHostError::Corrupt);
     }
+    validate_host_archive_stable_import_certificates(
+        &archive.stable_import_certificates,
+        complete,
+        archive.space,
+        archive.agent,
+    )?;
     Ok(archive)
+}
+
+fn validate_host_archive_stable_import_certificates(
+    certificates: &[Vec<u8>],
+    complete: bool,
+    space: SpaceId,
+    agent: AgentId,
+) -> Result<(), PrivateAgentHostError> {
+    if certificates.len() > MAX_PRIVATE_CONTROL_RECORDS as usize {
+        return Err(PrivateAgentHostError::LimitExceeded);
+    }
+    if !complete && !certificates.is_empty() {
+        return Err(PrivateAgentHostError::Corrupt);
+    }
+    let mut previous = None;
+    let mut destination = None;
+    for wire in certificates {
+        if wire.len() != PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES {
+            return Err(PrivateAgentHostError::Corrupt);
+        }
+        let certificate = PrivateStableImportCertificate::decode(wire)
+            .map_err(|_| PrivateAgentHostError::Corrupt)?;
+        if certificate.route().space != space
+            || certificate.route().agent != agent
+            || previous.is_some_and(|control| control >= certificate.control())
+        {
+            return Err(PrivateAgentHostError::Corrupt);
+        }
+        if destination.is_some_and(|identity| identity != certificate.destination_identity()) {
+            return Err(PrivateAgentHostError::Corrupt);
+        }
+        previous = Some(certificate.control());
+        destination = Some(certificate.destination_identity());
+    }
+    Ok(())
+}
+
+fn collect_stable_import_certificates(
+    store: &PrivateStore,
+) -> Result<Vec<Vec<u8>>, PrivateAgentHostError> {
+    let mut certificates = Vec::new();
+    certificates
+        .try_reserve(store.indexed_controls().len())
+        .map_err(|_| PrivateAgentHostError::LimitExceeded)?;
+    for entry in store.indexed_controls() {
+        let Some(wire) = store.read_stable_import_certificate(entry)? else {
+            continue;
+        };
+        let certificate = PrivateStableImportCertificate::decode(&wire)
+            .map_err(|_| PrivateAgentHostError::Corrupt)?;
+        if certificate.control() != entry.commitment {
+            return Err(PrivateAgentHostError::Corrupt);
+        }
+        certificates.push((certificate.control(), wire));
+    }
+    certificates.sort_unstable_by_key(|(control, _)| *control);
+    let certificates = certificates
+        .into_iter()
+        .map(|(_, wire)| wire)
+        .collect::<Vec<_>>();
+    let binding = store.binding();
+    validate_host_archive_stable_import_certificates(
+        &certificates,
+        true,
+        binding.space,
+        binding.agent,
+    )?;
+    Ok(certificates)
+}
+
+fn reattach_same_node_archive_stable_import_certificates(
+    store: &mut PrivateStore,
+    archive: &HostArchive,
+    expected_owner: PrincipalId,
+    local_node: &PrivateNodeIdentity,
+    node_key: &PrivateNodeDecryptionKey,
+) -> Result<(), PrivateAgentHostError> {
+    let Some(first_wire) = archive.stable_import_certificates.first() else {
+        return Ok(());
+    };
+    let first = PrivateStableImportCertificate::decode(first_wire)
+        .map_err(|_| PrivateAgentHostError::Corrupt)?;
+    if first.destination_identity() != authority_private_node_identity_commitment(local_node) {
+        // PSI1 is intentionally node-local. A portable/cross-node restore uses
+        // PVB3 only and must remint destination-authenticated certificates.
+        return Ok(());
+    }
+
+    require_exact_local_member(store.authorized_nodes(), local_node)?;
+    let data_keys = unwrap_local_data_keyring(store, local_node, node_key)?;
+    let current_key = data_keys
+        .get(&store.binding().epoch)
+        .ok_or(PrivateAgentHostError::Unauthorized)?;
+    let plaintext = decrypt_archive_plaintext(archive, store.binding().epoch, current_key)?;
+    validate_archive_plaintext(&plaintext, archive.space, archive.agent, expected_owner)?;
+
+    // Authenticate every row before writing the first one. This prevents a
+    // late malformed attachment from leaving an otherwise retryable restore
+    // with a partially reclassified provenance set.
+    let mut authenticated = Vec::new();
+    authenticated
+        .try_reserve(archive.stable_import_certificates.len())
+        .map_err(|_| PrivateAgentHostError::LimitExceeded)?;
+    for wire in &archive.stable_import_certificates {
+        let certificate = PrivateStableImportCertificate::decode(wire)
+            .map_err(|_| PrivateAgentHostError::Corrupt)?;
+        if certificate.destination_identity() != first.destination_identity() {
+            return Err(PrivateAgentHostError::Corrupt);
+        }
+        let entry = store
+            .indexed_controls()
+            .iter()
+            .find(|entry| entry.commitment == certificate.control())
+            .ok_or(PrivateAgentHostError::Corrupt)?;
+        let control_wire = store.read_control_wire(entry)?;
+        let control = PrivateControlRecord::decode(&control_wire)
+            .map_err(|_| PrivateAgentHostError::Corrupt)?;
+        let application = store
+            .read_runtime_application(entry.commitment)?
+            .ok_or(PrivateAgentHostError::Corrupt)?;
+        let evidence_wire = store
+            .read_control_authority_evidence(entry)?
+            .ok_or(PrivateAgentHostError::Corrupt)?;
+        authenticate_imported_runtime_application_endpoint(
+            &plaintext.descriptor,
+            &control,
+            entry.resulting_epoch,
+            &application,
+            &evidence_wire,
+            wire,
+            local_node,
+            node_key,
+        )?;
+        authenticated.push((entry.commitment, evidence_wire, wire.as_slice()));
+    }
+
+    for (control, evidence, certificate) in authenticated {
+        store.reattach_authenticated_stable_import_certificate_after_restore(
+            control,
+            &evidence,
+            certificate,
+        )?;
+    }
+    Ok(())
 }
 
 fn decrypt_archive_sidecar(
@@ -7794,6 +8104,74 @@ mod tests {
         (result, application)
     }
 
+    fn apply_and_attach_test_imported_authority_evidence(
+        host: &mut PrivateAgentHost,
+        fixture: &Fixture,
+        control: &PrivateControlRecord,
+        issued_at: u64,
+        applied_at: u64,
+        foreign_state_label: u8,
+    ) -> (PrivateControlRuntimeApplicationResult, Vec<u8>, Vec<u8>) {
+        let (authority, request) =
+            runtime_application_request(fixture, control, issued_at, applied_at);
+        let result = apply_runtime_request(host, authority, &request).unwrap();
+        let mut application_ack = signed_test_application_ack(fixture, &request, &result);
+        let foreign_reopened_runtime_state = Hash([foreign_state_label; 32]);
+        assert_ne!(
+            foreign_reopened_runtime_state,
+            application_ack.application.reopened_runtime_state
+        );
+        application_ack.application.reopened_runtime_state = foreign_reopened_runtime_state;
+        application_ack.signature = [0; 64];
+        application_ack.signature = authority_target(fixture)
+            .1
+            .sign(&application_ack.signing_bytes())
+            .to_bytes();
+        let issuance = AuthorityOperationIssuanceAck::decode(&request.issuance_ack).unwrap();
+        let evidence = PrivateControlAuthorityEvidence::from_acknowledgements(
+            &issuance,
+            &application_ack,
+            None,
+        )
+        .unwrap();
+        let evidence_wire = evidence.encode().unwrap();
+        let hosted = &host.agents[&control.agent];
+        let runtime_application = hosted
+            .store
+            .read_runtime_application(control.commitment())
+            .unwrap()
+            .unwrap();
+        let stable_projection = runtime_application
+            .successor_stable_projection()
+            .unwrap()
+            .commitment();
+        let certificate = PrivateStableImportCertificate::issue(
+            request.route,
+            fixture.owner,
+            hosted.descriptor.commitment(),
+            &host.scope.local_node,
+            control.commitment(),
+            runtime_application.commitment(),
+            evidence.commitment().unwrap(),
+            stable_projection,
+            &host.node_key,
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        host.agents
+            .get_mut(&control.agent)
+            .unwrap()
+            .store
+            .persist_imported_control_authority_evidence(
+                control.commitment(),
+                &evidence_wire,
+                &certificate,
+            )
+            .unwrap();
+        (result, evidence_wire, certificate)
+    }
+
     fn apply_and_attach_test_recovery_authority_evidence(
         host: &mut PrivateAgentHost,
         fixture: &Fixture,
@@ -8091,9 +8469,9 @@ mod tests {
     }
 
     #[test]
-    fn host_archive_v3_rejects_v2_after_mandatory_runtime_image_field() {
+    fn host_archive_v4_is_a_clean_break_and_bounds_canonical_psi_attachments() {
         let fixture = fixture(1);
-        let mut host = create_host(&fixture, 0, "archive-v3");
+        let mut host = create_host(&fixture, 0, "archive-v4");
         let agent = create_agent(&mut host, &fixture);
         for complete in [false, true] {
             let mut archive = if complete {
@@ -8107,12 +8485,104 @@ mod tests {
                 u16::from_le_bytes(archive[4..6].try_into().unwrap()),
                 HOST_ARCHIVE_VERSION
             );
-            archive[4..6].copy_from_slice(&2_u16.to_le_bytes());
+            archive[4..6].copy_from_slice(&3_u16.to_le_bytes());
             assert!(matches!(
                 decode_host_archive(&archive, complete),
                 Err(PrivateAgentHostError::Corrupt)
             ));
         }
+
+        let backup = host
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        let mut missing_v4_table = backup[..backup.len() - 4].to_vec();
+        missing_v4_table[4..6].copy_from_slice(&3_u16.to_le_bytes());
+        assert_eq!(
+            decode_host_archive(&missing_v4_table, true).err(),
+            Some(PrivateAgentHostError::Corrupt)
+        );
+        let mut oversized_count = backup.clone();
+        let count_offset = oversized_count.len() - 4;
+        oversized_count[count_offset..]
+            .copy_from_slice(&(MAX_PRIVATE_CONTROL_RECORDS as u32 + 1).to_le_bytes());
+        assert_eq!(
+            decode_host_archive(&oversized_count, true).err(),
+            Some(PrivateAgentHostError::Corrupt)
+        );
+
+        let route = recovery_route(&fixture, agent);
+        let certificate = |control: u8| {
+            PrivateStableImportCertificate::issue(
+                route,
+                fixture.owner,
+                fixture.descriptor.commitment(),
+                &fixture.nodes[0].identity,
+                Hash([control; 32]),
+                Hash([0xd1; 32]),
+                Hash([0xd2; 32]),
+                Hash([0xd3; 32]),
+                &fixture.nodes[0].key(),
+            )
+            .unwrap()
+            .encode()
+            .unwrap()
+        };
+        let first = certificate(0xc1);
+        let second = certificate(0xc2);
+        let mut archive = decode_host_archive(&backup, true).unwrap();
+        archive.stable_import_certificates = vec![first.clone(), second.clone()];
+        let canonical =
+            encode_host_archive(&archive, true, MAX_PRIVATE_HOST_ARCHIVE_BYTES).unwrap();
+        assert_eq!(
+            decode_host_archive(&canonical, true)
+                .unwrap()
+                .stable_import_certificates,
+            vec![first.clone(), second.clone()]
+        );
+
+        archive.stable_import_certificates.reverse();
+        assert_eq!(
+            encode_host_archive(&archive, true, MAX_PRIVATE_HOST_ARCHIVE_BYTES).err(),
+            Some(PrivateAgentHostError::Corrupt)
+        );
+        archive.stable_import_certificates = vec![first.clone(), first.clone()];
+        assert_eq!(
+            encode_host_archive(&archive, true, MAX_PRIVATE_HOST_ARCHIVE_BYTES).err(),
+            Some(PrivateAgentHostError::Corrupt)
+        );
+        let mut wrong_route = route;
+        wrong_route.agent = AgentId([0xe4; 32]);
+        archive.stable_import_certificates = vec![
+            PrivateStableImportCertificate::issue(
+                wrong_route,
+                fixture.owner,
+                fixture.descriptor.commitment(),
+                &fixture.nodes[0].identity,
+                Hash([0xc1; 32]),
+                Hash([0xd1; 32]),
+                Hash([0xd2; 32]),
+                Hash([0xd3; 32]),
+                &fixture.nodes[0].key(),
+            )
+            .unwrap()
+            .encode()
+            .unwrap(),
+        ];
+        assert_eq!(
+            encode_host_archive(&archive, true, MAX_PRIVATE_HOST_ARCHIVE_BYTES).err(),
+            Some(PrivateAgentHostError::Corrupt),
+            "PSI1 attachments are bound to the outer archive route"
+        );
+        archive.stable_import_certificates = vec![first.clone()];
+        assert_eq!(
+            encode_host_archive(&archive, false, MAX_PRIVATE_HOST_ARCHIVE_BYTES).err(),
+            Some(PrivateAgentHostError::Corrupt)
+        );
+        archive.stable_import_certificates = vec![first; MAX_PRIVATE_CONTROL_RECORDS as usize + 1];
+        assert_eq!(
+            encode_host_archive(&archive, true, MAX_PRIVATE_HOST_ARCHIVE_BYTES).err(),
+            Some(PrivateAgentHostError::LimitExceeded)
+        );
     }
 
     #[test]
@@ -9344,6 +9814,267 @@ mod tests {
                 authority_target(&fixture).0,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn provenance_classifier_is_strictly_local_imported_or_pending() {
+        let fixture = fixture(1);
+        let agent = fixture.descriptor.identity.agent;
+
+        let mut imported = create_host(&fixture, 0, "provenance-imported");
+        assert_eq!(create_agent(&mut imported, &fixture), agent);
+        let imported_control = signed_rotate_control(&imported, agent);
+        let (_, imported_evidence, imported_certificate) =
+            apply_and_attach_test_imported_authority_evidence(
+                &mut imported,
+                &fixture,
+                &imported_control,
+                80,
+                84,
+                0xe1,
+            );
+        let imported_application = imported.agents[&agent]
+            .store
+            .read_runtime_application(imported_control.commitment())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            authenticate_runtime_application_endpoint(
+                &fixture.descriptor,
+                &imported_control,
+                imported.agents[&agent].store.binding().epoch,
+                &imported_application,
+                &imported_evidence,
+                Some(&imported_certificate),
+                Some((&fixture.nodes[0].identity, &fixture.nodes[0].key())),
+            ),
+            Ok(PrivateRuntimeApplicationProvenance::ImportedStable)
+        );
+        assert_eq!(
+            authenticate_runtime_application_endpoint(
+                &fixture.descriptor,
+                &imported_control,
+                imported.agents[&agent].store.binding().epoch,
+                &imported_application,
+                &imported_evidence,
+                None,
+                Some((&fixture.nodes[0].identity, &fixture.nodes[0].key())),
+            )
+            .err(),
+            Some(PrivateAgentHostError::Corrupt)
+        );
+        let mut forged = imported_certificate.clone();
+        *forged.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            authenticate_runtime_application_endpoint(
+                &fixture.descriptor,
+                &imported_control,
+                imported.agents[&agent].store.binding().epoch,
+                &imported_application,
+                &imported_evidence,
+                Some(&forged),
+                Some((&fixture.nodes[0].identity, &fixture.nodes[0].key())),
+            )
+            .err(),
+            Some(PrivateAgentHostError::Corrupt)
+        );
+        drop(imported);
+        assert!(
+            PrivateAgentHost::open(
+                fixture.directory.child("provenance-imported"),
+                fixture.space,
+                fixture.owner,
+                fixture.nodes[0].identity.clone(),
+                fixture.nodes[0].key(),
+                &TestAuthority,
+            )
+            .is_ok(),
+            "ImportedStable must survive an ordinary restart"
+        );
+
+        let mut local = create_host(&fixture, 0, "provenance-local");
+        assert_eq!(create_agent(&mut local, &fixture), agent);
+        let local_control = signed_rotate_control(&local, agent);
+        apply_and_attach_test_authority_evidence(&mut local, &fixture, &local_control, 90, 94);
+        let entry = &local.agents[&agent].store.indexed_controls()[0];
+        let local_evidence = local.agents[&agent]
+            .store
+            .read_control_authority_evidence(entry)
+            .unwrap()
+            .unwrap();
+        let local_application = local.agents[&agent]
+            .store
+            .read_runtime_application(local_control.commitment())
+            .unwrap()
+            .unwrap();
+        let evidence = PrivateControlAuthorityEvidence::decode(&local_evidence).unwrap();
+        let overlap_certificate = PrivateStableImportCertificate::issue(
+            local_application.managed(),
+            fixture.owner,
+            fixture.descriptor.commitment(),
+            &fixture.nodes[0].identity,
+            local_control.commitment(),
+            local_application.commitment(),
+            evidence.commitment().unwrap(),
+            local_application
+                .successor_stable_projection()
+                .unwrap()
+                .commitment(),
+            &fixture.nodes[0].key(),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        assert_eq!(
+            authenticate_runtime_application_endpoint(
+                &fixture.descriptor,
+                &local_control,
+                entry.resulting_epoch,
+                &local_application,
+                &local_evidence,
+                None,
+                None,
+            ),
+            Ok(PrivateRuntimeApplicationProvenance::LocalExact)
+        );
+        assert_eq!(
+            authenticate_runtime_application_endpoint(
+                &fixture.descriptor,
+                &local_control,
+                entry.resulting_epoch,
+                &local_application,
+                &local_evidence,
+                Some(&overlap_certificate),
+                Some((&fixture.nodes[0].identity, &fixture.nodes[0].key())),
+            )
+            .err(),
+            Some(PrivateAgentHostError::Corrupt),
+            "a PSI must never overlap LocalExact provenance"
+        );
+        assert!(!PrivateRuntimeApplicationProvenance::Pending.is_authenticated());
+    }
+
+    #[test]
+    fn host_archive_v4_restores_same_node_psi_discards_cross_node_and_restarts() {
+        let fixture = fixture(2);
+        let mut source = create_host(&fixture, 0, "psi-archive-source");
+        let agent = create_agent(&mut source, &fixture);
+        let control = signed_rotate_control(&source, agent);
+        let (_, evidence, certificate) = apply_and_attach_test_imported_authority_evidence(
+            &mut source,
+            &fixture,
+            &control,
+            80,
+            84,
+            0xe2,
+        );
+        let backup = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        let archive = decode_host_archive(&backup, true).unwrap();
+        assert_eq!(
+            archive.stable_import_certificates,
+            vec![certificate.clone()]
+        );
+        assert!(
+            !archive
+                .store
+                .windows(certificate.len())
+                .any(|window| window == certificate),
+            "portable PVB3 must still exclude PSI1"
+        );
+
+        let mut restored = create_host(&fixture, 0, "psi-archive-restored");
+        restored
+            .restore_encrypted_backup(
+                agent,
+                DurableRecoveryRecipient::from_durable_keystore(
+                    fixture.recovery.verifying_key(),
+                    fixture.recovery_encryption.public_key(),
+                )
+                .unwrap(),
+                &backup,
+                &TestAuthority,
+            )
+            .unwrap();
+        let entry = &restored.agents[&agent].store.indexed_controls()[0];
+        assert_eq!(
+            restored.agents[&agent]
+                .store
+                .read_control_authority_evidence(entry),
+            Ok(Some(evidence.clone()))
+        );
+        assert_eq!(
+            restored.agents[&agent]
+                .store
+                .read_stable_import_certificate(entry),
+            Ok(Some(certificate.clone()))
+        );
+        drop(restored);
+        let reopened = reopen_host(&fixture, 0, "psi-archive-restored");
+        assert_eq!(
+            reopened.agents[&agent]
+                .store
+                .read_stable_import_certificate(
+                    &reopened.agents[&agent].store.indexed_controls()[0]
+                ),
+            Ok(Some(certificate.clone()))
+        );
+        drop(reopened);
+
+        let portable_path = fixture.directory.child("psi-portable-store");
+        let (mut portable, _) = PrivateStore::restore_encrypted_backup(
+            &portable_path,
+            fixture.space,
+            agent,
+            fixture.owner,
+            fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
+            &archive.store,
+            &TestAuthority,
+        )
+        .unwrap();
+        reattach_same_node_archive_stable_import_certificates(
+            &mut portable,
+            &archive,
+            fixture.owner,
+            &fixture.nodes[1].identity,
+            &fixture.nodes[1].key(),
+        )
+        .unwrap();
+        assert_eq!(
+            portable.read_stable_import_certificate(&portable.indexed_controls()[0]),
+            Ok(None),
+            "cross-node restore must discard source PSI1"
+        );
+        drop(portable);
+        let mut cross_node = create_host(&fixture, 1, "psi-archive-cross-node");
+        assert_node_local_backup_restore_fails_closed(&mut cross_node, &fixture, agent, &backup);
+
+        let mut substituted = decode_host_archive(&backup, true).unwrap();
+        *substituted.stable_import_certificates[0]
+            .last_mut()
+            .unwrap() ^= 1;
+        let substituted =
+            encode_host_archive(&substituted, true, MAX_PRIVATE_HOST_ARCHIVE_BYTES).unwrap();
+        let mut reject = create_host(&fixture, 0, "psi-archive-substituted");
+        assert_eq!(
+            reject
+                .restore_encrypted_backup(
+                    agent,
+                    DurableRecoveryRecipient::from_durable_keystore(
+                        fixture.recovery.verifying_key(),
+                        fixture.recovery_encryption.public_key(),
+                    )
+                    .unwrap(),
+                    &substituted,
+                    &TestAuthority,
+                )
+                .err(),
+            Some(PrivateAgentHostError::Corrupt)
+        );
+        assert!(!reject.agent_path(agent).exists());
+        assert!(!reject.creating_path(agent).exists());
     }
 
     #[test]

@@ -35,6 +35,7 @@ private-agent-crypto = [
     "dep:hkdf",
     "dep:rand_core",
     "dep:sha2",
+    "dep:subtle",
     "dep:x25519-dalek",
     "dep:zeroize",
 ]
@@ -132,6 +133,7 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 hkdf = { version = "0.12", default-features = false, optional = true }
 rand_core = { version = "0.6", features = ["getrandom"], optional = true }
 sha2 = { version = "0.10", default-features = false, optional = true }
+subtle = { workspace = true, optional = true }
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"], optional = true }
 ureq = { version = "2", optional = true, default-features = false, features = ["tls"] }
 dlmalloc = { version = "0.2", optional = true, features = ["global"] }

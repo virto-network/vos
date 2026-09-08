@@ -7679,6 +7679,7 @@ dependencies = [
  "sha2 0.10.9",
  "space-authority",
  "space-registry",
+ "subtle",
  "tokio",
  "tokio-rustls",
  "toml 0.8.23",
