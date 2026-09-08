@@ -392,6 +392,7 @@ dependencies = [
  "log",
  "rkyv",
  "vos-agent-sdk",
+ "vos-protocol",
  "vos-pvm-program",
 ]
 
