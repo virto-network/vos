@@ -85,7 +85,9 @@ use super::private_runtime::{
     MAX_PRIVATE_RUNTIME_IMAGE_WIRE_BYTES, PrivateControlReopenedState, PrivateKeyEpochCommitment,
     PrivateRuntimeApplication, PrivateRuntimeControlDisposition, PrivateRuntimeControlPosition,
     PrivateRuntimeImage, PrivateRuntimeSuccess, PrivateStoreCorePosition,
-    classify_private_runtime_control_transition, validate_private_runtime_genesis_transition,
+    classify_private_runtime_control_transition,
+    classify_private_runtime_control_transition_for_replay,
+    validate_private_runtime_genesis_transition,
 };
 use super::private_store::{
     ControlEvidenceCommitStop, MAX_PRIVATE_BACKUP_BYTES, PrivateObjectKey, PrivateStore,
@@ -99,6 +101,12 @@ use super::private_sync::{
     validate_private_actor_schema, validate_private_runtime_work, verify_private_sync_control_page,
 };
 use super::runtime_pvm::execute_canonical_wire;
+
+mod private_replica_establishment;
+#[allow(unused_imports)]
+pub(crate) use private_replica_establishment::{
+    PreparedPrivateReplicaEstablishment, PrivateReplicaEstablishmentDisposition,
+};
 
 pub const MAX_PRIVATE_HOST_AGENTS: usize = 4_096;
 pub const MAX_PRIVATE_BOOTSTRAP_METADATA_BYTES: usize = 1024 * 1024;
@@ -574,12 +582,22 @@ impl PrivateAgentHost {
             management_gas: DEFAULT_MANAGEMENT_GAS,
             agents: BTreeMap::new(),
         };
+        // Reject an already-overfull live namespace before startup recovery
+        // performs any rename or cleanup mutation.  Extra staged reservations
+        // are handled individually below and may remain inert at capacity.
+        if scan_root(&host.root)?.len() > MAX_PRIVATE_HOST_AGENTS {
+            return Err(PrivateAgentHostError::LimitExceeded);
+        }
         host.recover_creating(authority)?;
+        host.recover_live_replica_establishments(authority)?;
         let agent_ids = scan_root(&host.root)?;
         if agent_ids.len() > MAX_PRIVATE_HOST_AGENTS {
             return Err(PrivateAgentHostError::LimitExceeded);
         }
         for agent in agent_ids {
+            if host.agents.contains_key(&agent) {
+                continue;
+            }
             let hosted = open_hosted_agent(
                 &host.agent_path(agent),
                 host.scope.space,
@@ -588,6 +606,12 @@ impl PrivateAgentHost {
                 &host.node_key,
                 authority,
             )?;
+            // An establishment-origin PVRI is admitted only through its
+            // authenticated live plan/receipt recovery path above.  A missing
+            // or renamed receipt must never degrade it into an ordinary slot.
+            if hosted.runtime_image.establishment_origin().is_some() {
+                return Err(PrivateAgentHostError::Corrupt);
+            }
             if hosted.descriptor.identity.agent != agent
                 || host.agents.insert(agent, hosted).is_some()
             {
@@ -726,9 +750,6 @@ impl PrivateAgentHost {
     ) -> Result<AgentId, PrivateAgentHostError> {
         self.verify_root_scope()?;
         validate_create_request(&self.scope, &self.node_key, &request)?;
-        if self.agents.len() >= MAX_PRIVATE_HOST_AGENTS {
-            return Err(PrivateAgentHostError::LimitExceeded);
-        }
         let descriptor = request.descriptor;
         let agent = descriptor.identity.agent;
         if self.agents.contains_key(&agent)
@@ -737,6 +758,7 @@ impl PrivateAgentHost {
         {
             return Err(PrivateAgentHostError::AlreadyExists);
         }
+        self.require_new_private_agent_reservation_capacity(agent)?;
         // Execute after the read-only reservation checks but before creating
         // a staging directory: a duplicate cannot consume the management gas
         // budget, while traps or substituted output still leave no artifact.
@@ -1247,6 +1269,7 @@ impl PrivateAgentHost {
         {
             return Err(PrivateAgentHostError::AlreadyExists);
         }
+        self.require_new_private_agent_reservation_capacity(agent)?;
         let archive = decode_host_archive(bytes, true)?;
         if archive.space != self.scope.space || archive.agent != agent {
             return Err(PrivateAgentHostError::InvalidScope);
@@ -1476,6 +1499,8 @@ impl PrivateAgentHost {
                 proof,
             });
         }
+
+        self.require_new_private_agent_reservation_capacity(agent)?;
 
         let mut sources = Vec::new();
         sources
@@ -2833,6 +2858,8 @@ impl PrivateAgentHost {
         validate_recovery_plan_host(&plan, &reopened)?;
         drop(reopened);
 
+        self.require_private_agent_publication_capacity(agent)?;
+
         // The plan is legal only below `.creating`. Retire and sync it before
         // the directory rename so every published slot has the ordinary live
         // layout. A stop here leaves a planless, fully authenticated staged
@@ -2968,6 +2995,54 @@ impl PrivateAgentHost {
             .join(encode_agent_id(agent))
     }
 
+    /// Count durable AgentId reservations, deduplicating the ambiguous
+    /// stage-plus-live form of one exact publication.  The root lock makes
+    /// this namespace snapshot stable for each host operation.
+    fn reserved_private_agent_ids(&self) -> Result<BTreeMap<AgentId, ()>, PrivateAgentHostError> {
+        let mut reserved = BTreeMap::new();
+        for agent in scan_root(&self.root)? {
+            reserved.insert(agent, ());
+        }
+        for agent in scan_agent_directories(&self.root.join(CREATING_DIRECTORY))? {
+            reserved.insert(agent, ());
+        }
+        Ok(reserved)
+    }
+
+    fn require_new_private_agent_reservation_capacity(
+        &self,
+        agent: AgentId,
+    ) -> Result<(), PrivateAgentHostError> {
+        let reserved = self.reserved_private_agent_ids()?;
+        if reserved.contains_key(&agent) {
+            return Err(PrivateAgentHostError::AlreadyExists);
+        }
+        if reserved.len() >= MAX_PRIVATE_HOST_AGENTS {
+            return Err(PrivateAgentHostError::LimitExceeded);
+        }
+        Ok(())
+    }
+
+    fn require_private_agent_publication_capacity(
+        &self,
+        agent: AgentId,
+    ) -> Result<(), PrivateAgentHostError> {
+        let live = scan_root(&self.root)?;
+        if live.binary_search(&agent).is_ok() {
+            // Exact in-place marker repair and stage/live duplicate cleanup do
+            // not consume another live slot, regardless of other reservations.
+            return Ok(());
+        }
+        let staged = scan_agent_directories(&self.root.join(CREATING_DIRECTORY))?;
+        if !staged.contains(&agent) {
+            return Err(PrivateAgentHostError::NotFound);
+        }
+        if live.len() >= MAX_PRIVATE_HOST_AGENTS {
+            return Err(PrivateAgentHostError::LimitExceeded);
+        }
+        Ok(())
+    }
+
     fn verify_root_scope(&self) -> Result<(), PrivateAgentHostError> {
         require_real_directory(&self.root)?;
         if fs::canonicalize(&self.root).map_err(map_io)? != self.canonical_root {
@@ -2995,6 +3070,11 @@ impl PrivateAgentHost {
         for agent in staged {
             let source = self.creating_path(agent);
             let destination = self.agent_path(agent);
+            if private_replica_establishment::recover_staged_replica_establishment(
+                self, agent, authority,
+            )? {
+                continue;
+            }
             if fs::symlink_metadata(&destination).is_ok() {
                 reconcile_exact_duplicate_slot(
                     &source,
@@ -3042,6 +3122,11 @@ impl PrivateAgentHost {
                 )?;
                 validate_recovery_plan_host(&plan, &hosted)?;
                 drop(hosted);
+                match self.require_private_agent_publication_capacity(agent) {
+                    Ok(()) => {}
+                    Err(PrivateAgentHostError::LimitExceeded) => continue,
+                    Err(error) => return Err(error),
+                }
                 remove_regular_file_if_present(&source.join(RECOVERY_PLAN_FILE))?;
                 sync_directory(&source)?;
                 fs::rename(&source, &destination).map_err(map_io)?;
@@ -3079,6 +3164,11 @@ impl PrivateAgentHost {
             )?;
             validate_planless_staged_recovery(&hosted, false)?;
             drop(hosted);
+            match self.require_private_agent_publication_capacity(agent) {
+                Ok(()) => {}
+                Err(PrivateAgentHostError::LimitExceeded) => continue,
+                Err(error) => return Err(error),
+            }
             fs::rename(&source, &destination).map_err(map_io)?;
             sync_directory(&self.root)?;
             sync_directory(&creating)?;
@@ -3137,6 +3227,7 @@ impl PrivateAgentHost {
                 expected_authority,
             )?;
             drop(staged);
+            self.require_private_agent_publication_capacity(agent)?;
             // Repair an ambiguous failure of the preceding PVRP unlink
             // directory sync before moving this name into the live parent.
             sync_directory(&source)?;
@@ -5851,6 +5942,8 @@ fn runtime_image_is_direct_successor(
             == Some(predecessor.stable_projection().commitment())
         && successor.created_at() == predecessor.created_at()
         && successor.creation_receipt() == predecessor.creation_receipt()
+        && successor.establishment_origin() == predecessor.establishment_origin()
+        && successor.establishment_completion() == predecessor.establishment_completion()
         && successor.applied_at() >= predecessor.applied_at()
         && key_lineage
 }
@@ -5952,7 +6045,10 @@ fn validate_slot_layout(slot: &Path) -> Result<(), PrivateAgentHostError> {
             seen_store = true;
             continue;
         }
-        if name == RECOVERY_PLAN_FILE && allow_recovery_plan {
+        if (name == RECOVERY_PLAN_FILE && allow_recovery_plan)
+            || name == private_replica_establishment::ESTABLISHMENT_PLAN_FILE
+            || name == private_replica_establishment::ESTABLISHMENT_RECEIPT_FILE
+        {
             if file_type.is_symlink() || !file_type.is_file() || seen.insert(name, ()).is_some() {
                 return Err(PrivateAgentHostError::Alias);
             }
@@ -8061,7 +8157,7 @@ mod tests {
             fixture.nodes[node_index].key(),
             &TestAuthority,
         )
-        .unwrap()
+        .unwrap_or_else(|error| panic!("failed to reopen {name}: {error:?}"))
     }
 
     fn authority_target(fixture: &Fixture) -> (AuthorityActorTarget, SigningKey) {
@@ -8629,6 +8725,123 @@ mod tests {
         (result, application)
     }
 
+    fn apply_and_attach_replayable_recovery_authority_evidence(
+        host: &mut PrivateAgentHost,
+        fixture: &Fixture,
+        control: &PrivateControlRecord,
+        superseded_authority_head: Option<Hash>,
+        issued_at: u64,
+        applied_at: u64,
+    ) -> PrivateControlRuntimeApplicationResult {
+        let (authority, request, proof) = recovery_runtime_application_request(
+            fixture,
+            control,
+            superseded_authority_head,
+            issued_at,
+            applied_at,
+        );
+        let prepared = prepare_private_application(
+            &host.agents[&control.agent],
+            &host.scope.local_node,
+            authority,
+            &TestAuthority,
+            &request,
+            Some(&proof),
+            true,
+        )
+        .unwrap();
+        let PreparedPrivateRuntimeDisposition::Applied {
+            successor_image,
+            runtime_application,
+        } = prepare_private_runtime_disposition(
+            &host.agents[&control.agent],
+            &request,
+            &prepared,
+            host.management_gas,
+        )
+        .unwrap()
+        else {
+            panic!("Recover replay fixture retired unexpectedly")
+        };
+        let post_member_set =
+            private_member_set_commitment(prepared.expected_members.iter().copied()).unwrap();
+        let reopened_runtime_state =
+            PrivateControlReopenedState::commitment_from_application(&runtime_application).unwrap();
+        let stable_projection = runtime_application
+            .successor_stable_projection()
+            .unwrap()
+            .commitment();
+        let fact = PrivateControlApplicationFact {
+            managed: request.route,
+            operation: prepared.operation,
+            control: prepared.control.commitment(),
+            control_sequence: prepared.control.sequence,
+            control_previous: prepared.control.previous,
+            epoch: prepared.expected_epoch,
+            post_member_set,
+            reopened_runtime_state,
+            stable_projection,
+            reopened_control_head: prepared.control.commitment(),
+            applied_at: request.applied_at,
+        };
+        fact.validate_shape().unwrap();
+        let result = PrivateControlRuntimeApplicationResult {
+            route: request.route,
+            authority: request.authority,
+            control: request.control.clone(),
+            mutation: request.mutation.clone(),
+            receipt: request.receipt.clone(),
+            issuance_ack: request.issuance_ack.clone(),
+            applied_at: request.applied_at,
+            authenticated: true,
+            durably_applied: true,
+            durably_reopened: true,
+            reopened_runtime_state,
+            stable_projection,
+            application_fact: encode_private_application_fact(&fact),
+        };
+        let application = signed_test_application_ack(fixture, &request, &result);
+        let issuance = AuthorityOperationIssuanceAck::decode(&request.issuance_ack).unwrap();
+        let evidence = PrivateControlAuthorityEvidence::from_acknowledgements(
+            &issuance,
+            &application,
+            Some(&proof),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        let slot = host.agent_path(control.agent);
+        let mut hosted = host.agents.remove(&control.agent).unwrap();
+        apply_prepared_private_control(
+            &slot,
+            &mut hosted,
+            &host.scope.local_node,
+            &host.node_key,
+            &TestAuthority,
+            &prepared,
+            successor_image,
+            &runtime_application,
+            PrivateRuntimeApplicationStop::Never,
+        )
+        .unwrap();
+        hosted
+            .store
+            .persist_control_authority_evidence(control.commitment(), &evidence)
+            .unwrap();
+        drop(hosted);
+        let reopened = open_hosted_agent(
+            &slot,
+            host.scope.space,
+            host.scope.owner,
+            &host.scope.local_node,
+            &host.node_key,
+            &TestAuthority,
+        )
+        .unwrap();
+        assert!(host.agents.insert(control.agent, reopened).is_none());
+        result
+    }
+
     fn signed_test_application_ack(
         fixture: &Fixture,
         request: &PrivateControlRuntimeApplicationRequest,
@@ -8773,7 +8986,7 @@ mod tests {
     }
 
     #[test]
-    fn creation_executes_pvm_at_signed_valid_from_and_reopens_exact_pvi2() {
+    fn creation_executes_pvm_at_signed_valid_from_and_reopens_exact_pvi3() {
         let fixture = fixture(2);
         let mut host = create_host(&fixture, 0, "runtime-genesis");
         let agent = create_agent(&mut host, &fixture);
@@ -8785,7 +8998,7 @@ mod tests {
         assert_ne!(fixture.observed_at, genesis_at);
         assert_eq!(image.created_at(), genesis_at);
         assert_eq!(image.applied_at(), genesis_at);
-        assert_eq!(&image.encode().unwrap()[..4], b"PVI2");
+        assert_eq!(&image.encode().unwrap()[..4], b"PVR3");
         assert_eq!(image.state().control, RUNTIME_STATE_SENTINEL);
         assert!(image.state().linear.is_empty());
         assert_eq!(
@@ -11167,6 +11380,33 @@ mod tests {
         }
     }
 
+    fn create_empty_agent_reservations(
+        host: &PrivateAgentHost,
+        under_creating: bool,
+        count: usize,
+        excluded: AgentId,
+    ) -> Vec<AgentId> {
+        let parent = if under_creating {
+            host.root.join(CREATING_DIRECTORY)
+        } else {
+            host.root.clone()
+        };
+        let mut agents = Vec::with_capacity(count);
+        let mut sequence = 1u64;
+        while agents.len() < count {
+            let mut bytes = [0xe5; 32];
+            bytes[24..].copy_from_slice(&sequence.to_le_bytes());
+            sequence = sequence.checked_add(1).unwrap();
+            let agent = AgentId(bytes);
+            if agent == excluded || agents.contains(&agent) {
+                continue;
+            }
+            fs::create_dir(parent.join(encode_agent_id(agent))).unwrap();
+            agents.push(agent);
+        }
+        agents
+    }
+
     fn copy_directory_tree(source: &Path, destination: &Path) {
         fs::create_dir(destination).unwrap();
         for entry in fs::read_dir(source).unwrap() {
@@ -11191,7 +11431,7 @@ mod tests {
     }
 
     #[test]
-    fn independent_node_genesis_control_sync_is_local_and_leaks_no_plaintext() {
+    fn independently_created_cross_node_genesis_sync_fails_closed_without_plaintext_leak() {
         let fixture = fixture(2);
         let mut primary = create_host(&fixture, 0, "primary");
         let agent = create_agent(&mut primary, &fixture);
@@ -11218,14 +11458,18 @@ mod tests {
         assert!(!contains(&snapshot, SENTINEL));
         assert!(!contains(&backup, RUNTIME_STATE_SENTINEL));
         assert!(!contains(&snapshot, RUNTIME_STATE_SENTINEL));
-        for magic in [b"PVI1", b"PVI2"] {
-            assert!(!contains(&backup, magic));
-            assert!(!contains(&snapshot, magic));
+        // PVI3 is the intentionally public Store-index envelope embedded in PVB3;
+        // the node-local runtime-image generations must remain encrypted.
+        for magic in [b"PVI1", b"PVI2", b"PVR3"] {
+            assert!(!contains(&backup, magic), "backup leaked {magic:?}");
+            assert!(!contains(&snapshot, magic), "snapshot leaked {magic:?}");
         }
 
         let mut peer = create_host(&fixture, 1, "peer");
         assert_eq!(create_agent(&mut peer, &fixture), agent);
         let binding = peer.binding(agent).unwrap();
+        let mut before_peer = Vec::new();
+        collect_files(&peer.agent_path(agent), &mut before_peer);
         let cursor = PrivateSyncCursor::start(
             binding.space,
             binding.agent,
@@ -11247,7 +11491,7 @@ mod tests {
                 &TestTransport,
             )
             .unwrap();
-        assert_eq!(
+        assert!(
             peer.apply_sync_page(
                 agent,
                 PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
@@ -11256,13 +11500,12 @@ mod tests {
                 &TestAuthority,
                 &TestTransport,
             )
-            .unwrap(),
-            PrivateSyncApplyDisposition::Applied
+            .is_err()
         );
-        assert_eq!(
-            peer.binding(agent).unwrap(),
-            primary.binding(agent).unwrap()
-        );
+        assert_eq!(peer.binding(agent).unwrap(), binding);
+        let mut after_peer = Vec::new();
+        collect_files(&peer.agent_path(agent), &mut after_peer);
+        assert_eq!(after_peer, before_peer);
         assert!(fs::read_dir(peer.agent_path(agent)).unwrap().all(|entry| {
             !entry
                 .unwrap()
@@ -11297,7 +11540,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(primary.agent_ids().collect::<Vec<_>>(), vec![agent]);
-        assert_eq!(
+        assert_eq!(peer.binding(agent).unwrap(), binding);
+        assert_ne!(
             peer.binding(agent).unwrap(),
             primary.binding(agent).unwrap()
         );
@@ -11772,7 +12016,7 @@ mod tests {
     }
 
     #[test]
-    fn invite_retains_history_but_cross_node_pvri_requires_authenticated_rebind() {
+    fn late_invite_establishment_replays_history_with_typed_bootstrap_capability() {
         let fixture = fixture(1);
         let invited = node(fixture.space, fixture.owner, 99);
         let mut primary = create_host(&fixture, 0, "late-invite-primary");
@@ -11864,14 +12108,56 @@ mod tests {
         )
         .unwrap();
         assert_node_local_backup_restore_fails_closed(&mut invited_host, &fixture, agent, &backup);
+        assert_eq!(
+            invited_host
+                .establish_replica(
+                    recovery_route(&fixture, agent),
+                    &backup,
+                    authority_target(&fixture).0,
+                    &TestAuthority,
+                )
+                .unwrap(),
+            PrivateReplicaEstablishmentDisposition::Published
+        );
+        assert_eq!(
+            invited_host.binding(agent).unwrap(),
+            primary.binding(agent).unwrap()
+        );
+        for (key, expected) in [
+            (epoch_zero, b"epoch-zero".as_slice()),
+            (epoch_one, b"epoch-one".as_slice()),
+            (current, b"epoch-two".as_slice()),
+        ] {
+            assert_eq!(
+                invited_host.get_and_decrypt(agent, key).unwrap().as_slice(),
+                expected
+            );
+        }
+        drop(invited_host);
+        let invited_host = PrivateAgentHost::open(
+            invited_root,
+            fixture.space,
+            fixture.owner,
+            invited.identity.clone(),
+            invited.key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(
+            invited_host.binding(agent).unwrap(),
+            primary.binding(agent).unwrap()
+        );
         assert_eq!(primary.agents[&agent].descriptor, fixture.descriptor);
     }
 
     #[test]
     fn multi_control_sync_executes_locally_attaches_import_provenance_and_restarts() {
-        let fixture = fixture(2);
+        let fixture = fixture(3);
         let mut source = create_host(&fixture, 0, "multi-rotation-source");
         let agent = create_agent(&mut source, &fixture);
+        let genesis = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
         let first = signed_rotate_control(&source, agent);
         apply_and_attach_test_authority_evidence(&mut source, &fixture, &first, 40, 41);
         let second = signed_rotate_control(&source, agent);
@@ -11895,7 +12181,16 @@ mod tests {
         assert_eq!(page.phase, PrivateSyncPhase::Controls);
         assert_eq!(page.items.len(), 2);
         let mut peer = create_host(&fixture, 1, "multi-rotation-peer");
-        assert_eq!(create_agent(&mut peer, &fixture), agent);
+        assert_eq!(
+            peer.establish_replica(
+                recovery_route(&fixture, agent),
+                &genesis,
+                authority_target(&fixture).0,
+                &TestAuthority,
+            )
+            .unwrap(),
+            PrivateReplicaEstablishmentDisposition::Published
+        );
         assert_eq!(
             peer.apply_sync_page(
                 agent,
@@ -11974,6 +12269,28 @@ mod tests {
 
         drop(peer);
         let mut peer = reopen_host(&fixture, 1, "multi-rotation-peer");
+        assert_eq!(
+            peer.establish_replica(
+                recovery_route(&fixture, agent),
+                &genesis,
+                authority_target(&fixture).0,
+                &TestAuthority,
+            )
+            .unwrap(),
+            PrivateReplicaEstablishmentDisposition::AlreadyPresent
+        );
+        let evolved_source = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        assert_eq!(
+            peer.establish_replica(
+                recovery_route(&fixture, agent),
+                &evolved_source,
+                authority_target(&fixture).0,
+                &TestAuthority,
+            ),
+            Err(PrivateAgentHostError::Alias)
+        );
         let mut before_retry = Vec::new();
         collect_files(&peer.agent_path(agent), &mut before_retry);
         assert_eq!(
@@ -11991,6 +12308,44 @@ mod tests {
         let mut after_retry = Vec::new();
         collect_files(&peer.agent_path(agent), &mut after_retry);
         assert_eq!(after_retry, before_retry);
+
+        // A replica archive carries B-local PAPLs and A-issued PSEs plus
+        // B-local PSI. C must discard those PSI values, authenticate only the
+        // authority-signed PSP targets, execute locally, and mint C-local PSI.
+        let transitive_archive = peer
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        let mut transitive = create_host(&fixture, 2, "multi-rotation-transitive");
+        assert_eq!(
+            transitive
+                .establish_replica(
+                    recovery_route(&fixture, agent),
+                    &transitive_archive,
+                    authority_target(&fixture).0,
+                    &TestAuthority,
+                )
+                .unwrap(),
+            PrivateReplicaEstablishmentDisposition::Published
+        );
+        assert_eq!(
+            transitive.binding(agent).unwrap(),
+            source.binding(agent).unwrap()
+        );
+        for entry in transitive.agents[&agent].store.indexed_controls() {
+            assert!(
+                transitive.agents[&agent]
+                    .store
+                    .read_stable_import_certificate(entry)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        drop(transitive);
+        let transitive = reopen_host(&fixture, 2, "multi-rotation-transitive");
+        assert_eq!(
+            transitive.binding(agent).unwrap(),
+            source.binding(agent).unwrap()
+        );
     }
 
     #[test]
@@ -12078,6 +12433,9 @@ mod tests {
         let fixture = fixture(2);
         let mut source = create_host(&fixture, 0, "sync-papl-source");
         let agent = create_agent(&mut source, &fixture);
+        let genesis = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
         let rotate = signed_rotate_control(&source, agent);
         apply_and_attach_test_authority_evidence(&mut source, &fixture, &rotate, 40, 41);
         let request = PrivateSyncRequest {
@@ -12101,7 +12459,16 @@ mod tests {
         assert_eq!(verified.len(), 1);
 
         let mut peer = create_host(&fixture, 1, "sync-papl-peer");
-        assert_eq!(create_agent(&mut peer, &fixture), agent);
+        assert_eq!(
+            peer.establish_replica(
+                route,
+                &genesis,
+                authority_target(&fixture).0,
+                &TestAuthority,
+            )
+            .unwrap(),
+            PrivateReplicaEstablishmentDisposition::Published
+        );
         let application_request =
             sync_runtime_application_request(route, authority_target(&fixture).0, &verified[0])
                 .unwrap();
@@ -12239,6 +12606,9 @@ mod tests {
         let fixture = fixture(2);
         let mut source = create_host(&fixture, 0, "wrong-psp-source");
         let agent = create_agent(&mut source, &fixture);
+        let genesis = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
         let rotate = signed_rotate_control(&source, agent);
         apply_and_attach_test_authority_evidence(&mut source, &fixture, &rotate, 40, 41);
 
@@ -12279,7 +12649,16 @@ mod tests {
         let page_bytes = page.encode().unwrap();
 
         let mut peer = create_host(&fixture, 1, "wrong-psp-peer");
-        assert_eq!(create_agent(&mut peer, &fixture), agent);
+        assert_eq!(
+            peer.establish_replica(
+                recovery_route(&fixture, agent),
+                &genesis,
+                authority_target(&fixture).0,
+                &TestAuthority,
+            )
+            .unwrap(),
+            PrivateReplicaEstablishmentDisposition::Published
+        );
         assert!(
             authenticate_peer_identity(
                 peer.hosted(agent).unwrap(),
@@ -12369,6 +12748,985 @@ mod tests {
         assert_eq!(
             reopened.agents[&agent].store.authorized_nodes(),
             identities(&fixture)
+        );
+    }
+
+    #[test]
+    fn cross_node_replica_establishment_is_local_durable_and_exactly_retryable() {
+        let fixture = fixture(2);
+        let mut source = create_host(&fixture, 0, "establishment-source");
+        let agent = create_agent(&mut source, &fixture);
+        let archive = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        let source_image = source.agents[&agent].runtime_image.commitment();
+        assert_eq!(
+            source.agents[&agent].runtime_image.establishment_origin(),
+            None
+        );
+        let source_store = source.binding(agent).unwrap();
+        let source_core = source.agents[&agent].store.core_position().unwrap();
+        let route = recovery_route(&fixture, agent);
+        let authority = authority_target(&fixture).0;
+
+        let mut destination = create_host(&fixture, 1, "establishment-destination");
+        assert_eq!(
+            destination
+                .establish_replica(route, &archive, authority, &TestAuthority)
+                .unwrap(),
+            PrivateReplicaEstablishmentDisposition::Published
+        );
+        assert_eq!(destination.binding(agent).unwrap(), source_store);
+        assert_eq!(
+            destination.agents[&agent].runtime_image.node(),
+            fixture.nodes[1].identity.node
+        );
+        assert_ne!(
+            destination.agents[&agent].runtime_image.commitment(),
+            source_image
+        );
+        let establishment_origin = destination.agents[&agent]
+            .runtime_image
+            .establishment_origin()
+            .unwrap();
+        let establishment_completion = destination.agents[&agent]
+            .runtime_image
+            .establishment_completion()
+            .unwrap();
+        assert!(
+            destination
+                .agent_path(agent)
+                .join(private_replica_establishment::ESTABLISHMENT_RECEIPT_FILE)
+                .is_file()
+        );
+        assert!(!destination.creating_path(agent).exists());
+        assert_eq!(
+            destination
+                .establish_replica(route, &archive, authority, &TestAuthority)
+                .unwrap(),
+            PrivateReplicaEstablishmentDisposition::AlreadyPresent
+        );
+
+        source
+            .encrypt_and_put(
+                agent,
+                EncryptedObjectKind::Blob,
+                b"divergent-establishment-source",
+                authority,
+                &TestAuthority,
+            )
+            .unwrap();
+        let divergent = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        assert_eq!(
+            destination.establish_replica(route, &divergent, authority, &TestAuthority),
+            Err(PrivateAgentHostError::Alias)
+        );
+
+        let local_object = destination
+            .encrypt_and_put(
+                agent,
+                EncryptedObjectKind::Blob,
+                b"destination-growth-after-establishment",
+                authority,
+                &TestAuthority,
+            )
+            .unwrap();
+        let locally_grown = destination.binding(agent).unwrap();
+        let locally_grown_core = destination.agents[&agent].store.core_position().unwrap();
+        assert_ne!(locally_grown_core, source_core);
+        assert_eq!(
+            destination.agents[&agent]
+                .runtime_image
+                .establishment_origin(),
+            Some(establishment_origin)
+        );
+        assert_eq!(
+            destination.agents[&agent]
+                .runtime_image
+                .establishment_completion(),
+            Some(establishment_completion)
+        );
+
+        drop(destination);
+        let mut destination = reopen_host(&fixture, 1, "establishment-destination");
+        assert_eq!(destination.binding(agent).unwrap(), locally_grown);
+        assert_eq!(
+            destination
+                .get_and_decrypt(agent, local_object)
+                .unwrap()
+                .as_slice(),
+            b"destination-growth-after-establishment"
+        );
+        assert_eq!(
+            destination.agents[&agent]
+                .runtime_image
+                .establishment_origin(),
+            Some(establishment_origin)
+        );
+        assert_eq!(
+            destination.agents[&agent]
+                .runtime_image
+                .establishment_completion(),
+            Some(establishment_completion)
+        );
+        assert_eq!(
+            destination
+                .establish_replica(route, &archive, authority, &TestAuthority)
+                .unwrap(),
+            PrivateReplicaEstablishmentDisposition::AlreadyPresent
+        );
+        assert_eq!(
+            destination.establish_replica(route, &divergent, authority, &TestAuthority),
+            Err(PrivateAgentHostError::Alias)
+        );
+    }
+
+    #[test]
+    fn replica_establishment_post_growth_receipt_requires_imported_completion_tag() {
+        let fixture = fixture(2);
+        let mut source = create_host(&fixture, 0, "completion-growth-source");
+        let agent = create_agent(&mut source, &fixture);
+        let archive = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        let route = recovery_route(&fixture, agent);
+        let authority = authority_target(&fixture).0;
+        let mut destination = create_host(&fixture, 1, "completion-growth-destination");
+        destination
+            .establish_replica(route, &archive, authority, &TestAuthority)
+            .unwrap();
+        let completion = destination.agents[&agent]
+            .runtime_image
+            .establishment_completion()
+            .unwrap();
+
+        destination
+            .encrypt_and_put(
+                agent,
+                EncryptedObjectKind::Blob,
+                b"post-completion-object",
+                authority,
+                &TestAuthority,
+            )
+            .unwrap();
+        let rotate = signed_rotate_control(&destination, agent);
+        apply_and_attach_test_authority_evidence(&mut destination, &fixture, &rotate, 70, 71);
+        assert_eq!(
+            destination.agents[&agent]
+                .runtime_image
+                .establishment_completion(),
+            Some(completion)
+        );
+
+        drop(destination);
+        let mut destination = reopen_host(&fixture, 1, "completion-growth-destination");
+        assert_eq!(
+            destination
+                .establish_replica(route, &archive, authority, &TestAuthority)
+                .unwrap(),
+            PrivateReplicaEstablishmentDisposition::AlreadyPresent
+        );
+        assert_eq!(
+            destination.agents[&agent]
+                .runtime_image
+                .establishment_completion(),
+            Some(completion)
+        );
+
+        let unsealed = destination.agents[&agent]
+            .runtime_image
+            .synthetic_establishment_completion_for_host_test(None)
+            .unwrap();
+        let epoch = unsealed.store().epoch();
+        let wire = encrypt_runtime_image_sidecar(
+            destination.agents[&agent].data_keys.get(&epoch).unwrap(),
+            &unsealed,
+        )
+        .unwrap();
+        replace_regular_file_synced(
+            &destination.agent_path(agent).join(RUNTIME_STATE_FILE),
+            &wire,
+        )
+        .unwrap();
+        destination.agents.get_mut(&agent).unwrap().runtime_image = unsealed;
+        assert_eq!(
+            destination.establish_replica(route, &archive, authority, &TestAuthority),
+            Err(PrivateAgentHostError::Corrupt)
+        );
+        drop(destination);
+        assert_eq!(
+            PrivateAgentHost::open(
+                fixture.directory.child("completion-growth-destination"),
+                fixture.space,
+                fixture.owner,
+                fixture.nodes[1].identity.clone(),
+                fixture.nodes[1].key(),
+                &TestAuthority,
+            )
+            .err(),
+            Some(PrivateAgentHostError::Corrupt)
+        );
+    }
+
+    #[test]
+    fn replica_establishment_partial_prefix_cannot_splice_completed_receipt() {
+        use private_replica_establishment::ReplicaEstablishmentStop;
+
+        let fixture = fixture(2);
+        let mut source = create_host(&fixture, 0, "completion-prefix-source");
+        let agent = create_agent(&mut source, &fixture);
+        source
+            .encrypt_and_put(
+                agent,
+                EncryptedObjectKind::CrdtNode,
+                b"completion-prefix-object-zero",
+                authority_target(&fixture).0,
+                &TestAuthority,
+            )
+            .unwrap();
+        let rotate = signed_rotate_control(&source, agent);
+        apply_and_attach_test_authority_evidence(&mut source, &fixture, &rotate, 72, 73);
+        source
+            .encrypt_and_put(
+                agent,
+                EncryptedObjectKind::Blob,
+                b"completion-prefix-object-one",
+                authority_target(&fixture).0,
+                &TestAuthority,
+            )
+            .unwrap();
+        let archive = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        let route = recovery_route(&fixture, agent);
+        let authority = authority_target(&fixture).0;
+
+        let mut completed = create_host(&fixture, 1, "completion-prefix-completed");
+        let prepared = completed
+            .prepare_replica_establishment(route, &archive, authority, &TestAuthority)
+            .unwrap();
+        assert_eq!(
+            completed.resume_replica_establishment_with_stop(
+                prepared,
+                &TestAuthority,
+                ReplicaEstablishmentStop::AfterObjectPrefix,
+            ),
+            Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted))
+        );
+        let saved_prefix = fixture.directory.child("completion-prefix-snapshot");
+        copy_directory_tree(&completed.creating_path(agent), &saved_prefix);
+        assert_eq!(
+            completed
+                .resume_replica_establishment(prepared, &TestAuthority)
+                .unwrap(),
+            PrivateReplicaEstablishmentDisposition::Published
+        );
+        let receipt = fs::read(
+            completed
+                .agent_path(agent)
+                .join(private_replica_establishment::ESTABLISHMENT_RECEIPT_FILE),
+        )
+        .unwrap();
+
+        let cold_root = fixture.directory.child("completion-prefix-cold");
+        let cold = PrivateAgentHost::create(
+            &cold_root,
+            fixture.space,
+            fixture.owner,
+            fixture.nodes[1].identity.clone(),
+            fixture.nodes[1].key(),
+        )
+        .unwrap();
+        let cold_slot = cold.agent_path(agent);
+        drop(cold);
+        copy_directory_tree(&saved_prefix, &cold_slot);
+        fs::remove_file(cold_slot.join(private_replica_establishment::ESTABLISHMENT_PLAN_FILE))
+            .unwrap();
+        let _ = fs::remove_file(
+            cold_slot.join(private_replica_establishment::ESTABLISHMENT_PLAN_WRITE_FILE),
+        );
+        fs::write(
+            cold_slot.join(private_replica_establishment::ESTABLISHMENT_RECEIPT_FILE),
+            &receipt,
+        )
+        .unwrap();
+        assert_eq!(
+            PrivateAgentHost::open(
+                &cold_root,
+                fixture.space,
+                fixture.owner,
+                fixture.nodes[1].identity.clone(),
+                fixture.nodes[1].key(),
+                &TestAuthority,
+            )
+            .err(),
+            Some(PrivateAgentHostError::Corrupt)
+        );
+
+        let loaded_root = fixture.directory.child("completion-prefix-loaded");
+        let mut loaded = PrivateAgentHost::create(
+            &loaded_root,
+            fixture.space,
+            fixture.owner,
+            fixture.nodes[1].identity.clone(),
+            fixture.nodes[1].key(),
+        )
+        .unwrap();
+        let loaded_slot = loaded.agent_path(agent);
+        copy_directory_tree(&saved_prefix, &loaded_slot);
+        fs::remove_file(loaded_slot.join(private_replica_establishment::ESTABLISHMENT_PLAN_FILE))
+            .unwrap();
+        let _ = fs::remove_file(
+            loaded_slot.join(private_replica_establishment::ESTABLISHMENT_PLAN_WRITE_FILE),
+        );
+        fs::write(
+            loaded_slot.join(private_replica_establishment::ESTABLISHMENT_RECEIPT_FILE),
+            &receipt,
+        )
+        .unwrap();
+        let hosted = open_hosted_agent(
+            &loaded_slot,
+            fixture.space,
+            fixture.owner,
+            &fixture.nodes[1].identity,
+            &fixture.nodes[1].key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(hosted.runtime_image.establishment_completion(), None);
+        assert!(loaded.agents.insert(agent, hosted).is_none());
+        assert_eq!(
+            loaded.establish_replica(route, &archive, authority, &TestAuthority),
+            Err(PrivateAgentHostError::Corrupt)
+        );
+    }
+
+    #[test]
+    fn replica_establishment_receipt_rejects_final_lineage_tag_substitution() {
+        let fixture = fixture(2);
+        let mut source = create_host(&fixture, 0, "completion-lineage-source");
+        let agent = create_agent(&mut source, &fixture);
+        let archive = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        let route = recovery_route(&fixture, agent);
+        let authority = authority_target(&fixture).0;
+        let mut destination = create_host(&fixture, 1, "completion-lineage-destination");
+        destination
+            .establish_replica(route, &archive, authority, &TestAuthority)
+            .unwrap();
+        let original_lineage = destination.agents[&agent]
+            .runtime_image
+            .lineage_commitment();
+        let substituted_lineage = Hash([0xe7; 32]);
+        assert_ne!(substituted_lineage, original_lineage);
+        private_replica_establishment::rewrite_replica_establishment_receipt_lineage_for_test(
+            &destination.agent_path(agent),
+            &fixture.nodes[1].key(),
+            substituted_lineage,
+        )
+        .unwrap();
+        assert_eq!(
+            destination.establish_replica(route, &archive, authority, &TestAuthority),
+            Err(PrivateAgentHostError::Corrupt)
+        );
+        drop(destination);
+        assert_eq!(
+            PrivateAgentHost::open(
+                fixture.directory.child("completion-lineage-destination"),
+                fixture.space,
+                fixture.owner,
+                fixture.nodes[1].identity.clone(),
+                fixture.nodes[1].key(),
+                &TestAuthority,
+            )
+            .err(),
+            Some(PrivateAgentHostError::Corrupt)
+        );
+    }
+
+    #[test]
+    fn private_replica_establishment_format_tags_are_unique_and_retired_wires_fail_closed() {
+        let tags = [
+            *b"PVES", // authenticated establishment plan
+            *b"PVER", // authenticated establishment receipt
+            *b"PVE2", // active Store evidence transaction
+            *b"PVEP", // retired Store pending evidence
+            *b"PVI3", // active Store index
+            *b"PVR3", // active runtime image
+            *b"PVRP", // authenticated offline recovery plan
+        ];
+        for (index, tag) in tags.iter().enumerate() {
+            assert!(tags[..index].iter().all(|prior| prior != tag));
+        }
+
+        let fixture = fixture(2);
+        let mut source = create_host(&fixture, 0, "format-tag-source");
+        let agent = create_agent(&mut source, &fixture);
+        let archive = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        let route = recovery_route(&fixture, agent);
+        let authority = authority_target(&fixture).0;
+        let mut destination = create_host(&fixture, 1, "format-tag-destination");
+        let prepared = destination
+            .prepare_replica_establishment(route, &archive, authority, &TestAuthority)
+            .unwrap();
+        let plan_path = destination
+            .creating_path(agent)
+            .join(private_replica_establishment::ESTABLISHMENT_PLAN_FILE);
+        let plan = fs::read(plan_path).unwrap();
+        assert_eq!(&plan[..4], b"PVES");
+        assert!(
+            private_replica_establishment::decode_replica_establishment_plan_for_test(
+                &plan,
+                &fixture.nodes[1].key(),
+            )
+            .is_ok()
+        );
+        assert!(
+            private_replica_establishment::decode_replica_establishment_receipt_for_test(
+                &plan,
+                &fixture.nodes[1].key(),
+            )
+            .is_err()
+        );
+        for retired_or_foreign in [b"PVEP", b"PVE2", b"PVER"] {
+            let mut substituted = plan.clone();
+            substituted[..4].copy_from_slice(retired_or_foreign);
+            assert_eq!(
+                private_replica_establishment::decode_replica_establishment_plan_for_test(
+                    &substituted,
+                    &fixture.nodes[1].key(),
+                ),
+                Err(PrivateAgentHostError::Corrupt)
+            );
+        }
+
+        destination
+            .resume_replica_establishment(prepared, &TestAuthority)
+            .unwrap();
+        let receipt = fs::read(
+            destination
+                .agent_path(agent)
+                .join(private_replica_establishment::ESTABLISHMENT_RECEIPT_FILE),
+        )
+        .unwrap();
+        assert_eq!(&receipt[..4], b"PVER");
+        assert!(
+            private_replica_establishment::decode_replica_establishment_receipt_for_test(
+                &receipt,
+                &fixture.nodes[1].key(),
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            private_replica_establishment::decode_replica_establishment_plan_for_test(
+                &receipt,
+                &fixture.nodes[1].key(),
+            ),
+            Err(PrivateAgentHostError::Corrupt)
+        );
+        let mut retired = receipt;
+        retired[..4].copy_from_slice(b"PVEP");
+        assert_eq!(
+            private_replica_establishment::decode_replica_establishment_receipt_for_test(
+                &retired,
+                &fixture.nodes[1].key(),
+            ),
+            Err(PrivateAgentHostError::Corrupt)
+        );
+    }
+
+    #[test]
+    fn replica_establishment_maximum_archive_plan_and_receipt_codec_roundtrip() {
+        let fixture = fixture(2);
+        let mut source = create_host(&fixture, 0, "maximum-codec-source");
+        let agent = create_agent(&mut source, &fixture);
+        let archive = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        let mut destination = create_host(&fixture, 1, "maximum-codec-destination");
+        destination
+            .prepare_replica_establishment(
+                recovery_route(&fixture, agent),
+                &archive,
+                authority_target(&fixture).0,
+                &TestAuthority,
+            )
+            .unwrap();
+        let plan = fs::read(
+            destination
+                .creating_path(agent)
+                .join(private_replica_establishment::ESTABLISHMENT_PLAN_FILE),
+        )
+        .unwrap();
+        let (encoded_plan, encoded_receipt) =
+            private_replica_establishment::maximum_replica_establishment_codec_lengths_for_test(
+                &plan,
+                &fixture.nodes[1].key(),
+            )
+            .unwrap();
+        assert!(encoded_plan > MAX_PRIVATE_HOST_ARCHIVE_BYTES);
+        assert!(encoded_receipt > MAX_PRIVATE_NODE_IDENTITY_WIRE_BYTES);
+    }
+
+    #[test]
+    fn replica_establishment_durable_boundaries_resume_same_process_and_after_restart() {
+        use private_replica_establishment::ReplicaEstablishmentStop;
+
+        let stops = [
+            ReplicaEstablishmentStop::AfterReplayStoreCommitted,
+            ReplicaEstablishmentStop::AfterReplayEvidenceStaged,
+            ReplicaEstablishmentStop::AfterReplayProvenanceStaged,
+            ReplicaEstablishmentStop::AfterReplayEvidencePending,
+            ReplicaEstablishmentStop::AfterReplayProvenancePublished,
+            ReplicaEstablishmentStop::AfterReplayEvidencePublished,
+            ReplicaEstablishmentStop::AfterReplayEvidenceRetired,
+            ReplicaEstablishmentStop::AfterObjectPrefix,
+            ReplicaEstablishmentStop::BeforeRuntimeSealed,
+            ReplicaEstablishmentStop::AfterRuntimeSealed,
+            ReplicaEstablishmentStop::AfterCompletionPlanTemporary,
+            ReplicaEstablishmentStop::AfterCompletionPlanCommitted,
+            ReplicaEstablishmentStop::AfterStageRenamed,
+            ReplicaEstablishmentStop::AfterReceiptTemporary,
+            ReplicaEstablishmentStop::AfterReceiptPublished,
+            ReplicaEstablishmentStop::AfterPlanRetired,
+        ];
+        for (case, stop) in stops.into_iter().enumerate() {
+            for restart_before_retry in [false, true] {
+                let fixture = fixture(2);
+                let source_name = format!("durable-source-{case}-{restart_before_retry}");
+                let mut source = create_host(&fixture, 0, &source_name);
+                let agent = create_agent(&mut source, &fixture);
+                let replacement_nodes = identities(&fixture);
+                let recovery =
+                    signed_recovery_control(&source, agent, &replacement_nodes, &fixture.recovery);
+                apply_and_attach_replayable_recovery_authority_evidence(
+                    &mut source,
+                    &fixture,
+                    &recovery,
+                    None,
+                    80,
+                    81,
+                );
+                let first = source
+                    .encrypt_and_put(
+                        agent,
+                        EncryptedObjectKind::CrdtNode,
+                        b"durable-boundary-object-zero",
+                        authority_target(&fixture).0,
+                        &TestAuthority,
+                    )
+                    .unwrap();
+                let second = source
+                    .encrypt_and_put(
+                        agent,
+                        EncryptedObjectKind::Blob,
+                        b"durable-boundary-object-one",
+                        authority_target(&fixture).0,
+                        &TestAuthority,
+                    )
+                    .unwrap();
+                let archive = source
+                    .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+                    .unwrap();
+                let source_position = source.agents[&agent].store.core_position().unwrap();
+                let route = recovery_route(&fixture, agent);
+                let authority = authority_target(&fixture).0;
+                let destination_name = format!("durable-destination-{case}-{restart_before_retry}");
+                let mut destination = create_host(&fixture, 1, &destination_name);
+                let prepared = destination
+                    .prepare_replica_establishment(route, &archive, authority, &TestAuthority)
+                    .unwrap();
+                assert_eq!(
+                    destination.resume_replica_establishment_with_stop(
+                        prepared,
+                        &TestAuthority,
+                        stop,
+                    ),
+                    Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted)),
+                    "stop {stop:?}, restart={restart_before_retry}"
+                );
+                if restart_before_retry {
+                    drop(destination);
+                    destination = reopen_host(&fixture, 1, &destination_name);
+                }
+                assert!(matches!(
+                    destination.establish_replica(route, &archive, authority, &TestAuthority),
+                    Ok(PrivateReplicaEstablishmentDisposition::Published
+                        | PrivateReplicaEstablishmentDisposition::AlreadyPresent)
+                ));
+                assert_eq!(
+                    destination.agents[&agent].store.core_position().unwrap(),
+                    source_position,
+                    "stop {stop:?}, restart={restart_before_retry}"
+                );
+                assert_eq!(
+                    destination
+                        .get_and_decrypt(agent, first)
+                        .unwrap()
+                        .as_slice(),
+                    b"durable-boundary-object-zero"
+                );
+                assert_eq!(
+                    destination
+                        .get_and_decrypt(agent, second)
+                        .unwrap()
+                        .as_slice(),
+                    b"durable-boundary-object-one"
+                );
+                assert!(!destination.creating_path(agent).exists());
+                drop(destination);
+                let mut destination = reopen_host(&fixture, 1, &destination_name);
+                assert_eq!(
+                    destination
+                        .establish_replica(route, &archive, authority, &TestAuthority)
+                        .unwrap(),
+                    PrivateReplicaEstablishmentDisposition::AlreadyPresent
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replica_establishment_origin_requires_its_exact_receipt_cold_and_loaded() {
+        let fixture = fixture(2);
+        let mut source = create_host(&fixture, 0, "origin-source");
+        let agent = create_agent(&mut source, &fixture);
+        let archive = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        let route = recovery_route(&fixture, agent);
+        let authority = authority_target(&fixture).0;
+
+        let mut established = create_host(&fixture, 1, "origin-established");
+        established
+            .establish_replica(route, &archive, authority, &TestAuthority)
+            .unwrap();
+        let receipt = fs::read(
+            established
+                .agent_path(agent)
+                .join(private_replica_establishment::ESTABLISHMENT_RECEIPT_FILE),
+        )
+        .unwrap();
+
+        // A valid node-MACed receipt cannot bless an independently-created
+        // same-node/same-descriptor PVRI, even while that slot is loaded.
+        let mut ordinary = create_host(&fixture, 1, "origin-splice-loaded");
+        assert_eq!(create_agent(&mut ordinary, &fixture), agent);
+        assert_eq!(
+            ordinary.agents[&agent].runtime_image.establishment_origin(),
+            None
+        );
+        fs::write(
+            ordinary
+                .agent_path(agent)
+                .join(private_replica_establishment::ESTABLISHMENT_RECEIPT_FILE),
+            &receipt,
+        )
+        .unwrap();
+        assert_eq!(
+            ordinary.establish_replica(route, &archive, authority, &TestAuthority),
+            Err(PrivateAgentHostError::Corrupt)
+        );
+        drop(ordinary);
+        assert_eq!(
+            PrivateAgentHost::open(
+                fixture.directory.child("origin-splice-loaded"),
+                fixture.space,
+                fixture.owner,
+                fixture.nodes[1].identity.clone(),
+                fixture.nodes[1].key(),
+                &TestAuthority,
+            )
+            .err(),
+            Some(PrivateAgentHostError::Corrupt)
+        );
+
+        let mut alternate_authority = authority;
+        alternate_authority.system_agent = AgentId([0xd7; 32]);
+        let mut authority_origin = create_host(&fixture, 1, "origin-splice-authority");
+        authority_origin
+            .establish_replica(route, &archive, alternate_authority, &TestAuthority)
+            .unwrap();
+        fs::write(
+            authority_origin
+                .agent_path(agent)
+                .join(private_replica_establishment::ESTABLISHMENT_RECEIPT_FILE),
+            &receipt,
+        )
+        .unwrap();
+        assert_eq!(
+            authority_origin.establish_replica(route, &archive, authority, &TestAuthority),
+            Err(PrivateAgentHostError::Corrupt)
+        );
+
+        let mut gas_origin = create_host(&fixture, 1, "origin-splice-gas");
+        gas_origin.set_management_gas(DEFAULT_MANAGEMENT_GAS.saturating_add(1));
+        gas_origin
+            .establish_replica(route, &archive, authority, &TestAuthority)
+            .unwrap();
+        fs::write(
+            gas_origin
+                .agent_path(agent)
+                .join(private_replica_establishment::ESTABLISHMENT_RECEIPT_FILE),
+            &receipt,
+        )
+        .unwrap();
+        drop(gas_origin);
+        assert_eq!(
+            PrivateAgentHost::open(
+                fixture.directory.child("origin-splice-gas"),
+                fixture.space,
+                fixture.owner,
+                fixture.nodes[1].identity.clone(),
+                fixture.nodes[1].key(),
+                &TestAuthority,
+            )
+            .err(),
+            Some(PrivateAgentHostError::Corrupt)
+        );
+
+        // Conversely, an origin-bearing PVRI is never admitted through the
+        // generic live path when its authenticated receipt is missing.
+        fs::remove_file(
+            established
+                .agent_path(agent)
+                .join(private_replica_establishment::ESTABLISHMENT_RECEIPT_FILE),
+        )
+        .unwrap();
+        assert_eq!(
+            established.establish_replica(route, &archive, authority, &TestAuthority),
+            Err(PrivateAgentHostError::Corrupt)
+        );
+        drop(established);
+        assert_eq!(
+            PrivateAgentHost::open(
+                fixture.directory.child("origin-established"),
+                fixture.space,
+                fixture.owner,
+                fixture.nodes[1].identity.clone(),
+                fixture.nodes[1].key(),
+                &TestAuthority,
+            )
+            .err(),
+            Some(PrivateAgentHostError::Corrupt)
+        );
+
+        let mut renamed = create_host(&fixture, 1, "origin-receipt-renamed");
+        renamed
+            .establish_replica(route, &archive, authority, &TestAuthority)
+            .unwrap();
+        let slot = renamed.agent_path(agent);
+        fs::rename(
+            slot.join(private_replica_establishment::ESTABLISHMENT_RECEIPT_FILE),
+            slot.join(private_replica_establishment::ESTABLISHMENT_RECEIPT_WRITE_FILE),
+        )
+        .unwrap();
+        drop(renamed);
+        assert_eq!(
+            PrivateAgentHost::open(
+                fixture.directory.child("origin-receipt-renamed"),
+                fixture.space,
+                fixture.owner,
+                fixture.nodes[1].identity.clone(),
+                fixture.nodes[1].key(),
+                &TestAuthority,
+            )
+            .err(),
+            Some(PrivateAgentHostError::Corrupt)
+        );
+    }
+
+    #[test]
+    fn replica_establishment_capacity_reserves_staged_and_renamed_slots() {
+        use private_replica_establishment::ReplicaEstablishmentStop;
+
+        let fixture = fixture(2);
+        let mut source = create_host(&fixture, 0, "capacity-source");
+        let agent = create_agent(&mut source, &fixture);
+        let archive = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        let route = recovery_route(&fixture, agent);
+        let authority = authority_target(&fixture).0;
+        let mut destination = create_host(&fixture, 1, "capacity-destination");
+        let staged =
+            create_empty_agent_reservations(&destination, true, MAX_PRIVATE_HOST_AGENTS, agent);
+        assert_eq!(
+            destination.prepare_replica_establishment(route, &archive, authority, &TestAuthority,),
+            Err(PrivateAgentHostError::LimitExceeded)
+        );
+        let runtime = admit_runtime_package(&fixture.runtime).unwrap();
+        assert_eq!(
+            create_with_runtime(
+                &mut destination,
+                &fixture,
+                &fixture.descriptor,
+                &runtime,
+                &fixture.creation_receipt,
+            ),
+            Err(PrivateAgentHostError::LimitExceeded)
+        );
+        assert!(!destination.creating_path(agent).exists());
+        fs::remove_dir(destination.creating_path(staged[0])).unwrap();
+
+        let prepared = destination
+            .prepare_replica_establishment(route, &archive, authority, &TestAuthority)
+            .unwrap();
+        assert_eq!(
+            destination.resume_replica_establishment_with_stop(
+                prepared,
+                &TestAuthority,
+                ReplicaEstablishmentStop::AfterCompletionPlanCommitted,
+            ),
+            Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted))
+        );
+        assert!(destination.creating_path(agent).is_dir());
+        assert!(!destination.agent_path(agent).exists());
+
+        // A full live namespace leaves the additional completed stage inert.
+        let live =
+            create_empty_agent_reservations(&destination, false, MAX_PRIVATE_HOST_AGENTS, agent);
+        assert!(
+            private_replica_establishment::recover_staged_replica_establishment(
+                &mut destination,
+                agent,
+                &TestAuthority,
+            )
+            .unwrap()
+        );
+        assert!(destination.creating_path(agent).is_dir());
+        assert!(!destination.agent_path(agent).exists());
+        for live_agent in live {
+            fs::remove_dir(destination.agent_path(live_agent)).unwrap();
+        }
+
+        // Once a slot has crossed the rename, its durable name still consumes
+        // capacity before it is inserted into the in-memory map. Exact repair
+        // remains capacity-neutral and tokenless.
+        assert_eq!(
+            destination.resume_replica_establishment_with_stop(
+                prepared,
+                &TestAuthority,
+                ReplicaEstablishmentStop::AfterStageRenamed,
+            ),
+            Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted))
+        );
+        assert!(destination.agent_path(agent).is_dir());
+        assert!(!destination.agents.contains_key(&agent));
+        assert_eq!(
+            destination.require_new_private_agent_reservation_capacity(AgentId([0xf7; 32])),
+            Err(PrivateAgentHostError::LimitExceeded)
+        );
+        assert_eq!(
+            destination
+                .establish_replica(route, &archive, authority, &TestAuthority)
+                .unwrap(),
+            PrivateReplicaEstablishmentDisposition::AlreadyPresent
+        );
+        assert!(destination.agents.contains_key(&agent));
+    }
+
+    #[test]
+    fn replica_establishment_genesis_prefixes_resume_after_restart() {
+        use private_replica_establishment::ReplicaEstablishmentStop;
+
+        for (case, stop) in [
+            ReplicaEstablishmentStop::AfterGenesisStore,
+            ReplicaEstablishmentStop::AfterGenesisDescriptor,
+            ReplicaEstablishmentStop::AfterGenesisRuntime,
+            ReplicaEstablishmentStop::AfterGenesisBootstrap,
+            ReplicaEstablishmentStop::AfterGenesisRuntimeImage,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = fixture(2);
+            let mut source = create_host(&fixture, 0, &format!("prefix-source-{case}"));
+            let agent = create_agent(&mut source, &fixture);
+            let archive = source
+                .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+                .unwrap();
+            let route = recovery_route(&fixture, agent);
+            let authority = authority_target(&fixture).0;
+            let destination_name = format!("prefix-destination-{case}");
+            let mut destination = create_host(&fixture, 1, &destination_name);
+            let prepared = destination
+                .prepare_replica_establishment(route, &archive, authority, &TestAuthority)
+                .unwrap();
+            assert_eq!(
+                destination.resume_replica_establishment_with_stop(prepared, &TestAuthority, stop,),
+                Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted))
+            );
+            assert_eq!(
+                destination.binding(agent),
+                Err(PrivateAgentHostError::NotFound)
+            );
+            assert!(destination.creating_path(agent).is_dir());
+
+            drop(destination);
+            let mut destination = reopen_host(&fixture, 1, &destination_name);
+            assert_eq!(
+                destination.binding(agent),
+                Err(PrivateAgentHostError::NotFound)
+            );
+            let prepared = destination
+                .prepare_replica_establishment(route, &archive, authority, &TestAuthority)
+                .unwrap();
+            assert_eq!(
+                destination
+                    .resume_replica_establishment(prepared, &TestAuthority)
+                    .unwrap(),
+                PrivateReplicaEstablishmentDisposition::Published
+            );
+            assert_eq!(
+                destination.binding(agent).unwrap(),
+                source.binding(agent).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn replica_establishment_prepared_capability_binds_authority_and_gas() {
+        let fixture = fixture(2);
+        let mut source = create_host(&fixture, 0, "capability-source");
+        let agent = create_agent(&mut source, &fixture);
+        let archive = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        let route = recovery_route(&fixture, agent);
+        let authority = authority_target(&fixture).0;
+
+        let mut first = create_host(&fixture, 1, "capability-first");
+        let first_prepared = first
+            .prepare_replica_establishment(route, &archive, authority, &TestAuthority)
+            .unwrap();
+
+        let mut alternate_authority = authority;
+        alternate_authority.system_agent = AgentId([0xd7; 32]);
+        let mut second = create_host(&fixture, 1, "capability-second");
+        second.set_management_gas(DEFAULT_MANAGEMENT_GAS.saturating_add(1));
+        let second_prepared = second
+            .prepare_replica_establishment(route, &archive, alternate_authority, &TestAuthority)
+            .unwrap();
+        let mut before = Vec::new();
+        collect_files(&second.creating_path(agent), &mut before);
+        assert_eq!(
+            second.resume_replica_establishment(first_prepared, &TestAuthority),
+            Err(PrivateAgentHostError::Alias)
+        );
+        let mut after = Vec::new();
+        collect_files(&second.creating_path(agent), &mut after);
+        assert_eq!(after, before);
+        assert_eq!(
+            second
+                .resume_replica_establishment(second_prepared, &TestAuthority)
+                .unwrap(),
+            PrivateReplicaEstablishmentDisposition::Published
         );
     }
 

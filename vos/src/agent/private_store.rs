@@ -326,6 +326,30 @@ pub(crate) struct VerifiedEncryptedBackup {
     chain: PrivateControlChainVerifier,
 }
 
+/// Bounded, canonical genesis metadata decoded from an encrypted backup
+/// before the backup's independently selected descriptor has been opened.
+///
+/// This value is deliberately named a claim: its recovery keys are suitable
+/// only as inputs to [`verify_encrypted_backup`]. A physical importer must
+/// subsequently authenticate the decrypted descriptor/Create receipt and
+/// require their immutable recovery binding to equal these exact keys before
+/// it writes any destination state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EncryptedBackupGenesisClaim {
+    recovery_public_key: [u8; 32],
+    recovery_encryption_public_key: [u8; 32],
+}
+
+impl EncryptedBackupGenesisClaim {
+    pub(crate) const fn recovery_public_key(self) -> [u8; 32] {
+        self.recovery_public_key
+    }
+
+    pub(crate) const fn recovery_encryption_public_key(self) -> [u8; 32] {
+        self.recovery_encryption_public_key
+    }
+}
+
 /// Complete source material for replaying one archived control locally.
 ///
 /// Construction proves only that all three archive attachments are present
@@ -1221,6 +1245,25 @@ fn decode_pending_control_evidence(
         return Err(PrivateStoreError::Corrupt);
     }
     Ok(pending)
+}
+
+/// Decode only the bounded canonical recovery metadata needed to break the
+/// encrypted-backup bootstrap cycle. Nothing returned by this function is an
+/// authority fact until the complete backup and its independently signed
+/// descriptor/Create material have both been authenticated.
+pub(crate) fn encrypted_backup_genesis_claim(
+    bytes: &[u8],
+) -> Result<EncryptedBackupGenesisClaim, PrivateStoreError> {
+    let mut decoder = Decoder::new(bytes, BACKUP_MAGIC, MAX_PRIVATE_BACKUP_BYTES)?;
+    let recovery_wire = decoder.bytes(MAX_PRIVATE_RECOVERY_METADATA_BYTES)?;
+    let metadata = decode_recovery(&recovery_wire)?;
+    if encode_recovery(&metadata)? != recovery_wire {
+        return Err(PrivateStoreError::Corrupt);
+    }
+    Ok(EncryptedBackupGenesisClaim {
+        recovery_public_key: metadata.recovery_public_key,
+        recovery_encryption_public_key: metadata.recovery_encryption_public_key,
+    })
 }
 
 /// Fully decode an encrypted archive, authenticate its signed control chain,
@@ -3922,6 +3965,21 @@ impl PrivateStore {
             evidence,
             Some(stable_import_certificate),
             ControlEvidenceCommitStop::Never,
+        )
+    }
+
+    pub(crate) fn persist_imported_control_authority_evidence_with_stop_for_runtime(
+        &mut self,
+        control: Hash,
+        evidence: &[u8],
+        stable_import_certificate: &[u8],
+        stop: ControlEvidenceCommitStop,
+    ) -> Result<PutDisposition, PrivateStoreError> {
+        self.persist_control_authority_evidence_inner(
+            control,
+            evidence,
+            Some(stable_import_certificate),
+            stop,
         )
     }
 
@@ -8319,6 +8377,13 @@ mod tests {
         let backup = store
             .export_encrypted_backup(MAX_PRIVATE_BACKUP_BYTES)
             .unwrap();
+        let index_wire = fs::read(index_path.join(INDEX_FILE)).unwrap();
+        assert_eq!(index_wire.get(..4), Some(INDEX_MAGIC.as_slice()));
+        assert!(PrivateRuntimeImage::decode(&index_wire).is_err());
+        assert_eq!(
+            decode_index(&fixture.predecessor.encode().unwrap()).err(),
+            Some(PrivateStoreError::Corrupt)
+        );
         assert_eq!(snapshot.get(..4), Some(SNAPSHOT_MAGIC.as_slice()));
         assert_eq!(backup.get(..4), Some(BACKUP_MAGIC.as_slice()));
         let mut old_backup = backup;

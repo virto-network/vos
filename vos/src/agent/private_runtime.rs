@@ -2,7 +2,7 @@
 //!
 //! This module owns three clean-generation formats:
 //!
-//! - `PVRI2` is the exact node-local runtime image paired with one immutable
+//! - `PVRI3` is the exact node-local runtime image paired with one immutable
 //!   Private Store core position.
 //! - `PAPL1` is the pending/completed application of one exact PCTL. It keeps
 //!   the receipt and AOI1 preimages but can represent only a positive result.
@@ -11,7 +11,7 @@
 //!
 //! The Store position deliberately excludes PVRI/PAPL/PCRS and every
 //! authority acknowledgement derived from them. This preserves the acyclic
-//! commitment order `AOI1 -> PAPL1 -> (PVRI2, Store) -> PCRS3/PCAF2 -> PCA2 ->
+//! commitment order `AOI1 -> PAPL1 -> (PVRI3, Store) -> PCRS3/PCAF2 -> PCA2 ->
 //! PSE2`. Runtime images and applications include the local NodeId and are
 //! never suitable as cross-replica equality claims; only
 //! [`PrivateRuntimeStableProjection`] is replica-stable.
@@ -26,16 +26,17 @@ use vos_agent_sdk::authority::{
 use vos_agent_sdk::authority_operation::{
     AuthorityOperationIssuanceAck, MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES,
     MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES, PrivateRecoveryAuthorityProof,
-    PrivateRecoveryAuthorityProofVerifier,
+    PrivateRecoveryAuthorityProofVerifier, private_node_identity_set_commitment,
 };
 use vos_agent_sdk::contract::RuntimeResourcePolicy;
 use vos_agent_sdk::private::{
     MAX_PRIVATE_RECOVERY_KEYRING_EPOCHS, PrivateControlOperation, PrivateControlRecord,
-    PrivateKeyEpoch, recovery_signing_public_key_commitment,
+    PrivateKeyEpoch, PrivateNodeIdentity, recovery_signing_public_key_commitment,
 };
 use vos_agent_sdk::wire::{
     CanonicalWire, MAX_ACTOR_ENTRY_WIRE_BYTES, MAX_AUTHORITY_RECEIPT_WIRE_BYTES,
     MAX_PRIVATE_CONTROL_WIRE_BYTES, MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES,
+    authority_private_node_identity_commitment,
 };
 use vos_agent_sdk::{
     ActorEntry, ActorId, AgentDescriptor, AgentId, AgentProfile, BlobRef, DeploymentId, Hash,
@@ -59,7 +60,9 @@ const PRIVATE_RUNTIME_STABLE_PROJECTION_COMMITMENT_DOMAIN: &[u8] =
     b"vos/agent/private-runtime-stable-projection/v1";
 const PRIVATE_RUNTIME_CONTROL_STATE_COMMITMENT_DOMAIN: &[u8] =
     b"vos/agent/private-runtime-control-state/v1";
-const PRIVATE_RUNTIME_IMAGE_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/private-runtime-image/v2";
+const PRIVATE_RUNTIME_IMAGE_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/private-runtime-image/v3";
+const PRIVATE_RUNTIME_ESTABLISHMENT_SEAL_DOMAIN: &[u8] =
+    b"vos/agent/private-runtime-establishment-seal/v1";
 const PRIVATE_RUNTIME_APPLICATION_COMMITMENT_DOMAIN: &[u8] =
     b"vos/agent/private-runtime-application/v1";
 const PRIVATE_CONTROL_REOPENED_STATE_COMMITMENT_DOMAIN: &[u8] =
@@ -72,7 +75,7 @@ pub const MAX_PRIVATE_RUNTIME_SUCCESS_WIRE_BYTES: usize =
     HEADER_BYTES + 1 + 4 + HEADER_BYTES + 32 + MAX_ACTOR_ENTRY_WIRE_BYTES;
 /// Fixed-size exact commitment to one canonical PKEY preimage.
 pub const PRIVATE_KEY_EPOCH_COMMITMENT_WIRE_BYTES: usize = HEADER_BYTES + 8 + 32;
-/// Maximum exact node-local PVRI2 image.
+/// Maximum exact node-local PVRI3 image.
 pub const MAX_PRIVATE_RUNTIME_IMAGE_WIRE_BYTES: usize = MAX_RUNTIME_STATE_BYTES
     + MAX_PRIVATE_RUNTIME_KEY_EPOCHS * (4 + PRIVATE_KEY_EPOCH_COMMITMENT_WIRE_BYTES)
     + 16 * 1024;
@@ -731,12 +734,35 @@ pub fn classify_private_runtime_control_transition(
     transition: RuntimeTransition,
 ) -> Result<PrivateRuntimeControlDisposition, PrivateRuntimeEvidenceError> {
     predecessor.validate()?;
+    classify_private_runtime_control_transition_for_replay(
+        predecessor.managed(),
+        predecessor.state(),
+        predecessor.active_resource_policy(),
+        request,
+        transition,
+    )
+}
+
+/// Pure transition classifier used while authenticating an unpublished
+/// replica replay. It applies the same state/reply/resource-policy rules as
+/// the live PVRI path without requiring a destination Store or node-local
+/// image to exist yet.
+pub(crate) fn classify_private_runtime_control_transition_for_replay(
+    managed: ManagedAgentTarget,
+    predecessor_state: &RuntimeState,
+    predecessor_active_policy: RuntimeResourcePolicy,
+    request: &ManagementRequest,
+    transition: RuntimeTransition,
+) -> Result<PrivateRuntimeControlDisposition, PrivateRuntimeEvidenceError> {
     let ManagementRequest::PrivateControl { control, .. } = request else {
         return Err(PrivateRuntimeEvidenceError::InvalidApplication);
     };
     if !request.is_valid()
-        || control.space != predecessor.managed().space
-        || control.agent != predecessor.managed().agent
+        || !managed.is_valid()
+        || !predecessor_state.validate()
+        || !predecessor_active_policy.is_valid()
+        || control.space != managed.space
+        || control.agent != managed.agent
     {
         return Err(PrivateRuntimeEvidenceError::InvalidApplication);
     }
@@ -750,7 +776,7 @@ pub fn classify_private_runtime_control_transition(
             if !request.private_runtime_reply_matches(&reply) {
                 return Err(PrivateRuntimeEvidenceError::InvalidSuccess);
             }
-            if !private_state_transition_matches(predecessor.state(), &state, true)
+            if !private_state_transition_matches(predecessor_state, &state, true)
                 || state.is_empty()
             {
                 return Err(PrivateRuntimeEvidenceError::InvalidState);
@@ -771,7 +797,7 @@ pub fn classify_private_runtime_control_transition(
             }
             let active_policy = match &success {
                 PrivateRuntimeSuccess::ResourcePolicySet(policy) => *policy,
-                _ => predecessor.active_resource_policy(),
+                _ => predecessor_active_policy,
             };
             if state
                 .encoded_len()
@@ -782,7 +808,7 @@ pub fn classify_private_runtime_control_transition(
             Ok(PrivateRuntimeControlDisposition::Applied { state, success })
         }
         RuntimeOutcome::Management(Err(error)) => {
-            if state != *predecessor.state() {
+            if state != *predecessor_state {
                 return Err(PrivateRuntimeEvidenceError::InvalidState);
             }
             Ok(PrivateRuntimeControlDisposition::RetiredUnapplied { error })
@@ -935,6 +961,32 @@ impl PrivateRuntimeStableProjection {
         self.active_resource_policy_commitment
     }
 
+    /// Check the exact stable projection produced by a locally replayed
+    /// control result. This exposes no constructor and therefore cannot mint
+    /// portable authority; it only closes preflight against a signed PSP.
+    pub(crate) fn matches_replayed_successor(
+        &self,
+        predecessor: &Self,
+        control: &PrivateControlRecord,
+        full_replay: Hash,
+        success: &PrivateRuntimeSuccess,
+        state: &RuntimeState,
+    ) -> bool {
+        let active_resource_policy = match success {
+            PrivateRuntimeSuccess::ResourcePolicySet(policy) => *policy,
+            _ => predecessor.active_resource_policy,
+        };
+        Self::successor(
+            predecessor,
+            control,
+            full_replay,
+            success,
+            active_resource_policy,
+            &state.control,
+        )
+        .is_ok_and(|candidate| candidate == *self)
+    }
+
     pub fn commitment(&self) -> Hash {
         Hash::digest(
             PRIVATE_RUNTIME_STABLE_PROJECTION_COMMITMENT_DOMAIN,
@@ -1038,7 +1090,7 @@ impl PrivateRuntimeControlPosition {
     }
 }
 
-/// Exact node-local Private runtime image (`PVRI2`).
+/// Exact node-local Private runtime image (`PVRI3`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrivateRuntimeImage {
     managed: ManagedAgentTarget,
@@ -1048,6 +1100,8 @@ pub struct PrivateRuntimeImage {
     runtime_package: BlobRef,
     creation_receipt: AuthorityReceipt,
     created_at: u64,
+    establishment_origin: Option<Hash>,
+    establishment_completion: Option<Hash>,
     runtime_deployment: DeploymentId,
     state: RuntimeState,
     active_resource_policy: RuntimeResourcePolicy,
@@ -1058,6 +1112,124 @@ pub struct PrivateRuntimeImage {
     last_full_replay: Option<Hash>,
     stable_projection: PrivateRuntimeStableProjection,
     applied_at: u64,
+}
+
+/// Opaque one-shot authority to construct a replica-establishment genesis
+/// PVRI for either a descriptor-listed or later-admitted Node.
+///
+/// The physical import path may mint this value only after authenticating one
+/// complete source history. It binds the exact full destination identity,
+/// genesis Store/PKEY inputs, final authenticated membership, and the exact
+/// establishment identity. That identity commitment becomes an immutable
+/// node-local PVRI3 origin, preventing a valid establishment receipt from being
+/// spliced beside another same-node runtime lineage. Normal creation never needs this
+/// capability and continues to require membership in `AgentDescriptor::replicas`.
+///
+/// This type deliberately implements neither `Clone` nor `CanonicalWire`: it
+/// is an in-memory trust handoff, not portable evidence or durable authority.
+pub(super) struct PrivateRuntimeReplicaEstablishment {
+    descriptor: Hash,
+    node: NodeId,
+    local_identity: Hash,
+    genesis_store: PrivateStoreCorePosition,
+    genesis_key_epochs: Vec<PrivateKeyEpochCommitment>,
+    final_membership: Hash,
+    establishment_identity: Hash,
+}
+
+impl PrivateRuntimeReplicaEstablishment {
+    /// Bind inputs selected from an already authenticated complete source.
+    ///
+    /// This runtime layer validates canonical shape and exact correspondence;
+    /// the caller remains responsible for authenticating `final_members` and
+    /// deriving `establishment_identity` from the exact source, route, owner,
+    /// destination, authority, and execution budget before invoking this seam.
+    pub(super) fn bind_verified_source(
+        descriptor: &AgentDescriptor,
+        local_node: &PrivateNodeIdentity,
+        genesis_store: PrivateStoreCorePosition,
+        genesis_key_epochs: &[PrivateKeyEpochCommitment],
+        final_members: &[PrivateNodeIdentity],
+        establishment_identity: Hash,
+    ) -> Result<Self, PrivateRuntimeEvidenceError> {
+        if descriptor.validate().is_err()
+            || descriptor.identity.profile != AgentProfile::Private
+            || !local_node.validate()
+            || local_node.principal != descriptor.identity.owner
+        {
+            return Err(PrivateRuntimeEvidenceError::InvalidDescriptor);
+        }
+        validate_genesis_store_binding(descriptor, genesis_store, genesis_key_epochs)?;
+        let final_membership = private_node_identity_set_commitment(final_members.iter())
+            .ok_or(PrivateRuntimeEvidenceError::InvalidDescriptor)?;
+        if establishment_identity == Hash::ZERO
+            || final_members
+                .iter()
+                .any(|member| member.principal != descriptor.identity.owner)
+            || final_members
+                .binary_search_by_key(&local_node.node, |member| member.node)
+                .ok()
+                .and_then(|position| final_members.get(position))
+                != Some(local_node)
+        {
+            return Err(PrivateRuntimeEvidenceError::InvalidDescriptor);
+        }
+        Ok(Self {
+            descriptor: descriptor.commitment(),
+            node: local_node.node,
+            local_identity: authority_private_node_identity_commitment(local_node),
+            genesis_store,
+            genesis_key_epochs: genesis_key_epochs.to_vec(),
+            final_membership,
+            establishment_identity,
+        })
+    }
+
+    fn consume_for(
+        self,
+        descriptor: &AgentDescriptor,
+        store: PrivateStoreCorePosition,
+        key_epochs: &[PrivateKeyEpochCommitment],
+    ) -> Result<(NodeId, Hash), PrivateRuntimeEvidenceError> {
+        if self.descriptor != descriptor.commitment()
+            || self.local_identity == Hash::ZERO
+            || self.final_membership == Hash::ZERO
+            || self.establishment_identity == Hash::ZERO
+        {
+            return Err(PrivateRuntimeEvidenceError::InvalidDescriptor);
+        }
+        if self.genesis_store != store {
+            return Err(PrivateRuntimeEvidenceError::InvalidStorePosition);
+        }
+        if self.genesis_key_epochs != key_epochs {
+            return Err(PrivateRuntimeEvidenceError::InvalidKeyEpochs);
+        }
+        Ok((self.node, self.establishment_identity))
+    }
+}
+
+fn validate_genesis_store_binding(
+    descriptor: &AgentDescriptor,
+    store: PrivateStoreCorePosition,
+    key_epochs: &[PrivateKeyEpochCommitment],
+) -> Result<(), PrivateRuntimeEvidenceError> {
+    store.validate()?;
+    validate_key_epochs(key_epochs)?;
+    if store.space != descriptor.identity.space
+        || store.agent != descriptor.identity.agent
+        || store.owner != descriptor.identity.owner
+        || store.control_count != 0
+        || store.control_head.is_some()
+        || store.next_sequence != 0
+    {
+        return Err(PrivateRuntimeEvidenceError::InvalidStorePosition);
+    }
+    if private_key_epoch_root(key_epochs)? != store.key_epoch_root
+        || key_epochs.last().map(|value| value.epoch) != Some(store.epoch)
+    {
+        return Err(PrivateRuntimeEvidenceError::InvalidKeyEpochs);
+    }
+    Ok(())
 }
 
 impl PrivateRuntimeImage {
@@ -1075,12 +1247,73 @@ impl PrivateRuntimeImage {
         genesis_at: u64,
         authority_verifier: &V,
     ) -> Result<Self, PrivateRuntimeEvidenceError> {
+        Self::genesis_inner(
+            descriptor,
+            node,
+            true,
+            None,
+            state,
+            store,
+            key_epochs,
+            creation_receipt,
+            genesis_at,
+            authority_verifier,
+        )
+    }
+
+    /// Construct a genesis PVRI from one fully authenticated replica source.
+    ///
+    /// Consuming the opaque capability admits either an immutable descriptor
+    /// member or a later PKEY member and binds the verified source commitment
+    /// into PVRI3. Descriptor, receipt, post-Create state, Store/PKEY,
+    /// resource-policy, and stable-projection checks are shared with
+    /// [`Self::genesis`].
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn genesis_for_established_replica<V: AuthorityVerifier>(
+        descriptor: &AgentDescriptor,
+        bootstrap: PrivateRuntimeReplicaEstablishment,
+        state: RuntimeState,
+        store: PrivateStoreCorePosition,
+        key_epochs: Vec<PrivateKeyEpochCommitment>,
+        creation_receipt: AuthorityReceipt,
+        genesis_at: u64,
+        authority_verifier: &V,
+    ) -> Result<Self, PrivateRuntimeEvidenceError> {
+        let (node, establishment_origin) = bootstrap.consume_for(descriptor, store, &key_epochs)?;
+        Self::genesis_inner(
+            descriptor,
+            node,
+            false,
+            Some(establishment_origin),
+            state,
+            store,
+            key_epochs,
+            creation_receipt,
+            genesis_at,
+            authority_verifier,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn genesis_inner<V: AuthorityVerifier>(
+        descriptor: &AgentDescriptor,
+        node: NodeId,
+        require_descriptor_member: bool,
+        establishment_origin: Option<Hash>,
+        state: RuntimeState,
+        store: PrivateStoreCorePosition,
+        key_epochs: Vec<PrivateKeyEpochCommitment>,
+        creation_receipt: AuthorityReceipt,
+        genesis_at: u64,
+        authority_verifier: &V,
+    ) -> Result<Self, PrivateRuntimeEvidenceError> {
         if descriptor.validate().is_err()
             || descriptor.identity.profile != AgentProfile::Private
-            || !descriptor
-                .replicas
-                .iter()
-                .any(|replica| replica.node == node)
+            || (require_descriptor_member
+                && !descriptor
+                    .replicas
+                    .iter()
+                    .any(|replica| replica.node == node))
         {
             return Err(PrivateRuntimeEvidenceError::InvalidDescriptor);
         }
@@ -1095,15 +1328,7 @@ impl PrivateRuntimeImage {
             genesis_at,
             authority_verifier,
         )?;
-        if store.space != managed.space
-            || store.agent != managed.agent
-            || store.owner != descriptor.identity.owner
-            || store.control_count != 0
-            || store.control_head.is_some()
-            || store.next_sequence != 0
-        {
-            return Err(PrivateRuntimeEvidenceError::InvalidStorePosition);
-        }
+        validate_genesis_store_binding(descriptor, store, &key_epochs)?;
         let active_resource_policy = descriptor.initial_resource_policy();
         let stable_projection = PrivateRuntimeStableProjection::genesis(
             managed,
@@ -1121,6 +1346,8 @@ impl PrivateRuntimeImage {
             runtime_package: descriptor.runtime_package.clone(),
             creation_receipt,
             created_at: genesis_at,
+            establishment_origin,
+            establishment_completion: None,
             runtime_deployment: descriptor.identity.runtime_deployment,
             state,
             active_resource_policy,
@@ -1245,6 +1472,8 @@ impl PrivateRuntimeImage {
             runtime_package: predecessor.runtime_package.clone(),
             creation_receipt: predecessor.creation_receipt.clone(),
             created_at: predecessor.created_at,
+            establishment_origin: predecessor.establishment_origin,
+            establishment_completion: predecessor.establishment_completion,
             runtime_deployment: predecessor.runtime_deployment,
             state: predecessor.state.clone(),
             active_resource_policy: predecessor.active_resource_policy,
@@ -1276,9 +1505,22 @@ impl PrivateRuntimeImage {
         Ok(value)
     }
 
+    /// Hostile-test bridge for proving that node-local establishment metadata
+    /// cannot be dropped or substituted across durable reconciliation.
+    #[cfg(test)]
+    pub(crate) fn synthetic_establishment_completion_for_host_test(
+        &self,
+        completion: Option<Hash>,
+    ) -> Result<Self, PrivateRuntimeEvidenceError> {
+        let mut value = self.clone();
+        value.establishment_completion = completion;
+        value.validate()?;
+        Ok(value)
+    }
+
     /// Build the successor image selected by a pending PAPL1 and positive
     /// disposition. Completion is a separate step because PAPL1 records the
-    /// resulting image commitment while PVRI2 never points back to PAPL1.
+    /// resulting image commitment while PVRI3 never points back to PAPL1.
     #[allow(clippy::too_many_arguments)]
     pub fn successor<V: AuthorityVerifier, R: PrivateRecoveryAuthorityProofVerifier>(
         descriptor: &AgentDescriptor,
@@ -1332,6 +1574,8 @@ impl PrivateRuntimeImage {
             runtime_package: predecessor.runtime_package.clone(),
             creation_receipt: predecessor.creation_receipt.clone(),
             created_at: predecessor.created_at,
+            establishment_origin: predecessor.establishment_origin,
+            establishment_completion: predecessor.establishment_completion,
             runtime_deployment: predecessor.runtime_deployment,
             state,
             active_resource_policy,
@@ -1376,6 +1620,74 @@ impl PrivateRuntimeImage {
     pub const fn created_at(&self) -> u64 {
         self.created_at
     }
+    /// Immutable destination-local commitment to the authenticated source
+    /// capsule used for replica establishment. Ordinary local Create is None.
+    pub const fn establishment_origin(&self) -> Option<Hash> {
+        self.establishment_origin
+    }
+
+    /// Destination-local completion seal set only after the exact source
+    /// Store target has been reconstructed. Ordinary local Create and an
+    /// unpublished establishment prefix are None.
+    pub const fn establishment_completion(&self) -> Option<Hash> {
+        self.establishment_completion
+    }
+
+    /// Seal an in-progress replica image only at the exact authenticated
+    /// source target. The node-local tag is excluded from PAPL lineage but is
+    /// included in the full canonical-wire/storage commitment and preserved
+    /// by every ordinary successor and object rebind.
+    pub(super) fn seal_replica_establishment(
+        &self,
+        establishment_identity: Hash,
+        final_store: PrivateStoreCorePosition,
+    ) -> Result<Self, PrivateRuntimeEvidenceError> {
+        self.validate()?;
+        final_store.validate()?;
+        if self.store != final_store || self.establishment_origin != Some(establishment_identity) {
+            return Err(PrivateRuntimeEvidenceError::InvalidStorePosition);
+        }
+        let sealed = Self::replica_establishment_seal(
+            establishment_identity,
+            final_store.commitment(),
+            self.lineage_commitment(),
+        )?;
+        match self.establishment_completion {
+            Some(current) if current == sealed => Ok(self.clone()),
+            None => {
+                let mut value = self.clone();
+                value.establishment_completion = Some(sealed);
+                value.validate()?;
+                Ok(value)
+            }
+            _ => Err(PrivateRuntimeEvidenceError::InvalidState),
+        }
+    }
+
+    pub(super) fn replica_establishment_seal(
+        establishment_identity: Hash,
+        final_store: Hash,
+        final_lineage: Hash,
+    ) -> Result<Hash, PrivateRuntimeEvidenceError> {
+        if establishment_identity == Hash::ZERO
+            || final_store == Hash::ZERO
+            || final_lineage == Hash::ZERO
+        {
+            return Err(PrivateRuntimeEvidenceError::InvalidState);
+        }
+        let sealed = Hash::digest(
+            PRIVATE_RUNTIME_ESTABLISHMENT_SEAL_DOMAIN,
+            &[
+                establishment_identity.as_bytes(),
+                final_store.as_bytes(),
+                final_lineage.as_bytes(),
+            ],
+        );
+        if sealed == Hash::ZERO || sealed == establishment_identity {
+            return Err(PrivateRuntimeEvidenceError::InvalidState);
+        }
+        Ok(sealed)
+    }
     pub const fn runtime_deployment(&self) -> DeploymentId {
         self.runtime_deployment
     }
@@ -1410,7 +1722,20 @@ impl PrivateRuntimeImage {
     pub fn commitment(&self) -> Hash {
         Hash::digest(
             PRIVATE_RUNTIME_IMAGE_COMMITMENT_DOMAIN,
-            &[&self.encode().expect("valid PVI2")],
+            &[&self.encode().expect("valid PVR3")],
+        )
+    }
+
+    /// PAPL-facing PVRI identity. The establishment completion tag is
+    /// deliberately normalized away: it is node-local publication metadata,
+    /// not a runtime state transition. Every other canonical PVRI field,
+    /// including the immutable establishment origin, remains bound.
+    pub fn lineage_commitment(&self) -> Hash {
+        let mut lineage = self.clone();
+        lineage.establishment_completion = None;
+        Hash::digest(
+            PRIVATE_RUNTIME_IMAGE_COMMITMENT_DOMAIN,
+            &[&lineage.encode().expect("valid PVR3")],
         )
     }
 
@@ -1456,6 +1781,9 @@ impl PrivateRuntimeImage {
                 &self.creation_receipt,
                 self.created_at,
             )
+            || !nonzero_option(self.establishment_origin)
+            || !nonzero_option(self.establishment_completion)
+            || (self.establishment_completion.is_some() && self.establishment_origin.is_none())
             || self.runtime_deployment == DeploymentId::ZERO
             || self.managed.runtime_deployment != self.runtime_deployment
             || self.store.space != self.managed.space
@@ -1506,7 +1834,7 @@ impl PrivateRuntimeImage {
 }
 
 impl CanonicalWire for PrivateRuntimeImage {
-    const MAGIC: [u8; 4] = *b"PVI2";
+    const MAGIC: [u8; 4] = *b"PVR3";
     const MAX_ENCODED_BYTES: usize = MAX_PRIVATE_RUNTIME_IMAGE_WIRE_BYTES;
 
     fn validate_wire(&self) -> bool {
@@ -1521,6 +1849,8 @@ impl CanonicalWire for PrivateRuntimeImage {
         encode_blob(encoder, &self.runtime_package);
         encode_nested(encoder, &self.creation_receipt);
         encoder.u64(self.created_at);
+        encode_optional_hash(encoder, self.establishment_origin);
+        encode_optional_hash(encoder, self.establishment_completion);
         encoder.fixed(self.runtime_deployment.as_bytes());
         encode_runtime_state(encoder, &self.state);
         encode_nested(encoder, &self.active_resource_policy);
@@ -1545,6 +1875,8 @@ impl CanonicalWire for PrivateRuntimeImage {
             runtime_package: decode_blob(decoder)?,
             creation_receipt: decode_nested(decoder, MAX_AUTHORITY_RECEIPT_WIRE_BYTES)?,
             created_at: decoder.u64()?,
+            establishment_origin: decode_optional_hash(decoder)?,
+            establishment_completion: decode_optional_hash(decoder)?,
             runtime_deployment: DeploymentId(decoder.fixed()?),
             state: decode_runtime_state(decoder)?,
             active_resource_policy: decode_nested(
@@ -1933,7 +2265,7 @@ impl PrivateRuntimeApplication {
             issuance,
             applied_at,
             predecessor_store: predecessor.store,
-            predecessor_runtime_image: predecessor.commitment(),
+            predecessor_runtime_image: predecessor.lineage_commitment(),
             predecessor_stable_projection: predecessor.stable_projection.clone(),
             predecessor_runtime_control: predecessor.runtime_control,
             expected_successor_store,
@@ -1992,7 +2324,7 @@ impl PrivateRuntimeApplication {
         self.completion = Some(PrivateRuntimeApplicationCompletion {
             success,
             stable_projection,
-            successor_runtime_image: successor.commitment(),
+            successor_runtime_image: successor.lineage_commitment(),
         });
         self.validate()?;
         if !self.matches_successor(successor) {
@@ -2083,7 +2415,7 @@ impl PrivateRuntimeApplication {
             && self.descriptor == predecessor.descriptor
             && self.runtime_package == predecessor.runtime_package
             && self.predecessor_store == predecessor.store
-            && self.predecessor_runtime_image == predecessor.commitment()
+            && self.predecessor_runtime_image == predecessor.lineage_commitment()
             && self.predecessor_stable_projection == predecessor.stable_projection
             && self.predecessor_runtime_control == predecessor.runtime_control
     }
@@ -2206,7 +2538,7 @@ impl PrivateRuntimeApplication {
             && successor.applied_at == self.applied_at
             && successor.last_full_replay == Some(self.full_replay)
             && successor.stable_projection == completion.stable_projection
-            && successor.commitment() == completion.successor_runtime_image
+            && successor.lineage_commitment() == completion.successor_runtime_image
             && successor.runtime_control
                 == if self.mutation.is_some() {
                     Some(PrivateRuntimeControlPosition {
@@ -2452,7 +2784,8 @@ impl PrivateControlReopenedState {
     }
 
     /// Recompute the PCRS3 endpoint retained by PCAF2 using only a completed
-    /// PAPL. PAPL already carries the exact successor PSC and PVRI commitment,
+    /// PAPL. PAPL already carries the exact successor PSC and PVRI lineage
+    /// commitment,
     /// so no historical plaintext runtime image has to remain on disk.
     pub fn commitment_from_application(
         application: &PrivateRuntimeApplication,
@@ -3283,17 +3616,23 @@ mod tests {
         assert_round_trip(&successor);
         assert_round_trip(&reopened);
 
-        let pvi2_wire = fixture.predecessor.encode().unwrap();
-        assert_eq!(&pvi2_wire[..4], b"PVI2");
+        let pvi3_wire = fixture.predecessor.encode().unwrap();
+        assert_eq!(&pvi3_wire[..4], b"PVR3");
         assert_eq!(
             fixture.predecessor.commitment(),
-            Hash::digest(b"vos/agent/private-runtime-image/v2", &[&pvi2_wire])
+            Hash::digest(b"vos/agent/private-runtime-image/v3", &[&pvi3_wire])
         );
         assert_ne!(
             fixture.predecessor.commitment(),
-            Hash::digest(b"vos/agent/private-runtime-image/v1", &[&pvi2_wire])
+            Hash::digest(b"vos/agent/private-runtime-image/v2", &[&pvi3_wire])
         );
-        let mut retired_pvi1 = pvi2_wire;
+        let mut retired_pvi2 = pvi3_wire.clone();
+        retired_pvi2[..4].copy_from_slice(b"PVI2");
+        assert!(PrivateRuntimeImage::decode(&retired_pvi2).is_err());
+        let mut retired_pvi3 = pvi3_wire.clone();
+        retired_pvi3[..4].copy_from_slice(b"PVI3");
+        assert!(PrivateRuntimeImage::decode(&retired_pvi3).is_err());
+        let mut retired_pvi1 = pvi3_wire;
         retired_pvi1[..4].copy_from_slice(b"PVI1");
         assert!(PrivateRuntimeImage::decode(&retired_pvi1).is_err());
         assert_eq!(
@@ -4133,15 +4472,42 @@ mod tests {
             authority_binding: hash(0xc4),
             transport_signature: [0xc5; 64],
         };
+        let bootstrap = PrivateRuntimeReplicaEstablishment::bind_verified_source(
+            &fixture.descriptor,
+            &invited_identity,
+            fixture.predecessor.store,
+            &fixture.predecessor.key_epochs,
+            core::slice::from_ref(&invited_identity),
+            hash(0xc6),
+        )
+        .unwrap();
+        let imported = PrivateRuntimeImage::genesis_for_established_replica(
+            &fixture.descriptor,
+            bootstrap,
+            fixture.predecessor.state.clone(),
+            fixture.predecessor.store,
+            fixture.predecessor.key_epochs.clone(),
+            fixture.predecessor.creation_receipt.clone(),
+            GENESIS_AT,
+            &AllowVerifier,
+        )
+        .unwrap();
+        assert_eq!(imported.node(), invited_node);
+        assert_eq!(
+            imported.stable_projection(),
+            fixture.predecessor.stable_projection()
+        );
+        assert_ne!(imported.commitment(), fixture.predecessor.commitment());
+
         let sealed_owner_key = SealedPrivateKey {
             node: invited_node,
             recipient_key: encryption_public_key,
-            sealed: vec![0xc6],
+            sealed: vec![0xc7],
         };
         let sealed_data_key = SealedPrivateKey {
             node: invited_node,
             recipient_key: encryption_public_key,
-            sealed: vec![0xc7],
+            sealed: vec![0xc8],
         };
         let mut invited_epoch = key_epoch(
             fixture.predecessor.managed.space,
@@ -4175,8 +4541,8 @@ mod tests {
                 historical_grants: Vec::new(),
             },
             signer: PrivateControlSigner::Owner,
-            signer_public_key: [0xc8; 32],
-            signature: [0xc9; 64],
+            signer_public_key: [0xc9; 32],
+            signature: [0xca; 64],
         };
         let receipt = fixture.receipt(
             AuthorityOperationKind::InvitePrivateNode,
@@ -4187,11 +4553,11 @@ mod tests {
             fixture.predecessor.store,
             &invite,
             private_key_epoch_root(&invited_epochs).unwrap(),
-            0xca,
+            0xcb,
         );
         let pending = PrivateRuntimeApplication::pending(
             &fixture.descriptor,
-            &fixture.predecessor,
+            &imported,
             invite,
             None,
             None,
@@ -4205,28 +4571,243 @@ mod tests {
         .unwrap();
         let local_source = PrivateRuntimeImage::successor(
             &fixture.descriptor,
-            &fixture.predecessor,
+            &imported,
             &pending,
             &PrivateRuntimeSuccess::ControlOnly,
-            fixture.predecessor.state.clone(),
+            imported.state.clone(),
             invited_epochs,
             &AllowVerifier,
             &AllowVerifier,
         )
         .unwrap();
-
-        // This clone stands in for the physical sync/open path, which must
-        // verify the invited Node against the exact PKEY preimage first.
-        let mut imported = local_source;
-        imported.node = invited_node;
-        imported.applied_at = 6;
-        imported.state.local = vec![0xcb];
-        assert!(imported.validate().is_ok());
-        let (later, _, _, _) = policy_application(&fixture, &imported, 7);
+        let (later, _, _, _) = policy_application(&fixture, &local_source, 7);
         assert_eq!(later.node(), invited_node);
         later
             .verify_with(&fixture.descriptor, &AllowVerifier, &AllowVerifier)
             .unwrap();
+    }
+
+    #[test]
+    fn late_member_bootstrap_binds_source_identity_membership_store_and_pkey() {
+        let fixture = Fixture::new();
+        let transport_identity = vec![0xd0, 0xd1, 0xd2];
+        let late_node = NodeId::of_authenticated_peer(&transport_identity);
+        let local = PrivateNodeIdentity {
+            node: late_node,
+            principal: fixture.predecessor.owner,
+            transport_identity,
+            encryption_public_key: [0x43; 32],
+            authority_binding: hash(0xd4),
+            transport_signature: [0xd5; 64],
+        };
+        assert!(local.validate());
+        let final_members = vec![local.clone()];
+        let source_material = hash(0xd6);
+        let bootstrap = || {
+            PrivateRuntimeReplicaEstablishment::bind_verified_source(
+                &fixture.descriptor,
+                &local,
+                fixture.predecessor.store,
+                &fixture.predecessor.key_epochs,
+                &final_members,
+                source_material,
+            )
+            .unwrap()
+        };
+
+        let image = PrivateRuntimeImage::genesis_for_established_replica(
+            &fixture.descriptor,
+            bootstrap(),
+            fixture.predecessor.state.clone(),
+            fixture.predecessor.store,
+            fixture.predecessor.key_epochs.clone(),
+            fixture.predecessor.creation_receipt.clone(),
+            GENESIS_AT,
+            &AllowVerifier,
+        )
+        .unwrap();
+        assert_eq!(image.node(), late_node);
+        assert_eq!(image.establishment_origin(), Some(source_material));
+        assert_eq!(image.establishment_completion(), None);
+        assert_eq!(image.commitment(), image.lineage_commitment());
+        assert_eq!(
+            image.stable_projection(),
+            fixture.predecessor.stable_projection()
+        );
+
+        let mut future_store = image.store();
+        future_store.object_count = 1;
+        future_store.object_root = Some(hash(0xd7));
+        assert!(future_store.validate().is_ok());
+        assert!(matches!(
+            image.seal_replica_establishment(source_material, future_store),
+            Err(PrivateRuntimeEvidenceError::InvalidStorePosition)
+        ));
+        let unsealed_commitment = image.commitment();
+        let unsealed_lineage = image.lineage_commitment();
+        let expected_completion = PrivateRuntimeImage::replica_establishment_seal(
+            source_material,
+            image.store().commitment(),
+            unsealed_lineage,
+        )
+        .unwrap();
+        let sealed = image
+            .seal_replica_establishment(source_material, image.store())
+            .unwrap();
+        assert_ne!(sealed.commitment(), unsealed_commitment);
+        assert_eq!(sealed.lineage_commitment(), unsealed_lineage);
+        assert_eq!(sealed.establishment_completion(), Some(expected_completion));
+        assert_eq!(
+            sealed
+                .seal_replica_establishment(source_material, image.store())
+                .unwrap(),
+            sealed
+        );
+        assert_eq!(
+            PrivateRuntimeImage::decode(&sealed.encode().unwrap()).unwrap(),
+            sealed
+        );
+        let rebound = sealed.rebind_store_objects(future_store).unwrap();
+        assert_eq!(rebound.establishment_origin(), Some(source_material));
+        assert_eq!(
+            rebound.establishment_completion(),
+            Some(expected_completion)
+        );
+        let (_, successor, application, _) = policy_application(&fixture, &sealed, 5);
+        assert_eq!(successor.establishment_origin(), Some(source_material));
+        assert_eq!(
+            successor.establishment_completion(),
+            Some(expected_completion)
+        );
+        assert!(application.matches_predecessor(&sealed));
+        assert!(application.matches_successor(&successor));
+
+        let mut substituted_identity = local.clone();
+        substituted_identity.encryption_public_key = [0x44; 32];
+        assert!(substituted_identity.validate());
+        assert!(
+            PrivateRuntimeReplicaEstablishment::bind_verified_source(
+                &fixture.descriptor,
+                &local,
+                fixture.predecessor.store,
+                &fixture.predecessor.key_epochs,
+                &[substituted_identity],
+                source_material,
+            )
+            .is_err()
+        );
+        assert!(
+            PrivateRuntimeReplicaEstablishment::bind_verified_source(
+                &fixture.descriptor,
+                &local,
+                fixture.predecessor.store,
+                &fixture.predecessor.key_epochs,
+                &final_members,
+                Hash::ZERO,
+            )
+            .is_err()
+        );
+
+        let mut descriptor_member = fixture.descriptor.clone();
+        descriptor_member.replicas = vec![AgentReplica {
+            node: late_node,
+            principal: fixture.predecessor.owner,
+            role: ReplicaRole::Observer,
+        }];
+        descriptor_member.validate().unwrap();
+        assert!(
+            PrivateRuntimeReplicaEstablishment::bind_verified_source(
+                &descriptor_member,
+                &local,
+                fixture.predecessor.store,
+                &fixture.predecessor.key_epochs,
+                &final_members,
+                source_material,
+            )
+            .is_ok()
+        );
+
+        let mut different_store = fixture.predecessor.store;
+        different_store.object_count = 1;
+        different_store.object_root = Some(hash(0xd8));
+        assert!(different_store.validate().is_ok());
+        assert!(matches!(
+            PrivateRuntimeImage::genesis_for_established_replica(
+                &fixture.descriptor,
+                bootstrap(),
+                fixture.predecessor.state.clone(),
+                different_store,
+                fixture.predecessor.key_epochs.clone(),
+                fixture.predecessor.creation_receipt.clone(),
+                GENESIS_AT,
+                &AllowVerifier,
+            ),
+            Err(PrivateRuntimeEvidenceError::InvalidStorePosition)
+        ));
+
+        let mut different_key_epochs = fixture.predecessor.key_epochs.clone();
+        different_key_epochs[0].exact_wire = hash(0xd9);
+        assert!(matches!(
+            PrivateRuntimeImage::genesis_for_established_replica(
+                &fixture.descriptor,
+                bootstrap(),
+                fixture.predecessor.state.clone(),
+                fixture.predecessor.store,
+                different_key_epochs,
+                fixture.predecessor.creation_receipt.clone(),
+                GENESIS_AT,
+                &AllowVerifier,
+            ),
+            Err(PrivateRuntimeEvidenceError::InvalidKeyEpochs)
+        ));
+
+        assert!(matches!(
+            PrivateRuntimeImage::genesis_for_established_replica(
+                &fixture.descriptor,
+                bootstrap(),
+                fixture.predecessor.state.clone(),
+                fixture.predecessor.store,
+                fixture.predecessor.key_epochs.clone(),
+                fixture.predecessor.creation_receipt.clone(),
+                GENESIS_AT,
+                &DenyVerifier,
+            ),
+            Err(PrivateRuntimeEvidenceError::InvalidAuthority)
+        ));
+        assert!(
+            PrivateRuntimeImage::genesis_for_established_replica(
+                &fixture.descriptor,
+                bootstrap(),
+                RuntimeState {
+                    control: Vec::new(),
+                    linear: Vec::new(),
+                    merge: Vec::new(),
+                    local: Vec::new(),
+                },
+                fixture.predecessor.store,
+                fixture.predecessor.key_epochs.clone(),
+                fixture.predecessor.creation_receipt.clone(),
+                GENESIS_AT,
+                &AllowVerifier,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn replica_establishment_completion_tag_binds_final_runtime_lineage() {
+        let origin = hash(0xe1);
+        let store = hash(0xe2);
+        let first_lineage = hash(0xe3);
+        let second_lineage = hash(0xe4);
+        let first =
+            PrivateRuntimeImage::replica_establishment_seal(origin, store, first_lineage).unwrap();
+        let second =
+            PrivateRuntimeImage::replica_establishment_seal(origin, store, second_lineage).unwrap();
+        assert_ne!(first, second);
+        assert!(
+            PrivateRuntimeImage::replica_establishment_seal(origin, store, Hash::ZERO).is_err()
+        );
     }
 
     #[test]

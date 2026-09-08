@@ -72,6 +72,10 @@ const RECOVERY_KEYRING_FIXED_BYTES: usize = 4 + 2 + 32 + 32 + 32 + 8 + 4;
 const RECOVERY_KEYRING_ENTRY_BYTES: usize = 8 + 32 + SECRET_BYTES;
 const RECOVERY_PLAN_KDF_SALT: &[u8] = b"vos/private/recovery-plan-auth/salt/v1";
 const RECOVERY_PLAN_KDF_DOMAIN: &[u8] = b"vos/private/recovery-plan-auth/v1";
+const REPLICA_ESTABLISHMENT_PLAN_KDF_SALT: &[u8] =
+    b"vos/private/replica-establishment-plan-auth/salt/v1";
+const REPLICA_ESTABLISHMENT_PLAN_KDF_DOMAIN: &[u8] =
+    b"vos/private/replica-establishment-plan-auth/v1";
 const STABLE_IMPORT_CERTIFICATE_BODY_DOMAIN: &[u8] =
     b"vos/private/stable-import-certificate/body/v1";
 const STABLE_IMPORT_CERTIFICATE_KDF_SALT: &[u8] =
@@ -552,6 +556,23 @@ impl PrivateNodeDecryptionKey {
         let hkdf = Hkdf::<Sha256>::new(Some(RECOVERY_PLAN_KDF_SALT), self.0.bytes());
         let mut info = Vec::with_capacity(RECOVERY_PLAN_KDF_DOMAIN.len() + 32);
         info.extend_from_slice(RECOVERY_PLAN_KDF_DOMAIN);
+        info.extend_from_slice(plan_hash.as_bytes());
+        let mut output = Zeroizing::new([0; SECRET_BYTES]);
+        hkdf.expand(&info, &mut *output)
+            .map_err(|_| PrivateCryptoError::KeyDerivation)?;
+        Ok(Hash(*output))
+    }
+
+    /// Authenticate one bounded, ciphertext-only replica-establishment plan
+    /// to this exact destination. A distinct KDF domain prevents a staged
+    /// import manifest from being replayed as an offline-recovery plan.
+    pub(crate) fn replica_establishment_plan_authenticator(
+        &self,
+        plan_hash: Hash,
+    ) -> Result<Hash, PrivateCryptoError> {
+        let hkdf = Hkdf::<Sha256>::new(Some(REPLICA_ESTABLISHMENT_PLAN_KDF_SALT), self.0.bytes());
+        let mut info = Vec::with_capacity(REPLICA_ESTABLISHMENT_PLAN_KDF_DOMAIN.len() + 32);
+        info.extend_from_slice(REPLICA_ESTABLISHMENT_PLAN_KDF_DOMAIN);
         info.extend_from_slice(plan_hash.as_bytes());
         let mut output = Zeroizing::new([0; SECRET_BYTES]);
         hkdf.expand(&info, &mut *output)
