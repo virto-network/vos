@@ -1435,11 +1435,11 @@ pub struct PrivateControlApplicationFact {
     pub control_previous: Option<Hash>,
     pub epoch: u64,
     pub post_member_set: Hash,
-    /// Exact commitment of the complete node-local PCRS2 value constructed
+    /// Exact commitment of the complete node-local PCRS3 value constructed
     /// from the durably reopened Store position and Private runtime image.
     pub reopened_runtime_state: Hash,
     /// Exact commitment of the successor replica-stable Private runtime
-    /// projection. Unlike PCRS2, this projection can be carried and checked by
+    /// projection. Unlike PCRS3, this projection can be carried and checked by
     /// another replica without disclosing its node-local runtime image.
     pub stable_projection: Hash,
     /// Exact reopened control head. A valid application makes the authorized

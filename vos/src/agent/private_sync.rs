@@ -616,8 +616,8 @@ impl VerifiedPrivateSyncControl {
     }
 
     /// Source-node PCA2 retained for envelope audit. Its
-    /// `reopened_runtime_state` selects the source's node-local PCRS2 and may
-    /// never be adopted as the receiver's PCRS2; only the separately exposed
+    /// `reopened_runtime_state` selects the source's node-local PCRS3 and may
+    /// never be adopted as the receiver's PCRS3; only the separately exposed
     /// stable projection is a cross-node convergence target.
     pub(crate) const fn source_application(&self) -> &PrivateControlApplicationAck {
         &self.source_application
@@ -3277,7 +3277,7 @@ mod tests {
                     .any(|window| window == required_magic)
             );
         }
-        for forbidden_magic in [b"PAP1", b"PVI1", b"PCR2", b"PSP1"] {
+        for forbidden_magic in [b"PAP1", b"PVI1", b"PCR3", b"PSP1"] {
             assert!(
                 !frame
                     .windows(forbidden_magic.len())

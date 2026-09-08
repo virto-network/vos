@@ -59,12 +59,6 @@ use zeroize::Zeroizing;
 use super::authority_operation_issuer::private_intent_matches_application;
 use super::driver::DEFAULT_MANAGEMENT_GAS;
 use super::package_admission::{AdmittedRuntimePackage, admit_runtime_package};
-use super::private_runtime::{
-    MAX_PRIVATE_RUNTIME_IMAGE_WIRE_BYTES, PrivateKeyEpochCommitment, PrivateRuntimeImage,
-    validate_private_runtime_genesis_transition,
-};
-#[cfg(test)]
-use super::private_runtime::{PrivateRuntimeApplication, PrivateRuntimeSuccess};
 #[cfg(test)]
 use super::private_control_application_coordinator::decode_private_application_fact;
 use super::private_control_application_coordinator::{
@@ -88,6 +82,13 @@ use super::private_crypto::{
     sign_recovery_control_record, unwrap_data_key, unwrap_invite_history_grants, unwrap_owner_key,
     unwrap_recovery_data_key, unwrap_recovery_keyring, valid_x25519_public_key,
     verify_control_record_signature,
+};
+#[cfg(test)]
+use super::private_runtime::PrivateRuntimeSuccess;
+use super::private_runtime::{
+    MAX_PRIVATE_RUNTIME_IMAGE_WIRE_BYTES, PrivateControlReopenedState, PrivateKeyEpochCommitment,
+    PrivateRuntimeApplication, PrivateRuntimeControlPosition, PrivateRuntimeImage,
+    PrivateStoreCorePosition, validate_private_runtime_genesis_transition,
 };
 use super::private_store::{
     ControlEvidenceCommitStop, MAX_PRIVATE_BACKUP_BYTES, PrivateObjectKey, PrivateStore,
@@ -366,7 +367,7 @@ pub struct PrivateAgentHost {
 /// with the durable operation issuer/coordinator and an exact system-authority
 /// dispatcher. It accepts only the externally signed PCTL carried by the
 /// coordinator request; it has no key-generation or control-signing API.
-/// The ciphertext/control-only host cannot yet construct PCRS2 or the
+/// The ciphertext/control-only host cannot yet construct PCRS3 or the
 /// successor PSP1. Its production `apply` path therefore validates the exact
 /// canonical request and fails closed before any Store write. The physical
 /// runtime-lifecycle owner will replace that rejection with a real reopened
@@ -813,6 +814,7 @@ impl PrivateAgentHost {
         {
             return Err(PrivateAgentHostError::InvalidScope);
         }
+        require_resolved_runtime_application_head(&hosted.store)?;
         let mut hosted = self
             .agents
             .remove(&agent)
@@ -863,6 +865,7 @@ impl PrivateAgentHost {
         {
             return Err(PrivateAgentHostError::Unauthorized);
         }
+        require_resolved_runtime_application_head(&hosted.store)?;
         let data_key = hosted
             .data_keys
             .get(&binding.epoch)
@@ -1127,15 +1130,14 @@ impl PrivateAgentHost {
             hosted.store.key_epochs(),
             record,
         )?;
-        let successor_image =
-            PrivateRuntimeImage::synthetic_control_only_successor_for_host_test(
-                &hosted.runtime_image,
-                record,
-                successor_store,
-                key_epochs,
-                hosted.runtime_image.applied_at().saturating_add(1),
-            )
-            .map_err(|_| PrivateAgentHostError::Corrupt)?;
+        let successor_image = PrivateRuntimeImage::synthetic_control_only_successor_for_host_test(
+            &hosted.runtime_image,
+            record,
+            successor_store,
+            key_epochs,
+            hosted.runtime_image.applied_at().saturating_add(1),
+        )
+        .map_err(|_| PrivateAgentHostError::Corrupt)?;
         let runtime_stage = slot.join(staged_runtime_image_name(record.commitment()));
         remove_regular_file_if_present(&runtime_stage)?;
         write_new_synced(
@@ -1781,6 +1783,10 @@ impl PrivateAgentHost {
         if authority.binding != hosted.descriptor.authority {
             return Err(PrivateAgentHostError::Unauthorized);
         }
+        // An applied PAPL without its terminal authority evidence is a
+        // crash-resume state, not a sync-visible history endpoint.  Refuse
+        // every outbound page until the exact PSE is durable.
+        require_resolved_runtime_application_head(&hosted.store)?;
         Ok(
             serve_private_sync_page(&hosted.store, peer, &request, transport, route, authority)?
                 .encode()?,
@@ -1825,6 +1831,7 @@ impl PrivateAgentHost {
             // The legacy low-level Store receiver cannot supply those facts.
             return Err(PrivateAgentHostError::UnsupportedOperation);
         }
+        require_resolved_runtime_application_head(&hosted.store)?;
         let starting_store = hosted.store.core_position()?;
         let mut hosted = self
             .agents
@@ -1895,7 +1902,7 @@ impl PrivateAgentHost {
         // Validate as much of the currently supported envelope as the legacy
         // ciphertext/control host can authenticate, but never enter its Store
         // mutation path. A future physical runtime lifecycle must produce the
-        // PCRS2 and successor PSP1 commitments before this can return Applied.
+        // PCRS3 and successor PSP1 commitments before this can return Applied.
         if self.agents.contains_key(&request.route.agent) {
             match prepare_private_application(
                 self.hosted(request.route.agent)?,
@@ -2165,13 +2172,6 @@ impl PrivateAgentHost {
                 request.route,
                 authority,
             )?;
-        } else {
-            evidence.verify_for(
-                &control,
-                application.application.epoch,
-                request.route,
-                authority,
-            )?;
         }
         let evidence_commitment = evidence.commitment()?;
         let hosted = self.hosted(agent)?;
@@ -2193,6 +2193,19 @@ impl PrivateAgentHost {
                 .control_is_exact(control.commitment(), &request.control)?
         {
             return Err(PrivateAgentHostError::InvalidScope);
+        }
+        if !recovery {
+            let runtime_application = hosted
+                .store
+                .read_runtime_application(control.commitment())?
+                .ok_or(PrivateAgentHostError::Corrupt)?;
+            authenticate_local_runtime_application_endpoint(
+                &hosted.descriptor,
+                &control,
+                entry.resulting_epoch,
+                &runtime_application,
+                &evidence_wire,
+            )?;
         }
         if recovery {
             if control.signer != PrivateControlSigner::Recovery
@@ -3061,6 +3074,7 @@ where
             return Err(PrivateAgentHostError::InvalidArtifact);
         }
     } else {
+        require_resolved_runtime_application_head(&hosted.store)?;
         validate_new_private_application_position(hosted, local_node, &control)?;
         hosted
             .store
@@ -3111,6 +3125,37 @@ where
         expected_members,
         already_applied,
     })
+}
+
+fn require_resolved_runtime_application_head(
+    store: &PrivateStore,
+) -> Result<(), PrivateAgentHostError> {
+    let Some(head) = store.indexed_controls().last() else {
+        return Ok(());
+    };
+    if store.read_runtime_application(head.commitment)?.is_none()
+        || store.read_control_authority_evidence(head)?.is_none()
+    {
+        return Err(PrivateAgentHostError::UnsupportedOperation);
+    }
+    Ok(())
+}
+
+fn require_runtime_application_attachments_for_open(
+    store: &PrivateStore,
+) -> Result<(), PrivateAgentHostError> {
+    let controls = store.indexed_controls();
+    for (position, control) in controls.iter().enumerate() {
+        if store
+            .read_runtime_application(control.commitment)?
+            .is_none()
+            || (position + 1 != controls.len()
+                && store.read_control_authority_evidence(control)?.is_none())
+        {
+            return Err(PrivateAgentHostError::Corrupt);
+        }
+    }
+    Ok(())
 }
 
 fn validate_private_runtime_application_mutation(
@@ -3320,12 +3365,8 @@ where
         PrivateControlOperation::SetResourcePolicy { .. }
         | PrivateControlOperation::ActorLifecycle { .. } => None,
     };
-    let (successor_image, runtime_application) = prepare_synthetic_runtime_successor_for_test(
-        hosted,
-        node_authority,
-        request,
-        prepared,
-    )?;
+    let (successor_image, runtime_application) =
+        prepare_synthetic_runtime_successor_for_test(hosted, node_authority, request, prepared)?;
     if let Some(data) = successor_data.as_ref() {
         stage_metadata_for_application(slot, prepared.expected_epoch, data, hosted, stop)?;
     }
@@ -3473,9 +3514,7 @@ fn projected_private_runtime_key_epoch_commitments_for_test(
     control: &PrivateControlRecord,
 ) -> Result<Vec<PrivateKeyEpochCommitment>, PrivateAgentHostError> {
     let mut epochs = current.to_vec();
-    let active = epochs
-        .last_mut()
-        .ok_or(PrivateAgentHostError::Corrupt)?;
+    let active = epochs.last_mut().ok_or(PrivateAgentHostError::Corrupt)?;
     match &control.operation {
         PrivateControlOperation::Invite {
             node,
@@ -3508,8 +3547,7 @@ fn projected_private_runtime_key_epoch_commitments_for_test(
     epochs
         .iter()
         .map(|epoch| {
-            PrivateKeyEpochCommitment::from_epoch(epoch)
-                .map_err(|_| PrivateAgentHostError::Corrupt)
+            PrivateKeyEpochCommitment::from_epoch(epoch).map_err(|_| PrivateAgentHostError::Corrupt)
         })
         .collect()
 }
@@ -3543,7 +3581,10 @@ fn promote_runtime_image_for_application(
     require_regular_file(&path)?;
     fs::rename(path, slot.join(RUNTIME_STATE_FILE)).map_err(map_io)?;
     sync_directory(slot)?;
-    application_stop(stop, PrivateRuntimeApplicationStop::AfterRuntimeStatePromoted)
+    application_stop(
+        stop,
+        PrivateRuntimeApplicationStop::AfterRuntimeStatePromoted,
+    )
 }
 
 #[cfg(test)]
@@ -3579,6 +3620,29 @@ fn synthetic_legacy_private_application_fact_for_test(
     }
     let post_member_set = private_member_set_commitment(members.iter().copied())
         .ok_or(PrivateAgentHostError::Corrupt)?;
+    let (reopened_runtime_state, stable_projection) = match hosted
+        .store
+        .read_runtime_application(prepared.control.commitment())?
+    {
+        Some(application) => {
+            if !application.matches_successor(&hosted.runtime_image) {
+                return Err(PrivateAgentHostError::Corrupt);
+            }
+            let stable_projection = application
+                .successor_stable_projection()
+                .ok_or(PrivateAgentHostError::Corrupt)?
+                .commitment();
+            let reopened_runtime_state =
+                PrivateControlReopenedState::commitment_from_application(&application)
+                    .map_err(|_| PrivateAgentHostError::Corrupt)?;
+            (reopened_runtime_state, stable_projection)
+        }
+        None => {
+            // Test-only recovery fixtures still exercise the retired
+            // pre-PAPL crash path. Production reopen rejects this branch.
+            (Hash([0xf1; 32]), Hash([0xf2; 32]))
+        }
+    };
     let fact = PrivateControlApplicationFact {
         managed: request.route,
         operation: prepared.operation,
@@ -3587,10 +3651,8 @@ fn synthetic_legacy_private_application_fact_for_test(
         control_previous: prepared.control.previous,
         epoch: prepared.expected_epoch,
         post_member_set,
-        // These values are deliberately synthetic and exist only to preserve
-        // pre-PCRS Store transaction tests. Production never calls this path.
-        reopened_runtime_state: Hash([0xf1; 32]),
-        stable_projection: Hash([0xf2; 32]),
+        reopened_runtime_state,
+        stable_projection,
         reopened_control_head: prepared.control.commitment(),
         applied_at: request.applied_at,
     };
@@ -3744,7 +3806,9 @@ fn validate_private_creation_receipt(
         || selector.operation != AuthorityOperationKind::CreateAgent
         || selector.request != request.commitment()
         || !selector.is_live_at(created_at)
-        || receipt.verify_at(created_at, &RawAuthorityVerifier).is_err()
+        || receipt
+            .verify_at(created_at, &RawAuthorityVerifier)
+            .is_err()
     {
         return Err(PrivateAgentHostError::Unauthorized);
     }
@@ -3785,8 +3849,7 @@ fn private_runtime_key_epoch_commitments(
         .key_epochs()
         .iter()
         .map(|epoch| {
-            PrivateKeyEpochCommitment::from_epoch(epoch)
-                .map_err(|_| PrivateAgentHostError::Corrupt)
+            PrivateKeyEpochCommitment::from_epoch(epoch).map_err(|_| PrivateAgentHostError::Corrupt)
         })
         .collect()
 }
@@ -3837,9 +3900,7 @@ fn append_owner_record<V: PrivateNodeAuthorityVerifier>(
 }
 
 #[cfg(test)]
-fn append_synthetic_control_only_with_runtime_image_for_test<
-    V: PrivateNodeAuthorityVerifier,
->(
+fn append_synthetic_control_only_with_runtime_image_for_test<V: PrivateNodeAuthorityVerifier>(
     slot: &Path,
     hosted: &mut HostedPrivateAgent,
     record: &PrivateControlRecord,
@@ -4384,11 +4445,7 @@ fn encrypt_runtime_image_sidecar(
     data_key: &PrivateDataKey,
     image: &PrivateRuntimeImage,
 ) -> Result<Vec<u8>, PrivateAgentHostError> {
-    let wire = Zeroizing::new(
-        image
-            .encode()
-            .map_err(|_| PrivateAgentHostError::Corrupt)?,
-    );
+    let wire = Zeroizing::new(image.encode().map_err(|_| PrivateAgentHostError::Corrupt)?);
     encrypt_private_object(
         data_key,
         image.managed().space,
@@ -4528,6 +4585,10 @@ fn open_hosted_agent<V: PrivateNodeAuthorityVerifier>(
         return Err(PrivateAgentHostError::InvalidScope);
     }
     require_exact_local_member(store.authorized_nodes(), local_node)?;
+    // Reject incomplete historical lineage—and especially a bare PCTL—before
+    // reconciling any encrypted sidecar. Full signature/PVRI verification is
+    // performed once the immutable descriptor has been authenticated below.
+    require_runtime_application_attachments_for_open(&store)?;
     let owner_key = unwrap_owner_key(store.key_epoch(), local_node, node_key)?;
     let data_keys = unwrap_local_data_keyring(&store, local_node, node_key)?;
     let data_key = data_keys
@@ -4813,6 +4874,7 @@ fn reconcile_and_open_runtime_image(
     let staged = find_staged_runtime_image(slot)?;
 
     if runtime_image_matches_store(&canonical, current_store, &current_key_epochs) {
+        authenticate_runtime_application_lineage(store, descriptor, &canonical)?;
         if let Some((path, _)) = staged {
             // Deliberate deletion-only exception: when Store and canonical
             // PVRI agree, any single strictly named staged ciphertext is an
@@ -4831,6 +4893,7 @@ fn reconcile_and_open_runtime_image(
         let key = data_keys
             .get(&current_store.epoch())
             .ok_or(PrivateAgentHostError::Corrupt)?;
+        authenticate_runtime_application_lineage(store, descriptor, &rebound)?;
         replace_regular_file_synced(
             &canonical_path,
             &encrypt_runtime_image_sidecar(key, &rebound)?,
@@ -4859,12 +4922,202 @@ fn reconcile_and_open_runtime_image(
     {
         return Err(PrivateAgentHostError::Corrupt);
     }
-    // FOLLOW-UP(PAPL): creation of this stage must be preceded by an exact
-    // authenticated PAPL. Reopen is intentionally narrower: it repairs only
-    // the already-authenticated PVRI selected by the durable Store position.
+    authenticate_runtime_application_lineage(store, descriptor, &successor)?;
     fs::rename(&staged_path, &canonical_path).map_err(map_io)?;
     sync_directory(slot)?;
     Ok(successor)
+}
+
+fn authenticate_runtime_application_lineage(
+    store: &PrivateStore,
+    descriptor: &AgentDescriptor,
+    runtime_image: &PrivateRuntimeImage,
+) -> Result<(), PrivateAgentHostError> {
+    let controls = store.indexed_controls();
+    if controls.is_empty() {
+        if runtime_image.store().control_count() != 0
+            || runtime_image.stable_projection().generation() != 0
+            || runtime_image.stable_projection().control_head().is_some()
+            || runtime_image.runtime_control().is_some()
+            || runtime_image.last_full_replay().is_some()
+        {
+            return Err(PrivateAgentHostError::Corrupt);
+        }
+        return Ok(());
+    }
+
+    let mut previous: Option<(PrivateRuntimeApplication, bool)> = None;
+    for (position, indexed) in controls.iter().enumerate() {
+        let control_wire = store.read_control_wire(indexed)?;
+        let control = PrivateControlRecord::decode(&control_wire)
+            .map_err(|_| PrivateAgentHostError::Corrupt)?;
+        let application = store
+            .read_runtime_application(indexed.commitment)?
+            .ok_or(PrivateAgentHostError::Corrupt)?;
+        application
+            .verify_with(
+                descriptor,
+                &RawAuthorityVerifier,
+                &RawRecoveryAuthorityProofVerifier,
+            )
+            .map_err(|_| PrivateAgentHostError::Corrupt)?;
+        let is_last = position + 1 == controls.len();
+        let endpoint_authenticated = match store.read_control_authority_evidence(indexed)? {
+            Some(evidence_wire) => {
+                authenticate_local_runtime_application_endpoint(
+                    descriptor,
+                    &control,
+                    indexed.resulting_epoch,
+                    &application,
+                    &evidence_wire,
+                )?;
+                true
+            }
+            None if is_last => false,
+            None => return Err(PrivateAgentHostError::Corrupt),
+        };
+        let predecessor_count =
+            u32::try_from(position).map_err(|_| PrivateAgentHostError::LimitExceeded)?;
+        let successor_count = predecessor_count
+            .checked_add(1)
+            .ok_or(PrivateAgentHostError::LimitExceeded)?;
+        if !application.is_complete()
+            || application.node() != runtime_image.node()
+            || application.control() != &control
+            || application.predecessor_store().control_count() != predecessor_count
+            || application.expected_successor_store().control_count() != successor_count
+            || application.expected_successor_store().control_head() != Some(indexed.commitment)
+            || application.expected_successor_store().epoch() != indexed.resulting_epoch
+        {
+            return Err(PrivateAgentHostError::Corrupt);
+        }
+
+        if let Some((prior, prior_endpoint_authenticated)) = &previous {
+            let expected_runtime_control = if prior.mutation().is_some() {
+                Some(PrivateRuntimeControlPosition {
+                    control: prior.control().commitment(),
+                    sequence: prior.control().sequence,
+                })
+            } else {
+                prior.predecessor_runtime_control()
+            };
+            let store_continuity =
+                prior.expected_successor_store() == application.predecessor_store();
+            let object_rebind = private_store_is_strict_object_growth(
+                prior.expected_successor_store(),
+                application.predecessor_store(),
+            );
+            if (!store_continuity && !object_rebind)
+                || (object_rebind
+                    && (!*prior_endpoint_authenticated || (!endpoint_authenticated && !is_last)))
+                || (store_continuity
+                    && prior.successor_runtime_image()
+                        != Some(application.predecessor_runtime_image()))
+                || prior.successor_stable_projection()
+                    != Some(application.predecessor_stable_projection())
+                || application.predecessor_runtime_control() != expected_runtime_control
+                || application.applied_at() < prior.applied_at()
+            {
+                return Err(PrivateAgentHostError::Corrupt);
+            }
+        } else if application.predecessor_store().control_head().is_some()
+            || application.predecessor_store().next_sequence() != 0
+            || application.predecessor_stable_projection().generation() != 0
+            || application
+                .predecessor_stable_projection()
+                .control_head()
+                .is_some()
+            || application.predecessor_runtime_control().is_some()
+            || application
+                .predecessor_stable_projection()
+                .creation_receipt()
+                != runtime_image.creation_receipt().commitment()
+            || application.applied_at() < runtime_image.created_at()
+        {
+            return Err(PrivateAgentHostError::Corrupt);
+        }
+        previous = Some((application, endpoint_authenticated));
+    }
+
+    let (last, last_endpoint_authenticated) = previous.ok_or(PrivateAgentHostError::Corrupt)?;
+    if last.expected_successor_store().control_count() as usize != controls.len()
+        || last.expected_successor_store().control_head() != runtime_image.store().control_head()
+        || if last_endpoint_authenticated {
+            !runtime_image.matches_application_successor_after_object_growth(&last)
+        } else {
+            // The one crash-valid unresolved state is the exact newest PAPL
+            // and its exact reopened PVRI before PCA/PSE attachment. It may
+            // never become historical, and no object growth after that PAPL
+            // is accepted until the authority evidence is durable.
+            !last.matches_successor(runtime_image)
+        }
+    {
+        return Err(PrivateAgentHostError::Corrupt);
+    }
+    Ok(())
+}
+
+/// Authenticate an authority endpoint emitted for this node's own completed
+/// application. Local provenance requires exact PCRS3 equality. A future sync
+/// receiver must use an explicit replica-stable provenance record instead:
+/// raw-verify the source PCA/PRA/AOI, compare only its signed PSP with the
+/// local completed PAPL, and never adopt the source node's PCRS/PVRI.
+fn authenticate_local_runtime_application_endpoint(
+    descriptor: &AgentDescriptor,
+    control: &PrivateControlRecord,
+    resulting_epoch: u64,
+    application: &PrivateRuntimeApplication,
+    evidence_wire: &[u8],
+) -> Result<(), PrivateAgentHostError> {
+    let evidence = PrivateControlAuthorityEvidence::decode(evidence_wire)?;
+    let issuance = AuthorityOperationIssuanceAck::decode(&evidence.issuance_ack)
+        .map_err(|_| PrivateAgentHostError::Corrupt)?;
+    let application_ack = PrivateControlApplicationAck::decode(&evidence.application_ack)
+        .map_err(|_| PrivateAgentHostError::Corrupt)?;
+    let authority = issuance.authority;
+    let route = application.managed();
+    let successor_projection = application
+        .successor_stable_projection()
+        .ok_or(PrivateAgentHostError::Corrupt)?;
+    let reopened_runtime_state =
+        PrivateControlReopenedState::commitment_from_application(application)
+            .map_err(|_| PrivateAgentHostError::Corrupt)?;
+    if authority.space != route.space
+        || authority.binding != descriptor.authority
+        || application.issuance() != &issuance
+        || application_ack.application.reopened_runtime_state != reopened_runtime_state
+        || application_ack.application.stable_projection != successor_projection.commitment()
+        || application_ack.application.applied_at != application.applied_at()
+    {
+        return Err(PrivateAgentHostError::Corrupt);
+    }
+    evidence.verify_for_stable_projection(
+        control,
+        resulting_epoch,
+        successor_projection.commitment(),
+        route,
+        authority,
+    )?;
+    Ok(())
+}
+
+fn private_store_is_strict_object_growth(
+    predecessor: PrivateStoreCorePosition,
+    successor: PrivateStoreCorePosition,
+) -> bool {
+    predecessor.validate().is_ok()
+        && successor.validate().is_ok()
+        && predecessor.space() == successor.space()
+        && predecessor.agent() == successor.agent()
+        && predecessor.owner() == successor.owner()
+        && predecessor.epoch() == successor.epoch()
+        && predecessor.control_head() == successor.control_head()
+        && predecessor.next_sequence() == successor.next_sequence()
+        && predecessor.control_count() == successor.control_count()
+        && predecessor.control_root() == successor.control_root()
+        && predecessor.key_epoch_root() == successor.key_epoch_root()
+        && successor.object_count() > predecessor.object_count()
+        && successor.object_root() != predecessor.object_root()
 }
 
 fn runtime_image_matches_store(
@@ -4941,8 +5194,8 @@ fn read_and_authenticate_runtime_image(
     if plaintext.len() > MAX_PRIVATE_RUNTIME_IMAGE_WIRE_BYTES {
         return Err(PrivateAgentHostError::LimitExceeded);
     }
-    let image = PrivateRuntimeImage::decode(&plaintext)
-        .map_err(|_| PrivateAgentHostError::Corrupt)?;
+    let image =
+        PrivateRuntimeImage::decode(&plaintext).map_err(|_| PrivateAgentHostError::Corrupt)?;
     if image.node() != expected_node || image.store().epoch() != object.epoch {
         return Err(PrivateAgentHostError::Corrupt);
     }
@@ -5256,10 +5509,7 @@ fn write_exact_or_new_synced(path: &Path, bytes: &[u8]) -> Result<(), PrivateAge
     }
 }
 
-fn replace_regular_file_synced(
-    path: &Path,
-    bytes: &[u8],
-) -> Result<(), PrivateAgentHostError> {
+fn replace_regular_file_synced(path: &Path, bytes: &[u8]) -> Result<(), PrivateAgentHostError> {
     require_regular_file(path)?;
     let parent = path.parent().ok_or(PrivateAgentHostError::InvalidRoot)?;
     let file_name = path
@@ -6268,8 +6518,8 @@ fn authenticate_recovery_source_runtime_image(
     if plaintext.len() > MAX_PRIVATE_RUNTIME_IMAGE_WIRE_BYTES {
         return Err(PrivateAgentHostError::LimitExceeded);
     }
-    let image = PrivateRuntimeImage::decode(&plaintext)
-        .map_err(|_| PrivateAgentHostError::Corrupt)?;
+    let image =
+        PrivateRuntimeImage::decode(&plaintext).map_err(|_| PrivateAgentHostError::Corrupt)?;
     image
         .reopen_with(descriptor, &RawAuthorityVerifier)
         .map_err(|_| PrivateAgentHostError::Corrupt)?;
@@ -6279,23 +6529,16 @@ fn authenticate_recovery_source_runtime_image(
         .key_epochs()
         .iter()
         .map(|epoch| {
-            PrivateKeyEpochCommitment::from_epoch(epoch)
-                .map_err(|_| PrivateAgentHostError::Corrupt)
+            PrivateKeyEpochCommitment::from_epoch(epoch).map_err(|_| PrivateAgentHostError::Corrupt)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let source_node_is_current = verified
-        .key_epochs()
-        .last()
-        .is_some_and(|epoch| {
-            epoch
-                .sealed_data_keys
-                .binary_search_by_key(&image.node(), |sealed| sealed.node)
-                .is_ok()
-        });
-    if !source_node_is_current
-        || store != exact_store
-        || image.key_epochs() != key_epochs
-    {
+    let source_node_is_current = verified.key_epochs().last().is_some_and(|epoch| {
+        epoch
+            .sealed_data_keys
+            .binary_search_by_key(&image.node(), |sealed| sealed.node)
+            .is_ok()
+    });
+    if !source_node_is_current || store != exact_store || image.key_epochs() != key_epochs {
         return Err(PrivateAgentHostError::Corrupt);
     }
     Ok(())
@@ -6355,11 +6598,11 @@ mod tests {
     use vos_agent_sdk::authority::{
         AuthorityEvidence, AuthorityLaneRoots, AuthorityReceiptSelector,
     };
-    use vos_agent_sdk::private::PrivateControlSigner;
     use vos_agent_sdk::package::{
         AgentRuntimePackageManifest, PackageArtifact, PackageEnvelope, PackageManifest,
         PackageSigning,
     };
+    use vos_agent_sdk::private::PrivateControlSigner;
     use vos_agent_sdk::{
         InvocationId, ManagementReply, MethodMode, ResumeWork, RuntimeOutcome, RuntimeState,
         StateLane, StorageKind,
@@ -6373,7 +6616,6 @@ mod tests {
         OfflineRecoveryDecryptionKey, OfflineRecoveryKit, RecoverySigningKey,
         sign_recovery_control_record,
     };
-    use crate::agent::private_runtime::PrivateStoreCorePosition;
     use crate::agent::private_sync::{
         MAX_PRIVATE_SYNC_ITEMS, MAX_PRIVATE_SYNC_PAGE_BYTES, PrivateSyncCursor, PrivateSyncItem,
         PrivateSyncPhase,
@@ -6550,9 +6792,12 @@ mod tests {
 
     fn creation_receipt(descriptor: &AgentDescriptor, created_at: u64) -> AuthorityReceipt {
         let request = ManagementRequest::Create(Box::new(descriptor.clone()));
-        let key = SigningKey::from_bytes(&[descriptor.creation_nonce.as_bytes()[0]
-            .wrapping_add(90); 32]);
-        assert_eq!(key.verifying_key().to_bytes(), descriptor.authority.public_key);
+        let key =
+            SigningKey::from_bytes(&[descriptor.creation_nonce.as_bytes()[0].wrapping_add(90); 32]);
+        assert_eq!(
+            key.verifying_key().to_bytes(),
+            descriptor.authority.public_key
+        );
         let mut receipt = AuthorityReceipt {
             selector: AuthorityReceiptSelector {
                 policy: descriptor.authority.policy,
@@ -6689,8 +6934,7 @@ mod tests {
             }],
         };
         let signing_bytes = envelope.signing_bytes().unwrap();
-        envelope.manifest.signing_mut().signature =
-            signing_key.sign(&signing_bytes).to_bytes();
+        envelope.manifest.signing_mut().signature = signing_key.sign(&signing_bytes).to_bytes();
         admit_runtime_package(&envelope.encode().unwrap()).unwrap()
     }
 
@@ -6792,20 +7036,25 @@ mod tests {
         agent: AgentId,
         backup: &[u8],
     ) {
-        assert!(matches!(
-            host.restore_encrypted_backup(
-                agent,
-                DurableRecoveryRecipient::from_durable_keystore(
-                    fixture.recovery.verifying_key(),
-                    fixture.recovery_encryption.public_key(),
-                )
-                .unwrap(),
-                backup,
-                &TestAuthority,
+        let result = host.restore_encrypted_backup(
+            agent,
+            DurableRecoveryRecipient::from_durable_keystore(
+                fixture.recovery.verifying_key(),
+                fixture.recovery_encryption.public_key(),
+            )
+            .unwrap(),
+            backup,
+            &TestAuthority,
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(PrivateAgentHostError::Corrupt)
+                    | Err(PrivateAgentHostError::InvalidScope)
+                    | Err(PrivateAgentHostError::UnsupportedOperation)
             ),
-            Err(PrivateAgentHostError::Corrupt)
-                | Err(PrivateAgentHostError::UnsupportedOperation)
-        ));
+            "unexpected restore result: {result:?}"
+        );
         assert_eq!(host.binding(agent), Err(PrivateAgentHostError::NotFound));
         assert!(!host.agent_path(agent).exists());
         assert!(!host.creating_path(agent).exists());
@@ -7466,7 +7715,10 @@ mod tests {
         assert_eq!(image.applied_at(), fixture.created_at);
         assert_eq!(image.state().control, RUNTIME_STATE_SENTINEL);
         assert!(image.state().linear.is_empty());
-        assert_eq!(image.store(), host.agents[&agent].store.core_position().unwrap());
+        assert_eq!(
+            image.store(),
+            host.agents[&agent].store.core_position().unwrap()
+        );
         assert_eq!(
             image.key_epochs(),
             private_runtime_key_epoch_commitments(&host.agents[&agent].store)
@@ -7474,8 +7726,7 @@ mod tests {
                 .as_slice()
         );
         let commitment = image.commitment();
-        let runtime_state_wire =
-            fs::read(host.agent_path(agent).join(RUNTIME_STATE_FILE)).unwrap();
+        let runtime_state_wire = fs::read(host.agent_path(agent).join(RUNTIME_STATE_FILE)).unwrap();
         assert!(!contains(&runtime_state_wire, RUNTIME_STATE_SENTINEL));
         let mut disk = Vec::new();
         collect_files(&host.root, &mut disk);
@@ -7484,7 +7735,10 @@ mod tests {
 
         drop(host);
         let reopened = reopen_host(&fixture, 0, "runtime-genesis");
-        assert_eq!(reopened.agents[&agent].runtime_image.commitment(), commitment);
+        assert_eq!(
+            reopened.agents[&agent].runtime_image.commitment(),
+            commitment
+        );
     }
 
     #[test]
@@ -7544,6 +7798,57 @@ mod tests {
     }
 
     #[test]
+    fn create_duplicate_namespace_crash_retires_only_exact_genesis() {
+        let fixture = fixture(1);
+        let mut exact = create_host(&fixture, 0, "create-duplicate-exact");
+        let agent = create_agent(&mut exact, &fixture);
+        let exact_root = fixture.directory.child("create-duplicate-exact");
+        let published = exact.agent_path(agent);
+        let staged = exact.creating_path(agent);
+        drop(exact);
+        copy_directory_tree(&published, &staged);
+
+        let reopened = PrivateAgentHost::open(
+            &exact_root,
+            fixture.space,
+            fixture.owner,
+            fixture.nodes[0].identity.clone(),
+            fixture.nodes[0].key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(reopened.agent_ids().collect::<Vec<_>>(), vec![agent]);
+        assert!(!staged.exists());
+        drop(reopened);
+
+        let mut hostile = create_host(&fixture, 0, "create-duplicate-hostile");
+        let hostile_agent = create_agent(&mut hostile, &fixture);
+        let hostile_root = fixture.directory.child("create-duplicate-hostile");
+        let published = hostile.agent_path(hostile_agent);
+        let staged = hostile.creating_path(hostile_agent);
+        drop(hostile);
+        copy_directory_tree(&published, &staged);
+        let runtime_state = staged.join(RUNTIME_STATE_FILE);
+        let mut substituted = fs::read(&runtime_state).unwrap();
+        let last = substituted.last_mut().unwrap();
+        *last ^= 1;
+        fs::write(&runtime_state, substituted).unwrap();
+        assert!(
+            PrivateAgentHost::open(
+                &hostile_root,
+                fixture.space,
+                fixture.owner,
+                fixture.nodes[0].identity.clone(),
+                fixture.nodes[0].key(),
+                &TestAuthority,
+            )
+            .is_err()
+        );
+        assert!(published.exists());
+        assert!(staged.exists());
+    }
+
+    #[test]
     fn creation_rejects_receipt_route_request_time_and_signer_before_artifacts() {
         let fixture = fixture(1);
         let mut host = create_host(&fixture, 0, "creation-receipt-hostile");
@@ -7592,7 +7897,11 @@ mod tests {
                 "{label}"
             );
             assert!(!host.agent_path(fixture.descriptor.identity.agent).exists());
-            assert!(!host.creating_path(fixture.descriptor.identity.agent).exists());
+            assert!(
+                !host
+                    .creating_path(fixture.descriptor.identity.agent)
+                    .exists()
+            );
         }
     }
 
@@ -7776,10 +8085,7 @@ mod tests {
             ),
             Err(PrivateAgentHostError::Corrupt)
         );
-        assert_eq!(
-            host.binding(agent),
-            Err(PrivateAgentHostError::NotFound)
-        );
+        assert_eq!(host.binding(agent), Err(PrivateAgentHostError::NotFound));
         assert_eq!(
             host.export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES),
             Err(PrivateAgentHostError::NotFound)
@@ -7823,15 +8129,17 @@ mod tests {
         let right_path = right.agent_path(agent).join(RUNTIME_STATE_FILE);
         drop(right);
         replace_regular_file_synced(&right_path, &left_wire).unwrap();
-        assert!(PrivateAgentHost::open(
-            fixture.directory.child("pvri-substitution-right"),
-            fixture.space,
-            fixture.owner,
-            fixture.nodes[0].identity.clone(),
-            fixture.nodes[0].key(),
-            &TestAuthority,
-        )
-        .is_err());
+        assert!(
+            PrivateAgentHost::open(
+                fixture.directory.child("pvri-substitution-right"),
+                fixture.space,
+                fixture.owner,
+                fixture.nodes[0].identity.clone(),
+                fixture.nodes[0].key(),
+                &TestAuthority,
+            )
+            .is_err()
+        );
 
         let control = signed_rotate_control(&left, agent);
         let (authority, request) = runtime_application_request(&fixture, &control, 50, 55);
@@ -7848,15 +8156,17 @@ mod tests {
         let wrong = slot.join(staged_runtime_image_name(Hash([0x99; 32])));
         fs::rename(correct, wrong).unwrap();
         drop(left);
-        assert!(PrivateAgentHost::open(
-            fixture.directory.child("pvri-substitution-left"),
-            fixture.space,
-            fixture.owner,
-            fixture.nodes[0].identity.clone(),
-            fixture.nodes[0].key(),
-            &TestAuthority,
-        )
-        .is_err());
+        assert!(
+            PrivateAgentHost::open(
+                fixture.directory.child("pvri-substitution-left"),
+                fixture.space,
+                fixture.owner,
+                fixture.nodes[0].identity.clone(),
+                fixture.nodes[0].key(),
+                &TestAuthority,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -7916,6 +8226,27 @@ mod tests {
             host.agents[&agent].store.authorized_nodes()[0],
             fixture.nodes[0].identity
         );
+        let sync_request = PrivateSyncRequest {
+            cursor: PrivateSyncCursor::start(
+                binding.space,
+                binding.agent,
+                binding.epoch,
+                binding.control_head,
+            )
+            .unwrap(),
+            max_items: 1,
+            max_bytes: MAX_PRIVATE_SYNC_PAGE_BYTES as u32,
+        };
+        assert_eq!(
+            host.serve_sync_page(
+                agent,
+                PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
+                &sync_request.encode().unwrap(),
+                authority,
+                &TestTransport,
+            ),
+            Err(PrivateAgentHostError::UnsupportedOperation)
+        );
 
         let sidecars = canonical_sidecars(&host, agent);
         let retry = {
@@ -7937,6 +8268,16 @@ mod tests {
         };
         assert_eq!(restart_retry, first);
         assert_eq!(canonical_sidecars(&reopened, agent), sidecars);
+        assert_eq!(
+            reopened.serve_sync_page(
+                agent,
+                PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
+                &sync_request.encode().unwrap(),
+                authority,
+                &TestTransport,
+            ),
+            Err(PrivateAgentHostError::UnsupportedOperation)
+        );
     }
 
     #[test]
@@ -8136,6 +8477,23 @@ mod tests {
         application.signature[0] ^= 1;
         candidate.application_ack = application.encode().unwrap();
         cases.push(("application signature", candidate));
+        for (label, reopened_runtime_state, stable_projection) in [
+            ("PCRS3 endpoint", Some(Hash([0xce; 32])), None),
+            ("stable projection endpoint", None, Some(Hash([0xcf; 32]))),
+        ] {
+            let mut candidate = exact.clone();
+            let mut application =
+                PrivateControlApplicationAck::decode(&candidate.application_ack).unwrap();
+            if let Some(commitment) = reopened_runtime_state {
+                application.application.reopened_runtime_state = commitment;
+            }
+            if let Some(commitment) = stable_projection {
+                application.application.stable_projection = commitment;
+            }
+            application.signature = key.sign(&application.signing_bytes()).to_bytes();
+            candidate.application_ack = application.encode().unwrap();
+            cases.push((label, candidate));
+        }
         for (label, mutate) in [
             ("application control", 0u8),
             ("application sequence", 1),
@@ -8730,8 +9088,7 @@ mod tests {
         assert_eq!(prepared.proof.superseded_authority_head, None);
         assert!(matches!(
             complete_prepared_recovery(&mut host, &fixture, &prepared),
-            Err(PrivateAgentHostError::Corrupt)
-                | Err(PrivateAgentHostError::UnsupportedOperation)
+            Err(PrivateAgentHostError::Corrupt) | Err(PrivateAgentHostError::UnsupportedOperation)
         ));
         assert_eq!(host.binding(agent), Err(PrivateAgentHostError::NotFound));
         assert!(!host.agent_path(agent).exists());
@@ -8747,10 +9104,16 @@ mod tests {
             &TestAuthority,
         )
         .unwrap();
-        assert_eq!(reopened.binding(agent), Err(PrivateAgentHostError::NotFound));
+        assert_eq!(
+            reopened.binding(agent),
+            Err(PrivateAgentHostError::NotFound)
+        );
         assert!(!reopened.agent_path(agent).exists());
         assert!(reopened.creating_path(agent).exists());
-        assert_eq!(reopened.descriptor(agent), Err(PrivateAgentHostError::NotFound));
+        assert_eq!(
+            reopened.descriptor(agent),
+            Err(PrivateAgentHostError::NotFound)
+        );
 
         let source = PrivateAgentHost::open(
             fixture.directory.child("genesis-recovery-source"),
@@ -8982,8 +9345,7 @@ mod tests {
         let (authority, request) = prepared_recovery_runtime_request(&fixture, &prepared);
         assert!(matches!(
             apply_runtime_request(&mut target, authority, &request),
-            Err(PrivateAgentHostError::Corrupt)
-                | Err(PrivateAgentHostError::UnsupportedOperation)
+            Err(PrivateAgentHostError::Corrupt) | Err(PrivateAgentHostError::UnsupportedOperation)
         ));
         assert_eq!(target.binding(agent), Err(PrivateAgentHostError::NotFound));
         assert!(!target.agent_path(agent).exists());
@@ -9000,7 +9362,10 @@ mod tests {
             &TestAuthority,
         )
         .unwrap();
-        assert_eq!(reopened.binding(agent), Err(PrivateAgentHostError::NotFound));
+        assert_eq!(
+            reopened.binding(agent),
+            Err(PrivateAgentHostError::NotFound)
+        );
         assert!(reopened.prepared_recovery(agent).unwrap().is_some());
         assert!(!reopened.agent_path(agent).exists());
     }
@@ -9017,6 +9382,23 @@ mod tests {
         }
     }
 
+    fn copy_directory_tree(source: &Path, destination: &Path) {
+        fs::create_dir(destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            let metadata = fs::symlink_metadata(&source_path).unwrap();
+            assert!(!metadata.file_type().is_symlink());
+            if metadata.is_dir() {
+                copy_directory_tree(&source_path, &destination_path);
+            } else {
+                assert!(metadata.is_file());
+                fs::copy(source_path, destination_path).unwrap();
+            }
+        }
+    }
+
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         haystack
             .windows(needle.len())
@@ -9024,7 +9406,7 @@ mod tests {
     }
 
     #[test]
-    fn independent_node_genesis_rejects_unauthorized_sync_and_leaks_no_plaintext() {
+    fn independent_node_genesis_sync_is_fail_closed_and_leaks_no_plaintext() {
         let fixture = fixture(2);
         let mut primary = create_host(&fixture, 0, "primary");
         let agent = create_agent(&mut primary, &fixture);
@@ -9039,7 +9421,8 @@ mod tests {
                 &TestAuthority,
             )
             .unwrap();
-        primary.rotate_keys(agent, &TestAuthority).unwrap();
+        let rotate = signed_rotate_control(&primary, agent);
+        apply_and_attach_test_authority_evidence(&mut primary, &fixture, &rotate, 40, 41);
         let backup = primary
             .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
             .unwrap();
@@ -9071,17 +9454,25 @@ mod tests {
         let before_binding = peer.binding(agent).unwrap();
         let mut before_slot = Vec::new();
         collect_files(&peer.agent_path(agent), &mut before_slot);
-        assert_eq!(
-            primary.serve_sync_page(
+        let page = primary
+            .serve_sync_page(
                 agent,
                 PrivatePeerIdentity::Node(&fixture.nodes[1].identity),
                 &request.encode().unwrap(),
                 authority_target(&fixture).0,
                 &TestTransport,
+            )
+            .unwrap();
+        assert_eq!(
+            peer.apply_sync_page(
+                agent,
+                PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
+                &page,
+                authority_target(&fixture).0,
+                &TestAuthority,
+                &TestTransport,
             ),
-            Err(PrivateAgentHostError::Sync(
-                PrivateSyncError::MissingEvidence
-            ))
+            Err(PrivateAgentHostError::UnsupportedOperation)
         );
         assert_eq!(peer.binding(agent).unwrap(), before_binding);
         let mut after_slot = Vec::new();
@@ -9229,7 +9620,10 @@ mod tests {
                 .unwrap(),
             PrivateSyncApplyDisposition::AlreadyApplied
         );
-        assert_eq!(receiver.agents[&agent].runtime_image.commitment(), after_apply);
+        assert_eq!(
+            receiver.agents[&agent].runtime_image.commitment(),
+            after_apply
+        );
         drop(receiver);
         let receiver = reopen_host(&fixture, 0, "object-sync-receiver");
         assert_eq!(
@@ -9304,7 +9698,7 @@ mod tests {
         assert!(interrupted.get_encrypted_object(agent, applied_key).is_ok());
         assert_eq!(
             interrupted.get_encrypted_object(agent, blocked_key),
-            Err(PrivateAgentHostError::Store(PrivateStoreError::NotFound))
+            Err(PrivateAgentHostError::NotFound)
         );
         assert_eq!(
             interrupted
@@ -9331,6 +9725,43 @@ mod tests {
     }
 
     #[test]
+    fn runtime_application_lineage_accepts_object_growth_between_controls() {
+        let fixture = fixture(1);
+        let mut host = create_host(&fixture, 0, "papl-object-papl");
+        let agent = create_agent(&mut host, &fixture);
+        let first = signed_rotate_control(&host, agent);
+        apply_and_attach_test_authority_evidence(&mut host, &fixture, &first, 40, 41);
+        let object = host
+            .encrypt_and_put(
+                agent,
+                EncryptedObjectKind::Blob,
+                b"object-between-applications",
+                authority_target(&fixture).0,
+                &TestAuthority,
+            )
+            .unwrap();
+        let second = signed_rotate_control(&host, agent);
+        apply_and_attach_test_authority_evidence(&mut host, &fixture, &second, 42, 43);
+        let expected_image = host.agents[&agent].runtime_image.commitment();
+        let expected_store = host.agents[&agent].store.core_position().unwrap();
+        drop(host);
+
+        let reopened = reopen_host(&fixture, 0, "papl-object-papl");
+        assert_eq!(
+            reopened.agents[&agent].runtime_image.commitment(),
+            expected_image
+        );
+        assert_eq!(
+            reopened.agents[&agent].runtime_image.store(),
+            expected_store
+        );
+        assert_eq!(
+            reopened.get_and_decrypt(agent, object).unwrap().as_slice(),
+            b"object-between-applications"
+        );
+    }
+
+    #[test]
     fn revocation_rotates_before_writes_and_all_non_node_ingress_reads_nothing() {
         let fixture = fixture(2);
         let mut primary = create_host(&fixture, 0, "primary");
@@ -9342,9 +9773,8 @@ mod tests {
             &fixture.nodes[1].key(),
         )
         .unwrap();
-        primary
-            .revoke_node(agent, fixture.nodes[1].identity.node, &TestAuthority)
-            .unwrap();
+        let revoke = signed_revoke_control(&primary, agent, fixture.nodes[1].identity.node);
+        apply_and_attach_test_authority_evidence(&mut primary, &fixture, &revoke, 40, 41);
         assert_eq!(primary.binding(agent).unwrap().epoch, old_epoch + 1);
         assert!(
             unwrap_data_key(
@@ -9492,7 +9922,8 @@ mod tests {
                 &TestAuthority,
             )
             .unwrap();
-        primary.rotate_keys(agent, &TestAuthority).unwrap();
+        let first_rotate = signed_rotate_control(&primary, agent);
+        apply_and_attach_test_authority_evidence(&mut primary, &fixture, &first_rotate, 40, 41);
         let epoch_one = primary
             .encrypt_and_put(
                 agent,
@@ -9502,7 +9933,8 @@ mod tests {
                 &TestAuthority,
             )
             .unwrap();
-        primary.rotate_keys(agent, &TestAuthority).unwrap();
+        let second_rotate = signed_rotate_control(&primary, agent);
+        apply_and_attach_test_authority_evidence(&mut primary, &fixture, &second_rotate, 42, 43);
         let epoch_two = primary
             .encrypt_and_put(
                 agent,
@@ -9548,12 +9980,7 @@ mod tests {
         );
 
         let mut survivor = create_host(&fixture, 1, "historical-survivor");
-        assert_node_local_backup_restore_fails_closed(
-            &mut survivor,
-            &fixture,
-            agent,
-            &backup,
-        );
+        assert_node_local_backup_restore_fails_closed(&mut survivor, &fixture, agent, &backup);
     }
 
     #[test]
@@ -9571,7 +9998,8 @@ mod tests {
                 &TestAuthority,
             )
             .unwrap();
-        primary.rotate_keys(agent, &TestAuthority).unwrap();
+        let first_rotate = signed_rotate_control(&primary, agent);
+        apply_and_attach_test_authority_evidence(&mut primary, &fixture, &first_rotate, 40, 41);
         let epoch_one = primary
             .encrypt_and_put(
                 agent,
@@ -9581,7 +10009,8 @@ mod tests {
                 &TestAuthority,
             )
             .unwrap();
-        primary.rotate_keys(agent, &TestAuthority).unwrap();
+        let second_rotate = signed_rotate_control(&primary, agent);
+        apply_and_attach_test_authority_evidence(&mut primary, &fixture, &second_rotate, 42, 43);
         let current = primary
             .encrypt_and_put(
                 agent,
@@ -9601,9 +10030,8 @@ mod tests {
             &TestAuthority,
         )
         .unwrap();
-        primary
-            .invite_node(agent, invited.identity.clone(), &TestAuthority)
-            .unwrap();
+        let invite = signed_invite_control(&primary, agent, invited.identity.clone());
+        apply_and_attach_test_authority_evidence(&mut primary, &fixture, &invite, 44, 45);
         let invites = primary.agents[&agent]
             .store
             .invite_history_records(&invited.identity)
@@ -9647,12 +10075,7 @@ mod tests {
             invited.key(),
         )
         .unwrap();
-        assert_node_local_backup_restore_fails_closed(
-            &mut invited_host,
-            &fixture,
-            agent,
-            &backup,
-        );
+        assert_node_local_backup_restore_fails_closed(&mut invited_host, &fixture, agent, &backup);
         assert_eq!(primary.agents[&agent].descriptor, fixture.descriptor);
     }
 
@@ -9661,26 +10084,10 @@ mod tests {
         let fixture = fixture(2);
         let mut source = create_host(&fixture, 0, "multi-rotation-source");
         let agent = create_agent(&mut source, &fixture);
-        let first =
-            signed_recovery_control(&source, agent, &identities(&fixture), &fixture.recovery);
-        apply_and_attach_test_recovery_authority_evidence(
-            &mut source,
-            &fixture,
-            &first,
-            None,
-            40,
-            41,
-        );
-        let second =
-            signed_recovery_control(&source, agent, &identities(&fixture), &fixture.recovery);
-        apply_and_attach_test_recovery_authority_evidence(
-            &mut source,
-            &fixture,
-            &second,
-            None,
-            42,
-            43,
-        );
+        let first = signed_rotate_control(&source, agent);
+        apply_and_attach_test_authority_evidence(&mut source, &fixture, &first, 40, 41);
+        let second = signed_rotate_control(&source, agent);
+        apply_and_attach_test_authority_evidence(&mut source, &fixture, &second, 42, 43);
 
         let request = PrivateSyncRequest {
             cursor: PrivateSyncCursor::start(fixture.space, agent, 0, None).unwrap(),
@@ -9733,16 +10140,8 @@ mod tests {
         let fixture = fixture(2);
         let mut source = create_host(&fixture, 0, "unsigned-epoch-source");
         let agent = create_agent(&mut source, &fixture);
-        let recovery =
-            signed_recovery_control(&source, agent, &identities(&fixture), &fixture.recovery);
-        apply_and_attach_test_recovery_authority_evidence(
-            &mut source,
-            &fixture,
-            &recovery,
-            None,
-            40,
-            41,
-        );
+        let rotate = signed_rotate_control(&source, agent);
+        apply_and_attach_test_authority_evidence(&mut source, &fixture, &rotate, 40, 41);
 
         let request = PrivateSyncRequest {
             cursor: PrivateSyncCursor::start(fixture.space, agent, 0, None).unwrap(),
@@ -9811,78 +10210,36 @@ mod tests {
     }
 
     #[test]
-    fn offline_recovery_replaces_a_node_and_survives_restart() {
+    fn offline_recovery_without_authenticated_stage_is_restart_safe_and_unsupported() {
         let fixture = fixture(2);
         let replacement = node(fixture.space, fixture.owner, 99);
         let mut primary = create_host(&fixture, 0, "primary");
         let agent = create_agent(&mut primary, &fixture);
-        primary
-            .record_actor_lifecycle(
-                agent,
-                ActorId([51; 32]),
-                PrivateActorLifecycleKind::Install,
-                Hash([52; 32]),
-                &TestAuthority,
-            )
-            .unwrap();
-        let binding = primary.binding(agent).unwrap();
-        let prior_head = binding.control_head.unwrap();
         let mut replacements = vec![
             fixture.nodes[0].identity.clone(),
             replacement.identity.clone(),
         ];
         replacements.sort_by_key(|node| node.node);
-        let generated = generate_fresh_private_epoch(
-            fixture.space,
-            agent,
-            binding.epoch + 1,
-            fixture.owner,
-            &replacements,
-            fixture.recovery.verifying_key(),
-            fixture.recovery_encryption.public_key(),
-            &TestAuthority,
-        )
-        .unwrap();
-        let historical_keyring = build_recovery_keyring_grant(
-            primary.agents[&agent].store.key_epochs(),
-            &primary.agents[&agent].data_keys,
-            &generated.record,
-            &replacements,
-        )
-        .unwrap();
-        let mut recovery = PrivateControlRecord {
-            space: fixture.space,
-            agent,
-            sequence: binding.next_sequence,
-            previous: Some(prior_head),
-            operation: PrivateControlOperation::Recover {
-                superseded_heads: vec![prior_head],
-                next_epoch: generated.record,
-                replacement_nodes: replacements.clone(),
-                historical_keyring,
-            },
-            signer: PrivateControlSigner::Recovery,
-            signer_public_key: [0; 32],
-            signature: [0; 64],
-        };
-        sign_recovery_control_record(&mut recovery, &fixture.recovery).unwrap();
-        primary
-            .apply_recovery_record(agent, Some(prior_head), &recovery, &TestAuthority)
-            .unwrap();
-        assert_eq!(primary.binding(agent).unwrap().epoch, binding.epoch + 1);
+        let recovery = signed_recovery_control(&primary, agent, &replacements, &fixture.recovery);
+        let (authority, request, _) =
+            recovery_runtime_application_request(&fixture, &recovery, None, 80, 85);
+        let before_binding = primary.binding(agent).unwrap();
+        let before_descriptor = primary.descriptor(agent).unwrap().clone();
+        let mut before_slot = Vec::new();
+        collect_files(&primary.agent_path(agent), &mut before_slot);
         assert_eq!(
-            primary.agents[&agent].store.authorized_nodes(),
-            replacements
+            apply_runtime_request(&mut primary, authority, &request),
+            Err(PrivateAgentHostError::UnsupportedOperation)
         );
-        let key = primary
-            .encrypt_and_put(
-                agent,
-                EncryptedObjectKind::Snapshot,
-                b"recovered-state",
-                authority_target(&fixture).0,
-                &TestAuthority,
-            )
-            .unwrap();
+        assert_eq!(
+            apply_runtime_request(&mut primary, authority, &request),
+            Err(PrivateAgentHostError::UnsupportedOperation)
+        );
+        assert_eq!(primary.binding(agent).unwrap(), before_binding);
+        assert_eq!(primary.descriptor(agent).unwrap(), &before_descriptor);
+        let mut after_slot = Vec::new();
+        collect_files(&primary.agent_path(agent), &mut after_slot);
+        assert_eq!(after_slot, before_slot);
 
         drop(primary);
         let reopened = PrivateAgentHost::open(
@@ -9894,13 +10251,11 @@ mod tests {
             &TestAuthority,
         )
         .unwrap();
+        assert_eq!(reopened.binding(agent).unwrap(), before_binding);
+        assert_eq!(reopened.descriptor(agent).unwrap(), &before_descriptor);
         assert_eq!(
             reopened.agents[&agent].store.authorized_nodes(),
-            replacements
-        );
-        assert_eq!(
-            reopened.get_and_decrypt(agent, key).unwrap().as_slice(),
-            b"recovered-state"
+            identities(&fixture)
         );
     }
 
@@ -9909,14 +10264,6 @@ mod tests {
         let fixture = fixture(2);
         let mut left = create_host(&fixture, 0, "union-left");
         let agent = create_agent(&mut left, &fixture);
-        left.record_actor_lifecycle(
-            agent,
-            ActorId([0x41; 32]),
-            PrivateActorLifecycleKind::Install,
-            Hash([0x42; 32]),
-            &TestAuthority,
-        )
-        .unwrap();
         let object = left
             .encrypt_and_put(
                 agent,
@@ -10057,9 +10404,8 @@ mod tests {
                 &TestAuthority,
             )
             .unwrap();
-        source
-            .revoke_node(agent, fixture.nodes[1].identity.node, &TestAuthority)
-            .unwrap();
+        let revoke = signed_revoke_control(&source, agent, fixture.nodes[1].identity.node);
+        apply_and_attach_test_authority_evidence(&mut source, &fixture, &revoke, 40, 41);
         source
             .encrypt_and_put(
                 agent,
@@ -10069,7 +10415,8 @@ mod tests {
                 &TestAuthority,
             )
             .unwrap();
-        source.rotate_keys(agent, &TestAuthority).unwrap();
+        let rotate = signed_rotate_control(&source, agent);
+        apply_and_attach_test_authority_evidence(&mut source, &fixture, &rotate, 42, 43);
         source
             .encrypt_and_put(
                 agent,
@@ -10080,7 +10427,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            source.get_and_decrypt(agent, epoch_zero).unwrap().as_slice(),
+            source
+                .get_and_decrypt(agent, epoch_zero)
+                .unwrap()
+                .as_slice(),
             before_revocation.as_slice()
         );
         let backup = source
@@ -10216,12 +10566,9 @@ mod tests {
             .unwrap();
         substituted_archive.runtime_state =
             encrypt_runtime_image_sidecar(&data_key, &substituted_image).unwrap();
-        let substituted_backup = encode_host_archive(
-            &substituted_archive,
-            true,
-            MAX_PRIVATE_HOST_ARCHIVE_BYTES,
-        )
-        .unwrap();
+        let substituted_backup =
+            encode_host_archive(&substituted_archive, true, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+                .unwrap();
         let mut substituted = PrivateAgentHost::create(
             fixture.directory.child("substituted-pvri-store-root"),
             fixture.space,
@@ -10262,11 +10609,16 @@ mod tests {
                 &TestAuthority,
             )
             .unwrap();
-        assert!(matches!(
-            complete_prepared_recovery(&mut target, &fixture, &prepared),
-            Err(PrivateAgentHostError::Corrupt)
-                | Err(PrivateAgentHostError::UnsupportedOperation)
-        ));
+        let result = complete_prepared_recovery(&mut target, &fixture, &prepared);
+        assert!(
+            matches!(
+                &result,
+                Err(PrivateAgentHostError::Corrupt)
+                    | Err(PrivateAgentHostError::InvalidScope)
+                    | Err(PrivateAgentHostError::UnsupportedOperation)
+            ),
+            "unexpected recovery result: {result:?}"
+        );
         assert_eq!(target.binding(agent), Err(PrivateAgentHostError::NotFound));
         assert!(!target.agent_path(agent).exists());
         assert!(target.creating_path(agent).exists());
@@ -10288,7 +10640,10 @@ mod tests {
             .unwrap();
         source.rotate_keys(agent, &TestAuthority).unwrap();
         assert_eq!(
-            source.get_and_decrypt(agent, epoch_zero).unwrap().as_slice(),
+            source
+                .get_and_decrypt(agent, epoch_zero)
+                .unwrap()
+                .as_slice(),
             b"before-recovery-zero"
         );
         let source_backup = source
@@ -10316,10 +10671,12 @@ mod tests {
             .unwrap();
         assert!(matches!(
             complete_prepared_recovery(&mut recovered, &fixture, &prepared),
-            Err(PrivateAgentHostError::Corrupt)
-                | Err(PrivateAgentHostError::UnsupportedOperation)
+            Err(PrivateAgentHostError::Corrupt) | Err(PrivateAgentHostError::UnsupportedOperation)
         ));
-        assert_eq!(recovered.binding(agent), Err(PrivateAgentHostError::NotFound));
+        assert_eq!(
+            recovered.binding(agent),
+            Err(PrivateAgentHostError::NotFound)
+        );
         assert!(!recovered.agent_path(agent).exists());
         assert!(recovered.creating_path(agent).exists());
         assert_eq!(source.descriptor(agent).unwrap(), &fixture.descriptor);
@@ -10360,11 +10717,12 @@ mod tests {
             ids
         });
 
-        host.invite_node(first, invited.identity.clone(), &TestAuthority)
-            .unwrap();
+        let invite = signed_invite_control(&host, first, invited.identity.clone());
+        apply_and_attach_test_authority_evidence(&mut host, &fixture, &invite, 40, 41);
         assert_eq!(host.agents[&first].store.authorized_nodes().len(), 2);
         let before = host.binding(first).unwrap().epoch;
-        host.rotate_keys(first, &TestAuthority).unwrap();
+        let rotate = signed_rotate_control(&host, first);
+        apply_and_attach_test_authority_evidence(&mut host, &fixture, &rotate, 42, 43);
         assert_eq!(host.binding(first).unwrap().epoch, before + 1);
 
         drop(host);
@@ -10383,11 +10741,13 @@ mod tests {
     }
 
     #[test]
-    fn restart_finishes_metadata_promotion_after_committed_rotation() {
+    fn restart_rejects_committed_control_without_papl_before_promoting_sidecars() {
         let fixture = fixture(1);
         let mut host = create_host(&fixture, 0, "primary");
         let agent = create_agent(&mut host, &fixture);
         let slot = host.agent_path(agent);
+        let canonical_before = canonical_sidecars(&host, agent);
+        let runtime_before = fs::read(slot.join(RUNTIME_STATE_FILE)).unwrap();
         let hosted = host.agents.get_mut(&agent).unwrap();
         let binding = hosted.store.binding();
         let generated = generate_fresh_private_epoch(
@@ -10419,15 +10779,14 @@ mod tests {
             &record,
         )
         .unwrap();
-        let successor_image =
-            PrivateRuntimeImage::synthetic_control_only_successor_for_host_test(
-                &hosted.runtime_image,
-                &record,
-                successor_store,
-                successor_key_epochs,
-                hosted.runtime_image.applied_at().saturating_add(1),
-            )
-            .unwrap();
+        let successor_image = PrivateRuntimeImage::synthetic_control_only_successor_for_host_test(
+            &hosted.runtime_image,
+            &record,
+            successor_store,
+            successor_key_epochs,
+            hosted.runtime_image.applied_at().saturating_add(1),
+        )
+        .unwrap();
         let runtime_stage = slot.join(staged_runtime_image_name(record.commitment()));
         write_new_synced(
             &runtime_stage,
@@ -10439,33 +10798,43 @@ mod tests {
             .store
             .append_control(&record, &TestAuthority)
             .unwrap();
-        // Simulate process loss before `.next` files are promoted.
+        assert!(
+            host.agents[&agent]
+                .store
+                .read_runtime_application(record.commitment())
+                .unwrap()
+                .is_none()
+        );
+        // Simulate process loss after the PCTL commit but before `.next`
+        // promotion. A bare PCTL is never a trusted runtime transition.
         drop(host);
 
-        let reopened = PrivateAgentHost::open(
-            fixture.directory.child("primary"),
-            fixture.space,
-            fixture.owner,
-            fixture.nodes[0].identity.clone(),
-            fixture.nodes[0].key(),
-            &TestAuthority,
-        )
-        .unwrap();
-        assert_eq!(reopened.binding(agent).unwrap().epoch, binding.epoch + 1);
+        assert!(matches!(
+            PrivateAgentHost::open(
+                fixture.directory.child("primary"),
+                fixture.space,
+                fixture.owner,
+                fixture.nodes[0].identity.clone(),
+                fixture.nodes[0].key(),
+                &TestAuthority,
+            ),
+            Err(PrivateAgentHostError::Corrupt)
+        ));
+        assert_eq!(
+            SIDECAR_FILES.map(|name| fs::read(slot.join(name)).unwrap()),
+            canonical_before
+        );
+        assert_eq!(
+            fs::read(slot.join(RUNTIME_STATE_FILE)).unwrap(),
+            runtime_before
+        );
         for name in SIDECAR_FILES {
-            assert!(slot.join(name).is_file());
             assert!(
-                !slot
-                    .join(staged_sidecar_name(name, binding.epoch + 1))
+                slot.join(staged_sidecar_name(name, binding.epoch + 1))
                     .exists()
             );
         }
-        assert!(slot.join(RUNTIME_STATE_FILE).is_file());
-        assert!(!runtime_stage.exists());
-        assert_eq!(
-            reopened.agents[&agent].runtime_image.store(),
-            reopened.agents[&agent].store.core_position().unwrap()
-        );
+        assert!(runtime_stage.exists());
     }
 
     #[test]

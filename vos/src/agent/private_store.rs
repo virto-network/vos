@@ -1450,9 +1450,7 @@ impl VerifiedEncryptedBackup {
         }
     }
 
-    pub(crate) fn core_position(
-        &self,
-    ) -> Result<PrivateStoreCorePosition, PrivateStoreError> {
+    pub(crate) fn core_position(&self) -> Result<PrivateStoreCorePosition, PrivateStoreError> {
         if self.chain.epoch().epoch != self.index.epoch
             || self.chain.head() != self.index.control_head
             || self.chain.next_sequence() != self.index.next_sequence

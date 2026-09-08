@@ -872,7 +872,7 @@ pub struct PrivateAgentProjectionRow {
     /// redundant by design so reconstruction can reject either field drifting.
     pub members: Vec<[u8; 32]>,
     pub member_set: [u8; 32],
-    /// Commitment of the latest node-local PCRS2 reopened-state proof.
+    /// Commitment of the latest node-local PCRS3 reopened-state proof.
     pub reopened_runtime_state: Option<[u8; 32]>,
     /// Commitment of the latest successor replica-stable runtime projection.
     pub stable_projection: Option<[u8; 32]>,

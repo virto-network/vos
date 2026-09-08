@@ -6,12 +6,12 @@
 //!   Private Store core position.
 //! - `PAPL1` is the pending/completed application of one exact PCTL. It keeps
 //!   the receipt and AOI1 preimages but can represent only a positive result.
-//! - `PCRS2` reopens the exact completed application, Store position, and
+//! - `PCRS3` reopens the exact completed application, Store position, and
 //!   successor runtime image before downstream PCAF2/PCA2/PSE2 evidence exists.
 //!
 //! The Store position deliberately excludes PVRI/PAPL/PCRS and every
 //! authority acknowledgement derived from them. This preserves the acyclic
-//! commitment order `AOI1 -> PAPL1 -> (PVRI1, Store) -> PCRS2/PCAF2 -> PCA2 ->
+//! commitment order `AOI1 -> PAPL1 -> (PVRI1, Store) -> PCRS3/PCAF2 -> PCA2 ->
 //! PSE2`. Runtime images and applications include the local NodeId and are
 //! never suitable as cross-replica equality claims; only
 //! [`PrivateRuntimeStableProjection`] is replica-stable.
@@ -63,7 +63,7 @@ const PRIVATE_RUNTIME_IMAGE_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/private-runti
 const PRIVATE_RUNTIME_APPLICATION_COMMITMENT_DOMAIN: &[u8] =
     b"vos/agent/private-runtime-application/v1";
 const PRIVATE_CONTROL_REOPENED_STATE_COMMITMENT_DOMAIN: &[u8] =
-    b"vos/agent/private-control-reopened-state/v2";
+    b"vos/agent/private-control-reopened-state/v3";
 
 /// One genesis epoch plus one successor for every admitted PCTL.
 pub const MAX_PRIVATE_RUNTIME_KEY_EPOCHS: usize = MAX_PRIVATE_RECOVERY_KEYRING_EPOCHS + 1;
@@ -84,7 +84,7 @@ pub const MAX_PRIVATE_RUNTIME_APPLICATION_WIRE_BYTES: usize = MAX_PRIVATE_CONTRO
     + MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES
     + MAX_PRIVATE_RUNTIME_SUCCESS_WIRE_BYTES
     + 32 * 1024;
-/// Maximum reopened PCRS2 aggregate.
+/// Maximum reopened PCRS3 aggregate.
 pub const MAX_PRIVATE_CONTROL_REOPENED_STATE_WIRE_BYTES: usize =
     MAX_PRIVATE_RUNTIME_APPLICATION_WIRE_BYTES + MAX_PRIVATE_RUNTIME_IMAGE_WIRE_BYTES + 16 * 1024;
 
@@ -1168,6 +1168,38 @@ impl PrivateRuntimeImage {
         value.store = store;
         value.validate()?;
         Ok(value)
+    }
+
+    /// Match a completed PAPL successor after later ciphertext-only Store
+    /// inserts. Reconstructing the exact pre-insert PVRI before comparing its
+    /// commitment ensures object growth cannot hide a changed runtime state,
+    /// projection, control position, or PKEY lineage.
+    pub(crate) fn matches_application_successor_after_object_growth(
+        &self,
+        application: &PrivateRuntimeApplication,
+    ) -> bool {
+        if application.matches_successor(self) {
+            return true;
+        }
+        let expected = application.expected_successor_store;
+        if self.validate().is_err()
+            || expected.validate().is_err()
+            || self.store.space != expected.space
+            || self.store.agent != expected.agent
+            || self.store.owner != expected.owner
+            || self.store.epoch != expected.epoch
+            || self.store.control_head != expected.control_head
+            || self.store.next_sequence != expected.next_sequence
+            || self.store.control_count != expected.control_count
+            || self.store.control_root != expected.control_root
+            || self.store.key_epoch_root != expected.key_epoch_root
+            || self.store.object_count <= expected.object_count
+        {
+            return false;
+        }
+        let mut exact_successor = self.clone();
+        exact_successor.store = expected;
+        exact_successor.validate().is_ok() && application.matches_successor(&exact_successor)
     }
 
     /// Test-only bridge for legacy host helpers which historically appended
@@ -2373,10 +2405,11 @@ impl CanonicalWire for PrivateRuntimeApplication {
     }
 }
 
-/// Exact reopened Store/runtime/application aggregate (`PCRS2`).
+/// Exact reopened Store/runtime/application aggregate (`PCRS3`).
 ///
-/// A PCRS2 is intentionally unsigned. Its commitment is the preimage later
-/// bound by PCAF2/PCA2/PSE2; callers must still verify those downstream
+/// A PCRS3 is intentionally unsigned. Its Merkle-style commitment is later
+/// bound by PCAF2/PCA2/PSE2 and remains recomputable after the full historical
+/// PVRI preimage is retired; callers must still verify those downstream
 /// authority signatures independently.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrivateControlReopenedState {
@@ -2411,10 +2444,29 @@ impl PrivateControlReopenedState {
     }
 
     pub fn commitment(&self) -> Hash {
-        Hash::digest(
+        Self::commitment_from_application(&self.application).expect("valid PCRS3")
+    }
+
+    /// Recompute the PCRS3 endpoint retained by PCAF2 using only a completed
+    /// PAPL. PAPL already carries the exact successor PSC and PVRI commitment,
+    /// so no historical plaintext runtime image has to remain on disk.
+    pub fn commitment_from_application(
+        application: &PrivateRuntimeApplication,
+    ) -> Result<Hash, PrivateRuntimeEvidenceError> {
+        application.validate()?;
+        let successor_runtime_image = application
+            .successor_runtime_image()
+            .ok_or(PrivateRuntimeEvidenceError::InvalidApplication)?;
+        let application_commitment = application.commitment();
+        let store_commitment = application.expected_successor_store().commitment();
+        Ok(Hash::digest(
             PRIVATE_CONTROL_REOPENED_STATE_COMMITMENT_DOMAIN,
-            &[&self.encode().expect("valid PCR2")],
-        )
+            &[
+                application_commitment.as_bytes(),
+                store_commitment.as_bytes(),
+                successor_runtime_image.as_bytes(),
+            ],
+        ))
     }
 
     pub fn validate(&self) -> Result<(), PrivateRuntimeEvidenceError> {
@@ -2448,7 +2500,7 @@ impl PrivateControlReopenedState {
 }
 
 impl CanonicalWire for PrivateControlReopenedState {
-    const MAGIC: [u8; 4] = *b"PCR2";
+    const MAGIC: [u8; 4] = *b"PCR3";
     const MAX_ENCODED_BYTES: usize = MAX_PRIVATE_CONTROL_REOPENED_STATE_WIRE_BYTES;
 
     fn validate_wire(&self) -> bool {
@@ -3242,7 +3294,15 @@ mod tests {
                 .is_err()
         );
         assert_eq!(&pending.encode().unwrap()[..4], b"PAP1");
-        assert_eq!(&reopened.encode().unwrap()[..4], b"PCR2");
+        let reopened_wire = reopened.encode().unwrap();
+        assert_eq!(&reopened_wire[..4], b"PCR3");
+        assert_eq!(
+            reopened.commitment(),
+            PrivateControlReopenedState::commitment_from_application(&completed).unwrap()
+        );
+        let mut retired_pcr2 = reopened_wire;
+        retired_pcr2[..4].copy_from_slice(b"PCR2");
+        assert!(PrivateControlReopenedState::decode(&retired_pcr2).is_err());
         reopened
             .reopen_with(&fixture.descriptor, &AllowVerifier, &AllowVerifier)
             .unwrap();
@@ -3250,6 +3310,68 @@ mod tests {
             reopened
                 .reopen_with(&fixture.descriptor, &DenyVerifier, &AllowVerifier)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn pcrs3_commitment_binds_completed_papl_successor_store_and_pvri() {
+        let fixture = Fixture::new();
+        let (pending, _, completed, reopened) =
+            policy_application(&fixture, &fixture.predecessor, 5);
+        assert!(PrivateControlReopenedState::commitment_from_application(&pending).is_err());
+        let commitment = reopened.commitment();
+
+        let mut alternate_pvri = completed.clone();
+        alternate_pvri
+            .completion
+            .as_mut()
+            .unwrap()
+            .successor_runtime_image = hash(0xd8);
+        assert!(alternate_pvri.validate().is_ok());
+        assert_ne!(
+            PrivateControlReopenedState::commitment_from_application(&alternate_pvri).unwrap(),
+            commitment
+        );
+
+        // A control applied after authenticated object growth has a distinct
+        // predecessor/successor PSC endpoint even when every control field is
+        // unchanged. PCRS3 binds that exact Store endpoint as well.
+        let predecessor = completed.predecessor_store();
+        let successor = completed.expected_successor_store();
+        let object_root = Some(hash(0xd9));
+        let mut alternate_store = completed.clone();
+        alternate_store.predecessor_store = PrivateStoreCorePosition::new(
+            predecessor.space(),
+            predecessor.agent(),
+            predecessor.owner(),
+            predecessor.epoch(),
+            predecessor.control_head(),
+            predecessor.next_sequence(),
+            predecessor.object_count() + 1,
+            object_root,
+            predecessor.control_count(),
+            predecessor.control_root(),
+            predecessor.key_epoch_root(),
+        )
+        .unwrap();
+        alternate_store.expected_successor_store = PrivateStoreCorePosition::new(
+            successor.space(),
+            successor.agent(),
+            successor.owner(),
+            successor.epoch(),
+            successor.control_head(),
+            successor.next_sequence(),
+            successor.object_count() + 1,
+            object_root,
+            successor.control_count(),
+            successor.control_root(),
+            successor.key_epoch_root(),
+        )
+        .unwrap();
+        assert!(alternate_store.validate().is_ok());
+        assert_ne!(
+            PrivateControlReopenedState::commitment_from_application(&alternate_store).unwrap(),
+            commitment
         );
     }
 
@@ -3524,6 +3646,88 @@ mod tests {
                 },
             ),
             Err(PrivateRuntimeEvidenceError::InvalidSuccess)
+        );
+    }
+
+    #[test]
+    fn papl_successor_match_allows_only_authenticated_object_growth() {
+        let mut fixture = Fixture::new();
+        let genesis = fixture.predecessor.store();
+        let genesis_with_object = PrivateStoreCorePosition::new(
+            genesis.space(),
+            genesis.agent(),
+            genesis.owner(),
+            genesis.epoch(),
+            genesis.control_head(),
+            genesis.next_sequence(),
+            1,
+            Some(hash(0xd0)),
+            genesis.control_count(),
+            genesis.control_root(),
+            genesis.key_epoch_root(),
+        )
+        .unwrap();
+        fixture.predecessor = fixture
+            .predecessor
+            .rebind_store_objects(genesis_with_object)
+            .unwrap();
+        let (_, successor, completed, _) = policy_application(&fixture, &fixture.predecessor, 5);
+        assert!(successor.matches_application_successor_after_object_growth(&completed));
+
+        let applied = successor.store();
+        let grown_store = PrivateStoreCorePosition::new(
+            applied.space(),
+            applied.agent(),
+            applied.owner(),
+            applied.epoch(),
+            applied.control_head(),
+            applied.next_sequence(),
+            2,
+            Some(hash(0xd1)),
+            applied.control_count(),
+            applied.control_root(),
+            applied.key_epoch_root(),
+        )
+        .unwrap();
+        let grown = successor.rebind_store_objects(grown_store).unwrap();
+        assert!(grown.matches_application_successor_after_object_growth(&completed));
+
+        let mut state_tamper = grown.clone();
+        state_tamper.state.local.push(0xd2);
+        assert!(state_tamper.validate().is_ok());
+        assert!(!state_tamper.matches_application_successor_after_object_growth(&completed));
+
+        let mut projection_tamper = grown.clone();
+        projection_tamper.state.control.push(0xd3);
+        projection_tamper.stable_projection.control_state =
+            control_state_commitment(&projection_tamper.state.control);
+        assert!(projection_tamper.validate().is_ok());
+        assert!(!projection_tamper.matches_application_successor_after_object_growth(&completed));
+
+        let mut runtime_control_tamper = grown.clone();
+        runtime_control_tamper.runtime_control = None;
+        assert!(runtime_control_tamper.validate().is_ok());
+        assert!(
+            !runtime_control_tamper.matches_application_successor_after_object_growth(&completed)
+        );
+
+        let mut control_root_tamper = grown.clone();
+        control_root_tamper.store.control_root = Some(hash(0xd4));
+        assert!(control_root_tamper.validate().is_ok());
+        assert!(!control_root_tamper.matches_application_successor_after_object_growth(&completed));
+
+        let mut key_root_tamper = grown.clone();
+        key_root_tamper.key_epochs.last_mut().unwrap().exact_wire = hash(0xd5);
+        key_root_tamper.store.key_epoch_root =
+            private_key_epoch_root(&key_root_tamper.key_epochs).unwrap();
+        assert!(key_root_tamper.validate().is_ok());
+        assert!(!key_root_tamper.matches_application_successor_after_object_growth(&completed));
+
+        let mut same_count_root_tamper = successor.clone();
+        same_count_root_tamper.store.object_root = Some(hash(0xd6));
+        assert!(same_count_root_tamper.validate().is_ok());
+        assert!(
+            !same_count_root_tamper.matches_application_successor_after_object_growth(&completed)
         );
     }
 

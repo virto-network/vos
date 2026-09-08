@@ -77,7 +77,7 @@ pub(crate) struct PrivateControlRuntimeApplicationResult {
     pub(crate) authenticated: bool,
     pub(crate) durably_applied: bool,
     pub(crate) durably_reopened: bool,
-    /// Exact commitment of the durably reopened PCRS2 aggregate.
+    /// Exact commitment of the durably reopened PCRS3 aggregate.
     pub(crate) reopened_runtime_state: Hash,
     /// Exact commitment of the successor PSP1 stable projection.
     pub(crate) stable_projection: Hash,
