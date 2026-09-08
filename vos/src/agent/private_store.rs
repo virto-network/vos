@@ -2270,6 +2270,9 @@ pub struct PrivateStore {
     _lock: File,
     metadata: RecoveryMetadata,
     index: StoreIndex,
+    /// Exact Store-core position computed from authenticated in-memory state.
+    /// Only a successful object/control transaction may advance this cache.
+    cached_core_position: PrivateStoreCorePosition,
     chain: PrivateControlChainVerifier,
     /// Authenticated epoch records reconstructed from immutable genesis and
     /// the verified control chain. These contain recipient ciphertext only;
@@ -2349,6 +2352,7 @@ impl PrivateStore {
             objects: Vec::new(),
             controls: Vec::new(),
         };
+        let cached_core_position = store_core_position(&metadata, &index, &key_epochs)?;
         write_initial_file(
             &root,
             "recovery.initial",
@@ -2361,6 +2365,7 @@ impl PrivateStore {
             _lock: lock,
             metadata,
             index,
+            cached_core_position,
             chain,
             key_epochs,
             latest_recovery_keyring: None,
@@ -2486,11 +2491,13 @@ impl PrivateStore {
             }
             validate_object_index_entry(entry, &object, metadata.space, metadata.agent)?;
         }
+        let cached_core_position = store_core_position(&metadata, &index, &key_epochs)?;
         Ok(Self {
             root,
             _lock: lock,
             metadata,
             index,
+            cached_core_position,
             chain,
             key_epochs,
             latest_recovery_keyring,
@@ -2734,6 +2741,41 @@ impl PrivateStore {
         store_core_position(&self.metadata, &self.index, &self.key_epochs)
     }
 
+    /// Return the already-authenticated Store-core snapshot in O(1) time.
+    ///
+    /// This is intentionally crate-private and intended for repeated sync-page
+    /// target derivation. It cross-checks all scalar bindings against the live
+    /// Store view, but does not replace [`Self::core_position`]'s complete
+    /// index/key-history drift validation.
+    pub(crate) fn cached_core_position(
+        &self,
+    ) -> Result<PrivateStoreCorePosition, PrivateStoreError> {
+        let object_count =
+            u32::try_from(self.index.objects.len()).map_err(|_| PrivateStoreError::Corrupt)?;
+        let control_count =
+            u32::try_from(self.index.controls.len()).map_err(|_| PrivateStoreError::Corrupt)?;
+        let cached = self.cached_core_position;
+        if cached.validate().is_err()
+            || self.metadata.space != self.index.space
+            || self.metadata.agent != self.index.agent
+            || self.chain.epoch().epoch != self.index.epoch
+            || self.chain.head() != self.index.control_head
+            || self.chain.next_sequence() != self.index.next_sequence
+            || self.key_epochs.last() != Some(self.chain.epoch())
+            || cached.space() != self.metadata.space
+            || cached.agent() != self.metadata.agent
+            || cached.owner() != self.metadata.owner
+            || cached.epoch() != self.index.epoch
+            || cached.control_head() != self.index.control_head
+            || cached.next_sequence() != self.index.next_sequence
+            || cached.object_count() != object_count
+            || cached.control_count() != control_count
+        {
+            return Err(PrivateStoreError::Corrupt);
+        }
+        Ok(cached)
+    }
+
     pub fn authorized_nodes(&self) -> &[PrivateNodeIdentity] {
         self.chain.nodes()
     }
@@ -2862,6 +2904,7 @@ impl PrivateStore {
                             .map_err(|_| PrivateStoreError::LimitExceeded)?,
                     },
                 );
+                let successor = store_core_position(&self.metadata, &next, &self.key_epochs)?;
                 let index_bytes = encode_index(&next)?;
                 self.commit_transaction(
                     PendingArtifact::Object(key),
@@ -2871,6 +2914,8 @@ impl PrivateStore {
                     stop,
                 )?;
                 self.index = next;
+                self.cached_core_position = successor;
+                debug_assert_eq!(self.core_position().ok(), Some(successor));
             }
         }
         Ok(PutDisposition::Inserted)
@@ -2925,6 +2970,7 @@ impl PrivateStore {
                 self.key_epochs = plan.next_key_epochs;
                 self.latest_recovery_keyring = plan.next_recovery_keyring;
                 self.index = plan.next_index;
+                self.cached_core_position = plan.successor;
                 debug_assert_eq!(self.core_position().ok(), Some(plan.successor));
                 Ok(PutDisposition::Inserted)
             }
@@ -3027,6 +3073,7 @@ impl PrivateStore {
                 self.key_epochs = plan.next_key_epochs;
                 self.latest_recovery_keyring = plan.next_recovery_keyring;
                 self.index = plan.next_index;
+                self.cached_core_position = plan.successor;
                 debug_assert_eq!(self.core_position().ok(), Some(plan.successor));
                 Ok(PutDisposition::Inserted)
             }
@@ -4646,12 +4693,13 @@ mod tests {
     }
 
     #[test]
-    fn core_position_is_deterministic_initial_populated_and_reopened() {
+    fn core_position_cache_advances_and_is_deterministic_after_reopen() {
         let directory = TestDirectory::new("core-position-reopen");
         let fixture = fixture();
         let path = directory.store();
         let store = create_store(&path, &fixture);
         let initial = store.core_position().unwrap();
+        assert_eq!(store.cached_core_position().unwrap(), initial);
         assert_eq!(initial.object_count(), 0);
         assert_eq!(initial.object_root(), None);
         assert_eq!(initial.control_count(), 0);
@@ -4661,8 +4709,12 @@ mod tests {
         let mut store =
             PrivateStore::open(&path, fixture.space, fixture.agent, &TestAuthority).unwrap();
         assert_eq!(store.core_position().unwrap(), initial);
+        assert_eq!(store.cached_core_position().unwrap(), initial);
         let record = control(&fixture, 0, None);
         store.append_control(&record, &TestAuthority).unwrap();
+        let controlled = store.core_position().unwrap();
+        assert_ne!(controlled, initial);
+        assert_eq!(store.cached_core_position().unwrap(), controlled);
         let object = encrypt_private_object(
             &fixture.epoch.data_key,
             fixture.space,
@@ -4674,6 +4726,8 @@ mod tests {
         .unwrap();
         store.put_object(&object).unwrap();
         let populated = store.core_position().unwrap();
+        assert_ne!(populated, controlled);
+        assert_eq!(store.cached_core_position().unwrap(), populated);
         assert_eq!(populated.object_count(), 1);
         assert!(populated.object_root().is_some());
         assert_eq!(populated.control_count(), 1);
@@ -4683,6 +4737,7 @@ mod tests {
         let reopened =
             PrivateStore::open(&path, fixture.space, fixture.agent, &TestAuthority).unwrap();
         assert_eq!(reopened.core_position().unwrap(), populated);
+        assert_eq!(reopened.cached_core_position().unwrap(), populated);
     }
 
     #[test]

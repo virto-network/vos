@@ -46,7 +46,8 @@ pub const MAX_PRIVATE_SYNC_ITEMS: usize = 64;
 pub const MAX_PRIVATE_SYNC_PAGE_BYTES: usize = MAX_PRIVATE_OBJECT_WIRE_BYTES + 16 * 1024;
 pub const MAX_PRIVATE_SYNC_FRAME_BYTES: usize = MAX_PRIVATE_SYNC_PAGE_BYTES + 32 * 1024;
 // v3 adds the exact optional PRM1 and successor PSP commitment to every
-// control item. A clean break prevents v2's PCTL+PSE-only layout from being
+// control item and pins the source object-index target across paginated
+// requests. A clean break prevents v2's PCTL+PSE-only layout from being
 // interpreted as runtime-complete synchronization evidence.
 const SYNC_FORMAT_VERSION: u16 = 3;
 // PSE2 is an independently persisted envelope, not part of the sync-frame
@@ -1371,7 +1372,7 @@ fn authenticate_peer<V: PrivateTransportAuthVerifier>(
 }
 
 fn sync_target(store: &PrivateStore) -> Result<PrivateSyncTarget, PrivateSyncError> {
-    let position = store.core_position()?;
+    let position = store.cached_core_position()?;
     let target = PrivateSyncTarget {
         head: PrivateSyncHead {
             epoch: position.epoch(),
@@ -4519,16 +4520,27 @@ mod tests {
             Ok(PrivateSyncApplyDisposition::Applied)
         );
 
-        // A page may never repeat or move behind the request's advertised
-        // last-applied object, even if all of its object bytes are valid.
-        let mut backwards = first.clone();
-        backwards.request = PrivateSyncRequest {
+        // A page may never repeat the request's advertised last-applied
+        // object, even if all of its object bytes are valid.
+        let mut repeated = first.clone();
+        repeated.request = PrivateSyncRequest {
             cursor: next.clone(),
             max_items: 1,
             max_bytes: MAX_PRIVATE_SYNC_PAGE_BYTES as u32,
         };
-        backwards.next = None;
-        assert_eq!(backwards.validate_shape(), Err(PrivateSyncError::Duplicate));
+        repeated.next = None;
+        assert_eq!(repeated.validate_shape(), Err(PrivateSyncError::Duplicate));
+
+        // A valid object which sorts strictly below the advertised cursor is
+        // out of order rather than a duplicate.
+        let mut below = repeated;
+        let wire = objects[0].encode().unwrap();
+        below.items = vec![PrivateSyncItem::Object {
+            key: PrivateObjectKey::from_object(&objects[0]),
+            wire_hash: sync_wire_hash(&wire),
+            wire,
+        }];
+        assert_eq!(below.validate_shape(), Err(PrivateSyncError::OutOfOrder));
 
         let mut invalid_target = first.clone();
         invalid_target.target.object_count = 0;
