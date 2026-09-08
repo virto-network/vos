@@ -18,6 +18,7 @@ use sha2::Sha256;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
+use vos_agent_sdk::authority::ManagedAgentTarget;
 use vos_agent_sdk::authority_operation::PrivateRecoveryAuthorityProofSigner;
 use vos_agent_sdk::private::{
     EncryptedObjectKind, EncryptedPrivateObject, MAX_PRIVATE_CIPHERTEXT_BYTES,
@@ -29,7 +30,9 @@ use vos_agent_sdk::private::{
     SealedPrivateKey, SealedRecoveryKey, recovery_signing_public_key_commitment,
     valid_x25519_public_key as sdk_valid_x25519_public_key,
 };
-use vos_agent_sdk::{AgentId, Hash, NodeId, PrincipalId, SpaceId};
+use vos_agent_sdk::wire::{CanonicalWire, authority_private_node_identity_commitment};
+use vos_agent_sdk::{AgentId, Hash, NodeId, PrincipalId, RUNTIME_ABI_ID, SpaceId};
+use vos_protocol::wire::{DecodeError, Decoder, Encoder};
 
 const SECRET_BYTES: usize = 32;
 const AEAD_TAG_BYTES: usize = 16;
@@ -68,6 +71,215 @@ const RECOVERY_KEYRING_FIXED_BYTES: usize = 4 + 2 + 32 + 32 + 32 + 8 + 4;
 const RECOVERY_KEYRING_ENTRY_BYTES: usize = 8 + 32 + SECRET_BYTES;
 const RECOVERY_PLAN_KDF_SALT: &[u8] = b"vos/private/recovery-plan-auth/salt/v1";
 const RECOVERY_PLAN_KDF_DOMAIN: &[u8] = b"vos/private/recovery-plan-auth/v1";
+const STABLE_IMPORT_CERTIFICATE_BODY_DOMAIN: &[u8] =
+    b"vos/private/stable-import-certificate/body/v1";
+const STABLE_IMPORT_CERTIFICATE_KDF_SALT: &[u8] =
+    b"vos/private/stable-import-certificate-auth/salt/v1";
+const STABLE_IMPORT_CERTIFICATE_KDF_DOMAIN: &[u8] =
+    b"vos/private/stable-import-certificate-auth/v1";
+
+/// Exact PSI1 framing: canonical header, destination/source context, and MAC.
+pub(crate) const PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES: usize = 4 + 32 + 10 * 32 + 32;
+
+/// Destination-authenticated proof that one fully verified source PSE2 was
+/// accepted only after this node durably produced and reopened its own PAPL.
+///
+/// PSI1 is node-local and intentionally absent from Store core commitments,
+/// portable Store archives, and sync frames. Decoding proves canonical shape
+/// only; consumers must call [`Self::verify_for`] with every independently
+/// reopened input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PrivateStableImportCertificate {
+    route: ManagedAgentTarget,
+    owner: PrincipalId,
+    descriptor: Hash,
+    destination_identity: Hash,
+    control: Hash,
+    local_application: Hash,
+    source_evidence: Hash,
+    stable_projection: Hash,
+    authenticator: Hash,
+}
+
+impl PrivateStableImportCertificate {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn issue(
+        route: ManagedAgentTarget,
+        owner: PrincipalId,
+        descriptor: Hash,
+        destination: &PrivateNodeIdentity,
+        control: Hash,
+        local_application: Hash,
+        source_evidence: Hash,
+        stable_projection: Hash,
+        node_key: &PrivateNodeDecryptionKey,
+    ) -> Result<Self, PrivateCryptoError> {
+        if !destination.validate()
+            || destination.principal != owner
+            || destination.encryption_public_key != node_key.public_key()
+        {
+            return Err(PrivateCryptoError::InvalidScope);
+        }
+        let mut certificate = Self {
+            route,
+            owner,
+            descriptor,
+            destination_identity: authority_private_node_identity_commitment(destination),
+            control,
+            local_application,
+            source_evidence,
+            stable_projection,
+            authenticator: Hash::ZERO,
+        };
+        if !certificate.validate_context() {
+            return Err(PrivateCryptoError::InvalidRecord);
+        }
+        certificate.authenticator =
+            node_key.stable_import_certificate_authenticator(certificate.body_commitment())?;
+        if certificate.authenticator == Hash::ZERO {
+            return Err(PrivateCryptoError::KeyDerivation);
+        }
+        Ok(certificate)
+    }
+
+    pub(crate) const fn route(&self) -> ManagedAgentTarget {
+        self.route
+    }
+
+    pub(crate) const fn owner(&self) -> PrincipalId {
+        self.owner
+    }
+
+    pub(crate) const fn descriptor(&self) -> Hash {
+        self.descriptor
+    }
+
+    pub(crate) const fn destination_identity(&self) -> Hash {
+        self.destination_identity
+    }
+
+    pub(crate) const fn control(&self) -> Hash {
+        self.control
+    }
+
+    pub(crate) const fn local_application(&self) -> Hash {
+        self.local_application
+    }
+
+    pub(crate) const fn source_evidence(&self) -> Hash {
+        self.source_evidence
+    }
+
+    pub(crate) const fn stable_projection(&self) -> Hash {
+        self.stable_projection
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn verify_for(
+        &self,
+        route: ManagedAgentTarget,
+        owner: PrincipalId,
+        descriptor: Hash,
+        destination: &PrivateNodeIdentity,
+        control: Hash,
+        local_application: Hash,
+        source_evidence: Hash,
+        stable_projection: Hash,
+        node_key: &PrivateNodeDecryptionKey,
+    ) -> Result<(), PrivateCryptoError> {
+        if !destination.validate()
+            || destination.principal != owner
+            || destination.encryption_public_key != node_key.public_key()
+            || self.route != route
+            || self.owner != owner
+            || self.descriptor != descriptor
+            || self.destination_identity != authority_private_node_identity_commitment(destination)
+            || self.control != control
+            || self.local_application != local_application
+            || self.source_evidence != source_evidence
+            || self.stable_projection != stable_projection
+            || !self.validate_context()
+            || self.authenticator == Hash::ZERO
+            || node_key.stable_import_certificate_authenticator(self.body_commitment())?
+                != self.authenticator
+        {
+            return Err(PrivateCryptoError::InvalidSignature);
+        }
+        Ok(())
+    }
+
+    fn validate_context(&self) -> bool {
+        self.route.is_valid()
+            && self.owner != PrincipalId::ZERO
+            && self.descriptor != Hash::ZERO
+            && self.destination_identity != Hash::ZERO
+            && self.control != Hash::ZERO
+            && self.local_application != Hash::ZERO
+            && self.source_evidence != Hash::ZERO
+            && self.stable_projection != Hash::ZERO
+    }
+
+    fn body_commitment(&self) -> Hash {
+        let mut bytes = Vec::with_capacity(PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES - 32);
+        bytes.extend_from_slice(&Self::MAGIC);
+        bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+        let mut encoder = Encoder(&mut bytes);
+        encode_stable_import_certificate_context(&mut encoder, self);
+        Hash::digest(STABLE_IMPORT_CERTIFICATE_BODY_DOMAIN, &[&bytes])
+    }
+}
+
+fn encode_stable_import_certificate_context(
+    encoder: &mut Encoder<'_>,
+    certificate: &PrivateStableImportCertificate,
+) {
+    encoder.fixed(certificate.route.space.as_bytes());
+    encoder.fixed(certificate.route.agent.as_bytes());
+    encoder.fixed(certificate.route.runtime_deployment.as_bytes());
+    encoder.fixed(certificate.owner.as_bytes());
+    encoder.fixed(certificate.descriptor.as_bytes());
+    encoder.fixed(certificate.destination_identity.as_bytes());
+    encoder.fixed(certificate.control.as_bytes());
+    encoder.fixed(certificate.local_application.as_bytes());
+    encoder.fixed(certificate.source_evidence.as_bytes());
+    encoder.fixed(certificate.stable_projection.as_bytes());
+}
+
+impl CanonicalWire for PrivateStableImportCertificate {
+    const MAGIC: [u8; 4] = *b"PSI1";
+    const MAX_ENCODED_BYTES: usize = PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_context() && self.authenticator != Hash::ZERO
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_stable_import_certificate_context(encoder, self);
+        encoder.fixed(self.authenticator.as_bytes());
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let certificate = Self {
+            route: ManagedAgentTarget {
+                space: SpaceId(decoder.fixed()?),
+                agent: AgentId(decoder.fixed()?),
+                runtime_deployment: vos_agent_sdk::DeploymentId(decoder.fixed()?),
+            },
+            owner: PrincipalId(decoder.fixed()?),
+            descriptor: Hash(decoder.fixed()?),
+            destination_identity: Hash(decoder.fixed()?),
+            control: Hash(decoder.fixed()?),
+            local_application: Hash(decoder.fixed()?),
+            source_evidence: Hash(decoder.fixed()?),
+            stable_projection: Hash(decoder.fixed()?),
+            authenticator: Hash(decoder.fixed()?),
+        };
+        certificate
+            .validate_wire()
+            .then_some(certificate)
+            .ok_or(DecodeError::NonCanonical)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrivateCryptoError {
@@ -335,6 +547,23 @@ impl PrivateNodeDecryptionKey {
         let mut info = Vec::with_capacity(RECOVERY_PLAN_KDF_DOMAIN.len() + 32);
         info.extend_from_slice(RECOVERY_PLAN_KDF_DOMAIN);
         info.extend_from_slice(plan_hash.as_bytes());
+        let mut output = Zeroizing::new([0; SECRET_BYTES]);
+        hkdf.expand(&info, &mut *output)
+            .map_err(|_| PrivateCryptoError::KeyDerivation)?;
+        Ok(Hash(*output))
+    }
+
+    /// Authenticate one PSI1 body to this exact destination-node secret.
+    /// Separate salt and info domains prevent either authenticator from being
+    /// replayed as a recovery-plan MAC or another node-key derivation.
+    fn stable_import_certificate_authenticator(
+        &self,
+        body_hash: Hash,
+    ) -> Result<Hash, PrivateCryptoError> {
+        let hkdf = Hkdf::<Sha256>::new(Some(STABLE_IMPORT_CERTIFICATE_KDF_SALT), self.0.bytes());
+        let mut info = Vec::with_capacity(STABLE_IMPORT_CERTIFICATE_KDF_DOMAIN.len() + 32);
+        info.extend_from_slice(STABLE_IMPORT_CERTIFICATE_KDF_DOMAIN);
+        info.extend_from_slice(body_hash.as_bytes());
         let mut output = Zeroizing::new([0; SECRET_BYTES]);
         hkdf.expand(&info, &mut *output)
             .map_err(|_| PrivateCryptoError::KeyDerivation)?;
@@ -2369,7 +2598,7 @@ mod tests {
         MAX_SEALED_KEY_BYTES, NodeEncryptionEnrollment, PrivateActorLifecycleKind,
     };
     use vos_agent_sdk::wire::CanonicalWire;
-    use vos_agent_sdk::{ActorId, BlobRef};
+    use vos_agent_sdk::{ActorId, BlobRef, DeploymentId};
 
     const TEST_BINDING_DOMAIN: &[u8] = b"vos/test/private-node-authority/v1";
 
@@ -2456,6 +2685,343 @@ mod tests {
         let mut high_bit_alias = ordinary;
         high_bit_alias[31] |= 0x80;
         assert!(!valid_x25519_public_key(&high_bit_alias));
+    }
+
+    #[test]
+    fn stable_import_certificate_is_exact_destination_authenticated_and_clean_break() {
+        let fixture = fixture(2);
+        let destination = &fixture.recipients[0];
+        let route = ManagedAgentTarget {
+            space: fixture.space,
+            agent: fixture.agent,
+            runtime_deployment: DeploymentId([0x31; 32]),
+        };
+        let descriptor = Hash([0x32; 32]);
+        let control = Hash([0x33; 32]);
+        let local_application = Hash([0x34; 32]);
+        let source_evidence = Hash([0x35; 32]);
+        let stable_projection = Hash([0x36; 32]);
+        let certificate = PrivateStableImportCertificate::issue(
+            route,
+            fixture.owner,
+            descriptor,
+            &destination.identity,
+            control,
+            local_application,
+            source_evidence,
+            stable_projection,
+            &destination.key,
+        )
+        .unwrap();
+        let repeated = PrivateStableImportCertificate::issue(
+            route,
+            fixture.owner,
+            descriptor,
+            &destination.identity,
+            control,
+            local_application,
+            source_evidence,
+            stable_projection,
+            &destination.key,
+        )
+        .unwrap();
+        assert_eq!(certificate, repeated);
+        assert_eq!(certificate.route(), route);
+        assert_eq!(certificate.owner(), fixture.owner);
+        assert_eq!(certificate.descriptor(), descriptor);
+        assert_eq!(
+            certificate.destination_identity(),
+            authority_private_node_identity_commitment(&destination.identity)
+        );
+        assert_eq!(certificate.control(), control);
+        assert_eq!(certificate.local_application(), local_application);
+        assert_eq!(certificate.source_evidence(), source_evidence);
+        assert_eq!(certificate.stable_projection(), stable_projection);
+        certificate
+            .verify_for(
+                route,
+                fixture.owner,
+                descriptor,
+                &destination.identity,
+                control,
+                local_application,
+                source_evidence,
+                stable_projection,
+                &destination.key,
+            )
+            .unwrap();
+
+        let wire = certificate.encode().unwrap();
+        assert_eq!(wire.len(), PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES);
+        assert_eq!(&wire[..4], b"PSI1");
+        assert_eq!(
+            PrivateStableImportCertificate::decode(&wire),
+            Ok(certificate.clone())
+        );
+        assert_ne!(
+            destination
+                .key
+                .stable_import_certificate_authenticator(certificate.body_commitment())
+                .unwrap(),
+            destination
+                .key
+                .recovery_plan_authenticator(certificate.body_commitment())
+                .unwrap()
+        );
+
+        let mut old_generation = wire.clone();
+        old_generation[..4].copy_from_slice(b"PSI0");
+        assert!(PrivateStableImportCertificate::decode(&old_generation).is_err());
+        let mut wrong_abi = wire.clone();
+        wrong_abi[4] ^= 1;
+        assert!(PrivateStableImportCertificate::decode(&wrong_abi).is_err());
+        let mut trailing = wire.clone();
+        trailing.push(0);
+        assert!(PrivateStableImportCertificate::decode(&trailing).is_err());
+        assert!(PrivateStableImportCertificate::decode(&wire[..wire.len() - 1]).is_err());
+        let mut zero_descriptor = wire.clone();
+        // Canonical header + route (3 fields) + owner.
+        zero_descriptor[4 + 32 + 4 * 32..4 + 32 + 5 * 32].fill(0);
+        assert!(PrivateStableImportCertificate::decode(&zero_descriptor).is_err());
+        let mut forged_wire = wire;
+        let last = forged_wire.len() - 1;
+        forged_wire[last] ^= 1;
+        let forged = PrivateStableImportCertificate::decode(&forged_wire).unwrap();
+        assert_eq!(
+            forged.verify_for(
+                route,
+                fixture.owner,
+                descriptor,
+                &destination.identity,
+                control,
+                local_application,
+                source_evidence,
+                stable_projection,
+                &destination.key,
+            ),
+            Err(PrivateCryptoError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn stable_import_certificate_rejects_every_context_and_key_substitution() {
+        let fixture = fixture(2);
+        let destination = &fixture.recipients[0];
+        let route = ManagedAgentTarget {
+            space: fixture.space,
+            agent: fixture.agent,
+            runtime_deployment: DeploymentId([0x41; 32]),
+        };
+        let descriptor = Hash([0x42; 32]);
+        let control = Hash([0x43; 32]);
+        let local_application = Hash([0x44; 32]);
+        let source_evidence = Hash([0x45; 32]);
+        let stable_projection = Hash([0x46; 32]);
+        let certificate = PrivateStableImportCertificate::issue(
+            route,
+            fixture.owner,
+            descriptor,
+            &destination.identity,
+            control,
+            local_application,
+            source_evidence,
+            stable_projection,
+            &destination.key,
+        )
+        .unwrap();
+        let verify = |route,
+                      owner,
+                      descriptor,
+                      destination: &PrivateNodeIdentity,
+                      control,
+                      local_application,
+                      source_evidence,
+                      stable_projection,
+                      key: &PrivateNodeDecryptionKey| {
+            certificate.verify_for(
+                route,
+                owner,
+                descriptor,
+                destination,
+                control,
+                local_application,
+                source_evidence,
+                stable_projection,
+                key,
+            )
+        };
+        let invalid = Err(PrivateCryptoError::InvalidSignature);
+        let mut wrong_route = route;
+        wrong_route.space.0[0] ^= 1;
+        assert_eq!(
+            verify(
+                wrong_route,
+                fixture.owner,
+                descriptor,
+                &destination.identity,
+                control,
+                local_application,
+                source_evidence,
+                stable_projection,
+                &destination.key,
+            ),
+            invalid
+        );
+        wrong_route = route;
+        wrong_route.agent.0[0] ^= 1;
+        assert_eq!(
+            verify(
+                wrong_route,
+                fixture.owner,
+                descriptor,
+                &destination.identity,
+                control,
+                local_application,
+                source_evidence,
+                stable_projection,
+                &destination.key,
+            ),
+            invalid
+        );
+        wrong_route = route;
+        wrong_route.runtime_deployment.0[0] ^= 1;
+        assert_eq!(
+            verify(
+                wrong_route,
+                fixture.owner,
+                descriptor,
+                &destination.identity,
+                control,
+                local_application,
+                source_evidence,
+                stable_projection,
+                &destination.key,
+            ),
+            invalid
+        );
+        let mut wrong_destination = destination.identity.clone();
+        wrong_destination.authority_binding.0[0] ^= 1;
+        for result in [
+            verify(
+                route,
+                PrincipalId([0x47; 32]),
+                descriptor,
+                &destination.identity,
+                control,
+                local_application,
+                source_evidence,
+                stable_projection,
+                &destination.key,
+            ),
+            verify(
+                route,
+                fixture.owner,
+                Hash([0x48; 32]),
+                &destination.identity,
+                control,
+                local_application,
+                source_evidence,
+                stable_projection,
+                &destination.key,
+            ),
+            verify(
+                route,
+                fixture.owner,
+                descriptor,
+                &wrong_destination,
+                control,
+                local_application,
+                source_evidence,
+                stable_projection,
+                &destination.key,
+            ),
+            verify(
+                route,
+                fixture.owner,
+                descriptor,
+                &destination.identity,
+                Hash([0x49; 32]),
+                local_application,
+                source_evidence,
+                stable_projection,
+                &destination.key,
+            ),
+            verify(
+                route,
+                fixture.owner,
+                descriptor,
+                &destination.identity,
+                control,
+                Hash([0x4a; 32]),
+                source_evidence,
+                stable_projection,
+                &destination.key,
+            ),
+            verify(
+                route,
+                fixture.owner,
+                descriptor,
+                &destination.identity,
+                control,
+                local_application,
+                Hash([0x4b; 32]),
+                stable_projection,
+                &destination.key,
+            ),
+            verify(
+                route,
+                fixture.owner,
+                descriptor,
+                &destination.identity,
+                control,
+                local_application,
+                source_evidence,
+                Hash([0x4c; 32]),
+                &destination.key,
+            ),
+            verify(
+                route,
+                fixture.owner,
+                descriptor,
+                &fixture.recipients[1].identity,
+                control,
+                local_application,
+                source_evidence,
+                stable_projection,
+                &fixture.recipients[1].key,
+            ),
+        ] {
+            assert_eq!(result, invalid);
+        }
+
+        assert_eq!(
+            PrivateStableImportCertificate::issue(
+                route,
+                fixture.owner,
+                descriptor,
+                &destination.identity,
+                Hash::ZERO,
+                local_application,
+                source_evidence,
+                stable_projection,
+                &destination.key,
+            ),
+            Err(PrivateCryptoError::InvalidRecord)
+        );
+        assert_eq!(
+            PrivateStableImportCertificate::issue(
+                route,
+                fixture.owner,
+                descriptor,
+                &destination.identity,
+                control,
+                local_application,
+                source_evidence,
+                stable_projection,
+                &fixture.recipients[1].key,
+            ),
+            Err(PrivateCryptoError::InvalidScope)
+        );
     }
 
     struct Recipient {

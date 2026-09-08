@@ -6,6 +6,7 @@
 //! record bootstraps verification; a sorted index is advanced with each
 //! artifact through a durable stage -> artifact -> index/head transaction.
 
+use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
@@ -32,8 +33,8 @@ use vos_agent_sdk::wire::{
 use vos_agent_sdk::{AgentId, Hash, PrincipalId, RUNTIME_ABI_ID, SpaceId};
 
 use super::private_crypto::{
-    MAX_PRIVATE_CONTROL_RECORDS, PrivateControlChainVerifier, PrivateCryptoError,
-    PrivateNodeAuthorityVerifier,
+    MAX_PRIVATE_CONTROL_RECORDS, PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES,
+    PrivateControlChainVerifier, PrivateCryptoError, PrivateNodeAuthorityVerifier,
 };
 use super::private_runtime::{
     MAX_PRIVATE_RUNTIME_APPLICATION_WIRE_BYTES, PrivateKeyEpochCommitment,
@@ -88,8 +89,12 @@ const STAGED_RUNTIME_APPLICATION: &str = "runtime-application.next";
 const STAGED_INDEX: &str = "index.next";
 const PENDING_FILE: &str = "pending";
 const STAGED_CONTROL_EVIDENCE: &str = "control-authority-evidence.next";
+const STAGED_STABLE_IMPORT_CERTIFICATE: &str = "stable-import-certificate.next";
 const PENDING_CONTROL_EVIDENCE: &str = "control-authority-evidence.pending";
-const CONTROL_EVIDENCE_PENDING_MAGIC: &[u8; 4] = b"PVEP";
+// PVE2 binds an optional destination-authenticated PSI1 to the same durable
+// terminal attachment transaction as its exact source PSE2.
+const CONTROL_EVIDENCE_PENDING_MAGIC: &[u8; 4] = b"PVE2";
+const MAX_PENDING_CONTROL_EVIDENCE_BYTES: usize = 192;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrivateStoreError {
@@ -284,6 +289,13 @@ struct PendingControlEvidence {
     control: Hash,
     evidence_hash: Hash,
     evidence_len: u32,
+    stable_import_certificate: Option<PendingStableImportCertificate>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingStableImportCertificate {
+    wire_hash: Hash,
+    wire_len: u32,
 }
 
 /// Control-chain-authenticated, bounded ciphertext archive held only while an
@@ -364,9 +376,13 @@ pub(crate) enum CommitStop {
 pub(crate) enum ControlEvidenceCommitStop {
     Never,
     #[cfg(test)]
+    AfterEvidenceStaged,
+    #[cfg(test)]
     AfterStaged,
     #[cfg(test)]
     AfterPending,
+    #[cfg(test)]
+    AfterCertificatePublished,
     #[cfg(test)]
     AfterPublished,
     #[cfg(test)]
@@ -1149,6 +1165,12 @@ fn encode_pending_control_evidence(
         || pending.evidence_hash == Hash::ZERO
         || pending.evidence_len == 0
         || pending.evidence_len as usize > MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES
+        || pending
+            .stable_import_certificate
+            .is_some_and(|certificate| {
+                certificate.wire_hash == Hash::ZERO
+                    || certificate.wire_len as usize != PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES
+            })
     {
         return Err(PrivateStoreError::Corrupt);
     }
@@ -1156,17 +1178,37 @@ fn encode_pending_control_evidence(
     encoder.fixed(pending.control.as_bytes());
     encoder.fixed(pending.evidence_hash.as_bytes());
     encoder.u32(pending.evidence_len);
-    encoder.finish(128)
+    match pending.stable_import_certificate {
+        None => encoder.u8(0),
+        Some(certificate) => {
+            encoder.u8(1);
+            encoder.fixed(certificate.wire_hash.as_bytes());
+            encoder.u32(certificate.wire_len);
+        }
+    }
+    encoder.finish(MAX_PENDING_CONTROL_EVIDENCE_BYTES)
 }
 
 fn decode_pending_control_evidence(
     bytes: &[u8],
 ) -> Result<PendingControlEvidence, PrivateStoreError> {
-    let mut decoder = Decoder::new(bytes, CONTROL_EVIDENCE_PENDING_MAGIC, 128)?;
+    let mut decoder = Decoder::new(
+        bytes,
+        CONTROL_EVIDENCE_PENDING_MAGIC,
+        MAX_PENDING_CONTROL_EVIDENCE_BYTES,
+    )?;
     let pending = PendingControlEvidence {
         control: Hash(decoder.fixed()?),
         evidence_hash: Hash(decoder.fixed()?),
         evidence_len: decoder.u32()?,
+        stable_import_certificate: match decoder.u8()? {
+            0 => None,
+            1 => Some(PendingStableImportCertificate {
+                wire_hash: Hash(decoder.fixed()?),
+                wire_len: decoder.u32()?,
+            }),
+            _ => return Err(PrivateStoreError::Corrupt),
+        },
     };
     decoder.finish()?;
     if encode_pending_control_evidence(pending)?.as_slice() != bytes {
@@ -2071,6 +2113,17 @@ fn remove_file_if_present(path: &Path) -> Result<(), PrivateStoreError> {
     }
 }
 
+fn require_paths_absent(paths: &[&Path]) -> Result<(), PrivateStoreError> {
+    for path in paths {
+        match fs::symlink_metadata(path) {
+            Ok(_) => return Err(PrivateStoreError::Corrupt),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(PrivateStoreError::Io),
+        }
+    }
+    Ok(())
+}
+
 fn hash_name(hash: Hash) -> String {
     let mut name = String::with_capacity(64);
     for byte in hash.as_bytes() {
@@ -2107,6 +2160,96 @@ fn control_evidence_file_name(commitment: Hash) -> String {
     let mut name = hash_name(commitment);
     name.push_str(".pse");
     name
+}
+
+fn stable_import_certificate_file_name(commitment: Hash) -> String {
+    let mut name = hash_name(commitment);
+    name.push_str(".psic");
+    name
+}
+
+fn decode_hash_name(name: &str) -> Option<Hash> {
+    if name.len() != 64 || !name.is_ascii() {
+        return None;
+    }
+    let mut value = [0; 32];
+    for (index, pair) in name.as_bytes().chunks_exact(2).enumerate() {
+        let high = decode_lower_hex(pair[0])?;
+        let low = decode_lower_hex(pair[1])?;
+        value[index] = (high << 4) | low;
+    }
+    let value = Hash(value);
+    (value != Hash::ZERO).then_some(value)
+}
+
+fn decode_lower_hex(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn validate_control_attachment_directory(
+    root: &Path,
+    controls: &[StoredControlIndex],
+) -> Result<(), PrivateStoreError> {
+    let indexed: BTreeSet<_> = controls.iter().map(|entry| entry.commitment).collect();
+    let completed_applications: BTreeSet<_> = controls
+        .iter()
+        .filter(|entry| entry.runtime_application.is_some())
+        .map(|entry| entry.commitment)
+        .collect();
+    let maximum = controls
+        .len()
+        .checked_mul(2)
+        .ok_or(PrivateStoreError::LimitExceeded)?;
+    let mut count = 0usize;
+    let mut evidence_controls = BTreeSet::new();
+    let mut certificate_controls = BTreeSet::new();
+    for entry in fs::read_dir(root.join(CONTROL_EVIDENCE_DIR)).map_err(map_io)? {
+        let entry = entry.map_err(map_io)?;
+        count = count
+            .checked_add(1)
+            .ok_or(PrivateStoreError::LimitExceeded)?;
+        if count > maximum {
+            return Err(PrivateStoreError::Corrupt);
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| PrivateStoreError::Corrupt)?;
+        let (encoded, certificate) = if let Some(encoded) = name.strip_suffix(".pse") {
+            (encoded, false)
+        } else if let Some(encoded) = name.strip_suffix(".psic") {
+            (encoded, true)
+        } else {
+            return Err(PrivateStoreError::Corrupt);
+        };
+        let control = decode_hash_name(encoded).ok_or(PrivateStoreError::Corrupt)?;
+        let file_type = entry.file_type().map_err(map_io)?;
+        if file_type.is_symlink() || !file_type.is_file() || !indexed.contains(&control) {
+            return Err(PrivateStoreError::Corrupt);
+        }
+        let length = entry.metadata().map_err(map_io)?.len();
+        if certificate {
+            if length != PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES as u64
+                || !completed_applications.contains(&control)
+                || !certificate_controls.insert(control)
+            {
+                return Err(PrivateStoreError::Corrupt);
+            }
+        } else if length == 0
+            || length > MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES as u64
+            || !evidence_controls.insert(control)
+        {
+            return Err(PrivateStoreError::Corrupt);
+        }
+    }
+    if !certificate_controls.is_subset(&evidence_controls) {
+        return Err(PrivateStoreError::Corrupt);
+    }
+    Ok(())
 }
 
 fn artifact_path(root: &Path, artifact: &PendingArtifact) -> PathBuf {
@@ -2386,23 +2529,70 @@ fn publish_control_evidence(
     let target = root
         .join(CONTROL_EVIDENCE_DIR)
         .join(control_evidence_file_name(pending.control));
-    if target.exists() {
-        verify_file_identity(
-            &target,
-            pending.evidence_hash,
-            pending.evidence_len,
-            MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES,
-        )?;
+    publish_control_attachment(
+        root,
+        &staged,
+        &target,
+        pending.evidence_hash,
+        pending.evidence_len,
+        MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES,
+    )
+}
+
+fn publish_stable_import_certificate(
+    root: &Path,
+    pending: PendingControlEvidence,
+) -> Result<(), PrivateStoreError> {
+    let staged = root.join(STAGE_DIR).join(STAGED_STABLE_IMPORT_CERTIFICATE);
+    let target = root
+        .join(CONTROL_EVIDENCE_DIR)
+        .join(stable_import_certificate_file_name(pending.control));
+    let Some(certificate) = pending.stable_import_certificate else {
+        match fs::symlink_metadata(&target) {
+            Ok(_) => return Err(PrivateStoreError::Corrupt),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(PrivateStoreError::Io),
+        }
         remove_file_if_present(&staged)?;
-    } else {
-        verify_file_identity(
-            &staged,
-            pending.evidence_hash,
-            pending.evidence_len,
-            MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES,
-        )?;
-        fs::rename(&staged, &target).map_err(map_io)?;
-        sync_directory(&root.join(CONTROL_EVIDENCE_DIR))?;
+        return Ok(());
+    };
+    publish_control_attachment(
+        root,
+        &staged,
+        &target,
+        certificate.wire_hash,
+        certificate.wire_len,
+        PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES,
+    )
+}
+
+fn publish_control_attachment(
+    root: &Path,
+    staged: &Path,
+    target: &Path,
+    expected_hash: Hash,
+    expected_len: u32,
+    maximum: usize,
+) -> Result<(), PrivateStoreError> {
+    match fs::symlink_metadata(target) {
+        Ok(_) => {
+            verify_file_identity(target, expected_hash, expected_len, maximum)?;
+            remove_file_if_present(staged)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            verify_file_identity(staged, expected_hash, expected_len, maximum).map_err(
+                |error| {
+                    if error == PrivateStoreError::NotFound {
+                        PrivateStoreError::Corrupt
+                    } else {
+                        error
+                    }
+                },
+            )?;
+            fs::rename(staged, target).map_err(map_io)?;
+            sync_directory(&root.join(CONTROL_EVIDENCE_DIR))?;
+        }
+        Err(_) => return Err(PrivateStoreError::Io),
     }
     Ok(())
 }
@@ -2410,16 +2600,26 @@ fn publish_control_evidence(
 fn reconcile_pending_control_evidence(root: &Path) -> Result<(), PrivateStoreError> {
     let stage_dir = root.join(STAGE_DIR);
     let pending_path = stage_dir.join(PENDING_CONTROL_EVIDENCE);
-    if !pending_path.exists() {
-        remove_file_if_present(&stage_dir.join(STAGED_CONTROL_EVIDENCE))?;
-        sync_directory(&stage_dir)?;
-        return Ok(());
+    match fs::symlink_metadata(&pending_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(PrivateStoreError::Corrupt);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            remove_file_if_present(&stage_dir.join(STAGED_CONTROL_EVIDENCE))?;
+            remove_file_if_present(&stage_dir.join(STAGED_STABLE_IMPORT_CERTIFICATE))?;
+            sync_directory(&stage_dir)?;
+            return Ok(());
+        }
+        Err(_) => return Err(PrivateStoreError::Io),
     }
-    let bytes = read_bounded_file(&pending_path, 128)?;
+    let bytes = read_bounded_file(&pending_path, MAX_PENDING_CONTROL_EVIDENCE_BYTES)?;
     let pending = decode_pending_control_evidence(&bytes)?;
+    publish_stable_import_certificate(root, pending)?;
     publish_control_evidence(root, pending)?;
     remove_file_if_present(&pending_path)?;
     remove_file_if_present(&stage_dir.join(STAGED_CONTROL_EVIDENCE))?;
+    remove_file_if_present(&stage_dir.join(STAGED_STABLE_IMPORT_CERTIFICATE))?;
     sync_directory(&stage_dir)
 }
 
@@ -2696,6 +2896,7 @@ impl PrivateStore {
             }
             validate_object_index_entry(entry, &object, metadata.space, metadata.agent)?;
         }
+        validate_control_attachment_directory(&root, &index.controls)?;
         let cached_core_position = store_core_position(&metadata, &index, &key_epochs)?;
         Ok(Self {
             root,
@@ -3621,6 +3822,48 @@ impl PrivateStore {
         }
     }
 
+    /// Read the opaque destination-authenticated PSI1 paired with one PSE2.
+    ///
+    /// Store validates only the exact fixed wire size and filesystem identity;
+    /// the physical host must canonically decode and authenticate PSI1 with
+    /// its independently supplied destination-node key and runtime context.
+    pub(crate) fn read_stable_import_certificate(
+        &self,
+        entry: &StoredControlIndex,
+    ) -> Result<Option<Vec<u8>>, PrivateStoreError> {
+        #[cfg(test)]
+        self.artifact_reads.set(self.artifact_reads.get() + 1);
+        if !self
+            .index
+            .controls
+            .iter()
+            .any(|candidate| candidate == entry)
+        {
+            return Err(PrivateStoreError::InvalidRecord);
+        }
+        let path = self
+            .root
+            .join(CONTROL_EVIDENCE_DIR)
+            .join(stable_import_certificate_file_name(entry.commitment));
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                Err(PrivateStoreError::Corrupt)
+            }
+            Ok(_) => {
+                if entry.runtime_application.is_none() {
+                    return Err(PrivateStoreError::Corrupt);
+                }
+                let bytes = read_bounded_file(&path, PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES)?;
+                if bytes.len() != PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES {
+                    return Err(PrivateStoreError::Corrupt);
+                }
+                Ok(Some(bytes))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(PrivateStoreError::Io),
+        }
+    }
+
     /// Attach the exact post-coordinator PSE2 bytes to an existing PCTL.
     ///
     /// The store intentionally treats the bytes as opaque. The host adapter
@@ -3634,6 +3877,25 @@ impl PrivateStore {
         self.persist_control_authority_evidence_inner(
             control,
             evidence,
+            None,
+            ControlEvidenceCommitStop::Never,
+        )
+    }
+
+    /// Atomically attach one source PSE2 and its destination-authenticated
+    /// PSI1 to an already completed local PAPL/PCTL row. The Store treats both
+    /// byte strings as opaque; only the host may establish ImportedStable
+    /// provenance before entering this persistence seam.
+    pub(crate) fn persist_imported_control_authority_evidence(
+        &mut self,
+        control: Hash,
+        evidence: &[u8],
+        stable_import_certificate: &[u8],
+    ) -> Result<PutDisposition, PrivateStoreError> {
+        self.persist_control_authority_evidence_inner(
+            control,
+            evidence,
+            Some(stable_import_certificate),
             ControlEvidenceCommitStop::Never,
         )
     }
@@ -3644,13 +3906,14 @@ impl PrivateStore {
         evidence: &[u8],
         stop: ControlEvidenceCommitStop,
     ) -> Result<PutDisposition, PrivateStoreError> {
-        self.persist_control_authority_evidence_inner(control, evidence, stop)
+        self.persist_control_authority_evidence_inner(control, evidence, None, stop)
     }
 
     fn persist_control_authority_evidence_inner(
         &mut self,
         control: Hash,
         evidence: &[u8],
+        stable_import_certificate: Option<&[u8]>,
         stop: ControlEvidenceCommitStop,
     ) -> Result<PutDisposition, PrivateStoreError> {
         #[cfg(not(test))]
@@ -3658,6 +3921,9 @@ impl PrivateStore {
         if control == Hash::ZERO
             || evidence.is_empty()
             || evidence.len() > MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES
+            || stable_import_certificate.is_some_and(|certificate| {
+                certificate.len() != PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES
+            })
             || !self
                 .index
                 .controls
@@ -3667,34 +3933,50 @@ impl PrivateStore {
             return Err(PrivateStoreError::InvalidRecord);
         }
         reconcile_pending_control_evidence(&self.root)?;
-        let target = self
-            .root
-            .join(CONTROL_EVIDENCE_DIR)
-            .join(control_evidence_file_name(control));
-        match fs::symlink_metadata(&target) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-                return Err(PrivateStoreError::Corrupt);
+        let entry = self
+            .index
+            .controls
+            .iter()
+            .find(|entry| entry.commitment == control)
+            .cloned()
+            .ok_or(PrivateStoreError::InvalidRecord)?;
+        if stable_import_certificate.is_some() && entry.runtime_application.is_none() {
+            return Err(PrivateStoreError::InvalidRecord);
+        }
+        let existing_evidence = self.read_control_authority_evidence(&entry)?;
+        let existing_certificate = self.read_stable_import_certificate(&entry)?;
+        match (existing_evidence, existing_certificate) {
+            (None, None) => {}
+            (Some(existing), certificate)
+                if existing.as_slice() == evidence
+                    && certificate.as_deref() == stable_import_certificate =>
+            {
+                return Ok(PutDisposition::AlreadyPresent);
             }
-            Ok(_) => {
-                let existing =
-                    read_bounded_file(&target, MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES)?;
-                return if existing == evidence {
-                    Ok(PutDisposition::AlreadyPresent)
-                } else {
-                    Err(PrivateStoreError::Alias)
-                };
+            (Some(_), Some(_)) if stable_import_certificate.is_some() => {
+                return Err(PrivateStoreError::Alias);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(PrivateStoreError::Io),
+            (Some(existing), None)
+                if stable_import_certificate.is_none() && existing.as_slice() != evidence =>
+            {
+                return Err(PrivateStoreError::Alias);
+            }
+            _ => return Err(PrivateStoreError::Corrupt),
         }
 
         let stage_dir = self.root.join(STAGE_DIR);
         let staged = stage_dir.join(STAGED_CONTROL_EVIDENCE);
+        let staged_certificate = stage_dir.join(STAGED_STABLE_IMPORT_CERTIFICATE);
         let pending_path = stage_dir.join(PENDING_CONTROL_EVIDENCE);
-        if staged.exists() || pending_path.exists() {
-            return Err(PrivateStoreError::Corrupt);
-        }
+        require_paths_absent(&[&staged, &staged_certificate, &pending_path])?;
         write_new_synced(&staged, evidence)?;
+        #[cfg(test)]
+        if stop == ControlEvidenceCommitStop::AfterEvidenceStaged {
+            return Err(PrivateStoreError::Interrupted);
+        }
+        if let Some(certificate) = stable_import_certificate {
+            write_new_synced(&staged_certificate, certificate)?;
+        }
         #[cfg(test)]
         if stop == ControlEvidenceCommitStop::AfterStaged {
             return Err(PrivateStoreError::Interrupted);
@@ -3704,11 +3986,25 @@ impl PrivateStore {
             evidence_hash: raw_wire_hash(evidence),
             evidence_len: u32::try_from(evidence.len())
                 .map_err(|_| PrivateStoreError::LimitExceeded)?,
+            stable_import_certificate: stable_import_certificate
+                .map(|certificate| -> Result<_, PrivateStoreError> {
+                    Ok(PendingStableImportCertificate {
+                        wire_hash: raw_wire_hash(certificate),
+                        wire_len: u32::try_from(certificate.len())
+                            .map_err(|_| PrivateStoreError::LimitExceeded)?,
+                    })
+                })
+                .transpose()?,
         };
         write_new_synced(&pending_path, &encode_pending_control_evidence(pending)?)?;
         sync_directory(&stage_dir)?;
         #[cfg(test)]
         if stop == ControlEvidenceCommitStop::AfterPending {
+            return Err(PrivateStoreError::Interrupted);
+        }
+        publish_stable_import_certificate(&self.root, pending)?;
+        #[cfg(test)]
+        if stop == ControlEvidenceCommitStop::AfterCertificatePublished {
             return Err(PrivateStoreError::Interrupted);
         }
         publish_control_evidence(&self.root, pending)?;
@@ -3717,6 +4013,7 @@ impl PrivateStore {
             return Err(PrivateStoreError::Interrupted);
         }
         remove_file_if_present(&pending_path)?;
+        remove_file_if_present(&staged_certificate)?;
         #[cfg(test)]
         if stop == ControlEvidenceCommitStop::AfterRetired {
             return Err(PrivateStoreError::Interrupted);
@@ -4740,6 +5037,21 @@ mod tests {
         (successor, pending, completed)
     }
 
+    fn runtime_store_with_completed_control(
+        path: &Path,
+        marker: u8,
+    ) -> (PrivateStore, RuntimeStoreFixture, PrivateControlRecord) {
+        let (mut store, fixture) = runtime_store_fixture(path);
+        let invited = recipient(&fixture.store_fixture, 0xc1);
+        let control = invite_control(&store, &fixture.store_fixture, invited);
+        let (_, _, application) =
+            completed_runtime_application(&store, &fixture, &fixture.predecessor, &control, marker);
+        store
+            .append_control_with_runtime_application(&control, &application, &TestAuthority)
+            .unwrap();
+        (store, fixture, control)
+    }
+
     fn control(fixture: &Fixture, sequence: u64, previous: Option<Hash>) -> PrivateControlRecord {
         let mut record = PrivateControlRecord {
             space: fixture.space,
@@ -5541,8 +5853,10 @@ mod tests {
     fn evidence_attachment_reconciles_every_write_boundary_and_rejects_aliases() {
         let fixture = fixture();
         for (index, stop) in [
+            ControlEvidenceCommitStop::AfterEvidenceStaged,
             ControlEvidenceCommitStop::AfterStaged,
             ControlEvidenceCommitStop::AfterPending,
+            ControlEvidenceCommitStop::AfterCertificatePublished,
             ControlEvidenceCommitStop::AfterPublished,
             ControlEvidenceCommitStop::AfterRetired,
         ]
@@ -5560,6 +5874,7 @@ mod tests {
                 store.persist_control_authority_evidence_inner(
                     record.commitment(),
                     &evidence,
+                    None,
                     stop,
                 ),
                 Err(PrivateStoreError::Interrupted)
@@ -5570,7 +5885,11 @@ mod tests {
                 PrivateStore::open(&path, fixture.space, fixture.agent, &TestAuthority).unwrap();
             let entry = &reopened.indexed_controls()[0];
             let recovered = reopened.read_control_authority_evidence(entry).unwrap();
-            if stop == ControlEvidenceCommitStop::AfterStaged {
+            if matches!(
+                stop,
+                ControlEvidenceCommitStop::AfterEvidenceStaged
+                    | ControlEvidenceCommitStop::AfterStaged
+            ) {
                 assert_eq!(recovered, None);
             } else {
                 assert_eq!(recovered.as_deref(), Some(evidence.as_slice()));
@@ -5590,6 +5909,553 @@ mod tests {
                 Err(PrivateStoreError::Alias)
             );
         }
+    }
+
+    #[test]
+    fn imported_evidence_pair_reconciles_every_pve2_write_boundary_exactly() {
+        for (index, stop) in [
+            ControlEvidenceCommitStop::AfterEvidenceStaged,
+            ControlEvidenceCommitStop::AfterStaged,
+            ControlEvidenceCommitStop::AfterPending,
+            ControlEvidenceCommitStop::AfterCertificatePublished,
+            ControlEvidenceCommitStop::AfterPublished,
+            ControlEvidenceCommitStop::AfterRetired,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let directory = TestDirectory::new(&format!("imported-evidence-stop-{index}"));
+            let path = directory.store();
+            let (mut store, fixture, control) =
+                runtime_store_with_completed_control(&path, 0x80 + index as u8);
+            let mut evidence = b"PSE2-source-authority-evidence-".to_vec();
+            evidence.push(index as u8);
+            let certificate =
+                vec![0xa0 + index as u8; PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES];
+            assert_eq!(
+                store.persist_control_authority_evidence_inner(
+                    control.commitment(),
+                    &evidence,
+                    Some(&certificate),
+                    stop,
+                ),
+                Err(PrivateStoreError::Interrupted)
+            );
+            drop(store);
+
+            let mut reopened = PrivateStore::open(
+                &path,
+                fixture.store_fixture.space,
+                fixture.store_fixture.agent,
+                &TestAuthority,
+            )
+            .unwrap();
+            let entry = &reopened.indexed_controls()[0];
+            let recovered_evidence = reopened.read_control_authority_evidence(entry).unwrap();
+            let recovered_certificate = reopened.read_stable_import_certificate(entry).unwrap();
+            if matches!(
+                stop,
+                ControlEvidenceCommitStop::AfterEvidenceStaged
+                    | ControlEvidenceCommitStop::AfterStaged
+            ) {
+                assert_eq!(recovered_evidence, None);
+                assert_eq!(recovered_certificate, None);
+            } else {
+                assert_eq!(recovered_evidence.as_deref(), Some(evidence.as_slice()));
+                assert_eq!(
+                    recovered_certificate.as_deref(),
+                    Some(certificate.as_slice())
+                );
+            }
+            for staged in [
+                STAGED_CONTROL_EVIDENCE,
+                STAGED_STABLE_IMPORT_CERTIFICATE,
+                PENDING_CONTROL_EVIDENCE,
+            ] {
+                assert!(!path.join(STAGE_DIR).join(staged).exists());
+            }
+            assert!(matches!(
+                reopened.persist_imported_control_authority_evidence(
+                    control.commitment(),
+                    &evidence,
+                    &certificate,
+                ),
+                Ok(PutDisposition::Inserted | PutDisposition::AlreadyPresent)
+            ));
+            assert_eq!(
+                reopened.persist_imported_control_authority_evidence(
+                    control.commitment(),
+                    &evidence,
+                    &certificate,
+                ),
+                Ok(PutDisposition::AlreadyPresent)
+            );
+        }
+    }
+
+    #[test]
+    fn imported_evidence_rejects_aliases_asymmetry_and_missing_local_application() {
+        let directory = TestDirectory::new("imported-evidence-alias");
+        let path = directory.store();
+        let (mut store, fixture, imported_control) =
+            runtime_store_with_completed_control(&path, 0x91);
+        let evidence = b"PSE2-source-evidence-for-import".to_vec();
+        let certificate = vec![0x92; PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES];
+        assert_eq!(
+            store.persist_imported_control_authority_evidence(
+                imported_control.commitment(),
+                &evidence,
+                &certificate,
+            ),
+            Ok(PutDisposition::Inserted)
+        );
+        let mut evidence_alias = evidence.clone();
+        evidence_alias.push(0xff);
+        assert_eq!(
+            store.persist_imported_control_authority_evidence(
+                imported_control.commitment(),
+                &evidence_alias,
+                &certificate,
+            ),
+            Err(PrivateStoreError::Alias)
+        );
+        let mut certificate_alias = certificate.clone();
+        certificate_alias[0] ^= 1;
+        assert_eq!(
+            store.persist_imported_control_authority_evidence(
+                imported_control.commitment(),
+                &evidence,
+                &certificate_alias,
+            ),
+            Err(PrivateStoreError::Alias)
+        );
+        assert_eq!(
+            store.persist_control_authority_evidence(imported_control.commitment(), &evidence),
+            Err(PrivateStoreError::Corrupt)
+        );
+        assert_eq!(
+            store.persist_imported_control_authority_evidence(
+                imported_control.commitment(),
+                &evidence,
+                &certificate[..certificate.len() - 1],
+            ),
+            Err(PrivateStoreError::InvalidRecord)
+        );
+        let mut oversized = certificate.clone();
+        oversized.push(0);
+        assert_eq!(
+            store.persist_imported_control_authority_evidence(
+                imported_control.commitment(),
+                &evidence,
+                &oversized,
+            ),
+            Err(PrivateStoreError::InvalidRecord)
+        );
+        assert_eq!(
+            store.persist_imported_control_authority_evidence(
+                Hash([0x93; 32]),
+                &evidence,
+                &certificate,
+            ),
+            Err(PrivateStoreError::InvalidRecord)
+        );
+
+        let local_directory = TestDirectory::new("imported-after-local-evidence");
+        let local_path = local_directory.store();
+        let (mut local, _, local_control) = runtime_store_with_completed_control(&local_path, 0x94);
+        local
+            .persist_control_authority_evidence(local_control.commitment(), &evidence)
+            .unwrap();
+        assert_eq!(
+            local.persist_imported_control_authority_evidence(
+                local_control.commitment(),
+                &evidence,
+                &certificate,
+            ),
+            Err(PrivateStoreError::Corrupt)
+        );
+
+        let bare_directory = TestDirectory::new("imported-without-local-application");
+        let bare_path = bare_directory.store();
+        let mut bare = create_store(&bare_path, &fixture.store_fixture);
+        let bare_control = control(&fixture.store_fixture, 0, None);
+        bare.append_control(&bare_control, &TestAuthority).unwrap();
+        assert_eq!(
+            bare.persist_imported_control_authority_evidence(
+                bare_control.commitment(),
+                &evidence,
+                &certificate,
+            ),
+            Err(PrivateStoreError::InvalidRecord)
+        );
+        assert_eq!(
+            bare.read_control_authority_evidence(&bare.indexed_controls()[0]),
+            Ok(None)
+        );
+        assert_eq!(
+            bare.read_stable_import_certificate(&bare.indexed_controls()[0]),
+            Ok(None)
+        );
+        fs::write(
+            bare_path
+                .join(CONTROL_EVIDENCE_DIR)
+                .join(control_evidence_file_name(bare_control.commitment())),
+            &evidence,
+        )
+        .unwrap();
+        fs::write(
+            bare_path
+                .join(CONTROL_EVIDENCE_DIR)
+                .join(stable_import_certificate_file_name(
+                    bare_control.commitment(),
+                )),
+            &certificate,
+        )
+        .unwrap();
+        assert_eq!(
+            bare.read_stable_import_certificate(&bare.indexed_controls()[0]),
+            Err(PrivateStoreError::Corrupt)
+        );
+        drop(bare);
+        assert_eq!(
+            PrivateStore::open(
+                &bare_path,
+                fixture.store_fixture.space,
+                fixture.store_fixture.agent,
+                &TestAuthority,
+            )
+            .err(),
+            Some(PrivateStoreError::Corrupt)
+        );
+    }
+
+    #[test]
+    fn pve2_pending_codec_is_canonical_and_rejects_prior_generation() {
+        let pending = PendingControlEvidence {
+            control: Hash([0xb1; 32]),
+            evidence_hash: Hash([0xb2; 32]),
+            evidence_len: 73,
+            stable_import_certificate: Some(PendingStableImportCertificate {
+                wire_hash: Hash([0xb3; 32]),
+                wire_len: PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES as u32,
+            }),
+        };
+        let wire = encode_pending_control_evidence(pending).unwrap();
+        assert_eq!(decode_pending_control_evidence(&wire), Ok(pending));
+
+        let mut old_generation = wire.clone();
+        old_generation[..4].copy_from_slice(b"PVEP");
+        assert_eq!(
+            decode_pending_control_evidence(&old_generation),
+            Err(PrivateStoreError::Corrupt)
+        );
+        let mut invalid_option = wire.clone();
+        invalid_option[4 + 2 + 32 + 32 + 4] = 2;
+        assert_eq!(
+            decode_pending_control_evidence(&invalid_option),
+            Err(PrivateStoreError::Corrupt)
+        );
+        let mut trailing = wire.clone();
+        trailing.push(0);
+        assert_eq!(
+            decode_pending_control_evidence(&trailing),
+            Err(PrivateStoreError::Corrupt)
+        );
+        assert_eq!(
+            encode_pending_control_evidence(PendingControlEvidence {
+                stable_import_certificate: Some(PendingStableImportCertificate {
+                    wire_len: PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES as u32 - 1,
+                    ..pending.stable_import_certificate.unwrap()
+                }),
+                ..pending
+            }),
+            Err(PrivateStoreError::Corrupt)
+        );
+    }
+
+    #[test]
+    fn stable_import_certificates_are_node_local_and_excluded_from_pvb3_pvs3() {
+        let directory = TestDirectory::new("imported-evidence-archive-exclusion");
+        let path = directory.store();
+        let (mut store, fixture, control) = runtime_store_with_completed_control(&path, 0xc1);
+        let evidence = b"PSE2-portable-source-authority-evidence".to_vec();
+        let certificate: Vec<_> = (0..PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES)
+            .map(|index| 0x80 | (index % 0x71) as u8)
+            .collect();
+        store
+            .persist_imported_control_authority_evidence(
+                control.commitment(),
+                &evidence,
+                &certificate,
+            )
+            .unwrap();
+        let backup = store
+            .export_encrypted_backup(MAX_PRIVATE_BACKUP_BYTES)
+            .unwrap();
+        let snapshot = store
+            .export_encrypted_snapshot(MAX_PRIVATE_BACKUP_BYTES)
+            .unwrap();
+        for portable in [&backup, &snapshot] {
+            assert!(
+                !portable
+                    .windows(certificate.len())
+                    .any(|window| window == certificate)
+            );
+        }
+        let verified = verify_encrypted_backup(
+            &backup,
+            fixture.store_fixture.space,
+            fixture.store_fixture.agent,
+            fixture.store_fixture.owner,
+            fixture.store_fixture.recovery.verifying_key(),
+            fixture.store_fixture.recovery_encryption.public_key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(verified.control_evidence, vec![Some(evidence.clone())]);
+        drop(store);
+
+        let restored_path = directory.0.join("restored");
+        let (restored, _) = PrivateStore::restore_encrypted_backup(
+            &restored_path,
+            fixture.store_fixture.space,
+            fixture.store_fixture.agent,
+            fixture.store_fixture.owner,
+            fixture.store_fixture.recovery.verifying_key(),
+            fixture.store_fixture.recovery_encryption.public_key(),
+            &backup,
+            &TestAuthority,
+        )
+        .unwrap();
+        let entry = &restored.indexed_controls()[0];
+        assert_eq!(
+            restored.read_control_authority_evidence(entry),
+            Ok(Some(evidence))
+        );
+        assert_eq!(restored.read_stable_import_certificate(entry), Ok(None));
+    }
+
+    #[test]
+    fn stable_import_certificate_scan_rejects_orphans_asymmetry_and_bad_shape() {
+        let fixture = fixture();
+        let certificate = vec![0xd1; PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES];
+
+        let orphan_directory = TestDirectory::new("orphan-import-certificate");
+        let orphan_path = orphan_directory.store();
+        drop(create_store(&orphan_path, &fixture));
+        fs::write(
+            orphan_path
+                .join(CONTROL_EVIDENCE_DIR)
+                .join(stable_import_certificate_file_name(Hash([0xd2; 32]))),
+            &certificate,
+        )
+        .unwrap();
+        assert_eq!(
+            PrivateStore::open(&orphan_path, fixture.space, fixture.agent, &TestAuthority,).err(),
+            Some(PrivateStoreError::Corrupt)
+        );
+
+        let asymmetric_directory = TestDirectory::new("asymmetric-import-certificate");
+        let asymmetric_path = asymmetric_directory.store();
+        let (mut asymmetric, asymmetric_fixture, asymmetric_control) =
+            runtime_store_with_completed_control(&asymmetric_path, 0xd3);
+        let evidence = b"PSE2-asymmetric-crash-evidence".to_vec();
+        assert_eq!(
+            asymmetric.persist_control_authority_evidence_inner(
+                asymmetric_control.commitment(),
+                &evidence,
+                Some(&certificate),
+                ControlEvidenceCommitStop::AfterCertificatePublished,
+            ),
+            Err(PrivateStoreError::Interrupted)
+        );
+        fs::remove_file(
+            asymmetric_path
+                .join(STAGE_DIR)
+                .join(PENDING_CONTROL_EVIDENCE),
+        )
+        .unwrap();
+        drop(asymmetric);
+        assert_eq!(
+            PrivateStore::open(
+                &asymmetric_path,
+                asymmetric_fixture.store_fixture.space,
+                asymmetric_fixture.store_fixture.agent,
+                &TestAuthority,
+            )
+            .err(),
+            Some(PrivateStoreError::Corrupt)
+        );
+
+        let missing_stage_directory = TestDirectory::new("missing-staged-import-certificate");
+        let missing_stage_path = missing_stage_directory.store();
+        let (mut missing_stage, missing_stage_fixture, missing_stage_control) =
+            runtime_store_with_completed_control(&missing_stage_path, 0xd6);
+        assert_eq!(
+            missing_stage.persist_control_authority_evidence_inner(
+                missing_stage_control.commitment(),
+                &evidence,
+                Some(&certificate),
+                ControlEvidenceCommitStop::AfterPending,
+            ),
+            Err(PrivateStoreError::Interrupted)
+        );
+        fs::remove_file(
+            missing_stage_path
+                .join(STAGE_DIR)
+                .join(STAGED_STABLE_IMPORT_CERTIFICATE),
+        )
+        .unwrap();
+        drop(missing_stage);
+        assert_eq!(
+            PrivateStore::open(
+                &missing_stage_path,
+                missing_stage_fixture.store_fixture.space,
+                missing_stage_fixture.store_fixture.agent,
+                &TestAuthority,
+            )
+            .err(),
+            Some(PrivateStoreError::Corrupt)
+        );
+
+        let truncated_directory = TestDirectory::new("truncated-import-certificate");
+        let truncated_path = truncated_directory.store();
+        let (mut truncated, truncated_fixture, truncated_control) =
+            runtime_store_with_completed_control(&truncated_path, 0xd4);
+        truncated
+            .persist_imported_control_authority_evidence(
+                truncated_control.commitment(),
+                &evidence,
+                &certificate,
+            )
+            .unwrap();
+        let truncated_certificate =
+            truncated_path
+                .join(CONTROL_EVIDENCE_DIR)
+                .join(stable_import_certificate_file_name(
+                    truncated_control.commitment(),
+                ));
+        OpenOptions::new()
+            .write(true)
+            .open(&truncated_certificate)
+            .unwrap()
+            .set_len((PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES - 1) as u64)
+            .unwrap();
+        drop(truncated);
+        assert_eq!(
+            PrivateStore::open(
+                &truncated_path,
+                truncated_fixture.store_fixture.space,
+                truncated_fixture.store_fixture.agent,
+                &TestAuthority,
+            )
+            .err(),
+            Some(PrivateStoreError::Corrupt)
+        );
+
+        let uppercase_directory = TestDirectory::new("uppercase-import-certificate");
+        let uppercase_path = uppercase_directory.store();
+        let (mut uppercase, uppercase_fixture, uppercase_control) =
+            runtime_store_with_completed_control(&uppercase_path, 0xd5);
+        uppercase
+            .persist_imported_control_authority_evidence(
+                uppercase_control.commitment(),
+                &evidence,
+                &certificate,
+            )
+            .unwrap();
+        let canonical_name = stable_import_certificate_file_name(uppercase_control.commitment());
+        fs::rename(
+            uppercase_path
+                .join(CONTROL_EVIDENCE_DIR)
+                .join(&canonical_name),
+            uppercase_path
+                .join(CONTROL_EVIDENCE_DIR)
+                .join(canonical_name.to_ascii_uppercase()),
+        )
+        .unwrap();
+        drop(uppercase);
+        assert_eq!(
+            PrivateStore::open(
+                &uppercase_path,
+                uppercase_fixture.store_fixture.space,
+                uppercase_fixture.store_fixture.agent,
+                &TestAuthority,
+            )
+            .err(),
+            Some(PrivateStoreError::Corrupt)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_import_certificate_rejects_published_and_staged_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let certificate = vec![0xe1; PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES];
+        let evidence = b"PSE2-symlink-hostile-evidence".to_vec();
+        let published_directory = TestDirectory::new("published-import-certificate-symlink");
+        let published_path = published_directory.store();
+        let (mut published, published_fixture, published_control) =
+            runtime_store_with_completed_control(&published_path, 0xe2);
+        published
+            .persist_imported_control_authority_evidence(
+                published_control.commitment(),
+                &evidence,
+                &certificate,
+            )
+            .unwrap();
+        let certificate_path =
+            published_path
+                .join(CONTROL_EVIDENCE_DIR)
+                .join(stable_import_certificate_file_name(
+                    published_control.commitment(),
+                ));
+        let external = published_directory.0.join("external-psi1");
+        fs::write(&external, &certificate).unwrap();
+        fs::remove_file(&certificate_path).unwrap();
+        symlink(&external, &certificate_path).unwrap();
+        drop(published);
+        assert_eq!(
+            PrivateStore::open(
+                &published_path,
+                published_fixture.store_fixture.space,
+                published_fixture.store_fixture.agent,
+                &TestAuthority,
+            )
+            .err(),
+            Some(PrivateStoreError::Corrupt)
+        );
+
+        let staged_directory = TestDirectory::new("staged-import-certificate-symlink");
+        let staged_path = staged_directory.store();
+        let (mut staged, staged_fixture, staged_control) =
+            runtime_store_with_completed_control(&staged_path, 0xe3);
+        let staged_certificate = staged_path
+            .join(STAGE_DIR)
+            .join(STAGED_STABLE_IMPORT_CERTIFICATE);
+        assert_eq!(
+            staged.persist_control_authority_evidence_inner(
+                staged_control.commitment(),
+                &evidence,
+                Some(&certificate),
+                ControlEvidenceCommitStop::AfterPending,
+            ),
+            Err(PrivateStoreError::Interrupted)
+        );
+        fs::remove_file(&staged_certificate).unwrap();
+        symlink(&external, &staged_certificate).unwrap();
+        drop(staged);
+        assert_eq!(
+            PrivateStore::open(
+                &staged_path,
+                staged_fixture.store_fixture.space,
+                staged_fixture.store_fixture.agent,
+                &TestAuthority,
+            )
+            .err(),
+            Some(PrivateStoreError::Corrupt)
+        );
     }
 
     #[test]
