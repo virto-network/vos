@@ -281,9 +281,10 @@ pub struct PrivateAgentCreate<'a> {
     /// Exact descriptor-authority receipt authorizing the initial Create PVM
     /// invocation. It is retained verbatim in the genesis PVRI.
     pub creation_receipt: &'a AuthorityReceipt,
-    /// Trusted observation slot used both to authenticate the receipt and as
-    /// the exact `observed_slot` supplied to the PVM.
-    pub created_at: u64,
+    /// Trusted host observation slot used to authenticate receipt liveness.
+    /// The Direct Create PVM work and canonical PVRI use the receipt's signed
+    /// `valid_from` slot instead.
+    pub observed_at: u64,
 }
 
 /// Durable, ciphertext-only handoff from an offline recovery ceremony to the
@@ -742,7 +743,7 @@ impl PrivateAgentHost {
                 store.core_position()?,
                 private_runtime_key_epoch_commitments(&store)?,
                 request.creation_receipt.clone(),
-                request.created_at,
+                request.creation_receipt.selector.valid_from,
                 &RawAuthorityVerifier,
             )
             .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
@@ -3790,13 +3791,13 @@ fn validate_create_request(
         }
     }
     require_exact_local_member(request.nodes, &scope.local_node)?;
-    validate_private_creation_receipt(descriptor, request.creation_receipt, request.created_at)
+    validate_private_creation_receipt(descriptor, request.creation_receipt, request.observed_at)
 }
 
 fn validate_private_creation_receipt(
     descriptor: &AgentDescriptor,
     receipt: &AuthorityReceipt,
-    created_at: u64,
+    observed_at: u64,
 ) -> Result<(), PrivateAgentHostError> {
     let request = ManagementRequest::Create(Box::new(descriptor.clone()));
     let selector = &receipt.selector;
@@ -3810,9 +3811,9 @@ fn validate_private_creation_receipt(
         || selector.actor_deployment.is_some()
         || selector.operation != AuthorityOperationKind::CreateAgent
         || selector.request != request.commitment()
-        || !selector.is_live_at(created_at)
+        || !selector.is_live_at(observed_at)
         || receipt
-            .verify_at(created_at, &RawAuthorityVerifier)
+            .verify_at(observed_at, &RawAuthorityVerifier)
             .is_err()
     {
         return Err(PrivateAgentHostError::Unauthorized);
@@ -3824,6 +3825,7 @@ fn execute_private_runtime_genesis(
     request: &PrivateAgentCreate<'_>,
 ) -> Result<RuntimeState, PrivateAgentHostError> {
     let descriptor = request.descriptor;
+    let genesis_at = request.creation_receipt.selector.valid_from;
     let work = RuntimeWork::Manage {
         context: RuntimeExecutionContext::Direct,
         space: descriptor.identity.space,
@@ -3832,7 +3834,7 @@ fn execute_private_runtime_genesis(
         state: RuntimeState::default(),
         request: Box::new(ManagementRequest::Create(Box::new(descriptor.clone()))),
         authority: Some(Box::new(request.creation_receipt.clone())),
-        observed_slot: request.created_at,
+        observed_slot: genesis_at,
     };
     let wire = work
         .encode()
@@ -6799,7 +6801,7 @@ mod tests {
         descriptor
     }
 
-    fn creation_receipt(descriptor: &AgentDescriptor, created_at: u64) -> AuthorityReceipt {
+    fn creation_receipt(descriptor: &AgentDescriptor, observed_at: u64) -> AuthorityReceipt {
         let request = ManagementRequest::Create(Box::new(descriptor.clone()));
         let key =
             SigningKey::from_bytes(&[descriptor.creation_nonce.as_bytes()[0].wrapping_add(90); 32]);
@@ -6826,8 +6828,8 @@ mod tests {
                 epoch: descriptor.authority.initial_epoch,
                 decision_sequence: 1,
                 acknowledged_through: 0,
-                valid_from: created_at.saturating_sub(1),
-                expires_at: created_at.saturating_add(100),
+                valid_from: observed_at.saturating_sub(1),
+                expires_at: observed_at.saturating_add(100),
                 request: request.commitment(),
             },
             public_key: descriptor.authority.public_key,
@@ -6871,6 +6873,7 @@ mod tests {
         let placeholder_runtime = admitted_standard_runtime_for_test("private-placeholder", 0x59);
         let placeholder = descriptor(space, owner, 31, nodes, &placeholder_runtime);
         let placeholder_receipt = creation_receipt(&placeholder, CREATED_AT);
+        let genesis_at = placeholder_receipt.selector.valid_from;
         let input = RuntimeWork::Manage {
             context: RuntimeExecutionContext::Direct,
             space,
@@ -6879,7 +6882,7 @@ mod tests {
             state: RuntimeState::default(),
             request: Box::new(ManagementRequest::Create(Box::new(placeholder.clone()))),
             authority: Some(Box::new(placeholder_receipt)),
-            observed_slot: CREATED_AT,
+            observed_slot: genesis_at,
         }
         .encode()
         .unwrap();
@@ -6956,7 +6959,7 @@ mod tests {
         nodes: Vec<NodeFixture>,
         descriptor: AgentDescriptor,
         creation_receipt: AuthorityReceipt,
-        created_at: u64,
+        observed_at: u64,
         runtime: Vec<u8>,
         bootstrap: Vec<u8>,
     }
@@ -6985,7 +6988,7 @@ mod tests {
             nodes,
             descriptor,
             creation_receipt,
-            created_at: CREATED_AT,
+            observed_at: CREATED_AT,
             runtime,
             bootstrap,
         }
@@ -7032,7 +7035,7 @@ mod tests {
                 runtime_package: &runtime,
                 bootstrap_metadata: &fixture.bootstrap,
                 creation_receipt: &fixture.creation_receipt,
-                created_at: fixture.created_at,
+                observed_at: fixture.observed_at,
             },
             &TestAuthority,
         )
@@ -7088,7 +7091,7 @@ mod tests {
                 runtime_package: runtime,
                 bootstrap_metadata: &fixture.bootstrap,
                 creation_receipt: receipt,
-                created_at: fixture.created_at,
+                observed_at: fixture.observed_at,
             },
             &TestAuthority,
         )
@@ -7683,7 +7686,7 @@ mod tests {
                     runtime_package: &runtime,
                     bootstrap_metadata: &fixture.bootstrap,
                     creation_receipt: &fixture.creation_receipt,
-                    created_at: fixture.created_at,
+                    observed_at: fixture.observed_at,
                 },
                 &TestAuthority,
             ),
@@ -7705,7 +7708,7 @@ mod tests {
                     runtime_package: &runtime,
                     bootstrap_metadata: &fixture.bootstrap,
                     creation_receipt: &fixture.creation_receipt,
-                    created_at: fixture.created_at,
+                    observed_at: fixture.observed_at,
                 },
                 &TestAuthority,
             ),
@@ -7714,14 +7717,19 @@ mod tests {
     }
 
     #[test]
-    fn creation_executes_pvm_and_reopens_exact_encrypted_genesis_image() {
+    fn creation_executes_pvm_at_signed_valid_from_and_reopens_exact_pvi2() {
         let fixture = fixture(2);
         let mut host = create_host(&fixture, 0, "runtime-genesis");
         let agent = create_agent(&mut host, &fixture);
         let image = &host.agents[&agent].runtime_image;
         assert_eq!(image.creation_receipt(), &fixture.creation_receipt);
-        assert_eq!(image.created_at(), fixture.created_at);
-        assert_eq!(image.applied_at(), fixture.created_at);
+        let genesis_at = fixture.creation_receipt.selector.valid_from;
+        // The scripted PVM accepts only the exact Direct Create work encoded
+        // with this slot, while receipt admission observed it one slot later.
+        assert_ne!(fixture.observed_at, genesis_at);
+        assert_eq!(image.created_at(), genesis_at);
+        assert_eq!(image.applied_at(), genesis_at);
+        assert_eq!(&image.encode().unwrap()[..4], b"PVI2");
         assert_eq!(image.state().control, RUNTIME_STATE_SENTINEL);
         assert!(image.state().linear.is_empty());
         assert_eq!(
@@ -7795,7 +7803,7 @@ mod tests {
             &runtime,
         );
         assert_eq!(descriptor.identity.agent, agent);
-        let receipt = creation_receipt(&descriptor, fixture.created_at);
+        let receipt = creation_receipt(&descriptor, fixture.observed_at);
         assert_eq!(
             create_with_runtime(&mut host, &fixture, &descriptor, &runtime, &receipt),
             Err(PrivateAgentHostError::AlreadyExists)
@@ -7883,11 +7891,28 @@ mod tests {
             .sign(&wrong_signer.signing_bytes())
             .to_bytes();
 
-        for (label, receipt, created_at) in [
-            ("route", wrong_route, fixture.created_at),
-            ("request", wrong_request, fixture.created_at),
-            ("time", fixture.creation_receipt.clone(), u64::MAX),
-            ("signer", wrong_signer, fixture.created_at),
+        for (label, receipt, observed_at) in [
+            ("route", wrong_route, fixture.observed_at),
+            ("request", wrong_request, fixture.observed_at),
+            (
+                "before-valid",
+                fixture.creation_receipt.clone(),
+                fixture
+                    .creation_receipt
+                    .selector
+                    .valid_from
+                    .saturating_sub(1),
+            ),
+            (
+                "expired",
+                fixture.creation_receipt.clone(),
+                fixture
+                    .creation_receipt
+                    .selector
+                    .expires_at
+                    .saturating_add(1),
+            ),
+            ("signer", wrong_signer, fixture.observed_at),
         ] {
             assert_eq!(
                 host.create_agent(
@@ -7898,7 +7923,7 @@ mod tests {
                         runtime_package: &runtime,
                         bootstrap_metadata: &fixture.bootstrap,
                         creation_receipt: &receipt,
-                        created_at,
+                        observed_at,
                     },
                     &TestAuthority,
                 ),
@@ -7930,7 +7955,7 @@ mod tests {
             &identities(&fixture),
             &trap_runtime,
         );
-        let trap_receipt = creation_receipt(&trap_descriptor, fixture.created_at);
+        let trap_receipt = creation_receipt(&trap_descriptor, fixture.observed_at);
         assert_eq!(
             create_with_runtime(
                 &mut host,
@@ -7952,7 +7977,7 @@ mod tests {
                 fixture.descriptor.clone(),
             ))),
             authority: Some(Box::new(fixture.creation_receipt.clone())),
-            observed_slot: fixture.created_at,
+            observed_slot: fixture.creation_receipt.selector.valid_from,
         }
         .encode()
         .unwrap();
@@ -7972,7 +7997,7 @@ mod tests {
             &identities(&fixture),
             &malformed_runtime,
         );
-        let malformed_receipt = creation_receipt(&malformed_descriptor, fixture.created_at);
+        let malformed_receipt = creation_receipt(&malformed_descriptor, fixture.observed_at);
         assert_eq!(
             create_with_runtime(
                 &mut host,
@@ -8013,7 +8038,7 @@ mod tests {
             &identities(&fixture),
             &substituted_runtime,
         );
-        let substituted_receipt = creation_receipt(&substituted_descriptor, fixture.created_at);
+        let substituted_receipt = creation_receipt(&substituted_descriptor, fixture.observed_at);
         assert_eq!(
             create_with_runtime(
                 &mut host,
@@ -8059,7 +8084,7 @@ mod tests {
             &identities(&fixture),
             &changed_runtime,
         );
-        let changed_receipt = creation_receipt(&changed_descriptor, fixture.created_at);
+        let changed_receipt = creation_receipt(&changed_descriptor, fixture.observed_at);
         assert_eq!(
             create_with_runtime(
                 &mut host,
@@ -9439,8 +9464,10 @@ mod tests {
         assert!(!contains(&snapshot, SENTINEL));
         assert!(!contains(&backup, RUNTIME_STATE_SENTINEL));
         assert!(!contains(&snapshot, RUNTIME_STATE_SENTINEL));
-        assert!(!contains(&backup, b"PVI1"));
-        assert!(!contains(&snapshot, b"PVI1"));
+        for magic in [b"PVI1", b"PVI2"] {
+            assert!(!contains(&backup, magic));
+            assert!(!contains(&snapshot, magic));
+        }
 
         let mut peer = create_host(&fixture, 1, "peer");
         assert_eq!(create_agent(&mut peer, &fixture), agent);
@@ -10704,7 +10731,7 @@ mod tests {
         let admitted = admit_runtime_package(&fixture.runtime).unwrap();
         let nodes = identities(&fixture);
         let second_descriptor = descriptor(fixture.space, fixture.owner, 32, &nodes, &admitted);
-        let second_receipt = creation_receipt(&second_descriptor, fixture.created_at);
+        let second_receipt = creation_receipt(&second_descriptor, fixture.observed_at);
         let second = host
             .create_agent(
                 PrivateAgentCreate {
@@ -10718,7 +10745,7 @@ mod tests {
                     runtime_package: &admitted,
                     bootstrap_metadata: &fixture.bootstrap,
                     creation_receipt: &second_receipt,
-                    created_at: fixture.created_at,
+                    observed_at: fixture.observed_at,
                 },
                 &TestAuthority,
             )

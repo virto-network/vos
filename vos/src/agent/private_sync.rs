@@ -2274,6 +2274,8 @@ mod tests {
     }
 
     fn genesis_runtime_image(store: &PrivateStore, fixture: &Fixture) -> PrivateRuntimeImage {
+        let receipt = creation_receipt(fixture);
+        let genesis_at = receipt.selector.valid_from;
         PrivateRuntimeImage::genesis(
             &fixture.descriptor,
             fixture.recipients[0].identity.node,
@@ -2285,8 +2287,8 @@ mod tests {
             },
             store.core_position().unwrap(),
             vec![PrivateKeyEpochCommitment::from_epoch(&fixture.epoch.record).unwrap()],
-            creation_receipt(fixture),
-            3,
+            receipt,
+            genesis_at,
             &RawAuthorityVerifier,
         )
         .unwrap()
@@ -3277,7 +3279,7 @@ mod tests {
                     .any(|window| window == required_magic)
             );
         }
-        for forbidden_magic in [b"PAP1", b"PVI1", b"PCR3", b"PSP1"] {
+        for forbidden_magic in [b"PAP1", b"PVI1", b"PVI2", b"PCR3", b"PSP1"] {
             assert!(
                 !frame
                     .windows(forbidden_magic.len())

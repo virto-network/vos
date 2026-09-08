@@ -2,7 +2,7 @@
 //!
 //! This module owns three clean-generation formats:
 //!
-//! - `PVRI1` is the exact node-local runtime image paired with one immutable
+//! - `PVRI2` is the exact node-local runtime image paired with one immutable
 //!   Private Store core position.
 //! - `PAPL1` is the pending/completed application of one exact PCTL. It keeps
 //!   the receipt and AOI1 preimages but can represent only a positive result.
@@ -11,7 +11,7 @@
 //!
 //! The Store position deliberately excludes PVRI/PAPL/PCRS and every
 //! authority acknowledgement derived from them. This preserves the acyclic
-//! commitment order `AOI1 -> PAPL1 -> (PVRI1, Store) -> PCRS3/PCAF2 -> PCA2 ->
+//! commitment order `AOI1 -> PAPL1 -> (PVRI2, Store) -> PCRS3/PCAF2 -> PCA2 ->
 //! PSE2`. Runtime images and applications include the local NodeId and are
 //! never suitable as cross-replica equality claims; only
 //! [`PrivateRuntimeStableProjection`] is replica-stable.
@@ -59,7 +59,7 @@ const PRIVATE_RUNTIME_STABLE_PROJECTION_COMMITMENT_DOMAIN: &[u8] =
     b"vos/agent/private-runtime-stable-projection/v1";
 const PRIVATE_RUNTIME_CONTROL_STATE_COMMITMENT_DOMAIN: &[u8] =
     b"vos/agent/private-runtime-control-state/v1";
-const PRIVATE_RUNTIME_IMAGE_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/private-runtime-image/v1";
+const PRIVATE_RUNTIME_IMAGE_COMMITMENT_DOMAIN: &[u8] = b"vos/agent/private-runtime-image/v2";
 const PRIVATE_RUNTIME_APPLICATION_COMMITMENT_DOMAIN: &[u8] =
     b"vos/agent/private-runtime-application/v1";
 const PRIVATE_CONTROL_REOPENED_STATE_COMMITMENT_DOMAIN: &[u8] =
@@ -72,7 +72,7 @@ pub const MAX_PRIVATE_RUNTIME_SUCCESS_WIRE_BYTES: usize =
     HEADER_BYTES + 1 + 4 + HEADER_BYTES + 32 + MAX_ACTOR_ENTRY_WIRE_BYTES;
 /// Fixed-size exact commitment to one canonical PKEY preimage.
 pub const PRIVATE_KEY_EPOCH_COMMITMENT_WIRE_BYTES: usize = HEADER_BYTES + 8 + 32;
-/// Maximum exact node-local PVRI1 image.
+/// Maximum exact node-local PVRI2 image.
 pub const MAX_PRIVATE_RUNTIME_IMAGE_WIRE_BYTES: usize = MAX_RUNTIME_STATE_BYTES
     + MAX_PRIVATE_RUNTIME_KEY_EPOCHS * (4 + PRIVATE_KEY_EPOCH_COMMITMENT_WIRE_BYTES)
     + 16 * 1024;
@@ -175,7 +175,7 @@ fn valid_runtime_package(value: &BlobRef) -> bool {
 fn creation_receipt_matches_image(
     managed: ManagedAgentTarget,
     receipt: &AuthorityReceipt,
-    created_at: u64,
+    genesis_at: u64,
 ) -> bool {
     let selector = &receipt.selector;
     receipt.validate_shape().is_ok()
@@ -185,13 +185,14 @@ fn creation_receipt_matches_image(
         && selector.runtime_deployment == managed.runtime_deployment
         && selector.actor.is_none()
         && selector.actor_deployment.is_none()
-        && selector.is_live_at(created_at)
+        && genesis_at == selector.valid_from
+        && selector.is_live_at(genesis_at)
 }
 
 fn verify_creation_receipt<V: AuthorityVerifier>(
     descriptor: &AgentDescriptor,
     receipt: &AuthorityReceipt,
-    created_at: u64,
+    genesis_at: u64,
     verifier: &V,
 ) -> Result<(), PrivateRuntimeEvidenceError> {
     let managed = ManagedAgentTarget {
@@ -203,10 +204,10 @@ fn verify_creation_receipt<V: AuthorityVerifier>(
     if descriptor.validate().is_err()
         || descriptor.identity.profile != AgentProfile::Private
         || !request.is_valid()
-        || !creation_receipt_matches_image(managed, receipt, created_at)
+        || !creation_receipt_matches_image(managed, receipt, genesis_at)
         || !descriptor.authority.accepts(receipt)
         || receipt.selector.request != request.commitment()
-        || receipt.verify_at(created_at, verifier).is_err()
+        || receipt.verify_at(genesis_at, verifier).is_err()
     {
         return Err(PrivateRuntimeEvidenceError::InvalidAuthority);
     }
@@ -688,8 +689,8 @@ pub enum PrivateRuntimeControlDisposition {
 ///
 /// This is intentionally independent of receipt verification. The physical
 /// host must first execute the exact receipt-authorized `Create` work, then
-/// pass the transition here, and finally give that same receipt and trusted
-/// observation slot to [`PrivateRuntimeImage::genesis`].
+/// pass the transition here, and finally construct [`PrivateRuntimeImage`]
+/// at the receipt's signed `valid_from` slot.
 pub fn validate_private_runtime_genesis_transition(
     descriptor: &AgentDescriptor,
     transition: RuntimeTransition,
@@ -1037,7 +1038,7 @@ impl PrivateRuntimeControlPosition {
     }
 }
 
-/// Exact node-local Private runtime image (`PVRI1`).
+/// Exact node-local Private runtime image (`PVRI2`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrivateRuntimeImage {
     managed: ManagedAgentTarget,
@@ -1061,7 +1062,9 @@ pub struct PrivateRuntimeImage {
 
 impl PrivateRuntimeImage {
     /// Construct the first image only from a valid immutable Private
-    /// descriptor and the exact post-Create runtime state.
+    /// descriptor and the exact post-Create runtime state. `genesis_at` must
+    /// equal the receipt's signed `valid_from`; the host separately checks
+    /// receipt liveness at its trusted observation slot before execution.
     pub fn genesis<V: AuthorityVerifier>(
         descriptor: &AgentDescriptor,
         node: NodeId,
@@ -1069,7 +1072,7 @@ impl PrivateRuntimeImage {
         store: PrivateStoreCorePosition,
         key_epochs: Vec<PrivateKeyEpochCommitment>,
         creation_receipt: AuthorityReceipt,
-        created_at: u64,
+        genesis_at: u64,
         authority_verifier: &V,
     ) -> Result<Self, PrivateRuntimeEvidenceError> {
         if descriptor.validate().is_err()
@@ -1089,7 +1092,7 @@ impl PrivateRuntimeImage {
         verify_creation_receipt(
             descriptor,
             &creation_receipt,
-            created_at,
+            genesis_at,
             authority_verifier,
         )?;
         if store.space != managed.space
@@ -1117,7 +1120,7 @@ impl PrivateRuntimeImage {
             descriptor: descriptor.commitment(),
             runtime_package: descriptor.runtime_package.clone(),
             creation_receipt,
-            created_at,
+            created_at: genesis_at,
             runtime_deployment: descriptor.identity.runtime_deployment,
             state,
             active_resource_policy,
@@ -1127,7 +1130,7 @@ impl PrivateRuntimeImage {
             runtime_control: None,
             last_full_replay: None,
             stable_projection,
-            applied_at: created_at,
+            applied_at: genesis_at,
         };
         value.validate()?;
         if value.state.is_empty()
@@ -1275,7 +1278,7 @@ impl PrivateRuntimeImage {
 
     /// Build the successor image selected by a pending PAPL1 and positive
     /// disposition. Completion is a separate step because PAPL1 records the
-    /// resulting image commitment while PVRI1 never points back to PAPL1.
+    /// resulting image commitment while PVRI2 never points back to PAPL1.
     #[allow(clippy::too_many_arguments)]
     pub fn successor<V: AuthorityVerifier, R: PrivateRecoveryAuthorityProofVerifier>(
         descriptor: &AgentDescriptor,
@@ -1369,6 +1372,7 @@ impl PrivateRuntimeImage {
     pub const fn creation_receipt(&self) -> &AuthorityReceipt {
         &self.creation_receipt
     }
+    /// Canonical creation slot, exactly the retained receipt's `valid_from`.
     pub const fn created_at(&self) -> u64 {
         self.created_at
     }
@@ -1406,7 +1410,7 @@ impl PrivateRuntimeImage {
     pub fn commitment(&self) -> Hash {
         Hash::digest(
             PRIVATE_RUNTIME_IMAGE_COMMITMENT_DOMAIN,
-            &[&self.encode().expect("valid PVI1")],
+            &[&self.encode().expect("valid PVI2")],
         )
     }
 
@@ -1502,7 +1506,7 @@ impl PrivateRuntimeImage {
 }
 
 impl CanonicalWire for PrivateRuntimeImage {
-    const MAGIC: [u8; 4] = *b"PVI1";
+    const MAGIC: [u8; 4] = *b"PVI2";
     const MAX_ENCODED_BYTES: usize = MAX_PRIVATE_RUNTIME_IMAGE_WIRE_BYTES;
 
     fn validate_wire(&self) -> bool {
@@ -2546,6 +2550,7 @@ mod tests {
     };
 
     const RECOVERY_PUBLIC_KEY: [u8; 32] = [0x81; 32];
+    const GENESIS_AT: u64 = 1;
 
     fn hash(marker: u8) -> Hash {
         Hash([marker; 32])
@@ -2684,7 +2689,7 @@ mod tests {
                 store,
                 key_epochs,
                 creation_receipt,
-                3,
+                GENESIS_AT,
                 &AllowVerifier,
             )
             .unwrap();
@@ -2717,7 +2722,7 @@ mod tests {
                     epoch: descriptor.authority.initial_epoch,
                     decision_sequence: 1,
                     acknowledged_through: 0,
-                    valid_from: 1,
+                    valid_from: GENESIS_AT,
                     expires_at: 40,
                     request: request.commitment(),
                 },
@@ -3278,7 +3283,19 @@ mod tests {
         assert_round_trip(&successor);
         assert_round_trip(&reopened);
 
-        assert_eq!(&fixture.predecessor.encode().unwrap()[..4], b"PVI1");
+        let pvi2_wire = fixture.predecessor.encode().unwrap();
+        assert_eq!(&pvi2_wire[..4], b"PVI2");
+        assert_eq!(
+            fixture.predecessor.commitment(),
+            Hash::digest(b"vos/agent/private-runtime-image/v2", &[&pvi2_wire])
+        );
+        assert_ne!(
+            fixture.predecessor.commitment(),
+            Hash::digest(b"vos/agent/private-runtime-image/v1", &[&pvi2_wire])
+        );
+        let mut retired_pvi1 = pvi2_wire;
+        retired_pvi1[..4].copy_from_slice(b"PVI1");
+        assert!(PrivateRuntimeImage::decode(&retired_pvi1).is_err());
         assert_eq!(
             fixture.predecessor.stable_projection.creation_receipt(),
             fixture.predecessor.creation_receipt().commitment()
@@ -3417,7 +3434,7 @@ mod tests {
         let fixture = Fixture::new();
         let construct = |state: RuntimeState,
                          receipt: AuthorityReceipt,
-                         created_at: u64,
+                         genesis_at: u64,
                          verifier: &dyn AuthorityVerifier| {
             PrivateRuntimeImage::genesis(
                 &fixture.descriptor,
@@ -3426,24 +3443,32 @@ mod tests {
                 fixture.predecessor.store,
                 fixture.predecessor.key_epochs.clone(),
                 receipt,
-                created_at,
+                genesis_at,
                 &DynamicVerifier(verifier),
             )
         };
         let state = fixture.predecessor.state.clone();
         let receipt = Fixture::creation_receipt_for(&fixture.descriptor);
-        assert!(construct(state.clone(), receipt.clone(), 3, &AllowVerifier).is_ok());
-        assert!(construct(RuntimeState::default(), receipt.clone(), 3, &AllowVerifier).is_err());
-        assert!(construct(state.clone(), receipt.clone(), 41, &AllowVerifier).is_err());
-        assert!(construct(state.clone(), receipt.clone(), 3, &DenyVerifier).is_err());
+        assert!(construct(state.clone(), receipt.clone(), GENESIS_AT, &AllowVerifier).is_ok());
+        assert!(
+            construct(
+                RuntimeState::default(),
+                receipt.clone(),
+                GENESIS_AT,
+                &AllowVerifier
+            )
+            .is_err()
+        );
+        assert!(construct(state.clone(), receipt.clone(), 3, &AllowVerifier).is_err());
+        assert!(construct(state.clone(), receipt.clone(), GENESIS_AT, &DenyVerifier).is_err());
 
         let mut wrong_request = receipt.clone();
         wrong_request.selector.request = hash(0xa1);
-        assert!(construct(state.clone(), wrong_request, 3, &AllowVerifier).is_err());
+        assert!(construct(state.clone(), wrong_request, GENESIS_AT, &AllowVerifier).is_err());
 
         let mut wrong_route = receipt;
         wrong_route.selector.agent = AgentId([0xa2; 32]);
-        assert!(construct(state, wrong_route, 3, &AllowVerifier).is_err());
+        assert!(construct(state, wrong_route, GENESIS_AT, &AllowVerifier).is_err());
     }
 
     #[test]
@@ -3817,7 +3842,7 @@ mod tests {
             narrow_store,
             key_epochs,
             Fixture::creation_receipt_for(&narrow_descriptor),
-            3,
+            GENESIS_AT,
             &AllowVerifier,
         )
         .unwrap();
@@ -4055,7 +4080,7 @@ mod tests {
             fixture.predecessor.store,
             fixture.predecessor.key_epochs.clone(),
             fixture.predecessor.creation_receipt.clone(),
-            9,
+            GENESIS_AT,
             &AllowVerifier,
         )
         .unwrap();
@@ -4093,7 +4118,7 @@ mod tests {
                 fixture.predecessor.store,
                 fixture.predecessor.key_epochs.clone(),
                 fixture.predecessor.creation_receipt.clone(),
-                3,
+                GENESIS_AT,
                 &AllowVerifier,
             )
             .is_err()
