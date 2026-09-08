@@ -1654,11 +1654,19 @@ impl VerifiedEncryptedBackup {
     ) -> Result<(), PrivateStoreError> {
         if self.control_evidence.len() != self.index.controls.len()
             || source.control_evidence.len() != source.index.controls.len()
+            || self.controls.len() != self.index.controls.len()
+            || source.controls.len() != source.index.controls.len()
+            || self.runtime_applications.len() != self.index.controls.len()
+            || source.runtime_applications.len() != source.index.controls.len()
         {
             return Err(PrivateStoreError::Corrupt);
         }
-        for (source_entry, source_evidence) in
-            source.index.controls.iter().zip(&source.control_evidence)
+        for (source_position, (source_entry, source_evidence)) in source
+            .index
+            .controls
+            .iter()
+            .zip(&source.control_evidence)
+            .enumerate()
         {
             let Some(source_evidence) = source_evidence else {
                 continue;
@@ -1671,6 +1679,18 @@ impl VerifiedEncryptedBackup {
             else {
                 continue;
             };
+            // PSE authenticates a particular node-local PAPL lineage, not
+            // merely the shared PCTL. Never synthesize a provenance row by
+            // attaching one replica's evidence to another replica's runtime
+            // application. Exact canonical control/index/application identity
+            // is the minimum safe merge boundary.
+            if self.index.controls.get(position) != Some(source_entry)
+                || self.controls.get(position) != source.controls.get(source_position)
+                || self.runtime_applications.get(position)
+                    != source.runtime_applications.get(source_position)
+            {
+                continue;
+            }
             let selected = self
                 .control_evidence
                 .get_mut(position)
@@ -2451,31 +2471,10 @@ impl PrivateStore {
         genesis_nodes: Vec<PrivateNodeIdentity>,
         authority: &V,
     ) -> Result<Self, PrivateStoreError> {
-        let root = root.as_ref().to_path_buf();
-        match fs::symlink_metadata(&root) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                return Err(PrivateStoreError::Corrupt);
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir_all(&root).map_err(map_io)?;
-                let metadata = fs::symlink_metadata(&root).map_err(map_io)?;
-                if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                    return Err(PrivateStoreError::Corrupt);
-                }
-            }
-            Err(_) => return Err(PrivateStoreError::Io),
-        }
-        let lock = open_lock(&root)?;
-        if root.join(RECOVERY_FILE).exists() || root.join(INDEX_FILE).exists() {
-            return Err(PrivateStoreError::AlreadyExists);
-        }
-        fs::create_dir(root.join(OBJECTS_DIR)).map_err(map_io)?;
-        fs::create_dir(root.join(CONTROLS_DIR)).map_err(map_io)?;
-        fs::create_dir(root.join(RUNTIME_APPLICATIONS_DIR)).map_err(map_io)?;
-        fs::create_dir(root.join(CONTROL_EVIDENCE_DIR)).map_err(map_io)?;
-        fs::create_dir(root.join(STAGE_DIR)).map_err(map_io)?;
-        sync_directory(&root)?;
+        // Complete every semantic and canonical-encoding check before the
+        // destination path is inspected or created. In particular, a caller
+        // must never be left with a poisoned partial Store merely because its
+        // genesis authority verifier rejected the supplied node set.
         let chain = PrivateControlChainVerifier::new_genesis(
             space,
             agent,
@@ -2506,13 +2505,36 @@ impl PrivateStore {
             controls: Vec::new(),
         };
         let cached_core_position = store_core_position(&metadata, &index, &key_epochs)?;
-        write_initial_file(
-            &root,
-            "recovery.initial",
-            RECOVERY_FILE,
-            &encode_recovery(&metadata)?,
-        )?;
-        write_initial_file(&root, "index.initial", INDEX_FILE, &encode_index(&index)?)?;
+        let recovery_wire = encode_recovery(&metadata)?;
+        let index_wire = encode_index(&index)?;
+
+        let root = root.as_ref().to_path_buf();
+        match fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(PrivateStoreError::Corrupt);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(&root).map_err(map_io)?;
+                let metadata = fs::symlink_metadata(&root).map_err(map_io)?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(PrivateStoreError::Corrupt);
+                }
+            }
+            Err(_) => return Err(PrivateStoreError::Io),
+        }
+        let lock = open_lock(&root)?;
+        if root.join(RECOVERY_FILE).exists() || root.join(INDEX_FILE).exists() {
+            return Err(PrivateStoreError::AlreadyExists);
+        }
+        fs::create_dir(root.join(OBJECTS_DIR)).map_err(map_io)?;
+        fs::create_dir(root.join(CONTROLS_DIR)).map_err(map_io)?;
+        fs::create_dir(root.join(RUNTIME_APPLICATIONS_DIR)).map_err(map_io)?;
+        fs::create_dir(root.join(CONTROL_EVIDENCE_DIR)).map_err(map_io)?;
+        fs::create_dir(root.join(STAGE_DIR)).map_err(map_io)?;
+        sync_directory(&root)?;
+        write_initial_file(&root, "recovery.initial", RECOVERY_FILE, &recovery_wire)?;
+        write_initial_file(&root, "index.initial", INDEX_FILE, &index_wire)?;
         Ok(Self {
             root,
             _lock: lock,
@@ -4271,6 +4293,7 @@ mod tests {
     }
 
     struct TestAuthority;
+    struct DenyAuthority;
 
     struct AllowRuntimeVerifier;
 
@@ -4323,6 +4346,18 @@ mod tests {
         ) -> bool {
             node.principal == expected_principal
                 && node.authority_binding == Self::binding(space, agent, expected_principal, node)
+        }
+    }
+
+    impl PrivateNodeAuthorityVerifier for DenyAuthority {
+        fn verify_private_node_binding(
+            &self,
+            _space: SpaceId,
+            _agent: AgentId,
+            _expected_principal: PrincipalId,
+            _node: &PrivateNodeIdentity,
+        ) -> bool {
+            false
         }
     }
 
@@ -6339,6 +6374,43 @@ mod tests {
     }
 
     #[test]
+    fn empty_genesis_bootstrap_rejects_authority_before_touching_destination() {
+        let directory = TestDirectory::new("verified-backup-denied-genesis");
+        let source_path = directory.store();
+        let fixture = fixture();
+        let source = create_store(&source_path, &fixture);
+        let backup = source
+            .export_encrypted_backup(MAX_PRIVATE_BACKUP_BYTES)
+            .unwrap();
+        let verified = verify_encrypted_backup(
+            &backup,
+            fixture.space,
+            fixture.agent,
+            fixture.owner,
+            fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        drop(source);
+
+        let target_path = directory.0.join("denied-empty-genesis");
+        assert!(!target_path.exists());
+        assert_eq!(
+            PrivateStore::create_empty_from_verified_genesis(
+                &target_path,
+                &verified,
+                &DenyAuthority,
+            )
+            .err(),
+            Some(PrivateStoreError::Crypto(
+                PrivateCryptoError::UnauthorizedNode,
+            ))
+        );
+        assert!(!target_path.exists());
+    }
+
+    #[test]
     fn verified_backup_replay_rows_reject_each_missing_required_attachment() {
         let directory = TestDirectory::new("verified-backup-incomplete-replay");
         let papl_only_path = directory.store();
@@ -6909,7 +6981,7 @@ mod tests {
     }
 
     #[test]
-    fn backup_reconciliation_retains_one_node_local_papl_for_the_same_psp() {
+    fn backup_reconciliation_never_pairs_node_local_papl_with_foreign_evidence() {
         let directory = TestDirectory::new("runtime-reconcile-node-local");
         let first_path = directory.store();
         let second_path = directory.0.join("replica-b");
@@ -6975,10 +7047,10 @@ mod tests {
             .append_control_with_runtime_application(&control, &second_application, &TestAuthority)
             .unwrap();
 
-        let first_backup = first_store
+        let first_without_evidence = first_store
             .export_encrypted_backup(MAX_PRIVATE_BACKUP_BYTES)
             .unwrap();
-        let second_backup = second_store
+        let second_without_evidence = second_store
             .export_encrypted_backup(MAX_PRIVATE_BACKUP_BYTES)
             .unwrap();
         let verify = |bytes: &[u8]| {
@@ -6993,6 +7065,30 @@ mod tests {
             )
             .unwrap()
         };
+        let first_is_selected = match compare_recovery_base(
+            &verify(&first_without_evidence),
+            &verify(&second_without_evidence),
+        ) {
+            core::cmp::Ordering::Greater => true,
+            core::cmp::Ordering::Less => false,
+            core::cmp::Ordering::Equal => panic!("node-local PAPL identities must order exactly"),
+        };
+        let source_evidence = b"PSE2-evidence-for-only-the-unselected-node-local-papl".to_vec();
+        if first_is_selected {
+            second_store
+                .persist_control_authority_evidence(control.commitment(), &source_evidence)
+                .unwrap();
+        } else {
+            first_store
+                .persist_control_authority_evidence(control.commitment(), &source_evidence)
+                .unwrap();
+        }
+        let first_backup = first_store
+            .export_encrypted_backup(MAX_PRIVATE_BACKUP_BYTES)
+            .unwrap();
+        let second_backup = second_store
+            .export_encrypted_backup(MAX_PRIVATE_BACKUP_BYTES)
+            .unwrap();
         let (selected_forward, forward_heads, forward_sequence) =
             reconcile_encrypted_backups(vec![verify(&first_backup), verify(&second_backup)])
                 .unwrap();
@@ -7016,8 +7112,20 @@ mod tests {
             .2
             .unwrap();
         assert!(
-            selected_application == &first_application
-                || selected_application == &second_application
+            (first_is_selected && selected_application == &first_application)
+                || (!first_is_selected && selected_application == &second_application)
+        );
+        assert_eq!(
+            selected_forward
+                .controls_with_authority_evidence()
+                .next()
+                .unwrap()
+                .2,
+            None
+        );
+        assert_eq!(
+            selected_forward.replay_rows().err(),
+            Some(PrivateStoreError::Corrupt)
         );
     }
 
