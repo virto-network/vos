@@ -1225,6 +1225,22 @@ impl PrivateRuntimeImage {
         Ok(value)
     }
 
+    /// Hostile-test constructor for an independently authenticated PVRI whose
+    /// embedded PSC is structurally valid but not the source Store's exact
+    /// authenticated position.
+    #[cfg(test)]
+    pub(crate) fn synthetic_store_substitution_for_host_test(
+        &self,
+        store: PrivateStoreCorePosition,
+    ) -> Result<Self, PrivateRuntimeEvidenceError> {
+        self.validate()?;
+        store.validate()?;
+        let mut value = self.clone();
+        value.store = store;
+        value.validate()?;
+        Ok(value)
+    }
+
     /// Build the successor image selected by a pending PAPL1 and positive
     /// disposition. Completion is a separate step because PAPL1 records the
     /// resulting image commitment while PVRI1 never points back to PAPL1.

@@ -1450,6 +1450,19 @@ impl VerifiedEncryptedBackup {
         }
     }
 
+    pub(crate) fn core_position(
+        &self,
+    ) -> Result<PrivateStoreCorePosition, PrivateStoreError> {
+        if self.chain.epoch().epoch != self.index.epoch
+            || self.chain.head() != self.index.control_head
+            || self.chain.next_sequence() != self.index.next_sequence
+            || self.key_epochs.last() != Some(self.chain.epoch())
+        {
+            return Err(PrivateStoreError::Corrupt);
+        }
+        store_core_position(&self.metadata, &self.index, &self.key_epochs)
+    }
+
     pub(crate) fn key_epochs(&self) -> &[PrivateKeyEpoch] {
         &self.key_epochs
     }

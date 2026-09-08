@@ -1803,9 +1803,7 @@ impl PrivateAgentHost {
         A: PrivateNodeAuthorityVerifier,
         T: PrivateTransportAuthVerifier,
     {
-        let local_node = self.scope.local_node.clone();
         let slot = self.agent_path(agent);
-        let node_key = &self.node_key;
         let hosted = self
             .agents
             .get_mut(&agent)
@@ -3322,7 +3320,7 @@ where
         PrivateControlOperation::SetResourcePolicy { .. }
         | PrivateControlOperation::ActorLifecycle { .. } => None,
     };
-    let successor_image = prepare_synthetic_runtime_successor_for_test(
+    let (successor_image, runtime_application) = prepare_synthetic_runtime_successor_for_test(
         hosted,
         node_authority,
         request,
@@ -3378,11 +3376,18 @@ where
             if let Some(store_stop) = store_stop {
                 hosted
                     .store
-                    .append_control_with_stop(&prepared.control, node_authority, store_stop)
+                    .append_control_with_runtime_application_with_stop_for_runtime(
+                        &prepared.control,
+                        &runtime_application,
+                        node_authority,
+                        store_stop,
+                    )
             } else {
-                hosted
-                    .store
-                    .append_control(&prepared.control, node_authority)
+                hosted.store.append_control_with_runtime_application(
+                    &prepared.control,
+                    &runtime_application,
+                    node_authority,
+                )
             }
             #[cfg(not(test))]
             {
@@ -3411,7 +3416,7 @@ fn prepare_synthetic_runtime_successor_for_test<V: PrivateNodeAuthorityVerifier>
     node_authority: &V,
     request: &PrivateControlRuntimeApplicationRequest,
     prepared: &PreparedPrivateApplication,
-) -> Result<PrivateRuntimeImage, PrivateAgentHostError> {
+) -> Result<(PrivateRuntimeImage, PrivateRuntimeApplication), PrivateAgentHostError> {
     let receipt = AuthorityReceipt::decode(&request.receipt)
         .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
     let issuance = AuthorityOperationIssuanceAck::decode(&request.issuance_ack)
@@ -3438,7 +3443,7 @@ fn prepare_synthetic_runtime_successor_for_test<V: PrivateNodeAuthorityVerifier>
         &RawRecoveryAuthorityProofVerifier,
     )
     .map_err(|_| PrivateAgentHostError::Corrupt)?;
-    PrivateRuntimeImage::successor(
+    let successor = PrivateRuntimeImage::successor(
         &hosted.descriptor,
         &hosted.runtime_image,
         &pending,
@@ -3448,7 +3453,18 @@ fn prepare_synthetic_runtime_successor_for_test<V: PrivateNodeAuthorityVerifier>
         &RawAuthorityVerifier,
         &RawRecoveryAuthorityProofVerifier,
     )
-    .map_err(|_| PrivateAgentHostError::Corrupt)
+    .map_err(|_| PrivateAgentHostError::Corrupt)?;
+    let completed = pending
+        .complete(
+            &hosted.descriptor,
+            &hosted.runtime_image,
+            &successor,
+            PrivateRuntimeSuccess::ControlOnly,
+            &RawAuthorityVerifier,
+            &RawRecoveryAuthorityProofVerifier,
+        )
+        .map_err(|_| PrivateAgentHostError::Corrupt)?;
+    Ok((successor, completed))
 }
 
 #[cfg(test)]
@@ -5834,8 +5850,11 @@ fn reconcile_exact_duplicate_slot<V: PrivateNodeAuthorityVerifier>(
     }
     let staged = open_hosted_agent(source, space, owner, local_node, node_key, authority)?;
     let published = open_hosted_agent(destination, space, owner, local_node, node_key, authority)?;
-    validate_planless_staged_recovery(&staged, true)?;
-    validate_planless_staged_recovery(&published, true)?;
+    // A destination-first cross-directory Create publication can leave the
+    // exact zero-head genesis visible under both names. Recover heads remain
+    // accepted only when their own retained authority evidence verifies.
+    validate_planless_staged_recovery(&staged, false)?;
+    validate_planless_staged_recovery(&published, false)?;
     let exact_archive =
         |slot: &Path, hosted: &HostedPrivateAgent| -> Result<Vec<u8>, PrivateAgentHostError> {
             let archive = HostArchive {
@@ -6255,6 +6274,7 @@ fn authenticate_recovery_source_runtime_image(
         .reopen_with(descriptor, &RawAuthorityVerifier)
         .map_err(|_| PrivateAgentHostError::Corrupt)?;
     let store = image.store();
+    let exact_store = verified.core_position()?;
     let key_epochs = verified
         .key_epochs()
         .iter()
@@ -6273,15 +6293,7 @@ fn authenticate_recovery_source_runtime_image(
                 .is_ok()
         });
     if !source_node_is_current
-        || store.space() != binding.space
-        || store.agent() != binding.agent
-        || store.owner() != binding.owner
-        || store.epoch() != binding.epoch
-        || store.control_head() != binding.control_head
-        || store.next_sequence() != binding.next_sequence
-        || usize::try_from(store.object_count()).ok() != Some(verified.objects().len())
-        || usize::try_from(store.control_count()).ok()
-            != Some(verified.controls_with_authority_evidence().count())
+        || store != exact_store
         || image.key_epochs() != key_epochs
     {
         return Err(PrivateAgentHostError::Corrupt);
@@ -6361,6 +6373,7 @@ mod tests {
         OfflineRecoveryDecryptionKey, OfflineRecoveryKit, RecoverySigningKey,
         sign_recovery_control_record,
     };
+    use crate::agent::private_runtime::PrivateStoreCorePosition;
     use crate::agent::private_sync::{
         MAX_PRIVATE_SYNC_ITEMS, MAX_PRIVATE_SYNC_PAGE_BYTES, PrivateSyncCursor, PrivateSyncItem,
         PrivateSyncPhase,
@@ -7497,6 +7510,37 @@ mod tests {
                 Err(PrivateAgentHostError::Corrupt)
             ));
         }
+    }
+
+    #[test]
+    fn duplicate_create_is_rejected_before_executing_trapping_pvm() {
+        let fixture = fixture(1);
+        let mut host = create_host(&fixture, 0, "duplicate-before-pvm");
+        let agent = create_agent(&mut host, &fixture);
+        let mut before = Vec::new();
+        collect_files(&host.agent_path(agent), &mut before);
+
+        let mut trap = Assembler::new();
+        trap.trap();
+        let runtime =
+            admitted_runtime_with_program_for_test("private-duplicate-trap", trap.build_standard());
+        let descriptor = descriptor(
+            fixture.space,
+            fixture.owner,
+            31,
+            &identities(&fixture),
+            &runtime,
+        );
+        assert_eq!(descriptor.identity.agent, agent);
+        let receipt = creation_receipt(&descriptor, fixture.created_at);
+        assert_eq!(
+            create_with_runtime(&mut host, &fixture, &descriptor, &runtime, &receipt),
+            Err(PrivateAgentHostError::AlreadyExists)
+        );
+        let mut after = Vec::new();
+        collect_files(&host.agent_path(agent), &mut after);
+        assert_eq!(after, before);
+        assert!(!host.creating_path(agent).exists());
     }
 
     #[test]
@@ -9004,6 +9048,10 @@ mod tests {
             .unwrap();
         assert!(!contains(&backup, SENTINEL));
         assert!(!contains(&snapshot, SENTINEL));
+        assert!(!contains(&backup, RUNTIME_STATE_SENTINEL));
+        assert!(!contains(&snapshot, RUNTIME_STATE_SENTINEL));
+        assert!(!contains(&backup, b"PVI1"));
+        assert!(!contains(&snapshot, b"PVI1"));
 
         let mut peer = create_host(&fixture, 1, "peer");
         assert_eq!(create_agent(&mut peer, &fixture), agent);
@@ -9076,6 +9124,210 @@ mod tests {
         assert_eq!(peer.binding(agent).unwrap(), before_binding);
         assert_eq!(primary.descriptor(agent).unwrap(), &fixture.descriptor);
         assert_eq!(peer.descriptor(agent).unwrap(), &fixture.descriptor);
+    }
+
+    #[test]
+    fn object_sync_refreshes_pvri_and_quarantines_ambiguous_store_errors() {
+        let fixture = fixture(1);
+        let mut source = create_host(&fixture, 0, "object-sync-source");
+        let agent = create_agent(&mut source, &fixture);
+        let base = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        let first = source
+            .encrypt_and_put(
+                agent,
+                EncryptedObjectKind::CrdtNode,
+                b"object-sync-first",
+                authority_target(&fixture).0,
+                &TestAuthority,
+            )
+            .unwrap();
+        let second = source
+            .encrypt_and_put(
+                agent,
+                EncryptedObjectKind::Blob,
+                b"object-sync-second",
+                authority_target(&fixture).0,
+                &TestAuthority,
+            )
+            .unwrap();
+
+        let request_for = |host: &PrivateAgentHost| {
+            let binding = host.binding(agent).unwrap();
+            PrivateSyncRequest {
+                cursor: PrivateSyncCursor::start(
+                    binding.space,
+                    binding.agent,
+                    binding.epoch,
+                    binding.control_head,
+                )
+                .unwrap(),
+                max_items: MAX_PRIVATE_SYNC_ITEMS as u16,
+                max_bytes: MAX_PRIVATE_SYNC_PAGE_BYTES as u32,
+            }
+        };
+        let restore = |host: &mut PrivateAgentHost| {
+            assert_eq!(
+                host.restore_encrypted_backup(
+                    agent,
+                    DurableRecoveryRecipient::from_durable_keystore(
+                        fixture.recovery.verifying_key(),
+                        fixture.recovery_encryption.public_key(),
+                    )
+                    .unwrap(),
+                    &base,
+                    &TestAuthority,
+                )
+                .unwrap(),
+                RestoreDisposition::Restored
+            );
+        };
+
+        let mut receiver = create_host(&fixture, 0, "object-sync-receiver");
+        restore(&mut receiver);
+        let page_bytes = source
+            .serve_sync_page(
+                agent,
+                PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
+                &request_for(&receiver).encode().unwrap(),
+                authority_target(&fixture).0,
+                &TestTransport,
+            )
+            .unwrap();
+        let page = PrivateSyncPage::decode(&page_bytes).unwrap();
+        assert_eq!(page.phase, PrivateSyncPhase::Objects);
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(
+            receiver
+                .apply_sync_page(
+                    agent,
+                    PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
+                    &page_bytes,
+                    authority_target(&fixture).0,
+                    &TestAuthority,
+                    &TestTransport,
+                )
+                .unwrap(),
+            PrivateSyncApplyDisposition::Applied
+        );
+        assert_eq!(
+            receiver.agents[&agent].runtime_image.store(),
+            receiver.agents[&agent].store.core_position().unwrap()
+        );
+        let after_apply = receiver.agents[&agent].runtime_image.commitment();
+        assert_eq!(
+            receiver
+                .apply_sync_page(
+                    agent,
+                    PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
+                    &page_bytes,
+                    authority_target(&fixture).0,
+                    &TestAuthority,
+                    &TestTransport,
+                )
+                .unwrap(),
+            PrivateSyncApplyDisposition::AlreadyApplied
+        );
+        assert_eq!(receiver.agents[&agent].runtime_image.commitment(), after_apply);
+        drop(receiver);
+        let receiver = reopen_host(&fixture, 0, "object-sync-receiver");
+        assert_eq!(
+            receiver.get_and_decrypt(agent, first).unwrap().as_slice(),
+            b"object-sync-first"
+        );
+        assert_eq!(
+            receiver.get_and_decrypt(agent, second).unwrap().as_slice(),
+            b"object-sync-second"
+        );
+
+        let mut interrupted = create_host(&fixture, 0, "object-sync-interrupted");
+        restore(&mut interrupted);
+        let page_bytes = source
+            .serve_sync_page(
+                agent,
+                PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
+                &request_for(&interrupted).encode().unwrap(),
+                authority_target(&fixture).0,
+                &TestTransport,
+            )
+            .unwrap();
+        let page = PrivateSyncPage::decode(&page_bytes).unwrap();
+        let applied_key = match page.items.first().unwrap() {
+            PrivateSyncItem::Object { key, .. } => *key,
+            _ => panic!("object page contained a control"),
+        };
+        let blocked_key = match page.items.get(1).unwrap() {
+            PrivateSyncItem::Object { key, .. } => *key,
+            _ => panic!("object page contained a control"),
+        };
+        let blocked_name = format!(
+            "{:016x}-{:02x}-{}.pobj",
+            blocked_key.epoch,
+            blocked_key.kind,
+            encode_hash(blocked_key.content)
+        );
+        let blocker = interrupted
+            .agent_path(agent)
+            .join(STORE_DIRECTORY)
+            .join("objects")
+            .join(blocked_name);
+        fs::create_dir(&blocker).unwrap();
+        assert!(
+            interrupted
+                .apply_sync_page(
+                    agent,
+                    PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
+                    &page_bytes,
+                    authority_target(&fixture).0,
+                    &TestAuthority,
+                    &TestTransport,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            interrupted.binding(agent),
+            Err(PrivateAgentHostError::NotFound)
+        );
+        assert_eq!(
+            interrupted.export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES),
+            Err(PrivateAgentHostError::NotFound)
+        );
+        fs::remove_dir(&blocker).unwrap();
+        interrupted
+            .reopen_quarantined_agent(agent, &TestAuthority)
+            .unwrap();
+        assert_eq!(
+            interrupted.agents[&agent].runtime_image.store(),
+            interrupted.agents[&agent].store.core_position().unwrap()
+        );
+        assert!(interrupted.get_encrypted_object(agent, applied_key).is_ok());
+        assert_eq!(
+            interrupted.get_encrypted_object(agent, blocked_key),
+            Err(PrivateAgentHostError::Store(PrivateStoreError::NotFound))
+        );
+        assert_eq!(
+            interrupted
+                .apply_sync_page(
+                    agent,
+                    PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
+                    &page_bytes,
+                    authority_target(&fixture).0,
+                    &TestAuthority,
+                    &TestTransport,
+                )
+                .unwrap(),
+            PrivateSyncApplyDisposition::Applied
+        );
+        for (key, expected) in [
+            (first, b"object-sync-first".as_slice()),
+            (second, b"object-sync-second".as_slice()),
+        ] {
+            assert_eq!(
+                interrupted.get_and_decrypt(agent, key).unwrap().as_slice(),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -9920,6 +10172,77 @@ mod tests {
         );
         assert!(!forged.creating_path(agent).exists());
         assert!(!forged.agent_path(agent).exists());
+
+        let audit_kit = recovery_kit();
+        let mut substituted_archive = decode_host_archive(&backup, true).unwrap();
+        let verified = verify_encrypted_backup(
+            &substituted_archive.store,
+            fixture.space,
+            agent,
+            fixture.owner,
+            audit_kit.signing_public_key(),
+            audit_kit.encryption_public_key(),
+            &TestAuthority,
+        )
+        .unwrap();
+        let data_key = unwrap_recovery_data_key(
+            verified.key_epochs().last().unwrap(),
+            audit_kit.decryption_key(),
+        )
+        .unwrap();
+        let encrypted_image =
+            EncryptedPrivateObject::decode(&substituted_archive.runtime_state).unwrap();
+        let image = PrivateRuntimeImage::decode(
+            &decrypt_private_object(&data_key, &encrypted_image).unwrap(),
+        )
+        .unwrap();
+        let store = image.store();
+        let substituted_store = PrivateStoreCorePosition::new(
+            store.space(),
+            store.agent(),
+            store.owner(),
+            store.epoch(),
+            store.control_head(),
+            store.next_sequence(),
+            store.object_count(),
+            Some(Hash([0xd2; 32])),
+            store.control_count(),
+            store.control_root(),
+            store.key_epoch_root(),
+        )
+        .unwrap();
+        let substituted_image = image
+            .synthetic_store_substitution_for_host_test(substituted_store)
+            .unwrap();
+        substituted_archive.runtime_state =
+            encrypt_runtime_image_sidecar(&data_key, &substituted_image).unwrap();
+        let substituted_backup = encode_host_archive(
+            &substituted_archive,
+            true,
+            MAX_PRIVATE_HOST_ARCHIVE_BYTES,
+        )
+        .unwrap();
+        let mut substituted = PrivateAgentHost::create(
+            fixture.directory.child("substituted-pvri-store-root"),
+            fixture.space,
+            fixture.owner,
+            replacement.identity.clone(),
+            replacement.key(),
+        )
+        .unwrap();
+        assert_eq!(
+            substituted.prepare_recovery_from_encrypted_backup(
+                recovery_route(&fixture, agent),
+                None,
+                &audit_kit,
+                &replacements,
+                &substituted_backup,
+                &TestAuthority,
+            ),
+            Err(PrivateAgentHostError::Corrupt)
+        );
+        assert!(!substituted.creating_path(agent).exists());
+        assert!(!substituted.agent_path(agent).exists());
 
         let mut target = PrivateAgentHost::create(
             fixture.directory.child("valid-recovery-awaiting-pvri"),
