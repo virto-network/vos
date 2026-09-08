@@ -1960,8 +1960,8 @@ impl PrivateAgentHost {
             }
 
             // A completed local PAPL without PSE is the sole crash-valid
-            // endpoint. Bind the already verified source PSE to that exact
-            // local PAPL with a destination-secret PSI before advancing.
+            // endpoint. Bind the verified source PSE to that exact PAPL;
+            // cross-node evidence additionally requires a destination PSI.
             if existing_sync_control_state(
                 self.hosted(agent)?,
                 verified,
@@ -2008,49 +2008,67 @@ impl PrivateAgentHost {
             {
                 return Err(PrivateAgentHostError::Sync(PrivateSyncError::Tampered));
             }
-            let certificate = PrivateStableImportCertificate::issue(
-                route,
-                hosted.store.binding().owner,
-                hosted.descriptor.commitment(),
-                &self.scope.local_node,
-                control,
-                application.commitment(),
-                source_evidence,
-                verified.source_stable_projection(),
-                &self.node_key,
-            )?
-            .encode()
-            .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
-            authenticate_imported_runtime_application_endpoint(
+            if authenticate_local_runtime_application_endpoint(
                 &hosted.descriptor,
                 verified.control(),
                 verified.source_application().application.epoch,
                 &application,
                 verified.evidence_wire(),
-                &certificate,
-                &self.scope.local_node,
-                &self.node_key,
-            )?;
-            certificate
+            )
+            .is_ok()
+            {
+                None
+            } else {
+                let certificate = PrivateStableImportCertificate::issue(
+                    route,
+                    hosted.store.binding().owner,
+                    hosted.descriptor.commitment(),
+                    &self.scope.local_node,
+                    control,
+                    application.commitment(),
+                    source_evidence,
+                    verified.source_stable_projection(),
+                    &self.node_key,
+                )?
+                .encode()
+                .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
+                authenticate_imported_runtime_application_endpoint(
+                    &hosted.descriptor,
+                    verified.control(),
+                    verified.source_application().application.epoch,
+                    &application,
+                    verified.evidence_wire(),
+                    &certificate,
+                    &self.scope.local_node,
+                    &self.node_key,
+                )?;
+                Some(certificate)
+            }
         };
 
-        let persistence = self
-            .hosted_mut(agent)?
-            .store
-            .persist_imported_control_authority_evidence(
-                control,
-                verified.evidence_wire(),
-                &certificate,
-            );
+        let persistence = match certificate.as_deref() {
+            Some(certificate) => self
+                .hosted_mut(agent)?
+                .store
+                .persist_imported_control_authority_evidence(
+                    control,
+                    verified.evidence_wire(),
+                    certificate,
+                ),
+            None => self
+                .hosted_mut(agent)?
+                .store
+                .persist_control_authority_evidence(control, verified.evidence_wire()),
+        };
         if let Err(error) = persistence {
             drop(self.agents.remove(&agent));
             let _ = self.reopen_quarantined_agent(agent, node_authority);
             return Err(error.into());
         }
 
-        // Reopening is part of the import transaction: the next control may
-        // not use this predecessor until PSI, source PSE, local PAPL, and the
-        // node-local PVRI have been authenticated together from disk.
+        // Reopening is part of the transaction: the next control may not use
+        // this predecessor until PSE, local PAPL/PVRI, and any required PSI
+        // have been authenticated together from disk.
         drop(self.agents.remove(&agent));
         self.reopen_quarantined_agent(agent, node_authority)
     }
@@ -11973,6 +11991,86 @@ mod tests {
         let mut after_retry = Vec::new();
         collect_files(&peer.agent_path(agent), &mut after_retry);
         assert_eq!(after_retry, before_retry);
+    }
+
+    #[test]
+    fn same_node_control_sync_attaches_local_evidence_without_psi() {
+        let fixture = fixture(1);
+        let mut source = create_host(&fixture, 0, "same-node-sync-source");
+        let agent = create_agent(&mut source, &fixture);
+        let genesis = source
+            .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
+            .unwrap();
+        let rotate = signed_rotate_control(&source, agent);
+        apply_and_attach_test_authority_evidence(&mut source, &fixture, &rotate, 40, 41);
+
+        let mut receiver = create_host(&fixture, 0, "same-node-sync-receiver");
+        assert_eq!(
+            receiver
+                .restore_encrypted_backup(
+                    agent,
+                    DurableRecoveryRecipient::from_durable_keystore(
+                        fixture.recovery.verifying_key(),
+                        fixture.recovery_encryption.public_key(),
+                    )
+                    .unwrap(),
+                    &genesis,
+                    &TestAuthority,
+                )
+                .unwrap(),
+            RestoreDisposition::Restored
+        );
+        let request = PrivateSyncRequest {
+            cursor: PrivateSyncCursor::start(fixture.space, agent, 0, None).unwrap(),
+            max_items: MAX_PRIVATE_SYNC_ITEMS as u16,
+            max_bytes: MAX_PRIVATE_SYNC_PAGE_BYTES as u32,
+        };
+        let page = source
+            .serve_sync_page(
+                agent,
+                PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
+                &request.encode().unwrap(),
+                authority_target(&fixture).0,
+                &TestTransport,
+            )
+            .unwrap();
+        assert_eq!(
+            receiver
+                .apply_sync_page(
+                    agent,
+                    PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
+                    &page,
+                    authority_target(&fixture).0,
+                    &TestAuthority,
+                    &TestTransport,
+                )
+                .unwrap(),
+            PrivateSyncApplyDisposition::Applied
+        );
+        let entry = receiver.agents[&agent]
+            .store
+            .indexed_controls()
+            .last()
+            .unwrap();
+        assert!(
+            receiver.agents[&agent]
+                .store
+                .read_control_authority_evidence(entry)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            receiver.agents[&agent]
+                .store
+                .read_stable_import_certificate(entry),
+            Ok(None)
+        );
+        drop(receiver);
+        let receiver = reopen_host(&fixture, 0, "same-node-sync-receiver");
+        assert_eq!(
+            receiver.binding(agent).unwrap(),
+            source.binding(agent).unwrap()
+        );
     }
 
     #[test]
