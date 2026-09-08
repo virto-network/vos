@@ -22,7 +22,6 @@ use vos_agent_sdk::authority::{
     AgentAuthorityBinding, AuthorityActorTarget, AuthorityIssuer, AuthorityOperationKind,
     AuthorityReceipt, AuthorityVerifier, ManagedAgentTarget,
 };
-#[cfg(test)]
 use vos_agent_sdk::authority_operation::PrivateControlApplicationFact;
 use vos_agent_sdk::authority_operation::{
     AuthorityOperationIntent, AuthorityOperationIssuanceAck,
@@ -63,12 +62,9 @@ use super::package_admission::{AdmittedRuntimePackage, admit_runtime_package};
 use super::private_control_application_coordinator::decode_private_application_fact;
 use super::private_control_application_coordinator::{
     PrivateControlRuntimeApplicationAdapter, PrivateControlRuntimeApplicationRequest,
-    PrivateControlRuntimeApplicationResolution, PrivateControlRuntimeEvidenceRequest,
-    PrivateControlRuntimeEvidenceResult,
-};
-#[cfg(test)]
-use super::private_control_application_coordinator::{
-    PrivateControlRuntimeApplicationResult, encode_private_application_fact,
+    PrivateControlRuntimeApplicationResolution, PrivateControlRuntimeApplicationResult,
+    PrivateControlRuntimeEvidenceRequest, PrivateControlRuntimeEvidenceResult,
+    PrivateControlRuntimeRetirementResult, encode_private_application_fact,
 };
 #[cfg(test)]
 use super::private_crypto::{
@@ -83,12 +79,11 @@ use super::private_crypto::{
     unwrap_recovery_data_key, unwrap_recovery_keyring, valid_x25519_public_key,
     verify_control_record_signature,
 };
-#[cfg(test)]
-use super::private_runtime::PrivateRuntimeSuccess;
 use super::private_runtime::{
     MAX_PRIVATE_RUNTIME_IMAGE_WIRE_BYTES, PrivateControlReopenedState, PrivateKeyEpochCommitment,
-    PrivateRuntimeApplication, PrivateRuntimeControlPosition, PrivateRuntimeImage,
-    PrivateStoreCorePosition, validate_private_runtime_genesis_transition,
+    PrivateRuntimeApplication, PrivateRuntimeControlDisposition, PrivateRuntimeControlPosition,
+    PrivateRuntimeImage, PrivateRuntimeSuccess, PrivateStoreCorePosition,
+    classify_private_runtime_control_transition, validate_private_runtime_genesis_transition,
 };
 use super::private_store::{
     ControlEvidenceCommitStop, MAX_PRIVATE_BACKUP_BYTES, PrivateObjectKey, PrivateStore,
@@ -359,20 +354,21 @@ pub struct PrivateAgentHost {
     _lock: File,
     scope: RootScope,
     node_key: PrivateNodeDecryptionKey,
+    management_gas: u64,
     agents: BTreeMap<AgentId, HostedPrivateAgent>,
 }
 
-/// Placeholder for the physical Private-runtime half of the authority pipeline.
+/// Physical Private-runtime half of the authority pipeline.
 ///
 /// Construction is crate-private because the caller must pair this adapter
 /// with the durable operation issuer/coordinator and an exact system-authority
 /// dispatcher. It accepts only the externally signed PCTL carried by the
 /// coordinator request; it has no key-generation or control-signing API.
-/// The ciphertext/control-only host cannot yet construct PCRS3 or the
-/// successor PSP1. Its production `apply` path therefore validates the exact
-/// canonical request and fails closed before any Store write. The physical
-/// runtime-lifecycle owner will replace that rejection with a real reopened
-/// proof boundary.
+/// Runtime-backed controls execute only after canonical receipt, issuance,
+/// control, mutation, Store-position, PKEY, and membership validation. A
+/// positive transition stages its encrypted successor PVRI, atomically appends
+/// PCTL plus completed PAPL, promotes the PVRI, and fully reopens. A
+/// deterministic unchanged-state denial writes none of them.
 pub(crate) struct PrivateAgentRuntimeApplication<'host, V> {
     host: &'host mut PrivateAgentHost,
     authority: AuthorityActorTarget,
@@ -411,9 +407,11 @@ enum PrivateRuntimeApplicationStop {
     AfterBootstrapStaged,
     AfterRuntimeStateStaged,
     AfterStoreStagedArtifact,
+    AfterStoreStagedRuntimeApplication,
     AfterStoreStagedIndex,
     AfterStorePending,
     AfterStoreArtifact,
+    AfterStoreRuntimeApplication,
     AfterStoreIndex,
     AfterStoreCommitted,
     AfterDescriptorPromoted,
@@ -439,7 +437,20 @@ struct PreparedPrivateApplication {
     operation: AuthorityOperationKind,
     expected_epoch: u64,
     expected_members: Vec<NodeId>,
+    projected_store: PrivateStoreCorePosition,
+    projected_key_epochs: Vec<PrivateKeyEpochCommitment>,
+    mutation: Option<PrivateRuntimeMutation>,
+    receipt: Option<AuthorityReceipt>,
+    issuance: Option<AuthorityOperationIssuanceAck>,
     already_applied: bool,
+}
+
+enum PreparedPrivateRuntimeDisposition {
+    Applied {
+        successor_image: PrivateRuntimeImage,
+        runtime_application: PrivateRuntimeApplication,
+    },
+    RetiredUnapplied,
 }
 
 struct RawAuthorityVerifier;
@@ -510,6 +521,7 @@ impl PrivateAgentHost {
             _lock: lock,
             scope,
             node_key,
+            management_gas: DEFAULT_MANAGEMENT_GAS,
             agents: BTreeMap::new(),
         })
     }
@@ -549,6 +561,7 @@ impl PrivateAgentHost {
             _lock: lock,
             scope,
             node_key,
+            management_gas: DEFAULT_MANAGEMENT_GAS,
             agents: BTreeMap::new(),
         };
         host.recover_creating(authority)?;
@@ -586,6 +599,13 @@ impl PrivateAgentHost {
         &self.scope.local_node
     }
 
+    /// Set the gas budget used for physical Private management execution.
+    ///
+    /// The budget applies to both Create and runtime-backed Private controls.
+    pub fn set_management_gas(&mut self, gas: u64) {
+        self.management_gas = gas;
+    }
+
     pub fn agent_ids(&self) -> impl ExactSizeIterator<Item = AgentId> + '_ {
         self.agents.keys().copied()
     }
@@ -610,8 +630,7 @@ impl PrivateAgentHost {
     /// boot/control wiring must install it inside
     /// `DurablePrivateControlApplicationCoordinator` together with durable
     /// issuer/coordinator stores and the real exact-route authority actor
-    /// dispatcher. Until that dispatcher is wired, production control
-    /// application remains unavailable rather than bypassing evidence.
+    /// dispatcher.
     pub(crate) fn runtime_application_adapter<'host, V>(
         &'host mut self,
         authority: AuthorityActorTarget,
@@ -711,7 +730,7 @@ impl PrivateAgentHost {
         // Execute after the read-only reservation checks but before creating
         // a staging directory: a duplicate cannot consume the management gas
         // budget, while traps or substituted output still leave no artifact.
-        let initial_state = execute_private_runtime_genesis(&request)?;
+        let initial_state = execute_private_runtime_genesis(&request, self.management_gas)?;
         let generated = generate_fresh_private_epoch(
             self.scope.space,
             agent,
@@ -1123,14 +1142,9 @@ impl PrivateAgentHost {
             node_key,
         )?;
         stage_metadata(&slot, next_epoch.epoch, &next_data, hosted)?;
-        let successor_store = hosted
-            .store
-            .preview_control_position(record, authority)?
-            .position();
-        let key_epochs = projected_private_runtime_key_epoch_commitments_for_test(
-            hosted.store.key_epochs(),
-            record,
-        )?;
+        let preview = hosted.store.preview_control_position(record, authority)?;
+        let successor_store = preview.position();
+        let key_epochs = preview.key_epoch_commitments().to_vec();
         let successor_image = PrivateRuntimeImage::synthetic_control_only_successor_for_host_test(
             &hosted.runtime_image,
             record,
@@ -1883,11 +1897,12 @@ impl PrivateAgentHost {
         }
     }
 
-    fn reject_unwired_private_runtime_application<V>(
-        &self,
+    fn apply_private_runtime_application<V>(
+        &mut self,
         authority: AuthorityActorTarget,
         node_authority: &V,
         request: &PrivateControlRuntimeApplicationRequest,
+        stop: PrivateRuntimeApplicationStop,
     ) -> Result<PrivateControlRuntimeApplicationResolution, PrivateAgentHostError>
     where
         V: PrivateNodeAuthorityVerifier,
@@ -1898,25 +1913,213 @@ impl PrivateAgentHost {
         if control.encode().ok().as_deref() != Some(request.control.as_slice()) {
             return Err(PrivateAgentHostError::InvalidArtifact);
         }
-        validate_private_runtime_application_mutation(&control, request.mutation.as_deref())?;
+        if matches!(control.operation, PrivateControlOperation::Recover { .. }) {
+            // Recover selects a replacement-host lineage and is never a
+            // direct mutation of an already-live runtime image.
+            return Err(PrivateAgentHostError::UnsupportedOperation);
+        }
 
-        // Validate as much of the currently supported envelope as the legacy
-        // ciphertext/control host can authenticate, but never enter its Store
-        // mutation path. A future physical runtime lifecycle must produce the
-        // PCRS3 and successor PSP1 commitments before this can return Applied.
-        if self.agents.contains_key(&request.route.agent) {
-            match prepare_private_application(
-                self.hosted(request.route.agent)?,
-                &self.scope.local_node,
+        let agent = request.route.agent;
+        let prepared = prepare_private_application(
+            self.hosted(agent)?,
+            &self.scope.local_node,
+            authority,
+            node_authority,
+            request,
+        )?;
+        if prepared.already_applied {
+            return self.reopen_completed_private_application(
                 authority,
                 node_authority,
                 request,
-            ) {
-                Ok(_) | Err(PrivateAgentHostError::UnsupportedOperation) => {}
-                Err(error) => return Err(error),
-            }
+                &prepared,
+                stop,
+            );
         }
-        Err(PrivateAgentHostError::UnsupportedOperation)
+
+        let disposition = prepare_private_runtime_disposition(
+            self.hosted(agent)?,
+            request,
+            &prepared,
+            self.management_gas,
+        )?;
+        let PreparedPrivateRuntimeDisposition::Applied {
+            successor_image,
+            runtime_application,
+        } = disposition
+        else {
+            return self.reopen_retired_private_application(
+                authority,
+                node_authority,
+                request,
+                &prepared,
+                stop,
+            );
+        };
+
+        let slot = self.agent_path(agent);
+        let expected_space = self.scope.space;
+        let expected_owner = self.scope.owner;
+        let local_node = self.scope.local_node.clone();
+        let mut hosted = self
+            .agents
+            .remove(&agent)
+            .ok_or(PrivateAgentHostError::NotFound)?;
+        let transition = apply_prepared_private_control(
+            &slot,
+            &mut hosted,
+            &local_node,
+            &self.node_key,
+            node_authority,
+            &prepared,
+            successor_image,
+            &runtime_application,
+            stop,
+        );
+        drop(hosted);
+        if let Err(error) = transition {
+            // I/O errors after staging are ambiguous. Reopen immediately in
+            // production so pending Store/sidecar transactions reconcile
+            // before this handle becomes usable again. Test stop points model
+            // process death and deliberately leave recovery to a new host.
+            if stop == PrivateRuntimeApplicationStop::Never {
+                let reopened = open_hosted_agent(
+                    &slot,
+                    expected_space,
+                    expected_owner,
+                    &local_node,
+                    &self.node_key,
+                    node_authority,
+                )
+                .map_err(|_| PrivateAgentHostError::Corrupt)?;
+                if self.agents.insert(agent, reopened).is_some() {
+                    return Err(PrivateAgentHostError::Alias);
+                }
+            }
+            return Err(error);
+        }
+
+        self.reopen_completed_private_application(
+            authority,
+            node_authority,
+            request,
+            &prepared,
+            stop,
+        )
+    }
+
+    fn reopen_completed_private_application<V>(
+        &mut self,
+        authority: AuthorityActorTarget,
+        node_authority: &V,
+        request: &PrivateControlRuntimeApplicationRequest,
+        prepared: &PreparedPrivateApplication,
+        stop: PrivateRuntimeApplicationStop,
+    ) -> Result<PrivateControlRuntimeApplicationResolution, PrivateAgentHostError>
+    where
+        V: PrivateNodeAuthorityVerifier,
+    {
+        let agent = request.route.agent;
+        let slot = self.agent_path(agent);
+        drop(self.agents.remove(&agent));
+        let reopened = open_hosted_agent(
+            &slot,
+            self.scope.space,
+            self.scope.owner,
+            &self.scope.local_node,
+            &self.node_key,
+            node_authority,
+        )?;
+        let fact = private_application_fact(&reopened, request, prepared);
+        if self.agents.insert(agent, reopened).is_some() {
+            return Err(PrivateAgentHostError::Alias);
+        }
+        let fact = fact?;
+        #[cfg(test)]
+        if stop == PrivateRuntimeApplicationStop::AfterReopen {
+            return Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted));
+        }
+        let _ = stop;
+        Ok(PrivateControlRuntimeApplicationResolution::Applied(
+            PrivateControlRuntimeApplicationResult {
+                route: request.route,
+                authority,
+                control: request.control.clone(),
+                mutation: request.mutation.clone(),
+                receipt: request.receipt.clone(),
+                issuance_ack: request.issuance_ack.clone(),
+                applied_at: request.applied_at,
+                authenticated: true,
+                durably_applied: true,
+                durably_reopened: true,
+                reopened_runtime_state: fact.reopened_runtime_state,
+                stable_projection: fact.stable_projection,
+                application_fact: encode_private_application_fact(&fact),
+            },
+        ))
+    }
+
+    fn reopen_retired_private_application<V>(
+        &mut self,
+        authority: AuthorityActorTarget,
+        node_authority: &V,
+        request: &PrivateControlRuntimeApplicationRequest,
+        prepared: &PreparedPrivateApplication,
+        stop: PrivateRuntimeApplicationStop,
+    ) -> Result<PrivateControlRuntimeApplicationResolution, PrivateAgentHostError>
+    where
+        V: PrivateNodeAuthorityVerifier,
+    {
+        if prepared.already_applied {
+            return Err(PrivateAgentHostError::Corrupt);
+        }
+        let agent = request.route.agent;
+        let slot = self.agent_path(agent);
+        let predecessor = self
+            .agents
+            .remove(&agent)
+            .ok_or(PrivateAgentHostError::NotFound)?;
+        let predecessor_image = predecessor.runtime_image.commitment();
+        let predecessor_store = predecessor.store.core_position()?;
+        drop(predecessor);
+        let reopened = open_hosted_agent(
+            &slot,
+            self.scope.space,
+            self.scope.owner,
+            &self.scope.local_node,
+            &self.node_key,
+            node_authority,
+        )?;
+        if reopened.runtime_image.commitment() != predecessor_image
+            || reopened.store.core_position()? != predecessor_store
+            || reopened.store.binding().control_head == Some(prepared.control.commitment())
+        {
+            return Err(PrivateAgentHostError::Corrupt);
+        }
+        if self.agents.insert(agent, reopened).is_some() {
+            return Err(PrivateAgentHostError::Alias);
+        }
+        #[cfg(test)]
+        if stop == PrivateRuntimeApplicationStop::AfterReopen {
+            return Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted));
+        }
+        let _ = stop;
+        Ok(
+            PrivateControlRuntimeApplicationResolution::RetiredUnapplied(
+                PrivateControlRuntimeRetirementResult {
+                    route: request.route,
+                    authority,
+                    control: request.control.clone(),
+                    mutation: request.mutation.clone(),
+                    receipt: request.receipt.clone(),
+                    issuance_ack: request.issuance_ack.clone(),
+                    resolved_at: request.applied_at,
+                    authenticated: true,
+                    predecessor_unchanged: true,
+                    durably_reopened: true,
+                },
+            ),
+        )
     }
 
     #[cfg(test)]
@@ -1942,104 +2145,12 @@ impl PrivateAgentHost {
                 stop,
             );
         }
-        if self.agents.contains_key(&agent) {
-            let control = PrivateControlRecord::decode(&request.control)
-                .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
-            if matches!(control.operation, PrivateControlOperation::Recover { .. }) {
-                // Recover is a replacement-host operation. A fresh transition
-                // must be selected by an authenticated PVRP3 stage; accepting
-                // it against an already-live slot would create a second,
-                // coordinator-bypassing recovery pipeline. Published retries
-                // are recovered through the exact PSE2 evidence callback.
-                return Err(PrivateAgentHostError::UnsupportedOperation);
+        match self.apply_private_runtime_application(authority, node_authority, request, stop)? {
+            PrivateControlRuntimeApplicationResolution::Applied(result) => Ok(result),
+            PrivateControlRuntimeApplicationResolution::RetiredUnapplied(_) => {
+                Err(PrivateAgentHostError::Corrupt)
             }
         }
-        let prepared = prepare_private_application(
-            self.hosted(agent)?,
-            &self.scope.local_node,
-            authority,
-            node_authority,
-            request,
-        )?;
-        let slot = self.agent_path(agent);
-        let expected_space = self.scope.space;
-        let expected_owner = self.scope.owner;
-        let local_node = self.scope.local_node.clone();
-        let mut hosted = self
-            .agents
-            .remove(&agent)
-            .ok_or(PrivateAgentHostError::NotFound)?;
-
-        let transition = apply_prepared_private_control(
-            &slot,
-            &mut hosted,
-            &local_node,
-            &self.node_key,
-            node_authority,
-            request,
-            &prepared,
-            stop,
-        );
-        drop(hosted);
-        if let Err(error) = transition {
-            // Production I/O failures are ambiguous. Reopen the physical
-            // store immediately so its pending transaction and staged
-            // sidecars are reconciled before this handle can be used again.
-            // Test failpoints deliberately model a process stop and therefore
-            // leave reconciliation to a newly opened host.
-            if stop == PrivateRuntimeApplicationStop::Never {
-                let reopened = open_hosted_agent(
-                    &slot,
-                    expected_space,
-                    expected_owner,
-                    &local_node,
-                    &self.node_key,
-                    node_authority,
-                )
-                .map_err(|_| PrivateAgentHostError::Corrupt)?;
-                if self.agents.insert(agent, reopened).is_some() {
-                    return Err(PrivateAgentHostError::Alias);
-                }
-            }
-            return Err(error);
-        }
-
-        // A successful runtime assertion is made only from a brand-new
-        // physical reopen. This replays the signed chain, reconciles a pending
-        // store transaction, selects the exact committed sidecar generation,
-        // unwraps this node's keys, and authenticates the admitted runtime.
-        let reopened = open_hosted_agent(
-            &slot,
-            expected_space,
-            expected_owner,
-            &local_node,
-            &self.node_key,
-            node_authority,
-        )?;
-        let fact =
-            synthetic_legacy_private_application_fact_for_test(&reopened, request, &prepared)?;
-        if self.agents.insert(agent, reopened).is_some() {
-            return Err(PrivateAgentHostError::Alias);
-        }
-        #[cfg(test)]
-        if stop == PrivateRuntimeApplicationStop::AfterReopen {
-            return Err(PrivateAgentHostError::Store(PrivateStoreError::Interrupted));
-        }
-        Ok(PrivateControlRuntimeApplicationResult {
-            route: request.route,
-            authority: request.authority,
-            control: request.control.clone(),
-            mutation: request.mutation.clone(),
-            receipt: request.receipt.clone(),
-            issuance_ack: request.issuance_ack.clone(),
-            applied_at: request.applied_at,
-            authenticated: true,
-            durably_applied: true,
-            durably_reopened: true,
-            reopened_runtime_state: fact.reopened_runtime_state,
-            stable_projection: fact.stable_projection,
-            application_fact: encode_private_application_fact(&fact),
-        })
     }
 
     #[cfg(test)]
@@ -2846,10 +2957,11 @@ where
         &mut self,
         request: &PrivateControlRuntimeApplicationRequest,
     ) -> Result<PrivateControlRuntimeApplicationResolution, Self::Error> {
-        self.host.reject_unwired_private_runtime_application(
+        self.host.apply_private_runtime_application(
             self.authority,
             self.node_authority,
             request,
+            self.stop,
         )
     }
 
@@ -2863,6 +2975,13 @@ where
             request,
             self.stop,
         )
+    }
+}
+
+#[cfg(test)]
+impl<V> PrivateAgentRuntimeApplication<'_, V> {
+    fn stop_after(&mut self, stop: PrivateRuntimeApplicationStop) {
+        self.stop = stop;
     }
 }
 
@@ -2898,13 +3017,6 @@ where
             request,
             self.stop,
         )
-    }
-}
-
-#[cfg(test)]
-impl<V> SyntheticLegacyPrivateRuntimeApplicationForTest<'_, V> {
-    fn stop_after(&mut self, stop: PrivateRuntimeApplicationStop) {
-        self.stop = stop;
     }
 }
 
@@ -2979,6 +3091,11 @@ fn prepare_staged_recovery_application(
         operation: AuthorityOperationKind::RecoverPrivateAgent,
         expected_epoch: proof.next_epoch,
         expected_members,
+        projected_store: hosted.store.core_position()?,
+        projected_key_epochs: private_runtime_key_epoch_commitments(&hosted.store)?,
+        mutation: None,
+        receipt: None,
+        issuance: None,
         already_applied: true,
     })
 }
@@ -3014,19 +3131,8 @@ where
         return Err(PrivateAgentHostError::InvalidArtifact);
     }
     verify_control_record_signature(&control)?;
-    validate_private_runtime_application_mutation(&control, request.mutation.as_deref())?;
-    if matches!(
-        &control.operation,
-        PrivateControlOperation::SetResourcePolicy { .. }
-            | PrivateControlOperation::ActorLifecycle { .. }
-    ) {
-        // A control-chain append is not application of either operation. In
-        // particular, this request carries only the lifecycle request hash and
-        // HostedPrivateAgent has no durably reopenable runtime image. Refuse
-        // before inspecting or mutating the store until a real runtime bridge
-        // can commit and reopen the selected policy/actor-forest transition.
-        return Err(PrivateAgentHostError::UnsupportedOperation);
-    }
+    let mutation =
+        validate_private_runtime_application_mutation(&control, request.mutation.as_deref())?;
     if matches!(control.operation, PrivateControlOperation::Recover { .. }) {
         return Err(PrivateAgentHostError::UnsupportedOperation);
     }
@@ -3079,6 +3185,23 @@ where
         {
             return Err(PrivateAgentHostError::InvalidArtifact);
         }
+        let application = hosted
+            .store
+            .read_runtime_application(control.commitment())?
+            .ok_or(PrivateAgentHostError::Corrupt)?;
+        if !completed_private_application_matches_request(
+            &application,
+            request,
+            &control,
+            mutation.as_ref(),
+            &receipt,
+            &issuance,
+        ) {
+            return Err(PrivateAgentHostError::InvalidArtifact);
+        }
+        if !current_private_application_successor_is_exact(hosted, &application)? {
+            return Err(PrivateAgentHostError::Corrupt);
+        }
     } else {
         require_resolved_runtime_application_head(&hosted.store)?;
         validate_new_private_application_position(hosted, local_node, &control)?;
@@ -3087,7 +3210,14 @@ where
             .validate_next_control(&control, node_authority)?;
     }
 
-    let expected_epoch = match &control.operation {
+    let preview = hosted
+        .store
+        .preview_control_position(&control, node_authority)?;
+    if (preview.disposition() == PutDisposition::AlreadyPresent) != already_applied {
+        return Err(PrivateAgentHostError::Corrupt);
+    }
+
+    let operation_epoch = match &control.operation {
         PrivateControlOperation::Invite { epoch, .. } => *epoch,
         PrivateControlOperation::Revoke { next_epoch, .. }
         | PrivateControlOperation::RotateKeys { next_epoch }
@@ -3095,16 +3225,16 @@ where
         PrivateControlOperation::SetResourcePolicy { .. }
         | PrivateControlOperation::ActorLifecycle { .. } => binding.epoch,
     };
-    let expected_members = if already_applied {
-        hosted
-            .store
-            .authorized_nodes()
-            .iter()
-            .map(|node| node.node)
-            .collect()
-    } else {
-        expected_private_members(hosted.store.authorized_nodes(), local_node, &control)?
-    };
+    let expected_epoch = preview.position().epoch();
+    if expected_epoch != operation_epoch {
+        return Err(PrivateAgentHostError::Corrupt);
+    }
+    require_exact_local_member(preview.authorized_nodes(), local_node)?;
+    let expected_members = preview
+        .authorized_nodes()
+        .iter()
+        .map(|node| node.node)
+        .collect::<Vec<_>>();
     let member_set = private_member_set_commitment(expected_members.iter().copied())
         .ok_or(PrivateAgentHostError::InvalidMembership)?;
     match &intent {
@@ -3129,8 +3259,40 @@ where
         operation,
         expected_epoch,
         expected_members,
+        projected_store: preview.position(),
+        projected_key_epochs: preview.key_epoch_commitments().to_vec(),
+        mutation,
+        receipt: Some(receipt),
+        issuance: Some(issuance),
         already_applied,
     })
+}
+
+fn completed_private_application_matches_request(
+    application: &PrivateRuntimeApplication,
+    request: &PrivateControlRuntimeApplicationRequest,
+    control: &PrivateControlRecord,
+    mutation: Option<&PrivateRuntimeMutation>,
+    receipt: &AuthorityReceipt,
+    issuance: &AuthorityOperationIssuanceAck,
+) -> bool {
+    application.managed() == request.route
+        && application.control() == control
+        && application.mutation() == mutation
+        && application.receipt() == receipt
+        && application.issuance() == issuance
+        && application.applied_at() == request.applied_at
+}
+
+fn current_private_application_successor_is_exact(
+    hosted: &HostedPrivateAgent,
+    application: &PrivateRuntimeApplication,
+) -> Result<bool, PrivateAgentHostError> {
+    Ok((application.matches_successor(&hosted.runtime_image)
+        || hosted
+            .runtime_image
+            .matches_application_successor_after_object_growth(application))
+        && hosted.runtime_image.store() == hosted.store.core_position()?)
 }
 
 fn require_resolved_runtime_application_head(
@@ -3167,7 +3329,7 @@ fn require_runtime_application_attachments_for_open(
 fn validate_private_runtime_application_mutation(
     control: &PrivateControlRecord,
     mutation_wire: Option<&[u8]>,
-) -> Result<(), PrivateAgentHostError> {
+) -> Result<Option<PrivateRuntimeMutation>, PrivateAgentHostError> {
     match &control.operation {
         PrivateControlOperation::SetResourcePolicy { .. }
         | PrivateControlOperation::ActorLifecycle { .. } => {
@@ -3184,6 +3346,7 @@ fn validate_private_runtime_application_mutation(
             if mutation.encode().ok().as_deref() != Some(mutation_wire) || !request.is_valid() {
                 return Err(PrivateAgentHostError::InvalidArtifact);
             }
+            Ok(Some(mutation))
         }
         PrivateControlOperation::Invite { .. }
         | PrivateControlOperation::Revoke { .. }
@@ -3192,9 +3355,9 @@ fn validate_private_runtime_application_mutation(
             if mutation_wire.is_some() {
                 return Err(PrivateAgentHostError::InvalidArtifact);
             }
+            Ok(None)
         }
     }
-    Ok(())
 }
 
 fn validate_new_private_application_position(
@@ -3275,51 +3438,15 @@ fn validate_new_private_application_position(
     Ok(())
 }
 
-fn expected_private_members(
-    current: &[PrivateNodeIdentity],
-    local_node: &PrivateNodeIdentity,
-    control: &PrivateControlRecord,
-) -> Result<Vec<NodeId>, PrivateAgentHostError> {
-    let mut members: Vec<NodeId> = current.iter().map(|node| node.node).collect();
-    match &control.operation {
-        PrivateControlOperation::Invite { node, .. } => {
-            let position = members
-                .binary_search(&node.node)
-                .err()
-                .ok_or(PrivateAgentHostError::InvalidMembership)?;
-            members.insert(position, node.node);
-        }
-        PrivateControlOperation::Revoke { node, .. } => {
-            let position = members
-                .binary_search(node)
-                .map_err(|_| PrivateAgentHostError::InvalidMembership)?;
-            members.remove(position);
-            if members.binary_search(&local_node.node).is_err() {
-                return Err(PrivateAgentHostError::Unauthorized);
-            }
-        }
-        PrivateControlOperation::Recover {
-            replacement_nodes, ..
-        } => {
-            require_exact_local_member(replacement_nodes, local_node)?;
-            members = replacement_nodes.iter().map(|node| node.node).collect();
-        }
-        PrivateControlOperation::RotateKeys { .. }
-        | PrivateControlOperation::SetResourcePolicy { .. }
-        | PrivateControlOperation::ActorLifecycle { .. } => {}
-    }
-    Ok(members)
-}
-
-#[cfg(test)]
 fn apply_prepared_private_control<V>(
     slot: &Path,
     hosted: &mut HostedPrivateAgent,
     local_node: &PrivateNodeIdentity,
     node_key: &PrivateNodeDecryptionKey,
     node_authority: &V,
-    request: &PrivateControlRuntimeApplicationRequest,
     prepared: &PreparedPrivateApplication,
+    successor_image: PrivateRuntimeImage,
+    runtime_application: &PrivateRuntimeApplication,
     stop: PrivateRuntimeApplicationStop,
 ) -> Result<(), PrivateAgentHostError>
 where
@@ -3346,33 +3473,12 @@ where
             }
             Some(data)
         }
-        PrivateControlOperation::Recover {
-            next_epoch,
-            historical_keyring,
-            ..
-        } => {
-            let _owner = unwrap_owner_key(next_epoch, local_node, node_key)?;
-            let data = unwrap_data_key(next_epoch, local_node, node_key)?;
-            let prior_epoch_count = hosted
-                .store
-                .key_epochs()
-                .partition_point(|epoch| epoch.epoch < next_epoch.epoch);
-            if prior_epoch_count == 0 {
-                return Err(PrivateAgentHostError::Corrupt);
-            }
-            let _historical = unwrap_recovery_keyring(
-                historical_keyring,
-                &hosted.store.key_epochs()[..prior_epoch_count],
-                local_node,
-                node_key,
-            )?;
-            Some(data)
+        PrivateControlOperation::Recover { .. } => {
+            return Err(PrivateAgentHostError::UnsupportedOperation);
         }
         PrivateControlOperation::SetResourcePolicy { .. }
         | PrivateControlOperation::ActorLifecycle { .. } => None,
     };
-    let (successor_image, runtime_application) =
-        prepare_synthetic_runtime_successor_for_test(hosted, node_authority, request, prepared)?;
     if let Some(data) = successor_data.as_ref() {
         stage_metadata_for_application(slot, prepared.expected_epoch, data, hosted, stop)?;
     }
@@ -3392,58 +3498,29 @@ where
 
     #[cfg(test)]
     let store_stop = private_store_stop(stop);
-    let store_result = match &prepared.control.operation {
-        PrivateControlOperation::Recover { .. } => {
-            #[cfg(test)]
-            if let Some(store_stop) = store_stop {
-                hosted.store.apply_offline_recovery_with_stop(
-                    hosted.store.binding().control_head,
-                    &prepared.control,
-                    node_authority,
-                    store_stop,
-                )
-            } else {
-                hosted.store.apply_offline_recovery(
-                    hosted.store.binding().control_head,
-                    &prepared.control,
-                    node_authority,
-                )
-            }
-            #[cfg(not(test))]
-            {
-                hosted.store.apply_offline_recovery(
-                    hosted.store.binding().control_head,
-                    &prepared.control,
-                    node_authority,
-                )
-            }
-        }
-        _ => {
-            #[cfg(test)]
-            if let Some(store_stop) = store_stop {
-                hosted
-                    .store
-                    .append_control_with_runtime_application_with_stop_for_runtime(
-                        &prepared.control,
-                        &runtime_application,
-                        node_authority,
-                        store_stop,
-                    )
-            } else {
-                hosted.store.append_control_with_runtime_application(
-                    &prepared.control,
-                    &runtime_application,
-                    node_authority,
-                )
-            }
-            #[cfg(not(test))]
-            {
-                hosted
-                    .store
-                    .append_control(&prepared.control, node_authority)
-            }
-        }
+    #[cfg(test)]
+    let store_result = if let Some(store_stop) = store_stop {
+        hosted
+            .store
+            .append_control_with_runtime_application_with_stop_for_runtime(
+                &prepared.control,
+                runtime_application,
+                node_authority,
+                store_stop,
+            )
+    } else {
+        hosted.store.append_control_with_runtime_application(
+            &prepared.control,
+            runtime_application,
+            node_authority,
+        )
     };
+    #[cfg(not(test))]
+    let store_result = hosted.store.append_control_with_runtime_application(
+        &prepared.control,
+        runtime_application,
+        node_authority,
+    );
     store_result?;
     #[cfg(test)]
     if stop == PrivateRuntimeApplicationStop::AfterStoreCommitted {
@@ -3457,46 +3534,106 @@ where
     Ok(())
 }
 
-#[cfg(test)]
-fn prepare_synthetic_runtime_successor_for_test<V: PrivateNodeAuthorityVerifier>(
+fn prepare_private_runtime_disposition(
     hosted: &HostedPrivateAgent,
-    node_authority: &V,
     request: &PrivateControlRuntimeApplicationRequest,
     prepared: &PreparedPrivateApplication,
-) -> Result<(PrivateRuntimeImage, PrivateRuntimeApplication), PrivateAgentHostError> {
-    let receipt = AuthorityReceipt::decode(&request.receipt)
-        .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
-    let issuance = AuthorityOperationIssuanceAck::decode(&request.issuance_ack)
-        .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
-    let successor_store = hosted
-        .store
-        .preview_control_position(&prepared.control, node_authority)?
-        .position();
-    let key_epochs = projected_private_runtime_key_epoch_commitments_for_test(
-        hosted.store.key_epochs(),
-        &prepared.control,
-    )?;
+    management_gas: u64,
+) -> Result<PreparedPrivateRuntimeDisposition, PrivateAgentHostError> {
+    if prepared.already_applied {
+        return Err(PrivateAgentHostError::Corrupt);
+    }
     let pending = PrivateRuntimeApplication::pending(
         &hosted.descriptor,
         &hosted.runtime_image,
         prepared.control.clone(),
+        prepared.mutation.clone(),
         None,
-        None,
-        receipt,
-        issuance,
+        prepared
+            .receipt
+            .clone()
+            .ok_or(PrivateAgentHostError::Corrupt)?,
+        prepared
+            .issuance
+            .clone()
+            .ok_or(PrivateAgentHostError::Corrupt)?,
         request.applied_at,
-        successor_store,
+        prepared.projected_store,
         &RawAuthorityVerifier,
         &RawRecoveryAuthorityProofVerifier,
     )
     .map_err(|_| PrivateAgentHostError::Corrupt)?;
+
+    let (state, success) = match &prepared.control.operation {
+        PrivateControlOperation::Invite { .. }
+        | PrivateControlOperation::Revoke { .. }
+        | PrivateControlOperation::RotateKeys { .. } => (
+            hosted.runtime_image.state().clone(),
+            PrivateRuntimeSuccess::ControlOnly,
+        ),
+        PrivateControlOperation::SetResourcePolicy { .. }
+        | PrivateControlOperation::ActorLifecycle { .. } => {
+            let mutation = prepared
+                .mutation
+                .clone()
+                .ok_or(PrivateAgentHostError::Corrupt)?;
+            let management = ManagementRequest::PrivateControl {
+                control: Box::new(prepared.control.clone()),
+                mutation: Box::new(mutation),
+            };
+            if !management.is_valid() {
+                return Err(PrivateAgentHostError::InvalidArtifact);
+            }
+            let work = RuntimeWork::Manage {
+                context: RuntimeExecutionContext::Direct,
+                space: request.route.space,
+                agent: request.route.agent,
+                runtime_deployment: request.route.runtime_deployment,
+                state: hosted.runtime_image.state().clone(),
+                request: Box::new(management.clone()),
+                authority: Some(Box::new(
+                    prepared
+                        .receipt
+                        .clone()
+                        .ok_or(PrivateAgentHostError::Corrupt)?,
+                )),
+                observed_slot: request.applied_at,
+            };
+            let wire = work
+                .encode()
+                .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
+            let admitted = admit_runtime_package(&hosted.runtime_package)
+                .map_err(|_| PrivateAgentHostError::Corrupt)?;
+            let transition = execute_canonical_wire::<RuntimeTransition>(
+                admitted.program_bytes(),
+                management_gas,
+                &wire,
+            )
+            .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
+            match classify_private_runtime_control_transition(
+                &hosted.runtime_image,
+                &management,
+                transition,
+            )
+            .map_err(|_| PrivateAgentHostError::InvalidArtifact)?
+            {
+                PrivateRuntimeControlDisposition::Applied { state, success } => (state, success),
+                PrivateRuntimeControlDisposition::RetiredUnapplied { .. } => {
+                    return Ok(PreparedPrivateRuntimeDisposition::RetiredUnapplied);
+                }
+            }
+        }
+        PrivateControlOperation::Recover { .. } => {
+            return Err(PrivateAgentHostError::UnsupportedOperation);
+        }
+    };
     let successor = PrivateRuntimeImage::successor(
         &hosted.descriptor,
         &hosted.runtime_image,
         &pending,
-        &PrivateRuntimeSuccess::ControlOnly,
-        hosted.runtime_image.state().clone(),
-        key_epochs,
+        &success,
+        state,
+        prepared.projected_key_epochs.clone(),
         &RawAuthorityVerifier,
         &RawRecoveryAuthorityProofVerifier,
     )
@@ -3506,59 +3643,17 @@ fn prepare_synthetic_runtime_successor_for_test<V: PrivateNodeAuthorityVerifier>
             &hosted.descriptor,
             &hosted.runtime_image,
             &successor,
-            PrivateRuntimeSuccess::ControlOnly,
+            success,
             &RawAuthorityVerifier,
             &RawRecoveryAuthorityProofVerifier,
         )
         .map_err(|_| PrivateAgentHostError::Corrupt)?;
-    Ok((successor, completed))
+    Ok(PreparedPrivateRuntimeDisposition::Applied {
+        successor_image: successor,
+        runtime_application: completed,
+    })
 }
 
-#[cfg(test)]
-fn projected_private_runtime_key_epoch_commitments_for_test(
-    current: &[PrivateKeyEpoch],
-    control: &PrivateControlRecord,
-) -> Result<Vec<PrivateKeyEpochCommitment>, PrivateAgentHostError> {
-    let mut epochs = current.to_vec();
-    let active = epochs.last_mut().ok_or(PrivateAgentHostError::Corrupt)?;
-    match &control.operation {
-        PrivateControlOperation::Invite {
-            node,
-            epoch,
-            sealed_owner_key,
-            sealed_data_key,
-            ..
-        } => {
-            if active.epoch != *epoch {
-                return Err(PrivateAgentHostError::Corrupt);
-            }
-            let position = active
-                .sealed_owner_keys
-                .binary_search_by_key(&node.node, |sealed| sealed.node)
-                .err()
-                .ok_or(PrivateAgentHostError::Corrupt)?;
-            active
-                .sealed_owner_keys
-                .insert(position, sealed_owner_key.clone());
-            active
-                .sealed_data_keys
-                .insert(position, sealed_data_key.clone());
-        }
-        PrivateControlOperation::Revoke { next_epoch, .. }
-        | PrivateControlOperation::RotateKeys { next_epoch }
-        | PrivateControlOperation::Recover { next_epoch, .. } => epochs.push(next_epoch.clone()),
-        PrivateControlOperation::SetResourcePolicy { .. }
-        | PrivateControlOperation::ActorLifecycle { .. } => {}
-    }
-    epochs
-        .iter()
-        .map(|epoch| {
-            PrivateKeyEpochCommitment::from_epoch(epoch).map_err(|_| PrivateAgentHostError::Corrupt)
-        })
-        .collect()
-}
-
-#[cfg(test)]
 fn stage_runtime_image_for_application(
     slot: &Path,
     data_key: &PrivateDataKey,
@@ -3577,7 +3672,6 @@ fn stage_runtime_image_for_application(
     application_stop(stop, PrivateRuntimeApplicationStop::AfterRuntimeStateStaged)
 }
 
-#[cfg(test)]
 fn promote_runtime_image_for_application(
     slot: &Path,
     control: Hash,
@@ -3593,8 +3687,7 @@ fn promote_runtime_image_for_application(
     )
 }
 
-#[cfg(test)]
-fn synthetic_legacy_private_application_fact_for_test(
+fn private_application_fact(
     hosted: &HostedPrivateAgent,
     request: &PrivateControlRuntimeApplicationRequest,
     prepared: &PreparedPrivateApplication,
@@ -3631,7 +3724,21 @@ fn synthetic_legacy_private_application_fact_for_test(
         .read_runtime_application(prepared.control.commitment())?
     {
         Some(application) => {
-            if !application.matches_successor(&hosted.runtime_image) {
+            if !completed_private_application_matches_request(
+                &application,
+                request,
+                &prepared.control,
+                prepared.mutation.as_ref(),
+                prepared
+                    .receipt
+                    .as_ref()
+                    .ok_or(PrivateAgentHostError::Corrupt)?,
+                prepared
+                    .issuance
+                    .as_ref()
+                    .ok_or(PrivateAgentHostError::Corrupt)?,
+            ) || !current_private_application_successor_is_exact(hosted, &application)?
+            {
                 return Err(PrivateAgentHostError::Corrupt);
             }
             let stable_projection = application
@@ -3643,11 +3750,7 @@ fn synthetic_legacy_private_application_fact_for_test(
                     .map_err(|_| PrivateAgentHostError::Corrupt)?;
             (reopened_runtime_state, stable_projection)
         }
-        None => {
-            // Test-only recovery fixtures still exercise the retired
-            // pre-PAPL crash path. Production reopen rejects this branch.
-            (Hash([0xf1; 32]), Hash([0xf2; 32]))
-        }
+        None => return Err(PrivateAgentHostError::Corrupt),
     };
     let fact = PrivateControlApplicationFact {
         managed: request.route,
@@ -3659,6 +3762,67 @@ fn synthetic_legacy_private_application_fact_for_test(
         post_member_set,
         reopened_runtime_state,
         stable_projection,
+        reopened_control_head: prepared.control.commitment(),
+        applied_at: request.applied_at,
+    };
+    fact.validate_shape()
+        .map_err(|_| PrivateAgentHostError::Corrupt)?;
+    Ok(fact)
+}
+
+#[cfg(test)]
+fn synthetic_legacy_private_application_fact_for_test(
+    hosted: &HostedPrivateAgent,
+    request: &PrivateControlRuntimeApplicationRequest,
+    prepared: &PreparedPrivateApplication,
+) -> Result<PrivateControlApplicationFact, PrivateAgentHostError> {
+    if hosted
+        .store
+        .read_runtime_application(prepared.control.commitment())?
+        .is_some()
+    {
+        return private_application_fact(hosted, request, prepared);
+    }
+
+    // Retired pre-PAPL recovery fixtures cannot cross the production direct
+    // application boundary, but still need an opaque fact while exercising
+    // their isolated recovery crash machinery.
+    let binding = hosted.store.binding();
+    let members: Vec<NodeId> = hosted
+        .store
+        .authorized_nodes()
+        .iter()
+        .map(|node| node.node)
+        .collect();
+    if binding.space != request.route.space
+        || binding.agent != request.route.agent
+        || hosted.descriptor.identity.runtime_deployment != request.route.runtime_deployment
+        || binding.epoch != prepared.expected_epoch
+        || binding.control_head != Some(prepared.control.commitment())
+        || binding.next_sequence
+            != prepared
+                .control
+                .sequence
+                .checked_add(1)
+                .ok_or(PrivateAgentHostError::LimitExceeded)?
+        || members != prepared.expected_members
+        || !hosted
+            .store
+            .control_is_exact(prepared.control.commitment(), &prepared.control_wire)?
+    {
+        return Err(PrivateAgentHostError::Corrupt);
+    }
+    let fact = PrivateControlApplicationFact {
+        managed: request.route,
+        operation: prepared.operation,
+        control: prepared.control.commitment(),
+        control_sequence: prepared.control.sequence,
+        control_previous: prepared.control.previous,
+        epoch: prepared.expected_epoch,
+        post_member_set: private_member_set_commitment(members.iter().copied())
+            .ok_or(PrivateAgentHostError::Corrupt)?,
+        reopened_runtime_state: Hash([0xf1; 32]),
+        stable_projection: Hash([0xf2; 32]),
         reopened_control_head: prepared.control.commitment(),
         applied_at: request.applied_at,
     };
@@ -3732,9 +3896,15 @@ fn private_store_stop(
         PrivateRuntimeApplicationStop::AfterStoreStagedArtifact => {
             Some(CommitStop::AfterStagedArtifact)
         }
+        PrivateRuntimeApplicationStop::AfterStoreStagedRuntimeApplication => {
+            Some(CommitStop::AfterStagedRuntimeApplication)
+        }
         PrivateRuntimeApplicationStop::AfterStoreStagedIndex => Some(CommitStop::AfterStagedIndex),
         PrivateRuntimeApplicationStop::AfterStorePending => Some(CommitStop::AfterPending),
         PrivateRuntimeApplicationStop::AfterStoreArtifact => Some(CommitStop::AfterArtifact),
+        PrivateRuntimeApplicationStop::AfterStoreRuntimeApplication => {
+            Some(CommitStop::AfterRuntimeApplication)
+        }
         PrivateRuntimeApplicationStop::AfterStoreIndex => Some(CommitStop::AfterIndex),
         _ => None,
     }
@@ -3823,6 +3993,7 @@ fn validate_private_creation_receipt(
 
 fn execute_private_runtime_genesis(
     request: &PrivateAgentCreate<'_>,
+    management_gas: u64,
 ) -> Result<RuntimeState, PrivateAgentHostError> {
     let descriptor = request.descriptor;
     let genesis_at = request.creation_receipt.selector.valid_from;
@@ -3841,7 +4012,7 @@ fn execute_private_runtime_genesis(
         .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
     let transition = execute_canonical_wire::<RuntimeTransition>(
         request.runtime_package.program_bytes(),
-        DEFAULT_MANAGEMENT_GAS,
+        management_gas,
         &wire,
     )
     .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
@@ -3914,14 +4085,9 @@ fn append_synthetic_control_only_with_runtime_image_for_test<V: PrivateNodeAutho
     successor_data_key: Option<&PrivateDataKey>,
     authority: &V,
 ) -> Result<PutDisposition, PrivateAgentHostError> {
-    let successor_store = hosted
-        .store
-        .preview_control_position(record, authority)?
-        .position();
-    let key_epochs = projected_private_runtime_key_epoch_commitments_for_test(
-        hosted.store.key_epochs(),
-        record,
-    )?;
+    let preview = hosted.store.preview_control_position(record, authority)?;
+    let successor_store = preview.position();
+    let key_epochs = preview.key_epoch_commitments().to_vec();
     let successor = PrivateRuntimeImage::synthetic_control_only_successor_for_host_test(
         &hosted.runtime_image,
         record,
@@ -6615,8 +6781,8 @@ mod tests {
     };
     use vos_agent_sdk::private::PrivateControlSigner;
     use vos_agent_sdk::{
-        InvocationId, ManagementReply, MethodMode, ResumeWork, RuntimeOutcome, RuntimeState,
-        StateLane, StorageKind,
+        InvocationId, ManagementError, ManagementReply, MethodMode, ResumeWork, RuntimeOutcome,
+        RuntimeState, StateLane, StorageKind,
     };
 
     use crate::agent::package_admission::{
@@ -6866,6 +7032,24 @@ mod tests {
         owner: PrincipalId,
         nodes: &[PrivateNodeIdentity],
     ) -> (Vec<u8>, AgentDescriptor, AuthorityReceipt) {
+        scripted_runtime_fixture_with_management(space, owner, nodes, None)
+    }
+
+    fn genesis_runtime_state() -> RuntimeState {
+        RuntimeState {
+            control: RUNTIME_STATE_SENTINEL.to_vec(),
+            linear: Vec::new(),
+            merge: b"private-genesis-merge".to_vec(),
+            local: b"private-genesis-local".to_vec(),
+        }
+    }
+
+    fn scripted_runtime_fixture_with_management(
+        space: SpaceId,
+        owner: PrincipalId,
+        nodes: &[PrivateNodeIdentity],
+        management: Option<(PrivateControlOperation, PrivateRuntimeMutation, Vec<u8>)>,
+    ) -> (Vec<u8>, AgentDescriptor, AuthorityReceipt) {
         // Program identity and the descriptor refer to each other. Construct
         // one same-width placeholder call, then have the real PVM copy the
         // exact descriptor identity from its read-only input into the fixed
@@ -6887,12 +7071,7 @@ mod tests {
         .encode()
         .unwrap();
         let output = RuntimeTransition {
-            state: RuntimeState {
-                control: RUNTIME_STATE_SENTINEL.to_vec(),
-                linear: Vec::new(),
-                merge: b"private-genesis-merge".to_vec(),
-                local: b"private-genesis-local".to_vec(),
-            },
+            state: genesis_runtime_state(),
             outcome: RuntimeOutcome::Management(Ok(ManagementReply::Created(
                 placeholder.identity.clone(),
             ))),
@@ -6900,7 +7079,7 @@ mod tests {
         .encode()
         .unwrap();
         let identity = identity_bytes(&placeholder.identity);
-        let case = ScriptedRuntimeCase {
+        let create_case = ScriptedRuntimeCase {
             copies: vec![ScriptedRuntimeCopy {
                 input_offset: unique_offset(&input, &identity),
                 output_offset: unique_offset(&output, &identity),
@@ -6909,13 +7088,89 @@ mod tests {
             input,
             output,
         };
+        let mut cases = vec![create_case];
+        if let Some((operation, mutation, output)) = management {
+            let control = PrivateControlRecord {
+                space,
+                agent: placeholder.identity.agent,
+                sequence: 0,
+                previous: None,
+                operation,
+                signer: PrivateControlSigner::Owner,
+                signer_public_key: [0x71; 32],
+                signature: [0x72; 64],
+            };
+            // The runtime dispatch case needs canonical shape and exact wire
+            // length, not an owner-valid signature from the future Store.
+            assert!(control.validate_shape());
+            let management_request = ManagementRequest::PrivateControl {
+                control: Box::new(control.clone()),
+                mutation: Box::new(mutation),
+            };
+            assert!(management_request.is_valid());
+            let operation = management_request.authority_operation().unwrap();
+            let (actor, actor_deployment) = management_request.authority_actor_selector();
+            let key = SigningKey::from_bytes(
+                &[placeholder.creation_nonce.as_bytes()[0].wrapping_add(90); 32],
+            );
+            let mut authority_receipt = AuthorityReceipt {
+                selector: AuthorityReceiptSelector {
+                    policy: placeholder.authority.policy,
+                    issuer: placeholder.authority.issuer,
+                    space,
+                    agent: placeholder.identity.agent,
+                    operation,
+                    runtime_deployment: placeholder.identity.runtime_deployment,
+                    actor,
+                    actor_deployment,
+                    evidence: AuthorityEvidence {
+                        package: None,
+                        proof: None,
+                        commitment: Hash([0x73; 32]),
+                    },
+                    lane_roots: AuthorityLaneRoots {
+                        control: None,
+                        linear: Some(Hash([0x74; 32])),
+                        merge: None,
+                        local: None,
+                    },
+                    epoch: placeholder.authority.initial_epoch,
+                    decision_sequence: 0,
+                    acknowledged_through: 0,
+                    valid_from: 40,
+                    expires_at: 144,
+                    request: control.commitment(),
+                },
+                public_key: placeholder.authority.public_key,
+                signature: [0; 64],
+            };
+            authority_receipt.signature = key.sign(&authority_receipt.signing_bytes()).to_bytes();
+            let management_input = RuntimeWork::Manage {
+                context: RuntimeExecutionContext::Direct,
+                space,
+                agent: placeholder.identity.agent,
+                runtime_deployment: placeholder.identity.runtime_deployment,
+                state: genesis_runtime_state(),
+                request: Box::new(management_request),
+                authority: Some(Box::new(authority_receipt)),
+                observed_slot: 44,
+            }
+            .encode()
+            .unwrap();
+            assert_ne!(management_input.len(), cases[0].input.len());
+            cases.push(ScriptedRuntimeCase {
+                input: management_input,
+                output,
+                copies: Vec::new(),
+            });
+        }
         let runtime = admitted_scripted_runtime_for_test(
             &format!(
                 "fixture-runtime-{}",
                 core::str::from_utf8(SENTINEL).unwrap()
             ),
             0x5a,
-            vec![case],
+            cases,
         );
         let descriptor = descriptor(space, owner, 31, nodes, &runtime);
         let receipt = creation_receipt(&descriptor, CREATED_AT);
@@ -6992,6 +7247,26 @@ mod tests {
             runtime,
             bootstrap,
         }
+    }
+
+    fn fixture_with_management(
+        operation: PrivateControlOperation,
+        mutation: PrivateRuntimeMutation,
+        output: Vec<u8>,
+    ) -> Fixture {
+        let mut fixture = fixture(1);
+        let identities = identities(&fixture);
+        let (runtime, descriptor, creation_receipt) = scripted_runtime_fixture_with_management(
+            fixture.space,
+            fixture.owner,
+            &identities,
+            Some((operation, mutation, output)),
+        );
+        assert_eq!(descriptor.identity.agent, fixture.descriptor.identity.agent);
+        fixture.runtime = runtime;
+        fixture.descriptor = descriptor;
+        fixture.creation_receipt = creation_receipt;
+        fixture
     }
 
     fn identities(fixture: &Fixture) -> Vec<PrivateNodeIdentity> {
@@ -7311,6 +7586,27 @@ mod tests {
         runtime_application_request_for_intent(fixture, control, intent, issued_at, applied_at)
     }
 
+    fn signed_runtime_mutation_request(
+        host: &PrivateAgentHost,
+        fixture: &Fixture,
+        operation: PrivateControlOperation,
+        mutation: &PrivateRuntimeMutation,
+        issued_at: u64,
+        applied_at: u64,
+    ) -> (
+        PrivateControlRecord,
+        AuthorityActorTarget,
+        PrivateControlRuntimeApplicationRequest,
+    ) {
+        let agent = fixture.descriptor.identity.agent;
+        let mut control = unsigned_owner_record(host.hosted(agent).unwrap(), operation);
+        sign_owner_control_record(&mut control, &host.hosted(agent).unwrap().owner_key).unwrap();
+        let (authority, mut request) =
+            runtime_application_request(fixture, &control, issued_at, applied_at);
+        request.mutation = Some(mutation.encode().unwrap());
+        (control, authority, request)
+    }
+
     fn recovery_runtime_application_request(
         fixture: &Fixture,
         control: &PrivateControlRecord,
@@ -7452,7 +7748,7 @@ mod tests {
         request: &PrivateControlRuntimeApplicationRequest,
     ) -> Result<PrivateControlRuntimeApplicationResult, PrivateAgentHostError> {
         let resolution = host
-            .synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
+            .runtime_application_adapter(authority, &TestAuthority)
             .unwrap()
             .apply(request)?;
         match resolution {
@@ -7490,7 +7786,7 @@ mod tests {
         let application = signed_test_application_ack(fixture, &request, &result);
         let evidence_request = test_evidence_request(&request, &application);
         let evidence = host
-            .synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
+            .runtime_application_adapter(authority, &TestAuthority)
             .unwrap()
             .persist_completed_evidence(&evidence_request)
             .unwrap();
@@ -7534,6 +7830,14 @@ mod tests {
             operation: AuthorityOperationKind::RecoverPrivateAgent,
             expected_epoch: proof.next_epoch,
             expected_members,
+            projected_store: host.agents[&control.agent].store.core_position().unwrap(),
+            projected_key_epochs: private_runtime_key_epoch_commitments(
+                &host.agents[&control.agent].store,
+            )
+            .unwrap(),
+            mutation: None,
+            receipt: None,
+            issuance: None,
             already_applied: true,
         };
         let application_fact = synthetic_legacy_private_application_fact_for_test(
@@ -7639,11 +7943,14 @@ mod tests {
         prepared: &PreparedPrivateRecovery,
     ) -> Result<PrivateControlRuntimeEvidenceResult, PrivateAgentHostError> {
         let (authority, request) = prepared_recovery_runtime_request(fixture, prepared);
-        let result = apply_runtime_request(host, authority, &request)?;
+        let result = host
+            .synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)?
+            .apply(&request)
+            .map(require_applied_runtime_result)?;
         let application = signed_test_application_ack(fixture, &request, &result);
         let evidence_request =
             test_recovery_evidence_request(&request, &application, &prepared.proof);
-        host.synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)?
+        host.runtime_application_adapter(authority, &TestAuthority)?
             .persist_completed_evidence(&evidence_request)
     }
 
@@ -7756,6 +8063,31 @@ mod tests {
             reopened.agents[&agent].runtime_image.commitment(),
             commitment
         );
+    }
+
+    #[test]
+    fn creation_uses_configured_management_gas_without_leaving_artifacts() {
+        let fixture = fixture(1);
+        let mut host = create_host(&fixture, 0, "runtime-genesis-gas");
+        let runtime = admit_runtime_package(&fixture.runtime).unwrap();
+        let agent = fixture.descriptor.identity.agent;
+
+        host.set_management_gas(0);
+        assert_eq!(
+            create_with_runtime(
+                &mut host,
+                &fixture,
+                &fixture.descriptor,
+                &runtime,
+                &fixture.creation_receipt,
+            ),
+            Err(PrivateAgentHostError::InvalidArtifact)
+        );
+        assert!(!host.agent_path(agent).exists());
+        assert!(!host.creating_path(agent).exists());
+
+        host.set_management_gas(DEFAULT_MANAGEMENT_GAS);
+        assert_eq!(create_agent(&mut host, &fixture), agent);
     }
 
     #[test]
@@ -8178,7 +8510,7 @@ mod tests {
         let control = signed_rotate_control(&left, agent);
         let (authority, request) = runtime_application_request(&fixture, &control, 50, 55);
         let mut runtime = left
-            .synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
+            .runtime_application_adapter(authority, &TestAuthority)
             .unwrap();
         runtime.stop_after(PrivateRuntimeApplicationStop::AfterStoreCommitted);
         assert_eq!(
@@ -8204,31 +8536,362 @@ mod tests {
     }
 
     #[test]
-    fn production_runtime_adapter_fails_unsupported_before_any_store_write() {
+    fn production_runtime_adapter_commits_control_and_completed_papl() {
         let fixture = fixture(64);
-        let mut host = create_host(&fixture, 0, "unwired-runtime-application");
+        let mut host = create_host(&fixture, 0, "physical-runtime-application");
         let agent = create_agent(&mut host, &fixture);
         let revoked = fixture.nodes[1].identity.node;
         let control = signed_revoke_control(&host, agent, revoked);
         let (authority, request) = runtime_application_request(&fixture, &control, 40, 44);
         let binding = host.binding(agent).unwrap();
-        let sidecars = canonical_sidecars(&host, agent);
 
         let result = host
             .runtime_application_adapter(authority, &TestAuthority)
             .unwrap()
-            .apply(&request);
-        assert!(matches!(
-            result,
-            Err(PrivateAgentHostError::UnsupportedOperation)
-        ));
+            .apply(&request)
+            .map(require_applied_runtime_result)
+            .unwrap();
+        let applied = host.binding(agent).unwrap();
+        assert_eq!(applied.epoch, binding.epoch + 1);
+        assert_eq!(applied.control_head, Some(control.commitment()));
+        assert!(result.authenticated && result.durably_applied && result.durably_reopened);
+        assert!(
+            host.agents[&agent]
+                .store
+                .control_is_exact(control.commitment(), &request.control)
+                .unwrap()
+        );
+        assert!(
+            host.agents[&agent]
+                .store
+                .read_runtime_application(control.commitment())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn runtime_backed_policy_and_lifecycle_execute_commit_reopen_and_skip_retry_execution() {
+        let policy = vos_agent_sdk::contract::RuntimeResourcePolicy::standard();
+        let policy_mutation = PrivateRuntimeMutation::SetResourcePolicy(policy);
+        let policy_operation = PrivateControlOperation::SetResourcePolicy {
+            policy: BlobRef::of_bytes(&policy.encode().unwrap()),
+        };
+        let mut policy_state = genesis_runtime_state();
+        policy_state.control = b"runtime-policy-applied".to_vec();
+        let policy_output = RuntimeTransition {
+            state: policy_state.clone(),
+            outcome: RuntimeOutcome::Management(Ok(ManagementReply::ResourcePolicySet(policy))),
+        }
+        .encode()
+        .unwrap();
+        let fixture = fixture_with_management(
+            policy_operation.clone(),
+            policy_mutation.clone(),
+            policy_output,
+        );
+        let mut host = create_host(&fixture, 0, "runtime-policy-positive");
+        let agent = create_agent(&mut host, &fixture);
+        let (control, authority, request) = signed_runtime_mutation_request(
+            &host,
+            &fixture,
+            policy_operation,
+            &policy_mutation,
+            40,
+            44,
+        );
+        let mut before_exhaustion = Vec::new();
+        collect_files(&host.agent_path(agent), &mut before_exhaustion);
+        host.set_management_gas(0);
+        assert_eq!(
+            host.runtime_application_adapter(authority, &TestAuthority)
+                .unwrap()
+                .apply(&request),
+            Err(PrivateAgentHostError::InvalidArtifact)
+        );
+        let mut after_exhaustion = Vec::new();
+        collect_files(&host.agent_path(agent), &mut after_exhaustion);
+        assert_eq!(after_exhaustion, before_exhaustion);
+
+        host.set_management_gas(DEFAULT_MANAGEMENT_GAS);
+        let first = require_applied_runtime_result(
+            host.runtime_application_adapter(authority, &TestAuthority)
+                .unwrap()
+                .apply(&request)
+                .unwrap(),
+        );
+        let application = host.agents[&agent]
+            .store
+            .read_runtime_application(control.commitment())
+            .unwrap()
+            .unwrap();
+        assert_eq!(application.mutation(), Some(&policy_mutation));
+        assert_eq!(
+            application.success(),
+            Some(&PrivateRuntimeSuccess::ResourcePolicySet(policy))
+        );
+        assert_eq!(host.agents[&agent].runtime_image.state(), &policy_state);
+        assert_eq!(
+            host.agents[&agent].runtime_image.active_resource_policy(),
+            policy
+        );
+        let exact_slot = {
+            let mut bytes = Vec::new();
+            collect_files(&host.agent_path(agent), &mut bytes);
+            bytes
+        };
+
+        // Zero gas proves an exact retry never enters the PVM or rewrites the
+        // already committed Store/PVRI generation.
+        host.set_management_gas(0);
+        let retry = require_applied_runtime_result(
+            host.runtime_application_adapter(authority, &TestAuthority)
+                .unwrap()
+                .apply(&request)
+                .unwrap(),
+        );
+        assert_eq!(retry, first);
+        let mut retry_slot = Vec::new();
+        collect_files(&host.agent_path(agent), &mut retry_slot);
+        assert_eq!(retry_slot, exact_slot);
+
+        drop(host);
+        let mut reopened = reopen_host(&fixture, 0, "runtime-policy-positive");
+        reopened.set_management_gas(0);
+        assert_eq!(
+            require_applied_runtime_result(
+                reopened
+                    .runtime_application_adapter(authority, &TestAuthority)
+                    .unwrap()
+                    .apply(&request)
+                    .unwrap(),
+            ),
+            first
+        );
+
+        let actor = ActorId([0x81; 32]);
+        let expected_deployment = DeploymentId([0x82; 32]);
+        let lifecycle_mutation = PrivateRuntimeMutation::RemoveLeaf {
+            actor,
+            expected_deployment,
+        };
+        let lifecycle_operation = PrivateControlOperation::ActorLifecycle {
+            actor,
+            operation: PrivateActorLifecycleKind::Remove,
+            request: lifecycle_mutation.commitment(),
+        };
+        let mut lifecycle_state = genesis_runtime_state();
+        lifecycle_state.control = b"runtime-lifecycle-applied".to_vec();
+        let lifecycle_output = RuntimeTransition {
+            state: lifecycle_state.clone(),
+            outcome: RuntimeOutcome::Management(Ok(ManagementReply::Removed(actor))),
+        }
+        .encode()
+        .unwrap();
+        let fixture = fixture_with_management(
+            lifecycle_operation.clone(),
+            lifecycle_mutation.clone(),
+            lifecycle_output,
+        );
+        let mut host = create_host(&fixture, 0, "runtime-lifecycle-positive");
+        let agent = create_agent(&mut host, &fixture);
+        let (control, authority, request) = signed_runtime_mutation_request(
+            &host,
+            &fixture,
+            lifecycle_operation,
+            &lifecycle_mutation,
+            50,
+            54,
+        );
+        let result = require_applied_runtime_result(
+            host.runtime_application_adapter(authority, &TestAuthority)
+                .unwrap()
+                .apply(&request)
+                .unwrap(),
+        );
+        let application = host.agents[&agent]
+            .store
+            .read_runtime_application(control.commitment())
+            .unwrap()
+            .unwrap();
+        assert_eq!(application.mutation(), Some(&lifecycle_mutation));
+        assert_eq!(
+            application.success(),
+            Some(&PrivateRuntimeSuccess::Removed(actor))
+        );
+        assert_eq!(host.agents[&agent].runtime_image.state(), &lifecycle_state);
+        let fact = decode_private_application_fact(&result.application_fact).unwrap();
+        assert_eq!(
+            fact.operation,
+            AuthorityOperationKind::PrivateActorLifecycle
+        );
+        assert_eq!(fact.control, control.commitment());
+    }
+
+    #[test]
+    fn exact_unchanged_management_denial_retires_without_any_physical_write() {
+        let policy = vos_agent_sdk::contract::RuntimeResourcePolicy::standard();
+        let mutation = PrivateRuntimeMutation::SetResourcePolicy(policy);
+        let operation = PrivateControlOperation::SetResourcePolicy {
+            policy: BlobRef::of_bytes(&policy.encode().unwrap()),
+        };
+        let output = RuntimeTransition {
+            state: genesis_runtime_state(),
+            outcome: RuntimeOutcome::Management(Err(ManagementError::ResourceLimit)),
+        }
+        .encode()
+        .unwrap();
+        let fixture = fixture_with_management(operation.clone(), mutation.clone(), output);
+        let mut host = create_host(&fixture, 0, "runtime-retirement");
+        let agent = create_agent(&mut host, &fixture);
+        let (control, authority, request) =
+            signed_runtime_mutation_request(&host, &fixture, operation, &mutation, 40, 44);
+        let binding = host.binding(agent).unwrap();
+        let image = host.agents[&agent].runtime_image.commitment();
+        let mut before = Vec::new();
+        collect_files(&host.agent_path(agent), &mut before);
+
+        let resolution = host
+            .runtime_application_adapter(authority, &TestAuthority)
+            .unwrap()
+            .apply(&request)
+            .unwrap();
+        let PrivateControlRuntimeApplicationResolution::RetiredUnapplied(retired) = resolution
+        else {
+            panic!("exact management denial was reported as applied")
+        };
+        assert_eq!(retired.route, request.route);
+        assert_eq!(retired.resolved_at, request.applied_at);
+        assert!(retired.authenticated && retired.predecessor_unchanged && retired.durably_reopened);
         assert_eq!(host.binding(agent).unwrap(), binding);
-        assert_eq!(canonical_sidecars(&host, agent), sidecars);
+        assert_eq!(host.agents[&agent].runtime_image.commitment(), image);
         assert!(
             !host.agents[&agent]
                 .store
                 .control_is_exact(control.commitment(), &request.control)
                 .unwrap()
+        );
+        assert_eq!(
+            host.agents[&agent]
+                .store
+                .read_runtime_application(control.commitment()),
+            Err(PrivateStoreError::NotFound)
+        );
+        let mut after = Vec::new();
+        collect_files(&host.agent_path(agent), &mut after);
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn runtime_trap_malformed_and_changed_denial_leave_no_physical_write() {
+        let policy = vos_agent_sdk::contract::RuntimeResourcePolicy::standard();
+        let mutation = PrivateRuntimeMutation::SetResourcePolicy(policy);
+        let operation = PrivateControlOperation::SetResourcePolicy {
+            policy: BlobRef::of_bytes(&policy.encode().unwrap()),
+        };
+        let mut changed_state = genesis_runtime_state();
+        changed_state.control = b"changed-denial-must-not-commit".to_vec();
+        let changed_denial = RuntimeTransition {
+            state: changed_state,
+            outcome: RuntimeOutcome::Management(Err(ManagementError::InvalidRequest)),
+        }
+        .encode()
+        .unwrap();
+        let cases = [
+            ("trap", fixture(1)),
+            (
+                "malformed",
+                fixture_with_management(operation.clone(), mutation.clone(), vec![0xff]),
+            ),
+            (
+                "changed-denial",
+                fixture_with_management(operation.clone(), mutation.clone(), changed_denial),
+            ),
+        ];
+        for (label, fixture) in cases {
+            let mut host = create_host(&fixture, 0, &format!("runtime-{label}"));
+            let agent = create_agent(&mut host, &fixture);
+            let (control, authority, request) = signed_runtime_mutation_request(
+                &host,
+                &fixture,
+                operation.clone(),
+                &mutation,
+                40,
+                44,
+            );
+            let binding = host.binding(agent).unwrap();
+            let image = host.agents[&agent].runtime_image.commitment();
+            let mut before = Vec::new();
+            collect_files(&host.agent_path(agent), &mut before);
+            assert!(
+                host.runtime_application_adapter(authority, &TestAuthority)
+                    .unwrap()
+                    .apply(&request)
+                    .is_err(),
+                "accepted {label} runtime transition"
+            );
+            assert_eq!(host.binding(agent).unwrap(), binding, "case {label}");
+            assert_eq!(
+                host.agents[&agent].runtime_image.commitment(),
+                image,
+                "case {label}"
+            );
+            assert!(
+                !host.agents[&agent]
+                    .store
+                    .control_is_exact(control.commitment(), &request.control)
+                    .unwrap()
+            );
+            let mut after = Vec::new();
+            collect_files(&host.agent_path(agent), &mut after);
+            assert_eq!(after, before, "case {label}");
+        }
+    }
+
+    #[test]
+    fn applied_retry_rejects_fresh_receipt_issuance_and_slot_without_new_fact() {
+        let fixture = fixture(2);
+        let mut host = create_host(&fixture, 0, "runtime-divergent-retry");
+        let agent = create_agent(&mut host, &fixture);
+        let control = signed_revoke_control(&host, agent, fixture.nodes[1].identity.node);
+        let (authority, request) = runtime_application_request(&fixture, &control, 40, 44);
+        let first = apply_runtime_request(&mut host, authority, &request).unwrap();
+        let mut before = Vec::new();
+        collect_files(&host.agent_path(agent), &mut before);
+
+        let mut changed_slot = request.clone();
+        changed_slot.applied_at += 1;
+
+        let (_, fresh_pair) = runtime_application_request(&fixture, &control, 41, 44);
+
+        let (_, authority_key) = authority_target(&fixture);
+        let mut changed_issuance = request.clone();
+        let mut issuance =
+            AuthorityOperationIssuanceAck::decode(&changed_issuance.issuance_ack).unwrap();
+        issuance.issued_at += 1;
+        issuance.signature = [0; 64];
+        issuance.signature = authority_key.sign(&issuance.signing_bytes()).to_bytes();
+        changed_issuance.issuance_ack = issuance.encode().unwrap();
+
+        for (label, candidate) in [
+            ("applied slot", changed_slot),
+            ("fresh receipt and issuance", fresh_pair),
+            ("fresh issuance", changed_issuance),
+        ] {
+            assert!(
+                host.runtime_application_adapter(authority, &TestAuthority)
+                    .unwrap()
+                    .apply(&candidate)
+                    .is_err(),
+                "accepted divergent {label} retry"
+            );
+            let mut after = Vec::new();
+            collect_files(&host.agent_path(agent), &mut after);
+            assert_eq!(after, before, "divergent {label} retry wrote state");
+        }
+        assert_eq!(
+            apply_runtime_request(&mut host, authority, &request).unwrap(),
+            first
         );
     }
 
@@ -8243,7 +8906,7 @@ mod tests {
 
         let first = {
             let mut runtime = host
-                .synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
+                .runtime_application_adapter(authority, &TestAuthority)
                 .unwrap();
             require_applied_runtime_result(runtime.apply(&request).unwrap())
         };
@@ -8293,7 +8956,7 @@ mod tests {
         let sidecars = canonical_sidecars(&host, agent);
         let retry = {
             let mut runtime = host
-                .synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
+                .runtime_application_adapter(authority, &TestAuthority)
                 .unwrap();
             require_applied_runtime_result(runtime.apply(&request).unwrap())
         };
@@ -8304,7 +8967,7 @@ mod tests {
         let mut reopened = reopen_host(&fixture, 0, "authorized-application");
         let restart_retry = {
             let mut runtime = reopened
-                .synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
+                .runtime_application_adapter(authority, &TestAuthority)
                 .unwrap();
             require_applied_runtime_result(runtime.apply(&request).unwrap())
         };
@@ -8338,9 +9001,11 @@ mod tests {
             PrivateRuntimeApplicationStop::AfterBootstrapStaged,
             PrivateRuntimeApplicationStop::AfterRuntimeStateStaged,
             PrivateRuntimeApplicationStop::AfterStoreStagedArtifact,
+            PrivateRuntimeApplicationStop::AfterStoreStagedRuntimeApplication,
             PrivateRuntimeApplicationStop::AfterStoreStagedIndex,
             PrivateRuntimeApplicationStop::AfterStorePending,
             PrivateRuntimeApplicationStop::AfterStoreArtifact,
+            PrivateRuntimeApplicationStop::AfterStoreRuntimeApplication,
             PrivateRuntimeApplicationStop::AfterStoreIndex,
             PrivateRuntimeApplicationStop::AfterStoreCommitted,
             PrivateRuntimeApplicationStop::AfterDescriptorPromoted,
@@ -8363,10 +9028,7 @@ mod tests {
                 let (authority, request) = runtime_application_request(&fixture, &control, 50, 55);
                 let interrupted = {
                     let mut runtime = host
-                        .synthetic_legacy_runtime_application_adapter_for_test(
-                            authority,
-                            &TestAuthority,
-                        )
+                        .runtime_application_adapter(authority, &TestAuthority)
                         .unwrap();
                     runtime.stop_after(boundary);
                     runtime.apply(&request)
@@ -8381,10 +9043,7 @@ mod tests {
                 let mut reopened = reopen_host(&fixture, 0, &name);
                 let result = {
                     let mut runtime = reopened
-                        .synthetic_legacy_runtime_application_adapter_for_test(
-                            authority,
-                            &TestAuthority,
-                        )
+                        .runtime_application_adapter(authority, &TestAuthority)
                         .unwrap();
                     require_applied_runtime_result(runtime.apply(&request).unwrap())
                 };
@@ -8439,10 +9098,7 @@ mod tests {
             let expected_commitment = expected.commitment().unwrap();
             let interrupted = {
                 let mut runtime = host
-                    .synthetic_legacy_runtime_application_adapter_for_test(
-                        authority,
-                        &TestAuthority,
-                    )
+                    .runtime_application_adapter(authority, &TestAuthority)
                     .unwrap();
                 runtime.stop_after(boundary);
                 runtime.persist_completed_evidence(&evidence_request)
@@ -8462,7 +9118,7 @@ mod tests {
                 Some(control.commitment())
             );
             let result = reopened
-                .synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
+                .runtime_application_adapter(authority, &TestAuthority)
                 .unwrap()
                 .persist_completed_evidence(&evidence_request)
                 .unwrap();
@@ -8484,7 +9140,7 @@ mod tests {
                 "boundary {boundary:?}"
             );
             let retry = reopened
-                .synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
+                .runtime_application_adapter(authority, &TestAuthority)
                 .unwrap()
                 .persist_completed_evidence(&evidence_request)
                 .unwrap();
@@ -8591,13 +9247,10 @@ mod tests {
 
         for (label, candidate) in cases {
             assert!(
-                host.synthetic_legacy_runtime_application_adapter_for_test(
-                    authority,
-                    &TestAuthority
-                )
-                .unwrap()
-                .persist_completed_evidence(&candidate)
-                .is_err(),
+                host.runtime_application_adapter(authority, &TestAuthority)
+                    .unwrap()
+                    .persist_completed_evidence(&candidate)
+                    .is_err(),
                 "{label}"
             );
             let entry = &host.agents[&agent].store.indexed_controls()[0];
@@ -8626,7 +9279,7 @@ mod tests {
             );
         }
 
-        host.synthetic_legacy_runtime_application_adapter_for_test(authority, &TestAuthority)
+        host.runtime_application_adapter(authority, &TestAuthority)
             .unwrap()
             .persist_completed_evidence(&exact)
             .unwrap();
@@ -8871,7 +9524,7 @@ mod tests {
     }
 
     #[test]
-    fn authorized_rotation_is_restartable_and_unimplemented_controls_fail_closed() {
+    fn authorized_rotation_is_restartable_and_unresolved_head_blocks_later_controls() {
         let fixture = fixture(2);
         let mut host = create_host(&fixture, 0, "authorized-private-controls");
         let agent = create_agent(&mut host, &fixture);
@@ -8937,8 +9590,8 @@ mod tests {
             rotate_result
         );
 
-        // A resource-policy PCTL cannot be reported as applied until the host
-        // has a durable policy application/reopen implementation.
+        // A later resource-policy PCTL cannot pass the physical boundary while
+        // the preceding rotation still lacks its authority evidence endpoint.
         let policy = vos_agent_sdk::contract::RuntimeResourcePolicy::standard();
         let policy_mutation = PrivateRuntimeMutation::SetResourcePolicy(policy);
         let mut resource = unsigned_owner_record(
@@ -8973,9 +9626,8 @@ mod tests {
         assert_eq!(host.binding(agent).unwrap(), before_resource);
         assert_eq!(canonical_sidecars(&host, agent), before_resource_sidecars);
 
-        // A lifecycle PCTL carries only the committed request hash. It cannot
-        // mutate or reopen an actor forest without the exact request bytes and
-        // a durable runtime image.
+        // The same unresolved-head rule blocks a later lifecycle PCTL even
+        // when the exact mutation preimage is supplied.
         let actor = ActorId([0xb7; 32]);
         let lifecycle_mutation = PrivateRuntimeMutation::Suspend {
             actor,
@@ -10809,16 +11461,12 @@ mod tests {
             },
         );
         sign_owner_control_record(&mut record, &hosted.owner_key).unwrap();
-        let successor_store = hosted
+        let preview = hosted
             .store
             .preview_control_position(&record, &TestAuthority)
-            .unwrap()
-            .position();
-        let successor_key_epochs = projected_private_runtime_key_epoch_commitments_for_test(
-            hosted.store.key_epochs(),
-            &record,
-        )
-        .unwrap();
+            .unwrap();
+        let successor_store = preview.position();
+        let successor_key_epochs = preview.key_epoch_commitments().to_vec();
         let successor_image = PrivateRuntimeImage::synthetic_control_only_successor_for_host_test(
             &hosted.runtime_image,
             &record,
