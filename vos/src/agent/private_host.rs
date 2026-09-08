@@ -1933,7 +1933,12 @@ impl PrivateAgentHost {
     ) -> Result<PrivateSyncApplyDisposition, PrivateAgentHostError> {
         let mut changed = false;
         for verified in controls {
-            let state = existing_sync_control_state(self.hosted(agent)?, verified)?;
+            let state = existing_sync_control_state(
+                self.hosted(agent)?,
+                verified,
+                &self.scope.local_node,
+                &self.node_key,
+            )?;
             if state == ExistingSyncControlState::Missing {
                 let request = sync_runtime_application_request(route, authority, verified)?;
                 let resolution = self.apply_private_runtime_application_inner(
@@ -1957,8 +1962,12 @@ impl PrivateAgentHost {
             // A completed local PAPL without PSE is the sole crash-valid
             // endpoint. Bind the already verified source PSE to that exact
             // local PAPL with a destination-secret PSI before advancing.
-            if existing_sync_control_state(self.hosted(agent)?, verified)?
-                == ExistingSyncControlState::PendingEvidence
+            if existing_sync_control_state(
+                self.hosted(agent)?,
+                verified,
+                &self.scope.local_node,
+                &self.node_key,
+            )? == ExistingSyncControlState::PendingEvidence
             {
                 self.persist_verified_sync_control_evidence(
                     agent,
@@ -1999,7 +2008,7 @@ impl PrivateAgentHost {
             {
                 return Err(PrivateAgentHostError::Sync(PrivateSyncError::Tampered));
             }
-            PrivateStableImportCertificate::issue(
+            let certificate = PrivateStableImportCertificate::issue(
                 route,
                 hosted.store.binding().owner,
                 hosted.descriptor.commitment(),
@@ -2011,7 +2020,18 @@ impl PrivateAgentHost {
                 &self.node_key,
             )?
             .encode()
-            .map_err(|_| PrivateAgentHostError::InvalidArtifact)?
+            .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
+            authenticate_imported_runtime_application_endpoint(
+                &hosted.descriptor,
+                verified.control(),
+                verified.source_application().application.epoch,
+                &application,
+                verified.evidence_wire(),
+                &certificate,
+                &self.scope.local_node,
+                &self.node_key,
+            )?;
+            certificate
         };
 
         let persistence = self
@@ -3173,6 +3193,8 @@ fn validate_sync_receiver_position(
 fn existing_sync_control_state(
     hosted: &HostedPrivateAgent,
     verified: &VerifiedPrivateSyncControl,
+    local_node: &PrivateNodeIdentity,
+    node_key: &PrivateNodeDecryptionKey,
 ) -> Result<ExistingSyncControlState, PrivateAgentHostError> {
     let control = verified.control();
     let Some(entry) = hosted
@@ -3210,8 +3232,32 @@ fn existing_sync_control_state(
     }
     let evidence = hosted.store.read_control_authority_evidence(entry)?;
     let certificate = hosted.store.read_stable_import_certificate(entry)?;
-    match (evidence, certificate) {
-        (Some(_), _) => Ok(ExistingSyncControlState::Authenticated),
+    match (evidence.as_deref(), certificate.as_deref()) {
+        (Some(evidence), certificate) => {
+            if evidence != verified.evidence_wire() {
+                return Err(PrivateAgentHostError::Sync(PrivateSyncError::Tampered));
+            }
+            match certificate {
+                Some(certificate) => authenticate_imported_runtime_application_endpoint(
+                    &hosted.descriptor,
+                    control,
+                    entry.resulting_epoch,
+                    &application,
+                    evidence,
+                    certificate,
+                    local_node,
+                    node_key,
+                )?,
+                None => authenticate_local_runtime_application_endpoint(
+                    &hosted.descriptor,
+                    control,
+                    entry.resulting_epoch,
+                    &application,
+                    evidence,
+                )?,
+            }
+            Ok(ExistingSyncControlState::Authenticated)
+        }
         (None, None)
             if hosted.store.binding().control_head == Some(control.commitment())
                 && hosted.store.indexed_controls().last() == Some(entry) =>
