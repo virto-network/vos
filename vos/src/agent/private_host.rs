@@ -95,8 +95,8 @@ use super::private_store::{
 use super::private_sync::{
     PrivateControlAuthorityEvidence, PrivateSyncApplyDisposition, PrivateSyncError,
     PrivateSyncPage, PrivateSyncPhase, PrivateSyncRequest, PrivateTransportAuthVerifier,
-    apply_private_sync_page, serve_private_sync_page, validate_private_actor_schema,
-    validate_private_runtime_work, verify_private_control_page_authority_evidence,
+    VerifiedPrivateSyncControl, apply_private_sync_page, serve_private_sync_page,
+    validate_private_actor_schema, validate_private_runtime_work, verify_private_sync_control_page,
 };
 use super::runtime_pvm::execute_canonical_wire;
 
@@ -442,6 +442,7 @@ struct PreparedPrivateApplication {
     projected_store: PrivateStoreCorePosition,
     projected_key_epochs: Vec<PrivateKeyEpochCommitment>,
     mutation: Option<PrivateRuntimeMutation>,
+    recovery_proof: Option<PrivateRecoveryAuthorityProof>,
     receipt: Option<AuthorityReceipt>,
     issuance: Option<AuthorityOperationIssuanceAck>,
     already_applied: bool,
@@ -453,6 +454,13 @@ enum PreparedPrivateRuntimeDisposition {
         runtime_application: PrivateRuntimeApplication,
     },
     RetiredUnapplied,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExistingSyncControlState {
+    Missing,
+    PendingEvidence,
+    Authenticated,
 }
 
 struct RawAuthorityVerifier;
@@ -1849,12 +1857,20 @@ impl PrivateAgentHost {
         if authority.binding != hosted.descriptor.authority {
             return Err(PrivateAgentHostError::Unauthorized);
         }
-        verify_private_control_page_authority_evidence(&page, route, authority)?;
         if page.phase == PrivateSyncPhase::Controls {
-            // FOLLOW-UP(PAPL): controls require local PVM execution, a
-            // completed application attachment, and a staged successor PVRI.
-            // The legacy low-level Store receiver cannot supply those facts.
-            return Err(PrivateAgentHostError::UnsupportedOperation);
+            // Authenticate the complete page before the first PVM execution
+            // or filesystem mutation. Each item is then committed as its own
+            // recoverable PAPL/PVRI/PVE2 transaction, so a lost multi-item
+            // result can resume from the exact durable prefix.
+            let controls = verify_private_sync_control_page(&page, route, authority)?;
+            validate_sync_receiver_position(&hosted.store, &page)?;
+            return self.apply_verified_sync_controls(
+                agent,
+                route,
+                authority,
+                node_authority,
+                &controls,
+            );
         }
         require_resolved_runtime_application_head(&hosted.store)?;
         let starting_store = hosted.store.core_position()?;
@@ -1907,11 +1923,148 @@ impl PrivateAgentHost {
         }
     }
 
+    fn apply_verified_sync_controls<V: PrivateNodeAuthorityVerifier>(
+        &mut self,
+        agent: AgentId,
+        route: ManagedAgentTarget,
+        authority: AuthorityActorTarget,
+        node_authority: &V,
+        controls: &[VerifiedPrivateSyncControl],
+    ) -> Result<PrivateSyncApplyDisposition, PrivateAgentHostError> {
+        let mut changed = false;
+        for verified in controls {
+            let state = existing_sync_control_state(self.hosted(agent)?, verified)?;
+            if state == ExistingSyncControlState::Missing {
+                let request = sync_runtime_application_request(route, authority, verified)?;
+                let resolution = self.apply_private_runtime_application_inner(
+                    authority,
+                    node_authority,
+                    &request,
+                    verified.recovery_proof(),
+                    Some(verified.source_stable_projection()),
+                    true,
+                    PrivateRuntimeApplicationStop::Never,
+                )?;
+                let PrivateControlRuntimeApplicationResolution::Applied(result) = resolution else {
+                    return Err(PrivateAgentHostError::Sync(PrivateSyncError::Tampered));
+                };
+                if result.stable_projection != verified.source_stable_projection() {
+                    return Err(PrivateAgentHostError::Sync(PrivateSyncError::Tampered));
+                }
+                changed = true;
+            }
+
+            // A completed local PAPL without PSE is the sole crash-valid
+            // endpoint. Bind the already verified source PSE to that exact
+            // local PAPL with a destination-secret PSI before advancing.
+            if existing_sync_control_state(self.hosted(agent)?, verified)?
+                == ExistingSyncControlState::PendingEvidence
+            {
+                self.persist_verified_sync_control_evidence(
+                    agent,
+                    route,
+                    verified,
+                    node_authority,
+                )?;
+                changed = true;
+            }
+        }
+        Ok(if changed {
+            PrivateSyncApplyDisposition::Applied
+        } else {
+            PrivateSyncApplyDisposition::AlreadyApplied
+        })
+    }
+
+    fn persist_verified_sync_control_evidence<V: PrivateNodeAuthorityVerifier>(
+        &mut self,
+        agent: AgentId,
+        route: ManagedAgentTarget,
+        verified: &VerifiedPrivateSyncControl,
+        node_authority: &V,
+    ) -> Result<(), PrivateAgentHostError> {
+        let control = verified.control().commitment();
+        let evidence = PrivateControlAuthorityEvidence::decode(verified.evidence_wire())?;
+        let source_evidence = evidence.commitment()?;
+        let certificate = {
+            let hosted = self.hosted(agent)?;
+            let application = hosted
+                .store
+                .read_runtime_application(control)?
+                .ok_or(PrivateAgentHostError::Corrupt)?;
+            if application
+                .successor_stable_projection()
+                .map(|projection| projection.commitment())
+                != Some(verified.source_stable_projection())
+            {
+                return Err(PrivateAgentHostError::Sync(PrivateSyncError::Tampered));
+            }
+            PrivateStableImportCertificate::issue(
+                route,
+                hosted.store.binding().owner,
+                hosted.descriptor.commitment(),
+                &self.scope.local_node,
+                control,
+                application.commitment(),
+                source_evidence,
+                verified.source_stable_projection(),
+                &self.node_key,
+            )?
+            .encode()
+            .map_err(|_| PrivateAgentHostError::InvalidArtifact)?
+        };
+
+        let persistence = self
+            .hosted_mut(agent)?
+            .store
+            .persist_imported_control_authority_evidence(
+                control,
+                verified.evidence_wire(),
+                &certificate,
+            );
+        if let Err(error) = persistence {
+            drop(self.agents.remove(&agent));
+            let _ = self.reopen_quarantined_agent(agent, node_authority);
+            return Err(error.into());
+        }
+
+        // Reopening is part of the import transaction: the next control may
+        // not use this predecessor until PSI, source PSE, local PAPL, and the
+        // node-local PVRI have been authenticated together from disk.
+        drop(self.agents.remove(&agent));
+        self.reopen_quarantined_agent(agent, node_authority)
+    }
+
     fn apply_private_runtime_application<V>(
         &mut self,
         authority: AuthorityActorTarget,
         node_authority: &V,
         request: &PrivateControlRuntimeApplicationRequest,
+        stop: PrivateRuntimeApplicationStop,
+    ) -> Result<PrivateControlRuntimeApplicationResolution, PrivateAgentHostError>
+    where
+        V: PrivateNodeAuthorityVerifier,
+    {
+        self.apply_private_runtime_application_inner(
+            authority,
+            node_authority,
+            request,
+            None,
+            None,
+            false,
+            stop,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_private_runtime_application_inner<V>(
+        &mut self,
+        authority: AuthorityActorTarget,
+        node_authority: &V,
+        request: &PrivateControlRuntimeApplicationRequest,
+        recovery_proof: Option<&PrivateRecoveryAuthorityProof>,
+        expected_stable_projection: Option<Hash>,
+        allow_recover: bool,
         stop: PrivateRuntimeApplicationStop,
     ) -> Result<PrivateControlRuntimeApplicationResolution, PrivateAgentHostError>
     where
@@ -1923,7 +2076,7 @@ impl PrivateAgentHost {
         if control.encode().ok().as_deref() != Some(request.control.as_slice()) {
             return Err(PrivateAgentHostError::InvalidArtifact);
         }
-        if matches!(control.operation, PrivateControlOperation::Recover { .. }) {
+        if matches!(control.operation, PrivateControlOperation::Recover { .. }) && !allow_recover {
             // Recover selects a replacement-host lineage and is never a
             // direct mutation of an already-live runtime image.
             return Err(PrivateAgentHostError::UnsupportedOperation);
@@ -1936,8 +2089,24 @@ impl PrivateAgentHost {
             authority,
             node_authority,
             request,
+            recovery_proof,
+            allow_recover,
         )?;
         if prepared.already_applied {
+            if let Some(expected) = expected_stable_projection {
+                let application = self
+                    .hosted(agent)?
+                    .store
+                    .read_runtime_application(control.commitment())?
+                    .ok_or(PrivateAgentHostError::Corrupt)?;
+                if application
+                    .successor_stable_projection()
+                    .map(|projection| projection.commitment())
+                    != Some(expected)
+                {
+                    return Err(PrivateAgentHostError::Sync(PrivateSyncError::Tampered));
+                }
+            }
             return self.reopen_completed_private_application(
                 authority,
                 node_authority,
@@ -1958,6 +2127,9 @@ impl PrivateAgentHost {
             runtime_application,
         } = disposition
         else {
+            if expected_stable_projection.is_some() {
+                return Err(PrivateAgentHostError::Sync(PrivateSyncError::Tampered));
+            }
             return self.reopen_retired_private_application(
                 authority,
                 node_authority,
@@ -1966,6 +2138,14 @@ impl PrivateAgentHost {
                 stop,
             );
         };
+        if expected_stable_projection.is_some_and(|expected| {
+            runtime_application
+                .successor_stable_projection()
+                .map(|projection| projection.commitment())
+                != Some(expected)
+        }) {
+            return Err(PrivateAgentHostError::Sync(PrivateSyncError::Tampered));
+        }
 
         let slot = self.agent_path(agent);
         let expected_space = self.scope.space;
@@ -2962,6 +3142,116 @@ impl PrivateAgentHost {
     }
 }
 
+fn validate_sync_receiver_position(
+    store: &PrivateStore,
+    page: &PrivateSyncPage,
+) -> Result<(), PrivateAgentHostError> {
+    let binding = store.binding();
+    let current = super::private_sync::PrivateSyncHead {
+        epoch: binding.epoch,
+        control_head: binding.control_head,
+    };
+    if current == page.request.cursor.local {
+        return Ok(());
+    }
+    let current_is_durable_prefix = page.items.iter().any(|item| {
+        matches!(
+            item,
+            super::private_sync::PrivateSyncItem::Control {
+                commitment,
+                resulting_epoch,
+                ..
+            } if current.control_head == Some(*commitment) && current.epoch == *resulting_epoch
+        )
+    });
+    if !current_is_durable_prefix {
+        return Err(PrivateAgentHostError::Sync(PrivateSyncError::Diverged));
+    }
+    Ok(())
+}
+
+fn existing_sync_control_state(
+    hosted: &HostedPrivateAgent,
+    verified: &VerifiedPrivateSyncControl,
+) -> Result<ExistingSyncControlState, PrivateAgentHostError> {
+    let control = verified.control();
+    let Some(entry) = hosted
+        .store
+        .indexed_controls()
+        .iter()
+        .find(|entry| entry.commitment == control.commitment())
+    else {
+        return Ok(ExistingSyncControlState::Missing);
+    };
+    if entry.sequence != control.sequence
+        || entry.resulting_epoch != verified.source_application().application.epoch
+        || !hosted.store.control_is_exact(
+            control.commitment(),
+            &control
+                .encode()
+                .map_err(|_| PrivateAgentHostError::InvalidArtifact)?,
+        )?
+    {
+        return Err(PrivateAgentHostError::Corrupt);
+    }
+    let application = hosted
+        .store
+        .read_runtime_application(control.commitment())?
+        .ok_or(PrivateAgentHostError::Corrupt)?;
+    if application.control() != control
+        || application.mutation() != verified.mutation()
+        || application.recovery_authority_proof() != verified.recovery_proof()
+        || application
+            .successor_stable_projection()
+            .map(|projection| projection.commitment())
+            != Some(verified.source_stable_projection())
+    {
+        return Err(PrivateAgentHostError::Sync(PrivateSyncError::Tampered));
+    }
+    let evidence = hosted.store.read_control_authority_evidence(entry)?;
+    let certificate = hosted.store.read_stable_import_certificate(entry)?;
+    match (evidence, certificate) {
+        (Some(_), _) => Ok(ExistingSyncControlState::Authenticated),
+        (None, None)
+            if hosted.store.binding().control_head == Some(control.commitment())
+                && hosted.store.indexed_controls().last() == Some(entry) =>
+        {
+            Ok(ExistingSyncControlState::PendingEvidence)
+        }
+        _ => Err(PrivateAgentHostError::Corrupt),
+    }
+}
+
+fn sync_runtime_application_request(
+    route: ManagedAgentTarget,
+    authority: AuthorityActorTarget,
+    verified: &VerifiedPrivateSyncControl,
+) -> Result<PrivateControlRuntimeApplicationRequest, PrivateAgentHostError> {
+    Ok(PrivateControlRuntimeApplicationRequest {
+        route,
+        authority,
+        control: verified
+            .control()
+            .encode()
+            .map_err(|_| PrivateAgentHostError::InvalidArtifact)?,
+        mutation: verified
+            .mutation()
+            .map(CanonicalWire::encode)
+            .transpose()
+            .map_err(|_| PrivateAgentHostError::InvalidArtifact)?,
+        receipt: verified
+            .issuance()
+            .receipt
+            .encode()
+            .map_err(|_| PrivateAgentHostError::InvalidArtifact)?,
+        issuance_ack: verified
+            .issuance()
+            .encode()
+            .map_err(|_| PrivateAgentHostError::InvalidArtifact)?,
+        applied_at: verified.source_application().application.applied_at,
+    })
+}
+
 impl<V> PrivateControlRuntimeApplicationAdapter for PrivateAgentRuntimeApplication<'_, V>
 where
     V: PrivateNodeAuthorityVerifier,
@@ -3109,6 +3399,7 @@ fn prepare_staged_recovery_application(
         projected_store: hosted.store.core_position()?,
         projected_key_epochs: private_runtime_key_epoch_commitments(&hosted.store)?,
         mutation: None,
+        recovery_proof: Some(proof.clone()),
         receipt: None,
         issuance: None,
         already_applied: true,
@@ -3121,6 +3412,8 @@ fn prepare_private_application<V>(
     authority: AuthorityActorTarget,
     node_authority: &V,
     request: &PrivateControlRuntimeApplicationRequest,
+    recovery_proof: Option<&PrivateRecoveryAuthorityProof>,
+    allow_recover: bool,
 ) -> Result<PreparedPrivateApplication, PrivateAgentHostError>
 where
     V: PrivateNodeAuthorityVerifier,
@@ -3148,16 +3441,32 @@ where
     verify_control_record_signature(&control)?;
     let mutation =
         validate_private_runtime_application_mutation(&control, request.mutation.as_deref())?;
-    if matches!(control.operation, PrivateControlOperation::Recover { .. }) {
+    let recover = matches!(control.operation, PrivateControlOperation::Recover { .. });
+    if recover != recovery_proof.is_some() {
+        return Err(PrivateAgentHostError::InvalidArtifact);
+    }
+    if recovery_proof.is_some_and(|proof| !proof.matches_control(&control)) {
+        return Err(PrivateAgentHostError::Unauthorized);
+    }
+    if recover && !allow_recover {
         return Err(PrivateAgentHostError::UnsupportedOperation);
     }
-    let intent =
-        AuthorityOperationIntent::private_control(request.route.runtime_deployment, &control)
-            .map_err(|_| PrivateAgentHostError::Unauthorized)?;
+    let intent = match recovery_proof {
+        Some(proof) => AuthorityOperationIntent::private_recovery_control(proof.clone())
+            .map_err(|_| PrivateAgentHostError::Unauthorized)?,
+        None => {
+            AuthorityOperationIntent::private_control(request.route.runtime_deployment, &control)
+                .map_err(|_| PrivateAgentHostError::Unauthorized)?
+        }
+    };
     let operation = intent.operation();
     let expected_actor = match &intent {
         AuthorityOperationIntent::PrivateActorLifecycle { actor, .. } => Some(*actor),
         _ => None,
+    };
+    let expected_request = match &intent {
+        AuthorityOperationIntent::RecoverPrivateAgent { proof } => proof.commitment(),
+        _ => control.commitment(),
     };
 
     let receipt = AuthorityReceipt::decode(&request.receipt)
@@ -3176,7 +3485,7 @@ where
         || selector.operation != operation
         || selector.actor != expected_actor
         || selector.actor_deployment.is_some()
-        || selector.request != control.commitment()
+        || selector.request != expected_request
         || issuance
             .verify_with(authority.binding, &RawAuthorityVerifier)
             .is_err()
@@ -3277,6 +3586,7 @@ where
         projected_store: preview.position(),
         projected_key_epochs: preview.key_epoch_commitments().to_vec(),
         mutation,
+        recovery_proof: recovery_proof.cloned(),
         receipt: Some(receipt),
         issuance: Some(issuance),
         already_applied,
@@ -3473,7 +3783,8 @@ where
     let successor_data = match &prepared.control.operation {
         PrivateControlOperation::Invite { .. } => None,
         PrivateControlOperation::Revoke { next_epoch, .. }
-        | PrivateControlOperation::RotateKeys { next_epoch } => {
+        | PrivateControlOperation::RotateKeys { next_epoch }
+        | PrivateControlOperation::Recover { next_epoch, .. } => {
             let owner = unwrap_owner_key(next_epoch, local_node, node_key)?;
             let data = unwrap_data_key(next_epoch, local_node, node_key)?;
             if owner.verifying_key() == hosted.owner_key.verifying_key()
@@ -3487,9 +3798,6 @@ where
                 return Err(PrivateAgentHostError::InvalidArtifact);
             }
             Some(data)
-        }
-        PrivateControlOperation::Recover { .. } => {
-            return Err(PrivateAgentHostError::UnsupportedOperation);
         }
         PrivateControlOperation::SetResourcePolicy { .. }
         | PrivateControlOperation::ActorLifecycle { .. } => None,
@@ -3563,7 +3871,7 @@ fn prepare_private_runtime_disposition(
         &hosted.runtime_image,
         prepared.control.clone(),
         prepared.mutation.clone(),
-        None,
+        prepared.recovery_proof.clone(),
         prepared
             .receipt
             .clone()
@@ -3582,7 +3890,8 @@ fn prepare_private_runtime_disposition(
     let (state, success) = match &prepared.control.operation {
         PrivateControlOperation::Invite { .. }
         | PrivateControlOperation::Revoke { .. }
-        | PrivateControlOperation::RotateKeys { .. } => (
+        | PrivateControlOperation::RotateKeys { .. }
+        | PrivateControlOperation::Recover { .. } => (
             hosted.runtime_image.state().clone(),
             PrivateRuntimeSuccess::ControlOnly,
         ),
@@ -3637,9 +3946,6 @@ fn prepare_private_runtime_disposition(
                     return Ok(PreparedPrivateRuntimeDisposition::RetiredUnapplied);
                 }
             }
-        }
-        PrivateControlOperation::Recover { .. } => {
-            return Err(PrivateAgentHostError::UnsupportedOperation);
         }
     };
     let successor = PrivateRuntimeImage::successor(
@@ -8214,6 +8520,7 @@ mod tests {
             )
             .unwrap(),
             mutation: None,
+            recovery_proof: Some(proof.clone()),
             receipt: None,
             issuance: None,
             already_applied: true,
@@ -10820,7 +11127,7 @@ mod tests {
     }
 
     #[test]
-    fn independent_node_genesis_sync_is_fail_closed_and_leaks_no_plaintext() {
+    fn independent_node_genesis_control_sync_is_local_and_leaks_no_plaintext() {
         let fixture = fixture(2);
         let mut primary = create_host(&fixture, 0, "primary");
         let agent = create_agent(&mut primary, &fixture);
@@ -10867,9 +11174,6 @@ mod tests {
             max_items: MAX_PRIVATE_SYNC_ITEMS as u16,
             max_bytes: MAX_PRIVATE_SYNC_PAGE_BYTES as u32,
         };
-        let before_binding = peer.binding(agent).unwrap();
-        let mut before_slot = Vec::new();
-        collect_files(&peer.agent_path(agent), &mut before_slot);
         let page = primary
             .serve_sync_page(
                 agent,
@@ -10887,13 +11191,14 @@ mod tests {
                 authority_target(&fixture).0,
                 &TestAuthority,
                 &TestTransport,
-            ),
-            Err(PrivateAgentHostError::UnsupportedOperation)
+            )
+            .unwrap(),
+            PrivateSyncApplyDisposition::Applied
         );
-        assert_eq!(peer.binding(agent).unwrap(), before_binding);
-        let mut after_slot = Vec::new();
-        collect_files(&peer.agent_path(agent), &mut after_slot);
-        assert_eq!(after_slot, before_slot);
+        assert_eq!(
+            peer.binding(agent).unwrap(),
+            primary.binding(agent).unwrap()
+        );
         assert!(fs::read_dir(peer.agent_path(agent)).unwrap().all(|entry| {
             !entry
                 .unwrap()
@@ -10928,7 +11233,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(primary.agent_ids().collect::<Vec<_>>(), vec![agent]);
-        assert_eq!(peer.binding(agent).unwrap(), before_binding);
+        assert_eq!(
+            peer.binding(agent).unwrap(),
+            primary.binding(agent).unwrap()
+        );
         assert_eq!(primary.descriptor(agent).unwrap(), &fixture.descriptor);
         assert_eq!(peer.descriptor(agent).unwrap(), &fixture.descriptor);
     }
@@ -11496,7 +11804,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_control_sync_is_fail_closed_before_any_epoch_or_pvri_stage() {
+    fn multi_control_sync_executes_locally_attaches_import_provenance_and_restarts() {
         let fixture = fixture(2);
         let mut source = create_host(&fixture, 0, "multi-rotation-source");
         let agent = create_agent(&mut source, &fixture);
@@ -11524,10 +11832,7 @@ mod tests {
         assert_eq!(page.items.len(), 2);
         let mut peer = create_host(&fixture, 1, "multi-rotation-peer");
         assert_eq!(create_agent(&mut peer, &fixture), agent);
-        let before_binding = peer.binding(agent).unwrap();
-        let mut before_slot = Vec::new();
-        collect_files(&peer.agent_path(agent), &mut before_slot);
-        assert!(
+        assert_eq!(
             peer.apply_sync_page(
                 agent,
                 PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
@@ -11536,19 +11841,179 @@ mod tests {
                 &TestAuthority,
                 &TestTransport,
             )
-            .is_err()
+            .unwrap(),
+            PrivateSyncApplyDisposition::Applied
         );
-        assert_eq!(peer.binding(agent).unwrap(), before_binding);
-        let mut after_slot = Vec::new();
-        collect_files(&peer.agent_path(agent), &mut after_slot);
-        assert_eq!(after_slot, before_slot);
-        assert!(fs::read_dir(peer.agent_path(agent)).unwrap().all(|entry| {
-            !entry
+        assert_eq!(
+            peer.binding(agent).unwrap().epoch,
+            source.binding(agent).unwrap().epoch
+        );
+        assert_eq!(
+            peer.binding(agent).unwrap().control_head,
+            source.binding(agent).unwrap().control_head
+        );
+        for item in &page.items {
+            let PrivateSyncItem::Control {
+                commitment,
+                evidence,
+                stable_projection,
+                ..
+            } = item
+            else {
+                panic!("control page contained an object")
+            };
+            let peer_entry = peer.agents[&agent]
+                .store
+                .indexed_controls()
+                .iter()
+                .find(|entry| entry.commitment == *commitment)
+                .unwrap();
+            let source_application = source.agents[&agent]
+                .store
+                .read_runtime_application(*commitment)
                 .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .contains(NEXT_PREFIX)
-        }));
+                .unwrap();
+            let peer_application = peer.agents[&agent]
+                .store
+                .read_runtime_application(*commitment)
+                .unwrap()
+                .unwrap();
+            assert_eq!(source_application.node(), fixture.nodes[0].identity.node);
+            assert_eq!(peer_application.node(), fixture.nodes[1].identity.node);
+            assert_ne!(
+                source_application.commitment(),
+                peer_application.commitment()
+            );
+            assert_eq!(
+                peer_application
+                    .successor_stable_projection()
+                    .unwrap()
+                    .commitment(),
+                *stable_projection
+            );
+            assert_eq!(
+                peer.agents[&agent]
+                    .store
+                    .read_control_authority_evidence(peer_entry)
+                    .unwrap()
+                    .as_deref(),
+                Some(evidence.as_slice())
+            );
+            assert!(
+                peer.agents[&agent]
+                    .store
+                    .read_stable_import_certificate(peer_entry)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        drop(peer);
+        let mut peer = reopen_host(&fixture, 1, "multi-rotation-peer");
+        let mut before_retry = Vec::new();
+        collect_files(&peer.agent_path(agent), &mut before_retry);
+        assert_eq!(
+            peer.apply_sync_page(
+                agent,
+                PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
+                &page_bytes,
+                authority_target(&fixture).0,
+                &TestAuthority,
+                &TestTransport,
+            )
+            .unwrap(),
+            PrivateSyncApplyDisposition::AlreadyApplied
+        );
+        let mut after_retry = Vec::new();
+        collect_files(&peer.agent_path(agent), &mut after_retry);
+        assert_eq!(after_retry, before_retry);
+    }
+
+    #[test]
+    fn control_sync_resumes_a_completed_local_papl_before_import_evidence() {
+        let fixture = fixture(2);
+        let mut source = create_host(&fixture, 0, "sync-papl-source");
+        let agent = create_agent(&mut source, &fixture);
+        let rotate = signed_rotate_control(&source, agent);
+        apply_and_attach_test_authority_evidence(&mut source, &fixture, &rotate, 40, 41);
+        let request = PrivateSyncRequest {
+            cursor: PrivateSyncCursor::start(fixture.space, agent, 0, None).unwrap(),
+            max_items: MAX_PRIVATE_SYNC_ITEMS as u16,
+            max_bytes: MAX_PRIVATE_SYNC_PAGE_BYTES as u32,
+        };
+        let page_bytes = source
+            .serve_sync_page(
+                agent,
+                PrivatePeerIdentity::Node(&fixture.nodes[1].identity),
+                &request.encode().unwrap(),
+                authority_target(&fixture).0,
+                &TestTransport,
+            )
+            .unwrap();
+        let page = PrivateSyncPage::decode(&page_bytes).unwrap();
+        let route = recovery_route(&fixture, agent);
+        let verified =
+            verify_private_sync_control_page(&page, route, authority_target(&fixture).0).unwrap();
+        assert_eq!(verified.len(), 1);
+
+        let mut peer = create_host(&fixture, 1, "sync-papl-peer");
+        assert_eq!(create_agent(&mut peer, &fixture), agent);
+        let application_request =
+            sync_runtime_application_request(route, authority_target(&fixture).0, &verified[0])
+                .unwrap();
+        let resolution = peer
+            .apply_private_runtime_application_inner(
+                authority_target(&fixture).0,
+                &TestAuthority,
+                &application_request,
+                None,
+                Some(verified[0].source_stable_projection()),
+                true,
+                PrivateRuntimeApplicationStop::Never,
+            )
+            .unwrap();
+        assert!(matches!(
+            resolution,
+            PrivateControlRuntimeApplicationResolution::Applied(_)
+        ));
+        let entry = peer.agents[&agent].store.indexed_controls().last().unwrap();
+        assert_eq!(
+            peer.agents[&agent]
+                .store
+                .read_control_authority_evidence(entry),
+            Ok(None)
+        );
+        assert_eq!(
+            peer.agents[&agent]
+                .store
+                .read_stable_import_certificate(entry),
+            Ok(None)
+        );
+
+        drop(peer);
+        let mut peer = reopen_host(&fixture, 1, "sync-papl-peer");
+        assert_eq!(
+            peer.apply_sync_page(
+                agent,
+                PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
+                &page_bytes,
+                authority_target(&fixture).0,
+                &TestAuthority,
+                &TestTransport,
+            )
+            .unwrap(),
+            PrivateSyncApplyDisposition::Applied
+        );
+        drop(peer);
+        let peer = reopen_host(&fixture, 1, "sync-papl-peer");
+        let entry = peer.agents[&agent].store.indexed_controls().last().unwrap();
+        assert!(
+            peer.agents[&agent]
+                .store
+                .read_stable_import_certificate(entry)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -11622,6 +12087,94 @@ mod tests {
         assert!(fs::read_dir(slot).unwrap().all(|entry| {
             let name = entry.unwrap().file_name();
             !name.to_string_lossy().contains(NEXT_PREFIX)
+        }));
+    }
+
+    #[test]
+    fn authority_signed_wrong_sync_projection_never_reaches_store_or_sidecars() {
+        let fixture = fixture(2);
+        let mut source = create_host(&fixture, 0, "wrong-psp-source");
+        let agent = create_agent(&mut source, &fixture);
+        let rotate = signed_rotate_control(&source, agent);
+        apply_and_attach_test_authority_evidence(&mut source, &fixture, &rotate, 40, 41);
+
+        let request = PrivateSyncRequest {
+            cursor: PrivateSyncCursor::start(fixture.space, agent, 0, None).unwrap(),
+            max_items: MAX_PRIVATE_SYNC_ITEMS as u16,
+            max_bytes: MAX_PRIVATE_SYNC_PAGE_BYTES as u32,
+        };
+        let page_bytes = source
+            .serve_sync_page(
+                agent,
+                PrivatePeerIdentity::Node(&fixture.nodes[1].identity),
+                &request.encode().unwrap(),
+                authority_target(&fixture).0,
+                &TestTransport,
+            )
+            .unwrap();
+        let mut page = PrivateSyncPage::decode(&page_bytes).unwrap();
+        let PrivateSyncItem::Control {
+            evidence,
+            stable_projection,
+            ..
+        } = &mut page.items[0]
+        else {
+            panic!("rotation page contained an object")
+        };
+        let wrong_projection = Hash([0x83; 32]);
+        assert_ne!(*stable_projection, wrong_projection);
+        let mut envelope = PrivateControlAuthorityEvidence::decode(evidence).unwrap();
+        let mut application =
+            PrivateControlApplicationAck::decode(&envelope.application_ack).unwrap();
+        application.application.stable_projection = wrong_projection;
+        let (_, authority_key) = authority_target(&fixture);
+        application.signature = authority_key.sign(&application.signing_bytes()).to_bytes();
+        envelope.application_ack = application.encode().unwrap();
+        *evidence = envelope.encode().unwrap();
+        *stable_projection = wrong_projection;
+        let page_bytes = page.encode().unwrap();
+
+        let mut peer = create_host(&fixture, 1, "wrong-psp-peer");
+        assert_eq!(create_agent(&mut peer, &fixture), agent);
+        assert!(
+            authenticate_peer_identity(
+                peer.hosted(agent).unwrap(),
+                PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
+                &TestTransport,
+            )
+            .is_ok()
+        );
+        let verified = verify_private_sync_control_page(
+            &page,
+            recovery_route(&fixture, agent),
+            authority_target(&fixture).0,
+        )
+        .unwrap();
+        assert_eq!(verified.len(), 1);
+        let before_binding = peer.binding(agent).unwrap();
+        let mut before_slot = Vec::new();
+        collect_files(&peer.agent_path(agent), &mut before_slot);
+        assert_eq!(
+            peer.apply_sync_page(
+                agent,
+                PrivatePeerIdentity::Node(&fixture.nodes[0].identity),
+                &page_bytes,
+                authority_target(&fixture).0,
+                &TestAuthority,
+                &TestTransport,
+            ),
+            Err(PrivateAgentHostError::Sync(PrivateSyncError::Tampered))
+        );
+        assert_eq!(peer.binding(agent).unwrap(), before_binding);
+        let mut after_slot = Vec::new();
+        collect_files(&peer.agent_path(agent), &mut after_slot);
+        assert_eq!(after_slot, before_slot);
+        assert!(fs::read_dir(peer.agent_path(agent)).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(NEXT_PREFIX)
         }));
     }
 
