@@ -133,19 +133,33 @@ pub enum PutDisposition {
 ///
 /// An exact retry projects the current position with `AlreadyPresent`; a new
 /// control projects the position that the durable append will publish.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PrivateControlPositionPreview {
     disposition: PutDisposition,
     position: PrivateStoreCorePosition,
+    key_epoch_commitments: Vec<PrivateKeyEpochCommitment>,
+    authorized_nodes: Vec<PrivateNodeIdentity>,
 }
 
 impl PrivateControlPositionPreview {
-    pub(crate) const fn disposition(self) -> PutDisposition {
+    pub(crate) const fn disposition(&self) -> PutDisposition {
         self.disposition
     }
 
-    pub(crate) const fn position(self) -> PrivateStoreCorePosition {
+    pub(crate) const fn position(&self) -> PrivateStoreCorePosition {
         self.position
+    }
+
+    /// Exact projected public PKEY commitments produced by the Store's one
+    /// control-transition planner; no unwrapped key material is exposed.
+    pub(crate) fn key_epoch_commitments(&self) -> &[PrivateKeyEpochCommitment] {
+        &self.key_epoch_commitments
+    }
+
+    /// Exact projected authorized membership produced by the Store's one
+    /// control-transition planner.
+    pub(crate) fn authorized_nodes(&self) -> &[PrivateNodeIdentity] {
+        &self.authorized_nodes
     }
 }
 
@@ -292,6 +306,37 @@ pub(crate) struct VerifiedEncryptedBackup {
     objects: Vec<EncryptedPrivateObject>,
     key_epochs: Vec<PrivateKeyEpoch>,
     chain: PrivateControlChainVerifier,
+}
+
+/// Complete source material for replaying one archived control locally.
+///
+/// Construction proves only that all three archive attachments are present
+/// and retain their exact Store/index bindings. In particular, the PAPL is
+/// not PVRI- or authority-authenticated here, and the PSE remains opaque
+/// source bytes until a physical host verifies it.
+pub(crate) struct EncryptedBackupReplayRow<'a> {
+    index: &'a StoredControlIndex,
+    control: &'a PrivateControlRecord,
+    source_runtime_application: &'a PrivateRuntimeApplication,
+    source_authority_evidence: &'a [u8],
+}
+
+impl<'a> EncryptedBackupReplayRow<'a> {
+    pub(crate) const fn index(&self) -> &'a StoredControlIndex {
+        self.index
+    }
+
+    pub(crate) const fn control(&self) -> &'a PrivateControlRecord {
+        self.control
+    }
+
+    pub(crate) const fn source_runtime_application(&self) -> &'a PrivateRuntimeApplication {
+        self.source_runtime_application
+    }
+
+    pub(crate) const fn source_authority_evidence(&self) -> &'a [u8] {
+        self.source_authority_evidence
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -654,15 +699,7 @@ fn store_core_position(
         u32::try_from(index.objects.len()).map_err(|_| PrivateStoreError::LimitExceeded)?;
     let control_count =
         u32::try_from(index.controls.len()).map_err(|_| PrivateStoreError::LimitExceeded)?;
-    let mut key_commitments = Vec::new();
-    key_commitments
-        .try_reserve_exact(key_epochs.len())
-        .map_err(|_| PrivateStoreError::LimitExceeded)?;
-    for epoch in key_epochs {
-        key_commitments.push(
-            PrivateKeyEpochCommitment::from_epoch(epoch).map_err(|_| PrivateStoreError::Corrupt)?,
-        );
-    }
+    let key_commitments = private_key_epoch_commitments(key_epochs)?;
     let key_epoch_root =
         private_key_epoch_root(&key_commitments).map_err(|_| PrivateStoreError::Corrupt)?;
     PrivateStoreCorePosition::new(
@@ -679,6 +716,21 @@ fn store_core_position(
         key_epoch_root,
     )
     .map_err(|_| PrivateStoreError::Corrupt)
+}
+
+fn private_key_epoch_commitments(
+    key_epochs: &[PrivateKeyEpoch],
+) -> Result<Vec<PrivateKeyEpochCommitment>, PrivateStoreError> {
+    let mut commitments = Vec::new();
+    commitments
+        .try_reserve_exact(key_epochs.len())
+        .map_err(|_| PrivateStoreError::LimitExceeded)?;
+    for epoch in key_epochs {
+        commitments.push(
+            PrivateKeyEpochCommitment::from_epoch(epoch).map_err(|_| PrivateStoreError::Corrupt)?,
+        );
+    }
+    Ok(commitments)
 }
 
 fn encode_recovery(metadata: &RecoveryMetadata) -> Result<Vec<u8>, PrivateStoreError> {
@@ -1465,6 +1517,23 @@ impl VerifiedEncryptedBackup {
         &self.key_epochs
     }
 
+    /// Immutable genesis membership from the recovery metadata. This is not
+    /// the final membership after archived controls have been applied.
+    pub(crate) fn genesis_nodes(&self) -> &[PrivateNodeIdentity] {
+        &self.metadata.genesis_nodes
+    }
+
+    /// Final control-chain-authenticated membership selected by the archive.
+    pub(crate) fn final_authorized_nodes(&self) -> &[PrivateNodeIdentity] {
+        self.chain.nodes()
+    }
+
+    /// Final Store-core target selected by the archive's verified control
+    /// chain and ciphertext index. Runtime/PVRI state is outside this target.
+    pub(crate) fn final_target(&self) -> Result<PrivateStoreCorePosition, PrivateStoreError> {
+        self.core_position()
+    }
+
     /// Canonical encrypted objects authenticated by the archive index. The
     /// recovery host must additionally authenticate their AEAD tags with the
     /// exact archived epoch keys before it can publish a successor.
@@ -1504,6 +1573,79 @@ impl VerifiedEncryptedBackup {
             .zip(&self.controls)
             .zip(&self.runtime_applications)
             .map(|((index, control), application)| (index, control, application.as_ref()))
+    }
+
+    /// Return a bounded, read-only replay table only when every archived PCTL
+    /// has both its completed source PAPL and its opaque source PSE bytes.
+    ///
+    /// Success establishes presence and exact Store/index correspondence, not
+    /// authority signatures or PVRI provenance. Those are physical-host replay
+    /// checks and the source runtime image must never be adopted as local state.
+    pub(crate) fn replay_rows(
+        &self,
+    ) -> Result<Vec<EncryptedBackupReplayRow<'_>>, PrivateStoreError> {
+        self.validate_backing_vectors()?;
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(self.index.controls.len())
+            .map_err(|_| PrivateStoreError::LimitExceeded)?;
+        for position in 0..self.index.controls.len() {
+            let index = self
+                .index
+                .controls
+                .get(position)
+                .ok_or(PrivateStoreError::Corrupt)?;
+            let control = self
+                .controls
+                .get(position)
+                .ok_or(PrivateStoreError::Corrupt)?;
+            let source_runtime_application = self
+                .runtime_applications
+                .get(position)
+                .and_then(Option::as_ref)
+                .ok_or(PrivateStoreError::Corrupt)?;
+            let source_authority_evidence = self
+                .control_evidence
+                .get(position)
+                .and_then(Option::as_deref)
+                .ok_or(PrivateStoreError::Corrupt)?;
+            let control_wire = control.encode().map_err(|_| PrivateStoreError::Corrupt)?;
+            let application_wire = source_runtime_application
+                .encode()
+                .map_err(|_| PrivateStoreError::Corrupt)?;
+            if source_authority_evidence.is_empty()
+                || source_authority_evidence.len() > MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES
+                || control_wire.len() != index.wire_len as usize
+                || raw_wire_hash(&control_wire) != index.wire_hash
+                || source_runtime_application.control() != control
+                || index.runtime_application
+                    != Some(
+                        bind_runtime_application(source_runtime_application, &application_wire)
+                            .map_err(|_| PrivateStoreError::Corrupt)?,
+                    )
+            {
+                return Err(PrivateStoreError::Corrupt);
+            }
+            validate_control_index_entry(index, control)?;
+            rows.push(EncryptedBackupReplayRow {
+                index,
+                control,
+                source_runtime_application,
+                source_authority_evidence,
+            });
+        }
+        Ok(rows)
+    }
+
+    fn validate_backing_vectors(&self) -> Result<(), PrivateStoreError> {
+        self.core_position()?;
+        if self.controls.len() != self.index.controls.len()
+            || self.control_evidence.len() != self.index.controls.len()
+            || self.runtime_applications.len() != self.index.controls.len()
+            || self.objects.len() != self.index.objects.len()
+        {
+            return Err(PrivateStoreError::Corrupt);
+        }
+        Ok(())
     }
 
     fn merge_compatible_control_evidence(
@@ -2385,6 +2527,36 @@ impl PrivateStore {
         })
     }
 
+    /// Create a new empty Store from only the verified archive's immutable
+    /// genesis material.
+    ///
+    /// Archived controls, completed applications, authority evidence,
+    /// ciphertext objects, final membership, and final epoch state are never
+    /// imported by this constructor. A caller must replay and verify them
+    /// through the ordinary local transition paths before publication.
+    pub(crate) fn create_empty_from_verified_genesis<V: PrivateNodeAuthorityVerifier>(
+        root: impl AsRef<Path>,
+        backup: &VerifiedEncryptedBackup,
+        authority: &V,
+    ) -> Result<Self, PrivateStoreError> {
+        // Validate the complete in-memory container before the ordinary
+        // constructor is allowed to touch the destination path. Missing PAPL
+        // or PSE attachments remain a valid crash archive here; replay_rows()
+        // is the stricter completeness gate.
+        backup.validate_backing_vectors()?;
+        Self::create(
+            root,
+            backup.metadata.space,
+            backup.metadata.agent,
+            backup.metadata.owner,
+            backup.metadata.recovery_public_key,
+            backup.metadata.recovery_encryption_public_key,
+            backup.metadata.genesis_epoch.clone(),
+            backup.metadata.genesis_nodes.clone(),
+            authority,
+        )
+    }
+
     pub fn open<V: PrivateNodeAuthorityVerifier>(
         root: impl AsRef<Path>,
         expected_space: SpaceId,
@@ -3103,11 +3275,19 @@ impl PrivateStore {
             ControlTransitionPlan::AlreadyPresent { .. } => Ok(PrivateControlPositionPreview {
                 disposition: PutDisposition::AlreadyPresent,
                 position: self.core_position()?,
+                key_epoch_commitments: private_key_epoch_commitments(&self.key_epochs)?,
+                authorized_nodes: self.chain.nodes().to_vec(),
             }),
-            ControlTransitionPlan::Insert(plan) => Ok(PrivateControlPositionPreview {
-                disposition: PutDisposition::Inserted,
-                position: plan.successor,
-            }),
+            ControlTransitionPlan::Insert(plan) => {
+                let key_epoch_commitments = private_key_epoch_commitments(&plan.next_key_epochs)?;
+                let authorized_nodes = plan.next_chain.nodes().to_vec();
+                Ok(PrivateControlPositionPreview {
+                    disposition: PutDisposition::Inserted,
+                    position: plan.successor,
+                    key_epoch_commitments,
+                    authorized_nodes,
+                })
+            }
         }
     }
 
@@ -4231,7 +4411,7 @@ mod tests {
         store: &PrivateStore,
         descriptor: &AgentDescriptor,
         node: NodeId,
-        created_at: u64,
+        genesis_at: u64,
     ) -> PrivateRuntimeImage {
         let key_epochs = store
             .key_epochs
@@ -4257,7 +4437,7 @@ mod tests {
                 epoch: descriptor.authority.initial_epoch,
                 decision_sequence: 1,
                 acknowledged_through: 0,
-                valid_from: 1,
+                valid_from: genesis_at,
                 expires_at: 40,
                 request: ManagementRequest::Create(Box::new(descriptor.clone())).commitment(),
             },
@@ -4276,7 +4456,7 @@ mod tests {
             store.core_position().unwrap(),
             key_epochs,
             creation_receipt,
-            created_at,
+            genesis_at,
             &AllowRuntimeVerifier,
         )
         .unwrap()
@@ -4984,7 +5164,9 @@ mod tests {
         let fixture = fixture();
         let mut store = create_store(&directory.store(), &fixture);
         let predecessor = store.core_position().unwrap();
-        let invite = invite_control(&store, &fixture, recipient(&fixture, 31));
+        let invited = recipient(&fixture, 31);
+        let invite = invite_control(&store, &fixture, invited.clone());
+        let predecessor_key_epochs = private_key_epoch_commitments(store.key_epochs()).unwrap();
         let preview = store
             .preview_control_position(&invite, &TestAuthority)
             .unwrap();
@@ -4994,10 +5176,33 @@ mod tests {
             preview.position().key_epoch_root(),
             predecessor.key_epoch_root()
         );
+        assert_ne!(preview.key_epoch_commitments(), predecessor_key_epochs);
+        assert!(
+            preview
+                .authorized_nodes()
+                .binary_search_by_key(&invited.node, |node| node.node)
+                .is_ok()
+        );
         assert_eq!(store.key_epochs.len(), 1);
         store.append_control(&invite, &TestAuthority).unwrap();
         assert_eq!(store.core_position().unwrap(), preview.position());
         assert_eq!(store.key_epochs.len(), 1);
+        assert_eq!(
+            preview.key_epoch_commitments(),
+            private_key_epoch_commitments(store.key_epochs()).unwrap()
+        );
+        assert_eq!(preview.authorized_nodes(), store.authorized_nodes());
+
+        let retry = store
+            .preview_control_position(&invite, &TestAuthority)
+            .unwrap();
+        assert_eq!(retry.disposition(), PutDisposition::AlreadyPresent);
+        assert_eq!(retry.position(), preview.position());
+        assert_eq!(
+            retry.key_epoch_commitments(),
+            preview.key_epoch_commitments()
+        );
+        assert_eq!(retry.authorized_nodes(), preview.authorized_nodes());
     }
 
     #[test]
@@ -6025,6 +6230,178 @@ mod tests {
             !disk
                 .windows(RUNTIME_PLAINTEXT_SENTINEL.len())
                 .any(|window| window == RUNTIME_PLAINTEXT_SENTINEL)
+        );
+    }
+
+    #[test]
+    fn verified_backup_replay_views_bootstrap_only_exact_genesis() {
+        let directory = TestDirectory::new("verified-backup-empty-genesis");
+        let source_path = directory.store();
+        let (mut source, fixture) = runtime_store_fixture(&source_path);
+        let genesis_position = source.core_position().unwrap();
+        let genesis_epoch = source.key_epoch().clone();
+        let genesis_nodes = source.authorized_nodes().to_vec();
+        let invited = recipient(&fixture.store_fixture, 0xc1);
+        let control = invite_control(&source, &fixture.store_fixture, invited);
+        let (_, _, application) =
+            completed_runtime_application(&source, &fixture, &fixture.predecessor, &control, 0xc2);
+        source
+            .append_control_with_runtime_application(&control, &application, &TestAuthority)
+            .unwrap();
+        let evidence = b"PSE2-source-bytes-require-host-verification".to_vec();
+        source
+            .persist_control_authority_evidence(control.commitment(), &evidence)
+            .unwrap();
+        let object = encrypt_private_object(
+            &fixture.store_fixture.epoch.data_key,
+            fixture.store_fixture.space,
+            fixture.store_fixture.agent,
+            0,
+            EncryptedObjectKind::Snapshot,
+            b"archive-object-must-not-enter-empty-bootstrap",
+        )
+        .unwrap();
+        source.put_object(&object).unwrap();
+        let final_target = source.core_position().unwrap();
+        let final_nodes = source.authorized_nodes().to_vec();
+        let backup = source
+            .export_encrypted_backup(MAX_PRIVATE_BACKUP_BYTES)
+            .unwrap();
+        let verified = verify_encrypted_backup(
+            &backup,
+            fixture.store_fixture.space,
+            fixture.store_fixture.agent,
+            fixture.store_fixture.owner,
+            fixture.store_fixture.recovery.verifying_key(),
+            fixture.store_fixture.recovery_encryption.public_key(),
+            &TestAuthority,
+        )
+        .unwrap();
+
+        assert_ne!(final_nodes, genesis_nodes);
+        assert_eq!(verified.genesis_nodes(), genesis_nodes);
+        assert_eq!(verified.final_authorized_nodes(), final_nodes);
+        assert_eq!(verified.final_target().unwrap(), final_target);
+        assert_ne!(verified.final_target().unwrap(), genesis_position);
+        // Invite modifies the live epoch-zero envelopes. The empty Store must
+        // still use the immutable genesis PKEY, not this final epoch view.
+        assert_ne!(verified.key_epochs()[0], genesis_epoch);
+        let rows = verified.replay_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.index().commitment, control.commitment());
+        assert_eq!(row.control(), &control);
+        assert_eq!(row.source_runtime_application(), &application);
+        assert_eq!(row.source_authority_evidence(), evidence);
+
+        let target_path = directory.0.join("empty-genesis");
+        let empty = PrivateStore::create_empty_from_verified_genesis(
+            &target_path,
+            &verified,
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(empty.core_position().unwrap(), genesis_position);
+        assert_eq!(empty.key_epoch(), &genesis_epoch);
+        assert_eq!(empty.key_epochs(), core::slice::from_ref(&genesis_epoch));
+        assert_eq!(empty.authorized_nodes(), genesis_nodes);
+        assert_eq!(empty.object_count(), 0);
+        assert_eq!(empty.control_count(), 0);
+        assert!(empty.indexed_objects().is_empty());
+        assert!(empty.indexed_controls().is_empty());
+        assert_eq!(empty.binding().control_head, None);
+        assert_eq!(empty.binding().next_sequence, 0);
+        assert_eq!(empty.latest_recovery_keyring(), None);
+        for directory in [
+            OBJECTS_DIR,
+            CONTROLS_DIR,
+            RUNTIME_APPLICATIONS_DIR,
+            CONTROL_EVIDENCE_DIR,
+        ] {
+            assert_eq!(
+                fs::read_dir(target_path.join(directory)).unwrap().count(),
+                0
+            );
+        }
+        drop(empty);
+        let reopened = PrivateStore::open(
+            &target_path,
+            fixture.store_fixture.space,
+            fixture.store_fixture.agent,
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(reopened.core_position().unwrap(), genesis_position);
+        assert_eq!(reopened.key_epoch(), &genesis_epoch);
+        assert_eq!(reopened.authorized_nodes(), genesis_nodes);
+        assert_eq!(reopened.object_count(), 0);
+        assert_eq!(reopened.control_count(), 0);
+    }
+
+    #[test]
+    fn verified_backup_replay_rows_reject_each_missing_required_attachment() {
+        let directory = TestDirectory::new("verified-backup-incomplete-replay");
+        let papl_only_path = directory.store();
+        let (mut papl_only, fixture) = runtime_store_fixture(&papl_only_path);
+        let control = invite_control(
+            &papl_only,
+            &fixture.store_fixture,
+            recipient(&fixture.store_fixture, 0xc5),
+        );
+        let (_, _, application) = completed_runtime_application(
+            &papl_only,
+            &fixture,
+            &fixture.predecessor,
+            &control,
+            0xc6,
+        );
+        papl_only
+            .append_control_with_runtime_application(&control, &application, &TestAuthority)
+            .unwrap();
+        let verify = |bytes: &[u8]| {
+            verify_encrypted_backup(
+                bytes,
+                fixture.store_fixture.space,
+                fixture.store_fixture.agent,
+                fixture.store_fixture.owner,
+                fixture.store_fixture.recovery.verifying_key(),
+                fixture.store_fixture.recovery_encryption.public_key(),
+                &TestAuthority,
+            )
+            .unwrap()
+        };
+        let papl_only_backup = papl_only
+            .export_encrypted_backup(MAX_PRIVATE_BACKUP_BYTES)
+            .unwrap();
+        assert_eq!(
+            verify(&papl_only_backup).replay_rows().err(),
+            Some(PrivateStoreError::Corrupt)
+        );
+
+        let evidence = b"PSE2-completes-source-replay-row".to_vec();
+        papl_only
+            .persist_control_authority_evidence(control.commitment(), &evidence)
+            .unwrap();
+        let complete_backup = papl_only
+            .export_encrypted_backup(MAX_PRIVATE_BACKUP_BYTES)
+            .unwrap();
+        let complete = verify(&complete_backup);
+        let complete_rows = complete.replay_rows().unwrap();
+        assert_eq!(complete_rows.len(), 1);
+        assert_eq!(complete_rows[0].control(), &control);
+
+        let pse_only_path = directory.0.join("pse-only");
+        let mut pse_only = create_store(&pse_only_path, &fixture.store_fixture);
+        pse_only.append_control(&control, &TestAuthority).unwrap();
+        pse_only
+            .persist_control_authority_evidence(control.commitment(), &evidence)
+            .unwrap();
+        let pse_only_backup = pse_only
+            .export_encrypted_backup(MAX_PRIVATE_BACKUP_BYTES)
+            .unwrap();
+        assert_eq!(
+            verify(&pse_only_backup).replay_rows().err(),
+            Some(PrivateStoreError::Corrupt)
         );
     }
 
