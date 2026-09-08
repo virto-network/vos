@@ -38,8 +38,8 @@ use vos_agent_sdk::{
 use super::authority_operation_issuer::private_intent_matches_application;
 use super::private_crypto::{PrivateCryptoError, PrivateNodeAuthorityVerifier};
 use super::private_store::{
-    MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES, PrivateObjectKey, PrivateStore,
-    PrivateStoreError, PutDisposition, StoredControlIndex,
+    MAX_PRIVATE_CONTROL_AUTHORITY_EVIDENCE_BYTES, MAX_PRIVATE_STORE_OBJECTS, PrivateObjectKey,
+    PrivateStore, PrivateStoreError, PutDisposition, StoredControlIndex,
 };
 
 pub const MAX_PRIVATE_SYNC_ITEMS: usize = 64;
@@ -388,14 +388,41 @@ impl PrivateSyncHead {
     }
 }
 
+/// Immutable source snapshot selected by the first page of a sync session.
+///
+/// Controls are addressed by [`Self::head`]. The object index is pinned
+/// separately because same-epoch object writes do not advance that control
+/// head; without this pair, an insertion which sorts before `after_object`
+/// could be silently skipped by a later page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrivateSyncTarget {
+    pub head: PrivateSyncHead,
+    pub object_count: u32,
+    pub object_root: Option<Hash>,
+}
+
+impl PrivateSyncTarget {
+    fn validate(self) -> bool {
+        self.head.validate()
+            && usize::try_from(self.object_count)
+                .is_ok_and(|count| count <= MAX_PRIVATE_STORE_OBJECTS)
+            && match (self.object_count, self.object_root) {
+                (0, None) => true,
+                (0, Some(_)) | (_, None) => false,
+                (_, Some(root)) => root != Hash::ZERO,
+            }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrivateSyncCursor {
     pub space: SpaceId,
     pub agent: AgentId,
     /// State already authenticated and applied by the requester.
     pub local: PrivateSyncHead,
-    /// Server head fixed by the first response in a pagination session.
-    pub target: Option<PrivateSyncHead>,
+    /// Complete source target fixed by the first response in a pagination
+    /// session. A source-side control or object-index change makes it stale.
+    pub target: Option<PrivateSyncTarget>,
     /// Last object applied. Control synchronization never carries this field.
     pub after_object: Option<PrivateObjectKey>,
 }
@@ -426,11 +453,12 @@ impl PrivateSyncCursor {
             return Err(PrivateSyncError::InvalidRequest);
         }
         if let Some(target) = self.target {
-            if !target.validate() || target.epoch < self.local.epoch {
+            if !target.validate() || target.head.epoch < self.local.epoch {
                 return Err(PrivateSyncError::InvalidRequest);
             }
         }
-        if (self.after_object.is_some() && self.target != Some(self.local))
+        if (self.after_object.is_some()
+            && self.target.map(|target| target.head) != Some(self.local))
             || self
                 .after_object
                 .is_some_and(|key| !key_is_valid(key) || key.epoch > self.local.epoch)
@@ -606,7 +634,7 @@ impl VerifiedPrivateSyncControl {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrivateSyncPage {
     pub request: PrivateSyncRequest,
-    pub target: PrivateSyncHead,
+    pub target: PrivateSyncTarget,
     pub phase: PrivateSyncPhase,
     pub items: Vec<PrivateSyncItem>,
     pub next: Option<PrivateSyncCursor>,
@@ -638,7 +666,7 @@ impl PrivateSyncPage {
         }
         match self.phase {
             PrivateSyncPhase::Controls => {
-                if self.request.cursor.local == self.target
+                if self.request.cursor.local == self.target.head
                     || self.request.cursor.after_object.is_some()
                 {
                     return Err(PrivateSyncError::InvalidFrame);
@@ -651,10 +679,10 @@ impl PrivateSyncPage {
                 )?;
             }
             PrivateSyncPhase::Objects => {
-                if self.request.cursor.local != self.target {
+                if self.request.cursor.local != self.target.head {
                     return Err(PrivateSyncError::InvalidFrame);
                 }
-                validate_object_item_order(&self.items)?;
+                validate_object_item_order(&self.items, self.request.cursor.after_object)?;
             }
         }
         if let Some(next) = &self.next {
@@ -677,7 +705,7 @@ impl PrivateSyncPage {
                     && next.local.epoch == *resulting_epoch
                     && next.after_object.is_none() => {}
                 (PrivateSyncPhase::Objects, Some(PrivateSyncItem::Object { key, .. }))
-                    if next.local == self.target && next.after_object == Some(*key) => {}
+                    if next.local == self.target.head && next.after_object == Some(*key) => {}
                 _ => return Err(PrivateSyncError::InvalidFrame),
             }
         }
@@ -691,8 +719,8 @@ impl PrivateSyncPage {
                 return Err(PrivateSyncError::InvalidFrame);
             };
             if self.next.is_none()
-                && (self.target.control_head != Some(*commitment)
-                    || self.target.epoch != *resulting_epoch)
+                && (self.target.head.control_head != Some(*commitment)
+                    || self.target.head.epoch != *resulting_epoch)
             {
                 return Err(PrivateSyncError::InvalidFrame);
             }
@@ -707,7 +735,7 @@ impl PrivateSyncPage {
         self.validate_shape()?;
         let mut encoder = Encoder::new(PAGE_MAGIC, SYNC_FORMAT_VERSION);
         encode_request_body(&mut encoder, &self.request)?;
-        encode_head(&mut encoder, self.target);
+        encode_target(&mut encoder, self.target);
         encoder.u8(self.phase as u8);
         encoder.u16(u16::try_from(self.items.len()).map_err(|_| PrivateSyncError::LimitExceeded)?);
         for item in &self.items {
@@ -760,7 +788,7 @@ impl PrivateSyncPage {
             MAX_PRIVATE_SYNC_FRAME_BYTES,
         )?;
         let request = decode_request_body(&mut decoder)?;
-        let target = decode_head(&mut decoder)?;
+        let target = decode_target(&mut decoder)?;
         let phase = match decoder.u8()? {
             0 => PrivateSyncPhase::Controls,
             1 => PrivateSyncPhase::Objects,
@@ -1006,6 +1034,24 @@ fn decode_head(decoder: &mut Decoder<'_>) -> Result<PrivateSyncHead, PrivateSync
         .ok_or(PrivateSyncError::InvalidFrame)
 }
 
+fn encode_target(encoder: &mut Encoder, target: PrivateSyncTarget) {
+    encode_head(encoder, target.head);
+    encoder.u32(target.object_count);
+    encoder.optional_hash(target.object_root);
+}
+
+fn decode_target(decoder: &mut Decoder<'_>) -> Result<PrivateSyncTarget, PrivateSyncError> {
+    let target = PrivateSyncTarget {
+        head: decode_head(decoder)?,
+        object_count: decoder.u32()?,
+        object_root: decoder.optional_hash()?,
+    };
+    target
+        .validate()
+        .then_some(target)
+        .ok_or(PrivateSyncError::InvalidFrame)
+}
+
 fn encode_key(encoder: &mut Encoder, key: PrivateObjectKey) {
     encoder.u64(key.epoch);
     encoder.u8(key.kind);
@@ -1035,7 +1081,7 @@ fn encode_cursor(encoder: &mut Encoder, cursor: &PrivateSyncCursor) {
         None => encoder.u8(0),
         Some(target) => {
             encoder.u8(1);
-            encode_head(encoder, target);
+            encode_target(encoder, target);
         }
     }
     match cursor.after_object {
@@ -1054,7 +1100,7 @@ fn decode_cursor(decoder: &mut Decoder<'_>) -> Result<PrivateSyncCursor, Private
         local: decode_head(decoder)?,
         target: match decoder.u8()? {
             0 => None,
-            1 => Some(decode_head(decoder)?),
+            1 => Some(decode_target(decoder)?),
             _ => return Err(PrivateSyncError::InvalidFrame),
         },
         after_object: match decoder.u8()? {
@@ -1257,8 +1303,11 @@ fn decode_exact_private_control_material(
     Ok((control, mutation))
 }
 
-fn validate_object_item_order(items: &[PrivateSyncItem]) -> Result<(), PrivateSyncError> {
-    let mut previous = None;
+fn validate_object_item_order(
+    items: &[PrivateSyncItem],
+    after_object: Option<PrivateObjectKey>,
+) -> Result<(), PrivateSyncError> {
+    let mut previous = after_object;
     for item in items {
         let PrivateSyncItem::Object {
             key,
@@ -1321,6 +1370,22 @@ fn authenticate_peer<V: PrivateTransportAuthVerifier>(
     Ok(())
 }
 
+fn sync_target(store: &PrivateStore) -> Result<PrivateSyncTarget, PrivateSyncError> {
+    let position = store.core_position()?;
+    let target = PrivateSyncTarget {
+        head: PrivateSyncHead {
+            epoch: position.epoch(),
+            control_head: position.control_head(),
+        },
+        object_count: position.object_count(),
+        object_root: position.object_root(),
+    };
+    target
+        .validate()
+        .then_some(target)
+        .ok_or(PrivateSyncError::Store(PrivateStoreError::Corrupt))
+}
+
 /// Serve one authenticated page. Membership and live transport identity are
 /// checked entirely from the in-memory verified control view before any
 /// ciphertext/control file is opened.
@@ -1345,10 +1410,7 @@ pub(crate) fn serve_private_sync_page<V: PrivateTransportAuthVerifier>(
     {
         return Err(PrivateSyncError::InvalidScope);
     }
-    let target = PrivateSyncHead {
-        epoch: binding.epoch,
-        control_head: binding.control_head,
-    };
+    let target = sync_target(store)?;
     if request
         .cursor
         .target
@@ -1356,7 +1418,7 @@ pub(crate) fn serve_private_sync_page<V: PrivateTransportAuthVerifier>(
     {
         return Err(PrivateSyncError::StaleTarget);
     }
-    if request.cursor.local == target {
+    if request.cursor.local == target.head {
         return serve_object_page(store, request, target);
     }
     if request.cursor.after_object.is_some() {
@@ -1417,7 +1479,7 @@ fn next_control_position(
 fn serve_control_page(
     store: &PrivateStore,
     request: &PrivateSyncRequest,
-    target: PrivateSyncHead,
+    target: PrivateSyncTarget,
     route: ManagedAgentTarget,
     authority: AuthorityActorTarget,
 ) -> Result<PrivateSyncPage, PrivateSyncError> {
@@ -1426,13 +1488,13 @@ fn serve_control_page(
     let mut current = request.cursor.local;
     let mut items = Vec::new();
     let mut bytes = 0usize;
-    while current.control_head != target.control_head {
+    while current.control_head != target.head.control_head {
         let next_position = next_control_position(controls, position, current.control_head)
             .ok_or(PrivateSyncError::Diverged)?;
         let entry = controls
             .get(next_position)
             .ok_or(PrivateSyncError::Diverged)?;
-        if entry.resulting_epoch < current.epoch || entry.resulting_epoch > target.epoch {
+        if entry.resulting_epoch < current.epoch || entry.resulting_epoch > target.head.epoch {
             return Err(PrivateSyncError::Diverged);
         }
         let wire = store.read_control_wire(entry)?;
@@ -1507,7 +1569,7 @@ fn serve_control_page(
     if items.is_empty() {
         return Err(PrivateSyncError::Diverged);
     }
-    let next = if current == target && store.indexed_objects().is_empty() {
+    let next = if current == target.head && store.indexed_objects().is_empty() {
         None
     } else {
         Some(PrivateSyncCursor {
@@ -1532,7 +1594,7 @@ fn serve_control_page(
 fn serve_object_page(
     store: &PrivateStore,
     request: &PrivateSyncRequest,
-    target: PrivateSyncHead,
+    target: PrivateSyncTarget,
 ) -> Result<PrivateSyncPage, PrivateSyncError> {
     let objects = store.indexed_objects();
     let start = match request.cursor.after_object {
@@ -1550,7 +1612,7 @@ fn serve_object_page(
     let mut bytes = 0usize;
     let mut next_index = start;
     while let Some(entry) = objects.get(next_index) {
-        if entry.key.epoch > target.epoch {
+        if entry.key.epoch > target.head.epoch {
             return Err(PrivateSyncError::Tampered);
         }
         let item_len = (entry.wire_len as usize)
@@ -1584,7 +1646,7 @@ fn serve_object_page(
         Some(PrivateSyncCursor {
             space: request.cursor.space,
             agent: request.cursor.agent,
-            local: target,
+            local: target.head,
             target: Some(target),
             after_object: Some(last_key),
         })
@@ -1746,7 +1808,7 @@ fn apply_object_page(
         epoch: binding.epoch,
         control_head: binding.control_head,
     };
-    if current != page.target || page.request.cursor.local != page.target {
+    if current != page.target.head || page.request.cursor.local != page.target.head {
         return Err(PrivateSyncError::Diverged);
     }
     let mut objects = Vec::new();
@@ -1769,7 +1831,7 @@ fn apply_object_page(
             EncryptedPrivateObject::decode(wire).map_err(|_| PrivateSyncError::Tampered)?;
         if object.space != binding.space
             || object.agent != binding.agent
-            || object.epoch > page.target.epoch
+            || object.epoch > page.target.head.epoch
             || PrivateObjectKey::from_object(&object) != *key
         {
             return Err(PrivateSyncError::Tampered);
@@ -2728,10 +2790,7 @@ mod tests {
         let application = PrivateControlApplicationAck::decode(&evidence.application_ack).unwrap();
         let page = PrivateSyncPage {
             request: request_for(receiver, 4, MAX_PRIVATE_SYNC_PAGE_BYTES as u32),
-            target: PrivateSyncHead {
-                epoch: source_binding.epoch,
-                control_head: Some(control.commitment()),
-            },
+            target: sync_target(source).unwrap(),
             phase: PrivateSyncPhase::Controls,
             items: vec![PrivateSyncItem::Control {
                 sequence: control.sequence,
@@ -4226,10 +4285,7 @@ mod tests {
         let make_page = |client: &PrivateStore| {
             let page = PrivateSyncPage {
                 request: request_for(client, 4, MAX_PRIVATE_SYNC_PAGE_BYTES as u32),
-                target: PrivateSyncHead {
-                    epoch: server.binding().epoch,
-                    control_head: Some(second.commitment()),
-                },
+                target: sync_target(&server).unwrap(),
                 phase: PrivateSyncPhase::Controls,
                 items: vec![
                     control_item(&first, 0, None, &first_evidence),
@@ -4293,7 +4349,7 @@ mod tests {
         *commitment = alternate_commitment;
         *wire = alternate.encode().unwrap();
         *evidence = alternate_evidence;
-        invalid_chain.target.control_head = Some(alternate_commitment);
+        invalid_chain.target.head.control_head = Some(alternate_commitment);
         if let Some(next) = &mut invalid_chain.next {
             next.local.control_head = Some(alternate_commitment);
             next.target = Some(invalid_chain.target);
@@ -4409,6 +4465,112 @@ mod tests {
         );
         assert_eq!(client.binding(), before);
         assert_eq!(directory_image(&directory.child("client")), before_image);
+    }
+
+    #[test]
+    fn object_pagination_pins_source_index_and_rejects_backward_pages() {
+        let directory = TestDirectory::new("object-snapshot");
+        let fixture = fixture();
+        let mut server = create_store(&directory.child("server"), &fixture);
+        let mut client = create_store(&directory.child("client"), &fixture);
+        let mut objects: Vec<_> = (1..=4u8)
+            .map(|label| {
+                encrypt_private_object(
+                    &fixture.epoch.data_key,
+                    fixture.space,
+                    fixture.agent,
+                    0,
+                    EncryptedObjectKind::Blob,
+                    &[label; 32],
+                )
+                .unwrap()
+            })
+            .collect();
+        objects.sort_by_key(PrivateObjectKey::from_object);
+
+        // Publish B and C first so the first one-item page advances its cursor
+        // past the still-held A key.
+        server.put_object(&objects[1]).unwrap();
+        server.put_object(&objects[2]).unwrap();
+        let request = request_for(&client, 1, MAX_PRIVATE_SYNC_PAGE_BYTES as u32);
+        let first = serve_private_sync_page(
+            &server,
+            &fixture.recipients[0].identity,
+            &request,
+            &TestTransport,
+        )
+        .unwrap();
+        assert_eq!(first.target.object_count, 2);
+        assert!(first.target.object_root.is_some());
+        let next = first.next.clone().unwrap();
+
+        // A receiver may already contain a valid extra object. The source
+        // snapshot pins serving; it is not an equality claim about the
+        // receiver's mergeable object set.
+        client.put_object(&objects[3]).unwrap();
+        assert_eq!(
+            apply_private_sync_page(
+                &mut client,
+                &fixture.recipients[0].identity,
+                &first,
+                &TestAuthority,
+                &TestTransport,
+            ),
+            Ok(PrivateSyncApplyDisposition::Applied)
+        );
+
+        // A page may never repeat or move behind the request's advertised
+        // last-applied object, even if all of its object bytes are valid.
+        let mut backwards = first.clone();
+        backwards.request = PrivateSyncRequest {
+            cursor: next.clone(),
+            max_items: 1,
+            max_bytes: MAX_PRIVATE_SYNC_PAGE_BYTES as u32,
+        };
+        backwards.next = None;
+        assert_eq!(backwards.validate_shape(), Err(PrivateSyncError::Duplicate));
+
+        let mut invalid_target = first.clone();
+        invalid_target.target.object_count = 0;
+        assert_eq!(
+            invalid_target.validate_shape(),
+            Err(PrivateSyncError::InvalidFrame)
+        );
+
+        let mut substituted = PrivateSyncRequest {
+            cursor: next.clone(),
+            max_items: 1,
+            max_bytes: MAX_PRIVATE_SYNC_PAGE_BYTES as u32,
+        };
+        substituted.cursor.target.as_mut().unwrap().object_root = Some(Hash([0xa5; 32]));
+        assert_eq!(
+            serve_private_sync_page(
+                &server,
+                &fixture.recipients[0].identity,
+                &substituted,
+                &TestTransport,
+            ),
+            Err(PrivateSyncError::StaleTarget)
+        );
+
+        // Publishing A after the first page changes the pinned object-index
+        // snapshot even though epoch/control_head are unchanged. The old
+        // cursor is stale instead of silently resuming at C and missing A.
+        server.put_object(&objects[0]).unwrap();
+        let continuation = PrivateSyncRequest {
+            cursor: next,
+            max_items: 1,
+            max_bytes: MAX_PRIVATE_SYNC_PAGE_BYTES as u32,
+        };
+        assert_eq!(
+            serve_private_sync_page(
+                &server,
+                &fixture.recipients[0].identity,
+                &continuation,
+                &TestTransport,
+            ),
+            Err(PrivateSyncError::StaleTarget)
+        );
     }
 
     #[test]

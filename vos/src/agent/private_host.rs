@@ -8536,7 +8536,7 @@ mod tests {
         unsigned.signature[0] ^= 1;
         *wire = unsigned.encode().unwrap();
         *commitment = unsigned.commitment();
-        page.target.control_head = Some(*commitment);
+        page.target.head.control_head = Some(*commitment);
         if let Some(next) = &mut page.next {
             next.local.control_head = Some(*commitment);
             next.target = Some(page.target);
