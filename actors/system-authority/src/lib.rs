@@ -63,7 +63,7 @@ use vos::prelude::*;
 use vos::agent_sdk::ManagementRequest;
 
 /// Fixed installation-data wire for [`SystemAuthorityConfiguration`].
-pub const SYSTEM_AUTHORITY_CONFIGURATION_MAGIC: [u8; 4] = *b"SAC4";
+pub const SYSTEM_AUTHORITY_CONFIGURATION_MAGIC: [u8; 4] = *b"SAC5";
 
 /// The root admission consumes exactly one Create decision and one authority
 /// actor Install decision before this portable issuer can run.
@@ -114,7 +114,7 @@ pub const MAX_RETAINED_EXACT_WIRE_BYTES: usize = MAX_AUTHORITY_CREDENTIALS
 /// slot at which unseen work was accepted.
 pub const MAX_APPROVAL_VALIDITY_SLOTS: u64 = 4_096;
 
-const CONFIG_FIXED_FIELDS: usize = 20;
+const CONFIG_FIXED_FIELDS: usize = 21;
 const CONFIG_U64_FIELDS: usize = 3;
 const CONFIG_ENCODED_BYTES: usize = SYSTEM_AUTHORITY_CONFIGURATION_MAGIC.len()
     + 32
@@ -219,6 +219,9 @@ pub struct SystemAuthorityConfiguration {
     pub bootstrap_authorization_high_water: u64,
     pub bootstrap_system_agent_creation_nonce: [u8; 32],
     pub bootstrap_principal: [u8; 32],
+    /// Principal authenticated by the bootstrap replica's transport key.
+    /// This is distinct from the founding owner/Admin principal above.
+    pub bootstrap_replica_principal: [u8; 32],
     pub bootstrap_credential_public_key: [u8; 32],
     /// Canonical [`vos::agent_sdk::authority::AuthorityCredentialKind`] tag.
     pub bootstrap_credential_kind: u8,
@@ -246,6 +249,7 @@ impl Default for SystemAuthorityConfiguration {
             bootstrap_authorization_high_water: 0,
             bootstrap_system_agent_creation_nonce: [0; 32],
             bootstrap_principal: [0; 32],
+            bootstrap_replica_principal: [0; 32],
             bootstrap_credential_public_key: [0; 32],
             bootstrap_credential_kind: 0,
             bootstrap_node: [0; 32],
@@ -282,12 +286,15 @@ impl SystemAuthorityConfiguration {
             && self.bootstrap_authorization_high_water == ROOT_BOOTSTRAP_AUTHORIZATION_HIGH_WATER
             && self.bootstrap_system_agent_creation_nonce != [0; 32]
             && self.bootstrap_principal != [0; 32]
+            && self.bootstrap_replica_principal != [0; 32]
             && AgentId::derive(
                 SpaceId(self.space),
                 PrincipalId(self.bootstrap_principal),
                 &self.bootstrap_system_agent_creation_nonce,
             )
             .0 == self.system_agent
+            && PrincipalId::of_public_key(&self.bootstrap_node_transport_public_key).0
+                == self.bootstrap_replica_principal
             && canonical_credential_public_key(&self.bootstrap_credential_public_key)
             && CredentialId::of_public_key(&self.bootstrap_credential_public_key)
                 != CredentialId::ZERO
@@ -322,6 +329,7 @@ impl SystemAuthorityConfiguration {
         bytes.extend_from_slice(&self.bootstrap_authorization_high_water.to_le_bytes());
         bytes.extend_from_slice(&self.bootstrap_system_agent_creation_nonce);
         bytes.extend_from_slice(&self.bootstrap_principal);
+        bytes.extend_from_slice(&self.bootstrap_replica_principal);
         bytes.extend_from_slice(&self.bootstrap_credential_public_key);
         bytes.push(self.bootstrap_credential_kind);
         bytes.extend_from_slice(&self.bootstrap_node);
@@ -332,7 +340,7 @@ impl SystemAuthorityConfiguration {
         bytes
     }
 
-    /// Decode SAC4 exactly. Prior clean generations, truncation, and trailing
+    /// Decode SAC5 exactly. Prior clean generations, truncation, and trailing
     /// data are all rejected; there is no legacy constructor fallback.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != CONFIG_ENCODED_BYTES
@@ -369,6 +377,7 @@ impl SystemAuthorityConfiguration {
         cursor += 8;
         let bootstrap_system_agent_creation_nonce = take_fixed(bytes, &mut cursor)?;
         let bootstrap_principal = take_fixed(bytes, &mut cursor)?;
+        let bootstrap_replica_principal = take_fixed(bytes, &mut cursor)?;
         let bootstrap_credential_public_key = take_fixed(bytes, &mut cursor)?;
         let bootstrap_credential_kind = *bytes.get(cursor)?;
         cursor += 1;
@@ -397,6 +406,7 @@ impl SystemAuthorityConfiguration {
             bootstrap_authorization_high_water,
             bootstrap_system_agent_creation_nonce,
             bootstrap_principal,
+            bootstrap_replica_principal,
             bootstrap_credential_public_key,
             bootstrap_credential_kind,
             bootstrap_node,
@@ -843,7 +853,7 @@ fn root_managed_agent(config: SystemAuthorityConfiguration) -> ManagedAgentRow {
         capabilities: RuntimeCapabilitiesRow::from_sdk(RuntimeCapabilities::standard()),
         replicas: vec![ManagedReplicaRow {
             node: config.bootstrap_node,
-            principal: config.bootstrap_principal,
+            principal: config.bootstrap_replica_principal,
             role: ReplicaRole::Voter as u8,
         }],
         replica_generation: [0; 32],
@@ -5939,8 +5949,19 @@ fn managed_agent_projection_is_valid(
             replica.node == [0; 32]
                 || replica.principal == [0; 32]
                 || replica.sdk().is_none()
-                || enrolled_node(state, vos::agent_sdk::NodeId(replica.node))
-                    .is_none_or(|node| node.owner != replica.principal)
+                || enrolled_node(state, vos::agent_sdk::NodeId(replica.node)).is_none_or(|node| {
+                    if row.agent == configuration.system_agent
+                        && replica.node == configuration.bootstrap_node
+                    {
+                        // The founding operator owns and enrolls the Node,
+                        // while the physical replica principal is bound to
+                        // that Node's authenticated transport key.
+                        node.owner != configuration.bootstrap_principal
+                            || replica.principal != configuration.bootstrap_replica_principal
+                    } else {
+                        node.owner != replica.principal
+                    }
+                })
         })
         || state
             .roles
@@ -7976,6 +7997,10 @@ mod tests {
             bootstrap_authorization_high_water: ROOT_BOOTSTRAP_AUTHORIZATION_HIGH_WATER,
             bootstrap_system_agent_creation_nonce: creation_nonce.0,
             bootstrap_principal: ADMIN_PRINCIPAL.0,
+            bootstrap_replica_principal: PrincipalId::of_public_key(
+                &bootstrap_enrollment.transport_public_key,
+            )
+            .0,
             bootstrap_credential_public_key: signing(0x21).verifying_key().to_bytes(),
             bootstrap_credential_kind: 0,
             bootstrap_node: bootstrap_enrollment.node.0,
@@ -9523,11 +9548,11 @@ mod tests {
     }
 
     #[test]
-    fn sac4_configuration_is_exact_and_clean_generation_bound() {
+    fn sac5_configuration_is_exact_and_clean_generation_bound() {
         let config = configuration();
         let encoded = config.encode();
         assert_eq!(encoded.len(), CONFIG_ENCODED_BYTES);
-        assert_eq!(encoded.get(..4), Some(b"SAC4".as_slice()));
+        assert_eq!(encoded.get(..4), Some(b"SAC5".as_slice()));
         assert_eq!(SystemAuthorityConfiguration::decode(&encoded), Some(config));
         assert_eq!(
             <SystemAuthority as vos::Actor>::STATE_SCHEMA_VERSION,
@@ -9541,6 +9566,11 @@ mod tests {
         let mut old_sac3_shape = vec![0; CONFIG_ENCODED_BYTES - 40];
         old_sac3_shape[..4].copy_from_slice(b"SAC3");
         assert_eq!(SystemAuthorityConfiguration::decode(&old_sac3_shape), None);
+        let mut old_sac4_shape = encoded.clone();
+        old_sac4_shape[..4].copy_from_slice(b"SAC4");
+        let replica_principal_offset = 4 + 32 + 16 * 32 + 3 * 8;
+        old_sac4_shape.drain(replica_principal_offset..replica_principal_offset + 32);
+        assert_eq!(SystemAuthorityConfiguration::decode(&old_sac4_shape), None);
         let mut wrong_abi = encoded.clone();
         wrong_abi[4] ^= 1;
         assert_eq!(SystemAuthorityConfiguration::decode(&wrong_abi), None);
@@ -9552,7 +9582,9 @@ mod tests {
             None
         );
         let mut invalid_kind = encoded.clone();
-        invalid_kind[encoded.len() - 33] = 2;
+        let credential_kind_offset =
+            encoded.len() - 1 - 3 * 32 - ED25519_TRANSPORT_PEER_ID_BYTES - PRIVATE_SIGNATURE_BYTES;
+        invalid_kind[credential_kind_offset] = 2;
         assert_eq!(SystemAuthorityConfiguration::decode(&invalid_kind), None);
         let mut weak_key = [0; 32];
         weak_key[0] = 1;
@@ -9609,6 +9641,12 @@ mod tests {
         wrong_transport_key.bootstrap_node_transport_public_key[0] ^= 1;
         assert_eq!(
             SystemAuthorityConfiguration::decode(&wrong_transport_key.encode()),
+            None
+        );
+        let mut wrong_replica_principal = config;
+        wrong_replica_principal.bootstrap_replica_principal[0] ^= 1;
+        assert_eq!(
+            SystemAuthorityConfiguration::decode(&wrong_replica_principal.encode()),
             None
         );
         let mut wrong_peer_id = config;
@@ -10288,6 +10326,15 @@ mod tests {
         let config = configuration();
         let expected_seed = root_managed_agent(config);
         let mut actor = actor();
+        assert_ne!(
+            config.bootstrap_principal,
+            config.bootstrap_replica_principal
+        );
+        assert_eq!(expected_seed.owner, config.bootstrap_principal);
+        assert_eq!(
+            expected_seed.replicas[0].principal,
+            config.bootstrap_replica_principal,
+        );
         assert_eq!(
             actor.state.authorization_sequence,
             ROOT_BOOTSTRAP_AUTHORIZATION_HIGH_WATER
@@ -10415,7 +10462,7 @@ mod tests {
             None,
             None,
         )
-        .expect("seeded SAC4 authority state restarts");
+        .expect("seeded SAC5 authority state restarts");
         assert_eq!(restarted.state.authorization_sequence, 3);
         assert_eq!(restarted.state.managed_agents, vec![expected_seed]);
         assert_eq!(restarted.state.managed_actors, vec![expected_actor]);
