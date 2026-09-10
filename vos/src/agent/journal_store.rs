@@ -590,6 +590,176 @@ pub(crate) struct JournalGc {
     pub(crate) complete: bool,
 }
 
+/// Absolute decode bound for one typed portable Shared checkpoint closure.
+/// Callers apply a usually smaller operation-specific work budget before
+/// constructing one; this ceiling prevents a wire length from becoming an
+/// allocation policy.
+pub(crate) const MAX_PORTABLE_JOURNAL_IMAGE_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const MAX_PORTABLE_JOURNAL_OBJECTS: usize = 65_536;
+pub(crate) const MAX_PORTABLE_JOURNAL_BLOBS: usize = 65_536;
+const PORTABLE_JOURNAL_IMAGE_DOMAIN: &[u8] = b"vos/agent/shared/portable-journal-image/v1";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PortableJournalLimits {
+    pub(crate) max_objects: usize,
+    pub(crate) max_blobs: usize,
+    pub(crate) max_index_nodes: usize,
+    pub(crate) max_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PortableJournalObject {
+    class: JournalStorageClass,
+    id: [u8; 32],
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PortableJournalBlob {
+    class: JournalBlobClass,
+    reference: BlobRef,
+    bytes: Vec<u8>,
+}
+
+/// Canonically ordered, typed dependency closure for one already-installed
+/// Shared checkpoint. It contains no journal-store identity or mutable Raft
+/// bytes. Every record is decoded and content-address checked before import.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PortableJournalCheckpoint {
+    heads: JournalHeads,
+    objects: Vec<PortableJournalObject>,
+    blobs: Vec<PortableJournalBlob>,
+}
+
+impl PortableJournalCheckpoint {
+    pub(crate) const fn heads(&self) -> &JournalHeads {
+        &self.heads
+    }
+
+    pub(crate) fn commitment(&self) -> Hash {
+        Hash::digest(PORTABLE_JOURNAL_IMAGE_DOMAIN, &[&self.encode()])
+    }
+
+    pub(crate) fn validate_limits(
+        &self,
+        limits: PortableJournalLimits,
+    ) -> Result<(), JournalStoreError> {
+        validate_portable_journal_limits(limits)?;
+        if self.objects.len() > limits.max_objects
+            || self.blobs.len() > limits.max_blobs
+            || self.encode().len() as u64 > limits.max_bytes
+        {
+            return Err(JournalStoreError::LimitExceeded);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_shape(&self) -> Result<(), JournalStoreError> {
+        if self.heads.validate().is_err()
+            || self.heads.checkpoint.is_none()
+            || self.objects.is_empty()
+            || self.objects.len() > MAX_PORTABLE_JOURNAL_OBJECTS
+            || self.blobs.is_empty()
+            || self.blobs.len() > MAX_PORTABLE_JOURNAL_BLOBS
+            || self
+                .objects
+                .windows(2)
+                .any(|pair| (pair[0].class, pair[0].id) >= (pair[1].class, pair[1].id))
+            || self.blobs.windows(2).any(|pair| {
+                (pair[0].class, pair[0].reference.hash) >= (pair[1].class, pair[1].reference.hash)
+            })
+        {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        for object in &self.objects {
+            validate_portable_object(object)?;
+        }
+        for blob in &self.blobs {
+            validate_supplied_blob(blob.class, &blob.reference, &blob.bytes)?;
+        }
+        if self.encode().len() > MAX_PORTABLE_JOURNAL_IMAGE_BYTES {
+            return Err(JournalStoreError::LimitExceeded);
+        }
+        Ok(())
+    }
+}
+
+impl ServiceWire for PortableJournalCheckpoint {
+    const MAGIC: [u8; 4] = *b"AJB1";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.bytes(&self.heads.encode());
+        encoder.u32(self.objects.len() as u32);
+        for object in &self.objects {
+            encoder.u8(object.class as u8);
+            encoder.fixed(&object.id);
+            encoder.bytes(&object.bytes);
+        }
+        encoder.u32(self.blobs.len() as u32);
+        for blob in &self.blobs {
+            encoder.u8(blob.class as u8);
+            encoder.fixed(&blob.reference.hash.0);
+            encoder.u64(blob.reference.len);
+            encoder.bytes(&blob.bytes);
+        }
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        if decoder.remaining()
+            > MAX_PORTABLE_JOURNAL_IMAGE_BYTES
+                .checked_sub(4 + 32)
+                .ok_or(DecodeError::LimitExceeded)?
+        {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let heads = JournalHeads::decode(&decoder.bytes()?)?;
+        let object_count = decoder.u32()? as usize;
+        if object_count == 0 || object_count > MAX_PORTABLE_JOURNAL_OBJECTS {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let mut objects = Vec::new();
+        objects
+            .try_reserve_exact(object_count)
+            .map_err(|_| DecodeError::LimitExceeded)?;
+        for _ in 0..object_count {
+            objects.push(PortableJournalObject {
+                class: decode_journal_storage_class(decoder.u8()?)?,
+                id: decoder.fixed()?,
+                bytes: decoder.bytes()?,
+            });
+        }
+        let blob_count = decoder.u32()? as usize;
+        if blob_count == 0 || blob_count > MAX_PORTABLE_JOURNAL_BLOBS {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let mut blobs = Vec::new();
+        blobs
+            .try_reserve_exact(blob_count)
+            .map_err(|_| DecodeError::LimitExceeded)?;
+        for _ in 0..blob_count {
+            blobs.push(PortableJournalBlob {
+                class: decode_journal_blob_class(decoder.u8()?)?,
+                reference: BlobRef {
+                    hash: Hash(decoder.fixed()?),
+                    len: decoder.u64()?,
+                },
+                bytes: decoder.bytes()?,
+            });
+        }
+        let image = Self {
+            heads,
+            objects,
+            blobs,
+        };
+        image.validate_shape().map_err(|error| match error {
+            JournalStoreError::LimitExceeded => DecodeError::LimitExceeded,
+            _ => DecodeError::NonCanonical,
+        })?;
+        Ok(image)
+    }
+}
+
 /// Administrative collection boundary kept separate from normal journal
 /// mutation so replay-only store implementations need not expose physical GC.
 pub(crate) trait AgentJournalGarbageCollection: AgentJournalStore {
@@ -1601,7 +1771,7 @@ fn publication_is_exact_retry(
 #[derive(Debug)]
 struct GcMark {
     objects: BTreeSet<(JournalStorageClass, [u8; 32])>,
-    blobs: BTreeSet<(JournalBlobClass, Hash)>,
+    blobs: BTreeMap<(JournalBlobClass, Hash), u64>,
     max_objects: usize,
     max_blobs: usize,
 }
@@ -1610,7 +1780,7 @@ impl GcMark {
     fn new(limits: GcLimits) -> Self {
         Self {
             objects: BTreeSet::new(),
-            blobs: BTreeSet::new(),
+            blobs: BTreeMap::new(),
             max_objects: limits.max_marked_objects,
             max_blobs: limits.max_marked_blobs,
         }
@@ -1631,7 +1801,14 @@ impl GcMark {
         reference: &BlobRef,
     ) -> Result<(), JournalStoreError> {
         validate_blob_reference(class, reference)?;
-        if self.blobs.insert((class, reference.hash)) && self.blobs.len() > self.max_blobs {
+        match self.blobs.get(&(class, reference.hash)) {
+            Some(length) if *length != reference.len => return Err(JournalStoreError::Corrupt),
+            Some(_) => return Ok(()),
+            None => {
+                self.blobs.insert((class, reference.hash), reference.len);
+            }
+        }
+        if self.blobs.len() > self.max_blobs {
             return Err(JournalStoreError::LimitExceeded);
         }
         Ok(())
@@ -1664,6 +1841,87 @@ fn class_maximum(class: JournalStorageClass) -> usize {
         JournalStorageClass::InvocationHistoryNode => MAX_INVOCATION_HISTORY_NODE_BYTES,
         JournalStorageClass::TransitionProof => MAX_TRANSITION_PROOF_ENTRY_BYTES,
         JournalStorageClass::TransitionProofIndex => MAX_TRANSITION_PROOF_INDEX_BYTES,
+    }
+}
+
+fn decode_journal_storage_class(tag: u8) -> Result<JournalStorageClass, DecodeError> {
+    match tag {
+        0 => Ok(JournalStorageClass::ReplayInput),
+        1 => Ok(JournalStorageClass::Genesis),
+        2 => Ok(JournalStorageClass::OrderedEntry),
+        3 => Ok(JournalStorageClass::LocalEntry),
+        4 => Ok(JournalStorageClass::MergeEvent),
+        5 => Ok(JournalStorageClass::MergeFrontier),
+        6 => Ok(JournalStorageClass::MergeSeal),
+        7 => Ok(JournalStorageClass::LaneState),
+        8 => Ok(JournalStorageClass::ArtifactClosure),
+        9 => Ok(JournalStorageClass::InvocationIndex),
+        10 => Ok(JournalStorageClass::InvocationIndexNode),
+        11 => Ok(JournalStorageClass::Checkpoint),
+        12 => Ok(JournalStorageClass::Heads),
+        13 => Ok(JournalStorageClass::InvocationOutcome),
+        14 => Ok(JournalStorageClass::InvocationHistoryNode),
+        15 => Ok(JournalStorageClass::TransitionProof),
+        16 => Ok(JournalStorageClass::TransitionProofIndex),
+        _ => Err(DecodeError::InvalidTag),
+    }
+}
+
+fn decode_journal_blob_class(tag: u8) -> Result<JournalBlobClass, DecodeError> {
+    match tag {
+        0 => Ok(JournalBlobClass::LaneState),
+        1 => Ok(JournalBlobClass::CatalogArtifact),
+        2 => Ok(JournalBlobClass::TransitionProof),
+        _ => Err(DecodeError::InvalidTag),
+    }
+}
+
+fn validate_portable_object(object: &PortableJournalObject) -> Result<(), JournalStoreError> {
+    if object.id == [0; 32] || object.bytes.len() > class_maximum(object.class) {
+        return Err(JournalStoreError::NonCanonical);
+    }
+    macro_rules! exact {
+        ($record:ty, $id:expr) => {{ decode_object::<$record>(&object.bytes, $id).map(|_| ()) }};
+    }
+    match object.class {
+        JournalStorageClass::ReplayInput => {
+            exact!(ReplayInput, super::journal::ReplayInputId(object.id))
+        }
+        JournalStorageClass::Genesis => Err(JournalStoreError::InvalidClass),
+        JournalStorageClass::OrderedEntry => exact!(OrderedEntry, OrderedEntryId(object.id)),
+        JournalStorageClass::LocalEntry => exact!(LocalEntry, LocalEntryId(object.id)),
+        JournalStorageClass::MergeEvent => exact!(MergeEvent, MergeEventId(object.id)),
+        JournalStorageClass::MergeFrontier => exact!(MergeFrontier, MergeFrontierId(object.id)),
+        JournalStorageClass::MergeSeal => exact!(MergeSeal, MergeSealId(object.id)),
+        JournalStorageClass::LaneState => exact!(LaneStateManifest, LaneStateId(object.id)),
+        JournalStorageClass::ArtifactClosure => exact!(
+            ArtifactClosure,
+            super::journal::ArtifactClosureId(object.id)
+        ),
+        JournalStorageClass::InvocationIndex => {
+            exact!(InvocationIndexManifest, InvocationIndexId(object.id))
+        }
+        JournalStorageClass::InvocationIndexNode => {
+            exact!(InvocationIndexNode, InvocationIndexNodeId(object.id))
+        }
+        JournalStorageClass::Checkpoint => exact!(CheckpointManifest, CheckpointId(object.id)),
+        JournalStorageClass::Heads => exact!(JournalHeads, JournalHeadsId(object.id)),
+        JournalStorageClass::InvocationOutcome => {
+            exact!(InvocationOutcomeRecord, InvocationOutcomeId(object.id))
+        }
+        JournalStorageClass::InvocationHistoryNode => {
+            exact!(InvocationHistoryNode, InvocationHistoryNodeId(object.id))
+        }
+        JournalStorageClass::TransitionProof => exact!(
+            JournalTransitionProof,
+            super::journal::TransitionProofEntryId(object.id)
+        ),
+        JournalStorageClass::TransitionProofIndex => {
+            exact!(
+                TransitionProofIndexManifest,
+                TransitionProofIndexId(object.id)
+            )
+        }
     }
 }
 
@@ -5444,6 +5702,262 @@ fn build_gc_mark<S: AgentJournalStore>(
     ))
 }
 
+fn mark_portable_history_tree<S: AgentJournalStore>(
+    store: &S,
+    mark: &mut GcMark,
+    root: Option<InvocationHistoryNodeId>,
+    genesis: AgentJournalGenesisId,
+    scope: InvocationOwnershipScope,
+    maximum: usize,
+) -> Result<(), JournalStoreError> {
+    let Some(root) = root else {
+        return Ok(());
+    };
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
+        if visited.len() > maximum {
+            return Err(JournalStoreError::LimitExceeded);
+        }
+        let bytes = InvocationHistoryStore::load_history_node(store, id)?
+            .ok_or(JournalStoreError::MissingObject)?;
+        let node = decode_object::<InvocationHistoryNode>(&bytes, id)?;
+        if node.genesis() != genesis || node.scope() != scope {
+            return Err(JournalStoreError::Corrupt);
+        }
+        mark.object::<InvocationHistoryNode>(id)?;
+        if let Some((left, right)) = node.child_ids() {
+            pending.push(right);
+            pending.push(left);
+        }
+    }
+    Ok(())
+}
+
+fn mark_portable_history<S: AgentJournalStore>(
+    store: &S,
+    heads: &JournalHeads,
+    mark: &mut GcMark,
+    maximum: usize,
+) -> Result<(), JournalStoreError> {
+    for (id, scope) in [
+        (heads.ordered_invocations, InvocationOwnershipScope::Ordered),
+        (heads.merge_invocations, InvocationOwnershipScope::Merge),
+        (
+            heads.local_invocations,
+            InvocationOwnershipScope::Local(heads.node),
+        ),
+    ] {
+        let manifest = require_record::<S, InvocationIndexManifest>(store, id)?;
+        if manifest.genesis != heads.genesis || manifest.scope != scope {
+            return Err(JournalStoreError::Corrupt);
+        }
+        mark_portable_history_tree(
+            store,
+            mark,
+            manifest.history_root,
+            heads.genesis,
+            scope,
+            maximum,
+        )?;
+    }
+    let proofs = require_record::<S, TransitionProofIndexManifest>(store, heads.transition_proofs)?;
+    if proofs.genesis != heads.genesis {
+        return Err(JournalStoreError::Corrupt);
+    }
+    mark_portable_history_tree(
+        store,
+        mark,
+        proofs.retired_root(),
+        heads.genesis,
+        InvocationOwnershipScope::Ordered,
+        maximum,
+    )
+}
+
+fn read_portable_object<S: AgentJournalStore>(
+    store: &S,
+    class: JournalStorageClass,
+    id: [u8; 32],
+) -> Result<PortableJournalObject, JournalStoreError> {
+    macro_rules! load {
+        ($record:ty, $id:expr) => {{
+            let record = store
+                .get::<$record>($id)?
+                .ok_or(JournalStoreError::MissingObject)?;
+            record.encode()
+        }};
+    }
+    let bytes = match class {
+        JournalStorageClass::ReplayInput => load!(ReplayInput, super::journal::ReplayInputId(id)),
+        JournalStorageClass::Genesis => return Err(JournalStoreError::InvalidClass),
+        JournalStorageClass::OrderedEntry => load!(OrderedEntry, OrderedEntryId(id)),
+        JournalStorageClass::LocalEntry => load!(LocalEntry, LocalEntryId(id)),
+        JournalStorageClass::MergeEvent => load!(MergeEvent, MergeEventId(id)),
+        JournalStorageClass::MergeFrontier => load!(MergeFrontier, MergeFrontierId(id)),
+        JournalStorageClass::MergeSeal => load!(MergeSeal, MergeSealId(id)),
+        JournalStorageClass::LaneState => load!(LaneStateManifest, LaneStateId(id)),
+        JournalStorageClass::ArtifactClosure => {
+            load!(ArtifactClosure, super::journal::ArtifactClosureId(id))
+        }
+        JournalStorageClass::InvocationIndex => {
+            load!(InvocationIndexManifest, InvocationIndexId(id))
+        }
+        JournalStorageClass::InvocationIndexNode => {
+            load!(InvocationIndexNode, InvocationIndexNodeId(id))
+        }
+        JournalStorageClass::Checkpoint => load!(CheckpointManifest, CheckpointId(id)),
+        JournalStorageClass::Heads => store
+            .historical_heads(JournalHeadsId(id))?
+            .ok_or(JournalStoreError::MissingObject)?
+            .encode(),
+        JournalStorageClass::InvocationOutcome => {
+            load!(InvocationOutcomeRecord, InvocationOutcomeId(id))
+        }
+        JournalStorageClass::InvocationHistoryNode => {
+            let history_id = InvocationHistoryNodeId(id);
+            let bytes = InvocationHistoryStore::load_history_node(store, history_id)?
+                .ok_or(JournalStoreError::MissingObject)?;
+            decode_object::<InvocationHistoryNode>(&bytes, history_id)?;
+            bytes
+        }
+        JournalStorageClass::TransitionProof => load!(
+            JournalTransitionProof,
+            super::journal::TransitionProofEntryId(id)
+        ),
+        JournalStorageClass::TransitionProofIndex => {
+            load!(TransitionProofIndexManifest, TransitionProofIndexId(id))
+        }
+    };
+    let object = PortableJournalObject { class, id, bytes };
+    validate_portable_object(&object)?;
+    Ok(object)
+}
+
+pub(crate) fn export_portable_journal_checkpoint<S: AgentJournalStore>(
+    store: &S,
+    limits: PortableJournalLimits,
+) -> Result<PortableJournalCheckpoint, JournalStoreError> {
+    validate_portable_journal_limits(limits)?;
+    let heads = store.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+    let (_, mut mark) = build_gc_mark(
+        store,
+        heads.id(),
+        GcLimits {
+            max_index_nodes: limits.max_index_nodes,
+            max_marked_objects: limits.max_objects,
+            max_marked_blobs: limits.max_blobs,
+            max_scanned_files: 1,
+            max_scanned_bytes: 1,
+            max_unlinks_per_run: 1,
+        },
+    )?;
+    mark_portable_history(store, &heads, &mut mark, limits.max_index_nodes)?;
+
+    let mut objects = Vec::new();
+    objects
+        .try_reserve_exact(mark.objects.len())
+        .map_err(|_| JournalStoreError::LimitExceeded)?;
+    for (class, id) in mark.objects.iter().copied() {
+        objects.push(read_portable_object(store, class, id)?);
+    }
+    let mut blobs = Vec::new();
+    blobs
+        .try_reserve_exact(mark.blobs.len())
+        .map_err(|_| JournalStoreError::LimitExceeded)?;
+    for ((class, hash), len) in &mark.blobs {
+        let reference = BlobRef {
+            hash: *hash,
+            len: *len,
+        };
+        let bytes = store
+            .load_blob(*class, &reference)?
+            .ok_or(JournalStoreError::MissingObject)?;
+        blobs.push(PortableJournalBlob {
+            class: *class,
+            reference,
+            bytes,
+        });
+    }
+    let image = PortableJournalCheckpoint {
+        heads,
+        objects,
+        blobs,
+    };
+    image.validate_shape()?;
+    image.validate_limits(limits)?;
+    Ok(image)
+}
+
+fn validate_portable_journal_limits(
+    limits: PortableJournalLimits,
+) -> Result<(), JournalStoreError> {
+    if limits.max_objects == 0
+        || limits.max_objects > MAX_PORTABLE_JOURNAL_OBJECTS
+        || limits.max_blobs == 0
+        || limits.max_blobs > MAX_PORTABLE_JOURNAL_BLOBS
+        || limits.max_index_nodes == 0
+        || limits.max_bytes == 0
+        || limits.max_bytes > MAX_PORTABLE_JOURNAL_IMAGE_BYTES as u64
+    {
+        return Err(JournalStoreError::LimitExceeded);
+    }
+    Ok(())
+}
+
+fn portable_image_key_sets(
+    image: &PortableJournalCheckpoint,
+) -> (
+    BTreeSet<(JournalStorageClass, [u8; 32])>,
+    BTreeMap<(JournalBlobClass, Hash), u64>,
+) {
+    (
+        image
+            .objects
+            .iter()
+            .map(|object| (object.class, object.id))
+            .collect(),
+        image
+            .blobs
+            .iter()
+            .map(|blob| ((blob.class, blob.reference.hash), blob.reference.len))
+            .collect(),
+    )
+}
+
+fn validate_portable_journal_closure<S: AgentJournalStore>(
+    store: &S,
+    image: &PortableJournalCheckpoint,
+    maximum_index_nodes: usize,
+) -> Result<(), JournalStoreError> {
+    image.validate_shape()?;
+    let heads = store.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+    if heads != image.heads {
+        return Err(JournalStoreError::Conflict);
+    }
+    let (_, mut mark) = build_gc_mark(
+        store,
+        heads.id(),
+        GcLimits {
+            max_index_nodes: maximum_index_nodes,
+            max_marked_objects: image.objects.len(),
+            max_marked_blobs: image.blobs.len(),
+            max_scanned_files: 1,
+            max_scanned_bytes: 1,
+            max_unlinks_per_run: 1,
+        },
+    )?;
+    mark_portable_history(store, &heads, &mut mark, maximum_index_nodes)?;
+    let (objects, blobs) = portable_image_key_sets(image);
+    if objects != mark.objects || blobs != mark.blobs {
+        return Err(JournalStoreError::NonCanonical);
+    }
+    Ok(())
+}
+
 fn validate_history_retirement_coverage<S: AgentJournalStore>(
     store: &S,
     expected_heads: JournalHeadsId,
@@ -7168,6 +7682,66 @@ impl MemoryAgentJournalStore {
         })
     }
 
+    pub(crate) fn initialize_shared<T: ReplaySealedOrdinaryGenesis>(
+        &mut self,
+        sealed: &T,
+    ) -> Result<bool, JournalStoreError> {
+        self.initialize_ordinary(sealed)
+    }
+
+    pub(crate) fn install_portable_checkpoint(
+        &mut self,
+        image: &PortableJournalCheckpoint,
+        maximum_index_nodes: usize,
+    ) -> Result<(), JournalStoreError> {
+        image.validate_shape()?;
+        let current = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+        if current.genesis != image.heads.genesis
+            || current.admission != image.heads.admission
+            || current.node != image.heads.node
+            || current.ordered_index != 0
+            || current.ordered_head.is_some()
+            || current.local_revision != 0
+            || current.local_head.is_some()
+            || current.checkpoint.is_some()
+        {
+            return Err(JournalStoreError::Conflict);
+        }
+        let mut candidate = self.candidate_clone();
+        for blob in &image.blobs {
+            candidate.put_blob(blob.class, &blob.reference, &blob.bytes)?;
+        }
+        for object in &image.objects {
+            validate_portable_object(object)?;
+            let key = (object.class, object.id);
+            let target = if object.class == JournalStorageClass::InvocationHistoryNode {
+                let id = InvocationHistoryNodeId(object.id);
+                match candidate.history_nodes.get(&id) {
+                    Some(bytes) if bytes == &object.bytes => continue,
+                    Some(_) => return Err(JournalStoreError::Corrupt),
+                    None => {
+                        candidate.history_nodes.insert(id, object.bytes.clone());
+                        continue;
+                    }
+                }
+            } else {
+                &mut candidate.objects
+            };
+            match target.get(&key) {
+                Some(bytes) if bytes == &object.bytes => {}
+                Some(_) => return Err(JournalStoreError::Corrupt),
+                None => {
+                    target.insert(key, object.bytes.clone());
+                }
+            }
+        }
+        candidate.heads = Some(image.heads.encode());
+        validate_head_targets(&candidate, &image.heads)?;
+        validate_portable_journal_closure(&candidate, image, maximum_index_nodes)?;
+        *self = candidate;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn remove_transition_proof_index_for_test(
         &mut self,
@@ -7640,8 +8214,7 @@ impl MemoryAgentJournalStore {
         Ok(created)
     }
 
-    #[cfg(test)]
-    pub(crate) fn initialize_ordinary_for_test<T: ReplaySealedOrdinaryGenesis>(
+    fn initialize_ordinary<T: ReplaySealedOrdinaryGenesis>(
         &mut self,
         sealed: &T,
     ) -> Result<bool, JournalStoreError> {
@@ -7695,6 +8268,14 @@ impl MemoryAgentJournalStore {
         validate_head_targets(&candidate, &shape.initial)?;
         *self = candidate;
         Ok(created)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn initialize_ordinary_for_test<T: ReplaySealedOrdinaryGenesis>(
+        &mut self,
+        sealed: &T,
+    ) -> Result<bool, JournalStoreError> {
+        self.initialize_ordinary(sealed)
     }
 }
 
@@ -8179,7 +8760,7 @@ impl AgentJournalGarbageCollection for MemoryAgentJournalStore {
         let garbage_blobs = self
             .blobs
             .keys()
-            .filter(|key| !mark.blobs.contains(key))
+            .filter(|key| !mark.blobs.contains_key(key))
             .copied()
             .collect::<Vec<_>>();
         self.gc_intent = Some(intent);
@@ -8353,7 +8934,7 @@ impl FileGcEntry {
         }
         match self.kind {
             FileGcKind::Object(class) => mark.objects.contains(&(class, self.id)),
-            FileGcKind::Blob(class) => mark.blobs.contains(&(class, Hash(self.id))),
+            FileGcKind::Blob(class) => mark.blobs.contains_key(&(class, Hash(self.id))),
         }
     }
 }
@@ -9861,6 +10442,96 @@ impl FileLocalAgentJournalSlot {
         self.generation_exists
     }
 
+    /// Resolve only the `heads.next` state created by a host-retained,
+    /// quorum-authenticated portable restore marker. The caller has already
+    /// verified the complete bundle and supplies both exact endpoints; this
+    /// method neither decodes portable authority nor admits any other jump.
+    pub(crate) fn recover_portable_heads_stage(
+        &self,
+        initial: &JournalHeads,
+        target: &JournalHeads,
+    ) -> Result<(), JournalStoreError> {
+        if !self.generation_exists {
+            return Ok(());
+        }
+        self.verify_lock()?;
+        if initial.genesis != target.genesis
+            || initial.admission != target.admission
+            || initial.node != self.node
+            || target.node != self.node
+            || initial.id() == target.id()
+        {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let root_leaf = self
+            .root_name
+            .to_str()
+            .map_err(|_| JournalStoreError::InvalidPath)?;
+        let directory = open_directory_at(self.journal_parent.get()?, root_leaf)?;
+        validate_owned_directory(&directory)?;
+        let decode = |name: &str| -> Result<Option<JournalHeads>, JournalStoreError> {
+            let Some(bytes) = read_pinned_bounded_regular_at(
+                &directory,
+                name,
+                class_maximum(JournalStorageClass::Heads),
+            )?
+            else {
+                return Ok(None);
+            };
+            let heads = JournalHeads::decode(&bytes).map_err(|_| JournalStoreError::Corrupt)?;
+            decode_object::<JournalHeads>(&bytes, heads.id()).map(Some)
+        };
+        let current = decode("heads")?;
+        let staged = decode("heads.next")?;
+        let private_name = private_stage_name("heads.next")?;
+        let private_present = stat_at(&directory, &c_name(&private_name)?)
+            .map_err(|_| JournalStoreError::Unavailable)?
+            .is_some();
+        let Some(current) = current else {
+            // Portable publication begins only after normal genesis exposure.
+            return Err(JournalStoreError::Corrupt);
+        };
+        if current != *initial && current != *target {
+            return Err(JournalStoreError::Conflict);
+        }
+        if staged.as_ref().is_some_and(|staged| staged != target) {
+            return Err(JournalStoreError::Corrupt);
+        }
+        if !self.exposure_committed && (current == *target || staged.is_some()) {
+            // Portable activation is ordered strictly after ordinary Shared
+            // exposure. Without that irreversible lock bit, even exact target
+            // bytes are unauthenticated restored residue rather than a crash
+            // continuation.
+            return Err(JournalStoreError::Corrupt);
+        }
+        if current == *initial {
+            if staged.is_some() {
+                sync_regular_file_at(&directory, "heads.next")?;
+                rename_file_at(&directory, "heads.next", "heads")?;
+                directory
+                    .sync_all()
+                    .map_err(|_| JournalStoreError::Unavailable)?;
+            } else if private_present {
+                // A private file was never published as a durable stage and
+                // therefore carries no recovery authority.
+                unlink_file_at(&directory, &private_name)?;
+                directory
+                    .sync_all()
+                    .map_err(|_| JournalStoreError::Unavailable)?;
+                return Ok(());
+            }
+        } else if staged.is_some() {
+            unlink_file_at(&directory, "heads.next")?;
+        }
+        if private_present {
+            unlink_file_at(&directory, &private_name)?;
+        }
+        directory
+            .sync_all()
+            .map_err(|_| JournalStoreError::Unavailable)?;
+        self.verify_lock()
+    }
+
     /// Open or resume an ordinary Local generation under its exact opaque
     /// admission. `exposed` is the separately durable Host marker; an
     /// exposed store must already be complete, while an unexposed store may
@@ -10632,6 +11303,177 @@ impl FileAgentJournalStore {
         sealed: &T,
     ) -> Result<bool, JournalStoreError> {
         self.initialize_ordinary(sealed)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn persist_portable_object(
+        &self,
+        object: &PortableJournalObject,
+    ) -> Result<(), JournalStoreError> {
+        validate_portable_object(object)?;
+        macro_rules! persist {
+            ($record:ty, $id:expr) => {{
+                let record = decode_object::<$record>(&object.bytes, $id)?;
+                self.persist_object(&record).map(|_| ())
+            }};
+        }
+        match object.class {
+            JournalStorageClass::ReplayInput => {
+                persist!(ReplayInput, super::journal::ReplayInputId(object.id))
+            }
+            JournalStorageClass::Genesis => Err(JournalStoreError::InvalidClass),
+            JournalStorageClass::OrderedEntry => persist!(OrderedEntry, OrderedEntryId(object.id)),
+            JournalStorageClass::LocalEntry => persist!(LocalEntry, LocalEntryId(object.id)),
+            JournalStorageClass::MergeEvent => persist!(MergeEvent, MergeEventId(object.id)),
+            JournalStorageClass::MergeFrontier => {
+                persist!(MergeFrontier, MergeFrontierId(object.id))
+            }
+            JournalStorageClass::MergeSeal => persist!(MergeSeal, MergeSealId(object.id)),
+            JournalStorageClass::LaneState => {
+                persist!(LaneStateManifest, LaneStateId(object.id))
+            }
+            JournalStorageClass::ArtifactClosure => persist!(
+                ArtifactClosure,
+                super::journal::ArtifactClosureId(object.id)
+            ),
+            JournalStorageClass::InvocationIndex => {
+                persist!(InvocationIndexManifest, InvocationIndexId(object.id))
+            }
+            JournalStorageClass::InvocationIndexNode => {
+                persist!(InvocationIndexNode, InvocationIndexNodeId(object.id))
+            }
+            JournalStorageClass::Checkpoint => {
+                persist!(CheckpointManifest, CheckpointId(object.id))
+            }
+            JournalStorageClass::Heads => {
+                let heads =
+                    decode_object::<JournalHeads>(&object.bytes, JournalHeadsId(object.id))?;
+                if heads.node != self.node {
+                    return Err(JournalStoreError::ScopeMismatch);
+                }
+                self.persist_historical_heads(&heads).map(|_| ())
+            }
+            JournalStorageClass::InvocationOutcome => {
+                persist!(InvocationOutcomeRecord, InvocationOutcomeId(object.id))
+            }
+            JournalStorageClass::InvocationHistoryNode => {
+                let id = InvocationHistoryNodeId(object.id);
+                self.persist_history_node(id, &object.bytes).map(|_| ())
+            }
+            JournalStorageClass::TransitionProof => persist!(
+                JournalTransitionProof,
+                super::journal::TransitionProofEntryId(object.id)
+            ),
+            JournalStorageClass::TransitionProofIndex => {
+                persist!(
+                    TransitionProofIndexManifest,
+                    TransitionProofIndexId(object.id)
+                )
+            }
+        }
+    }
+
+    /// Install a fully preflighted checkpoint closure into an unadvanced
+    /// physical journal. Immutable dependencies become visible first; the
+    /// only mutable operation is the final synced head replacement.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn install_portable_checkpoint(
+        &mut self,
+        image: &PortableJournalCheckpoint,
+        maximum_index_nodes: usize,
+    ) -> Result<(), JournalStoreError> {
+        let shape = image.validate_shape();
+        #[cfg(test)]
+        if let Err(error) = &shape {
+            eprintln!("portable durable image shape failed: {error:?}");
+        }
+        shape?;
+        let lock = self.verify_lock();
+        #[cfg(test)]
+        if let Err(error) = &lock {
+            eprintln!("portable durable lock failed: {error:?}");
+        }
+        lock?;
+        let loaded_heads = self.heads();
+        #[cfg(test)]
+        if let Err(error) = &loaded_heads {
+            eprintln!("portable durable current heads failed: {error:?}");
+        }
+        let current = loaded_heads?.ok_or(JournalStoreError::NotInitialized)?;
+        if current == image.heads {
+            return validate_portable_journal_closure(self, image, maximum_index_nodes);
+        }
+        if current.genesis != image.heads.genesis
+            || current.admission != image.heads.admission
+            || current.node != image.heads.node
+            || current.ordered_index != 0
+            || current.ordered_head.is_some()
+            || current.local_revision != 0
+            || current.local_head.is_some()
+            || current.checkpoint.is_some()
+            || self.read_fixed::<JournalHeads>("", "heads.next")?.is_some()
+        {
+            return Err(JournalStoreError::Conflict);
+        }
+        for blob in &image.blobs {
+            if let Err(error) = self.persist_blob(blob.class, &blob.reference, &blob.bytes) {
+                #[cfg(test)]
+                eprintln!("portable blob {:?} failed: {error:?}", blob.class);
+                return Err(error);
+            }
+        }
+        for object in &image.objects {
+            if let Err(error) = self.persist_portable_object(object) {
+                #[cfg(test)]
+                eprintln!("portable object {:?} failed: {error:?}", object.class);
+                return Err(error);
+            }
+        }
+        let checkpoint_validation = validate_checkpoint_closure(
+            self,
+            &self
+                .get::<CheckpointManifest>(
+                    image
+                        .heads
+                        .checkpoint
+                        .ok_or(JournalStoreError::NonCanonical)?,
+                )?
+                .ok_or(JournalStoreError::MissingObject)?,
+        );
+        #[cfg(test)]
+        if let Err(error) = &checkpoint_validation {
+            eprintln!("portable checkpoint closure failed: {error:?}");
+        }
+        checkpoint_validation?;
+        let head_validation = validate_head_targets(self, &image.heads);
+        #[cfg(test)]
+        if let Err(error) = &head_validation {
+            eprintln!("portable head targets failed: {error:?}");
+        }
+        head_validation?;
+
+        let root = self.directory("")?;
+        create_synced_stage_at(root, "heads.next", &image.heads.encode())?;
+        // Read the canonical file directly while the portable jump is staged.
+        // Generic recovery intentionally rejects this non-successor `next`;
+        // the exclusive generation lock and exact preflight above are the
+        // authority for this one activation attempt.
+        let still_current = self
+            .read_fixed::<JournalHeads>("", "heads")?
+            .ok_or(JournalStoreError::Corrupt)?;
+        if still_current != current {
+            return Err(JournalStoreError::Conflict);
+        }
+        rename_file_at(root, "heads.next", "heads")?;
+        root.sync_all()
+            .map_err(|_| JournalStoreError::Unavailable)?;
+        self.verify_lock()?;
+        let closure = validate_portable_journal_closure(self, image, maximum_index_nodes);
+        #[cfg(test)]
+        if let Err(error) = &closure {
+            eprintln!("portable final closure failed: {error:?}");
+        }
+        closure
     }
 
     fn initialize_ordinary<T: ReplaySealedOrdinaryGenesis>(

@@ -37,8 +37,10 @@ use super::replay::PublishedSharedOrdered;
 #[cfg(feature = "storage")]
 use super::shared_commit::{
     MAX_ORDERED_COMMIT_CLAIM_BYTES, MAX_REPLICA_COMMIT_SIGNATURE_BYTES,
-    MAX_SHARED_AGENT_SNAPSHOT_CERTIFICATE_BYTES, ReplicaCommitSignature, ReplicaQuorumCertificate,
-    SharedAgentSnapshotCertificate, SharedAgentSnapshotClaim,
+    MAX_SHARED_AGENT_PORTABLE_SNAPSHOT_CERTIFICATE_BYTES,
+    MAX_SHARED_AGENT_SNAPSHOT_CERTIFICATE_BYTES, MAX_SHARED_AGENT_SNAPSHOT_CLAIM_BYTES,
+    ReplicaCommitSignature, ReplicaQuorumCertificate, SharedAgentPortableSnapshotCertificate,
+    SharedAgentSnapshotCertificate, SharedAgentSnapshotClaim, VerifiedSharedAgentPortableSnapshot,
 };
 use super::shared_commit::{OrderedCommitClaim, SharedCommitError};
 use super::{
@@ -1982,6 +1984,10 @@ impl CommitteeChangeAuthorityBinding {
         };
         binding.validate()?;
         Ok(binding)
+    }
+
+    pub(crate) const fn initial_epoch(self) -> u64 {
+        self.initial_epoch
     }
 
     fn validate(self) -> Result<(), AgentRaftWireError> {
@@ -4370,12 +4376,17 @@ mod application_ledger_v2 {
     const COMMAND_RESERVATION_RECORD_MAX_BYTES: usize = 1024;
     const MAX_SNAPSHOT_COMMITTEE_EVIDENCE: usize = 96;
     const SNAPSHOT_RECORD_MAX_BYTES: usize = MAX_SHARED_AGENT_SNAPSHOT_CERTIFICATE_BYTES
+        + MAX_SHARED_AGENT_PORTABLE_SNAPSHOT_CERTIFICATE_BYTES
+        + MAX_SHARED_AGENT_SNAPSHOT_CERTIFICATE_BYTES
         + MAX_SNAPSHOT_COMMITTEE_EVIDENCE
             * (MAX_AGENT_RAFT_APPLY_META_BYTES + MAX_AGENT_RAFT_PHYSICAL_SLOT_BYTES + 16)
         + 4096;
     const RETIRED_AUDIT_ROOT_DOMAIN: &[u8] = b"vos/agent/shared/retired-audit-root/v1";
     const COMMITTEE_EVIDENCE_ROOT_DOMAIN: &[u8] =
         b"vos/agent/shared/snapshot-committee-evidence/v1";
+    const PORTABLE_FOUNDATION_DOMAIN: &[u8] = b"vos/agent/shared/portable-recovery-foundation/v1";
+    const PORTABLE_RETIRED_ROOT_DOMAIN: &[u8] =
+        b"vos/agent/shared/portable-recovery-retired-root/v1";
     const GENERATION_STORAGE_KEY_BYTES: usize = 32 * 4;
     const AUDIT_STORAGE_KEY_BYTES: usize = GENERATION_STORAGE_KEY_BYTES + 8;
 
@@ -4672,20 +4683,92 @@ mod application_ledger_v2 {
         }
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum SnapshotAuthorityV2 {
+        Physical(SharedAgentSnapshotCertificate),
+        Portable(SharedAgentPortableSnapshotCertificate),
+    }
+
     /// One durable, quorum-authenticated snapshot anchor. There is exactly
     /// one row per generation and replacements must advance its Raft index.
+    /// A portable authority signs only logical state; `claim` is the exact
+    /// destination-physical rebind retained for journal/Raft reconciliation.
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct AgentRaftSnapshotRecordV2 {
         generation: AgentGenerationRouteKey,
         journal_store: JournalStoreInstanceId,
         local_node: NodeId,
-        certificate: SharedAgentSnapshotCertificate,
+        claim: SharedAgentSnapshotClaim,
+        authority: SnapshotAuthorityV2,
         committee_evidence: Vec<SnapshotCommitteeEvidenceV2>,
     }
 
     impl AgentRaftSnapshotRecordV2 {
+        fn authority_commitment(&self) -> Hash {
+            match &self.authority {
+                SnapshotAuthorityV2::Physical(certificate) => certificate.commitment(),
+                SnapshotAuthorityV2::Portable(certificate) => certificate.commitment(),
+            }
+        }
+
+        fn verify_authority(&self) -> Result<(), AgentRaftApplicationErrorV2> {
+            match &self.authority {
+                SnapshotAuthorityV2::Physical(certificate) => {
+                    if certificate.claim() != &self.claim {
+                        return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                    }
+                    certificate
+                        .verify(self.claim.active_committee(), &self.claim)
+                        .map(|_| ())
+                        .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)
+                }
+                SnapshotAuthorityV2::Portable(certificate) => {
+                    let portable = certificate.claim();
+                    if portable.ordered() != self.claim.ordered()
+                        || portable.active_committee() != self.claim.active_committee()
+                        || portable.authority_epoch() != self.claim.authority_epoch()
+                        || portable.ordered_successor() != self.claim.ordered_successor()
+                        || portable.checkpoint_predecessor() != self.claim.checkpoint_predecessor()
+                        || portable.journal_heads() != self.claim.journal_heads()
+                        || portable.checkpoint() != self.claim.checkpoint()
+                        || portable.local_node() != self.claim.local_node()
+                        || portable.control() != self.claim.control()
+                        || portable.linear() != self.claim.linear()
+                        || portable.merge() != self.claim.merge()
+                        || portable.local() != self.claim.local()
+                        || portable.ordered_invocations() != self.claim.ordered_invocations()
+                        || portable.merge_invocations() != self.claim.merge_invocations()
+                        || portable.local_invocations() != self.claim.local_invocations()
+                        || portable.artifacts() != self.claim.artifacts()
+                        || self.claim.boundary_payload_commitment()
+                            != portable_foundation_commitment(
+                                self.generation,
+                                self.journal_store,
+                                self.local_node,
+                                certificate.commitment(),
+                            )
+                        || self.claim.retired_audit_root()
+                            != portable_retired_audit_root(
+                                self.generation,
+                                self.journal_store,
+                                self.local_node,
+                                certificate.commitment(),
+                            )
+                        || self.claim.previous_snapshot().is_some()
+                        || !self.committee_evidence.is_empty()
+                    {
+                        return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                    }
+                    certificate
+                        .verify(portable.active_committee(), portable)
+                        .map(|_| ())
+                        .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)
+                }
+            }
+        }
+
         fn validate(&self) -> Result<(), AgentRaftApplicationErrorV2> {
-            let claim = self.certificate.claim();
+            let claim = &self.claim;
             if self.generation.validate().is_err()
                 || self.journal_store.as_bytes() == &[0; 32]
                 || self.local_node == NodeId::ZERO
@@ -4703,6 +4786,7 @@ mod application_ledger_v2 {
             {
                 return Err(AgentRaftApplicationErrorV2::CorruptLedger);
             }
+            self.verify_authority()?;
             for evidence in &self.committee_evidence {
                 evidence.validate()?;
                 if evidence.record.generation != self.generation
@@ -4722,14 +4806,24 @@ mod application_ledger_v2 {
     }
 
     impl ServiceWire for AgentRaftSnapshotRecordV2 {
-        const MAGIC: [u8; 4] = *b"ASR3";
+        const MAGIC: [u8; 4] = *b"ASR4";
 
         fn encode_body(&self, output: &mut Vec<u8>) {
             let mut encoder = Encoder(output);
             encode_generation_route(&mut encoder, self.generation);
             encoder.fixed(self.journal_store.as_bytes());
             encoder.fixed(&self.local_node.0);
-            encoder.bytes(&self.certificate.encode());
+            encoder.bytes(&self.claim.encode());
+            match &self.authority {
+                SnapshotAuthorityV2::Physical(certificate) => {
+                    encoder.u8(0);
+                    encoder.bytes(&certificate.encode());
+                }
+                SnapshotAuthorityV2::Portable(certificate) => {
+                    encoder.u8(1);
+                    encoder.bytes(&certificate.encode());
+                }
+            }
             encoder.u32(self.committee_evidence.len() as u32);
             for evidence in &self.committee_evidence {
                 encoder.bytes(&evidence.encode());
@@ -4742,10 +4836,25 @@ mod application_ledger_v2 {
             let journal_store = JournalStoreInstanceId::from_bytes(decoder.fixed()?)
                 .ok_or(DecodeError::NonCanonical)?;
             let local_node = NodeId(decoder.fixed()?);
-            let certificate = decode_nested::<SharedAgentSnapshotCertificate>(
+            let claim = decode_nested::<SharedAgentSnapshotClaim>(
                 decoder,
-                MAX_SHARED_AGENT_SNAPSHOT_CERTIFICATE_BYTES,
+                MAX_SHARED_AGENT_SNAPSHOT_CLAIM_BYTES,
             )?;
+            let authority = match decoder.u8()? {
+                0 => {
+                    SnapshotAuthorityV2::Physical(decode_nested::<SharedAgentSnapshotCertificate>(
+                        decoder,
+                        MAX_SHARED_AGENT_SNAPSHOT_CERTIFICATE_BYTES,
+                    )?)
+                }
+                1 => SnapshotAuthorityV2::Portable(decode_nested::<
+                    SharedAgentPortableSnapshotCertificate,
+                >(
+                    decoder,
+                    MAX_SHARED_AGENT_PORTABLE_SNAPSHOT_CERTIFICATE_BYTES,
+                )?),
+                _ => return Err(DecodeError::InvalidTag),
+            };
             let count = decoder.u32()? as usize;
             if count > MAX_SNAPSHOT_COMMITTEE_EVIDENCE {
                 return Err(DecodeError::LimitExceeded);
@@ -4764,7 +4873,8 @@ mod application_ledger_v2 {
                 generation,
                 journal_store,
                 local_node,
-                certificate,
+                claim,
+                authority,
                 committee_evidence,
             };
             record.validate().map_err(|_| DecodeError::NonCanonical)?;
@@ -5253,22 +5363,22 @@ mod application_ledger_v2 {
                 return Err(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired);
             }
             let boundary_from_previous = previous.as_ref().is_some_and(|previous| {
-                ordered == previous.certificate.claim().ordered()
+                ordered == previous.claim.ordered()
                     && ordered.raft_index() == raft.snap_last_index
                     && ordered.raft_term() == raft.snap_last_term
             });
             let (mut retired_audit_root, mut committee_evidence, previous_snapshot) =
                 match previous.as_ref() {
                     Some(previous) => {
-                        if raft.snap_last_index != previous.certificate.claim().raft_index()
-                            || raft.snap_last_term != previous.certificate.claim().raft_term()
+                        if raft.snap_last_index != previous.claim.raft_index()
+                            || raft.snap_last_term != previous.claim.raft_term()
                         {
                             return Err(AgentRaftApplicationErrorV2::CorruptLedger);
                         }
                         (
-                            previous.certificate.claim().retired_audit_root(),
+                            previous.claim.retired_audit_root(),
                             previous.committee_evidence.clone(),
-                            Some(previous.certificate.commitment()),
+                            Some(previous.authority_commitment()),
                         )
                     }
                     None => {
@@ -5293,7 +5403,7 @@ mod application_ledger_v2 {
             let mut ordered_successor = previous
                 .as_ref()
                 .filter(|_| boundary_from_previous)
-                .map(|previous| previous.certificate.claim().ordered_successor());
+                .map(|previous| previous.claim.ordered_successor());
             for row in audit.range(key.as_slice()..)? {
                 let (stored_key, value) = row?;
                 if !stored_key.value().starts_with(key.as_slice()) {
@@ -5390,12 +5500,15 @@ mod application_ledger_v2 {
             {
                 let transaction = self.database.begin_read()?;
                 if let Some(current) = read_snapshot_in_read(&transaction, key.as_slice())? {
-                    let current_index = current.certificate.claim().raft_index();
+                    let current_index = current.claim.raft_index();
                     if certificate.claim().raft_index() <= current_index {
-                        if &current.certificate == certificate {
+                        if matches!(
+                            &current.authority,
+                            SnapshotAuthorityV2::Physical(existing) if existing == certificate
+                        ) {
                             return Ok(InstalledAgentRaftSnapshotV2 {
-                                claim: current.certificate.claim().clone(),
-                                certificate_commitment: current.certificate.commitment(),
+                                claim: current.claim.clone(),
+                                certificate_commitment: current.authority_commitment(),
                             });
                         }
                         return Err(AgentRaftApplicationErrorV2::SnapshotStale);
@@ -5432,7 +5545,8 @@ mod application_ledger_v2 {
                 generation: self.generation,
                 journal_store: self.journal_store,
                 local_node: self.local_node,
-                certificate: certificate.clone(),
+                claim: claim.clone(),
+                authority: SnapshotAuthorityV2::Physical(certificate.clone()),
                 committee_evidence: context.committee_evidence,
             };
             record.validate()?;
@@ -5512,6 +5626,177 @@ mod application_ledger_v2 {
             })
         }
 
+        /// Establish one fresh physical Raft generation from a quorum-signed
+        /// portable logical checkpoint. The source store identity and source
+        /// audit root never enter this transaction; both physical roots are
+        /// re-derived from the destination binding and retained certificate.
+        pub(crate) fn restore_portable_snapshot(
+            &self,
+            certificate: &SharedAgentPortableSnapshotCertificate,
+            verified: &VerifiedSharedAgentPortableSnapshot,
+        ) -> Result<InstalledAgentRaftSnapshotV2, AgentRaftApplicationErrorV2> {
+            if verified.claim() != certificate.claim()
+                || verified.certificate_commitment() != certificate.commitment()
+            {
+                return Err(AgentRaftApplicationErrorV2::SnapshotCertificateInvalid);
+            }
+            let portable = certificate.claim();
+            certificate
+                .verify(&self.initial_committee, portable)
+                .map_err(|_| AgentRaftApplicationErrorV2::SnapshotCertificateInvalid)?;
+            if portable.active_committee() != &self.initial_committee
+                || portable.authority_epoch() != self.authority.initial_epoch
+                || portable.local_node() != self.local_node
+                || self.initial_committee.members().len() != 1
+                || self.initial_committee.voter_count() != 1
+                || portable.ordered().space() != self.generation.space
+                || portable.ordered().agent() != self.generation.agent
+                || portable.ordered().genesis() != self.generation.genesis
+                || portable.ordered().admission() != self.generation.admission
+            {
+                return Err(AgentRaftApplicationErrorV2::ConfigurationMismatch);
+            }
+            let certificate_commitment = certificate.commitment();
+            let foundation = portable_foundation_commitment(
+                self.generation,
+                self.journal_store,
+                self.local_node,
+                certificate_commitment,
+            );
+            let retired_audit_root = portable_retired_audit_root(
+                self.generation,
+                self.journal_store,
+                self.local_node,
+                certificate_commitment,
+            );
+            let claim = SharedAgentSnapshotClaim::new(
+                portable.ordered().clone(),
+                portable.active_committee().clone(),
+                portable.authority_epoch(),
+                Hash(*self.journal_store.as_bytes()),
+                foundation,
+                portable.ordered_successor(),
+                portable.checkpoint_predecessor(),
+                portable.journal_heads(),
+                portable.checkpoint(),
+                portable.local_node(),
+                portable.control(),
+                portable.linear(),
+                portable.merge(),
+                portable.local(),
+                portable.ordered_invocations(),
+                portable.merge_invocations(),
+                portable.local_invocations(),
+                portable.artifacts(),
+                retired_audit_root,
+                snapshot_committee_evidence_root(self.generation, &[]),
+                None,
+            )
+            .map_err(|_| AgentRaftApplicationErrorV2::SnapshotCertificateInvalid)?;
+            let record = AgentRaftSnapshotRecordV2 {
+                generation: self.generation,
+                journal_store: self.journal_store,
+                local_node: self.local_node,
+                claim: claim.clone(),
+                authority: SnapshotAuthorityV2::Portable(certificate.clone()),
+                committee_evidence: Vec::new(),
+            };
+            record.validate()?;
+
+            let _guard = self
+                .writes
+                .lock()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            let key = generation_storage_key(self.generation);
+            let transaction = self.database.begin_write()?;
+            ensure_v2_config_in_write(
+                &transaction,
+                key.as_slice(),
+                self.generation,
+                self.journal_store,
+                self.local_node,
+                &self.initial_committee,
+                self.authority,
+            )?;
+            if let Some(current) = read_snapshot_in_write(&transaction, key.as_slice())? {
+                if current.authority_commitment() == certificate_commitment
+                    && current.claim == claim
+                {
+                    return Ok(InstalledAgentRaftSnapshotV2 {
+                        claim,
+                        certificate_commitment,
+                    });
+                }
+                return Err(AgentRaftApplicationErrorV2::SnapshotStale);
+            }
+            let meta = read_meta_in_write(&transaction, key.as_slice())?
+                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+            let expected_meta =
+                AgentRaftApplyMetaV2::post_genesis(self.generation, self.journal_store);
+            let state = read_committee_state_in_write(&transaction, key.as_slice())?
+                .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
+            let expected_state = CommitteeApplicationStateV2::initial(
+                self.generation,
+                self.initial_committee.clone(),
+                self.authority.initial_epoch,
+            );
+            let raft = crate::raft::RaftMeta::load_from_write_transaction(&transaction)?;
+            if meta != expected_meta
+                || state != expected_state
+                || read_command_reservation_in_write(&transaction, key.as_slice())?.is_some()
+                || audit_prefix_has_row_in_write(&transaction, &key)?
+                || !transaction.open_table(crate::raft::RAFT_LOG)?.is_empty()?
+                || raft != crate::raft::RaftMeta::default()
+            {
+                return Err(AgentRaftApplicationErrorV2::SnapshotReplay);
+            }
+            let ordered_head = portable
+                .ordered()
+                .ordered()
+                .head
+                .ok_or(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired)?;
+            let disposition =
+                AgentRaftApplyDispositionV2::Command(AgentRaftAuditDisposition::OrderedApplied {
+                    entry: ordered_head,
+                    claim: portable.ordered().commitment(),
+                    successor: portable.ordered_successor(),
+                });
+            let restored_meta = AgentRaftApplyMetaV2 {
+                generation: self.generation,
+                journal_store: self.journal_store,
+                applied_index: portable.raft_index(),
+                applied_term: portable.raft_term(),
+                raw_payload_commitment: foundation,
+                disposition: Some(disposition),
+            };
+            restored_meta
+                .validate()
+                .map_err(|_| AgentRaftApplicationErrorV2::SnapshotCertificateInvalid)?;
+            {
+                let mut table = transaction.open_table(APPLY_META_TABLE_V2)?;
+                table.insert(key.as_slice(), restored_meta.encode().as_slice())?;
+            }
+            {
+                let mut table = transaction.open_table(SNAPSHOT_TABLE_V2)?;
+                table.insert(key.as_slice(), record.encode().as_slice())?;
+            }
+            let restored_raft = crate::raft::RaftMeta {
+                current_term: portable.raft_term(),
+                voted_for: None,
+                commit_index: portable.raft_index(),
+                last_applied: portable.raft_index(),
+                snap_last_index: portable.raft_index(),
+                snap_last_term: portable.raft_term(),
+            };
+            restored_raft.write_in_txn(&transaction)?;
+            transaction.commit()?;
+            self.audit_recovery()?;
+            Ok(InstalledAgentRaftSnapshotV2 {
+                claim,
+                certificate_commitment,
+            })
+        }
+
         pub(crate) fn current_snapshot(
             &self,
         ) -> Result<Option<InstalledAgentRaftSnapshotV2>, AgentRaftApplicationErrorV2> {
@@ -5526,8 +5811,8 @@ mod application_ledger_v2 {
                 generation_storage_key(self.generation).as_slice(),
             )?
             .map(|record| InstalledAgentRaftSnapshotV2 {
-                claim: record.certificate.claim().clone(),
-                certificate_commitment: record.certificate.commitment(),
+                claim: record.claim.clone(),
+                certificate_commitment: record.authority_commitment(),
             }))
         }
 
@@ -6293,7 +6578,7 @@ mod application_ledger_v2 {
                         self.authority,
                         &snapshot.committee_evidence,
                     )?;
-                    let claim = snapshot.certificate.claim();
+                    let claim = &snapshot.claim;
                     if state.active != *claim.active_committee()
                         || state.authority_epoch != claim.authority_epoch()
                         || claim.journal_store().0 != *self.journal_store.as_bytes()
@@ -6303,10 +6588,7 @@ mod application_ledger_v2 {
                     {
                         return Err(AgentRaftApplicationErrorV2::CorruptLedger);
                     }
-                    snapshot
-                        .certificate
-                        .verify(&state.active, claim)
-                        .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                    snapshot.verify_authority()?;
                     (state, Some(claim))
                 }
                 None => {
@@ -6569,8 +6851,8 @@ mod application_ledger_v2 {
                 reservation_pending: reservation.is_some(),
                 snapshot: read_snapshot_in_read(&transaction, key.as_slice())?.map(|record| {
                     InstalledAgentRaftSnapshotV2 {
-                        claim: record.certificate.claim().clone(),
-                        certificate_commitment: record.certificate.commitment(),
+                        claim: record.claim.clone(),
+                        certificate_commitment: record.authority_commitment(),
                     }
                 }),
                 ordered,
@@ -6590,6 +6872,40 @@ mod application_ledger_v2 {
                 &generation.encode(),
                 journal_store.as_bytes(),
                 &local_node.0,
+            ],
+        )
+    }
+
+    fn portable_foundation_commitment(
+        generation: AgentGenerationRouteKey,
+        journal_store: JournalStoreInstanceId,
+        local_node: NodeId,
+        certificate: Hash,
+    ) -> Hash {
+        Hash::digest(
+            PORTABLE_FOUNDATION_DOMAIN,
+            &[
+                &generation.encode(),
+                journal_store.as_bytes(),
+                &local_node.0,
+                &certificate.0,
+            ],
+        )
+    }
+
+    fn portable_retired_audit_root(
+        generation: AgentGenerationRouteKey,
+        journal_store: JournalStoreInstanceId,
+        local_node: NodeId,
+        certificate: Hash,
+    ) -> Hash {
+        Hash::digest(
+            PORTABLE_RETIRED_ROOT_DOMAIN,
+            &[
+                &generation.encode(),
+                journal_store.as_bytes(),
+                &local_node.0,
+                &certificate.0,
             ],
         )
     }

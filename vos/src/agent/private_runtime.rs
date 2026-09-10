@@ -3695,23 +3695,23 @@ mod tests {
         assert_round_trip(&successor);
         assert_round_trip(&reopened);
 
-        let pvi3_wire = fixture.predecessor.encode().unwrap();
-        assert_eq!(&pvi3_wire[..4], b"PVR3");
+        let pvr3_wire = fixture.predecessor.encode().unwrap();
+        assert_eq!(&pvr3_wire[..4], b"PVR3");
         assert_eq!(
             fixture.predecessor.commitment(),
-            Hash::digest(b"vos/agent/private-runtime-image/v3", &[&pvi3_wire])
+            Hash::digest(b"vos/agent/private-runtime-image/v3", &[&pvr3_wire])
         );
         assert_ne!(
             fixture.predecessor.commitment(),
-            Hash::digest(b"vos/agent/private-runtime-image/v2", &[&pvi3_wire])
+            Hash::digest(b"vos/agent/private-runtime-image/v2", &[&pvr3_wire])
         );
-        let mut retired_pvi2 = pvi3_wire.clone();
+        let mut retired_pvi2 = pvr3_wire.clone();
         retired_pvi2[..4].copy_from_slice(b"PVI2");
         assert!(PrivateRuntimeImage::decode(&retired_pvi2).is_err());
-        let mut retired_pvi3 = pvi3_wire.clone();
+        let mut retired_pvi3 = pvr3_wire.clone();
         retired_pvi3[..4].copy_from_slice(b"PVI3");
         assert!(PrivateRuntimeImage::decode(&retired_pvi3).is_err());
-        let mut retired_pvi1 = pvi3_wire;
+        let mut retired_pvi1 = pvr3_wire;
         retired_pvi1[..4].copy_from_slice(b"PVI1");
         assert!(PrivateRuntimeImage::decode(&retired_pvi1).is_err());
         assert_eq!(

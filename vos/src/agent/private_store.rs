@@ -64,13 +64,14 @@ pub const MAX_PRIVATE_BACKUP_BYTES: usize = 128 * 1024 * 1024;
 
 const FORMAT_VERSION: u16 = 1;
 const RECOVERY_MAGIC: &[u8; 4] = b"PVRM";
-// Generation-three Store wires add an indexed public PAPL attachment to each
-// control row. Distinct magics fail closed on every older index, transaction,
-// snapshot, and backup layout rather than ambiguously parsing a suffix.
-const INDEX_MAGIC: &[u8; 4] = b"PVI3";
-const TRANSACTION_MAGIC: &[u8; 4] = b"PVT3";
-const SNAPSHOT_MAGIC: &[u8; 4] = b"PVS3";
-const BACKUP_MAGIC: &[u8; 4] = b"PVB3";
+// Generation-four Store wires retain the exact control frontier at which each
+// ciphertext object first entered the sorted index. Distinct magics fail
+// closed on generation three, whose final object set could not reconstruct a
+// PAPL bound to an earlier object prefix during portable restore.
+const INDEX_MAGIC: &[u8; 4] = b"PVI4";
+const TRANSACTION_MAGIC: &[u8; 4] = b"PVT4";
+const SNAPSHOT_MAGIC: &[u8; 4] = b"PVS4";
+const BACKUP_MAGIC: &[u8; 4] = b"PVB4";
 const RAW_WIRE_DOMAIN: &[u8] = b"vos/private/stored-wire/v1";
 const OBJECT_INDEX_ENTRY_DOMAIN: &[u8] = b"vos/agent/private-store/object-index-entry/v1";
 const OBJECT_INDEX_ROOT_DOMAIN: &[u8] = b"vos/agent/private-store/object-index-root/v1";
@@ -217,6 +218,10 @@ pub(crate) struct StoredObjectIndex {
     pub key: PrivateObjectKey,
     pub wire_hash: Hash,
     pub wire_len: u32,
+    /// Number of committed controls present when this immutable object was
+    /// inserted. Objects at one frontier commute; the frontier itself is
+    /// retained so backup replay can rebuild every PAPL Store position.
+    pub control_frontier: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -667,10 +672,11 @@ fn object_index_root(entries: &[StoredObjectIndex]) -> Result<Option<Hash>, Priv
         .try_reserve_exact(entries.len())
         .map_err(|_| PrivateStoreError::LimitExceeded)?;
     for entry in entries {
-        let mut encoder = Encoder(Vec::with_capacity(8 + 1 + 32 + 32 + 4));
+        let mut encoder = Encoder(Vec::with_capacity(8 + 1 + 32 + 32 + 4 + 4));
         encode_object_key(&mut encoder, entry.key);
         encoder.fixed(entry.wire_hash.as_bytes());
         encoder.u32(entry.wire_len);
+        encoder.u32(entry.control_frontier);
         commitments.push(Hash::digest(
             OBJECT_INDEX_ENTRY_DOMAIN,
             &[RUNTIME_ABI_ID.as_bytes(), &encoder.0],
@@ -871,6 +877,7 @@ fn encode_index(index: &StoreIndex) -> Result<Vec<u8>, PrivateStoreError> {
         encode_object_key(&mut encoder, entry.key);
         encoder.fixed(entry.wire_hash.as_bytes());
         encoder.u32(entry.wire_len);
+        encoder.u32(entry.control_frontier);
     }
     encoder.u32(u32::try_from(index.controls.len()).map_err(|_| PrivateStoreError::LimitExceeded)?);
     for entry in &index.controls {
@@ -918,6 +925,7 @@ fn decode_index(bytes: &[u8]) -> Result<StoreIndex, PrivateStoreError> {
             key: decode_object_key(&mut decoder)?,
             wire_hash: Hash(decoder.fixed()?),
             wire_len: decoder.u32()?,
+            control_frontier: decoder.u32()?,
         };
         if !stored_object_index_shape_is_valid(&entry) {
             return Err(PrivateStoreError::Corrupt);
@@ -990,6 +998,19 @@ fn stored_object_index_shape_is_valid(entry: &StoredObjectIndex) -> bool {
         && entry.wire_hash != Hash::ZERO
         && entry.wire_len != 0
         && entry.wire_len as usize <= MAX_PRIVATE_OBJECT_WIRE_BYTES
+        && entry.control_frontier as usize <= MAX_PRIVATE_STORE_CONTROLS
+}
+
+fn control_frontier_epoch(index: &StoreIndex, frontier: u32) -> Option<u64> {
+    let frontier = usize::try_from(frontier).ok()?;
+    match frontier {
+        0 => Some(0),
+        value if value <= index.controls.len() => index
+            .controls
+            .get(value - 1)
+            .map(|entry| entry.resulting_epoch),
+        _ => None,
+    }
 }
 
 fn stored_control_index_shape_is_valid(entry: &StoredControlIndex) -> bool {
@@ -1072,6 +1093,10 @@ fn validate_index_shape(index: &StoreIndex) -> Result<(), PrivateStoreError> {
             .objects
             .iter()
             .any(|entry| !stored_object_index_shape_is_valid(entry))
+        || index.objects.iter().any(|entry| {
+            control_frontier_epoch(index, entry.control_frontier)
+                .is_none_or(|epoch| entry.key.epoch > epoch)
+        })
         || index
             .controls
             .iter()
@@ -1431,6 +1456,13 @@ pub(crate) fn verify_encrypted_backup<V: PrivateNodeAuthorityVerifier>(
     {
         return Err(PrivateStoreError::Corrupt);
     }
+    validate_runtime_application_history(
+        &metadata,
+        &index,
+        &controls,
+        &runtime_applications,
+        &key_epochs,
+    )?;
     Ok(VerifiedEncryptedBackup {
         metadata,
         index,
@@ -1632,6 +1664,15 @@ impl VerifiedEncryptedBackup {
         &self.objects
     }
 
+    /// Canonical ciphertexts paired with their authenticated insertion
+    /// frontier. Replica establishment uses this schedule to rebuild the
+    /// exact Store positions consumed by destination-local PAPL replay.
+    pub(crate) fn objects_with_index(
+        &self,
+    ) -> impl Iterator<Item = (&StoredObjectIndex, &EncryptedPrivateObject)> {
+        self.index.objects.iter().zip(&self.objects)
+    }
+
     /// Exact authenticated control rows and their optional canonical PSE2
     /// envelopes. Recovery preflight uses this read-only view to reject a
     /// historical Recover whose authority evidence was never durably
@@ -1736,7 +1777,13 @@ impl VerifiedEncryptedBackup {
         {
             return Err(PrivateStoreError::Corrupt);
         }
-        Ok(())
+        validate_runtime_application_history(
+            &self.metadata,
+            &self.index,
+            &self.controls,
+            &self.runtime_applications,
+            &self.key_epochs,
+        )
     }
 
     fn merge_compatible_control_evidence(
@@ -1833,6 +1880,12 @@ impl VerifiedEncryptedBackup {
                             key,
                             wire_hash: raw_wire_hash(&wire),
                             wire_len: u32::try_from(wire.len())
+                                .map_err(|_| PrivateStoreError::LimitExceeded)?,
+                            // Cross-replica reconciliation learns this object
+                            // only after selecting the complete local control
+                            // base. Never splice it into an earlier node-local
+                            // PAPL history.
+                            control_frontier: u32::try_from(self.index.controls.len())
                                 .map_err(|_| PrivateStoreError::LimitExceeded)?,
                         },
                     );
@@ -1962,6 +2015,13 @@ impl VerifiedEncryptedBackup {
         {
             return Err(PrivateStoreError::Corrupt);
         }
+        validate_runtime_application_history(
+            &self.metadata,
+            &self.index,
+            &self.controls,
+            &self.runtime_applications,
+            &self.key_epochs,
+        )?;
         let recovery = encode_recovery(&self.metadata)?;
         let index = encode_index(&self.index)?;
         let mut encoder = Encoder::new(BACKUP_MAGIC);
@@ -2879,6 +2939,14 @@ impl PrivateStore {
         )?;
         let mut key_epochs = vec![metadata.genesis_epoch.clone()];
         let mut latest_recovery_keyring = None;
+        let mut controls = Vec::new();
+        controls
+            .try_reserve_exact(index.controls.len())
+            .map_err(|_| PrivateStoreError::LimitExceeded)?;
+        let mut runtime_applications = Vec::new();
+        runtime_applications
+            .try_reserve_exact(index.controls.len())
+            .map_err(|_| PrivateStoreError::LimitExceeded)?;
         for entry in &index.controls {
             let bytes = verify_file_identity(
                 &root
@@ -2891,7 +2959,7 @@ impl PrivateStore {
             let record = PrivateControlRecord::decode(&bytes)
                 .map_err(|_| PrivateStoreError::InvalidRecord)?;
             validate_control_index_entry(entry, &record)?;
-            if let Some(application_binding) = entry.runtime_application {
+            let runtime_application = if let Some(application_binding) = entry.runtime_application {
                 let application_bytes = verify_runtime_application_file(
                     &root
                         .join(RUNTIME_APPLICATIONS_DIR)
@@ -2903,7 +2971,10 @@ impl PrivateStore {
                 if application.control() != &record {
                     return Err(PrivateStoreError::Corrupt);
                 }
-            }
+                Some(application)
+            } else {
+                None
+            };
             apply_control_transition(&mut chain, &record, authority)?;
             advance_key_epochs(&mut key_epochs, &record)?;
             if let PrivateControlOperation::Recover {
@@ -2922,6 +2993,8 @@ impl PrivateStore {
             {
                 return Err(PrivateStoreError::Corrupt);
             }
+            controls.push(record);
+            runtime_applications.push(runtime_application);
         }
         if chain.epoch().epoch != index.epoch
             || chain.head() != index.control_head
@@ -2946,6 +3019,13 @@ impl PrivateStore {
             validate_object_index_entry(entry, &object, metadata.space, metadata.agent)?;
         }
         validate_control_attachment_directory(&root, &index.controls)?;
+        validate_runtime_application_history(
+            &metadata,
+            &index,
+            &controls,
+            &runtime_applications,
+            &key_epochs,
+        )?;
         let cached_core_position = store_core_position(&metadata, &index, &key_epochs)?;
         Ok(Self {
             root,
@@ -2998,49 +3078,26 @@ impl PrivateStore {
                     false,
                 )
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let initial_index = StoreIndex {
-                    space: backup.metadata.space,
-                    agent: backup.metadata.agent,
-                    epoch: 0,
-                    control_head: None,
-                    next_sequence: 0,
-                    objects: Vec::new(),
-                    controls: Vec::new(),
-                };
-                preflight_restore_runtime_applications(
-                    &backup.metadata,
-                    &initial_index,
-                    core::slice::from_ref(&backup.metadata.genesis_epoch),
-                    &backup,
-                )?;
-                (
-                    Self::create(
-                        root,
-                        expected_space,
-                        expected_agent,
-                        expected_owner,
-                        expected_recovery_public_key,
-                        expected_recovery_encryption_public_key,
-                        backup.metadata.genesis_epoch.clone(),
-                        backup.metadata.genesis_nodes.clone(),
-                        authority,
-                    )?,
-                    true,
-                )
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
+                Self::create(
+                    root,
+                    expected_space,
+                    expected_agent,
+                    expected_owner,
+                    expected_recovery_public_key,
+                    expected_recovery_encryption_public_key,
+                    backup.metadata.genesis_epoch.clone(),
+                    backup.metadata.genesis_nodes.clone(),
+                    authority,
+                )?,
+                true,
+            ),
             Err(_) => return Err(PrivateStoreError::Io),
         };
         if store.metadata != backup.metadata {
             return Err(PrivateStoreError::Diverged);
         }
         validate_restore_prefix(&store.index, &backup.index)?;
-        preflight_restore_runtime_applications(
-            &store.metadata,
-            &store.index,
-            &store.key_epochs,
-            &backup,
-        )?;
         let mut changed = created || store.index != backup.index;
         // Reject a conflicting evidence attachment anywhere in the existing
         // prefix before appending even the first new control. Missing local
@@ -3068,6 +3125,11 @@ impl PrivateStore {
         }
         let existing_controls = store.index.controls.len();
         for (position, record) in backup.controls.iter().enumerate().skip(existing_controls) {
+            changed |= restore_objects_at_frontier(
+                &mut store,
+                &backup,
+                u32::try_from(position).map_err(|_| PrivateStoreError::LimitExceeded)?,
+            )?;
             match backup
                 .runtime_applications
                 .get(position)
@@ -3085,6 +3147,11 @@ impl PrivateStore {
                 }
             }
         }
+        changed |= restore_objects_at_frontier(
+            &mut store,
+            &backup,
+            u32::try_from(backup.controls.len()).map_err(|_| PrivateStoreError::LimitExceeded)?,
+        )?;
         for (position, (record, evidence)) in backup
             .controls
             .iter()
@@ -3110,9 +3177,6 @@ impl PrivateStore {
                     .persist_control_authority_evidence(record.commitment(), evidence)?
                     == PutDisposition::Inserted;
             }
-        }
-        for object in &backup.objects {
-            store.put_object(object)?;
         }
         if store.index != backup.index {
             return Err(PrivateStoreError::Diverged);
@@ -3375,6 +3439,8 @@ impl PrivateStore {
                         key,
                         wire_hash,
                         wire_len: u32::try_from(wire.len())
+                            .map_err(|_| PrivateStoreError::LimitExceeded)?,
+                        control_frontier: u32::try_from(self.index.controls.len())
                             .map_err(|_| PrivateStoreError::LimitExceeded)?,
                     },
                 );
@@ -3983,13 +4049,13 @@ impl PrivateStore {
         )
     }
 
-    /// Reattach a PSI1 which was deliberately excluded from a portable PVB3
+    /// Reattach a PSI1 which was deliberately excluded from a portable PVB4
     /// and was carried instead by a same-node HostArchive. The physical host
     /// must authenticate the certificate and every exact PAPL/PSE binding
     /// before entering this narrowly scoped seam.
     ///
     /// Unlike ordinary imported persistence, restoration starts with the PSE2
-    /// already present (it came from PVB3) and PSI1 absent. Keeping this case
+    /// already present (it came from PVB4) and PSI1 absent. Keeping this case
     /// separate preserves the generic local-PSE-to-import rejection.
     pub(crate) fn reattach_authenticated_stable_import_certificate_after_restore(
         &mut self,
@@ -4415,52 +4481,81 @@ fn validate_restore_prefix(
     if local.objects.len() > archive.objects.len() {
         return Err(PrivateStoreError::Rollback);
     }
-    for (local_entry, archive_entry) in local.objects.iter().zip(&archive.objects) {
-        if archive_entry.key != local_entry.key {
+    for local_entry in &local.objects {
+        let position = archive
+            .objects
+            .binary_search_by_key(&local_entry.key, |entry| entry.key)
+            .map_err(|_| PrivateStoreError::Diverged)?;
+        let archive_entry = archive
+            .objects
+            .get(position)
+            .ok_or(PrivateStoreError::Corrupt)?;
+        if local_entry.control_frontier != archive_entry.control_frontier {
             return Err(PrivateStoreError::Diverged);
         }
         if archive_entry != local_entry {
             return Err(PrivateStoreError::Alias);
         }
     }
+    let local_control_frontier =
+        u32::try_from(local.controls.len()).map_err(|_| PrivateStoreError::Corrupt)?;
+    for archive_entry in &archive.objects {
+        if archive_entry.control_frontier >= local_control_frontier {
+            continue;
+        }
+        if local
+            .objects
+            .binary_search_by_key(&archive_entry.key, |entry| entry.key)
+            .is_err()
+        {
+            // The destination already crossed a control boundary at which
+            // this object was present. Installing it now would fabricate the
+            // archived PAPL predecessor rather than extend an exact prefix.
+            return Err(PrivateStoreError::Diverged);
+        }
+    }
     Ok(())
 }
 
-/// Generation three archives retain final ciphertext objects but not their
-/// insertion chronology. Preflight the exact current restore order (existing
-/// objects, then missing controls, then missing objects) so a PAPL whose
-/// historical PSC1 object prefix cannot be reconstructed is rejected before
-/// any new control or attachment is published. Chapter 08 can remove this
-/// fail-closed limitation when it adds authenticated per-control history.
-fn preflight_restore_runtime_applications(
+/// Reconstruct every historical Store position from the generation-four
+/// object/control frontier. Each PAPL authenticates its exact predecessor and
+/// successor, while the final comparison proves that no object or control was
+/// omitted from the replay schedule.
+fn validate_runtime_application_history(
     metadata: &RecoveryMetadata,
-    local_index: &StoreIndex,
-    local_key_epochs: &[PrivateKeyEpoch],
-    archive: &VerifiedEncryptedBackup,
+    final_index: &StoreIndex,
+    controls: &[PrivateControlRecord],
+    runtime_applications: &[Option<PrivateRuntimeApplication>],
+    final_key_epochs: &[PrivateKeyEpoch],
 ) -> Result<(), PrivateStoreError> {
-    if local_index.controls.len() > archive.index.controls.len() || local_key_epochs.is_empty() {
+    if controls.len() != final_index.controls.len()
+        || runtime_applications.len() != final_index.controls.len()
+        || final_key_epochs.is_empty()
+    {
         return Err(PrivateStoreError::Corrupt);
     }
-    let mut index = local_index.clone();
-    let mut key_epochs = local_key_epochs.to_vec();
-    for position in local_index.controls.len()..archive.index.controls.len() {
-        let record = archive
-            .controls
-            .get(position)
-            .ok_or(PrivateStoreError::Corrupt)?;
-        let archive_entry = archive
-            .index
-            .controls
-            .get(position)
-            .ok_or(PrivateStoreError::Corrupt)?;
-        let application = archive
-            .runtime_applications
-            .get(position)
-            .ok_or(PrivateStoreError::Corrupt)?;
-        if archive_entry.runtime_application.is_some() != application.is_some() {
-            return Err(PrivateStoreError::Corrupt);
-        }
+    let mut index = StoreIndex {
+        space: final_index.space,
+        agent: final_index.agent,
+        epoch: 0,
+        control_head: None,
+        next_sequence: 0,
+        objects: Vec::new(),
+        controls: Vec::new(),
+    };
+    let mut key_epochs = vec![metadata.genesis_epoch.clone()];
+    for position in 0..final_index.controls.len() {
+        insert_index_objects_at_frontier(
+            &mut index,
+            final_index,
+            u32::try_from(position).map_err(|_| PrivateStoreError::LimitExceeded)?,
+        )?;
         let predecessor = store_core_position(metadata, &index, &key_epochs)?;
+        let record = controls.get(position).ok_or(PrivateStoreError::Corrupt)?;
+        let archive_entry = final_index
+            .controls
+            .get(position)
+            .ok_or(PrivateStoreError::Corrupt)?;
         advance_key_epochs(&mut key_epochs, record)?;
         index.controls.push(archive_entry.clone());
         index.epoch = archive_entry.resulting_epoch;
@@ -4471,6 +4566,12 @@ fn preflight_restore_runtime_applications(
             .ok_or(PrivateStoreError::LimitExceeded)?;
         validate_index_shape(&index)?;
         let successor = store_core_position(metadata, &index, &key_epochs)?;
+        let application = runtime_applications
+            .get(position)
+            .ok_or(PrivateStoreError::Corrupt)?;
+        if archive_entry.runtime_application.is_some() != application.is_some() {
+            return Err(PrivateStoreError::Corrupt);
+        }
         if let Some(application) = application {
             let (binding, _) =
                 prepare_runtime_application(application, record, predecessor, successor)?;
@@ -4479,7 +4580,68 @@ fn preflight_restore_runtime_applications(
             }
         }
     }
+    insert_index_objects_at_frontier(
+        &mut index,
+        final_index,
+        u32::try_from(final_index.controls.len()).map_err(|_| PrivateStoreError::LimitExceeded)?,
+    )?;
+    if index != *final_index || key_epochs != final_key_epochs {
+        return Err(PrivateStoreError::Corrupt);
+    }
     Ok(())
+}
+
+fn insert_index_objects_at_frontier(
+    index: &mut StoreIndex,
+    archive: &StoreIndex,
+    frontier: u32,
+) -> Result<(), PrivateStoreError> {
+    if usize::try_from(frontier).ok() != Some(index.controls.len()) {
+        return Err(PrivateStoreError::Corrupt);
+    }
+    for entry in archive
+        .objects
+        .iter()
+        .filter(|entry| entry.control_frontier == frontier)
+    {
+        match index
+            .objects
+            .binary_search_by_key(&entry.key, |candidate| candidate.key)
+        {
+            Ok(position) if index.objects.get(position) == Some(entry) => {}
+            Ok(_) => return Err(PrivateStoreError::Alias),
+            Err(position) => index.objects.insert(position, entry.clone()),
+        }
+    }
+    validate_index_shape(index)
+}
+
+fn restore_objects_at_frontier(
+    store: &mut PrivateStore,
+    archive: &VerifiedEncryptedBackup,
+    frontier: u32,
+) -> Result<bool, PrivateStoreError> {
+    if usize::try_from(frontier).ok() != Some(store.index.controls.len())
+        || archive.objects.len() != archive.index.objects.len()
+    {
+        return Err(PrivateStoreError::Corrupt);
+    }
+    let mut changed = false;
+    for (entry, object) in archive.index.objects.iter().zip(&archive.objects) {
+        if entry.control_frontier != frontier {
+            continue;
+        }
+        changed |= store.put_object(object)? == PutDisposition::Inserted;
+        let position = store
+            .index
+            .objects
+            .binary_search_by_key(&entry.key, |candidate| candidate.key)
+            .map_err(|_| PrivateStoreError::Corrupt)?;
+        if store.index.objects.get(position) != Some(entry) {
+            return Err(PrivateStoreError::Alias);
+        }
+    }
+    Ok(changed)
 }
 
 fn validate_object_index_entry(
@@ -5452,6 +5614,7 @@ mod tests {
             },
             wire_hash: Hash::ZERO,
             wire_len: 1,
+            control_frontier: 0,
         });
         assert_eq!(store.core_position(), Err(PrivateStoreError::Corrupt));
         store.index.objects.clear();
@@ -5536,6 +5699,7 @@ mod tests {
             },
             wire_hash: Hash([2; 32]),
             wire_len: 123,
+            control_frontier: 7,
         };
         let object_root = object_index_root(core::slice::from_ref(&object)).unwrap();
         let mut object_variants = Vec::new();
@@ -5553,6 +5717,9 @@ mod tests {
         object_variants.push(changed);
         let mut changed = object.clone();
         changed.wire_len += 1;
+        object_variants.push(changed);
+        let mut changed = object.clone();
+        changed.control_frontier += 1;
         object_variants.push(changed);
         for changed in object_variants {
             assert_ne!(
@@ -7699,7 +7866,7 @@ mod tests {
     }
 
     #[test]
-    fn chronology_ambiguous_runtime_backup_is_rejected_before_publication() {
+    fn object_control_frontier_restores_runtime_application_exactly() {
         let directory = TestDirectory::new("runtime-backup-chronology");
         let path = directory.store();
         let (mut store, fixture) = runtime_store_fixture(&path);
@@ -7732,45 +7899,209 @@ mod tests {
         let backup = store
             .export_encrypted_backup(MAX_PRIVATE_BACKUP_BYTES)
             .unwrap();
+        let expected_index = store.index.clone();
+        let expected_position = store.core_position().unwrap();
+        drop(store);
 
-        // PVB3 owns the final ciphertext set, not historical object-prefix
-        // chronology. Until Chapter 08 supplies that authenticated history,
-        // the Store must fail closed before creating a new destination.
         let absent_target = directory.0.join("absent-target");
-        assert_eq!(
-            PrivateStore::restore_encrypted_backup(
-                &absent_target,
-                fixture.store_fixture.space,
-                fixture.store_fixture.agent,
-                fixture.store_fixture.owner,
-                fixture.store_fixture.recovery.verifying_key(),
-                fixture.store_fixture.recovery_encryption.public_key(),
-                &backup,
-                &TestAuthority,
-            )
-            .err(),
-            Some(PrivateStoreError::InvalidBinding)
-        );
-        assert!(!absent_target.exists());
+        let (restored, disposition) = PrivateStore::restore_encrypted_backup(
+            &absent_target,
+            fixture.store_fixture.space,
+            fixture.store_fixture.agent,
+            fixture.store_fixture.owner,
+            fixture.store_fixture.recovery.verifying_key(),
+            fixture.store_fixture.recovery_encryption.public_key(),
+            &backup,
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(disposition, RestoreDisposition::Restored);
+        assert_eq!(restored.index, expected_index);
+        assert_eq!(restored.core_position().unwrap(), expected_position);
+        drop(restored);
 
         let existing_target = directory.0.join("existing-target");
         drop(create_store(&existing_target, &fixture.store_fixture));
-        let before = directory_image(&existing_target);
+        let (restored, disposition) = PrivateStore::restore_encrypted_backup(
+            &existing_target,
+            fixture.store_fixture.space,
+            fixture.store_fixture.agent,
+            fixture.store_fixture.owner,
+            fixture.store_fixture.recovery.verifying_key(),
+            fixture.store_fixture.recovery_encryption.public_key(),
+            &backup,
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(disposition, RestoreDisposition::Restored);
+        assert_eq!(restored.index, expected_index);
+        drop(restored);
+
+        let (_, disposition) = PrivateStore::restore_encrypted_backup(
+            &existing_target,
+            fixture.store_fixture.space,
+            fixture.store_fixture.agent,
+            fixture.store_fixture.owner,
+            fixture.store_fixture.recovery.verifying_key(),
+            fixture.store_fixture.recovery_encryption.public_key(),
+            &backup,
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(disposition, RestoreDisposition::AlreadyPresent);
+    }
+
+    #[test]
+    fn object_control_frontier_tamper_fails_before_restore_publication() {
+        let directory = TestDirectory::new("runtime-backup-frontier-tamper");
+        let path = directory.store();
+        let (mut store, fixture) = runtime_store_fixture(&path);
+        let object = encrypt_private_object(
+            &fixture.store_fixture.epoch.data_key,
+            fixture.store_fixture.space,
+            fixture.store_fixture.agent,
+            0,
+            EncryptedObjectKind::Package,
+            b"frontier-authenticated-ciphertext",
+        )
+        .unwrap();
+        store.put_object(&object).unwrap();
+        let predecessor = runtime_genesis(
+            &store,
+            &fixture.descriptor,
+            fixture.predecessor.node(),
+            fixture.predecessor.applied_at(),
+        );
+        let control = invite_control(
+            &store,
+            &fixture.store_fixture,
+            recipient(&fixture.store_fixture, 0xbc),
+        );
+        let (_, _, application) =
+            completed_runtime_application(&store, &fixture, &predecessor, &control, 0xbd);
+        store
+            .append_control_with_runtime_application(&control, &application, &TestAuthority)
+            .unwrap();
+        assert_eq!(store.index.objects[0].control_frontier, 0);
+        store.index.objects[0].control_frontier = 1;
+        let tampered = backup_with_orders(&store, &[0], &[0]);
+        let target = directory.0.join("target");
         assert_eq!(
             PrivateStore::restore_encrypted_backup(
-                &existing_target,
+                &target,
                 fixture.store_fixture.space,
                 fixture.store_fixture.agent,
                 fixture.store_fixture.owner,
                 fixture.store_fixture.recovery.verifying_key(),
                 fixture.store_fixture.recovery_encryption.public_key(),
-                &backup,
+                &tampered,
                 &TestAuthority,
             )
             .err(),
             Some(PrivateStoreError::InvalidBinding)
         );
-        assert_eq!(directory_image(&existing_target), before);
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn restore_accepts_same_frontier_subset_and_rejects_crossed_frontier_gap() {
+        let fixture = fixture();
+        let directory = TestDirectory::new("restore-object-frontier-prefix");
+        let source_path = directory.0.join("source");
+        let mut source = create_store(&source_path, &fixture);
+        let first = encrypt_private_object(
+            &fixture.epoch.data_key,
+            fixture.space,
+            fixture.agent,
+            0,
+            EncryptedObjectKind::Blob,
+            b"same-frontier-a",
+        )
+        .unwrap();
+        let second = encrypt_private_object(
+            &fixture.epoch.data_key,
+            fixture.space,
+            fixture.agent,
+            0,
+            EncryptedObjectKind::Blob,
+            b"same-frontier-b",
+        )
+        .unwrap();
+        let (lower, higher) =
+            if PrivateObjectKey::from_object(&first) < PrivateObjectKey::from_object(&second) {
+                (first, second)
+            } else {
+                (second, first)
+            };
+        source.put_object(&higher).unwrap();
+        let prefix = source
+            .export_encrypted_backup(MAX_PRIVATE_BACKUP_BYTES)
+            .unwrap();
+        source.put_object(&lower).unwrap();
+        let complete = source
+            .export_encrypted_backup(MAX_PRIVATE_BACKUP_BYTES)
+            .unwrap();
+
+        let target = directory.0.join("same-frontier-target");
+        drop(
+            PrivateStore::restore_encrypted_backup(
+                &target,
+                fixture.space,
+                fixture.agent,
+                fixture.owner,
+                fixture.recovery.verifying_key(),
+                fixture.recovery_encryption.public_key(),
+                &prefix,
+                &TestAuthority,
+            )
+            .unwrap()
+            .0,
+        );
+        let (restored, disposition) = PrivateStore::restore_encrypted_backup(
+            &target,
+            fixture.space,
+            fixture.agent,
+            fixture.owner,
+            fixture.recovery.verifying_key(),
+            fixture.recovery_encryption.public_key(),
+            &complete,
+            &TestAuthority,
+        )
+        .unwrap();
+        assert_eq!(disposition, RestoreDisposition::Restored);
+        assert_eq!(restored.index, source.index);
+        drop(restored);
+
+        let crossed_source_path = directory.0.join("crossed-source");
+        let mut crossed_source = create_store(&crossed_source_path, &fixture);
+        crossed_source.put_object(&lower).unwrap();
+        let control = control(&fixture, 0, None);
+        crossed_source
+            .append_control(&control, &TestAuthority)
+            .unwrap();
+        let crossed = crossed_source
+            .export_encrypted_backup(MAX_PRIVATE_BACKUP_BYTES)
+            .unwrap();
+        let crossed_target = directory.0.join("crossed-target");
+        let mut local = create_store(&crossed_target, &fixture);
+        local.append_control(&control, &TestAuthority).unwrap();
+        drop(local);
+        let before = fs::read(crossed_target.join(INDEX_FILE)).unwrap();
+        assert_eq!(
+            PrivateStore::restore_encrypted_backup(
+                &crossed_target,
+                fixture.space,
+                fixture.agent,
+                fixture.owner,
+                fixture.recovery.verifying_key(),
+                fixture.recovery_encryption.public_key(),
+                &crossed,
+                &TestAuthority,
+            )
+            .err(),
+            Some(PrivateStoreError::Diverged)
+        );
+        assert_eq!(fs::read(crossed_target.join(INDEX_FILE)).unwrap(), before);
     }
 
     #[test]
@@ -8368,7 +8699,7 @@ mod tests {
     }
 
     #[test]
-    fn generation_three_rejects_old_index_pending_and_backup_wire() {
+    fn generation_four_emits_new_snapshot_and_rejects_old_index_pending_and_backup_wire() {
         let directory = TestDirectory::new("runtime-old-wire");
         let index_path = directory.0.join("index-store");
         let (store, fixture) = runtime_store_fixture(&index_path);
@@ -8388,7 +8719,7 @@ mod tests {
         assert_eq!(snapshot.get(..4), Some(SNAPSHOT_MAGIC.as_slice()));
         assert_eq!(backup.get(..4), Some(BACKUP_MAGIC.as_slice()));
         let mut old_backup = backup;
-        old_backup[..4].copy_from_slice(b"PVB2");
+        old_backup[..4].copy_from_slice(b"PVB3");
         assert_eq!(
             verify_encrypted_backup(
                 &old_backup,
@@ -8405,7 +8736,7 @@ mod tests {
         drop(store);
         let mut old_index = fs::read(index_path.join(INDEX_FILE)).unwrap();
         assert_eq!(old_index.get(..4), Some(INDEX_MAGIC.as_slice()));
-        old_index[..4].copy_from_slice(b"PVI2");
+        old_index[..4].copy_from_slice(b"PVI3");
         fs::write(index_path.join(INDEX_FILE), old_index).unwrap();
         assert_eq!(
             PrivateStore::open(
@@ -8445,7 +8776,7 @@ mod tests {
         let pending_file = pending_path.join(STAGE_DIR).join(PENDING_FILE);
         let mut old_pending = fs::read(&pending_file).unwrap();
         assert_eq!(old_pending.get(..4), Some(TRANSACTION_MAGIC.as_slice()));
-        old_pending[..4].copy_from_slice(b"PVT2");
+        old_pending[..4].copy_from_slice(b"PVT3");
         fs::write(pending_file, old_pending).unwrap();
         assert_eq!(
             PrivateStore::open(

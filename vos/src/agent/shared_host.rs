@@ -24,7 +24,7 @@ use super::bootstrap::{
     SystemAgentGenesisProvision, seal_prepared_system_agent_genesis,
     validate_system_agent_genesis_catalog,
 };
-use super::committee::RootAnchorPins;
+use super::committee::{MAX_ROOT_ANCHOR_PINS_BYTES, RootAnchorPins};
 use super::driver::AgentTrustProvider;
 use super::driver::SdkManagementArtifacts;
 use super::execution::RuntimeBlob;
@@ -38,13 +38,22 @@ use super::journal::{
     AgentJournalGenesisId, CanonicalJournalRecord, MAX_JOURNAL_RECORD_BYTES, MergeEvent,
     MergeEventId, MergeFrontierId, OrderedEntryId, RuntimeBinding,
 };
-use super::journal_store::{AgentJournalStore, FileAgentJournalStore, FileLocalAgentJournalSlot};
+use super::journal_store::{
+    AgentJournalStore, FileAgentJournalStore, FileLocalAgentJournalSlot,
+    MAX_PORTABLE_JOURNAL_BLOBS, MAX_PORTABLE_JOURNAL_IMAGE_BYTES, MAX_PORTABLE_JOURNAL_OBJECTS,
+    PortableJournalCheckpoint, PortableJournalLimits,
+};
 use super::local_journal_driver::LocalJournalAgentDriver;
-use super::shared_commit::{SharedAgentSnapshotCertificate, SharedAgentSnapshotClaim};
+use super::replay::ReplaySealedOrdinaryGenesis;
+use super::shared_commit::{
+    MAX_SHARED_AGENT_PORTABLE_SNAPSHOT_CERTIFICATE_BYTES, SharedAgentPortableSnapshotCertificate,
+    SharedAgentPortableSnapshotClaim, SharedAgentSnapshotCertificate, SharedAgentSnapshotClaim,
+    VerifiedSharedAgentPortableSnapshot,
+};
 use super::shared_journal_driver::{
     FileSharedArtifactStager, SharedArtifactStagerError, SharedJournalAgentDriver,
     SharedJournalDriverError, SharedMergeObject, SharedPhysicalApplyOutcome,
-    install_immutable_file, read_regular_bounded,
+    install_immutable_file, preflight_portable_checkpoint, read_regular_bounded,
 };
 use super::shared_raft::{
     AgentGenerationRouteKey, AgentRaftApplicationErrorV2, AgentRaftApplicationLedgerV2,
@@ -62,7 +71,10 @@ const EXPOSURE_SUFFIX: &str = ".shared-genesis.exposed";
 const EXPOSURE_STAGE_SUFFIX: &str = ".shared-genesis.exposed.next";
 const RAFT_SUFFIX: &str = ".shared-raft.redb";
 const ARTIFACT_SUFFIX: &str = ".shared-artifacts";
+const PORTABLE_RESTORE_SUFFIX: &str = ".shared-portable-restore";
+const PORTABLE_RESTORE_STAGE_SUFFIX: &str = ".shared-portable-restore.next";
 const SHARED_GENESIS_INTENT_DOMAIN: &[u8] = b"vos/agent-host/shared-genesis-intent/v1";
+const SHARED_PORTABLE_ROOT_PINS_DOMAIN: &[u8] = b"vos/agent-host/shared-portable-root-pins/v1";
 
 /// Hard discovery bound for one Shared host root.
 pub const MAX_SHARED_HOST_AGENTS: usize = 4096;
@@ -73,6 +85,13 @@ pub const MAX_SHARED_GENESIS_INTENT_BYTES: usize = super::genesis::MAX_AGENT_GEN
     + super::bootstrap::MAX_SYSTEM_AGENT_GENESIS_PROVISION_BYTES
     + super::genesis::MAX_AGENT_REPLICA_COMMITTEE_BYTES
     + super::MAX_CATALOG_ARTIFACT_REFERENCED_BYTES as usize
+    + 4096;
+/// Absolute complete-wire ceiling for one singleton Shared system-Agent
+/// portable recovery bundle.
+pub const MAX_SHARED_AGENT_PORTABLE_BACKUP_BYTES: usize = MAX_PORTABLE_JOURNAL_IMAGE_BYTES
+    + MAX_SHARED_GENESIS_INTENT_BYTES
+    + MAX_ROOT_ANCHOR_PINS_BYTES
+    + MAX_SHARED_AGENT_PORTABLE_SNAPSHOT_CERTIFICATE_BYTES
     + 4096;
 
 type FileSharedDriver = SharedJournalAgentDriver<FileAgentJournalStore, FileSharedArtifactStager>;
@@ -98,6 +117,8 @@ pub enum SharedAgentHostError {
     SnapshotStale,
     SnapshotReplay,
     SnapshotEvidenceLimit,
+    PortableBackupUnsupported,
+    PortableBackupInvalid,
 }
 
 pub(crate) enum SharedAuthorityProjectionAudit {
@@ -177,6 +198,63 @@ impl VerifiedSharedAgentSnapshotCandidate {
     /// Domain-separated bytes an independently validating voter may sign.
     pub const fn signing_message(&self) -> Hash {
         self.message
+    }
+}
+
+/// Opaque result of reconstructing one exact source-store-independent
+/// recovery claim. The returned message is the only byte string replicas
+/// should sign for the subsequent aggregate export.
+#[derive(Clone, Debug)]
+pub struct VerifiedSharedAgentPortableBackupCandidate {
+    claim: SharedAgentPortableSnapshotClaim,
+    message: Hash,
+}
+
+impl VerifiedSharedAgentPortableBackupCandidate {
+    fn from_reconstructed(claim: SharedAgentPortableSnapshotClaim) -> Self {
+        let message = SharedAgentPortableSnapshotCertificate::signing_message(
+            claim.active_committee().id(),
+            claim.commitment(),
+        );
+        Self { claim, message }
+    }
+
+    pub const fn claim(&self) -> &SharedAgentPortableSnapshotClaim {
+        &self.claim
+    }
+
+    pub const fn signing_message(&self) -> Hash {
+        self.message
+    }
+}
+
+/// Caller-selected work and allocation ceilings for one portable checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedAgentPortableBackupLimits {
+    pub max_objects: usize,
+    pub max_blobs: usize,
+    pub max_index_nodes: usize,
+    pub max_bytes: u64,
+}
+
+impl SharedAgentPortableBackupLimits {
+    fn journal(self) -> Result<PortableJournalLimits, SharedAgentHostError> {
+        if self.max_objects == 0
+            || self.max_objects > MAX_PORTABLE_JOURNAL_OBJECTS
+            || self.max_blobs == 0
+            || self.max_blobs > MAX_PORTABLE_JOURNAL_BLOBS
+            || self.max_index_nodes == 0
+            || self.max_bytes == 0
+            || self.max_bytes > MAX_PORTABLE_JOURNAL_IMAGE_BYTES as u64
+        {
+            return Err(SharedAgentHostError::CapacityExhausted);
+        }
+        Ok(PortableJournalLimits {
+            max_objects: self.max_objects,
+            max_blobs: self.max_blobs,
+            max_index_nodes: self.max_index_nodes,
+            max_bytes: self.max_bytes,
+        })
     }
 }
 
@@ -546,6 +624,129 @@ impl ServiceWire for SharedGenesisIntent {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SharedAgentPortableBackupBundle {
+    intent: SharedGenesisIntent,
+    root_pins: RootAnchorPins,
+    certificate: SharedAgentPortableSnapshotCertificate,
+    journal: PortableJournalCheckpoint,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedPortableRestore {
+    bundle: SharedAgentPortableBackupBundle,
+    verified: VerifiedSharedAgentPortableSnapshot,
+    maximum_index_nodes: usize,
+    stage_heads_only_for_test: bool,
+}
+
+fn absolute_portable_journal_limits() -> PortableJournalLimits {
+    PortableJournalLimits {
+        max_objects: MAX_PORTABLE_JOURNAL_OBJECTS,
+        max_blobs: MAX_PORTABLE_JOURNAL_BLOBS,
+        max_index_nodes: MAX_PORTABLE_JOURNAL_OBJECTS,
+        max_bytes: MAX_PORTABLE_JOURNAL_IMAGE_BYTES as u64,
+    }
+}
+
+impl SharedAgentPortableBackupBundle {
+    fn validate(&self) -> Result<VerifiedSharedAgentPortableSnapshot, SharedAgentHostError> {
+        self.intent.validate()?;
+        self.root_pins
+            .validate()
+            .map_err(|_| SharedAgentHostError::PortableBackupInvalid)?;
+        self.journal
+            .validate_shape()
+            .map_err(|_| SharedAgentHostError::PortableBackupInvalid)?;
+        let SharedGenesisAuthority::SystemBootstrap {
+            provision,
+            committee,
+        } = &self.intent.authority
+        else {
+            return Err(SharedAgentHostError::PortableBackupUnsupported);
+        };
+        let claim = self.certificate.claim();
+        if provision.root() != &self.root_pins
+            || claim.genesis_intent() != self.intent.id()
+            || claim.root_pins() != portable_root_pins_commitment(&self.root_pins)
+            || claim.active_committee() != committee
+            || claim.ordered().space() != self.intent.space()
+            || claim.ordered().agent() != self.intent.agent()?
+            || claim.local_node() != self.journal.heads().node
+            || claim.ordered().genesis() != self.journal.heads().genesis
+            || claim.ordered().admission() != self.journal.heads().admission
+            || claim.journal_heads() != self.journal.heads().id()
+            || claim.checkpoint()
+                != self
+                    .journal
+                    .heads()
+                    .checkpoint
+                    .ok_or(SharedAgentHostError::PortableBackupInvalid)?
+            || claim.journal_image() != self.journal.commitment()
+        {
+            return Err(SharedAgentHostError::PortableBackupInvalid);
+        }
+        let verified = self
+            .certificate
+            .verify(committee, claim)
+            .map_err(|_| SharedAgentHostError::PortableBackupInvalid)?;
+        if self.encode().len() > MAX_SHARED_AGENT_PORTABLE_BACKUP_BYTES {
+            return Err(SharedAgentHostError::CapacityExhausted);
+        }
+        Ok(verified)
+    }
+}
+
+impl ServiceWire for SharedAgentPortableBackupBundle {
+    const MAGIC: [u8; 4] = *b"ASB1";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.bytes(&self.intent.encode());
+        encoder.bytes(&self.root_pins.encode());
+        encoder.bytes(&self.certificate.encode());
+        encoder.bytes(&self.journal.encode());
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        if decoder.remaining()
+            > MAX_SHARED_AGENT_PORTABLE_BACKUP_BYTES
+                .checked_sub(4 + 32)
+                .ok_or(DecodeError::LimitExceeded)?
+        {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let intent_bytes = decoder.bytes()?;
+        if intent_bytes.len() > MAX_SHARED_GENESIS_INTENT_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let root_bytes = decoder.bytes()?;
+        if root_bytes.len() > MAX_ROOT_ANCHOR_PINS_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let certificate_bytes = decoder.bytes()?;
+        if certificate_bytes.len() > MAX_SHARED_AGENT_PORTABLE_SNAPSHOT_CERTIFICATE_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let journal_bytes = decoder.bytes()?;
+        if journal_bytes.len() > MAX_PORTABLE_JOURNAL_IMAGE_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let bundle = Self {
+            intent: SharedGenesisIntent::decode(&intent_bytes)?,
+            root_pins: RootAnchorPins::decode(&root_bytes)?,
+            certificate: SharedAgentPortableSnapshotCertificate::decode(&certificate_bytes)?,
+            journal: PortableJournalCheckpoint::decode(&journal_bytes)?,
+        };
+        bundle.validate().map_err(|_| DecodeError::NonCanonical)?;
+        Ok(bundle)
+    }
+}
+
+fn portable_root_pins_commitment(root_pins: &RootAnchorPins) -> Hash {
+    Hash::digest(SHARED_PORTABLE_ROOT_PINS_DOMAIN, &[&root_pins.encode()])
+}
+
 enum PreparedSharedGenesis {
     AuthorityFinalized(super::replay::ReplaySealedSharedGenesis),
     SystemBootstrap(super::replay::ReplaySealedGenesis),
@@ -799,12 +1000,33 @@ impl SharedAgentHost {
             finality,
             root_pins,
         };
-        for (agent, files) in files {
-            let (intent, encoded) = host.read_intent(agent, files)?;
+        for (agent, mut files) in files {
+            let recovery = host.read_portable_restore(agent, files)?;
+            let (intent, encoded) = if let Some(recovery) = &recovery {
+                if files.intent || files.intent_stage {
+                    let (intent, encoded) = host.read_intent(agent, files)?;
+                    if intent != recovery.bundle.intent {
+                        return Err(SharedAgentHostError::CorruptResidue);
+                    }
+                    (intent, encoded)
+                } else {
+                    (
+                        recovery.bundle.intent.clone(),
+                        recovery.bundle.intent.encode(),
+                    )
+                }
+            } else {
+                host.read_intent(agent, files)?
+            };
             let sealed = host.verify_and_prepare(&intent)?;
             install_host_record(&host.intent_path(agent), &encoded)?;
+            files.intent = true;
             let exposed = host.read_exposure(agent, intent.id(), files)?;
-            let hosted = host.open_generation(intent, &sealed, exposed, files)?;
+            let hosted =
+                host.open_generation(intent, &sealed, exposed, files, recovery.as_ref())?;
+            if recovery.is_some() {
+                retire_host_record(&host.portable_restore_path(agent))?;
+            }
             if host.agents.insert(agent, hosted).is_some() {
                 return Err(SharedAgentHostError::CorruptResidue);
             }
@@ -897,6 +1119,7 @@ impl SharedAgentHost {
                 intent: true,
                 ..GenerationFiles::default()
             },
+            None,
         )?;
         let status = status_for(&hosted, false)?;
         self.agents.insert(agent, hosted);
@@ -1240,6 +1463,18 @@ impl SharedAgentHost {
                 None => SharedAgentSnapshotState::None,
             },
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn journal_store_instance_for_test(
+        &self,
+        agent: AgentId,
+    ) -> Result<super::shared_raft::JournalStoreInstanceId, SharedAgentHostError> {
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        Ok(hosted.driver.journal_store_instance_for_test())
     }
 
     pub(crate) fn prepare_clean_ordered(
@@ -1691,6 +1926,303 @@ impl SharedAgentHost {
         }
     }
 
+    /// Reconstruct one source-store-independent recovery claim for the exact
+    /// installed checkpoint of the clean singleton Shared system Agent.
+    /// Ordinary/multi-replica Shared generations remain explicitly
+    /// unsupported until their authority transfer has a separately specified
+    /// protocol.
+    pub fn request_portable_backup(
+        &mut self,
+        agent: AgentId,
+        limits: SharedAgentPortableBackupLimits,
+    ) -> Result<VerifiedSharedAgentPortableBackupCandidate, SharedAgentHostError> {
+        let (_, _, _, claim) = self.reconstruct_portable_backup(agent, limits)?;
+        Ok(VerifiedSharedAgentPortableBackupCandidate::from_reconstructed(claim))
+    }
+
+    /// Finish an authenticated portable export after the singleton voter has
+    /// signed the exact reconstructed claim. The checkpoint is reconstructed
+    /// again, so work committed after candidate issuance makes the supplied
+    /// certificate fail closed rather than exporting mixed state.
+    pub fn export_portable_backup(
+        &mut self,
+        agent: AgentId,
+        certificate: &SharedAgentPortableSnapshotCertificate,
+        limits: SharedAgentPortableBackupLimits,
+    ) -> Result<Vec<u8>, SharedAgentHostError> {
+        let (intent, root_pins, journal, claim) =
+            self.reconstruct_portable_backup(agent, limits)?;
+        certificate
+            .verify(intent.committee(), &claim)
+            .map_err(|_| SharedAgentHostError::PortableBackupInvalid)?;
+        let bundle = SharedAgentPortableBackupBundle {
+            intent,
+            root_pins,
+            certificate: certificate.clone(),
+            journal,
+        };
+        bundle.validate()?;
+        Ok(bundle.encode())
+    }
+
+    /// Import one fully preflighted portable system-Agent checkpoint into an
+    /// absent generation. The configured root pins remain independent input;
+    /// bytes carried by the bundle can only match them, never replace them.
+    pub fn restore_portable_backup(
+        &mut self,
+        bytes: &[u8],
+        limits: SharedAgentPortableBackupLimits,
+    ) -> Result<SharedAgentStatus, SharedAgentHostError> {
+        self.restore_portable_backup_inner(bytes, limits, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn restore_portable_backup_through_heads_stage_for_test(
+        &mut self,
+        bytes: &[u8],
+        limits: SharedAgentPortableBackupLimits,
+    ) -> Result<SharedAgentStatus, SharedAgentHostError> {
+        self.restore_portable_backup_inner(bytes, limits, true)
+    }
+
+    fn restore_portable_backup_inner(
+        &mut self,
+        bytes: &[u8],
+        limits: SharedAgentPortableBackupLimits,
+        stage_heads_only_for_test: bool,
+    ) -> Result<SharedAgentStatus, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let journal_limits = limits.journal()?;
+        let maximum = usize::try_from(limits.max_bytes)
+            .ok()
+            .and_then(|maximum| maximum.checked_add(MAX_SHARED_GENESIS_INTENT_BYTES))
+            .and_then(|maximum| maximum.checked_add(MAX_ROOT_ANCHOR_PINS_BYTES))
+            .and_then(|maximum| {
+                maximum.checked_add(MAX_SHARED_AGENT_PORTABLE_SNAPSHOT_CERTIFICATE_BYTES)
+            })
+            .and_then(|maximum| maximum.checked_add(4096))
+            .ok_or(SharedAgentHostError::CapacityExhausted)?;
+        let mut recovery = self.prepare_portable_restore(bytes, journal_limits, maximum)?;
+        recovery.stage_heads_only_for_test = stage_heads_only_for_test;
+        let agent = recovery.bundle.intent.agent()?;
+        if self.agents.contains_key(&agent) {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let current = scan_generation_namespaces(&self.lease)?;
+        if self.agents.len() == MAX_SHARED_HOST_AGENTS
+            || !current.contains_key(&agent) && current.len() == MAX_SHARED_HOST_AGENTS
+        {
+            return Err(SharedAgentHostError::CapacityExhausted);
+        }
+        if let Some(files) = current.get(&agent) {
+            if !files.portable_restore && !files.portable_restore_stage {
+                return Err(SharedAgentHostError::Conflict);
+            }
+            let retained = read_host_record_pair(
+                &self.portable_restore_path(agent),
+                MAX_SHARED_AGENT_PORTABLE_BACKUP_BYTES,
+            )?
+            .ok_or(SharedAgentHostError::CorruptResidue)?;
+            if retained != bytes {
+                return Err(SharedAgentHostError::Conflict);
+            }
+        }
+
+        // This independently authenticated full bundle is the sole recovery
+        // authority across the journal/Raft commit boundary. It is durable
+        // before the first generation byte and retained until both stores
+        // have reopened against the exact logical checkpoint.
+        install_host_record(&self.portable_restore_path(agent), bytes)?;
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let mut files = scan_generation_namespaces(&self.lease)?
+            .remove(&agent)
+            .ok_or(SharedAgentHostError::CorruptResidue)?;
+        if files.intent || files.intent_stage {
+            let (intent, _) = self.read_intent(agent, files)?;
+            if intent != recovery.bundle.intent {
+                return Err(SharedAgentHostError::Conflict);
+            }
+        }
+        let sealed = self.verify_and_prepare(&recovery.bundle.intent)?;
+        install_host_record(&self.intent_path(agent), &recovery.bundle.intent.encode())?;
+        files.intent = true;
+        let exposed = self.read_exposure(agent, recovery.bundle.intent.id(), files)?;
+        let hosted = self.open_generation(
+            recovery.bundle.intent.clone(),
+            &sealed,
+            exposed,
+            files,
+            Some(&recovery),
+        )?;
+        let status = status_for(&hosted, false)?;
+        retire_host_record(&self.portable_restore_path(agent))?;
+        if self.agents.insert(agent, hosted).is_some() {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        Ok(status)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retain_portable_restore_marker_for_test(
+        &mut self,
+        bytes: &[u8],
+        limits: SharedAgentPortableBackupLimits,
+    ) -> Result<AgentId, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let journal_limits = limits.journal()?;
+        let maximum = usize::try_from(limits.max_bytes)
+            .ok()
+            .and_then(|maximum| maximum.checked_add(MAX_SHARED_GENESIS_INTENT_BYTES))
+            .and_then(|maximum| maximum.checked_add(MAX_ROOT_ANCHOR_PINS_BYTES))
+            .and_then(|maximum| {
+                maximum.checked_add(MAX_SHARED_AGENT_PORTABLE_SNAPSHOT_CERTIFICATE_BYTES)
+            })
+            .and_then(|maximum| maximum.checked_add(4096))
+            .ok_or(SharedAgentHostError::CapacityExhausted)?;
+        let recovery = self.prepare_portable_restore(bytes, journal_limits, maximum)?;
+        let agent = recovery.bundle.intent.agent()?;
+        if self.agents.contains_key(&agent)
+            || scan_generation_namespaces(&self.lease)?.contains_key(&agent)
+        {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        install_host_record(&self.portable_restore_path(agent), bytes)?;
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        Ok(agent)
+    }
+
+    fn prepare_portable_restore(
+        &self,
+        bytes: &[u8],
+        journal_limits: PortableJournalLimits,
+        maximum_bundle_bytes: usize,
+    ) -> Result<PreparedPortableRestore, SharedAgentHostError> {
+        if bytes.len() > maximum_bundle_bytes
+            || bytes.len() > MAX_SHARED_AGENT_PORTABLE_BACKUP_BYTES
+        {
+            return Err(SharedAgentHostError::CapacityExhausted);
+        }
+        let bundle = SharedAgentPortableBackupBundle::decode(bytes)
+            .map_err(|_| SharedAgentHostError::PortableBackupInvalid)?;
+        if bundle.encode() != bytes {
+            return Err(SharedAgentHostError::PortableBackupInvalid);
+        }
+        let verified = bundle.validate()?;
+        bundle
+            .journal
+            .validate_limits(journal_limits)
+            .map_err(|_| SharedAgentHostError::CapacityExhausted)?;
+        let configured_root = self
+            .root_pins
+            .as_ref()
+            .ok_or(SharedAgentHostError::PortableBackupUnsupported)?;
+        if configured_root != &bundle.root_pins
+            || self.scope().space != bundle.intent.space()
+            || self.scope().node != bundle.certificate.claim().local_node()
+        {
+            return Err(SharedAgentHostError::PortableBackupInvalid);
+        }
+        let sealed = self.verify_and_prepare(&bundle.intent)?;
+        preflight_portable_checkpoint(
+            &sealed,
+            &bundle.intent.catalog,
+            &bundle.journal,
+            bundle.certificate.claim(),
+            journal_limits.max_index_nodes,
+            Arc::clone(&self.trust),
+            Arc::clone(&self.merge),
+            bundle.intent.committee().clone(),
+        )
+        .map_err(map_driver_error)?;
+        Ok(PreparedPortableRestore {
+            bundle,
+            verified,
+            maximum_index_nodes: journal_limits.max_index_nodes,
+            stage_heads_only_for_test: false,
+        })
+    }
+
+    fn read_portable_restore(
+        &self,
+        agent: AgentId,
+        files: GenerationFiles,
+    ) -> Result<Option<PreparedPortableRestore>, SharedAgentHostError> {
+        if !files.portable_restore && !files.portable_restore_stage {
+            return Ok(None);
+        }
+        let bytes = read_host_record_pair(
+            &self.portable_restore_path(agent),
+            MAX_SHARED_AGENT_PORTABLE_BACKUP_BYTES,
+        )?
+        .ok_or(SharedAgentHostError::CorruptResidue)?;
+        let recovery = self.prepare_portable_restore(
+            &bytes,
+            absolute_portable_journal_limits(),
+            MAX_SHARED_AGENT_PORTABLE_BACKUP_BYTES,
+        )?;
+        if recovery.bundle.intent.agent()? != agent {
+            return Err(SharedAgentHostError::CorruptResidue);
+        }
+        install_host_record(&self.portable_restore_path(agent), &bytes)?;
+        Ok(Some(recovery))
+    }
+
+    fn reconstruct_portable_backup(
+        &mut self,
+        agent: AgentId,
+        limits: SharedAgentPortableBackupLimits,
+    ) -> Result<
+        (
+            SharedGenesisIntent,
+            RootAnchorPins,
+            PortableJournalCheckpoint,
+            SharedAgentPortableSnapshotClaim,
+        ),
+        SharedAgentHostError,
+    > {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        let journal_limits = limits.journal()?;
+        if self.transport_leases.contains_key(&agent) {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        let SharedGenesisAuthority::SystemBootstrap {
+            provision,
+            committee,
+        } = &hosted.intent.authority
+        else {
+            return Err(SharedAgentHostError::PortableBackupUnsupported);
+        };
+        let root_pins = self
+            .root_pins
+            .as_ref()
+            .ok_or(SharedAgentHostError::PortableBackupUnsupported)?;
+        if provision.root() != root_pins
+            || committee.members().len() != 1
+            || committee.voter_count() != 1
+        {
+            return Err(SharedAgentHostError::PortableBackupUnsupported);
+        }
+        let (journal, claim) = hosted
+            .driver
+            .portable_snapshot_candidate(
+                hosted.intent.id(),
+                portable_root_pins_commitment(root_pins),
+                journal_limits,
+            )
+            .map_err(map_driver_error)?;
+        if claim.active_committee() != committee
+            || claim.authority_epoch() != hosted.intent.committee_authority.initial_epoch()
+            || claim.local_node() != self.scope().node
+        {
+            return Err(SharedAgentHostError::PortableBackupUnsupported);
+        }
+        Ok((hosted.intent.clone(), root_pins.clone(), journal, claim))
+    }
+
     /// Derive and locally verify an exact Agent checkpoint candidate without
     /// mutation. Only the opaque result exposes the signing message; decoding
     /// an unsigned claim is never signing authority. Remote voters must also
@@ -1873,9 +2405,13 @@ impl SharedAgentHost {
         sealed: &PreparedSharedGenesis,
         externally_exposed: bool,
         files: GenerationFiles,
+        portable_restore: Option<&PreparedPortableRestore>,
     ) -> Result<HostedSharedAgent, SharedAgentHostError> {
         let agent = intent.agent()?;
         let scope = self.scope();
+        if portable_restore.is_some_and(|recovery| recovery.bundle.intent != intent) {
+            return Err(SharedAgentHostError::CorruptResidue);
+        }
         if externally_exposed && !(files.journal && files.lock && files.raft && files.artifacts) {
             return Err(SharedAgentHostError::CorruptResidue);
         }
@@ -1892,7 +2428,14 @@ impl SharedAgentHost {
             &authority_parent,
         )
         .map_err(|_| SharedAgentHostError::CorruptResidue)?;
-        let store = slot
+        if let Some(recovery) = portable_restore {
+            slot.recover_portable_heads_stage(
+                &sealed.initial_heads(),
+                recovery.bundle.journal.heads(),
+            )
+            .map_err(|_| SharedAgentHostError::CorruptResidue)?;
+        }
+        let mut store = slot
             .open(sealed, externally_exposed)
             .map_err(|_| SharedAgentHostError::CorruptResidue)?;
         let state = (store.genesis(), store.heads());
@@ -1900,6 +2443,22 @@ impl SharedAgentHost {
             (Ok(genesis), Ok(heads)) => (genesis, heads),
             _ => return Err(SharedAgentHostError::CorruptResidue),
         };
+        let portable_already_activated = if let Some(recovery) = portable_restore {
+            if let Some(heads) = &state.1 {
+                if heads != &sealed.initial_heads() && heads != recovery.bundle.journal.heads() {
+                    return Err(SharedAgentHostError::CorruptResidue);
+                }
+            }
+            state.1.as_ref() == Some(recovery.bundle.journal.heads())
+        } else {
+            false
+        };
+        if portable_already_activated {
+            let recovery = portable_restore.ok_or(SharedAgentHostError::CorruptResidue)?;
+            store
+                .install_portable_checkpoint(&recovery.bundle.journal, recovery.maximum_index_nodes)
+                .map_err(|_| SharedAgentHostError::CorruptResidue)?;
+        }
 
         let generation = AgentGenerationRouteKey::new(
             scope.space,
@@ -1921,6 +2480,12 @@ impl SharedAgentHost {
             intent.committee_authority,
         )
         .map_err(map_ledger_error)?;
+        if portable_already_activated {
+            let recovery = portable_restore.ok_or(SharedAgentHostError::CorruptResidue)?;
+            ledger
+                .restore_portable_snapshot(&recovery.bundle.certificate, &recovery.verified)
+                .map_err(map_ledger_error)?;
+        }
 
         let artifact_path = self.artifact_path(agent);
         validate_artifact_path(&artifact_path, externally_exposed)?;
@@ -1975,6 +2540,16 @@ impl SharedAgentHost {
         }
         .map_err(map_driver_error)?;
         install_host_record(&self.exposure_path(agent), intent.id().as_bytes())?;
+        if let Some(recovery) = portable_restore {
+            driver
+                .restore_portable_checkpoint(
+                    &recovery.bundle.journal,
+                    recovery.maximum_index_nodes,
+                    &recovery.bundle.certificate,
+                    &recovery.verified,
+                )
+                .map_err(map_driver_error)?;
+        }
         self.lease.validate_live().map_err(map_outer_lease_error)?;
         Ok(HostedSharedAgent {
             intent,
@@ -2044,6 +2619,14 @@ impl SharedAgentHost {
             .authority_root()
             .expect("validated lease authority root")
             .join(format!("{}{}", encode_agent_id(agent), EXPOSURE_SUFFIX))
+    }
+
+    fn portable_restore_path(&self, agent: AgentId) -> PathBuf {
+        self.lease.root().join(format!(
+            "{}{}",
+            encode_agent_id(agent),
+            PORTABLE_RESTORE_SUFFIX
+        ))
     }
 
     fn raft_path(&self, agent: AgentId) -> PathBuf {
@@ -2249,6 +2832,30 @@ fn install_host_record(path: &Path, bytes: &[u8]) -> Result<(), SharedAgentHostE
     install_immutable_file(path, bytes).map_err(map_artifact_error)
 }
 
+fn retire_host_record(path: &Path) -> Result<(), SharedAgentHostError> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(SharedAgentHostError::CorruptResidue)?;
+    let staged = path.with_file_name(format!("{name}.next"));
+    for candidate in [&staged, path] {
+        match fs::symlink_metadata(candidate) {
+            Ok(metadata)
+                if metadata.file_type().is_file() && !metadata.file_type().is_symlink() =>
+            {
+                fs::remove_file(candidate).map_err(|_| SharedAgentHostError::Unavailable)?;
+            }
+            Ok(_) => return Err(SharedAgentHostError::CorruptResidue),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(SharedAgentHostError::Unavailable),
+        }
+    }
+    let parent = path.parent().ok_or(SharedAgentHostError::CorruptResidue)?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| SharedAgentHostError::Unavailable)
+}
+
 fn read_host_record_pair(
     canonical: &Path,
     maximum: usize,
@@ -2333,6 +2940,8 @@ struct GenerationFiles {
     intent_stage: bool,
     exposed: bool,
     exposed_stage: bool,
+    portable_restore: bool,
+    portable_restore_stage: bool,
     raft: bool,
     artifacts: bool,
 }
@@ -2347,21 +2956,35 @@ fn scan_generation_namespaces(
             .file_name()
             .into_string()
             .map_err(|_| SharedAgentHostError::CorruptResidue)?;
-        let agent = decode_suffixed_agent(&name, JOURNAL_SUFFIX)
-            .ok_or(SharedAgentHostError::CorruptResidue)?;
-        let metadata = entry
-            .metadata()
+        let file_type = entry
+            .file_type()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
-        if !metadata.is_dir()
-            || entry
-                .file_type()
-                .map_err(|_| SharedAgentHostError::Unavailable)?
-                .is_symlink()
-        {
+        if let Some(agent) = decode_suffixed_agent(&name, JOURNAL_SUFFIX) {
+            if !file_type.is_dir() || file_type.is_symlink() {
+                return Err(SharedAgentHostError::CorruptResidue);
+            }
+            let row = generation_row(&mut files, agent)?;
+            if core::mem::replace(&mut row.journal, true) {
+                return Err(SharedAgentHostError::CorruptResidue);
+            }
+            continue;
+        }
+        let (agent, staged) = decode_suffixed_agent(&name, PORTABLE_RESTORE_STAGE_SUFFIX)
+            .map(|agent| (agent, true))
+            .or_else(|| {
+                decode_suffixed_agent(&name, PORTABLE_RESTORE_SUFFIX).map(|agent| (agent, false))
+            })
+            .ok_or(SharedAgentHostError::CorruptResidue)?;
+        if !file_type.is_file() || file_type.is_symlink() {
             return Err(SharedAgentHostError::CorruptResidue);
         }
         let row = generation_row(&mut files, agent)?;
-        if core::mem::replace(&mut row.journal, true) {
+        let present = if staged {
+            &mut row.portable_restore_stage
+        } else {
+            &mut row.portable_restore
+        };
+        if core::mem::replace(present, true) {
             return Err(SharedAgentHostError::CorruptResidue);
         }
     }
@@ -2398,7 +3021,8 @@ fn scan_generation_namespaces(
         }
     }
     for row in files.values() {
-        if !row.intent && !row.intent_stage {
+        if !row.intent && !row.intent_stage && !row.portable_restore && !row.portable_restore_stage
+        {
             return Err(SharedAgentHostError::CorruptResidue);
         }
     }

@@ -113,7 +113,7 @@ pub const MAX_PRIVATE_BOOTSTRAP_METADATA_BYTES: usize = 1024 * 1024;
 pub const MAX_PRIVATE_HOST_ARCHIVE_BYTES: usize = MAX_PRIVATE_BACKUP_BYTES + 32 * 1024 * 1024;
 
 const FORMAT_VERSION: u16 = 2;
-const HOST_ARCHIVE_VERSION: u16 = 4;
+const HOST_ARCHIVE_VERSION: u16 = 5;
 const ROOT_SCOPE_MAGIC: &[u8; 4] = b"PVHR";
 const DESCRIPTOR_MAGIC: &[u8; 4] = b"PVHD";
 const RUNTIME_MAGIC: &[u8; 4] = b"PVHP";
@@ -6457,7 +6457,7 @@ struct HostArchive {
     bootstrap: Vec<u8>,
     runtime_state: Vec<u8>,
     /// Canonical PSI1 wires, strictly ordered by their bound control hash.
-    /// PVB3/PVS3 remain portable and exclude this node-local material.
+    /// PVB4/PVS4 remain portable and exclude this node-local material.
     stable_import_certificates: Vec<Vec<u8>>,
 }
 
@@ -7412,7 +7412,7 @@ fn reattach_same_node_archive_stable_import_certificates(
         .map_err(|_| PrivateAgentHostError::Corrupt)?;
     if first.destination_identity() != authority_private_node_identity_commitment(local_node) {
         // PSI1 is intentionally node-local. A portable/cross-node restore uses
-        // PVB3 only and must remint destination-authenticated certificates.
+        // PVB4 only and must remint destination-authenticated certificates.
         return Ok(());
     }
 
@@ -9149,9 +9149,9 @@ mod tests {
     }
 
     #[test]
-    fn host_archive_v4_is_a_clean_break_and_bounds_canonical_psi_attachments() {
+    fn host_archive_v5_is_a_clean_break_and_bounds_canonical_psi_attachments() {
         let fixture = fixture(1);
-        let mut host = create_host(&fixture, 0, "archive-v4");
+        let mut host = create_host(&fixture, 0, "archive-v5");
         let agent = create_agent(&mut host, &fixture);
         for complete in [false, true] {
             let mut archive = if complete {
@@ -9165,7 +9165,7 @@ mod tests {
                 u16::from_le_bytes(archive[4..6].try_into().unwrap()),
                 HOST_ARCHIVE_VERSION
             );
-            archive[4..6].copy_from_slice(&3_u16.to_le_bytes());
+            archive[4..6].copy_from_slice(&4_u16.to_le_bytes());
             assert!(matches!(
                 decode_host_archive(&archive, complete),
                 Err(PrivateAgentHostError::Corrupt)
@@ -9175,10 +9175,10 @@ mod tests {
         let backup = host
             .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
             .unwrap();
-        let mut missing_v4_table = backup[..backup.len() - 4].to_vec();
-        missing_v4_table[4..6].copy_from_slice(&3_u16.to_le_bytes());
+        let mut missing_v5_table = backup[..backup.len() - 4].to_vec();
+        missing_v5_table[4..6].copy_from_slice(&4_u16.to_le_bytes());
         assert_eq!(
-            decode_host_archive(&missing_v4_table, true).err(),
+            decode_host_archive(&missing_v5_table, true).err(),
             Some(PrivateAgentHostError::Corrupt)
         );
         let mut oversized_count = backup.clone();
@@ -10638,7 +10638,7 @@ mod tests {
     }
 
     #[test]
-    fn host_archive_v4_restores_same_node_psi_discards_cross_node_and_restarts() {
+    fn host_archive_v5_restores_same_node_psi_discards_cross_node_and_restarts() {
         let fixture = fixture(2);
         let mut source = create_host(&fixture, 0, "psi-archive-source");
         let agent = create_agent(&mut source, &fixture);
@@ -10664,7 +10664,7 @@ mod tests {
                 .store
                 .windows(certificate.len())
                 .any(|window| window == certificate),
-            "portable PVB3 must still exclude PSI1"
+            "portable PVB4 must still exclude PSI1"
         );
 
         let mut restored = create_host(&fixture, 0, "psi-archive-restored");
@@ -11557,9 +11557,9 @@ mod tests {
         assert!(!contains(&snapshot, SENTINEL));
         assert!(!contains(&backup, RUNTIME_STATE_SENTINEL));
         assert!(!contains(&snapshot, RUNTIME_STATE_SENTINEL));
-        // PVI3 is the intentionally public Store-index envelope embedded in PVB3;
+        // PVI4 is the intentionally public Store-index envelope embedded in PVB4;
         // the node-local runtime-image generations must remain encrypted.
-        for magic in [b"PVI1", b"PVI2", b"PVR3"] {
+        for magic in [b"PVI1", b"PVI2", b"PVI3", b"PVR3"] {
             assert!(!contains(&backup, magic), "backup leaked {magic:?}");
             assert!(!contains(&snapshot, magic), "snapshot leaked {magic:?}");
         }
@@ -13096,6 +13096,15 @@ mod tests {
                 &TestAuthority,
             )
             .unwrap();
+        source
+            .encrypt_and_put(
+                agent,
+                EncryptedObjectKind::Blob,
+                b"completion-prefix-object-two",
+                authority_target(&fixture).0,
+                &TestAuthority,
+            )
+            .unwrap();
         let archive = source
             .export_encrypted_backup(agent, MAX_PRIVATE_HOST_ARCHIVE_BYTES)
             .unwrap();
@@ -13253,7 +13262,7 @@ mod tests {
             *b"PVER", // authenticated establishment receipt
             *b"PVE2", // active Store evidence transaction
             *b"PVEP", // retired Store pending evidence
-            *b"PVI3", // active Store index
+            *b"PVI4", // active Store index
             *b"PVR3", // active runtime image
             *b"PVRP", // authenticated offline recovery plan
         ];

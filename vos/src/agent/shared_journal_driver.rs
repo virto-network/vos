@@ -24,8 +24,9 @@ use super::journal::{
 use super::journal_store::{
     AgentJournalGarbageCollection, AgentJournalStore, CatalogBlobResolver,
     CatalogBlobResolverFactory, GcLimits, JournalBlobClass, JournalGc, JournalStoreError,
+    MemoryAgentJournalStore, PortableJournalCheckpoint, PortableJournalLimits,
     ReverifiedRootJournalStore, SharedOrderedCommitRetirementStore, SharedOrderedCommitStore,
-    TransitionProofPublicationStore, validate_gc_limits,
+    TransitionProofPublicationStore, export_portable_journal_checkpoint, validate_gc_limits,
 };
 use super::local_journal_driver::{
     AttestedReplayTransitionProvider, LocalMergeAuthenticator, LocalReplayExecutorError,
@@ -39,7 +40,9 @@ use super::replay::{
     prepare_shared_ordered, validate_published_shared_checkpoint,
 };
 use super::shared_commit::{
-    OrderedCommitClaim, SharedAgentSnapshotCertificate, SharedAgentSnapshotClaim, SharedCommitError,
+    OrderedCommitClaim, SharedAgentPortableSnapshotCertificate, SharedAgentPortableSnapshotClaim,
+    SharedAgentSnapshotCertificate, SharedAgentSnapshotClaim, SharedCommitError,
+    VerifiedSharedAgentPortableSnapshot,
 };
 use super::shared_raft::{
     ARTIFACT_CHUNK_DATA_BYTES, AgentGenerationRouteKey, AgentRaftApplicationErrorV2,
@@ -2795,6 +2798,114 @@ where
 impl
     SharedJournalAgentDriver<super::journal_store::FileAgentJournalStore, FileSharedArtifactStager>
 {
+    pub(crate) fn portable_checkpoint(
+        &self,
+        limits: PortableJournalLimits,
+    ) -> Result<PortableJournalCheckpoint, SharedJournalDriverError> {
+        export_portable_journal_checkpoint(&self.store, limits).map_err(Into::into)
+    }
+
+    pub(crate) fn portable_snapshot_candidate(
+        &self,
+        genesis_intent: Hash,
+        root_pins: Hash,
+        limits: PortableJournalLimits,
+    ) -> Result<
+        (PortableJournalCheckpoint, SharedAgentPortableSnapshotClaim),
+        SharedJournalDriverError,
+    > {
+        let installed = self
+            .ledger
+            .current_snapshot()?
+            .ok_or(SharedJournalDriverError::Ledger(
+                AgentRaftApplicationErrorV2::SnapshotBoundaryRequired,
+            ))?;
+        validate_published_shared_checkpoint(&self.store, &self.materialization, &installed.claim)
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        let image = self.portable_checkpoint(limits)?;
+        if image.heads().id() != installed.claim.journal_heads() {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let physical = installed.claim;
+        let claim = SharedAgentPortableSnapshotClaim::new(
+            genesis_intent,
+            root_pins,
+            physical.ordered().clone(),
+            physical.active_committee().clone(),
+            physical.authority_epoch(),
+            physical.ordered_successor(),
+            physical.checkpoint_predecessor(),
+            physical.journal_heads(),
+            physical.checkpoint(),
+            physical.local_node(),
+            physical.control(),
+            physical.linear(),
+            physical.merge(),
+            physical.local(),
+            physical.ordered_invocations(),
+            physical.merge_invocations(),
+            physical.local_invocations(),
+            physical.artifacts(),
+            image.commitment(),
+        )?;
+        validate_portable_materialization(&self.store, &self.materialization, &claim)?;
+        Ok((image, claim))
+    }
+
+    pub(crate) fn restore_portable_checkpoint(
+        &mut self,
+        image: &PortableJournalCheckpoint,
+        maximum_index_nodes: usize,
+        certificate: &SharedAgentPortableSnapshotCertificate,
+        verified: &VerifiedSharedAgentPortableSnapshot,
+    ) -> Result<(), SharedJournalDriverError> {
+        if verified.claim() != certificate.claim()
+            || verified.certificate_commitment() != certificate.commitment()
+            || image.commitment() != certificate.claim().journal_image()
+            || image.heads().id() != certificate.claim().journal_heads()
+        {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        self.store
+            .install_portable_checkpoint(image, maximum_index_nodes)?;
+        let materialization =
+            materialize_current(&mut self.store, &mut self.executor, &NoPrunedOrderedBases);
+        #[cfg(test)]
+        if let Err(error) = &materialization {
+            eprintln!("portable durable materialization failed: {error:?}");
+        }
+        self.materialization = materialization?;
+        let validation = validate_portable_materialization(
+            &self.store,
+            &self.materialization,
+            certificate.claim(),
+        );
+        #[cfg(test)]
+        if let Err(error) = &validation {
+            eprintln!("portable durable claim validation failed: {error:?}");
+        }
+        validation?;
+        let installed = self
+            .ledger
+            .restore_portable_snapshot(certificate, verified)?;
+        validate_published_shared_checkpoint(&self.store, &self.materialization, &installed.claim)
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        let audit = self.ledger.journal_audit()?;
+        reconcile_journal_ledger(
+            &self.store,
+            &self.materialization,
+            self.ledger.journal_store(),
+            &audit,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn journal_store_instance_for_test(
+        &self,
+    ) -> super::shared_raft::JournalStoreInstanceId {
+        self.store.instance_id()
+    }
+
     pub(crate) fn create_shared_unexposed<T: super::replay::ReplaySealedOrdinaryGenesis>(
         mut store: super::journal_store::FileAgentJournalStore,
         artifacts: FileSharedArtifactStager,
@@ -2848,6 +2959,88 @@ fn command_outcome(
             SharedPhysicalApplyOutcome::Duplicate { index }
         }
     }
+}
+
+/// Reconstruct a portable image in an independent in-memory journal before
+/// any destination namespace is created. This repeats package trust and exact
+/// replay over the same typed store API used on restart.
+pub(crate) fn preflight_portable_checkpoint<T: super::replay::ReplaySealedOrdinaryGenesis>(
+    sealed: &T,
+    catalog: &[RuntimeBlob],
+    image: &PortableJournalCheckpoint,
+    claim: &super::shared_commit::SharedAgentPortableSnapshotClaim,
+    maximum_index_nodes: usize,
+    trust: Arc<dyn AgentTrustProvider>,
+    merge: Arc<dyn LocalMergeAuthenticator>,
+    committee: super::genesis::AgentReplicaCommittee,
+) -> Result<ReplayMaterialization, SharedJournalDriverError> {
+    if image.commitment() != claim.journal_image() || image.heads().id() != claim.journal_heads() {
+        return Err(SharedJournalDriverError::CrossStoreMismatch);
+    }
+    let mut store = MemoryAgentJournalStore::new(sealed.genesis().runtime().agent, merge.node())?;
+    for blob in catalog {
+        store.put_blob(
+            JournalBlobClass::CatalogArtifact,
+            &blob.reference,
+            &blob.bytes,
+        )?;
+    }
+    store.initialize_shared(sealed)?;
+    store.install_portable_checkpoint(image, maximum_index_nodes)?;
+    let resolver = store.catalog_blob_resolver()?;
+    let mut executor =
+        StandardLocalReplayExecutor::new_shared(resolver, trust, merge, vec![committee]);
+    let materialization = materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases)?;
+    validate_portable_materialization(&store, &materialization, claim)?;
+    Ok(materialization)
+}
+
+fn validate_portable_materialization<S>(
+    store: &S,
+    materialization: &ReplayMaterialization,
+    claim: &super::shared_commit::SharedAgentPortableSnapshotClaim,
+) -> Result<(), SharedJournalDriverError>
+where
+    S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+{
+    let commitment = claim.commitment();
+    let validation_claim = SharedAgentSnapshotClaim::new(
+        claim.ordered().clone(),
+        claim.active_committee().clone(),
+        claim.authority_epoch(),
+        Hash::digest(
+            b"vos/agent/shared/portable-validation/store/v1",
+            &[&commitment.0],
+        ),
+        Hash::digest(
+            b"vos/agent/shared/portable-validation/foundation/v1",
+            &[&commitment.0],
+        ),
+        claim.ordered_successor(),
+        claim.checkpoint_predecessor(),
+        claim.journal_heads(),
+        claim.checkpoint(),
+        claim.local_node(),
+        claim.control(),
+        claim.linear(),
+        claim.merge(),
+        claim.local(),
+        claim.ordered_invocations(),
+        claim.merge_invocations(),
+        claim.local_invocations(),
+        claim.artifacts(),
+        Hash::digest(
+            b"vos/agent/shared/portable-validation/retired/v1",
+            &[&commitment.0],
+        ),
+        Hash::digest(
+            b"vos/agent/shared/portable-validation/committee/v1",
+            &[&commitment.0],
+        ),
+        None,
+    )?;
+    validate_published_shared_checkpoint(store, materialization, &validation_claim)
+        .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)
 }
 
 fn clean_management_artifact_references(operation: &ReplayOperation) -> Option<Vec<BlobRef>> {

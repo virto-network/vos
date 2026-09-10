@@ -6765,6 +6765,188 @@ mod tests {
         }
 
         #[test]
+        fn singleton_system_agent_portable_backup_is_authenticated_fresh_and_restartable() {
+            let mut harness = NativeProjectionOwnerHarness::new("portable-shared-system");
+            let agent = HostAgentId(harness.fixture.plan.pins.agent.0);
+            let source_host = Arc::clone(&harness.owner.as_ref().unwrap().host);
+            drop(harness.owner.take());
+
+            let limits = crate::agent::shared_host::SharedAgentPortableBackupLimits {
+                max_objects: 4096,
+                max_blobs: 4096,
+                max_index_nodes: 4096,
+                max_bytes: 64 * 1024 * 1024,
+            };
+            let signing_key = SigningKey::from_bytes(&[NODE_SEED; 32]);
+            let (backup, source_store, source_position, source_snapshot) = {
+                let mut source = source_host.lock().unwrap();
+                let candidate = source.request_snapshot_compaction(agent).unwrap();
+                let signature = crate::agent::shared_commit::ReplicaCommitSignature::new(
+                    candidate.claim().local_node(),
+                    signing_key.sign(&candidate.signing_message().0).to_bytes(),
+                )
+                .unwrap();
+                let certificate = crate::agent::shared_commit::SharedAgentSnapshotCertificate::new(
+                    candidate.claim().clone(),
+                    vec![signature],
+                )
+                .unwrap();
+                source.install_snapshot(agent, &certificate).unwrap();
+
+                let candidate = source.request_portable_backup(agent, limits).unwrap();
+                let signature = crate::agent::shared_commit::ReplicaCommitSignature::new(
+                    candidate.claim().local_node(),
+                    signing_key.sign(&candidate.signing_message().0).to_bytes(),
+                )
+                .unwrap();
+                let certificate =
+                    crate::agent::shared_commit::SharedAgentPortableSnapshotCertificate::new(
+                        candidate.claim().clone(),
+                        vec![signature],
+                    )
+                    .unwrap();
+                let backup = source
+                    .export_portable_backup(agent, &certificate, limits)
+                    .unwrap();
+                (
+                    backup,
+                    source.journal_store_instance_for_test(agent).unwrap(),
+                    source.journal_position(agent).unwrap(),
+                    source.snapshot_state_for_test(agent).unwrap(),
+                )
+            };
+            assert!(
+                !backup
+                    .windows(source_store.as_bytes().len())
+                    .any(|window| window == source_store.as_bytes())
+            );
+
+            let destination = TestDirectory::new("portable-shared-system-destination");
+            let scope = AgentHostScope {
+                space: HostSpaceId(harness.fixture.plan.pins.space.0),
+                node: HostNodeId(harness.fixture.plan.pins.node.0),
+            };
+            let open_destination = || {
+                SharedAgentHost::open_with_root(
+                    destination.host(),
+                    destination.lock(),
+                    scope,
+                    Arc::clone(&harness.fixture.trust),
+                    Arc::clone(&harness.fixture.merge),
+                    Arc::clone(&harness.fixture.finality),
+                    harness.fixture.plan.pins.root.clone(),
+                )
+                .unwrap()
+            };
+            let mut restored = open_destination();
+            let mut tampered = backup.clone();
+            let offset = tampered.len() / 2;
+            tampered[offset] ^= 0x80;
+            assert_eq!(
+                restored.restore_portable_backup(&tampered, limits),
+                Err(crate::agent::shared_host::SharedAgentHostError::PortableBackupInvalid)
+            );
+            assert!(restored.is_empty());
+
+            let restored_status = restored.restore_portable_backup(&backup, limits).unwrap();
+            let destination_store = restored.journal_store_instance_for_test(agent).unwrap();
+            assert_ne!(source_store, destination_store);
+            assert_eq!(restored.journal_position(agent).unwrap(), source_position);
+            let (
+                crate::agent::shared_host::SharedAgentSnapshotState::Installed {
+                    raft_index: restored_index,
+                    raft_term: restored_term,
+                    ..
+                },
+                crate::agent::shared_host::SharedAgentSnapshotState::Installed {
+                    raft_index: source_index,
+                    raft_term: source_term,
+                    ..
+                },
+            ) = (restored_status.snapshots, source_snapshot)
+            else {
+                panic!("source and restored checkpoints must both be installed")
+            };
+            assert_eq!((restored_index, restored_term), (source_index, source_term));
+            let stable_status = restored.show(agent).unwrap().unwrap();
+            assert_eq!(
+                restored.restore_portable_backup(&backup, limits),
+                Err(crate::agent::shared_host::SharedAgentHostError::Conflict)
+            );
+            assert_eq!(restored.show(agent).unwrap().unwrap(), stable_status);
+            assert_eq!(
+                restored.journal_store_instance_for_test(agent).unwrap(),
+                destination_store
+            );
+
+            drop(restored);
+            let reopened = open_destination();
+            assert_eq!(reopened.show(agent).unwrap().unwrap(), stable_status);
+            assert_eq!(reopened.journal_position(agent).unwrap(), source_position);
+            assert_eq!(
+                reopened.journal_store_instance_for_test(agent).unwrap(),
+                destination_store
+            );
+            drop(reopened);
+
+            // The complete authenticated bundle is retained before any
+            // generation byte. A process loss at that first durable boundary
+            // resumes into the same logical state with another fresh physical
+            // store identity, then retires the recovery authority.
+            let interrupted_destination = TestDirectory::new("portable-shared-system-marker-crash");
+            let open_interrupted_destination = || {
+                SharedAgentHost::open_with_root(
+                    interrupted_destination.host(),
+                    interrupted_destination.lock(),
+                    scope,
+                    Arc::clone(&harness.fixture.trust),
+                    Arc::clone(&harness.fixture.merge),
+                    Arc::clone(&harness.fixture.finality),
+                    harness.fixture.plan.pins.root.clone(),
+                )
+                .unwrap()
+            };
+            {
+                let mut interrupted = open_interrupted_destination();
+                assert_eq!(
+                    interrupted
+                        .retain_portable_restore_marker_for_test(&backup, limits)
+                        .unwrap(),
+                    agent
+                );
+                assert!(interrupted.is_empty());
+            }
+            let recovered = open_interrupted_destination();
+            let recovered_store = recovered.journal_store_instance_for_test(agent).unwrap();
+            assert_ne!(recovered_store, source_store);
+            assert_ne!(recovered_store, destination_store);
+            assert_eq!(recovered.journal_position(agent).unwrap(), source_position);
+            assert!(matches!(
+                recovered.snapshot_state_for_test(agent).unwrap(),
+                crate::agent::shared_host::SharedAgentSnapshotState::Installed {
+                    raft_index,
+                    raft_term,
+                    ..
+                } if (raft_index, raft_term) == (source_index, source_term)
+            ));
+            drop(recovered);
+            let recovered_again = open_interrupted_destination();
+            assert_eq!(
+                recovered_again
+                    .journal_store_instance_for_test(agent)
+                    .unwrap(),
+                recovered_store
+            );
+            assert_eq!(
+                recovered_again.journal_position(agent).unwrap(),
+                source_position
+            );
+            drop(recovered_again);
+            drop(source_host);
+            harness.stop();
+        }
+
+        #[test]
         fn credential_sequence_and_derived_invocation_are_part_of_the_plan_boundary() {
             let fixture = physical_fixture();
             assert_eq!(fixture.plan.catalog_call.request_sequence.get(), 1);
