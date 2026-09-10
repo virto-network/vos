@@ -22,7 +22,7 @@ use vos::agent_sdk::{
 use vos::prelude::*;
 
 pub const SYSTEM_CATALOG_CONFIGURATION_MAGIC: [u8; 4] = *b"SCC1";
-pub const MAX_CATALOG_ALIASES: usize = 256;
+pub const MAX_CATALOG_ALIASES: usize = 241;
 pub const MAX_RETAINED_CATALOG_WIRE_BYTES: usize = MAX_CATALOG_ALIASES
     * (MAX_INVOCATION_MESSAGE_BYTES
         + MAX_CATALOG_MUTATION_RESULT_WIRE_BYTES
