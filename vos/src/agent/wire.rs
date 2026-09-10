@@ -7801,7 +7801,9 @@ pub(crate) mod tests {
         crate::agent_sdk::authority::AuthorityReceipt,
         crate::agent_sdk::YieldedInvocation,
     ) {
-        let (mut runtime, work) = clean_resolvable_fixture(false);
+        let (mut runtime, work) = clean_policy_fixture(
+            crate::agent_sdk::method_policy::AuthorizationPolicySelector::Public,
+        );
         let state = runtime.snapshot();
         let config = state.config.as_ref().unwrap().clone();
         let (invocation, ..) = runtime.resolve_clean_invocation(&work).unwrap();
@@ -8742,6 +8744,7 @@ pub(crate) mod tests {
     #[cfg(feature = "pvm")]
     #[test]
     fn clean_pending_retry_and_resume_validation_are_exact_and_state_preserving() {
+        use crate::actors::codec::Encode as _;
         use crate::agent_sdk::{InvocationError, ResumeInput, RuntimeOutcome, RuntimeWork};
 
         let (state, work, authority, yielded) = clean_pending_fixture();
@@ -8817,7 +8820,13 @@ pub(crate) mod tests {
         assert_rejected(failed, InvocationError::InvalidInput);
 
         let mut divergent = work.clone();
-        divergent.message.push(0xff);
+        let mut divergent_message = vec![crate::actors::value::TAG_DYNAMIC];
+        divergent_message.extend_from_slice(
+            &crate::actors::value::Msg::new("write")
+                .with("divergent", crate::actors::value::Value::Bool(true))
+                .encode(),
+        );
+        divergent.message = divergent_message;
         let divergent_authority = clean_authority_receipt(
             clean_sparse_standard_state().config.as_ref().unwrap(),
             &divergent,
@@ -8846,7 +8855,9 @@ pub(crate) mod tests {
         crate::agent_sdk::authority::AuthorityReceipt,
         crate::agent_sdk::InvocationReply,
     ) {
-        let (mut runtime, work) = clean_resolvable_fixture(false);
+        let (mut runtime, work) = clean_policy_fixture(
+            crate::agent_sdk::method_policy::AuthorizationPolicySelector::Public,
+        );
         let authority = clean_authority_receipt(runtime.config().unwrap(), &work);
         let authorization =
             crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(authority.clone());

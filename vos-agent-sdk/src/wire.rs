@@ -5410,8 +5410,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/acc3-golden", &[&call_bytes]).0,
             [
-                70, 226, 120, 242, 59, 173, 142, 196, 225, 89, 250, 96, 226, 43, 247, 147, 50, 141,
-                189, 163, 69, 78, 87, 222, 151, 171, 103, 199, 92, 111, 32, 54,
+                109, 220, 216, 104, 90, 240, 128, 79, 28, 116, 232, 203, 170, 119, 180, 209, 68, 2,
+                203, 154, 96, 192, 2, 12, 31, 138, 111, 225, 45, 172, 163, 90,
             ]
         );
 
@@ -5423,8 +5423,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/map2-golden", &[&approval_bytes]).0,
             [
-                45, 113, 251, 3, 161, 170, 249, 229, 47, 54, 186, 217, 147, 22, 209, 235, 130, 207,
-                68, 205, 69, 143, 96, 13, 116, 236, 143, 180, 244, 84, 170, 52,
+                73, 134, 235, 123, 175, 7, 118, 129, 88, 164, 11, 136, 116, 245, 4, 196, 18, 128,
+                163, 48, 229, 13, 10, 139, 30, 197, 97, 4, 19, 103, 63, 205,
             ]
         );
 
@@ -5439,8 +5439,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/maa2-golden", &[&acknowledgement_bytes]).0,
             [
-                187, 116, 176, 241, 211, 43, 226, 122, 92, 10, 159, 64, 192, 98, 148, 135, 58, 34,
-                209, 162, 31, 4, 198, 14, 135, 62, 228, 101, 206, 245, 215, 37,
+                71, 54, 101, 155, 44, 36, 104, 229, 254, 101, 82, 4, 207, 201, 199, 59, 49, 247,
+                190, 238, 204, 144, 42, 180, 154, 143, 176, 136, 227, 15, 243, 240,
             ]
         );
     }
@@ -5455,8 +5455,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/aad4-golden", &[&bytes]).0,
             [
-                122, 151, 25, 237, 134, 19, 77, 165, 135, 151, 71, 15, 11, 74, 251, 163, 30, 17,
-                136, 91, 171, 245, 77, 176, 57, 78, 132, 40, 112, 248, 194, 27,
+                172, 84, 165, 31, 32, 87, 124, 198, 82, 18, 206, 207, 179, 107, 122, 245, 42, 125,
+                97, 213, 124, 95, 17, 242, 128, 97, 16, 215, 13, 200, 59, 10,
             ]
         );
 
@@ -5471,8 +5471,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/aar4-golden", &[&result_bytes]).0,
             [
-                41, 106, 187, 249, 255, 59, 252, 150, 89, 49, 171, 8, 178, 173, 213, 24, 253, 235,
-                184, 127, 109, 58, 180, 83, 178, 134, 237, 201, 220, 217, 129, 231,
+                99, 113, 41, 1, 224, 22, 194, 248, 15, 247, 62, 79, 183, 54, 251, 30, 104, 106,
+                146, 16, 169, 66, 0, 218, 126, 179, 149, 159, 4, 57, 120, 215,
             ]
         );
         assert_ne!(call.commitment(), result.commitment());
@@ -6328,8 +6328,8 @@ mod tests {
         assert_eq!(
             golden.0,
             [
-                44, 49, 179, 82, 16, 78, 105, 5, 222, 246, 226, 29, 8, 166, 116, 141, 145, 19, 13,
-                61, 223, 75, 205, 233, 189, 255, 14, 88, 214, 60, 97, 74,
+                113, 26, 117, 6, 49, 208, 110, 209, 195, 62, 16, 108, 163, 70, 19, 201, 86, 123,
+                231, 215, 225, 144, 160, 66, 134, 75, 26, 152, 124, 210, 131, 12,
             ]
         );
 
@@ -6584,7 +6584,7 @@ mod tests {
     }
 
     #[test]
-    fn acknowledgement_work_and_outcome_have_one_r12_canonical_wire() {
+    fn acknowledgement_work_and_outcome_have_one_r14_canonical_wire() {
         let invocation = invocation();
         let authority = receipt_for(&invocation);
         let work = RuntimeWork::Acknowledge {
@@ -7077,7 +7077,7 @@ mod tests {
             Err(WireError::Decode(DecodeError::InvalidTag))
         );
         let mut old_abi = encoded_mutation.clone();
-        old_abi[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-260907-r12");
+        old_abi[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-260907-r13");
         assert_eq!(
             PrivateRuntimeMutation::decode(&old_abi),
             Err(WireError::Decode(DecodeError::InvalidPlatform))
@@ -7182,7 +7182,7 @@ mod tests {
         assert_eq!(selected_deployment.encode(), Err(WireError::InvalidValue));
 
         let mut old_abi = encoded.clone();
-        old_abi[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-260907-r12");
+        old_abi[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-260907-r13");
         assert_eq!(
             RuntimeWork::decode(&old_abi),
             Err(WireError::Decode(DecodeError::InvalidPlatform))

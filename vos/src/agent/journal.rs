@@ -732,7 +732,7 @@ impl InvocationAcknowledgedFact {
 }
 
 impl ServiceWire for InvocationAcknowledgedFact {
-    const MAGIC: [u8; 4] = *b"AHF3";
+    const MAGIC: [u8; 4] = *b"AHF4";
 
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
@@ -5138,7 +5138,7 @@ mod tests {
 
         // Neither the pre-purpose fact nor the prior work-key generation is
         // upgraded implicitly.
-        for magic in [b"AGHF", b"AHF2"] {
+        for magic in [b"AGHF", b"AHF2", b"AHF3"] {
             let mut predecessor_wire = first.encode();
             predecessor_wire[..4].copy_from_slice(magic);
             assert!(InvocationAcknowledgedFact::decode(&predecessor_wire).is_err());

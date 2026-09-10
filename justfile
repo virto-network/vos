@@ -183,8 +183,18 @@ test-examples:
     cd examples/actors; cargo +nightly actor -p private-notes
     cd examples/actors; cargo +nightly actor -p local-signer
     cd services/agent-runtime-guest; cargo test
-    cd examples/agent-runtimes/custom-linear; cargo test
     cd examples/agent-runtimes/custom-linear; cargo actor
+    cd examples/agent-runtimes/custom-linear; cargo test
+    cd examples/agent-runtimes/custom-linear; cargo test --lib tests::compiled_runtime_executes_scheduling_and_rejects_attested_context -- --ignored --exact --test-threads=1
+
+# Execute the maintained custom AgentRuntime through its freshly linked SPI
+# artifact. The ordinary host tests remain fast and artifact-independent;
+# this explicit gate proves that the checked source, target configuration, and
+# clean outer ABI produce the same durable scheduling transitions.
+test-custom-agent-runtime:
+    cd examples/agent-runtimes/custom-linear; cargo actor
+    cd examples/agent-runtimes/custom-linear; cargo test
+    cd examples/agent-runtimes/custom-linear; cargo test --lib tests::compiled_runtime_executes_scheduling_and_rejects_attested_context -- --ignored --exact --test-threads=1
 
 # Run extension tests.
 test-extensions: build-extensions build-workflow-fixture

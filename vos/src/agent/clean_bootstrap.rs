@@ -2359,7 +2359,6 @@ fn invoke_actor(
         .ok_or_else(|| rejected(CleanSystemAgentBootstrapRejection::WrongOutcome))
 }
 
-#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 fn dynamic_message(name: &str, argument: &str, value: crate::actors::value::Value) -> Vec<u8> {
     use crate::actors::codec::Encode as _;
 
@@ -5829,6 +5828,9 @@ mod tests {
             let mut trailing = record_bytes.clone();
             trailing.push(0);
             assert!(CleanSystemAgentBootstrapRecord::decode(&trailing).is_err());
+            let mut previous_record_version = record_bytes.clone();
+            previous_record_version[4 + 32] = 2;
+            assert!(CleanSystemAgentBootstrapRecord::decode(&previous_record_version).is_err());
             let mut old = record_bytes.clone();
             old[..4].copy_from_slice(b"CSB1");
             assert!(CleanSystemAgentBootstrapRecord::decode(&old).is_err());

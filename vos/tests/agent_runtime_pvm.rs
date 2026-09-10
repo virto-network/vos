@@ -760,7 +760,7 @@ fn bundled_runtime_identity_and_vos3_package_are_exactly_pinned() {
     );
     assert_eq!(
         sdk::RUNTIME_ABI_ID,
-        Hash(*b"vos-agent-runtime-abi-260907-r13")
+        Hash(*b"vos-agent-runtime-abi-260910-r14")
     );
 
     let mut previous_generation = bytes;
@@ -942,7 +942,13 @@ fn bundled_runtime_installs_exact_catalog_executes_retries_and_acknowledges() {
     assert_eq!(retried.outcome, completed.outcome);
 
     let mut divergent = work.clone();
-    divergent.message.push(0xff);
+    let mut divergent_message = vec![vos::value::TAG_DYNAMIC];
+    divergent_message.extend_from_slice(
+        &vos::value::Msg::new("write")
+            .with("divergent", vos::value::Value::Bool(true))
+            .encode(),
+    );
+    divergent.message = divergent_message;
     let divergent_authority = invocation_receipt(&descriptor, &divergent, 3, 100);
     let rejected = apply_runtime(RuntimeWork::Invoke {
         context: RuntimeExecutionContext::Direct,
@@ -996,32 +1002,32 @@ fn bundled_runtime_installs_exact_catalog_executes_retries_and_acknowledges() {
         invocation: Box::new(work.clone()),
         authorization: Box::new(InvocationAuthorization::AuthorityReceipt(authority.clone())),
     });
+    let expected_acknowledgement = InvocationAcknowledgement {
+        invocation: work.invocation,
+        actor: work.actor,
+        incarnation: work.incarnation,
+        deployment: work.deployment,
+        mode: work.mode,
+        work: work.commitment(),
+        authorization: InvocationAuthorization::AuthorityReceipt(authority.clone()).commitment(),
+    };
     assert_eq!(
         acknowledged.outcome,
-        RuntimeOutcome::Acknowledged(Ok(InvocationAcknowledgement {
-            invocation: work.invocation,
-            actor: work.actor,
-            incarnation: work.incarnation,
-            deployment: work.deployment,
-            mode: work.mode,
-            work: work.commitment(),
-            authorization: InvocationAuthorization::AuthorityReceipt(authority.clone())
-                .commitment(),
-        }))
+        RuntimeOutcome::Acknowledged(Ok(expected_acknowledgement.clone()))
     );
 
     let restarted = restart(&acknowledged);
-    let missing = apply_runtime(RuntimeWork::Acknowledge {
+    let replayed = apply_runtime(RuntimeWork::Acknowledge {
         context: RuntimeExecutionContext::Direct,
         state: restarted.state.clone(),
         invocation: Box::new(work.clone()),
         authorization: Box::new(InvocationAuthorization::AuthorityReceipt(authority.clone())),
     });
     assert_eq!(
-        missing.outcome,
-        RuntimeOutcome::Acknowledged(Err(InvocationError::NotFound))
+        replayed.outcome,
+        RuntimeOutcome::Acknowledged(Ok(expected_acknowledgement))
     );
-    assert_eq!(missing.state, restarted.state);
+    assert_eq!(replayed.state, restarted.state);
 
     let expired = apply_runtime(RuntimeWork::Invoke {
         context: RuntimeExecutionContext::Direct,

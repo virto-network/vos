@@ -125,7 +125,7 @@ const CONFIG_ENCODED_BYTES: usize = SYSTEM_AUTHORITY_CONFIGURATION_MAGIC.len()
     + PRIVATE_SIGNATURE_BYTES;
 const EVIDENCE_DOMAIN: &[u8] = b"vos/system-authority/policy-evidence/v1";
 const OPERATION_EVIDENCE_DOMAIN: &[u8] = b"vos/system-authority/operation-evidence/v1";
-const STATE_INTEGRITY_DOMAIN: &[u8] = b"vos/system-authority/state-integrity/v16";
+const STATE_INTEGRITY_DOMAIN: &[u8] = b"vos/system-authority/state-integrity/v17";
 
 const _: () = assert!(MAX_RETAINED_EXACT_WIRE_BYTES < MAX_RUNTIME_STATE_BYTES);
 
@@ -9531,7 +9531,7 @@ mod tests {
         assert_eq!(SystemAuthorityConfiguration::decode(&encoded), Some(config));
         assert_eq!(
             <SystemAuthority as vos::Actor>::STATE_SCHEMA_VERSION,
-            16,
+            17,
             "complete projection rows are a clean Linear state generation",
         );
 

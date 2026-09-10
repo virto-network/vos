@@ -348,6 +348,7 @@ impl LocalAgentHost {
         }
     }
 
+    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
     fn audit_authority_projection_exact(
         &self,
         projected: &[super::supervisor_adapters::AgentAuthorityRouteProjection],
@@ -391,6 +392,7 @@ impl LocalAgentHost {
         Ok(identities)
     }
 
+    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
     fn physical_projection_is_one_ack_ahead(
         &self,
         head: crate::agent_sdk::authority::AuthorityProjectionHead,
