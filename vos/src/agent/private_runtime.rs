@@ -41,8 +41,8 @@ use vos_agent_sdk::wire::{
 use vos_agent_sdk::{
     ActorEntry, ActorId, AgentDescriptor, AgentId, AgentProfile, BlobRef, DeploymentId, Hash,
     MAX_CATALOG_ARTIFACT_BYTES, MAX_RUNTIME_STATE_BYTES, ManagementError, ManagementReply,
-    ManagementRequest, NodeId, PrincipalId, PrivateRuntimeMutation, RUNTIME_ABI_ID, RuntimeOutcome,
-    RuntimeState, RuntimeTransition, SpaceId,
+    ManagementRequest, NodeId, PrincipalId, PrivateRuntimeMutation, ProducerId, ProgramId,
+    RUNTIME_ABI_ID, RuntimeOutcome, RuntimeState, RuntimeTransition, SpaceId,
 };
 use vos_protocol::wire::{DecodeError, Decoder, Encoder};
 
@@ -105,6 +105,18 @@ pub enum PrivateRuntimeEvidenceError {
     LimitExceeded,
 }
 
+/// Minimal non-secret route projection extracted inside the authenticated
+/// Private runtime boundary. Names, package references, lane state, messages,
+/// object bytes, and key material never cross this seam.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PrivateRuntimeActorRoute {
+    pub(super) actor: ActorId,
+    pub(super) incarnation: Hash,
+    pub(super) deployment: DeploymentId,
+    pub(super) program: ProgramId,
+    pub(super) suspended: bool,
+}
+
 impl fmt::Display for PrivateRuntimeEvidenceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "invalid Private runtime evidence: {self:?}")
@@ -141,14 +153,36 @@ fn decode_optional_u64(decoder: &mut Decoder<'_>) -> Result<Option<u64>, DecodeE
 fn encode_managed(encoder: &mut Encoder<'_>, managed: ManagedAgentTarget) {
     encoder.fixed(managed.space.as_bytes());
     encoder.fixed(managed.agent.as_bytes());
+    encoder.fixed(managed.owner.as_bytes());
+    encoder.u8(managed.profile as u8);
     encoder.fixed(managed.runtime_deployment.as_bytes());
+    encoder.fixed(managed.transition_producer.as_bytes());
+}
+
+fn managed_target_for_descriptor(descriptor: &AgentDescriptor) -> ManagedAgentTarget {
+    ManagedAgentTarget {
+        space: descriptor.identity.space,
+        agent: descriptor.identity.agent,
+        owner: descriptor.identity.owner,
+        profile: descriptor.identity.profile,
+        runtime_deployment: descriptor.identity.runtime_deployment,
+        transition_producer: descriptor.identity.transition_producer,
+    }
 }
 
 fn decode_managed(decoder: &mut Decoder<'_>) -> Result<ManagedAgentTarget, DecodeError> {
     let managed = ManagedAgentTarget {
         space: SpaceId(decoder.fixed()?),
         agent: AgentId(decoder.fixed()?),
+        owner: PrincipalId(decoder.fixed()?),
+        profile: match decoder.u8()? {
+            0 => AgentProfile::Local,
+            1 => AgentProfile::Shared,
+            2 => AgentProfile::Private,
+            _ => return Err(DecodeError::InvalidTag),
+        },
         runtime_deployment: DeploymentId(decoder.fixed()?),
+        transition_producer: ProducerId(decoder.fixed()?),
     };
     managed
         .is_valid()
@@ -198,11 +232,7 @@ fn verify_creation_receipt<V: AuthorityVerifier>(
     genesis_at: u64,
     verifier: &V,
 ) -> Result<(), PrivateRuntimeEvidenceError> {
-    let managed = ManagedAgentTarget {
-        space: descriptor.identity.space,
-        agent: descriptor.identity.agent,
-        runtime_deployment: descriptor.identity.runtime_deployment,
-    };
+    let managed = managed_target_for_descriptor(descriptor);
     let request = ManagementRequest::Create(Box::new(descriptor.clone()));
     if descriptor.validate().is_err()
         || descriptor.identity.profile != AgentProfile::Private
@@ -759,6 +789,7 @@ pub(crate) fn classify_private_runtime_control_transition_for_replay(
     };
     if !request.is_valid()
         || !managed.is_valid()
+        || managed.profile != AgentProfile::Private
         || !predecessor_state.validate()
         || !predecessor_active_policy.is_valid()
         || control.space != managed.space
@@ -996,6 +1027,7 @@ impl PrivateRuntimeStableProjection {
 
     pub fn validate(&self) -> Result<(), PrivateRuntimeEvidenceError> {
         if !self.managed.is_valid()
+            || self.managed.profile != AgentProfile::Private
             || self.descriptor == Hash::ZERO
             || !valid_runtime_package(&self.runtime_package)
             || self.creation_receipt == Hash::ZERO
@@ -1317,11 +1349,7 @@ impl PrivateRuntimeImage {
         {
             return Err(PrivateRuntimeEvidenceError::InvalidDescriptor);
         }
-        let managed = ManagedAgentTarget {
-            space: descriptor.identity.space,
-            agent: descriptor.identity.agent,
-            runtime_deployment: descriptor.identity.runtime_deployment,
-        };
+        let managed = managed_target_for_descriptor(descriptor);
         verify_creation_receipt(
             descriptor,
             &creation_receipt,
@@ -1694,6 +1722,55 @@ impl PrivateRuntimeImage {
     pub fn state(&self) -> &RuntimeState {
         &self.state
     }
+
+    /// Extract only full dispatch identities from the already-authenticated
+    /// PVRI state. This does not expose plaintext actor metadata or provide an
+    /// invocation path; the supervisor's Private adapter remains not-ready
+    /// until a ciphertext execution backend exists.
+    pub(super) fn supervisor_actor_routes(
+        &self,
+        descriptor: &AgentDescriptor,
+    ) -> Result<Vec<PrivateRuntimeActorRoute>, PrivateRuntimeEvidenceError> {
+        self.validate()?;
+        if descriptor.validate().is_err()
+            || descriptor.identity.profile != AgentProfile::Private
+            || descriptor.commitment() != self.descriptor
+            || descriptor.identity.runtime_deployment != self.runtime_deployment
+        {
+            return Err(PrivateRuntimeEvidenceError::InvalidDescriptor);
+        }
+        let state = super::wire::decode_clean_standard_runtime_state(&self.state)
+            .map_err(|_| PrivateRuntimeEvidenceError::InvalidState)?;
+        if state.clean_descriptor.as_ref() != Some(descriptor)
+            || state.actors.len() > descriptor.capabilities.max_actors as usize
+            || state
+                .actors
+                .windows(2)
+                .any(|pair| pair[0].record.entry.actor >= pair[1].record.entry.actor)
+        {
+            return Err(PrivateRuntimeEvidenceError::InvalidState);
+        }
+        let mut routes = Vec::with_capacity(state.actors.len());
+        for actor in state.actors {
+            let entry = actor.record.entry;
+            let route = PrivateRuntimeActorRoute {
+                actor: ActorId(entry.actor.0),
+                incarnation: Hash(actor.record.state_generation.0),
+                deployment: DeploymentId(entry.deployment.0),
+                program: ProgramId(entry.program.0),
+                suspended: entry.suspended,
+            };
+            if route.actor == ActorId::ZERO
+                || route.incarnation == Hash::ZERO
+                || route.deployment == DeploymentId::ZERO
+                || route.program == ProgramId::ZERO
+            {
+                return Err(PrivateRuntimeEvidenceError::InvalidState);
+            }
+            routes.push(route);
+        }
+        Ok(routes)
+    }
     pub const fn active_resource_policy(&self) -> RuntimeResourcePolicy {
         self.active_resource_policy
     }
@@ -1751,8 +1828,7 @@ impl PrivateRuntimeImage {
         if descriptor.validate().is_err()
             || descriptor.identity.profile != AgentProfile::Private
             || descriptor.commitment() != self.descriptor
-            || descriptor.identity.space != self.managed.space
-            || descriptor.identity.agent != self.managed.agent
+            || managed_target_for_descriptor(descriptor) != self.managed
             || descriptor.identity.owner != self.owner
             || descriptor.identity.runtime_deployment != self.runtime_deployment
             || descriptor.runtime_package != self.runtime_package
@@ -1772,6 +1848,7 @@ impl PrivateRuntimeImage {
         validate_key_epochs(&self.key_epochs)?;
         self.stable_projection.validate()?;
         if !self.managed.is_valid()
+            || self.managed.profile != AgentProfile::Private
             || self.node == NodeId::ZERO
             || self.owner == PrincipalId::ZERO
             || self.descriptor == Hash::ZERO
@@ -1786,6 +1863,7 @@ impl PrivateRuntimeImage {
             || (self.establishment_completion.is_some() && self.establishment_origin.is_none())
             || self.runtime_deployment == DeploymentId::ZERO
             || self.managed.runtime_deployment != self.runtime_deployment
+            || self.managed.owner != self.owner
             || self.store.space != self.managed.space
             || self.store.agent != self.managed.agent
             || self.store.owner != self.owner
@@ -2440,10 +2518,8 @@ impl PrivateRuntimeApplication {
         if descriptor.validate().is_err()
             || descriptor.identity.profile != AgentProfile::Private
             || descriptor.commitment() != self.descriptor
-            || descriptor.identity.space != self.managed.space
-            || descriptor.identity.agent != self.managed.agent
+            || managed_target_for_descriptor(descriptor) != self.managed
             || descriptor.identity.owner != self.predecessor_store.owner
-            || descriptor.identity.runtime_deployment != self.managed.runtime_deployment
             || descriptor.runtime_package != self.runtime_package
             || !descriptor.authority.accepts(&self.receipt)
         {
@@ -2582,6 +2658,7 @@ impl PrivateRuntimeApplication {
         self.expected_successor_store.validate()?;
         self.predecessor_stable_projection.validate()?;
         if !self.managed.is_valid()
+            || self.managed.profile != AgentProfile::Private
             || self.node == NodeId::ZERO
             || self.control.space != self.managed.space
             || self.control.agent != self.managed.agent
@@ -2600,6 +2677,7 @@ impl PrivateRuntimeApplication {
             || self.expected_successor_store.space != self.managed.space
             || self.expected_successor_store.agent != self.managed.agent
             || self.predecessor_store.owner != self.expected_successor_store.owner
+            || self.managed.owner != self.predecessor_store.owner
             || self.predecessor_stable_projection.managed != self.managed
             || self.predecessor_stable_projection.descriptor != self.descriptor
             || self.predecessor_stable_projection.runtime_package != self.runtime_package
@@ -2979,6 +3057,7 @@ mod tests {
                     runtime_deployment: DeploymentId([12; 32]),
                     runtime_program: ProgramId([13; 32]),
                     runtime_producer: ProducerId([14; 32]),
+                    transition_producer: ProducerId([15; 32]),
                 },
                 creation_nonce,
                 authority,
@@ -3465,7 +3544,7 @@ mod tests {
         };
         assert!(control.validate_shape());
         let proof = PrivateRecoveryAuthorityProof::from_control(
-            predecessor.runtime_deployment,
+            predecessor.managed,
             &control,
             None,
             &RecoverySigner(RECOVERY_PUBLIC_KEY),
@@ -5031,6 +5110,41 @@ mod tests {
     fn route_descriptor_and_store_substitution_are_detected() {
         let fixture = Fixture::new();
         let (_, successor, completed, _) = policy_application(&fixture, &fixture.predecessor, 5);
+
+        let mut shared_projection = fixture.predecessor.stable_projection.clone();
+        shared_projection.managed.profile = AgentProfile::Shared;
+        assert_eq!(
+            shared_projection.validate(),
+            Err(PrivateRuntimeEvidenceError::InvalidProjection)
+        );
+        let mut shared_image = fixture.predecessor.clone();
+        shared_image.managed.profile = AgentProfile::Shared;
+        shared_image.stable_projection.managed.profile = AgentProfile::Shared;
+        assert_eq!(
+            shared_image.validate(),
+            Err(PrivateRuntimeEvidenceError::InvalidProjection)
+        );
+        let mut shared_application = completed.clone();
+        shared_application.managed.profile = AgentProfile::Shared;
+        assert_eq!(
+            shared_application.validate(),
+            Err(PrivateRuntimeEvidenceError::InvalidApplication)
+        );
+
+        // A decoded image can be internally self-consistent while relabeling
+        // its portable transition signer. Reopening must bind the complete
+        // descriptor-derived target, not just space/agent/runtime deployment.
+        let mut wrong_transition_producer = fixture.predecessor.clone();
+        wrong_transition_producer.managed.transition_producer.0[0] ^= 1;
+        wrong_transition_producer
+            .stable_projection
+            .managed
+            .transition_producer = wrong_transition_producer.managed.transition_producer;
+        assert_eq!(wrong_transition_producer.validate(), Ok(()));
+        assert_eq!(
+            wrong_transition_producer.reopen_with(&fixture.descriptor, &AllowVerifier),
+            Err(PrivateRuntimeEvidenceError::InvalidDescriptor)
+        );
 
         let mut wrong_descriptor = fixture.descriptor.clone();
         wrong_descriptor.runtime_package = BlobRef::of_bytes(b"different-private-runtime");

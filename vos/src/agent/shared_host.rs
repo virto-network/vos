@@ -100,6 +100,11 @@ pub enum SharedAgentHostError {
     SnapshotEvidenceLimit,
 }
 
+pub(crate) enum SharedAuthorityProjectionAudit {
+    Ready(Vec<super::supervisor::AgentRouteIdentity>),
+    Lag,
+}
+
 impl core::fmt::Display for SharedAgentHostError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(formatter, "Shared Agent host: {self:?}")
@@ -253,6 +258,33 @@ pub struct SharedAgentStatus {
     pub reservation_pending: bool,
     pub transport: SharedAgentTransportState,
     pub snapshots: SharedAgentSnapshotState,
+}
+
+/// Attachment facts which do not require executing a full actor-directory
+/// projection. Invocation dispatch uses this view while holding the network
+/// generation lease, then performs one keyed actor/material lookup. The full
+/// [`SharedAgentStatus`] remains the administrative surface and may derive
+/// aggregate engine lanes from the complete bounded directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SharedAgentAttachmentStatus {
+    pub(crate) identity: AgentIdentity,
+    pub(crate) generation: AgentGenerationRouteKey,
+    pub(crate) route: AgentRouteKey,
+    pub(crate) replication_id: [u8; 32],
+    pub(crate) local_role: Option<ReplicaRole>,
+    pub(crate) replicas: Vec<SharedReplicaRoute>,
+    pub(crate) committee_transition: Option<SharedCommitteeTransitionRoute>,
+    pub(crate) transport: SharedAgentTransportState,
+}
+
+/// Exact SDK identity projection reconstructed from one authenticated Shared
+/// journal image while the host boundary is locked. This is deliberately
+/// narrower than a host handle: it carries no storage, consensus, or legacy
+/// Service identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SharedAgentRuntimeProjection {
+    pub(crate) descriptor: crate::agent_sdk::AgentDescriptor,
+    pub(crate) actors: Vec<crate::agent_sdk::ActorDirectoryRecord>,
 }
 
 /// Exact journal position needed to construct the next candidate outside the
@@ -885,6 +917,258 @@ impl SharedAgentHost {
             .transpose()
     }
 
+    /// Read only the authenticated generation/committee attachment facts.
+    /// Unlike `show`, this does not execute an actor-directory query and is
+    /// therefore safe to pair with one keyed invocation-material lookup on a
+    /// hot dispatch path.
+    pub(crate) fn supervisor_attachment_status(
+        &self,
+        agent: AgentId,
+    ) -> Result<Option<SharedAgentAttachmentStatus>, SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .map(|hosted| attachment_status_for(hosted, self.transport_is_attached(agent)))
+            .transpose()
+    }
+
+    /// Reconstruct a bounded actor-directory projection from the same live
+    /// journal driver that supplied the current runtime descriptor. Callers
+    /// hold the outer host mutex, so descriptor and directory cannot be mixed
+    /// across two locally submitted transitions.
+    pub(crate) fn clean_runtime_projection(
+        &self,
+        agent: AgentId,
+    ) -> Result<SharedAgentRuntimeProjection, SharedAgentHostError> {
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        let descriptor = hosted.driver.clean_descriptor().map_err(map_driver_error)?;
+        if descriptor.validate().is_err()
+            || descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared
+        {
+            return Err(SharedAgentHostError::CorruptResidue);
+        }
+        let maximum = descriptor.capabilities.max_actors as usize;
+        let limit = u16::try_from(crate::agent_sdk::MAX_DIRECTORY_PAGE_ENTRIES)
+            .map_err(|_| SharedAgentHostError::CorruptResidue)?;
+        let maximum_pages = maximum
+            .div_ceil(crate::agent_sdk::MAX_DIRECTORY_PAGE_ENTRIES)
+            .saturating_add(1);
+        let mut actors = Vec::new();
+        let mut after = None;
+        for _ in 0..maximum_pages {
+            let outcome = hosted
+                .driver
+                .inspect_clean_management(&crate::agent_sdk::ManagementRequest::InspectActors {
+                    after,
+                    limit,
+                })
+                .map_err(map_driver_error)?;
+            let crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                crate::agent_sdk::ManagementReply::Actors(page),
+            )) = outcome
+            else {
+                return Err(SharedAgentHostError::CorruptResidue);
+            };
+            if page.validate().is_err()
+                || page
+                    .entries
+                    .first()
+                    .is_some_and(|record| after.is_some_and(|cursor| record.entry.actor <= cursor))
+                || actors
+                    .len()
+                    .checked_add(page.entries.len())
+                    .is_none_or(|count| count > maximum)
+                || (page.next.is_some() && page.entries.len() != usize::from(limit))
+            {
+                return Err(SharedAgentHostError::CorruptResidue);
+            }
+            actors.extend(page.entries);
+            let Some(next) = page.next else {
+                return Ok(SharedAgentRuntimeProjection { descriptor, actors });
+            };
+            if after == Some(next) {
+                return Err(SharedAgentHostError::CorruptResidue);
+            }
+            after = Some(next);
+        }
+        Err(SharedAgentHostError::CorruptResidue)
+    }
+
+    /// Load one complete invocation closure from the exact journal generation
+    /// currently owned by this host. Network lifecycle ownership is checked
+    /// by the caller before this storage-level read is exposed to a
+    /// supervisor route.
+    pub(crate) fn supervisor_invocation_material(
+        &self,
+        agent: AgentId,
+        actor: crate::agent_sdk::ActorId,
+    ) -> Result<super::invocation_preparation::PhysicalInvocationMaterial, SharedAgentHostError>
+    {
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        hosted
+            .driver
+            .physical_invocation_material(actor)
+            .map_err(map_driver_error)
+    }
+
+    /// Audit every locally attached Shared generation against one complete
+    /// authority subset while the outer host lock is held by the network
+    /// owner. The optional root marker comes only from the independently
+    /// authenticated system bootstrap plan.
+    pub(crate) fn audit_authority_projection(
+        &self,
+        head: crate::agent_sdk::authority::AuthorityProjectionHead,
+        projected: &[super::supervisor_adapters::AgentAuthorityRouteProjection],
+        root: Option<&super::invocation_preparation::PhysicalRootLineage>,
+    ) -> Result<SharedAuthorityProjectionAudit, SharedAgentHostError> {
+        match self.audit_authority_projection_exact(projected, root) {
+            Ok(identities) => return Ok(SharedAuthorityProjectionAudit::Ready(identities)),
+            Err(error) => {
+                if self.physical_projection_is_one_ack_ahead(head, projected, root)? {
+                    return Ok(SharedAuthorityProjectionAudit::Lag);
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    fn audit_authority_projection_exact(
+        &self,
+        projected: &[super::supervisor_adapters::AgentAuthorityRouteProjection],
+        root: Option<&super::invocation_preparation::PhysicalRootLineage>,
+    ) -> Result<Vec<super::supervisor::AgentRouteIdentity>, SharedAgentHostError> {
+        let mut local = Vec::new();
+        for (agent, hosted) in &self.agents {
+            if hosted
+                .driver
+                .local_role()
+                .map_err(map_driver_error)?
+                .is_some()
+            {
+                local.push((*agent, hosted));
+            }
+        }
+        if local.len() != projected.len() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let mut identities = Vec::new();
+        for ((agent, hosted), authority) in local.into_iter().zip(projected) {
+            let descriptor = hosted.driver.clean_descriptor().map_err(map_driver_error)?;
+            let directory = self.clean_runtime_projection(agent)?;
+            if descriptor != *authority.descriptor()
+                || descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared
+                || directory.descriptor != descriptor
+                || directory.actors.len() != authority.actors().len()
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            for actor in authority.actors() {
+                let mut material = hosted
+                    .driver
+                    .physical_authority_material(actor.entry.actor)
+                    .map_err(map_driver_error)?;
+                match (
+                    actor.root_provenance,
+                    root.map(|expected| expected.matches(actor)),
+                ) {
+                    (true, Some(true)) => {
+                        material.root_provenance = true;
+                    }
+                    (false, Some(true)) => {
+                        return Err(SharedAgentHostError::ScopeMismatch);
+                    }
+                    (true, _) => return Err(SharedAgentHostError::ScopeMismatch),
+                    (false, _) => {}
+                }
+                if !super::supervisor_adapters::physical_material_matches_authority(
+                    &material,
+                    authority.descriptor(),
+                    actor,
+                ) {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                if !actor.entry.suspended {
+                    identities.push(
+                        super::supervisor_adapters::physical_material_identity(&material)
+                            .map_err(|_| SharedAgentHostError::ScopeMismatch)?,
+                    );
+                }
+            }
+        }
+        Ok(identities)
+    }
+
+    fn physical_projection_is_one_ack_ahead(
+        &self,
+        head: crate::agent_sdk::authority::AuthorityProjectionHead,
+        projected: &[super::supervisor_adapters::AgentAuthorityRouteProjection],
+        root: Option<&super::invocation_preparation::PhysicalRootLineage>,
+    ) -> Result<bool, SharedAgentHostError> {
+        let mut physical = Vec::new();
+        for (agent, hosted) in &self.agents {
+            if hosted
+                .driver
+                .local_role()
+                .map_err(map_driver_error)?
+                .is_none()
+            {
+                continue;
+            }
+            let directory = self.clean_runtime_projection(*agent)?;
+            let sdk_agent = crate::agent_sdk::AgentId(agent.0);
+            let authority = projected
+                .binary_search_by_key(&sdk_agent, |projection| {
+                    projection.descriptor().identity.agent
+                })
+                .ok()
+                .and_then(|index| projected.get(index));
+            let mut actors = Vec::with_capacity(directory.actors.len());
+            for actor in directory.actors {
+                let mut material = hosted
+                    .driver
+                    .physical_authority_material(actor.entry.actor)
+                    .map_err(map_driver_error)?;
+                if let Some(candidate) = authority.and_then(|projection| {
+                    projection
+                        .actors()
+                        .binary_search_by_key(&actor.entry.actor, |candidate| candidate.entry.actor)
+                        .ok()
+                        .and_then(|index| projection.actors().get(index))
+                }) {
+                    match (
+                        candidate.root_provenance,
+                        root.map(|expected| expected.matches(candidate)),
+                    ) {
+                        (true, Some(true)) => material.root_provenance = true,
+                        (false, Some(true)) | (true, _) => return Ok(false),
+                        (false, _) => {}
+                    }
+                }
+                actors.push(material);
+            }
+            physical.push(
+                super::supervisor_adapters::PhysicalAuthorityRouteProjection {
+                    descriptor: directory.descriptor,
+                    actors,
+                    disposition: hosted
+                        .driver
+                        .latest_clean_management_disposition()
+                        .map_err(map_driver_error)?,
+                },
+            );
+        }
+        Ok(
+            super::supervisor_adapters::physical_projection_is_exactly_one_ack_ahead(
+                head, projected, &physical,
+            ),
+        )
+    }
+
     pub fn role(&self, agent: AgentId) -> Result<Option<ReplicaRole>, SharedAgentHostError> {
         let hosted = self
             .agents
@@ -937,6 +1221,27 @@ impl SharedAgentHost {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn snapshot_state_for_test(
+        &self,
+        agent: AgentId,
+    ) -> Result<SharedAgentSnapshotState, SharedAgentHostError> {
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        Ok(
+            match hosted.driver.current_snapshot().map_err(map_driver_error)? {
+                Some(snapshot) => SharedAgentSnapshotState::Installed {
+                    raft_index: snapshot.claim.raft_index(),
+                    raft_term: snapshot.claim.raft_term(),
+                    certificate: snapshot.certificate_commitment,
+                },
+                None => SharedAgentSnapshotState::None,
+            },
+        )
+    }
+
     pub(crate) fn prepare_clean_ordered(
         &self,
         agent: AgentId,
@@ -948,6 +1253,118 @@ impl SharedAgentHost {
             .ok_or(SharedAgentHostError::AgentNotFound)?
             .driver
             .prepare_clean_ordered(work, authorization)
+            .map_err(map_driver_error)
+    }
+
+    pub(crate) fn projection_pair_fits(
+        &self,
+        agent: AgentId,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+    ) -> Result<bool, SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .projection_pair_fits(work, authorization)
+            .map_err(map_driver_error)
+    }
+
+    pub(crate) fn projection_admission_requirement(
+        &self,
+        agent: AgentId,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        recovering: bool,
+    ) -> Result<Option<usize>, SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .projection_admission_requirement(work, authorization, recovering)
+            .map_err(map_driver_error)
+    }
+
+    pub(crate) fn projection_admission_records(
+        &self,
+        agent: AgentId,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        recovering: bool,
+    ) -> Result<usize, SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .projection_admission_records(work, authorization, recovering)
+            .map_err(map_driver_error)
+    }
+
+    pub(crate) fn retained_positive_clean_acknowledgement(
+        &self,
+        agent: AgentId,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+    ) -> Result<bool, SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .retained_positive_clean_acknowledgement(work, authorization)
+            .map_err(map_driver_error)
+    }
+
+    pub(crate) fn retained_terminal_projection_invoke(
+        &self,
+        agent: AgentId,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+    ) -> Result<bool, SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .retained_terminal_projection_invoke(work, authorization)
+            .map_err(map_driver_error)
+    }
+
+    pub(crate) fn prepare_clean_ordered_operation(
+        &self,
+        agent: AgentId,
+        request: super::shared_journal_driver::CleanInvocationReplayRequest,
+    ) -> Result<super::shared_journal_driver::PreparedCleanOrdered, SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .prepare_clean_ordered_operation(request)
+            .map_err(map_driver_error)
+    }
+
+    pub(crate) fn prepare_terminal_clean_ordered_operation(
+        &self,
+        agent: AgentId,
+        request: super::shared_journal_driver::CleanInvocationReplayRequest,
+    ) -> Result<super::shared_journal_driver::PreparedCleanOrdered, SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .prepare_terminal_clean_ordered_operation(request)
+            .map_err(map_driver_error)
+    }
+
+    pub(crate) fn prepare_reserved_projection_operation(
+        &self,
+        agent: AgentId,
+        request: super::shared_journal_driver::CleanInvocationReplayRequest,
+        terminal_only: bool,
+    ) -> Result<super::shared_journal_driver::PreparedCleanOrdered, SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .prepare_reserved_projection_operation(request, terminal_only)
             .map_err(map_driver_error)
     }
 
@@ -1007,6 +1424,20 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
+    pub(crate) fn apply_clean_local_operation(
+        &mut self,
+        agent: AgentId,
+        request: super::shared_journal_driver::CleanInvocationReplayRequest,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get_mut(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .apply_clean_local_operation(request)
+            .map_err(map_driver_error)
+    }
+
     pub(crate) fn apply_clean_merge(
         &mut self,
         agent: AgentId,
@@ -1019,6 +1450,20 @@ impl SharedAgentHost {
             .ok_or(SharedAgentHostError::AgentNotFound)?
             .driver
             .apply_clean_merge(work, authorization)
+            .map_err(map_driver_error)
+    }
+
+    pub(crate) fn apply_clean_merge_operation(
+        &mut self,
+        agent: AgentId,
+        request: super::shared_journal_driver::CleanInvocationReplayRequest,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedAgentHostError> {
+        self.lease.validate_live().map_err(map_outer_lease_error)?;
+        self.agents
+            .get_mut(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .apply_clean_merge_operation(request)
             .map_err(map_driver_error)
     }
 
@@ -1620,15 +2065,7 @@ fn status_for(
     hosted: &HostedSharedAgent,
     transport_attached: bool,
 ) -> Result<SharedAgentStatus, SharedAgentHostError> {
-    let identity = hosted.driver.identity().map_err(map_driver_error)?;
-    let generation = hosted.driver.ledger().generation();
-    let route = hosted.driver.active_route().map_err(map_driver_error)?;
-    let committee_state = hosted
-        .driver
-        .network_committee_state()
-        .map_err(map_driver_error)?;
-    let committee = &committee_state.active;
-    let local_role = hosted.driver.local_role().map_err(map_driver_error)?;
+    let attachment = attachment_status_for(hosted, transport_attached)?;
     let lanes = hosted.driver.engine_lanes().map_err(map_driver_error)?;
     let (applied_slots, remaining_slots, reservation_pending) =
         hosted.driver.capacity().map_err(map_driver_error)?;
@@ -1640,6 +2077,41 @@ fn status_for(
         },
         None => SharedAgentSnapshotState::None,
     };
+    Ok(SharedAgentStatus {
+        identity: attachment.identity,
+        generation: attachment.generation,
+        route: attachment.route,
+        replication_id: attachment.replication_id,
+        local_role: attachment.local_role,
+        replicas: attachment.replicas,
+        committee_transition: attachment.committee_transition,
+        engines: SharedAgentEnginePlan {
+            control_raft: true,
+            linear_raft: lanes.contains(StateLane::Linear),
+            merge: lanes.contains(StateLane::Merge),
+            local: lanes.contains(StateLane::Local),
+        },
+        applied_slots,
+        remaining_slots,
+        reservation_pending,
+        transport: attachment.transport,
+        snapshots,
+    })
+}
+
+fn attachment_status_for(
+    hosted: &HostedSharedAgent,
+    transport_attached: bool,
+) -> Result<SharedAgentAttachmentStatus, SharedAgentHostError> {
+    let identity = hosted.driver.identity().map_err(map_driver_error)?;
+    let generation = hosted.driver.ledger().generation();
+    let route = hosted.driver.active_route().map_err(map_driver_error)?;
+    let committee_state = hosted
+        .driver
+        .network_committee_state()
+        .map_err(map_driver_error)?;
+    let committee = &committee_state.active;
+    let local_role = hosted.driver.local_role().map_err(map_driver_error)?;
     let replica_route = |member: &super::genesis::AgentReplicaMember| SharedReplicaRoute {
         node: member.replica().node,
         role: member.replica().role,
@@ -1655,7 +2127,7 @@ fn status_for(
             next_replicas: next.members().iter().map(replica_route).collect(),
             joint: committee_state.joint,
         });
-    Ok(SharedAgentStatus {
+    Ok(SharedAgentAttachmentStatus {
         identity,
         generation,
         route,
@@ -1663,21 +2135,11 @@ fn status_for(
         local_role,
         replicas,
         committee_transition,
-        engines: SharedAgentEnginePlan {
-            control_raft: true,
-            linear_raft: lanes.contains(StateLane::Linear),
-            merge: lanes.contains(StateLane::Merge),
-            local: lanes.contains(StateLane::Local),
-        },
-        applied_slots,
-        remaining_slots,
-        reservation_pending,
         transport: if transport_attached {
             SharedAgentTransportState::Attached
         } else {
             SharedAgentTransportState::NotAttached
         },
-        snapshots,
     })
 }
 
@@ -2018,7 +2480,10 @@ mod tests {
 
     use ed25519_dalek::{Signer as _, SigningKey};
     #[cfg(feature = "pvm")]
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
     use vos_raft::EntryKind;
 
     use super::super::authority::{
@@ -2107,6 +2572,39 @@ mod tests {
         fn use_native_standard_runtime_for_test(&self) -> bool {
             true
         }
+
+        fn use_native_clean_runtime_for_test(&self) -> bool {
+            false
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    struct NativeCleanTrust {
+        authority: AgentAuthorityBinding,
+        slot: Arc<AtomicU64>,
+    }
+
+    #[cfg(feature = "pvm")]
+    impl AgentTrustProvider for NativeCleanTrust {
+        fn current_logical_slot(&self) -> Option<u64> {
+            Some(self.slot.load(Ordering::SeqCst))
+        }
+
+        fn authority_for_space(&self, _space: SpaceId) -> Option<AgentAuthorityBinding> {
+            Some(self.authority.clone())
+        }
+
+        fn verify_package(&self, _agent: &AgentConfig, _package: &Package) -> bool {
+            true
+        }
+
+        fn use_native_standard_runtime_for_test(&self) -> bool {
+            true
+        }
+
+        fn use_native_clean_runtime_for_test(&self) -> bool {
+            true
+        }
     }
 
     #[cfg(feature = "pvm")]
@@ -2158,6 +2656,27 @@ mod tests {
 
         fn verify_event(&self, event: &MergeEvent) -> bool {
             event.author == self.node() && event.signature.len() == ED25519_SIGNATURE_BYTES
+        }
+
+        fn sign_snapshot_candidate(
+            &self,
+            candidate: &VerifiedSharedAgentSnapshotCandidate,
+        ) -> Option<ReplicaCommitSignature> {
+            let member = candidate
+                .claim()
+                .active_committee()
+                .member_by_node(self.node())?;
+            if member.replica().role != ReplicaRole::Voter
+                || member.ed25519_public_key() != &self.0.verifying_key().to_bytes()
+                || member.peer_id() != peer_id(&self.0)
+            {
+                return None;
+            }
+            ReplicaCommitSignature::new(
+                self.node(),
+                self.0.sign(&candidate.signing_message().0).to_bytes(),
+            )
+            .ok()
         }
     }
 
@@ -2311,6 +2830,7 @@ mod tests {
                 runtime_deployment: runtime.deployment(),
                 runtime_program: runtime.program(),
                 runtime_producer: runtime.producer(),
+                transition_producer: crate::agent_sdk::ProducerId([0x92; 32]),
             },
             creation_nonce: nonce,
             authority: crate::agent_sdk::authority::AgentAuthorityBinding {
@@ -2355,7 +2875,7 @@ mod tests {
     }
 
     fn clean_identity_bytes(identity: &crate::agent_sdk::AgentIdentity) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(193);
+        let mut bytes = Vec::with_capacity(225);
         bytes.extend_from_slice(identity.space.as_bytes());
         bytes.extend_from_slice(identity.agent.as_bytes());
         bytes.extend_from_slice(identity.owner.as_bytes());
@@ -2363,6 +2883,7 @@ mod tests {
         bytes.extend_from_slice(identity.runtime_deployment.as_bytes());
         bytes.extend_from_slice(identity.runtime_program.as_bytes());
         bytes.extend_from_slice(identity.runtime_producer.as_bytes());
+        bytes.extend_from_slice(identity.transition_producer.as_bytes());
         bytes
     }
 
@@ -2491,7 +3012,7 @@ mod tests {
     fn clean_fixture(nonce_byte: u8) -> CleanFixture {
         use super::super::package_admission::{
             ScriptedRuntimeCopy, admitted_scripted_runtime_for_test,
-            admitted_standard_actor_for_test, admitted_standard_runtime_for_test,
+            admitted_standard_actor_for_test,
         };
         use crate::agent_sdk::wire::CanonicalWire as _;
 
@@ -2508,7 +3029,15 @@ mod tests {
         // SDK is moving through r11. Build a small current-ABI custom runtime
         // which is physically interpreted as PVM bytecode; no native Standard
         // oracle participates in this generic journal/host test.
-        let placeholder = admitted_standard_runtime_for_test("script-shape-only", 0x60);
+        let placeholder = admitted_scripted_runtime_for_test(
+            "script-shape-only",
+            0x60,
+            vec![super::super::package_admission::ScriptedRuntimeCase {
+                input: vec![0],
+                output: vec![0],
+                copies: Vec::new(),
+            }],
+        );
         let placeholder_descriptor = clean_descriptor_for_runtime(
             &placeholder,
             clean_space,
@@ -2536,6 +3065,19 @@ mod tests {
         let inspect = crate::agent_sdk::ManagementRequest::InspectActors {
             after: None,
             limit: crate::agent_sdk::MAX_DIRECTORY_PAGE_ENTRIES as u16,
+        };
+        let mut actor_predecessor = install_body.entry.actor.0;
+        for byte in actor_predecessor.iter_mut().rev() {
+            if *byte == 0 {
+                *byte = u8::MAX;
+            } else {
+                *byte -= 1;
+                break;
+            }
+        }
+        let keyed_inspect = crate::agent_sdk::ManagementRequest::InspectActors {
+            after: Some(crate::agent_sdk::ActorId(actor_predecessor)),
+            limit: 1,
         };
         let remove = crate::agent_sdk::ManagementRequest::RemoveLeaf {
             actor: install_body.entry.actor,
@@ -2573,6 +3115,22 @@ mod tests {
                 installed_state.clone(),
                 crate::agent_sdk::RuntimeOutcome::Management(Ok(
                     crate::agent_sdk::ManagementReply::Installed(install_body.entry.clone()),
+                )),
+            ),
+            scripted_management_case(
+                &placeholder_descriptor,
+                installed_state.clone(),
+                keyed_inspect,
+                None,
+                &authority_key,
+                installed_state.clone(),
+                crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                    crate::agent_sdk::ManagementReply::Actors(
+                        crate::agent_sdk::ActorDirectoryPage {
+                            entries: vec![actor_record.clone()],
+                            next: None,
+                        },
+                    ),
                 )),
             ),
             scripted_management_case(
@@ -2887,9 +3445,14 @@ mod tests {
         let agent = AgentId(clean_agent.0);
         let authority_key = key(0x41);
         let authority = authority_binding(&authority_key);
-        let placeholder = super::super::package_admission::admitted_standard_runtime_for_test(
+        let placeholder = super::super::package_admission::admitted_scripted_runtime_for_test(
             "shared-host-runtime",
             0x71,
+            vec![super::super::package_admission::ScriptedRuntimeCase {
+                input: vec![0],
+                output: vec![0],
+                copies: Vec::new(),
+            }],
         );
         let replica_keys = vec![key(0x31), key(0x32), key(0x33)];
         let mut members = vec![
@@ -3106,12 +3669,203 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "pvm")]
+    fn standard_projection_fixture(nonce_byte: u8) -> Fixture {
+        const GENESIS_SLOT: u64 = 19;
+
+        let space = SpaceId([0x11; 32]);
+        let clean_space = crate::agent_sdk::SpaceId(space.0);
+        let owner = crate::agent_sdk::PrincipalId([0x12; 32]);
+        let nonce = crate::agent_sdk::Hash([nonce_byte; 32]);
+        let clean_agent = crate::agent_sdk::AgentId::derive(clean_space, owner, nonce.as_bytes());
+        let agent = AgentId(clean_agent.0);
+        let authority_key = key(0x41);
+        let authority = authority_binding(&authority_key);
+        // The checked-in Standard outer-runtime blob belongs to an older ABI.
+        // Admit a small current-ABI PVM artifact and use the explicit native
+        // clean-runtime oracle only in this focused physical journal test.
+        let admitted_runtime = super::super::package_admission::admitted_scripted_runtime_for_test(
+            "shared-projection-standard-shape",
+            0x74,
+            vec![super::super::package_admission::ScriptedRuntimeCase {
+                input: vec![0],
+                output: vec![0],
+                copies: Vec::new(),
+            }],
+        );
+        let replica_keys = vec![key(0x31)];
+        let member = replica_member(&replica_keys[0], ReplicaRole::Voter);
+        let descriptor = clean_descriptor_for_runtime(
+            &admitted_runtime,
+            clean_space,
+            clean_agent,
+            owner,
+            nonce,
+            core::slice::from_ref(&member),
+            &authority_key,
+        );
+        let request = crate::agent_sdk::ManagementRequest::Create(Box::new(descriptor.clone()));
+        let receipt = clean_management_receipt(&descriptor, &request, 1, &authority_key);
+        let transition = super::super::wire::apply_standard_runtime_work(
+            crate::agent_sdk::RuntimeWork::Manage {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                runtime_deployment: descriptor.identity.runtime_deployment,
+                state: crate::agent_sdk::RuntimeState::default(),
+                request: Box::new(request.clone()),
+                authority: Some(Box::new(receipt.clone())),
+                observed_slot: GENESIS_SLOT,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            transition.outcome,
+            crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                crate::agent_sdk::ManagementReply::Created(_)
+            ))
+        ));
+        let catalog_reference = BlobRef {
+            hash: Hash(admitted_runtime.package_ref().hash.0),
+            len: admitted_runtime.package_ref().len,
+        };
+        assert!(catalog_reference.matches(admitted_runtime.exact_bytes()));
+        let runtime = RuntimeBinding {
+            space,
+            agent,
+            deployment: DeploymentId(descriptor.identity.runtime_deployment.0),
+            program: ProgramId(descriptor.identity.runtime_program.0),
+            producer: ProducerId(descriptor.identity.runtime_producer.0),
+            package: catalog_reference.clone(),
+            runtime_abi: super::super::RUNTIME_ABI_ID,
+            execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+        };
+        let create = ReplayInput {
+            runtime: runtime.clone(),
+            operation: ReplayOperation::CleanManage {
+                request: request.clone(),
+                authority: receipt,
+                observed_slot: GENESIS_SLOT,
+            },
+        };
+        create.validate().unwrap();
+        let post_create = super::super::wire::RuntimeState {
+            control: transition.state.control,
+            linear: transition.state.linear,
+            merge: transition.state.merge,
+            local: transition.state.local,
+        };
+        let expectations = AgentGenesisExpectations::new(
+            runtime.commitment(),
+            Hash(request.commitment().0),
+            system_genesis_post_create_state_commitment(&post_create).unwrap(),
+            system_genesis_artifact_closure_commitment(core::slice::from_ref(&catalog_reference))
+                .unwrap(),
+            1,
+        )
+        .unwrap();
+        let proposal = AgentGenesisProposal::new(
+            AgentGenesisLocator { space, agent },
+            create,
+            expectations,
+            vec![catalog_reference.clone()],
+        )
+        .unwrap();
+        let replicas =
+            AgentReplicaCommittee::new(space, agent, AgentProfile::Shared, vec![member]).unwrap();
+        let system_key = key(0x51);
+        let system_member = AuthorityCommitteeMember::new(
+            NodeId([0x52; 32]),
+            system_key.verifying_key().to_bytes(),
+            AuthorityMemberRole::Voter,
+        )
+        .unwrap();
+        let signer = system_member.signer();
+        let system_committee = AuthorityCommittee::new(
+            space,
+            Hash(descriptor.authority.commitment().0),
+            1,
+            None,
+            vec![system_member],
+        )
+        .unwrap();
+        let genesis_claim = AgentGenesisClaim::new(
+            authority.agent,
+            AgentJournalGenesisId::new([0x92; 32]),
+            AgentGenesisAdmissionId::from_bytes([0x93; 32]),
+            &proposal,
+            &replicas,
+        )
+        .unwrap();
+        let message = AuthorityQuorumCertificate::signing_message(
+            system_committee.authority_binding(),
+            system_committee.epoch(),
+            system_committee.commitment(),
+            genesis_claim.authority_claim(),
+        );
+        let signature =
+            AuthoritySignature::new(signer, system_key.sign(&message.0).to_bytes()).unwrap();
+        let certificate = AuthorityQuorumCertificate::new(
+            &system_committee,
+            genesis_claim.authority_claim(),
+            vec![signature],
+        )
+        .unwrap();
+        let evidence = AgentGenesisEvidence::new(genesis_claim, certificate).unwrap();
+        let decision = AgentGenesisDecision::new(&proposal, &replicas, &evidence).unwrap();
+        let provision = AgentGenesisProvision::new(proposal, replicas, evidence, decision).unwrap();
+        Fixture {
+            provision,
+            catalog: vec![RuntimeBlob {
+                reference: catalog_reference,
+                bytes: admitted_runtime.exact_bytes().to_vec(),
+            }],
+            descriptor,
+            authority,
+            authority_key,
+            committee_authority: committee_authority_binding(&key(0xe1)),
+            replica_keys,
+            agent,
+            space,
+        }
+    }
+
     fn open_host(directory: &TempDirectory, fixture: &Fixture) -> SharedAgentHost {
         open_host_on_node(
             directory,
             fixture,
             fixture.provision.replicas().members()[0].replica().node,
         )
+    }
+
+    #[cfg(feature = "pvm")]
+    fn open_native_clean_host(directory: &TempDirectory, fixture: &Fixture) -> SharedAgentHost {
+        open_native_clean_host_at_slot(directory, fixture, Arc::new(AtomicU64::new(20)))
+    }
+
+    #[cfg(feature = "pvm")]
+    fn open_native_clean_host_at_slot(
+        directory: &TempDirectory,
+        fixture: &Fixture,
+        slot: Arc<AtomicU64>,
+    ) -> SharedAgentHost {
+        let node = fixture.provision.replicas().members()[0].replica().node;
+        let merge_key = fixture.replica_keys[0].clone();
+        SharedAgentHost::open(
+            directory.root(),
+            directory.lock(),
+            AgentHostScope {
+                space: fixture.space,
+                node,
+            },
+            Arc::new(NativeCleanTrust {
+                authority: fixture.authority.clone(),
+                slot,
+            }),
+            Arc::new(SigningMerge(merge_key)),
+            Arc::new(AcceptFinality),
+        )
+        .unwrap()
     }
 
     #[cfg(feature = "pvm")]
@@ -3325,6 +4079,7 @@ mod tests {
             .unwrap()
             .driver
             .publish_merge_for_test(ReplayOperation::CleanInvoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                 work,
                 authorization,
                 observed_slot: 20,
@@ -3469,7 +4224,9 @@ mod tests {
     #[cfg(feature = "pvm")]
     #[test]
     fn physical_current_abi_custom_runtime_clean_management_recovers_and_derives_actor_lanes() {
-        use super::super::shared_journal_driver::PreparedCleanManagement;
+        use super::super::shared_journal_driver::{
+            CleanInvocationReplayRequest, PreparedCleanManagement, PreparedCleanOrdered,
+        };
         use super::super::shared_raft::AgentRaftCommand;
 
         let directory = TempDirectory::new("clean_one_voter_management");
@@ -3723,8 +4480,9 @@ mod tests {
         else {
             panic!("install did not return its exact SDK entry")
         };
+        let full_status = host.show(fixture.shared.agent).unwrap().unwrap();
         assert_eq!(
-            host.show(fixture.shared.agent).unwrap().unwrap().engines,
+            full_status.engines,
             SharedAgentEnginePlan {
                 control_raft: true,
                 linear_raft: true,
@@ -3732,6 +4490,154 @@ mod tests {
                 local: false,
             },
         );
+        let attachment_status = host
+            .supervisor_attachment_status(fixture.shared.agent)
+            .unwrap()
+            .unwrap();
+        assert_eq!(attachment_status.identity, full_status.identity);
+        assert_eq!(attachment_status.generation, full_status.generation);
+        assert_eq!(attachment_status.route, full_status.route);
+        assert_eq!(attachment_status.replication_id, full_status.replication_id);
+        assert_eq!(attachment_status.local_role, full_status.local_role);
+        assert_eq!(attachment_status.replicas, full_status.replicas);
+        assert_eq!(
+            attachment_status.committee_transition,
+            full_status.committee_transition
+        );
+        assert_eq!(attachment_status.transport, full_status.transport);
+        let physical = host
+            .supervisor_invocation_material(fixture.shared.agent, entry.actor)
+            .unwrap();
+        assert_eq!(physical.descriptor, current_descriptor);
+        assert_eq!(physical.actor.entry, entry);
+        assert_eq!(physical.program.bytes, actor_package.program_bytes());
+        assert_eq!(
+            physical.schema.bytes,
+            actor_package.state_lane_schema_bytes()
+        );
+        assert_eq!(physical.policies.bytes, actor_package.method_policy_bytes());
+
+        drop(host);
+        let mut host = open_clean_host(&directory, &fixture, Arc::clone(&slot));
+        assert_eq!(
+            host.supervisor_invocation_material(fixture.shared.agent, entry.actor)
+                .unwrap()
+                .actor,
+            physical.actor,
+            "the keyed physical actor/material lookup survives journal reopen"
+        );
+
+        // Resume and acknowledgement state belongs to the physically admitted
+        // runtime. The host retains the exact public request and selector but
+        // must not attempt to decode a custom runtime's opaque components as
+        // Standard state before the command can enter deterministic replay.
+        let mut availability = vec![
+            physical.program.clone(),
+            physical.schema.clone(),
+            physical.policies.clone(),
+        ];
+        availability.sort_unstable_by(|left, right| left.reference.cmp(&right.reference));
+        let work = crate::agent_sdk::InvocationWork {
+            space: current_descriptor.identity.space,
+            agent: current_descriptor.identity.agent,
+            runtime_deployment: current_descriptor.identity.runtime_deployment,
+            invocation: crate::agent_sdk::InvocationId([0x94; 32]),
+            actor: entry.actor,
+            incarnation: physical.actor.incarnation,
+            deployment: entry.deployment,
+            program: entry.program,
+            mode: crate::agent_sdk::MethodMode::Linear,
+            origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+            roles: crate::agent_sdk::InvocationRoleClaims::none(),
+            message: vec![0x95],
+            installation_data: entry.installation_data.clone(),
+            availability,
+            gas: 1_000,
+            recovery_only: false,
+        };
+        let authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+            crate::agent_sdk::PublicPreflight::for_work(&work, 23),
+        );
+        let yielded = crate::agent_sdk::YieldedInvocation {
+            invocation: work.invocation,
+            actor: work.actor,
+            incarnation: work.incarnation,
+            deployment: work.deployment,
+            program: work.program,
+            mode: work.mode,
+            continuation: crate::agent_sdk::BlobRef::of_bytes(b"custom-runtime-continuation"),
+            ready_sequence: 1,
+            installation_data: work.installation_data.clone(),
+            required: work
+                .availability
+                .iter()
+                .map(|blob| blob.reference.clone())
+                .collect(),
+            reason: crate::agent_sdk::YieldReason::Cooperative,
+        };
+        for request in [
+            CleanInvocationReplayRequest::Resume {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                work: work.clone(),
+                authorization: authorization.clone(),
+                yielded: yielded.clone(),
+            },
+            CleanInvocationReplayRequest::Acknowledge {
+                work: work.clone(),
+                authorization: authorization.clone(),
+            },
+        ] {
+            let expected_operation = match request.clone() {
+                CleanInvocationReplayRequest::Invoke {
+                    context,
+                    work,
+                    authorization,
+                } => ReplayOperation::CleanInvoke {
+                    context,
+                    work,
+                    authorization,
+                    observed_slot: 23,
+                },
+                CleanInvocationReplayRequest::Resume {
+                    context,
+                    work,
+                    authorization,
+                    yielded,
+                } => ReplayOperation::CleanResume {
+                    context,
+                    expected_live: None,
+                    work,
+                    authorization,
+                    yielded,
+                    observed_slot: 23,
+                },
+                CleanInvocationReplayRequest::Acknowledge {
+                    work,
+                    authorization,
+                } => ReplayOperation::CleanAcknowledge {
+                    context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                    expected_live: None,
+                    work,
+                    authorization,
+                },
+            };
+            let prepared = host
+                .prepare_clean_ordered_operation(fixture.shared.agent, request.clone())
+                .unwrap();
+            let PreparedCleanOrdered::Proposal { input, payload } = prepared else {
+                panic!("unpublished custom-runtime lifecycle request resolved as retained")
+            };
+            let AgentRaftCommand::Ordered { entry, .. } =
+                AgentRaftCommand::decode(&payload).unwrap()
+            else {
+                panic!("clean lifecycle request was not a canonical Ordered command")
+            };
+            assert_eq!(entry.input.id(), input);
+            assert_eq!(
+                entry.input.operation, expected_operation,
+                "the proposed command retains the exact public work, authorization, and selector"
+            );
+        }
 
         let remove = crate::agent_sdk::ManagementRequest::RemoveLeaf {
             actor: entry.actor,
@@ -4223,6 +5129,721 @@ mod tests {
                 certificate: second_certificate.commitment(),
             }
         );
+    }
+
+    #[test]
+    fn authenticated_snapshots_advance_across_repeated_leader_noops_without_gc() {
+        let directory = TempDirectory::new("snapshot_repeated_leader_noops");
+        let fixture = fixture(0x24);
+        let mut host = open_host(&directory, &fixture);
+        host.provision(
+            fixture.provision.clone(),
+            fixture.catalog.clone(),
+            fixture.committee_authority,
+        )
+        .unwrap();
+        let ordered_index = host
+            .agents
+            .get_mut(&fixture.agent)
+            .unwrap()
+            .driver
+            .append_ordered_for_test(7, authorized_management(&fixture, 2, 0xc7))
+            .unwrap();
+        assert_eq!(ordered_index, 1);
+        assert_eq!(
+            host.apply_next(fixture.agent).unwrap(),
+            SharedAgentApplyOutcome::Applied { index: 1 },
+        );
+        let first_candidate = host.request_snapshot_compaction(fixture.agent).unwrap();
+        let logical = first_candidate.claim().ordered().ordered();
+        let first = snapshot_certificate(&first_candidate, &fixture);
+        host.install_snapshot(fixture.agent, &first).unwrap();
+
+        for (term, expected_index) in [(8, 2), (9, 3)] {
+            let index = host.agents[&fixture.agent]
+                .driver
+                .ledger()
+                .append_committed_for_test(
+                    term,
+                    &EntryKind::Data {
+                        payload: Vec::new(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(index, expected_index);
+            assert_eq!(
+                host.apply_next(fixture.agent).unwrap(),
+                SharedAgentApplyOutcome::Applied {
+                    index: expected_index,
+                },
+            );
+            let candidate = host.request_snapshot_compaction(fixture.agent).unwrap();
+            assert_eq!(candidate.claim().raft_index(), expected_index);
+            assert_eq!(candidate.claim().raft_term(), term);
+            assert_eq!(candidate.claim().ordered().ordered(), logical);
+            let certificate = snapshot_certificate(&candidate, &fixture);
+            host.install_snapshot(fixture.agent, &certificate).unwrap();
+
+            // Reopen after every synthetic physical foundation. The compacted
+            // boundary must authenticate as canonical empty Data, while the
+            // logical Ordered projection remains unchanged and the original
+            // binding is deliberately still present (no GC between passes).
+            drop(host);
+            host = open_host(&directory, &fixture);
+            let installed = host.agents[&fixture.agent]
+                .driver
+                .current_snapshot()
+                .unwrap()
+                .unwrap();
+            assert_eq!(installed.claim.raft_index(), expected_index);
+            assert_eq!(installed.claim.ordered().ordered(), logical);
+            assert_eq!(
+                host.apply_next(fixture.agent).unwrap(),
+                SharedAgentApplyOutcome::Idle,
+            );
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn terminal_projection_invoke_at_authenticated_boundary_reopens_without_replacement() {
+        use super::super::shared_journal_driver::{
+            CleanInvocationReplayRequest, PreparedCleanOrdered,
+        };
+        use crate::actors::codec::Encode as _;
+        use crate::actors::value::{Msg, TAG_DYNAMIC};
+
+        let directory = TempDirectory::new("projection_invoke_boundary");
+        let fixture = standard_projection_fixture(0x25);
+        let mut host = open_native_clean_host(&directory, &fixture);
+        host.provision(
+            fixture.provision.clone(),
+            fixture.catalog.clone(),
+            fixture.committee_authority,
+        )
+        .unwrap();
+
+        let actor_package = super::super::package_admission::admitted_standard_query_actor_for_test(
+            "projection-authority",
+            crate::agent_sdk::StateLane::Linear,
+            0x75,
+        );
+        let install = clean_install_request(fixture.descriptor.identity.agent, &actor_package);
+        let receipt =
+            clean_management_receipt(&fixture.descriptor, &install, 2, &fixture.authority_key);
+        let prepared_install = host
+            .prepare_clean_management(
+                fixture.agent,
+                install,
+                receipt,
+                SdkManagementArtifacts::Actor(&actor_package),
+            )
+            .unwrap();
+        let install_input = prepared_install
+            .input()
+            .unwrap_or_else(|| panic!("fresh actor install: {prepared_install:?}"));
+        let mut install_raft_index = 0;
+        for payload in prepared_install.into_commands() {
+            install_raft_index = host.agents[&fixture.agent]
+                .driver
+                .ledger()
+                .append_committed_for_test(6, &EntryKind::Data { payload })
+                .unwrap();
+            assert_eq!(
+                host.apply_next(fixture.agent).unwrap(),
+                SharedAgentApplyOutcome::Applied {
+                    index: install_raft_index,
+                },
+            );
+        }
+        let installed = host
+            .take_clean_ordered_result(fixture.agent, install_input)
+            .unwrap();
+        let crate::agent_sdk::RuntimeOutcome::Management(Ok(
+            crate::agent_sdk::ManagementReply::Installed(entry),
+        )) = installed
+        else {
+            panic!("physical Query actor install did not complete")
+        };
+        let material = host
+            .supervisor_invocation_material(fixture.agent, entry.actor)
+            .unwrap();
+        assert_eq!(material.actor.entry, entry);
+        let install_candidate = host.request_snapshot_compaction(fixture.agent).unwrap();
+        assert_eq!(install_candidate.claim().raft_index(), install_raft_index);
+        let install_certificate = snapshot_certificate(&install_candidate, &fixture);
+        host.install_snapshot(fixture.agent, &install_certificate)
+            .unwrap();
+
+        let mut message = vec![TAG_DYNAMIC];
+        message.extend_from_slice(&Msg::new("read").encode());
+        let mut availability = vec![
+            material.program.clone(),
+            material.schema.clone(),
+            material.policies.clone(),
+        ];
+        availability.sort_unstable_by(|left, right| left.reference.cmp(&right.reference));
+        let work = crate::agent_sdk::InvocationWork {
+            space: fixture.descriptor.identity.space,
+            agent: fixture.descriptor.identity.agent,
+            runtime_deployment: fixture.descriptor.identity.runtime_deployment,
+            invocation: crate::agent_sdk::InvocationId([0xd1; 32]),
+            actor: entry.actor,
+            incarnation: material.actor.incarnation,
+            deployment: entry.deployment,
+            program: entry.program,
+            mode: crate::agent_sdk::MethodMode::Query,
+            origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+            roles: crate::agent_sdk::InvocationRoleClaims::none(),
+            message,
+            installation_data: entry.installation_data.clone(),
+            availability,
+            gas: 10_000_000,
+            recovery_only: false,
+        };
+        let authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+            crate::agent_sdk::PublicPreflight::for_work(&work, 20),
+        );
+        assert_eq!(
+            host.projection_admission_requirement(fixture.agent, &work, &authorization, false,)
+                .unwrap(),
+            Some(2),
+        );
+        let prepared = host
+            .prepare_clean_ordered(fixture.agent, work.clone(), authorization.clone())
+            .unwrap();
+        let invoke_input = prepared.input();
+        let payload = prepared.into_payload().expect("fresh Invoke proposal");
+        let invoke_index = host.agents[&fixture.agent]
+            .driver
+            .ledger()
+            .append_committed_for_test(7, &EntryKind::Data { payload })
+            .unwrap();
+        assert_eq!(invoke_index, install_raft_index + 1);
+        assert_eq!(
+            host.apply_next(fixture.agent).unwrap(),
+            SharedAgentApplyOutcome::Applied {
+                index: invoke_index,
+            },
+        );
+        assert_eq!(
+            host.projection_admission_requirement(fixture.agent, &work, &authorization, true,)
+                .unwrap(),
+            Some(1),
+        );
+
+        let candidate = host.request_snapshot_compaction(fixture.agent).unwrap();
+        assert_eq!(candidate.claim().raft_index(), invoke_index);
+        let certificate = snapshot_certificate(&candidate, &fixture);
+        host.install_snapshot(fixture.agent, &certificate).unwrap();
+        drop(host);
+
+        let mut host = open_native_clean_host(&directory, &fixture);
+        let no_op_index = host.agents[&fixture.agent]
+            .driver
+            .ledger()
+            .append_committed_for_test(
+                8,
+                &EntryKind::Data {
+                    payload: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(no_op_index, invoke_index + 1);
+        assert_eq!(
+            host.apply_next(fixture.agent).unwrap(),
+            SharedAgentApplyOutcome::Applied { index: no_op_index },
+        );
+        let no_op_candidate = host.request_snapshot_compaction(fixture.agent).unwrap();
+        assert_eq!(no_op_candidate.claim().raft_index(), no_op_index);
+        assert_eq!(
+            no_op_candidate.claim().ordered().ordered().index,
+            candidate.claim().ordered().ordered().index,
+        );
+        let no_op_certificate = snapshot_certificate(&no_op_candidate, &fixture);
+        host.install_snapshot(fixture.agent, &no_op_certificate)
+            .unwrap();
+        drop(host);
+
+        let mut host = open_native_clean_host(&directory, &fixture);
+        assert_eq!(
+            host.projection_admission_requirement(fixture.agent, &work, &authorization, true,)
+                .unwrap(),
+            Some(1),
+        );
+        let retry = host.agents[&fixture.agent]
+            .driver
+            .prepare_reserved_projection_operation(
+                CleanInvocationReplayRequest::Invoke {
+                    context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                    work: work.clone(),
+                    authorization: authorization.clone(),
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(retry.input(), invoke_input);
+        assert!(matches!(
+            retry,
+            PreparedCleanOrdered::Retained {
+                outcome: crate::agent_sdk::RuntimeOutcome::Completed(Ok(
+                    crate::agent_sdk::InvocationReply {
+                        status: crate::agent_sdk::InvocationStatus::Done,
+                        ..
+                    }
+                )),
+                ..
+            }
+        ));
+
+        // The same work under a different valid preflight cannot borrow the
+        // boundary result solely by reusing its invocation identity.
+        let divergent_authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+            crate::agent_sdk::PublicPreflight::for_work(&work, 19),
+        );
+        assert!(divergent_authorization.matches_work(&work));
+        let before_divergent = host.journal_position(fixture.agent).unwrap();
+        assert!(!host
+            .retained_terminal_projection_invoke(
+                fixture.agent,
+                &work,
+                &divergent_authorization,
+            )
+            .unwrap());
+        assert_eq!(
+            host.journal_position(fixture.agent).unwrap(),
+            before_divergent
+        );
+
+        // A different valid PAP work item is independently rejected without
+        // mutating the journal while recovery compares exact work and auth.
+        let mut divergent_work = work.clone();
+        divergent_work.invocation = crate::agent_sdk::InvocationId([0xe1; 32]);
+        let divergent_authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+            crate::agent_sdk::PublicPreflight::for_work(&divergent_work, 20),
+        );
+        assert!(
+            !host
+                .retained_terminal_projection_invoke(
+                    fixture.agent,
+                    &divergent_work,
+                    &divergent_authorization,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            host.journal_position(fixture.agent).unwrap(),
+            before_divergent
+        );
+
+        let acknowledgement = host.agents[&fixture.agent]
+            .driver
+            .prepare_reserved_projection_operation(
+                CleanInvocationReplayRequest::Acknowledge {
+                    work: work.clone(),
+                    authorization: authorization.clone(),
+                },
+                false,
+            )
+            .unwrap();
+        let acknowledgement_payload = acknowledgement
+            .into_payload()
+            .expect("exact Ack must be the only successor");
+        let acknowledgement_index = host.agents[&fixture.agent]
+            .driver
+            .ledger()
+            .append_committed_for_test(
+                9,
+                &EntryKind::Data {
+                    payload: acknowledgement_payload,
+                },
+            )
+            .unwrap();
+        assert_eq!(acknowledgement_index, no_op_index + 1);
+        assert_eq!(
+            host.apply_next(fixture.agent).unwrap(),
+            SharedAgentApplyOutcome::Applied {
+                index: acknowledgement_index,
+            },
+        );
+        assert!(
+            host.retained_positive_clean_acknowledgement(fixture.agent, &work, &authorization,)
+                .unwrap()
+        );
+        assert_eq!(
+            host.journal_position(fixture.agent).unwrap().ordered_index,
+            3
+        );
+        drop(host);
+
+        let host = open_native_clean_host(&directory, &fixture);
+        assert!(
+            host.retained_positive_clean_acknowledgement(fixture.agent, &work, &authorization,)
+                .unwrap()
+        );
+        assert_eq!(
+            host.projection_admission_requirement(fixture.agent, &work, &authorization, true,)
+                .unwrap(),
+            Some(0),
+        );
+    }
+
+    #[cfg(all(feature = "pvm", feature = "network"))]
+    #[test]
+    fn system_attach_checkpoints_and_drains_raw_tail_before_publishing_route() {
+        let directory = TempDirectory::new("system_raw_tail_promotion_barrier");
+        let fixture = standard_projection_fixture(0x26);
+        let logical_slot = Arc::new(AtomicU64::new(20));
+        let mut host =
+            open_native_clean_host_at_slot(&directory, &fixture, Arc::clone(&logical_slot));
+        host.provision(
+            fixture.provision.clone(),
+            fixture.catalog.clone(),
+            fixture.committee_authority,
+        )
+        .unwrap();
+
+        // Establish one real actor and compact its installation so the full
+        // physical evidence budget below is post-snapshot capacity.
+        let actor_package = super::super::package_admission::admitted_standard_query_actor_for_test(
+            "raw-tail-worker",
+            crate::agent_sdk::StateLane::Linear,
+            0x76,
+        );
+        let install = clean_install_request(fixture.descriptor.identity.agent, &actor_package);
+        let receipt =
+            clean_management_receipt(&fixture.descriptor, &install, 2, &fixture.authority_key);
+        let prepared_install = host
+            .prepare_clean_management(
+                fixture.agent,
+                install,
+                receipt,
+                SdkManagementArtifacts::Actor(&actor_package),
+            )
+            .unwrap();
+        let install_input = prepared_install
+            .input()
+            .unwrap_or_else(|| panic!("fresh actor install: {prepared_install:?}"));
+        let mut install_raft_index = 0;
+        for payload in prepared_install.into_commands() {
+            install_raft_index = host.agents[&fixture.agent]
+                .driver
+                .ledger()
+                .append_committed_for_test(6, &EntryKind::Data { payload })
+                .unwrap();
+            assert_eq!(
+                host.apply_next(fixture.agent).unwrap(),
+                SharedAgentApplyOutcome::Applied {
+                    index: install_raft_index,
+                },
+            );
+        }
+        let installed = host
+            .take_clean_ordered_result(fixture.agent, install_input)
+            .unwrap();
+        let crate::agent_sdk::RuntimeOutcome::Management(Ok(
+            crate::agent_sdk::ManagementReply::Installed(entry),
+        )) = installed
+        else {
+            panic!("physical Query actor install did not complete")
+        };
+        let candidate = host.request_snapshot_compaction(fixture.agent).unwrap();
+        assert_eq!(candidate.claim().raft_index(), install_raft_index);
+        let certificate = snapshot_certificate(&candidate, &fixture);
+        host.install_snapshot(fixture.agent, &certificate).unwrap();
+        let logical_before_tail = host.journal_position(fixture.agent).unwrap();
+
+        // Fill every post-snapshot physical slot except one with canonical
+        // leader-noop evidence. Appending in one transaction keeps this exact
+        // 4095-entry capacity fixture practical; ordinary apply/audit still
+        // validates each durable row independently.
+        let database = host.raft_database(fixture.agent).unwrap();
+        let empty = super::super::shared_raft::encode_agent_raft_entry_kind(&EntryKind::Data {
+            payload: Vec::new(),
+        })
+        .unwrap();
+        let committed_tail = {
+            let mut log = crate::raft::RaftLog::open(Arc::clone(&database)).unwrap();
+            let transaction = database.begin_write().unwrap();
+            let mut index = install_raft_index;
+            for _ in 0..super::super::shared_raft::MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES - 1 {
+                index = log.append_in_txn(&transaction, 7, &empty).unwrap();
+            }
+            let mut meta =
+                crate::raft::RaftMeta::load_from_write_transaction(&transaction).unwrap();
+            meta.current_term = 7;
+            meta.commit_index = index;
+            meta.write_worker_fields_in_txn(&transaction).unwrap();
+            transaction.commit().unwrap();
+            index
+        };
+        for expected in install_raft_index + 1..=committed_tail {
+            assert_eq!(
+                host.apply_next(fixture.agent).unwrap(),
+                SharedAgentApplyOutcome::Applied { index: expected },
+            );
+        }
+        let full = host.show(fixture.agent).unwrap().unwrap();
+        assert_eq!(full.applied_slots, committed_tail);
+        assert_eq!(full.remaining_slots, 1);
+        assert_eq!(
+            host.journal_position(fixture.agent).unwrap(),
+            logical_before_tail
+        );
+
+        // Prepare a valid Ordered mutation, but persist only its raw old-term
+        // Raft row. Metadata deliberately remains committed/applied at N.
+        logical_slot.store(21, Ordering::SeqCst);
+        let suspend = crate::agent_sdk::ManagementRequest::Suspend {
+            actor: entry.actor,
+            expected_deployment: entry.deployment,
+        };
+        let suspend_receipt =
+            clean_management_receipt(&fixture.descriptor, &suspend, 3, &fixture.authority_key);
+        let prepared_suspend = host
+            .prepare_clean_management(
+                fixture.agent,
+                suspend,
+                suspend_receipt,
+                SdkManagementArtifacts::None,
+            )
+            .unwrap();
+        let suspend_input = prepared_suspend.input().expect("fresh Suspend proposal");
+        let commands = prepared_suspend.into_commands();
+        assert_eq!(commands.len(), 1);
+        let suspend_payload = commands.into_iter().next().unwrap();
+        let meta_before_raw = crate::raft::RaftMeta::load(&database).unwrap();
+        let raw_index = {
+            let mut log = crate::raft::RaftLog::open(Arc::clone(&database)).unwrap();
+            let transaction = database.begin_write().unwrap();
+            let index = log
+                .append_in_txn(
+                    &transaction,
+                    7,
+                    &super::super::shared_raft::encode_agent_raft_entry_kind(&EntryKind::Data {
+                        payload: suspend_payload.clone(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+            index
+        };
+        assert_eq!(raw_index, committed_tail + 1);
+        assert_eq!(
+            crate::raft::RaftMeta::load(&database).unwrap(),
+            meta_before_raw
+        );
+        assert_eq!(
+            crate::raft::RaftLog::open(Arc::clone(&database))
+                .unwrap()
+                .last_index(),
+            raw_index
+        );
+        assert_eq!(
+            host.show(fixture.agent).unwrap().unwrap().remaining_slots,
+            1
+        );
+        let raw = crate::raft::RaftLog::open(Arc::clone(&database))
+            .unwrap()
+            .entries(raw_index, raw_index)
+            .unwrap();
+        assert!(matches!(
+            super::super::shared_raft::decode_agent_raft_entry_kind(&raw[0].payload).unwrap(),
+            EntryKind::Data { payload } if payload == suspend_payload
+        ));
+
+        let host = Arc::new(Mutex::new(host));
+        let network = live_network(0x31, Vec::new());
+        let signer = SigningMerge(fixture.replica_keys[0].clone());
+        let attachment = crate::network::SharedAgentNetworkHost::attach_system(
+            Arc::clone(&host),
+            Arc::clone(&network),
+            fixture.agent,
+            fixture.provision.replicas(),
+            &signer,
+        )
+        .unwrap();
+
+        // This is intentionally immediate: attach may publish only after the
+        // preserved raw row and the mandatory current-term no-op are both
+        // committed, audited, and applied.
+        let after_attach = host.lock().unwrap().show(fixture.agent).unwrap().unwrap();
+        assert!(attachment.attachment_for_test(fixture.agent).is_some());
+        assert_eq!(after_attach.applied_slots, raw_index + 1);
+        assert_eq!(after_attach.remaining_slots, 4_094);
+        assert!(!after_attach.reservation_pending);
+        let SharedAgentSnapshotState::Installed {
+            raft_index,
+            raft_term,
+            ..
+        } = after_attach.snapshots
+        else {
+            panic!("raw-tail recovery did not install its authenticated checkpoint")
+        };
+        assert_eq!((raft_index, raft_term), (committed_tail, 7));
+        let after_meta = crate::raft::RaftMeta::load(&database).unwrap();
+        let after_log = crate::raft::RaftLog::open(Arc::clone(&database)).unwrap();
+        assert_eq!(after_meta.commit_index, raw_index + 1);
+        assert_eq!(after_meta.last_applied, raw_index + 1);
+        assert_eq!(after_meta.snap_last_index, committed_tail);
+        assert!(after_meta.current_term > 7);
+        assert_eq!(after_log.last_index(), raw_index + 1);
+        let promoted = after_log.entries(raw_index, raw_index + 1).unwrap();
+        assert_eq!(promoted.len(), 2);
+        assert!(matches!(
+            super::super::shared_raft::decode_agent_raft_entry_kind(&promoted[0].payload).unwrap(),
+            EntryKind::Data { payload } if payload == suspend_payload
+        ));
+        assert!(matches!(
+            super::super::shared_raft::decode_agent_raft_entry_kind(&promoted[1].payload).unwrap(),
+            EntryKind::Data { payload } if payload.is_empty()
+        ));
+        assert_eq!(
+            host.lock()
+                .unwrap()
+                .journal_position(fixture.agent)
+                .unwrap()
+                .ordered_index,
+            logical_before_tail.ordered_index + 1
+        );
+        assert!(matches!(
+            host.lock()
+                .unwrap()
+                .take_clean_ordered_result(fixture.agent, suspend_input)
+                .unwrap(),
+            crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                crate::agent_sdk::ManagementReply::Suspended(_)
+            ))
+        ));
+        let inspect = crate::agent_sdk::ManagementRequest::InspectActors {
+            after: None,
+            limit: crate::agent_sdk::MAX_DIRECTORY_PAGE_ENTRIES as u16,
+        };
+        let suspended_page = host
+            .lock()
+            .unwrap()
+            .inspect_clean_management(fixture.agent, &inspect)
+            .unwrap();
+        let crate::agent_sdk::RuntimeOutcome::Management(Ok(
+            crate::agent_sdk::ManagementReply::Actors(suspended_page),
+        )) = suspended_page
+        else {
+            panic!("InspectActors did not complete")
+        };
+        assert!(
+            suspended_page
+                .entries
+                .iter()
+                .any(|record| { record.entry.actor == entry.actor && record.entry.suspended })
+        );
+
+        drop(attachment);
+        drop(host);
+        drop(after_log);
+        drop(database);
+        let mut reopened =
+            open_native_clean_host_at_slot(&directory, &fixture, Arc::clone(&logical_slot));
+        let database = reopened.raft_database(fixture.agent).unwrap();
+        assert_eq!(
+            reopened
+                .journal_position(fixture.agent)
+                .unwrap()
+                .ordered_index,
+            logical_before_tail.ordered_index + 1
+        );
+        assert_eq!(
+            reopened.show(fixture.agent).unwrap().unwrap().snapshots,
+            after_attach.snapshots
+        );
+        assert_eq!(crate::raft::RaftMeta::load(&database).unwrap(), after_meta);
+        assert_eq!(
+            reopened.apply_next(fixture.agent).unwrap(),
+            SharedAgentApplyOutcome::Idle
+        );
+
+        let host = Arc::new(Mutex::new(reopened));
+        let attachment = crate::network::SharedAgentNetworkHost::attach_system(
+            Arc::clone(&host),
+            Arc::clone(&network),
+            fixture.agent,
+            fixture.provision.replicas(),
+            &signer,
+        )
+        .unwrap();
+        let second_attach = host.lock().unwrap().show(fixture.agent).unwrap().unwrap();
+        assert_eq!(second_attach.applied_slots, raw_index + 2);
+        assert_eq!(second_attach.remaining_slots, 4_093);
+        assert!(!second_attach.reservation_pending);
+        assert_eq!(
+            host.lock()
+                .unwrap()
+                .journal_position(fixture.agent)
+                .unwrap()
+                .ordered_index,
+            logical_before_tail.ordered_index + 1
+        );
+        let second_meta = crate::raft::RaftMeta::load(&database).unwrap();
+        assert_eq!(second_meta.commit_index, raw_index + 2);
+        assert_eq!(second_meta.last_applied, raw_index + 2);
+        assert_eq!(
+            crate::raft::RaftLog::open(Arc::clone(&database))
+                .unwrap()
+                .last_index(),
+            raw_index + 2
+        );
+        logical_slot.store(22, Ordering::SeqCst);
+        let resume = crate::agent_sdk::ManagementRequest::Resume {
+            actor: entry.actor,
+            expected_deployment: entry.deployment,
+        };
+        let resume_receipt =
+            clean_management_receipt(&fixture.descriptor, &resume, 4, &fixture.authority_key);
+        assert!(matches!(
+            attachment
+                .manage_clean(
+                    fixture.agent,
+                    resume,
+                    resume_receipt,
+                    SdkManagementArtifacts::None,
+                )
+                .unwrap(),
+            crate::network::shared_agent::CleanManagementSubmission::Applied {
+                outcome: crate::agent_sdk::RuntimeOutcome::Management(Ok(
+                    crate::agent_sdk::ManagementReply::Resumed(_)
+                )),
+                new_slot: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            host.lock()
+                .unwrap()
+                .journal_position(fixture.agent)
+                .unwrap()
+                .ordered_index,
+            logical_before_tail.ordered_index + 2
+        );
+        let resumed_page = host
+            .lock()
+            .unwrap()
+            .inspect_clean_management(fixture.agent, &inspect)
+            .unwrap();
+        let crate::agent_sdk::RuntimeOutcome::Management(Ok(
+            crate::agent_sdk::ManagementReply::Actors(resumed_page),
+        )) = resumed_page
+        else {
+            panic!("InspectActors did not complete")
+        };
+        assert!(
+            resumed_page
+                .entries
+                .iter()
+                .any(|record| { record.entry.actor == entry.actor && !record.entry.suspended })
+        );
+        drop(attachment);
+        drop(host);
+        join_live_network(network);
     }
 
     #[test]

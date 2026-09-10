@@ -5164,6 +5164,7 @@ mod tests {
                 runtime_deployment: DeploymentId([0x21; 32]),
                 runtime_program: ProgramId([0x22; 32]),
                 runtime_producer: ProducerId([0x23; 32]),
+                transition_producer: ProducerId([0x24; 32]),
             },
             creation_nonce: nonce,
             authority: authority_binding(),

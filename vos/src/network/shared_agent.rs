@@ -18,16 +18,23 @@ use std::time::{Duration, Instant};
 
 use libp2p::PeerId;
 use redb::Database;
-use vos_agent_sdk::{Hash, MethodMode, NodeId, RuntimeOutcome};
+use vos_agent_sdk::{
+    Hash, InvocationAuthorization, InvocationScope, InvocationWork, MethodMode, NodeId,
+    RuntimeExecutionContext, RuntimeOutcome,
+};
 use vos_raft::{ActiveConfigRecord, EntryKind, LogEntry, Meta, Storage, WriteBatch};
 
+use crate::agent::genesis::AgentReplicaCommittee;
+use crate::agent::host::LocalMergeAuthenticator;
 use crate::agent::journal::{
     CanonicalJournalRecord, MAX_IMPORT_BYTES, MAX_IMPORT_EVENTS, MAX_JOURNAL_RECORD_BYTES,
     MAX_MERGE_FRONTIER_ENTRIES, MAX_REPLAY_SUFFIX_BYTES, MAX_REPLAY_SUFFIX_ENTRIES, MergeEvent,
     MergeEventId, ReplayInputId,
 };
+use crate::agent::shared_commit::SharedAgentSnapshotCertificate;
 use crate::agent::shared_host::{
-    SharedAgentApplyOutcome, SharedAgentHost, SharedAgentHostError, SharedAgentStatus,
+    SharedAgentApplyOutcome, SharedAgentHost, SharedAgentHostError, SharedAgentRuntimeProjection,
+    SharedAgentStatus, SharedAgentTransportState,
 };
 use crate::agent::shared_journal_driver::SharedMergeObject;
 use crate::agent::{ReplicaRole, shared_raft};
@@ -218,15 +225,23 @@ fn decode_active_config(bytes: &[u8]) -> Result<ActiveConfigRecord<NodeId>, Comm
 struct AgentNodeStorage {
     database: Arc<Database>,
     log: RaftLog,
+    authenticated_snapshot: (u64, u64),
 }
 
 impl AgentNodeStorage {
-    fn open(database: Arc<Database>) -> Result<Self, CommitError> {
+    fn open(
+        database: Arc<Database>,
+        authenticated_snapshot: (u64, u64),
+    ) -> Result<Self, CommitError> {
         let log = RaftLog::open(Arc::clone(&database))?;
         let meta = RaftMeta::load(&database)?;
-        if meta.voted_for.is_some() || meta.snap_last_index != 0 || meta.snap_last_term != 0 {
+        if meta.voted_for.is_some()
+            || (meta.snap_last_index, meta.snap_last_term) != authenticated_snapshot
+            || (log.snap_last_index(), log.snap_last_term()) != authenticated_snapshot
+            || (authenticated_snapshot.0 == 0) != (authenticated_snapshot.1 == 0)
+        {
             return Err(storage_error(
-                "legacy vote or unauthenticated snapshot in clean Agent Raft database",
+                "legacy vote or mismatched authenticated snapshot in clean Agent Raft database",
             ));
         }
         let transaction = database.begin_read()?;
@@ -237,7 +252,11 @@ impl AgentNodeStorage {
                 "legacy compact Raft configuration in clean Agent database",
             ));
         }
-        let storage = Self { database, log };
+        let storage = Self {
+            database,
+            log,
+            authenticated_snapshot,
+        };
         let _ = storage.load_exact_vote()?;
         let _ = storage.load_active_config_sync()?;
         Ok(storage)
@@ -325,8 +344,7 @@ impl Storage<NodeId> for AgentNodeStorage {
     async fn load_meta(&self) -> Result<Meta<NodeId>, Self::Error> {
         let durable = RaftMeta::load(&self.database)?;
         if durable.voted_for.is_some()
-            || durable.snap_last_index != 0
-            || durable.snap_last_term != 0
+            || (durable.snap_last_index, durable.snap_last_term) != self.authenticated_snapshot
         {
             return Err(storage_error("non-clean Agent Raft metadata"));
         }
@@ -334,8 +352,8 @@ impl Storage<NodeId> for AgentNodeStorage {
             current_term: durable.current_term,
             voted_for: self.load_exact_vote()?,
             commit_index: durable.commit_index,
-            snap_last_index: 0,
-            snap_last_term: 0,
+            snap_last_index: self.authenticated_snapshot.0,
+            snap_last_term: self.authenticated_snapshot.1,
         })
     }
 
@@ -373,9 +391,9 @@ impl Storage<NodeId> for AgentNodeStorage {
                 }
             }
             if let Some(meta) = &new_meta {
-                if meta.snap_last_index != 0
-                    || meta.snap_last_term != 0
+                if (meta.snap_last_index, meta.snap_last_term) != self.authenticated_snapshot
                     || meta.commit_index > self.log.last_index()
+                    || meta.commit_index < self.authenticated_snapshot.0
                 {
                     return Err(storage_error("invalid clean Agent Raft metadata advance"));
                 }
@@ -393,8 +411,8 @@ impl Storage<NodeId> for AgentNodeStorage {
                     voted_for: None,
                     commit_index: meta.commit_index,
                     last_applied: current.last_applied,
-                    snap_last_index: 0,
-                    snap_last_term: 0,
+                    snap_last_index: self.authenticated_snapshot.0,
+                    snap_last_term: self.authenticated_snapshot.1,
                 };
                 durable.write_worker_fields_in_txn(&transaction)?;
                 let mut table = transaction.open_table(RAFT_META)?;
@@ -425,20 +443,33 @@ impl Storage<NodeId> for AgentNodeStorage {
 }
 
 fn protocol_route(status: &SharedAgentStatus) -> AgentGenerationRoute {
+    protocol_route_from(status.generation, status.replication_id)
+}
+
+fn protocol_route_from(
+    generation: crate::agent::shared_raft::AgentGenerationRouteKey,
+    replication_id: [u8; 32],
+) -> AgentGenerationRoute {
     AgentGenerationRoute {
-        space: vos_agent_sdk::SpaceId(status.generation.space().0),
-        agent: vos_agent_sdk::AgentId(status.generation.agent().0),
-        generation: Hash(status.replication_id),
+        space: vos_agent_sdk::SpaceId(generation.space().0),
+        agent: vos_agent_sdk::AgentId(generation.agent().0),
+        generation: Hash(replication_id),
     }
 }
 
 fn route_members(
     status: &SharedAgentStatus,
 ) -> Result<Vec<(NodeId, PeerId)>, SharedAgentHostError> {
+    route_members_from(&status.replicas, status.committee_transition.as_ref())
+}
+
+fn route_members_from(
+    replicas: &[crate::agent::shared_host::SharedReplicaRoute],
+    transition: Option<&crate::agent::shared_host::SharedCommitteeTransitionRoute>,
+) -> Result<Vec<(NodeId, PeerId)>, SharedAgentHostError> {
     let mut by_node = BTreeMap::new();
-    let replicas = status.replicas.iter().chain(
-        status
-            .committee_transition
+    let replicas = replicas.iter().chain(
+        transition
             .iter()
             .flat_map(|transition| transition.next_replicas.iter()),
     );
@@ -470,8 +501,15 @@ fn voter_nodes(replicas: &[crate::agent::shared_host::SharedReplicaRoute]) -> Ve
 }
 
 fn raft_configuration(status: &SharedAgentStatus) -> (Vec<NodeId>, Option<Vec<NodeId>>) {
-    let active = voter_nodes(&status.replicas);
-    match &status.committee_transition {
+    raft_configuration_from(&status.replicas, status.committee_transition.as_ref())
+}
+
+fn raft_configuration_from(
+    replicas: &[crate::agent::shared_host::SharedReplicaRoute],
+    transition: Option<&crate::agent::shared_host::SharedCommitteeTransitionRoute>,
+) -> (Vec<NodeId>, Option<Vec<NodeId>>) {
+    let active = voter_nodes(replicas);
+    match transition {
         Some(transition) if transition.joint => {
             (voter_nodes(&transition.next_replicas), Some(active))
         }
@@ -663,6 +701,41 @@ impl AttachmentFingerprint {
         })
     }
 
+    fn from_attachment_status(
+        status: &crate::agent::shared_host::SharedAgentAttachmentStatus,
+    ) -> Result<Self, SharedAgentHostError> {
+        let members = route_members_from(&status.replicas, status.committee_transition.as_ref())?;
+        let (voters, joint_old) =
+            raft_configuration_from(&status.replicas, status.committee_transition.as_ref());
+        let next_voters = status
+            .committee_transition
+            .as_ref()
+            .map(|transition| voter_nodes(&transition.next_replicas));
+        if !valid_nodes(&voters)
+            || joint_old.as_ref().is_some_and(|nodes| !valid_nodes(nodes))
+            || next_voters
+                .as_ref()
+                .is_some_and(|nodes| !valid_nodes(nodes))
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Ok(Self {
+            protocol_route: protocol_route_from(status.generation, status.replication_id),
+            durable_route: status.route,
+            members,
+            next_committee: status
+                .committee_transition
+                .as_ref()
+                .map(|transition| transition.next_committee),
+            next_voters,
+            voters,
+            joint_old,
+            local_role: status
+                .local_role
+                .ok_or(SharedAgentHostError::ScopeMismatch)?,
+        })
+    }
+
     fn validates_local(&self, local: NodeId) -> bool {
         if self.next_committee.is_some() != self.next_voters.is_some() {
             return false;
@@ -711,9 +784,39 @@ struct SharedRouteHandler {
     agent: crate::service::AgentId,
     route_nodes: Vec<NodeId>,
     worker: Option<vos_raft::WorkerHandle<NodeId>>,
-    proposal: Mutex<()>,
+    proposal: Mutex<ProposalAdmission>,
     ordered_replies: Arc<OrderedReplyWaiters>,
     lifecycle: Arc<RwLock<bool>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProjectionPairKey {
+    invocation: crate::agent_sdk::InvocationId,
+    work: Hash,
+    authorization: Hash,
+}
+
+impl ProjectionPairKey {
+    fn new(work: &InvocationWork, authorization: &InvocationAuthorization) -> Self {
+        Self {
+            invocation: work.invocation,
+            work: work.commitment(),
+            authorization: authorization.commitment(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProposalAdmission {
+    projection_pair: Option<ProjectionPairKey>,
+}
+
+struct RecoveringProjectionAdmission<'a> {
+    agent: crate::service::AgentId,
+    work: &'a InvocationWork,
+    authorization: &'a InvocationAuthorization,
+    expected_committee: &'a AgentReplicaCommittee,
+    signer: &'a dyn LocalMergeAuthenticator,
 }
 
 /// Result of one authenticated clean Ordered submission through the live
@@ -761,15 +864,185 @@ impl SharedRouteHandler {
         true
     }
 
+    fn reserve_projection_pair(
+        &self,
+        work: &InvocationWork,
+        authorization: &InvocationAuthorization,
+        recovering: bool,
+    ) -> Result<(), SharedAgentHostError> {
+        let key = ProjectionPairKey::new(work, authorization);
+        let mut proposal = self
+            .proposal
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        match proposal.projection_pair {
+            Some(existing) if existing == key => return Ok(()),
+            Some(_) => return Err(SharedAgentHostError::Conflict),
+            None => {}
+        }
+        let worker = self
+            .worker
+            .as_ref()
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        if !self.has_local_proposer(worker) {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        let barrier = futures_executor::block_on(worker.snapshot())
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        if barrier.role != vos_raft::Role::Leader || barrier.commit_index != barrier.last_log_index
+        {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        let mut host = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        drain_committed(&mut host, self.agent, &self.ordered_replies)?;
+        let status = host
+            .show(self.agent)?
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        if status.applied_slots != barrier.commit_index {
+            return Err(SharedAgentHostError::CorruptResidue);
+        }
+        let Some(required) =
+            host.projection_admission_requirement(self.agent, work, authorization, recovering)?
+        else {
+            return Err(SharedAgentHostError::CapacityExhausted);
+        };
+        // Keep one physical slot beyond every non-empty exact lifecycle.
+        // A crash can leave its final record committed while the next
+        // one-voter reopen must still append the mandatory current-term
+        // leader no-op before recovery may publish the route.
+        let required_with_reopen = (required as u64).saturating_add(u64::from(required != 0));
+        if status.remaining_slots < required_with_reopen {
+            return Err(SharedAgentHostError::CapacityExhausted);
+        }
+        proposal.projection_pair = Some(key);
+        Ok(())
+    }
+
+    fn release_projection_pair(
+        &self,
+        work: &InvocationWork,
+        authorization: &InvocationAuthorization,
+    ) -> Result<(), SharedAgentHostError> {
+        let key = ProjectionPairKey::new(work, authorization);
+        let mut proposal = self
+            .proposal
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if proposal.projection_pair != Some(key) {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        proposal.projection_pair = None;
+        Ok(())
+    }
+
+    fn complete_projection_pair<F>(
+        &self,
+        work: &InvocationWork,
+        authorization: &InvocationAuthorization,
+        complete: F,
+    ) -> Result<(), SharedAgentHostError>
+    where
+        F: FnOnce() -> Result<(), SharedAgentHostError>,
+    {
+        let key = ProjectionPairKey::new(work, authorization);
+        let mut proposal = self
+            .proposal
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if proposal.projection_pair != Some(key) {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        // Keep every suffix-consuming ingress path excluded through the
+        // durable pending-record clear. A failed clear leaves the exact key
+        // reserved; a successful clear and volatile release are one critical
+        // section, so neither an ingress gap nor an unrecoverable post-clear
+        // release failure exists.
+        complete()?;
+        proposal.projection_pair = None;
+        Ok(())
+    }
+
+    fn reserve_checkpoint_gate(
+        &self,
+        work: &InvocationWork,
+        authorization: &InvocationAuthorization,
+    ) -> Result<(), SharedAgentHostError> {
+        let key = ProjectionPairKey::new(work, authorization);
+        let mut proposal = self
+            .proposal
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        match proposal.projection_pair {
+            None => proposal.projection_pair = Some(key),
+            Some(existing) if existing == key => {}
+            Some(_) => return Err(SharedAgentHostError::Conflict),
+        }
+        Ok(())
+    }
+
     fn submit_clean_ordered(
         &self,
         work: crate::agent_sdk::InvocationWork,
         authorization: crate::agent_sdk::InvocationAuthorization,
     ) -> Result<CleanOrderedSubmission, SharedAgentHostError> {
-        let _proposal = self
+        self.submit_clean_ordered_operation(
+            crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Invoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                work,
+                authorization,
+            },
+        )
+    }
+
+    fn submit_clean_ordered_operation(
+        &self,
+        request: crate::agent::shared_journal_driver::CleanInvocationReplayRequest,
+    ) -> Result<CleanOrderedSubmission, SharedAgentHostError> {
+        self.submit_clean_ordered_operation_with_policy(request, false)
+    }
+
+    fn submit_terminal_clean_ordered_operation(
+        &self,
+        request: crate::agent::shared_journal_driver::CleanInvocationReplayRequest,
+    ) -> Result<CleanOrderedSubmission, SharedAgentHostError> {
+        self.submit_clean_ordered_operation_with_policy(request, true)
+    }
+
+    fn submit_clean_ordered_operation_with_policy(
+        &self,
+        request: crate::agent::shared_journal_driver::CleanInvocationReplayRequest,
+        terminal_only: bool,
+    ) -> Result<CleanOrderedSubmission, SharedAgentHostError> {
+        self.submit_clean_ordered_operation_with_admission(request, terminal_only, None)
+    }
+
+    fn submit_reserved_clean_ordered_operation(
+        &self,
+        request: crate::agent::shared_journal_driver::CleanInvocationReplayRequest,
+        terminal_only: bool,
+    ) -> Result<CleanOrderedSubmission, SharedAgentHostError> {
+        let key = ProjectionPairKey::new(request.work(), request.authorization());
+        self.submit_clean_ordered_operation_with_admission(request, terminal_only, Some(key))
+    }
+
+    fn submit_clean_ordered_operation_with_admission(
+        &self,
+        request: crate::agent::shared_journal_driver::CleanInvocationReplayRequest,
+        terminal_only: bool,
+        reservation: Option<ProjectionPairKey>,
+    ) -> Result<CleanOrderedSubmission, SharedAgentHostError> {
+        let proposal = self
             .proposal
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
+        match (proposal.projection_pair, reservation) {
+            (None, None) => {}
+            (Some(expected), Some(actual)) if expected == actual => {}
+            _ => return Err(SharedAgentHostError::CapacityExhausted),
+        }
         let worker = self
             .worker
             .as_ref()
@@ -783,7 +1056,13 @@ impl SharedRouteHandler {
                 .lock()
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
             drain_committed(&mut host, self.agent, &self.ordered_replies)?;
-            let prepared = host.prepare_clean_ordered(self.agent, work, authorization)?;
+            let prepared = if reservation.is_some() {
+                host.prepare_reserved_projection_operation(self.agent, request, terminal_only)?
+            } else if terminal_only {
+                host.prepare_terminal_clean_ordered_operation(self.agent, request)?
+            } else {
+                host.prepare_clean_ordered_operation(self.agent, request)?
+            };
             let input = prepared.input();
             if let Some(outcome) = prepared.retained().cloned() {
                 return Ok(CleanOrderedSubmission {
@@ -827,10 +1106,13 @@ impl SharedRouteHandler {
         authority: crate::agent_sdk::authority::AuthorityReceipt,
         artifacts: crate::agent::driver::SdkManagementArtifacts<'_>,
     ) -> Result<CleanManagementSubmission, SharedAgentHostError> {
-        let _proposal = self
+        let proposal = self
             .proposal
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if proposal.projection_pair.is_some() {
+            return Err(SharedAgentHostError::CapacityExhausted);
+        }
         let worker = self
             .worker
             .as_ref()
@@ -950,7 +1232,10 @@ impl SharedRouteHandler {
                 // invocation. This keeps the journal parent constructed below
                 // exact while the independent apply thread is free to commit
                 // and deliver its keyed result.
-                let _proposal = self.proposal.lock().map_err(|_| AgentHandlerError)?;
+                let proposal = self.proposal.lock().map_err(|_| AgentHandlerError)?;
+                if proposal.projection_pair.is_some() {
+                    return Err(AgentHandlerError);
+                }
                 let worker = self.worker.as_ref().ok_or(AgentHandlerError)?;
                 if worker.role() != vos_raft::Role::Leader {
                     let leader = worker
@@ -995,6 +1280,10 @@ impl SharedRouteHandler {
                 Ok(reply_for_outcome(correlation, outcome))
             }
             MethodMode::Merge => {
+                let proposal = self.proposal.lock().map_err(|_| AgentHandlerError)?;
+                if proposal.projection_pair.is_some() {
+                    return Err(AgentHandlerError);
+                }
                 let outcome = self
                     .host
                     .lock()
@@ -1004,6 +1293,10 @@ impl SharedRouteHandler {
                 Ok(reply_for_outcome(correlation, outcome))
             }
             MethodMode::LocalQuery | MethodMode::Local => {
+                let proposal = self.proposal.lock().map_err(|_| AgentHandlerError)?;
+                if proposal.projection_pair.is_some() {
+                    return Err(AgentHandlerError);
+                }
                 let outcome = self
                     .host
                     .lock()
@@ -1159,6 +1452,14 @@ impl SharedRouteHandler {
     }
 
     fn sync_merge_heads(&self, sender: NodeId, heads: Vec<Hash>) -> Result<(), AgentHandlerError> {
+        // Imported Merge events consume the same authenticated composite
+        // suffix budget as the reserved projection pair. Hold admission for
+        // the complete sync/import pass so neither ingress nor the background
+        // pump can race the exact headroom check.
+        let proposal = self.proposal.lock().map_err(|_| AgentHandlerError)?;
+        if proposal.projection_pair.is_some() {
+            return Err(AgentHandlerError);
+        }
         // First bring every already-committed Ordered base into the journal;
         // a Merge event may never synthesize or outrun that boundary.
         if let Ok(mut host) = self.host.lock() {
@@ -1399,6 +1700,14 @@ pub struct SharedAgentNetworkHost {
     host: Arc<Mutex<SharedAgentHost>>,
     network: Arc<Network>,
     generations: BTreeMap<crate::service::AgentId, AttachedGeneration>,
+    // System attachments always serialize leader promotion and drain the
+    // recovered physical suffix before publishing a route. Keep that
+    // identity across refresh/checkpoint reattachment, not just bootstrap.
+    system_agents: BTreeSet<crate::service::AgentId>,
+    #[cfg(test)]
+    force_checkpoint_once: bool,
+    #[cfg(test)]
+    fail_reattach_once: bool,
 }
 
 /// Reserves the host's storage boundary before any worker database handle,
@@ -1450,6 +1759,70 @@ impl SharedAgentNetworkHost {
         host: Arc<Mutex<SharedAgentHost>>,
         network: Arc<Network>,
     ) -> Result<Self, SharedAgentHostError> {
+        Self::attach_internal(host, network, None, None)
+    }
+
+    /// Attach the one-voter clean system Agent. With no durable pending
+    /// projection, checkpoint before a mandatory leader no-op could combine
+    /// with one retained uncommitted physical row and overrun the evidence
+    /// suffix. Snapshot installation preserves that tail but resets its
+    /// authenticated capacity domain at the applied boundary.
+    pub(crate) fn attach_system(
+        host: Arc<Mutex<SharedAgentHost>>,
+        network: Arc<Network>,
+        agent: crate::service::AgentId,
+        expected_committee: &AgentReplicaCommittee,
+        signer: &dyn LocalMergeAuthenticator,
+    ) -> Result<Self, SharedAgentHostError> {
+        let needs_checkpoint = host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .show(agent)?
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .remaining_slots
+            <= 1;
+        if needs_checkpoint {
+            let mut locked = host.lock().map_err(|_| SharedAgentHostError::Unavailable)?;
+            Self::install_detached_checkpoint(&mut locked, agent, expected_committee, signer)?;
+        }
+        Self::attach_internal(host, network, None, Some(agent))
+    }
+
+    /// Reopen a system host with the exact durable pending projection pair
+    /// already excluded before its route is activated. No ingress or Merge
+    /// pump can consume replay headroom in the attach-to-recovery window.
+    pub(crate) fn attach_recovering_projection(
+        host: Arc<Mutex<SharedAgentHost>>,
+        network: Arc<Network>,
+        agent: crate::service::AgentId,
+        work: &InvocationWork,
+        authorization: &InvocationAuthorization,
+        expected_committee: &AgentReplicaCommittee,
+        signer: &dyn LocalMergeAuthenticator,
+    ) -> Result<Self, SharedAgentHostError> {
+        if crate::service::AgentId(work.agent.0) != agent || !authorization.matches_work(work) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Self::attach_internal(
+            host,
+            network,
+            Some(RecoveringProjectionAdmission {
+                agent,
+                work,
+                authorization,
+                expected_committee,
+                signer,
+            }),
+            Some(agent),
+        )
+    }
+
+    fn attach_internal<'a>(
+        host: Arc<Mutex<SharedAgentHost>>,
+        network: Arc<Network>,
+        recovering: Option<RecoveringProjectionAdmission<'a>>,
+        promotion_barrier: Option<crate::service::AgentId>,
+    ) -> Result<Self, SharedAgentHostError> {
         let statuses = host
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?
@@ -1458,17 +1831,373 @@ impl SharedAgentNetworkHost {
             host,
             network,
             generations: BTreeMap::new(),
+            system_agents: promotion_barrier.into_iter().collect(),
+            #[cfg(test)]
+            force_checkpoint_once: false,
+            #[cfg(test)]
+            fail_reattach_once: false,
         };
         for status in statuses {
             if status.local_role.is_some() {
-                attachment.attach_status(status)?;
+                let pending = recovering
+                    .as_ref()
+                    .filter(|pending| pending.agent == status.generation.agent())
+                    .map(|pending| pending);
+                let barrier =
+                    pending.is_some() || promotion_barrier == Some(status.generation.agent());
+                attachment.attach_status(status, pending, barrier)?;
             }
+        }
+        if recovering
+            .as_ref()
+            .is_some_and(|pending| !attachment.generations.contains_key(&pending.agent))
+        {
+            return Err(SharedAgentHostError::AgentNotFound);
         }
         Ok(attachment)
     }
 
-    fn attach_status(&mut self, mut status: SharedAgentStatus) -> Result<(), SharedAgentHostError> {
+    fn install_detached_projection_checkpoint(
+        host: &mut SharedAgentHost,
+        recovering: &RecoveringProjectionAdmission<'_>,
+    ) -> Result<(), SharedAgentHostError> {
+        Self::install_detached_checkpoint(
+            host,
+            recovering.agent,
+            recovering.expected_committee,
+            recovering.signer,
+        )
+    }
+
+    fn install_detached_checkpoint(
+        host: &mut SharedAgentHost,
+        agent: crate::service::AgentId,
+        expected_committee: &AgentReplicaCommittee,
+        signer: &dyn LocalMergeAuthenticator,
+    ) -> Result<(), SharedAgentHostError> {
+        if expected_committee.members().len() != 1
+            || expected_committee.voter_count() != 1
+            || expected_committee
+                .member_by_node(signer.node())
+                .is_none_or(|member| member.replica().role != ReplicaRole::Voter)
+        {
+            return Err(SharedAgentHostError::SnapshotCertificateInvalid);
+        }
+        let candidate = host.request_snapshot_compaction(agent)?;
+        if candidate.claim().active_committee() != expected_committee {
+            return Err(SharedAgentHostError::SnapshotCertificateInvalid);
+        }
+        let signature = signer
+            .sign_snapshot_candidate(&candidate)
+            .ok_or(SharedAgentHostError::SnapshotCertificateInvalid)?;
+        let certificate =
+            SharedAgentSnapshotCertificate::new(candidate.claim().clone(), vec![signature])
+                .map_err(|_| SharedAgentHostError::SnapshotCertificateInvalid)?;
+        host.install_snapshot(agent, &certificate)?;
+
+        Ok(())
+    }
+
+    /// Repair a missing/stale live transport attachment from durable host
+    /// status before any projection capacity decision. This also closes the
+    /// same-process retry edge after snapshot installation succeeded but its
+    /// first reattachment attempt failed.
+    pub(crate) fn ensure_reattached(
+        &mut self,
+        agent: crate::service::AgentId,
+    ) -> Result<(), SharedAgentHostError> {
+        self.refresh()?;
+        self.generations
+            .contains_key(&agent)
+            .then_some(())
+            .ok_or(SharedAgentHostError::TransportNotAttached)
+    }
+
+    pub(crate) fn reserve_projection_pair(
+        &mut self,
+        agent: crate::service::AgentId,
+        work: &InvocationWork,
+        authorization: &InvocationAuthorization,
+        recovering: bool,
+    ) -> Result<(), SharedAgentHostError> {
+        if crate::service::AgentId(work.agent.0) != agent || !authorization.matches_work(work) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if recovering {
+            let stale = self
+                .generations
+                .get(&agent)
+                .is_some_and(|attached| attached.stale.load(Ordering::Acquire));
+            if stale {
+                self.retire(agent)?;
+            }
+            if !self.generations.contains_key(&agent) {
+                return Err(SharedAgentHostError::TransportNotAttached);
+            }
+        } else {
+            self.ensure_reattached(agent)?;
+        }
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        if attached.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        attached
+            .coordinator
+            .reserve_projection_pair(work, authorization, recovering)
+    }
+
+    pub(crate) fn reserve_recovering_projection_pair(
+        &mut self,
+        agent: crate::service::AgentId,
+        work: &InvocationWork,
+        authorization: &InvocationAuthorization,
+        expected_committee: &AgentReplicaCommittee,
+        signer: &dyn LocalMergeAuthenticator,
+    ) -> Result<(), SharedAgentHostError> {
+        if crate::service::AgentId(work.agent.0) != agent || !authorization.matches_work(work) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let stale = self
+            .generations
+            .get(&agent)
+            .is_some_and(|attached| attached.stale.load(Ordering::Acquire));
+        if stale {
+            self.retire(agent)?;
+        }
+        if !self.generations.contains_key(&agent) {
+            let status = self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .show(agent)?
+                .ok_or(SharedAgentHostError::AgentNotFound)?;
+            let recovering = RecoveringProjectionAdmission {
+                agent,
+                work,
+                authorization,
+                expected_committee,
+                signer,
+            };
+            self.attach_status(status, Some(&recovering), true)?;
+        }
+        self.reserve_projection_pair(agent, work, authorization, true)
+    }
+
+    pub(crate) fn release_projection_pair(
+        &self,
+        agent: crate::service::AgentId,
+        work: &InvocationWork,
+        authorization: &InvocationAuthorization,
+    ) -> Result<(), SharedAgentHostError> {
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        attached
+            .coordinator
+            .release_projection_pair(work, authorization)
+    }
+
+    pub(crate) fn complete_projection_pair<F>(
+        &self,
+        agent: crate::service::AgentId,
+        work: &InvocationWork,
+        authorization: &InvocationAuthorization,
+        complete: F,
+    ) -> Result<(), SharedAgentHostError>
+    where
+        F: FnOnce() -> Result<(), SharedAgentHostError>,
+    {
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        attached
+            .coordinator
+            .complete_projection_pair(work, authorization, complete)
+    }
+
+    /// Install a quorum-authenticated journal checkpoint before the bounded
+    /// Ordered suffix can strand a projection Invoke/Ack pair. Clean system
+    /// Agents are structurally one local voter; every other committee shape
+    /// fails closed rather than manufacturing a partial certificate.
+    pub(crate) fn certified_checkpoint_for_projection_pair(
+        &mut self,
+        agent: crate::service::AgentId,
+        work: &InvocationWork,
+        authorization: &InvocationAuthorization,
+        expected_committee: &AgentReplicaCommittee,
+        signer: &dyn LocalMergeAuthenticator,
+    ) -> Result<bool, SharedAgentHostError> {
+        self.ensure_reattached(agent)?;
+        let (raft_fits, replay_fits) = {
+            let host = self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let status = host
+                .show(agent)?
+                .ok_or(SharedAgentHostError::AgentNotFound)?;
+            let required = host.projection_admission_records(agent, work, authorization, false)?;
+            (
+                status.remaining_slots
+                    >= (required as u64).saturating_add(u64::from(required != 0)),
+                host.projection_pair_fits(agent, work, authorization)?,
+            )
+        };
+        #[cfg(test)]
+        let forced = core::mem::take(&mut self.force_checkpoint_once);
+        #[cfg(not(test))]
+        let forced = false;
+        if !forced && raft_fits && replay_fits {
+            return Ok(false);
+        }
+        if expected_committee.members().len() != 1
+            || expected_committee.voter_count() != 1
+            || expected_committee
+                .member_by_node(signer.node())
+                .is_none_or(|member| member.replica().role != ReplicaRole::Voter)
+        {
+            return Err(SharedAgentHostError::SnapshotCertificateInvalid);
+        }
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        attached
+            .coordinator
+            .reserve_checkpoint_gate(work, authorization)?;
+        let certificate = {
+            let mut host = self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let candidate = match host.request_snapshot_compaction(agent) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    drop(host);
+                    let _ = attached
+                        .coordinator
+                        .release_projection_pair(work, authorization);
+                    return Err(error);
+                }
+            };
+            if candidate.claim().active_committee() != expected_committee {
+                drop(host);
+                let _ = attached
+                    .coordinator
+                    .release_projection_pair(work, authorization);
+                return Err(SharedAgentHostError::SnapshotCertificateInvalid);
+            }
+            let Some(signature) = signer.sign_snapshot_candidate(&candidate) else {
+                drop(host);
+                let _ = attached
+                    .coordinator
+                    .release_projection_pair(work, authorization);
+                return Err(SharedAgentHostError::SnapshotCertificateInvalid);
+            };
+            match SharedAgentSnapshotCertificate::new(candidate.claim().clone(), vec![signature]) {
+                Ok(certificate) => certificate,
+                Err(_) => {
+                    drop(host);
+                    let _ = attached
+                        .coordinator
+                        .release_projection_pair(work, authorization);
+                    return Err(SharedAgentHostError::SnapshotCertificateInvalid);
+                }
+            }
+        };
+
+        // Only a fully reconstructed and locally signed candidate can retire
+        // the live worker. Signer refusal and candidate errors release the
+        // checkpoint gate while preserving the exact existing attachment.
+        self.retire(agent)?;
+        let checkpoint = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .install_snapshot(agent, &certificate);
+
+        // Restart always reconstructs this attachment from durable host
+        // status. In-process failures make the same attempt here regardless
+        // of whether retirement, signing, or installation failed.
+        let reattachment = self.reattach_current(agent);
+        match (checkpoint, reattachment) {
+            (Ok(_), Ok(())) => {
+                let host = self
+                    .host
+                    .lock()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+                let remaining = host
+                    .show(agent)?
+                    .ok_or(SharedAgentHostError::AgentNotFound)?
+                    .remaining_slots;
+                let required = host
+                    .projection_admission_requirement(agent, work, authorization, false)?
+                    .ok_or(SharedAgentHostError::CapacityExhausted)?;
+                if remaining < (required as u64).saturating_add(u64::from(required != 0))
+                    || !host.projection_pair_fits(agent, work, authorization)?
+                {
+                    return Err(SharedAgentHostError::CapacityExhausted);
+                }
+                Ok(true)
+            }
+            (Err(error), Ok(())) => Err(error),
+            (_, Err(error)) => Err(error),
+        }
+    }
+
+    fn reattach_current(
+        &mut self,
+        agent: crate::service::AgentId,
+    ) -> Result<(), SharedAgentHostError> {
+        #[cfg(test)]
+        if core::mem::take(&mut self.fail_reattach_once) {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        if self.generations.contains_key(&agent) {
+            return Ok(());
+        }
+        let status = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .show(agent)?
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        self.attach_status(status, None, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_checkpoint_once_for_test(&mut self) {
+        self.force_checkpoint_once = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_reattach_once_for_test(&mut self) {
+        self.fail_reattach_once = true;
+    }
+
+    fn attach_status(
+        &mut self,
+        status: SharedAgentStatus,
+        recovering: Option<&RecoveringProjectionAdmission<'_>>,
+        promotion_barrier: bool,
+    ) -> Result<(), SharedAgentHostError> {
+        self.attach_status_with_recovery_checkpoint(status, recovering, promotion_barrier, true)
+    }
+
+    fn attach_status_with_recovery_checkpoint(
+        &mut self,
+        status: SharedAgentStatus,
+        recovering: Option<&RecoveringProjectionAdmission<'_>>,
+        promotion_barrier: bool,
+        allow_checkpoint: bool,
+    ) -> Result<(), SharedAgentHostError> {
         let agent = status.generation.agent();
+        let promotion_barrier = promotion_barrier || self.system_agents.contains(&agent);
         if self.generations.contains_key(&agent) {
             return Err(SharedAgentHostError::Conflict);
         }
@@ -1478,21 +2207,79 @@ impl SharedAgentNetworkHost {
         // the journal application cursor. No new Raft event is guaranteed to
         // arrive, so drain that exact suffix before exposing a route or
         // deriving its current committee fingerprint.
-        {
+        let attachment_status = {
             let mut host = self
                 .host
                 .lock()
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
             drain_committed(&mut host, agent, &ordered_replies)?;
-            status = host
-                .show(agent)?
-                .ok_or(SharedAgentHostError::AgentNotFound)?;
+            host.supervisor_attachment_status(agent)?
+                .ok_or(SharedAgentHostError::AgentNotFound)?
+        };
+        if let Some(recovering) = recovering {
+            let (required, remaining) = {
+                let host = self
+                    .host
+                    .lock()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+                let status = host
+                    .show(agent)?
+                    .ok_or(SharedAgentHostError::AgentNotFound)?;
+                (
+                    host.projection_admission_requirement(
+                        agent,
+                        recovering.work,
+                        recovering.authorization,
+                        true,
+                    )?,
+                    status.remaining_slots,
+                )
+            };
+            let needs_checkpoint = required.is_none_or(|required| {
+                remaining
+                    < u64::try_from(required)
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(1)
+            });
+            if needs_checkpoint {
+                if !allow_checkpoint {
+                    return Err(SharedAgentHostError::CapacityExhausted);
+                }
+                drop(reservation);
+                {
+                    let mut host = self
+                        .host
+                        .lock()
+                        .map_err(|_| SharedAgentHostError::Unavailable)?;
+                    Self::install_detached_projection_checkpoint(&mut host, recovering)?;
+                }
+                let status = self
+                    .host
+                    .lock()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                    .show(agent)?
+                    .ok_or(SharedAgentHostError::AgentNotFound)?;
+                return self.attach_status_with_recovery_checkpoint(
+                    status,
+                    Some(recovering),
+                    promotion_barrier,
+                    false,
+                );
+            }
         }
-        let fingerprint = AttachmentFingerprint::from_status(&status)?;
+        let fingerprint = AttachmentFingerprint::from_attachment_status(&attachment_status)?;
         let local = self.network.agent_node_id();
         if !fingerprint.validates_local(local) {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
+        let authenticated_snapshot = match status.snapshots {
+            crate::agent::shared_host::SharedAgentSnapshotState::None => (0, 0),
+            crate::agent::shared_host::SharedAgentSnapshotState::Installed {
+                raft_index,
+                raft_term,
+                ..
+            } => (raft_index, raft_term),
+        };
         let route = fingerprint.protocol_route;
         let (mut worker, handle, receiver) = if fingerprint.owns_raft_worker(local) {
             let database = self
@@ -1500,11 +2287,14 @@ impl SharedAgentNetworkHost {
                 .lock()
                 .map_err(|_| SharedAgentHostError::Unavailable)?
                 .raft_database(agent)?;
-            let storage = AgentNodeStorage::open(database)
+            let storage = AgentNodeStorage::open(database, authenticated_snapshot)
                 .map_err(|_| SharedAgentHostError::CorruptResidue)?;
             let transport = Arc::new(AgentRaftTransport::new(Arc::clone(&self.network), route));
-            let mut config =
-                vos_raft::Config::new(local, fingerprint.voters.clone(), status.replication_id);
+            let mut config = vos_raft::Config::new(
+                local,
+                fingerprint.voters.clone(),
+                attachment_status.replication_id,
+            );
             config.max_append_entries = MAX_SHARED_RAFT_APPEND_ENTRIES;
             config.max_inflight_replications = 8;
             // Generic snapshots cannot represent an authenticated Agent
@@ -1524,8 +2314,125 @@ impl SharedAgentNetworkHost {
             // participate in Raft quorum or process Raft RPCs.
             (None, None, None)
         };
+        if promotion_barrier {
+            let recovery_worker = handle
+                .as_ref()
+                .ok_or(SharedAgentHostError::TransportNotAttached)?;
+            let deadline = Instant::now() + ORDERED_REPLY_WAIT;
+            while recovery_worker.role() != vos_raft::Role::Leader {
+                if Instant::now() >= deadline {
+                    return Err(SharedAgentHostError::Unavailable);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Serialize behind leader promotion: role publication can precede
+            // its mandatory current-term no-op commit advance by one worker
+            // step. The snapshot barrier proves the no-op and every recovered
+            // tail row are committed before we derive admission capacity.
+            let barrier = futures_executor::block_on(recovery_worker.snapshot())
+                .ok_or(SharedAgentHostError::Unavailable)?;
+            if barrier.role != vos_raft::Role::Leader
+                || barrier.commit_index != barrier.last_log_index
+            {
+                return Err(SharedAgentHostError::Unavailable);
+            }
+            let mut host = self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            drain_committed(&mut host, agent, &ordered_replies)?;
+            if host
+                .show(agent)?
+                .ok_or(SharedAgentHostError::AgentNotFound)?
+                .applied_slots
+                != barrier.commit_index
+            {
+                return Err(SharedAgentHostError::CorruptResidue);
+            }
+        }
+        if let Some(recovering) = recovering {
+            let (required, remaining) = {
+                let host = self
+                    .host
+                    .lock()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+                let status = host
+                    .show(agent)?
+                    .ok_or(SharedAgentHostError::AgentNotFound)?;
+                (
+                    host.projection_admission_requirement(
+                        agent,
+                        recovering.work,
+                        recovering.authorization,
+                        true,
+                    )?,
+                    status.remaining_slots,
+                )
+            };
+            let capacity = required
+                .is_some_and(|required| remaining >= u64::try_from(required).unwrap_or(u64::MAX));
+            if !capacity {
+                if let Some(worker) = worker.take() {
+                    worker.shutdown();
+                }
+                drop(handle);
+                drop(receiver);
+                drop(reservation);
+                if !allow_checkpoint {
+                    return Err(SharedAgentHostError::CapacityExhausted);
+                }
+                {
+                    let mut host = self
+                        .host
+                        .lock()
+                        .map_err(|_| SharedAgentHostError::Unavailable)?;
+                    Self::install_detached_projection_checkpoint(&mut host, recovering)?;
+                }
+                let status = self
+                    .host
+                    .lock()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                    .show(agent)?
+                    .ok_or(SharedAgentHostError::AgentNotFound)?;
+                return self.attach_status_with_recovery_checkpoint(
+                    status,
+                    Some(recovering),
+                    promotion_barrier,
+                    false,
+                );
+            }
+        }
         let lifecycle = Arc::new(RwLock::new(true));
         let apply_worker = handle.clone();
+        let initial_admission = if let Some(recovering) = recovering {
+            let host = self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let status = host
+                .show(agent)?
+                .ok_or(SharedAgentHostError::AgentNotFound)?;
+            let Some(required) = host.projection_admission_requirement(
+                agent,
+                recovering.work,
+                recovering.authorization,
+                true,
+            )?
+            else {
+                return Err(SharedAgentHostError::CapacityExhausted);
+            };
+            if status.remaining_slots < required as u64 {
+                return Err(SharedAgentHostError::CapacityExhausted);
+            }
+            ProposalAdmission {
+                projection_pair: Some(ProjectionPairKey::new(
+                    recovering.work,
+                    recovering.authorization,
+                )),
+            }
+        } else {
+            ProposalAdmission::default()
+        };
         let handler_impl = Arc::new(SharedRouteHandler {
             host: Arc::clone(&self.host),
             network: Arc::clone(&self.network),
@@ -1533,7 +2440,7 @@ impl SharedAgentNetworkHost {
             agent,
             route_nodes: fingerprint.members.iter().map(|(node, _)| *node).collect(),
             worker: handle,
-            proposal: Mutex::new(()),
+            proposal: Mutex::new(initial_admission),
             ordered_replies: Arc::clone(&ordered_replies),
             lifecycle: Arc::clone(&lifecycle),
         });
@@ -1584,9 +2491,12 @@ impl SharedAgentNetworkHost {
                             );
                             return;
                         }
-                        let current =
-                            host.show(agent).ok().flatten().and_then(|status| {
-                                AttachmentFingerprint::from_status(&status).ok()
+                        let current = host
+                            .supervisor_attachment_status(agent)
+                            .ok()
+                            .flatten()
+                            .and_then(|status| {
+                                AttachmentFingerprint::from_attachment_status(&status).ok()
                             });
                         if current.as_ref() != Some(&attached_fingerprint) {
                             ordered_replies.fail_all();
@@ -1762,10 +2672,388 @@ impl SharedAgentNetworkHost {
                 self.retire(agent)?;
             }
             if !self.generations.contains_key(&agent) {
-                self.attach_status(status)?;
+                self.attach_status(status, None, false)?;
             }
         }
         Ok(())
+    }
+
+    /// Reconcile transport ownership, then project every live generation from
+    /// its authenticated SDK descriptor and actor directory. The per-route
+    /// lifecycle lease prevents a concurrent worker failure from leaving a
+    /// projection visible after its exact network attachment was revoked.
+    pub(crate) fn supervisor_projections(
+        &mut self,
+    ) -> Result<Vec<SharedAgentRuntimeProjection>, SharedAgentHostError> {
+        self.refresh()?;
+        let agents = self.generations.keys().copied().collect::<Vec<_>>();
+        let mut projections = Vec::with_capacity(agents.len());
+        for agent in agents {
+            let attached = self
+                .generations
+                .get(&agent)
+                .ok_or(SharedAgentHostError::TransportNotAttached)?;
+            // Route operations always take the generation lease before the
+            // host mutex. Retirement may update the host first, but drops
+            // that mutex guard before taking the exclusive generation lease,
+            // so there is no host -> lifecycle lock inversion.
+            let live = attached
+                .lifecycle
+                .read()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            if !*live || attached.stale.load(Ordering::Acquire) {
+                return Err(SharedAgentHostError::TransportNotAttached);
+            }
+            let host = self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let status = host
+                .supervisor_attachment_status(agent)?
+                .ok_or(SharedAgentHostError::AgentNotFound)?;
+            if status.transport != SharedAgentTransportState::Attached
+                || AttachmentFingerprint::from_attachment_status(&status)? != attached.fingerprint
+            {
+                return Err(SharedAgentHostError::TransportNotAttached);
+            }
+            let projection = host.clean_runtime_projection(agent)?;
+            if !projection_matches_attachment_status(&projection, &status) {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            if attached.stale.load(Ordering::Acquire) {
+                return Err(SharedAgentHostError::TransportNotAttached);
+            }
+            projections.push(projection);
+        }
+        Ok(projections)
+    }
+
+    /// Reconcile transport ownership, hold every selected generation lease,
+    /// and authenticate a complete authority subset against the same physical
+    /// host/fingerprints used by invocation dispatch. A concurrent retirement
+    /// marks the generation stale and makes the audit fail before publication.
+    pub(crate) fn audit_authority_projection(
+        &mut self,
+        head: crate::agent_sdk::authority::AuthorityProjectionHead,
+        projected: &[crate::agent::supervisor_adapters::AgentAuthorityRouteProjection],
+        root: Option<&crate::agent::invocation_preparation::PhysicalRootLineage>,
+    ) -> Result<crate::agent::shared_host::SharedAuthorityProjectionAudit, SharedAgentHostError>
+    {
+        self.refresh()?;
+        let leased_agents = self.generations.keys().copied().collect::<Vec<_>>();
+        let mut leases = Vec::with_capacity(leased_agents.len());
+        for agent in &leased_agents {
+            let attached = self
+                .generations
+                .get(agent)
+                .ok_or(SharedAgentHostError::TransportNotAttached)?;
+            let lease = attached
+                .lifecycle
+                .read()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            if !*lease || attached.stale.load(Ordering::Acquire) {
+                return Err(SharedAgentHostError::TransportNotAttached);
+            }
+            leases.push(lease);
+        }
+        let host = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        for agent in &leased_agents {
+            let attached = self
+                .generations
+                .get(agent)
+                .ok_or(SharedAgentHostError::TransportNotAttached)?;
+            let status = host
+                .supervisor_attachment_status(*agent)?
+                .ok_or(SharedAgentHostError::AgentNotFound)?;
+            if status.transport != SharedAgentTransportState::Attached
+                || AttachmentFingerprint::from_attachment_status(&status)? != attached.fingerprint
+                || attached.stale.load(Ordering::Acquire)
+            {
+                return Err(SharedAgentHostError::TransportNotAttached);
+            }
+        }
+        let audit = host.audit_authority_projection(head, projected, root)?;
+        if leased_agents.iter().any(|agent| {
+            self.generations
+                .get(agent)
+                .is_none_or(|attached| attached.stale.load(Ordering::Acquire))
+        }) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        drop(host);
+        drop(leases);
+        Ok(audit)
+    }
+
+    /// Resolve physical invocation material while holding the same
+    /// generation lifecycle lease used by clean route dispatch. The catalog
+    /// read and status/fingerprint checks therefore cannot be detached from
+    /// the route owner which the supervisor published.
+    pub(crate) fn supervisor_invocation_material(
+        &self,
+        agent: vos_agent_sdk::AgentId,
+        actor: vos_agent_sdk::ActorId,
+    ) -> Result<
+        crate::agent::invocation_preparation::PhysicalInvocationMaterial,
+        SharedAgentHostError,
+    > {
+        let agent = crate::service::AgentId(agent.0);
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        let live = attached
+            .lifecycle
+            .read()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if !*live || attached.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        let host = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let status = host
+            .supervisor_attachment_status(agent)?
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        if status.transport != SharedAgentTransportState::Attached
+            || AttachmentFingerprint::from_attachment_status(&status)? != attached.fingerprint
+        {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        let material = host.supervisor_invocation_material(agent, actor)?;
+        let projection = SharedAgentRuntimeProjection {
+            descriptor: material.descriptor.clone(),
+            actors: vec![material.actor.clone()],
+        };
+        if !projection_matches_attachment_status(&projection, &status) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if attached.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        Ok(material)
+    }
+
+    /// Invoke one exact clean SDK work item through this attachment's owning
+    /// generation. Ordered calls use the authenticated Raft proposer; Merge
+    /// and Local calls remain on their profile-defined physical lanes.
+    pub(crate) fn supervisor_invoke(
+        &self,
+        expected: crate::agent::supervisor::AgentRouteIdentity,
+        work: InvocationWork,
+        authorization: InvocationAuthorization,
+    ) -> Result<RuntimeOutcome, SharedAgentHostError> {
+        self.supervisor_invocation_operation(
+            expected,
+            crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Invoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                work,
+                authorization,
+            },
+            false,
+            false,
+        )
+    }
+
+    pub(crate) fn supervisor_invoke_terminal(
+        &self,
+        expected: crate::agent::supervisor::AgentRouteIdentity,
+        work: InvocationWork,
+        authorization: InvocationAuthorization,
+    ) -> Result<RuntimeOutcome, SharedAgentHostError> {
+        self.supervisor_invocation_operation(
+            expected,
+            crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Invoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                work,
+                authorization,
+            },
+            true,
+            false,
+        )
+    }
+
+    pub(crate) fn supervisor_invoke_terminal_reserved(
+        &self,
+        expected: crate::agent::supervisor::AgentRouteIdentity,
+        work: InvocationWork,
+        authorization: InvocationAuthorization,
+    ) -> Result<RuntimeOutcome, SharedAgentHostError> {
+        self.supervisor_invocation_operation(
+            expected,
+            crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Invoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                work,
+                authorization,
+            },
+            true,
+            true,
+        )
+    }
+
+    pub(crate) fn supervisor_resume(
+        &self,
+        expected: crate::agent::supervisor::AgentRouteIdentity,
+        work: InvocationWork,
+        authorization: InvocationAuthorization,
+        yielded: crate::agent_sdk::YieldedInvocation,
+    ) -> Result<RuntimeOutcome, SharedAgentHostError> {
+        self.supervisor_invocation_operation(
+            expected,
+            crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Resume {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                work,
+                authorization,
+                yielded,
+            },
+            false,
+            false,
+        )
+    }
+
+    pub(crate) fn supervisor_acknowledge(
+        &self,
+        expected: crate::agent::supervisor::AgentRouteIdentity,
+        work: InvocationWork,
+        authorization: InvocationAuthorization,
+    ) -> Result<RuntimeOutcome, SharedAgentHostError> {
+        self.supervisor_invocation_operation(
+            expected,
+            crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Acknowledge {
+                work,
+                authorization,
+            },
+            false,
+            false,
+        )
+    }
+
+    pub(crate) fn supervisor_acknowledge_reserved(
+        &self,
+        expected: crate::agent::supervisor::AgentRouteIdentity,
+        work: InvocationWork,
+        authorization: InvocationAuthorization,
+    ) -> Result<RuntimeOutcome, SharedAgentHostError> {
+        self.supervisor_invocation_operation(
+            expected,
+            crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Acknowledge {
+                work,
+                authorization,
+            },
+            false,
+            true,
+        )
+    }
+
+    fn supervisor_invocation_operation(
+        &self,
+        expected: crate::agent::supervisor::AgentRouteIdentity,
+        request: crate::agent::shared_journal_driver::CleanInvocationReplayRequest,
+        terminal_only: bool,
+        reserved: bool,
+    ) -> Result<RuntimeOutcome, SharedAgentHostError> {
+        let work = request.work();
+        let authorization = request.authorization();
+        let agent = crate::service::AgentId(work.agent.0);
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        // Keep the same lifecycle -> host order as the network route handler.
+        // `retire` releases its host guard before requesting the write lease.
+        let live = attached
+            .lifecycle
+            .read()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if !*live || attached.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        {
+            let host = self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let status = host
+                .supervisor_attachment_status(agent)?
+                .ok_or(SharedAgentHostError::AgentNotFound)?;
+            if status.transport != SharedAgentTransportState::Attached
+                || AttachmentFingerprint::from_attachment_status(&status)? != attached.fingerprint
+            {
+                return Err(SharedAgentHostError::TransportNotAttached);
+            }
+            let material = host.supervisor_invocation_material(agent, work.actor)?;
+            if !crate::agent::supervisor_adapters::physical_material_authorizes_work(
+                &material,
+                expected,
+                RuntimeExecutionContext::Direct,
+                work,
+                authorization,
+            ) {
+                return Err(SharedAgentHostError::InvalidProvision);
+            }
+            let projection = SharedAgentRuntimeProjection {
+                descriptor: material.descriptor,
+                actors: vec![material.actor],
+            };
+            if !projection_matches_attachment_status(&projection, &status)
+                || !work_matches_projection(work, authorization, &projection)
+                || projection.descriptor.identity.space != expected.key().space()
+                || projection.descriptor.identity.agent != expected.key().agent()
+                || projection.descriptor.identity.profile != expected.profile()
+                || projection.descriptor.identity.runtime_deployment
+                    != expected.runtime_deployment()
+                || projection.actors.len() != 1
+                || projection.actors[0].entry.actor != expected.key().actor()
+                || projection.actors[0].incarnation != expected.incarnation()
+                || projection.actors[0].entry.deployment != expected.actor_deployment()
+                || projection.actors[0].entry.program != expected.actor_program()
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+        }
+        if attached.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        let scope = work.mode.invocation_scope();
+        let _nonordered_admission =
+            if matches!(scope, InvocationScope::Merge | InvocationScope::Local) {
+                let proposal = attached
+                    .coordinator
+                    .proposal
+                    .lock()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+                if proposal.projection_pair.is_some() {
+                    return Err(SharedAgentHostError::CapacityExhausted);
+                }
+                Some(proposal)
+            } else {
+                None
+            };
+        match scope {
+            InvocationScope::Ordered if reserved => self
+                .invoke_reserved_clean_operation(agent, request, terminal_only)
+                .map(|submission| submission.outcome),
+            InvocationScope::Ordered if terminal_only => self
+                .invoke_terminal_clean_operation(agent, request)
+                .map(|submission| submission.outcome),
+            InvocationScope::Ordered => self
+                .invoke_clean_operation(agent, request)
+                .map(|submission| submission.outcome),
+            InvocationScope::Merge => self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .apply_clean_merge_operation(agent, request),
+            InvocationScope::Local => self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .apply_clean_local_operation(agent, request),
+        }
     }
 
     /// Submit an exact clean ordered invocation through the generation's
@@ -1786,6 +3074,56 @@ impl SharedAgentNetworkHost {
         attached
             .coordinator
             .submit_clean_ordered(work, authorization)
+    }
+
+    fn invoke_clean_operation(
+        &self,
+        agent: crate::service::AgentId,
+        request: crate::agent::shared_journal_driver::CleanInvocationReplayRequest,
+    ) -> Result<CleanOrderedSubmission, SharedAgentHostError> {
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        if attached.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        attached.coordinator.submit_clean_ordered_operation(request)
+    }
+
+    fn invoke_terminal_clean_operation(
+        &self,
+        agent: crate::service::AgentId,
+        request: crate::agent::shared_journal_driver::CleanInvocationReplayRequest,
+    ) -> Result<CleanOrderedSubmission, SharedAgentHostError> {
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        if attached.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        attached
+            .coordinator
+            .submit_terminal_clean_ordered_operation(request)
+    }
+
+    fn invoke_reserved_clean_operation(
+        &self,
+        agent: crate::service::AgentId,
+        request: crate::agent::shared_journal_driver::CleanInvocationReplayRequest,
+        terminal_only: bool,
+    ) -> Result<CleanOrderedSubmission, SharedAgentHostError> {
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        if attached.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        attached
+            .coordinator
+            .submit_reserved_clean_ordered_operation(request, terminal_only)
     }
 
     /// Submit an exact clean management request, including any deterministic
@@ -1877,6 +3215,54 @@ impl Drop for SharedAgentNetworkHost {
     }
 }
 
+fn projection_matches_attachment_status(
+    projection: &SharedAgentRuntimeProjection,
+    status: &crate::agent::shared_host::SharedAgentAttachmentStatus,
+) -> bool {
+    let identity = &projection.descriptor.identity;
+    projection.descriptor.validate().is_ok()
+        && identity.profile == vos_agent_sdk::AgentProfile::Shared
+        && status.identity.profile == crate::agent::AgentProfile::Shared
+        && identity.space.0 == status.identity.space.0
+        && identity.agent.0 == status.identity.agent.0
+        && identity.owner.0 == status.identity.owner.0
+        && identity.runtime_deployment.0 == status.identity.runtime_deployment.0
+        && identity.runtime_program.0 == status.identity.runtime_program.0
+        && identity.runtime_producer.0 == status.identity.runtime_producer.0
+        && identity.transition_producer.0 == status.identity.transition_producer.0
+        && status.generation.space().0 == identity.space.0
+        && status.generation.agent().0 == identity.agent.0
+}
+
+fn work_matches_projection(
+    work: &InvocationWork,
+    authorization: &InvocationAuthorization,
+    projection: &SharedAgentRuntimeProjection,
+) -> bool {
+    let identity = &projection.descriptor.identity;
+    if !work.validate()
+        || !authorization.matches_work(work)
+        || identity.profile != vos_agent_sdk::AgentProfile::Shared
+        || work.space != identity.space
+        || work.agent != identity.agent
+        || work.runtime_deployment != identity.runtime_deployment
+    {
+        return false;
+    }
+    projection
+        .actors
+        .binary_search_by_key(&work.actor, |record| record.entry.actor)
+        .ok()
+        .and_then(|position| projection.actors.get(position))
+        .is_some_and(|record| {
+            record.validate().is_ok()
+                && !record.entry.suspended
+                && record.incarnation == work.incarnation
+                && record.entry.deployment == work.deployment
+                && record.entry.program == work.program
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Barrier};
@@ -1945,7 +3331,7 @@ mod tests {
         let mut members = vec![second, first];
         members.sort_unstable();
 
-        let mut storage = AgentNodeStorage::open(Arc::clone(&database)).unwrap();
+        let mut storage = AgentNodeStorage::open(Arc::clone(&database), (0, 0)).unwrap();
         futures_executor::block_on(storage.commit_batch(WriteBatch {
             appends: vec![LogEntry {
                 index: 1,
@@ -2003,7 +3389,7 @@ mod tests {
         .unwrap();
         drop(storage);
 
-        let mut reopened = AgentNodeStorage::open(Arc::clone(&database)).unwrap();
+        let mut reopened = AgentNodeStorage::open(Arc::clone(&database), (0, 0)).unwrap();
         let meta = futures_executor::block_on(reopened.load_meta()).unwrap();
         assert_eq!(meta.current_term, 2);
         assert_eq!(meta.voted_for, Some(second));
@@ -2036,7 +3422,7 @@ mod tests {
         legacy.voted_for = Some(0x5aa5);
         legacy.write_worker_fields_in_txn(&transaction).unwrap();
         transaction.commit().unwrap();
-        assert!(AgentNodeStorage::open(database).is_err());
+        assert!(AgentNodeStorage::open(database, (0, 0)).is_err());
 
         let legacy_config_path = TempDatabase::new("legacy_config");
         let legacy_config_database = initialize_database(&legacy_config_path.0);
@@ -2048,7 +3434,71 @@ mod tests {
                 .unwrap();
         }
         transaction.commit().unwrap();
-        assert!(AgentNodeStorage::open(legacy_config_database).is_err());
+        assert!(AgentNodeStorage::open(legacy_config_database, (0, 0)).is_err());
+    }
+
+    #[test]
+    fn full_node_storage_accepts_only_the_authenticated_snapshot_boundary() {
+        let path = TempDatabase::new("authenticated_snapshot_restart");
+        let database = initialize_database(&path.0);
+        let transaction = database.begin_write().unwrap();
+        let mut meta = RaftMeta::load_from_write_transaction(&transaction).unwrap();
+        meta.current_term = 3;
+        meta.commit_index = 7;
+        meta.last_applied = 7;
+        meta.snap_last_index = 7;
+        meta.snap_last_term = 2;
+        meta.write_worker_fields_in_txn(&transaction).unwrap();
+        meta.write_host_fields_in_txn(&transaction).unwrap();
+        transaction.commit().unwrap();
+
+        assert!(AgentNodeStorage::open(Arc::clone(&database), (0, 0)).is_err());
+        assert!(AgentNodeStorage::open(Arc::clone(&database), (7, 3)).is_err());
+        let mut storage = AgentNodeStorage::open(Arc::clone(&database), (7, 2)).unwrap();
+        let recovered = futures_executor::block_on(storage.load_meta()).unwrap();
+        assert_eq!(recovered.snap_last_index, 7);
+        assert_eq!(recovered.snap_last_term, 2);
+        assert_eq!(storage.last_index(), 7);
+        assert_eq!(storage.last_term(), 2);
+
+        assert!(
+            futures_executor::block_on(storage.commit_batch(WriteBatch {
+                meta: Some(Meta {
+                    current_term: 3,
+                    voted_for: None,
+                    commit_index: 7,
+                    snap_last_index: 0,
+                    snap_last_term: 0,
+                }),
+                ..WriteBatch::default()
+            }))
+            .is_err()
+        );
+        futures_executor::block_on(storage.commit_batch(WriteBatch {
+            appends: vec![LogEntry {
+                index: 8,
+                term: 3,
+                kind: EntryKind::Data {
+                    payload: vec![0x41],
+                },
+            }],
+            meta: Some(Meta {
+                current_term: 3,
+                voted_for: None,
+                commit_index: 8,
+                snap_last_index: 7,
+                snap_last_term: 2,
+            }),
+            ..WriteBatch::default()
+        }))
+        .unwrap();
+        drop(storage);
+
+        let reopened = AgentNodeStorage::open(database, (7, 2)).unwrap();
+        let meta = futures_executor::block_on(reopened.load_meta()).unwrap();
+        assert_eq!((meta.snap_last_index, meta.snap_last_term), (7, 2));
+        assert_eq!(meta.commit_index, 8);
+        assert_eq!(reopened.last_index(), 8);
     }
 
     #[test]

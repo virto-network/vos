@@ -8,17 +8,25 @@ use alloc::vec::Vec;
 use crate::contract::{ActorPackageContract, RuntimePackageContract};
 use crate::private::NodeEncryptionEnrollment;
 use crate::{
-    ActorEntry, ActorId, AgentDescriptor, AgentId, AgentIdentity, BlobRef, CredentialId,
-    DeploymentId, Hash, InstallationId, InvocationContext, InvocationId, InvocationRoleClaims,
-    ManagementReply, ManagementRequest, MethodMode, NodeId, PrincipalId, PrivateRecoveryBinding,
-    ProducerId, ProgramId, ReplicaRole, RuntimeCapabilities, RuntimeRequirements, RuntimeUpgrade,
-    SpaceId, UpgradeActor,
+    ActorEntry, ActorId, AgentDescriptor, AgentId, AgentIdentity, AgentProfile, AgentReplica,
+    BlobRef, CapabilityId, CredentialId, DeploymentId, Hash, InstallationId, InvocationContext,
+    InvocationId, InvocationRoleClaims, ManagementReply, ManagementRequest, MethodMode, NodeId,
+    PrincipalId, PrivateRecoveryBinding, ProducerId, ProgramId, ReplicaRole, RoleId,
+    RuntimeCapabilities, RuntimeRequirements, RuntimeUpgrade, SpaceId, UpgradeActor,
 };
 
 pub const AUTHORITY_PUBLIC_KEY_BYTES: usize = 32;
 pub const AUTHORITY_SIGNATURE_BYTES: usize = 64;
 pub const CREDENTIAL_PUBLIC_KEY_BYTES: usize = 32;
 pub const CREDENTIAL_SIGNATURE_BYTES: usize = 64;
+/// Maximum number of records returned by one authority inventory query.
+/// Encoded reply size remains an independent, stricter bound.
+pub const MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES: usize = 8;
+/// Maximum replicas returned by one Agent-roster query. A complete maximum
+/// roster is reconstructed across bounded pages sharing one projection head.
+pub const MAX_AUTHORITY_REPLICA_PAGE_ENTRIES: usize = 64;
+/// Maximum application authorization grants projected for one Principal.
+pub const MAX_AUTHORITY_PRINCIPAL_GRANTS: usize = 64;
 
 /// Exact installed system-authority route selected by a credential call.
 ///
@@ -47,14 +55,19 @@ impl AuthorityActorTarget {
 pub struct ManagedAgentTarget {
     pub space: SpaceId,
     pub agent: AgentId,
+    pub owner: PrincipalId,
+    pub profile: AgentProfile,
     pub runtime_deployment: DeploymentId,
+    pub transition_producer: ProducerId,
 }
 
 impl ManagedAgentTarget {
     pub fn is_valid(self) -> bool {
         self.space != SpaceId::ZERO
             && self.agent != AgentId::ZERO
+            && self.owner != PrincipalId::ZERO
             && self.runtime_deployment != DeploymentId::ZERO
+            && self.transition_producer != ProducerId::ZERO
     }
 }
 
@@ -154,6 +167,22 @@ impl CompactInstallActor {
             && self.producer != ProducerId::ZERO
             && self.contract.is_valid()
             && self.requirements.lanes == self.entry.lanes
+    }
+
+    /// Immutable install-lineage commitment retained across actor upgrades.
+    /// This is the exact SDK authorization-plan commitment and is therefore
+    /// identical whether derived from the compact authority value or the full
+    /// runtime request.
+    pub fn lineage_commitment(&self) -> Hash {
+        ManagementAuthorizationPlan::Install(Box::new(self.clone())).commitment()
+    }
+}
+
+impl crate::InstallActor {
+    /// Derive the same immutable SDK install lineage used by the authority's
+    /// compact install plan without depending on transitional lifecycle wire.
+    pub fn lineage_commitment(&self) -> Hash {
+        CompactInstallActor::from_install(self).lineage_commitment()
     }
 }
 
@@ -672,6 +701,30 @@ pub enum AuthorityAdminOperation {
         principal: PrincipalId,
         role: AuthorityBuiltinRole,
     },
+    /// Add or remove one exact Space-scoped AMP2 role grant.
+    SetSpaceRole {
+        principal: PrincipalId,
+        role: RoleId,
+        granted: bool,
+    },
+    /// Add or remove one exact deployment-scoped AMP2 actor-role grant.
+    SetActorRole {
+        principal: PrincipalId,
+        agent: AgentId,
+        actor: ActorId,
+        deployment: DeploymentId,
+        role: RoleId,
+        granted: bool,
+    },
+    /// Add or remove one exact deployment-scoped AMP2 capability grant.
+    SetCapability {
+        principal: PrincipalId,
+        agent: AgentId,
+        actor: ActorId,
+        deployment: DeploymentId,
+        capability: CapabilityId,
+        granted: bool,
+    },
 }
 
 impl AuthorityAdminOperation {
@@ -694,6 +747,37 @@ impl AuthorityAdminOperation {
                 *node != NodeId::ZERO && *owner != PrincipalId::ZERO
             }
             Self::SetBuiltinRole { principal, .. } => *principal != PrincipalId::ZERO,
+            Self::SetSpaceRole {
+                principal, role, ..
+            } => *principal != PrincipalId::ZERO && *role != RoleId::ZERO,
+            Self::SetActorRole {
+                principal,
+                agent,
+                actor,
+                deployment,
+                role,
+                ..
+            } => {
+                *principal != PrincipalId::ZERO
+                    && *agent != AgentId::ZERO
+                    && *actor != ActorId::ZERO
+                    && *deployment != DeploymentId::ZERO
+                    && *role != RoleId::ZERO
+            }
+            Self::SetCapability {
+                principal,
+                agent,
+                actor,
+                deployment,
+                capability,
+                ..
+            } => {
+                *principal != PrincipalId::ZERO
+                    && *agent != AgentId::ZERO
+                    && *actor != ActorId::ZERO
+                    && *deployment != DeploymentId::ZERO
+                    && *capability != CapabilityId::ZERO
+            }
         }
     }
 
@@ -738,7 +822,7 @@ impl AuthorityAdminCall {
     ) -> InvocationId {
         InvocationId(
             Hash::digest(
-                b"vos/agent/authority-admin-invocation/v3",
+                b"vos/agent/authority-admin-invocation/v4",
                 &[
                     crate::RUNTIME_ABI_ID.as_bytes(),
                     credential.as_bytes(),
@@ -764,7 +848,7 @@ impl AuthorityAdminCall {
 
     pub fn commitment(&self) -> Hash {
         Hash::digest(
-            b"vos/agent/authority-admin-call/v2",
+            b"vos/agent/authority-admin-call/v4",
             &[&self.signing_bytes(), &self.signature],
         )
     }
@@ -877,6 +961,614 @@ impl AuthorityAdminResult {
 
     pub fn commitment(&self) -> Hash {
         crate::wire::authority_admin_result_commitment(self)
+    }
+}
+
+/// Authentication proof for one ingress-originated authority request.
+///
+/// API credentials sign the request directly. SSH credentials are already
+/// proven at the transport boundary, where the client key cannot be used to
+/// sign an arbitrary actor message; an enrolled ingress Node therefore signs
+/// the exact request and a stable, caller-selected request binding. The Node
+/// is an ingress attester, not the credential owner's identity, and need not
+/// be enrolled to the same Principal.
+///
+/// This shape is shared by projection queries and the AOC5 general-operation
+/// protocol so both ingress paths enforce one SSH authentication format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthorityIngressAuthentication {
+    ApiCredentialSignature {
+        credential_public_key: [u8; CREDENTIAL_PUBLIC_KEY_BYTES],
+        signature: [u8; CREDENTIAL_SIGNATURE_BYTES],
+    },
+    SshNodeAttestation {
+        credential_public_key: [u8; CREDENTIAL_PUBLIC_KEY_BYTES],
+        node: NodeId,
+        /// Nonzero fixed-width binding derived from the ingress request's
+        /// stable idempotency identity, not from an ephemeral SSH connection.
+        request_binding: Hash,
+        signature: [u8; CREDENTIAL_SIGNATURE_BYTES],
+    },
+}
+
+impl AuthorityIngressAuthentication {
+    pub const fn credential_public_key(self) -> [u8; CREDENTIAL_PUBLIC_KEY_BYTES] {
+        match self {
+            Self::ApiCredentialSignature {
+                credential_public_key,
+                ..
+            }
+            | Self::SshNodeAttestation {
+                credential_public_key,
+                ..
+            } => credential_public_key,
+        }
+    }
+
+    pub const fn signature(self) -> [u8; CREDENTIAL_SIGNATURE_BYTES] {
+        match self {
+            Self::ApiCredentialSignature { signature, .. }
+            | Self::SshNodeAttestation { signature, .. } => signature,
+        }
+    }
+
+    pub const fn attesting_node(self) -> Option<NodeId> {
+        match self {
+            Self::ApiCredentialSignature { .. } => None,
+            Self::SshNodeAttestation { node, .. } => Some(node),
+        }
+    }
+
+    pub fn validate_shape(self, credential: CredentialId) -> bool {
+        let public_key = self.credential_public_key();
+        credential != CredentialId::ZERO
+            && public_key != [0; CREDENTIAL_PUBLIC_KEY_BYTES]
+            && CredentialId::of_public_key(&public_key) == credential
+            && self.signature() != [0; CREDENTIAL_SIGNATURE_BYTES]
+            && match self {
+                Self::ApiCredentialSignature { .. } => true,
+                Self::SshNodeAttestation {
+                    node,
+                    request_binding,
+                    ..
+                } => node != NodeId::ZERO && request_binding != Hash::ZERO,
+            }
+    }
+}
+
+/// One authenticated, read-only query against the durable system authority
+/// projection. The nonce is caller-selected and response-bound; replaying a
+/// query is harmless but cannot substitute a response for another request or
+/// authority installation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorityProjectionQuery {
+    pub authority: AuthorityActorTarget,
+    pub credential: CredentialId,
+    pub nonce: Hash,
+    pub selector: AuthorityProjectionSelector,
+    pub authentication: AuthorityIngressAuthentication,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthorityProjectionSelector {
+    /// Resolve only the credential signing this query, including revocation.
+    Credential,
+    /// Page the authority's Agent inventory by exclusive full-ID cursor.
+    Agents { after: Option<AgentId>, limit: u16 },
+    /// Page one exact Agent's replica roster by exclusive full Node ID.
+    AgentReplicas {
+        agent: AgentId,
+        after: Option<NodeId>,
+        limit: u16,
+    },
+    /// Page one exact Agent's Actors by exclusive full-ID cursor.
+    Actors {
+        agent: AgentId,
+        after: Option<ActorId>,
+        limit: u16,
+    },
+}
+
+impl AuthorityProjectionSelector {
+    pub fn validate_shape(self) -> bool {
+        match self {
+            Self::Credential => true,
+            Self::Agents { after, limit } => {
+                after != Some(AgentId::ZERO)
+                    && limit != 0
+                    && usize::from(limit) <= MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES
+            }
+            Self::AgentReplicas {
+                agent,
+                after,
+                limit,
+            } => {
+                agent != AgentId::ZERO
+                    && after != Some(NodeId::ZERO)
+                    && limit != 0
+                    && usize::from(limit) <= MAX_AUTHORITY_REPLICA_PAGE_ENTRIES
+            }
+            Self::Actors {
+                agent,
+                after,
+                limit,
+            } => {
+                agent != AgentId::ZERO
+                    && after != Some(ActorId::ZERO)
+                    && limit != 0
+                    && usize::from(limit) <= MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES
+            }
+        }
+    }
+}
+
+impl AuthorityProjectionQuery {
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        crate::wire::authority_projection_query_signing_bytes(self)
+    }
+
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(
+            b"vos/agent/authority-projection-query/v1",
+            &[&self.signing_bytes(), &self.authentication.signature()],
+        )
+    }
+
+    pub const fn credential_public_key(&self) -> [u8; CREDENTIAL_PUBLIC_KEY_BYTES] {
+        self.authentication.credential_public_key()
+    }
+
+    pub const fn attesting_node(&self) -> Option<NodeId> {
+        self.authentication.attesting_node()
+    }
+
+    pub fn validate_shape(&self) -> Result<(), AuthorityActorProtocolError> {
+        if !self.authority.is_valid() {
+            return Err(AuthorityActorProtocolError::InvalidTarget);
+        }
+        if !self.authentication.validate_shape(self.credential) {
+            return Err(AuthorityActorProtocolError::InvalidCaller);
+        }
+        if self.nonce == Hash::ZERO || !self.selector.validate_shape() {
+            return Err(AuthorityActorProtocolError::InvalidRequest);
+        }
+        if crate::wire::authority_projection_query_encoded_len(self)
+            > crate::MAX_INVOCATION_MESSAGE_BYTES
+        {
+            return Err(AuthorityActorProtocolError::LimitExceeded);
+        }
+        Ok(())
+    }
+
+    pub fn verify_api_with<V: AuthorityCredentialVerifier>(
+        &self,
+        verifier: &V,
+    ) -> Result<(), AuthorityActorProtocolError> {
+        self.validate_shape()?;
+        let AuthorityIngressAuthentication::ApiCredentialSignature {
+            credential_public_key,
+            signature,
+        } = self.authentication
+        else {
+            return Err(AuthorityActorProtocolError::InvalidCaller);
+        };
+        if !verifier.verify(&credential_public_key, &self.signing_bytes(), &signature) {
+            return Err(AuthorityActorProtocolError::InvalidSignature);
+        }
+        Ok(())
+    }
+
+    pub fn verify_ssh_node_attestation_with<V: AuthorityCredentialVerifier>(
+        &self,
+        node_public_key: &[u8; CREDENTIAL_PUBLIC_KEY_BYTES],
+        verifier: &V,
+    ) -> Result<(), AuthorityActorProtocolError> {
+        self.validate_shape()?;
+        let AuthorityIngressAuthentication::SshNodeAttestation { signature, .. } =
+            self.authentication
+        else {
+            return Err(AuthorityActorProtocolError::InvalidCaller);
+        };
+        if !verifier.verify(node_public_key, &self.signing_bytes(), &signature) {
+            return Err(AuthorityActorProtocolError::InvalidSignature);
+        }
+        Ok(())
+    }
+}
+
+/// Exact durable authority head shared by every projection response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthorityProjectionHead {
+    /// Monotonic revision of the complete authority state image. Unlike the
+    /// operation-specific counters below, this advances for every mutation.
+    pub state_revision: NonZeroU64,
+    pub epoch: NonZeroU64,
+    pub authorization_sequence: NonZeroU64,
+    pub administration_generation: NonZeroU64,
+    /// Commitment of the complete validated actor state represented here.
+    pub state_commitment: Hash,
+}
+
+impl AuthorityProjectionHead {
+    pub fn is_valid(self) -> bool {
+        self.state_commitment != Hash::ZERO
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AuthorityCredentialStatus {
+    Active = 0,
+    Revoked = 1,
+}
+
+/// One deployment-scoped actor-role assignment for the projected Principal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AuthorityActorRoleGrant {
+    pub agent: AgentId,
+    pub actor: ActorId,
+    pub deployment: DeploymentId,
+    pub role: RoleId,
+}
+
+impl AuthorityActorRoleGrant {
+    pub fn is_valid(self) -> bool {
+        self.agent != AgentId::ZERO
+            && self.actor != ActorId::ZERO
+            && self.deployment != DeploymentId::ZERO
+            && self.role != RoleId::ZERO
+    }
+}
+
+/// One deployment-scoped capability assignment for the projected Principal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AuthorityCapabilityGrant {
+    pub agent: AgentId,
+    pub actor: ActorId,
+    pub deployment: DeploymentId,
+    pub capability: CapabilityId,
+}
+
+impl AuthorityCapabilityGrant {
+    pub fn is_valid(self) -> bool {
+        self.agent != AgentId::ZERO
+            && self.actor != ActorId::ZERO
+            && self.deployment != DeploymentId::ZERO
+            && self.capability != CapabilityId::ZERO
+    }
+}
+
+/// Credential-to-Principal resolution and every typed application claim
+/// currently granted to that Principal. Revoked credentials remain
+/// self-queryable so ingress can distinguish revocation from malformed or
+/// unknown credentials, but cannot use the inventory queries below.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorityCredentialProjection {
+    pub query: AuthorityProjectionQuery,
+    pub head: AuthorityProjectionHead,
+    pub principal: PrincipalId,
+    pub status: AuthorityCredentialStatus,
+    pub kind: AuthorityCredentialKind,
+    pub builtin_role: AuthorityBuiltinRole,
+    /// Highest durable request sequence consumed in each credential-local
+    /// protocol domain. The next call must use the exact successor.
+    pub management_request_high_water: u64,
+    pub operation_request_high_water: u64,
+    pub admin_request_high_water: u64,
+    pub space_roles: Vec<RoleId>,
+    pub actor_roles: Vec<AuthorityActorRoleGrant>,
+    pub capabilities: Vec<AuthorityCapabilityGrant>,
+}
+
+impl AuthorityCredentialProjection {
+    pub fn validate_shape(&self) -> Result<(), AuthorityActorProtocolError> {
+        self.query.validate_shape()?;
+        if self.query.selector != AuthorityProjectionSelector::Credential
+            || !self.head.is_valid()
+            || self.principal == PrincipalId::ZERO
+            || self.space_roles.len() + self.actor_roles.len() + self.capabilities.len()
+                > MAX_AUTHORITY_PRINCIPAL_GRANTS
+            || self.space_roles.iter().any(|role| *role == RoleId::ZERO)
+            || self.space_roles.windows(2).any(|pair| pair[0] >= pair[1])
+            || self.actor_roles.iter().any(|grant| !grant.is_valid())
+            || self.actor_roles.windows(2).any(|pair| pair[0] >= pair[1])
+            || self.capabilities.iter().any(|grant| !grant.is_valid())
+            || self.capabilities.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(AuthorityActorProtocolError::InvalidApplication);
+        }
+        if crate::wire::authority_credential_projection_encoded_len(self)
+            > crate::MAX_INVOCATION_REPLY_BYTES
+        {
+            return Err(AuthorityActorProtocolError::LimitExceeded);
+        }
+        Ok(())
+    }
+}
+
+/// Complete authenticated Agent descriptor facts retained by the authority.
+/// Runtime package bytes, physical readiness, and incarnation are deliberately
+/// absent: the package reference and contract are authoritative, while a
+/// supervisor must reconcile those host-owned availability facts separately.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorityAgentProjection {
+    pub identity: AgentIdentity,
+    pub creation_nonce: Hash,
+    pub authority: AgentAuthorityBinding,
+    pub private_recovery: Option<PrivateRecoveryBinding>,
+    pub runtime_package: BlobRef,
+    pub runtime_contract: RuntimePackageContract,
+    pub capabilities: RuntimeCapabilities,
+    /// Exact size of the separately paged replica roster.
+    pub replica_count: u16,
+    pub replica_generation: Hash,
+}
+
+impl AuthorityAgentProjection {
+    pub fn validate_shape(&self) -> Result<(), AuthorityActorProtocolError> {
+        if self.identity.space == SpaceId::ZERO
+            || self.identity.agent == AgentId::ZERO
+            || self.identity.owner == PrincipalId::ZERO
+            || self.identity.runtime_deployment == DeploymentId::ZERO
+            || self.identity.runtime_program == ProgramId::ZERO
+            || self.identity.runtime_producer == ProducerId::ZERO
+            || self.identity.transition_producer == ProducerId::ZERO
+            || self.identity.transition_producer == self.identity.runtime_producer
+            || self.creation_nonce == Hash::ZERO
+            || AgentId::derive(
+                self.identity.space,
+                self.identity.owner,
+                self.creation_nonce.as_bytes(),
+            ) != self.identity.agent
+            || !self.authority.is_valid()
+            || self.runtime_package.hash == Hash::ZERO
+            || self.runtime_package.len == 0
+            || self.runtime_package.len > crate::MAX_CATALOG_ARTIFACT_BYTES
+            || !self.runtime_contract.is_valid()
+            || self.capabilities.validate().is_err()
+            || self.replica_count == 0
+            || usize::from(self.replica_count) > crate::MAX_AGENT_REPLICAS
+            || self.replica_generation == Hash::ZERO
+        {
+            return Err(AuthorityActorProtocolError::InvalidApplication);
+        }
+        match (self.identity.profile, self.private_recovery) {
+            (crate::AgentProfile::Private, Some(binding)) if binding.is_valid() => {}
+            (crate::AgentProfile::Private, _) | (_, Some(_)) => {
+                return Err(AuthorityActorProtocolError::InvalidApplication);
+            }
+            _ => {}
+        }
+        match self.identity.profile {
+            crate::AgentProfile::Local if self.replica_count != 1 => {
+                return Err(AuthorityActorProtocolError::InvalidApplication);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Reconstruct and validate the complete authenticated descriptor after
+    /// draining replica pages with the same head, count, and generation.
+    pub fn reconstruct_descriptor(
+        &self,
+        replicas: Vec<AgentReplica>,
+    ) -> Result<AgentDescriptor, AuthorityActorProtocolError> {
+        self.validate_shape()?;
+        if replicas.len() != usize::from(self.replica_count)
+            || crate::replica_set_generation(&self.identity, self.creation_nonce, &replicas)
+                != self.replica_generation
+        {
+            return Err(AuthorityActorProtocolError::InvalidApplication);
+        }
+        let descriptor = AgentDescriptor {
+            identity: self.identity.clone(),
+            creation_nonce: self.creation_nonce,
+            authority: self.authority,
+            private_recovery: self.private_recovery,
+            runtime_package: self.runtime_package.clone(),
+            runtime_contract: self.runtime_contract,
+            capabilities: self.capabilities,
+            replicas,
+        };
+        descriptor
+            .validate()
+            .map(|()| descriptor)
+            .map_err(|_| AuthorityActorProtocolError::InvalidApplication)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorityAgentProjectionPage {
+    pub query: AuthorityProjectionQuery,
+    pub head: AuthorityProjectionHead,
+    pub entries: Vec<AuthorityAgentProjection>,
+    pub next: Option<AgentId>,
+}
+
+impl AuthorityAgentProjectionPage {
+    pub fn validate_shape(&self) -> Result<(), AuthorityActorProtocolError> {
+        self.query.validate_shape()?;
+        let AuthorityProjectionSelector::Agents { after, limit } = self.query.selector else {
+            return Err(AuthorityActorProtocolError::InvalidApplication);
+        };
+        if !self.head.is_valid()
+            || self.entries.len() > usize::from(limit)
+            || self.entries.len() > MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES
+            || self.entries.iter().any(|entry| {
+                entry.validate_shape().is_err()
+                    || entry.identity.space != self.query.authority.space
+                    || entry.authority != self.query.authority.binding
+                    || entry.identity.agent == self.query.authority.system_agent
+                        && entry.identity.runtime_deployment
+                            != self.query.authority.system_runtime_deployment
+            })
+            || self
+                .entries
+                .windows(2)
+                .any(|pair| pair[0].identity.agent >= pair[1].identity.agent)
+            || self
+                .entries
+                .first()
+                .is_some_and(|entry| after.is_some_and(|after| entry.identity.agent <= after))
+            || self.next.is_some()
+                && self.entries.last().map(|entry| entry.identity.agent) != self.next
+        {
+            return Err(AuthorityActorProtocolError::InvalidApplication);
+        }
+        if crate::wire::authority_agent_projection_page_encoded_len(self)
+            > crate::MAX_INVOCATION_REPLY_BYTES
+        {
+            return Err(AuthorityActorProtocolError::LimitExceeded);
+        }
+        Ok(())
+    }
+}
+
+/// One bounded slice of an Agent's exact authenticated replica roster.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorityAgentReplicaProjectionPage {
+    pub query: AuthorityProjectionQuery,
+    pub head: AuthorityProjectionHead,
+    pub replica_count: u16,
+    pub replica_generation: Hash,
+    pub entries: Vec<AgentReplica>,
+    pub next: Option<NodeId>,
+}
+
+impl AuthorityAgentReplicaProjectionPage {
+    pub fn validate_shape(&self) -> Result<(), AuthorityActorProtocolError> {
+        self.query.validate_shape()?;
+        let AuthorityProjectionSelector::AgentReplicas { after, limit, .. } = self.query.selector
+        else {
+            return Err(AuthorityActorProtocolError::InvalidApplication);
+        };
+        if !self.head.is_valid()
+            || self.replica_count == 0
+            || usize::from(self.replica_count) > crate::MAX_AGENT_REPLICAS
+            || self.replica_generation == Hash::ZERO
+            || self.entries.len() > usize::from(limit)
+            || self.entries.len() > usize::from(self.replica_count)
+            || self.entries.len() > MAX_AUTHORITY_REPLICA_PAGE_ENTRIES
+            || self
+                .entries
+                .iter()
+                .any(|entry| entry.node == NodeId::ZERO || entry.principal == PrincipalId::ZERO)
+            || self
+                .entries
+                .windows(2)
+                .any(|pair| pair[0].node >= pair[1].node)
+            || self
+                .entries
+                .first()
+                .is_some_and(|entry| after.is_some_and(|after| entry.node <= after))
+            || self.next.is_some() && self.entries.last().map(|entry| entry.node) != self.next
+        {
+            return Err(AuthorityActorProtocolError::InvalidApplication);
+        }
+        if crate::wire::authority_agent_replica_projection_page_encoded_len(self)
+            > crate::MAX_INVOCATION_REPLY_BYTES
+        {
+            return Err(AuthorityActorProtocolError::LimitExceeded);
+        }
+        Ok(())
+    }
+
+    /// Check the immutable reconstruction facts shared with the Agent row.
+    pub fn matches_agent_at_head(
+        &self,
+        agent: &AuthorityAgentProjection,
+        head: AuthorityProjectionHead,
+    ) -> bool {
+        self.head == head
+            && matches!(
+                self.query.selector,
+                AuthorityProjectionSelector::AgentReplicas { agent: id, .. }
+                    if id == agent.identity.agent
+            )
+            && self.replica_count == agent.replica_count
+            && self.replica_generation == agent.replica_generation
+    }
+}
+
+/// Durable actor directory/status/artifact record. The runtime-selected
+/// incarnation and readiness are host-owned and intentionally not invented by
+/// the policy actor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorityActorProjection {
+    pub agent: AgentId,
+    pub entry: ActorEntry,
+    pub producer: ProducerId,
+    pub contract: ActorPackageContract,
+    pub requirements: RuntimeRequirements,
+    pub root_provenance: bool,
+    pub installation_id: InstallationId,
+    pub registry_reservation: Hash,
+    pub install_request: Hash,
+}
+
+impl AuthorityActorProjection {
+    pub fn validate_shape(&self) -> Result<(), AuthorityActorProtocolError> {
+        if self.agent == AgentId::ZERO
+            || self.entry.validate().is_err()
+            || self.producer == ProducerId::ZERO
+            || !self.contract.is_valid()
+            || self.requirements.lanes != self.entry.lanes
+            || self.installation_id == InstallationId::ZERO
+            || self.registry_reservation == Hash::ZERO
+            || self.install_request == Hash::ZERO
+        {
+            return Err(AuthorityActorProtocolError::InvalidApplication);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorityActorProjectionPage {
+    pub query: AuthorityProjectionQuery,
+    pub head: AuthorityProjectionHead,
+    pub entries: Vec<AuthorityActorProjection>,
+    pub next: Option<ActorId>,
+}
+
+impl AuthorityActorProjectionPage {
+    pub fn validate_shape(&self) -> Result<(), AuthorityActorProtocolError> {
+        self.query.validate_shape()?;
+        let AuthorityProjectionSelector::Actors {
+            agent,
+            after,
+            limit,
+        } = self.query.selector
+        else {
+            return Err(AuthorityActorProtocolError::InvalidApplication);
+        };
+        if !self.head.is_valid()
+            || self.entries.len() > usize::from(limit)
+            || self.entries.len() > MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES
+            || self
+                .entries
+                .iter()
+                .any(|entry| entry.agent != agent || entry.validate_shape().is_err())
+            || self
+                .entries
+                .windows(2)
+                .any(|pair| pair[0].entry.actor >= pair[1].entry.actor)
+            || self
+                .entries
+                .first()
+                .is_some_and(|entry| after.is_some_and(|after| entry.entry.actor <= after))
+            || self.next.is_some()
+                && self.entries.last().map(|entry| entry.entry.actor) != self.next
+        {
+            return Err(AuthorityActorProtocolError::InvalidApplication);
+        }
+        if crate::wire::authority_actor_projection_page_encoded_len(self)
+            > crate::MAX_INVOCATION_REPLY_BYTES
+        {
+            return Err(AuthorityActorProtocolError::LimitExceeded);
+        }
+        Ok(())
     }
 }
 
@@ -1221,9 +1913,12 @@ fn management_application_reply_shape_matches(
         ) => {
             identity.space == call.managed.space
                 && identity.agent == call.managed.agent
+                && identity.owner == call.managed.owner
+                && identity.profile == call.managed.profile
                 && identity.runtime_deployment == upgrade.to_deployment
                 && identity.runtime_program == upgrade.to_program
                 && identity.runtime_producer == upgrade.producer
+                && identity.transition_producer == call.managed.transition_producer
         }
         (
             ManagementAuthorizationPlan::ChangeReplicas { .. },
@@ -1274,11 +1969,15 @@ fn mutating_plan_matches_targets(
         ManagementAuthorizationPlan::Create { descriptor, .. } => {
             descriptor.identity.space == managed.space
                 && descriptor.identity.agent == managed.agent
+                && descriptor.identity.owner == managed.owner
+                && descriptor.identity.profile == managed.profile
                 && descriptor.identity.runtime_deployment == managed.runtime_deployment
+                && descriptor.identity.transition_producer == managed.transition_producer
                 && descriptor.authority == authority.binding
         }
         ManagementAuthorizationPlan::UpgradeRuntime(upgrade) => {
             upgrade.from_deployment == managed.runtime_deployment
+                && upgrade.producer != managed.transition_producer
         }
         _ => true,
     }
@@ -1603,7 +2302,10 @@ mod tests {
         ManagedAgentTarget {
             space: authority_target().space,
             agent: AgentId([29; 32]),
+            owner: PrincipalId([0x29; 32]),
+            profile: AgentProfile::Shared,
             runtime_deployment: DeploymentId([30; 32]),
+            transition_producer: ProducerId([0x2a; 32]),
         }
     }
 
@@ -1715,6 +2417,14 @@ mod tests {
             lanes: crate::LaneSet::NONE,
             suspended: true,
         });
+        application_ack_with_reply(call, approval, application)
+    }
+
+    fn application_ack_with_reply(
+        call: &AuthorityCredentialCall,
+        approval: &ManagementApproval,
+        application: ManagementReply,
+    ) -> ManagementApplicationAck {
         let actor = approval.plan.authority_actor();
         let mut receipt = AuthorityReceipt {
             selector: AuthorityReceiptSelector {
@@ -1800,6 +2510,83 @@ mod tests {
             public_key,
             initial_epoch: selector.epoch,
         }
+    }
+
+    #[test]
+    fn projection_authentication_variants_bind_the_complete_query() {
+        let api_key = [0x61; CREDENTIAL_PUBLIC_KEY_BYTES];
+        let mut api = AuthorityProjectionQuery {
+            authority: authority_target(),
+            credential: CredentialId::of_public_key(&api_key),
+            nonce: Hash([0x62; 32]),
+            selector: AuthorityProjectionSelector::Agents {
+                after: Some(AgentId([0x63; 32])),
+                limit: 2,
+            },
+            authentication: AuthorityIngressAuthentication::ApiCredentialSignature {
+                credential_public_key: api_key,
+                signature: [1; CREDENTIAL_SIGNATURE_BYTES],
+            },
+        };
+        let api_signature = test_signature(&api_key, &api.signing_bytes());
+        let AuthorityIngressAuthentication::ApiCredentialSignature { signature, .. } =
+            &mut api.authentication
+        else {
+            unreachable!();
+        };
+        *signature = api_signature;
+        assert_eq!(api.verify_api_with(&TestCredentialVerifier), Ok(()));
+        assert!(
+            api.verify_ssh_node_attestation_with(&[0x64; 32], &TestCredentialVerifier)
+                .is_err()
+        );
+        let mut substituted = api.clone();
+        substituted.nonce.0[0] ^= 1;
+        assert!(
+            substituted
+                .verify_api_with(&TestCredentialVerifier)
+                .is_err()
+        );
+
+        let node_key = [0x65; CREDENTIAL_PUBLIC_KEY_BYTES];
+        let ssh_key = [0x66; CREDENTIAL_PUBLIC_KEY_BYTES];
+        let mut ssh = AuthorityProjectionQuery {
+            authority: authority_target(),
+            credential: CredentialId::of_public_key(&ssh_key),
+            nonce: Hash([0x67; 32]),
+            selector: AuthorityProjectionSelector::Credential,
+            authentication: AuthorityIngressAuthentication::SshNodeAttestation {
+                credential_public_key: ssh_key,
+                node: NodeId([0x68; 32]),
+                request_binding: Hash([0x69; 32]),
+                signature: [1; CREDENTIAL_SIGNATURE_BYTES],
+            },
+        };
+        let node_signature = test_signature(&node_key, &ssh.signing_bytes());
+        let AuthorityIngressAuthentication::SshNodeAttestation { signature, .. } =
+            &mut ssh.authentication
+        else {
+            unreachable!();
+        };
+        *signature = node_signature;
+        assert_eq!(
+            ssh.verify_ssh_node_attestation_with(&node_key, &TestCredentialVerifier),
+            Ok(())
+        );
+        assert!(ssh.verify_api_with(&TestCredentialVerifier).is_err());
+
+        let mut zero_binding = ssh;
+        let AuthorityIngressAuthentication::SshNodeAttestation {
+            request_binding, ..
+        } = &mut zero_binding.authentication
+        else {
+            unreachable!();
+        };
+        *request_binding = Hash::ZERO;
+        assert_eq!(
+            zero_binding.validate_shape(),
+            Err(AuthorityActorProtocolError::InvalidCaller)
+        );
     }
 
     #[test]
@@ -2114,7 +2901,10 @@ mod tests {
         let managed = ManagedAgentTarget {
             space: authority.space,
             agent,
+            owner,
+            profile: crate::AgentProfile::Local,
             runtime_deployment: DeploymentId([49; 32]),
+            transition_producer: ProducerId([52; 32]),
         };
         let descriptor = crate::AgentDescriptor {
             identity: crate::AgentIdentity {
@@ -2125,6 +2915,7 @@ mod tests {
                 runtime_deployment: managed.runtime_deployment,
                 runtime_program: ProgramId([50; 32]),
                 runtime_producer: ProducerId([51; 32]),
+                transition_producer: ProducerId([52; 32]),
             },
             creation_nonce,
             authority: authority.binding,
@@ -2205,6 +2996,54 @@ mod tests {
         upgrade_call.managed = managed;
         resign(&mut upgrade_call);
         assert_eq!(upgrade_call.validate_shape(), Ok(()));
+
+        let upgrade_approval = approval(&upgrade_call);
+        let upgraded_identity = crate::AgentIdentity {
+            space: managed.space,
+            agent: managed.agent,
+            owner: managed.owner,
+            profile: managed.profile,
+            runtime_deployment: upgrade.to_deployment,
+            runtime_program: upgrade.to_program,
+            runtime_producer: upgrade.producer,
+            transition_producer: managed.transition_producer,
+        };
+        let upgrade_ack = application_ack_with_reply(
+            &upgrade_call,
+            &upgrade_approval,
+            ManagementReply::RuntimeUpgraded(upgraded_identity),
+        );
+        assert!(upgrade_ack.matches_pending(&upgrade_call, &upgrade_approval));
+        for substitute in [
+            |identity: &mut AgentIdentity| identity.owner = PrincipalId([0xe1; 32]),
+            |identity: &mut AgentIdentity| identity.profile = AgentProfile::Private,
+            |identity: &mut AgentIdentity| identity.transition_producer = ProducerId([0xe2; 32]),
+        ] {
+            let mut substituted = upgrade_ack.clone();
+            let ManagementReply::RuntimeUpgraded(identity) = &mut substituted.application else {
+                unreachable!();
+            };
+            substitute(identity);
+            substituted.signature = test_signature(
+                &substituted.authority.binding.public_key,
+                &substituted.signing_bytes(),
+            );
+            assert_eq!(substituted.verify_with(&TestCredentialVerifier), Ok(()));
+            assert!(!substituted.matches_pending(&upgrade_call, &upgrade_approval));
+        }
+
+        let mut reused_transition_signer = upgrade.clone();
+        reused_transition_signer.producer = managed.transition_producer;
+        let mut reused_transition_signer_call = upgrade_call.clone();
+        reused_transition_signer_call.plan =
+            ManagementRequest::UpgradeRuntime(alloc::boxed::Box::new(reused_transition_signer))
+                .authorization_plan()
+                .unwrap();
+        resign(&mut reused_transition_signer_call);
+        assert_eq!(
+            reused_transition_signer_call.validate_shape(),
+            Err(AuthorityActorProtocolError::InvalidRequest)
+        );
 
         let mut wrong_from = upgrade;
         wrong_from.from_deployment = DeploymentId([61; 32]);

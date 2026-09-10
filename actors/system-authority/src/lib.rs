@@ -1,7 +1,7 @@
 //! Clean, portable policy actor for standard Agent management.
 //!
-//! The actor accepts canonical `ACC3` management calls, canonical `AOC4`
-//! general-operation calls, and self-authenticating `AAD3` identity-admin calls
+//! The actor accepts canonical `ACC3` management calls, canonical `AOC5`
+//! general-operation calls, and self-authenticating `AAD4` identity-admin calls
 //! delivered with an exact clean `AIC1` invocation context. It performs policy,
 //! credential, and Admin-accessibility checks inside the guest and retains exact
 //! results for replay. Agent and actor lifecycle approvals remain pending until
@@ -20,12 +20,17 @@ use core::num::NonZeroU64;
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use vos::agent_sdk::authority::{
-    AgentAuthorityBinding, AuthorityActorTarget, AuthorityAdminCall, AuthorityAdminOperation,
-    AuthorityAdminResult, AuthorityBuiltinRole, AuthorityCredentialCall,
-    AuthorityCredentialEnrollment, AuthorityCredentialVerifier, AuthorityEvidence, AuthorityIssuer,
-    AuthorityLaneRoots, AuthorityOperationKind, AuthorityVerifier, CompactAgentDescriptor,
-    CompactInstallActor, CompactReplicaSlot, ManagedAgentTarget, ManagementApplicationAck,
-    ManagementApproval, ManagementAuthorizationPlan,
+    AgentAuthorityBinding, AuthorityActorProjection, AuthorityActorProjectionPage,
+    AuthorityActorRoleGrant, AuthorityActorTarget, AuthorityAdminCall, AuthorityAdminOperation,
+    AuthorityAdminResult, AuthorityAgentProjection, AuthorityAgentProjectionPage,
+    AuthorityAgentReplicaProjectionPage, AuthorityBuiltinRole, AuthorityCapabilityGrant,
+    AuthorityCredentialCall, AuthorityCredentialEnrollment, AuthorityCredentialKind,
+    AuthorityCredentialProjection, AuthorityCredentialStatus, AuthorityCredentialVerifier,
+    AuthorityEvidence, AuthorityIngressAuthentication, AuthorityIssuer, AuthorityLaneRoots,
+    AuthorityOperationKind, AuthorityProjectionHead, AuthorityProjectionQuery,
+    AuthorityProjectionSelector, AuthorityVerifier, CompactAgentDescriptor, CompactInstallActor,
+    CompactReplicaSlot, MAX_AUTHORITY_PRINCIPAL_GRANTS, ManagedAgentTarget,
+    ManagementApplicationAck, ManagementApproval, ManagementAuthorizationPlan,
 };
 use vos::agent_sdk::authority_operation::{
     AuthorityOperationApproval, AuthorityOperationCall, AuthorityOperationIntent,
@@ -35,6 +40,9 @@ use vos::agent_sdk::authority_operation::{
     PrivateRecoveryAuthorityProofVerifier, private_member_set_commitment,
     private_node_identity_set_commitment,
 };
+use vos::agent_sdk::contract::{
+    ActorAbiRange, RuntimeMigrationPolicy, RuntimePackageContract, RuntimeResourceLimits,
+};
 use vos::agent_sdk::private::{
     ED25519_TRANSPORT_PEER_ID_BYTES, MAX_PRIVATE_NODES, NodeEncryptionEnrollment,
     NodeEncryptionEnrollmentVerifier, PRIVATE_SIGNATURE_BYTES, PrivateNodeIdentity,
@@ -42,10 +50,11 @@ use vos::agent_sdk::private::{
 };
 use vos::agent_sdk::wire::CanonicalWire as _;
 use vos::agent_sdk::{
-    ActorId, AgentId, AgentIdentity, AgentProfile, AgentReplica, CredentialId, DeploymentId, Hash,
-    InvocationContext, InvocationId, InvocationRoleClaims, MAX_AGENT_REPLICAS,
+    ActorId, AgentId, AgentIdentity, AgentProfile, AgentReplica, CapabilityId, CredentialId,
+    DeploymentId, Hash, InvocationContext, InvocationId, MAX_AGENT_REPLICAS,
     MAX_INVOCATION_MESSAGE_BYTES, MAX_INVOCATION_REPLY_BYTES, MAX_RUNTIME_STATE_BYTES,
-    ManagementReply, PrincipalId, ProducerId, ProgramId, RUNTIME_ABI_ID, ReplicaRole, SpaceId,
+    ManagementReply, PrincipalId, PrivateRecoveryBinding, ProducerId, ProgramId, RUNTIME_ABI_ID,
+    ReplicaRole, RoleId, RuntimeCapabilities, RuntimeRequirements, SpaceId,
     replica_roster_commitment, replica_set_generation,
 };
 use vos::prelude::*;
@@ -54,7 +63,7 @@ use vos::prelude::*;
 use vos::agent_sdk::ManagementRequest;
 
 /// Fixed installation-data wire for [`SystemAuthorityConfiguration`].
-pub const SYSTEM_AUTHORITY_CONFIGURATION_MAGIC: [u8; 4] = *b"SAC3";
+pub const SYSTEM_AUTHORITY_CONFIGURATION_MAGIC: [u8; 4] = *b"SAC4";
 
 /// The root admission consumes exactly one Create decision and one authority
 /// actor Install decision before this portable issuer can run.
@@ -68,6 +77,10 @@ pub const MAX_AUTHORITY_CREDENTIALS: usize = 64;
 /// permits replacement of every Node in a maximum-size Private Agent.
 pub const MAX_AUTHORITY_NODES: usize = 2 * MAX_PRIVATE_NODES + 1;
 pub const MAX_AUTHORITY_PRINCIPALS: usize = 64;
+/// Aggregate durable AMP2 authorization grants. A stricter per-Principal SDK
+/// bound guarantees that one credential projection always fits one reply.
+pub const MAX_AUTHORITY_AUTHORIZATION_GRANTS: usize =
+    MAX_AUTHORITY_PRINCIPALS * MAX_AUTHORITY_PRINCIPAL_GRANTS;
 /// Maximum Agents for which this actor retains lifecycle policy state.
 pub const MAX_MANAGED_AGENTS: usize = 256;
 /// Actor-directory rows retained across all managed Agents. One Agent may use
@@ -91,7 +104,7 @@ pub const MAX_PRIVATE_APPLICATION_RECORDS: usize = 4_096;
 /// The lower independent cap keeps that variable state below 768 KiB; the
 /// exact serialized-state ceiling remains authoritative for all row metadata.
 pub const MAX_PRIVATE_RECOVERY_APPLICATION_RECORDS: usize = 64;
-/// Worst-case canonical ACC3/AOC4/AAD3 calls plus MAP2/AOP4/AAR3 results and
+/// Worst-case canonical ACC3/AOC5/AAD4 calls plus MAP2/AOP5/AAR4 results and
 /// MAA2/AOI1 acknowledgements retained by the bounded exact-retry tables. This
 /// leaves over one MiB of the standard state ceiling for row metadata and
 /// actor framing.
@@ -101,8 +114,8 @@ pub const MAX_RETAINED_EXACT_WIRE_BYTES: usize = MAX_AUTHORITY_CREDENTIALS
 /// slot at which unseen work was accepted.
 pub const MAX_APPROVAL_VALIDITY_SLOTS: u64 = 4_096;
 
-const CONFIG_FIXED_FIELDS: usize = 18;
-const CONFIG_U64_FIELDS: usize = 2;
+const CONFIG_FIXED_FIELDS: usize = 20;
+const CONFIG_U64_FIELDS: usize = 3;
 const CONFIG_ENCODED_BYTES: usize = SYSTEM_AUTHORITY_CONFIGURATION_MAGIC.len()
     + 32
     + CONFIG_FIXED_FIELDS * 32
@@ -112,7 +125,7 @@ const CONFIG_ENCODED_BYTES: usize = SYSTEM_AUTHORITY_CONFIGURATION_MAGIC.len()
     + PRIVATE_SIGNATURE_BYTES;
 const EVIDENCE_DOMAIN: &[u8] = b"vos/system-authority/policy-evidence/v1";
 const OPERATION_EVIDENCE_DOMAIN: &[u8] = b"vos/system-authority/operation-evidence/v1";
-const STATE_INTEGRITY_DOMAIN: &[u8] = b"vos/system-authority/state-integrity/v14";
+const STATE_INTEGRITY_DOMAIN: &[u8] = b"vos/system-authority/state-integrity/v16";
 
 const _: () = assert!(MAX_RETAINED_EXACT_WIRE_BYTES < MAX_RUNTIME_STATE_BYTES);
 
@@ -197,6 +210,10 @@ pub struct SystemAuthorityConfiguration {
     pub system_runtime_deployment: [u8; 32],
     pub system_runtime_program: [u8; 32],
     pub system_runtime_producer: [u8; 32],
+    /// Stable online transition-proof signer identity for the system Agent.
+    pub system_transition_producer: [u8; 32],
+    /// Exact bundled standard-runtime package admitted for the system Agent.
+    pub system_runtime_package: AuthorityBlobRow,
     pub binding: AuthorityBindingState,
     /// Exact durable issuer sequence already consumed by root admission.
     pub bootstrap_authorization_high_water: u64,
@@ -220,6 +237,11 @@ impl Default for SystemAuthorityConfiguration {
             system_runtime_deployment: [0; 32],
             system_runtime_program: [0; 32],
             system_runtime_producer: [0; 32],
+            system_transition_producer: [0; 32],
+            system_runtime_package: AuthorityBlobRow {
+                hash: [0; 32],
+                len: 0,
+            },
             binding: AuthorityBindingState::default(),
             bootstrap_authorization_high_water: 0,
             bootstrap_system_agent_creation_nonce: [0; 32],
@@ -254,6 +276,9 @@ impl SystemAuthorityConfiguration {
             && self.system_runtime_deployment != [0; 32]
             && self.system_runtime_program != [0; 32]
             && self.system_runtime_producer != [0; 32]
+            && self.system_transition_producer != [0; 32]
+            && self.system_transition_producer != self.system_runtime_producer
+            && authority_blob_is_valid(&self.system_runtime_package, false)
             && self.bootstrap_authorization_high_water == ROOT_BOOTSTRAP_AUTHORIZATION_HIGH_WATER
             && self.bootstrap_system_agent_creation_nonce != [0; 32]
             && self.bootstrap_principal != [0; 32]
@@ -283,6 +308,9 @@ impl SystemAuthorityConfiguration {
         bytes.extend_from_slice(&self.system_runtime_deployment);
         bytes.extend_from_slice(&self.system_runtime_program);
         bytes.extend_from_slice(&self.system_runtime_producer);
+        bytes.extend_from_slice(&self.system_transition_producer);
+        bytes.extend_from_slice(&self.system_runtime_package.hash);
+        bytes.extend_from_slice(&self.system_runtime_package.len.to_le_bytes());
         bytes.extend_from_slice(&self.binding.policy);
         bytes.extend_from_slice(&self.binding.issuer.principal);
         bytes.extend_from_slice(&self.binding.issuer.actor);
@@ -304,7 +332,7 @@ impl SystemAuthorityConfiguration {
         bytes
     }
 
-    /// Decode SAC3 exactly. Prior clean generations, truncation, and trailing
+    /// Decode SAC4 exactly. Prior clean generations, truncation, and trailing
     /// data are all rejected; there is no legacy constructor fallback.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != CONFIG_ENCODED_BYTES
@@ -319,6 +347,12 @@ impl SystemAuthorityConfiguration {
         let system_runtime_deployment = take_fixed(bytes, &mut cursor)?;
         let system_runtime_program = take_fixed(bytes, &mut cursor)?;
         let system_runtime_producer = take_fixed(bytes, &mut cursor)?;
+        let system_transition_producer = take_fixed(bytes, &mut cursor)?;
+        let system_runtime_package = AuthorityBlobRow {
+            hash: take_fixed(bytes, &mut cursor)?,
+            len: u64::from_le_bytes(bytes.get(cursor..cursor + 8)?.try_into().ok()?),
+        };
+        cursor += 8;
         let policy = take_fixed(bytes, &mut cursor)?;
         let issuer = AuthorityIssuerState {
             principal: take_fixed(bytes, &mut cursor)?,
@@ -352,6 +386,8 @@ impl SystemAuthorityConfiguration {
             system_runtime_deployment,
             system_runtime_program,
             system_runtime_producer,
+            system_transition_producer,
+            system_runtime_package,
             binding: AuthorityBindingState {
                 policy,
                 issuer,
@@ -439,7 +475,7 @@ pub struct CredentialRow {
     /// this state generation avoids a second schema transition when general
     /// operation retirement is compacted.
     pub operation_request_high_water: u64,
-    /// Highest applied AAD3 request sequence for this credential. Revocation
+    /// Highest applied AAD4 request sequence for this credential. Revocation
     /// never erases this replay boundary.
     pub admin_request_high_water: u64,
 }
@@ -496,6 +532,39 @@ pub struct PrincipalRoleRow {
 }
 
 #[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct SpaceRoleGrantRow {
+    pub principal: [u8; 32],
+    pub role: [u8; 32],
+}
+
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct ActorRoleGrantRow {
+    pub principal: [u8; 32],
+    pub agent: [u8; 32],
+    pub actor: [u8; 32],
+    pub deployment: [u8; 32],
+    pub role: [u8; 32],
+}
+
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct CapabilityGrantRow {
+    pub principal: [u8; 32],
+    pub agent: [u8; 32],
+    pub actor: [u8; 32],
+    pub deployment: [u8; 32],
+    pub capability: [u8; 32],
+}
+
+#[derive(
     vos::rkyv::Archive,
     vos::rkyv::Serialize,
     vos::rkyv::Deserialize,
@@ -537,6 +606,144 @@ impl ManagedReplicaRow {
 }
 
 #[derive(
+    vos::rkyv::Archive,
+    vos::rkyv::Serialize,
+    vos::rkyv::Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct RuntimeContractRow {
+    pub lifecycle_abi: [u8; 32],
+    pub actor_abi_minimum: u32,
+    pub actor_abi_maximum: u32,
+    pub control_schema: [u8; 32],
+    pub max_runtime_state_bytes: u32,
+    pub max_artifact_references: u32,
+    pub max_artifact_referenced_bytes: u64,
+    pub max_proof_material_bytes: u64,
+    pub migration: u8,
+}
+
+impl RuntimeContractRow {
+    fn from_sdk(contract: RuntimePackageContract) -> Self {
+        Self {
+            lifecycle_abi: contract.lifecycle_abi.0,
+            actor_abi_minimum: contract.actor_abis.minimum,
+            actor_abi_maximum: contract.actor_abis.maximum,
+            control_schema: contract.control_schema.0,
+            max_runtime_state_bytes: contract.resources.max_runtime_state_bytes,
+            max_artifact_references: contract.resources.max_artifact_references,
+            max_artifact_referenced_bytes: contract.resources.max_artifact_referenced_bytes,
+            max_proof_material_bytes: contract.resources.max_proof_material_bytes,
+            migration: contract.migration as u8,
+        }
+    }
+
+    fn sdk(self) -> Option<RuntimePackageContract> {
+        let migration = match self.migration {
+            value if value == RuntimeMigrationPolicy::None as u8 => RuntimeMigrationPolicy::None,
+            _ => return None,
+        };
+        let contract = RuntimePackageContract {
+            lifecycle_abi: Hash(self.lifecycle_abi),
+            actor_abis: ActorAbiRange {
+                minimum: self.actor_abi_minimum,
+                maximum: self.actor_abi_maximum,
+            },
+            control_schema: Hash(self.control_schema),
+            resources: RuntimeResourceLimits {
+                max_runtime_state_bytes: self.max_runtime_state_bytes,
+                max_artifact_references: self.max_artifact_references,
+                max_artifact_referenced_bytes: self.max_artifact_referenced_bytes,
+                max_proof_material_bytes: self.max_proof_material_bytes,
+            },
+            migration,
+        };
+        contract.is_valid().then_some(contract)
+    }
+}
+
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct RuntimeCapabilitiesRow {
+    pub lanes: u8,
+    pub scheduling: bool,
+    pub proof_systems: Vec<[u8; 32]>,
+    pub max_actors: u32,
+}
+
+impl RuntimeCapabilitiesRow {
+    fn from_sdk(capabilities: RuntimeCapabilities) -> Self {
+        Self {
+            lanes: capabilities.lanes.bits(),
+            scheduling: capabilities.scheduling,
+            proof_systems: capabilities
+                .proof_systems
+                .as_slice()
+                .iter()
+                .map(|system| system.0)
+                .collect(),
+            max_actors: capabilities.max_actors,
+        }
+    }
+
+    fn sdk(&self) -> Option<RuntimeCapabilities> {
+        let proof_systems = self
+            .proof_systems
+            .iter()
+            .copied()
+            .map(Hash)
+            .collect::<Vec<_>>();
+        let capabilities = RuntimeCapabilities {
+            lanes: vos::agent_sdk::LaneSet::from_bits(self.lanes)?,
+            scheduling: self.scheduling,
+            proof_systems: vos::agent_sdk::ProofSystemSet::from_sorted(&proof_systems).ok()?,
+            max_actors: self.max_actors,
+        };
+        capabilities.validate().is_ok().then_some(capabilities)
+    }
+}
+
+#[derive(
+    vos::rkyv::Archive,
+    vos::rkyv::Serialize,
+    vos::rkyv::Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct PrivateRecoveryBindingRow {
+    pub signing_key_commitment: [u8; 32],
+    pub encryption_public_key: [u8; 32],
+}
+
+impl PrivateRecoveryBindingRow {
+    fn from_sdk(binding: PrivateRecoveryBinding) -> Self {
+        Self {
+            signing_key_commitment: binding.signing_key_commitment.0,
+            encryption_public_key: binding.encryption_public_key,
+        }
+    }
+
+    fn sdk(self) -> Option<PrivateRecoveryBinding> {
+        let binding = PrivateRecoveryBinding {
+            signing_key_commitment: Hash(self.signing_key_commitment),
+            encryption_public_key: self.encryption_public_key,
+        };
+        binding.is_valid().then_some(binding)
+    }
+}
+
+#[derive(
     vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
 )]
 #[rkyv(crate = vos::rkyv)]
@@ -547,17 +754,26 @@ pub struct ManagedAgentRow {
     pub runtime_deployment: [u8; 32],
     pub runtime_program: [u8; 32],
     pub runtime_producer: [u8; 32],
+    pub transition_producer: [u8; 32],
     pub authority: AuthorityBindingState,
     pub creation_nonce: [u8; 32],
-    /// Immutable descriptor commitment to the offline recovery signing key.
-    /// Present exactly for Private Agents; Admin credentials cannot replace it.
-    pub private_recovery_signing_key_commitment: Option<[u8; 32]>,
+    pub private_recovery: Option<PrivateRecoveryBindingRow>,
+    pub runtime_package: AuthorityBlobRow,
+    pub runtime_contract: RuntimeContractRow,
+    pub capabilities: RuntimeCapabilitiesRow,
     pub replicas: Vec<ManagedReplicaRow>,
     pub replica_generation: [u8; 32],
 }
 
 #[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+    vos::rkyv::Archive,
+    vos::rkyv::Serialize,
+    vos::rkyv::Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
 )]
 #[rkyv(crate = vos::rkyv)]
 pub struct AuthorityBlobRow {
@@ -618,9 +834,13 @@ fn root_managed_agent(config: SystemAuthorityConfiguration) -> ManagedAgentRow {
         runtime_deployment: config.system_runtime_deployment,
         runtime_program: config.system_runtime_program,
         runtime_producer: config.system_runtime_producer,
+        transition_producer: config.system_transition_producer,
         authority: config.binding,
         creation_nonce: config.bootstrap_system_agent_creation_nonce,
-        private_recovery_signing_key_commitment: None,
+        private_recovery: None,
+        runtime_package: config.system_runtime_package,
+        runtime_contract: RuntimeContractRow::from_sdk(RuntimePackageContract::canonical()),
+        capabilities: RuntimeCapabilitiesRow::from_sdk(RuntimeCapabilities::standard()),
         replicas: vec![ManagedReplicaRow {
             node: config.bootstrap_node,
             principal: config.bootstrap_principal,
@@ -662,6 +882,7 @@ fn managed_replica_generation(
             runtime_deployment: DeploymentId(row.runtime_deployment),
             runtime_program: ProgramId(row.runtime_program),
             runtime_producer: ProducerId(row.runtime_producer),
+            transition_producer: ProducerId(row.transition_producer),
         },
         Hash(row.creation_nonce),
         &replicas,
@@ -711,6 +932,9 @@ pub enum PendingManagementEffect {
         to_deployment: [u8; 32],
         to_program: [u8; 32],
         producer: [u8; 32],
+        package: AuthorityBlobRow,
+        contract: RuntimeContractRow,
+        capabilities: RuntimeCapabilitiesRow,
     },
 }
 
@@ -758,7 +982,7 @@ pub struct LatestManagementAckRow {
     pub applied_at: u64,
 }
 
-/// Exact retained AOC4/AOP4 pair and, once observed, its exact AOI1. An
+/// Exact retained AOC5/AOP5 pair and, once observed, its exact AOI1. An
 /// out-of-order acknowledgement remains here until every earlier global
 /// authorization position is safe to cross.
 #[derive(
@@ -770,7 +994,7 @@ pub struct AuthorityOperationRetryRecord {
     pub acknowledgement_invocation: [u8; 32],
     pub credential: [u8; 32],
     pub request_sequence: u64,
-    /// Commitment of every caller-selected AOC4 field except the derived
+    /// Commitment of every caller-selected AOC5 field except the derived
     /// invocation and signature. This permits exact ID reconstruction after
     /// the full call preimage compacts.
     pub invocation_payload: [u8; 32],
@@ -789,7 +1013,7 @@ pub struct AuthorityOperationRetryRecord {
 }
 
 /// The newest durably issued operation for one credential. Exact AOI1 bytes
-/// remain retryable, while the AOC4/AOP4 preimages are intentionally absent.
+/// remain retryable, while the AOC5/AOP5 preimages are intentionally absent.
 /// Older requests are rejected by the credential's monotonic high-water.
 #[derive(
     vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
@@ -811,7 +1035,7 @@ pub struct LatestOperationAckRow {
     pub private_operation: Option<RetiredPrivateOperationRow>,
 }
 
-/// Exact Private-control intent fields which remain after the AOC4/AOP4/AOI1
+/// Exact Private-control intent fields which remain after the AOC5/AOP5/AOI1
 /// preimages retire. They let PCA2 prove the original operation without
 /// reconstructing or relabeling discarded bytes.
 #[derive(
@@ -827,18 +1051,18 @@ pub struct RetiredPrivateOperationRow {
     pub control_sequence: u64,
     pub control_previous: Option<[u8; 32]>,
     pub epoch: u64,
-    /// Exact Invite/Revoke membership target retained from AOC4. The other
+    /// Exact Invite/Revoke membership target retained from AOC5. The other
     /// Private operations do not select one Node.
     pub node: Option<[u8; 32]>,
     /// Invite's exact transport/encryption identity commitment. A separate
     /// enrollment projection can bind this retained value before admission.
     pub node_identity: Option<[u8; 32]>,
-    /// Revoke and Rotate fix the complete post-apply set in AOC4. Invite fixes
+    /// Revoke and Rotate fix the complete post-apply set in AOC5. Invite fixes
     /// the invited Node identity, while only PCA2 can report the resulting set.
     pub post_member_set: Option<[u8; 32]>,
     /// Exact canonical PRA1 bytes, present only for Recover. Keeping the proof
     /// makes issuance retirement, PCA retry, and state replay independently
-    /// re-verifiable without retaining the larger AOC4.
+    /// re-verifiable without retaining the larger AOC5.
     pub recovery_proof_bytes: Option<Vec<u8>>,
 }
 
@@ -968,12 +1192,16 @@ pub struct AdminRetryRecord {
 #[rkyv(crate = vos::rkyv)]
 pub struct AuthorityLinearState {
     initialized: bool,
+    state_revision: u64,
     epoch: u64,
     authorization_sequence: u64,
     administration_generation: u64,
     credentials: Vec<CredentialRow>,
     nodes: Vec<NodeOwnerRow>,
     roles: Vec<PrincipalRoleRow>,
+    space_role_grants: Vec<SpaceRoleGrantRow>,
+    actor_role_grants: Vec<ActorRoleGrantRow>,
+    capability_grants: Vec<CapabilityGrantRow>,
     managed_agents: Vec<ManagedAgentRow>,
     managed_actors: Vec<ManagedActorRow>,
     retired_actor_installations: Vec<RetiredActorInstallationRow>,
@@ -998,12 +1226,16 @@ impl AuthorityLinearState {
     fn inert() -> Self {
         Self {
             initialized: false,
+            state_revision: 0,
             epoch: 0,
             authorization_sequence: 0,
             administration_generation: 0,
             credentials: Vec::new(),
             nodes: Vec::new(),
             roles: Vec::new(),
+            space_role_grants: Vec::new(),
+            actor_role_grants: Vec::new(),
+            capability_grants: Vec::new(),
             managed_agents: Vec::new(),
             managed_actors: Vec::new(),
             retired_actor_installations: Vec::new(),
@@ -1047,12 +1279,16 @@ impl AuthorityLinearState {
         managed_agents.push(root_managed_agent(config));
         let mut state = Self {
             initialized: true,
+            state_revision: 0,
             epoch: config.binding.initial_epoch,
             authorization_sequence: config.bootstrap_authorization_high_water,
             administration_generation: 1,
             credentials,
             nodes,
             roles,
+            space_role_grants: Vec::new(),
+            actor_role_grants: Vec::new(),
+            capability_grants: Vec::new(),
             managed_agents,
             managed_actors: Vec::new(),
             retired_actor_installations: Vec::new(),
@@ -1103,15 +1339,21 @@ fn refresh_state_integrity_commitment(
     configuration: &SystemAuthorityConfiguration,
     state: &mut AuthorityLinearState,
 ) -> bool {
-    let Some(commitment) = computed_state_integrity_commitment(configuration, state) else {
+    let Some(next_revision) = state.state_revision.checked_add(1) else {
         return false;
     };
-    state.state_integrity_commitment = commitment.0;
+    let mut candidate = state.clone();
+    candidate.state_revision = next_revision;
+    let Some(commitment) = computed_state_integrity_commitment(configuration, &candidate) else {
+        return false;
+    };
+    candidate.state_integrity_commitment = commitment.0;
+    *state = candidate;
     true
 }
 
 /// Linear policy state for one Space's built-in system Agent.
-#[actor(agent, state_version = 14)]
+#[actor(agent, state_version = 17)]
 pub struct SystemAuthority {
     #[state(const)]
     configuration: SystemAuthorityConfiguration,
@@ -1154,7 +1396,7 @@ impl SystemAuthority {
         finalize_application(&self.configuration, &mut self.state, &ack, &context)
     }
 
-    /// Verify one exact credential-signed AOC4 and return its canonical AOP4.
+    /// Verify one exact ingress-authenticated AOC5 and return its canonical AOP5.
     /// The approval shares the management authorization clock and remains
     /// retained until its exact signed AOI1 is consumed.
     #[msg(linear)]
@@ -1185,12 +1427,7 @@ impl SystemAuthority {
         let Some(context) = ctx.agent_invocation_context().copied() else {
             return false;
         };
-        resolve_private_application(
-            &self.configuration,
-            &mut self.state,
-            &ack,
-            &context,
-        )
+        resolve_private_application(&self.configuration, &mut self.state, &ack, &context)
     }
 
     /// Apply one self-authenticating Admin identity mutation. The enclosing
@@ -1202,6 +1439,36 @@ impl SystemAuthority {
             return Vec::new();
         };
         administer_call(&self.configuration, &mut self.state, &call, &context)
+    }
+
+    /// Resolve the exact credential signing this request. A revoked
+    /// credential may still prove possession and receive its revoked status;
+    /// unknown, substituted, or corrupt state fails closed.
+    #[msg(query)]
+    fn credential_projection(&self, query: Vec<u8>) -> Vec<u8> {
+        credential_projection(&self.configuration, &self.state, &query)
+    }
+
+    /// Return one bounded, full-ID ordered Agent policy page. Private entries
+    /// are visible only to their owner or an Admin and never carry aliases.
+    #[msg(query)]
+    fn agent_projection_page(&self, query: Vec<u8>) -> Vec<u8> {
+        agent_projection_page(&self.configuration, &self.state, &query)
+    }
+
+    /// Return one bounded slice of an exact Agent's replica roster. Consumers
+    /// reconstruct the descriptor only from pages sharing the Agent row's
+    /// state head, replica count, and replica generation.
+    #[msg(query)]
+    fn agent_replica_projection_page(&self, query: Vec<u8>) -> Vec<u8> {
+        agent_replica_projection_page(&self.configuration, &self.state, &query)
+    }
+
+    /// Return one bounded Actor policy/status/artifact page for an exact
+    /// Agent. Private inventories are owner/Admin-only.
+    #[msg(query)]
+    fn actor_projection_page(&self, query: Vec<u8>) -> Vec<u8> {
+        actor_projection_page(&self.configuration, &self.state, &query)
     }
 }
 
@@ -1258,6 +1525,358 @@ impl PrivateRecoveryAuthorityProofVerifier for Ed25519CredentialVerifier {
 impl AuthorityVerifier for Ed25519CredentialVerifier {
     fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
         <Self as AuthorityCredentialVerifier>::verify(self, public_key, message, signature)
+    }
+}
+
+fn projection_head(state: &AuthorityLinearState) -> Option<AuthorityProjectionHead> {
+    Some(AuthorityProjectionHead {
+        state_revision: NonZeroU64::new(state.state_revision)?,
+        epoch: NonZeroU64::new(state.epoch)?,
+        authorization_sequence: NonZeroU64::new(state.authorization_sequence)?,
+        administration_generation: NonZeroU64::new(state.administration_generation)?,
+        state_commitment: Hash(state.state_integrity_commitment),
+    })
+}
+
+fn authenticated_projection_query(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+    encoded_query: &[u8],
+    allow_revoked: bool,
+) -> Option<(
+    AuthorityProjectionQuery,
+    usize,
+    PrincipalId,
+    BuiltinPrincipalRole,
+)> {
+    if encoded_query.is_empty()
+        || encoded_query.len() > MAX_INVOCATION_MESSAGE_BYTES
+        || !authority_state_is_valid(configuration, state)
+    {
+        return None;
+    }
+    let query = AuthorityProjectionQuery::decode(encoded_query).ok()?;
+    if !authority_target_matches(configuration, &query.authority) {
+        return None;
+    }
+    let credential_index = state
+        .credentials
+        .binary_search_by(|row| row.credential.cmp(&query.credential.0))
+        .ok()?;
+    let credential = &state.credentials[credential_index];
+    if credential.public_key != query.credential_public_key()
+        || (!allow_revoked && credential.status != CredentialStatus::Active)
+    {
+        return None;
+    }
+    match query.authentication {
+        AuthorityIngressAuthentication::ApiCredentialSignature { .. } => {
+            if credential.kind != AuthorityCredentialKind::Api as u8
+                || query.verify_api_with(&Ed25519CredentialVerifier).is_err()
+            {
+                return None;
+            }
+        }
+        AuthorityIngressAuthentication::SshNodeAttestation { node, .. } => {
+            if credential.kind != AuthorityCredentialKind::Ssh as u8 {
+                return None;
+            }
+            let node_index = state
+                .nodes
+                .binary_search_by(|row| row.node.cmp(&node.0))
+                .ok()?;
+            let attester = &state.nodes[node_index];
+            if attester.space != configuration.space
+                || query
+                    .verify_ssh_node_attestation_with(
+                        &attester.transport_public_key,
+                        &Ed25519CredentialVerifier,
+                    )
+                    .is_err()
+            {
+                return None;
+            }
+        }
+    }
+    let principal = PrincipalId(credential.principal);
+    let role_index = state
+        .roles
+        .binary_search_by(|row| row.principal.cmp(&principal.0))
+        .ok()?;
+    Some((
+        query,
+        credential_index,
+        principal,
+        state.roles[role_index].role,
+    ))
+}
+
+fn credential_projection(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+    encoded_query: &[u8],
+) -> Vec<u8> {
+    let Some((query, credential_index, principal, role)) =
+        authenticated_projection_query(configuration, state, encoded_query, true)
+    else {
+        return Vec::new();
+    };
+    if query.selector != AuthorityProjectionSelector::Credential {
+        return Vec::new();
+    }
+    let credential = &state.credentials[credential_index];
+    let kind = match credential.kind {
+        value if value == AuthorityCredentialKind::Ssh as u8 => AuthorityCredentialKind::Ssh,
+        value if value == AuthorityCredentialKind::Api as u8 => AuthorityCredentialKind::Api,
+        _ => return Vec::new(),
+    };
+    let status = match credential.status {
+        CredentialStatus::Active => AuthorityCredentialStatus::Active,
+        CredentialStatus::Revoked => AuthorityCredentialStatus::Revoked,
+    };
+    let Some(head) = projection_head(state) else {
+        return Vec::new();
+    };
+    let space_roles = state
+        .space_role_grants
+        .iter()
+        .filter(|grant| grant.principal == principal.0)
+        .map(|grant| RoleId(grant.role))
+        .collect();
+    let actor_roles = state
+        .actor_role_grants
+        .iter()
+        .filter(|grant| grant.principal == principal.0)
+        .map(|grant| AuthorityActorRoleGrant {
+            agent: AgentId(grant.agent),
+            actor: ActorId(grant.actor),
+            deployment: DeploymentId(grant.deployment),
+            role: RoleId(grant.role),
+        })
+        .collect();
+    let capabilities = state
+        .capability_grants
+        .iter()
+        .filter(|grant| grant.principal == principal.0)
+        .map(|grant| AuthorityCapabilityGrant {
+            agent: AgentId(grant.agent),
+            actor: ActorId(grant.actor),
+            deployment: DeploymentId(grant.deployment),
+            capability: CapabilityId(grant.capability),
+        })
+        .collect();
+    AuthorityCredentialProjection {
+        query,
+        head,
+        principal,
+        status,
+        kind,
+        builtin_role: match role {
+            BuiltinPrincipalRole::Member => AuthorityBuiltinRole::Member,
+            BuiltinPrincipalRole::Developer => AuthorityBuiltinRole::Developer,
+            BuiltinPrincipalRole::Admin => AuthorityBuiltinRole::Admin,
+        },
+        management_request_high_water: credential.management_request_high_water,
+        operation_request_high_water: credential.operation_request_high_water,
+        admin_request_high_water: credential.admin_request_high_water,
+        space_roles,
+        actor_roles,
+        capabilities,
+    }
+    .encode()
+    .unwrap_or_default()
+}
+
+fn private_agent_visible_to(
+    row: &ManagedAgentRow,
+    principal: PrincipalId,
+    role: BuiltinPrincipalRole,
+) -> bool {
+    row.profile != AgentProfile::Private as u8
+        || row.owner == principal.0
+        || role == BuiltinPrincipalRole::Admin
+}
+
+fn agent_projection_page(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+    encoded_query: &[u8],
+) -> Vec<u8> {
+    let Some((query, _, principal, role)) =
+        authenticated_projection_query(configuration, state, encoded_query, false)
+    else {
+        return Vec::new();
+    };
+    let AuthorityProjectionSelector::Agents { after, limit } = query.selector else {
+        return Vec::new();
+    };
+    let mut candidates = state.managed_agents.iter().filter(|row| {
+        after.is_none_or(|after| row.agent > after.0)
+            && private_agent_visible_to(row, principal, role)
+    });
+    let mut entries = Vec::with_capacity(usize::from(limit));
+    for row in candidates.by_ref().take(usize::from(limit)) {
+        let Some(entry) = managed_agent_projection(configuration, row) else {
+            return Vec::new();
+        };
+        entries.push(entry);
+    }
+    let mut has_more = candidates.next().is_some();
+    let Some(head) = projection_head(state) else {
+        return Vec::new();
+    };
+    loop {
+        if entries.is_empty() && has_more {
+            // A nonempty first row must fit by itself. Never emit an empty
+            // terminal-looking page when a hostile future row shape does not.
+            return Vec::new();
+        }
+        let next = has_more
+            .then(|| entries.last().map(|entry| entry.identity.agent))
+            .flatten();
+        let page = AuthorityAgentProjectionPage {
+            query: query.clone(),
+            head,
+            entries: entries.clone(),
+            next,
+        };
+        if let Ok(encoded) = page.encode() {
+            return encoded;
+        }
+        if entries.pop().is_none() {
+            return Vec::new();
+        }
+        has_more = true;
+    }
+}
+
+fn agent_replica_projection_page(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+    encoded_query: &[u8],
+) -> Vec<u8> {
+    let Some((query, _, principal, role)) =
+        authenticated_projection_query(configuration, state, encoded_query, false)
+    else {
+        return Vec::new();
+    };
+    let AuthorityProjectionSelector::AgentReplicas {
+        agent,
+        after,
+        limit,
+    } = query.selector
+    else {
+        return Vec::new();
+    };
+    let Ok(agent_index) = managed_agent(state, agent) else {
+        return Vec::new();
+    };
+    let row = &state.managed_agents[agent_index];
+    if !private_agent_visible_to(row, principal, role) {
+        return Vec::new();
+    }
+    let mut candidates = row
+        .replicas
+        .iter()
+        .filter(|replica| after.is_none_or(|after| replica.node > after.0));
+    let mut entries = Vec::with_capacity(usize::from(limit));
+    for replica in candidates.by_ref().take(usize::from(limit)) {
+        let Some(replica) = replica.sdk() else {
+            return Vec::new();
+        };
+        entries.push(replica);
+    }
+    let mut has_more = candidates.next().is_some();
+    let Some(head) = projection_head(state) else {
+        return Vec::new();
+    };
+    let Ok(replica_count) = row.replicas.len().try_into() else {
+        return Vec::new();
+    };
+    loop {
+        if entries.is_empty() && has_more {
+            return Vec::new();
+        }
+        let next = has_more
+            .then(|| entries.last().map(|entry| entry.node))
+            .flatten();
+        let page = AuthorityAgentReplicaProjectionPage {
+            query: query.clone(),
+            head,
+            replica_count,
+            replica_generation: Hash(row.replica_generation),
+            entries: entries.clone(),
+            next,
+        };
+        if let Ok(encoded) = page.encode() {
+            return encoded;
+        }
+        if entries.pop().is_none() {
+            return Vec::new();
+        }
+        has_more = true;
+    }
+}
+
+fn actor_projection_page(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+    encoded_query: &[u8],
+) -> Vec<u8> {
+    let Some((query, _, principal, role)) =
+        authenticated_projection_query(configuration, state, encoded_query, false)
+    else {
+        return Vec::new();
+    };
+    let AuthorityProjectionSelector::Actors {
+        agent,
+        after,
+        limit,
+    } = query.selector
+    else {
+        return Vec::new();
+    };
+    let Ok(agent_index) = managed_agent(state, agent) else {
+        return Vec::new();
+    };
+    if !private_agent_visible_to(&state.managed_agents[agent_index], principal, role) {
+        return Vec::new();
+    }
+    let mut candidates = state
+        .managed_actors
+        .iter()
+        .filter(|row| row.agent == agent.0 && after.is_none_or(|after| row.actor > after.0));
+    let mut entries = Vec::with_capacity(usize::from(limit));
+    for row in candidates.by_ref().take(usize::from(limit)) {
+        let Some(entry) = managed_actor_projection(row) else {
+            return Vec::new();
+        };
+        entries.push(entry);
+    }
+    let mut has_more = candidates.next().is_some();
+    let Some(head) = projection_head(state) else {
+        return Vec::new();
+    };
+    loop {
+        if entries.is_empty() && has_more {
+            return Vec::new();
+        }
+        let next = has_more
+            .then(|| entries.last().map(|entry| entry.entry.actor))
+            .flatten();
+        let page = AuthorityActorProjectionPage {
+            query: query.clone(),
+            head,
+            entries: entries.clone(),
+            next,
+        };
+        if let Ok(encoded) = page.encode() {
+            return encoded;
+        }
+        if entries.pop().is_none() {
+            return Vec::new();
+        }
+        has_more = true;
     }
 }
 
@@ -1476,10 +2095,12 @@ fn authorize_operation_call(
     };
     if !call.matches_invocation_context(context)
         || !authority_target_matches(configuration, &call.authority)
-        || call.verify_with(&Ed25519CredentialVerifier).is_err()
     {
         return Vec::new();
     }
+    let Some(role) = authenticated_operation_role(configuration, state, &call) else {
+        return Vec::new();
+    };
 
     let call_commitment = call.commitment();
     let acknowledgement_invocation =
@@ -1510,15 +2131,12 @@ fn authorize_operation_call(
             Vec::new()
         }
         Err(index) => {
-            let Some(role) = authenticated_operation_role(state, &call) else {
-                return Vec::new();
-            };
             let Ok(caller_index) = credential_index(state, call.credential) else {
                 return Vec::new();
             };
-            // Once AOI1 has advanced the floor, AOP4 bytes are intentionally
+            // Once AOI1 has advanced the floor, AOP5 bytes are intentionally
             // gone. The signed per-credential sequence rejects every retired
-            // AOC4 without synthesizing a result from commitments.
+            // AOC5 without synthesizing a result from commitments.
             if exact_retry_count(state) >= MAX_EXACT_RETRY_RECORDS
                 || state.credentials[caller_index]
                     .operation_request_high_water
@@ -1766,6 +2384,137 @@ fn authenticated_admin(state: &AuthorityLinearState, call: &AuthorityAdminCall) 
         .is_some_and(|index| state.roles[index].role == BuiltinPrincipalRole::Admin)
 }
 
+fn space_role_grant(
+    state: &AuthorityLinearState,
+    principal: PrincipalId,
+    role: RoleId,
+) -> core::result::Result<usize, usize> {
+    state
+        .space_role_grants
+        .binary_search_by(|row| (row.principal, row.role).cmp(&(principal.0, role.0)))
+}
+
+fn actor_role_grant(
+    state: &AuthorityLinearState,
+    principal: PrincipalId,
+    agent: AgentId,
+    actor: ActorId,
+    deployment: DeploymentId,
+    role: RoleId,
+) -> core::result::Result<usize, usize> {
+    state.actor_role_grants.binary_search_by(|row| {
+        (
+            row.principal,
+            row.agent,
+            row.actor,
+            row.deployment,
+            row.role,
+        )
+            .cmp(&(principal.0, agent.0, actor.0, deployment.0, role.0))
+    })
+}
+
+fn capability_grant(
+    state: &AuthorityLinearState,
+    principal: PrincipalId,
+    agent: AgentId,
+    actor: ActorId,
+    deployment: DeploymentId,
+    capability: CapabilityId,
+) -> core::result::Result<usize, usize> {
+    state.capability_grants.binary_search_by(|row| {
+        (
+            row.principal,
+            row.agent,
+            row.actor,
+            row.deployment,
+            row.capability,
+        )
+            .cmp(&(principal.0, agent.0, actor.0, deployment.0, capability.0))
+    })
+}
+
+fn authorization_grant_count(state: &AuthorityLinearState) -> usize {
+    state
+        .space_role_grants
+        .len()
+        .saturating_add(state.actor_role_grants.len())
+        .saturating_add(state.capability_grants.len())
+}
+
+fn principal_authorization_grant_count(
+    state: &AuthorityLinearState,
+    principal: PrincipalId,
+) -> usize {
+    state
+        .space_role_grants
+        .iter()
+        .filter(|row| row.principal == principal.0)
+        .count()
+        .saturating_add(
+            state
+                .actor_role_grants
+                .iter()
+                .filter(|row| row.principal == principal.0)
+                .count(),
+        )
+        .saturating_add(
+            state
+                .capability_grants
+                .iter()
+                .filter(|row| row.principal == principal.0)
+                .count(),
+        )
+}
+
+fn actor_accepts_authorization_grant(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+    agent: AgentId,
+    actor: ActorId,
+    deployment: DeploymentId,
+) -> bool {
+    !protected_authority_actor(configuration, actor)
+        && managed_actor(state, agent, actor)
+            .ok()
+            .is_some_and(|index| state.managed_actors[index].deployment == deployment.0)
+        && !state.retries.iter().any(|record| match &record.effect {
+            PendingManagementEffect::UpgradeActor {
+                agent: pending_agent,
+                actor: pending_actor,
+                ..
+            }
+            | PendingManagementEffect::SetActorSuspended {
+                agent: pending_agent,
+                actor: pending_actor,
+                ..
+            }
+            | PendingManagementEffect::RemoveActor {
+                agent: pending_agent,
+                actor: pending_actor,
+                ..
+            } => *pending_agent == agent.0 && *pending_actor == actor.0,
+            PendingManagementEffect::InstallActor {
+                agent: pending_agent,
+                actor: pending_actor,
+                ..
+            } => *pending_agent == agent.0 && *pending_actor == actor.0,
+            PendingManagementEffect::None
+            | PendingManagementEffect::Create(_)
+            | PendingManagementEffect::ChangeReplicas { .. }
+            | PendingManagementEffect::UpgradeRuntime { .. } => false,
+        })
+}
+
+fn can_add_authorization_grant(state: &AuthorityLinearState, principal: PrincipalId) -> bool {
+    state
+        .roles
+        .binary_search_by(|row| row.principal.cmp(&principal.0))
+        .is_ok()
+        && authorization_grant_count(state) < MAX_AUTHORITY_AUTHORIZATION_GRANTS
+        && principal_authorization_grant_count(state, principal) < MAX_AUTHORITY_PRINCIPAL_GRANTS
+}
+
 fn apply_admin_operation(
     configuration: &SystemAuthorityConfiguration,
     state: &mut AuthorityLinearState,
@@ -1895,6 +2644,99 @@ fn apply_admin_operation(
             }
             state.roles[index].role = role;
         }
+        AuthorityAdminOperation::SetSpaceRole {
+            principal,
+            role,
+            granted,
+        } => match (*granted, space_role_grant(state, *principal, *role)) {
+            (true, Err(index)) if can_add_authorization_grant(state, *principal) => {
+                state.space_role_grants.insert(
+                    index,
+                    SpaceRoleGrantRow {
+                        principal: principal.0,
+                        role: role.0,
+                    },
+                );
+            }
+            (false, Ok(index)) => {
+                state.space_role_grants.remove(index);
+            }
+            _ => return false,
+        },
+        AuthorityAdminOperation::SetActorRole {
+            principal,
+            agent,
+            actor,
+            deployment,
+            role,
+            granted,
+        } => match (
+            *granted,
+            actor_role_grant(state, *principal, *agent, *actor, *deployment, *role),
+        ) {
+            (true, Err(index))
+                if can_add_authorization_grant(state, *principal)
+                    && actor_accepts_authorization_grant(
+                        configuration,
+                        state,
+                        *agent,
+                        *actor,
+                        *deployment,
+                    ) =>
+            {
+                state.actor_role_grants.insert(
+                    index,
+                    ActorRoleGrantRow {
+                        principal: principal.0,
+                        agent: agent.0,
+                        actor: actor.0,
+                        deployment: deployment.0,
+                        role: role.0,
+                    },
+                );
+            }
+            (false, Ok(index)) => {
+                state.actor_role_grants.remove(index);
+            }
+            _ => return false,
+        },
+        AuthorityAdminOperation::SetCapability {
+            principal,
+            agent,
+            actor,
+            deployment,
+            capability,
+            granted,
+        } => match (
+            *granted,
+            capability_grant(state, *principal, *agent, *actor, *deployment, *capability),
+        ) {
+            (true, Err(index))
+                if can_add_authorization_grant(state, *principal)
+                    && actor_accepts_authorization_grant(
+                        configuration,
+                        state,
+                        *agent,
+                        *actor,
+                        *deployment,
+                    ) =>
+            {
+                state.capability_grants.insert(
+                    index,
+                    CapabilityGrantRow {
+                        principal: principal.0,
+                        agent: agent.0,
+                        actor: actor.0,
+                        deployment: deployment.0,
+                        capability: capability.0,
+                    },
+                );
+            }
+            (false, Ok(index)) => {
+                state.capability_grants.remove(index);
+            }
+            _ => return false,
+        },
     }
     true
 }
@@ -1956,7 +2798,7 @@ fn node_is_in_use(
         AuthorityOperationCall::decode(&record.operation_call_bytes)
             .ok()
             .and_then(|call| {
-                if call.authenticated_node == Some(node) {
+                if call.authenticated_node() == Some(node) {
                     return Some(node);
                 }
                 let retired = private_operation_source_is_retired(
@@ -1968,7 +2810,10 @@ fn node_is_in_use(
                 match call.intent {
                     AuthorityOperationIntent::InvitePrivateNode { node, .. }
                     | AuthorityOperationIntent::RevokePrivateNode { node, .. }
-                        if !retired => Some(node),
+                        if !retired =>
+                    {
+                        Some(node)
+                    }
                     AuthorityOperationIntent::RecoverPrivateAgent { proof } if !retired => {
                         proof.replacement_nodes.contains(&node).then_some(node)
                     }
@@ -2000,6 +2845,18 @@ fn credential_row(
         operation_request_high_water: 0,
         admin_request_high_water: 0,
     }
+}
+
+fn credential_matches_active_enrollment(
+    row: &CredentialRow,
+    principal: PrincipalId,
+    credential: AuthorityCredentialEnrollment,
+) -> bool {
+    row.credential == credential.credential.0
+        && row.principal == principal.0
+        && row.kind == credential.kind as u8
+        && row.public_key == credential.public_key
+        && row.status == CredentialStatus::Active
 }
 
 fn builtin_role(role: AuthorityBuiltinRole) -> BuiltinPrincipalRole {
@@ -2055,14 +2912,11 @@ fn admin_invocation_is_available(state: &AuthorityLinearState, invocation: Invoc
                 && record.issuance_invocation != invocation.0
                 && record.application_invocation != invocation.0
         })
-        && state
-            .private_application_retirements
-            .iter()
-            .all(|record| {
-                record.authorization_invocation != invocation.0
-                    && record.issuance_invocation != invocation.0
-                    && record.application_invocation != invocation.0
-            })
+        && state.private_application_retirements.iter().all(|record| {
+            record.authorization_invocation != invocation.0
+                && record.issuance_invocation != invocation.0
+                && record.application_invocation != invocation.0
+        })
 }
 
 fn finalize_application(
@@ -2203,8 +3057,8 @@ fn acknowledge_operation_issuance(
     let ack_commitment = ack.commitment();
 
     // The credential-bounded latest result makes an exact AOI1 retry
-    // idempotent after its AOC4/AOP4 preimages compact. It deliberately cannot
-    // answer an AOC4 retry.
+    // idempotent after its AOC5/AOP5 preimages compact. It deliberately cannot
+    // answer an AOC5 retry.
     if let Some(latest) = state
         .latest_operation_acks
         .iter()
@@ -2448,14 +3302,11 @@ fn retire_private_control_application(
                 || record.application_invocation == ack.application_invocation.0
                 || record.authorization_sequence == ack.authorization_sequence.get()
         })
-        || state
-            .private_application_retirements
-            .iter()
-            .any(|record| {
-                record.authorization_invocation == ack.authorization_invocation.0
-                    || record.issuance_invocation == ack.issuance_invocation.0
-                    || record.authorization_sequence == ack.authorization_sequence.get()
-            })
+        || state.private_application_retirements.iter().any(|record| {
+            record.authorization_invocation == ack.authorization_invocation.0
+                || record.issuance_invocation == ack.issuance_invocation.0
+                || record.authorization_sequence == ack.authorization_sequence.get()
+        })
     {
         return false;
     }
@@ -3093,7 +3944,7 @@ fn advance_operation_retirement_floor(state: &mut AuthorityLinearState) -> bool 
             private_application_invocation: record.private_application_invocation,
             private_operation: retained_private_operation(&call),
         };
-        // The durable floor is advanced before the retireable AOC4/AOP4
+        // The durable floor is advanced before the retireable AOC5/AOP5
         // buffers are removed. Actor state commits atomically, while this
         // ordering preserves the protocol's reopen rule explicitly.
         state.operation_retirement_floor = next;
@@ -3158,6 +4009,9 @@ enum ApplicationPlan {
         to_deployment: [u8; 32],
         to_program: [u8; 32],
         producer: [u8; 32],
+        package: AuthorityBlobRow,
+        contract: RuntimeContractRow,
+        capabilities: RuntimeCapabilitiesRow,
     },
 }
 
@@ -3260,11 +4114,7 @@ fn application_plan(
             else {
                 return None;
             };
-            let requested = reconstructed_replica_roster(
-                state,
-                slots,
-                *replica_roster_commitment,
-            )?;
+            let requested = reconstructed_replica_roster(state, slots, *replica_roster_commitment)?;
             let index = managed_agent(state, call.managed.agent).ok()?;
             let row = &state.managed_agents[index];
             if row.agent != *agent
@@ -3296,7 +4146,7 @@ fn application_plan(
             let row = installed_actor_row(
                 call.managed.agent,
                 install,
-                call.plan.commitment(),
+                install.lineage_commitment(),
                 root_provenance,
             );
             if acknowledgement.application != ManagementReply::Installed(install.entry.clone()) {
@@ -3386,6 +4236,9 @@ fn application_plan(
             to_deployment,
             to_program,
             producer,
+            package,
+            contract,
+            capabilities,
         } => {
             let index = state
                 .managed_agents
@@ -3397,6 +4250,10 @@ fn application_plan(
                 || *to_deployment == [0; 32]
                 || *to_program == [0; 32]
                 || *producer == [0; 32]
+                || *producer == row.transition_producer
+                || !authority_blob_is_valid(package, false)
+                || contract.sdk().is_none()
+                || capabilities.sdk().is_none()
             {
                 return None;
             }
@@ -3414,6 +4271,9 @@ fn application_plan(
             upgraded.runtime_deployment = *to_deployment;
             upgraded.runtime_program = *to_program;
             upgraded.runtime_producer = *producer;
+            upgraded.runtime_package = *package;
+            upgraded.runtime_contract = *contract;
+            upgraded.capabilities = capabilities.clone();
             if acknowledgement.application
                 != ManagementReply::RuntimeUpgraded(managed_agent_identity(
                     configuration,
@@ -3428,6 +4288,9 @@ fn application_plan(
                 to_deployment: *to_deployment,
                 to_program: *to_program,
                 producer: *producer,
+                package: *package,
+                contract: *contract,
+                capabilities: capabilities.clone(),
             })
         }
     }
@@ -3472,11 +4335,17 @@ fn apply_application_plan(state: &mut AuthorityLinearState, plan: ApplicationPla
             to_deployment,
             to_program,
             producer,
+            package,
+            contract,
+            capabilities,
         } => {
             let row = &mut state.managed_agents[index];
             row.runtime_deployment = to_deployment;
             row.runtime_program = to_program;
             row.runtime_producer = producer;
+            row.runtime_package = package;
+            row.runtime_contract = contract;
+            row.capabilities = capabilities;
             if let Some(private_index) = private_index {
                 state.private_agents[private_index].runtime_deployment = to_deployment;
             }
@@ -3549,17 +4418,14 @@ fn invocation_pair_is_available(
                 && record.application_invocation != authorization.0
                 && record.application_invocation != acknowledgement.0
         })
-        && state
-            .private_application_retirements
-            .iter()
-            .all(|record| {
-                record.authorization_invocation != authorization.0
-                    && record.authorization_invocation != acknowledgement.0
-                    && record.issuance_invocation != authorization.0
-                    && record.issuance_invocation != acknowledgement.0
-                    && record.application_invocation != authorization.0
-                    && record.application_invocation != acknowledgement.0
-            })
+        && state.private_application_retirements.iter().all(|record| {
+            record.authorization_invocation != authorization.0
+                && record.authorization_invocation != acknowledgement.0
+                && record.issuance_invocation != authorization.0
+                && record.issuance_invocation != acknowledgement.0
+                && record.application_invocation != authorization.0
+                && record.application_invocation != acknowledgement.0
+        })
 }
 
 fn private_application_invocation_is_unreserved(
@@ -3593,14 +4459,11 @@ fn private_application_invocation_is_unreserved(
                 && record.issuance_invocation != application.0
                 && record.application_invocation != application.0
         })
-        && state
-            .private_application_retirements
-            .iter()
-            .all(|record| {
-                record.authorization_invocation != application.0
-                    && record.issuance_invocation != application.0
-                    && record.application_invocation != application.0
-            })
+        && state.private_application_retirements.iter().all(|record| {
+            record.authorization_invocation != application.0
+                && record.issuance_invocation != application.0
+                && record.application_invocation != application.0
+        })
 }
 
 fn authenticated_role(
@@ -3617,16 +4480,51 @@ fn authenticated_role(
 }
 
 fn authenticated_operation_role(
+    configuration: &SystemAuthorityConfiguration,
     state: &AuthorityLinearState,
     call: &AuthorityOperationCall,
 ) -> Option<BuiltinPrincipalRole> {
-    authenticated_credential_role(
-        state,
-        call.principal,
-        call.credential,
-        &call.credential_public_key,
-        call.authenticated_node,
-    )
+    let credential = state
+        .credentials
+        .binary_search_by(|row| row.credential.cmp(&call.credential.0))
+        .ok()
+        .map(|index| &state.credentials[index])?;
+    if credential.principal != call.principal.0
+        || credential.public_key != call.credential_public_key()
+        || credential.status != CredentialStatus::Active
+    {
+        return None;
+    }
+    match call.authentication {
+        AuthorityIngressAuthentication::ApiCredentialSignature { .. } => {
+            if credential.kind != AuthorityCredentialKind::Api as u8
+                || call.verify_api_with(&Ed25519CredentialVerifier).is_err()
+            {
+                return None;
+            }
+        }
+        AuthorityIngressAuthentication::SshNodeAttestation { node, .. } => {
+            if credential.kind != AuthorityCredentialKind::Ssh as u8 {
+                return None;
+            }
+            let attester = enrolled_node(state, node)?;
+            if attester.space != configuration.space
+                || call
+                    .verify_ssh_node_attestation_with(
+                        &attester.transport_public_key,
+                        &Ed25519CredentialVerifier,
+                    )
+                    .is_err()
+            {
+                return None;
+            }
+        }
+    }
+    state
+        .roles
+        .binary_search_by(|row| row.principal.cmp(&call.principal.0))
+        .ok()
+        .map(|index| state.roles[index].role)
 }
 
 /// Credential possession authenticates a principal without requiring a
@@ -3770,11 +4668,15 @@ fn managed_agent_row_from_descriptor(
         runtime_deployment: descriptor.identity.runtime_deployment.0,
         runtime_program: descriptor.identity.runtime_program.0,
         runtime_producer: descriptor.identity.runtime_producer.0,
+        transition_producer: descriptor.identity.transition_producer.0,
         authority: configuration.binding,
         creation_nonce: descriptor.creation_nonce.0,
-        private_recovery_signing_key_commitment: descriptor
+        private_recovery: descriptor
             .private_recovery
-            .map(|binding| binding.signing_key_commitment.0),
+            .map(PrivateRecoveryBindingRow::from_sdk),
+        runtime_package: authority_blob(&descriptor.runtime_package),
+        runtime_contract: RuntimeContractRow::from_sdk(descriptor.runtime_contract),
+        capabilities: RuntimeCapabilitiesRow::from_sdk(descriptor.capabilities),
         replicas: managed_replica_rows(&descriptor.replicas),
         replica_generation: [0; 32],
     };
@@ -3867,16 +4769,21 @@ fn policy_effect(
             {
                 return None;
             }
-            let replicas = reconstructed_replica_roster(
-                state,
-                slots,
-                *replica_roster_commitment,
-            )?;
+            let replicas = reconstructed_replica_roster(state, slots, *replica_roster_commitment)?;
             replica_change_effect(configuration, state, row, *expected_generation, &replicas)
         }
         ManagementAuthorizationPlan::UpgradeRuntime(upgrade) => {
             let row = lifecycle_owner(configuration, state, call, role)?;
-            if pending_runtime_transition_conflicts(state, call) {
+            if upgrade.producer.0 == row.transition_producer
+                || pending_runtime_transition_conflicts(state, call)
+                || state.managed_actors.iter().any(|actor| {
+                    actor.agent == row.agent
+                        && managed_actor_projection(actor).is_none_or(|projection| {
+                            !upgrade.contract.supports(projection.contract)
+                                || !upgrade.capabilities.satisfies(projection.requirements)
+                        })
+                })
+            {
                 return None;
             }
             Some(PendingManagementEffect::UpgradeRuntime {
@@ -3885,6 +4792,9 @@ fn policy_effect(
                 to_deployment: upgrade.to_deployment.0,
                 to_program: upgrade.to_program.0,
                 producer: upgrade.producer.0,
+                package: authority_blob(&upgrade.package),
+                contract: RuntimeContractRow::from_sdk(upgrade.contract),
+                capabilities: RuntimeCapabilitiesRow::from_sdk(upgrade.capabilities),
             })
         }
     }
@@ -3902,7 +4812,10 @@ fn operation_policy_allows(
     };
     let managed = &state.managed_agents[managed_index];
     if target.space != SpaceId(configuration.space)
+        || target.owner != PrincipalId(managed.owner)
+        || target.profile as u8 != managed.profile
         || managed.runtime_deployment != target.runtime_deployment.0
+        || target.transition_producer != ProducerId(managed.transition_producer)
         || managed.authority != configuration.binding
     {
         return false;
@@ -3916,21 +4829,39 @@ fn operation_policy_allows(
             roles,
             ..
         } => {
-            // This generation has no durable arbitrary RoleId or delegated
-            // capability table. Only the credential identity itself is
-            // provable, so richer origin/role claims fail closed.
-            if origin.actor.is_some()
-                || origin.capability.is_some()
-                || *roles != InvocationRoleClaims::none()
-            {
+            if origin.actor.is_some() {
                 return false;
             }
-            managed_actor(state, target.agent, *actor)
-                .ok()
-                .is_some_and(|index| {
-                    let row = &state.managed_actors[index];
-                    row.deployment == actor_deployment.0 && !row.suspended
-                })
+            let exact_claim_is_granted = match (origin.capability, roles.space, roles.actor) {
+                (None, None, None) => true,
+                (Some(capability), None, None) => capability_grant(
+                    state,
+                    call.principal,
+                    target.agent,
+                    *actor,
+                    *actor_deployment,
+                    capability,
+                )
+                .is_ok(),
+                (None, Some(role), None) => space_role_grant(state, call.principal, role).is_ok(),
+                (None, None, Some(role)) => actor_role_grant(
+                    state,
+                    call.principal,
+                    target.agent,
+                    *actor,
+                    *actor_deployment,
+                    role,
+                )
+                .is_ok(),
+                _ => false,
+            };
+            exact_claim_is_granted
+                && managed_actor(state, target.agent, *actor)
+                    .ok()
+                    .is_some_and(|index| {
+                        let row = &state.managed_actors[index];
+                        row.deployment == actor_deployment.0 && !row.suspended
+                    })
         }
         AuthorityOperationIntent::Catalog {
             catalog,
@@ -3967,6 +4898,8 @@ fn operation_policy_allows(
                     == DeploymentId(managed.runtime_deployment)
                 && publication.identity.runtime_program == ProgramId(managed.runtime_program)
                 && publication.identity.runtime_producer == ProducerId(managed.runtime_producer)
+                && publication.identity.transition_producer
+                    == ProducerId(managed.transition_producer)
                 && publication_actor.deployment == publication.actor_deployment.0
                 && publication_actor.program == publication.actor_program.0
                 && publication_actor.package.hash == publication.actor_package.hash.0
@@ -4128,14 +5061,11 @@ fn private_operation_source_is_retired(
     issuance_invocation: [u8; 32],
     authorization_sequence: u64,
 ) -> bool {
-    state
-        .private_application_retirements
-        .iter()
-        .any(|record| {
-            record.authorization_invocation == authorization_invocation
-                && record.issuance_invocation == issuance_invocation
-                && record.authorization_sequence == authorization_sequence
-        })
+    state.private_application_retirements.iter().any(|record| {
+        record.authorization_invocation == authorization_invocation
+            && record.issuance_invocation == issuance_invocation
+            && record.authorization_sequence == authorization_sequence
+    })
 }
 
 fn private_operation_source_is_resolved(
@@ -4239,8 +5169,7 @@ fn completed_recovery_application_count(state: &AuthorityLinearState) -> usize {
         .private_application_retirements
         .iter()
         .filter(|record| {
-            record.private_operation.operation
-                == AuthorityOperationKind::RecoverPrivateAgent as u8
+            record.private_operation.operation == AuthorityOperationKind::RecoverPrivateAgent as u8
         })
         .count();
     applied.saturating_add(retired)
@@ -4273,6 +5202,9 @@ fn lifecycle_owner<'a>(
     let index = managed_agent(state, call.managed.agent).ok()?;
     let row = &state.managed_agents[index];
     if row.runtime_deployment != call.managed.runtime_deployment.0
+        || row.owner != call.managed.owner.0
+        || row.profile != call.managed.profile as u8
+        || row.transition_producer != call.managed.transition_producer.0
         || row.authority != configuration.binding
         || (role != BuiltinPrincipalRole::Admin && row.owner != call.principal.0)
     {
@@ -4361,6 +5293,21 @@ fn protected_authority_actor(configuration: &SystemAuthorityConfiguration, actor
     actor.0 == configuration.binding.issuer.actor
 }
 
+fn actor_has_authorization_grants(
+    state: &AuthorityLinearState,
+    agent: AgentId,
+    actor: ActorId,
+) -> bool {
+    state
+        .actor_role_grants
+        .iter()
+        .any(|grant| grant.agent == agent.0 && grant.actor == actor.0)
+        || state
+            .capability_grants
+            .iter()
+            .any(|grant| grant.agent == agent.0 && grant.actor == actor.0)
+}
+
 fn pending_actor_effect_conflicts(
     state: &AuthorityLinearState,
     call: &AuthorityCredentialCall,
@@ -4389,9 +5336,7 @@ fn pending_actor_effect_conflicts(
         }
         ManagementAuthorizationPlan::UpgradeActor(upgrade) => (upgrade.actor, None, None, false),
         ManagementAuthorizationPlan::Suspend { actor, .. }
-        | ManagementAuthorizationPlan::RemoveLeaf { actor, .. } => {
-            (*actor, None, None, true)
-        }
+        | ManagementAuthorizationPlan::RemoveLeaf { actor, .. } => (*actor, None, None, true),
         ManagementAuthorizationPlan::Resume { actor, .. } => (*actor, None, None, false),
         _ => return false,
     };
@@ -4443,10 +5388,8 @@ fn pending_runtime_transition_conflicts(
     state: &AuthorityLinearState,
     call: &AuthorityCredentialCall,
 ) -> bool {
-    let incoming_runtime_upgrade = matches!(
-        &call.plan,
-        ManagementAuthorizationPlan::UpgradeRuntime(_)
-    );
+    let incoming_runtime_upgrade =
+        matches!(&call.plan, ManagementAuthorizationPlan::UpgradeRuntime(_));
     state.retries.iter().any(|record| {
         if record.invocation == call.invocation.0 {
             return false;
@@ -4486,12 +5429,16 @@ fn projected_actor_effect(
     let agent = call.managed.agent;
     let managed = &state.managed_agents[managed_agent(state, agent).ok()?];
     let profile = agent_profile(managed.profile)?;
+    let runtime_contract = managed.runtime_contract.sdk()?;
+    let runtime_capabilities = managed.capabilities.sdk()?;
     match &call.plan {
         ManagementAuthorizationPlan::Install(install) => {
             if protected_authority_actor(configuration, install.entry.actor)
                 || install.entry.suspended
                 || install.entry.validate_for_profile(profile).is_err()
                 || !install.requirements.supported_by(profile)
+                || !runtime_contract.supports(install.contract)
+                || !runtime_capabilities.satisfies(install.requirements)
                 || state.managed_actors.len() >= MAX_MANAGED_ACTORS
                 || state
                     .managed_actors
@@ -4527,6 +5474,9 @@ fn projected_actor_effect(
         ManagementAuthorizationPlan::UpgradeActor(upgrade) => {
             if protected_authority_actor(configuration, upgrade.actor)
                 || !upgrade.requirements.supported_by(profile)
+                || !runtime_contract.supports(upgrade.contract)
+                || !runtime_capabilities.satisfies(upgrade.requirements)
+                || actor_has_authorization_grants(state, agent, upgrade.actor)
             {
                 return None;
             }
@@ -4588,6 +5538,7 @@ fn projected_actor_effect(
         } => {
             if protected_authority_actor(configuration, *actor)
                 || state.retired_actor_installations.len() >= MAX_RETIRED_ACTOR_INSTALLATIONS
+                || actor_has_authorization_grants(state, agent, *actor)
             {
                 return None;
             }
@@ -4627,6 +5578,13 @@ fn authority_blob(reference: &vos::agent_sdk::BlobRef) -> AuthorityBlobRow {
     }
 }
 
+fn authority_blob_sdk(row: AuthorityBlobRow) -> vos::agent_sdk::BlobRef {
+    vos::agent_sdk::BlobRef {
+        hash: Hash(row.hash),
+        len: row.len,
+    }
+}
+
 fn managed_agent_identity(
     configuration: &SystemAuthorityConfiguration,
     row: &ManagedAgentRow,
@@ -4639,7 +5597,28 @@ fn managed_agent_identity(
         runtime_deployment: DeploymentId(row.runtime_deployment),
         runtime_program: ProgramId(row.runtime_program),
         runtime_producer: ProducerId(row.runtime_producer),
+        transition_producer: ProducerId(row.transition_producer),
     })
+}
+
+fn managed_agent_projection(
+    configuration: &SystemAuthorityConfiguration,
+    row: &ManagedAgentRow,
+) -> Option<AuthorityAgentProjection> {
+    let projection = AuthorityAgentProjection {
+        identity: managed_agent_identity(configuration, row)?,
+        creation_nonce: Hash(row.creation_nonce),
+        authority: row.authority.sdk(),
+        private_recovery: row
+            .private_recovery
+            .and_then(PrivateRecoveryBindingRow::sdk),
+        runtime_package: authority_blob_sdk(row.runtime_package),
+        runtime_contract: row.runtime_contract.sdk()?,
+        capabilities: row.capabilities.sdk()?,
+        replica_count: row.replicas.len().try_into().ok()?,
+        replica_generation: Hash(row.replica_generation),
+    };
+    projection.validate_shape().ok().map(|()| projection)
 }
 
 fn managed_actor_entry(row: &ManagedActorRow) -> Option<vos::agent_sdk::ActorEntry> {
@@ -4675,6 +5654,33 @@ fn managed_actor_entry(row: &ManagedActorRow) -> Option<vos::agent_sdk::ActorEnt
     })
 }
 
+fn managed_actor_projection(row: &ManagedActorRow) -> Option<AuthorityActorProjection> {
+    let proof_systems = row
+        .proof_systems
+        .iter()
+        .copied()
+        .map(Hash)
+        .collect::<Vec<_>>();
+    let projection = AuthorityActorProjection {
+        agent: AgentId(row.agent),
+        entry: managed_actor_entry(row)?,
+        producer: ProducerId(row.producer),
+        contract: vos::agent_sdk::contract::ActorPackageContract {
+            actor_abi: row.actor_abi,
+        },
+        requirements: RuntimeRequirements {
+            lanes: vos::agent_sdk::LaneSet::from_bits(row.lanes)?,
+            scheduling: row.scheduling,
+            proof_systems: vos::agent_sdk::ProofSystemSet::from_sorted(&proof_systems).ok()?,
+        },
+        root_provenance: row.root_provenance,
+        installation_id: vos::agent_sdk::InstallationId(row.installation_id),
+        registry_reservation: Hash(row.registry_reservation),
+        install_request: Hash(row.install_request),
+    };
+    projection.validate_shape().ok().map(|()| projection)
+}
+
 fn installed_actor_row(
     agent: AgentId,
     install: &CompactInstallActor,
@@ -4693,11 +5699,7 @@ fn installed_actor_row(
         agent_schema: authority_blob(&install.entry.agent_schema),
         method_policy: authority_blob(&install.entry.method_policy),
         constructor_abi: install.entry.constructor_abi.0,
-        installation_data: install
-            .entry
-            .installation_data
-            .as_ref()
-            .map(authority_blob),
+        installation_data: install.entry.installation_data.as_ref().map(authority_blob),
         state_layout: install.entry.state_layout.0,
         lanes: install.requirements.lanes.bits(),
         scheduling: install.requirements.scheduling,
@@ -4800,7 +5802,17 @@ fn actor_projection_is_valid(
         let Ok(agent_index) = managed_agent(state, AgentId(row.agent)) else {
             return false;
         };
-        let Some(profile) = agent_profile(state.managed_agents[agent_index].profile) else {
+        let managed = &state.managed_agents[agent_index];
+        let Some(profile) = agent_profile(managed.profile) else {
+            return false;
+        };
+        let Some(runtime_contract) = managed.runtime_contract.sdk() else {
+            return false;
+        };
+        let Some(runtime_capabilities) = managed.capabilities.sdk() else {
+            return false;
+        };
+        let Some(projection) = managed_actor_projection(row) else {
             return false;
         };
         let Some(lanes) = vos::agent_sdk::LaneSet::from_bits(row.lanes) else {
@@ -4838,6 +5850,8 @@ fn actor_projection_is_valid(
             || row.proof_systems.iter().any(|system| *system == [0; 32])
             || row.proof_systems.windows(2).any(|pair| pair[0] >= pair[1])
             || row.actor_abi == 0
+            || !runtime_contract.supports(projection.contract)
+            || !runtime_capabilities.satisfies(projection.requirements)
             || (row.root_provenance && row.agent != configuration.system_agent)
             || row.installation_id == [0; 32]
             || row.registry_reservation == [0; 32]
@@ -4904,12 +5918,17 @@ fn managed_agent_projection_is_valid(
         || row.runtime_deployment == [0; 32]
         || row.runtime_program == [0; 32]
         || row.runtime_producer == [0; 32]
+        || row.transition_producer == [0; 32]
+        || row.transition_producer == row.runtime_producer
         || row.authority != configuration.binding
-        || match (profile, row.private_recovery_signing_key_commitment) {
-            (AgentProfile::Private, Some(commitment)) => commitment == [0; 32],
+        || match (profile, row.private_recovery) {
+            (AgentProfile::Private, Some(binding)) => binding.sdk().is_none(),
             (AgentProfile::Private, None) | (_, Some(_)) => true,
             _ => false,
         }
+        || !authority_blob_is_valid(&row.runtime_package, false)
+        || row.runtime_contract.sdk().is_none()
+        || row.capabilities.sdk().is_none()
         || row.replicas.is_empty()
         || row.replicas.len() > MAX_AGENT_REPLICAS
         || !row
@@ -4929,6 +5948,7 @@ fn managed_agent_projection_is_valid(
             .is_err()
         || managed_replica_generation(configuration, row).map(|value| value.0)
             != Some(row.replica_generation)
+        || managed_agent_projection(configuration, row).is_none()
     {
         return false;
     }
@@ -4942,6 +5962,84 @@ fn managed_agent_projection_is_valid(
             replica.principal == row.owner && replica.role == ReplicaRole::Observer as u8
         }),
     }
+}
+
+fn authorization_grants_are_valid(
+    configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
+) -> bool {
+    if authorization_grant_count(state) > MAX_AUTHORITY_AUTHORIZATION_GRANTS
+        || state
+            .space_role_grants
+            .windows(2)
+            .any(|pair| (pair[0].principal, pair[0].role) >= (pair[1].principal, pair[1].role))
+        || state.actor_role_grants.windows(2).any(|pair| {
+            (
+                pair[0].principal,
+                pair[0].agent,
+                pair[0].actor,
+                pair[0].deployment,
+                pair[0].role,
+            ) >= (
+                pair[1].principal,
+                pair[1].agent,
+                pair[1].actor,
+                pair[1].deployment,
+                pair[1].role,
+            )
+        })
+        || state.capability_grants.windows(2).any(|pair| {
+            (
+                pair[0].principal,
+                pair[0].agent,
+                pair[0].actor,
+                pair[0].deployment,
+                pair[0].capability,
+            ) >= (
+                pair[1].principal,
+                pair[1].agent,
+                pair[1].actor,
+                pair[1].deployment,
+                pair[1].capability,
+            )
+        })
+    {
+        return false;
+    }
+    for role in &state.roles {
+        if principal_authorization_grant_count(state, PrincipalId(role.principal))
+            > MAX_AUTHORITY_PRINCIPAL_GRANTS
+        {
+            return false;
+        }
+    }
+    state.space_role_grants.iter().all(|grant| {
+        grant.role != [0; 32]
+            && state
+                .roles
+                .binary_search_by(|row| row.principal.cmp(&grant.principal))
+                .is_ok()
+    }) && state.actor_role_grants.iter().all(|grant| {
+        grant.role != [0; 32]
+            && state
+                .roles
+                .binary_search_by(|row| row.principal.cmp(&grant.principal))
+                .is_ok()
+            && !protected_authority_actor(configuration, ActorId(grant.actor))
+            && managed_actor(state, AgentId(grant.agent), ActorId(grant.actor))
+                .ok()
+                .is_some_and(|index| state.managed_actors[index].deployment == grant.deployment)
+    }) && state.capability_grants.iter().all(|grant| {
+        grant.capability != [0; 32]
+            && state
+                .roles
+                .binary_search_by(|row| row.principal.cmp(&grant.principal))
+                .is_ok()
+            && !protected_authority_actor(configuration, ActorId(grant.actor))
+            && managed_actor(state, AgentId(grant.agent), ActorId(grant.actor))
+                .ok()
+                .is_some_and(|index| state.managed_actors[index].deployment == grant.deployment)
+    })
 }
 
 fn narrowed_validity(call: &AuthorityCredentialCall, observed_slot: u64) -> Option<(u64, u64)> {
@@ -5131,8 +6229,13 @@ fn recovery_proof_matches_managed_state(
     managed.profile == AgentProfile::Private as u8
         && proof.managed.space == SpaceId(configuration.space)
         && proof.managed.agent == AgentId(managed.agent)
-        && managed.private_recovery_signing_key_commitment
-            == Some(recovery_signing_public_key_commitment(&proof.recovery_public_key).0)
+        && proof.managed.owner == PrincipalId(managed.owner)
+        && proof.managed.profile == AgentProfile::Private
+        && proof.managed.transition_producer == ProducerId(managed.transition_producer)
+        && managed.private_recovery.is_some_and(|binding| {
+            binding.signing_key_commitment
+                == recovery_signing_public_key_commitment(&proof.recovery_public_key).0
+        })
         && proof.verify_with(&Ed25519CredentialVerifier).is_ok()
         && enrolled_private_identity_set_commitment(
             state,
@@ -5254,13 +6357,22 @@ fn retired_private_operation_is_valid(row: &RetiredPrivateOperationRow) -> bool 
 
 fn private_application_fact(
     configuration: &SystemAuthorityConfiguration,
+    state: &AuthorityLinearState,
     record: &PrivateApplicationRecord,
 ) -> Option<PrivateControlApplicationFact> {
+    let row = &state.managed_agents[managed_agent(state, AgentId(record.agent)).ok()?];
+    let identity = managed_agent_identity(configuration, row)?;
+    if identity.space != SpaceId(configuration.space) || identity.owner.0 != record.owner {
+        return None;
+    }
     let fact = PrivateControlApplicationFact {
         managed: ManagedAgentTarget {
-            space: SpaceId(configuration.space),
-            agent: AgentId(record.agent),
+            space: identity.space,
+            agent: identity.agent,
+            owner: identity.owner,
+            profile: identity.profile,
             runtime_deployment: DeploymentId(record.runtime_deployment),
+            transition_producer: identity.transition_producer,
         },
         operation: private_operation_kind(record.operation)?,
         control: Hash(record.control),
@@ -5281,7 +6393,7 @@ fn private_application_record_source(
     state: &AuthorityLinearState,
     record: &PrivateApplicationRecord,
 ) -> Option<PrivateApplicationSource> {
-    let fact = private_application_fact(configuration, record)?;
+    let fact = private_application_fact(configuration, state, record)?;
     let request_sequence = NonZeroU64::new(record.request_sequence)?;
     let authorization_invocation = AuthorityOperationCall::derive_invocation(
         CredentialId(record.credential),
@@ -5761,7 +6873,7 @@ fn private_projection_is_valid(
         if ack.encode().ok().as_deref() != Some(encoded)
             || ack.application_invocation.0 != application_invocation
             || ack.commitment().0 != record.application_ack
-            || ack.application != private_application_fact(configuration, record).unwrap()
+            || ack.application != private_application_fact(configuration, state, record).unwrap()
             || ack.operation_call.0 != record.operation_call
             || ack.approval.0 != record.approval
             || ack.issuance_ack.0 != record.issuance_ack
@@ -5790,6 +6902,7 @@ fn authority_state_is_valid(
 ) -> bool {
     state.initialized
         && configuration.is_valid()
+        && state.state_revision != 0
         && state.epoch >= configuration.binding.initial_epoch
         && state.epoch != 0
         && state.administration_generation != 0
@@ -5841,6 +6954,7 @@ fn authority_state_is_valid(
                         && credential.status == CredentialStatus::Active
                 })
         })
+        && authorization_grants_are_valid(configuration, state)
         && accessible_admin_exists(state)
         && state
             .managed_agents
@@ -6208,7 +7322,7 @@ fn active_operation_record_is_valid(
         || call.invocation_payload_commitment().0 != record.invocation_payload
         || call.commitment().0 != record.operation_call
         || call.encode().ok().as_deref() != Some(record.operation_call_bytes.as_slice())
-        || call.verify_with(&Ed25519CredentialVerifier).is_err()
+        || authenticated_operation_role(configuration, state, &call) != Some(record.role)
         || !authority_target_matches(configuration, &call.authority)
         || approval.commitment().0 != record.approval_commitment
         || approval.encode().ok().as_deref() != Some(record.approval.as_slice())
@@ -6225,7 +7339,6 @@ fn active_operation_record_is_valid(
             )
         || approval.selector.valid_from != valid_from
         || approval.selector.expires_at != expires_at
-        || authenticated_operation_role(state, &call) != Some(record.role)
         || state.credentials.iter().all(|credential| {
             credential.credential != record.credential
                 || credential.operation_request_high_water != record.request_sequence
@@ -6318,16 +7431,14 @@ fn reconstruction_effect(
             {
                 return None;
             }
-            let replicas = reconstructed_replica_roster(
-                state,
-                slots,
-                *replica_roster_commitment,
-            )?;
+            let replicas = reconstructed_replica_roster(state, slots, *replica_roster_commitment)?;
             replica_change_effect(configuration, state, row, *expected_generation, &replicas)
         }
         ManagementAuthorizationPlan::UpgradeRuntime(upgrade) => {
             let row = reconstruction_lifecycle_row(configuration, state, call)?;
-            if pending_runtime_transition_conflicts(state, call) {
+            if upgrade.producer.0 == row.transition_producer
+                || pending_runtime_transition_conflicts(state, call)
+            {
                 return None;
             }
             Some(PendingManagementEffect::UpgradeRuntime {
@@ -6336,6 +7447,9 @@ fn reconstruction_effect(
                 to_deployment: upgrade.to_deployment.0,
                 to_program: upgrade.to_program.0,
                 producer: upgrade.producer.0,
+                package: authority_blob(&upgrade.package),
+                contract: RuntimeContractRow::from_sdk(upgrade.contract),
+                capabilities: RuntimeCapabilitiesRow::from_sdk(upgrade.capabilities),
             })
         }
     }
@@ -6348,6 +7462,9 @@ fn reconstruction_lifecycle_row<'a>(
 ) -> Option<&'a ManagedAgentRow> {
     let row = &state.managed_agents[managed_agent(state, call.managed.agent).ok()?];
     (row.runtime_deployment == call.managed.runtime_deployment.0
+        && row.owner == call.managed.owner.0
+        && row.profile == call.managed.profile as u8
+        && row.transition_producer == call.managed.transition_producer.0
         && row.authority == configuration.binding)
         .then_some(row)
 }
@@ -6475,7 +7592,7 @@ fn admin_operation_postcondition(
                     .ok()
                     .is_some_and(|index| {
                         let row = &state.credentials[index];
-                        row == &credential_row(*principal, *credential)
+                        credential_matches_active_enrollment(row, *principal, *credential)
                     })
         }
         AuthorityAdminOperation::AddCredential {
@@ -6487,7 +7604,7 @@ fn admin_operation_postcondition(
             .ok()
             .is_some_and(|index| {
                 let row = &state.credentials[index];
-                row == &credential_row(*principal, *credential)
+                credential_matches_active_enrollment(row, *principal, *credential)
             }),
         AuthorityAdminOperation::RevokeCredential {
             principal,
@@ -6517,6 +7634,33 @@ fn admin_operation_postcondition(
             .binary_search_by(|row| row.principal.cmp(&principal.0))
             .ok()
             .is_some_and(|index| state.roles[index].role == builtin_role(*role)),
+        AuthorityAdminOperation::SetSpaceRole {
+            principal,
+            role,
+            granted,
+        } => space_role_grant(state, *principal, *role).is_ok() == *granted,
+        AuthorityAdminOperation::SetActorRole {
+            principal,
+            agent,
+            actor,
+            deployment,
+            role,
+            granted,
+        } => {
+            actor_role_grant(state, *principal, *agent, *actor, *deployment, *role).is_ok()
+                == *granted
+        }
+        AuthorityAdminOperation::SetCapability {
+            principal,
+            agent,
+            actor,
+            deployment,
+            capability,
+            granted,
+        } => {
+            capability_grant(state, *principal, *agent, *actor, *deployment, *capability).is_ok()
+                == *granted
+        }
     }
 }
 
@@ -6729,7 +7873,8 @@ mod tests {
     use vos::agent::StateLane;
     use vos::agent_sdk::authority::{
         AuthorityCredentialKind, AuthorityOperationKind, AuthorityReceipt,
-        AuthorityReceiptSelector, ManagementApplicationAck, ManagementApproval,
+        AuthorityReceiptSelector, MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES, ManagementApplicationAck,
+        ManagementApproval,
     };
     use vos::agent_sdk::authority_operation::{
         AuthorityOperationApproval, AuthorityOperationCall, AuthorityOperationIntent,
@@ -6811,6 +7956,11 @@ mod tests {
             system_runtime_deployment: [0x13; 32],
             system_runtime_program: [0x19; 32],
             system_runtime_producer: [0x1a; 32],
+            system_transition_producer: [0x1c; 32],
+            system_runtime_package: AuthorityBlobRow {
+                hash: [0x1b; 32],
+                len: 1_024,
+            },
             binding: AuthorityBindingState {
                 policy: [0x14; 32],
                 issuer: AuthorityIssuerState {
@@ -6871,6 +8021,7 @@ mod tests {
                 runtime_deployment: DeploymentId([nonce_byte.wrapping_add(1); 32]),
                 runtime_program: ProgramId([nonce_byte.wrapping_add(2); 32]),
                 runtime_producer: ProducerId([nonce_byte.wrapping_add(3); 32]),
+                transition_producer: ProducerId([nonce_byte.wrapping_add(0x20); 32]),
             },
             creation_nonce,
             authority: config.binding.sdk(),
@@ -6902,7 +8053,10 @@ mod tests {
         vos::agent_sdk::authority::ManagedAgentTarget {
             space: descriptor.identity.space,
             agent: descriptor.identity.agent,
+            owner: descriptor.identity.owner,
+            profile: descriptor.identity.profile,
             runtime_deployment: descriptor.identity.runtime_deployment,
+            transition_producer: descriptor.identity.transition_producer,
         }
     }
 
@@ -6912,7 +8066,10 @@ mod tests {
         vos::agent_sdk::authority::ManagedAgentTarget {
             space: SpaceId(config.space),
             agent: AgentId(config.system_agent),
+            owner: PrincipalId(config.bootstrap_principal),
+            profile: AgentProfile::Shared,
             runtime_deployment: DeploymentId(config.system_runtime_deployment),
+            transition_producer: ProducerId(config.system_transition_producer),
         }
     }
 
@@ -7167,20 +8324,32 @@ mod tests {
         intent: AuthorityOperationIntent,
     ) -> AuthorityOperationCall {
         let public_key = key.verifying_key().to_bytes();
+        let authentication = match node {
+            Some(node) => AuthorityIngressAuthentication::SshNodeAttestation {
+                credential_public_key: public_key,
+                node,
+                request_binding: Hash::digest(
+                    b"vos/test/system-authority/ssh-request-binding/v1",
+                    &[&principal.0, &[invocation_byte]],
+                ),
+                signature: [1; 64],
+            },
+            None => AuthorityIngressAuthentication::ApiCredentialSignature {
+                credential_public_key: public_key,
+                signature: [1; 64],
+            },
+        };
         let mut call = AuthorityOperationCall {
             invocation: InvocationId::ZERO,
             authority: authority_target(config),
             principal,
             credential: CredentialId::of_public_key(&public_key),
             request_sequence: NonZeroU64::new(1).unwrap(),
-            credential_public_key: public_key,
-            authenticated_node: node,
+            authentication,
             requested_valid_from: 1,
             requested_expires_at: 10_000,
             intent,
-            signature: [1; 64],
         };
-        let _ = invocation_byte;
         call.invocation = call.expected_invocation();
         resign_operation_call(&mut call, key);
         call
@@ -7222,8 +8391,43 @@ mod tests {
     }
 
     fn resign_operation_call(call: &mut AuthorityOperationCall, key: &SigningKey) {
-        call.signature = [1; 64];
-        call.signature = key.sign(&call.signing_bytes()).to_bytes();
+        let signer = match call.authentication {
+            AuthorityIngressAuthentication::ApiCredentialSignature { .. } => key.clone(),
+            AuthorityIngressAuthentication::SshNodeAttestation { node, .. }
+                if node == ADMIN_NODE =>
+            {
+                signing(0x31)
+            }
+            AuthorityIngressAuthentication::SshNodeAttestation { .. } => {
+                signing(call.principal.0[0])
+            }
+        };
+        let signature = signer.sign(&call.signing_bytes()).to_bytes();
+        match &mut call.authentication {
+            AuthorityIngressAuthentication::ApiCredentialSignature {
+                signature: value, ..
+            }
+            | AuthorityIngressAuthentication::SshNodeAttestation {
+                signature: value, ..
+            } => *value = signature,
+        }
+    }
+
+    fn resign_ssh_operation_call(call: &mut AuthorityOperationCall, attesting_key: &SigningKey) {
+        let AuthorityIngressAuthentication::SshNodeAttestation { signature, .. } =
+            &mut call.authentication
+        else {
+            panic!("fixture must use SSH Node attestation")
+        };
+        *signature = [1; 64];
+        let signature = attesting_key.sign(&call.signing_bytes()).to_bytes();
+        let AuthorityIngressAuthentication::SshNodeAttestation {
+            signature: value, ..
+        } = &mut call.authentication
+        else {
+            unreachable!()
+        };
+        *value = signature;
     }
 
     fn prepare_operation_call(
@@ -7251,7 +8455,7 @@ mod tests {
             mode: MethodMode::Linear,
             origin: InvocationOrigin {
                 principal: Some(call.principal),
-                transport_node: call.authenticated_node,
+                transport_node: call.authenticated_node(),
                 credential: Some(call.credential),
                 actor: None,
                 capability: None,
@@ -7280,7 +8484,7 @@ mod tests {
     fn dispatch_operation(actor: &mut SystemAuthority, call: &AuthorityOperationCall) -> Vec<u8> {
         dispatch_operation_bytes(
             actor,
-            call.encode().expect("valid AOC4 fixture"),
+            call.encode().expect("valid AOC5 fixture"),
             Some(operation_context(call)),
         )
     }
@@ -7528,9 +8732,7 @@ mod tests {
         ack
     }
 
-    fn resign_private_application_retirement_ack(
-        ack: &mut PrivateControlApplicationRetirementAck,
-    ) {
+    fn resign_private_application_retirement_ack(ack: &mut PrivateControlApplicationRetirementAck) {
         ack.signature = [1; 64];
         ack.signature = signing(0x71).sign(&ack.signing_bytes()).to_bytes();
     }
@@ -7568,11 +8770,13 @@ mod tests {
         if let Some(invocation_context) = invocation_context {
             ctx.__set_agent_invocation_context(invocation_context);
         }
-        block_on(<SystemAuthority as Message<ResolvePrivateApplication>>::handle(
-            actor,
-            ResolvePrivateApplication { ack: bytes },
-            &mut ctx,
-        ))
+        block_on(
+            <SystemAuthority as Message<ResolvePrivateApplication>>::handle(
+                actor,
+                ResolvePrivateApplication { ack: bytes },
+                &mut ctx,
+            ),
+        )
     }
 
     fn dispatch_private_application(
@@ -7860,7 +9064,7 @@ mod tests {
     fn dispatch_admin(actor: &mut SystemAuthority, call: &AuthorityAdminCall) -> Vec<u8> {
         dispatch_admin_bytes(
             actor,
-            call.encode().expect("valid AAD3 fixture"),
+            call.encode().expect("valid AAD4 fixture"),
             Some(admin_context(call)),
         )
     }
@@ -8233,6 +9437,71 @@ mod tests {
         assert!(dispatch_application_ack(actor, &call, &approval));
     }
 
+    fn api_projection_query(
+        config: SystemAuthorityConfiguration,
+        key: &SigningKey,
+        nonce: u8,
+        selector: AuthorityProjectionSelector,
+    ) -> AuthorityProjectionQuery {
+        let public_key = key.verifying_key().to_bytes();
+        let mut query = AuthorityProjectionQuery {
+            authority: authority_target(config),
+            credential: CredentialId::of_public_key(&public_key),
+            nonce: Hash([nonce; 32]),
+            selector,
+            authentication: AuthorityIngressAuthentication::ApiCredentialSignature {
+                credential_public_key: public_key,
+                signature: [1; 64],
+            },
+        };
+        let signature = key.sign(&query.signing_bytes()).to_bytes();
+        let AuthorityIngressAuthentication::ApiCredentialSignature {
+            signature: query_signature,
+            ..
+        } = &mut query.authentication
+        else {
+            unreachable!();
+        };
+        *query_signature = signature;
+        query
+    }
+
+    fn ssh_projection_query(
+        config: SystemAuthorityConfiguration,
+        credential_key: &SigningKey,
+        attesting_node: NodeId,
+        attesting_key: &SigningKey,
+        nonce: u8,
+        selector: AuthorityProjectionSelector,
+    ) -> AuthorityProjectionQuery {
+        let public_key = credential_key.verifying_key().to_bytes();
+        let mut query = AuthorityProjectionQuery {
+            authority: authority_target(config),
+            credential: CredentialId::of_public_key(&public_key),
+            nonce: Hash([nonce; 32]),
+            selector,
+            authentication: AuthorityIngressAuthentication::SshNodeAttestation {
+                credential_public_key: public_key,
+                node: attesting_node,
+                request_binding: Hash::digest(
+                    b"vos/test/system-authority/projection-request-binding/v1",
+                    &[&[nonce]],
+                ),
+                signature: [1; 64],
+            },
+        };
+        let signature = attesting_key.sign(&query.signing_bytes()).to_bytes();
+        let AuthorityIngressAuthentication::SshNodeAttestation {
+            signature: query_signature,
+            ..
+        } = &mut query.authentication
+        else {
+            unreachable!();
+        };
+        *query_signature = signature;
+        query
+    }
+
     fn install_catalog_projection(actor: &mut SystemAuthority) -> InstallActor {
         let config = actor.configuration;
         let install = catalog_install(config);
@@ -8254,24 +9523,24 @@ mod tests {
     }
 
     #[test]
-    fn sac3_configuration_is_exact_and_clean_generation_bound() {
+    fn sac4_configuration_is_exact_and_clean_generation_bound() {
         let config = configuration();
         let encoded = config.encode();
         assert_eq!(encoded.len(), CONFIG_ENCODED_BYTES);
-        assert_eq!(encoded.get(..4), Some(b"SAC3".as_slice()));
+        assert_eq!(encoded.get(..4), Some(b"SAC4".as_slice()));
         assert_eq!(SystemAuthorityConfiguration::decode(&encoded), Some(config));
         assert_eq!(
             <SystemAuthority as vos::Actor>::STATE_SCHEMA_VERSION,
-            14,
-            "PCA2 proof commitments are a clean Linear state generation",
+            16,
+            "complete projection rows are a clean Linear state generation",
         );
 
         let mut old_generation = encoded.clone();
         old_generation[..4].copy_from_slice(b"SAC2");
         assert_eq!(SystemAuthorityConfiguration::decode(&old_generation), None);
-        let mut old_sac2_shape = vec![0; CONFIG_ENCODED_BYTES - 198];
-        old_sac2_shape[..4].copy_from_slice(b"SAC2");
-        assert_eq!(SystemAuthorityConfiguration::decode(&old_sac2_shape), None);
+        let mut old_sac3_shape = vec![0; CONFIG_ENCODED_BYTES - 40];
+        old_sac3_shape[..4].copy_from_slice(b"SAC3");
+        assert_eq!(SystemAuthorityConfiguration::decode(&old_sac3_shape), None);
         let mut wrong_abi = encoded.clone();
         wrong_abi[4] ^= 1;
         assert_eq!(SystemAuthorityConfiguration::decode(&wrong_abi), None);
@@ -8305,6 +9574,19 @@ mod tests {
         missing_producer.system_runtime_producer = [0; 32];
         assert_eq!(
             SystemAuthorityConfiguration::decode(&missing_producer.encode()),
+            None
+        );
+        let mut missing_transition_producer = config;
+        missing_transition_producer.system_transition_producer = [0; 32];
+        assert_eq!(
+            SystemAuthorityConfiguration::decode(&missing_transition_producer.encode()),
+            None
+        );
+        let mut reused_runtime_producer = config;
+        reused_runtime_producer.system_transition_producer =
+            reused_runtime_producer.system_runtime_producer;
+        assert_eq!(
+            SystemAuthorityConfiguration::decode(&reused_runtime_producer.encode()),
             None
         );
         for altered_high_water in [0, 1, 3, u64::MAX] {
@@ -8354,6 +9636,654 @@ mod tests {
     }
 
     #[test]
+    fn projection_authentication_is_kind_exact_and_projects_durable_high_waters() {
+        let config = configuration();
+        let bootstrap_credential_key = signing(0x21);
+        let ingress_node_key = signing(0x31);
+        let mut actor = actor();
+
+        let bootstrap_query = ssh_projection_query(
+            config,
+            &bootstrap_credential_key,
+            ADMIN_NODE,
+            &ingress_node_key,
+            0x81,
+            AuthorityProjectionSelector::Credential,
+        );
+        let initial_bytes =
+            credential_projection(&config, &actor.state, &bootstrap_query.encode().unwrap());
+        let initial = AuthorityCredentialProjection::decode(&initial_bytes).unwrap();
+        assert_eq!(initial.query, bootstrap_query);
+        assert_eq!(initial.principal, ADMIN_PRINCIPAL);
+        assert_eq!(initial.kind, AuthorityCredentialKind::Ssh);
+        assert_eq!(initial.status, AuthorityCredentialStatus::Active);
+        assert_eq!(initial.management_request_high_water, 0);
+        assert_eq!(initial.operation_request_high_water, 0);
+        assert_eq!(initial.admin_request_high_water, 0);
+        assert_eq!(
+            initial.head.state_commitment.0,
+            actor.state.state_integrity_commitment
+        );
+        assert_eq!(
+            credential_projection(&config, &actor.state, &initial.query.encode().unwrap()),
+            initial_bytes,
+            "a read-only exact retry over unchanged state is byte-identical",
+        );
+
+        let wrong_kind_query = api_projection_query(
+            config,
+            &bootstrap_credential_key,
+            0x82,
+            AuthorityProjectionSelector::Credential,
+        );
+        assert!(
+            credential_projection(&config, &actor.state, &wrong_kind_query.encode().unwrap())
+                .is_empty()
+        );
+
+        let ssh_principal = PrincipalId([0x83; 32]);
+        let ssh_key = signing(0x84);
+        dispatch_fixture_admin(
+            &mut actor,
+            InvocationId([0x85; 32]),
+            AuthorityAdminOperation::EnrollPrincipal {
+                principal: ssh_principal,
+                credential: enrollment(&ssh_key, AuthorityCredentialKind::Ssh),
+            },
+        );
+        let ssh_query = ssh_projection_query(
+            config,
+            &ssh_key,
+            ADMIN_NODE,
+            &ingress_node_key,
+            0x86,
+            AuthorityProjectionSelector::Credential,
+        );
+        let ssh_projection = AuthorityCredentialProjection::decode(&credential_projection(
+            &config,
+            &actor.state,
+            &ssh_query.encode().unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(ssh_projection.principal, ssh_principal);
+        assert_eq!(ssh_projection.kind, AuthorityCredentialKind::Ssh);
+        assert_ne!(
+            actor.state.nodes[0].owner, ssh_principal.0,
+            "an enrolled ingress Node attests the SSH session, not user ownership",
+        );
+
+        let mut substituted_binding = ssh_query.clone();
+        let AuthorityIngressAuthentication::SshNodeAttestation {
+            request_binding, ..
+        } = &mut substituted_binding.authentication
+        else {
+            unreachable!();
+        };
+        request_binding.0[0] ^= 1;
+        assert!(
+            credential_projection(
+                &config,
+                &actor.state,
+                &substituted_binding.encode().unwrap()
+            )
+            .is_empty()
+        );
+
+        let api_principal = PrincipalId([0x87; 32]);
+        let api_key = signing(0x88);
+        let replacement_key = signing(0x89);
+        dispatch_fixture_admin(
+            &mut actor,
+            InvocationId([0x8a; 32]),
+            AuthorityAdminOperation::EnrollPrincipal {
+                principal: api_principal,
+                credential: enrollment(&api_key, AuthorityCredentialKind::Api),
+            },
+        );
+        dispatch_fixture_admin(
+            &mut actor,
+            InvocationId([0x8b; 32]),
+            AuthorityAdminOperation::AddCredential {
+                principal: api_principal,
+                credential: enrollment(&replacement_key, AuthorityCredentialKind::Api),
+            },
+        );
+        let catalog = install_catalog_projection(&mut actor);
+        let operation = invoke_operation_call(
+            config,
+            &api_key,
+            api_principal,
+            None,
+            0x8c,
+            0x8d,
+            system_target(config),
+            &catalog,
+        );
+        authorize_and_issue_operation(&mut actor, &operation);
+        dispatch_fixture_admin(
+            &mut actor,
+            InvocationId([0x8e; 32]),
+            AuthorityAdminOperation::RevokeCredential {
+                principal: api_principal,
+                credential: CredentialId::of_public_key(&api_key.verifying_key().to_bytes()),
+            },
+        );
+
+        let revoked_query = api_projection_query(
+            config,
+            &api_key,
+            0x8f,
+            AuthorityProjectionSelector::Credential,
+        );
+        let revoked_bytes =
+            credential_projection(&config, &actor.state, &revoked_query.encode().unwrap());
+        let revoked = AuthorityCredentialProjection::decode(&revoked_bytes).unwrap();
+        assert_eq!(revoked.principal, api_principal);
+        assert_eq!(revoked.status, AuthorityCredentialStatus::Revoked);
+        assert_eq!(revoked.management_request_high_water, 0);
+        assert_eq!(revoked.operation_request_high_water, 1);
+        assert_eq!(revoked.admin_request_high_water, 0);
+        let revoked_inventory_query = api_projection_query(
+            config,
+            &api_key,
+            0x90,
+            AuthorityProjectionSelector::Agents {
+                after: None,
+                limit: 1,
+            },
+        );
+        assert!(
+            agent_projection_page(
+                &config,
+                &actor.state,
+                &revoked_inventory_query.encode().unwrap()
+            )
+            .is_empty()
+        );
+
+        let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
+        let reopened = <SystemAuthority as vos::Actor>::__load_agent_state(
+            Some(&config.encode()),
+            Some(&linear),
+            None,
+            None,
+        )
+        .expect("projection credential rows restart");
+        assert_eq!(
+            credential_projection(&config, &reopened.state, &revoked_query.encode().unwrap()),
+            revoked_bytes,
+        );
+
+        let mut corrupt = reopened.state.clone();
+        corrupt.credentials[0].operation_request_high_water ^= 1;
+        assert!(
+            credential_projection(&config, &corrupt, &bootstrap_query.encode().unwrap()).is_empty(),
+            "the complete state is validated before any page is returned",
+        );
+    }
+
+    #[test]
+    fn projection_pages_are_full_ordered_private_filtered_and_head_stable() {
+        let config = configuration();
+        let mut actor = actor();
+        let catalog = install_catalog_projection(&mut actor);
+        let second_actor = actor_install(AgentId(config.system_agent), "second-system", 0x91);
+        let mut install_call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x92,
+            system_target(config),
+            ManagementRequest::Install(Box::new(second_actor.clone())),
+        );
+        prepare_management_call(&actor, &mut install_call, &signing(0x21));
+        let install_approval = ManagementApproval::decode(&dispatch(&mut actor, &install_call))
+            .expect("second system Actor installs");
+        assert!(dispatch_application_ack(
+            &mut actor,
+            &install_call,
+            &install_approval,
+        ));
+
+        let first_owner = PrincipalId([0x93; 32]);
+        let first_key = signing(0x94);
+        enroll(
+            &mut actor,
+            &first_key,
+            first_owner,
+            node_for_principal(config, first_owner),
+            BuiltinPrincipalRole::Member,
+        );
+        let second_owner = PrincipalId([0x95; 32]);
+        let second_key = signing(0x96);
+        enroll(
+            &mut actor,
+            &second_key,
+            second_owner,
+            node_for_principal(config, second_owner),
+            BuiltinPrincipalRole::Member,
+        );
+        let extra_first_owner_node =
+            signed_node_enrollment(SpaceId(config.space), first_owner, 0xad);
+        dispatch_fixture_admin(
+            &mut actor,
+            InvocationId([0xae; 32]),
+            AuthorityAdminOperation::EnrollNode {
+                enrollment: extra_first_owner_node.clone(),
+            },
+        );
+        let mut first_private = descriptor(config, first_owner, AgentProfile::Private, 0x97);
+        first_private.replicas.push(AgentReplica {
+            node: extra_first_owner_node.node,
+            principal: first_owner,
+            role: ReplicaRole::Observer,
+        });
+        first_private
+            .replicas
+            .sort_unstable_by_key(|replica| replica.node);
+        first_private.validate().unwrap();
+        let second_private = descriptor(config, second_owner, AgentProfile::Private, 0x98);
+        insert_live(&mut actor, &first_private);
+        insert_live(&mut actor, &second_private);
+
+        let mut after = None;
+        let mut admin_entries = Vec::new();
+        let mut stable_head = None;
+        for ordinal in 0..MAX_MANAGED_AGENTS {
+            let query = ssh_projection_query(
+                config,
+                &signing(0x21),
+                ADMIN_NODE,
+                &signing(0x31),
+                0xa0_u8.wrapping_add(ordinal as u8),
+                AuthorityProjectionSelector::Agents { after, limit: 1 },
+            );
+            let page = AuthorityAgentProjectionPage::decode(&agent_projection_page(
+                &config,
+                &actor.state,
+                &query.encode().unwrap(),
+            ))
+            .unwrap();
+            assert_eq!(page.query, query);
+            assert_eq!(stable_head.get_or_insert(page.head), &page.head);
+            admin_entries.extend(page.entries);
+            let Some(next) = page.next else {
+                break;
+            };
+            assert_eq!(
+                Some(next),
+                admin_entries.last().map(|entry| entry.identity.agent)
+            );
+            after = Some(next);
+        }
+        assert_eq!(admin_entries.len(), 3);
+        assert!(
+            admin_entries
+                .windows(2)
+                .all(|pair| pair[0].identity.agent < pair[1].identity.agent)
+        );
+        let projected_private = admin_entries
+            .iter()
+            .find(|entry| entry.identity.agent == first_private.identity.agent)
+            .unwrap();
+        assert_eq!(projected_private.identity, first_private.identity);
+        assert_eq!(
+            projected_private.creation_nonce,
+            first_private.creation_nonce
+        );
+        assert_eq!(projected_private.authority, first_private.authority);
+        assert_eq!(
+            projected_private.private_recovery,
+            first_private.private_recovery
+        );
+        assert_eq!(
+            projected_private.runtime_package,
+            first_private.runtime_package
+        );
+        assert_eq!(
+            projected_private.runtime_contract,
+            first_private.runtime_contract
+        );
+        assert_eq!(projected_private.capabilities, first_private.capabilities);
+        assert_eq!(
+            usize::from(projected_private.replica_count),
+            first_private.replicas.len()
+        );
+        assert_eq!(
+            projected_private.replica_generation,
+            first_private.replica_generation()
+        );
+
+        let mut replica_after = None;
+        let mut projected_replicas = Vec::new();
+        let mut first_replica_page = None;
+        for ordinal in 0..MAX_AGENT_REPLICAS {
+            let query = ssh_projection_query(
+                config,
+                &signing(0x21),
+                ADMIN_NODE,
+                &signing(0x31),
+                0xd0_u8.wrapping_add(ordinal as u8),
+                AuthorityProjectionSelector::AgentReplicas {
+                    agent: first_private.identity.agent,
+                    after: replica_after,
+                    limit: 1,
+                },
+            );
+            let page = AuthorityAgentReplicaProjectionPage::decode(&agent_replica_projection_page(
+                &config,
+                &actor.state,
+                &query.encode().unwrap(),
+            ))
+            .unwrap();
+            assert_eq!(stable_head, Some(page.head));
+            assert!(page.matches_agent_at_head(projected_private, stable_head.unwrap()));
+            first_replica_page.get_or_insert_with(|| page.clone());
+            projected_replicas.extend(page.entries);
+            let Some(next) = page.next else {
+                break;
+            };
+            assert_eq!(
+                Some(next),
+                projected_replicas.last().map(|replica| replica.node)
+            );
+            replica_after = Some(next);
+        }
+        assert_eq!(projected_replicas, first_private.replicas);
+        assert_eq!(
+            projected_private
+                .reconstruct_descriptor(projected_replicas)
+                .unwrap(),
+            first_private
+        );
+        let first_replica_page = first_replica_page.unwrap();
+        assert!(first_replica_page.next.is_some());
+
+        let member_query = ssh_projection_query(
+            config,
+            &first_key,
+            ADMIN_NODE,
+            &signing(0x31),
+            0xa8,
+            AuthorityProjectionSelector::Agents {
+                after: None,
+                limit: MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES as u16,
+            },
+        );
+        let member_page = AuthorityAgentProjectionPage::decode(&agent_projection_page(
+            &config,
+            &actor.state,
+            &member_query.encode().unwrap(),
+        ))
+        .unwrap();
+        assert!(
+            member_page
+                .entries
+                .iter()
+                .any(|entry| entry.identity.agent == first_private.identity.agent)
+        );
+        assert!(
+            member_page
+                .entries
+                .iter()
+                .all(|entry| entry.identity.agent != second_private.identity.agent)
+        );
+
+        let mut actor_after = None;
+        let mut actor_entries = Vec::new();
+        for ordinal in 0..MAX_MANAGED_ACTORS {
+            let query = ssh_projection_query(
+                config,
+                &signing(0x21),
+                ADMIN_NODE,
+                &signing(0x31),
+                0xb0_u8.wrapping_add(ordinal as u8),
+                AuthorityProjectionSelector::Actors {
+                    agent: AgentId(config.system_agent),
+                    after: actor_after,
+                    limit: 1,
+                },
+            );
+            let page = AuthorityActorProjectionPage::decode(&actor_projection_page(
+                &config,
+                &actor.state,
+                &query.encode().unwrap(),
+            ))
+            .unwrap();
+            assert_eq!(stable_head, Some(page.head));
+            actor_entries.extend(page.entries);
+            let Some(next) = page.next else {
+                break;
+            };
+            actor_after = Some(next);
+        }
+        assert_eq!(actor_entries.len(), 2);
+        assert!(
+            actor_entries
+                .windows(2)
+                .all(|pair| pair[0].entry.actor < pair[1].entry.actor)
+        );
+        for expected in [&catalog, &second_actor] {
+            let projected = actor_entries
+                .iter()
+                .find(|entry| entry.entry.actor == expected.entry.actor)
+                .unwrap();
+            assert_eq!(projected.entry, expected.entry);
+            assert_eq!(projected.producer, expected.producer);
+            assert_eq!(projected.contract, expected.contract);
+            assert_eq!(projected.requirements, expected.requirements);
+            assert_eq!(projected.installation_id, expected.installation_id);
+            assert_eq!(
+                projected.registry_reservation,
+                expected.registry_reservation
+            );
+            assert_eq!(
+                projected.install_request,
+                ManagementRequest::Install(Box::new(expected.clone())).commitment()
+            );
+        }
+        assert!(actor_entries.iter().any(|entry| entry.root_provenance));
+        assert!(
+            actor_entries
+                .iter()
+                .filter(|entry| entry.root_provenance)
+                .all(|entry| entry.entry.actor == catalog.entry.actor)
+        );
+
+        dispatch_fixture_admin(
+            &mut actor,
+            InvocationId([0xaf; 32]),
+            AuthorityAdminOperation::SetBuiltinRole {
+                principal: first_owner,
+                role: AuthorityBuiltinRole::Developer,
+            },
+        );
+        let changed_head_query = ssh_projection_query(
+            config,
+            &signing(0x21),
+            ADMIN_NODE,
+            &signing(0x31),
+            0xdf,
+            AuthorityProjectionSelector::AgentReplicas {
+                agent: first_private.identity.agent,
+                after: first_replica_page.next,
+                limit: 1,
+            },
+        );
+        let changed_head_page =
+            AuthorityAgentReplicaProjectionPage::decode(&agent_replica_projection_page(
+                &config,
+                &actor.state,
+                &changed_head_query.encode().unwrap(),
+            ))
+            .unwrap();
+        assert_ne!(first_replica_page.head, changed_head_page.head);
+        assert!(
+            !changed_head_page.matches_agent_at_head(projected_private, first_replica_page.head)
+        );
+        assert!(changed_head_page.matches_agent_at_head(projected_private, changed_head_page.head));
+    }
+
+    #[test]
+    fn durable_scoped_grants_drive_exact_operation_policy_and_mutation_time_bound() {
+        let config = configuration();
+        let mut actor = actor();
+        let catalog = install_catalog_projection(&mut actor);
+        let principal = PrincipalId([0xc1; 32]);
+        let key = signing(0xc2);
+        dispatch_fixture_admin(
+            &mut actor,
+            InvocationId([0xc3; 32]),
+            AuthorityAdminOperation::EnrollPrincipal {
+                principal,
+                credential: enrollment(&key, AuthorityCredentialKind::Api),
+            },
+        );
+        let space_role = RoleId([0xc4; 32]);
+        let actor_role = RoleId([0xc5; 32]);
+        let capability = CapabilityId([0xc6; 32]);
+        for (invocation, operation) in [
+            (
+                0xc7,
+                AuthorityAdminOperation::SetSpaceRole {
+                    principal,
+                    role: space_role,
+                    granted: true,
+                },
+            ),
+            (
+                0xc8,
+                AuthorityAdminOperation::SetActorRole {
+                    principal,
+                    agent: AgentId(config.system_agent),
+                    actor: catalog.entry.actor,
+                    deployment: catalog.entry.deployment,
+                    role: actor_role,
+                    granted: true,
+                },
+            ),
+            (
+                0xc9,
+                AuthorityAdminOperation::SetCapability {
+                    principal,
+                    agent: AgentId(config.system_agent),
+                    actor: catalog.entry.actor,
+                    deployment: catalog.entry.deployment,
+                    capability,
+                    granted: true,
+                },
+            ),
+        ] {
+            dispatch_fixture_admin(&mut actor, InvocationId([invocation; 32]), operation);
+        }
+
+        let query =
+            api_projection_query(config, &key, 0xca, AuthorityProjectionSelector::Credential);
+        let projected = AuthorityCredentialProjection::decode(&credential_projection(
+            &config,
+            &actor.state,
+            &query.encode().unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(projected.space_roles, vec![space_role]);
+        assert_eq!(
+            projected.actor_roles,
+            vec![AuthorityActorRoleGrant {
+                agent: AgentId(config.system_agent),
+                actor: catalog.entry.actor,
+                deployment: catalog.entry.deployment,
+                role: actor_role,
+            }]
+        );
+        assert_eq!(
+            projected.capabilities,
+            vec![AuthorityCapabilityGrant {
+                agent: AgentId(config.system_agent),
+                actor: catalog.entry.actor,
+                deployment: catalog.entry.deployment,
+                capability,
+            }]
+        );
+
+        for (ordinal, claim) in [(0_u8, 0_u8), (1_u8, 1_u8), (2_u8, 2_u8)] {
+            let mut call = invoke_operation_call(
+                config,
+                &key,
+                principal,
+                None,
+                0xcb_u8.wrapping_add(ordinal),
+                0xd0_u8.wrapping_add(ordinal),
+                system_target(config),
+                &catalog,
+            );
+            let AuthorityOperationIntent::InvokeActor { origin, roles, .. } = &mut call.intent
+            else {
+                unreachable!();
+            };
+            match claim {
+                0 => roles.space = Some(space_role),
+                1 => roles.actor = Some(actor_role),
+                2 => origin.capability = Some(capability),
+                _ => unreachable!(),
+            }
+            prepare_operation_call(&actor, &mut call, &key);
+            authorize_and_issue_operation(&mut actor, &call);
+        }
+
+        let mut substituted = invoke_operation_call(
+            config,
+            &key,
+            principal,
+            None,
+            0xd3,
+            0xd4,
+            system_target(config),
+            &catalog,
+        );
+        let AuthorityOperationIntent::InvokeActor { origin, .. } = &mut substituted.intent else {
+            unreachable!();
+        };
+        origin.capability = Some(CapabilityId([0xd5; 32]));
+        prepare_operation_call(&actor, &mut substituted, &key);
+        let before = actor.state.clone();
+        assert!(dispatch_operation(&mut actor, &substituted).is_empty());
+        assert_eq!(actor.state, before);
+
+        for ordinal in 0..(MAX_AUTHORITY_PRINCIPAL_GRANTS - 3) {
+            let mut role = [0xe0; 32];
+            role[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
+            assert!(apply_admin_operation(
+                &config,
+                &mut actor.state,
+                &AuthorityAdminOperation::SetSpaceRole {
+                    principal,
+                    role: RoleId(role),
+                    granted: true,
+                },
+            ));
+        }
+        assert_eq!(
+            principal_authorization_grant_count(&actor.state, principal),
+            MAX_AUTHORITY_PRINCIPAL_GRANTS
+        );
+        assert!(!apply_admin_operation(
+            &config,
+            &mut actor.state,
+            &AuthorityAdminOperation::SetSpaceRole {
+                principal,
+                role: RoleId([0xef; 32]),
+                granted: true,
+            },
+        ));
+        assert!(refresh_state_integrity_commitment(
+            &config,
+            &mut actor.state
+        ));
+        assert!(authority_state_is_valid(&config, &actor.state));
+    }
+
+    #[test]
     fn root_seed_starts_at_sequence_two_authorizes_catalog_install_as_three_and_restarts() {
         let config = configuration();
         let expected_seed = root_managed_agent(config);
@@ -8398,9 +10328,9 @@ mod tests {
         assert!(authority_state_is_valid(&config, &actor.state));
 
         let ack = application_ack(config, &actor.state, &call, &approval);
-        let install_plan = ManagementAuthorizationPlan::from_request(
-            &ManagementRequest::Install(Box::new(install.clone())),
-        )
+        let install_plan = ManagementAuthorizationPlan::from_request(&ManagementRequest::Install(
+            Box::new(install.clone()),
+        ))
         .expect("install fixture has a compact authorization plan");
         let ManagementAuthorizationPlan::Install(compact_install) = &install_plan else {
             unreachable!()
@@ -8485,7 +10415,7 @@ mod tests {
             None,
             None,
         )
-        .expect("seeded SAC3 authority state restarts");
+        .expect("seeded SAC4 authority state restarts");
         assert_eq!(restarted.state.authorization_sequence, 3);
         assert_eq!(restarted.state.managed_agents, vec![expected_seed]);
         assert_eq!(restarted.state.managed_actors, vec![expected_actor]);
@@ -8521,6 +10451,7 @@ mod tests {
             .expect("valid Install is approved");
         assert_eq!(install_approval.authorization_sequence.get(), 4);
         assert!(actor.state.managed_actors.is_empty());
+        let approval_head = projection_head(&actor.state).expect("approval has a signed head");
 
         let mut duplicate = credential_call(
             config,
@@ -8537,9 +10468,9 @@ mod tests {
         assert_eq!(actor.state, pending);
 
         let install_ack = application_ack(config, &actor.state, &install_call, &install_approval);
-        let install_plan = ManagementAuthorizationPlan::from_request(
-            &ManagementRequest::Install(Box::new(install.clone())),
-        )
+        let install_plan = ManagementAuthorizationPlan::from_request(&ManagementRequest::Install(
+            Box::new(install.clone()),
+        ))
         .expect("install fixture has a compact authorization plan");
         let ManagementAuthorizationPlan::Install(compact_install) = &install_plan else {
             unreachable!()
@@ -8551,6 +10482,21 @@ mod tests {
             false,
         );
         assert!(dispatch_ack(&mut actor, &install_ack));
+        let acknowledged_head = projection_head(&actor.state).expect("Ack has a signed head");
+        assert_eq!(acknowledged_head.epoch, approval_head.epoch);
+        assert_eq!(
+            acknowledged_head.authorization_sequence,
+            approval_head.authorization_sequence
+        );
+        assert_eq!(
+            acknowledged_head.administration_generation,
+            approval_head.administration_generation
+        );
+        assert!(acknowledged_head.state_revision > approval_head.state_revision);
+        assert_ne!(
+            acknowledged_head.state_commitment,
+            approval_head.state_commitment
+        );
         assert_eq!(actor.state.managed_actors, vec![installed.clone()]);
         assert_installed_projection(
             &actor.state.managed_actors[0],
@@ -8975,7 +10921,8 @@ mod tests {
         ));
 
         let managed_index = managed_agent(&actor.state, managed.agent).unwrap();
-        let expected_generation = Hash(actor.state.managed_agents[managed_index].replica_generation);
+        let expected_generation =
+            Hash(actor.state.managed_agents[managed_index].replica_generation);
         let mut replacement = descriptor.replicas.clone();
         replacement[MAX_AGENT_REPLICAS - 1].role = ReplicaRole::Observer;
         let mut substituted_replacement = replacement.clone();
@@ -9319,6 +11266,20 @@ mod tests {
         unbacked.managed_actors.push(row.clone());
         assert!(!authority_state_is_valid(&config, &unbacked));
 
+        let mut unsupported_actor_abi = actor.state.clone();
+        unsupported_actor_abi.managed_agents[0]
+            .runtime_contract
+            .actor_abi_minimum = vos::agent_sdk::contract::ACTOR_ABI + 1;
+        unsupported_actor_abi.managed_agents[0]
+            .runtime_contract
+            .actor_abi_maximum = vos::agent_sdk::contract::ACTOR_ABI + 1;
+        assert!(!authority_state_is_valid(&config, &unsupported_actor_abi));
+
+        let mut unsupported_actor_lane = actor.state.clone();
+        unsupported_actor_lane.managed_agents[0].capabilities.lanes =
+            LaneSet::of(vos::agent_sdk::StateLane::Linear).bits();
+        assert!(!authority_state_is_valid(&config, &unsupported_actor_lane));
+
         let later_install = actor_install(AgentId(config.system_agent), "later-system", 0x72);
         let mut later_call = credential_call(
             config,
@@ -9390,6 +11351,39 @@ mod tests {
     fn acknowledged_system_runtime_upgrade_is_the_only_seed_runtime_evolution() {
         let config = configuration();
         let mut actor = actor();
+        let reused_signer_request =
+            ManagementRequest::UpgradeRuntime(Box::new(vos::agent_sdk::RuntimeUpgrade {
+                from_deployment: DeploymentId(config.system_runtime_deployment),
+                to_deployment: DeploymentId([0x28; 32]),
+                to_program: ProgramId([0x29; 32]),
+                producer: ProducerId(config.system_transition_producer),
+                package: BlobRef::of_bytes(b"runtime-reusing-transition-signer"),
+                contract: RuntimePackageContract::canonical(),
+                capabilities: RuntimeCapabilities::standard(),
+            }));
+        let reused_signer_call = credential_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0x2b,
+            system_target(config),
+            reused_signer_request,
+        );
+        let before_reused_signer = actor.state.clone();
+        assert!(reused_signer_call.validate_shape().is_err());
+        assert!(
+            policy_effect(
+                &config,
+                &actor.state,
+                &reused_signer_call,
+                BuiltinPrincipalRole::Admin,
+            )
+            .is_none(),
+            "state-transition policy must independently reject role-reused signers",
+        );
+        assert_eq!(actor.state, before_reused_signer);
+
         let request = ManagementRequest::UpgradeRuntime(Box::new(vos::agent_sdk::RuntimeUpgrade {
             from_deployment: DeploymentId(config.system_runtime_deployment),
             to_deployment: DeploymentId([0x2c; 32]),
@@ -9410,12 +11404,25 @@ mod tests {
         );
         let approval = ManagementApproval::decode(&dispatch(&mut actor, &call)).unwrap();
         assert_eq!(approval.authorization_sequence.get(), 3);
+        let mut substituted = application_ack(config, &actor.state, &call, &approval);
+        let ManagementReply::RuntimeUpgraded(identity) = &mut substituted.application else {
+            unreachable!();
+        };
+        identity.transition_producer = ProducerId([0xef; 32]);
+        resign_ack(&mut substituted);
+        let before_substitution = actor.state.clone();
+        assert!(!dispatch_ack(&mut actor, &substituted));
+        assert_eq!(actor.state, before_substitution);
         assert!(dispatch_application_ack(&mut actor, &call, &approval));
         let system = &actor.state.managed_agents
             [managed_agent(&actor.state, AgentId(config.system_agent)).unwrap()];
         assert_eq!(system.runtime_deployment, [0x2c; 32]);
         assert_eq!(system.runtime_program, [0x2d; 32]);
         assert_eq!(system.runtime_producer, [0x2e; 32]);
+        assert_eq!(
+            system.transition_producer, config.system_transition_producer,
+            "runtime upgrades preserve the independently authenticated transition signer",
+        );
         assert!(authority_state_is_valid(&config, &actor.state));
 
         let mut unbacked_drift = actor.state.clone();
@@ -9519,15 +11526,25 @@ mod tests {
     }
 
     #[test]
-    fn aoc4_none_node_exact_retry_restart_and_compaction_are_explicit() {
+    fn aoc5_api_exact_retry_restart_and_compaction_are_explicit() {
         let config = configuration();
         let mut actor = actor();
         let catalog = install_catalog_projection(&mut actor);
         assert_eq!(actor.state.operation_retirement_floor, 3);
 
+        let api_key = signing(0x83);
+        dispatch_fixture_admin(
+            &mut actor,
+            InvocationId([0x80; 32]),
+            AuthorityAdminOperation::AddCredential {
+                principal: ADMIN_PRINCIPAL,
+                credential: enrollment(&api_key, AuthorityCredentialKind::Api),
+            },
+        );
+
         let call = invoke_operation_call(
             config,
-            &signing(0x21),
+            &api_key,
             ADMIN_PRINCIPAL,
             None,
             0x81,
@@ -9535,26 +11552,65 @@ mod tests {
             system_target(config),
             &catalog,
         );
+        assert_eq!(call.validate_shape(), Ok(()));
+        assert_eq!(call.verify_api_with(&Ed25519CredentialVerifier), Ok(()));
+        assert!(call.matches_invocation_context(&operation_context(&call)));
+        assert_eq!(
+            authenticated_operation_role(&config, &actor.state, &call),
+            Some(BuiltinPrincipalRole::Admin),
+        );
+        assert!(operation_policy_allows(
+            &config,
+            &actor.state,
+            &call,
+            BuiltinPrincipalRole::Admin,
+        ));
+        let caller_index = credential_index(&actor.state, call.credential).unwrap();
+        assert_eq!(
+            actor.state.credentials[caller_index].operation_request_high_water,
+            0,
+        );
+        assert!(!credential_has_pending_application(
+            &actor.state,
+            call.credential,
+        ));
+        assert!(invocation_pair_is_available(
+            &actor.state,
+            call.invocation,
+            AuthorityOperationApproval::derive_acknowledgement_invocation(&call),
+        ));
         let approval_bytes = dispatch_operation(&mut actor, &call);
         let approval = AuthorityOperationApproval::decode(&approval_bytes).unwrap();
         assert_eq!(approval.authorization_sequence.get(), 4);
-        assert_eq!(approval.authenticated_node, None);
+        assert_eq!(approval.authenticated_node(), None);
         assert!(approval.matches_call(&call));
         assert_eq!(dispatch_operation(&mut actor, &call), approval_bytes);
         assert_eq!(actor.state.operation_retries.len(), 1);
         assert_eq!(actor.state.operation_retirement_floor, 3);
 
-        let mut unknown_node = call.clone();
-        unknown_node.authenticated_node = Some(NodeId([0x84; 32]));
-        let AuthorityOperationIntent::InvokeActor { origin, .. } = &mut unknown_node.intent else {
+        let mut wrong_kind = call.clone();
+        wrong_kind.authentication = AuthorityIngressAuthentication::SshNodeAttestation {
+            credential_public_key: api_key.verifying_key().to_bytes(),
+            node: ADMIN_NODE,
+            request_binding: Hash([0x85; 32]),
+            signature: [1; 64],
+        };
+        let AuthorityOperationIntent::InvokeActor { origin, .. } = &mut wrong_kind.intent else {
             unreachable!()
         };
-        origin.transport_node = unknown_node.authenticated_node;
-        unknown_node.invocation = unknown_node.expected_invocation();
-        resign_operation_call(&mut unknown_node, &signing(0x21));
-        let before_unknown = actor.state.clone();
-        assert!(dispatch_operation(&mut actor, &unknown_node).is_empty());
-        assert_eq!(actor.state, before_unknown);
+        origin.transport_node = Some(ADMIN_NODE);
+        wrong_kind.invocation = wrong_kind.expected_invocation();
+        resign_ssh_operation_call(&mut wrong_kind, &signing(0x31));
+        assert_eq!(
+            wrong_kind.verify_ssh_node_attestation_with(
+                &signing(0x31).verifying_key().to_bytes(),
+                &Ed25519CredentialVerifier,
+            ),
+            Ok(()),
+        );
+        let before_wrong_kind = actor.state.clone();
+        assert!(dispatch_operation(&mut actor, &wrong_kind).is_empty());
+        assert_eq!(actor.state, before_wrong_kind);
 
         let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
         let mut restarted = <SystemAuthority as vos::Actor>::__load_agent_state(
@@ -9563,7 +11619,7 @@ mod tests {
             None,
             None,
         )
-        .expect("pending AOC4/AOP4 must restart");
+        .expect("pending AOC5/AOP5 must restart");
         assert_eq!(dispatch_operation(&mut restarted, &call), approval_bytes);
 
         let ack = operation_issuance_ack(config, &call, &approval);
@@ -9574,7 +11630,7 @@ mod tests {
         assert!(dispatch_operation_ack(&mut restarted, &ack));
 
         // Compaction deliberately ends AOC exact retry: the high-water and
-        // latest AOI cannot be used to invent AOP4 bytes.
+        // latest AOI cannot be used to invent AOP5 bytes.
         let retired_state = restarted.state.clone();
         assert!(dispatch_operation(&mut restarted, &call).is_empty());
         assert_eq!(restarted.state, retired_state);
@@ -9589,6 +11645,112 @@ mod tests {
         let mut corrupt_payload = restarted.state.clone();
         corrupt_payload.latest_operation_acks[0].invocation_payload[0] ^= 1;
         assert!(!authority_state_is_valid(&config, &corrupt_payload));
+    }
+
+    #[test]
+    fn aoc5_ssh_cross_owner_attestation_retries_across_reconnect_and_restart() {
+        let config = configuration();
+        let mut actor = actor();
+        let catalog = install_catalog_projection(&mut actor);
+        let principal = PrincipalId([0x90; 32]);
+        let credential_key = signing(0x91);
+        let principal_node = node_for_principal(config, principal);
+        enroll(
+            &mut actor,
+            &credential_key,
+            principal,
+            principal_node,
+            BuiltinPrincipalRole::Member,
+        );
+        assert_ne!(
+            principal,
+            PrincipalId(enrolled_node(&actor.state, ADMIN_NODE).unwrap().owner),
+        );
+
+        let call = invoke_operation_call(
+            config,
+            &credential_key,
+            principal,
+            Some(ADMIN_NODE),
+            0x92,
+            0x93,
+            system_target(config),
+            &catalog,
+        );
+        assert_eq!(call.authenticated_node(), Some(ADMIN_NODE));
+        assert_eq!(
+            call.verify_ssh_node_attestation_with(
+                &signing(0x31).verifying_key().to_bytes(),
+                &Ed25519CredentialVerifier,
+            ),
+            Ok(()),
+        );
+        let approval_bytes = dispatch_operation(&mut actor, &call);
+        let approval = AuthorityOperationApproval::decode(&approval_bytes).unwrap();
+        assert!(approval.matches_call(&call));
+        assert_eq!(dispatch_operation(&mut actor, &call), approval_bytes);
+
+        let reconnected = invoke_operation_call(
+            config,
+            &credential_key,
+            principal,
+            Some(ADMIN_NODE),
+            0x92,
+            0x93,
+            system_target(config),
+            &catalog,
+        );
+        assert_eq!(
+            reconnected, call,
+            "reconnect preserves the stable request binding"
+        );
+
+        let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
+        let mut restarted = <SystemAuthority as vos::Actor>::__load_agent_state(
+            Some(&config.encode()),
+            Some(&linear),
+            None,
+            None,
+        )
+        .expect("pending SSH-authenticated AOC5/AOP5 must restart");
+        assert_eq!(
+            dispatch_operation(&mut restarted, &reconnected),
+            approval_bytes
+        );
+
+        let mut changed_binding = call.clone();
+        let AuthorityIngressAuthentication::SshNodeAttestation {
+            request_binding, ..
+        } = &mut changed_binding.authentication
+        else {
+            unreachable!()
+        };
+        request_binding.0[0] ^= 1;
+        changed_binding.invocation = changed_binding.expected_invocation();
+        resign_ssh_operation_call(&mut changed_binding, &signing(0x31));
+        assert_ne!(changed_binding.invocation, call.invocation);
+        let before_changed_binding = restarted.state.clone();
+        assert!(dispatch_operation(&mut restarted, &changed_binding).is_empty());
+        assert_eq!(restarted.state, before_changed_binding);
+
+        let mut wrong_kind = call.clone();
+        wrong_kind.authentication = AuthorityIngressAuthentication::ApiCredentialSignature {
+            credential_public_key: credential_key.verifying_key().to_bytes(),
+            signature: [1; 64],
+        };
+        let AuthorityOperationIntent::InvokeActor { origin, .. } = &mut wrong_kind.intent else {
+            unreachable!()
+        };
+        origin.transport_node = None;
+        wrong_kind.invocation = wrong_kind.expected_invocation();
+        resign_operation_call(&mut wrong_kind, &credential_key);
+        assert_eq!(
+            wrong_kind.verify_api_with(&Ed25519CredentialVerifier),
+            Ok(()),
+        );
+        let before_wrong_kind = restarted.state.clone();
+        assert!(dispatch_operation(&mut restarted, &wrong_kind).is_empty());
+        assert_eq!(restarted.state, before_wrong_kind);
     }
 
     #[test]
@@ -9839,6 +12001,7 @@ mod tests {
                 runtime_deployment: DeploymentId(config.system_runtime_deployment),
                 runtime_program: ProgramId(config.system_runtime_program),
                 runtime_producer: ProducerId(config.system_runtime_producer),
+                transition_producer: ProducerId(config.system_transition_producer),
             },
             actor: catalog_install.entry.actor,
             actor_deployment: catalog_install.entry.deployment,
@@ -9856,7 +12019,14 @@ mod tests {
             publication.clone(),
         )
         .unwrap();
-        let call = operation_call(config, &signing(0x21), ADMIN_PRINCIPAL, None, 0xa2, intent);
+        let call = operation_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0xa2,
+            intent,
+        );
         let managed_before = actor.state.managed_agents.clone();
         let actors_before = actor.state.managed_actors.clone();
         let approval = AuthorityOperationApproval::decode(&dispatch_operation(&mut actor, &call))
@@ -9891,7 +12061,7 @@ mod tests {
             config,
             &signing(0x21),
             ADMIN_PRINCIPAL,
-            None,
+            Some(ADMIN_NODE),
             0xa5,
             wrong_intent,
         );
@@ -9963,7 +12133,7 @@ mod tests {
             assert_eq!(actor.state, before, "Admin has no Private-Agent keys");
         }
 
-        let invite_call = operation_call(config, &owner_key, owner, None, 0xbc, invite);
+        let invite_call = operation_call(config, &owner_key, owner, Some(owner_node), 0xbc, invite);
         let (invite_approval, invite_issuance) =
             authorize_and_issue_operation(&mut actor, &invite_call);
         let invite_application = private_application_ack(
@@ -10024,7 +12194,7 @@ mod tests {
             config,
             &owner_key,
             owner,
-            None,
+            Some(owner_node),
             0xc2,
             AuthorityOperationIntent::RecoverPrivateAgent {
                 proof: wrong_key_proof,
@@ -10060,7 +12230,7 @@ mod tests {
                 config,
                 &owner_key,
                 owner,
-                None,
+                Some(owner_node),
                 marker,
                 AuthorityOperationIntent::RecoverPrivateAgent { proof: hostile },
             );
@@ -10069,7 +12239,8 @@ mod tests {
             assert_eq!(actor.state, before);
         }
 
-        let mut recover_call = operation_call(config, &owner_key, owner, None, 0xca, recover);
+        let mut recover_call =
+            operation_call(config, &owner_key, owner, Some(owner_node), 0xca, recover);
         prepare_operation_call(&actor, &mut recover_call, &owner_key);
         let (approval, issuance) = authorize_and_issue_operation(&mut actor, &recover_call);
         // Recovery is likewise ordered by its signed fork position and may
@@ -10165,13 +12336,14 @@ mod tests {
     fn genesis_private_recovery_supersedes_none_and_reconciles_a_fork_jump() {
         let config = configuration();
         let owner = PrincipalId([0xc5; 32]);
+        let owner_node = node_for_principal(config, owner);
         let owner_key = signing(0xc7);
         let mut actor = actor();
         enroll(
             &mut actor,
             &owner_key,
             owner,
-            node_for_principal(config, owner),
+            owner_node,
             BuiltinPrincipalRole::Member,
         );
         let descriptor = descriptor(config, owner, AgentProfile::Private, 0xc8);
@@ -10195,7 +12367,7 @@ mod tests {
             config,
             &owner_key,
             owner,
-            None,
+            Some(owner_node),
             0xd1,
             AuthorityOperationIntent::RecoverPrivateAgent {
                 proof: proof.clone(),
@@ -10246,6 +12418,27 @@ mod tests {
             application_ack(config, &actor.state, &upgrade_call, &upgrade_approval);
         upgrade_ack.applied_at = OBSERVED_SLOT + 2;
         resign_ack(&mut upgrade_ack);
+        assert!(upgrade_ack.matches_pending(&upgrade_call, &upgrade_approval));
+        let upgrade_record = actor
+            .state
+            .retries
+            .iter()
+            .find(|record| record.invocation == upgrade_call.invocation.0)
+            .expect("runtime upgrade must retain its exact authorization record");
+        assert_eq!(
+            reconstruction_effect(&config, &actor.state, &upgrade_call).as_ref(),
+            Some(&upgrade_record.effect),
+        );
+        assert!(
+            application_plan(
+                &config,
+                &actor.state,
+                &upgrade_record.effect,
+                &upgrade_call,
+                &upgrade_ack,
+            )
+            .is_some()
+        );
         assert!(dispatch_ack(&mut actor, &upgrade_ack));
 
         assert!(dispatch_private_application(&mut actor, &pca));
@@ -10314,7 +12507,7 @@ mod tests {
             config,
             &owner_key,
             owner,
-            None,
+            Some(owner_node),
             0xc6,
             AuthorityOperationIntent::InvitePrivateNode {
                 managed,
@@ -10431,7 +12624,7 @@ mod tests {
             config,
             &owner_key,
             owner,
-            None,
+            Some(owner_node),
             0xcb,
             AuthorityOperationIntent::RevokePrivateNode {
                 managed,
@@ -10475,13 +12668,14 @@ mod tests {
     fn par1_retires_without_projecting_and_is_exclusive_with_pca2() {
         let config = configuration();
         let owner = PrincipalId([0x39; 32]);
+        let owner_node = node_for_principal(config, owner);
         let owner_key = signing(0x3a);
         let mut actor = actor();
         enroll(
             &mut actor,
             &owner_key,
             owner,
-            node_for_principal(config, owner),
+            owner_node,
             BuiltinPrincipalRole::Member,
         );
         let descriptor = descriptor(config, owner, AgentProfile::Private, 0x34);
@@ -10498,7 +12692,14 @@ mod tests {
             node: invited_node,
             node_identity: invited_identity,
         };
-        let call = operation_call(config, &owner_key, owner, None, 0x36, intent.clone());
+        let call = operation_call(
+            config,
+            &owner_key,
+            owner,
+            Some(owner_node),
+            0x36,
+            intent.clone(),
+        );
         let (approval, issuance) = authorize_and_issue_operation(&mut actor, &call);
         assert!(actor.state.operation_retries.is_empty());
         assert_eq!(actor.state.latest_operation_acks.len(), 1);
@@ -10508,12 +12709,8 @@ mod tests {
         let managed_actors = actor.state.managed_actors.clone();
         let applications = actor.state.private_applications.clone();
         let application_commitment = actor.state.private_application_commitment;
-        let retirement = private_application_retirement_ack(
-            &call,
-            &approval,
-            &issuance,
-            OBSERVED_SLOT + 1,
-        );
+        let retirement =
+            private_application_retirement_ack(&call, &approval, &issuance, OBSERVED_SLOT + 1);
 
         assert!(dispatch_private_application_retirement(
             &mut actor,
@@ -10542,12 +12739,7 @@ mod tests {
             &call,
             &approval,
             &issuance,
-            private_application_fact(
-                &call,
-                member_set,
-                Hash([0x37; 32]),
-                OBSERVED_SLOT + 1,
-            ),
+            private_application_fact(&call, member_set, Hash([0x37; 32]), OBSERVED_SLOT + 1),
         );
         assert!(!dispatch_private_application(&mut actor, &application));
         assert_eq!(actor.state, after_retirement);
@@ -10601,11 +12793,13 @@ mod tests {
                 owner,
             },
         );
-        assert!(restarted
-            .state
-            .nodes
-            .binary_search_by(|row| row.node.cmp(&invited_node.0))
-            .is_err());
+        assert!(
+            restarted
+                .state
+                .nodes
+                .binary_search_by(|row| row.node.cmp(&invited_node.0))
+                .is_err()
+        );
 
         // Retirement resolves the pending capability without advancing its
         // PCTL position, so a fresh credential request may retry that same
@@ -10620,14 +12814,19 @@ mod tests {
             node: retry_node,
             node_identity: enrolled_identity_commitment(&restarted, retry_node, owner),
         };
-        let mut retry_call =
-            operation_call(config, &owner_key, owner, None, 0x39, retry_intent);
+        let mut retry_call = operation_call(
+            config,
+            &owner_key,
+            owner,
+            Some(owner_node),
+            0x39,
+            retry_intent,
+        );
         prepare_operation_call(&restarted, &mut retry_call, &owner_key);
-        assert!(AuthorityOperationApproval::decode(&dispatch_operation(
-            &mut restarted,
-            &retry_call,
-        ))
-        .is_ok());
+        assert!(
+            AuthorityOperationApproval::decode(&dispatch_operation(&mut restarted, &retry_call,))
+                .is_ok()
+        );
 
         // Whichever terminal resolution commits first owns the shared third
         // invocation: the reverse PCA2-then-PAR1 race also fails closed.
@@ -10724,13 +12923,13 @@ mod tests {
         };
         *wrong_member_set_field = Hash([0x4b; 32]);
         for invalid in [wrong_rotate_epoch, wrong_rotate_members] {
-            let call = operation_call(config, &owner_key, owner, None, 0x4c, invalid);
+            let call = operation_call(config, &owner_key, owner, Some(owner_node), 0x4c, invalid);
             let before = actor.state.clone();
             assert!(dispatch_operation(&mut actor, &call).is_empty());
             assert_eq!(actor.state, before);
         }
 
-        let rotate_call = operation_call(config, &owner_key, owner, None, 0x4d, rotate);
+        let rotate_call = operation_call(config, &owner_key, owner, Some(owner_node), 0x4d, rotate);
         let rotate_approval_bytes = dispatch_operation(&mut actor, &rotate_call);
         let rotate_approval = AuthorityOperationApproval::decode(&rotate_approval_bytes).unwrap();
         assert_eq!(
@@ -10753,7 +12952,7 @@ mod tests {
             config,
             &owner_key,
             owner,
-            None,
+            Some(owner_node),
             0x4e,
             AuthorityOperationIntent::SetPrivateResourcePolicy {
                 managed,
@@ -10809,7 +13008,7 @@ mod tests {
             config,
             &owner_key,
             owner,
-            None,
+            Some(owner_node),
             0x53,
             AuthorityOperationIntent::SetPrivateResourcePolicy {
                 managed,
@@ -10883,7 +13082,7 @@ mod tests {
             config,
             &owner_key,
             owner,
-            None,
+            Some(owner_node),
             0x58,
             AuthorityOperationIntent::PrivateActorLifecycle {
                 managed,
@@ -11022,7 +13221,7 @@ mod tests {
             config,
             &owner_key,
             owner,
-            None,
+            Some(owner_node),
             0xd8,
             AuthorityOperationIntent::InvitePrivateNode {
                 managed,
@@ -11070,6 +13269,7 @@ mod tests {
     fn par1_resolves_an_active_aoi_source_before_its_gap_compacts() {
         let config = configuration();
         let owner = PrincipalId([0x2a; 32]);
+        let owner_node = node_for_principal(config, owner);
         let owner_key = signing(0x2b);
         let gap_key = signing(0x2c);
         let mut actor = actor();
@@ -11077,7 +13277,7 @@ mod tests {
             &mut actor,
             &owner_key,
             owner,
-            node_for_principal(config, owner),
+            owner_node,
             BuiltinPrincipalRole::Member,
         );
         dispatch_fixture_admin(
@@ -11114,15 +13314,14 @@ mod tests {
             },
         );
         let gap_approval =
-            AuthorityOperationApproval::decode(&dispatch_operation(&mut actor, &gap_call))
-                .unwrap();
+            AuthorityOperationApproval::decode(&dispatch_operation(&mut actor, &gap_call)).unwrap();
         let gap_issuance = operation_issuance_ack(config, &gap_call, &gap_approval);
 
         let target_call = operation_call(
             config,
             &owner_key,
             owner,
-            None,
+            Some(owner_node),
             0x42,
             AuthorityOperationIntent::InvitePrivateNode {
                 managed: target_managed,
@@ -11227,7 +13426,7 @@ mod tests {
             config,
             &owner_key,
             owner,
-            None,
+            Some(owner_node),
             0xe5,
             AuthorityOperationIntent::InvitePrivateNode {
                 managed: old_managed,
@@ -11327,7 +13526,7 @@ mod tests {
             config,
             &owner_key,
             owner,
-            None,
+            Some(owner_node),
             0xa5,
             AuthorityOperationIntent::InvitePrivateNode {
                 managed,
@@ -11555,7 +13754,7 @@ mod tests {
             config,
             &owner_key,
             owner,
-            None,
+            Some(owner_node),
             0x66,
             AuthorityOperationIntent::InvitePrivateNode {
                 managed,
@@ -11587,7 +13786,7 @@ mod tests {
             config,
             &owner_key,
             owner,
-            None,
+            Some(owner_node),
             0x6a,
             AuthorityOperationIntent::RevokePrivateNode {
                 managed,
@@ -11622,7 +13821,7 @@ mod tests {
             config,
             &owner_key,
             owner,
-            None,
+            Some(owner_node),
             0x6e,
             AuthorityOperationIntent::InvitePrivateNode {
                 managed,
@@ -11744,7 +13943,14 @@ mod tests {
             ),
         ];
         for (invocation, intent) in hostile {
-            let mut call = operation_call(config, &owner_key, owner, None, invocation, intent);
+            let mut call = operation_call(
+                config,
+                &owner_key,
+                owner,
+                Some(owner_node),
+                invocation,
+                intent,
+            );
             prepare_operation_call(&actor, &mut call, &owner_key);
             let before = actor.state.clone();
             assert!(dispatch_operation(&mut actor, &call).is_empty());
@@ -11759,7 +13965,7 @@ mod tests {
             config,
             &owner_key,
             owner,
-            None,
+            Some(owner_node),
             0x89,
             AuthorityOperationIntent::InvitePrivateNode {
                 managed,
@@ -11779,7 +13985,7 @@ mod tests {
             config,
             &owner_key,
             owner,
-            None,
+            Some(owner_node),
             0x8c,
             AuthorityOperationIntent::InvitePrivateNode {
                 managed,
@@ -11845,7 +14051,7 @@ mod tests {
             config,
             &owner_key,
             owner,
-            None,
+            Some(owner_node),
             0x55,
             AuthorityOperationIntent::InvitePrivateNode {
                 managed,
@@ -12010,7 +14216,7 @@ mod tests {
                 config,
                 &key,
                 ADMIN_PRINCIPAL,
-                None,
+                Some(ADMIN_NODE),
                 0xd5,
                 0xd6,
                 system_target(config),
@@ -13246,7 +15452,7 @@ mod tests {
         let before_retry = reopened.state.clone();
         assert!(
             dispatch_admin(&mut reopened, &enroll_call).is_empty(),
-            "only the credential's newest finalized AAR3 remains exact-retryable"
+            "only the credential's newest finalized AAR4 remains exact-retryable"
         );
         assert_eq!(reopened.state, before_retry);
     }
@@ -13256,7 +15462,7 @@ mod tests {
         let config = configuration();
         let admin_key = signing(0x21);
         let worker_key = signing(0x8a);
-        let worker_credential = enrollment(&worker_key, AuthorityCredentialKind::Api).credential;
+        let worker_credential = enrollment(&worker_key, AuthorityCredentialKind::Ssh).credential;
         let mut actor = actor();
 
         dispatch_fixture_admin(
@@ -13264,12 +15470,12 @@ mod tests {
             InvocationId([0x8b; 32]),
             AuthorityAdminOperation::AddCredential {
                 principal: ADMIN_PRINCIPAL,
-                credential: enrollment(&worker_key, AuthorityCredentialKind::Api),
+                credential: enrollment(&worker_key, AuthorityCredentialKind::Ssh),
             },
         );
         let worker_node = enroll_additional_node(&mut actor, ADMIN_PRINCIPAL, 0x8c);
         let catalog = install_catalog_projection(&mut actor);
-        let pending_call = invoke_operation_call(
+        let mut pending_call = invoke_operation_call(
             config,
             &worker_key,
             ADMIN_PRINCIPAL,
@@ -13279,9 +15485,10 @@ mod tests {
             system_target(config),
             &catalog,
         );
+        resign_ssh_operation_call(&mut pending_call, &signing(0x8c));
         let approval =
             AuthorityOperationApproval::decode(&dispatch_operation(&mut actor, &pending_call))
-                .expect("the secondary credential must retain one pending AOC4/AOP4");
+                .expect("the secondary credential must retain one pending AOC5/AOP5");
 
         for (invocation, operation) in [
             (
@@ -13837,8 +16044,18 @@ mod tests {
             runtime_deployment: [0xd7; 32],
             runtime_program: [0xd8; 32],
             runtime_producer: [0xd9; 32],
+            transition_producer: [0xdf; 32],
             authority: config.binding,
-            private_recovery_signing_key_commitment: Some([0xdc; 32]),
+            private_recovery: Some(PrivateRecoveryBindingRow {
+                signing_key_commitment: [0xdc; 32],
+                encryption_public_key: [0xdd; 32],
+            }),
+            runtime_package: AuthorityBlobRow {
+                hash: [0xde; 32],
+                len: 1,
+            },
+            runtime_contract: RuntimeContractRow::from_sdk(RuntimePackageContract::canonical()),
+            capabilities: RuntimeCapabilitiesRow::from_sdk(RuntimeCapabilities::standard()),
             replicas: Vec::new(),
             replica_generation: [0xdb; 32],
         });
@@ -13917,13 +16134,14 @@ mod tests {
     fn maximum_private_membership_can_be_replaced_disjointly_within_state_bound() {
         let config = configuration();
         let owner = PrincipalId([0x51; 32]);
+        let owner_node = node_for_principal(config, owner);
         let owner_key = signing(0x53);
         let mut actor = actor();
         enroll(
             &mut actor,
             &owner_key,
             owner,
-            node_for_principal(config, owner),
+            owner_node,
             BuiltinPrincipalRole::Member,
         );
 
@@ -14033,7 +16251,7 @@ mod tests {
             config,
             &owner_key,
             owner,
-            None,
+            Some(owner_node),
             0x5e,
             AuthorityOperationIntent::RecoverPrivateAgent {
                 proof: proof.clone(),
@@ -14170,7 +16388,7 @@ mod tests {
     #[test]
     fn generated_agent_schema_marks_authority_methods_as_explicit_linear_public_preflight() {
         let method = SystemAuthorityMsg::AGENT_METHODS;
-        assert_eq!(method.len(), 6);
+        assert_eq!(method.len(), 10);
         assert_eq!(method[0].name, "authorize");
         assert_eq!(method[0].mode, vos::agent_sdk::schema::MethodMode::Linear);
         assert!(method[0].explicit);
@@ -14189,7 +16407,23 @@ mod tests {
         assert_eq!(method[5].name, "administer");
         assert_eq!(method[5].mode, vos::agent_sdk::schema::MethodMode::Linear);
         assert!(method[5].explicit);
-        assert_eq!(SystemAuthorityMsg::AGENT_AUTHORIZATIONS.len(), 6);
+        for (index, name) in [
+            "credential_projection",
+            "agent_projection_page",
+            "agent_replica_projection_page",
+            "actor_projection_page",
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(method[index + 6].name, *name);
+            assert_eq!(
+                method[index + 6].mode,
+                vos::agent_sdk::schema::MethodMode::Query
+            );
+            assert!(method[index + 6].explicit);
+        }
+        assert_eq!(SystemAuthorityMsg::AGENT_AUTHORIZATIONS.len(), 10);
         assert!(
             SystemAuthorityMsg::AGENT_AUTHORIZATIONS
                 .iter()

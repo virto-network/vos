@@ -1107,6 +1107,17 @@ enum InvokeForwardCheck {
     DepthExceeded,
 }
 
+/// Node-owned signer used only for exact clean authority requests originating
+/// at the SSH transport boundary. Keeping the callback behind this typed
+/// wrapper prevents an ingress adapter from turning the daemon identity into a
+/// general-purpose signing oracle.
+#[cfg(feature = "ssh-ingress")]
+#[derive(Clone)]
+struct IngressNodeAttester {
+    node: crate::agent::sdk::NodeId,
+    signer: Arc<dyn Fn(&[u8]) -> Option<[u8; 64]> + Send + Sync>,
+}
+
 /// Decide whether to forward an invoke to `target` given the
 /// caller's current chain. Pulled out as a free function so the
 /// rule is testable without spinning up agent threads.
@@ -1288,6 +1299,11 @@ pub struct VosNode {
     /// torn down.
     #[cfg(any(feature = "http-ingress", feature = "ssh-ingress"))]
     ingress_threads: Vec<thread::JoinHandle<()>>,
+    /// Exact daemon identity used to attest SSH-authenticated authority
+    /// requests. The signer is never exposed directly and is configured once
+    /// before an ingress listener receives traffic.
+    #[cfg(feature = "ssh-ingress")]
+    ingress_node_attester: Option<IngressNodeAttester>,
     /// Content-addressed store for large opaque blobs (today: STARK
     /// proof bodies; future: any payload too big to ride inline
     /// through the PVM dispatch envelope). Keyed by domain-tagged
@@ -1316,6 +1332,18 @@ pub struct VosNode {
     /// compact ServiceId namespace, while Agent-native control is addressed
     /// exclusively by full AgentId / ActorId values and signed receipts.
     local_agent_host: Option<crate::agent::host::AgentHostControl>,
+    /// Sole clean-generation production supervisor owner. It becomes visible
+    /// to ingress only after its initial authenticated reconciliation and is
+    /// stopped and joined with the node.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    clean_agent_owner: Option<crate::agent::production_owner::AgentProductionOwner>,
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    clean_agent_owner_error: Option<crate::agent::production_owner::AgentProductionOwnerError>,
+    /// Live read-only ingress exposure. Route mutation and lifecycle ownership
+    /// stay in `clean_agent_owner`; shutdown clears this slot before joining.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    clean_agent_ingress_supervisor:
+        Arc<RwLock<Option<crate::agent::supervisor::AgentSupervisorHandle>>>,
 }
 
 /// Shared content-addressed proof-blob store. Cheap to clone; both
@@ -2159,6 +2187,10 @@ pub struct IngressHandle {
     shutdown: Arc<AtomicBool>,
     #[cfg(feature = "network")]
     shared_network: SharedNetwork,
+    #[cfg(feature = "ssh-ingress")]
+    ingress_node_attester: Option<IngressNodeAttester>,
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    clean_agent_supervisor: Arc<RwLock<Option<crate::agent::supervisor::AgentSupervisorHandle>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2167,11 +2199,101 @@ pub enum IngressAuthenticationError {
     AuthorityUnavailable,
 }
 
+/// Failure to configure or use the narrowly scoped SSH node-attestation
+/// boundary.
+#[cfg(feature = "ssh-ingress")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngressNodeAttestationError {
+    InvalidNode,
+    AlreadyConfigured,
+    NotConfigured,
+    InvalidCredential,
+    SigningFailed,
+    InvalidQuery(crate::agent::sdk::authority::AuthorityActorProtocolError),
+}
+
+#[cfg(feature = "ssh-ingress")]
+impl std::fmt::Display for IngressNodeAttestationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "SSH ingress node attestation failed: {self:?}")
+    }
+}
+
+#[cfg(feature = "ssh-ingress")]
+impl std::error::Error for IngressNodeAttestationError {}
+
 #[cfg_attr(
     not(any(feature = "http-ingress", feature = "ssh-ingress")),
     allow(dead_code)
 )]
 impl IngressHandle {
+    /// Return the currently exposed clean-generation supervisor. The slot is
+    /// populated only after authenticated owner construction and is cleared
+    /// before node shutdown begins.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    pub fn clean_agent_supervisor(
+        &self,
+    ) -> Option<crate::agent::supervisor::AgentSupervisorHandle> {
+        self.clean_agent_supervisor
+            .read()
+            .ok()
+            .and_then(|supervisor| supervisor.clone())
+    }
+
+    /// Attest one exact clean system-authority projection query after the SSH
+    /// server has proved possession of `credential_public_key`. The stable
+    /// request binding is caller-derived and must survive reconnect/retry; an
+    /// ephemeral SSH session identifier is not accepted as a substitute.
+    #[cfg(feature = "ssh-ingress")]
+    pub fn attest_ssh_projection_query(
+        &self,
+        authority: crate::agent::sdk::authority::AuthorityActorTarget,
+        credential_public_key: [u8; 32],
+        nonce: crate::agent::sdk::Hash,
+        selector: crate::agent::sdk::authority::AuthorityProjectionSelector,
+        request_binding: crate::agent::sdk::Hash,
+    ) -> Result<crate::agent::sdk::authority::AuthorityProjectionQuery, IngressNodeAttestationError>
+    {
+        use crate::agent::sdk::authority::{
+            AuthorityIngressAuthentication, AuthorityProjectionQuery,
+        };
+
+        let credential_key = ed25519_dalek::VerifyingKey::from_bytes(&credential_public_key)
+            .map_err(|_| IngressNodeAttestationError::InvalidCredential)?;
+        if credential_key.is_weak() {
+            return Err(IngressNodeAttestationError::InvalidCredential);
+        }
+        let attester = self
+            .ingress_node_attester
+            .as_ref()
+            .ok_or(IngressNodeAttestationError::NotConfigured)?;
+        let mut query = AuthorityProjectionQuery {
+            authority,
+            credential: crate::agent::sdk::CredentialId::of_public_key(&credential_public_key),
+            nonce,
+            selector,
+            authentication: AuthorityIngressAuthentication::SshNodeAttestation {
+                credential_public_key,
+                node: attester.node,
+                request_binding,
+                signature: [0; 64],
+            },
+        };
+        let signature = (attester.signer)(&query.signing_bytes())
+            .filter(|signature| *signature != [0; 64])
+            .ok_or(IngressNodeAttestationError::SigningFailed)?;
+        query.authentication = AuthorityIngressAuthentication::SshNodeAttestation {
+            credential_public_key,
+            node: attester.node,
+            request_binding,
+            signature,
+        };
+        query
+            .validate_shape()
+            .map_err(IngressNodeAttestationError::InvalidQuery)?;
+        Ok(query)
+    }
+
     /// Resolve a locally catalogued service root by its operator-visible name.
     /// Remote aliases are intentionally excluded: ingress listeners are
     /// host-local and only expose roots attached to their owning node.
@@ -2286,14 +2408,15 @@ impl IngressHandle {
             .ok_or(IngressAuthenticationError::Invalid)
     }
 
-    /// Resolve one canonical SSH public-key encoding against the same live
-    /// authority used by bearer ingress.
+    /// Resolve one canonical raw Ed25519 SSH public key against the same live
+    /// authority used by bearer ingress. The clean credential identity is
+    /// derived from the public key, never from an SSH wrapper or comment.
     #[cfg(feature = "ssh-ingress")]
     pub fn authenticate_ssh_public_key(
         &self,
-        public_key: &[u8],
+        public_key: &[u8; 32],
     ) -> Result<crate::IngressAccessStatus, IngressAuthenticationError> {
-        self.authenticate_credential(crate::ssh_credential_id(public_key))
+        self.authenticate_credential(crate::agent::sdk::CredentialId::of_public_key(public_key).0)
     }
 
     fn invoke_actor_wire(
@@ -5361,10 +5484,18 @@ impl VosNode {
             sync_threads: Vec::new(),
             #[cfg(any(feature = "http-ingress", feature = "ssh-ingress"))]
             ingress_threads: Vec::new(),
+            #[cfg(feature = "ssh-ingress")]
+            ingress_node_attester: None,
             proof_blobs: Arc::new(RwLock::new(HashMap::new())),
             proof_blobs_dir: None,
             program_blobs_dir: None,
             local_agent_host: None,
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            clean_agent_owner: None,
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            clean_agent_owner_error: None,
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            clean_agent_ingress_supervisor: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -5414,6 +5545,122 @@ impl VosNode {
         }
         self.local_agent_host = Some(control);
         Ok(())
+    }
+
+    /// Consume the live clean system-Agent bootstrap owner and start the one
+    /// authenticated production route owner for this node. Initial bounded
+    /// reconciliation completes before the supervisor becomes visible to
+    /// ingress; all resulting workers are subsequently shut down and joined
+    /// by this node.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_clean_agent_production<P, R, I>(
+        &mut self,
+        node: crate::agent::sdk::NodeId,
+        system_owner: crate::agent::clean_bootstrap::CleanSystemAgentBootstrapOwner<P, R, I>,
+        authenticator: Box<
+            dyn crate::agent::production_owner::AuthorityProjectionQueryAuthenticator,
+        >,
+        supervisor_limits: crate::agent::supervisor::AgentSupervisorLimits,
+        route_queue_capacity: usize,
+        reconcile_interval: Duration,
+    ) -> Result<(), crate::agent::production_owner::AgentProductionOwnerError>
+    where
+        P: crate::agent::clean_bootstrap::CleanSystemAgentBootstrapStore + Send + 'static,
+        R: crate::agent::clean_bootstrap::CleanSystemAgentBootstrapStore + Send + 'static,
+        I: crate::agent::clean_authority_issuer::CleanManagementIssuerStore + Send + 'static,
+    {
+        if self.clean_agent_owner.is_some() || self.shutdown.load(Ordering::Acquire) {
+            // Dropping the still-exclusive bootstrap owner retires its exact
+            // network generations and joins their workers. In particular, a
+            // rejected duplicate never starts a projection client or exposes
+            // a second supervisor.
+            drop(system_owner);
+            return Err(crate::agent::production_owner::AgentProductionOwnerError::DuplicateHost);
+        }
+        let system_attachment =
+            crate::agent::supervisor_adapters::system_agent_supervisor_attachment(
+                system_owner,
+                route_queue_capacity,
+            )?;
+        let owner = crate::agent::production_owner::AgentProductionOwner::start(
+            node,
+            supervisor_limits,
+            system_attachment,
+            authenticator,
+            reconcile_interval,
+        )?;
+        self.attach_clean_agent_owner(owner)
+    }
+
+    /// Complete the node-owned half of clean production construction after
+    /// the owner has performed its initial authenticated reconciliation.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    pub(crate) fn attach_clean_agent_owner(
+        &mut self,
+        owner: crate::agent::production_owner::AgentProductionOwner,
+    ) -> Result<(), crate::agent::production_owner::AgentProductionOwnerError> {
+        use crate::agent::production_owner::AgentProductionOwnerError;
+
+        if self.clean_agent_owner.is_some()
+            || self.shutdown.load(Ordering::Acquire)
+            || !owner.is_running()
+        {
+            let _ = owner.shutdown_and_join();
+            return Err(AgentProductionOwnerError::DuplicateHost);
+        }
+        let handle = owner.handle();
+        let Ok(mut exposed) = self.clean_agent_ingress_supervisor.write() else {
+            let _ = owner.shutdown_and_join();
+            return Err(AgentProductionOwnerError::InvalidConfiguration);
+        };
+        self.clean_agent_owner = Some(owner);
+        *exposed = Some(handle);
+        Ok(())
+    }
+
+    /// Clone the read-only clean supervisor dispatch handle. Lifecycle and
+    /// publication remain sealed inside the node-owned production owner.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    pub fn clean_agent_supervisor(
+        &self,
+    ) -> Option<crate::agent::supervisor::AgentSupervisorHandle> {
+        self.clean_agent_ingress_supervisor
+            .read()
+            .ok()
+            .and_then(|supervisor| supervisor.clone())
+    }
+
+    /// Hand one physical Local worker to the installed production owner. It
+    /// stays unpublished until the next complete authority reconciliation.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    pub fn attach_clean_local_routes(
+        &mut self,
+        attachment: crate::agent::supervisor_adapters::AgentRouteHostAttachment,
+    ) -> Result<(), crate::agent::production_owner::AgentProductionOwnerError> {
+        match self.clean_agent_owner.as_mut() {
+            Some(owner) => owner.install_local_host(attachment),
+            None => {
+                attachment.retire()?;
+                Err(crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration)
+            }
+        }
+    }
+
+    /// Hand one physical Shared worker to the installed production owner. It
+    /// stays unpublished until the next complete authority reconciliation.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    pub fn attach_clean_shared_routes(
+        &mut self,
+        attachment: crate::agent::supervisor_adapters::AgentRouteHostAttachment,
+    ) -> Result<(), crate::agent::production_owner::AgentProductionOwnerError> {
+        match self.clean_agent_owner.as_mut() {
+            Some(owner) => owner.install_shared_host(attachment),
+            None => {
+                attachment.retire()?;
+                Err(crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration)
+            }
+        }
     }
 
     /// Invoke one full-ID Local Agent actor and wait until its durable outcome
@@ -7594,6 +7841,10 @@ impl VosNode {
             if self.shutdown.load(Ordering::Acquire) {
                 break;
             }
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            if !self.drive_clean_agent_owner() {
+                break;
+            }
             if self.local_agent_host_failed() {
                 self.signal_node_shutdown();
                 break;
@@ -7618,6 +7869,12 @@ impl VosNode {
                             .local_agent_host
                             .as_ref()
                             .is_none_or(|host| !host.is_running());
+                    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+                    let all_done = all_done
+                        && self
+                            .clean_agent_owner
+                            .as_ref()
+                            .is_none_or(|owner| !owner.is_running());
                     #[cfg(all(feature = "network", feature = "storage"))]
                     let all_done = all_done && !self.has_pending_service_raft_roots();
                     if all_done {
@@ -7672,6 +7929,10 @@ impl VosNode {
             if self.shutdown.load(Ordering::Acquire) {
                 break;
             }
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            if !self.drive_clean_agent_owner() {
+                break;
+            }
             if self.local_agent_host_failed() {
                 self.signal_node_shutdown();
                 break;
@@ -7694,6 +7955,12 @@ impl VosNode {
                             .local_agent_host
                             .as_ref()
                             .is_none_or(|host| !host.is_running());
+                    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+                    let all_done = all_done
+                        && self
+                            .clean_agent_owner
+                            .as_ref()
+                            .is_none_or(|owner| !owner.is_running());
                     #[cfg(all(feature = "network", feature = "storage"))]
                     let all_done = all_done && !self.has_pending_service_raft_roots();
                     if all_done {
@@ -7723,12 +7990,37 @@ impl VosNode {
     /// (network bridge, sync ticker) still reads the node-wide flag directly.
     fn signal_node_shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+        {
+            if let Ok(mut exposed) = self.clean_agent_ingress_supervisor.write() {
+                *exposed = None;
+            }
+            if let Some(owner) = self.clean_agent_owner.as_ref() {
+                owner.request_shutdown();
+            }
+        }
         if let Some(host) = self.local_agent_host.as_ref() {
             host.request_shutdown();
         }
         if let Ok(map) = self.agent_shutdown.lock() {
             for flag in map.values() {
                 flag.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    fn drive_clean_agent_owner(&mut self) -> bool {
+        let result = self
+            .clean_agent_owner
+            .as_mut()
+            .map(|owner| owner.drive_if_due(Instant::now()));
+        match result {
+            None | Some(Ok(_)) => true,
+            Some(Err(error)) => {
+                self.clean_agent_owner_error.get_or_insert(error);
+                self.signal_node_shutdown();
+                false
             }
         }
     }
@@ -7881,7 +8173,36 @@ impl VosNode {
             shutdown: self.shutdown.clone(),
             #[cfg(feature = "network")]
             shared_network: self.shared_network.clone(),
+            #[cfg(feature = "ssh-ingress")]
+            ingress_node_attester: self.ingress_node_attester.clone(),
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            clean_agent_supervisor: self.clean_agent_ingress_supervisor.clone(),
         }
+    }
+
+    /// Configure the daemon's SSH ingress attester exactly once. The raw
+    /// callback remains private; callers receive only the typed authority-query
+    /// operation on [`IngressHandle`].
+    #[cfg(feature = "ssh-ingress")]
+    pub fn set_ingress_node_attester<F>(
+        &mut self,
+        node: crate::agent::sdk::NodeId,
+        signer: F,
+    ) -> Result<(), IngressNodeAttestationError>
+    where
+        F: Fn(&[u8]) -> Option<[u8; 64]> + Send + Sync + 'static,
+    {
+        if node == crate::agent::sdk::NodeId::ZERO {
+            return Err(IngressNodeAttestationError::InvalidNode);
+        }
+        if self.ingress_node_attester.is_some() {
+            return Err(IngressNodeAttestationError::AlreadyConfigured);
+        }
+        self.ingress_node_attester = Some(IngressNodeAttester {
+            node,
+            signer: Arc::new(signer),
+        });
+        Ok(())
     }
 
     /// Bind one built-in HTTP ingress listener. Merely compiling the feature
@@ -8659,10 +8980,22 @@ impl VosNode {
         for thread in self.ingress_threads.drain(..) {
             let _ = thread.join();
         }
-        let agent_host_error = self
+        let mut agent_host_error = self
             .local_agent_host
             .take()
             .and_then(|host| host.shutdown().err());
+        #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+        {
+            let shutdown_error = self
+                .clean_agent_owner
+                .take()
+                .and_then(|owner| owner.shutdown_and_join().err());
+            let clean_error = self.clean_agent_owner_error.take().or(shutdown_error);
+            if let Some(error) = clean_error {
+                warn!(%error, "node: clean Agent production owner did not shut down cleanly");
+                agent_host_error.get_or_insert(crate::agent::host::AgentHostError::Unavailable);
+            }
+        }
         #[cfg(all(feature = "network", feature = "storage"))]
         {
             for thread in self.pending_service_root_threads.drain(..) {
@@ -16079,6 +16412,144 @@ mod tests {
         );
         responder.join().unwrap();
         assert!(node.collect().is_empty());
+    }
+
+    #[cfg(feature = "ssh-ingress")]
+    #[test]
+    fn ssh_ingress_attester_is_set_once_and_signs_only_the_exact_query() {
+        use crate::agent::sdk::authority::{
+            AgentAuthorityBinding, AuthorityActorTarget, AuthorityIngressAuthentication,
+            AuthorityIssuer, AuthorityProjectionSelector,
+        };
+        use crate::agent::sdk::{
+            ActorId, AgentId, DeploymentId, Hash, NodeId, PrincipalId, ProducerId, ProgramId,
+            SpaceId,
+        };
+        use ed25519_dalek::{Signer as _, SigningKey};
+
+        let credential_key = SigningKey::from_bytes(&[0x21; 32]);
+        let credential_public_key = credential_key.verifying_key().to_bytes();
+        let authority_key = SigningKey::from_bytes(&[0x22; 32]);
+        let authority_public_key = authority_key.verifying_key().to_bytes();
+        let authority = AuthorityActorTarget {
+            space: SpaceId([0x31; 32]),
+            system_agent: AgentId([0x32; 32]),
+            system_runtime_deployment: DeploymentId([0x33; 32]),
+            binding: AgentAuthorityBinding {
+                policy: Hash([0x34; 32]),
+                issuer: AuthorityIssuer {
+                    principal: PrincipalId([0x35; 32]),
+                    actor: ActorId([0x36; 32]),
+                    deployment: DeploymentId([0x37; 32]),
+                    program: ProgramId([0x38; 32]),
+                    producer: ProducerId::of_public_key(&authority_public_key),
+                },
+                public_key: authority_public_key,
+                initial_epoch: 1,
+            },
+        };
+        let node_key = SigningKey::from_bytes(&[0x41; 32]);
+        let node_public_key = node_key.verifying_key();
+        let node = NodeId([0x42; 32]);
+        let nonce = Hash([0x43; 32]);
+        let request_binding = Hash([0x44; 32]);
+        let selector = AuthorityProjectionSelector::Actors {
+            agent: AgentId([0x45; 32]),
+            after: None,
+            limit: 8,
+        };
+
+        let mut vos_node = VosNode::new();
+        assert_eq!(
+            vos_node.ingress_handle().attest_ssh_projection_query(
+                authority,
+                credential_public_key,
+                nonce,
+                selector,
+                request_binding,
+            ),
+            Err(IngressNodeAttestationError::NotConfigured),
+        );
+        assert_eq!(
+            vos_node.set_ingress_node_attester(NodeId::ZERO, |_| Some([1; 64])),
+            Err(IngressNodeAttestationError::InvalidNode),
+        );
+        vos_node
+            .set_ingress_node_attester(node, move |message| Some(node_key.sign(message).to_bytes()))
+            .unwrap();
+        assert_eq!(
+            vos_node.set_ingress_node_attester(NodeId([0x46; 32]), |_| Some([1; 64])),
+            Err(IngressNodeAttestationError::AlreadyConfigured),
+        );
+
+        let query = vos_node
+            .ingress_handle()
+            .attest_ssh_projection_query(
+                authority,
+                credential_public_key,
+                nonce,
+                selector,
+                request_binding,
+            )
+            .unwrap();
+        let AuthorityIngressAuthentication::SshNodeAttestation {
+            node: attesting_node,
+            request_binding: signed_request_binding,
+            signature,
+            ..
+        } = query.authentication
+        else {
+            panic!("SSH transport must use node attestation");
+        };
+        assert_eq!(attesting_node, node);
+        assert_eq!(signed_request_binding, request_binding);
+        node_public_key
+            .verify_strict(
+                &query.signing_bytes(),
+                &ed25519_dalek::Signature::from_bytes(&signature),
+            )
+            .unwrap();
+
+        let mut substituted_selector = query.clone();
+        substituted_selector.selector = AuthorityProjectionSelector::Actors {
+            agent: AgentId([0x45; 32]),
+            after: Some(ActorId([0x47; 32])),
+            limit: 8,
+        };
+        assert!(
+            node_public_key
+                .verify_strict(
+                    &substituted_selector.signing_bytes(),
+                    &ed25519_dalek::Signature::from_bytes(&signature),
+                )
+                .is_err(),
+        );
+
+        let mut substituted_binding = query;
+        substituted_binding.authentication = AuthorityIngressAuthentication::SshNodeAttestation {
+            credential_public_key,
+            node,
+            request_binding: Hash([0x48; 32]),
+            signature,
+        };
+        assert!(
+            node_public_key
+                .verify_strict(
+                    &substituted_binding.signing_bytes(),
+                    &ed25519_dalek::Signature::from_bytes(&signature),
+                )
+                .is_err(),
+        );
+        assert_eq!(
+            vos_node.ingress_handle().attest_ssh_projection_query(
+                authority,
+                [0; 32],
+                nonce,
+                selector,
+                request_binding,
+            ),
+            Err(IngressNodeAttestationError::InvalidCredential),
+        );
     }
 
     #[cfg(all(feature = "network", feature = "storage"))]

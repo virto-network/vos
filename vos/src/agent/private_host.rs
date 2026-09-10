@@ -142,7 +142,7 @@ const RECOVERY_PLAN_WRITE_FILE: &str = "recovery.plan.write";
 const RETIRED_DUPLICATE_SUFFIX: &str = ".retired";
 const SIDECAR_FILES: [&str; 3] = [DESCRIPTOR_FILE, RUNTIME_FILE, BOOTSTRAP_FILE];
 const RECOVERY_PLAN_FIXED_BYTES: usize =
-    4 + 2 + 32 + 8 * 32 + 5 * core::mem::size_of::<u32>() + 1 + 32 + 32;
+    4 + 2 + 32 + 10 * 32 + 1 + 5 * core::mem::size_of::<u32>() + 1 + 32 + 32;
 const MAX_PRIVATE_RECOVERY_PLAN_BYTES: usize = MAX_PRIVATE_HOST_ARCHIVE_BYTES
     .saturating_add(MAX_PRIVATE_CONTROL_WIRE_BYTES)
     .saturating_add(MAX_PRIVATE_RECOVERY_AUTHORITY_PROOF_WIRE_BYTES)
@@ -151,6 +151,46 @@ const MAX_PRIVATE_RECOVERY_PLAN_BYTES: usize = MAX_PRIVATE_HOST_ARCHIVE_BYTES
     .saturating_add(RECOVERY_PLAN_FIXED_BYTES);
 const MAX_PRIVATE_RECOVERY_SOURCE_BYTES: usize =
     MAX_PRIVATE_HOST_ARCHIVE_BYTES.saturating_mul(MAX_PRIVATE_NODES);
+
+fn managed_target_for_descriptor(descriptor: &AgentDescriptor) -> ManagedAgentTarget {
+    ManagedAgentTarget {
+        space: descriptor.identity.space,
+        agent: descriptor.identity.agent,
+        owner: descriptor.identity.owner,
+        profile: descriptor.identity.profile,
+        runtime_deployment: descriptor.identity.runtime_deployment,
+        transition_producer: descriptor.identity.transition_producer,
+    }
+}
+
+fn encode_managed_target(encoder: &mut Encoder<'_>, route: ManagedAgentTarget) {
+    encoder.fixed(route.space.as_bytes());
+    encoder.fixed(route.agent.as_bytes());
+    encoder.fixed(route.owner.as_bytes());
+    encoder.u8(route.profile as u8);
+    encoder.fixed(route.runtime_deployment.as_bytes());
+    encoder.fixed(route.transition_producer.as_bytes());
+}
+
+fn decode_managed_target(decoder: &mut Decoder<'_>) -> Result<ManagedAgentTarget, DecodeError> {
+    let route = ManagedAgentTarget {
+        space: SpaceId(decoder.fixed()?),
+        agent: AgentId(decoder.fixed()?),
+        owner: PrincipalId(decoder.fixed()?),
+        profile: match decoder.u8()? {
+            0 => AgentProfile::Local,
+            1 => AgentProfile::Shared,
+            2 => AgentProfile::Private,
+            _ => return Err(DecodeError::InvalidTag),
+        },
+        runtime_deployment: DeploymentId(decoder.fixed()?),
+        transition_producer: ProducerId(decoder.fixed()?),
+    };
+    route
+        .is_valid()
+        .then_some(route)
+        .ok_or(DecodeError::NonCanonical)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrivateAgentHostError {
@@ -649,6 +689,58 @@ impl PrivateAgentHost {
             .get(&agent)
             .map(|hosted| &hosted.descriptor)
             .ok_or(PrivateAgentHostError::NotFound)
+    }
+
+    /// Project only full dispatch identities from authenticated in-memory
+    /// Private images. The returned values contain no actor names, package or
+    /// object references, runtime state, ciphertext, or key material.
+    pub(super) fn supervisor_route_identities(
+        &self,
+    ) -> Result<Vec<super::supervisor::AgentRouteIdentity>, PrivateAgentHostError> {
+        let mut identities = Vec::new();
+        for hosted in self.agents.values() {
+            let descriptor = &hosted.descriptor;
+            if descriptor.validate().is_err()
+                || descriptor.identity.profile != AgentProfile::Private
+                || descriptor.identity.space != self.scope.space
+                || descriptor.identity.owner != self.scope.owner
+            {
+                return Err(PrivateAgentHostError::Corrupt);
+            }
+            let routes = hosted
+                .runtime_image
+                .supervisor_actor_routes(descriptor)
+                .map_err(|_| PrivateAgentHostError::Corrupt)?;
+            for route in routes {
+                if route.suspended {
+                    continue;
+                }
+                let key = super::supervisor::AgentRouteKey::new(
+                    descriptor.identity.space,
+                    descriptor.identity.agent,
+                    route.actor,
+                )
+                .map_err(|_| PrivateAgentHostError::Corrupt)?;
+                identities.push(
+                    super::supervisor::AgentRouteIdentity::new(
+                        key,
+                        route.incarnation,
+                        descriptor.identity.runtime_deployment,
+                        route.deployment,
+                        route.program,
+                        AgentProfile::Private,
+                    )
+                    .map_err(|_| PrivateAgentHostError::Corrupt)?,
+                );
+            }
+        }
+        if identities
+            .windows(2)
+            .any(|pair| pair[0].key() >= pair[1].key())
+        {
+            return Err(PrivateAgentHostError::Corrupt);
+        }
+        Ok(identities)
     }
 
     pub fn binding(
@@ -1446,7 +1538,11 @@ impl PrivateAgentHost {
         stop: RecoveryInstallStop,
     ) -> Result<PreparedPrivateRecovery, PrivateAgentHostError> {
         self.verify_root_scope()?;
-        if !route.is_valid() || route.space != self.scope.space {
+        if !route.is_valid()
+            || route.profile != AgentProfile::Private
+            || route.space != self.scope.space
+            || route.owner != self.scope.owner
+        {
             return Err(PrivateAgentHostError::InvalidScope);
         }
         let agent = route.agent;
@@ -1676,7 +1772,7 @@ impl PrivateAgentHost {
         };
         sign_recovery_control_record(&mut recovery_record, recovery_kit.signing_key())?;
         let proof = PrivateRecoveryAuthorityProof::from_control(
-            route.runtime_deployment,
+            route,
             &recovery_record,
             superseded_authority_head,
             recovery_kit.signing_key(),
@@ -1833,11 +1929,7 @@ impl PrivateAgentHost {
         let hosted = self.hosted(agent)?;
         let peer = authenticate_peer_identity(hosted, peer, transport)?;
         let request = PrivateSyncRequest::decode(request_bytes)?;
-        let route = ManagedAgentTarget {
-            space: hosted.descriptor.identity.space,
-            agent: hosted.descriptor.identity.agent,
-            runtime_deployment: hosted.descriptor.identity.runtime_deployment,
-        };
+        let route = managed_target_for_descriptor(&hosted.descriptor);
         if authority.binding != hosted.descriptor.authority {
             return Err(PrivateAgentHostError::Unauthorized);
         }
@@ -1874,11 +1966,7 @@ impl PrivateAgentHost {
             .ok_or(PrivateAgentHostError::NotFound)?;
         let peer = authenticate_peer_identity(hosted, peer, transport)?;
         let page = PrivateSyncPage::decode(page_bytes)?;
-        let route = ManagedAgentTarget {
-            space: hosted.descriptor.identity.space,
-            agent: hosted.descriptor.identity.agent,
-            runtime_deployment: hosted.descriptor.identity.runtime_deployment,
-        };
+        let route = managed_target_for_descriptor(&hosted.descriptor);
         if authority.binding != hosted.descriptor.authority {
             return Err(PrivateAgentHostError::Unauthorized);
         }
@@ -2468,7 +2556,12 @@ impl PrivateAgentHost {
         V: PrivateNodeAuthorityVerifier,
     {
         self.verify_root_scope()?;
-        if request.authority != authority || !request.route.is_valid() {
+        if request.authority != authority
+            || !request.route.is_valid()
+            || request.route.profile != AgentProfile::Private
+            || request.route.space != self.scope.space
+            || request.route.owner != self.scope.owner
+        {
             return Err(PrivateAgentHostError::InvalidScope);
         }
         let agent = request.route.agent;
@@ -2547,9 +2640,9 @@ impl PrivateAgentHost {
             .iter()
             .find(|entry| entry.commitment == control.commitment())
             .ok_or(PrivateAgentHostError::InvalidArtifact)?;
-        if request.route.space != binding.space
+        if request.route != managed_target_for_descriptor(&hosted.descriptor)
+            || request.route.space != binding.space
             || request.route.agent != binding.agent
-            || request.route.runtime_deployment != hosted.descriptor.identity.runtime_deployment
             || authority.space != binding.space
             || authority.binding != hosted.descriptor.authority
             || application.application.epoch != entry.resulting_epoch
@@ -3576,10 +3669,11 @@ where
     let binding = hosted.store.binding();
     if request.authority != authority
         || !request.route.is_valid()
+        || request.route.profile != AgentProfile::Private
         || request.route.space != authority.space
         || request.route.space != binding.space
         || request.route.agent != binding.agent
-        || request.route.runtime_deployment != hosted.descriptor.identity.runtime_deployment
+        || request.route != managed_target_for_descriptor(&hosted.descriptor)
         || authority.binding != hosted.descriptor.authority
         || hosted.descriptor.identity.owner != binding.owner
     {
@@ -3609,10 +3703,8 @@ where
     let intent = match recovery_proof {
         Some(proof) => AuthorityOperationIntent::private_recovery_control(proof.clone())
             .map_err(|_| PrivateAgentHostError::Unauthorized)?,
-        None => {
-            AuthorityOperationIntent::private_control(request.route.runtime_deployment, &control)
-                .map_err(|_| PrivateAgentHostError::Unauthorized)?
-        }
+        None => AuthorityOperationIntent::private_control(request.route, &control)
+            .map_err(|_| PrivateAgentHostError::Unauthorized)?,
     };
     let operation = intent.operation();
     let expected_actor = match &intent {
@@ -4175,9 +4267,9 @@ fn private_application_fact(
         .iter()
         .map(|node| node.node)
         .collect();
-    if binding.space != request.route.space
+    if request.route != managed_target_for_descriptor(&hosted.descriptor)
+        || binding.space != request.route.space
         || binding.agent != request.route.agent
-        || hosted.descriptor.identity.runtime_deployment != request.route.runtime_deployment
         || binding.epoch != prepared.expected_epoch
         || binding.control_head != Some(prepared.control.commitment())
         || binding.next_sequence
@@ -4270,9 +4362,9 @@ fn synthetic_legacy_private_application_fact_for_test(
         .iter()
         .map(|node| node.node)
         .collect();
-    if binding.space != request.route.space
+    if request.route != managed_target_for_descriptor(&hosted.descriptor)
+        || binding.space != request.route.space
         || binding.agent != request.route.agent
-        || hosted.descriptor.identity.runtime_deployment != request.route.runtime_deployment
         || binding.epoch != prepared.expected_epoch
         || binding.control_head != Some(prepared.control.commitment())
         || binding.next_sequence
@@ -4791,6 +4883,7 @@ fn encode_agent_descriptor(encoder: &mut Encoder<'_>, value: &AgentDescriptor) {
     encoder.fixed(identity.runtime_deployment.as_bytes());
     encoder.fixed(identity.runtime_program.as_bytes());
     encoder.fixed(identity.runtime_producer.as_bytes());
+    encoder.fixed(identity.transition_producer.as_bytes());
     encoder.fixed(value.creation_nonce.as_bytes());
     encode_authority_binding(encoder, value.authority);
     encoder.option(&value.private_recovery, |encoder, binding| {
@@ -4821,6 +4914,7 @@ fn decode_agent_descriptor(decoder: &mut Decoder<'_>) -> Result<AgentDescriptor,
         runtime_deployment: DeploymentId(decoder.fixed()?),
         runtime_program: ProgramId(decoder.fixed()?),
         runtime_producer: ProducerId(decoder.fixed()?),
+        transition_producer: ProducerId(decoder.fixed()?),
     };
     let creation_nonce = Hash(decoder.fixed()?);
     let authority = decode_authority_binding(decoder)?;
@@ -6474,6 +6568,8 @@ fn encode_recovery_plan(
     node_key: &PrivateNodeDecryptionKey,
 ) -> Result<Vec<u8>, PrivateAgentHostError> {
     if !plan.route.is_valid()
+        || plan.route.owner != plan.owner
+        || plan.route.profile != AgentProfile::Private
         || plan.owner == PrincipalId::ZERO
         || plan.source_hash == Hash::ZERO
         || plan.replacements_hash == Hash::ZERO
@@ -6495,9 +6591,7 @@ fn encode_recovery_plan(
     bytes.extend_from_slice(&RECOVERY_PLAN_VERSION.to_le_bytes());
     bytes.extend_from_slice(vos_agent_sdk::RUNTIME_ABI_ID.as_bytes());
     let mut encoder = Encoder(&mut bytes);
-    encoder.fixed(plan.route.space.as_bytes());
-    encoder.fixed(plan.route.agent.as_bytes());
-    encoder.fixed(plan.route.runtime_deployment.as_bytes());
+    encode_managed_target(&mut encoder, plan.route);
     encoder.fixed(plan.owner.as_bytes());
     encoder.fixed(plan.source_hash.as_bytes());
     encoder.fixed(plan.replacements_hash.as_bytes());
@@ -6539,11 +6633,7 @@ fn decode_recovery_plan(
         return Err(PrivateAgentHostError::Corrupt);
     }
     let plan = RecoveryPlan {
-        route: ManagedAgentTarget {
-            space: SpaceId(decoder.fixed().map_err(map_decode)?),
-            agent: AgentId(decoder.fixed().map_err(map_decode)?),
-            runtime_deployment: DeploymentId(decoder.fixed().map_err(map_decode)?),
-        },
+        route: decode_managed_target(&mut decoder).map_err(map_decode)?,
         owner: PrincipalId(decoder.fixed().map_err(map_decode)?),
         source_hash: Hash(decoder.fixed().map_err(map_decode)?),
         replacements_hash: Hash(decoder.fixed().map_err(map_decode)?),
@@ -6573,6 +6663,8 @@ fn decode_recovery_plan(
     let authenticator = Hash(decoder.fixed().map_err(map_decode)?);
     if !decoder.exhausted()
         || !plan.route.is_valid()
+        || plan.route.profile != AgentProfile::Private
+        || plan.route.owner != plan.owner
         || plan.owner == PrincipalId::ZERO
         || plan.source_hash == Hash::ZERO
         || plan.replacements_hash == Hash::ZERO
@@ -6666,7 +6758,8 @@ fn validate_recovery_plan_host(
     let member_set =
         private_member_set_commitment(hosted.store.authorized_nodes().iter().map(|node| node.node))
             .ok_or(PrivateAgentHostError::Corrupt)?;
-    if binding.space != plan.route.space
+    if plan.route != managed_target_for_descriptor(&hosted.descriptor)
+        || binding.space != plan.route.space
         || binding.agent != plan.route.agent
         || binding.owner != plan.owner
         || binding.epoch != proof.next_epoch
@@ -6676,10 +6769,6 @@ fn validate_recovery_plan_host(
                 .sequence
                 .checked_add(1)
                 .ok_or(PrivateAgentHostError::LimitExceeded)?
-        || hosted.descriptor.identity.space != plan.route.space
-        || hosted.descriptor.identity.agent != plan.route.agent
-        || hosted.descriptor.identity.owner != plan.owner
-        || hosted.descriptor.identity.runtime_deployment != plan.route.runtime_deployment
         || hosted.descriptor.private_recovery
             != Some(PrivateRecoveryBinding {
                 signing_key_commitment: recovery_signing_public_key_commitment(
@@ -6745,14 +6834,14 @@ fn validate_planless_staged_recovery(
         let selector = &issuance.receipt.selector;
         let authority = issuance.authority;
         let route = ManagedAgentTarget {
-            space: selector.space,
-            agent: selector.agent,
             runtime_deployment: selector.runtime_deployment,
+            ..managed_target_for_descriptor(&hosted.descriptor)
         };
         let is_current = binding.control_head == Some(indexed.commitment);
         if !route.is_valid()
-            || route.space != hosted.descriptor.identity.space
-            || route.agent != hosted.descriptor.identity.agent
+            || route.profile != AgentProfile::Private
+            || selector.space != route.space
+            || selector.agent != route.agent
             || (is_current
                 && route.runtime_deployment != hosted.descriptor.identity.runtime_deployment)
             || authority.space != route.space
@@ -6804,12 +6893,11 @@ fn validate_verified_backup_recovery_evidence(
             .map_err(|_| PrivateAgentHostError::Corrupt)?;
         let selector = &issuance.receipt.selector;
         let route = ManagedAgentTarget {
-            space: selector.space,
-            agent: selector.agent,
             runtime_deployment: selector.runtime_deployment,
+            ..managed_target_for_descriptor(descriptor)
         };
-        if route.space != descriptor.identity.space
-            || route.agent != descriptor.identity.agent
+        if selector.space != route.space
+            || selector.agent != route.agent
             || issuance.authority.space != route.space
             || issuance.authority.binding != descriptor.authority
         {
@@ -7039,6 +7127,7 @@ fn verify_recovery_authority_evidence(
     authority: AuthorityActorTarget,
 ) -> Result<(), PrivateAgentHostError> {
     if !route.is_valid()
+        || route.profile != AgentProfile::Private
         || !authority.is_valid()
         || route.space != authority.space
         || control.space != route.space
@@ -7709,6 +7798,7 @@ mod tests {
                 runtime_deployment: runtime.deployment(),
                 runtime_program: runtime.program(),
                 runtime_producer: runtime.producer(),
+                transition_producer: ProducerId([0xb3; 32]),
             },
             creation_nonce,
             authority: AgentAuthorityBinding {
@@ -7782,7 +7872,7 @@ mod tests {
     }
 
     fn identity_bytes(identity: &AgentIdentity) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(193);
+        let mut bytes = Vec::with_capacity(225);
         bytes.extend_from_slice(identity.space.as_bytes());
         bytes.extend_from_slice(identity.agent.as_bytes());
         bytes.extend_from_slice(identity.owner.as_bytes());
@@ -7790,6 +7880,7 @@ mod tests {
         bytes.extend_from_slice(identity.runtime_deployment.as_bytes());
         bytes.extend_from_slice(identity.runtime_program.as_bytes());
         bytes.extend_from_slice(identity.runtime_producer.as_bytes());
+        bytes.extend_from_slice(identity.transition_producer.as_bytes());
         bytes
     }
 
@@ -8355,10 +8446,12 @@ mod tests {
         let route = ManagedAgentTarget {
             space: fixture.space,
             agent: control.agent,
+            owner: fixture.descriptor.identity.owner,
+            profile: fixture.descriptor.identity.profile,
             runtime_deployment: fixture.descriptor.identity.runtime_deployment,
+            transition_producer: fixture.descriptor.identity.transition_producer,
         };
-        let intent =
-            AuthorityOperationIntent::private_control(route.runtime_deployment, control).unwrap();
+        let intent = AuthorityOperationIntent::private_control(route, control).unwrap();
         runtime_application_request_for_intent(fixture, control, intent, issued_at, applied_at)
     }
 
@@ -8396,7 +8489,7 @@ mod tests {
     ) {
         let route = recovery_route(fixture, control.agent);
         let proof = PrivateRecoveryAuthorityProof::from_control(
-            route.runtime_deployment,
+            route,
             control,
             superseded_authority_head,
             &fixture.recovery,
@@ -8509,7 +8602,10 @@ mod tests {
         ManagedAgentTarget {
             space: fixture.space,
             agent,
+            owner: fixture.descriptor.identity.owner,
+            profile: fixture.descriptor.identity.profile,
             runtime_deployment: fixture.descriptor.identity.runtime_deployment,
+            transition_producer: fixture.descriptor.identity.transition_producer,
         }
     }
 
@@ -10393,7 +10489,10 @@ mod tests {
                 ManagedAgentTarget {
                     space: fixture.space,
                     agent,
+                    owner: fixture.descriptor.identity.owner,
+                    profile: fixture.descriptor.identity.profile,
                     runtime_deployment: fixture.descriptor.identity.runtime_deployment,
+                    transition_producer: fixture.descriptor.identity.transition_producer,
                 },
                 authority_target(&fixture).0,
             )

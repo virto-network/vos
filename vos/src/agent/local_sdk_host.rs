@@ -106,6 +106,11 @@ pub enum LocalAgentHostError {
     Driver(AgentDriverError),
 }
 
+pub(crate) enum LocalAuthorityProjectionAudit {
+    Ready(Vec<super::supervisor::AgentRouteIdentity>),
+    Lag,
+}
+
 impl fmt::Display for LocalAgentHostError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "Local-agent host operation failed: {self:?}")
@@ -299,6 +304,133 @@ impl LocalAgentHost {
             .ok_or(LocalAgentHostError::NotFound)
     }
 
+    /// Read the complete invocation closure from the exact live Local image.
+    /// This remains crate-private so ingress cannot bypass supervisor
+    /// snapshot/generation admission.
+    pub(crate) fn supervisor_invocation_material(
+        &self,
+        agent: AgentId,
+        actor: crate::agent_sdk::ActorId,
+    ) -> Result<super::invocation_preparation::PhysicalInvocationMaterial, LocalAgentHostError>
+    {
+        self.verify_root_scope()?;
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(LocalAgentHostError::NotFound)?;
+        if hosted.descriptor.identity.agent != agent {
+            return Err(LocalAgentHostError::Alias);
+        }
+        let material = hosted.driver.physical_invocation_material(actor)?;
+        if material.descriptor != hosted.descriptor {
+            return Err(LocalAgentHostError::Corrupt);
+        }
+        Ok(material)
+    }
+
+    /// Authenticate one complete authority inventory against the exact Local
+    /// images and content-addressed actor closures owned by this host.
+    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+    pub(crate) fn audit_authority_projection(
+        &self,
+        head: crate::agent_sdk::authority::AuthorityProjectionHead,
+        projected: &[super::supervisor_adapters::AgentAuthorityRouteProjection],
+    ) -> Result<LocalAuthorityProjectionAudit, LocalAgentHostError> {
+        self.verify_root_scope()?;
+        match self.audit_authority_projection_exact(projected) {
+            Ok(identities) => return Ok(LocalAuthorityProjectionAudit::Ready(identities)),
+            Err(error) => {
+                if self.physical_projection_is_one_ack_ahead(head, projected)? {
+                    return Ok(LocalAuthorityProjectionAudit::Lag);
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    fn audit_authority_projection_exact(
+        &self,
+        projected: &[super::supervisor_adapters::AgentAuthorityRouteProjection],
+    ) -> Result<Vec<super::supervisor::AgentRouteIdentity>, LocalAgentHostError> {
+        if projected.len() != self.agents.len() {
+            return Err(LocalAgentHostError::InvalidDescriptor);
+        }
+        let mut identities = Vec::new();
+        for ((agent, hosted), authority) in self.agents.iter().zip(projected) {
+            if *agent != authority.descriptor().identity.agent
+                || hosted.descriptor != *authority.descriptor()
+                || hosted.descriptor.identity.profile != AgentProfile::Local
+            {
+                return Err(LocalAgentHostError::InvalidDescriptor);
+            }
+            let state =
+                super::wire::decode_standard_runtime_state(&hosted.driver.image().runtime_state)
+                    .map_err(|_| LocalAgentHostError::Corrupt)?;
+            if state.actors.len() != authority.actors().len() {
+                return Err(LocalAgentHostError::InvalidDescriptor);
+            }
+            for actor in authority.actors() {
+                let material = hosted
+                    .driver
+                    .physical_authority_material(actor.entry.actor)?;
+                if !super::supervisor_adapters::physical_material_matches_authority(
+                    &material,
+                    authority.descriptor(),
+                    actor,
+                ) {
+                    return Err(LocalAgentHostError::InvalidDescriptor);
+                }
+                if !actor.entry.suspended {
+                    identities.push(
+                        super::supervisor_adapters::physical_material_identity(&material)
+                            .map_err(|_| LocalAgentHostError::InvalidDescriptor)?,
+                    );
+                }
+            }
+        }
+        Ok(identities)
+    }
+
+    fn physical_projection_is_one_ack_ahead(
+        &self,
+        head: crate::agent_sdk::authority::AuthorityProjectionHead,
+        projected: &[super::supervisor_adapters::AgentAuthorityRouteProjection],
+    ) -> Result<bool, LocalAgentHostError> {
+        let mut physical = Vec::with_capacity(self.agents.len());
+        for (agent, hosted) in &self.agents {
+            let state =
+                super::wire::decode_standard_runtime_state(&hosted.driver.image().runtime_state)
+                    .map_err(|_| LocalAgentHostError::Corrupt)?;
+            let mut actors = Vec::with_capacity(state.actors.len());
+            for actor in &state.actors {
+                let material =
+                    hosted
+                        .driver
+                        .physical_authority_material(crate::agent_sdk::ActorId(
+                            actor.record.entry.actor.0,
+                        ))?;
+                if material.descriptor != hosted.descriptor
+                    || material.descriptor.identity.agent != *agent
+                {
+                    return Err(LocalAgentHostError::Corrupt);
+                }
+                actors.push(material);
+            }
+            physical.push(
+                super::supervisor_adapters::PhysicalAuthorityRouteProjection {
+                    descriptor: hosted.descriptor.clone(),
+                    actors,
+                    disposition: state.clean_management_dispositions.last().cloned(),
+                },
+            );
+        }
+        Ok(
+            super::supervisor_adapters::physical_projection_is_exactly_one_ack_ahead(
+                head, projected, &physical,
+            ),
+        )
+    }
+
     /// Create one exact SDK agent. The runtime value is already VOS3-admitted
     /// and the driver verifies the signed authority receipt again in guest
     /// execution before any image is published.
@@ -450,6 +582,27 @@ impl LocalAgentHost {
                 .get_mut(&agent)
                 .ok_or(LocalAgentHostError::NotFound)?;
             hosted.driver.resume_sdk(resume)
+        };
+        self.finish_driver_operation(agent, result)
+    }
+
+    pub fn resume_sdk_exact(
+        &mut self,
+        agent: AgentId,
+        work: InvocationWork,
+        authorization: InvocationAuthorization,
+        yielded: crate::agent_sdk::YieldedInvocation,
+    ) -> Result<RuntimeOutcome, LocalAgentHostError> {
+        self.verify_root_scope()?;
+        if work.space != self.scope.space || work.agent != agent {
+            return Err(LocalAgentHostError::InvalidScope);
+        }
+        let result = {
+            let hosted = self
+                .agents
+                .get_mut(&agent)
+                .ok_or(LocalAgentHostError::NotFound)?;
+            hosted.driver.resume_sdk_exact(work, authorization, yielded)
         };
         self.finish_driver_operation(agent, result)
     }
@@ -1473,6 +1626,9 @@ mod tests {
                 runtime_deployment: runtime.deployment(),
                 runtime_program: runtime.program(),
                 runtime_producer: runtime.producer(),
+                transition_producer: crate::agent_sdk::ProducerId(
+                    [discriminator.wrapping_add(0x60); 32],
+                ),
             },
             creation_nonce,
             authority: AgentAuthorityBinding {
@@ -2277,7 +2433,7 @@ mod tests {
         assert_eq!(linear.value, [0x2a]);
         drop(host);
         slot.store(100, Ordering::SeqCst);
-        let mut host = LocalAgentHost::open(&root, space(), node(), trust).unwrap();
+        let mut host = LocalAgentHost::open(&root, space(), node(), trust.clone()).unwrap();
         assert_eq!(
             host.invoke(agent, work.clone(), authorization.clone())
                 .unwrap(),
@@ -2300,14 +2456,17 @@ mod tests {
             }))
         );
         let acknowledged_state = host.agents[&agent].driver.image().runtime_state.clone();
+        drop(host);
+        let mut host = LocalAgentHost::open(&root, space(), node(), trust).unwrap();
         assert_eq!(
             host.acknowledge_sdk(agent, work, authorization).unwrap(),
-            RuntimeOutcome::Acknowledged(Err(sdk::InvocationError::NotFound))
+            acknowledgement,
+            "response loss/restart replays the exact positive acknowledgement"
         );
         assert_eq!(
             host.agents[&agent].driver.image().runtime_state,
             acknowledged_state,
-            "a missing acknowledgement attempt is byte-identical"
+            "an acknowledgement retry is byte-identical"
         );
 
         let actor = record.entry.actor;

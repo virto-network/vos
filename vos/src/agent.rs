@@ -45,6 +45,8 @@ pub mod genesis;
 pub mod host;
 pub(crate) mod invocation_history;
 pub(crate) mod invocation_index;
+#[cfg(feature = "std")]
+pub(crate) mod invocation_preparation;
 pub mod journal;
 #[cfg(feature = "std")]
 pub(crate) mod journal_store;
@@ -69,6 +71,13 @@ pub mod private_runtime;
 pub mod private_store;
 #[cfg(feature = "private-agent-store")]
 pub mod private_sync;
+#[cfg(all(
+    feature = "std",
+    feature = "storage",
+    feature = "network",
+    target_os = "linux"
+))]
+pub mod production_owner;
 pub(crate) mod replay;
 #[cfg(feature = "std")]
 pub(crate) mod runtime_pvm;
@@ -80,8 +89,20 @@ pub mod shared_host;
 pub(crate) mod shared_journal_driver;
 pub mod shared_raft;
 pub mod standard;
+#[cfg(feature = "std")]
+pub mod supervisor;
+#[cfg(feature = "std")]
+pub mod supervisor_adapters;
 pub mod system_authority;
 pub(crate) mod system_authority_ledger;
+#[cfg(feature = "std")]
+// Sealed two-phase proof boundary awaiting the clean replay/Standard-runtime
+// integration described in the module docs; its complete API is exercised by
+// focused tests in the meantime.
+#[allow(dead_code)]
+pub(crate) mod transition_proof_host;
+#[allow(dead_code)]
+pub(crate) mod transition_proof_journal;
 pub mod wire;
 use crate::service::{
     ActorId, AgentId, BlobRef, DeploymentId, Hash, InstallationId, NodeId, PrincipalId, ProducerId,
@@ -437,6 +458,9 @@ pub struct AgentIdentity {
     pub runtime_deployment: DeploymentId,
     pub runtime_program: ProgramId,
     pub runtime_producer: ProducerId,
+    /// Stable producer identity authorized to sign transition proofs. Runtime
+    /// upgrades must preserve this independently owned online identity.
+    pub transition_producer: ProducerId,
 }
 
 /// Durable actor-directory entry. `parent = None` denotes a top-level actor;
@@ -858,6 +882,8 @@ impl AgentConfig {
         if self.identity.runtime_deployment == DeploymentId::ZERO
             || self.identity.runtime_program == ProgramId::ZERO
             || self.identity.runtime_producer == ProducerId::ZERO
+            || self.identity.transition_producer == ProducerId::ZERO
+            || self.identity.transition_producer == self.identity.runtime_producer
             || self.runtime_package.hash == Hash::ZERO
             || self.runtime_package.len == 0
         {
@@ -1044,6 +1070,7 @@ mod tests {
                 runtime_deployment: DeploymentId([4; 32]),
                 runtime_program: ProgramId([5; 32]),
                 runtime_producer: ProducerId([8; 32]),
+                transition_producer: ProducerId([9; 32]),
             },
             creation_nonce,
             authority: authority_binding(),
@@ -1066,6 +1093,19 @@ mod tests {
             }],
         };
         assert_eq!(config.validate(), Ok(()));
+        let mut missing_transition_producer = config.clone();
+        missing_transition_producer.identity.transition_producer = ProducerId::ZERO;
+        assert_eq!(
+            missing_transition_producer.validate(),
+            Err(AgentConfigError::InvalidRuntimePackage),
+        );
+        let mut reused_runtime_producer = config.clone();
+        reused_runtime_producer.identity.transition_producer =
+            reused_runtime_producer.identity.runtime_producer;
+        assert_eq!(
+            reused_runtime_producer.validate(),
+            Err(AgentConfigError::InvalidRuntimePackage),
+        );
         config.replicas[0].node = NodeId::ZERO;
         assert_eq!(
             config.validate(),
@@ -1098,6 +1138,7 @@ mod tests {
                 runtime_deployment: DeploymentId([4; 32]),
                 runtime_program: ProgramId([5; 32]),
                 runtime_producer: ProducerId([6; 32]),
+                transition_producer: ProducerId([8; 32]),
             },
             creation_nonce,
             authority: authority_binding(),

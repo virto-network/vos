@@ -29,18 +29,21 @@ use super::package_admission::{
 };
 use super::sdk::authority::{
     AgentAuthorityBinding, AuthorityActorTarget, AuthorityCredentialCall,
-    AuthorityCredentialVerifier, AuthorityIssuer, AuthorityOperationKind, AuthorityReceipt,
-    ManagedAgentTarget, ManagementApplicationAck, ManagementApproval,
+    AuthorityCredentialVerifier, AuthorityIssuer, AuthorityOperationKind, AuthorityProjectionQuery,
+    AuthorityProjectionSelector, AuthorityReceipt, ManagedAgentTarget, ManagementApplicationAck,
+    ManagementApproval,
 };
 use super::sdk::package::MAX_PACKAGE_ENCODED_BYTES;
 use super::sdk::wire::{
     CanonicalWire, MAX_AGENT_DESCRIPTOR_WIRE_BYTES, MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES,
-    MAX_AUTHORITY_RECEIPT_WIRE_BYTES, MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES,
-    MAX_MANAGEMENT_APPROVAL_WIRE_BYTES, MAX_RUNTIME_WORK_WIRE_BYTES,
+    MAX_AUTHORITY_PROJECTION_QUERY_WIRE_BYTES, MAX_AUTHORITY_RECEIPT_WIRE_BYTES,
+    MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES, MAX_MANAGEMENT_APPROVAL_WIRE_BYTES,
+    MAX_RUNTIME_WORK_WIRE_BYTES,
 };
 use super::sdk::{
-    ActorId, AgentDescriptor, AgentId, AgentProfile, BlobRef, Hash, ManagementRequest, NodeId,
-    SpaceId,
+    ActorId, AgentDescriptor, AgentId, AgentProfile, BlobRef, Hash, InvocationAuthorization,
+    InvocationId, InvocationRoleClaims, ManagementRequest, MethodMode, NodeId,
+    RuntimeExecutionContext, RuntimeState, RuntimeWork, SpaceId,
 };
 use crate::service::wire::ServiceWire;
 
@@ -71,7 +74,7 @@ use crate::network::{Network, SharedAgentNetworkHost};
 const CLEAN_SYSTEM_AGENT_PINS_MAGIC: [u8; 4] = *b"CSP2";
 const CLEAN_SYSTEM_AGENT_PLAN_MAGIC: [u8; 4] = *b"CBP2";
 const CLEAN_SYSTEM_AGENT_BOOTSTRAP_MAGIC: [u8; 4] = *b"CSB2";
-const CLEAN_SYSTEM_AGENT_BOOTSTRAP_VERSION: u8 = 2;
+const CLEAN_SYSTEM_AGENT_BOOTSTRAP_VERSION: u8 = 3;
 
 pub const MAX_CLEAN_SYSTEM_AGENT_PINS_BYTES: usize = MAX_AGENT_DESCRIPTOR_WIRE_BYTES
     + MAX_ROOT_ANCHOR_PINS_BYTES
@@ -87,12 +90,24 @@ pub const MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES: usize = MAX_CLEAN_SYSTEM_AGENT
     + 3 * MAX_AUTHORITY_RECEIPT_WIRE_BYTES
     + MAX_MANAGEMENT_APPROVAL_WIRE_BYTES
     + MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES
+    + MAX_PENDING_AUTHORITY_PROJECTION_BYTES
     + 8 * 1024;
+
+const MAX_PENDING_AUTHORITY_PROJECTION_BYTES: usize =
+    MAX_AUTHORITY_PROJECTION_QUERY_WIRE_BYTES + MAX_RUNTIME_WORK_WIRE_BYTES + 1024;
 
 pub trait CleanSystemAgentBootstrapStore {
     type Error;
 
+    /// Return the one authoritative visible image. Completion is also a
+    /// reconciliation barrier: a candidate staged by an earlier failed
+    /// `commit` cannot become visible after this returns unless a later
+    /// `commit` publishes it.
     fn load(&mut self, maximum_bytes: usize) -> Result<Option<Vec<u8>>, Self::Error>;
+
+    /// Atomically replace the visible image. An error does not identify the
+    /// publication point; callers must reconcile with `load` before deciding
+    /// whether the prior or candidate record owns subsequent work.
     fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error>;
 }
 
@@ -424,7 +439,10 @@ impl AuthorizedCleanSystemAgentBootstrap {
         ManagedAgentTarget {
             space: self.pins.space,
             agent: self.pins.agent,
+            owner: self.pins.descriptor.identity.owner,
+            profile: self.pins.descriptor.identity.profile,
             runtime_deployment: self.pins.descriptor.identity.runtime_deployment,
+            transition_producer: self.pins.descriptor.identity.transition_producer,
         }
     }
 
@@ -475,6 +493,128 @@ pub enum CleanSystemAgentBootstrapPhase {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingAuthorityProjection {
+    query: AuthorityProjectionQuery,
+    work: RuntimeWork,
+}
+
+impl PendingAuthorityProjection {
+    fn validate(&self) -> bool {
+        let RuntimeWork::Invoke {
+            context,
+            state,
+            invocation,
+            authorization,
+            observed_slot,
+        } = &self.work
+        else {
+            return false;
+        };
+        let InvocationAuthorization::PublicPreflight(preflight) = authorization.as_ref() else {
+            return false;
+        };
+        let target = self.query.authority;
+        let method = projection_method(self.query.selector);
+        let Ok(query_bytes) = self.query.encode() else {
+            return false;
+        };
+        self.query.validate_shape().is_ok()
+            && *context == RuntimeExecutionContext::Direct
+            && state.is_empty()
+            && *observed_slot == preflight.observed_slot
+            && invocation.validate()
+            && authorization.matches_work(invocation)
+            && invocation.space == target.space
+            && invocation.agent == target.system_agent
+            && invocation.runtime_deployment == target.system_runtime_deployment
+            && invocation.actor == target.binding.issuer.actor
+            && invocation.deployment == target.binding.issuer.deployment
+            && invocation.program == target.binding.issuer.program
+            && invocation.mode == MethodMode::Query
+            && invocation.invocation
+                == InvocationId(
+                    Hash::digest(
+                        b"vos/system-authority/projection-invocation/v2",
+                        &[self.query.commitment().as_bytes()],
+                    )
+                    .0,
+                )
+            && invocation.origin.principal.is_none()
+            && invocation.origin.transport_node == self.query.attesting_node()
+            && invocation.origin.credential.is_none()
+            && invocation.origin.actor.is_none()
+            && invocation.origin.capability.is_none()
+            && invocation.roles == InvocationRoleClaims::none()
+            && invocation.message
+                == dynamic_message(
+                    method,
+                    "query",
+                    crate::actors::value::Value::Bytes(query_bytes),
+                )
+            && !invocation.recovery_only
+    }
+
+    fn invocation(&self) -> Option<(&super::sdk::InvocationWork, &InvocationAuthorization)> {
+        let RuntimeWork::Invoke {
+            invocation,
+            authorization,
+            ..
+        } = &self.work
+        else {
+            return None;
+        };
+        Some((invocation, authorization))
+    }
+}
+
+impl CanonicalWire for PendingAuthorityProjection {
+    const MAGIC: [u8; 4] = *b"PAP1";
+    const MAX_ENCODED_BYTES: usize = MAX_PENDING_AUTHORITY_PROJECTION_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encoder.bytes(
+            &self
+                .query
+                .encode()
+                .expect("validated pending query is canonical"),
+        );
+        encoder.bytes(
+            &self
+                .work
+                .encode()
+                .expect("validated pending work is canonical"),
+        );
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let query = AuthorityProjectionQuery::decode(
+            &decoder.bytes_bounded(MAX_AUTHORITY_PROJECTION_QUERY_WIRE_BYTES)?,
+        )
+        .map_err(|_| DecodeError::NonCanonical)?;
+        let work = RuntimeWork::decode(&decoder.bytes_bounded(MAX_RUNTIME_WORK_WIRE_BYTES)?)
+            .map_err(|_| DecodeError::NonCanonical)?;
+        let value = Self { query, work };
+        value
+            .validate()
+            .then_some(value)
+            .ok_or(DecodeError::NonCanonical)
+    }
+}
+
+const fn projection_method(selector: AuthorityProjectionSelector) -> &'static str {
+    match selector {
+        AuthorityProjectionSelector::Credential => "credential_projection",
+        AuthorityProjectionSelector::Agents { .. } => "agent_projection_page",
+        AuthorityProjectionSelector::AgentReplicas { .. } => "agent_replica_projection_page",
+        AuthorityProjectionSelector::Actors { .. } => "actor_projection_page",
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CleanSystemAgentBootstrapRecord {
     phase: CleanSystemAgentBootstrapPhase,
     pins_commitment: Hash,
@@ -485,6 +625,7 @@ pub struct CleanSystemAgentBootstrapRecord {
     catalog_approval: Option<ManagementApproval>,
     catalog_receipt: Option<AuthorityReceipt>,
     catalog_acknowledgement: Option<ManagementApplicationAck>,
+    pending_projection: Option<PendingAuthorityProjection>,
 }
 
 impl CleanSystemAgentBootstrapRecord {
@@ -512,6 +653,7 @@ impl CleanSystemAgentBootstrapRecord {
             catalog_approval: None,
             catalog_receipt: None,
             catalog_acknowledgement: None,
+            pending_projection: None,
         }
     }
 
@@ -574,6 +716,9 @@ impl CleanSystemAgentBootstrapRecord {
                 .catalog_acknowledgement
                 .as_ref()
                 .is_none_or(|value| value.validate_shape().is_ok())
+            && self.pending_projection.as_ref().is_none_or(|value| {
+                self.phase == CleanSystemAgentBootstrapPhase::Complete && value.validate()
+            })
     }
 
     fn encode(&self) -> Vec<u8> {
@@ -591,6 +736,7 @@ impl CleanSystemAgentBootstrapRecord {
         encode_wire_option(&mut encoder, self.catalog_approval.as_ref());
         encode_wire_option(&mut encoder, self.catalog_receipt.as_ref());
         encode_wire_option(&mut encoder, self.catalog_acknowledgement.as_ref());
+        encode_wire_option(&mut encoder, self.pending_projection.as_ref());
         bytes
     }
 
@@ -633,6 +779,10 @@ impl CleanSystemAgentBootstrapRecord {
             catalog_acknowledgement: decode_wire_option(
                 &mut decoder,
                 MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES,
+            )?,
+            pending_projection: decode_wire_option(
+                &mut decoder,
+                MAX_PENDING_AUTHORITY_PROJECTION_BYTES,
             )?,
         };
         if !decoder.exhausted() || !value.is_valid() || value.encode() != bytes {
@@ -703,12 +853,38 @@ where
     I: CleanManagementIssuerStore,
 {
     _pins_store: P,
-    _record_store: R,
+    record_store: R,
+    record: CleanSystemAgentBootstrapRecord,
     issuer: DurableCleanManagementIssuer<I>,
     _network_host: SharedAgentNetworkHost,
     host: Arc<Mutex<SharedAgentHost>>,
+    snapshot_signer: Arc<dyn LocalMergeAuthenticator>,
     pins: CleanSystemAgentPins,
     creation_receipt: AuthorityReceipt,
+    root_lineage: super::invocation_preparation::PhysicalRootLineage,
+    invocation_gas: u64,
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+fn bootstrap_root_lineage(
+    plan: &AuthorizedCleanSystemAgentBootstrap,
+) -> Option<super::invocation_preparation::PhysicalRootLineage> {
+    let ManagementRequest::Install(install) = plan.catalog_request() else {
+        return None;
+    };
+    let lineage = super::invocation_preparation::PhysicalRootLineage {
+        agent: plan.pins.agent,
+        actor: install.entry.actor,
+        installation_id: install.installation_id,
+        registry_reservation: install.registry_reservation,
+        install_request: install.lineage_commitment(),
+    };
+    (lineage.agent != AgentId::ZERO
+        && lineage.actor != crate::agent_sdk::ActorId::ZERO
+        && lineage.installation_id != crate::agent_sdk::InstallationId::ZERO
+        && lineage.registry_reservation != Hash::ZERO
+        && lineage.install_request != Hash::ZERO)
+        .then_some(lineage)
 }
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
@@ -910,7 +1086,7 @@ where
             stable_lock_path.as_ref(),
             scope,
             trust,
-            merge,
+            Arc::clone(&merge),
             finality,
             plan.pins.root.clone(),
         )
@@ -924,9 +1100,70 @@ where
                 committee_authority,
             )
             .map_err(CleanSystemAgentBootstrapError::Host)?;
+        // Reopen may find Raft commit evidence ahead of the clean journal
+        // application cursor.  Drain it while the route is still detached so
+        // an exact terminal Ack can be proved before any startup checkpoint
+        // moves that Ack to the authenticated replay boundary.
+        loop {
+            match shared_host
+                .apply_next(crate::service::AgentId(plan.pins.agent.0))
+                .map_err(CleanSystemAgentBootstrapError::Host)?
+            {
+                crate::agent::shared_host::SharedAgentApplyOutcome::Applied { .. }
+                | crate::agent::shared_host::SharedAgentApplyOutcome::Duplicate { .. } => {}
+                crate::agent::shared_host::SharedAgentApplyOutcome::Idle => break,
+            }
+        }
         let host = Arc::new(Mutex::new(shared_host));
-        let network_host = SharedAgentNetworkHost::attach(Arc::clone(&host), network)
-            .map_err(CleanSystemAgentBootstrapError::Host)?;
+        // A crash may follow the exact positive Ack but precede clearing PAP.
+        // Prove that terminal boundary directly from authenticated replay and
+        // clear it while no route or suffix-consuming worker is reachable.
+        // This avoids burying the only Ack proof under a startup checkpoint.
+        if let Some(pending) = record.pending_projection.clone() {
+            let (work, authorization) = pending
+                .invocation()
+                .ok_or_else(|| rejected(CleanSystemAgentBootstrapRejection::DivergentRecord))?;
+            if host
+                .lock()
+                .map_err(|_| {
+                    CleanSystemAgentBootstrapError::Host(SharedAgentHostError::Unavailable)
+                })?
+                .retained_positive_clean_acknowledgement(
+                    crate::service::AgentId(plan.pins.agent.0),
+                    work,
+                    authorization,
+                )
+                .map_err(CleanSystemAgentBootstrapError::Host)?
+            {
+                let mut cleared = record.clone();
+                cleared.pending_projection = None;
+                commit_bootstrap_record(&mut record_store, &cleared)?;
+                record = cleared;
+            }
+        }
+        let network_host = if let Some(pending) = &record.pending_projection {
+            let (work, authorization) = pending
+                .invocation()
+                .ok_or_else(|| rejected(CleanSystemAgentBootstrapRejection::DivergentRecord))?;
+            SharedAgentNetworkHost::attach_recovering_projection(
+                Arc::clone(&host),
+                network,
+                crate::service::AgentId(plan.pins.agent.0),
+                work,
+                authorization,
+                &plan.pins.replicas,
+                merge.as_ref(),
+            )
+        } else {
+            SharedAgentNetworkHost::attach_system(
+                Arc::clone(&host),
+                network,
+                crate::service::AgentId(plan.pins.agent.0),
+                &plan.pins.replicas,
+                merge.as_ref(),
+            )
+        }
+        .map_err(CleanSystemAgentBootstrapError::Host)?;
 
         if issuer.acknowledged_through() < 1 {
             issuer
@@ -1091,15 +1328,42 @@ where
             return Err(CleanSystemAgentBootstrapError::InvalidIssuerState);
         }
 
-        Ok(Self {
+        let root_lineage =
+            bootstrap_root_lineage(plan).ok_or(CleanSystemAgentBootstrapError::Rejected(
+                CleanSystemAgentBootstrapRejection::InvalidDecision,
+            ))?;
+        let mut owner = Self {
             _pins_store: pins_store,
-            _record_store: record_store,
+            record_store,
+            record,
             issuer,
             _network_host: network_host,
             host,
+            snapshot_signer: merge,
             pins: plan.pins.clone(),
             creation_receipt: create_receipt,
-        })
+            root_lineage,
+            invocation_gas: plan.invocation_gas,
+        };
+        // Reconstruct volatile admission from the durable exact pending work
+        // before returning an owner that could authenticate a fresh query.
+        // This reservation is idempotent with the first recovery drive.
+        if let Some(pending) = owner.record.pending_projection.clone() {
+            let (work, authorization) = pending
+                .invocation()
+                .ok_or_else(|| rejected(CleanSystemAgentBootstrapRejection::DivergentRecord))?;
+            owner
+                ._network_host
+                .reserve_recovering_projection_pair(
+                    crate::service::AgentId(owner.pins.agent.0),
+                    work,
+                    authorization,
+                    &owner.pins.replicas,
+                    owner.snapshot_signer.as_ref(),
+                )
+                .map_err(CleanSystemAgentBootstrapError::Host)?;
+        }
+        Ok(owner)
     }
 
     pub const fn pins(&self) -> &CleanSystemAgentPins {
@@ -1139,6 +1403,520 @@ where
             .map(|_| self.pins.descriptor.clone())
             .ok_or(SharedAgentHostError::AgentNotFound)
             .map(Some)
+    }
+
+    /// Exact live SDK projection for the bootstrapped system Agent. Runtime
+    /// and actor upgrades are read from authenticated journal state; immutable
+    /// system identity fields remain pinned independently by the bootstrap
+    /// record.
+    pub(crate) fn supervisor_projections(
+        &mut self,
+    ) -> Result<Vec<super::shared_host::SharedAgentRuntimeProjection>, SharedAgentHostError> {
+        let projections = self._network_host.supervisor_projections()?;
+        if projections.len() != 1 {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let projection = &projections[0];
+        let current = &projection.descriptor;
+        if current.validate().is_err()
+            || current.identity.space != self.pins.space
+            || current.identity.agent != self.pins.agent
+            || current.identity.owner != self.pins.descriptor.identity.owner
+            || current.identity.profile != AgentProfile::Shared
+            || current.creation_nonce != self.pins.descriptor.creation_nonce
+            || current.authority != self.pins.descriptor.authority
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Ok(projections)
+    }
+
+    pub(crate) fn supervisor_invoke(
+        &self,
+        expected: super::supervisor::AgentRouteIdentity,
+        work: super::sdk::InvocationWork,
+        authorization: super::sdk::InvocationAuthorization,
+    ) -> Result<super::sdk::RuntimeOutcome, SharedAgentHostError> {
+        if work.space != self.pins.space || work.agent != self.pins.agent {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self._network_host
+            .supervisor_invoke(expected, work, authorization)
+    }
+
+    fn supervisor_invoke_terminal(
+        &self,
+        expected: super::supervisor::AgentRouteIdentity,
+        work: super::sdk::InvocationWork,
+        authorization: super::sdk::InvocationAuthorization,
+    ) -> Result<super::sdk::RuntimeOutcome, SharedAgentHostError> {
+        if work.space != self.pins.space || work.agent != self.pins.agent {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self._network_host
+            .supervisor_invoke_terminal(expected, work, authorization)
+    }
+
+    fn supervisor_invoke_terminal_reserved(
+        &self,
+        expected: super::supervisor::AgentRouteIdentity,
+        work: super::sdk::InvocationWork,
+        authorization: super::sdk::InvocationAuthorization,
+    ) -> Result<super::sdk::RuntimeOutcome, SharedAgentHostError> {
+        if work.space != self.pins.space || work.agent != self.pins.agent {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self._network_host
+            .supervisor_invoke_terminal_reserved(expected, work, authorization)
+    }
+
+    pub(crate) fn supervisor_resume(
+        &self,
+        expected: super::supervisor::AgentRouteIdentity,
+        work: super::sdk::InvocationWork,
+        authorization: super::sdk::InvocationAuthorization,
+        yielded: super::sdk::YieldedInvocation,
+    ) -> Result<super::sdk::RuntimeOutcome, SharedAgentHostError> {
+        if work.space != self.pins.space || work.agent != self.pins.agent {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self._network_host
+            .supervisor_resume(expected, work, authorization, yielded)
+    }
+
+    pub(crate) fn supervisor_acknowledge(
+        &self,
+        expected: super::supervisor::AgentRouteIdentity,
+        work: super::sdk::InvocationWork,
+        authorization: super::sdk::InvocationAuthorization,
+    ) -> Result<super::sdk::RuntimeOutcome, SharedAgentHostError> {
+        if work.space != self.pins.space || work.agent != self.pins.agent {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self._network_host
+            .supervisor_acknowledge(expected, work, authorization)
+    }
+
+    fn supervisor_acknowledge_reserved(
+        &self,
+        expected: super::supervisor::AgentRouteIdentity,
+        work: super::sdk::InvocationWork,
+        authorization: super::sdk::InvocationAuthorization,
+    ) -> Result<super::sdk::RuntimeOutcome, SharedAgentHostError> {
+        if work.space != self.pins.space || work.agent != self.pins.agent {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self._network_host
+            .supervisor_acknowledge_reserved(expected, work, authorization)
+    }
+
+    pub(crate) fn supervisor_invocation_material(
+        &self,
+        agent: super::sdk::AgentId,
+        actor: super::sdk::ActorId,
+    ) -> Result<super::invocation_preparation::PhysicalInvocationMaterial, SharedAgentHostError>
+    {
+        if agent != self.pins.agent {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let material = self
+            ._network_host
+            .supervisor_invocation_material(agent, actor)?;
+        if material.descriptor.identity.space != self.pins.space
+            || material.descriptor.identity.agent != self.pins.agent
+            || material.descriptor.identity.owner != self.pins.descriptor.identity.owner
+            || material.descriptor.creation_nonce != self.pins.descriptor.creation_nonce
+            || material.descriptor.authority != self.pins.descriptor.authority
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Ok(material)
+    }
+
+    /// Exact installed target used for authenticated authority inventory
+    /// queries. No request-supplied route identity is trusted here.
+    pub(crate) const fn authority_target(&self) -> AuthorityActorTarget {
+        AuthorityActorTarget {
+            space: self.pins.space,
+            system_agent: self.pins.agent,
+            system_runtime_deployment: self.pins.descriptor.identity.runtime_deployment,
+            binding: self.pins.authority,
+        }
+    }
+
+    pub(crate) fn audit_authority_projection(
+        &mut self,
+        head: super::sdk::authority::AuthorityProjectionHead,
+        projection: &[super::supervisor_adapters::AgentAuthorityRouteProjection],
+    ) -> Result<super::shared_host::SharedAuthorityProjectionAudit, SharedAgentHostError> {
+        if projection.len() != 1
+            || projection[0].descriptor().identity.agent != self.pins.agent
+            || projection[0].descriptor().identity.space != self.pins.space
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self._network_host
+            .audit_authority_projection(head, projection, Some(&self.root_lineage))
+    }
+
+    /// Drain the exact authenticated operation retained before a failed
+    /// dispatch. Callers must do this before minting another query nonce.
+    pub(crate) fn recover_pending_authority_projection(
+        &mut self,
+    ) -> Result<bool, SharedAgentHostError> {
+        let Some(pending) = self.record.pending_projection.clone() else {
+            return Ok(false);
+        };
+        let (work, authorization) = pending
+            .invocation()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let work = work.clone();
+        let authorization = authorization.clone();
+        self._network_host.reserve_recovering_projection_pair(
+            crate::service::AgentId(self.pins.agent.0),
+            &work,
+            &authorization,
+            &self.pins.replicas,
+            self.snapshot_signer.as_ref(),
+        )?;
+        self.execute_pending_authority_projection().map(|_| true)
+    }
+
+    /// Execute one read-only authority projection through the exact physical
+    /// system route, then durably acknowledge its retained result before any
+    /// bytes are returned to the inventory client.
+    pub(crate) fn invoke_authority_projection(
+        &mut self,
+        query: AuthorityProjectionQuery,
+    ) -> Result<Vec<u8>, SharedAgentHostError> {
+        if query.validate_shape().is_err() || query.authority != self.authority_target() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if let Some(pending) = &self.record.pending_projection {
+            return if pending.query == query {
+                let pending = pending.clone();
+                let (work, authorization) = pending
+                    .invocation()
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                self._network_host.reserve_recovering_projection_pair(
+                    crate::service::AgentId(self.pins.agent.0),
+                    work,
+                    authorization,
+                    &self.pins.replicas,
+                    self.snapshot_signer.as_ref(),
+                )?;
+                self.execute_pending_authority_projection()?
+                    .ok_or(SharedAgentHostError::Unavailable)
+            } else {
+                Err(SharedAgentHostError::Conflict)
+            };
+        }
+        let agent = crate::service::AgentId(self.pins.agent.0);
+        self._network_host.ensure_reattached(agent)?;
+        let pending = self.prepare_authority_projection(query)?;
+        let (work, authorization) = pending
+            .invocation()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let work = work.clone();
+        let authorization = authorization.clone();
+        let mut reserved = false;
+        for attempt in 0..3 {
+            match self
+                ._network_host
+                .reserve_projection_pair(agent, &work, &authorization, false)
+            {
+                Ok(()) => {
+                    reserved = true;
+                    break;
+                }
+                Err(SharedAgentHostError::CapacityExhausted) if attempt < 2 => {
+                    self._network_host
+                        .certified_checkpoint_for_projection_pair(
+                            agent,
+                            &work,
+                            &authorization,
+                            &self.pins.replicas,
+                            self.snapshot_signer.as_ref(),
+                        )?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if !reserved {
+            return Err(SharedAgentHostError::CapacityExhausted);
+        }
+        if let Err(error) = self.pending_authority_projection_identity(&pending, false) {
+            let _ = self
+                ._network_host
+                .release_projection_pair(agent, &work, &authorization);
+            return Err(error);
+        }
+        let prior = self.record.clone();
+        let mut record = prior.clone();
+        record.pending_projection = Some(pending);
+        match commit_new_pending_projection(&mut self.record_store, &prior, &record) {
+            PendingProjectionRecordCommit::Durable => {}
+            PendingProjectionRecordCommit::PriorVisible => {
+                let _ = self
+                    ._network_host
+                    .release_projection_pair(agent, &work, &authorization);
+                return Err(SharedAgentHostError::Unavailable);
+            }
+            PendingProjectionRecordCommit::Ambiguous => {
+                // The write may have published without returning success.
+                // Retain the exact volatile exclusion and fail closed; only
+                // reopen/reload can safely decide which record is durable.
+                return Err(SharedAgentHostError::Unavailable);
+            }
+        }
+        self.record = record;
+        self.execute_pending_authority_projection()?
+            .ok_or(SharedAgentHostError::Unavailable)
+    }
+
+    fn prepare_authority_projection(
+        &self,
+        query: AuthorityProjectionQuery,
+    ) -> Result<PendingAuthorityProjection, SharedAgentHostError> {
+        let mut material =
+            self.supervisor_invocation_material(self.pins.agent, self.pins.authority.issuer.actor)?;
+        if material.actor.entry.actor != self.pins.authority.issuer.actor
+            || material.actor.entry.deployment != self.pins.authority.issuer.deployment
+            || material.actor.entry.program != self.pins.authority.issuer.program
+            || material.producer != self.pins.authority.issuer.producer
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        // The authority actor is bootstrapped before the authority's root
+        // catalog marker and therefore is not itself root-provenance marked.
+        material.root_provenance = false;
+        let query_bytes = query
+            .encode()
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let mut availability = vec![
+            material.program.clone(),
+            material.schema.clone(),
+            material.policies.clone(),
+        ];
+        availability.extend(material.installation_data.clone());
+        availability.sort_unstable_by(|left, right| left.reference.cmp(&right.reference));
+        if availability
+            .windows(2)
+            .any(|pair| pair[0].reference >= pair[1].reference)
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let work = super::sdk::InvocationWork {
+            space: self.pins.space,
+            agent: self.pins.agent,
+            runtime_deployment: material.descriptor.identity.runtime_deployment,
+            invocation: super::sdk::InvocationId(
+                Hash::digest(
+                    b"vos/system-authority/projection-invocation/v2",
+                    &[query.commitment().as_bytes()],
+                )
+                .0,
+            ),
+            actor: material.actor.entry.actor,
+            incarnation: material.actor.incarnation,
+            deployment: material.actor.entry.deployment,
+            program: material.actor.entry.program,
+            mode: super::sdk::MethodMode::Query,
+            origin: super::sdk::InvocationOrigin {
+                principal: None,
+                transport_node: query.attesting_node(),
+                credential: None,
+                actor: None,
+                capability: None,
+            },
+            roles: super::sdk::InvocationRoleClaims::none(),
+            message: dynamic_message(
+                projection_method(query.selector),
+                "query",
+                crate::actors::value::Value::Bytes(query_bytes),
+            ),
+            installation_data: material.actor.entry.installation_data.clone(),
+            availability,
+            gas: self.invocation_gas,
+            recovery_only: false,
+        };
+        if !work.validate() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let authorization = super::sdk::InvocationAuthorization::PublicPreflight(
+            super::sdk::PublicPreflight::for_work(&work, material.observed_slot),
+        );
+        let pending = PendingAuthorityProjection {
+            query,
+            work: RuntimeWork::Invoke {
+                context: RuntimeExecutionContext::Direct,
+                state: RuntimeState::default(),
+                invocation: Box::new(work),
+                observed_slot: match &authorization {
+                    InvocationAuthorization::PublicPreflight(preflight) => preflight.observed_slot,
+                    InvocationAuthorization::AuthorityReceipt(_) => unreachable!(),
+                },
+                authorization: Box::new(authorization),
+            },
+        };
+        pending
+            .validate()
+            .then_some(pending)
+            .ok_or(SharedAgentHostError::ScopeMismatch)
+    }
+
+    fn execute_pending_authority_projection(
+        &mut self,
+    ) -> Result<Option<Vec<u8>>, SharedAgentHostError> {
+        use crate::actors::codec::Decode as _;
+
+        let pending = self
+            .record
+            .pending_projection
+            .clone()
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        if !pending.validate() || pending.query.authority != self.authority_target() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let (work, authorization) = pending
+            .invocation()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        if self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .retained_positive_clean_acknowledgement(
+                crate::service::AgentId(self.pins.agent.0),
+                work,
+                authorization,
+            )?
+        {
+            self.complete_pending_authority_projection(work, authorization)?;
+            return Ok(None);
+        }
+        let identity = self.pending_authority_projection_identity(&pending, true)?;
+        let outcome = self.supervisor_invoke_terminal_reserved(
+            identity,
+            work.clone(),
+            authorization.clone(),
+        )?;
+        let response = match &outcome {
+            super::sdk::RuntimeOutcome::Completed(Ok(reply))
+                if reply.invocation == work.invocation
+                    && reply.actor == work.actor
+                    && reply.incarnation == work.incarnation
+                    && reply.deployment == work.deployment
+                    && reply.mode == work.mode
+                    && reply.status == super::sdk::InvocationStatus::Done =>
+            {
+                match crate::actors::value::Value::try_decode(&reply.reply) {
+                    Some(crate::actors::value::Value::Bytes(bytes)) => Some(bytes),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if !matches!(outcome, super::sdk::RuntimeOutcome::Completed(_)) {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        let acknowledgement =
+            self.supervisor_acknowledge_reserved(identity, work.clone(), authorization.clone())?;
+        let super::sdk::RuntimeOutcome::Acknowledged(Ok(acknowledged)) = acknowledgement else {
+            return Err(SharedAgentHostError::Unavailable);
+        };
+        if acknowledged.invocation != work.invocation
+            || acknowledged.actor != work.actor
+            || acknowledged.incarnation != work.incarnation
+            || acknowledged.deployment != work.deployment
+            || acknowledged.mode != work.mode
+            || acknowledged.work != work.commitment()
+            || acknowledged.authorization != authorization.commitment()
+        {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        self.complete_pending_authority_projection(work, authorization)?;
+        Ok(response)
+    }
+
+    fn pending_authority_projection_identity(
+        &self,
+        pending: &PendingAuthorityProjection,
+        persisted: bool,
+    ) -> Result<super::supervisor::AgentRouteIdentity, SharedAgentHostError> {
+        if !pending.validate() || pending.query.authority != self.authority_target() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let (work, authorization) = pending
+            .invocation()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let mut material =
+            self.supervisor_invocation_material(self.pins.agent, self.pins.authority.issuer.actor)?;
+        if material.actor.entry.actor != self.pins.authority.issuer.actor
+            || material.actor.entry.deployment != self.pins.authority.issuer.deployment
+            || material.actor.entry.program != self.pins.authority.issuer.program
+            || material.producer != self.pins.authority.issuer.producer
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        material.root_provenance = false;
+        let identity = super::supervisor_adapters::physical_material_identity(&material)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let InvocationAuthorization::PublicPreflight(preflight) = authorization else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        let authorized = if persisted {
+            super::supervisor_adapters::physical_material_authorizes_reserved_work(
+                &material,
+                identity,
+                RuntimeExecutionContext::Direct,
+                work,
+                authorization,
+                preflight.observed_slot,
+            )
+        } else {
+            super::supervisor_adapters::physical_material_authorizes_work(
+                &material,
+                identity,
+                RuntimeExecutionContext::Direct,
+                work,
+                authorization,
+            )
+        };
+        if !authorized {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Ok(identity)
+    }
+
+    fn clear_pending_authority_projection(&mut self) -> Result<(), SharedAgentHostError> {
+        let mut record = self.record.clone();
+        record.pending_projection = None;
+        commit_bootstrap_record(&mut self.record_store, &record)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        self.record = record;
+        Ok(())
+    }
+
+    fn complete_pending_authority_projection(
+        &mut self,
+        work: &super::sdk::InvocationWork,
+        authorization: &super::sdk::InvocationAuthorization,
+    ) -> Result<(), SharedAgentHostError> {
+        let mut record = self.record.clone();
+        record.pending_projection = None;
+        let network_host = &self._network_host;
+        let record_store = &mut self.record_store;
+        network_host.complete_projection_pair(
+            crate::service::AgentId(self.pins.agent.0),
+            work,
+            authorization,
+            || {
+                commit_bootstrap_record(record_store, &record)
+                    .map_err(|_| SharedAgentHostError::Unavailable)
+            },
+        )?;
+        self.record = record;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1206,6 +1984,64 @@ fn commit_bootstrap_record<R: CleanSystemAgentBootstrapStore>(
     store
         .commit(&record.encode())
         .map_err(|_| CleanSystemAgentBootstrapError::RecordStorage)
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingProjectionRecordCommit {
+    Durable,
+    PriorVisible,
+    Ambiguous,
+}
+
+/// Persist a first PAP while preserving its volatile proposal exclusion over
+/// an error whose publication point is unknown. Only the exact prior record
+/// proves that no durable pending key exists. An exact visible candidate is
+/// retried idempotently and must receive a successful commit result before
+/// its physical Invoke may execute.
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+fn commit_new_pending_projection<R: CleanSystemAgentBootstrapStore>(
+    store: &mut R,
+    prior: &CleanSystemAgentBootstrapRecord,
+    candidate: &CleanSystemAgentBootstrapRecord,
+) -> PendingProjectionRecordCommit {
+    if prior.pending_projection.is_some()
+        || candidate.pending_projection.is_none()
+        || commit_bootstrap_record(store, candidate).is_ok()
+    {
+        return if prior.pending_projection.is_none() && candidate.pending_projection.is_some() {
+            PendingProjectionRecordCommit::Durable
+        } else {
+            PendingProjectionRecordCommit::Ambiguous
+        };
+    }
+    let visible = match store.load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) | Err(_) => return PendingProjectionRecordCommit::Ambiguous,
+    };
+    let prior_bytes = prior.encode();
+    if visible == prior_bytes
+        && CleanSystemAgentBootstrapRecord::decode(&visible)
+            .ok()
+            .as_ref()
+            == Some(prior)
+    {
+        return PendingProjectionRecordCommit::PriorVisible;
+    }
+    let candidate_bytes = candidate.encode();
+    if visible != candidate_bytes
+        || CleanSystemAgentBootstrapRecord::decode(&visible)
+            .ok()
+            .as_ref()
+            != Some(candidate)
+    {
+        return PendingProjectionRecordCommit::Ambiguous;
+    }
+    if commit_bootstrap_record(store, candidate).is_ok() {
+        PendingProjectionRecordCommit::Durable
+    } else {
+        PendingProjectionRecordCommit::Ambiguous
+    }
 }
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
@@ -1290,6 +2126,13 @@ fn validate_record_against_plan(
         return Err(rejected(
             CleanSystemAgentBootstrapRejection::DivergentRecord,
         ));
+    }
+    if record
+        .pending_projection
+        .as_ref()
+        .is_some_and(|pending| pending.query.authority != plan.authority_target())
+    {
+        return Err(rejected(CleanSystemAgentBootstrapRejection::InvalidRecord));
     }
     if let Some(receipt) = &record.create_receipt {
         validate_exact_receipt(plan, &plan.create_decision, receipt, 1, 0)?;
@@ -1783,12 +2626,12 @@ mod tests {
         use alloc::boxed::Box;
         use core::num::NonZeroU64;
         use std::path::PathBuf;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
         use ed25519_dalek::{Signer as _, SigningKey};
 
         use super::*;
-        use crate::actors::codec::Encode as _;
+        use crate::actors::codec::{Decode as _, Encode as _};
         use crate::agent::authority::{ED25519_SIGNATURE_BYTES, ed25519_public_key_wire};
         use crate::agent::clean_authority_issuer::CleanManagementDecisionContext;
         use crate::agent::committee::{
@@ -1800,29 +2643,39 @@ mod tests {
         use crate::agent::journal::MergeEvent;
         use crate::agent::package_admission::{
             ScriptedRuntimeCase, ScriptedRuntimeCopy, admitted_scripted_runtime_for_test,
-            admitted_standard_actor_for_test, admitted_standard_runtime_for_test,
+            admitted_standard_actor_for_test,
         };
         use crate::agent::sdk::authority::{
-            AuthorityEvidence, AuthorityLaneRoots, AuthorityReceiptSelector,
+            AuthorityActorProjectionPage, AuthorityAgentProjection, AuthorityAgentProjectionPage,
+            AuthorityAgentReplicaProjectionPage, AuthorityBuiltinRole, AuthorityCredentialKind,
+            AuthorityCredentialProjection, AuthorityCredentialStatus, AuthorityEvidence,
+            AuthorityIngressAuthentication, AuthorityLaneRoots, AuthorityProjectionHead,
+            AuthorityReceiptSelector, MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES,
+            MAX_AUTHORITY_REPLICA_PAGE_ENTRIES,
         };
-        use crate::agent::sdk::contract::ActorPackageContract;
-        use crate::agent::sdk::introspection::ActorIntrospectionArtifact;
-        use crate::agent::sdk::method_policy::ActorMethodPolicyArtifact;
+        use crate::agent::sdk::contract::{ActorPackageContract, RuntimePackageContract};
+        use crate::agent::sdk::introspection::{
+            ActorIntrospectionArtifact, ActorMethodIntrospection, CliExposure, MethodDispatch,
+        };
+        use crate::agent::sdk::method_policy::{
+            ActorMethodPolicy, ActorMethodPolicyArtifact, AttestationRequirement,
+            AuthorizationPolicySelector, IdempotencyRequirement,
+        };
         use crate::agent::sdk::package::{
             ActorPackageManifest, PackageArtifact, PackageEnvelope, PackageManifest, PackageSigning,
         };
         use crate::agent::sdk::schema::{
-            ConstructorArgument, ConstructorContract, ParsedField, ParsedInlineField, ParsedSchema,
-            RAW_CONSTRUCTOR_TYPE_IDENTITY,
+            ConstructorArgument, ConstructorContract, ParsedField, ParsedInlineField, ParsedMethod,
+            ParsedSchema, RAW_CONSTRUCTOR_TYPE_IDENTITY,
         };
         use crate::agent::sdk::task::TaskDependencySetArtifact;
         use crate::agent::sdk::{
             ActorDirectoryPage, ActorDirectoryRecord, ActorEntry, AgentIdentity, AgentReplica,
-            CredentialId, FieldPersistence, InstallationData, InstallationId, InvocationId,
-            InvocationObservation, InvocationOrigin, InvocationReply, InvocationRoleClaims,
-            InvocationStatus, InvocationWork, LaneSet, ManagementReply, MethodMode, PrincipalId,
-            ProducerId, ProofSystemSet, ReplicaRole, RuntimeOutcome, RuntimeRequirements,
-            RuntimeTransition, StateLane,
+            CredentialId, DeploymentId, FieldPersistence, InstallationData, InstallationId,
+            InvocationId, InvocationObservation, InvocationOrigin, InvocationReply,
+            InvocationRoleClaims, InvocationStatus, InvocationWork, LaneSet, ManagementReply,
+            MethodMode, PrincipalId, ProducerId, ProgramId, ProofSystemSet, ReplicaRole,
+            RuntimeCapabilities, RuntimeOutcome, RuntimeRequirements, RuntimeTransition, StateLane,
         };
         use crate::agent::sdk::{RuntimeState, RuntimeWork};
         use crate::agent::{
@@ -1863,6 +2716,7 @@ mod tests {
             image: Option<Vec<u8>>,
             commits: usize,
             failure: RecordFailure,
+            fail_next_before_publish: bool,
         }
 
         #[derive(Clone, Default)]
@@ -1887,6 +2741,10 @@ mod tests {
             fn commits(&self) -> usize {
                 self.inner.lock().unwrap().commits
             }
+
+            fn fail_next_before_publish(&self) {
+                self.inner.lock().unwrap().fail_next_before_publish = true;
+            }
         }
 
         impl CleanSystemAgentBootstrapStore for BootstrapMemoryStore {
@@ -1907,6 +2765,9 @@ mod tests {
                 let mut state = self.inner.lock().unwrap();
                 state.commits += 1;
                 let commit = state.commits;
+                if core::mem::take(&mut state.fail_next_before_publish) {
+                    return Err(MemoryError);
+                }
                 if state.failure == RecordFailure::BeforeEveryPhase
                     && commit <= 19
                     && commit % 2 == 1
@@ -1918,6 +2779,77 @@ mod tests {
                     return Err(MemoryError);
                 }
                 Ok(())
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        enum ProjectionCommitFailure {
+            BeforePublish,
+            AfterPublishOnce,
+            AfterPublishAlways,
+            MissingAfterError,
+        }
+
+        struct ProjectionCommitStore {
+            image: Option<Vec<u8>>,
+            failure: ProjectionCommitFailure,
+            commits: usize,
+        }
+
+        impl ProjectionCommitStore {
+            fn new(
+                prior: &CleanSystemAgentBootstrapRecord,
+                failure: ProjectionCommitFailure,
+            ) -> Self {
+                Self {
+                    image: Some(prior.encode()),
+                    failure,
+                    commits: 0,
+                }
+            }
+        }
+
+        impl CleanSystemAgentBootstrapStore for ProjectionCommitStore {
+            type Error = MemoryError;
+
+            fn load(&mut self, maximum_bytes: usize) -> Result<Option<Vec<u8>>, Self::Error> {
+                if matches!(self.failure, ProjectionCommitFailure::MissingAfterError)
+                    && self.commits != 0
+                {
+                    return Ok(None);
+                }
+                if self
+                    .image
+                    .as_ref()
+                    .is_some_and(|bytes| bytes.len() > maximum_bytes)
+                {
+                    return Err(MemoryError);
+                }
+                Ok(self.image.clone())
+            }
+
+            fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+                self.commits += 1;
+                match self.failure {
+                    ProjectionCommitFailure::BeforePublish
+                    | ProjectionCommitFailure::MissingAfterError
+                        if self.commits == 1 =>
+                    {
+                        Err(MemoryError)
+                    }
+                    ProjectionCommitFailure::AfterPublishOnce if self.commits == 1 => {
+                        self.image = Some(image.to_vec());
+                        Err(MemoryError)
+                    }
+                    ProjectionCommitFailure::AfterPublishAlways => {
+                        self.image = Some(image.to_vec());
+                        Err(MemoryError)
+                    }
+                    _ => {
+                        self.image = Some(image.to_vec());
+                        Ok(())
+                    }
+                }
             }
         }
 
@@ -2040,6 +2972,40 @@ mod tests {
             }
         }
 
+        struct NativePhysicalTrust {
+            authority: super::super::super::authority::AgentAuthorityBinding,
+            logical_slot: Arc<AtomicU64>,
+        }
+
+        impl AgentTrustProvider for NativePhysicalTrust {
+            fn current_logical_slot(&self) -> Option<u64> {
+                Some(self.logical_slot.load(Ordering::Acquire))
+            }
+
+            fn authority_for_space(
+                &self,
+                _space: HostSpaceId,
+            ) -> Option<super::super::super::authority::AgentAuthorityBinding> {
+                Some(self.authority.clone())
+            }
+
+            fn verify_package(
+                &self,
+                _agent: &AgentConfig,
+                _package: &super::super::super::package::Package,
+            ) -> bool {
+                true
+            }
+
+            fn use_native_standard_runtime_for_test(&self) -> bool {
+                true
+            }
+
+            fn use_native_clean_runtime_for_test(&self) -> bool {
+                true
+            }
+        }
+
         struct SigningMerge {
             key: SigningKey,
             node: HostNodeId,
@@ -2064,6 +3030,69 @@ mod tests {
 
             fn verify_event(&self, event: &MergeEvent) -> bool {
                 event.author == self.node && event.signature.len() == ED25519_SIGNATURE_BYTES
+            }
+
+            fn sign_snapshot_candidate(
+                &self,
+                candidate: &crate::agent::shared_host::VerifiedSharedAgentSnapshotCandidate,
+            ) -> Option<crate::agent::shared_commit::ReplicaCommitSignature> {
+                let member = candidate
+                    .claim()
+                    .active_committee()
+                    .member_by_node(self.node)?;
+                let keypair =
+                    libp2p::identity::Keypair::ed25519_from_bytes(self.key.to_bytes()).ok()?;
+                let peer = keypair.public().to_peer_id().to_bytes();
+                if member.replica().role != HostReplicaRole::Voter
+                    || member.ed25519_public_key() != &self.key.verifying_key().to_bytes()
+                    || member.peer_id() != peer
+                {
+                    return None;
+                }
+                crate::agent::shared_commit::ReplicaCommitSignature::new(
+                    self.node,
+                    self.key.sign(&candidate.signing_message().0).to_bytes(),
+                )
+                .ok()
+            }
+        }
+
+        struct RefusingSnapshotSigner(HostNodeId);
+
+        impl LocalMergeAuthenticator for RefusingSnapshotSigner {
+            fn node(&self) -> HostNodeId {
+                self.0
+            }
+
+            fn sign_event(&self, _event: &mut MergeEvent) -> bool {
+                false
+            }
+
+            fn verify_event(&self, _event: &MergeEvent) -> bool {
+                false
+            }
+        }
+
+        struct InvalidSnapshotSigner(HostNodeId);
+
+        impl LocalMergeAuthenticator for InvalidSnapshotSigner {
+            fn node(&self) -> HostNodeId {
+                self.0
+            }
+
+            fn sign_event(&self, _event: &mut MergeEvent) -> bool {
+                false
+            }
+
+            fn verify_event(&self, _event: &MergeEvent) -> bool {
+                false
+            }
+
+            fn sign_snapshot_candidate(
+                &self,
+                _candidate: &crate::agent::shared_host::VerifiedSharedAgentSnapshotCandidate,
+            ) -> Option<crate::agent::shared_commit::ReplicaCommitSignature> {
+                crate::agent::shared_commit::ReplicaCommitSignature::new(self.0, [0; 64]).ok()
             }
         }
 
@@ -2238,6 +3267,857 @@ mod tests {
             admit_actor_package(&package.encode().unwrap()).unwrap()
         }
 
+        /// Purpose-built system-authority projection actor for the native
+        /// Standard bootstrap fixture below. The PVM consumes the same five
+        /// FETCH items as a generated actor, copies the exact query bytes from
+        /// the authenticated message into a canonical response template, and
+        /// returns through the ordinary actor ABI.
+        fn credential_projection_actor(
+            name: &str,
+            seed: u8,
+            placeholder: &crate::agent::sdk::authority::AuthorityCredentialProjection,
+        ) -> AdmittedActorPackage {
+            let query = placeholder.query.encode().unwrap();
+            let query_body = &query[4 + 32..];
+            let message = dynamic_message(
+                "credential_projection",
+                "query",
+                crate::actors::value::Value::Bytes(query.clone()),
+            );
+            let reply = crate::actors::value::Value::Bytes(placeholder.encode().unwrap()).encode();
+            let input_offsets = offsets(&message, query_body);
+            let output_offsets = offsets(&reply, query_body);
+            assert_eq!(input_offsets.len(), 1);
+            assert_eq!(output_offsets.len(), 1);
+
+            let mut output = vec![crate::actors::STATUS_DONE];
+            output.extend_from_slice(&[0; 12]);
+            output.extend_from_slice(&reply);
+            const SCRATCH_BYTES: usize = 16 * 1024;
+            let scratch_offset = output.len().next_multiple_of(8);
+            let rw_base = 2 * usize::try_from(vos_pvm::PVM_ZONE_SIZE).unwrap();
+            let scratch_address = rw_base + scratch_offset;
+            let response_query_address = rw_base + 13 + output_offsets[0];
+            let mut rw = output.clone();
+            rw.resize(scratch_offset + SCRATCH_BYTES, 0);
+            assert!(message.len() <= SCRATCH_BYTES);
+
+            let mut assembler = Assembler::new();
+            assembler.set_rw_data(rw);
+            for _ in 0..5 {
+                assembler
+                    .load_imm_64(Reg::A0, scratch_address as u64)
+                    .load_imm_64(Reg::A1, SCRATCH_BYTES as u64)
+                    .ecalli(crate::abi::hostcall::FETCH);
+            }
+            for offset in 0..query_body.len() {
+                assembler
+                    .load_u8(
+                        Reg::T0,
+                        u32::try_from(scratch_address + input_offsets[0] + offset).unwrap(),
+                    )
+                    .store_u8(
+                        Reg::T0,
+                        u32::try_from(response_query_address + offset).unwrap(),
+                    );
+            }
+            let program = assembler
+                .load_imm_64(Reg::A0, rw_base as u64)
+                .load_imm_64(Reg::A1, output.len() as u64)
+                .jump_ind(Reg::RA, 0)
+                .build_standard();
+
+            let schema = ParsedSchema {
+                constructor: ConstructorContract::Forbidden,
+                fields: vec![ParsedField::Inline(ParsedInlineField {
+                    source_index: 0,
+                    name: "state".into(),
+                    type_identity: "core::primitive::u64".into(),
+                    persistence: FieldPersistence::State(StateLane::Linear),
+                })],
+                methods: vec![
+                    ParsedMethod {
+                        source_index: 0,
+                        name: "credential_projection".into(),
+                        mode: MethodMode::Query,
+                        explicit: false,
+                    },
+                    ParsedMethod {
+                        source_index: 1,
+                        name: "projection_merge_probe".into(),
+                        mode: MethodMode::Merge,
+                        explicit: false,
+                    },
+                    ParsedMethod {
+                        source_index: 2,
+                        name: "projection_local_probe".into(),
+                        mode: MethodMode::Local,
+                        explicit: false,
+                    },
+                ],
+            }
+            .encode()
+            .unwrap();
+            let policies = ActorMethodPolicyArtifact {
+                actor_schema: BlobRef::of_bytes(&schema),
+                methods: [
+                    ("credential_projection", MethodMode::Query),
+                    ("projection_local_probe", MethodMode::Local),
+                    ("projection_merge_probe", MethodMode::Merge),
+                ]
+                .into_iter()
+                .map(|(name, mode)| ActorMethodPolicy {
+                    name: name.into(),
+                    mode,
+                    arguments: Vec::new(),
+                    return_type_identity: "alloc::vec::Vec<u8>".into(),
+                    authorization_policy: AuthorizationPolicySelector::Public,
+                    idempotency: IdempotencyRequirement::for_mode(mode),
+                    attestation: AttestationRequirement::None,
+                })
+                .collect(),
+            }
+            .encode()
+            .unwrap();
+            let introspection = ActorIntrospectionArtifact {
+                actor_schema: BlobRef::of_bytes(&schema),
+                method_policy: BlobRef::of_bytes(&policies),
+                actor_doc: "physical projection lifecycle fixture".into(),
+                methods: [
+                    "credential_projection",
+                    "projection_local_probe",
+                    "projection_merge_probe",
+                ]
+                .into_iter()
+                .map(|name| ActorMethodIntrospection {
+                    name: name.into(),
+                    doc: String::new(),
+                    cli_exposure: CliExposure::Exposed,
+                    timeout_ms: 0,
+                    dispatch: MethodDispatch::Sync,
+                })
+                .collect(),
+            }
+            .encode()
+            .unwrap();
+            let tasks = TaskDependencySetArtifact {
+                dependencies: Vec::new(),
+            }
+            .encode()
+            .unwrap();
+            let artifact = |bytes: &[u8]| PackageArtifact {
+                identity: BlobRef::of_bytes(bytes),
+                bytes: bytes.to_vec(),
+            };
+            let signing = SigningKey::from_bytes(&[seed; 32]);
+            let public_key = signing.verifying_key().to_bytes();
+            let mut artifacts = vec![
+                artifact(&program),
+                artifact(&schema),
+                artifact(&policies),
+                artifact(&introspection),
+                artifact(&tasks),
+            ];
+            artifacts.sort_unstable_by(|left, right| left.identity.cmp(&right.identity));
+            let mut package = PackageEnvelope {
+                manifest: PackageManifest::Actor(ActorPackageManifest {
+                    name: name.into(),
+                    program: BlobRef::of_bytes(&program),
+                    contract: ActorPackageContract::canonical(),
+                    state_lane_schema: BlobRef::of_bytes(&schema),
+                    method_policy: BlobRef::of_bytes(&policies),
+                    introspection: BlobRef::of_bytes(&introspection),
+                    task_dependencies: BlobRef::of_bytes(&tasks),
+                    scheduling: false,
+                    requirements: RuntimeRequirements {
+                        lanes: LaneSet::of(StateLane::Linear)
+                            .union(LaneSet::of(StateLane::Merge))
+                            .union(LaneSet::of(StateLane::Local)),
+                        scheduling: false,
+                        proof_systems: ProofSystemSet::EMPTY,
+                    },
+                    signing: PackageSigning {
+                        producer: ProducerId::of_public_key(&public_key),
+                        public_key,
+                        signature: [0; 64],
+                    },
+                }),
+                artifacts,
+            };
+            let signing_bytes = package.signing_bytes().unwrap();
+            package.manifest.signing_mut().signature = signing.sign(&signing_bytes).to_bytes();
+            admit_actor_package(&package.encode().unwrap()).unwrap()
+        }
+
+        struct ProjectionActorCase {
+            input: Vec<u8>,
+            output: Vec<u8>,
+            copies: Vec<ScriptedRuntimeCopy>,
+            discriminators: [(usize, u8); 2],
+        }
+
+        struct ProjectionTableCopy {
+            source_offset: usize,
+            output_offsets: Vec<usize>,
+            len: usize,
+        }
+
+        struct ProjectionActorRoutine {
+            case: ProjectionActorCase,
+            /// Accepted nonce ordinals and their offsets in the shared compact
+            /// descriptor table. Empty means every ordinal for this selector
+            /// shares one response shape and no table-backed fields.
+            table_sources: Vec<(u8, usize)>,
+            table_copies: Vec<ProjectionTableCopy>,
+        }
+
+        fn inventory_nonce(group: u8, ordinal: u8) -> Hash {
+            let mut bytes = [group; 32];
+            bytes[0] = ordinal;
+            bytes[1] = ordinal.rotate_left(1);
+            bytes[30] = ordinal ^ 0x5a;
+            bytes[31] = group ^ 0xa5;
+            Hash(bytes)
+        }
+
+        fn inventory_template_query(
+            target: AuthorityActorTarget,
+            selector: AuthorityProjectionSelector,
+            group: u8,
+            ordinal: u8,
+        ) -> AuthorityProjectionQuery {
+            let key = SigningKey::from_bytes(&[0xa4; 32]);
+            let public_key = key.verifying_key().to_bytes();
+            let mut query = AuthorityProjectionQuery {
+                authority: target,
+                credential: CredentialId::of_public_key(&public_key),
+                nonce: inventory_nonce(group, ordinal),
+                selector,
+                authentication: AuthorityIngressAuthentication::ApiCredentialSignature {
+                    credential_public_key: public_key,
+                    signature: [1; 64],
+                },
+            };
+            let signature = key.sign(&query.signing_bytes()).to_bytes();
+            let AuthorityIngressAuthentication::ApiCredentialSignature {
+                signature: query_signature,
+                ..
+            } = &mut query.authentication
+            else {
+                unreachable!()
+            };
+            *query_signature = signature;
+            query.validate_shape().unwrap();
+            query
+        }
+
+        fn inventory_descriptor(target: AuthorityActorTarget, index: u64) -> AgentDescriptor {
+            let owner = PrincipalId([0x71; 32]);
+            let mut nonce = [0u8; 32];
+            nonce[..8].copy_from_slice(&index.saturating_add(2).to_be_bytes());
+            nonce[31] = 2;
+            let creation_nonce = Hash(nonce);
+            let agent = AgentId::derive(target.space, owner, creation_nonce.as_bytes());
+            let descriptor = AgentDescriptor {
+                identity: AgentIdentity {
+                    space: target.space,
+                    agent,
+                    owner,
+                    profile: AgentProfile::Shared,
+                    runtime_deployment: DeploymentId([0x72; 32]),
+                    runtime_program: ProgramId([0x73; 32]),
+                    runtime_producer: ProducerId([0x74; 32]),
+                    transition_producer: ProducerId([0x75; 32]),
+                },
+                creation_nonce,
+                authority: target.binding,
+                private_recovery: None,
+                runtime_package: BlobRef::of_bytes(b"remote-runtime"),
+                runtime_contract: RuntimePackageContract::canonical(),
+                capabilities: RuntimeCapabilities::standard(),
+                replicas: vec![AgentReplica {
+                    node: NodeId([0xf1; 32]),
+                    principal: owner,
+                    role: ReplicaRole::Voter,
+                }],
+            };
+            descriptor.validate().unwrap();
+            descriptor
+        }
+
+        fn inventory_agent_row(descriptor: &AgentDescriptor) -> AuthorityAgentProjection {
+            AuthorityAgentProjection {
+                identity: descriptor.identity.clone(),
+                creation_nonce: descriptor.creation_nonce,
+                authority: descriptor.authority,
+                private_recovery: descriptor.private_recovery,
+                runtime_package: descriptor.runtime_package.clone(),
+                runtime_contract: descriptor.runtime_contract,
+                capabilities: descriptor.capabilities,
+                replica_count: descriptor.replicas.len() as u16,
+                replica_generation: descriptor.replica_generation(),
+            }
+        }
+
+        fn projection_actor_case<T: CanonicalWire>(
+            query: AuthorityProjectionQuery,
+            response: &T,
+            placeholder_binding: AgentAuthorityBinding,
+        ) -> ProjectionActorCase {
+            let query_wire = query.encode().unwrap();
+            let query_body = query_wire[4 + 32..].to_vec();
+            let input = dynamic_message(
+                projection_method(query.selector),
+                "query",
+                crate::actors::value::Value::Bytes(query_wire),
+            );
+            let reply = crate::actors::value::Value::Bytes(response.encode().unwrap()).encode();
+            let mut output = vec![crate::actors::STATUS_DONE];
+            output.extend_from_slice(&[0; 12]);
+            output.extend_from_slice(&reply);
+            let input_query = offsets(&input, &query_body);
+            let output_query = offsets(&output, &query_body);
+            assert_eq!(input_query.len(), 1);
+            assert_eq!(output_query.len(), 1);
+            let mut copies = vec![ScriptedRuntimeCopy {
+                input_offset: input_query[0],
+                output_offset: output_query[0],
+                len: query_body.len(),
+            }];
+            for field in [
+                placeholder_binding.issuer.deployment.0,
+                placeholder_binding.issuer.program.0,
+            ] {
+                let input_offsets = offsets(&input, &field);
+                assert_eq!(input_offsets.len(), 1);
+                for output_offset in offsets(&output, &field) {
+                    copies.push(ScriptedRuntimeCopy {
+                        input_offset: input_offsets[0],
+                        output_offset,
+                        len: field.len(),
+                    });
+                }
+            }
+            let nonce = query.nonce.0;
+            let nonce_offsets = offsets(&input, &nonce);
+            assert_eq!(nonce_offsets.len(), 1);
+            ProjectionActorCase {
+                input,
+                output,
+                copies,
+                discriminators: [
+                    (nonce_offsets[0], nonce[0]),
+                    (nonce_offsets[0] + nonce.len() - 1, nonce[nonce.len() - 1]),
+                ],
+            }
+        }
+
+        fn copy_instruction_bytes(len: usize) -> usize {
+            (len / 8 + len % 8).checked_mul(12).unwrap()
+        }
+
+        fn emit_projection_copy(
+            assembler: &mut Assembler,
+            source: usize,
+            destination: usize,
+            len: usize,
+            indirect_source: bool,
+        ) {
+            let mut copied = 0;
+            while len - copied >= 8 {
+                if indirect_source {
+                    assembler.load_ind_u64(
+                        Reg::T0,
+                        Reg::S0,
+                        i32::try_from(source + copied).unwrap(),
+                    );
+                } else {
+                    assembler.load_u64(Reg::T0, u32::try_from(source + copied).unwrap());
+                }
+                assembler.store_u64(Reg::T0, u32::try_from(destination + copied).unwrap());
+                copied += 8;
+            }
+            while copied < len {
+                if indirect_source {
+                    assembler.load_ind_u8(
+                        Reg::T0,
+                        Reg::S0,
+                        i32::try_from(source + copied).unwrap(),
+                    );
+                } else {
+                    assembler.load_u8(Reg::T0, u32::try_from(source + copied).unwrap());
+                }
+                assembler.store_u8(Reg::T0, u32::try_from(destination + copied).unwrap());
+                copied += 1;
+            }
+        }
+
+        /// Compact purpose PVM for the real 514-query inventory regression.
+        /// It retains one response template per wire shape and one 96-byte row
+        /// (Agent ID, creation nonce, replica generation) per advertised Agent.
+        /// Query authentication and response validation still traverse the real
+        /// actor ABI; only repetitive fixture bytes are factored out so replay's
+        /// entry bound, rather than its byte bound, is exercised.
+        fn scripted_projection_actor_program(
+            routines: Vec<ProjectionActorRoutine>,
+            descriptor_table: Vec<u8>,
+        ) -> Vec<u8> {
+            assert!(!routines.is_empty());
+            let mut data = Vec::new();
+            let mut output_offsets = Vec::with_capacity(routines.len());
+            for routine in &routines {
+                output_offsets.push(data.len());
+                data.extend_from_slice(&routine.case.output);
+            }
+            let table_offset = data.len().next_multiple_of(8);
+            data.resize(table_offset, 0);
+            data.extend_from_slice(&descriptor_table);
+            const SCRATCH_BYTES: usize = 4 * 1024;
+            assert!(
+                routines
+                    .iter()
+                    .all(|routine| routine.case.input.len() <= SCRATCH_BYTES)
+            );
+            let scratch_offset = data.len().next_multiple_of(8);
+            data.resize(scratch_offset + SCRATCH_BYTES, 0);
+            let rw_base = 2 * usize::try_from(vos_pvm::PVM_ZONE_SIZE).unwrap();
+            let scratch_address = rw_base + scratch_offset;
+            let mut assembler = Assembler::new();
+            assembler.set_rw_data(data);
+            for _ in 0..5 {
+                assembler
+                    .load_imm_64(Reg::A0, scratch_address as u64)
+                    .load_imm_64(Reg::A1, SCRATCH_BYTES as u64)
+                    .ecalli(crate::abi::hostcall::FETCH);
+            }
+            for (routine, data_offset) in routines.iter().zip(output_offsets) {
+                let direct_copy_bytes = routine
+                    .case
+                    .copies
+                    .iter()
+                    .map(|copy| copy_instruction_bytes(copy.len))
+                    .sum::<usize>();
+                let table_copy_bytes = routine
+                    .table_copies
+                    .iter()
+                    .map(|copy| {
+                        copy.output_offsets
+                            .len()
+                            .checked_mul(copy_instruction_bytes(copy.len))
+                            .unwrap()
+                    })
+                    .sum::<usize>();
+                let common_bytes = direct_copy_bytes + table_copy_bytes + 26;
+                let dispatch_bytes = if routine.table_sources.is_empty() {
+                    0
+                } else {
+                    6 + routine.table_sources.len() * 20 + 5
+                };
+                let block_bytes = 10 + 16 + dispatch_bytes + common_bytes;
+                assembler.branch_ne_imm(
+                    Reg::A0,
+                    i32::try_from(routine.case.input.len()).unwrap(),
+                    u32::try_from(block_bytes).unwrap(),
+                );
+                let group = routine.case.discriminators[1];
+                assembler
+                    .load_u8(Reg::T1, u32::try_from(scratch_address + group.0).unwrap())
+                    .branch_ne_imm(
+                        Reg::T1,
+                        i32::from(group.1),
+                        u32::try_from(block_bytes - 16).unwrap(),
+                    );
+                if !routine.table_sources.is_empty() {
+                    let ordinal = routine.case.discriminators[0];
+                    assembler.load_u8(Reg::T1, u32::try_from(scratch_address + ordinal.0).unwrap());
+                    for (index, (value, source_offset)) in routine.table_sources.iter().enumerate()
+                    {
+                        assembler.branch_ne_imm(Reg::T1, i32::from(*value), 20);
+                        let remaining = routine.table_sources.len() - index;
+                        assembler.load_imm_jump(
+                            Reg::S0,
+                            i32::try_from(rw_base + table_offset + *source_offset).unwrap(),
+                            u32::try_from(remaining * 20 - 5).unwrap(),
+                        );
+                    }
+                    assembler.jump(u32::try_from(5 + common_bytes).unwrap());
+                }
+                for copy in &routine.case.copies {
+                    emit_projection_copy(
+                        &mut assembler,
+                        scratch_address + copy.input_offset,
+                        rw_base + data_offset + copy.output_offset,
+                        copy.len,
+                        false,
+                    );
+                }
+                for copy in &routine.table_copies {
+                    for output_offset in &copy.output_offsets {
+                        emit_projection_copy(
+                            &mut assembler,
+                            copy.source_offset,
+                            rw_base + data_offset + *output_offset,
+                            copy.len,
+                            true,
+                        );
+                    }
+                }
+                assembler
+                    .load_imm_64(Reg::A0, (rw_base + data_offset) as u64)
+                    .load_imm_64(Reg::A1, routine.case.output.len() as u64)
+                    .jump_ind(Reg::RA, 0);
+            }
+            assembler.trap();
+            let program = assembler.build_standard();
+            assert!(
+                program.len() < 64 * 1024,
+                "compact inventory purpose PVM is {} bytes",
+                program.len()
+            );
+            program
+        }
+
+        const INVENTORY_DESCRIPTOR_ROW_BYTES: usize = 3 * 32;
+
+        fn projection_table_copy(
+            output: &[u8],
+            field: &[u8; 32],
+            source_offset: usize,
+            expected_occurrences: usize,
+        ) -> ProjectionTableCopy {
+            let output_offsets = offsets(output, field);
+            assert_eq!(output_offsets.len(), expected_occurrences);
+            ProjectionTableCopy {
+                source_offset,
+                output_offsets,
+                len: field.len(),
+            }
+        }
+
+        fn agent_page_table_copies(
+            case: &ProjectionActorCase,
+            page: &AuthorityAgentProjectionPage,
+        ) -> Vec<ProjectionTableCopy> {
+            let mut copies = Vec::with_capacity(page.entries.len() * 3);
+            for (index, entry) in page.entries.iter().enumerate() {
+                let source = index * INVENTORY_DESCRIPTOR_ROW_BYTES;
+                copies.push(projection_table_copy(
+                    &case.output,
+                    &entry.identity.agent.0,
+                    source,
+                    1 + usize::from(page.next == Some(entry.identity.agent)),
+                ));
+                copies.push(projection_table_copy(
+                    &case.output,
+                    &entry.creation_nonce.0,
+                    source + 32,
+                    1,
+                ));
+                copies.push(projection_table_copy(
+                    &case.output,
+                    &entry.replica_generation.0,
+                    source + 64,
+                    1,
+                ));
+            }
+            copies
+        }
+
+        fn normalized_projection_routine(routine: &ProjectionActorRoutine) -> Vec<u8> {
+            let mut output = routine.case.output.clone();
+            for copy in &routine.case.copies {
+                output[copy.output_offset..copy.output_offset + copy.len].fill(0);
+            }
+            for copy in &routine.table_copies {
+                for offset in &copy.output_offsets {
+                    output[*offset..*offset + copy.len].fill(0);
+                }
+            }
+            output
+        }
+
+        fn inventory_projection_actor(
+            name: &str,
+            seed: u8,
+            target: AuthorityActorTarget,
+            descriptors: &[AgentDescriptor],
+            head: AuthorityProjectionHead,
+        ) -> AdmittedActorPackage {
+            let credential_query =
+                inventory_template_query(target, AuthorityProjectionSelector::Credential, 1, 1);
+            let credential = AuthorityCredentialProjection {
+                query: credential_query.clone(),
+                head,
+                principal: PrincipalId([0xb1; 32]),
+                status: AuthorityCredentialStatus::Active,
+                kind: AuthorityCredentialKind::Api,
+                builtin_role: AuthorityBuiltinRole::Admin,
+                management_request_high_water: 0,
+                operation_request_high_water: 0,
+                admin_request_high_water: 0,
+                space_roles: Vec::new(),
+                actor_roles: Vec::new(),
+                capabilities: Vec::new(),
+            };
+            credential.validate_shape().unwrap();
+            let credential_routine = ProjectionActorRoutine {
+                case: projection_actor_case(credential_query, &credential, target.binding),
+                table_sources: Vec::new(),
+                table_copies: Vec::new(),
+            };
+
+            let rows = descriptors
+                .iter()
+                .map(inventory_agent_row)
+                .collect::<Vec<_>>();
+            let mut descriptor_table =
+                Vec::with_capacity(descriptors.len() * INVENTORY_DESCRIPTOR_ROW_BYTES);
+            for descriptor in descriptors {
+                descriptor_table.extend_from_slice(&descriptor.identity.agent.0);
+                descriptor_table.extend_from_slice(&descriptor.creation_nonce.0);
+                descriptor_table.extend_from_slice(&descriptor.replica_generation().0);
+            }
+            let mut agent_page_routines = Vec::new();
+            let mut after = None;
+            for (page_index, chunk) in rows
+                .chunks(MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES)
+                .enumerate()
+            {
+                let more = (page_index + 1) * MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES < rows.len();
+                let next = more.then(|| chunk.last().unwrap().identity.agent);
+                let query = inventory_template_query(
+                    target,
+                    AuthorityProjectionSelector::Agents {
+                        after,
+                        limit: MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES as u16,
+                    },
+                    2,
+                    u8::try_from(page_index + 1).unwrap(),
+                );
+                let page = AuthorityAgentProjectionPage {
+                    query: query.clone(),
+                    head,
+                    entries: chunk.to_vec(),
+                    next,
+                };
+                page.validate_shape().unwrap();
+                let case = projection_actor_case(query, &page, target.binding);
+                let table_copies = agent_page_table_copies(&case, &page);
+                agent_page_routines.push(ProjectionActorRoutine {
+                    case,
+                    table_sources: vec![(
+                        u8::try_from(page_index + 1).unwrap(),
+                        page_index
+                            * MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES
+                            * INVENTORY_DESCRIPTOR_ROW_BYTES,
+                    )],
+                    table_copies,
+                });
+                after = next;
+            }
+
+            assert_eq!(agent_page_routines.len(), 31);
+            let first_agent_page = agent_page_routines.remove(0);
+            let last_agent_page = agent_page_routines.pop().unwrap();
+            let mut middle_agent_pages = agent_page_routines.remove(0);
+            let middle_shape = normalized_projection_routine(&middle_agent_pages);
+            for routine in agent_page_routines {
+                assert_eq!(normalized_projection_routine(&routine), middle_shape);
+                middle_agent_pages
+                    .table_sources
+                    .extend(routine.table_sources);
+            }
+
+            let first_descriptor = descriptors.first().unwrap();
+            let replica_query = inventory_template_query(
+                target,
+                AuthorityProjectionSelector::AgentReplicas {
+                    agent: first_descriptor.identity.agent,
+                    after: None,
+                    limit: MAX_AUTHORITY_REPLICA_PAGE_ENTRIES as u16,
+                },
+                3,
+                1,
+            );
+            let replica_page = AuthorityAgentReplicaProjectionPage {
+                query: replica_query.clone(),
+                head,
+                replica_count: 1,
+                replica_generation: first_descriptor.replica_generation(),
+                entries: first_descriptor.replicas.clone(),
+                next: None,
+            };
+            replica_page.validate_shape().unwrap();
+            let replica_case = projection_actor_case(replica_query, &replica_page, target.binding);
+            let replica_generation_offsets =
+                offsets(&replica_case.output, &replica_page.replica_generation.0);
+            assert_eq!(replica_generation_offsets.len(), 1);
+            let replica_routine = ProjectionActorRoutine {
+                case: replica_case,
+                table_sources: descriptors
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| {
+                        (
+                            u8::try_from(index + 1).unwrap(),
+                            index * INVENTORY_DESCRIPTOR_ROW_BYTES,
+                        )
+                    })
+                    .collect(),
+                table_copies: vec![ProjectionTableCopy {
+                    source_offset: 64,
+                    output_offsets: replica_generation_offsets,
+                    len: 32,
+                }],
+            };
+
+            let actor_query = inventory_template_query(
+                target,
+                AuthorityProjectionSelector::Actors {
+                    agent: first_descriptor.identity.agent,
+                    after: None,
+                    limit: MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES as u16,
+                },
+                4,
+                1,
+            );
+            let actor_page = AuthorityActorProjectionPage {
+                query: actor_query.clone(),
+                head,
+                entries: Vec::new(),
+                next: None,
+            };
+            actor_page.validate_shape().unwrap();
+            let actor_routine = ProjectionActorRoutine {
+                case: projection_actor_case(actor_query, &actor_page, target.binding),
+                table_sources: Vec::new(),
+                table_copies: Vec::new(),
+            };
+
+            // The one-row terminal page shares the same query length/group as
+            // the full middle pages, so test it first and fall through on every
+            // other ordinal. All other selector shapes are disjoint by length
+            // and the authenticated nonce group byte.
+            let program = scripted_projection_actor_program(
+                vec![
+                    credential_routine,
+                    first_agent_page,
+                    last_agent_page,
+                    middle_agent_pages,
+                    replica_routine,
+                    actor_routine,
+                ],
+                descriptor_table,
+            );
+
+            let method_names = [
+                "actor_projection_page",
+                "agent_projection_page",
+                "agent_replica_projection_page",
+                "credential_projection",
+            ];
+            let schema = ParsedSchema {
+                constructor: ConstructorContract::Forbidden,
+                fields: vec![ParsedField::Inline(ParsedInlineField {
+                    source_index: 0,
+                    name: "state".into(),
+                    type_identity: "core::primitive::u64".into(),
+                    persistence: FieldPersistence::State(StateLane::Linear),
+                })],
+                methods: method_names
+                    .iter()
+                    .enumerate()
+                    .map(|(index, method)| ParsedMethod {
+                        source_index: index as u16,
+                        name: (*method).into(),
+                        mode: MethodMode::Query,
+                        explicit: false,
+                    })
+                    .collect(),
+            }
+            .encode()
+            .unwrap();
+            let policies = ActorMethodPolicyArtifact {
+                actor_schema: BlobRef::of_bytes(&schema),
+                methods: method_names
+                    .iter()
+                    .map(|method| ActorMethodPolicy {
+                        name: (*method).into(),
+                        mode: MethodMode::Query,
+                        arguments: Vec::new(),
+                        return_type_identity: "alloc::vec::Vec<u8>".into(),
+                        authorization_policy: AuthorizationPolicySelector::Public,
+                        idempotency: IdempotencyRequirement::NotRequired,
+                        attestation: AttestationRequirement::None,
+                    })
+                    .collect(),
+            }
+            .encode()
+            .unwrap();
+            let introspection = ActorIntrospectionArtifact {
+                actor_schema: BlobRef::of_bytes(&schema),
+                method_policy: BlobRef::of_bytes(&policies),
+                actor_doc: "bounded production inventory rotation fixture".into(),
+                methods: method_names
+                    .iter()
+                    .map(|method| ActorMethodIntrospection {
+                        name: (*method).into(),
+                        doc: String::new(),
+                        cli_exposure: CliExposure::Exposed,
+                        timeout_ms: 0,
+                        dispatch: MethodDispatch::Sync,
+                    })
+                    .collect(),
+            }
+            .encode()
+            .unwrap();
+            let tasks = TaskDependencySetArtifact {
+                dependencies: Vec::new(),
+            }
+            .encode()
+            .unwrap();
+            let artifact = |bytes: &[u8]| PackageArtifact {
+                identity: BlobRef::of_bytes(bytes),
+                bytes: bytes.to_vec(),
+            };
+            let signing = SigningKey::from_bytes(&[seed; 32]);
+            let public_key = signing.verifying_key().to_bytes();
+            let mut artifacts = vec![
+                artifact(&program),
+                artifact(&schema),
+                artifact(&policies),
+                artifact(&introspection),
+                artifact(&tasks),
+            ];
+            artifacts.sort_unstable_by(|left, right| left.identity.cmp(&right.identity));
+            let mut package = PackageEnvelope {
+                manifest: PackageManifest::Actor(ActorPackageManifest {
+                    name: name.into(),
+                    program: BlobRef::of_bytes(&program),
+                    contract: ActorPackageContract::canonical(),
+                    state_lane_schema: BlobRef::of_bytes(&schema),
+                    method_policy: BlobRef::of_bytes(&policies),
+                    introspection: BlobRef::of_bytes(&introspection),
+                    task_dependencies: BlobRef::of_bytes(&tasks),
+                    scheduling: false,
+                    requirements: RuntimeRequirements {
+                        lanes: LaneSet::of(StateLane::Linear),
+                        scheduling: false,
+                        proof_systems: ProofSystemSet::EMPTY,
+                    },
+                    signing: PackageSigning {
+                        producer: ProducerId::of_public_key(&public_key),
+                        public_key,
+                        signature: [0; 64],
+                    },
+                }),
+                artifacts,
+            };
+            let signing_bytes = package.signing_bytes().unwrap();
+            package.manifest.signing_mut().signature = signing.sign(&signing_bytes).to_bytes();
+            admit_actor_package(&package.encode().unwrap()).unwrap()
+        }
+
         fn network(seed: u8) -> Arc<Network> {
             let keypair = libp2p::identity::Keypair::ed25519_from_bytes([seed; 32]).unwrap();
             let peer = keypair.public().to_peer_id();
@@ -2346,6 +4226,7 @@ mod tests {
                     runtime_deployment: runtime.deployment(),
                     runtime_program: runtime.program(),
                     runtime_producer: runtime.producer(),
+                    transition_producer: ProducerId([0xb1; 32]),
                 },
                 creation_nonce: nonce,
                 authority,
@@ -2538,7 +4419,10 @@ mod tests {
                 ManagedAgentTarget {
                     space: descriptor.identity.space,
                     agent: descriptor.identity.agent,
+                    owner: descriptor.identity.owner,
+                    profile: descriptor.identity.profile,
                     runtime_deployment: descriptor.identity.runtime_deployment,
+                    transition_producer: descriptor.identity.transition_producer,
                 },
             )
         }
@@ -2608,7 +4492,7 @@ mod tests {
         }
 
         fn identity_bytes(identity: &AgentIdentity) -> Vec<u8> {
-            let mut bytes = Vec::with_capacity(193);
+            let mut bytes = Vec::with_capacity(225);
             bytes.extend_from_slice(identity.space.as_bytes());
             bytes.extend_from_slice(identity.agent.as_bytes());
             bytes.extend_from_slice(identity.owner.as_bytes());
@@ -2616,6 +4500,7 @@ mod tests {
             bytes.extend_from_slice(identity.runtime_deployment.as_bytes());
             bytes.extend_from_slice(identity.runtime_program.as_bytes());
             bytes.extend_from_slice(identity.runtime_producer.as_bytes());
+            bytes.extend_from_slice(identity.transition_producer.as_bytes());
             bytes
         }
 
@@ -2774,6 +4659,35 @@ mod tests {
             catalog_approval: ManagementApproval,
         }
 
+        fn shape_only_runtime() -> AdmittedRuntimePackage {
+            let mut assembler = Assembler::new();
+            let program = assembler.load_imm_64(Reg::A0, 0x63).trap().build_standard();
+            let signing = SigningKey::from_bytes(&[0x63; 32]);
+            let public_key = signing.verifying_key().to_bytes();
+            let mut package = PackageEnvelope {
+                manifest: PackageManifest::AgentRuntime(
+                    crate::agent::sdk::package::AgentRuntimePackageManifest {
+                        name: "shape-only-r7".into(),
+                        outer_program: crate::agent::sdk::BlobRef::of_bytes(&program),
+                        contract: crate::agent::sdk::contract::RuntimePackageContract::canonical(),
+                        capabilities: crate::agent::sdk::RuntimeCapabilities::standard(),
+                        signing: PackageSigning {
+                            producer: ProducerId::of_public_key(&public_key),
+                            public_key,
+                            signature: [0; 64],
+                        },
+                    },
+                ),
+                artifacts: vec![PackageArtifact {
+                    identity: crate::agent::sdk::BlobRef::of_bytes(&program),
+                    bytes: program,
+                }],
+            };
+            let signing_bytes = package.signing_bytes().unwrap();
+            package.manifest.signing_mut().signature = signing.sign(&signing_bytes).to_bytes();
+            admit_runtime_package(&package.encode().unwrap()).unwrap()
+        }
+
         fn runtime_fixture() -> RuntimeFixture {
             let receipt_key = SigningKey::from_bytes(&[RECEIPT_SEED; 32]);
             let credential_key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
@@ -2793,7 +4707,7 @@ mod tests {
             // The committed runtime blob is used only to establish a fixed-width
             // descriptor template. It is never executed. Every transition below
             // is served by the newly assembled current-ABI VOS3 custom PVM.
-            let placeholder = admitted_standard_runtime_for_test("shape-only-r7", 0x63);
+            let placeholder = shape_only_runtime();
             let placeholder_descriptor =
                 descriptor(&placeholder, space, agent, owner, nonce, &member, authority);
             let catalog_request = install_request(agent, &catalog_package, 0x82, None);
@@ -3146,9 +5060,11 @@ mod tests {
         struct PhysicalFixture {
             plan: AuthorizedCleanSystemAgentBootstrap,
             provision: super::super::super::bootstrap::SystemAgentGenesisProvision,
+            catalog: Vec<RuntimeBlob>,
             trust: Arc<dyn AgentTrustProvider>,
             merge: Arc<dyn LocalMergeAuthenticator>,
             finality: Arc<dyn AgentGenesisFinalityVerifier>,
+            logical_slot: Option<Arc<AtomicU64>>,
         }
 
         fn physical_fixture() -> PhysicalFixture {
@@ -3234,10 +5150,419 @@ mod tests {
             PhysicalFixture {
                 plan,
                 provision,
+                catalog,
                 trust,
                 merge,
                 finality: Arc::new(AcceptFinality),
+                logical_slot: None,
             }
+        }
+
+        fn placeholder_credential_projection()
+        -> crate::agent::sdk::authority::AuthorityCredentialProjection {
+            use crate::agent::sdk::authority::{
+                AuthorityBuiltinRole, AuthorityCredentialKind, AuthorityCredentialProjection,
+                AuthorityCredentialStatus, AuthorityIngressAuthentication, AuthorityProjectionHead,
+            };
+
+            let credential_key = SigningKey::from_bytes(&[0xa4; 32]);
+            let credential_public_key = credential_key.verifying_key().to_bytes();
+            let authority_public_key = SigningKey::from_bytes(&[RECEIPT_SEED; 32])
+                .verifying_key()
+                .to_bytes();
+            let authority = AuthorityActorTarget {
+                space: SpaceId([0x91; 32]),
+                system_agent: AgentId([0x92; 32]),
+                system_runtime_deployment: crate::agent::sdk::DeploymentId([0x93; 32]),
+                binding: AgentAuthorityBinding {
+                    policy: Hash([0x94; 32]),
+                    issuer: AuthorityIssuer {
+                        principal: PrincipalId([0x95; 32]),
+                        actor: ActorId([0x96; 32]),
+                        deployment: crate::agent::sdk::DeploymentId([0x97; 32]),
+                        program: crate::agent::sdk::ProgramId([0x98; 32]),
+                        producer: ProducerId::of_public_key(&authority_public_key),
+                    },
+                    public_key: authority_public_key,
+                    initial_epoch: 1,
+                },
+            };
+            let query = AuthorityProjectionQuery {
+                authority,
+                credential: CredentialId::of_public_key(&credential_public_key),
+                nonce: Hash([0x9a; 32]),
+                selector: AuthorityProjectionSelector::Credential,
+                authentication: AuthorityIngressAuthentication::ApiCredentialSignature {
+                    credential_public_key,
+                    signature: [0x9b; 64],
+                },
+            };
+            query.validate_shape().unwrap();
+            let projection = AuthorityCredentialProjection {
+                query,
+                head: AuthorityProjectionHead {
+                    state_revision: NonZeroU64::new(1).unwrap(),
+                    epoch: NonZeroU64::new(1).unwrap(),
+                    authorization_sequence: NonZeroU64::new(1).unwrap(),
+                    administration_generation: NonZeroU64::new(1).unwrap(),
+                    state_commitment: Hash([0x9c; 32]),
+                },
+                principal: PrincipalId([0x9d; 32]),
+                status: AuthorityCredentialStatus::Active,
+                kind: AuthorityCredentialKind::Api,
+                builtin_role: AuthorityBuiltinRole::Admin,
+                management_request_high_water: 0,
+                operation_request_high_water: 0,
+                admin_request_high_water: 0,
+                space_roles: Vec::new(),
+                actor_roles: Vec::new(),
+                capabilities: Vec::new(),
+            };
+            projection.validate_shape().unwrap();
+            projection
+        }
+
+        fn native_projection_physical_fixture() -> PhysicalFixture {
+            native_projection_physical_fixture_with_authority(credential_projection_actor(
+                "system-authority",
+                RECEIPT_SEED,
+                &placeholder_credential_projection(),
+            ))
+        }
+
+        fn native_projection_physical_fixture_with_authority(
+            authority_package: AdmittedActorPackage,
+        ) -> PhysicalFixture {
+            let receipt_key = SigningKey::from_bytes(&[RECEIPT_SEED; 32]);
+            let credential_key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
+            let runtime = shape_only_runtime();
+            let space = SpaceId([0x31; 32]);
+            let owner = PrincipalId([0x32; 32]);
+            let nonce = Hash([0x33; 32]);
+            let agent = AgentId::derive(space, owner, nonce.as_bytes());
+            let (replicas, member) = replica_member(space, agent);
+            let catalog_package =
+                admitted_standard_actor_for_test("root-catalog", StateLane::Linear, 0xa5);
+            let authority = authority_binding(agent, &authority_package, &receipt_key);
+            let descriptor = descriptor(&runtime, space, agent, owner, nonce, &member, authority);
+            let authority_request = install_request(agent, &authority_package, 0xa6, None);
+            let catalog_request = install_request(agent, &catalog_package, 0xa8, None);
+            let (catalog_call, _) =
+                credential_call_and_approval(&descriptor, &catalog_request, &credential_key);
+            let create_request = ManagementRequest::Create(Box::new(descriptor.clone()));
+            let create_decision = decision(&descriptor, &create_request, 1, 0xb1);
+            let authority_decision = decision(&descriptor, &authority_request, 2, 0xb2);
+
+            let mut receipt_signer = CountingSigner::new();
+            let mut temporary_issuer = DurableCleanManagementIssuer::open(
+                IssuerMemoryStore::default(),
+                descriptor.authority,
+                descriptor.identity.space,
+                descriptor.identity.agent,
+            )
+            .unwrap();
+            let create_receipt = temporary_issuer
+                .issue(&create_decision, &mut receipt_signer)
+                .unwrap();
+            let host_authority = host_authority_binding(&descriptor);
+            let logical_slot = Arc::new(AtomicU64::new(LOGICAL_SLOT));
+            let trust: Arc<dyn AgentTrustProvider> = Arc::new(NativePhysicalTrust {
+                authority: host_authority,
+                logical_slot: Arc::clone(&logical_slot),
+            });
+            let (node_key, _, _, node) = node_material();
+            let merge: Arc<dyn LocalMergeAuthenticator> = Arc::new(SigningMerge {
+                key: node_key,
+                node,
+            });
+            let (create, catalog) =
+                LocalJournalAgentDriver::<FileAgentJournalStore>::clean_shared_system_genesis_input(
+                    descriptor.clone(),
+                    &runtime,
+                    create_receipt,
+                    LOGICAL_SLOT,
+                    &trust,
+                    &merge,
+                )
+                .unwrap();
+            let prepared =
+                LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_system_genesis(
+                    create,
+                    replicas.members()[0].replica(),
+                    &catalog,
+                    Arc::clone(&trust),
+                    Arc::clone(&merge),
+                )
+                .unwrap();
+            let locator = SystemAgentGenesisLocator {
+                space: HostSpaceId(descriptor.identity.space.0),
+                agent: HostAgentId(descriptor.identity.agent.0),
+                node,
+            };
+            let proposal = SystemAgentGenesisProposal::from_prepared(locator, &prepared).unwrap();
+            let (root, provision) = root_provision(proposal, &descriptor);
+            let plan = AuthorizedCleanSystemAgentBootstrap::new(
+                descriptor,
+                runtime.exact_bytes().to_vec(),
+                replicas,
+                root,
+                LOGICAL_SLOT,
+                create_decision,
+                authority_package.exact_bytes().to_vec(),
+                authority_request,
+                authority_decision,
+                catalog_package.exact_bytes().to_vec(),
+                catalog_request,
+                catalog_call,
+                10_000_000,
+            )
+            .unwrap();
+            PhysicalFixture {
+                plan,
+                provision,
+                catalog,
+                trust,
+                merge,
+                finality: Arc::new(AcceptFinality),
+                logical_slot: Some(logical_slot),
+            }
+        }
+
+        fn native_inventory_projection_fixture() -> (
+            PhysicalFixture,
+            Vec<AgentDescriptor>,
+            AuthorityProjectionHead,
+        ) {
+            let mut target = placeholder_credential_projection().query.authority;
+            target.space = SpaceId([0x31; 32]);
+            target.system_agent = AgentId::derive(
+                target.space,
+                PrincipalId([0x32; 32]),
+                Hash([0x33; 32]).as_bytes(),
+            );
+            target.binding.policy = Hash([0x51; 32]);
+            target.binding.issuer.principal = PrincipalId([0x52; 32]);
+            target.binding.issuer.actor =
+                ActorId::top_level(target.system_agent, "system-authority");
+            let mut descriptors = (0..241)
+                .map(|index| inventory_descriptor(target, index))
+                .collect::<Vec<_>>();
+            descriptors.sort_unstable_by_key(|descriptor| descriptor.identity.agent);
+            let head = placeholder_credential_projection().head;
+            let package = inventory_projection_actor(
+                "system-authority",
+                RECEIPT_SEED,
+                target,
+                &descriptors,
+                head,
+            );
+            let fixture = native_projection_physical_fixture_with_authority(package);
+            for descriptor in &mut descriptors {
+                descriptor.authority = fixture.plan.pins.authority;
+                descriptor.validate().unwrap();
+            }
+            (fixture, descriptors, head)
+        }
+
+        /// Seed only the already-complete predecessor needed by projection
+        /// recovery tests. Create and both actor installations traverse the
+        /// real native Standard journal and live Raft worker. The authority
+        /// approval/finalization records are constructed and retained through
+        /// the issuer API so this helper is not evidence for the separate
+        /// bootstrap actor-finalization lifecycle.
+        #[allow(clippy::too_many_arguments)]
+        fn seed_complete_native_projection_owner(
+            fixture: &PhysicalFixture,
+            directory: &TestDirectory,
+            pins: BootstrapMemoryStore,
+            record: BootstrapMemoryStore,
+            issuer_store: IssuerMemoryStore,
+            signer: &mut CountingSigner,
+            provider: Arc<MemoryProvider>,
+            network: Arc<Network>,
+        ) -> CleanSystemAgentBootstrapOwner<
+            BootstrapMemoryStore,
+            BootstrapMemoryStore,
+            IssuerMemoryStore,
+        > {
+            assert_eq!(
+                provider
+                    .create(fixture.provision.proposal(), &fixture.catalog)
+                    .unwrap(),
+                fixture.provision,
+            );
+            let plan = &fixture.plan;
+            let mut issuer = DurableCleanManagementIssuer::open(
+                issuer_store.clone(),
+                plan.pins.authority,
+                plan.pins.space,
+                plan.pins.agent,
+            )
+            .unwrap();
+            let create_receipt = issuer.issue(&plan.create_decision, signer).unwrap();
+
+            let scope = AgentHostScope {
+                space: HostSpaceId(plan.pins.space.0),
+                node: HostNodeId(plan.pins.node.0),
+            };
+            let mut shared_host = SharedAgentHost::open_with_root(
+                directory.host(),
+                directory.lock(),
+                scope,
+                Arc::clone(&fixture.trust),
+                Arc::clone(&fixture.merge),
+                Arc::clone(&fixture.finality),
+                plan.pins.root.clone(),
+            )
+            .unwrap();
+            shared_host
+                .provision_system_bootstrap(
+                    fixture.provision.clone(),
+                    plan.pins.replicas.clone(),
+                    fixture.catalog.clone(),
+                    committee_authority_binding(plan).unwrap(),
+                )
+                .unwrap();
+            issuer.observe_durable(&create_receipt).unwrap();
+
+            let host = Arc::new(Mutex::new(shared_host));
+            let network_host = SharedAgentNetworkHost::attach_system(
+                Arc::clone(&host),
+                Arc::clone(&network),
+                HostAgentId(plan.pins.agent.0),
+                &plan.pins.replicas,
+                fixture.merge.as_ref(),
+            )
+            .unwrap();
+            fixture
+                .logical_slot
+                .as_ref()
+                .expect("native projection fixture clock")
+                .store(LOGICAL_SLOT + 1, Ordering::Release);
+            let authority_receipt = issuer.issue(&plan.authority_decision, signer).unwrap();
+            apply_actor_install(
+                &host,
+                &network_host,
+                plan,
+                &plan.authority_request,
+                &authority_receipt,
+                plan.authority_package().unwrap(),
+            )
+            .unwrap();
+            issuer.observe_durable(&authority_receipt).unwrap();
+
+            let credential_key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
+            let (catalog_call, catalog_approval) = credential_call_and_approval(
+                &plan.pins.descriptor,
+                &plan.catalog_request,
+                &credential_key,
+            );
+            assert_eq!(catalog_call, plan.catalog_call);
+            let catalog_decision = AuthorizedCleanManagementDecision::from_approval(
+                plan.authority_target(),
+                plan.managed_target(),
+                &plan.catalog_request,
+                &catalog_call,
+                &catalog_approval,
+                &RawCredentialVerifier,
+            )
+            .unwrap();
+            let catalog_receipt = issuer.issue(&catalog_decision, signer).unwrap();
+            fixture
+                .logical_slot
+                .as_ref()
+                .expect("native projection fixture clock")
+                .store(LOGICAL_SLOT + 2, Ordering::Release);
+            let (catalog_application, applied_at) = apply_actor_install(
+                &host,
+                &network_host,
+                plan,
+                &plan.catalog_request,
+                &catalog_receipt,
+                plan.catalog_package().unwrap(),
+            )
+            .unwrap();
+            let reopened_state = host
+                .lock()
+                .unwrap()
+                .clean_state_commitment(HostAgentId(plan.pins.agent.0))
+                .unwrap();
+            let catalog_acknowledgement = issuer
+                .observe_durable_application(
+                    &catalog_receipt,
+                    &catalog_application,
+                    reopened_state,
+                    applied_at,
+                    signer,
+                )
+                .unwrap();
+            assert!(
+                issuer
+                    .observe_durable_actor_finalization(&catalog_acknowledgement)
+                    .unwrap()
+            );
+            assert_eq!(issuer.sequence_high_water(), 3);
+            assert_eq!(issuer.acknowledged_through(), 3);
+
+            let mut complete = CleanSystemAgentBootstrapRecord::intent(plan);
+            complete.create_receipt = Some(create_receipt);
+            complete.authority_receipt = Some(authority_receipt);
+            complete.catalog_approval = Some(catalog_approval);
+            complete.catalog_receipt = Some(catalog_receipt);
+            complete.catalog_acknowledgement = Some(catalog_acknowledgement);
+            complete.advance(CleanSystemAgentBootstrapPhase::Complete);
+            assert!(complete.is_valid());
+            pins.clone().commit(&plan.pins.encode()).unwrap();
+            record.clone().commit(&complete.encode()).unwrap();
+
+            drop(network_host);
+            drop(host);
+            open_owner(
+                fixture,
+                directory,
+                pins,
+                record,
+                issuer_store,
+                signer,
+                provider,
+                network,
+            )
+            .unwrap()
+        }
+
+        fn signed_credential_projection_query(
+            owner: &CleanSystemAgentBootstrapOwner<
+                BootstrapMemoryStore,
+                BootstrapMemoryStore,
+                IssuerMemoryStore,
+            >,
+            nonce: u8,
+        ) -> AuthorityProjectionQuery {
+            use crate::agent::sdk::authority::AuthorityIngressAuthentication;
+
+            let key = SigningKey::from_bytes(&[0xa4; 32]);
+            let public_key = key.verifying_key().to_bytes();
+            let mut query = AuthorityProjectionQuery {
+                authority: owner.authority_target(),
+                credential: CredentialId::of_public_key(&public_key),
+                nonce: Hash([nonce; 32]),
+                selector: AuthorityProjectionSelector::Credential,
+                authentication: AuthorityIngressAuthentication::ApiCredentialSignature {
+                    credential_public_key: public_key,
+                    signature: [1; 64],
+                },
+            };
+            let signature = key.sign(&query.signing_bytes()).to_bytes();
+            let AuthorityIngressAuthentication::ApiCredentialSignature {
+                signature: query_signature,
+                ..
+            } = &mut query.authentication
+            else {
+                unreachable!()
+            };
+            *query_signature = signature;
+            query.verify_api_with(&RawCredentialVerifier).unwrap();
+            query
         }
 
         fn open_owner(
@@ -3273,6 +5598,160 @@ mod tests {
                 provider,
                 network,
             )
+        }
+
+        type MemoryBootstrapOwner = CleanSystemAgentBootstrapOwner<
+            BootstrapMemoryStore,
+            BootstrapMemoryStore,
+            IssuerMemoryStore,
+        >;
+
+        struct NativeProjectionOwnerHarness {
+            owner: Option<MemoryBootstrapOwner>,
+            fixture: PhysicalFixture,
+            record: BootstrapMemoryStore,
+            _directory: TestDirectory,
+            network: Arc<Network>,
+        }
+
+        impl NativeProjectionOwnerHarness {
+            fn new(label: &str) -> Self {
+                Self::with_fixture(label, native_projection_physical_fixture())
+            }
+
+            fn with_fixture(label: &str, fixture: PhysicalFixture) -> Self {
+                let directory = TestDirectory::new(label);
+                let network = network(NODE_SEED);
+                let mut signer = CountingSigner::new();
+                let record = BootstrapMemoryStore::default();
+                let owner = seed_complete_native_projection_owner(
+                    &fixture,
+                    &directory,
+                    BootstrapMemoryStore::default(),
+                    record.clone(),
+                    IssuerMemoryStore::default(),
+                    &mut signer,
+                    Arc::new(MemoryProvider::new(fixture.provision.clone())),
+                    Arc::clone(&network),
+                );
+                Self {
+                    owner: Some(owner),
+                    fixture,
+                    record,
+                    _directory: directory,
+                    network,
+                }
+            }
+
+            fn stop(mut self) {
+                drop(self.owner.take());
+                stop_network(self.network);
+            }
+        }
+
+        fn fresh_projection_pair(
+            owner: &MemoryBootstrapOwner,
+            nonce: u8,
+        ) -> (InvocationWork, InvocationAuthorization) {
+            let pending = owner
+                .prepare_authority_projection(signed_credential_projection_query(owner, nonce))
+                .unwrap();
+            let (work, authorization) = pending.invocation().unwrap();
+            (work.clone(), authorization.clone())
+        }
+
+        fn native_owner_physical_state(
+            owner: &MemoryBootstrapOwner,
+        ) -> (
+            crate::agent::shared_host::SharedAgentJournalPosition,
+            Hash,
+            crate::agent::shared_host::SharedAgentStatus,
+        ) {
+            let agent = HostAgentId(owner.pins.agent.0);
+            let host = owner.host.lock().unwrap();
+            (
+                host.journal_position(agent).unwrap(),
+                host.clean_state_commitment(agent).unwrap(),
+                host.show(agent).unwrap().unwrap(),
+            )
+        }
+
+        fn assert_projection_gate_released(owner: &mut MemoryBootstrapOwner, nonce: u8) {
+            let agent = HostAgentId(owner.pins.agent.0);
+            let (work, authorization) = fresh_projection_pair(owner, nonce);
+            owner
+                ._network_host
+                .reserve_projection_pair(agent, &work, &authorization, false)
+                .unwrap();
+            owner
+                ._network_host
+                .release_projection_pair(agent, &work, &authorization)
+                .unwrap();
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct InventoryProjectionObservation {
+            query: AuthorityProjectionQuery,
+            ordered_index: u64,
+            snapshot: Option<crate::agent::shared_host::SharedAgentSnapshotState>,
+        }
+
+        struct InventoryProjectionAuthenticator {
+            counters: [u8; 4],
+            host: Arc<Mutex<SharedAgentHost>>,
+            agent: HostAgentId,
+            observations: Arc<Mutex<Vec<InventoryProjectionObservation>>>,
+        }
+
+        impl crate::agent::production_owner::AuthorityProjectionQueryAuthenticator
+            for InventoryProjectionAuthenticator
+        {
+            fn expected_kind(&self) -> AuthorityCredentialKind {
+                AuthorityCredentialKind::Api
+            }
+
+            fn authenticate(
+                &mut self,
+                authority: AuthorityActorTarget,
+                selector: AuthorityProjectionSelector,
+            ) -> Result<
+                AuthorityProjectionQuery,
+                crate::agent::production_owner::AgentProductionOwnerError,
+            > {
+                let group = match selector {
+                    AuthorityProjectionSelector::Credential => 1,
+                    AuthorityProjectionSelector::Agents { .. } => 2,
+                    AuthorityProjectionSelector::AgentReplicas { .. } => 3,
+                    AuthorityProjectionSelector::Actors { .. } => 4,
+                };
+                let counter = &mut self.counters[usize::from(group - 1)];
+                *counter = counter.checked_add(1).ok_or(
+                    crate::agent::production_owner::AgentProductionOwnerError::InventoryLimit,
+                )?;
+                let query = inventory_template_query(authority, selector, group, *counter);
+                let call = self
+                    .counters
+                    .iter()
+                    .map(|counter| usize::from(*counter))
+                    .sum::<usize>();
+                let (ordered_index, snapshot) = {
+                    let host = self.host.lock().unwrap();
+                    (
+                        host.journal_position(self.agent).unwrap().ordered_index,
+                        matches!(call, 513 | 514)
+                            .then(|| host.snapshot_state_for_test(self.agent).unwrap()),
+                    )
+                };
+                self.observations
+                    .lock()
+                    .unwrap()
+                    .push(InventoryProjectionObservation {
+                        query: query.clone(),
+                        ordered_index,
+                        snapshot,
+                    });
+                Ok(query)
+            }
         }
 
         fn exercise_restart_mode(failure: RecordFailure, label: &str) {
@@ -3401,6 +5880,886 @@ mod tests {
         fn physical_current_abi_shared_bootstrap_restarts_after_every_phase_without_duplicate_slots()
          {
             exercise_restart_mode(RecordFailure::AfterEveryPhase, "after-every-phase");
+        }
+
+        #[test]
+        fn pending_projection_commit_error_classifies_the_exact_visible_record() {
+            let fixture = physical_fixture();
+            let directory = TestDirectory::new("pending-projection-commit");
+            let pins = BootstrapMemoryStore::default();
+            let record = BootstrapMemoryStore::default();
+            let issuer = IssuerMemoryStore::default();
+            let provider = Arc::new(MemoryProvider::new(fixture.provision.clone()));
+            let network = network(NODE_SEED);
+            let mut signer = CountingSigner::new();
+            let owner = open_owner(
+                &fixture,
+                &directory,
+                pins,
+                record,
+                issuer,
+                &mut signer,
+                provider,
+                Arc::clone(&network),
+            )
+            .unwrap();
+            let public_key = [0xb7; 32];
+            let query = AuthorityProjectionQuery {
+                authority: owner.authority_target(),
+                credential: CredentialId::of_public_key(&public_key),
+                nonce: Hash([0xb8; 32]),
+                selector: AuthorityProjectionSelector::Credential,
+                authentication:
+                    crate::agent::sdk::authority::AuthorityIngressAuthentication::ApiCredentialSignature {
+                        credential_public_key: public_key,
+                        signature: [0xb9; 64],
+                    },
+            };
+            assert!(query.validate_shape().is_ok());
+            let target = owner.authority_target();
+            let query_bytes = query.encode().unwrap();
+            let invocation = InvocationWork {
+                space: target.space,
+                agent: target.system_agent,
+                runtime_deployment: target.system_runtime_deployment,
+                invocation: InvocationId(
+                    Hash::digest(
+                        b"vos/system-authority/projection-invocation/v2",
+                        &[query.commitment().as_bytes()],
+                    )
+                    .0,
+                ),
+                actor: target.binding.issuer.actor,
+                incarnation: Hash([0xba; 32]),
+                deployment: target.binding.issuer.deployment,
+                program: target.binding.issuer.program,
+                mode: MethodMode::Query,
+                origin: InvocationOrigin::anonymous(),
+                roles: InvocationRoleClaims::none(),
+                message: dynamic_message(
+                    projection_method(query.selector),
+                    "query",
+                    crate::actors::value::Value::Bytes(query_bytes),
+                ),
+                installation_data: None,
+                availability: Vec::new(),
+                gas: 1_000_000,
+                recovery_only: false,
+            };
+            assert!(invocation.validate());
+            let authorization = InvocationAuthorization::PublicPreflight(
+                crate::agent::sdk::PublicPreflight::for_work(&invocation, LOGICAL_SLOT),
+            );
+            let pending = PendingAuthorityProjection {
+                query,
+                work: RuntimeWork::Invoke {
+                    context: RuntimeExecutionContext::Direct,
+                    state: RuntimeState::default(),
+                    invocation: Box::new(invocation),
+                    authorization: Box::new(authorization),
+                    observed_slot: LOGICAL_SLOT,
+                },
+            };
+            assert!(pending.validate());
+            let prior = owner.record.clone();
+            let mut candidate = prior.clone();
+            candidate.pending_projection = Some(pending);
+            assert!(prior.is_valid());
+            assert!(candidate.is_valid());
+            drop(owner);
+
+            let mut before =
+                ProjectionCommitStore::new(&prior, ProjectionCommitFailure::BeforePublish);
+            assert_eq!(
+                commit_new_pending_projection(&mut before, &prior, &candidate),
+                PendingProjectionRecordCommit::PriorVisible,
+            );
+            assert_eq!(before.image, Some(prior.encode()));
+            assert_eq!(before.commits, 1);
+
+            let mut after_once =
+                ProjectionCommitStore::new(&prior, ProjectionCommitFailure::AfterPublishOnce);
+            assert_eq!(
+                commit_new_pending_projection(&mut after_once, &prior, &candidate),
+                PendingProjectionRecordCommit::Durable,
+            );
+            assert_eq!(after_once.image, Some(candidate.encode()));
+            assert_eq!(after_once.commits, 2);
+
+            let mut after_always =
+                ProjectionCommitStore::new(&prior, ProjectionCommitFailure::AfterPublishAlways);
+            assert_eq!(
+                commit_new_pending_projection(&mut after_always, &prior, &candidate),
+                PendingProjectionRecordCommit::Ambiguous,
+            );
+            assert_eq!(after_always.image, Some(candidate.encode()));
+            assert_eq!(after_always.commits, 2);
+
+            let mut missing =
+                ProjectionCommitStore::new(&prior, ProjectionCommitFailure::MissingAfterError);
+            assert_eq!(
+                commit_new_pending_projection(&mut missing, &prior, &candidate),
+                PendingProjectionRecordCommit::Ambiguous,
+            );
+            assert_eq!(missing.commits, 1);
+
+            stop_network(network);
+        }
+
+        #[test]
+        fn pending_projection_recovers_exact_invoke_and_ack_before_record_clear() {
+            use crate::agent::sdk::authority::AuthorityCredentialProjection;
+            use crate::agent::shared_journal_driver::CleanInvocationReplayRequest;
+
+            let fixture = native_projection_physical_fixture();
+            let directory = TestDirectory::new("pending-projection-exact-recovery");
+            let pins = BootstrapMemoryStore::default();
+            let record = BootstrapMemoryStore::default();
+            let issuer = IssuerMemoryStore::default();
+            let provider = Arc::new(MemoryProvider::new(fixture.provision.clone()));
+            let network = network(NODE_SEED);
+            let mut signer = CountingSigner::new();
+            let mut owner = seed_complete_native_projection_owner(
+                &fixture,
+                &directory,
+                pins.clone(),
+                record.clone(),
+                issuer.clone(),
+                &mut signer,
+                Arc::clone(&provider),
+                Arc::clone(&network),
+            );
+            let query = signed_credential_projection_query(&owner, 0xc1);
+            assert_eq!(
+                query.encode().unwrap().len(),
+                placeholder_credential_projection()
+                    .query
+                    .encode()
+                    .unwrap()
+                    .len()
+            );
+            let pending = owner.prepare_authority_projection(query.clone()).unwrap();
+            let (work, authorization) = pending.invocation().unwrap();
+            let work = work.clone();
+            let authorization = authorization.clone();
+            let agent = HostAgentId(owner.pins.agent.0);
+            owner
+                ._network_host
+                .reserve_projection_pair(agent, &work, &authorization, false)
+                .unwrap();
+            owner
+                .pending_authority_projection_identity(&pending, false)
+                .unwrap();
+            let prior = owner.record.clone();
+            let mut candidate = prior.clone();
+            candidate.pending_projection = Some(pending.clone());
+            assert_eq!(
+                commit_new_pending_projection(&mut owner.record_store, &prior, &candidate),
+                PendingProjectionRecordCommit::Durable
+            );
+            owner.record = candidate.clone();
+            let durable_pending = candidate.encode();
+            assert_eq!(record.image(), Some(durable_pending.clone()));
+
+            let identity = owner
+                .pending_authority_projection_identity(&pending, true)
+                .unwrap();
+            let before_invoke = owner.ordered_index_for_test().unwrap();
+            let prepared_input = owner
+                .host
+                .lock()
+                .unwrap()
+                .prepare_reserved_projection_operation(
+                    agent,
+                    CleanInvocationReplayRequest::Invoke {
+                        context: RuntimeExecutionContext::Direct,
+                        work: work.clone(),
+                        authorization: authorization.clone(),
+                    },
+                    true,
+                )
+                .unwrap()
+                .input();
+            let invoked = owner
+                .supervisor_invoke_terminal_reserved(identity, work.clone(), authorization.clone())
+                .unwrap();
+            let RuntimeOutcome::Completed(Ok(reply)) = &invoked else {
+                panic!("projection invoke did not complete successfully: {invoked:?}");
+            };
+            assert_eq!(reply.status, InvocationStatus::Done);
+            let crate::actors::value::Value::Bytes(response) =
+                crate::actors::value::Value::try_decode(&reply.reply).unwrap()
+            else {
+                panic!("projection reply was not bytes");
+            };
+            let projection = AuthorityCredentialProjection::decode(&response).unwrap();
+            assert_eq!(projection.query, query);
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before_invoke + 1);
+            {
+                let host = owner.host.lock().unwrap();
+                assert!(
+                    host.retained_terminal_projection_invoke(agent, &work, &authorization)
+                        .unwrap()
+                );
+                assert!(
+                    !host
+                        .retained_positive_clean_acknowledgement(agent, &work, &authorization)
+                        .unwrap()
+                );
+                assert_eq!(
+                    host.projection_admission_requirement(agent, &work, &authorization, true)
+                        .unwrap(),
+                    Some(1)
+                );
+            }
+            let rival = owner
+                .prepare_authority_projection(signed_credential_projection_query(&owner, 0xc2))
+                .unwrap();
+            let (rival_work, rival_authorization) = rival.invocation().unwrap();
+            let earlier_authorization = InvocationAuthorization::PublicPreflight(
+                crate::agent::sdk::PublicPreflight::for_work(&work, LOGICAL_SLOT - 1),
+            );
+            assert_ne!(authorization, earlier_authorization);
+            assert_eq!(
+                owner._network_host.reserve_projection_pair(
+                    agent,
+                    &work,
+                    &earlier_authorization,
+                    false,
+                ),
+                Err(SharedAgentHostError::Conflict)
+            );
+            assert!(
+                matches!(
+                    owner._network_host.reserve_projection_pair(
+                        agent,
+                        rival_work,
+                        rival_authorization,
+                        false,
+                    ),
+                    Err(SharedAgentHostError::Conflict)
+                ),
+                "a durable PAP must exclude every rival projection pair"
+            );
+            let pre_crash_snapshot = owner
+                .host
+                .lock()
+                .unwrap()
+                .show(agent)
+                .unwrap()
+                .unwrap()
+                .snapshots;
+            drop(owner);
+
+            let mut owner = open_owner(
+                &fixture,
+                &directory,
+                pins.clone(),
+                record.clone(),
+                issuer.clone(),
+                &mut signer,
+                Arc::clone(&provider),
+                Arc::clone(&network),
+            )
+            .unwrap();
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before_invoke + 1);
+            assert_eq!(
+                owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .show(agent)
+                    .unwrap()
+                    .unwrap()
+                    .snapshots,
+                pre_crash_snapshot
+            );
+            let retained = owner
+                .host
+                .lock()
+                .unwrap()
+                .prepare_reserved_projection_operation(
+                    agent,
+                    CleanInvocationReplayRequest::Invoke {
+                        context: RuntimeExecutionContext::Direct,
+                        work: work.clone(),
+                        authorization: authorization.clone(),
+                    },
+                    true,
+                )
+                .unwrap();
+            assert_eq!(retained.input(), prepared_input);
+            assert_eq!(retained.retained(), Some(&invoked));
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before_invoke + 1);
+
+            record.fail_next_before_publish();
+            assert_eq!(
+                owner.recover_pending_authority_projection(),
+                Err(SharedAgentHostError::Unavailable)
+            );
+            let after_ack = before_invoke + 2;
+            assert_eq!(owner.ordered_index_for_test().unwrap(), after_ack);
+            assert_eq!(record.image(), Some(durable_pending.clone()));
+            assert_eq!(owner.record.pending_projection, Some(pending.clone()));
+            {
+                let host = owner.host.lock().unwrap();
+                assert!(
+                    host.retained_positive_clean_acknowledgement(agent, &work, &authorization)
+                        .unwrap()
+                );
+                assert_eq!(
+                    host.projection_admission_requirement(agent, &work, &authorization, true)
+                        .unwrap(),
+                    Some(0)
+                );
+            }
+            let before_blocked_competitors = {
+                let host = owner.host.lock().unwrap();
+                (
+                    host.journal_position(agent).unwrap(),
+                    host.clean_state_commitment(agent).unwrap(),
+                    host.show(agent).unwrap().unwrap(),
+                )
+            };
+            assert_eq!(
+                owner._network_host.reserve_projection_pair(
+                    agent,
+                    &work,
+                    &earlier_authorization,
+                    false,
+                ),
+                Err(SharedAgentHostError::Conflict)
+            );
+            assert_eq!(
+                owner.supervisor_invoke_terminal(identity, work.clone(), authorization.clone()),
+                Err(SharedAgentHostError::CapacityExhausted)
+            );
+            assert_eq!(
+                owner._network_host.reserve_projection_pair(
+                    agent,
+                    rival_work,
+                    rival_authorization,
+                    false,
+                ),
+                Err(SharedAgentHostError::Conflict)
+            );
+            for (mode, method, nonce) in [
+                (MethodMode::Merge, "projection_merge_probe", 0xd1),
+                (MethodMode::Local, "projection_local_probe", 0xd2),
+            ] {
+                let mut probe = work.clone();
+                probe.invocation = InvocationId([nonce; 32]);
+                probe.mode = mode;
+                probe.message = dynamic_message(method, "probe", crate::actors::value::Value::Unit);
+                assert!(probe.validate());
+                let probe_authorization = InvocationAuthorization::PublicPreflight(
+                    crate::agent::sdk::PublicPreflight::for_work(&probe, LOGICAL_SLOT - 1),
+                );
+                assert_eq!(
+                    owner.supervisor_invoke(identity, probe, probe_authorization),
+                    Err(SharedAgentHostError::CapacityExhausted)
+                );
+            }
+            let after_blocked_competitors = {
+                let host = owner.host.lock().unwrap();
+                (
+                    host.journal_position(agent).unwrap(),
+                    host.clean_state_commitment(agent).unwrap(),
+                    host.show(agent).unwrap().unwrap(),
+                )
+            };
+            assert_eq!(after_blocked_competitors, before_blocked_competitors);
+            assert_eq!(owner.ordered_index_for_test().unwrap(), after_ack);
+            let snapshots = owner
+                .host
+                .lock()
+                .unwrap()
+                .show(agent)
+                .unwrap()
+                .unwrap()
+                .snapshots;
+            drop(owner);
+
+            let mut owner = open_owner(
+                &fixture,
+                &directory,
+                pins,
+                record.clone(),
+                issuer,
+                &mut signer,
+                provider,
+                Arc::clone(&network),
+            )
+            .unwrap();
+            assert_eq!(owner.record.pending_projection, None);
+            assert!(
+                CleanSystemAgentBootstrapRecord::decode(&record.image().unwrap())
+                    .unwrap()
+                    .pending_projection
+                    .is_none()
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), after_ack);
+            assert_eq!(
+                owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .show(agent)
+                    .unwrap()
+                    .unwrap()
+                    .snapshots,
+                snapshots
+            );
+            assert!(
+                owner
+                    .network_host_for_test()
+                    .attachment_for_test(agent)
+                    .is_some()
+            );
+            assert!(
+                owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .retained_positive_clean_acknowledgement(agent, &work, &authorization)
+                    .unwrap()
+            );
+            let fresh = signed_credential_projection_query(&owner, 0xc3);
+            assert!(owner.invoke_authority_projection(fresh).is_ok());
+            assert_eq!(owner.ordered_index_for_test().unwrap(), after_ack + 2);
+            assert_eq!(owner.record.pending_projection, None);
+            drop(owner);
+            stop_network(network);
+        }
+
+        #[test]
+        fn projection_checkpoint_failures_restore_exact_attachment_and_gate() {
+            // Candidate/committee mismatch and signer refusal occur before
+            // retirement, so the exact live handler and all physical state
+            // must remain unchanged.
+            for (label, refusal) in [
+                ("checkpoint-candidate-mismatch", false),
+                ("checkpoint-signer-refusal", true),
+            ] {
+                let mut harness = NativeProjectionOwnerHarness::new(label);
+                let expected_committee = harness.fixture.plan.pins.replicas.clone();
+                let valid_signer = Arc::clone(&harness.fixture.merge);
+                let wrong_agent = AgentId([0xe1; 32]);
+                let (wrong_committee, _) =
+                    replica_member(harness.fixture.plan.pins.space, wrong_agent);
+                let refusing = RefusingSnapshotSigner(HostNodeId(harness.fixture.plan.pins.node.0));
+                let owner = harness.owner.as_mut().unwrap();
+                let agent = HostAgentId(owner.pins.agent.0);
+                let (work, authorization) = fresh_projection_pair(owner, 0xe2);
+                owner
+                    ._network_host
+                    .reserve_projection_pair(agent, &work, &authorization, false)
+                    .unwrap();
+                owner
+                    ._network_host
+                    .release_projection_pair(agent, &work, &authorization)
+                    .unwrap();
+                let before = native_owner_physical_state(owner);
+                let (before_handler, before_worker) = owner
+                    .network_host_for_test()
+                    .attachment_for_test(agent)
+                    .unwrap();
+                assert!(before_worker);
+                owner._network_host.force_checkpoint_once_for_test();
+                let (committee, signer): (&AgentReplicaCommittee, &dyn LocalMergeAuthenticator) =
+                    if refusal {
+                        (&expected_committee, &refusing)
+                    } else {
+                        (&wrong_committee, valid_signer.as_ref())
+                    };
+                assert_eq!(
+                    owner
+                        ._network_host
+                        .certified_checkpoint_for_projection_pair(
+                            agent,
+                            &work,
+                            &authorization,
+                            committee,
+                            signer,
+                        ),
+                    Err(SharedAgentHostError::SnapshotCertificateInvalid)
+                );
+                let (after_handler, after_worker) = owner
+                    .network_host_for_test()
+                    .attachment_for_test(agent)
+                    .unwrap();
+                assert!(after_worker);
+                assert!(Arc::ptr_eq(&before_handler, &after_handler));
+                assert_eq!(native_owner_physical_state(owner), before);
+                assert_projection_gate_released(owner, 0xe3);
+                assert_eq!(native_owner_physical_state(owner), before);
+                drop(before_handler);
+                drop(after_handler);
+                harness.stop();
+            }
+
+            // A shape-valid but cryptographically invalid certificate reaches
+            // the real install boundary. Installation fails, then a fresh
+            // worker/handler is attached to the unchanged snapshot and
+            // journal before the error is returned.
+            {
+                let mut harness = NativeProjectionOwnerHarness::new("checkpoint-install-failure");
+                let expected_committee = harness.fixture.plan.pins.replicas.clone();
+                let invalid = InvalidSnapshotSigner(HostNodeId(harness.fixture.plan.pins.node.0));
+                let owner = harness.owner.as_mut().unwrap();
+                let agent = HostAgentId(owner.pins.agent.0);
+                let (work, authorization) = fresh_projection_pair(owner, 0xe4);
+                owner
+                    ._network_host
+                    .reserve_projection_pair(agent, &work, &authorization, false)
+                    .unwrap();
+                owner
+                    ._network_host
+                    .release_projection_pair(agent, &work, &authorization)
+                    .unwrap();
+                let before = native_owner_physical_state(owner);
+                let (before_handler, _) = owner
+                    .network_host_for_test()
+                    .attachment_for_test(agent)
+                    .unwrap();
+                owner._network_host.force_checkpoint_once_for_test();
+                assert_eq!(
+                    owner
+                        ._network_host
+                        .certified_checkpoint_for_projection_pair(
+                            agent,
+                            &work,
+                            &authorization,
+                            &expected_committee,
+                            &invalid,
+                        ),
+                    Err(SharedAgentHostError::SnapshotCertificateInvalid)
+                );
+                let after = native_owner_physical_state(owner);
+                let (after_handler, after_worker) = owner
+                    .network_host_for_test()
+                    .attachment_for_test(agent)
+                    .unwrap();
+                assert!(after_worker);
+                assert!(!Arc::ptr_eq(&before_handler, &after_handler));
+                assert_eq!(after.0, before.0);
+                assert_eq!(after.1, before.1);
+                assert_eq!(after.2.snapshots, before.2.snapshots);
+                assert_eq!(
+                    after.2.transport,
+                    crate::agent::shared_host::SharedAgentTransportState::Attached
+                );
+                assert_projection_gate_released(owner, 0xe5);
+                drop(before_handler);
+                drop(after_handler);
+                harness.stop();
+            }
+
+            // Once a valid snapshot is installed, an injected first
+            // reattachment failure is observable as no live generation. The
+            // next ordinary ensure call repairs that exact durable snapshot
+            // without installing a second checkpoint.
+            {
+                let mut harness = NativeProjectionOwnerHarness::new("checkpoint-reattach-repair");
+                let expected_committee = harness.fixture.plan.pins.replicas.clone();
+                let valid_signer = Arc::clone(&harness.fixture.merge);
+                let owner = harness.owner.as_mut().unwrap();
+                let agent = HostAgentId(owner.pins.agent.0);
+                let (work, authorization) = fresh_projection_pair(owner, 0xe6);
+                owner
+                    ._network_host
+                    .reserve_projection_pair(agent, &work, &authorization, false)
+                    .unwrap();
+                owner
+                    ._network_host
+                    .release_projection_pair(agent, &work, &authorization)
+                    .unwrap();
+                let before = native_owner_physical_state(owner);
+                owner._network_host.force_checkpoint_once_for_test();
+                owner._network_host.fail_reattach_once_for_test();
+                assert_eq!(
+                    owner
+                        ._network_host
+                        .certified_checkpoint_for_projection_pair(
+                            agent,
+                            &work,
+                            &authorization,
+                            &expected_committee,
+                            valid_signer.as_ref(),
+                        ),
+                    Err(SharedAgentHostError::Unavailable)
+                );
+                assert!(
+                    owner
+                        .network_host_for_test()
+                        .attachment_for_test(agent)
+                        .is_none()
+                );
+                let installed = native_owner_physical_state(owner);
+                assert_eq!(installed.0, before.0);
+                assert_eq!(installed.1, before.1);
+                assert_ne!(installed.2.snapshots, before.2.snapshots);
+                owner._network_host.ensure_reattached(agent).unwrap();
+                let repaired = native_owner_physical_state(owner);
+                assert_eq!(repaired.0, before.0);
+                assert_eq!(repaired.1, before.1);
+                assert_eq!(repaired.2.snapshots, installed.2.snapshots);
+                let (handler, worker) = owner
+                    .network_host_for_test()
+                    .attachment_for_test(agent)
+                    .unwrap();
+                assert!(worker);
+                assert_projection_gate_released(owner, 0xe7);
+                drop(handler);
+                harness.stop();
+            }
+        }
+
+        #[test]
+        fn same_head_inventory_rotates_authenticated_suffix_past_1024_entries() {
+            let (fixture, expected_descriptors, expected_head) =
+                native_inventory_projection_fixture();
+            let mut harness = NativeProjectionOwnerHarness::with_fixture(
+                "production-inventory-suffix-rotation",
+                fixture,
+            );
+            let owner = harness.owner.as_mut().unwrap();
+            let agent = HostAgentId(owner.pins.agent.0);
+            let (checkpoint_work, checkpoint_authorization) = fresh_projection_pair(owner, 0xf0);
+            owner
+                ._network_host
+                .reserve_projection_pair(agent, &checkpoint_work, &checkpoint_authorization, false)
+                .unwrap();
+            owner
+                ._network_host
+                .release_projection_pair(agent, &checkpoint_work, &checkpoint_authorization)
+                .unwrap();
+            owner._network_host.force_checkpoint_once_for_test();
+            assert_eq!(
+                owner
+                    ._network_host
+                    .certified_checkpoint_for_projection_pair(
+                        agent,
+                        &checkpoint_work,
+                        &checkpoint_authorization,
+                        &harness.fixture.plan.pins.replicas,
+                        harness.fixture.merge.as_ref(),
+                    ),
+                Ok(true)
+            );
+            let initial = native_owner_physical_state(owner);
+            assert!(matches!(
+                initial.2.snapshots,
+                crate::agent::shared_host::SharedAgentSnapshotState::Installed { .. }
+            ));
+            let host = Arc::clone(&owner.host);
+            let record = harness.record.clone();
+            let owner = harness.owner.take().unwrap();
+            let attachment =
+                crate::agent::supervisor_adapters::system_agent_supervisor_attachment(owner, 8)
+                    .unwrap();
+            let observations = Arc::new(Mutex::new(Vec::new()));
+            let inventory = crate::agent::production_owner::load_system_inventory_for_test(
+                &attachment,
+                Box::new(InventoryProjectionAuthenticator {
+                    counters: [0; 4],
+                    host: Arc::clone(&host),
+                    agent,
+                    observations: Arc::clone(&observations),
+                }),
+            );
+            let (head, principal, projections) = inventory.unwrap_or_else(|error| {
+                let observed = observations.lock().unwrap();
+                let last = observed.last().cloned();
+                let physical = {
+                    let host = host.lock().unwrap();
+                    (
+                        host.journal_position(agent),
+                        host.snapshot_state_for_test(agent),
+                        host.show(agent),
+                    )
+                };
+                panic!(
+                    "inventory failed after {} authenticated queries: {error:?}; last={last:?}; physical={physical:?}",
+                    observed.len()
+                )
+            });
+            assert_eq!(head, expected_head);
+            assert_eq!(principal, PrincipalId([0xb1; 32]));
+            assert_eq!(projections.len(), expected_descriptors.len());
+            for (projection, expected) in projections.iter().zip(&expected_descriptors) {
+                assert_eq!(projection.descriptor(), expected);
+                assert!(projection.actors().is_empty());
+                assert_eq!(
+                    projection.replica_generation(),
+                    expected.replica_generation()
+                );
+            }
+
+            let observations = observations.lock().unwrap();
+            assert_eq!(observations.len(), 514);
+            let mut expected_selectors = vec![AuthorityProjectionSelector::Credential];
+            for page in 0..31 {
+                let after = (page != 0).then(|| {
+                    expected_descriptors[page * MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES - 1]
+                        .identity
+                        .agent
+                });
+                expected_selectors.push(AuthorityProjectionSelector::Agents {
+                    after,
+                    limit: MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES as u16,
+                });
+            }
+            for descriptor in &expected_descriptors {
+                expected_selectors.push(AuthorityProjectionSelector::AgentReplicas {
+                    agent: descriptor.identity.agent,
+                    after: None,
+                    limit: MAX_AUTHORITY_REPLICA_PAGE_ENTRIES as u16,
+                });
+                expected_selectors.push(AuthorityProjectionSelector::Actors {
+                    agent: descriptor.identity.agent,
+                    after: None,
+                    limit: MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES as u16,
+                });
+            }
+            assert_eq!(
+                observations
+                    .iter()
+                    .map(|observation| observation.query.selector)
+                    .collect::<Vec<_>>(),
+                expected_selectors
+            );
+            let unique_nonces = observations
+                .iter()
+                .map(|observation| observation.query.nonce.0)
+                .collect::<std::collections::BTreeSet<_>>();
+            let unique_queries = observations
+                .iter()
+                .map(|observation| observation.query.commitment().0)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(unique_nonces.len(), 514);
+            assert_eq!(unique_queries.len(), 514);
+            for (index, observation) in observations.iter().enumerate() {
+                assert_eq!(
+                    observation.ordered_index,
+                    initial.0.ordered_index + 2 * index as u64
+                );
+                if index <= 512 {
+                    if index == 512 {
+                        assert_eq!(observation.snapshot, Some(initial.2.snapshots));
+                    } else {
+                        assert_eq!(observation.snapshot, None);
+                    }
+                }
+            }
+            let rotated_snapshot = observations[513].snapshot.unwrap();
+            assert_ne!(rotated_snapshot, initial.2.snapshots);
+            assert!(matches!(
+                rotated_snapshot,
+                crate::agent::shared_host::SharedAgentSnapshotState::Installed { raft_index, .. }
+                    if raft_index == initial.2.applied_slots + 1_024
+            ));
+            drop(observations);
+
+            let final_state = {
+                let host = host.lock().unwrap();
+                (
+                    host.journal_position(agent).unwrap(),
+                    host.show(agent).unwrap().unwrap(),
+                )
+            };
+            assert_eq!(final_state.0.ordered_index, initial.0.ordered_index + 1_028);
+            assert_eq!(final_state.1.snapshots, rotated_snapshot);
+            assert!(!final_state.1.reservation_pending);
+            assert!(
+                CleanSystemAgentBootstrapRecord::decode(&record.image().unwrap())
+                    .unwrap()
+                    .pending_projection
+                    .is_none()
+            );
+            assert!(attachment.handle().is_running());
+            assert!(!attachment.handle().recover_authority_projection().unwrap());
+            attachment.retire().unwrap();
+            drop(host);
+            harness.stop();
+        }
+
+        struct NeverProjectionAuthenticator(Arc<AtomicUsize>);
+
+        impl crate::agent::production_owner::AuthorityProjectionQueryAuthenticator
+            for NeverProjectionAuthenticator
+        {
+            fn expected_kind(&self) -> crate::agent::sdk::authority::AuthorityCredentialKind {
+                crate::agent::sdk::authority::AuthorityCredentialKind::Api
+            }
+
+            fn authenticate(
+                &mut self,
+                _authority: AuthorityActorTarget,
+                _selector: AuthorityProjectionSelector,
+            ) -> Result<
+                AuthorityProjectionQuery,
+                crate::agent::production_owner::AgentProductionOwnerError,
+            > {
+                self.0.fetch_add(1, Ordering::AcqRel);
+                Err(crate::agent::production_owner::AgentProductionOwnerError::Authentication)
+            }
+        }
+
+        #[test]
+        fn real_bootstrap_refused_before_projection_is_retired_joined_and_reopenable() {
+            let fixture = physical_fixture();
+            let directory = TestDirectory::new("node-production-preflight");
+            let pins = BootstrapMemoryStore::default();
+            let record = BootstrapMemoryStore::default();
+            let issuer = IssuerMemoryStore::default();
+            let provider = Arc::new(MemoryProvider::new(fixture.provision.clone()));
+            let network = network(NODE_SEED);
+            let mut signer = CountingSigner::new();
+            let incoming = open_owner(
+                &fixture,
+                &directory,
+                pins.clone(),
+                record.clone(),
+                issuer.clone(),
+                &mut signer,
+                Arc::clone(&provider),
+                Arc::clone(&network),
+            )
+            .unwrap();
+            let authentications = Arc::new(AtomicUsize::new(0));
+            let mut node = crate::node::VosNode::new();
+            node.shutdown();
+            assert_eq!(
+                node.start_clean_agent_production(
+                    fixture.plan.pins.node,
+                    incoming,
+                    Box::new(NeverProjectionAuthenticator(Arc::clone(&authentications))),
+                    crate::agent::supervisor::AgentSupervisorLimits::new(8, 4, 4, 1 << 20),
+                    8,
+                    std::time::Duration::from_secs(60),
+                ),
+                Err(crate::agent::production_owner::AgentProductionOwnerError::DuplicateHost)
+            );
+            assert_eq!(authentications.load(Ordering::Acquire), 0);
+            assert!(node.clean_agent_supervisor().is_none());
+            assert!(node.ingress_handle().clean_agent_supervisor().is_none());
+            node.collect_checked().unwrap();
+
+            let reopened = open_owner(
+                &fixture,
+                &directory,
+                pins,
+                record,
+                issuer,
+                &mut signer,
+                provider,
+                Arc::clone(&network),
+            )
+            .unwrap();
+            assert_eq!(reopened.ordered_index_for_test().unwrap(), 4);
+            drop(reopened);
+            stop_network(network);
         }
 
         #[test]
