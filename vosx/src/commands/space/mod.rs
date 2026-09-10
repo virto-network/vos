@@ -33,6 +33,9 @@ pub mod caps;
 // The hardened store depends on Unix dirfd, no-follow, ownership, link-count,
 // and durable-directory semantics. It is intentionally unavailable where
 // those guarantees cannot be enforced.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // Wired by the clean native startup owner in this chapter.
+pub(crate) mod clean_genesis_archive;
 #[allow(dead_code)] // Deliberately unwired until clean space genesis owns these capabilities.
 pub(crate) mod clean_identity;
 #[cfg(unix)]

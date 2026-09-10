@@ -16,6 +16,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use fs2::FileExt as _;
+use vos::agent::bootstrap::MAX_SYSTEM_AGENT_GENESIS_PROVISION_BYTES;
 use vos::agent::clean_authority_issuer::{
     CleanManagementIssuerStore, MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
 };
@@ -23,6 +24,7 @@ use vos::agent::clean_bootstrap::{
     CleanSystemAgentBootstrapStore, MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES,
     MAX_CLEAN_SYSTEM_AGENT_PINS_BYTES,
 };
+use vos::agent::sdk::package::MAX_PACKAGE_ENCODED_BYTES;
 
 #[cfg(unix)]
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -38,6 +40,11 @@ const BOOTSTRAP_FILE: &str = "system-agent.bootstrap";
 const BOOTSTRAP_STAGE_FILE: &str = "system-agent.bootstrap.next";
 const ISSUER_FILE: &str = "system-agent.management-issuer";
 const ISSUER_STAGE_FILE: &str = "system-agent.management-issuer.next";
+const GENESIS_FILE: &str = "system-agent.genesis-archive";
+const GENESIS_STAGE_FILE: &str = "system-agent.genesis-archive.next";
+
+pub(crate) const MAX_CLEAN_SYSTEM_AGENT_GENESIS_ARCHIVE_BYTES: usize =
+    MAX_SYSTEM_AGENT_GENESIS_PROVISION_BYTES + MAX_PACKAGE_ENCODED_BYTES + 1024;
 
 const STORE_MAGIC: [u8; 4] = *b"CSF1";
 const STORE_VERSION: u8 = 1;
@@ -45,7 +52,7 @@ const STORE_HEADER_BYTES: usize = 80;
 const NO_PREDECESSOR: [u8; 32] = [0; 32];
 const ENVELOPE_DIGEST_DOMAIN: &[u8] = b"vos/clean-system-agent/file-envelope/v1";
 
-const ALLOWED_ENTRIES: [&str; 7] = [
+const ALLOWED_ENTRIES: [&str; 9] = [
     LOCK_FILE,
     PINS_FILE,
     PINS_STAGE_FILE,
@@ -53,6 +60,8 @@ const ALLOWED_ENTRIES: [&str; 7] = [
     BOOTSTRAP_STAGE_FILE,
     ISSUER_FILE,
     ISSUER_STAGE_FILE,
+    GENESIS_FILE,
+    GENESIS_STAGE_FILE,
 ];
 
 /// Failure at the physical clean-system-Agent persistence boundary.
@@ -110,6 +119,7 @@ enum StoreRole {
     Pins = 1,
     Bootstrap = 2,
     ManagementIssuer = 3,
+    GenesisArchive = 4,
 }
 
 impl StoreRole {
@@ -118,6 +128,7 @@ impl StoreRole {
             Self::Pins => PINS_FILE,
             Self::Bootstrap => BOOTSTRAP_FILE,
             Self::ManagementIssuer => ISSUER_FILE,
+            Self::GenesisArchive => GENESIS_FILE,
         }
     }
 
@@ -126,6 +137,7 @@ impl StoreRole {
             Self::Pins => PINS_STAGE_FILE,
             Self::Bootstrap => BOOTSTRAP_STAGE_FILE,
             Self::ManagementIssuer => ISSUER_STAGE_FILE,
+            Self::GenesisArchive => GENESIS_STAGE_FILE,
         }
     }
 
@@ -134,6 +146,7 @@ impl StoreRole {
             Self::Pins => MAX_CLEAN_SYSTEM_AGENT_PINS_BYTES,
             Self::Bootstrap => MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES,
             Self::ManagementIssuer => MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
+            Self::GenesisArchive => MAX_CLEAN_SYSTEM_AGENT_GENESIS_ARCHIVE_BYTES,
         }
     }
 
@@ -142,6 +155,7 @@ impl StoreRole {
             1 => Some(Self::Pins),
             2 => Some(Self::Bootstrap),
             3 => Some(Self::ManagementIssuer),
+            4 => Some(Self::GenesisArchive),
             _ => None,
         }
     }
@@ -152,6 +166,7 @@ pub(crate) struct CleanSystemAgentFileStores {
     pins: CleanSystemAgentPinsFile,
     bootstrap: CleanSystemAgentBootstrapFile,
     issuer: CleanManagementIssuerFile,
+    genesis: CleanSystemAgentGenesisFile,
 }
 
 impl CleanSystemAgentFileStores {
@@ -170,8 +185,12 @@ impl CleanSystemAgentFileStores {
                 StoreRole::Bootstrap,
             )),
             issuer: CleanManagementIssuerFile(ExactFileStore::new(
-                root,
+                Arc::clone(&root),
                 StoreRole::ManagementIssuer,
+            )),
+            genesis: CleanSystemAgentGenesisFile(ExactFileStore::new(
+                root,
+                StoreRole::GenesisArchive,
             )),
         })
     }
@@ -185,11 +204,33 @@ impl CleanSystemAgentFileStores {
     ) {
         (self.pins, self.bootstrap, self.issuer)
     }
+
+    pub(crate) fn into_production_parts(
+        self,
+    ) -> (
+        CleanSystemAgentPinsFile,
+        CleanSystemAgentBootstrapFile,
+        CleanManagementIssuerFile,
+        CleanSystemAgentGenesisFile,
+    ) {
+        (self.pins, self.bootstrap, self.issuer, self.genesis)
+    }
 }
 
 pub(crate) struct CleanSystemAgentPinsFile(ExactFileStore);
 pub(crate) struct CleanSystemAgentBootstrapFile(ExactFileStore);
 pub(crate) struct CleanManagementIssuerFile(ExactFileStore);
+pub(crate) struct CleanSystemAgentGenesisFile(ExactFileStore);
+
+impl CleanSystemAgentGenesisFile {
+    pub(crate) fn load(&mut self) -> Result<Option<Vec<u8>>, CleanFileStoreError> {
+        self.0.load(MAX_CLEAN_SYSTEM_AGENT_GENESIS_ARCHIVE_BYTES)
+    }
+
+    pub(crate) fn commit(&mut self, image: &[u8]) -> Result<(), CleanFileStoreError> {
+        self.0.commit(image)
+    }
+}
 
 impl CleanSystemAgentBootstrapStore for CleanSystemAgentPinsFile {
     type Error = CleanFileStoreError;
@@ -1178,6 +1219,27 @@ mod tests {
         assert!(!fixture.root.join(PINS_STAGE_FILE).exists());
         assert!(!fixture.root.join(BOOTSTRAP_STAGE_FILE).exists());
         assert!(!fixture.root.join(ISSUER_STAGE_FILE).exists());
+    }
+
+    #[test]
+    fn genesis_archive_shares_the_lease_and_has_an_independent_role() {
+        let fixture = Fixture::new("genesis-archive");
+        let (pins, bootstrap, issuer, mut genesis) = fixture.stores().into_production_parts();
+        assert_eq!(genesis.load().unwrap(), None);
+        genesis.commit(b"exact-root-provision-and-catalog").unwrap();
+        assert_ne!(
+            fs::read(fixture.root.join(GENESIS_FILE)).unwrap(),
+            b"exact-root-provision-and-catalog",
+        );
+        drop((pins, bootstrap, issuer, genesis));
+
+        let (pins, bootstrap, issuer, mut genesis) = fixture.stores().into_production_parts();
+        assert_eq!(
+            genesis.load().unwrap().as_deref(),
+            Some(b"exact-root-provision-and-catalog".as_slice()),
+        );
+        assert!(!fixture.root.join(GENESIS_STAGE_FILE).exists());
+        drop((pins, bootstrap, issuer, genesis));
     }
 
     #[test]

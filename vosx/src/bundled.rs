@@ -17,7 +17,9 @@
 
 use anyhow::{anyhow, bail};
 use libp2p::identity::{KeyType, Keypair};
-use vos::agent::package_admission::{AdmittedRuntimePackage, admit_runtime_package};
+use vos::agent::package_admission::{
+    AdmittedActorPackage, AdmittedRuntimePackage, admit_actor_package, admit_runtime_package,
+};
 use vos::agent::sdk::contract::RuntimePackageContract;
 use vos::agent::sdk::package::{
     AgentRuntimePackageManifest, PackageArtifact, PackageEnvelope, PackageManifest, PackageSigning,
@@ -114,6 +116,54 @@ pub(crate) fn root_signed_agent_runtime_package(
     // signer/producer binding, exact Ed25519 verification, and that the
     // bundled outer artifact parses as a canonical standard PVM.
     admit_runtime_package(&bytes).map_err(Into::into)
+}
+
+/// Rebind a checked source-derived actor package template to the explicit
+/// space root. The template signature is verified before any field is used;
+/// only the signing identity changes, so the exact PVM/schema/policy/
+/// introspection/task closure remains release-pinned.
+pub(crate) fn root_signed_actor_package(
+    template: &[u8],
+    expected_name: &str,
+    root: &Keypair,
+) -> anyhow::Result<AdmittedActorPackage> {
+    require_ed25519_space_root(root.key_type())?;
+    let admitted_template = admit_actor_package(template)
+        .map_err(|error| anyhow!("invalid bundled {expected_name} template: {error}"))?;
+    if admitted_template.manifest().name != expected_name {
+        bail!(
+            "bundled actor template is named '{}', expected '{expected_name}'",
+            admitted_template.manifest().name,
+        );
+    }
+    let public_key = root
+        .public()
+        .try_into_ed25519()
+        .map_err(|_| anyhow!("space root did not yield a raw Ed25519 public key"))?
+        .to_bytes();
+    let mut envelope = PackageEnvelope::decode(template)?;
+    let PackageManifest::Actor(manifest) = &mut envelope.manifest else {
+        bail!("bundled {expected_name} template is not an actor package");
+    };
+    manifest.signing = PackageSigning {
+        producer: ProducerId::of_public_key(&public_key),
+        public_key,
+        signature: [0; 64],
+    };
+    let signature = root
+        .sign(&envelope.signing_bytes()?)
+        .map_err(|error| anyhow!("sign bundled {expected_name} package: {error}"))?
+        .try_into()
+        .map_err(|signature: Vec<u8>| {
+            anyhow!(
+                "Ed25519 space root returned a {}-byte signature instead of 64 bytes",
+                signature.len()
+            )
+        })?;
+    envelope.manifest.signing_mut().signature = signature;
+    admit_actor_package(&envelope.encode()?).map_err(|error| {
+        anyhow!("root-signed bundled {expected_name} package failed admission: {error}")
+    })
 }
 
 fn require_ed25519_space_root(key_type: KeyType) -> anyhow::Result<()> {
