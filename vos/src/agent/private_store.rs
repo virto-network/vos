@@ -5005,6 +5005,7 @@ mod tests {
                 runtime_deployment: DeploymentId([0xa1; 32]),
                 runtime_program: ProgramId([0xa2; 32]),
                 runtime_producer: ProducerId([0xa3; 32]),
+                transition_producer: ProducerId([0xa4; 32]),
             },
             creation_nonce,
             authority,

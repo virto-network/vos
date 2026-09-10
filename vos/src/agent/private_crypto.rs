@@ -32,7 +32,9 @@ use vos_agent_sdk::private::{
     valid_x25519_public_key as sdk_valid_x25519_public_key,
 };
 use vos_agent_sdk::wire::{CanonicalWire, authority_private_node_identity_commitment};
-use vos_agent_sdk::{AgentId, Hash, NodeId, PrincipalId, RUNTIME_ABI_ID, SpaceId};
+use vos_agent_sdk::{
+    AgentId, AgentProfile, Hash, NodeId, PrincipalId, ProducerId, RUNTIME_ABI_ID, SpaceId,
+};
 use vos_protocol::wire::{DecodeError, Decoder, Encoder};
 
 const SECRET_BYTES: usize = 32;
@@ -84,7 +86,7 @@ const STABLE_IMPORT_CERTIFICATE_KDF_DOMAIN: &[u8] =
     b"vos/private/stable-import-certificate-auth/v1";
 
 /// Exact PSI1 framing: canonical header, destination/source context, and MAC.
-pub(crate) const PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES: usize = 4 + 32 + 10 * 32 + 32;
+pub(crate) const PRIVATE_STABLE_IMPORT_CERTIFICATE_WIRE_BYTES: usize = 4 + 32 + 12 * 32 + 1 + 32;
 
 /// Destination-authenticated proof that one fully verified source PSE2 was
 /// accepted only after this node durably produced and reopened its own PAPL.
@@ -220,7 +222,9 @@ impl PrivateStableImportCertificate {
 
     fn validate_context(&self) -> bool {
         self.route.is_valid()
+            && self.route.profile == AgentProfile::Private
             && self.owner != PrincipalId::ZERO
+            && self.owner == self.route.owner
             && self.descriptor != Hash::ZERO
             && self.destination_identity != Hash::ZERO
             && self.control != Hash::ZERO
@@ -245,7 +249,10 @@ fn encode_stable_import_certificate_context(
 ) {
     encoder.fixed(certificate.route.space.as_bytes());
     encoder.fixed(certificate.route.agent.as_bytes());
+    encoder.fixed(certificate.route.owner.as_bytes());
+    encoder.u8(certificate.route.profile as u8);
     encoder.fixed(certificate.route.runtime_deployment.as_bytes());
+    encoder.fixed(certificate.route.transition_producer.as_bytes());
     encoder.fixed(certificate.owner.as_bytes());
     encoder.fixed(certificate.descriptor.as_bytes());
     encoder.fixed(certificate.destination_identity.as_bytes());
@@ -273,7 +280,15 @@ impl CanonicalWire for PrivateStableImportCertificate {
             route: ManagedAgentTarget {
                 space: SpaceId(decoder.fixed()?),
                 agent: AgentId(decoder.fixed()?),
+                owner: PrincipalId(decoder.fixed()?),
+                profile: match decoder.u8()? {
+                    0 => AgentProfile::Local,
+                    1 => AgentProfile::Shared,
+                    2 => AgentProfile::Private,
+                    _ => return Err(DecodeError::InvalidTag),
+                },
                 runtime_deployment: vos_agent_sdk::DeploymentId(decoder.fixed()?),
+                transition_producer: ProducerId(decoder.fixed()?),
             },
             owner: PrincipalId(decoder.fixed()?),
             descriptor: Hash(decoder.fixed()?),
@@ -2721,7 +2736,10 @@ mod tests {
         let route = ManagedAgentTarget {
             space: fixture.space,
             agent: fixture.agent,
+            owner: fixture.owner,
+            profile: AgentProfile::Private,
             runtime_deployment: DeploymentId([0x31; 32]),
+            transition_producer: ProducerId([0x30; 32]),
         };
         let descriptor = Hash([0x32; 32]);
         let control = Hash([0x33; 32]);
@@ -2740,6 +2758,22 @@ mod tests {
             &destination.key,
         )
         .unwrap();
+        let mut shared_route = route;
+        shared_route.profile = AgentProfile::Shared;
+        assert_eq!(
+            PrivateStableImportCertificate::issue(
+                shared_route,
+                fixture.owner,
+                descriptor,
+                &destination.identity,
+                control,
+                local_application,
+                source_evidence,
+                stable_projection,
+                &destination.key,
+            ),
+            Err(PrivateCryptoError::InvalidRecord)
+        );
         let repeated = PrivateStableImportCertificate::issue(
             route,
             fixture.owner,
@@ -2807,8 +2841,9 @@ mod tests {
         assert!(PrivateStableImportCertificate::decode(&trailing).is_err());
         assert!(PrivateStableImportCertificate::decode(&wire[..wire.len() - 1]).is_err());
         let mut zero_descriptor = wire.clone();
-        // Canonical header + route (3 fields) + owner.
-        zero_descriptor[4 + 32 + 4 * 32..4 + 32 + 5 * 32].fill(0);
+        // Canonical header + ABI + complete managed route + owner.
+        let descriptor_offset = 4 + 32 + (5 * 32 + 1) + 32;
+        zero_descriptor[descriptor_offset..descriptor_offset + 32].fill(0);
         assert!(PrivateStableImportCertificate::decode(&zero_descriptor).is_err());
         let mut forged_wire = wire;
         let last = forged_wire.len() - 1;
@@ -2837,7 +2872,10 @@ mod tests {
         let route = ManagedAgentTarget {
             space: fixture.space,
             agent: fixture.agent,
+            owner: fixture.owner,
+            profile: AgentProfile::Private,
             runtime_deployment: DeploymentId([0x41; 32]),
+            transition_producer: ProducerId([0x40; 32]),
         };
         let descriptor = Hash([0x42; 32]);
         let control = Hash([0x43; 32]);
@@ -2911,7 +2949,55 @@ mod tests {
             invalid
         );
         wrong_route = route;
+        wrong_route.owner.0[0] ^= 1;
+        assert_eq!(
+            verify(
+                wrong_route,
+                fixture.owner,
+                descriptor,
+                &destination.identity,
+                control,
+                local_application,
+                source_evidence,
+                stable_projection,
+                &destination.key,
+            ),
+            invalid
+        );
+        wrong_route = route;
+        wrong_route.profile = AgentProfile::Shared;
+        assert_eq!(
+            verify(
+                wrong_route,
+                fixture.owner,
+                descriptor,
+                &destination.identity,
+                control,
+                local_application,
+                source_evidence,
+                stable_projection,
+                &destination.key,
+            ),
+            invalid
+        );
+        wrong_route = route;
         wrong_route.runtime_deployment.0[0] ^= 1;
+        assert_eq!(
+            verify(
+                wrong_route,
+                fixture.owner,
+                descriptor,
+                &destination.identity,
+                control,
+                local_application,
+                source_evidence,
+                stable_projection,
+                &destination.key,
+            ),
+            invalid
+        );
+        wrong_route = route;
+        wrong_route.transition_producer.0[0] ^= 1;
         assert_eq!(
             verify(
                 wrong_route,

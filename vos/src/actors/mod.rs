@@ -113,5 +113,8 @@ mod guest_panic;
 // so they're exposed at the vos crate root regardless; the prelude
 // re-exports them under `pvm` so a single `use vos::prelude::*;`
 // covers both `log::info!` and `println!` for actor source files.
-#[cfg(feature = "pvm")]
+#[cfg(all(
+    feature = "pvm",
+    not(all(target_arch = "riscv64", feature = "agent-runtime"))
+))]
 mod guest_io;

@@ -239,14 +239,14 @@ fn authenticate<B>(
     request: &Request<B>,
     handle: &IngressHandle,
 ) -> Result<crate::IngressAccessStatus, (StatusCode, &'static str)> {
-    let token = request
+    let credential = request
         .headers()
         .get(http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .and_then(decode_access_token)
         .ok_or((StatusCode::UNAUTHORIZED, "invalid access token"))?;
-    let credential_id = crate::ingress_credential_id(&token);
+    let credential_id = credential.credential_id().0;
     let access = match handle.authenticate_credential(credential_id) {
         Ok(access) => access,
         Err(IngressAuthenticationError::Invalid) => {

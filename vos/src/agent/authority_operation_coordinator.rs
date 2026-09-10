@@ -2,8 +2,8 @@
 //!
 //! The system-authority actor owns policy and its global authorization clock;
 //! [`super::authority_operation_issuer`] owns the two authority signatures.
-//! This module joins those durable boundaries without treating unsigned AOP4
-//! bytes as public authority. It pledges the exact AOC4, authorization
+//! This module joins those durable boundaries without treating unsigned AOP5
+//! bytes as public authority. It pledges the exact AOC5, authorization
 //! [`InvocationContext`], and issuance slot before the first actor dispatch.
 //! After that point, retained issuer preimages always take precedence over
 //! asking the actor to authorize again.
@@ -21,7 +21,8 @@ use super::authority_operation_issuer::{
     MAX_AUTHORITY_OPERATION_ISSUER_RECORDS,
 };
 use crate::agent::sdk::authority::{
-    AgentAuthorityBinding, AuthorityActorTarget, AuthorityCredentialVerifier, AuthorityIssuer,
+    AgentAuthorityBinding, AuthorityActorTarget, AuthorityCredentialVerifier,
+    AuthorityIngressAuthentication, AuthorityIssuer,
 };
 use crate::agent::sdk::authority_operation::{
     AuthorityOperationApproval, AuthorityOperationCall, AuthorityOperationIssuanceAck,
@@ -246,7 +247,7 @@ impl AuthorityOperationCoordinatorImage {
                 AuthorityOperationApproval::derive_acknowledgement_invocation(&call);
             if call.encode().ok().as_deref() != Some(record.call.as_slice())
                 || context.encode().ok().as_deref() != Some(record.authorization_context.as_slice())
-                || call.verify_with(&verifier).is_err()
+                || !operation_call_has_valid_ingress_envelope(&call, &verifier)
                 || call.authority != self.authority
                 || !call.matches_invocation_context(&context)
                 || record.issued_at < context.observed_slot
@@ -421,7 +422,7 @@ where
     /// Execute one exact credential-authenticated operation through policy,
     /// durable evidence issuance, and durable AOI1 consumption.
     ///
-    /// This method is crate-private so callers cannot pair an arbitrary AOP4
+    /// This method is crate-private so callers cannot pair an arbitrary AOP5
     /// with the signer. Only this coordinator may pass the exact canonical
     /// result of its trusted `authorize_operation` dispatch to the issuer.
     pub(crate) fn coordinate<S: AuthorityOperationEvidenceSigner>(
@@ -436,7 +437,7 @@ where
     > {
         self.ensure_live()?;
         let verifier = RawEd25519Verifier;
-        if call.verify_with(&verifier).is_err() {
+        if !operation_call_has_valid_ingress_envelope(call, &verifier) {
             return Err(AuthorityOperationCoordinatorError::Rejected(
                 AuthorityOperationCoordinatorRejection::InvalidCall,
             ));
@@ -867,6 +868,22 @@ fn acknowledgement_context(ack: &AuthorityOperationIssuanceAck) -> InvocationCon
 
 struct RawEd25519Verifier;
 
+fn operation_call_has_valid_ingress_envelope(
+    call: &AuthorityOperationCall,
+    verifier: &RawEd25519Verifier,
+) -> bool {
+    match call.authentication {
+        AuthorityIngressAuthentication::ApiCredentialSignature { .. } => {
+            call.verify_api_with(verifier).is_ok()
+        }
+        // Only the system-authority actor owns the enrolled Node key for an
+        // SSH attestation. The coordinator checks its canonical shape and
+        // exact invocation context before dispatch; the authenticated actor
+        // verifies the Node signature before returning the matching AOP5.
+        AuthorityIngressAuthentication::SshNodeAttestation { .. } => call.validate_shape().is_ok(),
+    }
+}
+
 impl AuthorityCredentialVerifier for RawEd25519Verifier {
     fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
         crate::agent::authority::verify_raw_ed25519(public_key, message, signature)
@@ -949,11 +966,9 @@ mod tests {
 
     use super::*;
     use crate::agent::authority_operation_issuer::DurableAuthorityOperationIssuer;
-    use crate::agent::sdk::authority::{
-        AuthorityEvidence, AuthorityLaneRoots, CREDENTIAL_SIGNATURE_BYTES,
-    };
+    use crate::agent::sdk::authority::{AuthorityEvidence, AuthorityLaneRoots};
     use crate::agent::sdk::authority_operation::AuthorityOperationIntent;
-    use crate::agent::sdk::{CredentialId, InvocationWork, NodeId, RuntimeBlob};
+    use crate::agent::sdk::{CredentialId, InvocationWork, RuntimeBlob};
 
     #[derive(Clone, Debug, Default)]
     struct MemoryImageStore {
@@ -1255,7 +1270,7 @@ mod tests {
                     };
                     if call.encode().ok().as_deref() != Some(request.request.as_slice())
                         || !call.matches_invocation_context(&request.context)
-                        || call.verify_with(&RawEd25519Verifier).is_err()
+                        || !operation_call_has_valid_ingress_envelope(&call, &RawEd25519Verifier)
                     {
                         return crate::value::Value::Bytes(Vec::new());
                     }
@@ -1522,7 +1537,6 @@ mod tests {
             let credential_public_key = self.credential_key.verifying_key().to_bytes();
             let principal = PrincipalId(id(0x22, 1));
             let credential = CredentialId::of_public_key(&credential_public_key);
-            let node = NodeId(id(0x23, 1));
             let work = InvocationWork {
                 space: self.authority.space,
                 agent: AgentId(id(0x31, discriminator)),
@@ -1535,7 +1549,7 @@ mod tests {
                 mode: MethodMode::Linear,
                 origin: InvocationOrigin {
                     principal: Some(principal),
-                    transport_node: Some(node),
+                    transport_node: None,
                     credential: Some(credential),
                     actor: None,
                     capability: None,
@@ -1547,23 +1561,39 @@ mod tests {
                 gas: 100,
                 recovery_only: false,
             };
+            let managed = crate::agent::sdk::authority::ManagedAgentTarget {
+                space: work.space,
+                agent: work.agent,
+                owner: principal,
+                profile: crate::agent::sdk::AgentProfile::Shared,
+                runtime_deployment: work.runtime_deployment,
+                transition_producer: ProducerId(id(0x3f, discriminator)),
+            };
             let mut call = AuthorityOperationCall {
                 invocation: authorization_invocation,
                 authority: self.authority,
                 principal,
                 credential,
                 request_sequence: core::num::NonZeroU64::new(discriminator).unwrap(),
-                credential_public_key,
-                authenticated_node: Some(node),
+                authentication: AuthorityIngressAuthentication::ApiCredentialSignature {
+                    credential_public_key,
+                    signature: [1; 64],
+                },
                 requested_valid_from: 10,
                 requested_expires_at: 100,
-                intent: AuthorityOperationIntent::invoke(&work).unwrap(),
-                signature: [0; CREDENTIAL_SIGNATURE_BYTES],
+                intent: AuthorityOperationIntent::invoke(managed, &work).unwrap(),
             };
             if call.invocation == InvocationId::ZERO {
                 call.invocation = call.expected_invocation();
             }
-            call.signature = self.credential_key.sign(&call.signing_bytes()).to_bytes();
+            let signature = self.credential_key.sign(&call.signing_bytes()).to_bytes();
+            let AuthorityIngressAuthentication::ApiCredentialSignature {
+                signature: value, ..
+            } = &mut call.authentication
+            else {
+                unreachable!()
+            };
+            *value = signature;
             call
         }
 
@@ -1574,7 +1604,7 @@ mod tests {
                 mode: MethodMode::Linear,
                 origin: InvocationOrigin {
                     principal: Some(call.principal),
-                    transport_node: call.authenticated_node,
+                    transport_node: call.authenticated_node(),
                     credential: Some(call.credential),
                     actor: None,
                     capability: None,
@@ -1975,7 +2005,7 @@ mod tests {
         assert_eq!(issuer_store.commits(), 3);
 
         // The actor's retirement tombstone deliberately cannot reconstruct
-        // unsigned AOP4. Recovery therefore has to consult the issuer first.
+        // unsigned AOP5. Recovery therefore has to consult the issuer first.
         let authorization = AuthorityOperationActorDispatch {
             target: fixture.authority,
             method: AuthorityOperationActorMethod::AuthorizeOperation,
@@ -2114,7 +2144,7 @@ mod tests {
         ));
         assert_eq!(issuer_store.commits(), 1);
 
-        // This alternate AOP4 remains well-shaped and matches the AOC4, but
+        // This alternate AOP5 remains well-shaped and matches the AOC5, but
         // it is not the exact actor result retained before the failed sign.
         dispatcher.fault_next(DispatchFault::DifferentMatchingApproval);
         assert!(matches!(
@@ -2344,7 +2374,12 @@ mod tests {
         let context = fixture.context(&call, 20);
 
         let mut forged = call.clone();
-        forged.signature[0] ^= 1;
+        let AuthorityIngressAuthentication::ApiCredentialSignature { signature, .. } =
+            &mut forged.authentication
+        else {
+            unreachable!()
+        };
+        signature[0] ^= 1;
         let mut coordinator = open(
             coordinator_store.clone(),
             issuer_store.clone(),

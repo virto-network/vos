@@ -1,6 +1,6 @@
 //! Durable host-side issuance for non-management authority operations.
 //!
-//! AOC4/AOP4 policy evaluation happens in the system-authority actor. This
+//! AOC5/AOP5 policy evaluation happens in the system-authority actor. This
 //! module owns the narrower crash-consistency boundary between that actor's
 //! exact approval and the authority signatures which leave the host: the
 //! operation receipt, AOI1 issuance acknowledgement, and (for Private
@@ -18,8 +18,9 @@
 use core::{convert::Infallible, fmt};
 
 use crate::agent::sdk::authority::{
-    AgentAuthorityBinding, AuthorityActorTarget, AuthorityCredentialVerifier, AuthorityIssuer,
-    AuthorityOperationKind, AuthorityReceipt, AuthorityVerifier, ManagedAgentTarget,
+    AgentAuthorityBinding, AuthorityActorTarget, AuthorityCredentialVerifier,
+    AuthorityIngressAuthentication, AuthorityIssuer, AuthorityOperationKind, AuthorityReceipt,
+    AuthorityVerifier, ManagedAgentTarget,
 };
 use crate::agent::sdk::authority_operation::{
     AuthorityOperationApproval, AuthorityOperationCall, AuthorityOperationIntent,
@@ -31,7 +32,8 @@ use crate::agent::sdk::authority_operation::{
 };
 use crate::agent::sdk::wire::{CanonicalWire, MAX_AUTHORITY_RECEIPT_WIRE_BYTES};
 use crate::agent::sdk::{
-    ActorId, AgentId, DeploymentId, Hash, InvocationId, PrincipalId, ProducerId, ProgramId, SpaceId,
+    ActorId, AgentId, AgentProfile, DeploymentId, Hash, InvocationId, PrincipalId, ProducerId,
+    ProgramId, SpaceId,
 };
 use vos_protocol::wire::{DecodeError, Decoder, Encoder};
 
@@ -129,7 +131,7 @@ pub(crate) enum RetainedPrivateResolution {
 
 /// Exact durable issuer material reopened by the trusted actor coordinator.
 ///
-/// This stays crate-private: an AOP4 is unsigned actor output and must never
+/// This stays crate-private: an AOP5 is unsigned actor output and must never
 /// become a public capability for reaching the authority signer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RetainedAuthorityOperation {
@@ -383,7 +385,7 @@ impl AuthorityOperationIssuerImage {
             };
             if call.encode().ok().as_deref() != Some(record.call.as_slice())
                 || approval.encode().ok().as_deref() != Some(record.approval.as_slice())
-                || call.verify_with(&verifier).is_err()
+                || !operation_call_has_valid_ingress_envelope(&call, &verifier)
                 || call.authority != self.authority
                 || approval.authority != self.authority
                 || !approval.matches_call(&call)
@@ -600,7 +602,7 @@ impl AuthorityOperationIssuerImage {
     }
 }
 
-/// Durable issuer for the AOC4 -> AOP4 -> receipt -> AOI1 boundary.
+/// Durable issuer for the AOC5 -> AOP5 -> receipt -> AOI1 boundary.
 ///
 /// One image belongs to exactly one independently configured authority actor
 /// target. The route encoded by caller-controlled protocol values is never
@@ -722,7 +724,7 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
     /// Reopen exact retained preimages before a coordinator considers calling
     /// the authority actor again. In particular, a completed record must
     /// drive an AOI1 retry directly because the actor intentionally cannot
-    /// reconstruct AOP4 after consuming that acknowledgement.
+    /// reconstruct AOP5 after consuming that acknowledgement.
     pub(crate) fn recover_retained(
         &self,
         authorization_invocation: InvocationId,
@@ -790,12 +792,12 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
     /// Issue and retain exact receipt evidence for one actor-approved call.
     ///
     /// The caller supplies the logical issuance slot; it is pledged with the
-    /// exact AOC4/AOP4 before any signature callback. The receipt is then
+    /// exact AOC5/AOP5 before any signature callback. The receipt is then
     /// committed before AOI1 is constructed or signed. A completed exact
     /// retry returns the retained values without inspecting `signer`.
-    /// This entrypoint is crate-private because AOP4 is deliberately unsigned:
+    /// This entrypoint is crate-private because AOP5 is deliberately unsigned:
     /// only the trusted local actor-dispatch coordinator may pass the exact
-    /// AOP4 returned by the configured authority actor transition. Shape and
+    /// AOP5 returned by the configured authority actor transition. Shape and
     /// call matching are necessary substitution checks, not policy proof.
     pub(crate) fn issue<S: AuthorityOperationEvidenceSigner>(
         &mut self,
@@ -806,7 +808,7 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
     ) -> Result<IssuedAuthorityOperation, AuthorityOperationIssuerError<B::Error, S::Error>> {
         self.ensure_live()?;
         let verifier = RawEd25519Verifier;
-        if call.verify_with(&verifier).is_err() {
+        if !operation_call_has_valid_ingress_envelope(call, &verifier) {
             return Err(AuthorityOperationIssuerError::Rejected(
                 AuthorityOperationIssuerRejection::InvalidCall,
             ));
@@ -1023,7 +1025,7 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
     /// pledged after this issuer had durably retained the complete AOI1.
     ///
     /// This raw fact entrypoint is crate-private. A fact is not authenticated
-    /// merely because its fields match an AOC4; only the trusted Private
+    /// merely because its fields match an AOC5; only the trusted Private
     /// runtime coordinator may pass the exact echoed result of a durable
     /// apply-and-reopen transition. Exact completed retries return retained
     /// PCA2 without consulting the signer.
@@ -1067,7 +1069,7 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
                 AuthorityOperationIssuerRejection::WrongRoute,
             ));
         }
-        if call.verify_with(&verifier).is_err()
+        if !operation_call_has_valid_ingress_envelope(&call, &verifier)
             || !issuance.matches_pending(&call, &approval)
             || issuance
                 .verify_with(self.image.authority.binding, &verifier)
@@ -1268,7 +1270,7 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
                 AuthorityOperationIssuerRejection::WrongRoute,
             ));
         }
-        if call.verify_with(&verifier).is_err()
+        if !operation_call_has_valid_ingress_envelope(&call, &verifier)
             || !issuance.matches_pending(&call, &approval)
             || issuance
                 .verify_with(self.image.authority.binding, &verifier)
@@ -1693,14 +1695,25 @@ fn decode_application_fact(
 fn encode_managed_target(encoder: &mut Encoder<'_>, target: ManagedAgentTarget) {
     encoder.fixed(target.space.as_bytes());
     encoder.fixed(target.agent.as_bytes());
+    encoder.fixed(target.owner.as_bytes());
+    encoder.u8(target.profile as u8);
     encoder.fixed(target.runtime_deployment.as_bytes());
+    encoder.fixed(target.transition_producer.as_bytes());
 }
 
 fn decode_managed_target(decoder: &mut Decoder<'_>) -> Result<ManagedAgentTarget, DecodeError> {
     let target = ManagedAgentTarget {
         space: SpaceId(decoder.fixed()?),
         agent: AgentId(decoder.fixed()?),
+        owner: PrincipalId(decoder.fixed()?),
+        profile: match decoder.u8()? {
+            0 => AgentProfile::Local,
+            1 => AgentProfile::Shared,
+            2 => AgentProfile::Private,
+            _ => return Err(DecodeError::InvalidTag),
+        },
         runtime_deployment: DeploymentId(decoder.fixed()?),
+        transition_producer: ProducerId(decoder.fixed()?),
     };
     target
         .is_valid()
@@ -1716,6 +1729,22 @@ fn decode_completed(record: &RetainedOperation) -> Option<IssuedAuthorityOperati
 }
 
 struct RawEd25519Verifier;
+
+fn operation_call_has_valid_ingress_envelope(
+    call: &AuthorityOperationCall,
+    verifier: &RawEd25519Verifier,
+) -> bool {
+    match call.authentication {
+        AuthorityIngressAuthentication::ApiCredentialSignature { .. } => {
+            call.verify_api_with(verifier).is_ok()
+        }
+        // The actor-approved AOP5 is this issuer's authenticated boundary for
+        // SSH calls; the issuer does not own the system authority's enrolled
+        // Node keys. Retained state still validates the exact canonical call
+        // and its equality with that approval.
+        AuthorityIngressAuthentication::SshNodeAttestation { .. } => call.validate_shape().is_ok(),
+    }
+}
 
 impl AuthorityCredentialVerifier for RawEd25519Verifier {
     fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
@@ -1800,7 +1829,6 @@ mod tests {
     use super::*;
     use crate::agent::sdk::authority::{
         AUTHORITY_SIGNATURE_BYTES, AuthorityEvidence, AuthorityLaneRoots,
-        CREDENTIAL_SIGNATURE_BYTES,
     };
     use crate::agent::sdk::authority_operation::AuthorityOperationIntent;
     use crate::agent::sdk::private::{
@@ -2062,7 +2090,6 @@ mod tests {
             let credential_public_key = self.credential_key.verifying_key().to_bytes();
             let principal = PrincipalId(id(0x22, 1));
             let credential = CredentialId::of_public_key(&credential_public_key);
-            let node = NodeId(id(0x23, 1));
             let work = InvocationWork {
                 space: self.authority.space,
                 agent: AgentId(id(0x31, discriminator)),
@@ -2075,7 +2102,7 @@ mod tests {
                 mode: MethodMode::Linear,
                 origin: InvocationOrigin {
                     principal: Some(principal),
-                    transport_node: Some(node),
+                    transport_node: None,
                     credential: Some(credential),
                     actor: None,
                     capability: None,
@@ -2087,23 +2114,39 @@ mod tests {
                 gas: 100,
                 recovery_only: false,
             };
+            let managed = ManagedAgentTarget {
+                space: work.space,
+                agent: work.agent,
+                owner: principal,
+                profile: crate::agent::sdk::AgentProfile::Shared,
+                runtime_deployment: work.runtime_deployment,
+                transition_producer: ProducerId(id(0x3f, discriminator)),
+            };
             let mut call = AuthorityOperationCall {
                 invocation: authorization_invocation,
                 authority: self.authority,
                 principal,
                 credential,
                 request_sequence: core::num::NonZeroU64::new(discriminator).unwrap(),
-                credential_public_key,
-                authenticated_node: Some(node),
+                authentication: AuthorityIngressAuthentication::ApiCredentialSignature {
+                    credential_public_key,
+                    signature: [1; 64],
+                },
                 requested_valid_from: 10,
                 requested_expires_at: 30,
-                intent: AuthorityOperationIntent::invoke(&work).unwrap(),
-                signature: [0; CREDENTIAL_SIGNATURE_BYTES],
+                intent: AuthorityOperationIntent::invoke(managed, &work).unwrap(),
             };
             if call.invocation == InvocationId::ZERO {
                 call.invocation = call.expected_invocation();
             }
-            call.signature = self.credential_key.sign(&call.signing_bytes()).to_bytes();
+            let signature = self.credential_key.sign(&call.signing_bytes()).to_bytes();
+            let AuthorityIngressAuthentication::ApiCredentialSignature {
+                signature: value, ..
+            } = &mut call.authentication
+            else {
+                unreachable!()
+            };
+            *value = signature;
             let approval = AuthorityOperationApproval::from_call(
                 &call,
                 core::num::NonZeroU64::new(authorization_sequence).unwrap(),
@@ -2133,7 +2176,14 @@ mod tests {
             control: &PrivateControlRecord,
         ) -> (AuthorityOperationCall, AuthorityOperationApproval) {
             let intent = AuthorityOperationIntent::private_control(
-                DeploymentId(id(0x82, discriminator)),
+                ManagedAgentTarget {
+                    space: control.space,
+                    agent: control.agent,
+                    owner: PrincipalId(id(0x22, 1)),
+                    profile: crate::agent::sdk::AgentProfile::Private,
+                    runtime_deployment: DeploymentId(id(0x82, discriminator)),
+                    transition_producer: ProducerId(id(0x83, discriminator)),
+                },
                 control,
             )
             .unwrap();
@@ -2150,22 +2200,29 @@ mod tests {
             let credential_public_key = self.credential_key.verifying_key().to_bytes();
             let principal = PrincipalId(id(0x22, 1));
             let credential = CredentialId::of_public_key(&credential_public_key);
-            let node = NodeId(id(0x23, 1));
             let mut call = AuthorityOperationCall {
                 invocation: InvocationId::ZERO,
                 authority: self.authority,
                 principal,
                 credential,
                 request_sequence: core::num::NonZeroU64::new(discriminator).unwrap(),
-                credential_public_key,
-                authenticated_node: Some(node),
+                authentication: AuthorityIngressAuthentication::ApiCredentialSignature {
+                    credential_public_key,
+                    signature: [1; 64],
+                },
                 requested_valid_from: 10,
                 requested_expires_at: 40,
                 intent,
-                signature: [0; CREDENTIAL_SIGNATURE_BYTES],
             };
             call.invocation = call.expected_invocation();
-            call.signature = self.credential_key.sign(&call.signing_bytes()).to_bytes();
+            let signature = self.credential_key.sign(&call.signing_bytes()).to_bytes();
+            let AuthorityIngressAuthentication::ApiCredentialSignature {
+                signature: value, ..
+            } = &mut call.authentication
+            else {
+                unreachable!()
+            };
+            *value = signature;
             let approval = AuthorityOperationApproval::from_call(
                 &call,
                 core::num::NonZeroU64::new(authorization_sequence).unwrap(),
@@ -2246,7 +2303,10 @@ mod tests {
         let managed = ManagedAgentTarget {
             space: fixture.authority.space,
             agent: AgentId(id(0x8a, discriminator)),
+            owner: PrincipalId(id(0x22, 1)),
+            profile: crate::agent::sdk::AgentProfile::Private,
             runtime_deployment: DeploymentId(id(0x82, discriminator)),
+            transition_producer: ProducerId(id(0x83, discriminator)),
         };
         let control = Hash(id(0x8b, discriminator));
         let control_sequence = discriminator;
@@ -2573,7 +2633,12 @@ mod tests {
         let mut issuer = open(store.clone(), &fixture);
 
         let mut forged_call = call.clone();
-        forged_call.signature[0] ^= 1;
+        let AuthorityIngressAuthentication::ApiCredentialSignature { signature, .. } =
+            &mut forged_call.authentication
+        else {
+            unreachable!()
+        };
+        signature[0] ^= 1;
         assert!(matches!(
             issuer.issue(&forged_call, &approval, 20, &mut signer),
             Err(AuthorityOperationIssuerError::Rejected(
@@ -2680,10 +2745,17 @@ mod tests {
         let (mut authorization_collision, authorization_collision_approval) =
             fixture.approved(2, 2);
         authorization_collision.invocation = approval.acknowledgement_invocation;
-        authorization_collision.signature = fixture
+        let signature = fixture
             .credential_key
             .sign(&authorization_collision.signing_bytes())
             .to_bytes();
+        let AuthorityIngressAuthentication::ApiCredentialSignature {
+            signature: value, ..
+        } = &mut authorization_collision.authentication
+        else {
+            unreachable!()
+        };
+        *value = signature;
         assert!(authorization_collision.validate_shape().is_err());
         assert!(matches!(
             issuer.issue(
@@ -2702,10 +2774,17 @@ mod tests {
         let (second, second_approval) = fixture.approved(3, 3);
         let (mut first, first_approval) = fixture.approved(2, 2);
         first.invocation = second_approval.acknowledgement_invocation;
-        first.signature = fixture
+        let signature = fixture
             .credential_key
             .sign(&first.signing_bytes())
             .to_bytes();
+        let AuthorityIngressAuthentication::ApiCredentialSignature {
+            signature: value, ..
+        } = &mut first.authentication
+        else {
+            unreachable!()
+        };
+        *value = signature;
         assert!(first.validate_shape().is_err());
         assert!(matches!(
             issuer.issue(&first, &first_approval, 20, &mut signer),

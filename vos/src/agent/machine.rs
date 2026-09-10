@@ -40,6 +40,8 @@ pub struct ActorMachine {
     frame: [u64; 14],
     writable_regions: Vec<Region>,
     live: bool,
+    #[cfg(all(test, feature = "std", not(target_arch = "riscv64")))]
+    test_machines: core::cell::RefCell<vos_pvm::inner::InnerMachines>,
 }
 
 impl ActorMachine {
@@ -86,6 +88,17 @@ impl ActorMachine {
         if let Some(snapshot) = snapshot {
             Self::validate_snapshot_regions(snapshot, &writable_regions)?;
         }
+        #[cfg(all(test, feature = "std", not(target_arch = "riscv64")))]
+        let (raw_id, test_machines) = {
+            let mut machines = vos_pvm::inner::InnerMachines::new();
+            let raw_id = match machines.create(&compact, initial_pc) {
+                Ok(id) => u64::from(id),
+                Err(vos_pvm::inner::InnerError::Full) => inner::RESULT_FULL,
+                Err(_) => inner::RESULT_HUH,
+            };
+            (raw_id, machines)
+        };
+        #[cfg(any(not(test), not(feature = "std"), target_arch = "riscv64"))]
         let raw_id = inner::machine(&compact, initial_pc);
         if raw_id == inner::RESULT_FULL {
             return Err(LoadError::MachineLimit);
@@ -96,6 +109,8 @@ impl ActorMachine {
             frame: [0; 14],
             writable_regions,
             live: true,
+            #[cfg(all(test, feature = "std", not(target_arch = "riscv64")))]
+            test_machines: core::cell::RefCell::new(test_machines),
         };
         machine.frame[1..].copy_from_slice(&layout.registers);
 
@@ -153,6 +168,27 @@ impl ActorMachine {
     /// actor ABI host operation.
     pub fn resume(&mut self, gas: u64) -> InnerExit {
         self.frame[0] = gas;
+        #[cfg(all(test, feature = "std", not(target_arch = "riscv64")))]
+        let [status, detail] = {
+            let state = vos_pvm::inner::InvokeState {
+                gas,
+                registers: *self.registers(),
+            };
+            let outcome = match self.test_machines.borrow_mut().invoke(self.id, state) {
+                Ok(outcome) => outcome,
+                Err(_) => return InnerExit::InvalidResult(inner::RESULT_HUH),
+            };
+            self.frame[0] = outcome.state.gas;
+            self.frame[1..].copy_from_slice(&outcome.state.registers);
+            match outcome.exit {
+                vos_pvm::inner::InnerExit::Halt => [0, 0],
+                vos_pvm::inner::InnerExit::Panic => [1, 0],
+                vos_pvm::inner::InnerExit::Fault(address) => [2, u64::from(address)],
+                vos_pvm::inner::InnerExit::Host(id) => [3, id],
+                vos_pvm::inner::InnerExit::OutOfGas => [4, 0],
+            }
+        };
+        #[cfg(any(not(test), not(feature = "std"), target_arch = "riscv64"))]
         let [status, detail] = inner::invoke(self.id, &mut self.frame);
         match status {
             0 => InnerExit::Halt,
@@ -167,6 +203,17 @@ impl ActorMachine {
     }
 
     pub fn read(&self, address: u32, output: &mut [u8]) -> Result<(), LoadError> {
+        #[cfg(all(test, feature = "std", not(target_arch = "riscv64")))]
+        {
+            let bytes = self
+                .test_machines
+                .borrow_mut()
+                .peek(self.id, address, output.len())
+                .map_err(|_| LoadError::MemoryOperation)?;
+            output.copy_from_slice(&bytes);
+            return Ok(());
+        }
+        #[cfg(any(not(test), not(feature = "std"), target_arch = "riscv64"))]
         match inner::peek(self.id, address, output) {
             inner::RESULT_OK => Ok(()),
             _ => Err(LoadError::MemoryOperation),
@@ -174,6 +221,15 @@ impl ActorMachine {
     }
 
     pub fn write(&mut self, address: u32, input: &[u8]) -> Result<(), LoadError> {
+        #[cfg(all(test, feature = "std", not(target_arch = "riscv64")))]
+        {
+            return self
+                .test_machines
+                .borrow_mut()
+                .poke(self.id, address, input)
+                .map_err(|_| LoadError::MemoryOperation);
+        }
+        #[cfg(any(not(test), not(feature = "std"), target_arch = "riscv64"))]
         match inner::poke(self.id, address, input) {
             inner::RESULT_OK => Ok(()),
             _ => Err(LoadError::MemoryOperation),
@@ -211,6 +267,14 @@ impl ActorMachine {
             memory.push(PortableMemoryRegion { base, bytes });
         }
         debug_assert_eq!(captured, memory_bytes);
+        #[cfg(all(test, feature = "std", not(target_arch = "riscv64")))]
+        let raw_pc = self
+            .test_machines
+            .borrow_mut()
+            .expunge(self.id)
+            .map(u64::from)
+            .unwrap_or(inner::RESULT_WHO);
+        #[cfg(any(not(test), not(feature = "std"), target_arch = "riscv64"))]
         let raw_pc = inner::expunge(self.id);
         let pc = decode_expunge_pc(raw_pc)?;
         self.live = false;
@@ -243,6 +307,17 @@ impl ActorMachine {
             .map_err(|_| LoadError::InvalidLayout)?;
         let count = u32::try_from(region.size / u64::from(PAGE_SIZE))
             .map_err(|_| LoadError::InvalidLayout)?;
+        #[cfg(all(test, feature = "std", not(target_arch = "riscv64")))]
+        self.test_machines
+            .borrow_mut()
+            .pages(
+                self.id,
+                first,
+                count,
+                vos_pvm::inner::PageMode::AllocateReadWrite,
+            )
+            .map_err(|_| LoadError::PageOperation)?;
+        #[cfg(any(not(test), not(feature = "std"), target_arch = "riscv64"))]
         if inner::pages(self.id, first, count, 2) != inner::RESULT_OK {
             return Err(LoadError::PageOperation);
         }
@@ -250,8 +325,16 @@ impl ActorMachine {
             let address = u32::try_from(region.base).map_err(|_| LoadError::InvalidLayout)?;
             self.write(address, data)?;
         }
-        if !region.writable && inner::pages(self.id, first, count, 3) != inner::RESULT_OK {
-            return Err(LoadError::PageOperation);
+        if !region.writable {
+            #[cfg(all(test, feature = "std", not(target_arch = "riscv64")))]
+            self.test_machines
+                .borrow_mut()
+                .pages(self.id, first, count, vos_pvm::inner::PageMode::SetReadOnly)
+                .map_err(|_| LoadError::PageOperation)?;
+            #[cfg(any(not(test), not(feature = "std"), target_arch = "riscv64"))]
+            if inner::pages(self.id, first, count, 3) != inner::RESULT_OK {
+                return Err(LoadError::PageOperation);
+            }
         }
         Ok(())
     }
@@ -267,6 +350,9 @@ fn decode_expunge_pc(raw: u64) -> Result<u32, LoadError> {
 impl Drop for ActorMachine {
     fn drop(&mut self) {
         if self.live {
+            #[cfg(all(test, feature = "std", not(target_arch = "riscv64")))]
+            let _ = self.test_machines.borrow_mut().expunge(self.id);
+            #[cfg(any(not(test), not(feature = "std"), target_arch = "riscv64"))]
             let _ = inner::expunge(self.id);
         }
     }
@@ -306,6 +392,45 @@ mod tests {
         };
         // ro 1 + rw initialization/heap 3 + stack 1 + args 1.
         assert_eq!(mapped_pages(&program, &[3]), Some(6));
+    }
+
+    #[cfg(all(feature = "std", not(target_arch = "riscv64")))]
+    #[test]
+    fn native_test_backend_preserves_actor_machine_lifecycle() {
+        use vos_pvm_compiler::assembler::{Assembler, Reg};
+
+        let output = b"native-inner-done";
+        let base = 2 * u64::from(vos_pvm_program::ZONE_SIZE);
+        let blob = Assembler::new()
+            .set_rw_data(output.to_vec())
+            .load_imm_64(Reg::A0, base)
+            .load_imm_64(Reg::A1, output.len() as u64)
+            .jump_ind(Reg::RA, 0)
+            .build_standard();
+        let mut machine = ActorMachine::load(&blob, b"actor-args").unwrap();
+        assert_eq!(machine.id(), 0);
+        assert_eq!(machine.resume(100_000), InnerExit::Halt);
+        assert!(machine.gas_remaining() < 100_000);
+        let mut returned = vec![0; output.len()];
+        machine
+            .read(
+                u32::try_from(machine.registers()[7]).unwrap(),
+                &mut returned,
+            )
+            .unwrap();
+        assert_eq!(returned, output);
+
+        let snapshot = machine.capture().unwrap();
+        let mut reopened = ActorMachine::restore(&blob, b"actor-args", &snapshot).unwrap();
+        assert_eq!(reopened.resume(snapshot.gas_remaining), InnerExit::Halt);
+        let mut returned = vec![0; output.len()];
+        reopened
+            .read(
+                u32::try_from(reopened.registers()[7]).unwrap(),
+                &mut returned,
+            )
+            .unwrap();
+        assert_eq!(returned, output);
     }
 
     #[test]

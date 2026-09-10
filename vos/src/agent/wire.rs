@@ -8,9 +8,9 @@ use super::execution::{
 };
 use super::standard::{
     StandardActorState, StandardAgentRuntime, StandardAuthorityDisposition,
-    StandardCleanManagementDisposition, StandardInvocationResult, StandardLaneEntry,
-    StandardLaneState, StandardMachineContinuation, StandardPrivateManagementDisposition,
-    StandardRuntimeState,
+    StandardCleanActorInstallation, StandardCleanActorPackage, StandardCleanManagementDisposition,
+    StandardInvocationResult, StandardLaneEntry, StandardLaneState, StandardMachineContinuation,
+    StandardPrivateManagementDisposition, StandardRuntimeState,
 };
 use super::{
     ActorDirectoryPage, ActorDirectoryRecord, ActorEntry, ActorLifecycleDebt, AgentConfig,
@@ -458,6 +458,8 @@ fn decode_bounded_list<T>(
 }
 
 const MAX_CLEAN_MANAGEMENT_RESULT_BYTES: usize = 8 * 1024;
+const STANDARD_CLEAN_ACTOR_PACKAGES_MAGIC: [u8; 4] = *b"SCAP";
+const STANDARD_CLEAN_ACTOR_INSTALLATIONS_MAGIC: [u8; 4] = *b"SCAI";
 
 fn encode_clean_management_result(
     result: &Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>,
@@ -627,6 +629,18 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
     );
     encoder.list(
         &state
+            .clean_invocation_acknowledgements
+            .iter()
+            .filter(|item| {
+                item.mode.result_storage() == crate::agent_sdk::InvocationResultStorage::Control
+            })
+            .collect::<Vec<_>>(),
+        |encoder, acknowledgement| {
+            encode_clean_invocation_acknowledgement(encoder, acknowledgement)
+        },
+    );
+    encoder.list(
+        &state
             .machine_continuations
             .iter()
             .filter(|continuation| {
@@ -635,12 +649,59 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
             .collect::<Vec<_>>(),
         |encoder, continuation| encode_machine_continuation(encoder, continuation),
     );
+    if let Some(packages) = &state.clean_actor_packages {
+        encoder
+            .0
+            .extend_from_slice(&STANDARD_CLEAN_ACTOR_PACKAGES_MAGIC);
+        encoder.list(packages, |encoder, package| {
+            encoder.fixed(package.actor.as_bytes());
+            encoder.u32(package.contract.actor_abi);
+            encoder.u8(package.requirements.lanes.bits());
+            encoder.bool(package.requirements.scheduling);
+            encoder.list(
+                package.requirements.proof_systems.as_slice(),
+                |encoder, proof_system| encoder.fixed(proof_system.as_bytes()),
+            );
+        });
+    }
+    if let Some(installations) = &state.clean_actor_installations {
+        encoder
+            .0
+            .extend_from_slice(&STANDARD_CLEAN_ACTOR_INSTALLATIONS_MAGIC);
+        encoder.list(installations, |encoder, installation| {
+            encoder.fixed(installation.actor.as_bytes());
+            encoder.fixed(installation.commitment.as_bytes());
+            encoder.u32(installation.contract.actor_abi);
+            encoder.u8(installation.requirements.lanes.bits());
+            encoder.bool(installation.requirements.scheduling);
+            encoder.list(
+                installation.requirements.proof_systems.as_slice(),
+                |encoder, proof_system| encoder.fixed(proof_system.as_bytes()),
+            );
+        });
+    }
     RuntimeState {
         control,
         linear: encode_standard_lane(state, StateLane::Linear),
         merge: encode_standard_lane(state, StateLane::Merge),
         local: encode_standard_lane(state, StateLane::Local),
     }
+}
+
+/// A clean Create starts from the wholly absent runtime state, while the
+/// canonical Standard successor materializes empty lane envelopes alongside
+/// Control. Treat those envelopes as initialization, never as actor-owned
+/// lane mutation. Any revision, value, result, acknowledgement, or
+/// continuation makes the bytes differ from this exact empty encoding.
+pub(crate) fn clean_create_initializes_only_empty_lanes(
+    before: &RuntimeState,
+    after: &RuntimeState,
+) -> bool {
+    if !before.is_empty() || decode_standard_runtime_state(after).is_err() {
+        return false;
+    }
+    let empty = encode_standard_runtime_state(&StandardRuntimeState::default());
+    after.linear == empty.linear && after.merge == empty.merge && after.local == empty.local
 }
 
 /// Decode all opaque standard-runtime components. Lane maps are sparse and
@@ -891,6 +952,16 @@ pub fn decode_standard_runtime_state(
     {
         return Err(DecodeError::NonCanonical);
     }
+    let mut clean_invocation_acknowledgements = decode_bounded_list(
+        &mut decoder,
+        super::standard::MAX_INVOCATION_ACKNOWLEDGEMENTS_PER_LANE,
+        |decoder| {
+            decode_clean_invocation_acknowledgement(
+                decoder,
+                super::InvocationResultStorage::Control,
+            )
+        },
+    )?;
     let mut machine_continuations = decode_bounded_list(
         &mut decoder,
         super::standard::MAX_MACHINE_CONTINUATIONS,
@@ -902,6 +973,93 @@ pub fn decode_standard_runtime_state(
     {
         return Err(DecodeError::NonCanonical);
     }
+    let clean_actor_packages = if decoder.exhausted() {
+        None
+    } else {
+        if decoder.take(STANDARD_CLEAN_ACTOR_PACKAGES_MAGIC.len())?
+            != STANDARD_CLEAN_ACTOR_PACKAGES_MAGIC
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Some(decode_bounded_list(
+            &mut decoder,
+            super::contract::STANDARD_MAX_ACTORS as usize,
+            |decoder| {
+                let actor = crate::agent_sdk::ActorId(decoder.fixed()?);
+                let contract = crate::agent_sdk::contract::ActorPackageContract {
+                    actor_abi: decoder.u32()?,
+                };
+                let lanes = crate::agent_sdk::LaneSet::from_bits(decoder.u8()?)
+                    .ok_or(DecodeError::NonCanonical)?;
+                let scheduling = decoder.bool()?;
+                let proof_systems = decode_bounded_list(
+                    decoder,
+                    crate::agent_sdk::proof_system::MAX_PROOF_SYSTEMS,
+                    |decoder| Ok(crate::agent_sdk::Hash(decoder.fixed()?)),
+                )?;
+                let proof_systems = crate::agent_sdk::ProofSystemSet::from_sorted(&proof_systems)
+                    .map_err(|_| DecodeError::NonCanonical)?;
+                if actor == crate::agent_sdk::ActorId::ZERO || !contract.is_valid() {
+                    return Err(DecodeError::NonCanonical);
+                }
+                Ok(StandardCleanActorPackage {
+                    actor,
+                    contract,
+                    requirements: crate::agent_sdk::RuntimeRequirements {
+                        lanes,
+                        scheduling,
+                        proof_systems,
+                    },
+                })
+            },
+        )?)
+    };
+    let clean_actor_installations = if decoder.exhausted() {
+        None
+    } else {
+        if decoder.take(STANDARD_CLEAN_ACTOR_INSTALLATIONS_MAGIC.len())?
+            != STANDARD_CLEAN_ACTOR_INSTALLATIONS_MAGIC
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Some(decode_bounded_list(
+            &mut decoder,
+            super::contract::STANDARD_MAX_ACTORS as usize,
+            |decoder| {
+                let actor = crate::agent_sdk::ActorId(decoder.fixed()?);
+                let commitment = crate::agent_sdk::Hash(decoder.fixed()?);
+                let contract = crate::agent_sdk::contract::ActorPackageContract {
+                    actor_abi: decoder.u32()?,
+                };
+                let lanes = crate::agent_sdk::LaneSet::from_bits(decoder.u8()?)
+                    .ok_or(DecodeError::NonCanonical)?;
+                let scheduling = decoder.bool()?;
+                let proof_systems = decode_bounded_list(
+                    decoder,
+                    crate::agent_sdk::proof_system::MAX_PROOF_SYSTEMS,
+                    |decoder| Ok(crate::agent_sdk::Hash(decoder.fixed()?)),
+                )?;
+                let proof_systems = crate::agent_sdk::ProofSystemSet::from_sorted(&proof_systems)
+                    .map_err(|_| DecodeError::NonCanonical)?;
+                if actor == crate::agent_sdk::ActorId::ZERO
+                    || commitment == crate::agent_sdk::Hash::ZERO
+                    || !contract.is_valid()
+                {
+                    return Err(DecodeError::NonCanonical);
+                }
+                Ok(StandardCleanActorInstallation {
+                    actor,
+                    commitment,
+                    contract,
+                    requirements: crate::agent_sdk::RuntimeRequirements {
+                        lanes,
+                        scheduling,
+                        proof_systems,
+                    },
+                })
+            },
+        )?)
+    };
     if !decoder.exhausted() {
         return Err(DecodeError::TrailingBytes);
     }
@@ -936,6 +1094,7 @@ pub fn decode_standard_runtime_state(
             StateLane::Local => lane_state.local = decoded.values,
         }
         invocation_results.extend(decoded.invocation_results);
+        clean_invocation_acknowledgements.extend(decoded.clean_invocation_acknowledgements);
         machine_continuations.extend(decoded.machine_continuations);
     }
     invocation_results.sort_unstable_by_key(|result| (result.scope, result.invocation));
@@ -972,9 +1131,12 @@ pub fn decode_standard_runtime_state(
         private_management_dispositions,
         system_authority,
         actors,
+        clean_actor_packages,
+        clean_actor_installations,
         retired_installation_ids,
         lane_state,
         invocation_results,
+        clean_invocation_acknowledgements,
         machine_continuations,
         lane_revisions,
         control_authority_slot,
@@ -984,6 +1146,20 @@ pub fn decode_standard_runtime_state(
     };
     StandardAgentRuntime::restore(state.clone()).map_err(|_| DecodeError::NonCanonical)?;
     Ok(state)
+}
+
+/// Decode the clean SDK state container through the same canonical Standard
+/// runtime decoder used by execution. Host-side route projection uses this
+/// narrow bridge without exposing or re-encoding any state component.
+pub(crate) fn decode_clean_standard_runtime_state(
+    state: &crate::agent_sdk::RuntimeState,
+) -> Result<StandardRuntimeState, DecodeError> {
+    decode_standard_runtime_state(&RuntimeState {
+        control: state.control.clone(),
+        linear: state.linear.clone(),
+        merge: state.merge.clone(),
+        local: state.local.clone(),
+    })
 }
 
 fn encode_standard_lane(state: &StandardRuntimeState, lane: StateLane) -> Vec<u8> {
@@ -1029,6 +1205,24 @@ fn encode_standard_lane(state: &StandardRuntimeState, lane: StateLane) -> Vec<u8
             encoder.option(&result.clean, encode_clean_invocation_result);
         },
     );
+    let sdk_lane = match lane {
+        StateLane::Linear => crate::agent_sdk::StateLane::Linear,
+        StateLane::Merge => crate::agent_sdk::StateLane::Merge,
+        StateLane::Local => crate::agent_sdk::StateLane::Local,
+    };
+    encoder.list(
+        &state
+            .clean_invocation_acknowledgements
+            .iter()
+            .filter(|item| {
+                item.mode.result_storage()
+                    == crate::agent_sdk::InvocationResultStorage::Lane(sdk_lane)
+            })
+            .collect::<Vec<_>>(),
+        |encoder, acknowledgement| {
+            encode_clean_invocation_acknowledgement(encoder, acknowledgement)
+        },
+    );
     encoder.list(
         &state
             .machine_continuations
@@ -1047,6 +1241,7 @@ struct DecodedStandardLane {
     authority_slot: Option<u64>,
     values: Vec<StandardLaneEntry>,
     invocation_results: Vec<StandardInvocationResult>,
+    clean_invocation_acknowledgements: Vec<crate::agent_sdk::InvocationAcknowledgement>,
     machine_continuations: Vec<StandardMachineContinuation>,
 }
 
@@ -1457,6 +1652,52 @@ fn decode_clean_invocation_result(
     })
 }
 
+fn encode_clean_invocation_acknowledgement(
+    encoder: &mut Encoder<'_>,
+    value: &crate::agent_sdk::InvocationAcknowledgement,
+) {
+    encoder.u8(value.mode as u8);
+    encoder.fixed(value.invocation.as_bytes());
+    encoder.fixed(value.actor.as_bytes());
+    encoder.fixed(value.incarnation.as_bytes());
+    encoder.fixed(value.deployment.as_bytes());
+    encoder.fixed(value.work.as_bytes());
+    encoder.fixed(value.authorization.as_bytes());
+}
+
+fn decode_clean_invocation_acknowledgement(
+    decoder: &mut Decoder<'_>,
+    expected_storage: super::InvocationResultStorage,
+) -> Result<crate::agent_sdk::InvocationAcknowledgement, DecodeError> {
+    let value = crate::agent_sdk::InvocationAcknowledgement {
+        mode: decode_sdk_method_mode(decoder.u8()?)?,
+        invocation: crate::agent_sdk::InvocationId(decoder.fixed()?),
+        actor: crate::agent_sdk::ActorId(decoder.fixed()?),
+        incarnation: crate::agent_sdk::Hash(decoder.fixed()?),
+        deployment: crate::agent_sdk::DeploymentId(decoder.fixed()?),
+        work: crate::agent_sdk::Hash(decoder.fixed()?),
+        authorization: crate::agent_sdk::Hash(decoder.fixed()?),
+    };
+    let storage = match value.mode.result_storage() {
+        crate::agent_sdk::InvocationResultStorage::Control => {
+            super::InvocationResultStorage::Control
+        }
+        crate::agent_sdk::InvocationResultStorage::Lane(crate::agent_sdk::StateLane::Linear) => {
+            super::InvocationResultStorage::Lane(StateLane::Linear)
+        }
+        crate::agent_sdk::InvocationResultStorage::Lane(crate::agent_sdk::StateLane::Merge) => {
+            super::InvocationResultStorage::Lane(StateLane::Merge)
+        }
+        crate::agent_sdk::InvocationResultStorage::Lane(crate::agent_sdk::StateLane::Local) => {
+            super::InvocationResultStorage::Lane(StateLane::Local)
+        }
+    };
+    if !value.validate() || storage != expected_storage {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(value)
+}
+
 fn decode_standard_lane(
     bytes: &[u8],
     expected_lane: StateLane,
@@ -1535,6 +1776,16 @@ fn decode_standard_lane(
     {
         return Err(DecodeError::NonCanonical);
     }
+    let clean_invocation_acknowledgements = decode_bounded_list(
+        &mut decoder,
+        super::standard::MAX_INVOCATION_ACKNOWLEDGEMENTS_PER_LANE,
+        |decoder| {
+            decode_clean_invocation_acknowledgement(
+                decoder,
+                super::InvocationResultStorage::Lane(expected_lane),
+            )
+        },
+    )?;
     let machine_continuations =
         decode_bounded_list(&mut decoder, remaining_continuations, |decoder| {
             decode_machine_continuation(
@@ -1556,6 +1807,7 @@ fn decode_standard_lane(
         authority_slot,
         values,
         invocation_results,
+        clean_invocation_acknowledgements,
         machine_continuations,
     })
 }
@@ -1768,9 +2020,15 @@ pub fn apply_standard_runtime_work(
             authorization,
             observed_slot,
             ..
-        } => apply_clean_invoke(state, *invocation, *authorization, observed_slot),
+        } => apply_clean_invoke(
+            state,
+            *invocation,
+            *authorization,
+            observed_slot,
+            CleanExecutionAdmission::direct(),
+        ),
         crate::agent_sdk::RuntimeWork::Resume { state, resume, .. } => {
-            apply_clean_resume(state, *resume)
+            apply_clean_resume(state, *resume, CleanExecutionAdmission::direct())
         }
         crate::agent_sdk::RuntimeWork::Acknowledge {
             state,
@@ -1796,6 +2054,118 @@ pub fn apply_standard_runtime_work(
             authority.map(|value| *value),
             observed_slot,
         ),
+    }
+}
+
+/// Apply an Attested Invoke/Resume inside the bundled Standard runtime PVM.
+///
+/// This target-only entry is not a native authorization API. Its caller is
+/// the proof host, which authenticates the exact package/program/work before
+/// starting the PVM and publishes output only after physical proof
+/// verification. The guest repeats installed-package and AMP2
+/// Required{proof system} checks. Native callers cannot select this function,
+/// and the ordinary public runtime entry remains Direct-only.
+#[doc(hidden)]
+#[cfg(all(feature = "pvm", feature = "agent-runtime", target_arch = "riscv64"))]
+pub fn apply_proof_host_attested_standard_runtime_work(
+    work: crate::agent_sdk::RuntimeWork,
+) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
+    let proof_system = match work.execution_context() {
+        crate::agent_sdk::RuntimeExecutionContext::Attested { proof_system } => proof_system,
+        crate::agent_sdk::RuntimeExecutionContext::Direct => return Err(DecodeError::NonCanonical),
+    };
+    match work {
+        crate::agent_sdk::RuntimeWork::Invoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+            state,
+            invocation,
+            authorization,
+            observed_slot,
+        } => apply_clean_invoke(
+            state,
+            *invocation,
+            *authorization,
+            observed_slot,
+            CleanExecutionAdmission::ProofHostAttested(proof_system),
+        ),
+        crate::agent_sdk::RuntimeWork::Resume {
+            context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+            state,
+            resume,
+        } => apply_clean_resume(
+            state,
+            *resume,
+            CleanExecutionAdmission::ProofHostAttested(proof_system),
+        ),
+        crate::agent_sdk::RuntimeWork::Manage { .. }
+        | crate::agent_sdk::RuntimeWork::Acknowledge { .. }
+        | crate::agent_sdk::RuntimeWork::Invoke { .. }
+        | crate::agent_sdk::RuntimeWork::Resume { .. } => Err(DecodeError::NonCanonical),
+    }
+}
+
+/// Execute an exact attested Invoke or Resume after proof-host admission.
+///
+/// The capability is intentionally constructible only by
+/// `transition_proof_host`; callers cannot turn an arbitrary Attested work
+/// item into a Standard-runtime execution. Management and acknowledgement
+/// remain Direct-only, and the public executor above rejects every Attested
+/// context.
+#[cfg(all(feature = "pvm", feature = "std"))]
+pub(crate) fn apply_authenticated_attested_standard_runtime_work(
+    authenticated: &super::transition_proof_host::AuthenticatedAttestedTransition,
+    work: crate::agent_sdk::RuntimeWork,
+) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
+    if !authenticated.authorizes_standard_work(&work) {
+        return Err(DecodeError::NonCanonical);
+    }
+    if let crate::agent_sdk::RuntimeWork::Resume { state, resume, .. } = &work {
+        use crate::actors::codec::Decode as _;
+        use crate::actors::value::{Msg, TAG_DYNAMIC};
+
+        let decoded = decode_standard_runtime_state(&clean_state_to_legacy(state))?;
+        let runtime =
+            StandardAgentRuntime::restore(decoded).map_err(|_| DecodeError::NonCanonical)?;
+        let (_, accepted_work) = runtime
+            .resolve_clean_resume(resume)
+            .map_err(|_| DecodeError::NonCanonical)?;
+        let recovered_method = accepted_work
+            .message
+            .strip_prefix(&[TAG_DYNAMIC])
+            .and_then(Msg::try_decode)
+            .map(|message| message.name)
+            .ok_or(DecodeError::NonCanonical)?;
+        if recovered_method != authenticated.method() {
+            return Err(DecodeError::NonCanonical);
+        }
+    }
+    match work {
+        crate::agent_sdk::RuntimeWork::Invoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+            state,
+            invocation,
+            authorization,
+            observed_slot,
+        } => apply_clean_invoke(
+            state,
+            *invocation,
+            *authorization,
+            observed_slot,
+            CleanExecutionAdmission::Attested(authenticated),
+        ),
+        crate::agent_sdk::RuntimeWork::Resume {
+            context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+            state,
+            resume,
+        } => apply_clean_resume(
+            state,
+            *resume,
+            CleanExecutionAdmission::Attested(authenticated),
+        ),
+        crate::agent_sdk::RuntimeWork::Manage { .. }
+        | crate::agent_sdk::RuntimeWork::Acknowledge { .. }
+        | crate::agent_sdk::RuntimeWork::Invoke { .. }
+        | crate::agent_sdk::RuntimeWork::Resume { .. } => Err(DecodeError::NonCanonical),
     }
 }
 
@@ -1839,11 +2209,28 @@ fn apply_clean_manage(
 }
 
 #[cfg(feature = "pvm")]
+enum CleanExecutionAdmission<'a> {
+    Direct(core::marker::PhantomData<&'a ()>),
+    #[cfg(feature = "std")]
+    Attested(&'a super::transition_proof_host::AuthenticatedAttestedTransition),
+    #[cfg(all(feature = "agent-runtime", target_arch = "riscv64"))]
+    ProofHostAttested(crate::agent_sdk::Hash),
+}
+
+#[cfg(feature = "pvm")]
+impl CleanExecutionAdmission<'_> {
+    fn direct() -> Self {
+        Self::Direct(core::marker::PhantomData)
+    }
+}
+
+#[cfg(feature = "pvm")]
 fn apply_clean_invoke(
     state: crate::agent_sdk::RuntimeState,
     work: crate::agent_sdk::InvocationWork,
     authorization: crate::agent_sdk::InvocationAuthorization,
     observed_slot: u64,
+    admission: CleanExecutionAdmission<'_>,
 ) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
     use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeTransition};
 
@@ -1857,7 +2244,20 @@ fn apply_clean_invoke(
     {
         return Ok(clean_completed(state, Err(error)));
     }
-    if let Err(error) = admit_clean_public_preflight(&runtime, &work, &authorization) {
+    let policy_admission = match &admission {
+        #[cfg(feature = "std")]
+        CleanExecutionAdmission::Attested(authenticated) => {
+            admit_clean_attested_work(&runtime, authenticated, &work, &authorization)
+        }
+        #[cfg(all(feature = "agent-runtime", target_arch = "riscv64"))]
+        CleanExecutionAdmission::ProofHostAttested(proof_system) => {
+            admit_clean_proof_host_work(&runtime, *proof_system, &work, &authorization)
+        }
+        CleanExecutionAdmission::Direct(_) => {
+            admit_clean_public_preflight(&runtime, &work, &authorization)
+        }
+    };
+    if let Err(error) = policy_admission {
         return Ok(clean_completed(state, Err(error)));
     }
     match runtime.recover_clean_yield(&work, &authorization, observed_slot) {
@@ -1940,7 +2340,9 @@ fn apply_clean_invoke(
                                     runtime.validate_clean_execution_schema(&work, &actor_schema)
                                 })
                                 .and_then(|()| {
-                                    runtime.authorize_clean_execution(
+                                    authorize_clean_execution_context(
+                                        &runtime,
+                                        &admission,
                                         &work,
                                         &authorization,
                                         &actor_schema,
@@ -2067,6 +2469,7 @@ fn apply_clean_invoke(
 fn apply_clean_resume(
     state: crate::agent_sdk::RuntimeState,
     resume: crate::agent_sdk::ResumeWork,
+    admission: CleanExecutionAdmission<'_>,
 ) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
     use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeTransition};
 
@@ -2109,7 +2512,14 @@ fn apply_clean_resume(
         })
         .and_then(|()| runtime.validate_clean_execution_schema(&work, &actor_schema))
         .and_then(|()| {
-            runtime.authorize_clean_execution(&work, &authorization, &actor_schema, &actor_policies)
+            authorize_clean_execution_context(
+                &runtime,
+                &admission,
+                &work,
+                &authorization,
+                &actor_schema,
+                &actor_policies,
+            )
         })
         .and_then(|authorized| {
             if !authorized {
@@ -2219,12 +2629,27 @@ fn apply_clean_acknowledge(
     let state_limit = standard_state_limit(&decoded);
     let mut runtime =
         StandardAgentRuntime::restore(decoded).map_err(|_| DecodeError::NonCanonical)?;
-    if let Err(error) = admit_clean_public_preflight(&runtime, &work, &authorization) {
-        return Ok(RuntimeTransition {
-            state,
-            outcome: RuntimeOutcome::Acknowledged(Err(error)),
-        });
+    match runtime.recover_clean_acknowledgement(&work, &authorization) {
+        Ok(Some(acknowledgement)) => {
+            return Ok(RuntimeTransition {
+                state,
+                outcome: RuntimeOutcome::Acknowledged(Ok(acknowledgement)),
+            });
+        }
+        Err(error) => {
+            return Ok(RuntimeTransition {
+                state,
+                outcome: RuntimeOutcome::Acknowledged(Err(error)),
+            });
+        }
+        Ok(None) => {}
     }
+    // Acknowledge retires an already retained exact result; it does not
+    // execute the actor method again. Re-running the current AMP2 method
+    // policy here would make a Required-attestation result impossible to
+    // retire through the deliberately Direct housekeeping route. The runtime
+    // below authenticates the original work, authorization, preflight, and
+    // exact retained result before removing anything.
     let acknowledgement = match runtime.acknowledge_clean_invocation(&work, &authorization) {
         Ok(acknowledgement) => acknowledgement,
         Err(error) => {
@@ -2255,17 +2680,87 @@ pub(crate) fn admit_clean_public_preflight(
     work: &crate::agent_sdk::InvocationWork,
     authorization: &crate::agent_sdk::InvocationAuthorization,
 ) -> Result<(), crate::agent_sdk::InvocationError> {
-    if matches!(
-        authorization,
-        crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(_)
-    ) {
-        return Ok(());
-    }
     let (_, _, schema, policies, _) = runtime.resolve_clean_invocation(work)?;
     match runtime.authorize_clean_execution(work, authorization, &schema, &policies) {
         Ok(true) => Ok(()),
         Ok(false) => Err(crate::agent_sdk::InvocationError::InvalidAuthorization),
         Err(error) => Err(clean_error(error)),
+    }
+}
+
+#[cfg(all(feature = "pvm", feature = "std"))]
+fn admit_clean_attested_work(
+    runtime: &StandardAgentRuntime,
+    authenticated: &super::transition_proof_host::AuthenticatedAttestedTransition,
+    work: &crate::agent_sdk::InvocationWork,
+    authorization: &crate::agent_sdk::InvocationAuthorization,
+) -> Result<(), crate::agent_sdk::InvocationError> {
+    let (_, _, schema, policies, _) = runtime.resolve_clean_invocation(work)?;
+    match runtime.authorize_clean_attested_execution(
+        authenticated,
+        work,
+        authorization,
+        &schema,
+        &policies,
+    ) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(crate::agent_sdk::InvocationError::InvalidAuthorization),
+        Err(error) => Err(clean_error(error)),
+    }
+}
+
+#[cfg(all(feature = "pvm", feature = "agent-runtime", target_arch = "riscv64"))]
+fn admit_clean_proof_host_work(
+    runtime: &StandardAgentRuntime,
+    proof_system: crate::agent_sdk::Hash,
+    work: &crate::agent_sdk::InvocationWork,
+    authorization: &crate::agent_sdk::InvocationAuthorization,
+) -> Result<(), crate::agent_sdk::InvocationError> {
+    let (_, _, schema, policies, _) = runtime.resolve_clean_invocation(work)?;
+    match runtime.authorize_clean_proof_host_execution(
+        proof_system,
+        work,
+        authorization,
+        &schema,
+        &policies,
+    ) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(crate::agent_sdk::InvocationError::InvalidAuthorization),
+        Err(error) => Err(clean_error(error)),
+    }
+}
+
+#[cfg(feature = "pvm")]
+fn authorize_clean_execution_context(
+    runtime: &StandardAgentRuntime,
+    admission: &CleanExecutionAdmission<'_>,
+    work: &crate::agent_sdk::InvocationWork,
+    authorization: &crate::agent_sdk::InvocationAuthorization,
+    schema: &crate::agent_sdk::RuntimeBlob,
+    policies: &crate::agent_sdk::RuntimeBlob,
+) -> Result<bool, ActorExecutionError> {
+    match admission {
+        #[cfg(feature = "std")]
+        CleanExecutionAdmission::Attested(authenticated) => runtime
+            .authorize_clean_attested_execution(
+                authenticated,
+                work,
+                authorization,
+                schema,
+                policies,
+            ),
+        #[cfg(all(feature = "agent-runtime", target_arch = "riscv64"))]
+        CleanExecutionAdmission::ProofHostAttested(proof_system) => runtime
+            .authorize_clean_proof_host_execution(
+                *proof_system,
+                work,
+                authorization,
+                schema,
+                policies,
+            ),
+        CleanExecutionAdmission::Direct(_) => {
+            runtime.authorize_clean_execution(work, authorization, schema, policies)
+        }
     }
 }
 
@@ -3630,6 +4125,7 @@ fn encode_identity(encoder: &mut Encoder<'_>, identity: &AgentIdentity) {
     encoder.fixed(&identity.runtime_deployment.0);
     encoder.fixed(&identity.runtime_program.0);
     encoder.fixed(&identity.runtime_producer.0);
+    encoder.fixed(&identity.transition_producer.0);
 }
 
 fn decode_identity(decoder: &mut Decoder<'_>) -> Result<AgentIdentity, DecodeError> {
@@ -3646,6 +4142,7 @@ fn decode_identity(decoder: &mut Decoder<'_>) -> Result<AgentIdentity, DecodeErr
         runtime_deployment: DeploymentId(decoder.fixed()?),
         runtime_program: ProgramId(decoder.fixed()?),
         runtime_producer: ProducerId(decoder.fixed()?),
+        transition_producer: ProducerId(decoder.fixed()?),
     })
 }
 
@@ -3843,7 +4340,7 @@ fn decode_debt(decoder: &mut Decoder<'_>) -> Result<ActorLifecycleDebt, DecodeEr
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use alloc::vec;
     use ed25519_dalek::{Signer as _, SigningKey};
@@ -3879,6 +4376,7 @@ mod tests {
                 runtime_deployment: DeploymentId([4; 32]),
                 runtime_program: ProgramId([5; 32]),
                 runtime_producer: ProducerId([6; 32]),
+                transition_producer: ProducerId([16; 32]),
             },
             creation_nonce,
             authority: authority_binding(),
@@ -4037,6 +4535,7 @@ mod tests {
                 runtime_deployment: crate::agent_sdk::DeploymentId([4; 32]),
                 runtime_program: crate::agent_sdk::ProgramId([5; 32]),
                 runtime_producer: crate::agent_sdk::ProducerId([6; 32]),
+                transition_producer: crate::agent_sdk::ProducerId([0x92; 32]),
             },
             creation_nonce,
             authority: AgentAuthorityBinding {
@@ -4070,6 +4569,32 @@ mod tests {
     }
 
     #[cfg(feature = "pvm")]
+    #[test]
+    fn attested_route_uses_only_the_authenticated_transition_producer() {
+        let descriptor = clean_test_descriptor(crate::agent_sdk::AgentProfile::Local);
+        let route = super::super::transition_proof_host::AttestedTransitionRoute::for_descriptor(
+            &descriptor,
+            crate::agent_sdk::Hash([0x93; 32]),
+            crate::agent_sdk::MAX_TRANSITION_PROOF_MATERIAL_BYTES,
+        )
+        .unwrap();
+        assert_eq!(route.producer(), descriptor.identity.transition_producer);
+        assert_ne!(route.producer(), descriptor.identity.runtime_producer);
+
+        let mut reused_runtime_producer = descriptor;
+        reused_runtime_producer.identity.transition_producer =
+            reused_runtime_producer.identity.runtime_producer;
+        assert!(
+            super::super::transition_proof_host::AttestedTransitionRoute::for_descriptor(
+                &reused_runtime_producer,
+                crate::agent_sdk::Hash([0x93; 32]),
+                crate::agent_sdk::MAX_TRANSITION_PROOF_MATERIAL_BYTES,
+            )
+            .is_none()
+        );
+    }
+
+    #[cfg(feature = "pvm")]
     fn clean_sparse_standard_state() -> StandardRuntimeState {
         let mut state = sparse_standard_state();
         let descriptor = clean_test_descriptor(crate::agent_sdk::AgentProfile::Shared);
@@ -4086,6 +4611,29 @@ mod tests {
         state.lane_state.linear[0].actor = actor;
         state.clean_creation_descriptor = Some(descriptor.clone());
         state.clean_descriptor = Some(descriptor.clone());
+        state.clean_actor_packages = Some(vec![StandardCleanActorPackage {
+            actor: crate::agent_sdk::ActorId(actor.0),
+            contract: crate::agent_sdk::contract::ActorPackageContract::canonical(),
+            requirements: crate::agent_sdk::RuntimeRequirements {
+                lanes: crate::agent_sdk::LaneSet::ALL,
+                scheduling: false,
+                proof_systems: crate::agent_sdk::ProofSystemSet::EMPTY,
+            },
+        }]);
+        state.clean_actor_installations = Some(vec![StandardCleanActorInstallation {
+            actor: crate::agent_sdk::ActorId(actor.0),
+            commitment: crate::agent_sdk::Hash::digest(
+                b"vos/test/clean-install-lineage",
+                &[actor.as_bytes()],
+            ),
+            contract: crate::agent_sdk::contract::ActorPackageContract::canonical(),
+            requirements: crate::agent_sdk::RuntimeRequirements {
+                lanes: crate::agent_sdk::LaneSet::ALL,
+                scheduling: false,
+                proof_systems: crate::agent_sdk::ProofSystemSet::EMPTY,
+            },
+        }]);
+        state.active_resource_policy = Some(descriptor.initial_resource_policy());
         state.clean_authority_epoch_high_water = Some(1);
         state.clean_decision_sequence_high_water = Some(1);
         state.clean_management_dispositions = vec![StandardCleanManagementDisposition {
@@ -4594,6 +5142,30 @@ mod tests {
     }
 
     #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_create_lane_initialization_accepts_only_empty_canonical_envelopes() {
+        let (_, created, _) = create_clean_management_state(crate::agent_sdk::AgentProfile::Local);
+        let empty = RuntimeState::default();
+        let created_legacy = clean_state_to_legacy(&created);
+        assert!(clean_create_initializes_only_empty_lanes(
+            &empty,
+            &created_legacy
+        ));
+        assert!(!clean_create_initializes_only_empty_lanes(
+            &created_legacy,
+            &created_legacy,
+        ));
+
+        let mut nonempty = decode_standard_runtime_state(&created_legacy).unwrap();
+        nonempty.lane_revisions.linear = 1;
+        let nonempty = encode_standard_runtime_state(&nonempty);
+        assert!(decode_standard_runtime_state(&nonempty).is_ok());
+        assert!(!clean_create_initializes_only_empty_lanes(
+            &empty, &nonempty,
+        ));
+    }
+
+    #[cfg(feature = "pvm")]
     fn clean_install_request(
         descriptor: &crate::agent_sdk::AgentDescriptor,
         name: &str,
@@ -4649,6 +5221,493 @@ mod tests {
     }
 
     #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_create_and_install_preserve_exact_proof_capabilities() {
+        use crate::agent_sdk::{
+            ManagementError, ManagementReply, ManagementRequest, RuntimeOutcome,
+        };
+
+        let proof_system = crate::agent_sdk::Hash([0x35; 32]);
+        let alternate_system = crate::agent_sdk::Hash([0x36; 32]);
+        let unsupported_system = crate::agent_sdk::Hash([0x37; 32]);
+        let supported = crate::agent_sdk::ProofSystemSet::from_sorted(&[proof_system]).unwrap();
+        let runtime_supported =
+            crate::agent_sdk::ProofSystemSet::from_sorted(&[proof_system, alternate_system])
+                .unwrap();
+        let mut descriptor = clean_test_descriptor(crate::agent_sdk::AgentProfile::Local);
+        descriptor.capabilities.proof_systems = runtime_supported;
+        descriptor.validate().unwrap();
+
+        let create = ManagementRequest::Create(Box::new(descriptor.clone()));
+        let create_receipt = clean_management_receipt(&descriptor, &create, 1, 1, 10);
+        let created = apply_clean_management_test(
+            crate::agent_sdk::RuntimeState::default(),
+            &descriptor,
+            create,
+            Some(create_receipt),
+            1,
+        );
+        assert_eq!(
+            created.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::Created(descriptor.identity.clone(),)))
+        );
+        let reopened = StandardAgentRuntime::restore(
+            decode_standard_runtime_state(&clean_state_to_legacy(&created.state)).unwrap(),
+        )
+        .unwrap();
+        let persisted = reopened.clean_descriptor().unwrap();
+        assert_eq!(persisted.runtime_package, descriptor.runtime_package);
+        assert_eq!(persisted.runtime_contract, descriptor.runtime_contract);
+        assert_eq!(persisted.capabilities.proof_systems, runtime_supported);
+
+        let mut install = clean_install_request(
+            &descriptor,
+            "proof-capable",
+            None,
+            0x37,
+            crate::agent_sdk::LaneSet::of(crate::agent_sdk::StateLane::Linear),
+        );
+        install.requirements.proof_systems = supported;
+        let exact_install = install.clone();
+        let expected_installation =
+            super::super::standard::clean_installation_binding(&exact_install);
+        let expected_actor = install.entry.actor;
+        let expected_contract = install.contract;
+        let expected_requirements = install.requirements;
+        let install = ManagementRequest::Install(Box::new(install));
+        let install_receipt = clean_management_receipt(&descriptor, &install, 1, 2, 10);
+        let installed = apply_clean_management_test(
+            created.state,
+            &descriptor,
+            install,
+            Some(install_receipt),
+            2,
+        );
+        assert!(matches!(
+            installed.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::Installed(_)))
+        ));
+        let persisted_state =
+            decode_standard_runtime_state(&clean_state_to_legacy(&installed.state)).unwrap();
+        assert_eq!(
+            persisted_state.clean_actor_packages,
+            Some(vec![StandardCleanActorPackage {
+                actor: expected_actor,
+                contract: expected_contract,
+                requirements: expected_requirements,
+            }]),
+            "restart state retains exact actor proof-system identities",
+        );
+        assert_eq!(
+            persisted_state.clean_actor_installations,
+            Some(vec![expected_installation]),
+            "restart state retains the immutable exact install-time binding",
+        );
+        assert_eq!(
+            encode_standard_runtime_state(&persisted_state),
+            clean_state_to_legacy(&installed.state),
+        );
+
+        let mut substituted_retry = exact_install;
+        substituted_retry.requirements.proof_systems =
+            crate::agent_sdk::ProofSystemSet::from_sorted(&[alternate_system]).unwrap();
+        let substituted_retry = ManagementRequest::Install(Box::new(substituted_retry));
+        let substituted_retry_receipt =
+            clean_management_receipt(&descriptor, &substituted_retry, 1, 3, 10);
+        let substituted_retry = apply_clean_management_test(
+            installed.state.clone(),
+            &descriptor,
+            substituted_retry,
+            Some(substituted_retry_receipt),
+            3,
+        );
+        assert_eq!(
+            substituted_retry.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::InvalidRequest)),
+            "an InstallationId retry cannot substitute an exact proof-system set hidden by the legacy bool projection",
+        );
+        let substituted_state =
+            decode_standard_runtime_state(&clean_state_to_legacy(&substituted_retry.state))
+                .unwrap();
+        assert_eq!(
+            substituted_state.clean_actor_packages,
+            persisted_state.clean_actor_packages,
+        );
+
+        let mut missing = persisted_state.clone();
+        missing.clean_actor_packages = None;
+        assert_eq!(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&missing)),
+            Err(DecodeError::NonCanonical),
+            "an old clean image with no exact package table fails closed",
+        );
+        let mut missing_installation = persisted_state.clone();
+        missing_installation.clean_actor_installations = None;
+        assert_eq!(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&missing_installation)),
+            Err(DecodeError::NonCanonical),
+            "an old clean image with no immutable exact installation table fails closed",
+        );
+        let mut corrupt_installation = persisted_state.clone();
+        corrupt_installation
+            .clean_actor_installations
+            .as_mut()
+            .unwrap()[0]
+            .requirements
+            .proof_systems =
+            crate::agent_sdk::ProofSystemSet::from_sorted(&[alternate_system]).unwrap();
+        assert_eq!(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&corrupt_installation)),
+            Err(DecodeError::NonCanonical),
+            "install-time exact fields must match their durable binding commitment",
+        );
+        let mut collapsed = persisted_state.clone();
+        collapsed.clean_actor_packages.as_mut().unwrap()[0]
+            .requirements
+            .proof_systems = crate::agent_sdk::ProofSystemSet::EMPTY;
+        assert_eq!(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&collapsed)),
+            Err(DecodeError::NonCanonical),
+            "the exact requirements must match their legacy compatibility projection",
+        );
+        let mut unsupported_binding = persisted_state.clone();
+        unsupported_binding.clean_actor_packages.as_mut().unwrap()[0]
+            .requirements
+            .proof_systems =
+            crate::agent_sdk::ProofSystemSet::from_sorted(&[unsupported_system]).unwrap();
+        assert_eq!(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&unsupported_binding)),
+            Err(DecodeError::NonCanonical),
+            "the exact requirements must remain supported by the pinned runtime package",
+        );
+        let mut corrupt = encode_standard_runtime_state(&persisted_state);
+        let extension = corrupt
+            .control
+            .windows(STANDARD_CLEAN_ACTOR_PACKAGES_MAGIC.len())
+            .rposition(|bytes| bytes == STANDARD_CLEAN_ACTOR_PACKAGES_MAGIC)
+            .unwrap();
+        corrupt.control[extension] ^= 1;
+        assert_eq!(
+            decode_standard_runtime_state(&corrupt),
+            Err(DecodeError::NonCanonical),
+        );
+
+        let mut unsupported = clean_install_request(
+            &descriptor,
+            "wrong-proof-system",
+            None,
+            0x38,
+            crate::agent_sdk::LaneSet::of(crate::agent_sdk::StateLane::Linear),
+        );
+        unsupported.requirements.proof_systems =
+            crate::agent_sdk::ProofSystemSet::from_sorted(&[unsupported_system]).unwrap();
+        let unsupported = ManagementRequest::Install(Box::new(unsupported));
+        let unsupported_receipt = clean_management_receipt(&descriptor, &unsupported, 1, 3, 10);
+        let rejected = apply_clean_management_test(
+            installed.state.clone(),
+            &descriptor,
+            unsupported,
+            Some(unsupported_receipt),
+            3,
+        );
+        assert_eq!(
+            rejected.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::UnsupportedRuntime))
+        );
+        let rejected = StandardAgentRuntime::restore(
+            decode_standard_runtime_state(&clean_state_to_legacy(&rejected.state)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rejected.snapshot().actors.len(), 1);
+        let persisted = rejected.clean_descriptor().unwrap();
+        assert_eq!(persisted.runtime_package, descriptor.runtime_package);
+        assert_eq!(persisted.runtime_contract, descriptor.runtime_contract);
+        assert_eq!(persisted.capabilities.proof_systems, runtime_supported);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_runtime_upgrade_preserves_outer_proofs_and_exact_actor_requirements() {
+        use crate::agent_sdk::{
+            ManagementError, ManagementReply, ManagementRequest, RuntimeOutcome, RuntimeUpgrade,
+            UpgradeActor,
+        };
+
+        let required_proof = crate::agent_sdk::Hash([0x39; 32]);
+        let substitute_proof = crate::agent_sdk::Hash([0x3a; 32]);
+        let required = crate::agent_sdk::ProofSystemSet::from_sorted(&[required_proof]).unwrap();
+        let substitute =
+            crate::agent_sdk::ProofSystemSet::from_sorted(&[substitute_proof]).unwrap();
+        let all_proofs =
+            crate::agent_sdk::ProofSystemSet::from_sorted(&[required_proof, substitute_proof])
+                .unwrap();
+        let mut descriptor = clean_test_descriptor(crate::agent_sdk::AgentProfile::Local);
+        descriptor.capabilities.proof_systems = all_proofs;
+        descriptor.validate().unwrap();
+
+        let create = ManagementRequest::Create(Box::new(descriptor.clone()));
+        let created = apply_clean_management_test(
+            crate::agent_sdk::RuntimeState::default(),
+            &descriptor,
+            create.clone(),
+            Some(clean_management_receipt(&descriptor, &create, 1, 1, 10)),
+            1,
+        );
+        let mut install = clean_install_request(
+            &descriptor,
+            "runtime-upgrade-proof",
+            None,
+            0x3b,
+            crate::agent_sdk::LaneSet::of(crate::agent_sdk::StateLane::Linear),
+        );
+        install.requirements.proof_systems = required;
+        let actor = install.entry.actor;
+        let original_install = install.clone();
+        let install = ManagementRequest::Install(Box::new(install));
+        let installed = apply_clean_management_test(
+            created.state,
+            &descriptor,
+            install.clone(),
+            Some(clean_management_receipt(&descriptor, &install, 1, 2, 10)),
+            2,
+        );
+        assert!(matches!(
+            installed.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::Installed(_)))
+        ));
+
+        let actor_upgrade = UpgradeActor {
+            actor,
+            from_deployment: original_install.entry.deployment,
+            to_deployment: crate::agent_sdk::DeploymentId([0x42; 32]),
+            // Stateful actors require the same program until an explicit
+            // migration ABI exists; package/artifact pins still advance.
+            to_program: original_install.entry.program,
+            producer: crate::agent_sdk::ProducerId([0x43; 32]),
+            package: crate::agent_sdk::BlobRef::of_bytes(b"upgraded-proof-actor-package"),
+            agent_schema: crate::agent_sdk::BlobRef::of_bytes(b"upgraded-proof-actor-schema"),
+            method_policy: crate::agent_sdk::BlobRef::of_bytes(b"upgraded-proof-actor-policy"),
+            constructor_abi: original_install.constructor_abi,
+            state_layout: original_install.state_layout,
+            contract: original_install.contract,
+            requirements: crate::agent_sdk::RuntimeRequirements {
+                proof_systems: substitute,
+                ..original_install.requirements
+            },
+        };
+        let actor_upgrade_request =
+            ManagementRequest::UpgradeActor(Box::new(actor_upgrade.clone()));
+        let actor_upgraded = apply_clean_management_test(
+            installed.state,
+            &descriptor,
+            actor_upgrade_request.clone(),
+            Some(clean_management_receipt(
+                &descriptor,
+                &actor_upgrade_request,
+                1,
+                3,
+                10,
+            )),
+            3,
+        );
+        assert!(matches!(
+            actor_upgraded.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::Upgraded(ref entry)))
+                if entry.deployment == actor_upgrade.to_deployment
+        ));
+
+        let upgraded_actor_state =
+            decode_standard_runtime_state(&clean_state_to_legacy(&actor_upgraded.state)).unwrap();
+        assert_eq!(
+            upgraded_actor_state.clean_actor_packages.as_ref().unwrap()[0]
+                .requirements
+                .proof_systems,
+            substitute,
+            "the current package follows the actor upgrade",
+        );
+        let original_installation =
+            super::super::standard::clean_installation_binding(&original_install);
+        assert_eq!(
+            upgraded_actor_state
+                .clean_actor_installations
+                .as_ref()
+                .unwrap()[0],
+            original_installation,
+            "the immutable install-time proof requirements survive the upgrade",
+        );
+
+        let exact_retry = apply_clean_management_test(
+            actor_upgraded.state,
+            &descriptor,
+            install.clone(),
+            Some(clean_management_receipt(&descriptor, &install, 1, 4, 10)),
+            4,
+        );
+        assert!(matches!(
+            exact_retry.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::Installed(ref entry)))
+                if entry == &original_install.entry
+        ));
+        let exact_retry_state =
+            decode_standard_runtime_state(&clean_state_to_legacy(&exact_retry.state)).unwrap();
+        assert_eq!(
+            exact_retry_state.clean_actor_packages, upgraded_actor_state.clean_actor_packages,
+            "an exact retry must not roll the upgraded package back",
+        );
+        assert_eq!(
+            exact_retry_state.clean_actor_installations,
+            upgraded_actor_state.clean_actor_installations,
+        );
+
+        let mut substituted_install = original_install.clone();
+        substituted_install.requirements.proof_systems = substitute;
+        let substituted_install = ManagementRequest::Install(Box::new(substituted_install));
+        let substituted_retry = apply_clean_management_test(
+            exact_retry.state,
+            &descriptor,
+            substituted_install.clone(),
+            Some(clean_management_receipt(
+                &descriptor,
+                &substituted_install,
+                1,
+                5,
+                10,
+            )),
+            5,
+        );
+        assert_eq!(
+            substituted_retry.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::InvalidRequest)),
+            "the current upgraded proof requirement cannot replace the original install binding",
+        );
+        let substituted_state =
+            decode_standard_runtime_state(&clean_state_to_legacy(&substituted_retry.state))
+                .unwrap();
+        assert_eq!(
+            substituted_state.clean_actor_packages,
+            upgraded_actor_state.clean_actor_packages,
+        );
+        assert_eq!(
+            substituted_state.clean_actor_installations,
+            upgraded_actor_state.clean_actor_installations,
+        );
+
+        let upgrade = RuntimeUpgrade {
+            from_deployment: descriptor.identity.runtime_deployment,
+            to_deployment: crate::agent_sdk::DeploymentId([0x3c; 32]),
+            to_program: crate::agent_sdk::ProgramId([0x3d; 32]),
+            producer: crate::agent_sdk::ProducerId([0x3e; 32]),
+            package: crate::agent_sdk::BlobRef::of_bytes(b"proof-capable-runtime-upgrade"),
+            contract: descriptor.runtime_contract,
+            capabilities: crate::agent_sdk::RuntimeCapabilities {
+                proof_systems: substitute,
+                ..descriptor.capabilities
+            },
+        };
+        let mut reused_signer_upgrade = upgrade.clone();
+        reused_signer_upgrade.producer = descriptor.identity.transition_producer;
+        let reused_signer_request =
+            ManagementRequest::UpgradeRuntime(Box::new(reused_signer_upgrade));
+        let reused_signer = apply_clean_management_test(
+            substituted_retry.state.clone(),
+            &descriptor,
+            reused_signer_request.clone(),
+            Some(clean_management_receipt(
+                &descriptor,
+                &reused_signer_request,
+                1,
+                6,
+                10,
+            )),
+            6,
+        );
+        assert_eq!(
+            reused_signer.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::UnsupportedRuntime)),
+        );
+        let request = ManagementRequest::UpgradeRuntime(Box::new(upgrade.clone()));
+        let upgraded = apply_clean_management_test(
+            substituted_retry.state,
+            &descriptor,
+            request.clone(),
+            Some(clean_management_receipt(&descriptor, &request, 1, 6, 10)),
+            6,
+        );
+        assert!(matches!(
+            upgraded.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::RuntimeUpgraded(ref identity)))
+                if identity.runtime_deployment == upgrade.to_deployment
+                    && identity.transition_producer
+                        == descriptor.identity.transition_producer
+        ));
+        let restarted =
+            decode_standard_runtime_state(&clean_state_to_legacy(&upgraded.state)).unwrap();
+        assert_eq!(
+            restarted.clean_descriptor.as_ref().unwrap().runtime_package,
+            upgrade.package,
+        );
+        assert_eq!(
+            restarted
+                .clean_descriptor
+                .as_ref()
+                .unwrap()
+                .identity
+                .transition_producer,
+            descriptor.identity.transition_producer,
+        );
+        assert_eq!(
+            restarted.clean_actor_packages.as_ref().unwrap()[0],
+            StandardCleanActorPackage {
+                actor,
+                contract: crate::agent_sdk::contract::ActorPackageContract::canonical(),
+                requirements: crate::agent_sdk::RuntimeRequirements {
+                    lanes: crate::agent_sdk::LaneSet::of(crate::agent_sdk::StateLane::Linear),
+                    scheduling: false,
+                    proof_systems: substitute,
+                },
+            },
+        );
+        let current = restarted.clean_descriptor.clone().unwrap();
+
+        let incompatible = RuntimeUpgrade {
+            from_deployment: current.identity.runtime_deployment,
+            to_deployment: crate::agent_sdk::DeploymentId([0x3f; 32]),
+            to_program: crate::agent_sdk::ProgramId([0x40; 32]),
+            producer: crate::agent_sdk::ProducerId([0x41; 32]),
+            package: crate::agent_sdk::BlobRef::of_bytes(b"substituted-proof-runtime"),
+            contract: current.runtime_contract,
+            capabilities: crate::agent_sdk::RuntimeCapabilities {
+                proof_systems: required,
+                ..current.capabilities
+            },
+        };
+        let request = ManagementRequest::UpgradeRuntime(Box::new(incompatible));
+        let rejected = apply_clean_management_test(
+            upgraded.state,
+            &current,
+            request.clone(),
+            Some(clean_management_receipt(&current, &request, 1, 7, 10)),
+            7,
+        );
+        assert_eq!(
+            rejected.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::UnsupportedRuntime)),
+        );
+        let rejected =
+            decode_standard_runtime_state(&clean_state_to_legacy(&rejected.state)).unwrap();
+        assert_eq!(
+            rejected.clean_descriptor.as_ref().unwrap().identity,
+            current.identity,
+        );
+        assert_eq!(
+            rejected.clean_actor_packages.as_ref().unwrap()[0]
+                .requirements
+                .proof_systems,
+            substitute,
+        );
+    }
+
+    #[cfg(feature = "pvm")]
     fn private_runtime_management_request(
         descriptor: &crate::agent_sdk::AgentDescriptor,
         sequence: u64,
@@ -4701,6 +5760,204 @@ mod tests {
         clean_management_receipt_with_sequence(
             descriptor, request, epoch, 0, 0, valid_from, expires_at,
         )
+    }
+
+    #[cfg(feature = "pvm")]
+    fn private_control_commitment(
+        request: &crate::agent_sdk::ManagementRequest,
+    ) -> crate::agent_sdk::Hash {
+        match request {
+            crate::agent_sdk::ManagementRequest::PrivateControl { control, .. } => {
+                control.commitment()
+            }
+            _ => panic!("expected a Private control request"),
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn private_installation_id_replay_keeps_pre_upgrade_exact_proof_requirements() {
+        use crate::agent_sdk::{
+            ManagementError, ManagementReply, ManagementRequest, PrivateRuntimeMutation,
+            RuntimeOutcome, UpgradeActor,
+        };
+
+        let original_proof = crate::agent_sdk::Hash([0x71; 32]);
+        let upgraded_proof = crate::agent_sdk::Hash([0x72; 32]);
+        let original_set =
+            crate::agent_sdk::ProofSystemSet::from_sorted(&[original_proof]).unwrap();
+        let upgraded_set =
+            crate::agent_sdk::ProofSystemSet::from_sorted(&[upgraded_proof]).unwrap();
+        let mut descriptor = clean_test_descriptor(crate::agent_sdk::AgentProfile::Private);
+        descriptor.capabilities.proof_systems =
+            crate::agent_sdk::ProofSystemSet::from_sorted(&[original_proof, upgraded_proof])
+                .unwrap();
+        descriptor.validate().unwrap();
+
+        let create = ManagementRequest::Create(Box::new(descriptor.clone()));
+        let created = apply_clean_management_test(
+            crate::agent_sdk::RuntimeState::default(),
+            &descriptor,
+            create.clone(),
+            Some(clean_management_receipt(&descriptor, &create, 1, 1, 10)),
+            1,
+        );
+        let mut original_install = clean_install_request(
+            &descriptor,
+            "private-proof-replay",
+            None,
+            0x73,
+            crate::agent_sdk::LaneSet::of(crate::agent_sdk::StateLane::Merge),
+        );
+        original_install.requirements.proof_systems = original_set;
+        let expected_installation =
+            super::super::standard::clean_installation_binding(&original_install);
+        let install_request = private_runtime_management_request(
+            &descriptor,
+            0,
+            None,
+            PrivateRuntimeMutation::Install(original_install.clone()),
+        );
+        let install_control = private_control_commitment(&install_request);
+        let installed = apply_clean_management_test(
+            created.state,
+            &descriptor,
+            install_request.clone(),
+            Some(private_runtime_management_receipt(
+                &descriptor,
+                &install_request,
+                1,
+                2,
+                10,
+            )),
+            2,
+        );
+        assert!(matches!(
+            installed.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::Installed(_)))
+        ));
+
+        let upgrade = UpgradeActor {
+            actor: original_install.entry.actor,
+            from_deployment: original_install.entry.deployment,
+            to_deployment: crate::agent_sdk::DeploymentId([0x74; 32]),
+            to_program: original_install.entry.program,
+            producer: crate::agent_sdk::ProducerId([0x75; 32]),
+            package: crate::agent_sdk::BlobRef::of_bytes(b"private-upgraded-package"),
+            agent_schema: crate::agent_sdk::BlobRef::of_bytes(b"private-upgraded-schema"),
+            method_policy: crate::agent_sdk::BlobRef::of_bytes(b"private-upgraded-policy"),
+            constructor_abi: original_install.constructor_abi,
+            state_layout: original_install.state_layout,
+            contract: original_install.contract,
+            requirements: crate::agent_sdk::RuntimeRequirements {
+                proof_systems: upgraded_set,
+                ..original_install.requirements
+            },
+        };
+        let upgrade_request = private_runtime_management_request(
+            &descriptor,
+            1,
+            Some(install_control),
+            PrivateRuntimeMutation::UpgradeActor(upgrade.clone()),
+        );
+        let upgrade_control = private_control_commitment(&upgrade_request);
+        let upgraded = apply_clean_management_test(
+            installed.state,
+            &descriptor,
+            upgrade_request.clone(),
+            Some(private_runtime_management_receipt(
+                &descriptor,
+                &upgrade_request,
+                1,
+                3,
+                10,
+            )),
+            3,
+        );
+        assert!(matches!(
+            upgraded.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::Upgraded(ref entry)))
+                if entry.deployment == upgrade.to_deployment
+        ));
+        let reopened =
+            decode_standard_runtime_state(&clean_state_to_legacy(&upgraded.state)).unwrap();
+        assert_eq!(
+            reopened.clean_actor_packages.as_ref().unwrap()[0]
+                .requirements
+                .proof_systems,
+            upgraded_set,
+        );
+        assert_eq!(
+            reopened.clean_actor_installations.as_ref().unwrap()[0],
+            expected_installation,
+        );
+
+        let retry_request = private_runtime_management_request(
+            &descriptor,
+            2,
+            Some(upgrade_control),
+            PrivateRuntimeMutation::Install(original_install.clone()),
+        );
+        let retry_control = private_control_commitment(&retry_request);
+        let retried = apply_clean_management_test(
+            upgraded.state,
+            &descriptor,
+            retry_request.clone(),
+            Some(private_runtime_management_receipt(
+                &descriptor,
+                &retry_request,
+                1,
+                4,
+                10,
+            )),
+            4,
+        );
+        assert_eq!(
+            retried.outcome,
+            RuntimeOutcome::Management(Ok(ManagementReply::Installed(
+                original_install.entry.clone(),
+            ))),
+        );
+        let retried_state =
+            decode_standard_runtime_state(&clean_state_to_legacy(&retried.state)).unwrap();
+        assert_eq!(
+            retried_state.clean_actor_packages, reopened.clean_actor_packages,
+            "an exact retry must not roll back the Private actor upgrade",
+        );
+        assert_eq!(
+            retried_state.clean_actor_installations,
+            reopened.clean_actor_installations,
+        );
+
+        let mut substituted = original_install;
+        substituted.requirements.proof_systems = upgraded_set;
+        let substituted_request = private_runtime_management_request(
+            &descriptor,
+            3,
+            Some(retry_control),
+            PrivateRuntimeMutation::Install(substituted),
+        );
+        let rejected = apply_clean_management_test(
+            retried.state.clone(),
+            &descriptor,
+            substituted_request.clone(),
+            Some(private_runtime_management_receipt(
+                &descriptor,
+                &substituted_request,
+                1,
+                5,
+                10,
+            )),
+            5,
+        );
+        assert_eq!(
+            rejected.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::InvalidRequest)),
+        );
+        assert_eq!(
+            rejected.state, retried.state,
+            "a rejected Private substitution does not consume or mutate state",
+        );
     }
 
     #[cfg(feature = "pvm")]
@@ -5890,6 +7147,7 @@ mod tests {
         current.runtime_contract.resources.max_runtime_state_bytes = exact_bytes;
         constrained.config =
             Some(super::super::standard::clean_descriptor_to_legacy_config(&current).unwrap());
+        constrained.active_resource_policy = Some(current.initial_resource_policy());
         constrained.clean_descriptor = Some(current.clone());
         let state = legacy_state_to_clean(encode_standard_runtime_state(&constrained));
         assert_eq!(state.encoded_len(), Some(exact_bytes as usize));
@@ -6543,57 +7801,13 @@ mod tests {
         crate::agent_sdk::authority::AuthorityReceipt,
         crate::agent_sdk::YieldedInvocation,
     ) {
-        let state = clean_sparse_standard_state();
+        let (mut runtime, work) = clean_resolvable_fixture(false);
+        let state = runtime.snapshot();
         let config = state.config.as_ref().unwrap().clone();
-        let actor = &state.actors[0].record;
-        let invocation = ActorInvocation {
-            invocation: crate::service::InvocationId([0xc1; 32]),
-            actor: actor.entry.actor,
-            incarnation: actor.state_generation,
-            deployment: actor.entry.deployment,
-            program: actor.entry.program,
-            mode: MethodMode::Linear,
-            auth: ActorInvocationAuth::anonymous(),
-            message: vec![1],
-            availability: Vec::new(),
-            gas: 100,
-        };
-        let mut availability = [
-            b"immutable-program".as_slice(),
-            b"immutable-schema",
-            b"immutable-policy",
-        ]
-        .into_iter()
-        .map(|bytes| crate::agent_sdk::RuntimeBlob {
-            reference: crate::agent_sdk::BlobRef::of_bytes(bytes),
-            bytes: bytes.to_vec(),
-        })
-        .collect::<Vec<_>>();
-        availability.sort_unstable_by_key(|blob| blob.reference.clone());
-        let work = crate::agent_sdk::InvocationWork {
-            space: crate::agent_sdk::SpaceId(config.identity.space.0),
-            agent: crate::agent_sdk::AgentId(config.identity.agent.0),
-            runtime_deployment: crate::agent_sdk::DeploymentId(
-                config.identity.runtime_deployment.0,
-            ),
-            invocation: crate::agent_sdk::InvocationId(invocation.invocation.0),
-            actor: crate::agent_sdk::ActorId(invocation.actor.0),
-            incarnation: crate::agent_sdk::Hash(invocation.incarnation.0),
-            deployment: crate::agent_sdk::DeploymentId(invocation.deployment.0),
-            program: crate::agent_sdk::ProgramId(invocation.program.0),
-            mode: crate::agent_sdk::MethodMode::Linear,
-            origin: crate::agent_sdk::InvocationOrigin::anonymous(),
-            roles: crate::agent_sdk::InvocationRoleClaims::none(),
-            message: invocation.message.clone(),
-            installation_data: None,
-            availability,
-            gas: invocation.gas,
-            recovery_only: false,
-        };
+        let (invocation, ..) = runtime.resolve_clean_invocation(&work).unwrap();
         let authority = clean_authority_receipt(&config, &work);
         let authorization =
             crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(authority.clone());
-        let mut runtime = StandardAgentRuntime::restore(state).unwrap();
         let before = runtime.prepare_execution_state(&invocation).unwrap();
         let mut after = before.clone();
         after.linear = Some(vec![0xa1]);
@@ -6712,6 +7926,43 @@ mod tests {
     fn clean_policy_fixture(
         selector: crate::agent_sdk::method_policy::AuthorizationPolicySelector,
     ) -> (StandardAgentRuntime, crate::agent_sdk::InvocationWork) {
+        clean_policy_fixture_with_attestation(
+            selector,
+            crate::agent_sdk::method_policy::AttestationRequirement::None,
+        )
+    }
+
+    #[cfg(feature = "pvm")]
+    fn enable_clean_test_proof_system(
+        state: &mut StandardRuntimeState,
+        proof_system: crate::agent_sdk::Hash,
+    ) {
+        state.actors[0].record.requirements.proofs = true;
+        let proof_systems = crate::agent_sdk::ProofSystemSet::from_sorted(&[proof_system]).unwrap();
+        state.clean_actor_packages.as_mut().unwrap()[0]
+            .requirements
+            .proof_systems = proof_systems;
+        state.clean_actor_installations.as_mut().unwrap()[0]
+            .requirements
+            .proof_systems = proof_systems;
+        state
+            .clean_creation_descriptor
+            .as_mut()
+            .unwrap()
+            .capabilities
+            .proof_systems = proof_systems;
+        let descriptor = state.clean_descriptor.as_mut().unwrap();
+        descriptor.capabilities.proof_systems = proof_systems;
+        state.config =
+            Some(super::super::standard::clean_descriptor_to_legacy_config(descriptor).unwrap());
+        state.active_resource_policy = Some(descriptor.initial_resource_policy());
+    }
+
+    #[cfg(feature = "pvm")]
+    fn clean_policy_fixture_with_attestation(
+        selector: crate::agent_sdk::method_policy::AuthorizationPolicySelector,
+        attestation: crate::agent_sdk::method_policy::AttestationRequirement,
+    ) -> (StandardAgentRuntime, crate::agent_sdk::InvocationWork) {
         use crate::actors::codec::Encode as _;
         use crate::actors::value::{Msg, TAG_DYNAMIC};
         use crate::agent_sdk::method_policy::{
@@ -6755,7 +8006,7 @@ mod tests {
                 return_type_identity: "core::primitive::u8".into(),
                 authorization_policy: selector,
                 idempotency: IdempotencyRequirement::Required,
-                attestation: AttestationRequirement::None,
+                attestation,
             }],
         }
         .encode()
@@ -6794,7 +8045,481 @@ mod tests {
         actor.state_layout = state_layout;
         actor.entry.lanes = LaneSet::of(StateLane::Linear);
         actor.requirements.lanes = LaneSet::of(StateLane::Linear);
+        state.clean_actor_packages.as_mut().unwrap()[0]
+            .requirements
+            .lanes = crate::agent_sdk::LaneSet::of(crate::agent_sdk::StateLane::Linear);
+        state.clean_actor_installations.as_mut().unwrap()[0]
+            .requirements
+            .lanes = crate::agent_sdk::LaneSet::of(crate::agent_sdk::StateLane::Linear);
+        if let AttestationRequirement::Required { proof_system } = attestation {
+            enable_clean_test_proof_system(&mut state, proof_system);
+        }
         (StandardAgentRuntime::restore(state).unwrap(), work)
+    }
+
+    #[cfg(feature = "pvm")]
+    fn attested_test_route(
+        state: &crate::agent_sdk::RuntimeState,
+        work: &crate::agent_sdk::InvocationWork,
+        proof_system: crate::agent_sdk::Hash,
+    ) -> super::super::transition_proof_host::AttestedTransitionRoute {
+        let decoded = decode_standard_runtime_state(&clean_state_to_legacy(state)).unwrap();
+        let runtime = StandardAgentRuntime::restore(decoded).unwrap();
+        let descriptor = runtime.clean_descriptor().unwrap();
+        assert_eq!(work.space, descriptor.identity.space);
+        assert_eq!(work.agent, descriptor.identity.agent);
+        assert_eq!(
+            work.runtime_deployment,
+            descriptor.identity.runtime_deployment
+        );
+        let route = super::super::transition_proof_host::AttestedTransitionRoute::for_descriptor(
+            descriptor,
+            proof_system,
+            crate::agent_sdk::MAX_TRANSITION_PROOF_MATERIAL_BYTES,
+        )
+        .unwrap();
+        assert_eq!(route.producer(), descriptor.identity.transition_producer);
+        assert_ne!(route.producer(), descriptor.identity.runtime_producer);
+        route
+    }
+
+    #[cfg(feature = "pvm")]
+    fn attested_test_admission(
+        route: &super::super::transition_proof_host::AttestedTransitionRoute,
+        work: &crate::agent_sdk::RuntimeWork,
+        method: &str,
+    ) -> super::super::transition_proof_host::AttestedTransitionAdmission {
+        let (state, actor) = match work {
+            crate::agent_sdk::RuntimeWork::Invoke {
+                state, invocation, ..
+            } => (state, invocation.actor),
+            crate::agent_sdk::RuntimeWork::Resume { state, resume, .. } => (state, resume.actor),
+            crate::agent_sdk::RuntimeWork::Manage { .. }
+            | crate::agent_sdk::RuntimeWork::Acknowledge { .. } => unreachable!(),
+        };
+        let decoded = decode_standard_runtime_state(&clean_state_to_legacy(state)).unwrap();
+        let package = decoded
+            .clean_actor_packages
+            .as_ref()
+            .and_then(|packages| packages.iter().find(|package| package.actor == actor))
+            .copied()
+            .unwrap();
+        let runtime = StandardAgentRuntime::restore(decoded).unwrap();
+        let descriptor = runtime.clean_descriptor().unwrap();
+        let actor = runtime
+            .actor(crate::service::ActorId(actor.0))
+            .map(super::super::standard::legacy_entry_to_clean)
+            .unwrap();
+        super::super::transition_proof_host::AttestedTransitionAdmission {
+            space: route.space,
+            agent: route.agent,
+            runtime_deployment: route.runtime_deployment,
+            runtime_program: route.runtime_program,
+            runtime_package: route.runtime_package.clone(),
+            max_proof_material_bytes: route.max_proof_material_bytes,
+            runtime_contract: descriptor.runtime_contract,
+            runtime_capabilities: descriptor.capabilities,
+            actor_entry: actor.clone(),
+            actor_contract: package.contract,
+            actor_requirements: package.requirements,
+            method: method.into(),
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    pub(crate) fn completed_clean_policy_fixture(
+        proof_system: crate::agent_sdk::Hash,
+    ) -> (
+        crate::agent_sdk::RuntimeState,
+        crate::agent_sdk::InvocationWork,
+        crate::agent_sdk::InvocationAuthorization,
+    ) {
+        use crate::agent_sdk::method_policy::AuthorizationPolicySelector;
+        use crate::agent_sdk::{InvocationAuthorization, PublicPreflight};
+
+        let (mut runtime, work) = clean_policy_fixture_with_attestation(
+            AuthorizationPolicySelector::Public,
+            crate::agent_sdk::method_policy::AttestationRequirement::Required { proof_system },
+        );
+        let authorization =
+            InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&work, 1));
+        runtime
+            .verify_clean_invocation_authorization(&work, &authorization, 1)
+            .unwrap();
+        let (invocation, _, schema, policy, _) = runtime.resolve_clean_invocation(&work).unwrap();
+        assert!(matches!(
+            runtime.authorize_clean_execution(&work, &authorization, &schema, &policy),
+            Err(ActorExecutionError::UnsupportedMethod),
+        ));
+        let before = runtime.prepare_execution_state(&invocation).unwrap();
+        let mut after = before.clone();
+        after.linear = Some(vec![0xa7]);
+        let mut reply = exact_reply(&invocation, ActorExecutionStatus::Done);
+        runtime
+            .commit_clean_execution(
+                &work,
+                &authorization,
+                &invocation,
+                &mut reply,
+                &before,
+                after,
+                1,
+                None,
+            )
+            .unwrap();
+        (
+            legacy_state_to_clean(encode_standard_runtime_state(&runtime.snapshot())),
+            work,
+            authorization,
+        )
+    }
+
+    #[cfg(feature = "pvm")]
+    fn yielded_clean_policy_fixture(
+        proof_system: crate::agent_sdk::Hash,
+    ) -> (
+        crate::agent_sdk::RuntimeState,
+        crate::agent_sdk::InvocationWork,
+        crate::agent_sdk::YieldedInvocation,
+    ) {
+        use crate::agent_sdk::method_policy::AuthorizationPolicySelector;
+        use crate::agent_sdk::{InvocationAuthorization, PublicPreflight};
+
+        let (mut runtime, work) = clean_policy_fixture_with_attestation(
+            AuthorizationPolicySelector::Public,
+            crate::agent_sdk::method_policy::AttestationRequirement::Required { proof_system },
+        );
+        let authorization =
+            InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&work, 1));
+        let (invocation, ..) = runtime.resolve_clean_invocation(&work).unwrap();
+        let before = runtime.prepare_execution_state(&invocation).unwrap();
+        runtime
+            .commit_yielded_execution(
+                &invocation,
+                &exact_reply(&invocation, ActorExecutionStatus::Yielded),
+                &before,
+                before.clone(),
+                1,
+                None,
+                portable_continuation(&invocation, 1, 3).continuation,
+                Some((
+                    super::super::standard::StandardAcceptedInvocation::from_work(&work),
+                    authorization.clone(),
+                )),
+            )
+            .unwrap();
+        let yielded = runtime
+            .recover_clean_yield(&work, &authorization, 1)
+            .unwrap()
+            .unwrap();
+        (
+            legacy_state_to_clean(encode_standard_runtime_state(&runtime.snapshot())),
+            work,
+            yielded,
+        )
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn authenticated_attested_standard_invoke_restart_requires_the_exact_capability() {
+        use crate::agent::transition_proof_host::AuthenticatedAttestedTransition;
+        use crate::agent_sdk::{
+            InvocationError, RuntimeExecutionContext, RuntimeOutcome, RuntimeWork,
+        };
+
+        let proof_system = crate::agent_sdk::Hash([0x93; 32]);
+        let (state, invocation, authorization) = completed_clean_policy_fixture(proof_system);
+        let reopened_state = legacy_state_to_clean(encode_standard_runtime_state(
+            &decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap(),
+        ));
+        assert_eq!(reopened_state, state);
+        let route = attested_test_route(&state, &invocation, proof_system);
+        let exact = RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Attested { proof_system },
+            state,
+            invocation: Box::new(invocation),
+            authorization: Box::new(authorization),
+            observed_slot: 9,
+        };
+        let authenticated = AuthenticatedAttestedTransition::authenticate_for_test(
+            &route,
+            &exact,
+            attested_test_admission(&route, &exact, "write"),
+        )
+        .unwrap();
+        assert_eq!(authenticated.runtime_package(), &route.runtime_package);
+        let mut direct = exact.clone();
+        let RuntimeWork::Invoke { context, .. } = &mut direct else {
+            unreachable!()
+        };
+        *context = RuntimeExecutionContext::Direct;
+        assert!(matches!(
+            apply_standard_runtime_work(direct).unwrap().outcome,
+            RuntimeOutcome::Completed(Err(InvocationError::UnsupportedMethod)),
+        ));
+        let applied =
+            apply_authenticated_attested_standard_runtime_work(&authenticated, exact.clone())
+                .unwrap();
+        assert!(matches!(applied.outcome, RuntimeOutcome::Completed(Ok(_))));
+        assert_eq!(
+            apply_standard_runtime_work(exact.clone()),
+            Err(DecodeError::NonCanonical),
+            "the public Direct executor must not bypass proof hosting",
+        );
+
+        let mut wrong_route = exact.clone();
+        let RuntimeWork::Invoke { invocation, .. } = &mut wrong_route else {
+            unreachable!()
+        };
+        invocation.runtime_deployment = crate::agent_sdk::DeploymentId([0x94; 32]);
+        assert_eq!(
+            apply_authenticated_attested_standard_runtime_work(&authenticated, wrong_route),
+            Err(DecodeError::NonCanonical),
+        );
+
+        let mut wrong_system = exact.clone();
+        let RuntimeWork::Invoke { context, .. } = &mut wrong_system else {
+            unreachable!()
+        };
+        *context = RuntimeExecutionContext::Attested {
+            proof_system: crate::agent_sdk::Hash([0x95; 32]),
+        };
+        assert_eq!(
+            apply_authenticated_attested_standard_runtime_work(&authenticated, wrong_system),
+            Err(DecodeError::NonCanonical),
+        );
+
+        let mut wrong_package = attested_test_admission(&route, &exact, "write");
+        wrong_package.runtime_package = crate::agent_sdk::BlobRef::of_bytes(b"substitution");
+        assert!(
+            AuthenticatedAttestedTransition::authenticate_for_test(&route, &exact, wrong_package,)
+                .is_none()
+        );
+        assert!(
+            AuthenticatedAttestedTransition::authenticate_for_test(
+                &route,
+                &exact,
+                attested_test_admission(&route, &exact, "read"),
+            )
+            .is_none()
+        );
+
+        let mut missing_runtime_system = attested_test_admission(&route, &exact, "write");
+        missing_runtime_system.runtime_capabilities.proof_systems =
+            crate::agent_sdk::ProofSystemSet::EMPTY;
+        assert!(
+            AuthenticatedAttestedTransition::authenticate_for_test(
+                &route,
+                &exact,
+                missing_runtime_system,
+            )
+            .is_none()
+        );
+
+        let mut missing_actor_system = attested_test_admission(&route, &exact, "write");
+        missing_actor_system.actor_requirements.proof_systems =
+            crate::agent_sdk::ProofSystemSet::EMPTY;
+        assert!(
+            AuthenticatedAttestedTransition::authenticate_for_test(
+                &route,
+                &exact,
+                missing_actor_system,
+            )
+            .is_none()
+        );
+
+        let mut substituted_capabilities = attested_test_admission(&route, &exact, "write");
+        substituted_capabilities.runtime_capabilities.proof_systems =
+            crate::agent_sdk::ProofSystemSet::from_sorted(&[
+                proof_system,
+                crate::agent_sdk::Hash([0x94; 32]),
+            ])
+            .unwrap();
+        let substituted_capabilities = AuthenticatedAttestedTransition::authenticate_for_test(
+            &route,
+            &exact,
+            substituted_capabilities,
+        )
+        .unwrap();
+        assert!(matches!(
+            apply_authenticated_attested_standard_runtime_work(
+                &substituted_capabilities,
+                exact.clone(),
+            )
+            .unwrap()
+            .outcome,
+            RuntimeOutcome::Completed(Err(InvocationError::InvalidAvailability)),
+        ));
+
+        let mut substituted_actor = attested_test_admission(&route, &exact, "write");
+        substituted_actor.actor_entry.package =
+            crate::agent_sdk::BlobRef::of_bytes(b"substituted-actor-package");
+        let substituted_actor = AuthenticatedAttestedTransition::authenticate_for_test(
+            &route,
+            &exact,
+            substituted_actor,
+        )
+        .unwrap();
+        assert!(matches!(
+            apply_authenticated_attested_standard_runtime_work(&substituted_actor, exact.clone())
+                .unwrap()
+                .outcome,
+            RuntimeOutcome::Completed(Err(InvocationError::InvalidAvailability)),
+        ));
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn authenticated_attested_standard_rejects_an_amp2_none_method() {
+        use crate::agent::transition_proof_host::AuthenticatedAttestedTransition;
+        use crate::agent_sdk::method_policy::AuthorizationPolicySelector;
+        use crate::agent_sdk::{
+            InvocationAuthorization, InvocationError, PublicPreflight, RuntimeExecutionContext,
+            RuntimeOutcome, RuntimeWork,
+        };
+
+        let proof_system = crate::agent_sdk::Hash([0x95; 32]);
+        let (runtime, invocation) = clean_policy_fixture(AuthorizationPolicySelector::Public);
+        let authorization =
+            InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&invocation, 1));
+        let mut snapshot = runtime.snapshot();
+        enable_clean_test_proof_system(&mut snapshot, proof_system);
+        let reopened = StandardAgentRuntime::restore(snapshot).unwrap();
+        let state = legacy_state_to_clean(encode_standard_runtime_state(&reopened.snapshot()));
+        let route = attested_test_route(&state, &invocation, proof_system);
+        let exact = RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Attested { proof_system },
+            state,
+            invocation: Box::new(invocation),
+            authorization: Box::new(authorization),
+            observed_slot: 1,
+        };
+        let authenticated = AuthenticatedAttestedTransition::authenticate_for_test(
+            &route,
+            &exact,
+            attested_test_admission(&route, &exact, "write"),
+        )
+        .unwrap();
+        assert!(matches!(
+            apply_authenticated_attested_standard_runtime_work(&authenticated, exact.clone())
+                .unwrap()
+                .outcome,
+            RuntimeOutcome::Completed(Err(InvocationError::UnsupportedMethod)),
+        ));
+
+        let mut direct = exact;
+        let RuntimeWork::Invoke { context, .. } = &mut direct else {
+            unreachable!()
+        };
+        *context = RuntimeExecutionContext::Direct;
+        assert!(!matches!(
+            apply_standard_runtime_work(direct).unwrap().outcome,
+            RuntimeOutcome::Completed(Err(InvocationError::UnsupportedMethod)),
+        ));
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn authenticated_attested_standard_resume_restart_recovers_the_exact_method() {
+        use crate::agent::transition_proof_host::AuthenticatedAttestedTransition;
+        use crate::agent_sdk::{
+            InvocationError, RuntimeExecutionContext, RuntimeOutcome, RuntimeWork,
+        };
+
+        let proof_system = crate::agent_sdk::Hash([0x96; 32]);
+        let (state, invocation, yielded) = yielded_clean_policy_fixture(proof_system);
+        let route = attested_test_route(&state, &invocation, proof_system);
+        let exact = RuntimeWork::Resume {
+            context: RuntimeExecutionContext::Attested { proof_system },
+            state,
+            resume: Box::new(clean_resume(&yielded, invocation.availability.clone())),
+        };
+        let authenticated = AuthenticatedAttestedTransition::authenticate_for_test(
+            &route,
+            &exact,
+            attested_test_admission(&route, &exact, "write"),
+        )
+        .unwrap();
+        let mut direct = exact.clone();
+        let RuntimeWork::Resume { context, .. } = &mut direct else {
+            unreachable!()
+        };
+        *context = RuntimeExecutionContext::Direct;
+        assert!(matches!(
+            apply_standard_runtime_work(direct).unwrap().outcome,
+            RuntimeOutcome::Completed(Err(InvocationError::UnsupportedMethod)),
+        ));
+        let applied =
+            apply_authenticated_attested_standard_runtime_work(&authenticated, exact.clone())
+                .unwrap();
+        assert!(!matches!(
+            applied.outcome,
+            RuntimeOutcome::Completed(Err(InvocationError::UnsupportedMethod)),
+        ));
+        assert_eq!(
+            apply_standard_runtime_work(exact.clone()),
+            Err(DecodeError::NonCanonical),
+        );
+
+        // Even when the current runtime package supports a strict superset,
+        // Resume remains bound to the actor package requirements persisted
+        // with the original accepted Invoke.
+        let substitute_proof = crate::agent_sdk::Hash([0x97; 32]);
+        let supported =
+            crate::agent_sdk::ProofSystemSet::from_sorted(&[proof_system, substitute_proof])
+                .unwrap();
+        let mut substituted = exact.clone();
+        let RuntimeWork::Resume { state, .. } = &mut substituted else {
+            unreachable!()
+        };
+        let mut decoded = decode_standard_runtime_state(&clean_state_to_legacy(state)).unwrap();
+        let descriptor = decoded.clean_descriptor.as_mut().unwrap();
+        descriptor.capabilities.proof_systems = supported;
+        decoded.config =
+            Some(super::super::standard::clean_descriptor_to_legacy_config(descriptor).unwrap());
+        decoded.active_resource_policy = Some(descriptor.initial_resource_policy());
+        *state = legacy_state_to_clean(encode_standard_runtime_state(&decoded));
+        let substituted_route = attested_test_route(state, &invocation, proof_system);
+        let mut substituted_admission =
+            attested_test_admission(&substituted_route, &substituted, "write");
+        substituted_admission.actor_requirements.proof_systems = supported;
+        let substituted_capability = AuthenticatedAttestedTransition::authenticate_for_test(
+            &substituted_route,
+            &substituted,
+            substituted_admission,
+        )
+        .unwrap();
+        assert!(matches!(
+            apply_authenticated_attested_standard_runtime_work(
+                &substituted_capability,
+                substituted,
+            )
+            .unwrap()
+            .outcome,
+            RuntimeOutcome::Completed(Err(InvocationError::InvalidAvailability)),
+        ));
+
+        let wrong_method = AuthenticatedAttestedTransition::authenticate_for_test(
+            &route,
+            &exact,
+            attested_test_admission(&route, &exact, "read"),
+        )
+        .unwrap();
+        assert_eq!(
+            apply_authenticated_attested_standard_runtime_work(&wrong_method, exact.clone()),
+            Err(DecodeError::NonCanonical),
+            "Resume must recover the original Invoke method from durable state",
+        );
+
+        let mut wrong_slice = exact;
+        let RuntimeWork::Resume { resume, .. } = &mut wrong_slice else {
+            unreachable!()
+        };
+        resume.ready_sequence += 1;
+        assert_eq!(
+            apply_authenticated_attested_standard_runtime_work(&authenticated, wrong_slice),
+            Err(DecodeError::NonCanonical),
+        );
     }
 
     #[cfg(feature = "pvm")]
@@ -7155,6 +8880,115 @@ mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
+    fn required_attested_result_is_directly_acknowledged_only_by_its_exact_binding() {
+        use crate::agent::transition_proof_host::AuthenticatedAttestedTransition;
+        use crate::agent_sdk::{
+            InvocationAcknowledgement, InvocationAuthorization, InvocationError, PublicPreflight,
+            RuntimeExecutionContext, RuntimeOutcome, RuntimeWork,
+        };
+
+        let proof_system = crate::agent_sdk::Hash([0xe1; 32]);
+        let (retained_state, work, authorization) = completed_clean_policy_fixture(proof_system);
+        let route = attested_test_route(&retained_state, &work, proof_system);
+        let attested_retry = RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Attested { proof_system },
+            state: retained_state,
+            invocation: Box::new(work.clone()),
+            authorization: Box::new(authorization.clone()),
+            observed_slot: 9,
+        };
+        let authenticated = AuthenticatedAttestedTransition::authenticate_for_test(
+            &route,
+            &attested_retry,
+            attested_test_admission(&route, &attested_retry, "write"),
+        )
+        .unwrap();
+        let delivered =
+            apply_authenticated_attested_standard_runtime_work(&authenticated, attested_retry)
+                .unwrap();
+        assert!(matches!(
+            delivered.outcome,
+            RuntimeOutcome::Completed(Ok(_))
+        ));
+        let state = delivered.state;
+        let expected = InvocationAcknowledgement {
+            invocation: work.invocation,
+            actor: work.actor,
+            incarnation: work.incarnation,
+            deployment: work.deployment,
+            mode: work.mode,
+            work: work.commitment(),
+            authorization: authorization.commitment(),
+        };
+        let exact = apply_standard_runtime_work(RuntimeWork::Acknowledge {
+            context: RuntimeExecutionContext::Direct,
+            state: state.clone(),
+            invocation: Box::new(work.clone()),
+            authorization: Box::new(authorization.clone()),
+        })
+        .unwrap();
+        assert_eq!(
+            exact.outcome,
+            RuntimeOutcome::Acknowledged(Ok(expected)),
+            "Direct acknowledgement retires retained Required work without re-executing its method",
+        );
+        assert!(
+            decode_standard_runtime_state(&clean_state_to_legacy(&exact.state))
+                .unwrap()
+                .invocation_results
+                .is_empty(),
+        );
+
+        let assert_ack_error = |work: crate::agent_sdk::InvocationWork,
+                                authorization: InvocationAuthorization,
+                                expected: InvocationError| {
+            let rejected = apply_standard_runtime_work(RuntimeWork::Acknowledge {
+                context: RuntimeExecutionContext::Direct,
+                state: state.clone(),
+                invocation: Box::new(work),
+                authorization: Box::new(authorization),
+            })
+            .unwrap();
+            assert_eq!(rejected.state, state);
+            assert_eq!(
+                rejected.outcome,
+                RuntimeOutcome::Acknowledged(Err(expected)),
+            );
+        };
+
+        let mut substituted_work = work.clone();
+        substituted_work.gas += 1;
+        assert_ack_error(
+            substituted_work,
+            authorization.clone(),
+            InvocationError::InvalidAuthorization,
+        );
+        let InvocationAuthorization::PublicPreflight(original_preflight) = authorization.clone()
+        else {
+            unreachable!()
+        };
+        assert_ack_error(
+            work.clone(),
+            InvocationAuthorization::PublicPreflight(PublicPreflight {
+                observed_slot: original_preflight.observed_slot + 1,
+                ..original_preflight
+            }),
+            InvocationError::InvalidAuthorization,
+        );
+        assert_eq!(
+            apply_standard_runtime_work(RuntimeWork::Acknowledge {
+                context: RuntimeExecutionContext::Attested { proof_system },
+                state,
+                invocation: Box::new(work),
+                authorization: Box::new(authorization),
+            }),
+            Err(DecodeError::NonCanonical),
+            "Acknowledge has no attested execution route",
+        );
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
     fn clean_done_retries_restarts_and_requires_exact_acknowledgement() {
         use crate::agent_sdk::{
             InvocationAcknowledgement, InvocationError, RuntimeOutcome, RuntimeWork,
@@ -7204,26 +9038,29 @@ mod tests {
             )),
         })
         .unwrap();
+        let acknowledgement = InvocationAcknowledgement {
+            invocation: work.invocation,
+            actor: work.actor,
+            incarnation: work.incarnation,
+            deployment: work.deployment,
+            mode: work.mode,
+            work: work.commitment(),
+            authorization: crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
+                authority.clone(),
+            )
+            .commitment(),
+        };
         assert_eq!(
             acknowledged.outcome,
-            RuntimeOutcome::Acknowledged(Ok(InvocationAcknowledgement {
-                invocation: work.invocation,
-                actor: work.actor,
-                incarnation: work.incarnation,
-                deployment: work.deployment,
-                mode: work.mode,
-                work: work.commitment(),
-                authorization: crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
-                    authority.clone(),
-                )
-                .commitment(),
-            }))
+            RuntimeOutcome::Acknowledged(Ok(acknowledgement))
         );
-        assert!(
-            decode_standard_runtime_state(&clean_state_to_legacy(&acknowledged.state))
-                .unwrap()
-                .invocation_results
-                .is_empty()
+        let acknowledged_state =
+            decode_standard_runtime_state(&clean_state_to_legacy(&acknowledged.state)).unwrap();
+        assert!(acknowledged_state.invocation_results.is_empty());
+        assert_eq!(
+            acknowledged_state.clean_invocation_acknowledgements,
+            vec![acknowledgement],
+            "the positive retirement fact is guest-owned durable state"
         );
 
         let restarted = StandardAgentRuntime::restore(
@@ -7232,19 +9069,41 @@ mod tests {
         .unwrap();
         let after_restart =
             legacy_state_to_clean(encode_standard_runtime_state(&restarted.snapshot()));
-        let missing = apply_standard_runtime_work(RuntimeWork::Acknowledge {
+        let replayed = apply_standard_runtime_work(RuntimeWork::Acknowledge {
             context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: after_restart.clone(),
-            invocation: Box::new(work),
+            invocation: Box::new(work.clone()),
             authorization: Box::new(crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
-                authority,
+                authority.clone(),
             )),
         })
         .unwrap();
-        assert_eq!(missing.state, after_restart);
+        assert_eq!(replayed.state, after_restart);
         assert_eq!(
-            missing.outcome,
-            RuntimeOutcome::Acknowledged(Err(InvocationError::NotFound))
+            replayed.outcome,
+            RuntimeOutcome::Acknowledged(Ok(acknowledgement)),
+            "response loss/restart replays the exact positive acknowledgement"
+        );
+
+        let mut divergent = work;
+        divergent.message.push(0xff);
+        let divergent_authority = clean_authority_receipt(
+            clean_sparse_standard_state().config.as_ref().unwrap(),
+            &divergent,
+        );
+        let rejected = apply_standard_runtime_work(RuntimeWork::Acknowledge {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            state: after_restart.clone(),
+            invocation: Box::new(divergent),
+            authorization: Box::new(crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
+                divergent_authority,
+            )),
+        })
+        .unwrap();
+        assert_eq!(rejected.state, after_restart);
+        assert_eq!(
+            rejected.outcome,
+            RuntimeOutcome::Acknowledged(Err(InvocationError::DivergentInvocation))
         );
     }
 
@@ -7316,6 +9175,246 @@ mod tests {
             .sign(&different_window.signing_bytes())
             .to_bytes();
         assert_error(work, different_window, InvocationError::DivergentInvocation);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_acknowledgement_capacity_preserves_facts_and_result_across_restart() {
+        use crate::agent_sdk::{InvocationAuthorization, InvocationError};
+
+        let (mut runtime, template) = clean_resolvable_fixture(false);
+        let config = runtime.config().unwrap().clone();
+        let capacity = super::super::standard::MAX_INVOCATION_ACKNOWLEDGEMENTS_PER_LANE;
+        let mut retained = Vec::with_capacity(capacity);
+        for discriminator in 1..=capacity as u8 {
+            let mut work = template.clone();
+            work.invocation = crate::agent_sdk::InvocationId([discriminator; 32]);
+            let authorization =
+                InvocationAuthorization::AuthorityReceipt(clean_authority_receipt(&config, &work));
+            runtime
+                .validate_clean_unseen_invocation_slot(&authorization, 1)
+                .unwrap();
+            let (invocation, ..) = runtime.resolve_clean_invocation(&work).unwrap();
+            let before = runtime.prepare_execution_state(&invocation).unwrap();
+            let mut after = before.clone();
+            after.linear = Some(vec![discriminator]);
+            let mut reply = exact_reply(&invocation, ActorExecutionStatus::Done);
+            runtime
+                .commit_clean_execution(
+                    &work,
+                    &authorization,
+                    &invocation,
+                    &mut reply,
+                    &before,
+                    after,
+                    1,
+                    None,
+                )
+                .unwrap();
+            let acknowledgement = runtime
+                .acknowledge_clean_invocation(&work, &authorization)
+                .unwrap();
+            retained.push((work, authorization, acknowledgement));
+        }
+
+        let mut overflow_work = template;
+        overflow_work.invocation = crate::agent_sdk::InvocationId([(capacity + 1) as u8; 32]);
+        let overflow_authorization = InvocationAuthorization::AuthorityReceipt(
+            clean_authority_receipt(&config, &overflow_work),
+        );
+        runtime
+            .validate_clean_unseen_invocation_slot(&overflow_authorization, 1)
+            .unwrap();
+        let (overflow_invocation, ..) = runtime.resolve_clean_invocation(&overflow_work).unwrap();
+        let before = runtime
+            .prepare_execution_state(&overflow_invocation)
+            .unwrap();
+        let mut after = before.clone();
+        after.linear = Some(vec![(capacity + 1) as u8]);
+        let mut overflow_reply = exact_reply(&overflow_invocation, ActorExecutionStatus::Done);
+        runtime
+            .commit_clean_execution(
+                &overflow_work,
+                &overflow_authorization,
+                &overflow_invocation,
+                &mut overflow_reply,
+                &before,
+                after,
+                1,
+                None,
+            )
+            .unwrap();
+        let before_full_acknowledgement = encode_standard_runtime_state(&runtime.snapshot());
+        assert_eq!(
+            runtime.acknowledge_clean_invocation(&overflow_work, &overflow_authorization),
+            Err(InvocationError::ResultCapacity)
+        );
+        assert_eq!(
+            encode_standard_runtime_state(&runtime.snapshot()),
+            before_full_acknowledgement,
+            "a full acknowledgement component fails before retiring the result or any fact"
+        );
+
+        let encoded = encode_standard_runtime_state(&runtime.snapshot());
+        let decoded = decode_standard_runtime_state(&encoded).unwrap();
+        assert_eq!(decoded.clean_invocation_acknowledgements.len(), capacity);
+        assert_eq!(decoded.invocation_results.len(), 1);
+        assert_eq!(
+            decoded.invocation_results[0].invocation.0,
+            overflow_work.invocation.0
+        );
+        let mut reopened = StandardAgentRuntime::restore(decoded).unwrap();
+        assert_eq!(
+            encode_standard_runtime_state(&reopened.snapshot()),
+            encoded,
+            "checkpoint/reopen retains all facts and the unretired result byte-identically"
+        );
+
+        for (work, authorization, acknowledgement) in &retained {
+            assert_eq!(
+                reopened
+                    .recover_clean_acknowledgement(work, authorization)
+                    .unwrap(),
+                Some(*acknowledgement),
+                "every positive acknowledgement remains exactly replayable"
+            );
+        }
+        assert_eq!(
+            reopened
+                .recover_clean_execution(&overflow_work, &overflow_authorization, 1)
+                .unwrap(),
+            Some(overflow_reply),
+            "the result whose acknowledgement could not be retained remains exactly retryable"
+        );
+        assert_eq!(
+            reopened.acknowledge_clean_invocation(&overflow_work, &overflow_authorization),
+            Err(InvocationError::ResultCapacity)
+        );
+        assert_eq!(
+            encode_standard_runtime_state(&reopened.snapshot()),
+            encoded,
+            "retries at acknowledgement capacity are stable and mutation-free"
+        );
+
+        let mut hostile = reopened.snapshot();
+        hostile
+            .clean_invocation_acknowledgements
+            .push(retained[0].2);
+        assert!(StandardAgentRuntime::restore(hostile).is_err());
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn more_than_32_system_projection_queries_restart_without_lifecycle_or_proof_capacity() {
+        use crate::actors::codec::Encode as _;
+        use crate::actors::value::{Msg, TAG_DYNAMIC};
+        use crate::agent_sdk::authority::{
+            AuthorityActorTarget, AuthorityIngressAuthentication, AuthorityProjectionQuery,
+            AuthorityProjectionSelector,
+        };
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        use crate::agent_sdk::{InvocationAuthorization, PublicPreflight};
+
+        let (runtime, template) = clean_resolvable_fixture(false);
+        let mut state = runtime.snapshot();
+        let actor = &state.actors[0].record;
+        let mut descriptor = state.clean_descriptor.clone().unwrap();
+        descriptor.authority.issuer.actor = crate::agent_sdk::ActorId(actor.entry.actor.0);
+        descriptor.authority.issuer.deployment =
+            crate::agent_sdk::DeploymentId(actor.entry.deployment.0);
+        descriptor.authority.issuer.program = crate::agent_sdk::ProgramId(actor.entry.program.0);
+        descriptor.validate().unwrap();
+        state.config =
+            Some(super::super::standard::clean_descriptor_to_legacy_config(&descriptor).unwrap());
+        state.clean_creation_descriptor = Some(descriptor.clone());
+        state.clean_descriptor = Some(descriptor.clone());
+        let mut runtime = StandardAgentRuntime::restore(state).unwrap();
+        let target = AuthorityActorTarget {
+            space: descriptor.identity.space,
+            system_agent: descriptor.identity.agent,
+            system_runtime_deployment: descriptor.identity.runtime_deployment,
+            binding: descriptor.authority,
+        };
+        let public_key = [0xd1; 32];
+
+        let apply = |runtime: &mut StandardAgentRuntime, ordinal: u16| {
+            let mut nonce = [0u8; 32];
+            nonce[..2].copy_from_slice(&ordinal.to_be_bytes());
+            nonce[31] = 1;
+            let query = AuthorityProjectionQuery {
+                authority: target,
+                credential: crate::agent_sdk::CredentialId::of_public_key(&public_key),
+                nonce: crate::agent_sdk::Hash(nonce),
+                selector: AuthorityProjectionSelector::Credential,
+                authentication: AuthorityIngressAuthentication::ApiCredentialSignature {
+                    credential_public_key: public_key,
+                    signature: [0xd2; 64],
+                },
+            };
+            query.validate_shape().unwrap();
+            let mut work = template.clone();
+            work.invocation = crate::agent_sdk::InvocationId(
+                crate::agent_sdk::Hash::digest(
+                    b"vos/system-authority/projection-invocation/v2",
+                    &[query.commitment().as_bytes()],
+                )
+                .0,
+            );
+            work.mode = crate::agent_sdk::MethodMode::Query;
+            let mut message = vec![TAG_DYNAMIC];
+            message.extend_from_slice(
+                &Msg::new("credential_projection")
+                    .with("query", query.encode().unwrap())
+                    .encode(),
+            );
+            work.message = message;
+            let authorization =
+                InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&work, 1));
+            runtime
+                .validate_clean_unseen_invocation_slot(&authorization, 1)
+                .unwrap();
+            let (invocation, ..) = runtime.resolve_clean_invocation(&work).unwrap();
+            let before = runtime.prepare_execution_state(&invocation).unwrap();
+            let after = before.clone();
+            let mut reply = exact_reply(&invocation, ActorExecutionStatus::Done);
+            runtime
+                .commit_clean_execution(
+                    &work,
+                    &authorization,
+                    &invocation,
+                    &mut reply,
+                    &before,
+                    after,
+                    1,
+                    None,
+                )
+                .unwrap();
+            runtime
+                .acknowledge_clean_invocation(&work, &authorization)
+                .unwrap();
+            let snapshot = runtime.snapshot();
+            assert!(snapshot.invocation_results.is_empty());
+            assert!(snapshot.clean_invocation_acknowledgements.is_empty());
+            assert!(matches!(
+                authorization,
+                InvocationAuthorization::PublicPreflight(_)
+            ));
+        };
+
+        for ordinal in 1..=40 {
+            apply(&mut runtime, ordinal);
+        }
+        let checkpoint = encode_standard_runtime_state(&runtime.snapshot());
+        let mut reopened =
+            StandardAgentRuntime::restore(decode_standard_runtime_state(&checkpoint).unwrap())
+                .unwrap();
+        assert_eq!(
+            encode_standard_runtime_state(&reopened.snapshot()),
+            checkpoint
+        );
+        for ordinal in 41..=80 {
+            apply(&mut reopened, ordinal);
+        }
     }
 
     #[cfg(feature = "pvm")]

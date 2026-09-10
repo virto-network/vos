@@ -1,7 +1,22 @@
 //! Panic handler for guest actors.
 
 #[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
+fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+    #[cfg(not(all(target_arch = "riscv64", feature = "agent-runtime")))]
+    report(_info);
+
+    // A guest panic is a terminal PVM condition. RISC-V EBREAK transpiles to
+    // the GP trap opcode, so the invocation fails deterministically instead
+    // of consuming its remaining gas in a loop. AgentRuntime deliberately
+    // reaches this trap without formatting or invoking DEBUG_WRITE: its outer
+    // host-call surface is restricted to the standard inner-machine calls.
+    unsafe {
+        core::arch::asm!("ebreak", options(noreturn, nostack));
+    }
+}
+
+#[cfg(not(all(target_arch = "riscv64", feature = "agent-runtime")))]
+fn report(info: &core::panic::PanicInfo<'_>) {
     use core::fmt::Write;
     struct PanicWriter;
     impl core::fmt::Write for PanicWriter {
@@ -11,10 +26,4 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         }
     }
     let _ = write!(PanicWriter, "panic: {}\n", info);
-    // A guest panic is a terminal PVM condition. RISC-V EBREAK transpiles to
-    // the GP trap opcode, so the invocation fails deterministically instead
-    // of consuming its remaining gas in a loop.
-    unsafe {
-        core::arch::asm!("ebreak", options(noreturn, nostack));
-    }
 }

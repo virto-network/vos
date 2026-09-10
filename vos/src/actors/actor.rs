@@ -264,7 +264,10 @@ pub trait Actor: Sized + Encode + Decode {
     /// stop processing remaining messages in this batch, `false` to continue.
     #[allow(unused_variables)]
     fn on_error(&mut self, error: &Self::Error) -> bool {
-        #[cfg(feature = "pvm")]
+        #[cfg(all(
+            feature = "pvm",
+            not(all(target_arch = "riscv64", feature = "agent-runtime"))
+        ))]
         {
             struct ErrorWriter;
             impl core::fmt::Write for ErrorWriter {
@@ -275,6 +278,8 @@ pub trait Actor: Sized + Encode + Decode {
             }
             let _ = core::fmt::write(&mut ErrorWriter, format_args!("error: {:?}\n", error));
         }
+        #[cfg(all(target_arch = "riscv64", feature = "agent-runtime"))]
+        let _ = error;
         true
     }
 }

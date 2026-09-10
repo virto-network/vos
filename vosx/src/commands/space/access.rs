@@ -12,8 +12,9 @@ use super::client::DaemonClient;
 
 #[derive(Subcommand, Debug)]
 pub enum AccessCommand {
-    /// Issue a bearer token for a stable space member. The secret is
-    /// displayed once. Omit `--subject` to add a credential for yourself.
+    /// Issue a versioned Ed25519 bearer credential for a stable space member.
+    /// The signing seed is displayed once. Omit `--subject` to add a
+    /// credential for yourself.
     Issue {
         /// Hex-encoded member SubjectId. Requires credential-management
         /// authority when it differs from the caller.
@@ -93,10 +94,9 @@ fn issue(space: &str, subject: Option<&str>, expires: &str) -> anyhow::Result<()
     let expires_at = now
         .checked_add(ttl)
         .ok_or_else(|| anyhow::anyhow!("access expiry overflows Unix time"))?;
-    let mut secret = [0_u8; 32];
-    getrandom::getrandom(&mut secret)?;
-    let credential_id = vos::ingress_credential_id(&secret);
-    let token = vos::ingress::encode_access_token(&secret);
+    let credential = vos::ingress::ApiAccessCredential::generate()?;
+    let credential_id = credential.credential_id().0;
+    let token = credential.encode_token();
     let recovery_file = persist_recovery_token(space, &credential_id, &token)?;
     DaemonClient::with_connect(space, |client| {
         let target = client.resolve_target(vos::service::ROLE_AUTHORITY_INSTANCE_)?;
@@ -155,10 +155,9 @@ fn issue_ssh(
         .map_err(|error| anyhow::anyhow!("read {}: {error}", public_key_path.display()))?;
     let public_key = ssh_key::PublicKey::from_openssh(encoded.trim())
         .map_err(|error| anyhow::anyhow!("parse {}: {error}", public_key_path.display()))?;
-    let canonical = public_key
-        .to_bytes()
-        .map_err(|error| anyhow::anyhow!("encode SSH public key: {error}"))?;
-    let credential_id = vos::ssh_credential_id(&canonical);
+    let canonical = vos::ssh_ingress::canonical_ssh_ed25519_public_key(&public_key)
+        .ok_or_else(|| anyhow::anyhow!("SSH access requires a non-weak ssh-ed25519 public key"))?;
+    let credential_id = vos::agent::sdk::CredentialId::of_public_key(&canonical).0;
     let ttl = crate::token::parse_duration(expires)?;
     let expires_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)?

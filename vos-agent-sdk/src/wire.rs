@@ -10,13 +10,18 @@ use vos_protocol::wire::{DecodeError, Decoder, Encoder};
 
 use crate::authority::{
     AUTHORITY_PUBLIC_KEY_BYTES, AUTHORITY_SIGNATURE_BYTES, AgentAuthorityBinding,
+    AuthorityActorProjection, AuthorityActorProjectionPage, AuthorityActorRoleGrant,
     AuthorityActorTarget, AuthorityAdminCall, AuthorityAdminOperation, AuthorityAdminResult,
-    AuthorityBuiltinRole, AuthorityCredentialCall, AuthorityCredentialEnrollment,
-    AuthorityCredentialKind, AuthorityEvidence, AuthorityIssuer, AuthorityLaneRoots,
-    AuthorityOperationKind, AuthorityReceipt, AuthorityReceiptSelector,
+    AuthorityAgentProjection, AuthorityAgentProjectionPage, AuthorityAgentReplicaProjectionPage,
+    AuthorityBuiltinRole, AuthorityCapabilityGrant, AuthorityCredentialCall,
+    AuthorityCredentialEnrollment, AuthorityCredentialKind, AuthorityCredentialProjection,
+    AuthorityCredentialStatus, AuthorityEvidence, AuthorityIngressAuthentication, AuthorityIssuer,
+    AuthorityLaneRoots, AuthorityOperationKind, AuthorityProjectionHead, AuthorityProjectionQuery,
+    AuthorityProjectionSelector, AuthorityReceipt, AuthorityReceiptSelector,
     CREDENTIAL_PUBLIC_KEY_BYTES, CREDENTIAL_SIGNATURE_BYTES, CompactAgentDescriptor,
-    CompactInstallActor, CompactReplicaSlot, ManagedAgentTarget, ManagementApplicationAck,
-    ManagementApproval, ManagementAuthorizationPlan,
+    CompactInstallActor, CompactReplicaSlot, MAX_AUTHORITY_PRINCIPAL_GRANTS,
+    MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES, MAX_AUTHORITY_REPLICA_PAGE_ENTRIES, ManagedAgentTarget,
+    ManagementApplicationAck, ManagementApproval, ManagementAuthorizationPlan,
 };
 use crate::catalog::{
     CatalogActorTarget, CatalogAlias, CatalogEntry, CatalogMutationCall, CatalogMutationKind,
@@ -38,6 +43,12 @@ pub const MAX_AUTHORITY_RECEIPT_WIRE_BYTES: usize = 1_024;
 pub const MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES: usize = MAX_INVOCATION_MESSAGE_BYTES;
 pub const MAX_AUTHORITY_ADMIN_CALL_WIRE_BYTES: usize = MAX_INVOCATION_MESSAGE_BYTES;
 pub const MAX_AUTHORITY_ADMIN_RESULT_WIRE_BYTES: usize = MAX_INVOCATION_REPLY_BYTES;
+pub const MAX_AUTHORITY_PROJECTION_QUERY_WIRE_BYTES: usize = MAX_INVOCATION_MESSAGE_BYTES;
+pub const MAX_AUTHORITY_CREDENTIAL_PROJECTION_WIRE_BYTES: usize = MAX_INVOCATION_REPLY_BYTES;
+pub const MAX_AUTHORITY_AGENT_PROJECTION_PAGE_WIRE_BYTES: usize = MAX_INVOCATION_REPLY_BYTES;
+pub const MAX_AUTHORITY_AGENT_REPLICA_PROJECTION_PAGE_WIRE_BYTES: usize =
+    MAX_INVOCATION_REPLY_BYTES;
+pub const MAX_AUTHORITY_ACTOR_PROJECTION_PAGE_WIRE_BYTES: usize = MAX_INVOCATION_REPLY_BYTES;
 pub const MAX_MANAGEMENT_APPROVAL_WIRE_BYTES: usize = MAX_INVOCATION_REPLY_BYTES;
 pub const MAX_MANAGEMENT_AUTHORIZATION_PLAN_WIRE_BYTES: usize = MAX_INVOCATION_MESSAGE_BYTES;
 pub const MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES: usize = MAX_INVOCATION_MESSAGE_BYTES;
@@ -421,6 +432,7 @@ fn encode_agent_identity(encoder: &mut Encoder<'_>, value: &AgentIdentity) {
     encoder.fixed(value.runtime_deployment.as_bytes());
     encoder.fixed(value.runtime_program.as_bytes());
     encoder.fixed(value.runtime_producer.as_bytes());
+    encoder.fixed(value.transition_producer.as_bytes());
 }
 
 fn decode_agent_identity(decoder: &mut Decoder<'_>) -> Result<AgentIdentity, DecodeError> {
@@ -437,6 +449,7 @@ fn decode_agent_identity(decoder: &mut Decoder<'_>) -> Result<AgentIdentity, Dec
         runtime_deployment: DeploymentId(decoder.fixed()?),
         runtime_program: ProgramId(decoder.fixed()?),
         runtime_producer: ProducerId(decoder.fixed()?),
+        transition_producer: ProducerId(decoder.fixed()?),
     })
 }
 
@@ -1130,7 +1143,10 @@ pub(crate) fn decode_authority_actor_target(
 fn encode_managed_agent_target(encoder: &mut Encoder<'_>, value: ManagedAgentTarget) {
     encoder.fixed(value.space.as_bytes());
     encoder.fixed(value.agent.as_bytes());
+    encoder.fixed(value.owner.as_bytes());
+    encoder.u8(value.profile as u8);
     encoder.fixed(value.runtime_deployment.as_bytes());
+    encoder.fixed(value.transition_producer.as_bytes());
 }
 
 fn decode_managed_agent_target(
@@ -1139,7 +1155,15 @@ fn decode_managed_agent_target(
     let value = ManagedAgentTarget {
         space: SpaceId(decoder.fixed()?),
         agent: AgentId(decoder.fixed()?),
+        owner: PrincipalId(decoder.fixed()?),
+        profile: match decoder.u8()? {
+            0 => AgentProfile::Local,
+            1 => AgentProfile::Shared,
+            2 => AgentProfile::Private,
+            _ => return Err(DecodeError::InvalidTag),
+        },
         runtime_deployment: DeploymentId(decoder.fixed()?),
+        transition_producer: ProducerId(decoder.fixed()?),
     };
     value
         .is_valid()
@@ -1386,6 +1410,48 @@ fn encode_authority_admin_operation(encoder: &mut Encoder<'_>, value: &Authority
             encoder.fixed(principal.as_bytes());
             encoder.u8(*role as u8);
         }
+        AuthorityAdminOperation::SetSpaceRole {
+            principal,
+            role,
+            granted,
+        } => {
+            encoder.u8(6);
+            encoder.fixed(principal.as_bytes());
+            encoder.fixed(role.as_bytes());
+            encoder.bool(*granted);
+        }
+        AuthorityAdminOperation::SetActorRole {
+            principal,
+            agent,
+            actor,
+            deployment,
+            role,
+            granted,
+        } => {
+            encoder.u8(7);
+            encoder.fixed(principal.as_bytes());
+            encoder.fixed(agent.as_bytes());
+            encoder.fixed(actor.as_bytes());
+            encoder.fixed(deployment.as_bytes());
+            encoder.fixed(role.as_bytes());
+            encoder.bool(*granted);
+        }
+        AuthorityAdminOperation::SetCapability {
+            principal,
+            agent,
+            actor,
+            deployment,
+            capability,
+            granted,
+        } => {
+            encoder.u8(8);
+            encoder.fixed(principal.as_bytes());
+            encoder.fixed(agent.as_bytes());
+            encoder.fixed(actor.as_bytes());
+            encoder.fixed(deployment.as_bytes());
+            encoder.fixed(capability.as_bytes());
+            encoder.bool(*granted);
+        }
     }
 }
 
@@ -1424,6 +1490,27 @@ fn decode_authority_admin_operation(
                 _ => return Err(DecodeError::InvalidTag),
             },
         },
+        6 => AuthorityAdminOperation::SetSpaceRole {
+            principal: PrincipalId(decoder.fixed()?),
+            role: RoleId(decoder.fixed()?),
+            granted: decoder.bool()?,
+        },
+        7 => AuthorityAdminOperation::SetActorRole {
+            principal: PrincipalId(decoder.fixed()?),
+            agent: AgentId(decoder.fixed()?),
+            actor: ActorId(decoder.fixed()?),
+            deployment: DeploymentId(decoder.fixed()?),
+            role: RoleId(decoder.fixed()?),
+            granted: decoder.bool()?,
+        },
+        8 => AuthorityAdminOperation::SetCapability {
+            principal: PrincipalId(decoder.fixed()?),
+            agent: AgentId(decoder.fixed()?),
+            actor: ActorId(decoder.fixed()?),
+            deployment: DeploymentId(decoder.fixed()?),
+            capability: CapabilityId(decoder.fixed()?),
+            granted: decoder.bool()?,
+        },
         _ => return Err(DecodeError::InvalidTag),
     };
     value
@@ -1434,10 +1521,10 @@ fn decode_authority_admin_operation(
 
 pub(crate) fn authority_admin_operation_commitment(value: &AuthorityAdminOperation) -> Hash {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"AAO2");
+    bytes.extend_from_slice(b"AAO3");
     bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
     encode_authority_admin_operation(&mut Encoder(&mut bytes), value);
-    Hash::digest(b"vos/agent/authority-admin-operation/v2", &[&bytes])
+    Hash::digest(b"vos/agent/authority-admin-operation/v3", &[&bytes])
 }
 
 fn encode_authority_admin_call_unsigned(encoder: &mut Encoder<'_>, value: &AuthorityAdminCall) {
@@ -1464,18 +1551,18 @@ pub(crate) fn authority_admin_call_invocation_payload_commitment(
     value: &AuthorityAdminCall,
 ) -> Hash {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"AIP3");
+    bytes.extend_from_slice(b"AIP4");
     bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
     encode_authority_admin_call_invocation_payload(&mut Encoder(&mut bytes), value);
     Hash::digest(
-        b"vos/agent/authority-admin-invocation-payload/v3",
+        b"vos/agent/authority-admin-invocation-payload/v4",
         &[&bytes],
     )
 }
 
 pub(crate) fn authority_admin_call_signing_bytes(value: &AuthorityAdminCall) -> Vec<u8> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"AA3S");
+    bytes.extend_from_slice(b"AA4S");
     bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
     encode_authority_admin_call_unsigned(&mut Encoder(&mut bytes), value);
     bytes
@@ -1526,7 +1613,7 @@ fn decode_authority_admin_call_body(
 }
 
 impl CanonicalWire for AuthorityAdminCall {
-    const MAGIC: [u8; 4] = *b"AAD3";
+    const MAGIC: [u8; 4] = *b"AAD4";
     const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_ADMIN_CALL_WIRE_BYTES;
 
     fn validate_wire(&self) -> bool {
@@ -1555,14 +1642,14 @@ pub(crate) fn authority_admin_result_encoded_len(value: &AuthorityAdminResult) -
 
 pub(crate) fn authority_admin_result_commitment(value: &AuthorityAdminResult) -> Hash {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"AAR3");
+    bytes.extend_from_slice(b"AAR4");
     bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
     encode_authority_admin_result_body(&mut Encoder(&mut bytes), value);
-    Hash::digest(b"vos/agent/authority-admin-result/v3", &[&bytes])
+    Hash::digest(b"vos/agent/authority-admin-result/v4", &[&bytes])
 }
 
 impl CanonicalWire for AuthorityAdminResult {
-    const MAGIC: [u8; 4] = *b"AAR3";
+    const MAGIC: [u8; 4] = *b"AAR4";
     const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_ADMIN_RESULT_WIRE_BYTES;
 
     fn validate_wire(&self) -> bool {
@@ -1584,6 +1671,596 @@ impl CanonicalWire for AuthorityAdminResult {
             .is_ok()
             .then_some(value)
             .ok_or(DecodeError::NonCanonical)
+    }
+}
+
+fn encode_authority_projection_selector(
+    encoder: &mut Encoder<'_>,
+    value: AuthorityProjectionSelector,
+) {
+    match value {
+        AuthorityProjectionSelector::Credential => encoder.u8(0),
+        AuthorityProjectionSelector::Agents { after, limit } => {
+            encoder.u8(1);
+            encoder.option(&after, |encoder, value| encoder.fixed(value.as_bytes()));
+            encoder.u16(limit);
+        }
+        AuthorityProjectionSelector::AgentReplicas {
+            agent,
+            after,
+            limit,
+        } => {
+            encoder.u8(2);
+            encoder.fixed(agent.as_bytes());
+            encoder.option(&after, |encoder, value| encoder.fixed(value.as_bytes()));
+            encoder.u16(limit);
+        }
+        AuthorityProjectionSelector::Actors {
+            agent,
+            after,
+            limit,
+        } => {
+            encoder.u8(3);
+            encoder.fixed(agent.as_bytes());
+            encoder.option(&after, |encoder, value| encoder.fixed(value.as_bytes()));
+            encoder.u16(limit);
+        }
+    }
+}
+
+fn decode_authority_projection_selector(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorityProjectionSelector, DecodeError> {
+    let value = match decoder.u8()? {
+        0 => AuthorityProjectionSelector::Credential,
+        1 => AuthorityProjectionSelector::Agents {
+            after: decoder.option(|decoder| Ok(AgentId(decoder.fixed()?)))?,
+            limit: decoder.u16()?,
+        },
+        2 => AuthorityProjectionSelector::AgentReplicas {
+            agent: AgentId(decoder.fixed()?),
+            after: decoder.option(|decoder| Ok(NodeId(decoder.fixed()?)))?,
+            limit: decoder.u16()?,
+        },
+        3 => AuthorityProjectionSelector::Actors {
+            agent: AgentId(decoder.fixed()?),
+            after: decoder.option(|decoder| Ok(ActorId(decoder.fixed()?)))?,
+            limit: decoder.u16()?,
+        },
+        _ => return Err(DecodeError::InvalidTag),
+    };
+    value
+        .validate_shape()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn encode_authority_projection_query_unsigned(
+    encoder: &mut Encoder<'_>,
+    value: &AuthorityProjectionQuery,
+) {
+    encode_authority_actor_target(encoder, value.authority);
+    encoder.fixed(value.credential.as_bytes());
+    encoder.fixed(value.nonce.as_bytes());
+    encode_authority_projection_selector(encoder, value.selector);
+    encode_authority_ingress_authentication_unsigned(encoder, value.authentication);
+}
+
+pub(crate) fn encode_authority_ingress_authentication_unsigned(
+    encoder: &mut Encoder<'_>,
+    value: AuthorityIngressAuthentication,
+) {
+    match value {
+        AuthorityIngressAuthentication::ApiCredentialSignature {
+            credential_public_key,
+            ..
+        } => {
+            encoder.u8(0);
+            encoder.0.extend_from_slice(&credential_public_key);
+        }
+        AuthorityIngressAuthentication::SshNodeAttestation {
+            credential_public_key,
+            node,
+            request_binding,
+            ..
+        } => {
+            encoder.u8(1);
+            encoder.0.extend_from_slice(&credential_public_key);
+            encoder.fixed(node.as_bytes());
+            encoder.fixed(request_binding.as_bytes());
+        }
+    }
+}
+
+pub(crate) fn encode_authority_ingress_authentication(
+    encoder: &mut Encoder<'_>,
+    value: AuthorityIngressAuthentication,
+) {
+    encode_authority_ingress_authentication_unsigned(encoder, value);
+    encoder.0.extend_from_slice(&value.signature());
+}
+
+pub(crate) fn decode_authority_ingress_authentication(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorityIngressAuthentication, DecodeError> {
+    let authentication = match decoder.u8()? {
+        0 => AuthorityIngressAuthentication::ApiCredentialSignature {
+            credential_public_key: decoder
+                .take(CREDENTIAL_PUBLIC_KEY_BYTES)?
+                .try_into()
+                .map_err(|_| DecodeError::Truncated)?,
+            signature: decoder
+                .take(CREDENTIAL_SIGNATURE_BYTES)?
+                .try_into()
+                .map_err(|_| DecodeError::Truncated)?,
+        },
+        1 => AuthorityIngressAuthentication::SshNodeAttestation {
+            credential_public_key: decoder
+                .take(CREDENTIAL_PUBLIC_KEY_BYTES)?
+                .try_into()
+                .map_err(|_| DecodeError::Truncated)?,
+            node: NodeId(decoder.fixed()?),
+            request_binding: Hash(decoder.fixed()?),
+            signature: decoder
+                .take(CREDENTIAL_SIGNATURE_BYTES)?
+                .try_into()
+                .map_err(|_| DecodeError::Truncated)?,
+        },
+        _ => return Err(DecodeError::InvalidTag),
+    };
+    Ok(authentication)
+}
+
+pub(crate) fn authority_projection_query_signing_bytes(
+    value: &AuthorityProjectionQuery,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"APQS");
+    bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    encode_authority_projection_query_unsigned(&mut Encoder(&mut bytes), value);
+    bytes
+}
+
+fn encode_authority_projection_query_body(
+    encoder: &mut Encoder<'_>,
+    value: &AuthorityProjectionQuery,
+) {
+    encode_authority_actor_target(encoder, value.authority);
+    encoder.fixed(value.credential.as_bytes());
+    encoder.fixed(value.nonce.as_bytes());
+    encode_authority_projection_selector(encoder, value.selector);
+    encode_authority_ingress_authentication(encoder, value.authentication);
+}
+
+fn decode_authority_projection_query_body(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorityProjectionQuery, DecodeError> {
+    let value = AuthorityProjectionQuery {
+        authority: decode_authority_actor_target(decoder)?,
+        credential: CredentialId(decoder.fixed()?),
+        nonce: Hash(decoder.fixed()?),
+        selector: decode_authority_projection_selector(decoder)?,
+        authentication: decode_authority_ingress_authentication(decoder)?,
+    };
+    value
+        .validate_shape()
+        .is_ok()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+pub(crate) fn authority_projection_query_encoded_len(value: &AuthorityProjectionQuery) -> usize {
+    let mut body = Vec::new();
+    encode_authority_projection_query_body(&mut Encoder(&mut body), value);
+    HEADER_BYTES.saturating_add(body.len())
+}
+
+impl CanonicalWire for AuthorityProjectionQuery {
+    const MAGIC: [u8; 4] = *b"APQ1";
+    const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_PROJECTION_QUERY_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_shape().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_authority_projection_query_body(encoder, self);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        decode_authority_projection_query_body(decoder)
+    }
+}
+
+fn encode_authority_projection_head(encoder: &mut Encoder<'_>, value: AuthorityProjectionHead) {
+    encoder.u64(value.state_revision.get());
+    encoder.u64(value.epoch.get());
+    encoder.u64(value.authorization_sequence.get());
+    encoder.u64(value.administration_generation.get());
+    encoder.fixed(value.state_commitment.as_bytes());
+}
+
+fn decode_authority_projection_head(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorityProjectionHead, DecodeError> {
+    let value = AuthorityProjectionHead {
+        state_revision: core::num::NonZeroU64::new(decoder.u64()?)
+            .ok_or(DecodeError::NonCanonical)?,
+        epoch: core::num::NonZeroU64::new(decoder.u64()?).ok_or(DecodeError::NonCanonical)?,
+        authorization_sequence: core::num::NonZeroU64::new(decoder.u64()?)
+            .ok_or(DecodeError::NonCanonical)?,
+        administration_generation: core::num::NonZeroU64::new(decoder.u64()?)
+            .ok_or(DecodeError::NonCanonical)?,
+        state_commitment: Hash(decoder.fixed()?),
+    };
+    value
+        .is_valid()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn encode_actor_role_grant(encoder: &mut Encoder<'_>, value: &AuthorityActorRoleGrant) {
+    encoder.fixed(value.agent.as_bytes());
+    encoder.fixed(value.actor.as_bytes());
+    encoder.fixed(value.deployment.as_bytes());
+    encoder.fixed(value.role.as_bytes());
+}
+
+fn decode_actor_role_grant(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorityActorRoleGrant, DecodeError> {
+    let value = AuthorityActorRoleGrant {
+        agent: AgentId(decoder.fixed()?),
+        actor: ActorId(decoder.fixed()?),
+        deployment: DeploymentId(decoder.fixed()?),
+        role: RoleId(decoder.fixed()?),
+    };
+    value
+        .is_valid()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn encode_capability_grant(encoder: &mut Encoder<'_>, value: &AuthorityCapabilityGrant) {
+    encoder.fixed(value.agent.as_bytes());
+    encoder.fixed(value.actor.as_bytes());
+    encoder.fixed(value.deployment.as_bytes());
+    encoder.fixed(value.capability.as_bytes());
+}
+
+fn decode_capability_grant(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorityCapabilityGrant, DecodeError> {
+    let value = AuthorityCapabilityGrant {
+        agent: AgentId(decoder.fixed()?),
+        actor: ActorId(decoder.fixed()?),
+        deployment: DeploymentId(decoder.fixed()?),
+        capability: CapabilityId(decoder.fixed()?),
+    };
+    value
+        .is_valid()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn encode_authority_credential_projection_body(
+    encoder: &mut Encoder<'_>,
+    value: &AuthorityCredentialProjection,
+) {
+    encode_authority_projection_query_body(encoder, &value.query);
+    encode_authority_projection_head(encoder, value.head);
+    encoder.fixed(value.principal.as_bytes());
+    encoder.u8(value.status as u8);
+    encoder.u8(value.kind as u8);
+    encoder.u8(value.builtin_role as u8);
+    encoder.u64(value.management_request_high_water);
+    encoder.u64(value.operation_request_high_water);
+    encoder.u64(value.admin_request_high_water);
+    encoder.list(&value.space_roles, |encoder, role| {
+        encoder.fixed(role.as_bytes())
+    });
+    encoder.list(&value.actor_roles, encode_actor_role_grant);
+    encoder.list(&value.capabilities, encode_capability_grant);
+}
+
+fn decode_authority_credential_projection_body(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorityCredentialProjection, DecodeError> {
+    let value = AuthorityCredentialProjection {
+        query: decode_authority_projection_query_body(decoder)?,
+        head: decode_authority_projection_head(decoder)?,
+        principal: PrincipalId(decoder.fixed()?),
+        status: match decoder.u8()? {
+            0 => AuthorityCredentialStatus::Active,
+            1 => AuthorityCredentialStatus::Revoked,
+            _ => return Err(DecodeError::InvalidTag),
+        },
+        kind: match decoder.u8()? {
+            0 => AuthorityCredentialKind::Ssh,
+            1 => AuthorityCredentialKind::Api,
+            _ => return Err(DecodeError::InvalidTag),
+        },
+        builtin_role: match decoder.u8()? {
+            0 => AuthorityBuiltinRole::Member,
+            1 => AuthorityBuiltinRole::Developer,
+            2 => AuthorityBuiltinRole::Admin,
+            _ => return Err(DecodeError::InvalidTag),
+        },
+        management_request_high_water: decoder.u64()?,
+        operation_request_high_water: decoder.u64()?,
+        admin_request_high_water: decoder.u64()?,
+        space_roles: decoder.list_bounded(MAX_AUTHORITY_PRINCIPAL_GRANTS, |decoder| {
+            Ok(RoleId(decoder.fixed()?))
+        })?,
+        actor_roles: decoder
+            .list_bounded(MAX_AUTHORITY_PRINCIPAL_GRANTS, decode_actor_role_grant)?,
+        capabilities: decoder
+            .list_bounded(MAX_AUTHORITY_PRINCIPAL_GRANTS, decode_capability_grant)?,
+    };
+    value
+        .validate_shape()
+        .is_ok()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+pub(crate) fn authority_credential_projection_encoded_len(
+    value: &AuthorityCredentialProjection,
+) -> usize {
+    let mut body = Vec::new();
+    encode_authority_credential_projection_body(&mut Encoder(&mut body), value);
+    HEADER_BYTES.saturating_add(body.len())
+}
+
+impl CanonicalWire for AuthorityCredentialProjection {
+    const MAGIC: [u8; 4] = *b"ACP2";
+    const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_CREDENTIAL_PROJECTION_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_shape().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_authority_credential_projection_body(encoder, self);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        decode_authority_credential_projection_body(decoder)
+    }
+}
+
+fn encode_authority_agent_projection(encoder: &mut Encoder<'_>, value: &AuthorityAgentProjection) {
+    encode_agent_identity(encoder, &value.identity);
+    encoder.fixed(value.creation_nonce.as_bytes());
+    encode_agent_authority_binding(encoder, value.authority);
+    encoder.option(&value.private_recovery, encode_private_recovery_binding);
+    encode_blob(encoder, &value.runtime_package);
+    encode_runtime_contract(encoder, value.runtime_contract);
+    encode_capabilities(encoder, value.capabilities);
+    encoder.u16(value.replica_count);
+    encoder.fixed(value.replica_generation.as_bytes());
+}
+
+fn decode_authority_agent_projection(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorityAgentProjection, DecodeError> {
+    let value = AuthorityAgentProjection {
+        identity: decode_agent_identity(decoder)?,
+        creation_nonce: Hash(decoder.fixed()?),
+        authority: decode_agent_authority_binding(decoder)?,
+        private_recovery: decoder.option(decode_private_recovery_binding)?,
+        runtime_package: decode_blob(decoder)?,
+        runtime_contract: decode_runtime_contract(decoder)?,
+        capabilities: decode_capabilities(decoder)?,
+        replica_count: decoder.u16()?,
+        replica_generation: Hash(decoder.fixed()?),
+    };
+    value
+        .validate_shape()
+        .is_ok()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn encode_authority_agent_projection_page_body(
+    encoder: &mut Encoder<'_>,
+    value: &AuthorityAgentProjectionPage,
+) {
+    encode_authority_projection_query_body(encoder, &value.query);
+    encode_authority_projection_head(encoder, value.head);
+    encoder.list(&value.entries, encode_authority_agent_projection);
+    encoder.option(&value.next, |encoder, value| {
+        encoder.fixed(value.as_bytes())
+    });
+}
+
+fn decode_authority_agent_projection_page_body(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorityAgentProjectionPage, DecodeError> {
+    let value = AuthorityAgentProjectionPage {
+        query: decode_authority_projection_query_body(decoder)?,
+        head: decode_authority_projection_head(decoder)?,
+        entries: decoder.list_bounded(
+            MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES,
+            decode_authority_agent_projection,
+        )?,
+        next: decoder.option(|decoder| Ok(AgentId(decoder.fixed()?)))?,
+    };
+    value
+        .validate_shape()
+        .is_ok()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+pub(crate) fn authority_agent_projection_page_encoded_len(
+    value: &AuthorityAgentProjectionPage,
+) -> usize {
+    let mut body = Vec::new();
+    encode_authority_agent_projection_page_body(&mut Encoder(&mut body), value);
+    HEADER_BYTES.saturating_add(body.len())
+}
+
+impl CanonicalWire for AuthorityAgentProjectionPage {
+    const MAGIC: [u8; 4] = *b"AAP2";
+    const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_AGENT_PROJECTION_PAGE_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_shape().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_authority_agent_projection_page_body(encoder, self);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        decode_authority_agent_projection_page_body(decoder)
+    }
+}
+
+fn encode_authority_agent_replica_projection_page_body(
+    encoder: &mut Encoder<'_>,
+    value: &AuthorityAgentReplicaProjectionPage,
+) {
+    encode_authority_projection_query_body(encoder, &value.query);
+    encode_authority_projection_head(encoder, value.head);
+    encoder.u16(value.replica_count);
+    encoder.fixed(value.replica_generation.as_bytes());
+    encoder.list(&value.entries, encode_replica);
+    encoder.option(&value.next, |encoder, value| {
+        encoder.fixed(value.as_bytes())
+    });
+}
+
+fn decode_authority_agent_replica_projection_page_body(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorityAgentReplicaProjectionPage, DecodeError> {
+    let value = AuthorityAgentReplicaProjectionPage {
+        query: decode_authority_projection_query_body(decoder)?,
+        head: decode_authority_projection_head(decoder)?,
+        replica_count: decoder.u16()?,
+        replica_generation: Hash(decoder.fixed()?),
+        entries: decoder.list_bounded(MAX_AUTHORITY_REPLICA_PAGE_ENTRIES, decode_replica)?,
+        next: decoder.option(|decoder| Ok(NodeId(decoder.fixed()?)))?,
+    };
+    value
+        .validate_shape()
+        .is_ok()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+pub(crate) fn authority_agent_replica_projection_page_encoded_len(
+    value: &AuthorityAgentReplicaProjectionPage,
+) -> usize {
+    let mut body = Vec::new();
+    encode_authority_agent_replica_projection_page_body(&mut Encoder(&mut body), value);
+    HEADER_BYTES.saturating_add(body.len())
+}
+
+impl CanonicalWire for AuthorityAgentReplicaProjectionPage {
+    const MAGIC: [u8; 4] = *b"ARP2";
+    const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_AGENT_REPLICA_PROJECTION_PAGE_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_shape().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_authority_agent_replica_projection_page_body(encoder, self);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        decode_authority_agent_replica_projection_page_body(decoder)
+    }
+}
+
+fn encode_authority_actor_projection(encoder: &mut Encoder<'_>, value: &AuthorityActorProjection) {
+    encoder.fixed(value.agent.as_bytes());
+    encode_actor_entry(encoder, &value.entry);
+    encoder.fixed(value.producer.as_bytes());
+    encode_actor_contract(encoder, value.contract);
+    encode_requirements(encoder, value.requirements);
+    encoder.bool(value.root_provenance);
+    encoder.fixed(value.installation_id.as_bytes());
+    encoder.fixed(value.registry_reservation.as_bytes());
+    encoder.fixed(value.install_request.as_bytes());
+}
+
+fn decode_authority_actor_projection(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorityActorProjection, DecodeError> {
+    let value = AuthorityActorProjection {
+        agent: AgentId(decoder.fixed()?),
+        entry: decode_actor_entry(decoder)?,
+        producer: ProducerId(decoder.fixed()?),
+        contract: decode_actor_contract(decoder)?,
+        requirements: decode_requirements(decoder)?,
+        root_provenance: decoder.bool()?,
+        installation_id: InstallationId(decoder.fixed()?),
+        registry_reservation: Hash(decoder.fixed()?),
+        install_request: Hash(decoder.fixed()?),
+    };
+    value
+        .validate_shape()
+        .is_ok()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+fn encode_authority_actor_projection_page_body(
+    encoder: &mut Encoder<'_>,
+    value: &AuthorityActorProjectionPage,
+) {
+    encode_authority_projection_query_body(encoder, &value.query);
+    encode_authority_projection_head(encoder, value.head);
+    encoder.list(&value.entries, encode_authority_actor_projection);
+    encoder.option(&value.next, |encoder, value| {
+        encoder.fixed(value.as_bytes())
+    });
+}
+
+fn decode_authority_actor_projection_page_body(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuthorityActorProjectionPage, DecodeError> {
+    let value = AuthorityActorProjectionPage {
+        query: decode_authority_projection_query_body(decoder)?,
+        head: decode_authority_projection_head(decoder)?,
+        entries: decoder.list_bounded(
+            MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES,
+            decode_authority_actor_projection,
+        )?,
+        next: decoder.option(|decoder| Ok(ActorId(decoder.fixed()?)))?,
+    };
+    value
+        .validate_shape()
+        .is_ok()
+        .then_some(value)
+        .ok_or(DecodeError::NonCanonical)
+}
+
+pub(crate) fn authority_actor_projection_page_encoded_len(
+    value: &AuthorityActorProjectionPage,
+) -> usize {
+    let mut body = Vec::new();
+    encode_authority_actor_projection_page_body(&mut Encoder(&mut body), value);
+    HEADER_BYTES.saturating_add(body.len())
+}
+
+impl CanonicalWire for AuthorityActorProjectionPage {
+    const MAGIC: [u8; 4] = *b"ATP2";
+    const MAX_ENCODED_BYTES: usize = MAX_AUTHORITY_ACTOR_PROJECTION_PAGE_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate_shape().is_ok()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_authority_actor_projection_page_body(encoder, self);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        decode_authority_actor_projection_page_body(decoder)
     }
 }
 
@@ -3399,6 +4076,8 @@ fn identity_valid(value: &AgentIdentity) -> bool {
         && value.runtime_deployment != DeploymentId::ZERO
         && value.runtime_program != ProgramId::ZERO
         && value.runtime_producer != ProducerId::ZERO
+        && value.transition_producer != ProducerId::ZERO
+        && value.transition_producer != value.runtime_producer
 }
 
 pub(crate) fn management_reply_valid(value: &ManagementReply) -> bool {
@@ -4511,7 +5190,10 @@ mod tests {
         ManagedAgentTarget {
             space: authority_actor_target().space,
             agent: AgentId([0x29; 32]),
+            owner: PrincipalId([0x2b; 32]),
+            profile: AgentProfile::Shared,
             runtime_deployment: DeploymentId([0x2a; 32]),
+            transition_producer: ProducerId([0x2c; 32]),
         }
     }
 
@@ -4634,6 +5316,90 @@ mod tests {
         call
     }
 
+    fn authority_projection_query(
+        selector: AuthorityProjectionSelector,
+    ) -> AuthorityProjectionQuery {
+        let credential_public_key = [0x71; CREDENTIAL_PUBLIC_KEY_BYTES];
+        AuthorityProjectionQuery {
+            authority: authority_actor_target(),
+            credential: CredentialId::of_public_key(&credential_public_key),
+            nonce: Hash([0x72; 32]),
+            selector,
+            authentication: AuthorityIngressAuthentication::ApiCredentialSignature {
+                credential_public_key,
+                signature: [0x73; CREDENTIAL_SIGNATURE_BYTES],
+            },
+        }
+    }
+
+    fn authority_projection_head() -> AuthorityProjectionHead {
+        AuthorityProjectionHead {
+            state_revision: core::num::NonZeroU64::new(10).unwrap(),
+            epoch: core::num::NonZeroU64::new(7).unwrap(),
+            authorization_sequence: core::num::NonZeroU64::new(8).unwrap(),
+            administration_generation: core::num::NonZeroU64::new(9).unwrap(),
+            state_commitment: Hash([0x74; 32]),
+        }
+    }
+
+    fn authority_agent_projection(marker: u8) -> AuthorityAgentProjection {
+        let owner = PrincipalId([marker.wrapping_add(1); 32]);
+        let creation_nonce = Hash([marker.wrapping_add(2); 32]);
+        let identity = AgentIdentity {
+            space: authority_actor_target().space,
+            agent: AgentId::derive(
+                authority_actor_target().space,
+                owner,
+                creation_nonce.as_bytes(),
+            ),
+            owner,
+            profile: AgentProfile::Private,
+            runtime_deployment: DeploymentId([marker.wrapping_add(3); 32]),
+            runtime_program: ProgramId([marker.wrapping_add(4); 32]),
+            runtime_producer: ProducerId([marker.wrapping_add(5); 32]),
+            transition_producer: ProducerId([marker.wrapping_add(0x20); 32]),
+        };
+        let replicas = alloc::vec![AgentReplica {
+            node: NodeId([marker.wrapping_add(6); 32]),
+            principal: owner,
+            role: ReplicaRole::Observer,
+        }];
+        let replica_generation = replica_set_generation(&identity, creation_nonce, &replicas);
+        AuthorityAgentProjection {
+            identity,
+            creation_nonce,
+            authority: authority_actor_target().binding,
+            private_recovery: Some(PrivateRecoveryBinding {
+                signing_key_commitment: Hash([marker.wrapping_add(7); 32]),
+                encryption_public_key: [0x42; 32],
+            }),
+            runtime_package: blob(marker.wrapping_add(8)),
+            runtime_contract: RuntimePackageContract::canonical(),
+            capabilities: RuntimeCapabilities::standard(),
+            replica_count: replicas.len().try_into().unwrap(),
+            replica_generation,
+        }
+    }
+
+    fn authority_actor_projection(agent: AgentId, marker: u8) -> AuthorityActorProjection {
+        let entry = actor(marker);
+        AuthorityActorProjection {
+            agent,
+            requirements: RuntimeRequirements {
+                lanes: entry.lanes,
+                scheduling: true,
+                proof_systems: ProofSystemSet::EMPTY,
+            },
+            entry,
+            producer: ProducerId([marker.wrapping_add(9); 32]),
+            contract: ActorPackageContract::canonical(),
+            root_provenance: false,
+            installation_id: InstallationId([marker.wrapping_add(10); 32]),
+            registry_reservation: Hash([marker.wrapping_add(11); 32]),
+            install_request: Hash([marker.wrapping_add(12); 32]),
+        }
+    }
+
     #[test]
     fn authority_actor_protocol_has_bounded_distinct_golden_wires() {
         let call = authority_credential_call();
@@ -4644,8 +5410,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/acc3-golden", &[&call_bytes]).0,
             [
-                205, 124, 27, 133, 136, 197, 36, 118, 4, 75, 25, 255, 204, 23, 224, 19, 191, 142,
-                32, 39, 23, 166, 120, 202, 7, 41, 152, 102, 37, 99, 21, 226,
+                70, 226, 120, 242, 59, 173, 142, 196, 225, 89, 250, 96, 226, 43, 247, 147, 50, 141,
+                189, 163, 69, 78, 87, 222, 151, 171, 103, 199, 92, 111, 32, 54,
             ]
         );
 
@@ -4657,8 +5423,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/map2-golden", &[&approval_bytes]).0,
             [
-                159, 180, 28, 190, 114, 149, 62, 194, 180, 161, 193, 192, 225, 96, 31, 26, 121, 82,
-                25, 51, 93, 218, 226, 148, 171, 144, 6, 234, 52, 178, 9, 241,
+                45, 113, 251, 3, 161, 170, 249, 229, 47, 54, 186, 217, 147, 22, 209, 235, 130, 207,
+                68, 205, 69, 143, 96, 13, 116, 236, 143, 180, 244, 84, 170, 52,
             ]
         );
 
@@ -4673,8 +5439,8 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/maa2-golden", &[&acknowledgement_bytes]).0,
             [
-                17, 168, 152, 131, 216, 243, 34, 26, 25, 241, 103, 52, 66, 81, 144, 89, 81, 246,
-                147, 10, 135, 218, 217, 153, 24, 59, 161, 143, 158, 146, 187, 63,
+                187, 116, 176, 241, 211, 43, 226, 122, 92, 10, 159, 64, 192, 98, 148, 135, 58, 34,
+                209, 162, 31, 4, 198, 14, 135, 62, 228, 101, 206, 245, 215, 37,
             ]
         );
     }
@@ -4683,30 +5449,30 @@ mod tests {
     fn authority_admin_call_and_result_are_exact_bounded_clean_wires() {
         let call = authority_admin_call();
         let bytes = call.encode().unwrap();
-        assert_eq!(bytes.get(..4), Some(b"AAD3".as_slice()));
+        assert_eq!(bytes.get(..4), Some(b"AAD4".as_slice()));
         assert!(bytes.len() <= MAX_AUTHORITY_ADMIN_CALL_WIRE_BYTES);
         assert_eq!(AuthorityAdminCall::decode(&bytes), Ok(call.clone()));
         assert_eq!(
-            Hash::digest(b"vos/test/aad3-golden", &[&bytes]).0,
+            Hash::digest(b"vos/test/aad4-golden", &[&bytes]).0,
             [
-                226, 206, 76, 92, 176, 194, 61, 82, 23, 103, 31, 120, 189, 193, 225, 56, 207, 196,
-                145, 1, 246, 168, 139, 55, 158, 167, 112, 150, 13, 11, 202, 211,
+                122, 151, 25, 237, 134, 19, 77, 165, 135, 151, 71, 15, 11, 74, 251, 163, 30, 17,
+                136, 91, 171, 245, 77, 176, 57, 78, 132, 40, 112, 248, 194, 27,
             ]
         );
 
         let result = AuthorityAdminResult::from_call(call.clone()).unwrap();
         let result_bytes = result.encode().unwrap();
-        assert_eq!(result_bytes.get(..4), Some(b"AAR3".as_slice()));
+        assert_eq!(result_bytes.get(..4), Some(b"AAR4".as_slice()));
         assert!(result_bytes.len() <= MAX_AUTHORITY_ADMIN_RESULT_WIRE_BYTES);
         assert_eq!(
             AuthorityAdminResult::decode(&result_bytes),
             Ok(result.clone())
         );
         assert_eq!(
-            Hash::digest(b"vos/test/aar3-golden", &[&result_bytes]).0,
+            Hash::digest(b"vos/test/aar4-golden", &[&result_bytes]).0,
             [
-                214, 238, 87, 107, 175, 244, 219, 136, 9, 4, 206, 173, 227, 195, 107, 196, 12, 90,
-                162, 75, 127, 212, 69, 232, 254, 64, 40, 125, 219, 20, 61, 118,
+                41, 106, 187, 249, 255, 59, 252, 150, 89, 49, 171, 8, 178, 173, 213, 24, 253, 235,
+                184, 127, 109, 58, 180, 83, 178, 134, 237, 201, 220, 217, 129, 231,
             ]
         );
         assert_ne!(call.commitment(), result.commitment());
@@ -4730,10 +5496,10 @@ mod tests {
         trailing.push(0);
         assert!(AuthorityAdminCall::decode(&trailing).is_err());
         let mut previous_generation = bytes.clone();
-        previous_generation[..4].copy_from_slice(b"AAD2");
+        previous_generation[..4].copy_from_slice(b"AAD3");
         assert!(AuthorityAdminCall::decode(&previous_generation).is_err());
         let mut previous_result_generation = result_bytes;
-        previous_result_generation[..4].copy_from_slice(b"AAR2");
+        previous_result_generation[..4].copy_from_slice(b"AAR3");
         assert!(AuthorityAdminResult::decode(&previous_result_generation).is_err());
         let mut prior_abi = bytes;
         prior_abi[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-20260906r9");
@@ -4745,6 +5511,262 @@ mod tests {
         let operation_tag = 36 + 32 + 328 + 32 + 32 + 8 + 32 + 32 + 8 + 8;
         unknown_operation[operation_tag] = 0xff;
         assert!(AuthorityAdminCall::decode(&unknown_operation).is_err());
+    }
+
+    #[test]
+    fn authority_projection_wires_are_bounded_complete_and_canonical() {
+        let credential_query = authority_projection_query(AuthorityProjectionSelector::Credential);
+        let query_bytes = credential_query.encode().unwrap();
+        assert_eq!(query_bytes.get(..4), Some(b"APQ1".as_slice()));
+        assert!(query_bytes.len() <= MAX_AUTHORITY_PROJECTION_QUERY_WIRE_BYTES);
+        assert_eq!(
+            AuthorityProjectionQuery::decode(&query_bytes),
+            Ok(credential_query.clone())
+        );
+
+        let credential = AuthorityCredentialProjection {
+            query: credential_query,
+            head: authority_projection_head(),
+            principal: PrincipalId([0x75; 32]),
+            status: AuthorityCredentialStatus::Revoked,
+            kind: AuthorityCredentialKind::Api,
+            builtin_role: AuthorityBuiltinRole::Developer,
+            management_request_high_water: 11,
+            operation_request_high_water: 12,
+            admin_request_high_water: 13,
+            space_roles: alloc::vec![RoleId([0x10; 32]), RoleId([0x11; 32])],
+            actor_roles: alloc::vec![AuthorityActorRoleGrant {
+                agent: AgentId([0x12; 32]),
+                actor: ActorId([0x13; 32]),
+                deployment: DeploymentId([0x14; 32]),
+                role: RoleId([0x15; 32]),
+            }],
+            capabilities: alloc::vec![AuthorityCapabilityGrant {
+                agent: AgentId([0x16; 32]),
+                actor: ActorId([0x17; 32]),
+                deployment: DeploymentId([0x18; 32]),
+                capability: CapabilityId([0x19; 32]),
+            }],
+        };
+        let credential_bytes = credential.encode().unwrap();
+        assert_eq!(credential_bytes.get(..4), Some(b"ACP2".as_slice()));
+        let mut credential_v1 = credential_bytes.clone();
+        credential_v1[..4].copy_from_slice(b"ACP1");
+        assert!(AuthorityCredentialProjection::decode(&credential_v1).is_err());
+        assert!(credential_bytes.len() <= MAX_AUTHORITY_CREDENTIAL_PROJECTION_WIRE_BYTES);
+        assert_eq!(
+            AuthorityCredentialProjection::decode(&credential_bytes),
+            Ok(credential)
+        );
+
+        let mut agents = alloc::vec![
+            authority_agent_projection(0x31),
+            authority_agent_projection(0x41),
+        ];
+        agents.sort_unstable_by_key(|entry| entry.identity.agent);
+        let agent_query = authority_projection_query(AuthorityProjectionSelector::Agents {
+            after: None,
+            limit: 2,
+        });
+        let agent_page = AuthorityAgentProjectionPage {
+            query: agent_query,
+            head: authority_projection_head(),
+            next: agents.last().map(|entry| entry.identity.agent),
+            entries: agents,
+        };
+        let agent_bytes = agent_page.encode().unwrap();
+        assert_eq!(agent_bytes.get(..4), Some(b"AAP2".as_slice()));
+        let mut agent_v1 = agent_bytes.clone();
+        agent_v1[..4].copy_from_slice(b"AAP1");
+        assert!(AuthorityAgentProjectionPage::decode(&agent_v1).is_err());
+        assert!(agent_bytes.len() <= MAX_AUTHORITY_AGENT_PROJECTION_PAGE_WIRE_BYTES);
+        assert_eq!(
+            AuthorityAgentProjectionPage::decode(&agent_bytes),
+            Ok(agent_page.clone())
+        );
+        let projected = &agent_page.entries[0];
+        assert!(projected.private_recovery.is_some());
+        assert!(projected.runtime_contract.is_valid());
+        assert_eq!(projected.capabilities, RuntimeCapabilities::standard());
+
+        let replicas = alloc::vec![AgentReplica {
+            node: NodeId([0x4a; 32]),
+            principal: projected.identity.owner,
+            role: ReplicaRole::Observer,
+        }];
+        let replica_page = AuthorityAgentReplicaProjectionPage {
+            query: authority_projection_query(AuthorityProjectionSelector::AgentReplicas {
+                agent: projected.identity.agent,
+                after: None,
+                limit: 1,
+            }),
+            head: authority_projection_head(),
+            replica_count: projected.replica_count,
+            replica_generation: projected.replica_generation,
+            next: None,
+            entries: replicas,
+        };
+        let replica_bytes = replica_page.encode().unwrap();
+        assert_eq!(replica_bytes.get(..4), Some(b"ARP2".as_slice()));
+        let mut replica_v1 = replica_bytes.clone();
+        replica_v1[..4].copy_from_slice(b"ARP1");
+        assert!(AuthorityAgentReplicaProjectionPage::decode(&replica_v1).is_err());
+        assert!(replica_bytes.len() <= MAX_AUTHORITY_AGENT_REPLICA_PROJECTION_PAGE_WIRE_BYTES);
+        assert_eq!(
+            AuthorityAgentReplicaProjectionPage::decode(&replica_bytes),
+            Ok(replica_page.clone())
+        );
+        assert!(replica_page.matches_agent_at_head(projected, agent_page.head));
+
+        let agent = AgentId([0x51; 32]);
+        let mut actors = alloc::vec![
+            authority_actor_projection(agent, 0x52),
+            authority_actor_projection(agent, 0x62),
+        ];
+        actors.sort_unstable_by_key(|entry| entry.entry.actor);
+        let actor_query = authority_projection_query(AuthorityProjectionSelector::Actors {
+            agent,
+            after: None,
+            limit: 2,
+        });
+        let actor_page = AuthorityActorProjectionPage {
+            query: actor_query,
+            head: authority_projection_head(),
+            next: actors.last().map(|entry| entry.entry.actor),
+            entries: actors,
+        };
+        let actor_bytes = actor_page.encode().unwrap();
+        assert_eq!(actor_bytes.get(..4), Some(b"ATP2".as_slice()));
+        let mut actor_v1 = actor_bytes.clone();
+        actor_v1[..4].copy_from_slice(b"ATP1");
+        assert!(AuthorityActorProjectionPage::decode(&actor_v1).is_err());
+        assert!(actor_bytes.len() <= MAX_AUTHORITY_ACTOR_PROJECTION_PAGE_WIRE_BYTES);
+        assert_eq!(
+            AuthorityActorProjectionPage::decode(&actor_bytes),
+            Ok(actor_page.clone())
+        );
+        assert!(actor_page.entries.iter().all(|entry| {
+            entry.contract == ActorPackageContract::canonical()
+                && entry.requirements.lanes == entry.entry.lanes
+                && entry.entry.package.hash != Hash::ZERO
+                && entry.entry.agent_schema.hash != Hash::ZERO
+                && entry.entry.method_policy.hash != Hash::ZERO
+        }));
+
+        let mut reordered = agent_page.clone();
+        reordered.entries.swap(0, 1);
+        assert_eq!(reordered.encode(), Err(WireError::InvalidValue));
+        let mut wrong_cursor = actor_page.clone();
+        wrong_cursor.next = Some(ActorId([0xff; 32]));
+        assert_eq!(wrong_cursor.encode(), Err(WireError::InvalidValue));
+        let mut zero_progress = replica_page;
+        zero_progress.entries.clear();
+        zero_progress.next = Some(NodeId([0x4a; 32]));
+        assert_eq!(zero_progress.encode(), Err(WireError::InvalidValue));
+        let mut old_query = query_bytes;
+        old_query[..4].copy_from_slice(b"APQ0");
+        assert!(AuthorityProjectionQuery::decode(&old_query).is_err());
+    }
+
+    #[test]
+    fn authority_projection_ssh_attestation_wire_binds_stable_request_identity() {
+        let credential_public_key = [0x81; CREDENTIAL_PUBLIC_KEY_BYTES];
+        let query = AuthorityProjectionQuery {
+            authority: authority_actor_target(),
+            credential: CredentialId::of_public_key(&credential_public_key),
+            nonce: Hash([0x82; 32]),
+            selector: AuthorityProjectionSelector::Agents {
+                after: Some(AgentId([0x83; 32])),
+                limit: 3,
+            },
+            authentication: AuthorityIngressAuthentication::SshNodeAttestation {
+                credential_public_key,
+                node: NodeId([0x84; 32]),
+                request_binding: Hash([0x85; 32]),
+                signature: [0x86; CREDENTIAL_SIGNATURE_BYTES],
+            },
+        };
+        let bytes = query.encode().unwrap();
+        assert_eq!(AuthorityProjectionQuery::decode(&bytes), Ok(query.clone()));
+        let signing = query.signing_bytes();
+
+        let mut rebound = query.clone();
+        let AuthorityIngressAuthentication::SshNodeAttestation {
+            request_binding, ..
+        } = &mut rebound.authentication
+        else {
+            unreachable!();
+        };
+        request_binding.0[0] ^= 1;
+        assert_ne!(rebound.signing_bytes(), signing);
+
+        let mut zero_binding = query;
+        let AuthorityIngressAuthentication::SshNodeAttestation {
+            request_binding, ..
+        } = &mut zero_binding.authentication
+        else {
+            unreachable!();
+        };
+        *request_binding = Hash::ZERO;
+        assert_eq!(zero_binding.encode(), Err(WireError::InvalidValue));
+    }
+
+    #[test]
+    fn maximum_agent_roster_is_reconstructible_from_bounded_progress_pages() {
+        let mut agent = authority_agent_projection(0x91);
+        let mut replicas = Vec::with_capacity(MAX_AGENT_REPLICAS);
+        for ordinal in 1..=MAX_AGENT_REPLICAS {
+            let mut node = [0; 32];
+            node[30..].copy_from_slice(&(ordinal as u16).to_be_bytes());
+            replicas.push(AgentReplica {
+                node: NodeId(node),
+                principal: agent.identity.owner,
+                role: ReplicaRole::Observer,
+            });
+        }
+        agent.replica_count = replicas.len().try_into().unwrap();
+        agent.replica_generation =
+            replica_set_generation(&agent.identity, agent.creation_nonce, &replicas);
+        assert_eq!(
+            agent
+                .reconstruct_descriptor(replicas.clone())
+                .unwrap()
+                .replicas,
+            replicas
+        );
+
+        let first_entries = replicas[..MAX_AUTHORITY_REPLICA_PAGE_ENTRIES].to_vec();
+        let first = AuthorityAgentReplicaProjectionPage {
+            query: authority_projection_query(AuthorityProjectionSelector::AgentReplicas {
+                agent: agent.identity.agent,
+                after: None,
+                limit: MAX_AUTHORITY_REPLICA_PAGE_ENTRIES as u16,
+            }),
+            head: authority_projection_head(),
+            replica_count: agent.replica_count,
+            replica_generation: agent.replica_generation,
+            next: first_entries.last().map(|replica| replica.node),
+            entries: first_entries,
+        };
+        let encoded = first.encode().unwrap();
+        assert!(encoded.len() <= MAX_AUTHORITY_AGENT_REPLICA_PROJECTION_PAGE_WIRE_BYTES);
+        assert_eq!(
+            AuthorityAgentReplicaProjectionPage::decode(&encoded),
+            Ok(first.clone())
+        );
+        let mut duplicate = first;
+        duplicate.entries[1] = duplicate.entries[0];
+        assert_eq!(duplicate.encode(), Err(WireError::InvalidValue));
+
+        let mut too_many = replicas;
+        let mut node = [0xff; 32];
+        node[31] = 1;
+        too_many.push(AgentReplica {
+            node: NodeId(node),
+            principal: agent.identity.owner,
+            role: ReplicaRole::Observer,
+        });
+        assert!(agent.reconstruct_descriptor(too_many).is_err());
     }
 
     #[test]
@@ -5009,6 +6031,7 @@ mod tests {
                 runtime_deployment: DeploymentId([0x64; 32]),
                 runtime_program: ProgramId([0x65; 32]),
                 runtime_producer: ProducerId([0x66; 32]),
+                transition_producer: ProducerId([0x6b; 32]),
             },
             creation_nonce,
             authority: authority.binding,
@@ -5056,7 +6079,10 @@ mod tests {
             };
             if let ManagementRequest::Create(descriptor) = &request {
                 call.managed.agent = descriptor.identity.agent;
+                call.managed.owner = descriptor.identity.owner;
+                call.managed.profile = descriptor.identity.profile;
                 call.managed.runtime_deployment = descriptor.identity.runtime_deployment;
+                call.managed.transition_producer = descriptor.identity.transition_producer;
             }
             call.invocation = call.expected_invocation();
             assert_eq!(call.validate_shape(), Ok(()));
@@ -5796,6 +6822,7 @@ mod tests {
                 runtime_deployment,
                 runtime_program: ProgramId([45; 32]),
                 runtime_producer: ProducerId([46; 32]),
+                transition_producer: ProducerId([52; 32]),
             },
             creation_nonce,
             authority: AgentAuthorityBinding {

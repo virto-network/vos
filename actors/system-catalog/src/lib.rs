@@ -567,6 +567,7 @@ mod tests {
                 runtime_deployment: DeploymentId([0x43; 32]),
                 runtime_program: ProgramId([0x44; 32]),
                 runtime_producer: ProducerId([0x45; 32]),
+                transition_producer: ProducerId([0x4b; 32]),
             },
             actor: ActorId([0x46; 32]),
             actor_deployment: DeploymentId([0x47; 32]),

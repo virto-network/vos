@@ -59,18 +59,24 @@ pub mod prelude {
     pub use crate::{Attestation, AttestationError, Verified};
     #[cfg(feature = "macros")]
     pub use crate::{actor, messages};
-    // Guest-side stdout shims backed by DEBUG_WRITE. Available at
-    // crate root via `#[macro_export]` on pvm builds; re-exporting
-    // them through the prelude lets a single glob cover both
-    // `log::info!` and `println!`.
-    #[cfg(feature = "pvm")]
+    // Guest-side stdout shims backed by DEBUG_WRITE. Available at crate root
+    // via `#[macro_export]` on ordinary pvm builds; AgentRuntime excludes
+    // every DEBUG_WRITE-backed surface on its riscv64 target.
+    #[cfg(all(
+        feature = "pvm",
+        not(all(target_arch = "riscv64", feature = "agent-runtime"))
+    ))]
     pub use crate::{eprint, eprintln, print, println};
     pub use ::log;
 }
 
-/// Backing for the print!/println! macros declared in
-/// `actors::guest_io`. Hidden — user code goes through the macros.
-#[cfg(feature = "pvm")]
+/// Backing for the print!/println! macros declared in `actors::guest_io`.
+/// Hidden — user code goes through the macros. The standard AgentRuntime
+/// target does not compile this non-standard outer host call.
+#[cfg(all(
+    feature = "pvm",
+    not(all(target_arch = "riscv64", feature = "agent-runtime"))
+))]
 #[doc(hidden)]
 pub mod __io {
     pub use crate::abi::pvm::hostcalls::debug_write;

@@ -27,11 +27,42 @@ const ESTABLISHMENT_RECEIPT_HASH_DOMAIN: &[u8] = b"vos/private/replica-establish
 const ESTABLISHMENT_SOURCE_HASH_DOMAIN: &[u8] = b"vos/private/replica-establishment-source/v1";
 const ESTABLISHMENT_IDENTITY_HASH_DOMAIN: &[u8] = b"vos/private/replica-establishment-identity/v1";
 const ESTABLISHMENT_HEADER_BYTES: usize = 4 + 2 + 32;
-const MANAGED_AGENT_TARGET_WIRE_BYTES: usize = 3 * 32;
+const MANAGED_AGENT_TARGET_WIRE_BYTES: usize = 5 * 32 + 1;
 const AUTHORITY_BINDING_WIRE_BYTES: usize = 7 * 32 + 8;
 const AUTHORITY_TARGET_WIRE_BYTES: usize = 3 * 32 + AUTHORITY_BINDING_WIRE_BYTES;
 const ESTABLISHMENT_COMPLETION_WIRE_BYTES: usize = 4 * 32;
 const ESTABLISHMENT_AUTHENTICATOR_BYTES: usize = 32;
+
+fn encode_managed_target(encoder: &mut Encoder<'_>, route: ManagedAgentTarget) {
+    encoder.fixed(route.space.as_bytes());
+    encoder.fixed(route.agent.as_bytes());
+    encoder.fixed(route.owner.as_bytes());
+    encoder.u8(route.profile as u8);
+    encoder.fixed(route.runtime_deployment.as_bytes());
+    encoder.fixed(route.transition_producer.as_bytes());
+}
+
+fn decode_managed_target(
+    decoder: &mut Decoder<'_>,
+) -> Result<ManagedAgentTarget, vos_protocol::wire::DecodeError> {
+    let route = ManagedAgentTarget {
+        space: SpaceId(decoder.fixed()?),
+        agent: AgentId(decoder.fixed()?),
+        owner: PrincipalId(decoder.fixed()?),
+        profile: match decoder.u8()? {
+            0 => AgentProfile::Local,
+            1 => AgentProfile::Shared,
+            2 => AgentProfile::Private,
+            _ => return Err(vos_protocol::wire::DecodeError::InvalidTag),
+        },
+        runtime_deployment: DeploymentId(decoder.fixed()?),
+        transition_producer: ProducerId(decoder.fixed()?),
+    };
+    route
+        .is_valid()
+        .then_some(route)
+        .ok_or(vos_protocol::wire::DecodeError::NonCanonical)
+}
 // Header + route + owner + length-prefixed destination + authority + source
 // hash + gas + length-prefixed archive + optional completion + authenticator.
 const MAX_ESTABLISHMENT_PLAN_BYTES: usize = ESTABLISHMENT_HEADER_BYTES
@@ -185,6 +216,8 @@ impl PrivateAgentHost {
     ) -> Result<PreparedPrivateReplicaEstablishment, PrivateAgentHostError> {
         self.verify_root_scope()?;
         if !route.is_valid()
+            || route.profile != AgentProfile::Private
+            || route.owner != self.scope.owner
             || !authority.is_valid()
             || route.space != self.scope.space
             || authority.space != route.space
@@ -604,6 +637,8 @@ fn replica_establishment_identity_commitment(
     management_gas: u64,
 ) -> Result<Hash, PrivateAgentHostError> {
     if !route.is_valid()
+        || route.owner != owner
+        || route.profile != AgentProfile::Private
         || owner == PrincipalId::ZERO
         || !destination.validate()
         || destination.principal != owner
@@ -618,9 +653,7 @@ fn replica_establishment_identity_commitment(
         .map_err(|_| PrivateAgentHostError::InvalidArtifact)?;
     let mut preimage = Vec::new();
     let mut encoder = Encoder(&mut preimage);
-    encoder.fixed(route.space.as_bytes());
-    encoder.fixed(route.agent.as_bytes());
-    encoder.fixed(route.runtime_deployment.as_bytes());
+    encode_managed_target(&mut encoder, route);
     encoder.fixed(owner.as_bytes());
     encoder.bytes(&destination);
     encoder.fixed(authority.space.as_bytes());
@@ -720,6 +753,8 @@ fn encode_replica_establishment_plan(
     node_key: &PrivateNodeDecryptionKey,
 ) -> Result<Vec<u8>, PrivateAgentHostError> {
     if !plan.route.is_valid()
+        || plan.route.owner != plan.owner
+        || plan.route.profile != AgentProfile::Private
         || plan.owner == PrincipalId::ZERO
         || !plan.destination.validate()
         || plan.destination.principal != plan.owner
@@ -759,9 +794,7 @@ fn encode_replica_establishment_plan(
     bytes.extend_from_slice(&ESTABLISHMENT_PLAN_VERSION.to_le_bytes());
     bytes.extend_from_slice(vos_agent_sdk::RUNTIME_ABI_ID.as_bytes());
     let mut encoder = Encoder(&mut bytes);
-    encoder.fixed(plan.route.space.as_bytes());
-    encoder.fixed(plan.route.agent.as_bytes());
-    encoder.fixed(plan.route.runtime_deployment.as_bytes());
+    encode_managed_target(&mut encoder, plan.route);
     encoder.fixed(plan.owner.as_bytes());
     encoder.bytes(&destination);
     encoder.fixed(plan.authority.space.as_bytes());
@@ -804,11 +837,7 @@ fn decode_replica_establishment_plan(
     {
         return Err(PrivateAgentHostError::Corrupt);
     }
-    let route = ManagedAgentTarget {
-        space: SpaceId(decoder.fixed().map_err(map_decode)?),
-        agent: AgentId(decoder.fixed().map_err(map_decode)?),
-        runtime_deployment: DeploymentId(decoder.fixed().map_err(map_decode)?),
-    };
+    let route = decode_managed_target(&mut decoder).map_err(map_decode)?;
     let owner = PrincipalId(decoder.fixed().map_err(map_decode)?);
     let destination_wire = decoder
         .bytes_bounded(MAX_PRIVATE_NODE_IDENTITY_WIRE_BYTES)
@@ -952,6 +981,8 @@ fn encode_replica_establishment_receipt(
     node_key: &PrivateNodeDecryptionKey,
 ) -> Result<Vec<u8>, PrivateAgentHostError> {
     if !receipt.route.is_valid()
+        || receipt.route.owner != receipt.owner
+        || receipt.route.profile != AgentProfile::Private
         || receipt.owner == PrincipalId::ZERO
         || !receipt.destination.validate()
         || receipt.destination.principal != receipt.owner
@@ -986,9 +1017,7 @@ fn encode_replica_establishment_receipt(
     bytes.extend_from_slice(&ESTABLISHMENT_RECEIPT_VERSION.to_le_bytes());
     bytes.extend_from_slice(vos_agent_sdk::RUNTIME_ABI_ID.as_bytes());
     let mut encoder = Encoder(&mut bytes);
-    encoder.fixed(receipt.route.space.as_bytes());
-    encoder.fixed(receipt.route.agent.as_bytes());
-    encoder.fixed(receipt.route.runtime_deployment.as_bytes());
+    encode_managed_target(&mut encoder, receipt.route);
     encoder.fixed(receipt.owner.as_bytes());
     encoder.bytes(&destination);
     encoder.fixed(receipt.authority.space.as_bytes());
@@ -1029,11 +1058,7 @@ fn decode_replica_establishment_receipt(
         return Err(PrivateAgentHostError::Corrupt);
     }
     let receipt = ReplicaEstablishmentReceipt {
-        route: ManagedAgentTarget {
-            space: SpaceId(decoder.fixed().map_err(map_decode)?),
-            agent: AgentId(decoder.fixed().map_err(map_decode)?),
-            runtime_deployment: DeploymentId(decoder.fixed().map_err(map_decode)?),
-        },
+        route: decode_managed_target(&mut decoder).map_err(map_decode)?,
         owner: PrincipalId(decoder.fixed().map_err(map_decode)?),
         destination: PrivateNodeIdentity::decode(
             &decoder
@@ -1244,7 +1269,10 @@ fn authenticate_replica_source<V: PrivateNodeAuthorityVerifier>(
     source_hash: Hash,
     node_authority: &V,
 ) -> Result<VerifiedReplicaSource, PrivateAgentHostError> {
-    if archive.space != route.space
+    if !route.is_valid()
+        || route.profile != AgentProfile::Private
+        || route.owner != scope.owner
+        || archive.space != route.space
         || archive.agent != route.agent
         || route.space != scope.space
         || authority.space != route.space
@@ -1561,9 +1589,7 @@ fn validate_replica_descriptor_and_package(
         .validate()
         .map_err(|_| PrivateAgentHostError::InvalidDescriptor)?;
     if descriptor.identity.profile != AgentProfile::Private
-        || descriptor.identity.space != route.space
-        || descriptor.identity.agent != route.agent
-        || descriptor.identity.runtime_deployment != route.runtime_deployment
+        || managed_target_for_descriptor(descriptor) != route
         || descriptor.identity.owner != backup.binding().owner
         || descriptor.authority != authority.binding
         || descriptor.private_recovery
@@ -2759,10 +2785,7 @@ fn authenticate_hosted_replica_establishment_receipt(
     if receipt.route.space != scope.space
         || receipt.owner != scope.owner
         || receipt.destination != scope.local_node
-        || hosted.descriptor.identity.space != receipt.route.space
-        || hosted.descriptor.identity.agent != receipt.route.agent
-        || hosted.descriptor.identity.owner != receipt.owner
-        || hosted.descriptor.identity.runtime_deployment != receipt.route.runtime_deployment
+        || managed_target_for_descriptor(&hosted.descriptor) != receipt.route
         || hosted.descriptor.authority != receipt.authority.binding
         || receipt.completion.establishment_tag != expected_tag
         || hosted.runtime_image.establishment_origin() != Some(establishment_identity)
@@ -2811,7 +2834,7 @@ fn open_completed_replica_establishment<V: PrivateNodeAuthorityVerifier>(
         completion.runtime_lineage,
     )
     .map_err(|_| PrivateAgentHostError::Corrupt)?;
-    if hosted.descriptor.identity.runtime_deployment != plan.route.runtime_deployment
+    if managed_target_for_descriptor(&hosted.descriptor) != plan.route
         || hosted.descriptor.authority != plan.authority.binding
         || completion.establishment_tag != expected_tag
         || hosted.runtime_image.establishment_origin() != Some(establishment_identity)

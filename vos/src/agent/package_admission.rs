@@ -171,7 +171,7 @@ impl AdmittedActorPackage {
 }
 
 /// One signature-checked VOS3 AgentRuntime package whose outer executable has
-/// passed the host's standard-PVM parser.
+/// passed the host's standard-PVM parser and exact Refine host-call allowlist.
 #[derive(Clone, Debug)]
 pub struct AdmittedRuntimePackage {
     envelope: PackageEnvelope,
@@ -261,7 +261,7 @@ pub fn admit_runtime_package(
         return Err(PackageAdmissionError::WrongKind);
     };
     let program_bytes = artifact_bytes(&envelope, &manifest.outer_program)?;
-    if vos_pvm::spi::parse_standard_program(program_bytes).is_none() {
+    if vos_pvm::spi::validate_refine_host_calls(program_bytes).is_err() {
         return Err(PackageAdmissionError::InvalidRuntimeProgram);
     }
     let program = ProgramId::of_pvm(program_bytes);
@@ -307,21 +307,77 @@ pub(crate) fn admitted_standard_actor_for_test(
     lane: vos_agent_sdk::StateLane,
     signing_seed: u8,
 ) -> AdmittedActorPackage {
+    admitted_standard_actor_fixture(name, lane, signing_seed, false)
+}
+
+#[cfg(test)]
+pub(crate) fn admitted_standard_query_actor_for_test(
+    name: &str,
+    lane: vos_agent_sdk::StateLane,
+    signing_seed: u8,
+) -> AdmittedActorPackage {
+    admitted_standard_actor_fixture(name, lane, signing_seed, true)
+}
+
+#[cfg(test)]
+fn admitted_standard_actor_fixture(
+    name: &str,
+    lane: vos_agent_sdk::StateLane,
+    signing_seed: u8,
+    public_query: bool,
+) -> AdmittedActorPackage {
     use ed25519_dalek::{Signer as _, SigningKey};
     use vos_agent_sdk::contract::ActorPackageContract;
-    use vos_agent_sdk::introspection::ActorIntrospectionArtifact;
-    use vos_agent_sdk::method_policy::ActorMethodPolicyArtifact;
+    use vos_agent_sdk::introspection::{
+        ActorIntrospectionArtifact, ActorMethodIntrospection, CliExposure, MethodDispatch,
+    };
+    use vos_agent_sdk::method_policy::{
+        ActorMethodPolicy, ActorMethodPolicyArtifact, AttestationRequirement,
+        AuthorizationPolicySelector, IdempotencyRequirement,
+    };
     use vos_agent_sdk::package::{PackageArtifact, PackageSigning};
     use vos_agent_sdk::schema::{
-        ConstructorContract, ParsedField, ParsedInlineField, ParsedSchema,
+        ConstructorContract, ParsedField, ParsedInlineField, ParsedMethod, ParsedSchema,
     };
     use vos_agent_sdk::task::TaskDependencySetArtifact;
     use vos_agent_sdk::wire::CanonicalWire as _;
-    use vos_agent_sdk::{FieldPersistence, Hash, LaneSet, ProofSystemSet};
+    use vos_agent_sdk::{FieldPersistence, Hash, LaneSet, MethodMode, ProofSystemSet};
     use vos_pvm_compiler::assembler::{Assembler, Reg};
 
     let mut assembler = Assembler::new();
-    let program = assembler.load_imm_64(Reg::A0, 1).trap().build_standard();
+    let program = if public_query {
+        // Done + the three zero lane lengths + one reply byte.
+        let output = vec![
+            crate::actors::STATUS_DONE,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0x63,
+        ];
+        assembler
+            .set_rw_data(output.clone())
+            .load_imm_64(Reg::A0, 2 * u64::from(vos_pvm::PVM_ZONE_SIZE))
+            .load_imm_64(Reg::A1, output.len() as u64)
+            .jump_ind(Reg::RA, 0)
+            .build_standard()
+    } else {
+        assembler.load_imm_64(Reg::A0, 1).trap().build_standard()
+    };
+    let methods = public_query.then(|| ParsedMethod {
+        source_index: 0,
+        name: "read".into(),
+        mode: MethodMode::Query,
+        explicit: false,
+    });
     let schema = ParsedSchema {
         constructor: ConstructorContract::Forbidden,
         fields: vec![ParsedField::Inline(ParsedInlineField {
@@ -330,13 +386,24 @@ pub(crate) fn admitted_standard_actor_for_test(
             type_identity: "core::primitive::u64".into(),
             persistence: FieldPersistence::State(lane),
         })],
-        methods: Vec::new(),
+        methods: methods.into_iter().collect(),
     }
     .encode()
     .unwrap();
     let method_policy = ActorMethodPolicyArtifact {
         actor_schema: BlobRef::of_bytes(&schema),
-        methods: Vec::new(),
+        methods: public_query
+            .then(|| ActorMethodPolicy {
+                name: "read".into(),
+                mode: MethodMode::Query,
+                arguments: Vec::new(),
+                return_type_identity: "core::primitive::u8".into(),
+                authorization_policy: AuthorizationPolicySelector::Public,
+                idempotency: IdempotencyRequirement::NotRequired,
+                attestation: AttestationRequirement::None,
+            })
+            .into_iter()
+            .collect(),
     }
     .encode()
     .unwrap();
@@ -344,7 +411,16 @@ pub(crate) fn admitted_standard_actor_for_test(
         actor_schema: BlobRef::of_bytes(&schema),
         method_policy: BlobRef::of_bytes(&method_policy),
         actor_doc: "clean journal lane fixture".into(),
-        methods: Vec::new(),
+        methods: public_query
+            .then(|| ActorMethodIntrospection {
+                name: "read".into(),
+                doc: String::new(),
+                cli_exposure: CliExposure::Exposed,
+                timeout_ms: 0,
+                dispatch: MethodDispatch::Sync,
+            })
+            .into_iter()
+            .collect(),
     }
     .encode()
     .unwrap();
@@ -784,6 +860,13 @@ mod tests {
         } else {
             b"not a standard runtime PVM".to_vec()
         };
+        runtime_package_with_program(capabilities, program)
+    }
+
+    fn runtime_package_with_program(
+        capabilities: RuntimeCapabilities,
+        program: Vec<u8>,
+    ) -> PackageEnvelope {
         sign(PackageEnvelope {
             manifest: PackageManifest::AgentRuntime(AgentRuntimePackageManifest {
                 name: "fixture-runtime".into(),
@@ -889,6 +972,57 @@ mod tests {
             admit_runtime_package(&runtime.encode().unwrap()).unwrap_err(),
             PackageAdmissionError::InvalidRuntimeProgram
         );
+    }
+
+    #[test]
+    fn runtime_admission_rejects_retired_and_non_outer_program_surfaces() {
+        let mut legacy = Assembler::new();
+        legacy.trap();
+        let jar = runtime_package_with_program(RuntimeCapabilities::standard(), legacy.build());
+        assert_eq!(
+            admit_runtime_package(&jar.encode().unwrap()).unwrap_err(),
+            PackageAdmissionError::InvalidRuntimeProgram,
+            "a signed VOS3 envelope must not revive a JAR-generation outer program"
+        );
+
+        let mut vos_only = Assembler::new();
+        let vos_only = vos_only
+            .trap()
+            .ecalli(crate::abi::hostcall::DEBUG_WRITE)
+            .build_standard();
+        let runtime = runtime_package_with_program(RuntimeCapabilities::standard(), vos_only);
+        assert_eq!(
+            admit_runtime_package(&runtime.encode().unwrap()).unwrap_err(),
+            PackageAdmissionError::InvalidRuntimeProgram,
+            "even an unreachable VOS-only host call is outside the outer Refine interface"
+        );
+
+        // The same `ecalli` is valid inside an AgentActor: inner-machine host
+        // exits are consumed by the outer runtime and are not the outer
+        // runtime's own host surface.
+        let mut actor = actor_package(ActorFixture::default());
+        let mut inner = Assembler::new();
+        let inner = inner
+            .ecalli(crate::abi::hostcall::DEBUG_WRITE)
+            .trap()
+            .build_standard();
+        let PackageManifest::Actor(manifest) = &mut actor.manifest else {
+            unreachable!()
+        };
+        let previous = manifest.program.clone();
+        manifest.program = BlobRef::of_bytes(&inner);
+        let stored = actor
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.identity == previous)
+            .unwrap();
+        *stored = artifact(&inner);
+        actor
+            .artifacts
+            .sort_unstable_by(|left, right| left.identity.cmp(&right.identity));
+        let actor = sign(actor);
+        admit_actor_package(&actor.encode().unwrap())
+            .expect("standard inner actor host exits remain admissible");
     }
 
     #[test]

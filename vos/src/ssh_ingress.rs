@@ -33,6 +33,19 @@ const MAX_BLOCKING_OPERATIONS: usize = 32;
 /// blocking semaphore remains the resource bound for accepted work.
 const ACCEPTED_WORK_TIMEOUT: Duration = Duration::MAX;
 
+/// Extract the sole SSH credential shape admitted by the clean authority.
+/// Comments, SSH wire wrappers, and alternate algorithms never contribute to
+/// identity. Weak Ed25519 encodings fail closed before authority lookup.
+pub fn canonical_ssh_ed25519_public_key(public_key: &ssh_key::PublicKey) -> Option<[u8; 32]> {
+    let ssh_key::public::KeyData::Ed25519(public_key) = public_key.key_data() else {
+        return None;
+    };
+    let public_key = public_key.0;
+    ed25519_dalek::VerifyingKey::from_bytes(&public_key)
+        .is_ok_and(|key| !key.is_weak())
+        .then_some(public_key)
+}
+
 fn default_max_connections() -> usize {
     128
 }
@@ -164,10 +177,9 @@ fn build_server(
                 let Credential::PublicKey(public_key) = request.credential else {
                     return Ok(None);
                 };
-                let public_key = public_key
-                    .to_bytes()
-                    .map_err(|error| AuthError::new(error.to_string()))?;
-                let credential_id = crate::ssh_credential_id(&public_key);
+                let Some(public_key) = canonical_ssh_ed25519_public_key(&public_key) else {
+                    return Ok(None);
+                };
                 let permit = blocking
                     .acquire_owned()
                     .await
@@ -187,7 +199,7 @@ fn build_server(
                 };
                 Ok(Some(AuthenticatedIdentity::new(
                     identity("member", &access.subject)?,
-                    identity("ssh", &credential_id)?,
+                    identity("ssh-ed25519", &public_key)?,
                 )))
             }
         })
@@ -551,14 +563,14 @@ fn access_for_request(
     handle: &IngressHandle,
     request: &HostServiceRequest,
 ) -> Result<crate::IngressAccessStatus, HostServiceError> {
-    let credential = request
+    let public_key = request
         .credential
         .as_str()
-        .strip_prefix("ssh:")
+        .strip_prefix("ssh-ed25519:")
         .and_then(decode_hex_32)
         .ok_or_else(|| service_error("vos.invalid-credential", "invalid SSH credential"))?;
     let access = handle
-        .authenticate_credential(credential)
+        .authenticate_ssh_public_key(&public_key)
         .map_err(|_| service_error("vos.authority-unavailable", "credential is no longer live"))?;
     if access.expires_at <= now_unix()
         || request.principal.as_str() != format!("member:{}", hex(&access.subject))
@@ -1501,11 +1513,39 @@ mod tests {
         let principal = identity("member", &subject).unwrap();
         assert_eq!(principal.as_str(), format!("member:{}", hex(&subject)));
         assert_ne!(
-            identity("ssh", &first).unwrap(),
-            identity("ssh", &second).unwrap()
+            identity("ssh-ed25519", &first).unwrap(),
+            identity("ssh-ed25519", &second).unwrap()
         );
         assert_eq!(decode_hex_32(&hex(&subject)), Some(subject));
         assert_eq!(decode_hex_32("not-a-subject"), None);
+    }
+
+    #[test]
+    fn ssh_credentials_use_only_canonical_nonweak_ed25519_keys() {
+        use ssh_key::public::{Ed25519PublicKey, KeyData, SkEd25519};
+
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x62; 32]);
+        let raw = signing.verifying_key().to_bytes();
+        let plain = ssh_key::PublicKey::new(
+            KeyData::Ed25519(Ed25519PublicKey(raw)),
+            "comment-is-not-identity",
+        );
+        assert_eq!(canonical_ssh_ed25519_public_key(&plain), Some(raw));
+        assert_eq!(
+            crate::agent::sdk::CredentialId::of_public_key(&raw),
+            crate::agent::sdk::CredentialId::of_public_key(
+                &canonical_ssh_ed25519_public_key(&plain).unwrap()
+            )
+        );
+
+        let security_key = ssh_key::PublicKey::new(
+            KeyData::SkEd25519(SkEd25519::new(Ed25519PublicKey(raw), "ssh:")),
+            "",
+        );
+        assert!(canonical_ssh_ed25519_public_key(&security_key).is_none());
+
+        let weak = ssh_key::PublicKey::new(KeyData::Ed25519(Ed25519PublicKey([0; 32])), "");
+        assert!(canonical_ssh_ed25519_public_key(&weak).is_none());
     }
 
     #[test]

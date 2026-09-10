@@ -304,6 +304,22 @@ impl OrderedCommitClaim {
         self.raft_term
     }
 
+    /// Rebind this exact logical journal projection to a later authenticated
+    /// Raft foundation. Snapshot construction uses this only after the
+    /// physical ledger proves every intervening applied row is a leader no-op;
+    /// ordinary Ordered commit certificates must keep their original slot.
+    pub(crate) fn with_raft_foundation(
+        &self,
+        raft_index: u64,
+        raft_term: u64,
+    ) -> Result<Self, SharedCommitError> {
+        let mut claim = self.clone();
+        claim.raft_index = raft_index;
+        claim.raft_term = raft_term;
+        claim.validate()?;
+        Ok(claim)
+    }
+
     pub const fn ordered(&self) -> OrderedBase {
         self.ordered
     }

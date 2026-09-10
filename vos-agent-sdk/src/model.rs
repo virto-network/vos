@@ -368,6 +368,9 @@ pub struct AgentIdentity {
     pub runtime_deployment: DeploymentId,
     pub runtime_program: ProgramId,
     pub runtime_producer: ProducerId,
+    /// Stable producer identity authorized to sign this Agent's transition
+    /// proofs. Unlike `runtime_producer`, runtime upgrades never replace it.
+    pub transition_producer: ProducerId,
 }
 
 /// Immutable offline-recovery identity selected when a Private agent is
@@ -443,6 +446,8 @@ impl AgentDescriptor {
         if self.identity.runtime_deployment == DeploymentId::ZERO
             || self.identity.runtime_program == ProgramId::ZERO
             || self.identity.runtime_producer == ProducerId::ZERO
+            || self.identity.transition_producer == ProducerId::ZERO
+            || self.identity.transition_producer == self.identity.runtime_producer
             || !valid_blob(&self.runtime_package)
             || !self.runtime_contract.is_valid()
             || self.capabilities.max_actors == 0
@@ -542,11 +547,12 @@ pub fn replica_set_generation(
     creation_nonce: Hash,
     replicas: &[AgentReplica],
 ) -> Hash {
-    let mut bytes = Vec::with_capacity(4 * 32 + 1 + 4 + replicas.len() * 65);
+    let mut bytes = Vec::with_capacity(5 * 32 + 1 + 4 + replicas.len() * 65);
     bytes.extend_from_slice(identity.space.as_bytes());
     bytes.extend_from_slice(identity.agent.as_bytes());
     bytes.extend_from_slice(identity.owner.as_bytes());
     bytes.push(identity.profile as u8);
+    bytes.extend_from_slice(identity.transition_producer.as_bytes());
     bytes.extend_from_slice(creation_nonce.as_bytes());
     bytes.extend_from_slice(&(replicas.len() as u32).to_le_bytes());
     for replica in replicas {
@@ -843,6 +849,7 @@ mod tests {
                 runtime_deployment: DeploymentId([4; 32]),
                 runtime_program: ProgramId([5; 32]),
                 runtime_producer: ProducerId([6; 32]),
+                transition_producer: ProducerId([0x26; 32]),
             },
             creation_nonce,
             authority: crate::authority::AgentAuthorityBinding {
@@ -887,6 +894,24 @@ mod tests {
             .encryption_public_key = [0; 32];
         assert_eq!(invalid_recovery.validate(), Err(ModelError::InvalidProfile));
         let generation = descriptor.replica_generation();
+        let commitment = descriptor.commitment();
+        let mut changed = descriptor.clone();
+        changed.identity.transition_producer = ProducerId([0x27; 32]);
+        assert_ne!(changed.commitment(), commitment);
+        assert_ne!(changed.replica_generation(), generation);
+        let mut missing_transition_producer = descriptor.clone();
+        missing_transition_producer.identity.transition_producer = ProducerId::ZERO;
+        assert_eq!(
+            missing_transition_producer.validate(),
+            Err(ModelError::InvalidRuntime)
+        );
+        let mut reused_runtime_producer = descriptor.clone();
+        reused_runtime_producer.identity.transition_producer =
+            reused_runtime_producer.identity.runtime_producer;
+        assert_eq!(
+            reused_runtime_producer.validate(),
+            Err(ModelError::InvalidRuntime)
+        );
         let mut changed = descriptor.clone();
         changed.replicas[0].node = NodeId([15; 32]);
         assert_ne!(changed.replica_generation(), generation);

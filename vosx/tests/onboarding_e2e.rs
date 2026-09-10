@@ -1940,8 +1940,12 @@ fn signed_service_roots_run_under_production_trust_and_recover() {
     assert_eq!(http_body(&first_mutation), http_body(&exact_retry));
     assert_eq!(http_body(&exact_retry).trim(), "16");
 
-    let secret = vos::ingress::decode_access_token(&token).unwrap();
-    let credential = hex::encode(vos::ingress_credential_id(&secret));
+    let credential = hex::encode(
+        vos::ingress::decode_access_token(&token)
+            .unwrap()
+            .credential_id()
+            .0,
+    );
     vosx_ok(
         data.path(),
         config.path(),

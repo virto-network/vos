@@ -1,7 +1,7 @@
 //! Crash-safe host coordination for applying authority-approved Private controls.
 //!
 //! AOI1 proves receipt issuance, not application. This module first reopens the
-//! exact issuer-retained AOC4/AOP4/AOI1 chain and reconstructs that AOC4 intent
+//! exact issuer-retained AOC5/AOP5/AOI1 chain and reconstructs that AOC5 intent
 //! from the supplied canonical PCTL. It then pledges the exact PCTL and logical
 //! application slot before asking the configured Private runtime to apply it.
 //! Only an authenticated result which echoes every request field and asserts a
@@ -39,9 +39,9 @@ use crate::agent::sdk::wire::{
     CanonicalWire, MAX_PRIVATE_CONTROL_WIRE_BYTES, MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES,
 };
 use crate::agent::sdk::{
-    ActorId, AgentId, DeploymentId, Hash, InvocationContext, InvocationId, InvocationOrigin,
-    InvocationRoleClaims, ManagementRequest, MethodMode, PrincipalId, PrivateRuntimeMutation,
-    ProducerId, ProgramId, SpaceId,
+    ActorId, AgentId, AgentProfile, DeploymentId, Hash, InvocationContext, InvocationId,
+    InvocationOrigin, InvocationRoleClaims, ManagementRequest, MethodMode, PrincipalId,
+    PrivateRuntimeMutation, ProducerId, ProgramId, SpaceId,
 };
 use vos_protocol::wire::{DecodeError, Decoder, Encoder};
 
@@ -1663,14 +1663,25 @@ pub(crate) fn decode_private_application_fact(
 fn encode_managed_target(encoder: &mut Encoder<'_>, target: ManagedAgentTarget) {
     encoder.fixed(target.space.as_bytes());
     encoder.fixed(target.agent.as_bytes());
+    encoder.fixed(target.owner.as_bytes());
+    encoder.u8(target.profile as u8);
     encoder.fixed(target.runtime_deployment.as_bytes());
+    encoder.fixed(target.transition_producer.as_bytes());
 }
 
 fn decode_managed_target(decoder: &mut Decoder<'_>) -> Result<ManagedAgentTarget, DecodeError> {
     let target = ManagedAgentTarget {
         space: SpaceId(decoder.fixed()?),
         agent: AgentId(decoder.fixed()?),
+        owner: PrincipalId(decoder.fixed()?),
+        profile: match decoder.u8()? {
+            0 => AgentProfile::Local,
+            1 => AgentProfile::Shared,
+            2 => AgentProfile::Private,
+            _ => return Err(DecodeError::InvalidTag),
+        },
         runtime_deployment: DeploymentId(decoder.fixed()?),
+        transition_producer: ProducerId(decoder.fixed()?),
     };
     target
         .is_valid()
@@ -1761,7 +1772,8 @@ mod tests {
     };
     use crate::agent::private_crypto::{RecoverySigningKey, sign_recovery_control_record};
     use crate::agent::sdk::authority::{
-        AuthorityEvidence, AuthorityLaneRoots, AuthorityOperationKind, CREDENTIAL_SIGNATURE_BYTES,
+        AuthorityEvidence, AuthorityIngressAuthentication, AuthorityLaneRoots,
+        AuthorityOperationKind,
     };
     use crate::agent::sdk::authority_operation::{
         AuthorityOperationApproval, AuthorityOperationCall, AuthorityOperationIssuanceAck,
@@ -2497,6 +2509,21 @@ mod tests {
             private_control(self.authority.space, discriminator)
         }
 
+        fn managed(
+            &self,
+            discriminator: u64,
+            control: &PrivateControlRecord,
+        ) -> ManagedAgentTarget {
+            ManagedAgentTarget {
+                space: control.space,
+                agent: control.agent,
+                owner: PrincipalId(id(0x22, 1)),
+                profile: AgentProfile::Private,
+                runtime_deployment: DeploymentId(id(0x32, discriminator)),
+                transition_producer: ProducerId(id(0x33, discriminator)),
+            }
+        }
+
         fn approved(
             &self,
             discriminator: u64,
@@ -2504,7 +2531,7 @@ mod tests {
             control: &PrivateControlRecord,
         ) -> (AuthorityOperationCall, AuthorityOperationApproval) {
             let intent = AuthorityOperationIntent::private_control(
-                DeploymentId(id(0x32, discriminator)),
+                self.managed(discriminator, control),
                 control,
             )
             .unwrap();
@@ -2526,15 +2553,23 @@ mod tests {
                 principal,
                 credential,
                 request_sequence: core::num::NonZeroU64::new(discriminator).unwrap(),
-                credential_public_key: public_key,
-                authenticated_node: Some(NodeId(id(0x23, 1))),
+                authentication: AuthorityIngressAuthentication::ApiCredentialSignature {
+                    credential_public_key: public_key,
+                    signature: [1; 64],
+                },
                 requested_valid_from: 10,
                 requested_expires_at: 40,
                 intent,
-                signature: [0; CREDENTIAL_SIGNATURE_BYTES],
             };
             call.invocation = call.expected_invocation();
-            call.signature = self.credential_key.sign(&call.signing_bytes()).to_bytes();
+            let signature = self.credential_key.sign(&call.signing_bytes()).to_bytes();
+            let AuthorityIngressAuthentication::ApiCredentialSignature {
+                signature: value, ..
+            } = &mut call.authentication
+            else {
+                unreachable!()
+            };
+            *value = signature;
             let approval = AuthorityOperationApproval::from_call(
                 &call,
                 core::num::NonZeroU64::new(sequence).unwrap(),
@@ -2628,9 +2663,9 @@ mod tests {
         let fixture = Fixture::new(&signer);
         let (control, recovery_key) =
             private_recovery_control(fixture.authority.space, discriminator);
-        let runtime_deployment = DeploymentId(id(0x32, discriminator));
+        let managed = fixture.managed(discriminator, &control);
         let proof = PrivateRecoveryAuthorityProof::from_control(
-            runtime_deployment,
+            managed,
             &control,
             control.previous,
             &recovery_key,

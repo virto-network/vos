@@ -4,9 +4,11 @@
 //! at its entry point so user code can call `log::info!(...)`
 //! without manual subscriber setup:
 //!
-//! - **PVM** (`feature = "pvm"`): writes formatted records to the
-//!   `DEBUG_WRITE` hostcall (vosx surfaces these on stderr).
-//!   Installed by `run_refine_service` on first refine call.
+//! - **PVM** (`feature = "pvm"`): ordinary actor guests write formatted
+//!   records to the `DEBUG_WRITE` hostcall (vosx surfaces these on stderr).
+//!   Installed by `run_refine_service` on first refine call. The standard
+//!   riscv64 AgentRuntime excludes this implementation because its outer
+//!   host-call surface contains only standard inner-machine operations.
 //! - **Worker** (`feature = "worker"`): writes formatted records
 //!   to `std::io::stderr`. Installed by `vos_extension_create`. A
 //!   downstream worker host that wants tracing integration can
@@ -19,6 +21,7 @@
 //!   embedder. Calls to `log::info!` are no-ops without an
 //!   installed subscriber, which is safe by default.
 
+#[cfg(not(all(target_arch = "riscv64", feature = "agent-runtime")))]
 mod pvm {
     use crate::abi::pvm::hostcalls::debug_write;
     use ::log::{Level, LevelFilter, Log, Metadata, Record};
@@ -119,6 +122,7 @@ mod pvm {
 /// `run_refine_service` so user actors don't need to opt in.
 #[cfg(feature = "pvm")]
 pub(crate) fn install_pvm_logger() {
+    #[cfg(not(all(target_arch = "riscv64", feature = "agent-runtime")))]
     pvm::install();
 }
 

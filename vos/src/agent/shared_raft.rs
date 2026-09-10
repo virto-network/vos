@@ -4379,6 +4379,17 @@ mod application_ledger_v2 {
     const GENERATION_STORAGE_KEY_BYTES: usize = 32 * 4;
     const AUDIT_STORAGE_KEY_BYTES: usize = GENERATION_STORAGE_KEY_BYTES + 8;
 
+    fn canonical_leader_noop_commitment() -> Result<Hash, AgentRaftApplicationErrorV2> {
+        let raw = encode_agent_raft_entry_kind(&vos_raft::EntryKind::Data {
+            payload: Vec::new(),
+        })
+        .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+        Ok(Hash::digest(
+            AGENT_RAFT_PHYSICAL_SLOT_COMMITMENT_DOMAIN,
+            &[&raw],
+        ))
+    }
+
     const CONFIG_TABLE_V2: TableDefinition<&[u8], &[u8]> =
         TableDefinition::new("agent_shared_raft_application_config_v2");
     const APPLY_META_TABLE_V2: TableDefinition<&[u8], &[u8]> =
@@ -4764,6 +4775,9 @@ mod application_ledger_v2 {
     /// Read-only ledger contribution to an exact journal checkpoint claim.
     #[derive(Clone, Debug)]
     pub(crate) struct AgentRaftSnapshotContextV2 {
+        /// Exact logical Ordered projection rebound only for this snapshot to
+        /// the latest authenticated physical foundation.
+        pub(crate) ordered: OrderedCommitClaim,
         pub(crate) active_committee: AgentReplicaCommittee,
         pub(crate) authority_epoch: u64,
         pub(crate) boundary_payload_commitment: Hash,
@@ -5168,9 +5182,10 @@ mod application_ledger_v2 {
         }
 
         /// Derive the exact ledger half of a snapshot claim without mutating
-        /// either durable store. The selected boundary must be the current
-        /// applied Ordered slot under a stable committee; callers then bind
-        /// these values to a separately reconstructed journal checkpoint.
+        /// either durable store. The logical boundary is the latest exact
+        /// Ordered projection. A contiguous applied suffix after it may
+        /// contain only leader no-ops; that suffix is authenticated as the
+        /// snapshot's physical foundation without changing journal state.
         pub(crate) fn snapshot_context(
             &self,
             ordered: &OrderedCommitClaim,
@@ -5222,8 +5237,7 @@ mod application_ledger_v2 {
                     .open_table(COMMAND_RESERVATION_TABLE_V2)?
                     .get(key.as_slice())?
                     .is_some()
-                || meta.applied_index != ordered.raft_index()
-                || meta.applied_term != ordered.raft_term()
+                || meta.applied_index < ordered.raft_index()
                 || ordered.space() != self.generation.space
                 || ordered.agent() != self.generation.agent
                 || ordered.genesis() != self.generation.genesis
@@ -5232,57 +5246,54 @@ mod application_ledger_v2 {
             {
                 return Err(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired);
             }
-            let AgentRaftApplyDispositionV2::Command(AgentRaftAuditDisposition::OrderedApplied {
-                entry,
-                claim,
-                successor,
-            }) = meta
-                .disposition
-                .ok_or(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired)?
-            else {
-                return Err(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired);
-            };
-            if ordered.ordered().head != Some(entry) || ordered.commitment() != claim {
-                return Err(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired);
-            }
 
             let previous = read_snapshot_in_read(&transaction, key.as_slice())?;
             let raft = crate::raft::RaftMeta::load_from_read_transaction(&transaction)?;
             if meta.applied_index <= raft.snap_last_index {
                 return Err(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired);
             }
-            let (mut retired_audit_root, mut committee_evidence, previous_snapshot) = match previous
-            {
-                Some(previous) => {
-                    if raft.snap_last_index != previous.certificate.claim().raft_index()
-                        || raft.snap_last_term != previous.certificate.claim().raft_term()
-                    {
-                        return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+            let boundary_from_previous = previous.as_ref().is_some_and(|previous| {
+                ordered == previous.certificate.claim().ordered()
+                    && ordered.raft_index() == raft.snap_last_index
+                    && ordered.raft_term() == raft.snap_last_term
+            });
+            let (mut retired_audit_root, mut committee_evidence, previous_snapshot) =
+                match previous.as_ref() {
+                    Some(previous) => {
+                        if raft.snap_last_index != previous.certificate.claim().raft_index()
+                            || raft.snap_last_term != previous.certificate.claim().raft_term()
+                        {
+                            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                        }
+                        (
+                            previous.certificate.claim().retired_audit_root(),
+                            previous.committee_evidence.clone(),
+                            Some(previous.certificate.commitment()),
+                        )
                     }
-                    (
-                        previous.certificate.claim().retired_audit_root(),
-                        previous.committee_evidence,
-                        Some(previous.certificate.commitment()),
-                    )
-                }
-                None => {
-                    if raft.snap_last_index != 0 || raft.snap_last_term != 0 {
-                        return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                    None => {
+                        if raft.snap_last_index != 0 || raft.snap_last_term != 0 {
+                            return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                        }
+                        (
+                            initial_retired_audit_root(
+                                self.generation,
+                                self.journal_store,
+                                self.local_node,
+                            ),
+                            Vec::new(),
+                            None,
+                        )
                     }
-                    (
-                        initial_retired_audit_root(
-                            self.generation,
-                            self.journal_store,
-                            self.local_node,
-                        ),
-                        Vec::new(),
-                        None,
-                    )
-                }
-            };
+                };
             let audit = transaction.open_table(APPLY_AUDIT_TABLE_V2)?;
             let physical = transaction.open_table(crate::raft::RAFT_LOG)?;
             let mut observed = raft.snap_last_index;
+            let mut logical_boundary_seen = boundary_from_previous;
+            let mut ordered_successor = previous
+                .as_ref()
+                .filter(|_| boundary_from_previous)
+                .map(|previous| previous.certificate.claim().ordered_successor());
             for row in audit.range(key.as_slice()..)? {
                 let (stored_key, value) = row?;
                 if !stored_key.value().starts_with(key.as_slice()) {
@@ -5296,6 +5307,27 @@ mod application_ledger_v2 {
                     return Err(AgentRaftApplicationErrorV2::CorruptLedger);
                 }
                 let bytes = physical_bytes_for_record(&physical, &record)?;
+                if record.index == ordered.raft_index() && !boundary_from_previous {
+                    let AgentRaftApplyDispositionV2::Command(
+                        AgentRaftAuditDisposition::OrderedApplied {
+                            entry,
+                            claim,
+                            successor,
+                        },
+                    ) = record.disposition
+                    else {
+                        return Err(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired);
+                    };
+                    if ordered.ordered().head != Some(entry) || ordered.commitment() != claim {
+                        return Err(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired);
+                    }
+                    logical_boundary_seen = true;
+                    ordered_successor = Some(successor);
+                } else if record.index > ordered.raft_index()
+                    && record.disposition != AgentRaftApplyDispositionV2::LeaderNoop
+                {
+                    return Err(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired);
+                }
                 retired_audit_root = fold_retired_audit_root(retired_audit_root, &record, &bytes);
                 if matches!(
                     record.disposition,
@@ -5316,11 +5348,19 @@ mod application_ledger_v2 {
             if observed != meta.applied_index {
                 return Err(AgentRaftApplicationErrorV2::CorruptLedger);
             }
+            if !logical_boundary_seen {
+                return Err(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired);
+            }
+            let ordered = ordered
+                .with_raft_foundation(meta.applied_index, meta.applied_term)
+                .map_err(|_| AgentRaftApplicationErrorV2::SnapshotBoundaryRequired)?;
             Ok(AgentRaftSnapshotContextV2 {
+                ordered,
                 active_committee: state.active,
                 authority_epoch: state.authority_epoch,
                 boundary_payload_commitment: meta.raw_payload_commitment,
-                ordered_successor: successor,
+                ordered_successor: ordered_successor
+                    .ok_or(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired)?,
                 retired_audit_root,
                 committee_evidence_root: snapshot_committee_evidence_root(
                     self.generation,
@@ -5339,6 +5379,7 @@ mod application_ledger_v2 {
         pub(crate) fn install_snapshot(
             &self,
             certificate: &SharedAgentSnapshotCertificate,
+            logical_ordered: Option<&OrderedCommitClaim>,
         ) -> Result<InstalledAgentRaftSnapshotV2, AgentRaftApplicationErrorV2> {
             let _guard = self
                 .writes
@@ -5362,9 +5403,17 @@ mod application_ledger_v2 {
                 }
             }
 
-            let context = self.snapshot_context_unlocked(certificate.claim().ordered())?;
+            // The certificate may bind the same logical Ordered projection to
+            // a later leader-noop foundation. Reconstruct that projection
+            // independently from the journal binding (or prior installed
+            // snapshot); never feed the synthetic foundation back into an
+            // Ordered commit-verification path.
+            let logical_ordered =
+                logical_ordered.ok_or(AgentRaftApplicationErrorV2::SnapshotBoundaryRequired)?;
+            let context = self.snapshot_context_unlocked(logical_ordered)?;
             let claim = certificate.claim();
-            if claim.active_committee() != &context.active_committee
+            if claim.ordered() != &context.ordered
+                || claim.active_committee() != &context.active_committee
                 || claim.authority_epoch() != context.authority_epoch
                 || claim.journal_store().0 != *self.journal_store.as_bytes()
                 || claim.local_node() != self.local_node
@@ -6328,6 +6377,7 @@ mod application_ledger_v2 {
                     expected_index.min(meta.applied_index),
                 ));
             }
+            let canonical_noop = canonical_leader_noop_commitment()?;
             match last_record {
                 Some(record)
                     if record.term == meta.applied_term
@@ -6335,17 +6385,21 @@ mod application_ledger_v2 {
                         && Some(record.disposition) == meta.disposition => {}
                 None if meta.applied_index == 0 && snapshot_claim.is_none() => {}
                 None if snapshot_claim.is_some_and(|claim| {
-                    let expected = AgentRaftApplyDispositionV2::Command(
-                        AgentRaftAuditDisposition::OrderedApplied {
-                            entry: claim
-                                .ordered()
-                                .ordered()
-                                .head
-                                .unwrap_or(OrderedEntryId::ZERO),
-                            claim: claim.ordered().commitment(),
-                            successor: claim.ordered_successor(),
-                        },
-                    );
+                    let expected = if canonical_noop == claim.boundary_payload_commitment() {
+                        AgentRaftApplyDispositionV2::LeaderNoop
+                    } else {
+                        AgentRaftApplyDispositionV2::Command(
+                            AgentRaftAuditDisposition::OrderedApplied {
+                                entry: claim
+                                    .ordered()
+                                    .ordered()
+                                    .head
+                                    .unwrap_or(OrderedEntryId::ZERO),
+                                claim: claim.ordered().commitment(),
+                                successor: claim.ordered_successor(),
+                            },
+                        )
+                    };
                     meta.applied_index == claim.raft_index()
                         && meta.applied_term == claim.raft_term()
                         && meta.raw_payload_commitment == claim.boundary_payload_commitment()
@@ -9175,7 +9229,9 @@ mod tests {
                 .collect::<Vec<_>>();
             signatures.sort_by_key(ReplicaCommitSignature::signer);
             certificate = SharedAgentSnapshotCertificate::new(claim, signatures).unwrap();
-            ledger.install_snapshot(&certificate).unwrap();
+            ledger
+                .install_snapshot(&certificate, Some(certificate.claim().ordered()))
+                .unwrap();
             let audit = ledger.journal_audit().unwrap();
             assert!(audit.ordered.is_empty());
             assert_eq!(

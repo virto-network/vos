@@ -263,6 +263,7 @@ impl PrivateControlAuthorityEvidence {
         authority: AuthorityActorTarget,
     ) -> Result<VerifiedPrivateControlAuthorityEvidence, PrivateSyncError> {
         if !route.is_valid()
+            || route.profile != AgentProfile::Private
             || !authority.is_valid()
             || route.space != authority.space
             || control.space != route.space
@@ -304,7 +305,7 @@ impl PrivateControlAuthorityEvidence {
                 return Err(PrivateSyncError::Tampered);
             }
             (_, None) => (
-                AuthorityOperationIntent::private_control(route.runtime_deployment, control)
+                AuthorityOperationIntent::private_control(route, control)
                     .map_err(|_| PrivateSyncError::Tampered)?,
                 None,
             ),
@@ -1405,6 +1406,8 @@ pub(crate) fn serve_private_sync_page<V: PrivateTransportAuthVerifier>(
         || request.cursor.agent != binding.agent
         || route.space != binding.space
         || route.agent != binding.agent
+        || route.owner != binding.owner
+        || route.profile != AgentProfile::Private
         || authority.space != binding.space
         || !route.is_valid()
         || !authority.is_valid()
@@ -1689,6 +1692,8 @@ pub(crate) fn apply_private_sync_page<
         || page.request.cursor.agent != binding.agent
         || route.space != binding.space
         || route.agent != binding.agent
+        || route.owner != binding.owner
+        || route.profile != AgentProfile::Private
         || authority.space != binding.space
         || !route.is_valid()
         || !authority.is_valid()
@@ -1720,6 +1725,15 @@ pub(crate) fn verify_private_sync_control_page(
     authority: AuthorityActorTarget,
 ) -> Result<Vec<VerifiedPrivateSyncControl>, PrivateSyncError> {
     page.validate_shape()?;
+    if !route.is_valid()
+        || route.profile != AgentProfile::Private
+        || !authority.is_valid()
+        || route.space != authority.space
+        || route.space != page.request.cursor.space
+        || route.agent != page.request.cursor.agent
+    {
+        return Err(PrivateSyncError::InvalidScope);
+    }
     if page.phase != PrivateSyncPhase::Controls {
         return Ok(Vec::new());
     }
@@ -1984,6 +1998,7 @@ mod tests {
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
     const TEST_AUTHORITY_DOMAIN: &[u8] = b"vos/test/private-sync-authority/v1";
+    const TEST_TRANSITION_PRODUCER: ProducerId = ProducerId([0x7c; 32]);
 
     struct TestDirectory(PathBuf);
 
@@ -2158,6 +2173,7 @@ mod tests {
                 runtime_deployment: DeploymentId([0x79; 32]),
                 runtime_program: ProgramId([0x7a; 32]),
                 runtime_producer: ProducerId([0x7b; 32]),
+                transition_producer: TEST_TRANSITION_PRODUCER,
             },
             creation_nonce,
             authority,
@@ -2236,7 +2252,10 @@ mod tests {
         ManagedAgentTarget {
             space: binding.space,
             agent: binding.agent,
+            owner: binding.owner,
+            profile: AgentProfile::Private,
             runtime_deployment: DeploymentId([0x79; 32]),
+            transition_producer: TEST_TRANSITION_PRODUCER,
         }
     }
 
@@ -2299,8 +2318,7 @@ mod tests {
         control: &PrivateControlRecord,
     ) -> PrivateControlAuthorityEvidence {
         let route = test_route(store);
-        let intent =
-            AuthorityOperationIntent::private_control(route.runtime_deployment, control).unwrap();
+        let intent = AuthorityOperationIntent::private_control(route, control).unwrap();
         signed_evidence_for_intent(store, control, intent, None)
     }
 
@@ -2312,7 +2330,7 @@ mod tests {
     ) -> PrivateControlAuthorityEvidence {
         let route = test_route(store);
         let proof = PrivateRecoveryAuthorityProof::from_control(
-            route.runtime_deployment,
+            route,
             control,
             superseded_authority_head,
             recovery,
@@ -2604,11 +2622,7 @@ mod tests {
             Some(proof) => AuthorityOperationIntent::RecoverPrivateAgent {
                 proof: proof.clone(),
             },
-            None => AuthorityOperationIntent::private_control(
-                test_route(store).runtime_deployment,
-                control,
-            )
-            .unwrap(),
+            None => AuthorityOperationIntent::private_control(test_route(store), control).unwrap(),
         };
         let evidence = signed_evidence_for_intent_with_projection(
             store,
@@ -3525,7 +3539,7 @@ mod tests {
 
         let route = test_route(&source);
         let retained_proof = PrivateRecoveryAuthorityProof::from_control(
-            route.runtime_deployment,
+            route,
             &recovery,
             Some(selected_head),
             &fixture.recovery,
@@ -3546,7 +3560,7 @@ mod tests {
         );
 
         let substituted_proof = PrivateRecoveryAuthorityProof::from_control(
-            route.runtime_deployment,
+            route,
             &recovery,
             Some(alternate_head),
             &fixture.recovery,
@@ -4142,6 +4156,41 @@ mod tests {
         source.append_control(&control, &TestAuthority).unwrap();
         let evidence = signed_evidence(&source, &control);
         let page = verified_control_page(&client, &source, &control, Some(&mutation), &evidence);
+
+        let mut shared_route = test_route(&client);
+        shared_route.profile = AgentProfile::Shared;
+        let authority = test_authority_target(&client);
+        assert_eq!(
+            evidence.verify_for(&control, source.binding().epoch, shared_route, authority),
+            Err(PrivateSyncError::InvalidScope)
+        );
+        assert_eq!(
+            verify_private_sync_control_page(&page, shared_route, authority),
+            Err(PrivateSyncError::InvalidScope)
+        );
+        assert_eq!(
+            super::serve_private_sync_page(
+                &source,
+                &fixture.recipients[0].identity,
+                &page.request,
+                &TestTransport,
+                shared_route,
+                authority,
+            ),
+            Err(PrivateSyncError::InvalidScope)
+        );
+        assert_eq!(
+            super::apply_private_sync_page(
+                &mut client,
+                &fixture.recipients[0].identity,
+                &page,
+                &TestAuthority,
+                &TestTransport,
+                shared_route,
+                authority,
+            ),
+            Err(PrivateSyncError::InvalidScope)
+        );
 
         let mut v2_request = page.request.encode().unwrap();
         assert_eq!(

@@ -5687,6 +5687,7 @@ mod tests {
                 runtime_deployment: DeploymentId([0x77; 32]),
                 runtime_program: runtime_package.manifest.program,
                 runtime_producer: runtime_package.deployment_signature.producer,
+                transition_producer: crate::service::ProducerId([0x79; 32]),
             },
             creation_nonce,
             authority: payload_test_authority(agent),

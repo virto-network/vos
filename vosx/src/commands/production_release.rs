@@ -214,9 +214,9 @@ fn validate_catalog(bytes: &[u8]) -> anyhow::Result<()> {
 }
 
 fn validate_standard_runtime_program(bytes: &[u8]) -> anyhow::Result<()> {
-    vos_pvm::spi::parse_standard_program(bytes)
-        .ok_or_else(|| anyhow::anyhow!("AgentRuntime is not a canonical standard PVM program"))?;
-    Ok(())
+    vos_pvm::spi::validate_refine_host_calls(bytes).map_err(|error| {
+        anyhow::anyhow!("AgentRuntime outer host-call surface is invalid: {error:?}")
+    })
 }
 
 fn validate_actor_program(bytes: &[u8], label: &str) -> anyhow::Result<()> {
@@ -494,6 +494,23 @@ mod tests {
     #[test]
     fn standard_runtime_pin_rejects_changed_bytes() {
         assert!(validate_standard_runtime(b"not the canonical agent runtime").is_err());
+    }
+
+    #[test]
+    fn standard_runtime_program_rejects_vos_only_outer_host_calls() {
+        use vos_pvm_compiler::assembler::Assembler;
+
+        let mut program = Assembler::new();
+        let program = program
+            .ecalli(vos::abi::hostcall::DEBUG_WRITE)
+            .trap()
+            .build_standard();
+        let error = validate_standard_runtime_program(&program)
+            .expect_err("release verification must inspect the complete outer host-call surface");
+        assert!(
+            error.to_string().contains("UnsupportedHostCall(118)"),
+            "unexpected rejection: {error:#}"
+        );
     }
 
     #[test]

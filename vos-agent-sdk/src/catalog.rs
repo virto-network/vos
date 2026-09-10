@@ -93,6 +93,8 @@ impl CatalogPublication {
             && self.identity.runtime_deployment != DeploymentId::ZERO
             && self.identity.runtime_program != ProgramId::ZERO
             && self.identity.runtime_producer != crate::ProducerId::ZERO
+            && self.identity.transition_producer != crate::ProducerId::ZERO
+            && self.identity.transition_producer != self.identity.runtime_producer
             && self.actor != ActorId::ZERO
             && self.actor_deployment != DeploymentId::ZERO
             && self.actor_program != ProgramId::ZERO
@@ -445,6 +447,7 @@ mod tests {
                 runtime_deployment: DeploymentId([0x43; 32]),
                 runtime_program: ProgramId([0x44; 32]),
                 runtime_producer: ProducerId([0x45; 32]),
+                transition_producer: ProducerId([0x4b; 32]),
             },
             actor: ActorId([0x46; 32]),
             actor_deployment: DeploymentId([0x47; 32]),
@@ -593,22 +596,22 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/catalog/test/golden/request", &[&request_bytes]).0,
             [
-                152, 166, 215, 216, 1, 116, 87, 121, 75, 108, 173, 62, 93, 112, 55, 76, 24, 182,
-                118, 138, 44, 78, 217, 111, 136, 201, 195, 255, 186, 51, 177, 35,
+                182, 177, 156, 59, 150, 73, 84, 217, 150, 29, 152, 62, 238, 6, 68, 103, 169, 13,
+                186, 130, 96, 79, 119, 72, 232, 112, 37, 221, 48, 64, 125, 115,
             ]
         );
         assert_eq!(
             Hash::digest(b"vos/catalog/test/golden/call", &[&call_bytes]).0,
             [
-                237, 14, 6, 77, 22, 240, 114, 148, 138, 254, 229, 166, 148, 85, 170, 23, 67, 114,
-                247, 43, 156, 122, 4, 17, 170, 11, 65, 216, 235, 164, 24, 101,
+                228, 131, 112, 224, 113, 220, 50, 160, 26, 154, 222, 89, 222, 159, 254, 183, 215,
+                89, 153, 184, 148, 104, 109, 212, 102, 226, 167, 171, 12, 56, 41, 108,
             ]
         );
         assert_eq!(
             Hash::digest(b"vos/catalog/test/golden/page", &[&page_bytes]).0,
             [
-                202, 135, 170, 106, 248, 210, 51, 1, 228, 108, 248, 126, 133, 254, 74, 169, 102,
-                75, 27, 93, 126, 37, 107, 11, 54, 163, 158, 49, 33, 110, 160, 194,
+                164, 153, 71, 104, 34, 238, 103, 241, 232, 97, 185, 101, 201, 12, 39, 151, 21, 205,
+                229, 142, 172, 235, 127, 195, 110, 68, 102, 250, 189, 127, 128, 80,
             ]
         );
     }

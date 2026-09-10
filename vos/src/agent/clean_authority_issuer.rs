@@ -17,7 +17,7 @@ use crate::agent::sdk::authority::{
 };
 use crate::agent::sdk::wire::{CanonicalWire, management_reply_commitment};
 use crate::agent::sdk::{
-    ActorId, AgentId, BlobRef, DeploymentId, Hash, InvocationId, ManagementReply,
+    ActorId, AgentId, AgentProfile, BlobRef, DeploymentId, Hash, InvocationId, ManagementReply,
     ManagementRequest, PrincipalId, ProducerId, ProgramId, SpaceId,
 };
 use vos_protocol::wire::{DecodeError, Decoder, Encoder};
@@ -1705,7 +1705,10 @@ fn decode_authority_actor_target(
 fn encode_managed_agent_target(encoder: &mut Encoder<'_>, target: ManagedAgentTarget) {
     encoder.fixed(target.space.as_bytes());
     encoder.fixed(target.agent.as_bytes());
+    encoder.fixed(target.owner.as_bytes());
+    encoder.u8(target.profile as u8);
     encoder.fixed(target.runtime_deployment.as_bytes());
+    encoder.fixed(target.transition_producer.as_bytes());
 }
 
 fn decode_managed_agent_target(
@@ -1714,7 +1717,15 @@ fn decode_managed_agent_target(
     let value = ManagedAgentTarget {
         space: SpaceId(decoder.fixed()?),
         agent: AgentId(decoder.fixed()?),
+        owner: PrincipalId(decoder.fixed()?),
+        profile: match decoder.u8()? {
+            0 => AgentProfile::Local,
+            1 => AgentProfile::Shared,
+            2 => AgentProfile::Private,
+            _ => return Err(DecodeError::InvalidTag),
+        },
         runtime_deployment: DeploymentId(decoder.fixed()?),
+        transition_producer: ProducerId(decoder.fixed()?),
     };
     value
         .is_valid()
@@ -2061,7 +2072,10 @@ mod tests {
             managed: crate::agent::sdk::authority::ManagedAgentTarget {
                 space: fixture.space,
                 agent: fixture.agent,
+                owner: PrincipalId([0x26; 32]),
+                profile: crate::agent::sdk::AgentProfile::Local,
                 runtime_deployment: fixture.context.runtime_deployment,
+                transition_producer: ProducerId([0x27; 32]),
             },
             principal: PrincipalId([0x24; 32]),
             credential: crate::agent::sdk::CredentialId::of_public_key(&credential_public_key),

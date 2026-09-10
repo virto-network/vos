@@ -986,6 +986,15 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // an agent it never received in the recipe can fetch the ELF from us.
     let mut node =
         VosNode::with_prefix(local_prefix).with_program_blobs_dir(blob_store::cache_dir());
+    let ingress_attestation_key = daemon_keypair.clone();
+    node.set_ingress_node_attester(
+        vos::agent::sdk::NodeId(agent_host_scope.node.0),
+        move |canonical: &[u8]| {
+            let signature = ingress_attestation_key.sign(canonical).ok()?;
+            signature.as_slice().try_into().ok()
+        },
+    )
+    .map_err(|error| anyhow::anyhow!("configure SSH ingress node attester: {error}"))?;
 
     if let Some((pins, merge, scope, archive_expected)) = prepared_agent_host {
         let stable_lock = stable_agent_host_lease;
