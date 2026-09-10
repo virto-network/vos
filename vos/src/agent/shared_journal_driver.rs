@@ -22,13 +22,15 @@ use super::journal::{
     PersistedLane, ReplayInput, ReplayInputId, ReplayOperation,
 };
 use super::journal_store::{
-    AgentJournalGarbageCollection, AgentJournalStore, CatalogBlobResolverFactory, GcLimits,
-    JournalBlobClass, JournalGc, JournalStoreError, ReverifiedRootJournalStore,
-    SharedOrderedCommitRetirementStore, SharedOrderedCommitStore, validate_gc_limits,
+    AgentJournalGarbageCollection, AgentJournalStore, CatalogBlobResolver,
+    CatalogBlobResolverFactory, GcLimits, JournalBlobClass, JournalGc, JournalStoreError,
+    ReverifiedRootJournalStore, SharedOrderedCommitRetirementStore, SharedOrderedCommitStore,
+    TransitionProofPublicationStore, validate_gc_limits,
 };
 use super::local_journal_driver::{
-    LocalMergeAuthenticator, LocalReplayExecutorError, StandardLocalReplayExecutor,
-    recent_clean_management_operation, recent_clean_ordered_input,
+    AttestedReplayTransitionProvider, LocalMergeAuthenticator, LocalReplayExecutorError,
+    StandardLocalReplayExecutor, recent_clean_local_operation, recent_clean_management_operation,
+    recent_clean_merge_operation, recent_clean_ordered_operation,
 };
 use super::replay::{
     CommittedSharedOrdered, MaterializeError, NoPrunedOrderedBases, ReplayExecutor,
@@ -727,6 +729,109 @@ impl PreparedCleanOrdered {
     }
 }
 
+/// Exact clean invocation-lifecycle request before its trusted observation
+/// slot is fixed by the physical driver. No ResumeWork is accepted here: the
+/// yielded selector is only a concurrency token and replay reconstructs the
+/// executable resume from durable guest state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CleanInvocationReplayRequest {
+    Invoke {
+        context: crate::agent_sdk::RuntimeExecutionContext,
+        work: crate::agent_sdk::InvocationWork,
+        authorization: crate::agent_sdk::InvocationAuthorization,
+    },
+    Resume {
+        context: crate::agent_sdk::RuntimeExecutionContext,
+        work: crate::agent_sdk::InvocationWork,
+        authorization: crate::agent_sdk::InvocationAuthorization,
+        yielded: crate::agent_sdk::YieldedInvocation,
+    },
+    Acknowledge {
+        work: crate::agent_sdk::InvocationWork,
+        authorization: crate::agent_sdk::InvocationAuthorization,
+    },
+}
+
+/// Cursor immediately preceding one canonical actor key. `InspectActors`
+/// uses an exclusive cursor, so a one-entry request from this value is a
+/// keyed lookup without adding a second directory authority surface.
+fn exclusive_actor_predecessor(
+    target: crate::agent_sdk::ActorId,
+) -> Option<crate::agent_sdk::ActorId> {
+    if target == crate::agent_sdk::ActorId::ZERO {
+        return None;
+    }
+    let mut predecessor = target.0;
+    for byte in predecessor.iter_mut().rev() {
+        if *byte == 0 {
+            *byte = u8::MAX;
+        } else {
+            *byte -= 1;
+            let predecessor = crate::agent_sdk::ActorId(predecessor);
+            // `InspectActors` rejects an explicit zero cursor. For the
+            // smallest valid ActorId, an absent cursor is the exact
+            // exclusive predecessor and still yields a one-record lookup.
+            return (predecessor != crate::agent_sdk::ActorId::ZERO).then_some(predecessor);
+        }
+    }
+    None
+}
+
+impl CleanInvocationReplayRequest {
+    pub(crate) const fn work(&self) -> &crate::agent_sdk::InvocationWork {
+        match self {
+            Self::Invoke { work, .. }
+            | Self::Resume { work, .. }
+            | Self::Acknowledge { work, .. } => work,
+        }
+    }
+
+    pub(crate) const fn authorization(&self) -> &crate::agent_sdk::InvocationAuthorization {
+        match self {
+            Self::Invoke { authorization, .. }
+            | Self::Resume { authorization, .. }
+            | Self::Acknowledge { authorization, .. } => authorization,
+        }
+    }
+
+    fn into_operation(self, observed_slot: u64) -> ReplayOperation {
+        match self {
+            Self::Invoke {
+                context,
+                work,
+                authorization,
+            } => ReplayOperation::CleanInvoke {
+                context,
+                work,
+                authorization,
+                observed_slot,
+            },
+            Self::Resume {
+                context,
+                work,
+                authorization,
+                yielded,
+            } => ReplayOperation::CleanResume {
+                context,
+                expected_live: None,
+                work,
+                authorization,
+                yielded,
+                observed_slot,
+            },
+            Self::Acknowledge {
+                work,
+                authorization,
+            } => ReplayOperation::CleanAcknowledge {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                expected_live: None,
+                work,
+                authorization,
+            },
+        }
+    }
+}
+
 /// Result of clean management proposal preparation. An unchanged denial is
 /// nondurable and allocates no Raft slot. A successful no-op returns an
 /// Ordered command unless a bounded durable suffix lookup proves this exact
@@ -794,7 +899,8 @@ where
         + CatalogBlobResolverFactory
         + SharedOrderedCommitStore
         + SharedOrderedCommitRetirementStore
-        + AgentJournalGarbageCollection,
+        + AgentJournalGarbageCollection
+        + TransitionProofPublicationStore,
     A: SharedArtifactStager,
 {
     store: S,
@@ -812,15 +918,49 @@ where
         + CatalogBlobResolverFactory
         + SharedOrderedCommitStore
         + SharedOrderedCommitRetirementStore
-        + AgentJournalGarbageCollection,
+        + AgentJournalGarbageCollection
+        + TransitionProofPublicationStore,
     A: SharedArtifactStager,
 {
     pub(crate) fn open(
+        store: S,
+        artifacts: A,
+        ledger: AgentRaftApplicationLedgerV2,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+    ) -> Result<Self, SharedJournalDriverError> {
+        Self::open_with_optional_attested_transition_provider(
+            store, artifacts, ledger, trust, merge, None,
+        )
+    }
+
+    /// Open a Shared replica with the producer/journal coordinator installed
+    /// before replaying any retained Attested suffix.
+    pub(crate) fn open_with_attested_transition_provider(
+        store: S,
+        artifacts: A,
+        ledger: AgentRaftApplicationLedgerV2,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        provider: Box<dyn AttestedReplayTransitionProvider>,
+    ) -> Result<Self, SharedJournalDriverError> {
+        Self::open_with_optional_attested_transition_provider(
+            store,
+            artifacts,
+            ledger,
+            trust,
+            merge,
+            Some(provider),
+        )
+    }
+
+    fn open_with_optional_attested_transition_provider(
         mut store: S,
         artifacts: A,
         ledger: AgentRaftApplicationLedgerV2,
         trust: Arc<dyn AgentTrustProvider>,
         merge: Arc<dyn LocalMergeAuthenticator>,
+        provider: Option<Box<dyn AttestedReplayTransitionProvider>>,
     ) -> Result<Self, SharedJournalDriverError> {
         let local_node = merge.node();
         if local_node != ledger.local_node() {
@@ -831,6 +971,9 @@ where
         let resolver = store.catalog_blob_resolver()?;
         let mut executor =
             StandardLocalReplayExecutor::new_shared(resolver, trust, merge, committees);
+        if let Some(provider) = provider {
+            executor.replace_attested_transition_provider(provider);
+        }
         let materialization =
             materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases)?;
         let active = ledger.active_committee()?;
@@ -911,6 +1054,7 @@ where
                 runtime_deployment: crate::service::DeploymentId(identity.runtime_deployment.0),
                 runtime_program: crate::service::ProgramId(identity.runtime_program.0),
                 runtime_producer: crate::service::ProducerId(identity.runtime_producer.0),
+                transition_producer: crate::service::ProducerId(identity.transition_producer.0),
             });
         }
         let state = super::wire::decode_standard_runtime_state(self.materialization.state())
@@ -919,6 +1063,205 @@ where
             .config
             .ok_or(SharedJournalDriverError::InvalidProfile)?
             .identity)
+    }
+
+    /// Exact current clean descriptor reconstructed from the authenticated
+    /// runtime binding and admitted package. Supervisor projections must use
+    /// this value rather than the immutable genesis descriptor so a runtime
+    /// upgrade invalidates every older readiness generation.
+    pub(crate) fn clean_descriptor(
+        &self,
+    ) -> Result<crate::agent_sdk::AgentDescriptor, SharedJournalDriverError> {
+        self.executor
+            .trusted_current_clean_descriptor(self.materialization.runtime())
+            .map_err(Into::into)
+    }
+
+    /// Resolve the current actor and every immutable invocation artifact from
+    /// the authenticated journal catalog. This is read-only, but it remains
+    /// on the physical driver so a policy projection can never provide the
+    /// bytes or logical slot used for authority issuance.
+    pub(crate) fn physical_invocation_material(
+        &self,
+        target: crate::agent_sdk::ActorId,
+    ) -> Result<super::invocation_preparation::PhysicalInvocationMaterial, SharedJournalDriverError>
+    {
+        self.physical_material(target, true)
+    }
+
+    pub(crate) fn physical_authority_material(
+        &self,
+        target: crate::agent_sdk::ActorId,
+    ) -> Result<super::invocation_preparation::PhysicalInvocationMaterial, SharedJournalDriverError>
+    {
+        self.physical_material(target, false)
+    }
+
+    fn physical_material(
+        &self,
+        target: crate::agent_sdk::ActorId,
+        require_ready: bool,
+    ) -> Result<super::invocation_preparation::PhysicalInvocationMaterial, SharedJournalDriverError>
+    {
+        if target == crate::agent_sdk::ActorId::ZERO {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let descriptor = self.clean_descriptor()?;
+        if descriptor.validate().is_err()
+            || descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared
+        {
+            return Err(SharedJournalDriverError::InvalidProfile);
+        }
+        let runtime_state =
+            super::wire::decode_standard_runtime_state(self.materialization.state())
+                .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        let physical_record = runtime_state
+            .actors
+            .binary_search_by_key(&target.0, |candidate| candidate.record.entry.actor.0)
+            .ok()
+            .and_then(|index| runtime_state.actors.get(index))
+            .map(|candidate| &candidate.record)
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        let durable_actor = super::standard::legacy_actor_record_to_clean(physical_record);
+        let installation = runtime_state
+            .clean_actor_installations
+            .as_ref()
+            .and_then(|installations| {
+                installations
+                    .binary_search_by_key(&target, |candidate| candidate.actor)
+                    .ok()
+                    .and_then(|index| installations.get(index))
+            })
+            .copied()
+            .filter(|installation| {
+                installation.actor == target
+                    && installation.commitment != crate::agent_sdk::Hash::ZERO
+            })
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        // `InspectActors` is exclusive-after and the directory is ordered by
+        // the actor's canonical bytes. Query from the immediate predecessor
+        // with a one-record limit so one invocation never walks the global
+        // directory (or lets unrelated actor count become backpressure).
+        if target == crate::agent_sdk::ActorId::ZERO {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let after = exclusive_actor_predecessor(target);
+        let outcome =
+            self.inspect_clean_management(&crate::agent_sdk::ManagementRequest::InspectActors {
+                after,
+                limit: 1,
+            })?;
+        let crate::agent_sdk::RuntimeOutcome::Management(Ok(
+            crate::agent_sdk::ManagementReply::Actors(page),
+        )) = outcome
+        else {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        };
+        if page.validate().is_err()
+            || page.entries.len() != 1
+            || page.entries[0].entry.actor != target
+        {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let actor = page.entries[0].clone();
+        if actor.validate().is_err()
+            || actor != durable_actor
+            || require_ready && actor.entry.suspended
+            || actor
+                .entry
+                .validate_for_profile(descriptor.identity.profile)
+                .is_err()
+        {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+
+        let resolver = self.store.catalog_blob_resolver()?;
+        let legacy_ref = |reference: &crate::agent_sdk::BlobRef| BlobRef {
+            hash: Hash(reference.hash.0),
+            len: reference.len,
+        };
+        let load = |reference: &crate::agent_sdk::BlobRef| {
+            resolver
+                .load_catalog(&legacy_ref(reference))
+                .map_err(SharedJournalDriverError::Store)?
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)
+        };
+        let package_bytes = load(&actor.entry.package)?;
+        let package = super::package_admission::admit_actor_package(&package_bytes)
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        let schema_bytes = load(&actor.entry.agent_schema)?;
+        let policy_bytes = load(&actor.entry.method_policy)?;
+        let installation_data = actor
+            .entry
+            .installation_data
+            .as_ref()
+            .map(|reference| {
+                load(reference).map(|bytes| crate::agent_sdk::RuntimeBlob {
+                    reference: reference.clone(),
+                    bytes,
+                })
+            })
+            .transpose()?;
+        let parsed_schema = crate::agent_sdk::schema::decode(&schema_bytes)
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        if package.package_ref() != &actor.entry.package
+            || package.deployment() != actor.entry.deployment
+            || package.program() != actor.entry.program
+            || package.manifest().state_lane_schema != actor.entry.agent_schema
+            || package.manifest().method_policy != actor.entry.method_policy
+            || package.state_lane_schema_bytes() != schema_bytes
+            || package.method_policy_bytes() != policy_bytes
+            || package
+                .envelope()
+                .constructor_abi()
+                .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?
+                != actor.entry.constructor_abi
+            || parsed_schema
+                .state_layout_hash()
+                .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?
+                != actor.entry.state_layout
+            || parsed_schema.lanes() != actor.entry.lanes
+            || parsed_schema.requires_installation_data() != actor.entry.installation_data.is_some()
+            || installation_data
+                .as_ref()
+                .map(|blob| crate::agent_sdk::BlobRef::of_bytes(&blob.bytes))
+                != actor.entry.installation_data
+            || !package
+                .requirements()
+                .supported_by(descriptor.identity.profile)
+            || !descriptor
+                .runtime_contract
+                .supports(package.manifest().contract)
+            || !descriptor.capabilities.satisfies(package.requirements())
+            || package.producer().0 != physical_record.producer.0
+        {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let program_bytes = package.program_bytes().to_vec();
+        let observed_slot = self.executor.current_logical_slot()?;
+        Ok(super::invocation_preparation::PhysicalInvocationMaterial {
+            descriptor,
+            actor,
+            install_request: installation.commitment,
+            producer: package.producer(),
+            contract: package.manifest().contract,
+            requirements: package.requirements(),
+            root_provenance: false,
+            observed_slot,
+            program: crate::agent_sdk::RuntimeBlob {
+                reference: crate::agent_sdk::BlobRef::of_bytes(&program_bytes),
+                bytes: program_bytes,
+            },
+            schema: crate::agent_sdk::RuntimeBlob {
+                reference: crate::agent_sdk::BlobRef::of_bytes(&schema_bytes),
+                bytes: schema_bytes,
+            },
+            policies: crate::agent_sdk::RuntimeBlob {
+                reference: crate::agent_sdk::BlobRef::of_bytes(&policy_bytes),
+                bytes: policy_bytes,
+            },
+            installation_data,
+        })
     }
 
     pub(crate) fn active_route(
@@ -1026,6 +1369,284 @@ where
 
     pub(crate) fn materialization(&self) -> &ReplayMaterialization {
         &self.materialization
+    }
+
+    pub(crate) fn latest_clean_management_disposition(
+        &self,
+    ) -> Result<Option<super::standard::StandardCleanManagementDisposition>, SharedJournalDriverError>
+    {
+        let state = super::wire::decode_standard_runtime_state(self.materialization.state())
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        Ok(state.clean_management_dispositions.last().cloned())
+    }
+
+    /// Return the number of durable Ordered records still required by an
+    /// exact projection lifecycle when those records fit the authenticated
+    /// composite replay budgets. Recovery first proves a retained positive
+    /// Ack, then an exact terminal Invoke, so it reserves zero, one, or two
+    /// records rather than pessimistically requiring a fresh pair.
+    pub(crate) fn projection_admission_requirement(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        recovering: bool,
+    ) -> Result<Option<usize>, SharedJournalDriverError> {
+        let (required_entries, required_bytes) =
+            self.projection_admission_delta(work, authorization, recovering)?;
+        Ok(self
+            .materialization
+            .has_suffix_headroom(required_entries, required_bytes)
+            .then_some(required_entries))
+    }
+
+    /// Validate and encode the exact projection lifecycle delta independently
+    /// of current suffix capacity. Checkpoint selection needs this count while
+    /// the old authenticated suffix is deliberately full; ordinary admission
+    /// still calls [`Self::projection_admission_requirement`] and therefore
+    /// cannot bypass either replay budget.
+    pub(crate) fn projection_admission_records(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        recovering: bool,
+    ) -> Result<usize, SharedJournalDriverError> {
+        self.projection_admission_delta(work, authorization, recovering)
+            .map(|(entries, _)| entries)
+    }
+
+    fn projection_admission_delta(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        recovering: bool,
+    ) -> Result<(usize, usize), SharedJournalDriverError> {
+        if work.mode != crate::agent_sdk::MethodMode::Query || !authorization.matches_work(work) {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let crate::agent_sdk::InvocationAuthorization::PublicPreflight(preflight) = authorization
+        else {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        };
+        if recovering && self.retained_positive_clean_acknowledgement(work, authorization)? {
+            return Ok((0, 0));
+        }
+
+        let invoke_operation = ReplayOperation::CleanInvoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            work: work.clone(),
+            authorization: authorization.clone(),
+            observed_slot: preflight.observed_slot,
+        };
+        let retained_invoke = if recovering {
+            self.retained_terminal_projection_input(&invoke_operation)?
+        } else {
+            None
+        };
+
+        let heads = self.materialization.heads();
+        let mut entries = Vec::with_capacity(if retained_invoke.is_some() { 1 } else { 2 });
+        if retained_invoke.is_none() {
+            let invoke = OrderedEntry {
+                genesis: heads.genesis,
+                index: heads
+                    .ordered_index
+                    .checked_add(1)
+                    .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
+                parent: heads.ordered_head,
+                merge_frontier: heads.merge_frontier,
+                merge_seal: None,
+                input: ReplayInput {
+                    runtime: heads.runtime.clone(),
+                    operation: invoke_operation,
+                },
+            };
+            invoke
+                .validate()
+                .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+            entries.push(invoke);
+        }
+        let (ack_index, ack_parent) = match entries.last() {
+            Some(invoke) => (
+                invoke
+                    .index
+                    .checked_add(1)
+                    .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
+                Some(invoke.id()),
+            ),
+            None => (
+                heads
+                    .ordered_index
+                    .checked_add(1)
+                    .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
+                heads.ordered_head,
+            ),
+        };
+        let acknowledgement = OrderedEntry {
+            genesis: heads.genesis,
+            index: ack_index,
+            parent: ack_parent,
+            merge_frontier: heads.merge_frontier,
+            merge_seal: None,
+            input: ReplayInput {
+                runtime: heads.runtime.clone(),
+                operation: ReplayOperation::CleanAcknowledge {
+                    context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                    expected_live: None,
+                    work: work.clone(),
+                    authorization: authorization.clone(),
+                },
+            },
+        };
+        acknowledgement
+            .validate()
+            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        entries.push(acknowledgement);
+        let required_bytes = entries.iter().try_fold(0usize, |total, entry| {
+            total
+                .checked_add(entry.encode().len())
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)
+        })?;
+        let required_entries = entries.len();
+        Ok((required_entries, required_bytes))
+    }
+
+    fn retained_terminal_projection_input(
+        &self,
+        operation: &ReplayOperation,
+    ) -> Result<Option<(ReplayInputId, crate::agent_sdk::RuntimeOutcome)>, SharedJournalDriverError>
+    {
+        let retained =
+            recent_clean_ordered_operation(&self.store, &self.materialization, operation)?;
+        if let Some(input) = retained {
+            let outcome = self
+                .executor
+                .clean_ordered_result(input)
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+            if !matches!(outcome, crate::agent_sdk::RuntimeOutcome::Completed(_)) {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            return Ok(Some((input, outcome)));
+        }
+        self.retained_terminal_projection_boundary(operation)
+    }
+
+    /// A certified checkpoint may make the exact pending Invoke its replay
+    /// boundary. The boundary entry remains content-addressed, while Standard
+    /// guest state retains the immutable clean result. Re-execute that exact
+    /// read-only work without publication to recover the original outcome;
+    /// no replacement Invoke record is appended.
+    fn retained_terminal_projection_boundary(
+        &self,
+        operation: &ReplayOperation,
+    ) -> Result<Option<(ReplayInputId, crate::agent_sdk::RuntimeOutcome)>, SharedJournalDriverError>
+    {
+        let boundary = self.materialization.replay_boundary();
+        let Some(id) = boundary.head else {
+            return Ok(None);
+        };
+        let entry = self
+            .store
+            .get::<OrderedEntry>(id)?
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        if entry.id() != id
+            || entry.index != boundary.index
+            || entry.genesis != self.materialization.heads().genesis
+        {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let (
+            ReplayOperation::CleanInvoke {
+                context: prior_context,
+                work: prior_work,
+                authorization: prior_authorization,
+                ..
+            },
+            ReplayOperation::CleanInvoke {
+                context,
+                work,
+                authorization,
+                ..
+            },
+        ) = (&entry.input.operation, operation)
+        else {
+            return Ok(None);
+        };
+        if prior_context != context || prior_work != work || prior_authorization != authorization {
+            return Ok(None);
+        }
+        let outcome = self
+            .executor
+            .clean_invocation_terminal_outcome(
+                &entry.input.operation,
+                self.materialization.state(),
+                self.materialization.runtime(),
+            )?
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        Ok(Some((entry.input.id(), outcome)))
+    }
+
+    pub(crate) fn retained_terminal_projection_invoke(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+    ) -> Result<bool, SharedJournalDriverError> {
+        let operation = ReplayOperation::CleanInvoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            work: work.clone(),
+            authorization: authorization.clone(),
+            observed_slot: 0,
+        };
+        Ok(self
+            .retained_terminal_projection_input(&operation)?
+            .is_some())
+    }
+
+    /// Prove that a fresh exact projection Invoke/Ack pair fits both
+    /// authenticated composite replay budgets.
+    pub(crate) fn projection_pair_fits(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+    ) -> Result<bool, SharedJournalDriverError> {
+        Ok(self
+            .projection_admission_requirement(work, authorization, false)?
+            .is_some())
+    }
+
+    /// Read-only proof that the exact pending projection lifecycle already
+    /// reached a positive durable acknowledgement. This is used after a
+    /// crash between committing Ack and clearing the bootstrap record; it
+    /// never appends a replacement Invoke merely to rediscover the result.
+    pub(crate) fn retained_positive_clean_acknowledgement(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+    ) -> Result<bool, SharedJournalDriverError> {
+        let operation = ReplayOperation::CleanAcknowledge {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            expected_live: None,
+            work: work.clone(),
+            authorization: authorization.clone(),
+        };
+        let Some(input) =
+            recent_clean_ordered_operation(&self.store, &self.materialization, &operation)?
+        else {
+            return Ok(false);
+        };
+        match self.executor.clean_ordered_result(input) {
+            Some(crate::agent_sdk::RuntimeOutcome::Acknowledged(Ok(acknowledged)))
+                if acknowledged.invocation == work.invocation
+                    && acknowledged.actor == work.actor
+                    && acknowledged.incarnation == work.incarnation
+                    && acknowledged.deployment == work.deployment
+                    && acknowledged.mode == work.mode
+                    && acknowledged.work == work.commitment()
+                    && acknowledged.authorization == authorization.commitment() =>
+            {
+                Ok(true)
+            }
+            _ => Err(SharedJournalDriverError::CrossStoreMismatch),
+        }
     }
 
     pub(crate) fn journal_position(
@@ -1306,36 +1927,29 @@ where
             .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)
     }
 
-    fn clean_invocation_input(
+    fn clean_operation_input(
         &self,
-        work: crate::agent_sdk::InvocationWork,
-        authorization: crate::agent_sdk::InvocationAuthorization,
+        request: CleanInvocationReplayRequest,
+    ) -> Result<ReplayInput, SharedJournalDriverError> {
+        let observed_slot = self.executor.current_logical_slot()?;
+        self.clean_operation_input_at(request, observed_slot)
+    }
+
+    fn clean_operation_input_at(
+        &self,
+        request: CleanInvocationReplayRequest,
+        observed_slot: u64,
     ) -> Result<ReplayInput, SharedJournalDriverError> {
         let heads = self.materialization.heads();
-        let observed_slot = self.executor.current_logical_slot()?;
         let input = ReplayInput {
             runtime: heads.runtime.clone(),
-            operation: ReplayOperation::CleanInvoke {
-                work,
-                authorization,
-                observed_slot,
-            },
+            operation: request.into_operation(observed_slot),
         };
         input
             .validate()
             .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
-        let ReplayOperation::CleanInvoke {
-            work,
-            authorization,
-            observed_slot,
-        } = &input.operation
-        else {
-            unreachable!()
-        };
-        self.executor.verify_clean_invocation_input(
-            work,
-            authorization,
-            *observed_slot,
+        self.executor.verify_clean_operation_input(
+            &input.operation,
             self.materialization.state(),
             &input.runtime,
         )?;
@@ -1350,20 +1964,102 @@ where
         work: crate::agent_sdk::InvocationWork,
         authorization: crate::agent_sdk::InvocationAuthorization,
     ) -> Result<PreparedCleanOrdered, SharedJournalDriverError> {
+        self.prepare_clean_ordered_operation(CleanInvocationReplayRequest::Invoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            work,
+            authorization,
+        })
+    }
+
+    pub(crate) fn prepare_clean_ordered_operation(
+        &self,
+        request: CleanInvocationReplayRequest,
+    ) -> Result<PreparedCleanOrdered, SharedJournalDriverError> {
+        self.prepare_clean_ordered_operation_with_policy(request, false, None)
+    }
+
+    pub(crate) fn prepare_terminal_clean_ordered_operation(
+        &self,
+        request: CleanInvocationReplayRequest,
+    ) -> Result<PreparedCleanOrdered, SharedJournalDriverError> {
+        self.prepare_clean_ordered_operation_with_policy(request, true, None)
+    }
+
+    /// Prepare only the exact persisted system-authority projection work
+    /// protected by a projection-pair admission. Its PublicPreflight slot was
+    /// sampled before the pending bootstrap record became durable, so recovery
+    /// must reuse that accepted slot rather than resampling the trust clock.
+    pub(crate) fn prepare_reserved_projection_operation(
+        &self,
+        request: CleanInvocationReplayRequest,
+        terminal_only: bool,
+    ) -> Result<PreparedCleanOrdered, SharedJournalDriverError> {
+        let work = request.work();
+        let crate::agent_sdk::InvocationAuthorization::PublicPreflight(preflight) =
+            request.authorization()
+        else {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        };
+        let accepted_observed_slot = preflight.observed_slot;
+        if work.mode != crate::agent_sdk::MethodMode::Query
+            || !request
+                .authorization()
+                .matches_invoke(work, accepted_observed_slot)
+        {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        self.prepare_clean_ordered_operation_with_policy(
+            request,
+            terminal_only,
+            Some(accepted_observed_slot),
+        )
+    }
+
+    fn prepare_clean_ordered_operation_with_policy(
+        &self,
+        request: CleanInvocationReplayRequest,
+        terminal_only: bool,
+        accepted_observed_slot: Option<u64>,
+    ) -> Result<PreparedCleanOrdered, SharedJournalDriverError> {
+        // Retry identity excludes the trusted observation slot. The real slot
+        // is sampled exactly once below only when a new operation is built.
+        let operation = request.clone().into_operation(0);
         if let Some(input) =
-            recent_clean_ordered_input(&self.store, &self.materialization, &work, &authorization)?
+            recent_clean_ordered_operation(&self.store, &self.materialization, &operation)?
         {
             let outcome = self
                 .executor
                 .clean_ordered_result(input)
                 .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+            if terminal_only && !matches!(outcome, crate::agent_sdk::RuntimeOutcome::Completed(_)) {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
             return Ok(PreparedCleanOrdered::Retained { input, outcome });
         }
-        let input = self.clean_invocation_input(work, authorization)?;
+        if accepted_observed_slot.is_some()
+            && terminal_only
+            && let Some((input, outcome)) =
+                self.retained_terminal_projection_boundary(&operation)?
+        {
+            return Ok(PreparedCleanOrdered::Retained { input, outcome });
+        }
+        let input = match accepted_observed_slot {
+            Some(observed_slot) => self.clean_operation_input_at(request, observed_slot)?,
+            None => self.clean_operation_input(request)?,
+        };
         if !matches!(
             input.persisted_lane(),
             PersistedLane::Control | PersistedLane::Linear
         ) {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        if terminal_only
+            && !self.executor.clean_invocation_is_terminal(
+                &input.operation,
+                self.materialization.state(),
+                &input.runtime,
+            )?
+        {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
         let heads = self.materialization.heads();
@@ -1401,7 +2097,27 @@ where
         work: crate::agent_sdk::InvocationWork,
         authorization: crate::agent_sdk::InvocationAuthorization,
     ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedJournalDriverError> {
-        let input = self.clean_invocation_input(work, authorization)?;
+        self.apply_clean_local_operation(CleanInvocationReplayRequest::Invoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            work,
+            authorization,
+        })
+    }
+
+    pub(crate) fn apply_clean_local_operation(
+        &mut self,
+        request: CleanInvocationReplayRequest,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedJournalDriverError> {
+        let retry = request.clone().into_operation(0);
+        if let Some(input) =
+            recent_clean_local_operation(&self.store, &self.materialization, &retry)?
+        {
+            return self
+                .executor
+                .clean_ordered_result(input)
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let input = self.clean_operation_input(request)?;
         if input.persisted_lane() != PersistedLane::Local {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
@@ -1449,7 +2165,27 @@ where
         work: crate::agent_sdk::InvocationWork,
         authorization: crate::agent_sdk::InvocationAuthorization,
     ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedJournalDriverError> {
-        let input = self.clean_invocation_input(work, authorization)?;
+        self.apply_clean_merge_operation(CleanInvocationReplayRequest::Invoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            work,
+            authorization,
+        })
+    }
+
+    pub(crate) fn apply_clean_merge_operation(
+        &mut self,
+        request: CleanInvocationReplayRequest,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedJournalDriverError> {
+        let retry = request.clone().into_operation(0);
+        if let Some(input) =
+            recent_clean_merge_operation(&self.store, &self.materialization, &retry)?
+        {
+            return self
+                .executor
+                .clean_ordered_result(input)
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let input = self.clean_operation_input(request)?;
         if input.persisted_lane() != PersistedLane::Merge {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
@@ -1676,17 +2412,28 @@ where
         let entry = heads.ordered_head.ok_or(SharedJournalDriverError::Ledger(
             AgentRaftApplicationErrorV2::SnapshotBoundaryRequired,
         ))?;
+        let matches_heads = |claim: &OrderedCommitClaim| {
+            claim.ordered().head == Some(entry)
+                && claim.ordered().index == heads.ordered_index
+                && claim.genesis() == heads.genesis
+                && claim.admission() == heads.admission
+                && claim.runtime() == &heads.runtime
+        };
+        // Prefer the current verified snapshot when no new logical Ordered
+        // transition followed it. Its physical foundation may already be a
+        // later leader no-op, and using an older still-retained binding would
+        // make the next no-op-only compaction appear to skip its base.
+        if let Some(installed) = self.ledger.current_snapshot()?
+            && matches_heads(installed.claim.ordered())
+        {
+            return Ok(installed.claim.ordered().clone());
+        }
         let binding = self
             .store
             .shared_ordered_commit(entry)?
             .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
         let claim = binding.claim();
-        if claim.ordered().head != Some(entry)
-            || claim.ordered().index != heads.ordered_index
-            || claim.genesis() != heads.genesis
-            || claim.admission() != heads.admission
-            || claim.runtime() != &heads.runtime
-        {
+        if !matches_heads(claim) {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
         Ok(claim.clone())
@@ -1710,7 +2457,7 @@ where
             .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
         let next = plan.next_heads();
         let claim = SharedAgentSnapshotClaim::new(
-            ordered,
+            context.ordered,
             context.active_committee,
             context.authority_epoch,
             Hash(*self.store.instance_id().as_bytes()),
@@ -1736,9 +2483,9 @@ where
         Ok((plan, claim))
     }
 
-    /// Return the exact unsigned checkpoint claim. This is a read-only
-    /// operation: no lane blob, journal head, audit row, or Raft scalar is
-    /// changed until a voter-majority certificate is returned.
+    /// Return the exact unsigned checkpoint claim. This may stage immutable
+    /// proof-compaction objects, but no lane blob, journal head, audit row, or
+    /// Raft scalar is changed until a voter-majority certificate is returned.
     pub(crate) fn snapshot_candidate(
         &mut self,
     ) -> Result<SharedAgentSnapshotClaim, SharedJournalDriverError> {
@@ -1765,7 +2512,7 @@ where
                 .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
                 return self
                     .ledger
-                    .install_snapshot(certificate)
+                    .install_snapshot(certificate, None)
                     .map_err(Into::into);
             }
             // Let the ledger's authenticated snapshot cursor reject lower or
@@ -1774,14 +2521,14 @@ where
             if certificate.claim().raft_index() <= installed.claim.raft_index() {
                 return self
                     .ledger
-                    .install_snapshot(certificate)
+                    .install_snapshot(certificate, None)
                     .map_err(Into::into);
             }
         }
 
+        let logical_ordered = self.snapshot_boundary_claim()?;
         let verified = if self.materialization.heads_id() == certificate.claim().journal_heads() {
-            let ordered = self.snapshot_boundary_claim()?;
-            let context = self.ledger.snapshot_context(&ordered)?;
+            let context = self.ledger.snapshot_context(&logical_ordered)?;
             validate_published_shared_checkpoint(
                 &self.store,
                 &self.materialization,
@@ -1789,7 +2536,7 @@ where
             )
             .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
             let claim = certificate.claim();
-            if claim.ordered() != &ordered
+            if claim.ordered() != &context.ordered
                 || claim.active_committee() != &context.active_committee
                 || claim.authority_epoch() != context.authority_epoch
                 || claim.journal_store().0 != *self.store.instance_id().as_bytes()
@@ -1814,7 +2561,7 @@ where
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
         self.ledger
-            .install_snapshot(certificate)
+            .install_snapshot(certificate, Some(&logical_ordered))
             .map_err(Into::into)
     }
 
@@ -2334,4 +3081,35 @@ fn validate_pending_binding<S: AgentJournalStore + SharedOrderedCommitStore>(
         return Err(SharedJournalDriverError::CrossStoreMismatch);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod keyed_actor_cursor_tests {
+    use super::exclusive_actor_predecessor;
+
+    #[test]
+    fn actor_predecessor_is_exact_across_borrows_and_refuses_zero() {
+        use crate::agent_sdk::ActorId;
+
+        assert_eq!(exclusive_actor_predecessor(ActorId::ZERO), None);
+        let mut minimum = [0_u8; 32];
+        minimum[31] = 1;
+        assert_eq!(exclusive_actor_predecessor(ActorId(minimum)), None);
+        let mut target = [0_u8; 32];
+        target[30] = 1;
+        let mut predecessor = [0_u8; 32];
+        predecessor[31] = u8::MAX;
+        assert_eq!(
+            exclusive_actor_predecessor(ActorId(target)),
+            Some(ActorId(predecessor))
+        );
+        assert_eq!(
+            exclusive_actor_predecessor(ActorId([u8::MAX; 32])),
+            Some(ActorId({
+                let mut bytes = [u8::MAX; 32];
+                bytes[31] -= 1;
+                bytes
+            }))
+        );
+    }
 }

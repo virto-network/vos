@@ -8,6 +8,8 @@
 //! the Agent directory. No recovery path promotes a staged head without
 //! decoding it, recomputing its identity, and proving its predecessor.
 
+use std::any::Any;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(target_os = "linux")]
 use std::ffi::{CStr, CString};
@@ -38,7 +40,7 @@ use super::committee::{
 use super::execution::MAX_RUNTIME_STATE_BYTES;
 use super::genesis::{AgentGenesisAdmissionRecord, MAX_AGENT_GENESIS_ADMISSION_BYTES};
 use super::invocation_history::{
-    InvocationHistoryError, InvocationHistoryNode, InvocationHistoryStore,
+    InvocationHistory, InvocationHistoryError, InvocationHistoryNode, InvocationHistoryStore,
     InvocationHistoryWritePlan, MAX_INVOCATION_HISTORY_INSERTIONS,
     MAX_INVOCATION_HISTORY_NODE_BYTES, MAX_INVOCATION_HISTORY_PLAN_NODE_BYTES,
     MAX_INVOCATION_HISTORY_PLAN_NODES, MAX_INVOCATION_HISTORY_RETIRED_NODES,
@@ -61,12 +63,18 @@ use super::journal::{
     MAX_INVOCATION_OUTCOME_BYTES, MAX_JOURNAL_RECORD_BYTES, MAX_REPLAY_INPUT_BYTES,
     MAX_REPLAY_SUFFIX_BYTES, MAX_REPLAY_SUFFIX_ENTRIES, MergeEvent, MergeEventId, MergeFrontier,
     MergeFrontierId, MergeSeal, MergeSealId, OrderedBase, OrderedEntry, OrderedEntryId,
-    PersistedLane, ReplayOperation, system_genesis_post_create_state_commitment,
+    PersistedLane, ReplayInput, ReplayOperation, TransitionProofIndexId,
+    system_genesis_post_create_state_commitment,
 };
+#[cfg(test)]
+use super::replay::ReplayTransitionProofTestAction;
 use super::replay::{
-    ReplayPublicationAnchor, ReplayPublicationMode, ReplaySealedGenesis, ReplaySealedLocalGenesis,
-    ReplaySealedOrdinaryGenesis, ReplaySealedPublication, ReplaySealedSharedMergeProjection,
-    ReplaySystemAuthorityStoragePlan, ReplayedRootJournalIdentity,
+    ReplayPosition, ReplayPublicationAnchor, ReplayPublicationMode, ReplaySealedGenesis,
+    ReplaySealedLocalGenesis, ReplaySealedOrdinaryGenesis, ReplaySealedPublication,
+    ReplaySealedSharedMergeProjection, ReplaySystemAuthorityStoragePlan,
+    ReplayTransitionProofAction, ReplayTransitionProofIntent, ReplayTransitionProofLifecycle,
+    ReplayTransitionProofProjection, ReplayTransitionProofProjectionAction,
+    ReplayedRootJournalIdentity,
 };
 use super::shared_commit::{MAX_ORDERED_COMMIT_CLAIM_BYTES, OrderedCommitClaim};
 use super::shared_raft::JournalStoreInstanceId;
@@ -84,8 +92,18 @@ use super::system_authority::{
 };
 #[cfg(all(target_os = "linux", feature = "storage"))]
 use super::system_authority_ledger::{SystemAuthorityLedgerError, SystemAuthorityLedgerRouteOwner};
+use super::transition_proof_host::{
+    AuthenticatedTransitionRetirement, PreparedVerifiedTransition, PublishedAttestedTransition,
+    VerifiedTransitionPublisher,
+};
+use super::transition_proof_journal::{
+    JournalTransitionProof, MAX_TRANSITION_PROOF_ENTRY_BYTES, MAX_TRANSITION_PROOF_INDEX_BYTES,
+    MAX_TRANSITION_PROOF_INDEX_MATERIAL_BYTES, TransitionProofAnchor, TransitionProofIndexEntry,
+    TransitionProofIndexManifest,
+};
 use super::wire::RuntimeState;
 use super::{LifecycleReply, LifecycleRequest};
+use crate::agent_sdk::wire::CanonicalWire as AgentCanonicalWire;
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 use crate::service::{AgentId, BlobRef, Hash, NodeId};
 
@@ -99,10 +117,116 @@ pub struct JournalPublication {
     pub heads_advanced: bool,
 }
 
+/// Replay-authenticated metadata and catalog bytes needed to turn one durable
+/// host preparation into a public AJPT closure. Large proof material is
+/// consumed and staged immediately; batches retain only the thin capability
+/// returned by [`JournalVerifiedTransitionPublisher::stage_verified`].
+pub(crate) struct TransitionProofStageContext<'a> {
+    pub(crate) expected_heads: JournalHeadsId,
+    pub(crate) input: &'a ReplayInput,
+    pub(crate) position: ReplayPosition,
+    pub(crate) artifacts: &'a ArtifactClosure,
+    pub(crate) runtime_package: &'a [u8],
+    pub(crate) actor_package: &'a [u8],
+    pub(crate) expected_live: Option<crate::agent_sdk::proof::TransitionProofKey>,
+}
+
+/// Store-bound, bounded proof reference safe to retain across a 1024-item
+/// Merge preparation. It contains no proof material or package bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StagedTransitionProof {
+    store: JournalStoreInstanceId,
+    predecessor: JournalHeadsId,
+    entry: TransitionProofIndexEntry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StagedTransitionProofMutation {
+    /// One canonical replay projection. Prepared entries, authoritative
+    /// published reuse, live repoints, and final acknowledgement retirements
+    /// are validated and applied together.
+    Apply,
+    Checkpoint,
+}
+
+/// Exact proof-index delta to bind into one replay-sealed head CAS.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StagedTransitionProofBatch {
+    store: JournalStoreInstanceId,
+    predecessor: JournalHeadsId,
+    previous: super::journal::TransitionProofIndexId,
+    next: TransitionProofIndexManifest,
+    mutation: StagedTransitionProofMutation,
+    publications: Vec<StagedTransitionProof>,
+    retirement_plan: Option<InvocationHistoryWritePlan>,
+}
+
+impl StagedTransitionProofBatch {
+    pub(crate) const fn store(&self) -> JournalStoreInstanceId {
+        self.store
+    }
+
+    pub(crate) const fn predecessor(&self) -> JournalHeadsId {
+        self.predecessor
+    }
+
+    pub(crate) const fn previous(&self) -> super::journal::TransitionProofIndexId {
+        self.previous
+    }
+
+    pub(crate) fn next(&self) -> &TransitionProofIndexManifest {
+        &self.next
+    }
+
+    pub(crate) const fn mutation(&self) -> StagedTransitionProofMutation {
+        self.mutation
+    }
+
+    pub(crate) fn publications(&self) -> &[StagedTransitionProof] {
+        &self.publications
+    }
+
+    pub(crate) fn retirement_plan(&self) -> Option<&InvocationHistoryWritePlan> {
+        self.retirement_plan.as_ref()
+    }
+}
+
+/// Private extension required by the durable publisher. Head snapshots remain
+/// unavailable through generic object writes.
+pub(crate) trait TransitionProofPublicationStore: AgentJournalStore {
+    fn stage_proof_predecessor(&mut self, heads: &JournalHeads) -> Result<bool, JournalStoreError>;
+}
+
+/// Authoritative journal-backed proof publisher and lookup adapter.
+pub(crate) struct JournalVerifiedTransitionPublisher<'store, S> {
+    store: &'store mut S,
+}
+
+impl<'store, S> JournalVerifiedTransitionPublisher<'store, S>
+where
+    S: TransitionProofPublicationStore,
+{
+    pub(crate) fn new(store: &'store mut S) -> Self {
+        Self { store }
+    }
+
+    pub(crate) fn store(&self) -> &S {
+        self.store
+    }
+
+    pub(crate) fn store_mut(&mut self) -> &mut S {
+        self.store
+    }
+}
+
 const MAX_SHARED_ORDERED_COMMIT_BINDING_BYTES: usize = MAX_ORDERED_COMMIT_CLAIM_BYTES + 288;
 const MAX_SHARED_ORDERED_COMMIT_BINDINGS: usize = 4_096;
 const MAX_SHARED_ORDERED_COMMIT_FILES: usize = 2 * MAX_SHARED_ORDERED_COMMIT_BINDINGS;
 const SHARED_ORDERED_COMMIT_DIRECTORY: &str = "shared-ordered-commits";
+/// Immutable, content-addressed copies of every head envelope replaced by a
+/// successful CAS. The public generic object API continues to reject Heads;
+/// only publication can populate this namespace.
+const HEADS_HISTORY_DIRECTORY: &str = "heads-history";
 
 /// Maximum cumulative immutable Merge objects retained by one physical
 /// journal. One replay suffix plus one full concurrent frontier fits, while
@@ -484,12 +608,16 @@ pub enum JournalBlobClass {
     /// Packages, programs, schemas, policies, and other catalog closure
     /// objects named by [`ArtifactClosure::artifacts`].
     CatalogArtifact,
+    /// Canonical RuntimeWork/RuntimeTransition, APR4/APM1, and bounded public
+    /// proof chunks reachable only through a heads-authenticated proof index.
+    TransitionProof,
 }
 
 fn blob_maximum(class: JournalBlobClass) -> usize {
     match class {
         JournalBlobClass::LaneState => MAX_RUNTIME_STATE_BYTES,
         JournalBlobClass::CatalogArtifact => MAX_ARTIFACT_CLOSURE_BYTES,
+        JournalBlobClass::TransitionProof => super::MAX_CATALOG_ARTIFACT_BYTES as usize,
     }
 }
 
@@ -566,6 +694,14 @@ pub trait AgentJournalStore:
 
     fn heads(&self) -> Result<Option<JournalHeads>, JournalStoreError>;
 
+    /// Read one immutable head snapshot retained by the publication path.
+    /// Generic `put`/`get` deliberately continue to reject the Heads class.
+    #[doc(hidden)]
+    fn historical_heads(
+        &self,
+        id: JournalHeadsId,
+    ) -> Result<Option<JournalHeads>, JournalStoreError>;
+
     /// Complete deferred crash cleanup after a caller has authenticated the
     /// current materialized heads. In-memory and already-recovered stores are
     /// no-ops; descriptor-backed exposed stores use this boundary so no
@@ -580,6 +716,44 @@ pub trait AgentJournalStore:
 
     fn get<R: CanonicalJournalRecord>(&self, id: R::Id) -> Result<Option<R>, JournalStoreError>;
 
+    /// Read one object beneath an operation-owned physical work allowance.
+    /// The default is conservative: it requires room for the type's complete
+    /// wire maximum before delegating to stores whose read internals are not
+    /// budget-aware. File storage overrides this to account for both staged
+    /// and canonical inode reads before either allocation.
+    #[doc(hidden)]
+    fn get_with_work_limit<R: CanonicalJournalRecord>(
+        &self,
+        id: R::Id,
+        max_bytes: u64,
+        max_fetches: usize,
+    ) -> Result<(Option<R>, u64, usize), JournalStoreError> {
+        let maximum = class_maximum(R::STORAGE_CLASS) as u64;
+        if max_fetches == 0 || max_bytes < maximum {
+            return Err(JournalStoreError::LimitExceeded);
+        }
+        let value = self.get::<R>(id)?;
+        let bytes = value.as_ref().map_or(0, |record| record.encode().len()) as u64;
+        Ok((value, bytes, 1))
+    }
+
+    /// Budget-aware counterpart of [`Self::historical_heads`].
+    #[doc(hidden)]
+    fn historical_heads_with_work_limit(
+        &self,
+        id: JournalHeadsId,
+        max_bytes: u64,
+        max_fetches: usize,
+    ) -> Result<(Option<JournalHeads>, u64, usize), JournalStoreError> {
+        let maximum = class_maximum(JournalStorageClass::Heads) as u64;
+        if max_fetches == 0 || max_bytes < maximum {
+            return Err(JournalStoreError::LimitExceeded);
+        }
+        let value = self.historical_heads(id)?;
+        let bytes = value.as_ref().map_or(0, |heads| heads.encode().len()) as u64;
+        Ok((value, bytes, 1))
+    }
+
     /// Persist bytes before installing any manifest which references them.
     fn put_blob(
         &mut self,
@@ -593,6 +767,43 @@ pub trait AgentJournalStore:
         class: JournalBlobClass,
         reference: &BlobRef,
     ) -> Result<Option<Vec<u8>>, JournalStoreError>;
+
+    /// Budget-aware counterpart of [`Self::load_blob`]. References carry the
+    /// exact byte count, so even the default rejects before delegating.
+    #[doc(hidden)]
+    fn load_blob_with_work_limit(
+        &self,
+        class: JournalBlobClass,
+        reference: &BlobRef,
+        max_bytes: u64,
+        max_fetches: usize,
+    ) -> Result<(Option<Vec<u8>>, u64, usize), JournalStoreError> {
+        validate_blob_reference(class, reference)?;
+        if max_fetches == 0 || reference.len > max_bytes {
+            return Err(JournalStoreError::LimitExceeded);
+        }
+        let value = self.load_blob(class, reference)?;
+        let bytes = value.as_ref().map_or(0, |bytes| bytes.len()) as u64;
+        Ok((value, bytes, 1))
+    }
+
+    /// Budget-aware history-node lookup used by authenticated proof-index
+    /// retirement checks.
+    #[doc(hidden)]
+    fn load_history_node_with_work_limit(
+        &self,
+        id: InvocationHistoryNodeId,
+        max_bytes: u64,
+        max_fetches: usize,
+    ) -> Result<(Option<Vec<u8>>, u64, usize), JournalStoreError> {
+        let maximum = MAX_INVOCATION_HISTORY_NODE_BYTES as u64;
+        if max_fetches == 0 || max_bytes < maximum {
+            return Err(JournalStoreError::LimitExceeded);
+        }
+        let value = InvocationHistoryStore::load_history_node(self, id)?;
+        let bytes = value.as_ref().map_or(0, |bytes| bytes.len()) as u64;
+        Ok((value, bytes, 1))
+    }
 
     /// Publish one replay-sealed anchor and its one-step successor head.
     ///
@@ -694,11 +905,12 @@ const HISTORY_CANDIDATE_INTENT_NAME: &str = "candidate-intent";
 const HISTORY_CANDIDATE_INTENT_STAGE_NAME: &str = "candidate-intent.next";
 const HISTORY_RETIREMENTS_NAME: &str = "retirements";
 const HISTORY_RETIREMENTS_STAGE_NAME: &str = "retirements.next";
-const MAX_HISTORY_PUBLICATION_PLANS: usize = 3;
+const MAX_HISTORY_PUBLICATION_PLANS: usize = 4;
 const MAX_HISTORY_RETIREMENT_PUBLICATIONS: usize = 64;
 const MAX_HISTORY_RETIREMENT_BACKLOG_IDS: usize = 4 * MAX_INVOCATION_HISTORY_RETIRED_NODES;
-const MAX_HISTORY_CANDIDATE_INTENT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_HISTORY_RETIREMENT_QUEUE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_HISTORY_CANDIDATE_INTENT_BYTES: usize = 1024 + MAX_INVOCATION_HISTORY_RETIRED_NODES * 32;
+const MAX_HISTORY_RETIREMENT_QUEUE_BYTES: usize =
+    MAX_HISTORY_RETIREMENT_PUBLICATIONS * 1024 + MAX_HISTORY_RETIREMENT_BACKLOG_IDS * 32;
 const HISTORY_CANDIDATE_DOMAIN: &[u8] = b"vos/agent/journal/history-candidate/v1";
 const HISTORY_QUEUE_DOMAIN: &[u8] = b"vos/agent/journal/history-retirement-queue/v1";
 
@@ -741,6 +953,7 @@ struct HistoryRoots {
     ordered: Option<InvocationHistoryNodeId>,
     merge: Option<InvocationHistoryNodeId>,
     local: Option<InvocationHistoryNodeId>,
+    transition_proofs: Option<InvocationHistoryNodeId>,
 }
 
 impl HistoryRoots {
@@ -753,7 +966,7 @@ impl HistoryRoots {
     }
 
     fn validate(self) -> Result<Self, JournalStoreError> {
-        if [self.ordered, self.merge, self.local]
+        if [self.ordered, self.merge, self.local, self.transition_proofs]
             .into_iter()
             .flatten()
             .any(|root| root == InvocationHistoryNodeId::ZERO)
@@ -768,6 +981,7 @@ impl HistoryRoots {
         encode_history_root(encoder, &self.ordered);
         encode_history_root(encoder, &self.merge);
         encode_history_root(encoder, &self.local);
+        encode_history_root(encoder, &self.transition_proofs);
     }
 
     fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -775,11 +989,17 @@ impl HistoryRoots {
             ordered: decode_history_root(decoder)?,
             merge: decode_history_root(decoder)?,
             local: decode_history_root(decoder)?,
+            transition_proofs: decode_history_root(decoder)?,
         };
-        if [roots.ordered, roots.merge, roots.local]
-            .into_iter()
-            .flatten()
-            .any(|root| root == InvocationHistoryNodeId::ZERO)
+        if [
+            roots.ordered,
+            roots.merge,
+            roots.local,
+            roots.transition_proofs,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|root| root == InvocationHistoryNodeId::ZERO)
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -936,7 +1156,7 @@ impl HistoryRetirementQueue {
 }
 
 impl ServiceWire for HistoryRetirementQueue {
-    const MAGIC: [u8; 4] = *b"IHRQ";
+    const MAGIC: [u8; 4] = *b"IHR2";
 
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
@@ -1021,6 +1241,7 @@ fn history_retirement_stage_delta(
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HistoryCandidatePlanDescriptor {
     scope: InvocationOwnershipScope,
+    transition_proof: bool,
     hash: Hash,
     encoded_bytes: u64,
 }
@@ -1038,10 +1259,13 @@ impl HistoryCandidateIntent {
         if self.queue_commitment == Hash::ZERO
             || self.plans.is_empty()
             || self.plans.len() > MAX_HISTORY_PUBLICATION_PLANS
-            || self
-                .plans
-                .windows(2)
-                .any(|pair| pair[0].scope >= pair[1].scope)
+            || self.plans.windows(2).any(|pair| {
+                (pair[0].transition_proof, pair[0].scope)
+                    >= (pair[1].transition_proof, pair[1].scope)
+            })
+            || self.plans.iter().any(|plan| {
+                plan.transition_proof && plan.scope != InvocationOwnershipScope::Ordered
+            })
             || self.plans.iter().any(|plan| {
                 plan.hash == Hash::ZERO
                     || plan.encoded_bytes == 0
@@ -1055,13 +1279,14 @@ impl HistoryCandidateIntent {
 }
 
 impl ServiceWire for HistoryCandidateIntent {
-    const MAGIC: [u8; 4] = *b"IHCI";
+    const MAGIC: [u8; 4] = *b"IHC2";
 
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
         encoder.fixed(self.queue_commitment.as_bytes());
         self.retirement.encode_to(&mut encoder);
         encoder.list(&self.plans, |encoder, plan| {
+            encoder.bool(plan.transition_proof);
             encode_history_scope(encoder, plan.scope);
             encoder.fixed(plan.hash.as_bytes());
             encoder.u64(plan.encoded_bytes);
@@ -1074,6 +1299,7 @@ impl ServiceWire for HistoryCandidateIntent {
             retirement: HistoryRetirementRecord::decode_from(decoder)?,
             plans: decoder.list(|decoder| {
                 Ok(HistoryCandidatePlanDescriptor {
+                    transition_proof: decoder.bool()?,
                     scope: decode_history_scope(decoder)?,
                     hash: Hash(decoder.fixed()?),
                     encoded_bytes: decoder.u64()?,
@@ -1136,12 +1362,15 @@ fn history_roots_for_heads<S: AgentJournalStore>(
     let ordered = require_record::<S, InvocationIndexManifest>(store, heads.ordered_invocations)?;
     let merge = require_record::<S, InvocationIndexManifest>(store, heads.merge_invocations)?;
     let local = require_record::<S, InvocationIndexManifest>(store, heads.local_invocations)?;
+    let transition_proofs =
+        require_record::<S, TransitionProofIndexManifest>(store, heads.transition_proofs)?;
     if ordered.genesis != heads.genesis
         || ordered.scope != InvocationOwnershipScope::Ordered
         || merge.genesis != heads.genesis
         || merge.scope != InvocationOwnershipScope::Merge
         || local.genesis != heads.genesis
         || local.scope != InvocationOwnershipScope::Local(heads.node)
+        || transition_proofs.genesis != heads.genesis
     {
         return Err(JournalStoreError::Corrupt);
     }
@@ -1149,6 +1378,7 @@ fn history_roots_for_heads<S: AgentJournalStore>(
         ordered: ordered.history_root,
         merge: merge.history_root,
         local: local.history_root,
+        transition_proofs: transition_proofs.retired_root(),
     }
     .validate()
 }
@@ -1158,21 +1388,32 @@ fn build_history_candidate<S: AgentJournalStore>(
     current: &JournalHeads,
     next: &JournalHeads,
     plans: &[InvocationHistoryWritePlan],
+    transition_proof_plan: Option<&InvocationHistoryWritePlan>,
     queue: &HistoryRetirementQueue,
 ) -> Result<Option<HistoryCandidateOverlay>, JournalStoreError> {
     let expected_roots = history_roots_for_heads(store, current)?;
     let next_roots = history_roots_for_heads(store, next)?;
-    if plans.is_empty() {
+    if plans.is_empty() && transition_proof_plan.is_none() {
         return if expected_roots == next_roots {
             Ok(None)
         } else {
             Err(JournalStoreError::NonCanonical)
         };
     }
-    if plans.len() > MAX_HISTORY_PUBLICATION_PLANS
+    if plans
+        .len()
+        .saturating_add(usize::from(transition_proof_plan.is_some()))
+        > MAX_HISTORY_PUBLICATION_PLANS
         || plans
             .windows(2)
             .any(|pair| pair[0].scope() >= pair[1].scope())
+        || transition_proof_plan.is_some_and(|plan| {
+            plan.scope() != InvocationOwnershipScope::Ordered
+                || plan
+                    .inserted_facts()
+                    .iter()
+                    .any(|fact| fact.transition_proof_retirement_key().is_none())
+        })
         || queue.genesis != current.genesis
         || queue.node != current.node
     {
@@ -1185,10 +1426,31 @@ fn build_history_candidate<S: AgentJournalStore>(
     let mut retired = Vec::new();
     let mut overlay_nodes = BTreeMap::new();
     let mut descriptors = Vec::new();
-    for plan in plans {
+    for (is_transition_proof, plan) in plans
+        .iter()
+        .map(|plan| (false, plan))
+        .chain(transition_proof_plan.into_iter().map(|plan| (true, plan)))
+    {
+        if plan
+            .inserted_facts()
+            .iter()
+            .any(|fact| fact.transition_proof_retirement_key().is_some() != is_transition_proof)
+        {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        let expected_root = if is_transition_proof {
+            expected_roots.transition_proofs
+        } else {
+            expected_roots.get(plan.scope())
+        };
+        let next_root = if is_transition_proof {
+            next_roots.transition_proofs
+        } else {
+            next_roots.get(plan.scope())
+        };
         if plan.genesis() != current.genesis
-            || plan.expected_root() != expected_roots.get(plan.scope())
-            || plan.root() != next_roots.get(plan.scope())
+            || plan.expected_root() != expected_root
+            || plan.root() != next_root
             || plan.expected_root() == plan.root()
         {
             return Err(JournalStoreError::NonCanonical);
@@ -1215,13 +1477,14 @@ fn build_history_candidate<S: AgentJournalStore>(
         let bytes = plan.encode();
         descriptors.push(HistoryCandidatePlanDescriptor {
             scope: plan.scope(),
+            transition_proof: is_transition_proof,
             hash: Hash::digest(HISTORY_CANDIDATE_DOMAIN, &[&bytes]),
             encoded_bytes: bytes.len() as u64,
         });
     }
-    if insertions > MAX_INVOCATION_HISTORY_INSERTIONS
-        || plan_nodes > MAX_INVOCATION_HISTORY_PLAN_NODES
-        || plan_node_bytes > MAX_INVOCATION_HISTORY_PLAN_NODE_BYTES
+    if insertions > MAX_INVOCATION_HISTORY_INSERTIONS.saturating_add(MAX_REPLAY_SUFFIX_ENTRIES)
+        || plan_nodes > MAX_INVOCATION_HISTORY_PLAN_NODES.saturating_mul(2)
+        || plan_node_bytes > MAX_INVOCATION_HISTORY_PLAN_NODE_BYTES.saturating_mul(2)
     {
         return Err(JournalStoreError::LimitExceeded);
     }
@@ -1244,6 +1507,11 @@ fn build_history_candidate<S: AgentJournalStore>(
             return Err(JournalStoreError::NonCanonical);
         }
     }
+    if (expected_roots.transition_proofs != next_roots.transition_proofs)
+        != transition_proof_plan.is_some()
+    {
+        return Err(JournalStoreError::NonCanonical);
+    }
     let retirement = HistoryRetirementRecord {
         expected_heads: current.id(),
         next_heads: next.id(),
@@ -1262,7 +1530,11 @@ fn build_history_candidate<S: AgentJournalStore>(
     intent.validate()?;
     Ok(Some(HistoryCandidateOverlay {
         intent,
-        plans: plans.to_vec(),
+        plans: plans
+            .iter()
+            .cloned()
+            .chain(transition_proof_plan.cloned())
+            .collect(),
         nodes: overlay_nodes,
     }))
 }
@@ -1271,17 +1543,36 @@ fn validate_idempotent_history_plans<S: AgentJournalStore>(
     store: &S,
     current: &JournalHeads,
     plans: &[InvocationHistoryWritePlan],
+    transition_proof_plan: Option<&InvocationHistoryWritePlan>,
 ) -> Result<(), JournalStoreError> {
     let roots = history_roots_for_heads(store, current)?;
-    if plans.len() > MAX_HISTORY_PUBLICATION_PLANS
+    if plans
+        .len()
+        .saturating_add(usize::from(transition_proof_plan.is_some()))
+        > MAX_HISTORY_PUBLICATION_PLANS
         || plans
             .windows(2)
             .any(|pair| pair[0].scope() >= pair[1].scope())
     {
         return Err(JournalStoreError::NonCanonical);
     }
-    for plan in plans {
-        if plan.genesis() != current.genesis || plan.root() != roots.get(plan.scope()) {
+    for (is_transition_proof, plan) in plans
+        .iter()
+        .map(|plan| (false, plan))
+        .chain(transition_proof_plan.into_iter().map(|plan| (true, plan)))
+    {
+        let root = if is_transition_proof {
+            roots.transition_proofs
+        } else {
+            roots.get(plan.scope())
+        };
+        if plan.genesis() != current.genesis
+            || plan.root() != root
+            || plan
+                .inserted_facts()
+                .iter()
+                .any(|fact| fact.transition_proof_retirement_key().is_some() != is_transition_proof)
+        {
             return Err(JournalStoreError::NonCanonical);
         }
         for write in plan.overlay_nodes() {
@@ -1371,6 +1662,8 @@ fn class_maximum(class: JournalStorageClass) -> usize {
         JournalStorageClass::InvocationIndexNode => MAX_INVOCATION_INDEX_NODE_BYTES,
         JournalStorageClass::InvocationOutcome => MAX_INVOCATION_OUTCOME_BYTES,
         JournalStorageClass::InvocationHistoryNode => MAX_INVOCATION_HISTORY_NODE_BYTES,
+        JournalStorageClass::TransitionProof => MAX_TRANSITION_PROOF_ENTRY_BYTES,
+        JournalStorageClass::TransitionProofIndex => MAX_TRANSITION_PROOF_INDEX_BYTES,
     }
 }
 
@@ -1590,7 +1883,13 @@ fn validate_publication_shape<R: CanonicalJournalRecord>(
     anchor: &R,
     next: &JournalHeads,
 ) -> Result<(), JournalStoreError> {
-    validate_publication_shape_with_mode(current, anchor, next, ReplayPublicationMode::Canonical)
+    validate_publication_shape_with_mode(
+        current,
+        anchor,
+        next,
+        ReplayPublicationMode::Canonical,
+        false,
+    )
 }
 
 fn validate_publication_shape_with_mode<R: CanonicalJournalRecord>(
@@ -1598,6 +1897,7 @@ fn validate_publication_shape_with_mode<R: CanonicalJournalRecord>(
     anchor: &R,
     next: &JournalHeads,
     mode: ReplayPublicationMode,
+    transition_proof_change: bool,
 ) -> Result<(), JournalStoreError> {
     match R::STORAGE_CLASS {
         JournalStorageClass::OrderedEntry => {
@@ -1666,6 +1966,7 @@ fn validate_publication_shape_with_mode<R: CanonicalJournalRecord>(
                 || next.local_invocations != current.local_invocations
                 || next.local_head != current.local_head
                 || next.local_revision != current.local_revision
+                || (!transition_proof_change && next.transition_proofs != current.transition_proofs)
                 || next.checkpoint != current.checkpoint
             {
                 return Err(JournalStoreError::NonCanonical);
@@ -1697,6 +1998,7 @@ fn validate_publication_shape_with_mode<R: CanonicalJournalRecord>(
                 || next.runtime != current.runtime
                 || next.ordered_invocations != current.ordered_invocations
                 || next.merge_invocations != current.merge_invocations
+                || (!transition_proof_change && next.transition_proofs != current.transition_proofs)
                 || next.checkpoint != current.checkpoint
             {
                 return Err(JournalStoreError::NonCanonical);
@@ -1719,6 +2021,7 @@ fn validate_publication_shape_with_mode<R: CanonicalJournalRecord>(
                 || next.local_invocations != current.local_invocations
                 || next.local_head != current.local_head
                 || next.local_revision != current.local_revision
+                || (!transition_proof_change && next.transition_proofs != current.transition_proofs)
                 || next.checkpoint != current.checkpoint
             {
                 return Err(JournalStoreError::NonCanonical);
@@ -1739,6 +2042,7 @@ fn validate_publication_shape_with_mode<R: CanonicalJournalRecord>(
                 || checkpoint.merge_seal != current.merge_seal
                 || checkpoint.ordered_invocations != current.ordered_invocations
                 || checkpoint.merge_invocations != current.merge_invocations
+                || checkpoint.transition_proofs != next.transition_proofs
                 || next.checkpoint != Some(checkpoint.id())
                 || next.ordered_head != current.ordered_head
                 || next.ordered_index != current.ordered_index
@@ -1751,6 +2055,7 @@ fn validate_publication_shape_with_mode<R: CanonicalJournalRecord>(
                 || next.local_invocations != current.local_invocations
                 || next.local_head != current.local_head
                 || next.local_revision != current.local_revision
+                || (!transition_proof_change && next.transition_proofs != current.transition_proofs)
             {
                 return Err(JournalStoreError::NonCanonical);
             }
@@ -2152,6 +2457,28 @@ where
     store.get::<R>(id)?.ok_or(JournalStoreError::MissingObject)
 }
 
+/// Persist and exact-read back the canonical empty proof index before an
+/// initial head can make its root authoritative. This is intentionally part
+/// of both in-memory and file-backed initialization rather than a lazy repair
+/// on open: a visible head with a missing index is corrupt.
+fn persist_initial_transition_proof_index<S: AgentJournalStore>(
+    store: &mut S,
+    initial: &JournalHeads,
+) -> Result<bool, JournalStoreError> {
+    let expected = TransitionProofIndexManifest::empty(initial.genesis);
+    if expected.id() != initial.transition_proofs {
+        return Err(JournalStoreError::NonCanonical);
+    }
+    let created = store.put(&expected)?;
+    let retained = store
+        .get::<TransitionProofIndexManifest>(initial.transition_proofs)?
+        .ok_or(JournalStoreError::MissingObject)?;
+    if retained != expected || retained.id() != initial.transition_proofs {
+        return Err(JournalStoreError::Corrupt);
+    }
+    Ok(created)
+}
+
 fn require_blob<S: AgentJournalStore>(
     store: &S,
     class: JournalBlobClass,
@@ -2193,6 +2520,2300 @@ fn validate_artifact_closure<S: AgentJournalStore>(
         require_blob(store, JournalBlobClass::CatalogArtifact, reference)?;
     }
     Ok(())
+}
+
+fn service_proof_blob(reference: &crate::agent_sdk::BlobRef) -> BlobRef {
+    BlobRef {
+        hash: Hash(reference.hash.0),
+        len: reference.len,
+    }
+}
+
+fn transition_proof_anchor_for_position(
+    position: ReplayPosition,
+) -> Result<TransitionProofAnchor, JournalStoreError> {
+    match position {
+        ReplayPosition::Genesis => Err(JournalStoreError::NonCanonical),
+        ReplayPosition::Ordered {
+            id,
+            index,
+            merge_frontier,
+            merge_seal,
+        } => Ok(TransitionProofAnchor::Ordered {
+            entry: id,
+            index,
+            merge_frontier,
+            merge_seal,
+        }),
+        ReplayPosition::Merge {
+            id,
+            causal_height,
+            ordered_base,
+        } => Ok(TransitionProofAnchor::Merge {
+            event: id,
+            causal_height,
+            ordered_base,
+        }),
+        ReplayPosition::Local {
+            id,
+            node,
+            revision,
+            ordered_base,
+            merge_frontier,
+        } => Ok(TransitionProofAnchor::Local {
+            entry: id,
+            node,
+            revision,
+            ordered_base,
+            merge_frontier,
+        }),
+    }
+}
+
+fn transition_proof_input_at_position<S: AgentJournalStore>(
+    store: &S,
+    publication: &ReplaySealedPublication,
+    position: ReplayPosition,
+) -> Result<ReplayInput, JournalStoreError> {
+    let staged_anchor_input = match (publication.anchor(), position) {
+        (
+            ReplayPublicationAnchor::Ordered(entry),
+            ReplayPosition::Ordered {
+                id,
+                index,
+                merge_frontier,
+                merge_seal,
+            },
+        ) if entry.id() == id
+            && entry.index == index
+            && entry.merge_frontier == merge_frontier
+            && entry.merge_seal == merge_seal =>
+        {
+            Some(entry.input.clone())
+        }
+        (
+            ReplayPublicationAnchor::Local(entry),
+            ReplayPosition::Local {
+                id,
+                node,
+                revision,
+                ordered_base,
+                merge_frontier,
+            },
+        ) if entry.id() == id
+            && entry.node == node
+            && entry.revision == revision
+            && entry.ordered_base == ordered_base
+            && entry.merge_frontier == merge_frontier =>
+        {
+            Some(entry.input.clone())
+        }
+        (
+            ReplayPublicationAnchor::Merge { event, .. },
+            ReplayPosition::Merge {
+                id,
+                causal_height,
+                ordered_base,
+            },
+        ) if event.id() == id
+            && event.causal_height == causal_height
+            && event.ordered_base == ordered_base =>
+        {
+            Some(event.input.clone())
+        }
+        _ => None,
+    };
+    if let Some(input) = staged_anchor_input {
+        return Ok(input);
+    }
+    match position {
+        ReplayPosition::Genesis => Err(JournalStoreError::NonCanonical),
+        ReplayPosition::Ordered {
+            id,
+            index,
+            merge_frontier,
+            merge_seal,
+        } => {
+            let entry = require_record::<S, OrderedEntry>(store, id)?;
+            (entry.id() == id
+                && entry.index == index
+                && entry.merge_frontier == merge_frontier
+                && entry.merge_seal == merge_seal)
+                .then_some(entry.input)
+                .ok_or(JournalStoreError::Corrupt)
+        }
+        ReplayPosition::Merge {
+            id,
+            causal_height,
+            ordered_base,
+        } => {
+            let event = require_record::<S, MergeEvent>(store, id)?;
+            (event.id() == id
+                && event.causal_height == causal_height
+                && event.ordered_base == ordered_base)
+                .then_some(event.input)
+                .ok_or(JournalStoreError::Corrupt)
+        }
+        ReplayPosition::Local {
+            id,
+            node,
+            revision,
+            ordered_base,
+            merge_frontier,
+        } => {
+            let entry = require_record::<S, LocalEntry>(store, id)?;
+            (entry.id() == id
+                && entry.node == node
+                && entry.revision == revision
+                && entry.ordered_base == ordered_base
+                && entry.merge_frontier == merge_frontier)
+                .then_some(entry.input)
+                .ok_or(JournalStoreError::Corrupt)
+        }
+    }
+}
+
+fn validate_transition_proof_requirement<S: AgentJournalStore>(
+    store: &S,
+    publication: &ReplaySealedPublication,
+    requirement: &super::replay::ReplayTransitionProofRequirement,
+    entry: TransitionProofIndexEntry,
+    proof: &JournalTransitionProof,
+    prepared: bool,
+) -> Result<(), JournalStoreError> {
+    let binding = requirement.binding();
+    let expected_anchor = transition_proof_anchor_for_position(requirement.position())?;
+    let input = transition_proof_input_at_position(store, publication, requirement.position())?;
+    let statement = &proof.proof_record().statement;
+    if input.id() != requirement.input()
+        || proof.input() != requirement.input()
+        || proof.anchor() != expected_anchor
+        || prepared && proof.predecessor() != publication.expected()
+        || entry.key != binding.key()
+        || statement.key() != binding.key()
+        || statement.work != binding.work()
+        || statement.transition != binding.transition()
+        || statement.before != binding.before()
+        || statement.after != binding.after()
+        || proof.publication().as_bytes() != binding.publication().as_bytes()
+        || TransitionProofIndexEntry::for_record(proof).map_err(|_| JournalStoreError::Corrupt)?
+            != entry
+        || !transition_proof_lifecycle_matches_input(requirement.lifecycle(), &input)
+    {
+        return Err(JournalStoreError::NonCanonical);
+    }
+    Ok(())
+}
+
+fn validate_transition_proof_retirement<S: AgentJournalStore>(
+    store: &S,
+    publication: &ReplaySealedPublication,
+    predecessor: &JournalHeads,
+    retirement: super::replay::ReplayTransitionProofRetirement,
+) -> Result<(), JournalStoreError> {
+    if matches!(publication.anchor(), ReplayPublicationAnchor::Merge { .. }) {
+        // Merge results are provisional. Only an Ordered fence may carry
+        // retirement authority for a canonical Merge acknowledgement.
+        return Err(JournalStoreError::NonCanonical);
+    }
+    let input = transition_proof_input_at_position(store, publication, retirement.position())?;
+    let ReplayOperation::CleanAcknowledge {
+        context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+        expected_live: Some(expected_live),
+        work,
+        ..
+    } = &input.operation
+    else {
+        return Err(JournalStoreError::NonCanonical);
+    };
+    if input.id() != retirement.input()
+        || *expected_live != retirement.key()
+        || expected_live.invocation != work.invocation
+    {
+        return Err(JournalStoreError::NonCanonical);
+    }
+    match (publication.anchor(), retirement.position()) {
+        (ReplayPublicationAnchor::Ordered(anchor), ReplayPosition::Ordered { id, .. })
+            if anchor.id() == id && anchor.input.id() == retirement.input() =>
+        {
+            Ok(())
+        }
+        (ReplayPublicationAnchor::Local(anchor), ReplayPosition::Local { id, .. })
+            if anchor.id() == id && anchor.input.id() == retirement.input() =>
+        {
+            Ok(())
+        }
+        (ReplayPublicationAnchor::Ordered(anchor), ReplayPosition::Merge { id, .. })
+            if anchor.merge_seal.is_some() =>
+        {
+            if predecessor.id() != publication.expected() {
+                return Err(JournalStoreError::Conflict);
+            }
+            let frontier = require_record::<S, MergeFrontier>(store, anchor.merge_frontier)?;
+            let boundary = retained_merge_boundary(store, predecessor)?;
+            let dag = validate_frontier(store, &frontier, &boundary.tips)?;
+            dag.contains_at_or_below(&frontier.events, id)?
+                .then_some(())
+                .ok_or(JournalStoreError::NonCanonical)
+        }
+        _ => Err(JournalStoreError::NonCanonical),
+    }
+}
+
+fn transition_proof_lifecycle_matches_input(
+    lifecycle: super::replay::ReplayTransitionProofLifecycle,
+    input: &ReplayInput,
+) -> bool {
+    match (lifecycle, &input.operation) {
+        (
+            super::replay::ReplayTransitionProofLifecycle::Invoke,
+            ReplayOperation::CleanInvoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+                ..
+            },
+        ) => true,
+        (
+            super::replay::ReplayTransitionProofLifecycle::Resume(expected),
+            ReplayOperation::CleanResume {
+                context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+                expected_live: Some(encoded),
+                work,
+                ..
+            },
+        ) => *encoded == expected && expected.invocation == work.invocation,
+        (
+            super::replay::ReplayTransitionProofLifecycle::Acknowledge(expected),
+            ReplayOperation::CleanAcknowledge {
+                context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+                expected_live: Some(encoded),
+                work,
+                ..
+            },
+        ) => *encoded == expected && expected.invocation == work.invocation,
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoredTransitionProofRequirementContext {
+    Lifecycle,
+    Recanonicalize,
+    Preserve,
+}
+
+#[derive(Clone, Debug)]
+struct StoredTransitionProofLifecycleInput {
+    input: ReplayInput,
+    position: ReplayPosition,
+    lifecycle: ReplayTransitionProofLifecycle,
+    requirement_context: StoredTransitionProofRequirementContext,
+    final_acknowledgement: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct StoredTransitionProofShadow {
+    retired_root: Option<InvocationHistoryNodeId>,
+    live: BTreeMap<
+        crate::agent_sdk::InvocationId,
+        Option<crate::agent_sdk::proof::TransitionProofKey>,
+    >,
+}
+
+impl StoredTransitionProofShadow {
+    fn from_manifest(manifest: &TransitionProofIndexManifest) -> Self {
+        Self {
+            retired_root: manifest.retired_root(),
+            live: manifest
+                .live_entries()
+                .iter()
+                .map(|key| (key.invocation, Some(*key)))
+                .collect(),
+        }
+    }
+
+    fn from_replay_boundary(publication: &ReplaySealedPublication) -> Self {
+        Self {
+            retired_root: publication.transition_proof_boundary().retired_root(),
+            live: publication
+                .transition_proof_boundary()
+                .live_entries()
+                .map(|key| (key.invocation, Some(key)))
+                .collect(),
+        }
+    }
+
+    fn matches_manifest(&self, manifest: &TransitionProofIndexManifest) -> bool {
+        self.retired_root == manifest.retired_root()
+            && self.live.values().filter(|key| key.is_some()).count()
+                == manifest.live_entries().len()
+            && manifest
+                .live_entries()
+                .iter()
+                .all(|key| self.live(key.invocation) == Some(*key))
+    }
+
+    fn seed_terminal<S: InvocationHistoryStore<Error = JournalStoreError>>(
+        &mut self,
+        store: &S,
+        genesis: AgentJournalGenesisId,
+        invocation: crate::agent_sdk::InvocationId,
+    ) -> Result<(), JournalStoreError> {
+        if transition_proof_retirement_for_invocation(
+            store,
+            genesis,
+            self.retired_root,
+            invocation,
+        )?
+        .is_some()
+        {
+            if self.live(invocation).is_some() {
+                return Err(JournalStoreError::Corrupt);
+            }
+            self.live.insert(invocation, None);
+        }
+        Ok(())
+    }
+
+    fn live(
+        &self,
+        invocation: crate::agent_sdk::InvocationId,
+    ) -> Option<crate::agent_sdk::proof::TransitionProofKey> {
+        self.live.get(&invocation).copied().flatten()
+    }
+
+    fn has_tombstone(&self, invocation: crate::agent_sdk::InvocationId) -> bool {
+        self.live.get(&invocation) == Some(&None)
+    }
+
+    fn install(&mut self, key: crate::agent_sdk::proof::TransitionProofKey) {
+        self.live.insert(key.invocation, Some(key));
+    }
+
+    fn retire(&mut self, key: crate::agent_sdk::proof::TransitionProofKey) -> bool {
+        if self.live(key.invocation) != Some(key) {
+            return false;
+        }
+        self.live.insert(key.invocation, None);
+        true
+    }
+
+    fn overlay(
+        &mut self,
+        external: &BTreeMap<
+            crate::agent_sdk::InvocationId,
+            Option<crate::agent_sdk::proof::TransitionProofKey>,
+        >,
+    ) {
+        for (invocation, key) in external {
+            match key {
+                Some(key) => {
+                    self.live.insert(*invocation, Some(*key));
+                }
+                None => {
+                    self.live.insert(*invocation, None);
+                }
+            }
+        }
+    }
+}
+
+fn transition_proof_lifecycle(
+    input: &ReplayInput,
+) -> Option<(
+    crate::agent_sdk::InvocationId,
+    ReplayTransitionProofLifecycle,
+)> {
+    match &input.operation {
+        ReplayOperation::CleanInvoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+            work,
+            ..
+        } => Some((work.invocation, ReplayTransitionProofLifecycle::Invoke)),
+        ReplayOperation::CleanResume {
+            context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+            expected_live: Some(expected),
+            work,
+            ..
+        } if expected.invocation == work.invocation => Some((
+            work.invocation,
+            ReplayTransitionProofLifecycle::Resume(*expected),
+        )),
+        ReplayOperation::CleanAcknowledge {
+            context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+            expected_live: Some(expected),
+            work,
+            ..
+        } if expected.invocation == work.invocation => Some((
+            work.invocation,
+            ReplayTransitionProofLifecycle::Acknowledge(*expected),
+        )),
+        _ => None,
+    }
+}
+
+fn transition_proof_lifecycle_is_admitted(
+    shadow: &StoredTransitionProofShadow,
+    invocation: crate::agent_sdk::InvocationId,
+    lifecycle: ReplayTransitionProofLifecycle,
+) -> bool {
+    match lifecycle {
+        ReplayTransitionProofLifecycle::Invoke => !shadow.live.contains_key(&invocation),
+        ReplayTransitionProofLifecycle::Resume(expected)
+        | ReplayTransitionProofLifecycle::Acknowledge(expected) => {
+            expected.invocation == invocation && shadow.live(invocation) == Some(expected)
+        }
+    }
+}
+
+fn transition_proof_position(event: &MergeEvent) -> ReplayPosition {
+    ReplayPosition::Merge {
+        id: event.id(),
+        causal_height: event.causal_height,
+        ordered_base: event.ordered_base,
+    }
+}
+
+fn load_publication_merge_suffix<S: AgentJournalStore>(
+    store: &S,
+    publication: &ReplaySealedPublication,
+    predecessor: &JournalHeads,
+    frontier_id: MergeFrontierId,
+) -> Result<Vec<MergeEvent>, JournalStoreError> {
+    let frontier = match publication.anchor() {
+        ReplayPublicationAnchor::Merge { frontier, .. } if frontier.id() == frontier_id => {
+            frontier.clone()
+        }
+        _ => require_record::<S, MergeFrontier>(store, frontier_id)?,
+    };
+    if frontier.id() != frontier_id || frontier.genesis != predecessor.genesis {
+        return Err(JournalStoreError::NonCanonical);
+    }
+    let boundary = retained_merge_boundary(store, predecessor)?;
+    let staged_event = match publication.anchor() {
+        ReplayPublicationAnchor::Merge { event, .. } => Some(event),
+        _ => None,
+    };
+    let mut events = BTreeMap::new();
+    let mut stack = frontier.events.clone();
+    let mut bytes = 0_usize;
+    while let Some(id) = stack.pop() {
+        if events.contains_key(&id) {
+            continue;
+        }
+        let event = match staged_event {
+            Some(event) if event.id() == id => event.clone(),
+            _ => require_record::<S, MergeEvent>(store, id)?,
+        };
+        if event.id() != id || event.genesis != predecessor.genesis {
+            return Err(JournalStoreError::Corrupt);
+        }
+        bytes = bytes
+            .checked_add(event.encode().len())
+            .ok_or(JournalStoreError::LimitExceeded)?;
+        if events.len() >= MAX_REPLAY_SUFFIX_ENTRIES || bytes > MAX_REPLAY_SUFFIX_BYTES {
+            return Err(JournalStoreError::LimitExceeded);
+        }
+        if !boundary.tips.contains(&id) {
+            stack.extend(event.parents.iter().copied());
+        }
+        events.insert(id, event);
+    }
+    if !boundary.tips.iter().all(|id| events.contains_key(id)) {
+        return Err(JournalStoreError::Corrupt);
+    }
+    let dag = ValidatedMergeDag {
+        events,
+        boundary: boundary.tips.clone(),
+    };
+    if dag.canonical_frontier(&frontier.events)? != frontier.events {
+        return Err(JournalStoreError::NonCanonical);
+    }
+    for (id, event) in &dag.events {
+        if dag.boundary.contains(id) {
+            continue;
+        }
+        let expected_height = if event.parents.is_empty() {
+            1
+        } else {
+            event
+                .parents
+                .iter()
+                .map(|parent| {
+                    dag.events
+                        .get(parent)
+                        .map(|event| event.causal_height)
+                        .ok_or(JournalStoreError::Corrupt)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .max()
+                .ok_or(JournalStoreError::Corrupt)?
+                .checked_add(1)
+                .ok_or(JournalStoreError::LimitExceeded)?
+        };
+        if event.causal_height != expected_height {
+            return Err(JournalStoreError::Corrupt);
+        }
+    }
+    let mut suffix = dag
+        .events
+        .into_iter()
+        .filter(|(id, _)| !dag.boundary.contains(id))
+        .map(|(_, event)| event)
+        .collect::<Vec<_>>();
+    suffix.sort_unstable_by_key(|event| (event.causal_height, event.id()));
+    Ok(suffix)
+}
+
+fn transition_proof_lifecycle_input(
+    input: ReplayInput,
+    position: ReplayPosition,
+    requirement_context: StoredTransitionProofRequirementContext,
+    final_acknowledgement: bool,
+) -> Option<StoredTransitionProofLifecycleInput> {
+    let (_, lifecycle) = transition_proof_lifecycle(&input)?;
+    Some(StoredTransitionProofLifecycleInput {
+        input,
+        position,
+        lifecycle,
+        requirement_context,
+        final_acknowledgement,
+    })
+}
+
+fn canonical_transition_proof_inputs<S: AgentJournalStore>(
+    store: &S,
+    publication: &ReplaySealedPublication,
+    predecessor: &JournalHeads,
+) -> Result<
+    (
+        Vec<StoredTransitionProofLifecycleInput>,
+        Option<StoredTransitionProofLifecycleInput>,
+        BTreeSet<MergeEventId>,
+    ),
+    JournalStoreError,
+> {
+    let mut merge_inputs = Vec::new();
+    let mut predecessor_suffix = BTreeSet::new();
+    if !matches!(publication.anchor(), ReplayPublicationAnchor::Local(_)) {
+        for event in load_publication_merge_suffix(
+            store,
+            publication,
+            predecessor,
+            predecessor.merge_frontier,
+        )? {
+            predecessor_suffix.insert(event.id());
+        }
+    }
+
+    let current_input = match publication.anchor() {
+        ReplayPublicationAnchor::Merge {
+            event: imported,
+            frontier,
+        } => {
+            for event in
+                load_publication_merge_suffix(store, publication, predecessor, frontier.id())?
+            {
+                let context = if event.id() == imported.id() {
+                    StoredTransitionProofRequirementContext::Lifecycle
+                } else {
+                    StoredTransitionProofRequirementContext::Recanonicalize
+                };
+                if let Some(input) = transition_proof_lifecycle_input(
+                    event.input.clone(),
+                    transition_proof_position(&event),
+                    context,
+                    false,
+                ) {
+                    merge_inputs.push(input);
+                }
+            }
+            None
+        }
+        ReplayPublicationAnchor::Ordered(entry) => {
+            let replaying_merge = entry.merge_seal.is_some()
+                || !matches!(publication.mode(), ReplayPublicationMode::Canonical);
+            if replaying_merge {
+                let context = if matches!(
+                    publication.mode(),
+                    ReplayPublicationMode::SharedOrderedPreserveMerge
+                ) {
+                    StoredTransitionProofRequirementContext::Preserve
+                } else {
+                    StoredTransitionProofRequirementContext::Recanonicalize
+                };
+                for event in load_publication_merge_suffix(
+                    store,
+                    publication,
+                    predecessor,
+                    entry.merge_frontier,
+                )? {
+                    if let Some(input) = transition_proof_lifecycle_input(
+                        event.input.clone(),
+                        transition_proof_position(&event),
+                        context,
+                        entry.merge_seal.is_some(),
+                    ) {
+                        merge_inputs.push(input);
+                    }
+                }
+            }
+            transition_proof_lifecycle_input(
+                entry.input.clone(),
+                ReplayPosition::Ordered {
+                    id: entry.id(),
+                    index: entry.index,
+                    merge_frontier: entry.merge_frontier,
+                    merge_seal: entry.merge_seal,
+                },
+                StoredTransitionProofRequirementContext::Lifecycle,
+                true,
+            )
+        }
+        ReplayPublicationAnchor::Local(entry) => transition_proof_lifecycle_input(
+            entry.input.clone(),
+            ReplayPosition::Local {
+                id: entry.id(),
+                node: entry.node,
+                revision: entry.revision,
+                ordered_base: entry.ordered_base,
+                merge_frontier: entry.merge_frontier,
+            },
+            StoredTransitionProofRequirementContext::Lifecycle,
+            true,
+        ),
+        ReplayPublicationAnchor::Checkpoint(_) => None,
+    };
+    Ok((merge_inputs, current_input, predecessor_suffix))
+}
+
+fn transition_proof_external_projection<S: AgentJournalStore>(
+    store: &S,
+    predecessor: &JournalHeads,
+    previous: &TransitionProofIndexManifest,
+    boundary: &StoredTransitionProofShadow,
+    predecessor_merge_suffix: &BTreeSet<MergeEventId>,
+) -> Result<
+    BTreeMap<crate::agent_sdk::InvocationId, Option<crate::agent_sdk::proof::TransitionProofKey>>,
+    JournalStoreError,
+> {
+    let mut external = BTreeMap::new();
+    for boundary_key in boundary.live.values().flatten() {
+        if previous.get(*boundary_key).is_none() {
+            return Err(JournalStoreError::MissingObject);
+        }
+        if previous.live(boundary_key.invocation).is_none()
+            && transition_proof_key_is_retired(
+                store,
+                predecessor.genesis,
+                previous.retired_root(),
+                *boundary_key,
+            )?
+        {
+            external.insert(boundary_key.invocation, None);
+        }
+    }
+    // A post-boundary acknowledgement can retire a proof first published by
+    // any lane. Its current live slot is empty, so boundary/current
+    // comparison alone cannot preserve the external tombstone. Retained
+    // records plus exact purpose-tagged history make that absence
+    // independently discoverable; a later current live edge for the same
+    // invocation is overlaid below and wins.
+    for entry in previous.entries() {
+        if previous.live(entry.key.invocation).is_some() {
+            continue;
+        }
+        if transition_proof_key_is_retired(
+            store,
+            predecessor.genesis,
+            previous.retired_root(),
+            entry.key,
+        )? {
+            external.insert(entry.key.invocation, None);
+        }
+    }
+    for key in previous.live_entries() {
+        if boundary.live(key.invocation) == Some(*key) {
+            continue;
+        }
+        let entry = previous.get(*key).ok_or(JournalStoreError::Corrupt)?;
+        let proof = require_record::<S, JournalTransitionProof>(store, entry.record)?;
+        let belongs_to_replaced_merge_suffix = matches!(
+            proof.anchor(),
+            TransitionProofAnchor::Merge { event, .. }
+                if predecessor_merge_suffix.contains(&event)
+        );
+        if !belongs_to_replaced_merge_suffix {
+            external.insert(key.invocation, Some(*key));
+        }
+    }
+    Ok(external)
+}
+
+fn retain_transition_proof_record(
+    manifest: &TransitionProofIndexManifest,
+    entry: TransitionProofIndexEntry,
+) -> Result<TransitionProofIndexManifest, JournalStoreError> {
+    if let Some(existing) = manifest.get(entry.key) {
+        return (existing == entry)
+            .then(|| manifest.clone())
+            .ok_or(JournalStoreError::Conflict);
+    }
+    let prior = manifest.live(entry.key.invocation);
+    let mut retained = manifest
+        .publish(entry, prior)
+        .map_err(map_transition_proof_index_error)?;
+    match prior {
+        Some(prior) => {
+            let prior_entry = retained.get(prior).ok_or(JournalStoreError::Corrupt)?;
+            retained = retained
+                .publish(prior_entry, Some(entry.key))
+                .map_err(map_transition_proof_index_error)?;
+        }
+        None => {
+            retained = retained
+                .retire(entry.key)
+                .map_err(map_transition_proof_index_error)?;
+        }
+    }
+    Ok(retained)
+}
+
+fn set_transition_proof_live(
+    manifest: &TransitionProofIndexManifest,
+    invocation: crate::agent_sdk::InvocationId,
+    desired: Option<crate::agent_sdk::proof::TransitionProofKey>,
+) -> Result<TransitionProofIndexManifest, JournalStoreError> {
+    let current = manifest.live(invocation);
+    if current == desired {
+        return Ok(manifest.clone());
+    }
+    match desired {
+        Some(key) => {
+            if key.invocation != invocation {
+                return Err(JournalStoreError::NonCanonical);
+            }
+            let entry = manifest.get(key).ok_or(JournalStoreError::MissingObject)?;
+            manifest
+                .publish(entry, current)
+                .map_err(map_transition_proof_index_error)
+        }
+        None => manifest
+            .retire(current.ok_or(JournalStoreError::Conflict)?)
+            .map_err(map_transition_proof_index_error),
+    }
+}
+
+fn validate_transition_proof_acknowledgement_action(
+    input: &StoredTransitionProofLifecycleInput,
+    action_input: super::journal::ReplayInputId,
+    action_position: ReplayPosition,
+    key: crate::agent_sdk::proof::TransitionProofKey,
+    final_acknowledgement: bool,
+) -> Result<(), JournalStoreError> {
+    let ReplayTransitionProofLifecycle::Acknowledge(expected) = input.lifecycle else {
+        return Err(JournalStoreError::NonCanonical);
+    };
+    if input.input.id() != action_input
+        || input.position != action_position
+        || expected != key
+        || input.final_acknowledgement != final_acknowledgement
+        || (!final_acknowledgement && !matches!(input.position, ReplayPosition::Merge { .. }))
+    {
+        return Err(JournalStoreError::NonCanonical);
+    }
+    Ok(())
+}
+
+fn transition_proof_action_position(action: &ReplayTransitionProofAction) -> ReplayPosition {
+    match action {
+        ReplayTransitionProofAction::Requirement(requirement) => requirement.position(),
+        ReplayTransitionProofAction::Acknowledgement(acknowledgement) => acknowledgement.position(),
+        ReplayTransitionProofAction::Retirement(retirement) => retirement.position(),
+        ReplayTransitionProofAction::Stale(stale) => stale.position(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_transition_proof_lifecycle_input<S: AgentJournalStore>(
+    store: &mut S,
+    publication: &ReplaySealedPublication,
+    predecessor: &JournalHeads,
+    previous: &TransitionProofIndexManifest,
+    input: &StoredTransitionProofLifecycleInput,
+    actions: &[ReplayTransitionProofAction],
+    action_cursor: &mut usize,
+    publications: &[StagedTransitionProof],
+    publication_cursor: &mut usize,
+    derived: &mut TransitionProofIndexManifest,
+    shadow: &mut StoredTransitionProofShadow,
+    projection: &mut StoredTransitionProofShadow,
+    anchors: &mut Vec<TransitionProofAnchor>,
+    retired: &mut Vec<crate::agent_sdk::proof::TransitionProofKey>,
+) -> Result<(), JournalStoreError> {
+    let (invocation, lifecycle) =
+        transition_proof_lifecycle(&input.input).ok_or(JournalStoreError::NonCanonical)?;
+    if lifecycle != input.lifecycle {
+        return Err(JournalStoreError::NonCanonical);
+    }
+    shadow.seed_terminal(store, predecessor.genesis, invocation)?;
+    projection.seed_terminal(store, predecessor.genesis, invocation)?;
+    if projection.has_tombstone(invocation) {
+        // The predecessor root may contain a terminal acknowledgement made
+        // after the retained Merge boundary. It is external to the suffix
+        // being rebuilt and therefore constrains admission even when its
+        // compacted proof record is no longer enumerable from AJP3.
+        shadow.live.insert(invocation, None);
+    }
+    let admitted = transition_proof_lifecycle_is_admitted(shadow, invocation, lifecycle);
+    if !admitted {
+        let Some(ReplayTransitionProofAction::Stale(stale)) = actions.get(*action_cursor) else {
+            return Err(JournalStoreError::NonCanonical);
+        };
+        if stale.input() != input.input.id()
+            || stale.position() != input.position
+            || stale.lifecycle() != input.lifecycle
+        {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        *action_cursor = action_cursor
+            .checked_add(1)
+            .ok_or(JournalStoreError::LimitExceeded)?;
+        return Ok(());
+    }
+
+    match lifecycle {
+        ReplayTransitionProofLifecycle::Invoke | ReplayTransitionProofLifecycle::Resume(_) => {
+            let Some(ReplayTransitionProofAction::Requirement(requirement)) =
+                actions.get(*action_cursor)
+            else {
+                return Err(JournalStoreError::NonCanonical);
+            };
+            if requirement.input() != input.input.id()
+                || requirement.position() != input.position
+                || requirement.lifecycle() != input.lifecycle
+            {
+                return Err(JournalStoreError::NonCanonical);
+            }
+            let expected_shape = match (input.requirement_context, input.lifecycle) {
+                (
+                    StoredTransitionProofRequirementContext::Lifecycle,
+                    ReplayTransitionProofLifecycle::Invoke,
+                ) => (
+                    ReplayTransitionProofIntent::FirstPublication,
+                    ReplayTransitionProofProjectionAction::UpdateLive,
+                ),
+                (
+                    StoredTransitionProofRequirementContext::Lifecycle,
+                    ReplayTransitionProofLifecycle::Resume(expected),
+                ) => (
+                    ReplayTransitionProofIntent::Resume(expected),
+                    ReplayTransitionProofProjectionAction::UpdateLive,
+                ),
+                (
+                    StoredTransitionProofRequirementContext::Recanonicalize,
+                    ReplayTransitionProofLifecycle::Invoke
+                    | ReplayTransitionProofLifecycle::Resume(_),
+                ) => (
+                    ReplayTransitionProofIntent::Recanonicalize,
+                    ReplayTransitionProofProjectionAction::UpdateLive,
+                ),
+                (
+                    StoredTransitionProofRequirementContext::Preserve,
+                    ReplayTransitionProofLifecycle::Invoke
+                    | ReplayTransitionProofLifecycle::Resume(_),
+                ) => (
+                    ReplayTransitionProofIntent::Recanonicalize,
+                    ReplayTransitionProofProjectionAction::ValidateOnly,
+                ),
+                (_, ReplayTransitionProofLifecycle::Acknowledge(_)) => {
+                    return Err(JournalStoreError::NonCanonical);
+                }
+            };
+            if (requirement.intent(), requirement.projection_action()) != expected_shape {
+                return Err(JournalStoreError::NonCanonical);
+            }
+            let (entry, proof, prepared) = match requirement.projection() {
+                ReplayTransitionProofProjection::Prepared => {
+                    let staged = publications
+                        .get(*publication_cursor)
+                        .ok_or(JournalStoreError::NonCanonical)?;
+                    if staged.store != store.instance_id() || staged.predecessor != predecessor.id()
+                    {
+                        return Err(JournalStoreError::Conflict);
+                    }
+                    *publication_cursor = publication_cursor
+                        .checked_add(1)
+                        .ok_or(JournalStoreError::LimitExceeded)?;
+                    let proof =
+                        require_record::<S, JournalTransitionProof>(store, staged.entry.record)?;
+                    (staged.entry, proof, true)
+                }
+                ReplayTransitionProofProjection::Published => {
+                    let entry = previous
+                        .get(requirement.binding().key())
+                        .ok_or(JournalStoreError::MissingObject)?;
+                    let proof = require_record::<S, JournalTransitionProof>(store, entry.record)?;
+                    (entry, proof, false)
+                }
+            };
+            if matches!(
+                requirement.projection_action(),
+                ReplayTransitionProofProjectionAction::ValidateOnly
+            ) && prepared
+            {
+                return Err(JournalStoreError::NonCanonical);
+            }
+            validate_transition_proof_requirement(
+                store,
+                publication,
+                requirement,
+                entry,
+                &proof,
+                prepared,
+            )?;
+            if anchors.contains(&proof.anchor()) {
+                return Err(JournalStoreError::NonCanonical);
+            }
+            anchors.push(proof.anchor());
+            *derived = retain_transition_proof_record(derived, entry)?;
+            shadow.install(entry.key);
+            if matches!(
+                requirement.projection_action(),
+                ReplayTransitionProofProjectionAction::UpdateLive
+            ) {
+                projection.install(entry.key);
+            }
+            *action_cursor = action_cursor
+                .checked_add(1)
+                .ok_or(JournalStoreError::LimitExceeded)?;
+        }
+        ReplayTransitionProofLifecycle::Acknowledge(expected) => {
+            // Clean operations deliberately do not mutate InvocationIndex.
+            // The private replay seal is the Applied/no-effect authority;
+            // storage independently binds the exact canonical input,
+            // position, and live-edge condition here.
+            // A rejected acknowledgement has no action. Do not consume or
+            // reject the next canonical acknowledgement merely because it is
+            // the next element in the ordered action vector; only an action
+            // claiming this exact replay position belongs to this input.
+            let action = actions
+                .get(*action_cursor)
+                .filter(|action| transition_proof_action_position(action) == input.position);
+            let consumed = match action {
+                Some(ReplayTransitionProofAction::Retirement(retirement))
+                    if input.final_acknowledgement =>
+                {
+                    validate_transition_proof_acknowledgement_action(
+                        input,
+                        retirement.input(),
+                        retirement.position(),
+                        retirement.key(),
+                        true,
+                    )?;
+                    validate_transition_proof_retirement(
+                        store,
+                        publication,
+                        predecessor,
+                        *retirement,
+                    )?;
+                    if retired.contains(&expected) {
+                        return Err(JournalStoreError::NonCanonical);
+                    }
+                    retired.push(expected);
+                    true
+                }
+                Some(ReplayTransitionProofAction::Acknowledgement(acknowledgement))
+                    if !input.final_acknowledgement =>
+                {
+                    validate_transition_proof_acknowledgement_action(
+                        input,
+                        acknowledgement.input(),
+                        acknowledgement.position(),
+                        acknowledgement.key(),
+                        false,
+                    )?;
+                    true
+                }
+                Some(
+                    ReplayTransitionProofAction::Retirement(_)
+                    | ReplayTransitionProofAction::Acknowledgement(_),
+                ) => return Err(JournalStoreError::NonCanonical),
+                Some(
+                    ReplayTransitionProofAction::Requirement(_)
+                    | ReplayTransitionProofAction::Stale(_),
+                )
+                | None => false,
+            };
+            if !consumed {
+                // Rejected/non-Applied acknowledgement has no sealed effect.
+                return Ok(());
+            }
+            if !shadow.retire(expected) {
+                return Err(JournalStoreError::NonCanonical);
+            }
+            if input.final_acknowledgement && !projection.retire(expected) {
+                return Err(JournalStoreError::NonCanonical);
+            }
+            *action_cursor = action_cursor
+                .checked_add(1)
+                .ok_or(JournalStoreError::LimitExceeded)?;
+        }
+    }
+    Ok(())
+}
+
+fn derive_transition_proof_apply<S: AgentJournalStore>(
+    store: &mut S,
+    publication: &ReplaySealedPublication,
+    predecessor: &JournalHeads,
+    previous: &TransitionProofIndexManifest,
+    publications: &[StagedTransitionProof],
+) -> Result<
+    (
+        TransitionProofIndexManifest,
+        Vec<crate::agent_sdk::proof::TransitionProofKey>,
+    ),
+    JournalStoreError,
+> {
+    let (merge_inputs, current_input, predecessor_merge_suffix) =
+        canonical_transition_proof_inputs(store, publication, predecessor)?;
+    let mut all_inputs = merge_inputs.clone();
+    if let Some(current) = &current_input {
+        all_inputs
+            .try_reserve(1)
+            .map_err(|_| JournalStoreError::LimitExceeded)?;
+        all_inputs.push(current.clone());
+    }
+    if all_inputs.len() > MAX_REPLAY_SUFFIX_ENTRIES
+        || publication.transition_proof_actions().len() > MAX_REPLAY_SUFFIX_ENTRIES
+    {
+        return Err(JournalStoreError::LimitExceeded);
+    }
+    let rebuilds_merge = matches!(publication.anchor(), ReplayPublicationAnchor::Merge { .. })
+        || matches!(publication.anchor(), ReplayPublicationAnchor::Ordered(entry) if entry.merge_seal.is_some())
+        || !matches!(publication.mode(), ReplayPublicationMode::Canonical);
+    let preserves_merge = matches!(
+        publication.mode(),
+        ReplayPublicationMode::SharedOrderedPreserveMerge
+    );
+    let boundary = StoredTransitionProofShadow::from_replay_boundary(publication);
+    let authenticated_boundary =
+        transition_proof_index_at_replay_boundary(store, predecessor, predecessor.merge_fence)?;
+    if !boundary.matches_manifest(&authenticated_boundary) {
+        return Err(JournalStoreError::NonCanonical);
+    }
+    let external = if rebuilds_merge {
+        transition_proof_external_projection(
+            store,
+            predecessor,
+            previous,
+            &boundary,
+            &predecessor_merge_suffix,
+        )?
+    } else {
+        BTreeMap::new()
+    };
+    let mut shadow = if rebuilds_merge {
+        boundary
+    } else {
+        StoredTransitionProofShadow::from_manifest(previous)
+    };
+    // A Shared Ordered splice validates the pinned Merge suffix against its
+    // authenticated fence boundary, but it preserves the predecessor's
+    // newer physical Merge projection. The current Ordered input must then
+    // admit against that physical projection, not the pinned suffix tip.
+    let mut projection = if preserves_merge {
+        StoredTransitionProofShadow::from_manifest(previous)
+    } else {
+        shadow.clone()
+    };
+    // Ordered/Local proof edges and terminal tombstones published after the
+    // Merge boundary constrain admission before the replaceable suffix is
+    // replayed. Applying them only after the walk would run stale guest/proof
+    // work and then merely discard its staged result.
+    if rebuilds_merge {
+        shadow.overlay(&external);
+        projection.overlay(&external);
+    }
+    let mut derived = previous.clone();
+    let mut action_cursor = 0_usize;
+    let mut publication_cursor = 0_usize;
+    let mut anchors = Vec::new();
+    let mut retired = Vec::new();
+
+    for input in &merge_inputs {
+        apply_transition_proof_lifecycle_input(
+            store,
+            publication,
+            predecessor,
+            previous,
+            input,
+            publication.transition_proof_actions(),
+            &mut action_cursor,
+            publications,
+            &mut publication_cursor,
+            &mut derived,
+            &mut shadow,
+            &mut projection,
+            &mut anchors,
+            &mut retired,
+        )?;
+    }
+    if preserves_merge {
+        shadow = projection.clone();
+    }
+    if let Some(input) = &current_input {
+        apply_transition_proof_lifecycle_input(
+            store,
+            publication,
+            predecessor,
+            previous,
+            input,
+            publication.transition_proof_actions(),
+            &mut action_cursor,
+            publications,
+            &mut publication_cursor,
+            &mut derived,
+            &mut shadow,
+            &mut projection,
+            &mut anchors,
+            &mut retired,
+        )?;
+    }
+    if action_cursor != publication.transition_proof_actions().len()
+        || publication_cursor != publications.len()
+    {
+        return Err(JournalStoreError::NonCanonical);
+    }
+
+    let mut invocations = derived
+        .live_entries()
+        .iter()
+        .map(|key| key.invocation)
+        .chain(projection.live.keys().copied())
+        .collect::<Vec<_>>();
+    invocations.sort_unstable();
+    invocations.dedup();
+    for invocation in invocations {
+        let desired = projection.live(invocation);
+        if let Some(key) = desired {
+            if derived.live(invocation) != Some(key)
+                && transition_proof_key_is_retired(
+                    store,
+                    predecessor.genesis,
+                    previous.retired_root(),
+                    key,
+                )?
+            {
+                return Err(JournalStoreError::Conflict);
+            }
+        }
+        derived = set_transition_proof_live(&derived, invocation, desired)?;
+    }
+    Ok((derived, retired))
+}
+
+fn transition_proof_retirements_are_canonical(
+    retirements: &[super::replay::ReplayTransitionProofRetirement],
+) -> bool {
+    let mut last_merge = None;
+    let mut saw_current = false;
+    for (index, retirement) in retirements.iter().enumerate() {
+        if !retirement.key().validate()
+            || retirements[..index].iter().any(|prior| {
+                prior.key().invocation == retirement.key().invocation
+                    || prior.input() == retirement.input()
+                    || prior.position() == retirement.position()
+            })
+        {
+            return false;
+        }
+        match retirement.position() {
+            ReplayPosition::Merge {
+                id, causal_height, ..
+            } if !saw_current => {
+                let order = (causal_height, id);
+                if last_merge.is_some_and(|prior| prior >= order) {
+                    return false;
+                }
+                last_merge = Some(order);
+            }
+            ReplayPosition::Ordered { .. } | ReplayPosition::Local { .. }
+                if !saw_current && index + 1 == retirements.len() =>
+            {
+                saw_current = true;
+            }
+            ReplayPosition::Genesis
+            | ReplayPosition::Merge { .. }
+            | ReplayPosition::Ordered { .. }
+            | ReplayPosition::Local { .. } => return false,
+        }
+    }
+    true
+}
+
+impl<S> JournalVerifiedTransitionPublisher<'_, S>
+where
+    S: TransitionProofPublicationStore,
+{
+    pub(crate) fn stage_verified(
+        &mut self,
+        prepared: &PreparedVerifiedTransition,
+        context: TransitionProofStageContext<'_>,
+    ) -> Result<StagedTransitionProof, JournalStoreError> {
+        let current = self
+            .store
+            .heads()?
+            .ok_or(JournalStoreError::NotInitialized)?;
+        let runtime_is_replay_anchored = match context.position {
+            ReplayPosition::Ordered { .. } | ReplayPosition::Local { .. } => {
+                context.input.runtime == current.runtime
+            }
+            ReplayPosition::Merge { ordered_base, .. } => {
+                ordered_base.index < current.ordered_index
+                    || (ordered_base.index == current.ordered_index
+                        && ordered_base.head == current.ordered_head)
+            }
+            ReplayPosition::Genesis => false,
+        };
+        if current.id() != context.expected_heads
+            || current.genesis != context.artifacts.genesis
+            || !runtime_is_replay_anchored
+            || context
+                .expected_live
+                .is_some_and(|key| key.invocation != prepared.key().invocation)
+        {
+            return Err(JournalStoreError::Conflict);
+        }
+        validate_head_targets(self.store, &current)?;
+        let anchor = transition_proof_anchor_for_position(context.position)?;
+        let runtime_package = context.input.runtime.package.clone();
+        let actor_package = service_proof_blob(prepared.actor_package());
+        if !runtime_package.matches(context.runtime_package)
+            || !actor_package.matches(context.actor_package)
+            || service_proof_blob(&prepared.proof_record().statement.subject.runtime_package)
+                != runtime_package
+            || !context.artifacts.artifacts.contains(&runtime_package)
+            || !context.artifacts.artifacts.contains(&actor_package)
+        {
+            return Err(JournalStoreError::NonCanonical);
+        }
+
+        let manifest = crate::agent_sdk::proof::TransitionProofMaterialManifest::decode(
+            prepared.proof_manifest_bytes(),
+        )
+        .map_err(|_| JournalStoreError::NonCanonical)?;
+        if manifest
+            .encode()
+            .map_err(|_| JournalStoreError::NonCanonical)?
+            != prepared.proof_manifest_bytes()
+            || !manifest.matches_material(prepared.proof_material())
+            || service_proof_blob(&prepared.proof_record().proof)
+                != BlobRef::of_bytes(prepared.proof_manifest_bytes())
+        {
+            return Err(JournalStoreError::NonCanonical);
+        }
+
+        // Every referenced byte/object is made durable and exact-read back
+        // before a replay-sealed publication can name the resulting index.
+        self.store.stage_proof_predecessor(&current)?;
+        self.store.put_blob(
+            JournalBlobClass::CatalogArtifact,
+            &runtime_package,
+            context.runtime_package,
+        )?;
+        self.store.put_blob(
+            JournalBlobClass::CatalogArtifact,
+            &actor_package,
+            context.actor_package,
+        )?;
+        self.store.put(context.input)?;
+        self.store.put(context.artifacts)?;
+
+        let canonical_work = BlobRef::of_bytes(prepared.canonical_work());
+        let canonical_transition = BlobRef::of_bytes(prepared.canonical_transition());
+        let manifest_ref = BlobRef::of_bytes(prepared.proof_manifest_bytes());
+        self.store.put_blob(
+            JournalBlobClass::TransitionProof,
+            &canonical_work,
+            prepared.canonical_work(),
+        )?;
+        self.store.put_blob(
+            JournalBlobClass::TransitionProof,
+            &canonical_transition,
+            prepared.canonical_transition(),
+        )?;
+        self.store.put_blob(
+            JournalBlobClass::TransitionProof,
+            &manifest_ref,
+            prepared.proof_manifest_bytes(),
+        )?;
+        let chunk_bytes =
+            usize::try_from(crate::agent_sdk::proof::TRANSITION_PROOF_MATERIAL_CHUNK_BYTES)
+                .map_err(|_| JournalStoreError::LimitExceeded)?;
+        for (chunk, bytes) in manifest
+            .chunks
+            .iter()
+            .zip(prepared.proof_material().chunks(chunk_bytes))
+        {
+            self.store.put_blob(
+                JournalBlobClass::TransitionProof,
+                &service_proof_blob(chunk),
+                bytes,
+            )?;
+        }
+
+        let publication = prepared.expected_fact().publication();
+        let proof = JournalTransitionProof::new(
+            current.genesis,
+            current.id(),
+            context.input.id(),
+            anchor,
+            canonical_work,
+            canonical_transition,
+            context.artifacts.id(),
+            actor_package,
+            prepared.proof_record().clone(),
+            manifest,
+            Hash(publication.0),
+        )
+        .map_err(|_| JournalStoreError::NonCanonical)?;
+        let entry = TransitionProofIndexEntry::for_record(&proof)
+            .map_err(|_| JournalStoreError::NonCanonical)?;
+        self.store.put(&proof)?;
+        if self.store.get::<ReplayInput>(context.input.id())?.as_ref() != Some(context.input)
+            || self
+                .store
+                .get::<ArtifactClosure>(context.artifacts.id())?
+                .as_ref()
+                != Some(context.artifacts)
+            || self
+                .store
+                .get::<JournalTransitionProof>(proof.id())?
+                .as_ref()
+                != Some(&proof)
+            || self.store.historical_heads(current.id())?.as_ref() != Some(&current)
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        Ok(StagedTransitionProof {
+            store: self.store.instance_id(),
+            predecessor: current.id(),
+            entry,
+        })
+    }
+
+    pub(crate) fn stage_apply_batch(
+        &mut self,
+        publication: &ReplaySealedPublication,
+        publications: Vec<StagedTransitionProof>,
+    ) -> Result<StagedTransitionProofBatch, JournalStoreError> {
+        if publication.transition_proof_batch().is_some()
+            || publications.len() > MAX_REPLAY_SUFFIX_ENTRIES
+            || publication.transition_proof_actions().len() > MAX_REPLAY_SUFFIX_ENTRIES
+        {
+            return Err(JournalStoreError::LimitExceeded);
+        }
+        if publications.iter().enumerate().any(|(index, staged)| {
+            publications[..index]
+                .iter()
+                .any(|prior| prior.entry.key == staged.entry.key)
+        }) {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        let current = self
+            .store
+            .heads()?
+            .ok_or(JournalStoreError::NotInitialized)?;
+        if current.id() != publication.expected()
+            || publication.next().transition_proofs != current.transition_proofs
+            || matches!(publication.anchor(), ReplayPublicationAnchor::Checkpoint(_))
+            || publication.transition_proof_actions().is_empty()
+        {
+            return Err(JournalStoreError::Conflict);
+        }
+        let previous = require_record::<S, TransitionProofIndexManifest>(
+            self.store,
+            current.transition_proofs,
+        )?;
+        let (mut next, retired) = derive_transition_proof_apply(
+            self.store,
+            publication,
+            &current,
+            &previous,
+            &publications,
+        )?;
+        let retirement_plan = prepare_transition_proof_retirements(
+            self.store,
+            current.genesis,
+            previous.retired_root(),
+            &retired,
+        )?;
+        if let Some(plan) = &retirement_plan {
+            next = next
+                .with_retired_root(previous.retired_root(), plan.root())
+                .map_err(map_transition_proof_index_error)?;
+        }
+        self.store.stage_proof_predecessor(&current)?;
+        self.store.put(&next)?;
+        if self
+            .store
+            .get::<TransitionProofIndexManifest>(next.id())?
+            .as_ref()
+            != Some(&next)
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        Ok(StagedTransitionProofBatch {
+            store: self.store.instance_id(),
+            predecessor: current.id(),
+            previous: current.transition_proofs,
+            next,
+            mutation: StagedTransitionProofMutation::Apply,
+            publications,
+            retirement_plan,
+        })
+    }
+
+    pub(crate) fn stage_retirement(
+        &mut self,
+        expected_live: crate::agent_sdk::proof::TransitionProofKey,
+    ) -> Result<StagedTransitionProofBatch, JournalStoreError> {
+        let current = self
+            .store
+            .heads()?
+            .ok_or(JournalStoreError::NotInitialized)?;
+        let previous = require_record::<S, TransitionProofIndexManifest>(
+            self.store,
+            current.transition_proofs,
+        )?;
+        let mut next = previous
+            .retire(expected_live)
+            .map_err(map_transition_proof_index_error)?;
+        let retirement_plan = prepare_transition_proof_retirements(
+            self.store,
+            current.genesis,
+            previous.retired_root(),
+            core::slice::from_ref(&expected_live),
+        )?;
+        if let Some(plan) = &retirement_plan {
+            next = next
+                .with_retired_root(previous.retired_root(), plan.root())
+                .map_err(map_transition_proof_index_error)?;
+        }
+        self.store.stage_proof_predecessor(&current)?;
+        self.store.put(&next)?;
+        Ok(StagedTransitionProofBatch {
+            store: self.store.instance_id(),
+            predecessor: current.id(),
+            previous: current.transition_proofs,
+            next,
+            mutation: StagedTransitionProofMutation::Apply,
+            publications: Vec::new(),
+            retirement_plan,
+        })
+    }
+
+    pub(crate) fn stage_checkpoint_compaction(
+        &mut self,
+    ) -> Result<StagedTransitionProofBatch, JournalStoreError> {
+        let current = self
+            .store
+            .heads()?
+            .ok_or(JournalStoreError::NotInitialized)?;
+        let previous = require_record::<S, TransitionProofIndexManifest>(
+            self.store,
+            current.transition_proofs,
+        )?;
+        let next = previous
+            .checkpointed()
+            .map_err(map_transition_proof_index_error)?;
+        self.store.stage_proof_predecessor(&current)?;
+        self.store.put(&next)?;
+        Ok(StagedTransitionProofBatch {
+            store: self.store.instance_id(),
+            predecessor: current.id(),
+            previous: current.transition_proofs,
+            next,
+            mutation: StagedTransitionProofMutation::Checkpoint,
+            publications: Vec::new(),
+            retirement_plan: None,
+        })
+    }
+}
+
+fn prepare_transition_proof_retirements<S: TransitionProofPublicationStore>(
+    store: &S,
+    genesis: AgentJournalGenesisId,
+    root: Option<InvocationHistoryNodeId>,
+    keys: &[crate::agent_sdk::proof::TransitionProofKey],
+) -> Result<Option<InvocationHistoryWritePlan>, JournalStoreError> {
+    let facts = missing_transition_proof_retirement_facts(store, genesis, root, keys)?;
+    if facts.is_empty() {
+        return Ok(None);
+    }
+    let mut history =
+        InvocationHistory::open(store, genesis, InvocationOwnershipScope::Ordered, root)
+            .map_err(map_invocation_history_error)?;
+    history
+        .require_history_purpose(true)
+        .map_err(map_invocation_history_error)?;
+    for fact in facts {
+        if !history
+            .insert(fact)
+            .map_err(map_invocation_history_error)?
+            .inserted()
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+    }
+    history
+        .write_plan()
+        .map(Some)
+        .map_err(map_invocation_history_error)
+}
+
+fn missing_transition_proof_retirement_facts<
+    S: InvocationHistoryStore<Error = JournalStoreError>,
+>(
+    store: &S,
+    genesis: AgentJournalGenesisId,
+    root: Option<InvocationHistoryNodeId>,
+    keys: &[crate::agent_sdk::proof::TransitionProofKey],
+) -> Result<Vec<super::journal::InvocationAcknowledgedFact>, JournalStoreError> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut exact = keys.to_vec();
+    exact.sort_unstable_by_key(|key| (key.invocation, key.execution));
+    for pair in exact.windows(2) {
+        if pair[0].invocation == pair[1].invocation && pair[0] != pair[1] {
+            // One logical invocation has exactly one terminal execution.
+            // A batch may retry the same fact, but it cannot mint competing
+            // terminal executions beneath the same Patricia key.
+            return Err(JournalStoreError::Conflict);
+        }
+    }
+    exact.dedup();
+    if exact.len() > MAX_REPLAY_SUFFIX_ENTRIES {
+        return Err(JournalStoreError::LimitExceeded);
+    }
+    let history = InvocationHistory::open(store, genesis, InvocationOwnershipScope::Ordered, root)
+        .map_err(map_invocation_history_error)?;
+    history
+        .require_history_purpose(true)
+        .map_err(map_invocation_history_error)?;
+    let mut missing = Vec::new();
+    for key in exact {
+        let fact = super::journal::InvocationAcknowledgedFact::for_transition_proof_retirement(
+            genesis, key,
+        )
+        .map_err(|_| JournalStoreError::NonCanonical)?;
+        match history
+            .lookup(fact.key())
+            .map_err(map_invocation_history_error)?
+        {
+            Some(existing) if existing == fact => {}
+            Some(_) => return Err(JournalStoreError::Conflict),
+            None => missing.push(fact),
+        }
+    }
+    missing.sort_unstable_by_key(|fact| fact.key().invocation);
+    Ok(missing)
+}
+
+fn transition_proof_key_is_retired<S: InvocationHistoryStore<Error = JournalStoreError>>(
+    store: &S,
+    genesis: AgentJournalGenesisId,
+    root: Option<InvocationHistoryNodeId>,
+    key: crate::agent_sdk::proof::TransitionProofKey,
+) -> Result<bool, JournalStoreError> {
+    if !key.validate() {
+        return Err(JournalStoreError::NonCanonical);
+    }
+    Ok(transition_proof_retirement_for_invocation(store, genesis, root, key.invocation)?.is_some())
+}
+
+pub(crate) fn transition_proof_retirement_for_invocation<
+    S: InvocationHistoryStore<Error = JournalStoreError>,
+>(
+    store: &S,
+    genesis: AgentJournalGenesisId,
+    root: Option<InvocationHistoryNodeId>,
+    invocation: crate::agent_sdk::InvocationId,
+) -> Result<Option<crate::agent_sdk::proof::TransitionProofKey>, JournalStoreError> {
+    if invocation == crate::agent_sdk::InvocationId::ZERO {
+        return Err(JournalStoreError::NonCanonical);
+    }
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    let history = InvocationHistory::open(
+        store,
+        genesis,
+        InvocationOwnershipScope::Ordered,
+        Some(root),
+    )
+    .map_err(map_invocation_history_error)?;
+    history
+        .require_history_purpose(true)
+        .map_err(map_invocation_history_error)?;
+    let lookup = super::journal::InvocationOwnershipKey {
+        scope: InvocationOwnershipScope::Ordered,
+        invocation: crate::service::InvocationId(*invocation.as_bytes()),
+    };
+    match history
+        .lookup(lookup)
+        .map_err(map_invocation_history_error)?
+    {
+        Some(fact) => fact
+            .transition_proof_retirement_key()
+            .filter(|key| key.invocation == invocation)
+            .map(Some)
+            .ok_or(JournalStoreError::Corrupt),
+        None => Ok(None),
+    }
+}
+
+impl<S> VerifiedTransitionPublisher for JournalVerifiedTransitionPublisher<'_, S>
+where
+    S: TransitionProofPublicationStore,
+{
+    type Error = JournalStoreError;
+
+    fn load_published(
+        &mut self,
+        key: crate::agent_sdk::proof::TransitionProofKey,
+    ) -> Result<Option<PublishedAttestedTransition>, Self::Error> {
+        if !key.validate() {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        let heads = self
+            .store
+            .heads()?
+            .ok_or(JournalStoreError::NotInitialized)?;
+        validate_head_targets(self.store, &heads)?;
+        let mut roots = vec![heads.transition_proofs];
+        if let Some(checkpoint_id) = heads.checkpoint {
+            let checkpoint = require_record::<S, CheckpointManifest>(self.store, checkpoint_id)?;
+            if checkpoint.genesis != heads.genesis {
+                return Err(JournalStoreError::Corrupt);
+            }
+            if !roots.contains(&checkpoint.transition_proofs) {
+                roots.push(checkpoint.transition_proofs);
+            }
+        }
+
+        let mut found = None;
+        for root in roots {
+            let index = validate_transition_proof_index_closure(self.store, root, &heads)?;
+            let Some(entry) = index.get(key) else {
+                continue;
+            };
+            let proof = require_record::<S, JournalTransitionProof>(self.store, entry.record)?;
+            let canonical_work = require_transition_proof_blob(self.store, proof.canonical_work())?;
+            let canonical_transition =
+                require_transition_proof_blob(self.store, proof.canonical_transition())?;
+            let manifest = require_transition_proof_blob(
+                self.store,
+                &service_proof_blob(&proof.proof_record().proof),
+            )?;
+            if manifest != proof.proof_manifest_wire() {
+                return Err(JournalStoreError::Corrupt);
+            }
+            let published = PublishedAttestedTransition::reconstruct(
+                canonical_work,
+                canonical_transition,
+                proof.proof_record().clone(),
+                manifest,
+                crate::agent_sdk::Hash(proof.publication().0),
+            )
+            .map_err(|_| JournalStoreError::Corrupt)?;
+            if found
+                .as_ref()
+                .is_some_and(|retained| retained != &published)
+            {
+                return Err(JournalStoreError::Corrupt);
+            }
+            found = Some(published);
+        }
+        Ok(found)
+    }
+
+    fn load_retired(
+        &mut self,
+        key: crate::agent_sdk::proof::TransitionProofKey,
+    ) -> Result<Option<AuthenticatedTransitionRetirement>, Self::Error> {
+        if !key.validate() {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        let heads = self
+            .store
+            .heads()?
+            .ok_or(JournalStoreError::NotInitialized)?;
+        // Retirement recovery is intentionally not coupled to the one-write
+        // freshness window required by destructive GC. Current heads carry
+        // their authenticated checkpoint pointer forward across later
+        // publications; validate that complete ancestry/closure, then query
+        // the checkpoint's compact proof index. This lets a producer which
+        // was offline across Ack, checkpoint, and subsequent writes safely
+        // reclaim its exact private key without reopening a one-revision
+        // window.
+        validate_head_targets(self.store, &heads)?;
+        let Some(checkpoint_id) = heads.checkpoint else {
+            return Ok(None);
+        };
+        let checkpoint = require_record::<S, CheckpointManifest>(self.store, checkpoint_id)?;
+        if checkpoint.id() != checkpoint_id
+            || checkpoint.genesis != heads.genesis
+            || checkpoint.publication_revision >= heads.publication_revision
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let proof_index = require_record::<S, TransitionProofIndexManifest>(
+            self.store,
+            checkpoint.transition_proofs,
+        )?;
+        if proof_index.genesis != heads.genesis || proof_index.id() != checkpoint.transition_proofs
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let Some(root) = proof_index.retired_root() else {
+            return Ok(None);
+        };
+        let Some(retired_key) = transition_proof_retirement_for_invocation(
+            self.store,
+            heads.genesis,
+            Some(root),
+            key.invocation,
+        )?
+        else {
+            return Ok(None);
+        };
+        AuthenticatedTransitionRetirement::new(
+            retired_key,
+            crate::agent_sdk::Hash(*checkpoint.id().as_bytes()),
+            checkpoint.publication_revision,
+        )
+        .map(Some)
+        .ok_or(JournalStoreError::Corrupt)
+    }
+}
+
+fn map_transition_proof_index_error(
+    error: super::transition_proof_journal::TransitionProofIndexError,
+) -> JournalStoreError {
+    use super::transition_proof_journal::TransitionProofIndexError;
+    match error {
+        TransitionProofIndexError::Invalid => JournalStoreError::Corrupt,
+        TransitionProofIndexError::Missing | TransitionProofIndexError::Conflict => {
+            JournalStoreError::Conflict
+        }
+        TransitionProofIndexError::Capacity => JournalStoreError::Backpressure,
+    }
+}
+
+fn require_transition_proof_blob<S: AgentJournalStore>(
+    store: &S,
+    reference: &BlobRef,
+) -> Result<Vec<u8>, JournalStoreError> {
+    store
+        .load_blob(JournalBlobClass::TransitionProof, reference)?
+        .ok_or(JournalStoreError::MissingObject)
+}
+
+fn validate_transition_proof_anchor<S: AgentJournalStore>(
+    reader: &TransitionProofClosureReader<'_, S>,
+    proof: &JournalTransitionProof,
+    predecessor: &JournalHeads,
+    input: &ReplayInput,
+) -> Result<(), JournalStoreError> {
+    match proof.anchor() {
+        TransitionProofAnchor::Ordered {
+            entry,
+            index,
+            merge_frontier,
+            merge_seal,
+        } => {
+            let retained = reader.require_record::<OrderedEntry>(entry)?;
+            if retained.genesis != proof.genesis()
+                || retained.input.id() != proof.input()
+                || &retained.input != input
+                || retained.index != index
+                || retained.parent != predecessor.ordered_head
+                || predecessor.ordered_index.checked_add(1) != Some(index)
+                || retained.merge_frontier != merge_frontier
+                || retained.merge_seal != merge_seal
+            {
+                return Err(JournalStoreError::Corrupt);
+            }
+        }
+        TransitionProofAnchor::Local {
+            entry,
+            node,
+            revision,
+            ordered_base,
+            merge_frontier,
+        } => {
+            let retained = reader.require_record::<LocalEntry>(entry)?;
+            if retained.genesis != proof.genesis()
+                || retained.input.id() != proof.input()
+                || &retained.input != input
+                || retained.node != node
+                || node != predecessor.node
+                || retained.revision != revision
+                || retained.parent != predecessor.local_head
+                || predecessor.local_revision.checked_add(1) != Some(revision)
+                || retained.ordered_base != ordered_base
+                || ordered_base != ordered_base_from_heads(predecessor)
+                || retained.merge_frontier != merge_frontier
+                || merge_frontier != predecessor.merge_frontier
+            {
+                return Err(JournalStoreError::Corrupt);
+            }
+        }
+        TransitionProofAnchor::Merge {
+            event,
+            causal_height,
+            ordered_base,
+        } => {
+            let retained = reader.require_record::<MergeEvent>(event)?;
+            if retained.genesis != proof.genesis()
+                || retained.input.id() != proof.input()
+                || &retained.input != input
+                || retained.causal_height != causal_height
+                || retained.ordered_base != ordered_base
+                || ordered_base.index > predecessor.ordered_index
+            {
+                return Err(JournalStoreError::Corrupt);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ordered_base_from_heads(heads: &JournalHeads) -> OrderedBase {
+    OrderedBase {
+        index: heads.ordered_index,
+        head: heads.ordered_head,
+    }
+}
+
+fn validate_transition_proof_work(
+    input: &ReplayInput,
+    proof: &JournalTransitionProof,
+    canonical_work: &[u8],
+    canonical_transition: &[u8],
+) -> Result<(), JournalStoreError> {
+    let decoded_work = crate::agent_sdk::RuntimeWork::decode(canonical_work)
+        .map_err(|_| JournalStoreError::Corrupt)?;
+    if decoded_work
+        .encode()
+        .map_err(|_| JournalStoreError::Corrupt)?
+        != canonical_work
+    {
+        return Err(JournalStoreError::Corrupt);
+    }
+    let (context, work) = match (&input.operation, &decoded_work) {
+        (
+            ReplayOperation::CleanInvoke {
+                context,
+                work,
+                authorization,
+                observed_slot,
+            },
+            crate::agent_sdk::RuntimeWork::Invoke {
+                context: exact_context,
+                invocation,
+                authorization: exact_authorization,
+                observed_slot: exact_slot,
+                ..
+            },
+        ) if context == exact_context
+            && work == invocation.as_ref()
+            && authorization == exact_authorization.as_ref()
+            && observed_slot == exact_slot =>
+        {
+            (*context, work)
+        }
+        (
+            ReplayOperation::CleanResume {
+                context,
+                work,
+                yielded,
+                ..
+            },
+            crate::agent_sdk::RuntimeWork::Resume {
+                context: exact_context,
+                resume,
+                ..
+            },
+        ) if context == exact_context
+            && resume.invocation == yielded.invocation
+            && resume.actor == yielded.actor
+            && resume.incarnation == yielded.incarnation
+            && resume.deployment == yielded.deployment
+            && resume.program == yielded.program
+            && resume.mode == yielded.mode
+            && resume.continuation == yielded.continuation
+            && resume.ready_sequence == yielded.ready_sequence
+            && resume.installation_data == yielded.installation_data
+            && resume.availability == work.availability
+            && resume.input.is_none() =>
+        {
+            (*context, work)
+        }
+        _ => return Err(JournalStoreError::Corrupt),
+    };
+    let crate::agent_sdk::RuntimeExecutionContext::Attested { proof_system } = context else {
+        return Err(JournalStoreError::Corrupt);
+    };
+    let statement = &proof.proof_record().statement;
+    let subject = &statement.subject;
+    if statement.proof_system != proof_system
+        || statement.work
+            != crate::agent_sdk::proof::TransitionProofStatement::work_commitment(canonical_work)
+        || statement.transition
+            != crate::agent_sdk::proof::TransitionProofStatement::transition_commitment(
+                canonical_transition,
+            )
+        || subject.space != work.space
+        || subject.agent != work.agent
+        || subject.runtime_deployment != work.runtime_deployment
+        || subject.actor != work.actor
+        || subject.incarnation != work.incarnation
+        || subject.actor_deployment != work.deployment
+        || subject.actor_program != work.program
+        || subject.invocation != work.invocation
+        || subject.mode != work.mode
+        || subject.space.0 != input.runtime.space.0
+        || subject.agent.0 != input.runtime.agent.0
+        || subject.runtime_deployment.0 != input.runtime.deployment.0
+        || subject.runtime_program.0 != input.runtime.program.0
+        || service_proof_blob(&subject.runtime_package) != input.runtime.package
+    {
+        return Err(JournalStoreError::Corrupt);
+    }
+    let decoded_transition = crate::agent_sdk::RuntimeTransition::decode(canonical_transition)
+        .map_err(|_| JournalStoreError::Corrupt)?;
+    if decoded_transition
+        .encode()
+        .map_err(|_| JournalStoreError::Corrupt)?
+        != canonical_transition
+    {
+        return Err(JournalStoreError::Corrupt);
+    }
+    Ok(())
+}
+
+/// One proof may consume every independently bounded public payload, but an
+/// authenticated index must not multiply those maxima by its record count.
+/// This budget counts unique physical blob identities across the complete
+/// closure; the index separately charges proof material logically per record.
+const MAX_TRANSITION_PROOF_CLOSURE_REFERENCED_BYTES: u64 = MAX_TRANSITION_PROOF_INDEX_MATERIAL_BYTES
+    + MAX_ARTIFACT_CLOSURE_REFERENCED_BYTES
+    + crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES as u64
+    + crate::agent_sdk::wire::MAX_RUNTIME_TRANSITION_WIRE_BYTES as u64
+    + crate::agent_sdk::proof::MAX_TRANSITION_PROOF_MATERIAL_MANIFEST_BYTES as u64;
+/// Complete unique encoded-read allowance for one proof-index authentication.
+/// It admits one proof at every current payload/object maximum plus one full
+/// retirement-history path, while preventing small authenticated references
+/// from turning closure validation into an unbounded number of store reads.
+const MAX_TRANSITION_PROOF_CLOSURE_READ_BYTES: u64 = 160 * 1024 * 1024;
+const MAX_TRANSITION_PROOF_CLOSURE_FETCHES: usize = 64 * 1024;
+
+type ProofClosureObjectKey = (JournalStorageClass, [u8; 32]);
+type ProofClosureBlobKey = (JournalBlobClass, Hash, u64);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TransitionProofClosureReadReport {
+    bytes: u64,
+    fetches: usize,
+    referenced_bytes: u64,
+    catalog_bytes: u64,
+    catalog_references: usize,
+}
+
+#[derive(Default)]
+struct TransitionProofClosureReadState {
+    report: TransitionProofClosureReadReport,
+    objects: BTreeMap<ProofClosureObjectKey, Arc<dyn Any + Send + Sync>>,
+    blobs: BTreeMap<ProofClosureBlobKey, Arc<[u8]>>,
+    history_nodes: BTreeMap<InvocationHistoryNodeId, Arc<[u8]>>,
+    referenced: BTreeSet<ProofClosureBlobKey>,
+    catalog: BTreeSet<(Hash, u64)>,
+}
+
+impl TransitionProofClosureReadState {
+    fn remaining_read_work(&self) -> Result<(u64, usize), JournalStoreError> {
+        let bytes = MAX_TRANSITION_PROOF_CLOSURE_READ_BYTES
+            .checked_sub(self.report.bytes)
+            .ok_or(JournalStoreError::LimitExceeded)?;
+        let fetches = MAX_TRANSITION_PROOF_CLOSURE_FETCHES
+            .checked_sub(self.report.fetches)
+            .ok_or(JournalStoreError::LimitExceeded)?;
+        Ok((bytes, fetches))
+    }
+
+    fn charge_read(&mut self, bytes: u64, fetches: usize) -> Result<(), JournalStoreError> {
+        let next_bytes = self
+            .report
+            .bytes
+            .checked_add(bytes)
+            .ok_or(JournalStoreError::LimitExceeded)?;
+        let next_fetches = self
+            .report
+            .fetches
+            .checked_add(fetches)
+            .ok_or(JournalStoreError::LimitExceeded)?;
+        if next_bytes > MAX_TRANSITION_PROOF_CLOSURE_READ_BYTES
+            || next_fetches > MAX_TRANSITION_PROOF_CLOSURE_FETCHES
+        {
+            return Err(JournalStoreError::LimitExceeded);
+        }
+        self.report.bytes = next_bytes;
+        self.report.fetches = next_fetches;
+        Ok(())
+    }
+
+    fn reference(
+        &mut self,
+        class: JournalBlobClass,
+        reference: &BlobRef,
+    ) -> Result<(), JournalStoreError> {
+        let key = (class, reference.hash, reference.len);
+        if self.referenced.insert(key) {
+            self.report.referenced_bytes = self
+                .report
+                .referenced_bytes
+                .checked_add(reference.len)
+                .ok_or(JournalStoreError::LimitExceeded)?;
+            if self.report.referenced_bytes > MAX_TRANSITION_PROOF_CLOSURE_REFERENCED_BYTES {
+                return Err(JournalStoreError::LimitExceeded);
+            }
+        }
+        if class == JournalBlobClass::CatalogArtifact
+            && self.catalog.insert((reference.hash, reference.len))
+        {
+            self.report.catalog_references += 1;
+            self.report.catalog_bytes = self
+                .report
+                .catalog_bytes
+                .checked_add(reference.len)
+                .ok_or(JournalStoreError::LimitExceeded)?;
+            if self.report.catalog_references > MAX_ARTIFACT_CLOSURE_ENTRIES
+                || self.report.catalog_bytes > MAX_ARTIFACT_CLOSURE_REFERENCED_BYTES
+            {
+                return Err(JournalStoreError::LimitExceeded);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Ephemeral authenticated reader for one proof-index traversal. Cached
+/// values never outlive the head validation which established their root.
+struct TransitionProofClosureReader<'store, S> {
+    store: &'store S,
+    state: RefCell<TransitionProofClosureReadState>,
+}
+
+impl<'store, S: AgentJournalStore> TransitionProofClosureReader<'store, S> {
+    fn new(store: &'store S) -> Self {
+        Self {
+            store,
+            state: RefCell::new(TransitionProofClosureReadState::default()),
+        }
+    }
+
+    fn report(&self) -> TransitionProofClosureReadReport {
+        self.state.borrow().report
+    }
+
+    fn require_record<R>(&self, id: R::Id) -> Result<Arc<R>, JournalStoreError>
+    where
+        R: CanonicalJournalRecord + Any + Send + Sync,
+    {
+        self.require_record_with(id, |max_bytes, max_fetches| {
+            self.store
+                .get_with_work_limit::<R>(id, max_bytes, max_fetches)
+        })
+    }
+
+    fn historical_heads(&self, id: JournalHeadsId) -> Result<Arc<JournalHeads>, JournalStoreError> {
+        self.require_record_with(id, |max_bytes, max_fetches| {
+            self.store
+                .historical_heads_with_work_limit(id, max_bytes, max_fetches)
+        })
+    }
+
+    fn require_record_with<R>(
+        &self,
+        id: R::Id,
+        load: impl FnOnce(u64, usize) -> Result<(Option<R>, u64, usize), JournalStoreError>,
+    ) -> Result<Arc<R>, JournalStoreError>
+    where
+        R: CanonicalJournalRecord + Any + Send + Sync,
+    {
+        let key = (R::STORAGE_CLASS, *id.as_bytes());
+        if let Some(cached) = self.state.borrow().objects.get(&key).cloned() {
+            return Arc::downcast::<R>(cached).map_err(|_| JournalStoreError::Corrupt);
+        }
+
+        let (max_bytes, max_fetches) = self.state.borrow().remaining_read_work()?;
+        let (record, bytes, fetches) = load(max_bytes, max_fetches)?;
+        self.state.borrow_mut().charge_read(bytes, fetches)?;
+        let record = record.ok_or(JournalStoreError::MissingObject)?;
+        if record.id() != id || record.validate().is_err() {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let record = Arc::new(record);
+        self.state.borrow_mut().objects.insert(key, record.clone());
+        Ok(record)
+    }
+
+    fn require_blob(
+        &self,
+        class: JournalBlobClass,
+        reference: &BlobRef,
+    ) -> Result<Arc<[u8]>, JournalStoreError> {
+        validate_blob_reference(class, reference)?;
+        let key = (class, reference.hash, reference.len);
+        if let Some(cached) = self.state.borrow().blobs.get(&key).cloned() {
+            return Ok(cached);
+        }
+
+        {
+            let mut state = self.state.borrow_mut();
+            state.reference(class, reference)?;
+        }
+        let (max_bytes, max_fetches) = self.state.borrow().remaining_read_work()?;
+        let (bytes, read_bytes, fetches) =
+            self.store
+                .load_blob_with_work_limit(class, reference, max_bytes, max_fetches)?;
+        self.state.borrow_mut().charge_read(read_bytes, fetches)?;
+        let bytes = bytes.ok_or(JournalStoreError::MissingObject)?;
+        if !reference.matches(&bytes) {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let bytes: Arc<[u8]> = bytes.into();
+        self.state.borrow_mut().blobs.insert(key, bytes.clone());
+        Ok(bytes)
+    }
+}
+
+impl<S: AgentJournalStore> InvocationHistoryStore for TransitionProofClosureReader<'_, S> {
+    type Error = JournalStoreError;
+
+    fn load_history_node(
+        &self,
+        id: InvocationHistoryNodeId,
+    ) -> Result<Option<Vec<u8>>, Self::Error> {
+        if let Some(cached) = self.state.borrow().history_nodes.get(&id).cloned() {
+            return Ok(Some(cached.as_ref().to_vec()));
+        }
+        let (max_bytes, max_fetches) = self.state.borrow().remaining_read_work()?;
+        let (bytes, read_bytes, fetches) =
+            self.store
+                .load_history_node_with_work_limit(id, max_bytes, max_fetches)?;
+        self.state.borrow_mut().charge_read(read_bytes, fetches)?;
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        let node = InvocationHistoryNode::decode(&bytes).map_err(|_| JournalStoreError::Corrupt)?;
+        if node.id() != id || node.encode() != bytes {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let bytes: Arc<[u8]> = bytes.into();
+        self.state
+            .borrow_mut()
+            .history_nodes
+            .insert(id, bytes.clone());
+        Ok(Some(bytes.as_ref().to_vec()))
+    }
+}
+
+fn validate_transition_proof_index_closure<S: AgentJournalStore>(
+    store: &S,
+    index_id: super::journal::TransitionProofIndexId,
+    heads: &JournalHeads,
+) -> Result<TransitionProofIndexManifest, JournalStoreError> {
+    validate_transition_proof_index_closure_with_report(store, index_id, heads)
+        .map(|(index, _)| index)
+}
+
+fn validate_transition_proof_index_closure_with_report<S: AgentJournalStore>(
+    store: &S,
+    index_id: super::journal::TransitionProofIndexId,
+    heads: &JournalHeads,
+) -> Result<
+    (
+        TransitionProofIndexManifest,
+        TransitionProofClosureReadReport,
+    ),
+    JournalStoreError,
+> {
+    let reader = TransitionProofClosureReader::new(store);
+    let index = reader.require_record::<TransitionProofIndexManifest>(index_id)?;
+    if index.genesis != heads.genesis {
+        return Err(JournalStoreError::Corrupt);
+    }
+    validate_transition_proof_retirement_history(&reader, &index)?;
+    for entry in index.entries() {
+        let proof = reader.require_record::<JournalTransitionProof>(entry.record)?;
+        if proof.genesis() != heads.genesis
+            || TransitionProofIndexEntry::for_record(&proof)
+                .map_err(|_| JournalStoreError::Corrupt)?
+                != *entry
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let predecessor = reader.historical_heads(proof.predecessor())?;
+        if predecessor.id() != proof.predecessor()
+            || predecessor.genesis != heads.genesis
+            || predecessor.admission != heads.admission
+            || predecessor.node != heads.node
+            || predecessor.publication_revision >= heads.publication_revision
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let input = reader.require_record::<ReplayInput>(proof.input())?;
+        validate_transition_proof_anchor(&reader, &proof, &predecessor, &input)?;
+        let canonical_work =
+            reader.require_blob(JournalBlobClass::TransitionProof, proof.canonical_work())?;
+        let canonical_transition = reader.require_blob(
+            JournalBlobClass::TransitionProof,
+            proof.canonical_transition(),
+        )?;
+        validate_transition_proof_work(&input, &proof, &canonical_work, &canonical_transition)?;
+
+        let manifest_reference = service_proof_blob(&proof.proof_record().proof);
+        let manifest =
+            reader.require_blob(JournalBlobClass::TransitionProof, &manifest_reference)?;
+        if manifest.as_ref() != proof.proof_manifest_wire() {
+            return Err(JournalStoreError::Corrupt);
+        }
+        for chunk in &proof.proof_manifest().chunks {
+            reader.require_blob(
+                JournalBlobClass::TransitionProof,
+                &service_proof_blob(chunk),
+            )?;
+        }
+        let closure = reader.require_record::<ArtifactClosure>(proof.artifacts())?;
+        if closure.genesis != heads.genesis
+            || !closure.artifacts.contains(&input.runtime.package)
+            || !closure.artifacts.contains(proof.actor_package())
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        for reference in &closure.artifacts {
+            reader.require_blob(JournalBlobClass::CatalogArtifact, reference)?;
+        }
+    }
+    let report = reader.report();
+    let index = Arc::unwrap_or_clone(index);
+    Ok((index, report))
 }
 
 fn validate_invocation_index<S: AgentJournalStore>(
@@ -2259,6 +4880,41 @@ fn map_invocation_history_error(
     }
 }
 
+/// Authenticate the retirement-history root and prove that its permanent
+/// tombstones are disjoint from the current live projection.
+///
+/// Retirement history is cumulative and intentionally has no protocol-wide
+/// cardinality ceiling. The root carries an authenticated tree-wide purpose;
+/// each membership check below follows at most one 256-bit Patricia path.
+/// Superseded path nodes are handled by the exact history-retirement queue,
+/// independently of ordinary object sweeping.
+fn validate_transition_proof_retirement_history<
+    S: InvocationHistoryStore<Error = JournalStoreError>,
+>(
+    store: &S,
+    index: &TransitionProofIndexManifest,
+) -> Result<(), JournalStoreError> {
+    let Some(root) = index.retired_root() else {
+        return Ok(());
+    };
+    let history = InvocationHistory::open(
+        store,
+        index.genesis,
+        InvocationOwnershipScope::Ordered,
+        Some(root),
+    )
+    .map_err(map_invocation_history_error)?;
+    history
+        .require_history_purpose(true)
+        .map_err(map_invocation_history_error)?;
+    for key in index.live_entries() {
+        if transition_proof_key_is_retired(store, index.genesis, Some(root), *key)? {
+            return Err(JournalStoreError::Corrupt);
+        }
+    }
+    Ok(())
+}
+
 fn validate_checkpoint_closure<S: AgentJournalStore>(
     store: &S,
     checkpoint: &CheckpointManifest,
@@ -2283,6 +4939,12 @@ fn validate_checkpoint_closure<S: AgentJournalStore>(
         checkpoint.genesis,
         InvocationOwnershipScope::Merge,
     )?;
+    let transition_proofs =
+        require_record::<S, TransitionProofIndexManifest>(store, checkpoint.transition_proofs)?;
+    if transition_proofs.genesis != checkpoint.genesis {
+        return Err(JournalStoreError::Corrupt);
+    }
+    validate_transition_proof_retirement_history(store, &transition_proofs)?;
     validate_merge_fence_structure(
         store,
         checkpoint.genesis,
@@ -2354,11 +5016,13 @@ fn validate_checkpoint_closure<S: AgentJournalStore>(
 fn validate_checkpoint_publication<S: AgentJournalStore>(
     store: &S,
     current: &JournalHeads,
+    next_transition_proofs: TransitionProofIndexId,
     checkpoint: &CheckpointManifest,
 ) -> Result<(), JournalStoreError> {
     if checkpoint.runtime != current.runtime
         || checkpoint.ordered_invocations != current.ordered_invocations
         || checkpoint.merge_invocations != current.merge_invocations
+        || checkpoint.transition_proofs != next_transition_proofs
         || checkpoint
             .lanes
             .iter()
@@ -2425,6 +5089,7 @@ fn fresh_gc_checkpoint<S: AgentJournalStore>(
         || checkpoint.merge_seal != heads.merge_seal
         || checkpoint.ordered_invocations != heads.ordered_invocations
         || checkpoint.merge_invocations != heads.merge_invocations
+        || checkpoint.transition_proofs != heads.transition_proofs
     {
         return Err(JournalStoreError::Conflict);
     }
@@ -2485,6 +5150,56 @@ fn mark_catalog_blob<S: AgentJournalStore>(
 ) -> Result<(), JournalStoreError> {
     require_blob(store, JournalBlobClass::CatalogArtifact, reference)?;
     mark.blob(JournalBlobClass::CatalogArtifact, reference)
+}
+
+fn mark_transition_proof_index<S: AgentJournalStore>(
+    store: &S,
+    mark: &mut GcMark,
+    id: super::journal::TransitionProofIndexId,
+    heads: &JournalHeads,
+) -> Result<(), JournalStoreError> {
+    let index = validate_transition_proof_index_closure(store, id, heads)?;
+    mark.object::<TransitionProofIndexManifest>(id)?;
+    for entry in index.entries() {
+        let proof = require_record::<S, JournalTransitionProof>(store, entry.record)?;
+        mark.object::<JournalTransitionProof>(entry.record)?;
+        mark.object::<ReplayInput>(proof.input())?;
+        mark.object::<JournalHeads>(proof.predecessor())?;
+        match proof.anchor() {
+            TransitionProofAnchor::Ordered { entry, .. } => {
+                mark.object::<OrderedEntry>(entry)?;
+            }
+            TransitionProofAnchor::Local { entry, .. } => {
+                mark.object::<LocalEntry>(entry)?;
+            }
+            TransitionProofAnchor::Merge { event, .. } => {
+                mark.object::<MergeEvent>(event)?;
+            }
+        }
+
+        mark.blob(JournalBlobClass::TransitionProof, proof.canonical_work())?;
+        mark.blob(
+            JournalBlobClass::TransitionProof,
+            proof.canonical_transition(),
+        )?;
+        mark.blob(
+            JournalBlobClass::TransitionProof,
+            &service_proof_blob(&proof.proof_record().proof),
+        )?;
+        for chunk in &proof.proof_manifest().chunks {
+            mark.blob(
+                JournalBlobClass::TransitionProof,
+                &service_proof_blob(chunk),
+            )?;
+        }
+
+        let artifacts = require_record::<S, ArtifactClosure>(store, proof.artifacts())?;
+        mark.object::<ArtifactClosure>(proof.artifacts())?;
+        for artifact in &artifacts.artifacts {
+            mark_catalog_blob(store, mark, artifact)?;
+        }
+    }
+    Ok(())
 }
 
 fn mark_lane_state<S: AgentJournalStore>(
@@ -2706,6 +5421,19 @@ fn build_gc_mark<S: AgentJournalStore>(
         InvocationOwnershipScope::Local(heads.node),
         limits.max_index_nodes,
     )?;
+
+    // A fresh checkpoint and its successor currently share the compacted
+    // proof root, but mark both explicitly so a later wire generation may
+    // separate checkpoint history from the live projection without silently
+    // weakening collection reachability.
+    mark_transition_proof_index(store, &mut mark, checkpoint.transition_proofs, &heads)?;
+    mark_transition_proof_index(store, &mut mark, heads.transition_proofs, &heads)?;
+    if let Some(previous) = heads.previous {
+        store
+            .historical_heads(previous)?
+            .ok_or(JournalStoreError::MissingObject)?;
+        mark.object::<JournalHeads>(previous)?;
+    }
 
     Ok((
         GcIntent {
@@ -2982,6 +5710,116 @@ struct RetainedMergeBoundary {
     tips: BTreeSet<MergeEventId>,
 }
 
+/// Resolve the proof-index image which became authoritative at one exact
+/// replay boundary. A checkpoint is a direct authenticated boundary. For a
+/// newer Merge fence, walk the bounded post-checkpoint heads history back to
+/// the first successor carrying that fence; later publications with the same
+/// fence may contain terminal facts which occur after the boundary and must
+/// not be applied retroactively while replaying its retained suffix.
+pub(crate) fn transition_proof_index_at_replay_boundary<S: AgentJournalStore>(
+    store: &S,
+    heads: &JournalHeads,
+    boundary: OrderedBase,
+) -> Result<TransitionProofIndexManifest, JournalStoreError> {
+    if heads.validate().is_err()
+        || heads.id() == JournalHeadsId::ZERO
+        || boundary.validate().is_err()
+        || boundary.index > heads.merge_fence.index
+        || (boundary.index == heads.merge_fence.index && boundary.head != heads.merge_fence.head)
+    {
+        return Err(JournalStoreError::Corrupt);
+    }
+
+    let checkpoint = heads
+        .checkpoint
+        .map(|id| require_record::<S, CheckpointManifest>(store, id))
+        .transpose()?;
+    if let Some(checkpoint) = &checkpoint {
+        if checkpoint.id() != heads.checkpoint.ok_or(JournalStoreError::Corrupt)?
+            || checkpoint.genesis != heads.genesis
+            || checkpoint.publication_revision >= heads.publication_revision
+            || checkpoint.merge_fence.index > boundary.index
+            || (checkpoint.merge_fence.index == boundary.index
+                && checkpoint.merge_fence.head != boundary.head)
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        if checkpoint.merge_fence == boundary {
+            let index = require_record::<S, TransitionProofIndexManifest>(
+                store,
+                checkpoint.transition_proofs,
+            )?;
+            return (index.genesis == heads.genesis && index.id() == checkpoint.transition_proofs)
+                .then_some(index)
+                .ok_or(JournalStoreError::Corrupt);
+        }
+    } else if boundary == OrderedBase::post_genesis() {
+        let empty = TransitionProofIndexManifest::empty(heads.genesis);
+        let stored = require_record::<S, TransitionProofIndexManifest>(store, empty.id())?;
+        return (stored == empty)
+            .then_some(stored)
+            .ok_or(JournalStoreError::Corrupt);
+    }
+
+    let minimum_revision = checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint.publication_revision.saturating_add(1))
+        .unwrap_or(0);
+    let mut cursor = heads.clone();
+    for _ in 0..=MAX_REPLAY_SUFFIX_ENTRIES.saturating_add(1) {
+        if cursor.merge_fence == boundary {
+            let is_first_successor = if cursor.publication_revision == minimum_revision {
+                true
+            } else {
+                let previous_id = cursor.previous.ok_or(JournalStoreError::MissingObject)?;
+                let previous = store
+                    .historical_heads(previous_id)?
+                    .ok_or(JournalStoreError::MissingObject)?;
+                if previous.id() != previous_id
+                    || previous.genesis != heads.genesis
+                    || previous.admission != heads.admission
+                    || previous.node != heads.node
+                    || previous.publication_revision.checked_add(1)
+                        != Some(cursor.publication_revision)
+                {
+                    return Err(JournalStoreError::Corrupt);
+                }
+                if previous.merge_fence == boundary {
+                    cursor = previous;
+                    continue;
+                }
+                true
+            };
+            if is_first_successor {
+                let index = require_record::<S, TransitionProofIndexManifest>(
+                    store,
+                    cursor.transition_proofs,
+                )?;
+                return (index.genesis == heads.genesis && index.id() == cursor.transition_proofs)
+                    .then_some(index)
+                    .ok_or(JournalStoreError::Corrupt);
+            }
+        }
+        if cursor.publication_revision <= minimum_revision {
+            break;
+        }
+        let previous_id = cursor.previous.ok_or(JournalStoreError::MissingObject)?;
+        let previous = store
+            .historical_heads(previous_id)?
+            .ok_or(JournalStoreError::MissingObject)?;
+        if previous.id() != previous_id
+            || previous.genesis != heads.genesis
+            || previous.admission != heads.admission
+            || previous.node != heads.node
+            || previous.publication_revision.checked_add(1) != Some(cursor.publication_revision)
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        cursor = previous;
+    }
+    Err(JournalStoreError::MissingObject)
+}
+
 fn retained_merge_boundary<S: AgentJournalStore>(
     store: &S,
     heads: &JournalHeads,
@@ -3118,6 +5956,21 @@ fn validate_head_targets<S: AgentJournalStore>(
         heads.genesis,
         InvocationOwnershipScope::Local(heads.node),
     )?;
+    validate_transition_proof_index_closure(store, heads.transition_proofs, heads)?;
+
+    if let Some(previous) = heads.previous {
+        let predecessor = store
+            .historical_heads(previous)?
+            .ok_or(JournalStoreError::MissingObject)?;
+        if predecessor.id() != previous
+            || predecessor.genesis != heads.genesis
+            || predecessor.admission != heads.admission
+            || predecessor.node != heads.node
+            || predecessor.publication_revision.checked_add(1) != Some(heads.publication_revision)
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+    }
 
     validate_merge_fence_structure(store, heads.genesis, heads.merge_fence, heads.merge_seal)?;
     if let Some(id) = heads.ordered_head {
@@ -3267,7 +6120,7 @@ where
         }
     } else if R::STORAGE_CLASS == JournalStorageClass::Checkpoint {
         let checkpoint = decode_anchor::<CheckpointManifest, _>(anchor)?;
-        validate_checkpoint_publication(store, current, &checkpoint)?;
+        validate_checkpoint_publication(store, current, next.transition_proofs, &checkpoint)?;
     }
     Ok(())
 }
@@ -3952,6 +6805,21 @@ fn stage_sealed_dependencies<S: SharedOrderedCommitStore>(
     if let Some(binding) = &shared_commit {
         created |= stage_shared_ordered_commit(store, binding)?;
     }
+    // AJPT closure validation dereferences its exact transition anchor. Make
+    // that immutable record durable before validating/staging the proof
+    // index; publish_anchor will read it back idempotently immediately before
+    // the sole mutable head CAS.
+    created |= match publication.anchor() {
+        ReplayPublicationAnchor::Ordered(entry) => store.put(entry)?,
+        ReplayPublicationAnchor::Local(entry) => store.put(entry)?,
+        ReplayPublicationAnchor::Merge { event, frontier } => {
+            let event_created = store.put(event)?;
+            let frontier_created = store.put(frontier)?;
+            event_created || frontier_created
+        }
+        ReplayPublicationAnchor::Checkpoint(_) => false,
+    };
+    created |= stage_transition_proof_batch(store, publication)?;
     let mut outcome_ids = BTreeSet::new();
     for sealed in publication.outcomes() {
         let record = sealed.record();
@@ -3974,7 +6842,6 @@ fn stage_sealed_dependencies<S: SharedOrderedCommitStore>(
             {
                 return Err(JournalStoreError::NonCanonical);
             }
-            created |= store.put(frontier)?;
         }
         ReplayPublicationAnchor::Checkpoint(manifest) => {
             let sealed = publication
@@ -4009,6 +6876,174 @@ fn stage_sealed_dependencies<S: SharedOrderedCommitStore>(
         }
     }
     Ok(created)
+}
+
+fn stage_transition_proof_batch<S: SharedOrderedCommitStore>(
+    store: &mut S,
+    publication: &ReplaySealedPublication,
+) -> Result<bool, JournalStoreError> {
+    let authoritative = store.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+    let next = publication.next();
+    if publication.transition_proof_actions().len() > MAX_REPLAY_SUFFIX_ENTRIES {
+        return Err(JournalStoreError::LimitExceeded);
+    }
+    let Some(batch) = publication.transition_proof_batch() else {
+        if next.transition_proofs != authoritative.transition_proofs {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        if publication.transition_proof_actions().is_empty() {
+            return Ok(false);
+        }
+        let previous = require_record::<S, TransitionProofIndexManifest>(
+            store,
+            authoritative.transition_proofs,
+        )?;
+        let (derived, retired) =
+            derive_transition_proof_apply(store, publication, &authoritative, &previous, &[])?;
+        return if derived == previous && retired.is_empty() {
+            Ok(false)
+        } else {
+            Err(JournalStoreError::NonCanonical)
+        };
+    };
+    let exact_retry = authoritative.id() == next.id();
+    let predecessor = if exact_retry {
+        let predecessor = store
+            .historical_heads(publication.expected())?
+            .ok_or(JournalStoreError::MissingObject)?;
+        if predecessor.id() != publication.expected()
+            || next.previous != Some(predecessor.id())
+            || authoritative != *next
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        predecessor
+    } else {
+        if authoritative.id() != publication.expected() {
+            return Err(JournalStoreError::Conflict);
+        }
+        authoritative
+    };
+    if batch.store() != store.instance_id()
+        || batch.predecessor() != publication.expected()
+        || batch.previous() != predecessor.transition_proofs
+        || batch.next().id() != next.transition_proofs
+        || batch.next().genesis != predecessor.genesis
+    {
+        return Err(JournalStoreError::Conflict);
+    }
+    let previous = require_record::<S, TransitionProofIndexManifest>(store, batch.previous())?;
+    let mut derived = previous.clone();
+    let mut retired_keys = Vec::new();
+    match batch.mutation() {
+        StagedTransitionProofMutation::Apply => {
+            if matches!(publication.anchor(), ReplayPublicationAnchor::Checkpoint(_))
+                || publication.transition_proof_actions().is_empty()
+            {
+                return Err(JournalStoreError::NonCanonical);
+            }
+            (derived, retired_keys) = derive_transition_proof_apply(
+                store,
+                publication,
+                &predecessor,
+                &previous,
+                batch.publications(),
+            )?;
+        }
+        StagedTransitionProofMutation::Checkpoint => {
+            if !batch.publications().is_empty()
+                || !publication.transition_proof_actions().is_empty()
+                || !matches!(publication.anchor(), ReplayPublicationAnchor::Checkpoint(_))
+                || batch.retirement_plan().is_some()
+            {
+                return Err(JournalStoreError::NonCanonical);
+            }
+            derived = derived
+                .checkpointed()
+                .map_err(map_transition_proof_index_error)?;
+        }
+    }
+    let expected_retirement_facts = missing_transition_proof_retirement_facts(
+        store,
+        predecessor.genesis,
+        previous.retired_root(),
+        &retired_keys,
+    )?;
+    match batch.retirement_plan() {
+        Some(plan) => {
+            if plan.genesis() != predecessor.genesis
+                || plan.scope() != InvocationOwnershipScope::Ordered
+                || plan.expected_root() != previous.retired_root()
+                || plan.inserted_facts() != expected_retirement_facts
+            {
+                return Err(JournalStoreError::NonCanonical);
+            }
+            derived = derived
+                .with_retired_root(previous.retired_root(), plan.root())
+                .map_err(map_transition_proof_index_error)?;
+        }
+        None if !expected_retirement_facts.is_empty()
+            || derived.retired_root() != previous.retired_root() =>
+        {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        None => {}
+    }
+    if derived != *batch.next() {
+        return Err(JournalStoreError::NonCanonical);
+    }
+    let created = store.put(batch.next())?;
+    let exact = require_record::<S, TransitionProofIndexManifest>(store, batch.next().id())?;
+    if exact != *batch.next() {
+        return Err(JournalStoreError::Corrupt);
+    }
+    validate_transition_proof_index_closure(store, batch.next().id(), next)?;
+    Ok(created)
+}
+
+fn transition_proof_publication_expected_live(
+    input: &ReplayInput,
+) -> Option<Option<crate::agent_sdk::proof::TransitionProofKey>> {
+    match &input.operation {
+        ReplayOperation::CleanInvoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+            ..
+        } => Some(None),
+        ReplayOperation::CleanResume {
+            context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+            expected_live: Some(expected_live),
+            ..
+        } => Some(Some(*expected_live)),
+        ReplayOperation::Management { .. }
+        | ReplayOperation::CleanManage { .. }
+        | ReplayOperation::Invoke { .. }
+        | ReplayOperation::CleanInvoke { .. }
+        | ReplayOperation::CleanResume { .. }
+        | ReplayOperation::CleanAcknowledge { .. }
+        | ReplayOperation::Acknowledge { .. }
+        | ReplayOperation::SealMerge => None,
+    }
+}
+
+fn transition_proof_intent_matches_input(
+    intent: ReplayTransitionProofIntent,
+    input: &ReplayInput,
+    actual_live: Option<crate::agent_sdk::proof::TransitionProofKey>,
+    target: crate::agent_sdk::proof::TransitionProofKey,
+    prepared: bool,
+) -> bool {
+    let encoded = transition_proof_publication_expected_live(input);
+    match intent {
+        ReplayTransitionProofIntent::FirstPublication => {
+            encoded == Some(None)
+                && (actual_live.is_none() || !prepared && actual_live == Some(target))
+        }
+        ReplayTransitionProofIntent::Resume(expected) => {
+            encoded == Some(Some(expected))
+                && (actual_live == Some(expected) || !prepared && actual_live == Some(target))
+        }
+        ReplayTransitionProofIntent::Recanonicalize => encoded.is_some() && actual_live.is_some(),
+    }
 }
 
 /// Process-local reference implementation used by deterministic replay and
@@ -4131,6 +7166,16 @@ impl MemoryAgentJournalStore {
             gc_intent: None,
             replayed_root: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_transition_proof_index_for_test(
+        &mut self,
+        id: super::journal::TransitionProofIndexId,
+    ) -> bool {
+        self.objects
+            .remove(&(JournalStorageClass::TransitionProofIndex, *id.as_bytes()))
+            .is_some()
     }
 
     fn copy_with_instance(&self, instance_id: JournalStoreInstanceId) -> Self {
@@ -4286,6 +7331,38 @@ impl MemoryAgentJournalStore {
             .map(Vec::as_slice)
     }
 
+    fn persist_historical_heads(
+        &mut self,
+        heads: &JournalHeads,
+    ) -> Result<bool, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
+        let encoded = encode_object(heads)?;
+        if encoded.class != JournalStorageClass::Heads || heads.node != self.node {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let key = (JournalStorageClass::Heads, encoded.id);
+        let created = match self.objects.get(&key) {
+            Some(existing) if existing == &encoded.bytes => false,
+            Some(_) => return Err(JournalStoreError::Corrupt),
+            None => {
+                self.objects.insert(key, encoded.bytes);
+                true
+            }
+        };
+        if self.historical_heads(heads.id())?.as_ref() != Some(heads) {
+            return Err(JournalStoreError::Corrupt);
+        }
+        Ok(created)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persist_historical_heads_for_test(
+        &mut self,
+        heads: &JournalHeads,
+    ) -> Result<bool, JournalStoreError> {
+        self.persist_historical_heads(heads)
+    }
+
     fn preflight_merge_event_insert(&self, encoded_bytes: usize) -> Result<(), JournalStoreError> {
         let mut objects = 0_usize;
         let mut bytes = 0_usize;
@@ -4316,6 +7393,7 @@ impl MemoryAgentJournalStore {
         anchor: &R,
         next: &JournalHeads,
         mode: ReplayPublicationMode,
+        transition_proof_change: bool,
     ) -> Result<JournalPublication, JournalStoreError> {
         self.ensure_no_gc_pending()?;
         ensure_publication_class(R::STORAGE_CLASS)?;
@@ -4333,6 +7411,16 @@ impl MemoryAgentJournalStore {
             }
             validate_head_targets(self, &current)?;
             validate_idempotent_anchor(self, &current, anchor)?;
+            let predecessor = next.previous.ok_or(JournalStoreError::Corrupt)?;
+            if predecessor != expected
+                || self
+                    .historical_heads(predecessor)?
+                    .ok_or(JournalStoreError::MissingObject)?
+                    .id()
+                    != predecessor
+            {
+                return Err(JournalStoreError::Corrupt);
+            }
             return Ok(JournalPublication {
                 object_created: false,
                 heads_advanced: false,
@@ -4345,12 +7433,19 @@ impl MemoryAgentJournalStore {
         current
             .validate_successor(next)
             .map_err(supplied_decode_error)?;
-        validate_publication_shape_with_mode(&current, anchor, next, mode)?;
+        validate_publication_shape_with_mode(
+            &current,
+            anchor,
+            next,
+            mode,
+            transition_proof_change,
+        )?;
 
         // Build the candidate in a clone so an in-memory reference has the
         // same all-or-nothing head visibility as the filesystem head swap.
         let mut candidate = self.candidate_clone();
-        let object_created = candidate.put(anchor)?;
+        let snapshot_created = candidate.persist_historical_heads(&current)?;
+        let object_created = candidate.put(anchor)? || snapshot_created;
         validate_anchor_dependencies(&candidate, &current, anchor, next)?;
         validate_head_targets(&candidate, next)?;
         candidate.heads = Some(encoded_next.bytes);
@@ -4367,7 +7462,13 @@ impl MemoryAgentJournalStore {
         anchor: &R,
         next: &JournalHeads,
     ) -> Result<JournalPublication, JournalStoreError> {
-        self.publish_anchor_with_mode(expected, anchor, next, ReplayPublicationMode::Canonical)
+        self.publish_anchor_with_mode(
+            expected,
+            anchor,
+            next,
+            ReplayPublicationMode::Canonical,
+            false,
+        )
     }
 
     fn publish_sealed_internal(
@@ -4382,16 +7483,31 @@ impl MemoryAgentJournalStore {
         self.ensure_no_gc_pending()?;
         let expected = publication.expected();
         let next = publication.next();
+        let transition_proof_plan = publication
+            .transition_proof_batch()
+            .and_then(StagedTransitionProofBatch::retirement_plan);
         let current = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
         let exact_retry = publication_is_exact_retry(&current, expected, next)?;
         if exact_retry {
-            validate_idempotent_history_plans(self, &current, publication.history_plans())?;
+            validate_idempotent_history_plans(
+                self,
+                &current,
+                publication.history_plans(),
+                transition_proof_plan,
+            )?;
         }
         let overlay = if exact_retry {
             None
         } else {
             let queue = self.history_queue(current.genesis)?.clone();
-            build_history_candidate(self, &current, next, publication.history_plans(), &queue)?
+            build_history_candidate(
+                self,
+                &current,
+                next,
+                publication.history_plans(),
+                transition_proof_plan,
+                &queue,
+            )?
         };
 
         // Build the complete candidate in a private clone. Authority history
@@ -4409,20 +7525,37 @@ impl MemoryAgentJournalStore {
             .transpose()?
             .unwrap_or(false);
         let dependency_created = stage_sealed_dependencies(&mut candidate, publication)?;
-        let mut result =
-            match publication.anchor() {
-                ReplayPublicationAnchor::Ordered(entry) => {
-                    candidate.publish_anchor_with_mode(expected, entry, next, publication.mode())?
-                }
-                ReplayPublicationAnchor::Local(entry) => {
-                    candidate.publish_anchor_with_mode(expected, entry, next, publication.mode())?
-                }
-                ReplayPublicationAnchor::Merge { event, .. } => {
-                    candidate.publish_anchor_with_mode(expected, event, next, publication.mode())?
-                }
-                ReplayPublicationAnchor::Checkpoint(checkpoint) => candidate
-                    .publish_anchor_with_mode(expected, checkpoint, next, publication.mode())?,
-            };
+        let transition_proof_change = publication.transition_proof_batch().is_some();
+        let mut result = match publication.anchor() {
+            ReplayPublicationAnchor::Ordered(entry) => candidate.publish_anchor_with_mode(
+                expected,
+                entry,
+                next,
+                publication.mode(),
+                transition_proof_change,
+            )?,
+            ReplayPublicationAnchor::Local(entry) => candidate.publish_anchor_with_mode(
+                expected,
+                entry,
+                next,
+                publication.mode(),
+                transition_proof_change,
+            )?,
+            ReplayPublicationAnchor::Merge { event, .. } => candidate.publish_anchor_with_mode(
+                expected,
+                event,
+                next,
+                publication.mode(),
+                transition_proof_change,
+            )?,
+            ReplayPublicationAnchor::Checkpoint(checkpoint) => candidate.publish_anchor_with_mode(
+                expected,
+                checkpoint,
+                next,
+                publication.mode(),
+                transition_proof_change,
+            )?,
+        };
         if result.heads_advanced
             && let Some(overlay) = &overlay
         {
@@ -4497,6 +7630,7 @@ impl MemoryAgentJournalStore {
         candidate.put(&local_invocations)?;
         candidate.genesis_admission = Some(test_admission);
         candidate.genesis = Some(encoded.bytes);
+        persist_initial_transition_proof_index(&mut candidate, &initial)?;
         candidate.heads = Some(encoded_heads.bytes);
         candidate.history_retirements =
             Some(HistoryRetirementQueue::empty(genesis.id(), self.node));
@@ -4553,6 +7687,7 @@ impl MemoryAgentJournalStore {
         }
         candidate.genesis_admission = Some(sealed.admission_commitment());
         candidate.genesis = Some(encoded.bytes);
+        persist_initial_transition_proof_index(&mut candidate, &shape.initial)?;
         candidate.heads = Some(encoded_heads.bytes);
         candidate.history_retirements =
             Some(HistoryRetirementQueue::empty(genesis.id(), self.node));
@@ -4617,6 +7752,7 @@ impl AgentJournalStore for MemoryAgentJournalStore {
         }
         candidate.genesis_admission = Some(sealed.admission_commitment());
         candidate.genesis = Some(encoded.bytes);
+        persist_initial_transition_proof_index(&mut candidate, &shape.initial)?;
         candidate.heads = Some(encoded_heads.bytes);
         candidate.history_retirements =
             Some(HistoryRetirementQueue::empty(genesis.id(), self.node));
@@ -4648,6 +7784,25 @@ impl AgentJournalStore for MemoryAgentJournalStore {
                     return Err(JournalStoreError::ScopeMismatch);
                 }
                 Ok(decoded)
+            })
+            .transpose()
+    }
+
+    fn historical_heads(
+        &self,
+        id: JournalHeadsId,
+    ) -> Result<Option<JournalHeads>, JournalStoreError> {
+        if id == JournalHeadsId::ZERO {
+            return Err(JournalStoreError::Corrupt);
+        }
+        self.objects
+            .get(&(JournalStorageClass::Heads, *id.as_bytes()))
+            .map(|bytes| {
+                let heads = decode_object::<JournalHeads>(bytes, id)?;
+                if heads.node != self.node {
+                    return Err(JournalStoreError::ScopeMismatch);
+                }
+                Ok(heads)
             })
             .transpose()
     }
@@ -4716,6 +7871,16 @@ impl AgentJournalStore for MemoryAgentJournalStore {
         publication: &ReplaySealedPublication,
     ) -> Result<JournalPublication, JournalStoreError> {
         self.publish_sealed_internal(publication, None)
+    }
+}
+
+impl TransitionProofPublicationStore for MemoryAgentJournalStore {
+    fn stage_proof_predecessor(&mut self, heads: &JournalHeads) -> Result<bool, JournalStoreError> {
+        let current = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+        if current.id() != heads.id() || current != *heads {
+            return Err(JournalStoreError::Conflict);
+        }
+        self.persist_historical_heads(heads)
     }
 }
 
@@ -5143,12 +8308,22 @@ const GC_OBJECT_NAMESPACES: &[(JournalStorageClass, &str)] = &[
         "invocation-outcomes",
     ),
     (JournalStorageClass::Checkpoint, "checkpoints"),
+    (
+        JournalStorageClass::TransitionProof,
+        "transition-proofs/records",
+    ),
+    (
+        JournalStorageClass::TransitionProofIndex,
+        "transition-proofs/indexes",
+    ),
+    (JournalStorageClass::Heads, HEADS_HISTORY_DIRECTORY),
 ];
 
 #[cfg(target_os = "linux")]
 const GC_BLOB_NAMESPACES: &[(JournalBlobClass, &str)] = &[
     (JournalBlobClass::LaneState, "lane-state/blobs"),
     (JournalBlobClass::CatalogArtifact, "catalog/blobs"),
+    (JournalBlobClass::TransitionProof, "transition-proofs/blobs"),
 ];
 
 #[cfg(target_os = "linux")]
@@ -6270,6 +9445,8 @@ impl FileAgentJournalSlot {
                 "artifact-closures",
                 "invocation-index",
                 "invocation-outcomes",
+                "transition-proofs",
+                HEADS_HISTORY_DIRECTORY,
                 SHARED_ORDERED_COMMIT_DIRECTORY,
                 HISTORY_DIRECTORY,
                 "catalog",
@@ -6306,6 +9483,7 @@ impl FileAgentJournalSlot {
         store.validate_recovery_state()?;
         if read_only_open {
             store.open_existing_layout()?;
+            store.load_history_candidate_for_read_only_open()?;
         } else {
             store.ensure_layout()?;
             store.recover_history_state()?;
@@ -6455,9 +9633,13 @@ impl FileAgentJournalSlot {
 
         validate_initialization_anchor_links(&root_directory, "genesis-admission", true)?;
         validate_initialization_anchor_links(&root_directory, "genesis", true)?;
-        validate_initialization_anchor_links(&root_directory, "heads", false)?;
+        validate_exposed_heads_links(&root_directory)?;
 
-        for stage in ["genesis-admission.next", "genesis.next", "heads.next"] {
+        // Genesis stages are initialization-only and cannot survive exposure.
+        // A canonical `heads.next`, however, is a valid publication crash
+        // boundary; its complete target closure is authenticated after the
+        // history-candidate overlay has been admitted read-only.
+        for stage in ["genesis-admission.next", "genesis.next"] {
             if stat_at(&root_directory, &c_name(stage)?)
                 .map_err(|_| JournalStoreError::Unavailable)?
                 .is_some()
@@ -6513,6 +9695,8 @@ impl FileAgentJournalSlot {
                 "artifact-closures",
                 "invocation-index",
                 "invocation-outcomes",
+                "transition-proofs",
+                HEADS_HISTORY_DIRECTORY,
                 SHARED_ORDERED_COMMIT_DIRECTORY,
                 HISTORY_DIRECTORY,
                 "catalog",
@@ -6530,7 +9714,7 @@ impl FileAgentJournalSlot {
 
         validate_initialization_anchor_links(&root_directory, "genesis-admission", true)?;
         validate_initialization_anchor_links(&root_directory, "genesis", true)?;
-        validate_initialization_anchor_links(&root_directory, "heads", false)?;
+        validate_exposed_heads_links(&root_directory)?;
         verify_directory_entry(parent, &self.root_name, root_identity)?;
         Ok(())
     }
@@ -6728,6 +9912,8 @@ impl FileLocalAgentJournalSlot {
                 "artifact-closures",
                 "invocation-index",
                 "invocation-outcomes",
+                "transition-proofs",
+                HEADS_HISTORY_DIRECTORY,
                 SHARED_ORDERED_COMMIT_DIRECTORY,
                 HISTORY_DIRECTORY,
                 "catalog",
@@ -6766,6 +9952,7 @@ impl FileLocalAgentJournalSlot {
         store.validate_recovery_state()?;
         if read_only_open {
             store.open_existing_layout()?;
+            store.load_history_candidate_for_read_only_open()?;
         } else {
             store.ensure_layout()?;
             store.recover_history_state()?;
@@ -6891,8 +10078,12 @@ impl FileLocalAgentJournalSlot {
         verify_directory_entry(parent, &self.root_name, root_identity)?;
         validate_initialization_anchor_links(&root_directory, "genesis-admission", true)?;
         validate_initialization_anchor_links(&root_directory, "genesis", true)?;
-        validate_initialization_anchor_links(&root_directory, "heads", false)?;
-        for stage in ["genesis-admission.next", "genesis.next", "heads.next"] {
+        validate_exposed_heads_links(&root_directory)?;
+        // Genesis stages are initialization-only and cannot survive exposure.
+        // A canonical `heads.next`, however, is a valid publication crash
+        // boundary; its complete target closure is authenticated after the
+        // history-candidate overlay has been admitted read-only.
+        for stage in ["genesis-admission.next", "genesis.next"] {
             if stat_at(&root_directory, &c_name(stage)?)
                 .map_err(|_| JournalStoreError::Unavailable)?
                 .is_some()
@@ -6944,6 +10135,8 @@ impl FileLocalAgentJournalSlot {
                 "artifact-closures",
                 "invocation-index",
                 "invocation-outcomes",
+                "transition-proofs",
+                HEADS_HISTORY_DIRECTORY,
                 SHARED_ORDERED_COMMIT_DIRECTORY,
                 HISTORY_DIRECTORY,
                 "catalog",
@@ -6960,7 +10153,7 @@ impl FileLocalAgentJournalSlot {
         )?;
         validate_initialization_anchor_links(&root_directory, "genesis-admission", true)?;
         validate_initialization_anchor_links(&root_directory, "genesis", true)?;
-        validate_initialization_anchor_links(&root_directory, "heads", false)?;
+        validate_exposed_heads_links(&root_directory)?;
         verify_directory_entry(parent, &self.root_name, root_identity)?;
         Ok(())
     }
@@ -7516,6 +10709,7 @@ impl FileAgentJournalStore {
                 decode_object::<AgentJournalGenesis>(bytes, decoded.id()).map(|_| ())
             },
         )?;
+        persist_initial_transition_proof_index(self, &shape.initial)?;
         let heads_created = self.install_initial_heads(&shape.initial)?;
         validate_head_targets(self, &shape.initial)?;
         Ok(genesis_created || heads_created)
@@ -7723,6 +10917,8 @@ impl FileAgentJournalStore {
                 "artifact-closures",
                 "invocation-index",
                 "invocation-outcomes",
+                "transition-proofs",
+                HEADS_HISTORY_DIRECTORY,
                 SHARED_ORDERED_COMMIT_DIRECTORY,
                 HISTORY_DIRECTORY,
                 "catalog",
@@ -7875,6 +11071,10 @@ impl FileAgentJournalStore {
             "invocation-index/manifests",
             "invocation-index/nodes",
             "invocation-outcomes",
+            "transition-proofs/records",
+            "transition-proofs/indexes",
+            "transition-proofs/blobs",
+            HEADS_HISTORY_DIRECTORY,
             SHARED_ORDERED_COMMIT_DIRECTORY,
             "catalog/blobs",
             "authority/root-anchors",
@@ -7902,6 +11102,8 @@ impl FileAgentJournalStore {
                 ("artifact-closures", "", "artifact-closures"),
                 ("invocation-index", "", "invocation-index"),
                 ("invocation-outcomes", "", "invocation-outcomes"),
+                ("transition-proofs", "", "transition-proofs"),
+                (HEADS_HISTORY_DIRECTORY, "", HEADS_HISTORY_DIRECTORY),
                 (
                     SHARED_ORDERED_COMMIT_DIRECTORY,
                     "",
@@ -7938,6 +11140,10 @@ impl FileAgentJournalStore {
             validate_directory_names(
                 self.directories.get("invocation-index")?,
                 &["manifests", "nodes"],
+            )?;
+            validate_directory_names(
+                self.directories.get("transition-proofs")?,
+                &["records", "indexes", "blobs"],
             )?;
             validate_directory_names(
                 self.directories.get(HISTORY_DIRECTORY)?,
@@ -7979,6 +11185,9 @@ impl FileAgentJournalStore {
                     "manifests",
                 ),
                 ("invocation-index/nodes", "invocation-index", "nodes"),
+                ("transition-proofs/records", "transition-proofs", "records"),
+                ("transition-proofs/indexes", "transition-proofs", "indexes"),
+                ("transition-proofs/blobs", "transition-proofs", "blobs"),
                 (HISTORY_NODES_DIRECTORY, HISTORY_DIRECTORY, "nodes"),
                 (HISTORY_CANDIDATE_DIRECTORY, HISTORY_DIRECTORY, "candidate"),
                 ("catalog/blobs", "catalog", "blobs"),
@@ -8070,6 +11279,10 @@ impl FileAgentJournalStore {
                 "invocation-index/manifests",
                 "invocation-index/nodes",
                 "invocation-outcomes",
+                "transition-proofs/records",
+                "transition-proofs/indexes",
+                "transition-proofs/blobs",
+                HEADS_HISTORY_DIRECTORY,
                 SHARED_ORDERED_COMMIT_DIRECTORY,
                 "catalog/blobs",
                 "authority/root-anchors",
@@ -8089,6 +11302,8 @@ impl FileAgentJournalStore {
                     "records",
                     "lane-state",
                     "invocation-index",
+                    "transition-proofs",
+                    HEADS_HISTORY_DIRECTORY,
                     SHARED_ORDERED_COMMIT_DIRECTORY,
                     "catalog",
                     "authority",
@@ -8191,6 +11406,9 @@ impl FileAgentJournalStore {
             if bytes.len() as u64 != descriptor.encoded_bytes
                 || Hash::digest(HISTORY_CANDIDATE_DOMAIN, &[&bytes]) != descriptor.hash
                 || plan.scope() != descriptor.scope
+                || plan.inserted_facts().iter().any(|fact| {
+                    fact.transition_proof_retirement_key().is_some() != descriptor.transition_proof
+                })
                 || plan.genesis() == AgentJournalGenesisId::ZERO
             {
                 return Err(JournalStoreError::Corrupt);
@@ -8236,9 +11454,9 @@ impl FileAgentJournalStore {
                 return Err(JournalStoreError::Corrupt);
             }
         }
-        if insertions > MAX_INVOCATION_HISTORY_INSERTIONS
-            || nodes.len() > MAX_INVOCATION_HISTORY_PLAN_NODES
-            || aggregate_bytes > MAX_INVOCATION_HISTORY_PLAN_NODE_BYTES
+        if insertions > MAX_INVOCATION_HISTORY_INSERTIONS.saturating_add(MAX_REPLAY_SUFFIX_ENTRIES)
+            || nodes.len() > MAX_INVOCATION_HISTORY_PLAN_NODES.saturating_mul(2)
+            || aggregate_bytes > MAX_INVOCATION_HISTORY_PLAN_NODE_BYTES.saturating_mul(2)
         {
             return Err(JournalStoreError::Corrupt);
         }
@@ -8248,10 +11466,18 @@ impl FileAgentJournalStore {
         {
             return Err(JournalStoreError::Corrupt);
         }
-        for plan in &plans {
-            if plan.expected_root() != intent.retirement.expected_roots.get(plan.scope())
-                || plan.root() != intent.retirement.next_roots.get(plan.scope())
-            {
+        for (descriptor, plan) in intent.plans.iter().zip(&plans) {
+            let expected = if descriptor.transition_proof {
+                intent.retirement.expected_roots.transition_proofs
+            } else {
+                intent.retirement.expected_roots.get(plan.scope())
+            };
+            let next = if descriptor.transition_proof {
+                intent.retirement.next_roots.transition_proofs
+            } else {
+                intent.retirement.next_roots.get(plan.scope())
+            };
+            if plan.expected_root() != expected || plan.root() != next {
                 return Err(JournalStoreError::Corrupt);
             }
         }
@@ -8260,6 +11486,61 @@ impl FileAgentJournalStore {
             plans,
             nodes,
         })
+    }
+
+    /// Admit the durable history overlay needed to authenticate a staged or
+    /// newly durable head during mutation-free production open. Destructive
+    /// rollback or promotion remains deferred until replay has reverified the
+    /// opened journal and calls `finish_reverified_open`.
+    #[cfg(target_os = "linux")]
+    fn load_history_candidate_for_read_only_open(&mut self) -> Result<(), JournalStoreError> {
+        if self.history_candidate.is_some() {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let intent = self.read_history_candidate_intent_file(HISTORY_CANDIDATE_INTENT_NAME)?;
+        let staged_intent =
+            self.read_history_candidate_intent_file(HISTORY_CANDIDATE_INTENT_STAGE_NAME)?;
+        let Some(intent) = intent else {
+            // A staged intent or orphan plans are still private. Recovery may
+            // discard them only after replay authenticates the durable head.
+            return Ok(());
+        };
+        if staged_intent.is_some() {
+            return Err(JournalStoreError::Corrupt);
+        }
+
+        let overlay = self.load_history_candidate_overlay(intent)?;
+        self.history_candidate = Some(overlay.clone());
+        for plan in &overlay.plans {
+            plan.validate(self).map_err(map_invocation_history_error)?;
+        }
+
+        let current = self
+            .read_fixed::<JournalHeads>("", "heads")?
+            .ok_or(JournalStoreError::Corrupt)?;
+        let staged = self.read_fixed::<JournalHeads>("", "heads.next")?;
+        let expected = overlay.intent.retirement.expected_heads;
+        let next = overlay.intent.retirement.next_heads;
+        match (current.id(), staged.as_ref().map(JournalHeads::id)) {
+            (head, None) if head == expected => {
+                let genesis = overlay
+                    .plans
+                    .first()
+                    .ok_or(JournalStoreError::Corrupt)?
+                    .genesis();
+                let queue = self.history_queue(genesis)?;
+                if queue.commitment() != overlay.intent.queue_commitment {
+                    return Err(JournalStoreError::Corrupt);
+                }
+                // The candidate never reached a public head. Do not let its
+                // private nodes satisfy validation of the durable predecessor.
+                self.history_candidate = None;
+                Ok(())
+            }
+            (head, Some(stage)) if head == expected && stage == next => Ok(()),
+            (head, None) if head == next => Ok(()),
+            _ => Err(JournalStoreError::Corrupt),
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -8503,9 +11784,10 @@ impl FileAgentJournalStore {
             JournalStorageClass::InvocationIndexNode => "invocation-index/nodes",
             JournalStorageClass::InvocationOutcome => "invocation-outcomes",
             JournalStorageClass::Checkpoint => "checkpoints",
-            JournalStorageClass::Genesis
-            | JournalStorageClass::Heads
-            | JournalStorageClass::InvocationHistoryNode => {
+            JournalStorageClass::TransitionProof => "transition-proofs/records",
+            JournalStorageClass::TransitionProofIndex => "transition-proofs/indexes",
+            JournalStorageClass::Heads => HEADS_HISTORY_DIRECTORY,
+            JournalStorageClass::Genesis | JournalStorageClass::InvocationHistoryNode => {
                 return Err(JournalStoreError::InvalidClass);
             }
         };
@@ -8531,21 +11813,37 @@ impl FileAgentJournalStore {
         &self,
         id: InvocationHistoryNodeId,
     ) -> Result<Option<Vec<u8>>, JournalStoreError> {
+        self.read_global_history_node_with_work_limit(id, u64::MAX, usize::MAX)
+            .map(|(bytes, _, _)| bytes)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_global_history_node_with_work_limit(
+        &self,
+        id: InvocationHistoryNodeId,
+        max_bytes: u64,
+        max_fetches: usize,
+    ) -> Result<(Option<Vec<u8>>, u64, usize), JournalStoreError> {
         let directory = self.history_shard_directory(id)?;
         let name = encode_hex(id.as_bytes());
-        let stage = sibling_next_name(&name);
-        if let Some(bytes) =
-            read_bounded_regular_at(&directory, &stage, MAX_INVOCATION_HISTORY_NODE_BYTES)?
-        {
+        let read = read_bounded_immutable_at(
+            &directory,
+            &name,
+            MAX_INVOCATION_HISTORY_NODE_BYTES,
+            max_bytes,
+            max_fetches,
+        )?;
+        if let Some(bytes) = &read.staged {
             decode_object::<InvocationHistoryNode>(&bytes, id)?;
         }
-        let Some(bytes) =
-            read_bounded_regular_at(&directory, &name, MAX_INVOCATION_HISTORY_NODE_BYTES)?
-        else {
-            return Ok(None);
-        };
-        decode_object::<InvocationHistoryNode>(&bytes, id)?;
-        Ok(Some(bytes))
+        let canonical = read
+            .canonical
+            .map(|bytes| {
+                decode_object::<InvocationHistoryNode>(&bytes, id)?;
+                Ok(bytes)
+            })
+            .transpose()?;
+        Ok((canonical, read.bytes, read.fetches))
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -8642,6 +11940,7 @@ impl FileAgentJournalStore {
         match class {
             JournalBlobClass::LaneState => "lane-state/blobs",
             JournalBlobClass::CatalogArtifact => "catalog/blobs",
+            JournalBlobClass::TransitionProof => "transition-proofs/blobs",
         }
     }
 
@@ -9048,35 +12347,51 @@ impl FileAgentJournalStore {
         &self,
         id: R::Id,
     ) -> Result<Option<R>, JournalStoreError> {
+        self.read_object_with_work_limit(id, u64::MAX, usize::MAX)
+            .map(|(record, _, _)| record)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_object_with_work_limit<R: CanonicalJournalRecord>(
+        &self,
+        id: R::Id,
+        max_bytes: u64,
+        max_fetches: usize,
+    ) -> Result<(Option<R>, u64, usize), JournalStoreError> {
         ensure_readable_content_class(R::STORAGE_CLASS)?;
         if R::STORAGE_CLASS == JournalStorageClass::InvocationHistoryNode {
             let history_id = InvocationHistoryNodeId(*id.as_bytes());
-            return self
-                .load_history_node(history_id)?
+            let (bytes, work_bytes, work_fetches) =
+                AgentJournalStore::load_history_node_with_work_limit(
+                    self,
+                    history_id,
+                    max_bytes,
+                    max_fetches,
+                )?;
+            let record = bytes
                 .map(|bytes| decode_object::<R>(&bytes, id))
-                .transpose();
+                .transpose()?;
+            return Ok((record, work_bytes, work_fetches));
         }
         let directory = self.object_directory(R::STORAGE_CLASS)?;
         let name = encode_hex(id.as_bytes());
-        let staged = sibling_next_name(&name);
-        if let Some(bytes) = read_bounded_regular_at(
-            self.directory(directory)?,
-            &staged,
-            class_maximum(R::STORAGE_CLASS),
-        )? {
-            // A crash stage is not visible, but it must still be an exact
-            // canonical candidate for this content-addressed path.
-            decode_object::<R>(&bytes, id)?;
-        }
-        let Some(bytes) = read_bounded_regular_at(
+        let read = read_bounded_immutable_at(
             self.directory(directory)?,
             &name,
             class_maximum(R::STORAGE_CLASS),
-        )?
-        else {
-            return Ok(None);
-        };
-        decode_object(&bytes, id).map(Some)
+            max_bytes,
+            max_fetches,
+        )?;
+        if let Some(bytes) = &read.staged {
+            // A crash stage is not visible, but it must still be an exact
+            // canonical candidate for this content-addressed path.
+            decode_object::<R>(bytes, id)?;
+        }
+        let record = read
+            .canonical
+            .map(|bytes| decode_object(&bytes, id))
+            .transpose()?;
+        Ok((record, read.bytes, read.fetches))
     }
 
     fn persist_object<R: CanonicalJournalRecord>(
@@ -9099,27 +12414,108 @@ impl FileAgentJournalStore {
         )
     }
 
+    fn read_historical_heads(
+        &self,
+        id: JournalHeadsId,
+    ) -> Result<Option<JournalHeads>, JournalStoreError> {
+        self.read_historical_heads_with_work_limit(id, u64::MAX, usize::MAX)
+            .map(|(heads, _, _)| heads)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_historical_heads_with_work_limit(
+        &self,
+        id: JournalHeadsId,
+        max_bytes: u64,
+        max_fetches: usize,
+    ) -> Result<(Option<JournalHeads>, u64, usize), JournalStoreError> {
+        if id == JournalHeadsId::ZERO {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let directory = self.directory(HEADS_HISTORY_DIRECTORY)?;
+        let name = encode_hex(id.as_bytes());
+        let read = read_bounded_immutable_at(
+            directory,
+            &name,
+            class_maximum(JournalStorageClass::Heads),
+            max_bytes,
+            max_fetches,
+        )?;
+        if let Some(bytes) = &read.staged {
+            decode_object::<JournalHeads>(bytes, id)?;
+        }
+        let heads = read
+            .canonical
+            .map(|bytes| {
+                let heads = decode_object::<JournalHeads>(&bytes, id)?;
+                if heads.node != self.node {
+                    return Err(JournalStoreError::ScopeMismatch);
+                }
+                Ok(heads)
+            })
+            .transpose()?;
+        Ok((heads, read.bytes, read.fetches))
+    }
+
+    fn persist_historical_heads(&self, heads: &JournalHeads) -> Result<bool, JournalStoreError> {
+        self.ensure_no_gc_pending()?;
+        if heads.node != self.node {
+            return Err(JournalStoreError::ScopeMismatch);
+        }
+        let encoded = encode_object(heads)?;
+        let created = persist_immutable_at(
+            self.directory(HEADS_HISTORY_DIRECTORY)?,
+            &encode_hex(&encoded.id),
+            &encoded.bytes,
+            class_maximum(JournalStorageClass::Heads),
+            |bytes| decode_object::<JournalHeads>(bytes, heads.id()).map(|_| ()),
+        )?;
+        if self.read_historical_heads(heads.id())?.as_ref() != Some(heads) {
+            return Err(JournalStoreError::Corrupt);
+        }
+        Ok(created)
+    }
+
     fn read_blob(
         &self,
         class: JournalBlobClass,
         reference: &BlobRef,
     ) -> Result<Option<Vec<u8>>, JournalStoreError> {
+        self.read_blob_with_work_limit(class, reference, u64::MAX, usize::MAX)
+            .map(|(bytes, _, _)| bytes)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_blob_with_work_limit(
+        &self,
+        class: JournalBlobClass,
+        reference: &BlobRef,
+        max_bytes: u64,
+        max_fetches: usize,
+    ) -> Result<(Option<Vec<u8>>, u64, usize), JournalStoreError> {
         validate_blob_reference(class, reference)?;
         let directory = self.blob_directory(class);
         let name = encode_hex(reference.hash.as_bytes());
-        let staged = sibling_next_name(&name);
-        if let Some(bytes) =
-            read_bounded_regular_at(self.directory(directory)?, &staged, blob_maximum(class))?
-        {
+        let exact_length =
+            usize::try_from(reference.len).map_err(|_| JournalStoreError::LimitExceeded)?;
+        let read = read_bounded_immutable_at(
+            self.directory(directory)?,
+            &name,
+            exact_length,
+            max_bytes,
+            max_fetches,
+        )?;
+        if let Some(bytes) = &read.staged {
             validate_stored_blob(class, reference, &bytes)?;
         }
-        let Some(bytes) =
-            read_bounded_regular_at(self.directory(directory)?, &name, blob_maximum(class))?
-        else {
-            return Ok(None);
-        };
-        validate_stored_blob(class, reference, &bytes)?;
-        Ok(Some(bytes))
+        let bytes = read
+            .canonical
+            .map(|bytes| {
+                validate_stored_blob(class, reference, &bytes)?;
+                Ok(bytes)
+            })
+            .transpose()?;
+        Ok((bytes, read.bytes, read.fetches))
     }
 
     fn persist_blob(
@@ -9374,6 +12770,7 @@ impl FileAgentJournalStore {
         anchor: &R,
         next: &JournalHeads,
         mode: ReplayPublicationMode,
+        transition_proof_change: bool,
         mut publication_point: F,
     ) -> Result<JournalPublication, JournalStoreError>
     where
@@ -9394,6 +12791,16 @@ impl FileAgentJournalStore {
             }
             validate_head_targets(self, &current)?;
             validate_idempotent_anchor(self, &current, anchor)?;
+            let predecessor = next.previous.ok_or(JournalStoreError::Corrupt)?;
+            if predecessor != expected
+                || self
+                    .read_historical_heads(predecessor)?
+                    .ok_or(JournalStoreError::MissingObject)?
+                    .id()
+                    != predecessor
+            {
+                return Err(JournalStoreError::Corrupt);
+            }
             return Ok(JournalPublication {
                 object_created: false,
                 heads_advanced: false,
@@ -9406,9 +12813,16 @@ impl FileAgentJournalStore {
         current
             .validate_successor(next)
             .map_err(supplied_decode_error)?;
-        validate_publication_shape_with_mode(&current, anchor, next, mode)?;
+        validate_publication_shape_with_mode(
+            &current,
+            anchor,
+            next,
+            mode,
+            transition_proof_change,
+        )?;
 
-        let object_created = self.persist_object(anchor)?;
+        let snapshot_created = self.persist_historical_heads(&current)?;
+        let object_created = self.persist_object(anchor)? || snapshot_created;
         publication_point(PublicationPoint::ObjectDurable)?;
         validate_anchor_dependencies(self, &current, anchor, next)?;
         validate_head_targets(self, next)?;
@@ -9464,6 +12878,7 @@ impl FileAgentJournalStore {
             anchor,
             next,
             ReplayPublicationMode::Canonical,
+            false,
             publication_point,
         )
     }
@@ -9483,6 +12898,7 @@ impl FileAgentJournalStore {
         expected: JournalHeadsId,
         next: &JournalHeads,
         plans: &[InvocationHistoryWritePlan],
+        transition_proof_plan: Option<&InvocationHistoryWritePlan>,
         publication_point: &mut impl FnMut(PublicationPoint) -> Result<(), JournalStoreError>,
     ) -> Result<(bool, Option<HistoryCandidateOverlay>), JournalStoreError> {
         self.ensure_no_gc_pending()?;
@@ -9490,12 +12906,13 @@ impl FileAgentJournalStore {
         let current = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
         let exact_retry = publication_is_exact_retry(&current, expected, next)?;
         if exact_retry {
-            validate_idempotent_history_plans(self, &current, plans)?;
+            validate_idempotent_history_plans(self, &current, plans, transition_proof_plan)?;
             return Ok((true, None));
         }
 
         let queue = self.history_queue(current.genesis)?;
-        let overlay = build_history_candidate(self, &current, next, plans, &queue)?;
+        let overlay =
+            build_history_candidate(self, &current, next, plans, transition_proof_plan, &queue)?;
         if let Some(overlay) = overlay.clone() {
             self.stage_history_candidate(overlay, publication_point)?;
         } else if self.history_candidate.is_some() {
@@ -9517,10 +12934,14 @@ impl FileAgentJournalStore {
         }
         let expected = publication.expected();
         let next = publication.next();
+        let transition_proof_plan = publication
+            .transition_proof_batch()
+            .and_then(StagedTransitionProofBatch::retirement_plan);
         let (exact_retry, overlay) = self.stage_sealed_history_candidate(
             expected,
             next,
             publication.history_plans(),
+            transition_proof_plan,
             &mut publication_point,
         )?;
         if exact_retry {
@@ -9532,12 +12953,14 @@ impl FileAgentJournalStore {
                 publication_point(PublicationPoint::AuthorityDependenciesDurable)?;
             }
             let dependency_created = stage_sealed_dependencies(self, publication)?;
+            let transition_proof_change = publication.transition_proof_batch().is_some();
             let mut result = match publication.anchor() {
                 ReplayPublicationAnchor::Ordered(entry) => self.publish_inner_with_mode(
                     expected,
                     entry,
                     next,
                     publication.mode(),
+                    transition_proof_change,
                     &mut publication_point,
                 )?,
                 ReplayPublicationAnchor::Local(entry) => self.publish_inner_with_mode(
@@ -9545,6 +12968,7 @@ impl FileAgentJournalStore {
                     entry,
                     next,
                     publication.mode(),
+                    transition_proof_change,
                     &mut publication_point,
                 )?,
                 ReplayPublicationAnchor::Merge { event, .. } => self.publish_inner_with_mode(
@@ -9552,6 +12976,7 @@ impl FileAgentJournalStore {
                     event,
                     next,
                     publication.mode(),
+                    transition_proof_change,
                     &mut publication_point,
                 )?,
                 ReplayPublicationAnchor::Checkpoint(checkpoint) => self.publish_inner_with_mode(
@@ -9559,6 +12984,7 @@ impl FileAgentJournalStore {
                     checkpoint,
                     next,
                     publication.mode(),
+                    transition_proof_change,
                     &mut publication_point,
                 )?,
             };
@@ -9578,12 +13004,14 @@ impl FileAgentJournalStore {
                 publication_point(PublicationPoint::AuthorityDependenciesDurable)?;
             }
             let dependency_created = stage_sealed_dependencies(self, publication)?;
+            let transition_proof_change = publication.transition_proof_batch().is_some();
             let mut result = match publication.anchor() {
                 ReplayPublicationAnchor::Ordered(entry) => self.publish_inner_with_mode(
                     expected,
                     entry,
                     next,
                     publication.mode(),
+                    transition_proof_change,
                     &mut publication_point,
                 )?,
                 ReplayPublicationAnchor::Local(entry) => self.publish_inner_with_mode(
@@ -9591,6 +13019,7 @@ impl FileAgentJournalStore {
                     entry,
                     next,
                     publication.mode(),
+                    transition_proof_change,
                     &mut publication_point,
                 )?,
                 ReplayPublicationAnchor::Merge { event, .. } => self.publish_inner_with_mode(
@@ -9598,6 +13027,7 @@ impl FileAgentJournalStore {
                     event,
                     next,
                     publication.mode(),
+                    transition_proof_change,
                     &mut publication_point,
                 )?,
                 ReplayPublicationAnchor::Checkpoint(checkpoint) => self.publish_inner_with_mode(
@@ -9605,6 +13035,7 @@ impl FileAgentJournalStore {
                     checkpoint,
                     next,
                     publication.mode(),
+                    transition_proof_change,
                     &mut publication_point,
                 )?,
             };
@@ -9685,6 +13116,7 @@ impl FileAgentJournalStore {
             empty_frontier.id(),
             genesis.runtime().clone(),
         );
+        persist_initial_transition_proof_index(self, &initial)?;
         let heads_created = self.install_initial_heads(&initial)?;
         validate_head_targets(self, &initial)?;
         Ok(genesis_created || heads_created)
@@ -10156,6 +13588,7 @@ impl AgentJournalStore for FileAgentJournalStore {
                 decode_object::<AgentJournalGenesis>(bytes, decoded.id()).map(|_| ())
             },
         )?;
+        persist_initial_transition_proof_index(self, &shape.initial)?;
         let heads_created = self.install_initial_heads(&shape.initial)?;
         validate_head_targets(self, &shape.initial)?;
         self.replayed_root = Some(replayed_root);
@@ -10193,6 +13626,23 @@ impl AgentJournalStore for FileAgentJournalStore {
         Ok(current)
     }
 
+    fn historical_heads(
+        &self,
+        id: JournalHeadsId,
+    ) -> Result<Option<JournalHeads>, JournalStoreError> {
+        self.read_historical_heads(id)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn historical_heads_with_work_limit(
+        &self,
+        id: JournalHeadsId,
+        max_bytes: u64,
+        max_fetches: usize,
+    ) -> Result<(Option<JournalHeads>, u64, usize), JournalStoreError> {
+        self.read_historical_heads_with_work_limit(id, max_bytes, max_fetches)
+    }
+
     fn put<R: CanonicalJournalRecord>(&mut self, record: &R) -> Result<bool, JournalStoreError> {
         self.ensure_no_gc_pending()?;
         self.persist_object(record)
@@ -10200,6 +13650,16 @@ impl AgentJournalStore for FileAgentJournalStore {
 
     fn get<R: CanonicalJournalRecord>(&self, id: R::Id) -> Result<Option<R>, JournalStoreError> {
         self.read_object(id)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn get_with_work_limit<R: CanonicalJournalRecord>(
+        &self,
+        id: R::Id,
+        max_bytes: u64,
+        max_fetches: usize,
+    ) -> Result<(Option<R>, u64, usize), JournalStoreError> {
+        self.read_object_with_work_limit(id, max_bytes, max_fetches)
     }
 
     fn put_blob(
@@ -10220,6 +13680,43 @@ impl AgentJournalStore for FileAgentJournalStore {
         self.read_blob(class, reference)
     }
 
+    #[cfg(target_os = "linux")]
+    fn load_blob_with_work_limit(
+        &self,
+        class: JournalBlobClass,
+        reference: &BlobRef,
+        max_bytes: u64,
+        max_fetches: usize,
+    ) -> Result<(Option<Vec<u8>>, u64, usize), JournalStoreError> {
+        self.read_blob_with_work_limit(class, reference, max_bytes, max_fetches)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn load_history_node_with_work_limit(
+        &self,
+        id: InvocationHistoryNodeId,
+        max_bytes: u64,
+        max_fetches: usize,
+    ) -> Result<(Option<Vec<u8>>, u64, usize), JournalStoreError> {
+        if id == InvocationHistoryNodeId::ZERO {
+            return Err(JournalStoreError::Corrupt);
+        }
+        if let Some(bytes) = self
+            .history_candidate
+            .as_ref()
+            .and_then(|candidate| candidate.nodes.get(&id))
+        {
+            let length =
+                u64::try_from(bytes.len()).map_err(|_| JournalStoreError::LimitExceeded)?;
+            if max_fetches == 0 || length > max_bytes {
+                return Err(JournalStoreError::LimitExceeded);
+            }
+            decode_object::<InvocationHistoryNode>(bytes, id)?;
+            return Ok((Some(bytes.clone()), length, 1));
+        }
+        self.read_global_history_node_with_work_limit(id, max_bytes, max_fetches)
+    }
+
     fn publish(
         &mut self,
         publication: &ReplaySealedPublication,
@@ -10233,6 +13730,16 @@ impl AgentJournalStore for FileAgentJournalStore {
         {
             self.publish_sealed_inner(publication, None, |_| Ok(()))
         }
+    }
+}
+
+impl TransitionProofPublicationStore for FileAgentJournalStore {
+    fn stage_proof_predecessor(&mut self, heads: &JournalHeads) -> Result<bool, JournalStoreError> {
+        let current = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
+        if current.id() != heads.id() || current != *heads {
+            return Err(JournalStoreError::Conflict);
+        }
+        self.persist_historical_heads(heads)
     }
 }
 
@@ -10636,12 +14143,16 @@ mod tests {
     use crate::agent::journal::{
         ArtifactClosureId, CheckpointLane, InvocationAcknowledgedFact, InvocationDisposition,
         InvocationOutcomeAnchor, InvocationOutcomeRecord, InvocationOwner, InvocationOwnershipKey,
-        InvocationResultState, ReplayInput, ReplayOperation, RuntimeBinding,
+        InvocationResultState, ReplayInput, ReplayInputId, ReplayOperation, RuntimeBinding,
+        TransitionProofEntryId, TransitionProofIndexId,
     };
     use crate::agent::shared_commit::SharedLaneProjection;
     use crate::agent::system_authority::{
         SystemAuthorityCatalogFinalize, SystemAuthorityCatalogProof, SystemAuthorityGenesis,
         SystemAuthorityJournalScope, SystemAuthorityState,
+    };
+    use crate::agent::transition_proof_journal::{
+        TransitionProofIndexEntry, TransitionProofIndexManifest,
     };
     use crate::agent::{
         AgentConfig, AgentIdentity, AgentProfile, AgentReplica, LaneSet,
@@ -10684,6 +14195,40 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn file_tree_snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        fn visit(root: &Path, directory: &Path, snapshot: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+            let mut entries = fs::read_dir(directory)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>();
+            entries.sort_unstable_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    assert!(snapshot.insert(relative, None).is_none());
+                    visit(root, &path, snapshot);
+                } else {
+                    assert!(
+                        kind.is_file(),
+                        "journal tree must contain only files and dirs"
+                    );
+                    assert!(
+                        snapshot
+                            .insert(relative, Some(fs::read(path).unwrap()))
+                            .is_none()
+                    );
+                }
+            }
+        }
+
+        let mut snapshot = BTreeMap::new();
+        visit(root, root, &mut snapshot);
+        snapshot
+    }
+
     fn authority_binding() -> AgentAuthorityBinding {
         let public_key = ed25519_public_key_wire([0x41; 32]);
         AgentAuthorityBinding {
@@ -10710,6 +14255,7 @@ mod tests {
                 runtime_deployment: DeploymentId([4; 32]),
                 runtime_program: ProgramId([5; 32]),
                 runtime_producer: ProducerId([6; 32]),
+                transition_producer: ProducerId([16; 32]),
             },
             creation_nonce,
             authority: authority_binding(),
@@ -10945,6 +14491,18 @@ mod tests {
             )
             .unwrap();
         assert!(store.initialize_raw(genesis).unwrap());
+        assert_initial_transition_proof_index(store, genesis);
+    }
+
+    fn assert_initial_transition_proof_index<S: AgentJournalStore>(
+        store: &S,
+        genesis: &AgentJournalGenesis,
+    ) {
+        let heads = store.heads().unwrap().unwrap();
+        let expected = TransitionProofIndexManifest::empty(genesis.id());
+        assert_eq!(heads.transition_proofs, expected.id());
+        assert_eq!(store.get(heads.transition_proofs).unwrap(), Some(expected));
+        validate_head_targets(store, &heads).unwrap();
     }
 
     fn gc_limits() -> GcLimits {
@@ -10958,13 +14516,18 @@ mod tests {
         }
     }
 
-    fn install_fresh_checkpoint<S>(
+    struct TestCheckpointClosure {
+        manifest: CheckpointManifest,
+        next: JournalHeads,
+        lanes: Vec<(CheckpointLane, LaneStateManifest)>,
+        artifacts: ArtifactClosure,
+        invocation_indexes: Vec<(InvocationIndexId, InvocationIndexManifest)>,
+    }
+
+    fn stage_test_checkpoint_closure<S: AgentJournalStore>(
         store: &mut S,
         genesis: &AgentJournalGenesis,
-    ) -> (JournalHeads, CheckpointManifest)
-    where
-        S: AgentJournalStore + RawTestPublish,
-    {
+    ) -> TestCheckpointClosure {
         let heads = store.heads().unwrap().unwrap();
         let state_bytes = b"gc-checkpoint-state";
         let state = BlobRef::of_bytes(state_bytes);
@@ -11015,7 +14578,33 @@ mod tests {
             artifacts: vec![genesis.runtime().package.clone()],
         };
         store.put(&artifacts).unwrap();
-        let checkpoint = CheckpointManifest {
+        let checkpoint_lanes = vec![
+            CheckpointLane {
+                lane: PersistedLane::Control,
+                node: None,
+                state: lanes[0].id(),
+                invocations: None,
+            },
+            CheckpointLane {
+                lane: PersistedLane::Linear,
+                node: None,
+                state: lanes[1].id(),
+                invocations: None,
+            },
+            CheckpointLane {
+                lane: PersistedLane::Merge,
+                node: None,
+                state: lanes[2].id(),
+                invocations: None,
+            },
+            CheckpointLane {
+                lane: PersistedLane::Local,
+                node: Some(heads.node),
+                state: lanes[3].id(),
+                invocations: Some(heads.local_invocations),
+            },
+        ];
+        let manifest = CheckpointManifest {
             genesis: genesis.id(),
             admission: genesis.admission,
             runtime: heads.runtime.clone(),
@@ -11027,44 +14616,80 @@ mod tests {
             merge_seal: heads.merge_seal,
             ordered_invocations: heads.ordered_invocations,
             merge_invocations: heads.merge_invocations,
-            lanes: vec![
-                CheckpointLane {
-                    lane: PersistedLane::Control,
-                    node: None,
-                    state: lanes[0].id(),
-                    invocations: None,
-                },
-                CheckpointLane {
-                    lane: PersistedLane::Linear,
-                    node: None,
-                    state: lanes[1].id(),
-                    invocations: None,
-                },
-                CheckpointLane {
-                    lane: PersistedLane::Merge,
-                    node: None,
-                    state: lanes[2].id(),
-                    invocations: None,
-                },
-                CheckpointLane {
-                    lane: PersistedLane::Local,
-                    node: Some(heads.node),
-                    state: lanes[3].id(),
-                    invocations: Some(heads.local_invocations),
-                },
-            ],
+            transition_proofs: heads.transition_proofs,
+            lanes: checkpoint_lanes.clone(),
             artifacts: artifacts.id(),
         };
         let next = JournalHeads {
             publication_revision: heads.publication_revision + 1,
             previous: Some(heads.id()),
-            checkpoint: Some(checkpoint.id()),
+            checkpoint: Some(manifest.id()),
             ..heads
         };
-        store
-            .publish_raw(next.previous.unwrap(), &checkpoint, &next)
+        let sealed_lanes = checkpoint_lanes.into_iter().zip(lanes).collect::<Vec<_>>();
+        let invocation_indexes = [
+            next.ordered_invocations,
+            next.merge_invocations,
+            next.local_invocations,
+        ]
+        .into_iter()
+        .map(|id| {
+            (
+                id,
+                store.get::<InvocationIndexManifest>(id).unwrap().unwrap(),
+            )
+        })
+        .collect();
+        TestCheckpointClosure {
+            manifest,
+            next,
+            lanes: sealed_lanes,
+            artifacts,
+            invocation_indexes,
+        }
+    }
+
+    fn sealed_test_checkpoint<S>(
+        store: &mut S,
+        genesis: &AgentJournalGenesis,
+    ) -> ReplaySealedPublication
+    where
+        S: TransitionProofPublicationStore,
+    {
+        let current = store.heads().unwrap().unwrap();
+        let closure = stage_test_checkpoint_closure(store, genesis);
+        let batch = JournalVerifiedTransitionPublisher::new(store)
+            .stage_checkpoint_compaction()
             .unwrap();
-        (next, checkpoint)
+        ReplaySealedPublication::checkpoint_transition_proof_test_publication(
+            &current,
+            closure.manifest,
+            closure.next,
+            closure.lanes,
+            closure.artifacts,
+            closure.invocation_indexes,
+        )
+        .unwrap()
+        .with_transition_proof_batch(batch)
+        .unwrap()
+    }
+
+    fn install_fresh_checkpoint<S>(
+        store: &mut S,
+        genesis: &AgentJournalGenesis,
+    ) -> (JournalHeads, CheckpointManifest)
+    where
+        S: AgentJournalStore + RawTestPublish,
+    {
+        let closure = stage_test_checkpoint_closure(store, genesis);
+        store
+            .publish_raw(
+                closure.next.previous.unwrap(),
+                &closure.manifest,
+                &closure.next,
+            )
+            .unwrap();
+        (closure.next, closure.manifest)
     }
 
     fn first_ordered(genesis: &AgentJournalGenesis, heads: &JournalHeads) -> OrderedEntry {
@@ -11085,6 +14710,2044 @@ mod tests {
             ordered_head: Some(entry.id()),
             ordered_index: entry.index,
             ..heads.clone()
+        }
+    }
+
+    struct AttestedProofFixture {
+        entry: OrderedEntry,
+        successor: JournalHeads,
+        position: ReplayPosition,
+        prepared: PreparedVerifiedTransition,
+        artifacts: ArtifactClosure,
+        runtime_package: Vec<u8>,
+        actor_package: Vec<u8>,
+    }
+
+    struct AttestedMergeProofFixture {
+        event: MergeEvent,
+        frontier: MergeFrontier,
+        successor: JournalHeads,
+        position: ReplayPosition,
+        prepared: PreparedVerifiedTransition,
+        artifacts: ArtifactClosure,
+        runtime_package: Vec<u8>,
+        actor_package: Vec<u8>,
+    }
+
+    fn attested_merge_invoke_proof_fixture(
+        genesis: &AgentJournalGenesis,
+        heads: &JournalHeads,
+        discriminator: u8,
+    ) -> AttestedMergeProofFixture {
+        let runtime = heads.runtime.clone();
+        let proof_system = crate::agent_sdk::Hash([0xb1; 32]);
+        let context = crate::agent_sdk::RuntimeExecutionContext::Attested { proof_system };
+        let work = crate::agent_sdk::InvocationWork {
+            space: crate::agent_sdk::SpaceId(runtime.space.0),
+            agent: crate::agent_sdk::AgentId(runtime.agent.0),
+            runtime_deployment: crate::agent_sdk::DeploymentId(runtime.deployment.0),
+            invocation: crate::agent_sdk::InvocationId([discriminator; 32]),
+            actor: crate::agent_sdk::ActorId([0xb2; 32]),
+            incarnation: crate::agent_sdk::Hash([0xb3; 32]),
+            deployment: crate::agent_sdk::DeploymentId([0xb4; 32]),
+            program: crate::agent_sdk::ProgramId([0xb5; 32]),
+            mode: crate::agent_sdk::MethodMode::Merge,
+            origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+            roles: crate::agent_sdk::InvocationRoleClaims::none(),
+            message: vec![discriminator],
+            installation_data: None,
+            availability: Vec::new(),
+            gas: 1_000,
+            recovery_only: false,
+        };
+        let observed_slot = 15;
+        let authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+            crate::agent_sdk::PublicPreflight::for_work(&work, observed_slot),
+        );
+        let input = ReplayInput {
+            runtime: runtime.clone(),
+            operation: ReplayOperation::CleanInvoke {
+                context,
+                work: work.clone(),
+                authorization: authorization.clone(),
+                observed_slot,
+            },
+        };
+        input.validate().unwrap();
+        let event = MergeEvent {
+            genesis: genesis.id(),
+            committee: None,
+            author: heads.node,
+            ordered_base: ordered_base(heads),
+            causal_height: 1,
+            parents: Vec::new(),
+            input,
+            signature: vec![discriminator; ED25519_SIGNATURE_BYTES],
+        };
+        event.validate().unwrap();
+        let position = transition_proof_position(&event);
+        let state = crate::agent_sdk::RuntimeState {
+            control: b"proof-control".to_vec(),
+            linear: b"proof-linear".to_vec(),
+            merge: vec![b'm', discriminator],
+            local: b"proof-local".to_vec(),
+        };
+        let runtime_work = crate::agent_sdk::RuntimeWork::Invoke {
+            context,
+            state: state.clone(),
+            invocation: Box::new(work.clone()),
+            authorization: Box::new(authorization),
+            observed_slot,
+        };
+        let transition = crate::agent_sdk::RuntimeTransition {
+            state,
+            outcome: crate::agent_sdk::RuntimeOutcome::Completed(Err(
+                crate::agent_sdk::InvocationError::NotFound,
+            )),
+        };
+        let (prepared, artifacts, runtime_package, actor_package) = attested_prepared_fixture(
+            genesis,
+            &runtime,
+            &work,
+            runtime_work,
+            transition,
+            proof_system,
+            discriminator,
+        );
+        let frontier = MergeFrontier {
+            genesis: genesis.id(),
+            events: vec![event.id()],
+        };
+        let successor = JournalHeads {
+            publication_revision: heads.publication_revision.checked_add(1).unwrap(),
+            previous: Some(heads.id()),
+            merge_frontier: frontier.id(),
+            ..heads.clone()
+        };
+        AttestedMergeProofFixture {
+            event,
+            frontier,
+            successor,
+            position,
+            prepared,
+            artifacts,
+            runtime_package,
+            actor_package,
+        }
+    }
+
+    fn attested_merge_resume_proof_fixture(
+        genesis: &AgentJournalGenesis,
+        heads: &JournalHeads,
+        original: &AttestedMergeProofFixture,
+        expected_live: crate::agent_sdk::proof::TransitionProofKey,
+        ready_sequence: u64,
+        discriminator: u8,
+    ) -> AttestedMergeProofFixture {
+        let ReplayOperation::CleanInvoke {
+            context,
+            work,
+            authorization,
+            observed_slot,
+        } = &original.event.input.operation
+        else {
+            panic!("resume fixture requires a clean Merge invoke")
+        };
+        let crate::agent_sdk::RuntimeExecutionContext::Attested { proof_system } = *context else {
+            panic!("resume fixture requires Attested execution")
+        };
+        let yielded = crate::agent_sdk::YieldedInvocation {
+            invocation: work.invocation,
+            actor: work.actor,
+            incarnation: work.incarnation,
+            deployment: work.deployment,
+            program: work.program,
+            mode: work.mode,
+            continuation: crate::agent_sdk::BlobRef::of_bytes(&[
+                b'c',
+                discriminator,
+                ready_sequence as u8,
+            ]),
+            ready_sequence,
+            installation_data: work.installation_data.clone(),
+            required: work
+                .availability
+                .iter()
+                .map(|blob| blob.reference.clone())
+                .collect(),
+            reason: crate::agent_sdk::YieldReason::Cooperative,
+        };
+        let input = ReplayInput {
+            runtime: original.event.input.runtime.clone(),
+            operation: ReplayOperation::CleanResume {
+                context: *context,
+                expected_live: Some(expected_live),
+                work: work.clone(),
+                authorization: authorization.clone(),
+                yielded: yielded.clone(),
+                observed_slot: *observed_slot,
+            },
+        };
+        input.validate().unwrap();
+        let event = MergeEvent {
+            genesis: genesis.id(),
+            committee: None,
+            author: heads.node,
+            ordered_base: ordered_base(heads),
+            causal_height: original.event.causal_height.checked_add(1).unwrap(),
+            parents: vec![original.event.id()],
+            input,
+            signature: vec![discriminator; ED25519_SIGNATURE_BYTES],
+        };
+        event.validate().unwrap();
+        let position = transition_proof_position(&event);
+        let state = crate::agent_sdk::RuntimeState {
+            control: b"proof-control".to_vec(),
+            linear: b"proof-linear".to_vec(),
+            merge: vec![b'r', discriminator],
+            local: b"proof-local".to_vec(),
+        };
+        let runtime_work = crate::agent_sdk::RuntimeWork::Resume {
+            context: *context,
+            state: state.clone(),
+            resume: Box::new(crate::agent_sdk::ResumeWork {
+                invocation: yielded.invocation,
+                actor: yielded.actor,
+                incarnation: yielded.incarnation,
+                deployment: yielded.deployment,
+                program: yielded.program,
+                mode: yielded.mode,
+                continuation: yielded.continuation,
+                ready_sequence: yielded.ready_sequence,
+                installation_data: yielded.installation_data,
+                availability: work.availability.clone(),
+                input: None,
+            }),
+        };
+        let transition = crate::agent_sdk::RuntimeTransition {
+            state,
+            outcome: crate::agent_sdk::RuntimeOutcome::Completed(Err(
+                crate::agent_sdk::InvocationError::NotFound,
+            )),
+        };
+        let (prepared, artifacts, runtime_package, actor_package) = attested_prepared_fixture(
+            genesis,
+            &original.event.input.runtime,
+            work,
+            runtime_work,
+            transition,
+            proof_system,
+            discriminator,
+        );
+        let frontier = MergeFrontier {
+            genesis: genesis.id(),
+            events: vec![event.id()],
+        };
+        let successor = JournalHeads {
+            publication_revision: heads.publication_revision.checked_add(1).unwrap(),
+            previous: Some(heads.id()),
+            merge_frontier: frontier.id(),
+            ..heads.clone()
+        };
+        AttestedMergeProofFixture {
+            event,
+            frontier,
+            successor,
+            position,
+            prepared,
+            artifacts,
+            runtime_package,
+            actor_package,
+        }
+    }
+
+    fn stage_attested_merge_fixture<S>(
+        store: &mut S,
+        fixture: &AttestedMergeProofFixture,
+        expected_live: Option<crate::agent_sdk::proof::TransitionProofKey>,
+    ) -> StagedTransitionProof
+    where
+        S: TransitionProofPublicationStore,
+    {
+        let expected_heads = store.heads().unwrap().unwrap().id();
+        JournalVerifiedTransitionPublisher::new(store)
+            .stage_verified(
+                &fixture.prepared,
+                TransitionProofStageContext {
+                    expected_heads,
+                    input: &fixture.event.input,
+                    position: fixture.position,
+                    artifacts: &fixture.artifacts,
+                    runtime_package: &fixture.runtime_package,
+                    actor_package: &fixture.actor_package,
+                    expected_live,
+                },
+            )
+            .unwrap()
+    }
+
+    fn reproved_attested_merge_fixture(
+        genesis: &AgentJournalGenesis,
+        original: &AttestedMergeProofFixture,
+        discriminator: u8,
+        root_discriminator: u8,
+    ) -> AttestedMergeProofFixture {
+        let ReplayOperation::CleanInvoke { context, work, .. } = &original.event.input.operation
+        else {
+            panic!("reproof fixture requires a clean Merge invoke")
+        };
+        let crate::agent_sdk::RuntimeExecutionContext::Attested { proof_system } = *context else {
+            panic!("reproof fixture requires Attested execution")
+        };
+        let runtime_work =
+            crate::agent_sdk::RuntimeWork::decode(original.prepared.canonical_work()).unwrap();
+        let transition =
+            crate::agent_sdk::RuntimeTransition::decode(original.prepared.canonical_transition())
+                .unwrap();
+        let roots = crate::agent_sdk::proof::ProofLaneRoots {
+            control: crate::agent_sdk::Hash([root_discriminator; 32]),
+            linear: Some(crate::agent_sdk::Hash(
+                [root_discriminator.wrapping_add(1); 32],
+            )),
+            merge: Some(crate::agent_sdk::Hash(
+                [root_discriminator.wrapping_add(2); 32],
+            )),
+            local: Some(crate::agent_sdk::Hash(
+                [root_discriminator.wrapping_add(3); 32],
+            )),
+        };
+        let (prepared, artifacts, runtime_package, actor_package) =
+            attested_prepared_fixture_with_roots(
+                genesis,
+                &original.event.input.runtime,
+                work,
+                runtime_work,
+                transition,
+                proof_system,
+                discriminator,
+                roots,
+            );
+        assert_eq!(
+            prepared.proof_record().statement.work,
+            original.prepared.proof_record().statement.work,
+        );
+        assert_ne!(prepared.key(), original.prepared.key());
+        AttestedMergeProofFixture {
+            event: original.event.clone(),
+            frontier: original.frontier.clone(),
+            successor: original.successor.clone(),
+            position: original.position,
+            prepared,
+            artifacts,
+            runtime_package,
+            actor_package,
+        }
+    }
+
+    fn merge_requirement_action(
+        fixture: &AttestedMergeProofFixture,
+        intent: ReplayTransitionProofIntent,
+        lifecycle: ReplayTransitionProofLifecycle,
+        projection: ReplayTransitionProofProjection,
+    ) -> ReplayTransitionProofTestAction {
+        ReplayTransitionProofTestAction::Requirement {
+            input: fixture.event.input.id(),
+            position: fixture.position,
+            intent,
+            lifecycle,
+            projection_action: ReplayTransitionProofProjectionAction::UpdateLive,
+            projection,
+            record: fixture.prepared.proof_record().clone(),
+        }
+    }
+
+    fn attested_invoke_proof_fixture(
+        genesis: &AgentJournalGenesis,
+        heads: &JournalHeads,
+        discriminator: u8,
+    ) -> AttestedProofFixture {
+        let runtime = heads.runtime.clone();
+        let proof_system = crate::agent_sdk::Hash([0xb1; 32]);
+        let context = crate::agent_sdk::RuntimeExecutionContext::Attested { proof_system };
+        let work = crate::agent_sdk::InvocationWork {
+            space: crate::agent_sdk::SpaceId(runtime.space.0),
+            agent: crate::agent_sdk::AgentId(runtime.agent.0),
+            runtime_deployment: crate::agent_sdk::DeploymentId(runtime.deployment.0),
+            invocation: crate::agent_sdk::InvocationId([discriminator; 32]),
+            actor: crate::agent_sdk::ActorId([0xb2; 32]),
+            incarnation: crate::agent_sdk::Hash([0xb3; 32]),
+            deployment: crate::agent_sdk::DeploymentId([0xb4; 32]),
+            program: crate::agent_sdk::ProgramId([0xb5; 32]),
+            mode: crate::agent_sdk::MethodMode::Linear,
+            origin: crate::agent_sdk::InvocationOrigin::anonymous(),
+            roles: crate::agent_sdk::InvocationRoleClaims::none(),
+            message: vec![discriminator],
+            installation_data: None,
+            availability: Vec::new(),
+            gas: 1_000,
+            recovery_only: false,
+        };
+        let observed_slot = 15;
+        let authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+            crate::agent_sdk::PublicPreflight::for_work(&work, observed_slot),
+        );
+        let input = ReplayInput {
+            runtime: runtime.clone(),
+            operation: ReplayOperation::CleanInvoke {
+                context,
+                work: work.clone(),
+                authorization: authorization.clone(),
+                observed_slot,
+            },
+        };
+        input.validate().unwrap();
+        let entry = OrderedEntry {
+            genesis: genesis.id(),
+            index: heads.ordered_index.checked_add(1).unwrap(),
+            parent: heads.ordered_head,
+            merge_frontier: heads.merge_frontier,
+            merge_seal: None,
+            input,
+        };
+        let position = ReplayPosition::Ordered {
+            id: entry.id(),
+            index: entry.index,
+            merge_frontier: entry.merge_frontier,
+            merge_seal: entry.merge_seal,
+        };
+        let state = crate::agent_sdk::RuntimeState {
+            control: b"proof-control".to_vec(),
+            linear: b"proof-linear".to_vec(),
+            merge: b"proof-merge".to_vec(),
+            local: b"proof-local".to_vec(),
+        };
+        let runtime_work = crate::agent_sdk::RuntimeWork::Invoke {
+            context,
+            state: state.clone(),
+            invocation: Box::new(work.clone()),
+            authorization: Box::new(authorization),
+            observed_slot,
+        };
+        let transition = crate::agent_sdk::RuntimeTransition {
+            state,
+            outcome: crate::agent_sdk::RuntimeOutcome::Completed(Err(
+                crate::agent_sdk::InvocationError::NotFound,
+            )),
+        };
+        let (prepared, artifacts, runtime_package, actor_package) = attested_prepared_fixture(
+            genesis,
+            &runtime,
+            &work,
+            runtime_work,
+            transition,
+            proof_system,
+            discriminator,
+        );
+        let successor = ordered_successor(heads, &entry);
+        AttestedProofFixture {
+            entry,
+            successor,
+            position,
+            prepared,
+            artifacts,
+            runtime_package,
+            actor_package,
+        }
+    }
+
+    fn attested_resume_proof_fixture(
+        genesis: &AgentJournalGenesis,
+        heads: &JournalHeads,
+        original: &AttestedProofFixture,
+        expected_live: crate::agent_sdk::proof::TransitionProofKey,
+        ready_sequence: u64,
+        discriminator: u8,
+    ) -> AttestedProofFixture {
+        let ReplayOperation::CleanInvoke {
+            context,
+            work,
+            authorization,
+            observed_slot,
+        } = &original.entry.input.operation
+        else {
+            panic!("resume fixture requires a clean invoke")
+        };
+        let crate::agent_sdk::RuntimeExecutionContext::Attested { proof_system } = *context else {
+            panic!("resume fixture requires Attested execution")
+        };
+        let yielded = crate::agent_sdk::YieldedInvocation {
+            invocation: work.invocation,
+            actor: work.actor,
+            incarnation: work.incarnation,
+            deployment: work.deployment,
+            program: work.program,
+            mode: work.mode,
+            continuation: crate::agent_sdk::BlobRef::of_bytes(&[
+                b'c',
+                discriminator,
+                ready_sequence as u8,
+            ]),
+            ready_sequence,
+            installation_data: work.installation_data.clone(),
+            required: work
+                .availability
+                .iter()
+                .map(|blob| blob.reference.clone())
+                .collect(),
+            reason: crate::agent_sdk::YieldReason::Cooperative,
+        };
+        let input = ReplayInput {
+            runtime: original.entry.input.runtime.clone(),
+            operation: ReplayOperation::CleanResume {
+                context: *context,
+                expected_live: Some(expected_live),
+                work: work.clone(),
+                authorization: authorization.clone(),
+                yielded: yielded.clone(),
+                observed_slot: *observed_slot,
+            },
+        };
+        input.validate().unwrap();
+        let entry = OrderedEntry {
+            genesis: genesis.id(),
+            index: heads.ordered_index.checked_add(1).unwrap(),
+            parent: heads.ordered_head,
+            merge_frontier: heads.merge_frontier,
+            merge_seal: None,
+            input,
+        };
+        let position = ReplayPosition::Ordered {
+            id: entry.id(),
+            index: entry.index,
+            merge_frontier: entry.merge_frontier,
+            merge_seal: entry.merge_seal,
+        };
+        let state = crate::agent_sdk::RuntimeState {
+            control: b"proof-control".to_vec(),
+            linear: vec![b'r', discriminator],
+            merge: b"proof-merge".to_vec(),
+            local: b"proof-local".to_vec(),
+        };
+        let runtime_work = crate::agent_sdk::RuntimeWork::Resume {
+            context: *context,
+            state: state.clone(),
+            resume: Box::new(crate::agent_sdk::ResumeWork {
+                invocation: yielded.invocation,
+                actor: yielded.actor,
+                incarnation: yielded.incarnation,
+                deployment: yielded.deployment,
+                program: yielded.program,
+                mode: yielded.mode,
+                continuation: yielded.continuation,
+                ready_sequence: yielded.ready_sequence,
+                installation_data: yielded.installation_data,
+                availability: work.availability.clone(),
+                input: None,
+            }),
+        };
+        let transition = crate::agent_sdk::RuntimeTransition {
+            state,
+            outcome: crate::agent_sdk::RuntimeOutcome::Completed(Err(
+                crate::agent_sdk::InvocationError::NotFound,
+            )),
+        };
+        let (prepared, artifacts, runtime_package, actor_package) = attested_prepared_fixture(
+            genesis,
+            &original.entry.input.runtime,
+            work,
+            runtime_work,
+            transition,
+            proof_system,
+            discriminator,
+        );
+        assert_eq!(prepared.key().invocation, expected_live.invocation);
+        let successor = ordered_successor(heads, &entry);
+        AttestedProofFixture {
+            entry,
+            successor,
+            position,
+            prepared,
+            artifacts,
+            runtime_package,
+            actor_package,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attested_prepared_fixture(
+        genesis: &AgentJournalGenesis,
+        runtime: &RuntimeBinding,
+        work: &crate::agent_sdk::InvocationWork,
+        runtime_work: crate::agent_sdk::RuntimeWork,
+        transition: crate::agent_sdk::RuntimeTransition,
+        proof_system: crate::agent_sdk::Hash,
+        discriminator: u8,
+    ) -> (
+        PreparedVerifiedTransition,
+        ArtifactClosure,
+        Vec<u8>,
+        Vec<u8>,
+    ) {
+        attested_prepared_fixture_with_roots(
+            genesis,
+            runtime,
+            work,
+            runtime_work,
+            transition,
+            proof_system,
+            discriminator,
+            crate::agent_sdk::proof::ProofLaneRoots {
+                control: crate::agent_sdk::Hash([0xc1; 32]),
+                linear: Some(crate::agent_sdk::Hash([0xc2; 32])),
+                merge: Some(crate::agent_sdk::Hash([0xc3; 32])),
+                local: Some(crate::agent_sdk::Hash([0xc4; 32])),
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attested_prepared_fixture_with_roots(
+        genesis: &AgentJournalGenesis,
+        runtime: &RuntimeBinding,
+        work: &crate::agent_sdk::InvocationWork,
+        runtime_work: crate::agent_sdk::RuntimeWork,
+        transition: crate::agent_sdk::RuntimeTransition,
+        proof_system: crate::agent_sdk::Hash,
+        discriminator: u8,
+        roots: crate::agent_sdk::proof::ProofLaneRoots,
+    ) -> (
+        PreparedVerifiedTransition,
+        ArtifactClosure,
+        Vec<u8>,
+        Vec<u8>,
+    ) {
+        let canonical_work = runtime_work.encode().unwrap();
+        let canonical_transition = transition.encode().unwrap();
+        let runtime_package = [
+            b"runtime-package".as_slice(),
+            b"replay-runtime-package".as_slice(),
+        ]
+        .into_iter()
+        .find(|bytes| runtime.package.matches(bytes))
+        .expect("fixture runtime package must be known")
+        .to_vec();
+        let actor_package = b"transition-proof-actor-package".to_vec();
+        let actor_package_ref = crate::agent_sdk::BlobRef::of_bytes(&actor_package);
+        let proof_material = vec![0xd1, discriminator];
+        let manifest =
+            crate::agent_sdk::proof::TransitionProofMaterialManifest::for_material(&proof_material)
+                .unwrap();
+        let proof_manifest_bytes = manifest.encode().unwrap();
+        let producer_public_key = [0xd2; 32];
+        let proof_record = crate::agent_sdk::proof::TransitionProofRecord {
+            statement: crate::agent_sdk::proof::TransitionProofStatement {
+                subject: crate::agent_sdk::proof::TransitionProofSubject {
+                    space: work.space,
+                    agent: work.agent,
+                    runtime_deployment: work.runtime_deployment,
+                    runtime_program: crate::agent_sdk::ProgramId(runtime.program.0),
+                    runtime_package: crate::agent_sdk::BlobRef {
+                        hash: crate::agent_sdk::Hash(runtime.package.hash.0),
+                        len: runtime.package.len,
+                    },
+                    actor: work.actor,
+                    incarnation: work.incarnation,
+                    actor_deployment: work.deployment,
+                    actor_program: work.program,
+                    invocation: work.invocation,
+                    method: "journal-store-fixture".into(),
+                    mode: work.mode,
+                },
+                before: roots,
+                after: roots,
+                work: crate::agent_sdk::proof::TransitionProofStatement::work_commitment(
+                    &canonical_work,
+                ),
+                transition:
+                    crate::agent_sdk::proof::TransitionProofStatement::transition_commitment(
+                        &canonical_transition,
+                    ),
+                refine_trace: crate::agent_sdk::Hash([0xd3; 32]),
+                public_io: crate::agent_sdk::Hash([0xd4; 32]),
+                proof_system,
+            },
+            proof: crate::agent_sdk::BlobRef::of_bytes(&proof_manifest_bytes),
+            producer: crate::agent_sdk::ProducerId::of_public_key(&producer_public_key),
+            producer_public_key,
+            producer_signature: [0xd5; 64],
+        };
+        let prepared = PreparedVerifiedTransition::from_parts_for_test(
+            canonical_work,
+            canonical_transition,
+            proof_record,
+            proof_manifest_bytes,
+            proof_material,
+            actor_package_ref.clone(),
+        );
+        let mut artifact_refs = vec![
+            runtime.package.clone(),
+            BlobRef {
+                hash: Hash(actor_package_ref.hash.0),
+                len: actor_package_ref.len,
+            },
+        ];
+        artifact_refs.sort_by_key(|reference| (reference.hash, reference.len));
+        let artifacts = ArtifactClosure {
+            genesis: genesis.id(),
+            artifacts: artifact_refs,
+        };
+        artifacts.validate().unwrap();
+        (prepared, artifacts, runtime_package, actor_package)
+    }
+
+    fn stage_attested_fixture<S>(
+        store: &mut S,
+        fixture: &AttestedProofFixture,
+        expected_live: Option<crate::agent_sdk::proof::TransitionProofKey>,
+    ) -> StagedTransitionProofBatch
+    where
+        S: TransitionProofPublicationStore,
+    {
+        try_stage_attested_fixture(store, fixture, expected_live).unwrap()
+    }
+
+    fn try_stage_attested_fixture<S>(
+        store: &mut S,
+        fixture: &AttestedProofFixture,
+        expected_live: Option<crate::agent_sdk::proof::TransitionProofKey>,
+    ) -> Result<StagedTransitionProofBatch, JournalStoreError>
+    where
+        S: TransitionProofPublicationStore,
+    {
+        let current = store.heads().unwrap().unwrap();
+        let expected_heads = current.id();
+        let staged = JournalVerifiedTransitionPublisher::new(store).stage_verified(
+            &fixture.prepared,
+            TransitionProofStageContext {
+                expected_heads,
+                input: &fixture.entry.input,
+                position: fixture.position,
+                artifacts: &fixture.artifacts,
+                runtime_package: &fixture.runtime_package,
+                actor_package: &fixture.actor_package,
+                expected_live,
+            },
+        )?;
+        let sealed = ReplaySealedPublication::ordered_transition_proof_test_publication(
+            &current,
+            fixture.entry.clone(),
+            fixture.successor.clone(),
+            vec![attested_requirement(fixture, expected_live)],
+            None,
+        )
+        .map_err(|_| JournalStoreError::NonCanonical)?;
+        JournalVerifiedTransitionPublisher::new(store).stage_apply_batch(&sealed, vec![staged])
+    }
+
+    fn attested_requirement(
+        fixture: &AttestedProofFixture,
+        expected_live: Option<crate::agent_sdk::proof::TransitionProofKey>,
+    ) -> (
+        ReplayInputId,
+        ReplayPosition,
+        ReplayTransitionProofIntent,
+        crate::agent_sdk::proof::TransitionProofRecord,
+    ) {
+        let intent = expected_live.map_or(
+            ReplayTransitionProofIntent::FirstPublication,
+            ReplayTransitionProofIntent::Resume,
+        );
+        (
+            fixture.entry.input.id(),
+            fixture.position,
+            intent,
+            fixture.prepared.proof_record().clone(),
+        )
+    }
+
+    fn sealed_attested_fixture<S>(
+        store: &mut S,
+        current: &JournalHeads,
+        fixture: &AttestedProofFixture,
+        expected_live: Option<crate::agent_sdk::proof::TransitionProofKey>,
+    ) -> ReplaySealedPublication
+    where
+        S: TransitionProofPublicationStore,
+    {
+        let batch = stage_attested_fixture(store, fixture, expected_live);
+        ReplaySealedPublication::ordered_transition_proof_test_publication(
+            current,
+            fixture.entry.clone(),
+            fixture.successor.clone(),
+            vec![attested_requirement(fixture, expected_live)],
+            None,
+        )
+        .unwrap()
+        .with_transition_proof_batch(batch)
+        .unwrap()
+    }
+
+    fn attested_acknowledgement_entry(
+        genesis: &AgentJournalGenesis,
+        heads: &JournalHeads,
+        original: &AttestedProofFixture,
+        expected_live: crate::agent_sdk::proof::TransitionProofKey,
+    ) -> (OrderedEntry, JournalHeads) {
+        let ReplayOperation::CleanInvoke {
+            context,
+            work,
+            authorization,
+            ..
+        } = &original.entry.input.operation
+        else {
+            panic!("ack fixture requires a clean invoke")
+        };
+        let input = ReplayInput {
+            runtime: original.entry.input.runtime.clone(),
+            operation: ReplayOperation::CleanAcknowledge {
+                context: *context,
+                expected_live: Some(expected_live),
+                work: work.clone(),
+                authorization: authorization.clone(),
+            },
+        };
+        input.validate().unwrap();
+        let entry = OrderedEntry {
+            genesis: genesis.id(),
+            index: heads.ordered_index.checked_add(1).unwrap(),
+            parent: heads.ordered_head,
+            merge_frontier: heads.merge_frontier,
+            merge_seal: None,
+            input,
+        };
+        let successor = ordered_successor(heads, &entry);
+        (entry, successor)
+    }
+
+    fn sealed_attested_retirement<S>(
+        store: &mut S,
+        current: &JournalHeads,
+        entry: OrderedEntry,
+        successor: JournalHeads,
+        retire: crate::agent_sdk::proof::TransitionProofKey,
+    ) -> ReplaySealedPublication
+    where
+        S: TransitionProofPublicationStore,
+    {
+        let batch = JournalVerifiedTransitionPublisher::new(store)
+            .stage_retirement(retire)
+            .unwrap();
+        ReplaySealedPublication::ordered_transition_proof_test_publication(
+            current,
+            entry,
+            successor,
+            Vec::new(),
+            Some(retire),
+        )
+        .unwrap()
+        .with_transition_proof_batch(batch)
+        .unwrap()
+    }
+
+    fn budget_blob(discriminator: u64, len: u64) -> BlobRef {
+        let mut hash = [0u8; 32];
+        hash[..8].copy_from_slice(&discriminator.to_le_bytes());
+        BlobRef {
+            hash: Hash(hash),
+            len,
+        }
+    }
+
+    #[test]
+    fn transition_proof_closure_budget_is_aggregate_and_identity_deduplicated() {
+        let mut state = TransitionProofClosureReadState::default();
+        let mut discriminator = 1u64;
+        let chunk = crate::agent_sdk::proof::TRANSITION_PROOF_MATERIAL_CHUNK_BYTES;
+        for _ in 0..crate::agent_sdk::proof::MAX_TRANSITION_PROOF_MATERIAL_CHUNKS {
+            state
+                .reference(
+                    JournalBlobClass::TransitionProof,
+                    &budget_blob(discriminator, chunk),
+                )
+                .unwrap();
+            discriminator += 1;
+        }
+        let duplicate = budget_blob(1, chunk);
+        state
+            .reference(JournalBlobClass::TransitionProof, &duplicate)
+            .unwrap();
+        assert_eq!(
+            state.report.referenced_bytes,
+            MAX_TRANSITION_PROOF_INDEX_MATERIAL_BYTES
+        );
+
+        for _ in 0..8 {
+            state
+                .reference(
+                    JournalBlobClass::CatalogArtifact,
+                    &budget_blob(discriminator, crate::agent_sdk::MAX_CATALOG_ARTIFACT_BYTES),
+                )
+                .unwrap();
+            discriminator += 1;
+        }
+        for len in [
+            crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES as u64,
+            crate::agent_sdk::wire::MAX_RUNTIME_TRANSITION_WIRE_BYTES as u64,
+            crate::agent_sdk::proof::MAX_TRANSITION_PROOF_MATERIAL_MANIFEST_BYTES as u64,
+        ] {
+            state
+                .reference(
+                    JournalBlobClass::TransitionProof,
+                    &budget_blob(discriminator, len),
+                )
+                .unwrap();
+            discriminator += 1;
+        }
+        assert_eq!(
+            state.report.referenced_bytes,
+            MAX_TRANSITION_PROOF_CLOSURE_REFERENCED_BYTES
+        );
+        assert_eq!(
+            state.report.catalog_bytes,
+            MAX_ARTIFACT_CLOSURE_REFERENCED_BYTES
+        );
+        assert_eq!(state.report.catalog_references, 8);
+        assert_eq!(
+            state.reference(
+                JournalBlobClass::TransitionProof,
+                &budget_blob(discriminator, 1),
+            ),
+            Err(JournalStoreError::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn transition_proof_closure_budget_caps_physical_bytes_fetches_and_catalog_refs() {
+        let mut bytes = TransitionProofClosureReadState::default();
+        bytes
+            .charge_read(MAX_TRANSITION_PROOF_CLOSURE_READ_BYTES, 1)
+            .unwrap();
+        assert_eq!(
+            bytes.charge_read(1, 0),
+            Err(JournalStoreError::LimitExceeded)
+        );
+
+        let mut fetches = TransitionProofClosureReadState::default();
+        fetches
+            .charge_read(0, MAX_TRANSITION_PROOF_CLOSURE_FETCHES)
+            .unwrap();
+        assert_eq!(
+            fetches.charge_read(0, 1),
+            Err(JournalStoreError::LimitExceeded)
+        );
+
+        let mut catalog = TransitionProofClosureReadState::default();
+        catalog.report.catalog_references = MAX_ARTIFACT_CLOSURE_ENTRIES;
+        assert_eq!(
+            catalog.reference(JournalBlobClass::CatalogArtifact, &budget_blob(1, 1),),
+            Err(JournalStoreError::LimitExceeded)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_immutable_read_accounts_stage_and_canonical_before_allocation() {
+        let directory = TestDirectory::new("bounded-immutable-read");
+        fs::write(directory.0.join("object.next"), b"abc").unwrap();
+        fs::write(directory.0.join("object"), b"def").unwrap();
+        let descriptor = File::open(&directory.0).unwrap();
+
+        let read = read_bounded_immutable_at(&descriptor, "object", 3, 6, 2).unwrap();
+        assert_eq!(read.staged.as_deref(), Some(b"abc".as_slice()));
+        assert_eq!(read.canonical.as_deref(), Some(b"def".as_slice()));
+        assert_eq!(read.bytes, 6);
+        assert_eq!(read.fetches, 2);
+
+        assert!(matches!(
+            read_bounded_immutable_at(&descriptor, "object", 3, 5, 2),
+            Err(JournalStoreError::LimitExceeded)
+        ));
+        assert!(matches!(
+            read_bounded_immutable_at(&descriptor, "object", 3, 2, 2),
+            Err(JournalStoreError::LimitExceeded)
+        ));
+        assert!(matches!(
+            read_bounded_immutable_at(&descriptor, "object", 3, 6, 1),
+            Err(JournalStoreError::LimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn memory_transition_proof_batch_is_same_cas_and_exact_retry_safe() {
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut store, &genesis);
+        let current = store.heads().unwrap().unwrap();
+        let fixture = attested_invoke_proof_fixture(&genesis, &current, 0xe1);
+        let key = fixture.prepared.key();
+        let batch = stage_attested_fixture(&mut store, &fixture, None);
+        assert_eq!(store.heads().unwrap(), Some(current.clone()));
+        let publication = ReplaySealedPublication::ordered_transition_proof_test_publication(
+            &current,
+            fixture.entry.clone(),
+            fixture.successor.clone(),
+            vec![attested_requirement(&fixture, None)],
+            None,
+        )
+        .unwrap()
+        .with_transition_proof_batch(batch)
+        .unwrap();
+        let successor = publication.next().clone();
+        assert_ne!(successor.transition_proofs, current.transition_proofs);
+
+        let first = store.publish(&publication).unwrap();
+        assert!(first.heads_advanced);
+        assert_eq!(store.heads().unwrap(), Some(successor.clone()));
+        assert_eq!(store.historical_heads(current.id()).unwrap(), Some(current));
+        let recovered = JournalVerifiedTransitionPublisher::new(&mut store)
+            .load_published(key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.canonical_work, fixture.prepared.canonical_work());
+        assert_eq!(
+            recovered.canonical_transition,
+            fixture.prepared.canonical_transition()
+        );
+        assert_eq!(recovered.proof_record, *fixture.prepared.proof_record());
+        assert_eq!(
+            recovered.proof_manifest_bytes,
+            fixture.prepared.proof_manifest_bytes()
+        );
+
+        // Simulate losing the successful CAS response. Exact retry validates
+        // the immutable predecessor snapshot and complete old batch closure;
+        // it neither reapplies the AJP3 mutation nor advances heads again.
+        let retry = store.publish(&publication).unwrap();
+        assert!(!retry.heads_advanced);
+        assert_eq!(store.heads().unwrap(), Some(successor));
+    }
+
+    #[test]
+    fn memory_transition_proof_closure_reads_shared_artifacts_once() {
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut store, &genesis);
+
+        let initial = store.heads().unwrap().unwrap();
+        let invoke = attested_invoke_proof_fixture(&genesis, &initial, 0xdc);
+        let invoke_key = invoke.prepared.key();
+        let invoke_publication = sealed_attested_fixture(&mut store, &initial, &invoke, None);
+        store.publish(&invoke_publication).unwrap();
+
+        let after_invoke = store.heads().unwrap().unwrap();
+        let resume =
+            attested_resume_proof_fixture(&genesis, &after_invoke, &invoke, invoke_key, 1, 0xdd);
+        assert_eq!(resume.artifacts.id(), invoke.artifacts.id());
+        let resume_publication =
+            sealed_attested_fixture(&mut store, &after_invoke, &resume, Some(invoke_key));
+        store.publish(&resume_publication).unwrap();
+
+        let heads = store.heads().unwrap().unwrap();
+        let (index, report) = validate_transition_proof_index_closure_with_report(
+            &store,
+            heads.transition_proofs,
+            &heads,
+        )
+        .unwrap();
+        assert_eq!(index.entries().len(), 2);
+        assert_eq!(report.catalog_references, 2);
+        assert_eq!(
+            report.catalog_bytes,
+            invoke
+                .artifacts
+                .artifacts
+                .iter()
+                .map(|reference| reference.len)
+                .sum::<u64>()
+        );
+        assert!(report.bytes <= MAX_TRANSITION_PROOF_CLOSURE_READ_BYTES);
+        assert!(report.fetches <= MAX_TRANSITION_PROOF_CLOSURE_FETCHES);
+    }
+
+    #[test]
+    fn memory_transition_proof_batch_rejects_missing_extra_and_sibling_proofs() {
+        enum Tamper {
+            Missing,
+            Extra,
+            Sibling,
+        }
+
+        for tamper in [Tamper::Missing, Tamper::Extra, Tamper::Sibling] {
+            let genesis = genesis();
+            let config = config();
+            let mut store =
+                MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node)
+                    .unwrap();
+            initialize(&mut store, &genesis);
+            let current = store.heads().unwrap().unwrap();
+            let anchor = attested_invoke_proof_fixture(&genesis, &current, 0xe2);
+            let proof = match tamper {
+                Tamper::Sibling => {
+                    let sibling = attested_invoke_proof_fixture(&genesis, &current, 0xe3);
+                    // Make the hostile sibling fully available so rejection
+                    // proves anchor binding rather than accidental absence.
+                    store.put(&sibling.entry).unwrap();
+                    sibling
+                }
+                Tamper::Missing | Tamper::Extra => {
+                    attested_invoke_proof_fixture(&genesis, &current, 0xe2)
+                }
+            };
+            let mut batch = stage_attested_fixture(&mut store, &proof, None);
+            let requirements = match tamper {
+                Tamper::Missing => {
+                    batch.publications.clear();
+                    vec![attested_requirement(&anchor, None)]
+                }
+                Tamper::Extra => Vec::new(),
+                Tamper::Sibling => vec![attested_requirement(&anchor, None)],
+            };
+            let publication = ReplaySealedPublication::ordered_transition_proof_test_publication(
+                &current,
+                anchor.entry.clone(),
+                anchor.successor.clone(),
+                requirements,
+                None,
+            )
+            .unwrap()
+            .with_transition_proof_batch(batch)
+            .unwrap();
+            assert_eq!(
+                store.publish(&publication),
+                Err(JournalStoreError::NonCanonical)
+            );
+            assert_eq!(store.heads().unwrap(), Some(current));
+        }
+    }
+
+    #[test]
+    fn memory_attested_resume_and_ack_bind_exact_live_key_and_retry() {
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut store, &genesis);
+
+        let initial = store.heads().unwrap().unwrap();
+        let invoke = attested_invoke_proof_fixture(&genesis, &initial, 0xe5);
+        let invoke_key = invoke.prepared.key();
+        let invoke_publication = sealed_attested_fixture(&mut store, &initial, &invoke, None);
+        store.publish(&invoke_publication).unwrap();
+
+        let after_invoke = store.heads().unwrap().unwrap();
+        let resume =
+            attested_resume_proof_fixture(&genesis, &after_invoke, &invoke, invoke_key, 1, 0xe6);
+        let resume_key = resume.prepared.key();
+        assert_ne!(resume_key, invoke_key);
+        let resume_publication =
+            sealed_attested_fixture(&mut store, &after_invoke, &resume, Some(invoke_key));
+        store.publish(&resume_publication).unwrap();
+        assert!(!store.publish(&resume_publication).unwrap().heads_advanced);
+        let after_resume = store.heads().unwrap().unwrap();
+        let resume_index: TransitionProofIndexManifest =
+            store.get(after_resume.transition_proofs).unwrap().unwrap();
+        assert_eq!(resume_index.live(invoke_key.invocation), Some(resume_key));
+        assert_eq!(resume_index.entries().len(), 2);
+        assert!(
+            !transition_proof_key_is_retired(
+                &store,
+                genesis.id(),
+                resume_index.retired_root(),
+                invoke_key,
+            )
+            .unwrap(),
+            "Resume supersession is reversible and must not mint an acknowledgement tombstone",
+        );
+        assert_eq!(
+            prepare_transition_proof_retirements(
+                &store,
+                genesis.id(),
+                resume_index.retired_root(),
+                &[invoke_key, resume_key],
+            ),
+            Err(JournalStoreError::Conflict),
+            "one atomic batch cannot mint competing final executions for one logical invocation",
+        );
+
+        let wrong = crate::agent_sdk::proof::TransitionProofKey {
+            invocation: resume_key.invocation,
+            execution: crate::agent_sdk::Hash([0xfe; 32]),
+        };
+        let substituted_resume =
+            attested_resume_proof_fixture(&genesis, &after_resume, &invoke, wrong, 2, 0xe7);
+        assert_eq!(
+            try_stage_attested_fixture(&mut store, &substituted_resume, Some(resume_key)),
+            Err(JournalStoreError::NonCanonical)
+        );
+        assert_eq!(store.heads().unwrap(), Some(after_resume.clone()));
+
+        let (wrong_ack, wrong_ack_successor) =
+            attested_acknowledgement_entry(&genesis, &after_resume, &invoke, wrong);
+        assert!(
+            ReplaySealedPublication::ordered_transition_proof_test_publication(
+                &after_resume,
+                wrong_ack,
+                wrong_ack_successor,
+                Vec::new(),
+                Some(resume_key),
+            )
+            .is_err(),
+            "the replay seal rejects an acknowledgement/retirement key substitution",
+        );
+        assert_eq!(store.heads().unwrap(), Some(after_resume.clone()));
+
+        let (ack, ack_successor) =
+            attested_acknowledgement_entry(&genesis, &after_resume, &invoke, resume_key);
+        let ack_publication =
+            sealed_attested_retirement(&mut store, &after_resume, ack, ack_successor, resume_key);
+        store.publish(&ack_publication).unwrap();
+        assert!(!store.publish(&ack_publication).unwrap().heads_advanced);
+        let after_ack = store.heads().unwrap().unwrap();
+        let ack_index: TransitionProofIndexManifest =
+            store.get(after_ack.transition_proofs).unwrap().unwrap();
+        assert_eq!(ack_index.live(invoke_key.invocation), None);
+        assert_eq!(ack_index.entries().len(), 2);
+        assert!(
+            transition_proof_key_is_retired(
+                &store,
+                genesis.id(),
+                ack_index.retired_root(),
+                resume_key,
+            )
+            .unwrap()
+        );
+        assert!(
+            transition_proof_key_is_retired(
+                &store,
+                genesis.id(),
+                ack_index.retired_root(),
+                invoke_key,
+            )
+            .unwrap(),
+            "the final acknowledgement makes the logical invocation terminal",
+        );
+        assert_eq!(
+            transition_proof_retirement_for_invocation(
+                &store,
+                genesis.id(),
+                ack_index.retired_root(),
+                invoke_key.invocation,
+            )
+            .unwrap(),
+            Some(resume_key),
+            "every execution query resolves to the exact execution finally acknowledged",
+        );
+        assert_eq!(
+            prepare_transition_proof_retirements(
+                &store,
+                genesis.id(),
+                ack_index.retired_root(),
+                core::slice::from_ref(&wrong),
+            ),
+            Err(JournalStoreError::Conflict),
+            "an existing terminal logical invocation cannot acquire a second final execution",
+        );
+    }
+
+    #[test]
+    fn memory_merge_resume_reuses_published_execution_without_restage_or_retirement() {
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut store, &genesis);
+
+        let initial = store.heads().unwrap().unwrap();
+        let boundary: TransitionProofIndexManifest =
+            store.get(initial.transition_proofs).unwrap().unwrap();
+        let invoke = attested_merge_invoke_proof_fixture(&genesis, &initial, 0xed);
+        let k2 = invoke.prepared.key();
+        let invoke_staged = stage_attested_merge_fixture(&mut store, &invoke, None);
+        let invoke_sealed = ReplaySealedPublication::merge_transition_proof_test_publication(
+            &initial,
+            invoke.event.clone(),
+            invoke.frontier.clone(),
+            invoke.successor.clone(),
+            &boundary,
+            OrderedBase::post_genesis(),
+            vec![merge_requirement_action(
+                &invoke,
+                ReplayTransitionProofIntent::FirstPublication,
+                ReplayTransitionProofLifecycle::Invoke,
+                ReplayTransitionProofProjection::Prepared,
+            )],
+        )
+        .unwrap();
+        let invoke_batch = JournalVerifiedTransitionPublisher::new(&mut store)
+            .stage_apply_batch(&invoke_sealed, vec![invoke_staged])
+            .unwrap();
+        let invoke_publication = invoke_sealed
+            .with_transition_proof_batch(invoke_batch)
+            .unwrap();
+        assert!(store.publish(&invoke_publication).unwrap().heads_advanced);
+
+        let after_invoke = store.heads().unwrap().unwrap();
+        let resume =
+            attested_merge_resume_proof_fixture(&genesis, &after_invoke, &invoke, k2, 1, 0xee);
+        let k1 = resume.prepared.key();
+        assert_ne!(k1, k2);
+        let resume_staged = stage_attested_merge_fixture(&mut store, &resume, Some(k2));
+        let resume_sealed = ReplaySealedPublication::merge_transition_proof_test_publication(
+            &after_invoke,
+            resume.event.clone(),
+            resume.frontier.clone(),
+            resume.successor.clone(),
+            &boundary,
+            OrderedBase::post_genesis(),
+            vec![
+                merge_requirement_action(
+                    &invoke,
+                    ReplayTransitionProofIntent::Recanonicalize,
+                    ReplayTransitionProofLifecycle::Invoke,
+                    ReplayTransitionProofProjection::Published,
+                ),
+                merge_requirement_action(
+                    &resume,
+                    ReplayTransitionProofIntent::Resume(k2),
+                    ReplayTransitionProofLifecycle::Resume(k2),
+                    ReplayTransitionProofProjection::Prepared,
+                ),
+            ],
+        )
+        .unwrap();
+        let resume_batch = JournalVerifiedTransitionPublisher::new(&mut store)
+            .stage_apply_batch(&resume_sealed, vec![resume_staged])
+            .unwrap();
+        let resume_publication = resume_sealed
+            .with_transition_proof_batch(resume_batch)
+            .unwrap();
+        assert!(store.publish(&resume_publication).unwrap().heads_advanced);
+
+        // A later direct Merge event rebuilds the full suffix. The exact
+        // CleanResume(K2) transition is already public as K1, so replay and
+        // storage reuse it with no staged proof/AJPT and no terminal history.
+        let after_resume = store.heads().unwrap().unwrap();
+        let direct = MergeEvent {
+            genesis: genesis.id(),
+            committee: None,
+            author: after_resume.node,
+            ordered_base: ordered_base(&after_resume),
+            causal_height: resume.event.causal_height.checked_add(1).unwrap(),
+            parents: vec![resume.event.id()],
+            input: replay_input(MethodMode::Linear, 0xef),
+            signature: vec![0xef; ED25519_SIGNATURE_BYTES],
+        };
+        // The fixture helper's generic replay input is Linear; make the
+        // direct suffix event a valid Merge-lane operation.
+        let mut direct = direct;
+        direct.input = replay_input(MethodMode::Merge, 0xef);
+        direct.validate().unwrap();
+        let direct_frontier = MergeFrontier {
+            genesis: genesis.id(),
+            events: vec![direct.id()],
+        };
+        let direct_successor = JournalHeads {
+            publication_revision: after_resume.publication_revision.checked_add(1).unwrap(),
+            previous: Some(after_resume.id()),
+            merge_frontier: direct_frontier.id(),
+            ..after_resume.clone()
+        };
+        let publication = ReplaySealedPublication::merge_transition_proof_test_publication(
+            &after_resume,
+            direct,
+            direct_frontier,
+            direct_successor,
+            &boundary,
+            OrderedBase::post_genesis(),
+            vec![
+                merge_requirement_action(
+                    &invoke,
+                    ReplayTransitionProofIntent::Recanonicalize,
+                    ReplayTransitionProofLifecycle::Invoke,
+                    ReplayTransitionProofProjection::Published,
+                ),
+                merge_requirement_action(
+                    &resume,
+                    ReplayTransitionProofIntent::Recanonicalize,
+                    ReplayTransitionProofLifecycle::Resume(k2),
+                    ReplayTransitionProofProjection::Published,
+                ),
+            ],
+        )
+        .unwrap();
+        assert!(store.publish(&publication).unwrap().heads_advanced);
+        assert!(!store.publish(&publication).unwrap().heads_advanced);
+
+        let current = store.heads().unwrap().unwrap();
+        let index: TransitionProofIndexManifest =
+            store.get(current.transition_proofs).unwrap().unwrap();
+        assert_eq!(index.live(k1.invocation), Some(k1));
+        assert_eq!(index.entries().len(), 2);
+        for key in [k1, k2] {
+            assert!(
+                !transition_proof_key_is_retired(&store, genesis.id(), index.retired_root(), key,)
+                    .unwrap()
+            );
+        }
+
+        // Exercise the actual reversible cycle independently: K1 is live,
+        // an earlier canonical event changes the exact before-root tuple and
+        // installs K2, then another canonical rebuild restores the retained
+        // K1 tuple without staging or resigning it. Supersession is never a
+        // terminal acknowledgement.
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut store, &genesis);
+        let initial = store.heads().unwrap().unwrap();
+        let boundary: TransitionProofIndexManifest =
+            store.get(initial.transition_proofs).unwrap().unwrap();
+        let original = attested_merge_invoke_proof_fixture(&genesis, &initial, 0xf1);
+        let k1 = original.prepared.key();
+        let staged = stage_attested_merge_fixture(&mut store, &original, None);
+        let sealed = ReplaySealedPublication::merge_transition_proof_test_publication(
+            &initial,
+            original.event.clone(),
+            original.frontier.clone(),
+            original.successor.clone(),
+            &boundary,
+            OrderedBase::post_genesis(),
+            vec![merge_requirement_action(
+                &original,
+                ReplayTransitionProofIntent::FirstPublication,
+                ReplayTransitionProofLifecycle::Invoke,
+                ReplayTransitionProofProjection::Prepared,
+            )],
+        )
+        .unwrap();
+        let batch = JournalVerifiedTransitionPublisher::new(&mut store)
+            .stage_apply_batch(&sealed, vec![staged])
+            .unwrap();
+        store
+            .publish(&sealed.with_transition_proof_batch(batch).unwrap())
+            .unwrap();
+
+        let current = store.heads().unwrap().unwrap();
+        let reproved = reproved_attested_merge_fixture(&genesis, &original, 0xf2, 0x71);
+        let k2 = reproved.prepared.key();
+        let mut earlier_events = (1_u8..=u8::MAX)
+            .map(|discriminator| MergeEvent {
+                genesis: genesis.id(),
+                committee: None,
+                author: current.node,
+                ordered_base: OrderedBase::post_genesis(),
+                causal_height: 1,
+                parents: Vec::new(),
+                input: replay_input(MethodMode::Merge, discriminator),
+                signature: vec![discriminator; ED25519_SIGNATURE_BYTES],
+            })
+            .filter(|event| event.id() < original.event.id())
+            .take(2)
+            .collect::<Vec<_>>();
+        assert_eq!(earlier_events.len(), 2);
+        let first_change = earlier_events.remove(0);
+        let second_change = earlier_events.remove(0);
+        first_change.validate().unwrap();
+        second_change.validate().unwrap();
+
+        let mut changed_tips = vec![first_change.id(), original.event.id()];
+        changed_tips.sort_unstable();
+        let changed_frontier = MergeFrontier {
+            genesis: genesis.id(),
+            events: changed_tips,
+        };
+        let changed_successor = JournalHeads {
+            publication_revision: current.publication_revision.checked_add(1).unwrap(),
+            previous: Some(current.id()),
+            merge_frontier: changed_frontier.id(),
+            ..current.clone()
+        };
+        let changed_sealed = ReplaySealedPublication::merge_transition_proof_test_publication(
+            &current,
+            first_change.clone(),
+            changed_frontier,
+            changed_successor,
+            &boundary,
+            OrderedBase::post_genesis(),
+            vec![merge_requirement_action(
+                &reproved,
+                ReplayTransitionProofIntent::Recanonicalize,
+                ReplayTransitionProofLifecycle::Invoke,
+                ReplayTransitionProofProjection::Prepared,
+            )],
+        )
+        .unwrap();
+        let staged = stage_attested_merge_fixture(&mut store, &reproved, Some(k1));
+        let changed_batch = JournalVerifiedTransitionPublisher::new(&mut store)
+            .stage_apply_batch(&changed_sealed, vec![staged])
+            .unwrap();
+        store
+            .publish(
+                &changed_sealed
+                    .with_transition_proof_batch(changed_batch)
+                    .unwrap(),
+            )
+            .unwrap();
+        let changed = store.heads().unwrap().unwrap();
+        let changed_index: TransitionProofIndexManifest =
+            store.get(changed.transition_proofs).unwrap().unwrap();
+        assert_eq!(changed_index.live(k1.invocation), Some(k2));
+
+        let mut restored_tips = vec![first_change.id(), second_change.id(), original.event.id()];
+        restored_tips.sort_unstable();
+        let restored_frontier = MergeFrontier {
+            genesis: genesis.id(),
+            events: restored_tips,
+        };
+        let restored_successor = JournalHeads {
+            publication_revision: changed.publication_revision.checked_add(1).unwrap(),
+            previous: Some(changed.id()),
+            merge_frontier: restored_frontier.id(),
+            ..changed.clone()
+        };
+        let restored_sealed = ReplaySealedPublication::merge_transition_proof_test_publication(
+            &changed,
+            second_change,
+            restored_frontier,
+            restored_successor,
+            &boundary,
+            OrderedBase::post_genesis(),
+            vec![merge_requirement_action(
+                &original,
+                ReplayTransitionProofIntent::Recanonicalize,
+                ReplayTransitionProofLifecycle::Invoke,
+                ReplayTransitionProofProjection::Published,
+            )],
+        )
+        .unwrap();
+        let restored_batch = JournalVerifiedTransitionPublisher::new(&mut store)
+            .stage_apply_batch(&restored_sealed, Vec::new())
+            .unwrap();
+        let restored_publication = restored_sealed
+            .with_transition_proof_batch(restored_batch)
+            .unwrap();
+        assert!(store.publish(&restored_publication).unwrap().heads_advanced);
+        assert!(!store.publish(&restored_publication).unwrap().heads_advanced);
+        let restored = store.heads().unwrap().unwrap();
+        let restored_index: TransitionProofIndexManifest =
+            store.get(restored.transition_proofs).unwrap().unwrap();
+        assert_eq!(restored_index.live(k1.invocation), Some(k1));
+        assert_eq!(restored_index.entries().len(), 2);
+        for key in [k1, k2] {
+            assert!(
+                !transition_proof_key_is_retired(
+                    &store,
+                    genesis.id(),
+                    restored_index.retired_root(),
+                    key,
+                )
+                .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn memory_attested_ack_requires_exact_success_and_rejects_failed_retirement() {
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut store, &genesis);
+
+        let initial = store.heads().unwrap().unwrap();
+        let invoke = attested_invoke_proof_fixture(&genesis, &initial, 0xe8);
+        let key = invoke.prepared.key();
+        let publication = sealed_attested_fixture(&mut store, &initial, &invoke, None);
+        store.publish(&publication).unwrap();
+        let current = store.heads().unwrap().unwrap();
+        let (ack, successor) = attested_acknowledgement_entry(&genesis, &current, &invoke, key);
+
+        // A successfully applied Attested acknowledgement carries mandatory
+        // replay-sealed retirement authority. Omitting its exact mutation is
+        // not a valid ordinary publication.
+        let omitted = ReplaySealedPublication::ordered_transition_proof_test_publication(
+            &current,
+            ack.clone(),
+            successor.clone(),
+            Vec::new(),
+            Some(key),
+        )
+        .unwrap();
+        assert_eq!(
+            store.publish(&omitted),
+            Err(JournalStoreError::NonCanonical)
+        );
+        assert_eq!(store.heads().unwrap(), Some(current.clone()));
+
+        // Conversely, a rejected/no-effect acknowledgement seals no
+        // retirement authority. A caller cannot attach a voluntary Retire.
+        let batch = JournalVerifiedTransitionPublisher::new(&mut store)
+            .stage_retirement(key)
+            .unwrap();
+        let rejected = ReplaySealedPublication::ordered_transition_proof_test_publication(
+            &current,
+            ack,
+            successor,
+            Vec::new(),
+            None,
+        )
+        .unwrap()
+        .with_transition_proof_batch(batch)
+        .unwrap();
+        assert_eq!(
+            store.publish(&rejected),
+            Err(JournalStoreError::NonCanonical)
+        );
+        assert_eq!(store.heads().unwrap(), Some(current.clone()));
+        let index: TransitionProofIndexManifest =
+            store.get(current.transition_proofs).unwrap().unwrap();
+        assert_eq!(index.live(key.invocation), Some(key));
+        assert!(
+            !transition_proof_key_is_retired(&store, genesis.id(), index.retired_root(), key,)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn memory_checkpoint_compaction_preserves_live_then_retires_exact_history_across_later_writes()
+    {
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut store, &genesis);
+
+        let initial = store.heads().unwrap().unwrap();
+        let invoke = attested_invoke_proof_fixture(&genesis, &initial, 0xea);
+        let key = invoke.prepared.key();
+        let publication = sealed_attested_fixture(&mut store, &initial, &invoke, None);
+        store.publish(&publication).unwrap();
+
+        // C1 retains the exact live entry. Checkpoint publication itself is
+        // the one CAS which installs the compact AJP3 root.
+        let live_checkpoint = sealed_test_checkpoint(&mut store, &genesis);
+        let live_successor = live_checkpoint.next().clone();
+        assert!(store.publish(&live_checkpoint).unwrap().heads_advanced);
+        assert!(!store.publish(&live_checkpoint).unwrap().heads_advanced);
+        let live_index: TransitionProofIndexManifest = store
+            .get(live_successor.transition_proofs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(live_index.entries().len(), 1);
+        assert_eq!(live_index.live(key.invocation), Some(key));
+
+        let live_checkpoint_base = ordered_base(&live_successor);
+        let (ack, ack_successor) =
+            attested_acknowledgement_entry(&genesis, &live_successor, &invoke, key);
+        let ack_action = ReplayTransitionProofTestAction::Retirement {
+            input: ack.input.id(),
+            position: ReplayPosition::Ordered {
+                id: ack.id(),
+                index: ack.index,
+                merge_frontier: ack.merge_frontier,
+                merge_seal: ack.merge_seal,
+            },
+            key,
+        };
+        let ack_batch = JournalVerifiedTransitionPublisher::new(&mut store)
+            .stage_retirement(key)
+            .unwrap();
+        let ack_publication =
+            ReplaySealedPublication::ordered_transition_proof_test_publication_at_boundary(
+                &live_successor,
+                ack,
+                ack_successor,
+                Vec::new(),
+                Some(key),
+                live_checkpoint_base,
+            )
+            .unwrap()
+            .with_transition_proof_test_actions(&live_index, vec![ack_action])
+            .unwrap()
+            .with_transition_proof_batch(ack_batch)
+            .unwrap();
+        store.publish(&ack_publication).unwrap();
+        let after_ack = store.heads().unwrap().unwrap();
+        let retained_index: TransitionProofIndexManifest =
+            store.get(after_ack.transition_proofs).unwrap().unwrap();
+        assert_eq!(retained_index.live(key.invocation), None);
+        assert_eq!(retained_index.entries().len(), 1);
+        assert!(
+            JournalVerifiedTransitionPublisher::new(&mut store)
+                .load_published(key)
+                .unwrap()
+                .is_some()
+        );
+
+        // An unrelated ordinary publication carries C1 and the retained AJP3
+        // forward. The Ack tombstone blocks resurrection while response-loss
+        // recovery may still load the replay-retained public tuple.
+        let ordinary_input = replay_input(MethodMode::Linear, 0xeb);
+        let ordinary = OrderedEntry {
+            genesis: genesis.id(),
+            index: after_ack.ordered_index.checked_add(1).unwrap(),
+            parent: after_ack.ordered_head,
+            merge_frontier: after_ack.merge_frontier,
+            merge_seal: None,
+            input: ordinary_input,
+        };
+        let ordinary_next = ordered_successor(&after_ack, &ordinary);
+        let ordinary_publication =
+            ReplaySealedPublication::ordered_transition_proof_test_publication_at_boundary(
+                &after_ack,
+                ordinary,
+                ordinary_next,
+                Vec::new(),
+                None,
+                live_checkpoint_base,
+            )
+            .unwrap();
+        store.publish(&ordinary_publication).unwrap();
+        assert!(
+            JournalVerifiedTransitionPublisher::new(&mut store)
+                .load_published(key)
+                .unwrap()
+                .is_some()
+        );
+
+        // C2 is the sole proof-material pruning boundary. It retains the
+        // exact-purpose tombstone, drops the non-live AJPT record, and remains
+        // exactly retryable before any later head advances.
+        let retired_checkpoint = sealed_test_checkpoint(&mut store, &genesis);
+        let retired_successor = retired_checkpoint.next().clone();
+        assert!(store.publish(&retired_checkpoint).unwrap().heads_advanced);
+        assert!(!store.publish(&retired_checkpoint).unwrap().heads_advanced);
+        let compact: TransitionProofIndexManifest = store
+            .get(retired_successor.transition_proofs)
+            .unwrap()
+            .unwrap();
+        assert!(compact.entries().is_empty());
+        assert!(compact.live_entries().is_empty());
+        assert!(
+            transition_proof_key_is_retired(&store, genesis.id(), compact.retired_root(), key,)
+                .unwrap()
+        );
+        assert!(
+            JournalVerifiedTransitionPublisher::new(&mut store)
+                .load_published(key)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            JournalVerifiedTransitionPublisher::new(&mut store)
+                .load_retired(key)
+                .unwrap()
+                .map(AuthenticatedTransitionRetirement::key),
+            Some(key)
+        );
+
+        let after_c2 = store.heads().unwrap().unwrap();
+        let retired_checkpoint_base = ordered_base(&after_c2);
+        let later = OrderedEntry {
+            genesis: genesis.id(),
+            index: after_c2.ordered_index.checked_add(1).unwrap(),
+            parent: after_c2.ordered_head,
+            merge_frontier: after_c2.merge_frontier,
+            merge_seal: None,
+            input: replay_input(MethodMode::Linear, 0xec),
+        };
+        let later_next = ordered_successor(&after_c2, &later);
+        let later_publication =
+            ReplaySealedPublication::ordered_transition_proof_test_publication_at_boundary(
+                &after_c2,
+                later,
+                later_next,
+                Vec::new(),
+                None,
+                retired_checkpoint_base,
+            )
+            .unwrap();
+        store.publish(&later_publication).unwrap();
+        assert!(
+            JournalVerifiedTransitionPublisher::new(&mut store)
+                .load_published(key)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            JournalVerifiedTransitionPublisher::new(&mut store)
+                .load_retired(key)
+                .unwrap()
+                .map(AuthenticatedTransitionRetirement::key),
+            Some(key)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_transition_proof_publication_recovers_each_head_cas_boundary() {
+        for crash_at in [
+            PublicationPoint::ObjectDurable,
+            PublicationPoint::HeadsStaged,
+            PublicationPoint::HeadsDurable,
+        ] {
+            let directory = TestDirectory::new("transition-proof-cas-crash");
+            let genesis = genesis();
+            let mut store = open_file_store(&directory);
+            initialize(&mut store, &genesis);
+            let current = store.heads().unwrap().unwrap();
+            let fixture = attested_invoke_proof_fixture(&genesis, &current, 0xe4);
+            let key = fixture.prepared.key();
+            let batch = stage_attested_fixture(&mut store, &fixture, None);
+            let publication = ReplaySealedPublication::ordered_transition_proof_test_publication(
+                &current,
+                fixture.entry.clone(),
+                fixture.successor.clone(),
+                vec![attested_requirement(&fixture, None)],
+                None,
+            )
+            .unwrap()
+            .with_transition_proof_batch(batch)
+            .unwrap();
+            let successor = publication.next().clone();
+            assert_eq!(
+                store.publish_sealed_inner(&publication, None, |point| {
+                    if point == crash_at {
+                        Err(JournalStoreError::Unavailable)
+                    } else {
+                        Ok(())
+                    }
+                }),
+                Err(JournalStoreError::Unavailable)
+            );
+            drop(store);
+
+            let mut reopened = open_file_store(&directory);
+            let recovered = reopened.heads().unwrap().unwrap();
+            if crash_at == PublicationPoint::HeadsDurable {
+                assert_eq!(recovered, successor);
+            } else {
+                assert_eq!(recovered, current);
+                assert!(
+                    JournalVerifiedTransitionPublisher::new(&mut reopened)
+                        .load_published(key)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            let retry = reopened.publish(&publication).unwrap();
+            assert_eq!(
+                retry.heads_advanced,
+                crash_at != PublicationPoint::HeadsDurable
+            );
+            assert_eq!(reopened.heads().unwrap(), Some(successor.clone()));
+            assert!(
+                JournalVerifiedTransitionPublisher::new(&mut reopened)
+                    .load_published(key)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(!reopened.root().join("heads.next").exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_transition_proof_replacement_recovers_each_history_boundary() {
+        for crash_at in [
+            PublicationPoint::HistoryCandidateDurable,
+            PublicationPoint::ObjectDurable,
+            PublicationPoint::HeadsStaged,
+            PublicationPoint::HeadsDurable,
+            PublicationPoint::HistoryPromoted,
+            PublicationPoint::HistoryRetirementDurable,
+            PublicationPoint::HistoryCandidateCleared,
+        ] {
+            let directory = TestDirectory::new("transition-proof-history-crash");
+            let genesis = genesis();
+            let mut store = open_file_store(&directory);
+            initialize(&mut store, &genesis);
+            let initial = store.heads().unwrap().unwrap();
+            let invoke = attested_invoke_proof_fixture(&genesis, &initial, 0xe8);
+            let invoke_key = invoke.prepared.key();
+            let invoke_publication = sealed_attested_fixture(&mut store, &initial, &invoke, None);
+            store.publish(&invoke_publication).unwrap();
+
+            let current = store.heads().unwrap().unwrap();
+            let (acknowledgement, acknowledgement_successor) =
+                attested_acknowledgement_entry(&genesis, &current, &invoke, invoke_key);
+            let publication = sealed_attested_retirement(
+                &mut store,
+                &current,
+                acknowledgement,
+                acknowledgement_successor,
+                invoke_key,
+            );
+            let successor = publication.next().clone();
+            assert_eq!(
+                store.publish_sealed_inner(&publication, None, |point| {
+                    if point == crash_at {
+                        Err(JournalStoreError::Unavailable)
+                    } else {
+                        Ok(())
+                    }
+                }),
+                Err(JournalStoreError::Unavailable)
+            );
+            drop(store);
+
+            let mut reopened = open_file_store(&directory);
+            let recovered = reopened.heads().unwrap().unwrap();
+            if matches!(
+                crash_at,
+                PublicationPoint::HeadsDurable
+                    | PublicationPoint::HistoryPromoted
+                    | PublicationPoint::HistoryRetirementDurable
+                    | PublicationPoint::HistoryCandidateCleared
+            ) {
+                assert_eq!(recovered, successor);
+            } else {
+                assert_eq!(recovered, current);
+            }
+            reopened.publish(&publication).unwrap();
+            assert_eq!(reopened.heads().unwrap(), Some(successor.clone()));
+            let index: TransitionProofIndexManifest =
+                reopened.get(successor.transition_proofs).unwrap().unwrap();
+            assert_eq!(index.live(invoke_key.invocation), None);
+            assert!(
+                transition_proof_key_is_retired(
+                    &reopened,
+                    genesis.id(),
+                    index.retired_root(),
+                    invoke_key,
+                )
+                .unwrap()
+            );
+            assert!(
+                JournalVerifiedTransitionPublisher::new(&mut reopened)
+                    .load_published(invoke_key)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "storage"))]
+    #[test]
+    fn production_local_reverified_open_loads_proof_retirement_at_head_boundaries() {
+        for (index, crash_at) in [
+            PublicationPoint::HeadsStaged,
+            PublicationPoint::HeadsDurable,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let directory = TestDirectory::new("production-proof-retirement-reopen");
+            let sealed = crate::agent::replay::tests::admitted_local_genesis(
+                0xd8_u8.wrapping_add(index as u8),
+            );
+            let genesis = sealed.genesis();
+            let mut store = initialize_production_local_file_store(&directory, &sealed);
+            let initial = store.heads().unwrap().unwrap();
+            let invoke =
+                attested_invoke_proof_fixture(genesis, &initial, 0xe8_u8.wrapping_add(index as u8));
+            let invoke_key = invoke.prepared.key();
+            let invoke_publication = sealed_attested_fixture(&mut store, &initial, &invoke, None);
+            store.publish(&invoke_publication).unwrap();
+
+            let current = store.heads().unwrap().unwrap();
+            let (acknowledgement, acknowledgement_successor) =
+                attested_acknowledgement_entry(genesis, &current, &invoke, invoke_key);
+            let publication = sealed_attested_retirement(
+                &mut store,
+                &current,
+                acknowledgement,
+                acknowledgement_successor,
+                invoke_key,
+            );
+            let successor = publication.next().clone();
+            let candidate_root = publication
+                .transition_proof_batch()
+                .and_then(StagedTransitionProofBatch::retirement_plan)
+                .and_then(InvocationHistoryWritePlan::root)
+                .unwrap();
+            assert!(
+                store
+                    .read_global_history_node(candidate_root)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                store.publish_sealed_inner(&publication, None, |point| {
+                    if point == crash_at {
+                        Err(JournalStoreError::Unavailable)
+                    } else {
+                        Ok(())
+                    }
+                }),
+                Err(JournalStoreError::Unavailable)
+            );
+            drop(store);
+
+            let before_open = file_tree_snapshot(&directory.0);
+            let mut reopened = reopen_production_local_file_store(&directory, &sealed)
+                .expect("production Local slot must admit proof retirement before head validation");
+            assert_eq!(file_tree_snapshot(&directory.0), before_open);
+            assert!(reopened.history_candidate.is_some());
+            assert!(
+                reopened
+                    .read_global_history_node(candidate_root)
+                    .unwrap()
+                    .is_none()
+            );
+            let candidate_index: TransitionProofIndexManifest =
+                reopened.get(successor.transition_proofs).unwrap().unwrap();
+            assert_eq!(candidate_index.live(invoke_key.invocation), None);
+            assert!(
+                transition_proof_key_is_retired(
+                    &reopened,
+                    genesis.id(),
+                    candidate_index.retired_root(),
+                    invoke_key,
+                )
+                .unwrap()
+            );
+
+            reopened.finish_reverified_open().unwrap();
+            let retry = reopened.publish(&publication).unwrap();
+            assert_eq!(
+                retry.heads_advanced,
+                crash_at == PublicationPoint::HeadsStaged
+            );
+            assert_eq!(reopened.heads().unwrap(), Some(successor.clone()));
+            assert!(reopened.history_candidate.is_none());
+            assert!(
+                reopened
+                    .read_global_history_node(candidate_root)
+                    .unwrap()
+                    .is_some()
+            );
+            let committed_index: TransitionProofIndexManifest =
+                reopened.get(successor.transition_proofs).unwrap().unwrap();
+            assert_eq!(committed_index.live(invoke_key.invocation), None);
+            assert!(
+                transition_proof_key_is_retired(
+                    &reopened,
+                    genesis.id(),
+                    committed_index.retired_root(),
+                    invoke_key,
+                )
+                .unwrap()
+            );
+            assert!(
+                JournalVerifiedTransitionPublisher::new(&mut reopened)
+                    .load_published(invoke_key)
+                    .unwrap()
+                    .is_some()
+            );
         }
     }
 
@@ -11160,7 +16823,14 @@ mod tests {
     where
         S: AgentJournalStore + InvocationIndexStore<Error = JournalStoreError>,
     {
-        let input = replay_input(MethodMode::Linear, discriminator);
+        let mut input = replay_input(MethodMode::Linear, discriminator);
+        input.runtime = current.runtime.clone();
+        let ReplayOperation::Invoke { authority, .. } = &mut input.operation else {
+            unreachable!()
+        };
+        authority.claim.space = input.runtime.space;
+        authority.claim.agent = input.runtime.agent;
+        input.validate().unwrap();
         let ReplayOperation::Invoke { invocation, .. } = &input.operation else {
             unreachable!()
         };
@@ -11240,6 +16910,7 @@ mod tests {
             current,
             &transition.next,
             core::slice::from_ref(&transition.plan),
+            None,
             queue,
         )
         .unwrap()
@@ -11255,6 +16926,7 @@ mod tests {
             ordered: Some(InvocationHistoryNodeId([0xe1; 32])),
             merge: tail.merge,
             local: tail.local,
+            transition_proofs: tail.transition_proofs,
         };
         assert_ne!(alternate, tail);
         let mut roots = tail;
@@ -11304,6 +16976,65 @@ mod tests {
             sealed.replica().node,
         )
         .unwrap()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "storage"))]
+    const PRODUCTION_LOCAL_INTENT: Hash = Hash([0xa7; 32]);
+
+    #[cfg(all(target_os = "linux", feature = "storage"))]
+    fn acquire_production_local_slot(
+        directory: &TestDirectory,
+        sealed: &ReplaySealedLocalGenesis,
+    ) -> FileLocalAgentJournalSlot {
+        let parent = File::open(&directory.0).unwrap();
+        FileLocalAgentJournalSlot::acquire_with_pinned_parents(
+            directory.agent_root(sealed.genesis().runtime().agent),
+            directory.lock(sealed.genesis().runtime().agent),
+            sealed.replica().node,
+            PRODUCTION_LOCAL_INTENT,
+            &parent,
+            &parent,
+        )
+        .unwrap()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "storage"))]
+    fn initialize_production_local_file_store(
+        directory: &TestDirectory,
+        sealed: &ReplaySealedLocalGenesis,
+    ) -> FileAgentJournalStore {
+        let slot = acquire_production_local_slot(directory, sealed);
+        assert!(!slot.generation_exists());
+        let mut store = slot.open(sealed, false).unwrap();
+        let package_bytes = b"replay-runtime-package";
+        assert_eq!(
+            sealed.artifacts().artifacts,
+            vec![BlobRef::of_bytes(package_bytes)]
+        );
+        assert!(
+            store
+                .put_blob(
+                    JournalBlobClass::CatalogArtifact,
+                    &sealed.genesis().runtime().package,
+                    package_bytes,
+                )
+                .unwrap()
+        );
+        assert!(store.initialize_local(sealed).unwrap());
+        store
+            .commit_local_exposure(sealed, PRODUCTION_LOCAL_INTENT)
+            .unwrap();
+        store
+    }
+
+    #[cfg(all(target_os = "linux", feature = "storage"))]
+    fn reopen_production_local_file_store(
+        directory: &TestDirectory,
+        sealed: &ReplaySealedLocalGenesis,
+    ) -> Result<FileAgentJournalStore, JournalStoreError> {
+        let slot = acquire_production_local_slot(directory, sealed);
+        assert!(slot.generation_exists());
+        slot.open(sealed, true)
     }
 
     #[cfg(all(target_os = "linux", feature = "storage"))]
@@ -11389,6 +17120,7 @@ mod tests {
             )
             .unwrap();
         assert!(store.initialize(sealed).unwrap());
+        assert_initial_transition_proof_index(store, sealed.genesis());
     }
 
     fn authority_paths(
@@ -12351,6 +18083,316 @@ mod tests {
     }
 
     #[test]
+    fn memory_head_snapshots_are_private_and_checkpoint_gc_keeps_only_reachable_history() {
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut store, &genesis);
+
+        let initial = store.heads().unwrap().unwrap();
+        let entry = first_ordered(&genesis, &initial);
+        let ordered = ordered_successor(&initial, &entry);
+        store
+            .publish_anchor(initial.id(), &entry, &ordered)
+            .unwrap();
+        assert_eq!(
+            store.historical_heads(initial.id()).unwrap(),
+            Some(initial.clone())
+        );
+        assert_eq!(store.put(&initial), Err(JournalStoreError::InvalidClass));
+        assert_eq!(
+            store.get::<JournalHeads>(initial.id()),
+            Err(JournalStoreError::InvalidClass)
+        );
+
+        let (checkpoint_heads, _) = install_fresh_checkpoint(&mut store, &genesis);
+        assert_eq!(checkpoint_heads.previous, Some(ordered.id()));
+        assert_eq!(
+            store.historical_heads(ordered.id()).unwrap(),
+            Some(ordered.clone())
+        );
+        assert!(
+            store
+                .collect_garbage(checkpoint_heads.id(), gc_limits())
+                .unwrap()
+                .complete
+        );
+        assert_eq!(store.historical_heads(initial.id()).unwrap(), None);
+        assert_eq!(store.historical_heads(ordered.id()).unwrap(), Some(ordered));
+        validate_head_targets(&store, &checkpoint_heads).unwrap();
+    }
+
+    #[test]
+    fn memory_initialization_rejects_a_substituted_empty_transition_proof_index() {
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        store
+            .put_blob(
+                JournalBlobClass::CatalogArtifact,
+                &genesis.runtime().package,
+                b"runtime-package",
+            )
+            .unwrap();
+        let expected = TransitionProofIndexManifest::empty(genesis.id());
+        let substituted =
+            TransitionProofIndexManifest::empty(AgentJournalGenesisId([0xa7; 32])).encode();
+        store.objects.insert(
+            (
+                JournalStorageClass::TransitionProofIndex,
+                *expected.id().as_bytes(),
+            ),
+            substituted,
+        );
+
+        assert_eq!(
+            store.initialize_raw_for_test(&genesis),
+            Err(JournalStoreError::Corrupt)
+        );
+        assert_eq!(store.heads().unwrap(), None);
+    }
+
+    #[test]
+    fn memory_sealed_initialization_persists_the_exact_empty_transition_proof_index() {
+        let sealed = crate::agent::replay::tests::admitted_genesis(0xa6);
+        let mut store =
+            MemoryAgentJournalStore::new(sealed.genesis().runtime().agent, sealed.replica().node)
+                .unwrap();
+        store
+            .put_blob(
+                JournalBlobClass::CatalogArtifact,
+                &sealed.genesis().runtime().package,
+                b"replay-runtime-package",
+            )
+            .unwrap();
+        assert!(store.initialize(&sealed).unwrap());
+        assert_initial_transition_proof_index(&store, sealed.genesis());
+    }
+
+    #[test]
+    fn ordinary_publications_preserve_the_authenticated_transition_proof_root() {
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut store, &genesis);
+        let initial = store.heads().unwrap().unwrap();
+        let proof_root = initial.transition_proofs;
+
+        let event = merge_event(&genesis, Vec::new(), 1, 0x28);
+        let merge = merge_successor(&mut store, &initial, vec![event.id()]);
+        assert_eq!(merge.transition_proofs, proof_root);
+        let mut substituted_merge = merge.clone();
+        substituted_merge.transition_proofs = TransitionProofIndexId([0xa8; 32]);
+        assert_eq!(
+            store.publish_anchor(initial.id(), &event, &substituted_merge),
+            Err(JournalStoreError::NonCanonical)
+        );
+        assert_eq!(store.heads().unwrap(), Some(initial.clone()));
+        store.publish_anchor(initial.id(), &event, &merge).unwrap();
+
+        let ordered_entry = first_ordered(&genesis, &merge);
+        let ordered = ordered_successor(&merge, &ordered_entry);
+        assert_eq!(ordered.transition_proofs, proof_root);
+        store
+            .publish_anchor(merge.id(), &ordered_entry, &ordered)
+            .unwrap();
+
+        let local_entry = LocalEntry {
+            genesis: genesis.id(),
+            node: ordered.node,
+            revision: 1,
+            parent: None,
+            ordered_base: ordered_base(&ordered),
+            merge_frontier: ordered.merge_frontier,
+            input: replay_input(MethodMode::Local, 0x29),
+        };
+        let local = JournalHeads {
+            publication_revision: ordered.publication_revision + 1,
+            previous: Some(ordered.id()),
+            local_head: Some(local_entry.id()),
+            local_revision: 1,
+            ..ordered.clone()
+        };
+        assert_eq!(local.transition_proofs, proof_root);
+        store
+            .publish_anchor(ordered.id(), &local_entry, &local)
+            .unwrap();
+
+        let (checkpoint, manifest) = install_fresh_checkpoint(&mut store, &genesis);
+        assert_eq!(manifest.transition_proofs, proof_root);
+        assert_eq!(checkpoint.transition_proofs, proof_root);
+    }
+
+    #[test]
+    fn checkpoint_publication_binds_the_root_while_later_heads_may_advance_it() {
+        let genesis = genesis();
+        let config = config();
+        let mut store =
+            MemoryAgentJournalStore::new(config.identity.agent, config.replicas[0].node).unwrap();
+        initialize(&mut store, &genesis);
+        let predecessor = store.heads().unwrap().unwrap();
+        let (checkpoint_heads, checkpoint) = install_fresh_checkpoint(&mut store, &genesis);
+        assert_eq!(
+            checkpoint.transition_proofs,
+            checkpoint_heads.transition_proofs
+        );
+
+        let fixture = attested_invoke_proof_fixture(&genesis, &checkpoint_heads, 0xa9);
+        let publication = sealed_attested_fixture(&mut store, &checkpoint_heads, &fixture, None);
+        let alternate = publication.transition_proof_batch().unwrap().next().clone();
+        let substituted_checkpoint = CheckpointManifest {
+            transition_proofs: alternate.id(),
+            ..checkpoint.clone()
+        };
+        assert_eq!(
+            validate_checkpoint_publication(
+                &store,
+                &predecessor,
+                predecessor.transition_proofs,
+                &substituted_checkpoint,
+            ),
+            Err(JournalStoreError::NonCanonical)
+        );
+
+        let advanced_heads = publication.next().clone();
+        advanced_heads.validate().unwrap();
+        store.publish(&publication).unwrap();
+        validate_head_targets(&store, &advanced_heads).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_initialization_reopens_only_with_its_exact_empty_transition_proof_index() {
+        let directory = TestDirectory::new("initial-transition-proof-index");
+        let genesis = genesis();
+        let mut store = open_file_store(&directory);
+        initialize(&mut store, &genesis);
+        let heads = store.heads().unwrap().unwrap();
+        let proof_root = heads.transition_proofs;
+        let proof_path = store
+            .root()
+            .join("transition-proofs/indexes")
+            .join(encode_hex(proof_root.as_bytes()));
+        assert!(proof_path.is_file());
+        drop(store);
+
+        let reopened = open_file_store(&directory);
+        assert_eq!(reopened.heads().unwrap(), Some(heads.clone()));
+        assert_initial_transition_proof_index(&reopened, &genesis);
+        drop(reopened);
+
+        fs::remove_file(&proof_path).unwrap();
+        let config = config();
+        assert!(matches!(
+            FileAgentJournalStore::open_unverified_for_test(
+                directory.agent_root(config.identity.agent),
+                directory.lock(config.identity.agent),
+                config.replicas[0].node,
+            ),
+            Err(JournalStoreError::MissingObject)
+        ));
+
+        fs::write(&proof_path, b"corrupt-transition-proof-index").unwrap();
+        assert!(matches!(
+            FileAgentJournalStore::open_unverified_for_test(
+                directory.agent_root(config.identity.agent),
+                directory.lock(config.identity.agent),
+                config.replicas[0].node,
+            ),
+            Err(JournalStoreError::Corrupt)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_head_snapshot_reopens_exactly_and_tampering_fails_closed() {
+        let directory = TestDirectory::new("head-history-reopen");
+        let genesis = genesis();
+        let mut store = open_file_store(&directory);
+        initialize(&mut store, &genesis);
+        let initial = store.heads().unwrap().unwrap();
+        let entry = first_ordered(&genesis, &initial);
+        let next = ordered_successor(&initial, &entry);
+        store.publish_anchor(initial.id(), &entry, &next).unwrap();
+        let snapshot = store
+            .root()
+            .join(HEADS_HISTORY_DIRECTORY)
+            .join(encode_hex(initial.id().as_bytes()));
+        assert!(snapshot.is_file());
+        drop(store);
+
+        let reopened = open_file_store(&directory);
+        assert_eq!(reopened.heads().unwrap(), Some(next));
+        assert_eq!(
+            reopened.historical_heads(initial.id()).unwrap(),
+            Some(initial.clone())
+        );
+        assert_eq!(
+            reopened.get::<JournalHeads>(initial.id()),
+            Err(JournalStoreError::InvalidClass)
+        );
+        drop(reopened);
+
+        fs::write(snapshot, b"corrupt-head-history").unwrap();
+        let config = config();
+        assert!(matches!(
+            FileAgentJournalStore::open_unverified_for_test(
+                directory.agent_root(config.identity.agent),
+                directory.lock(config.identity.agent),
+                config.replicas[0].node,
+            ),
+            Err(JournalStoreError::Corrupt)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_checkpoint_gc_retires_only_unreachable_head_snapshots() {
+        let directory = TestDirectory::new("head-history-gc");
+        let genesis = genesis();
+        let mut store = open_file_store(&directory);
+        initialize(&mut store, &genesis);
+        let initial = store.heads().unwrap().unwrap();
+        let entry = first_ordered(&genesis, &initial);
+        let ordered = ordered_successor(&initial, &entry);
+        store
+            .publish_anchor(initial.id(), &entry, &ordered)
+            .unwrap();
+        let initial_snapshot = store
+            .root()
+            .join(HEADS_HISTORY_DIRECTORY)
+            .join(encode_hex(initial.id().as_bytes()));
+        let ordered_snapshot = store
+            .root()
+            .join(HEADS_HISTORY_DIRECTORY)
+            .join(encode_hex(ordered.id().as_bytes()));
+
+        let (checkpoint_heads, _) = install_fresh_checkpoint(&mut store, &genesis);
+        assert!(initial_snapshot.is_file());
+        assert!(ordered_snapshot.is_file());
+        assert!(
+            store
+                .collect_garbage(checkpoint_heads.id(), gc_limits())
+                .unwrap()
+                .complete
+        );
+        assert!(!initial_snapshot.exists());
+        assert!(ordered_snapshot.is_file());
+        drop(store);
+
+        let reopened = open_file_store(&directory);
+        assert_eq!(reopened.heads().unwrap(), Some(checkpoint_heads.clone()));
+        assert_eq!(
+            reopened.historical_heads(ordered.id()).unwrap(),
+            Some(ordered)
+        );
+        validate_head_targets(&reopened, &checkpoint_heads).unwrap();
+    }
+
+    #[test]
     fn system_authorized_admission_stays_closed_until_live_verifier_exists() {
         let admission = phase_one_system_authorized_admission();
         admission.validate().unwrap();
@@ -12559,6 +18601,7 @@ mod tests {
                 &fake_current,
                 &transition.next,
                 core::slice::from_ref(&transition.plan),
+                None,
                 &queue,
             ),
             Err(JournalStoreError::Backpressure)
@@ -12621,6 +18664,7 @@ mod tests {
                     fake_current.id(),
                     &transition.next,
                     core::slice::from_ref(&transition.plan),
+                    None,
                     &mut |_| {
                         reached_write_point = true;
                         Ok(())
@@ -12859,6 +18903,7 @@ mod tests {
             &entry,
             &next,
             ReplayPublicationMode::SharedOrderedPreserveMerge,
+            false,
         )
         .unwrap();
 
@@ -12890,6 +18935,7 @@ mod tests {
             &fenced,
             &fenced_next,
             ReplayPublicationMode::SharedOrderedInstallFence,
+            false,
         )
         .unwrap();
     }
@@ -13240,10 +19286,16 @@ mod tests {
             ..heads_two.clone()
         };
         let queue = store.history_queue(genesis.id()).unwrap().clone();
-        let history =
-            build_history_candidate(&store, &heads_two, &heads_three, &[history_plan], &queue)
-                .unwrap()
-                .unwrap();
+        let history = build_history_candidate(
+            &store,
+            &heads_two,
+            &heads_three,
+            &[history_plan],
+            None,
+            &queue,
+        )
+        .unwrap()
+        .unwrap();
         store.install_history_candidate(&history).unwrap();
         store
             .publish_anchor(heads_three.previous.unwrap(), &entry_three, &heads_three)
@@ -13402,6 +19454,7 @@ mod tests {
             merge_seal: coherent.merge_seal,
             ordered_invocations: coherent.ordered_invocations,
             merge_invocations: coherent.merge_invocations,
+            transition_proofs: coherent.transition_proofs,
             lanes: vec![CheckpointLane {
                 lane: PersistedLane::Control,
                 node: None,
@@ -13589,6 +19642,7 @@ mod tests {
             input: ReplayInput {
                 runtime,
                 operation: ReplayOperation::CleanInvoke {
+                    context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                     work,
                     authorization: crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
                         authority,
@@ -13855,6 +19909,7 @@ mod tests {
             merge_seal: boundary_heads.merge_seal,
             ordered_invocations: boundary_heads.ordered_invocations,
             merge_invocations: boundary_heads.merge_invocations,
+            transition_proofs: boundary_heads.transition_proofs,
             lanes: vec![
                 CheckpointLane {
                     lane: PersistedLane::Control,
@@ -14149,6 +20204,200 @@ mod tests {
         }
     }
 
+    #[cfg(all(target_os = "linux", feature = "storage"))]
+    #[test]
+    fn production_local_reverified_open_loads_ack_history_at_head_boundaries() {
+        for (index, crash_at) in [
+            PublicationPoint::HeadsStaged,
+            PublicationPoint::HeadsDurable,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let directory = TestDirectory::new("production-ack-history-reopen");
+            let sealed = crate::agent::replay::tests::admitted_local_genesis(
+                0xc4_u8.wrapping_add(index as u8),
+            );
+            let genesis = sealed.genesis();
+            let mut store = initialize_production_local_file_store(&directory, &sealed);
+            let current = store.heads().unwrap().unwrap();
+            let transition = prepare_history_transition(
+                &mut store,
+                genesis,
+                &current,
+                0xd4_u8.wrapping_add(index as u8),
+            );
+            let queue = store.history_queue(genesis.id()).unwrap();
+            let history = build_test_history_candidate(&store, &current, &transition, &queue);
+            let candidate_root = transition.plan.root().unwrap();
+            assert!(
+                store
+                    .read_global_history_node(candidate_root)
+                    .unwrap()
+                    .is_none()
+            );
+
+            let attempted = (|| {
+                store.stage_history_candidate(history, &mut |_| Ok(()))?;
+                store.publish_inner(
+                    current.id(),
+                    &transition.entry,
+                    &transition.next,
+                    |point| {
+                        if point == crash_at {
+                            Err(JournalStoreError::Unavailable)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )?;
+                Ok::<(), JournalStoreError>(())
+            })();
+            assert_eq!(attempted, Err(JournalStoreError::Unavailable));
+            drop(store);
+
+            let before_open = file_tree_snapshot(&directory.0);
+            let mut reopened = reopen_production_local_file_store(&directory, &sealed)
+                .expect("production Local slot must admit the candidate before head validation");
+            assert_eq!(file_tree_snapshot(&directory.0), before_open);
+            assert!(reopened.history_candidate.is_some());
+            assert!(
+                reopened
+                    .read_global_history_node(candidate_root)
+                    .unwrap()
+                    .is_none()
+            );
+            match crash_at {
+                PublicationPoint::HeadsStaged => {
+                    assert_eq!(reopened.heads().unwrap(), Some(current.clone()));
+                    assert_eq!(
+                        reopened
+                            .read_fixed::<JournalHeads>("", "heads.next")
+                            .unwrap(),
+                        Some(transition.next.clone())
+                    );
+                }
+                PublicationPoint::HeadsDurable => {
+                    assert_eq!(reopened.heads().unwrap(), Some(transition.next.clone()));
+                    assert!(
+                        reopened
+                            .read_fixed::<JournalHeads>("", "heads.next")
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let candidate_index =
+                InvocationIndex::open(&mut reopened, transition.next.ordered_invocations).unwrap();
+            assert_eq!(
+                candidate_index.lookup(transition.key).unwrap(),
+                Some(InvocationIndexLookup::Archived(transition.fact))
+            );
+            drop(candidate_index);
+
+            reopened.finish_reverified_open().unwrap();
+            if crash_at == PublicationPoint::HeadsStaged {
+                assert_eq!(reopened.heads().unwrap(), Some(current.clone()));
+                assert!(
+                    reopened
+                        .read_global_history_node(candidate_root)
+                        .unwrap()
+                        .is_none()
+                );
+                let queue = reopened.history_queue(genesis.id()).unwrap();
+                let retry = build_test_history_candidate(&reopened, &current, &transition, &queue);
+                reopened
+                    .stage_history_candidate(retry, &mut |_| Ok(()))
+                    .unwrap();
+                reopened
+                    .publish_inner(
+                        current.id(),
+                        &transition.entry,
+                        &transition.next,
+                        |_| Ok(()),
+                    )
+                    .unwrap();
+                reopened.finish_history_candidate(&mut |_| Ok(())).unwrap();
+            }
+
+            assert_eq!(reopened.heads().unwrap(), Some(transition.next.clone()));
+            assert!(reopened.history_candidate.is_none());
+            assert!(!reopened.root().join("heads.next").exists());
+            assert!(
+                reopened
+                    .read_global_history_node(candidate_root)
+                    .unwrap()
+                    .is_some()
+            );
+            let committed =
+                InvocationIndex::open(&mut reopened, transition.next.ordered_invocations).unwrap();
+            assert_eq!(
+                committed.lookup(transition.key).unwrap(),
+                Some(InvocationIndexLookup::Archived(transition.fact))
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "storage"))]
+    #[test]
+    fn production_local_reverified_open_rejects_bad_candidate_intent_without_mutation() {
+        for (index, malformed) in [false, true].into_iter().enumerate() {
+            let directory = TestDirectory::new("production-bad-history-intent");
+            let sealed = crate::agent::replay::tests::admitted_local_genesis(
+                0xe4_u8.wrapping_add(index as u8),
+            );
+            let genesis = sealed.genesis();
+            let mut store = initialize_production_local_file_store(&directory, &sealed);
+            let current = store.heads().unwrap().unwrap();
+            let transition = prepare_history_transition(
+                &mut store,
+                genesis,
+                &current,
+                0xf4_u8.wrapping_add(index as u8),
+            );
+            let queue = store.history_queue(genesis.id()).unwrap();
+            let history = build_test_history_candidate(&store, &current, &transition, &queue);
+            store
+                .stage_history_candidate(history, &mut |_| Ok(()))
+                .unwrap();
+            assert_eq!(
+                store.publish_inner(current.id(), &transition.entry, &transition.next, |point| {
+                    if point == PublicationPoint::HeadsStaged {
+                        Err(JournalStoreError::Unavailable)
+                    } else {
+                        Ok(())
+                    }
+                },),
+                Err(JournalStoreError::Unavailable)
+            );
+            let intent_path = store
+                .root()
+                .join(HISTORY_DIRECTORY)
+                .join(HISTORY_CANDIDATE_INTENT_NAME);
+            drop(store);
+
+            if malformed {
+                fs::write(&intent_path, b"malformed candidate intent").unwrap();
+            } else {
+                let mut intent =
+                    decode_history_candidate_intent(&fs::read(&intent_path).unwrap()).unwrap();
+                intent.retirement.expected_heads = JournalHeadsId([0xfd; 32]);
+                assert_ne!(intent.retirement.expected_heads, current.id());
+                assert_ne!(intent.retirement.expected_heads, transition.next.id());
+                intent.validate().unwrap();
+                fs::write(&intent_path, intent.encode()).unwrap();
+            }
+
+            let before_open = file_tree_snapshot(&directory.0);
+            assert!(matches!(
+                reopen_production_local_file_store(&directory, &sealed),
+                Err(JournalStoreError::Corrupt)
+            ));
+            assert_eq!(file_tree_snapshot(&directory.0), before_open);
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn file_history_stale_cas_is_zero_write_and_reopen_rejects_tampering() {
@@ -14180,6 +20429,7 @@ mod tests {
                 current.id(),
                 &transition.next,
                 core::slice::from_ref(&transition.plan),
+                None,
                 &mut |_| {
                     reached_write_point = true;
                     Ok(())
@@ -14643,25 +20893,65 @@ mod tests {
             .root()
             .join("catalog/blobs")
             .join(format!("{}.next.partial", encode_hex(blob.hash.as_bytes())));
+        let proof_index = TransitionProofIndexManifest::empty(genesis.id())
+            .publish(
+                TransitionProofIndexEntry {
+                    key: crate::agent_sdk::proof::TransitionProofKey {
+                        invocation: crate::agent_sdk::InvocationId([0xf1; 32]),
+                        execution: crate::agent_sdk::Hash([0xf2; 32]),
+                    },
+                    record: TransitionProofEntryId([0xf3; 32]),
+                    proof_material_bytes: 1,
+                },
+                None,
+            )
+            .unwrap();
+        let proof_index_stage = store.root().join("transition-proofs/indexes").join(format!(
+            "{}.next.partial",
+            encode_hex(proof_index.id().as_bytes())
+        ));
+        let proof_bytes = b"public transition proof chunk after interrupted staging";
+        let proof_blob = BlobRef::of_bytes(proof_bytes);
+        let proof_blob_stage = store.root().join("transition-proofs/blobs").join(format!(
+            "{}.next.partial",
+            encode_hex(proof_blob.hash.as_bytes())
+        ));
         fs::write(&object_stage, &entry.encode()[..3]).unwrap();
         fs::write(&blob_stage, &blob_bytes[..3]).unwrap();
+        fs::write(&proof_index_stage, &proof_index.encode()[..3]).unwrap();
+        fs::write(&proof_blob_stage, &proof_bytes[..3]).unwrap();
         drop(store);
 
         let mut reopened = open_file_store(&directory);
         assert!(!object_stage.exists());
         assert!(!blob_stage.exists());
+        assert!(!proof_index_stage.exists());
+        assert!(!proof_blob_stage.exists());
         assert!(reopened.put(&entry).unwrap());
+        assert!(reopened.put(&proof_index).unwrap());
         assert!(
             reopened
                 .put_blob(JournalBlobClass::CatalogArtifact, &blob, blob_bytes)
                 .unwrap()
         );
+        assert!(
+            reopened
+                .put_blob(JournalBlobClass::TransitionProof, &proof_blob, proof_bytes,)
+                .unwrap()
+        );
         assert_eq!(reopened.get(entry.id()).unwrap(), Some(entry));
+        assert_eq!(reopened.get(proof_index.id()).unwrap(), Some(proof_index));
         assert_eq!(
             reopened
                 .load_blob(JournalBlobClass::CatalogArtifact, &blob)
                 .unwrap(),
             Some(blob_bytes.to_vec())
+        );
+        assert_eq!(
+            reopened
+                .load_blob(JournalBlobClass::TransitionProof, &proof_blob)
+                .unwrap(),
+            Some(proof_bytes.to_vec())
         );
     }
 
@@ -16157,6 +22447,8 @@ fn validate_unexposed_initialization_namespace(root: &File) -> Result<(), Journa
             "artifact-closures",
             "invocation-index",
             "invocation-outcomes",
+            "transition-proofs",
+            HEADS_HISTORY_DIRECTORY,
             SHARED_ORDERED_COMMIT_DIRECTORY,
             HISTORY_DIRECTORY,
             "catalog",
@@ -16177,6 +22469,7 @@ fn validate_unexposed_initialization_namespace(root: &File) -> Result<(), Journa
         "checkpoints",
         "artifact-closures",
         "invocation-outcomes",
+        HEADS_HISTORY_DIRECTORY,
         SHARED_ORDERED_COMMIT_DIRECTORY,
     ] {
         let _ = open_optional_owned_directory_at(root, name)?;
@@ -16208,6 +22501,13 @@ fn validate_unexposed_initialization_namespace(root: &File) -> Result<(), Journa
         validate_directory_names(&index, &children)?;
         for name in children {
             let _ = open_optional_owned_directory_at(&index, name)?;
+        }
+    }
+    if let Some(proofs) = open_optional_owned_directory_at(root, "transition-proofs")? {
+        let children = ["records", "indexes", "blobs"];
+        validate_directory_names(&proofs, &children)?;
+        for name in children {
+            let _ = open_optional_owned_directory_at(&proofs, name)?;
         }
     }
     if let Some(catalog) = open_optional_owned_directory_at(root, "catalog")? {
@@ -16308,6 +22608,40 @@ fn validate_initialization_anchor_links(
         }
         _ => Err(JournalStoreError::Corrupt),
     }
+}
+
+/// Validate the immutable namespace shape of an exposed `heads` anchor
+/// without recovering it. Unlike initialization anchors, an ordinary head
+/// CAS can legitimately leave the old canonical file beside a distinct,
+/// fully written `heads.next`; the candidate overlay authenticates that
+/// staged target later in the read-only open.
+#[cfg(target_os = "linux")]
+fn validate_exposed_heads_links(directory: &File) -> Result<(), JournalStoreError> {
+    let canonical = stat_at(directory, &c_name("heads")?)
+        .map_err(|_| JournalStoreError::Unavailable)?
+        .ok_or(JournalStoreError::Corrupt)?;
+    let stage =
+        stat_at(directory, &c_name("heads.next")?).map_err(|_| JournalStoreError::Unavailable)?;
+    let private = stat_at(directory, &c_name(&private_stage_name("heads.next")?)?)
+        .map_err(|_| JournalStoreError::Unavailable)?;
+    let effective_user = unsafe { libc::geteuid() };
+    for status in [Some(&canonical), stage.as_ref()].into_iter().flatten() {
+        if status.st_mode & libc::S_IFMT != libc::S_IFREG
+            || status.st_uid != effective_user
+            || status.st_mode & 0o022 != 0
+            || status.st_nlink != 1
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+    }
+    if private.is_some()
+        || stage
+            .as_ref()
+            .is_some_and(|staged| status_identity(staged) == status_identity(&canonical))
+    {
+        return Err(JournalStoreError::Corrupt);
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -17054,6 +23388,51 @@ fn bounded_directory_names(
     }
     result?;
     Ok(names)
+}
+
+#[cfg(target_os = "linux")]
+struct BoundedImmutableRead {
+    staged: Option<Vec<u8>>,
+    canonical: Option<Vec<u8>>,
+    bytes: u64,
+    fetches: usize,
+}
+
+/// Read the private crash candidate and canonical content slot beneath one
+/// caller budget. Both namespace probes count as physical fetches, and the
+/// canonical file receives only the bytes left after reading its sibling.
+#[cfg(target_os = "linux")]
+fn read_bounded_immutable_at(
+    directory: &File,
+    name: &str,
+    maximum: usize,
+    max_bytes: u64,
+    max_fetches: usize,
+) -> Result<BoundedImmutableRead, JournalStoreError> {
+    if max_fetches < 2 {
+        return Err(JournalStoreError::LimitExceeded);
+    }
+    let staged = read_bounded_regular_at_with_work_limit(
+        directory,
+        &sibling_next_name(name),
+        maximum,
+        max_bytes,
+    )?;
+    let staged_bytes = staged.as_ref().map_or(0, |bytes| bytes.len()) as u64;
+    let remaining = max_bytes
+        .checked_sub(staged_bytes)
+        .ok_or(JournalStoreError::LimitExceeded)?;
+    let canonical = read_bounded_regular_at_with_work_limit(directory, name, maximum, remaining)?;
+    let canonical_bytes = canonical.as_ref().map_or(0, |bytes| bytes.len()) as u64;
+    let bytes = staged_bytes
+        .checked_add(canonical_bytes)
+        .ok_or(JournalStoreError::LimitExceeded)?;
+    Ok(BoundedImmutableRead {
+        staged,
+        canonical,
+        bytes,
+        fetches: 2,
+    })
 }
 
 #[cfg(target_os = "linux")]

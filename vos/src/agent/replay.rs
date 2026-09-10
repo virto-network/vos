@@ -30,14 +30,15 @@ use super::invocation_index::{InvocationIndexBatchOperation, InvocationIndexLook
 use super::journal::{
     AgentJournalGenesis, AgentJournalGenesisId, ArtifactClosure, ArtifactClosureId,
     CanonicalJournalRecord, CheckpointId, CheckpointLane, CheckpointManifest,
-    InvocationAcknowledgedFact, InvocationDisposition, InvocationIndexId, InvocationIndexManifest,
-    InvocationOutcomeAnchor, InvocationOutcomeId, InvocationOutcomeRecord, InvocationOutcomeRef,
-    InvocationOwnershipKey, InvocationOwnershipScope, InvocationOwnershipValue,
-    InvocationResultState, JournalHeads, JournalHeadsId, LaneCursor, LaneStateId,
-    LaneStateManifest, LocalEntry, LocalEntryId, MergeEvent, MergeEventId, MergeFrontier,
-    MergeFrontierId, MergeSeal, MergeSealId, OrderedBase, OrderedEntry, OrderedEntryId,
-    PersistedLane, ReplayInput, ReplayOperation, RuntimeBinding,
-    system_genesis_artifact_closure_commitment, system_genesis_post_create_state_commitment,
+    InvocationAcknowledgedFact, InvocationDisposition, InvocationHistoryNodeId, InvocationIndexId,
+    InvocationIndexManifest, InvocationOutcomeAnchor, InvocationOutcomeId, InvocationOutcomeRecord,
+    InvocationOutcomeRef, InvocationOwnershipKey, InvocationOwnershipScope,
+    InvocationOwnershipValue, InvocationResultState, JournalHeads, JournalHeadsId, LaneCursor,
+    LaneStateId, LaneStateManifest, LocalEntry, LocalEntryId, MergeEvent, MergeEventId,
+    MergeFrontier, MergeFrontierId, MergeSeal, MergeSealId, OrderedBase, OrderedEntry,
+    OrderedEntryId, PersistedLane, ReplayInput, ReplayInputId, ReplayOperation, RuntimeBinding,
+    TransitionProofIndexId, system_genesis_artifact_closure_commitment,
+    system_genesis_post_create_state_commitment,
 };
 #[cfg(feature = "std")]
 use super::journal::{
@@ -47,12 +48,16 @@ use super::journal::{
 #[cfg(feature = "std")]
 use super::journal_store::{
     AgentJournalStore, JournalBlobClass, JournalPublication, JournalStoreError,
-    SharedOrderedCommitStore,
+    JournalVerifiedTransitionPublisher, SharedOrderedCommitStore, StagedTransitionProofBatch,
+    TransitionProofPublicationStore, transition_proof_index_at_replay_boundary,
+    transition_proof_retirement_for_invocation,
 };
 #[cfg(all(feature = "std", feature = "storage"))]
 use super::journal_store::{
     ReverifiedRootJournalStore, SystemAuthorityHistoryStore, SystemAuthorityPublicationStore,
 };
+#[cfg(all(test, feature = "std"))]
+use super::journal_store::{StagedTransitionProof, TransitionProofStageContext};
 use super::shared_commit::OrderedCommitClaim;
 #[cfg(feature = "std")]
 use super::shared_commit::{
@@ -85,6 +90,9 @@ use super::system_authority_ledger::{
     RetiredSystemAuthorityCatalog, RetiredSystemAuthorityRotation, SystemAuthorityLedgerClaim,
     SystemAuthorityLedgerError, SystemAuthorityLedgerRoute, SystemAuthorityLedgerRouteOwner,
 };
+#[cfg(all(test, feature = "std"))]
+use super::transition_proof_host::PreparedVerifiedTransition;
+use super::transition_proof_journal::TransitionProofIndexManifest;
 use super::wire::{
     RuntimeJournalContext, RuntimeState, decode_standard_runtime_state,
     encode_standard_runtime_state,
@@ -224,6 +232,149 @@ pub enum ReplayPosition {
     },
 }
 
+/// Exact public transition tuple produced by a trusted Attested executor for
+/// one replay step. The journal seal copies this commitment verbatim; storage
+/// then requires the staged AJPT and signed proof record to match every field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayTransitionProofBinding {
+    input: ReplayInputId,
+    position: ReplayPosition,
+    key: crate::agent_sdk::proof::TransitionProofKey,
+    /// Exact canonical RuntimeWork commitment. The execution-bound key also
+    /// commits this value, but retaining it independently lets storage check
+    /// the signed statement without treating a derived lookup key as the
+    /// statement itself.
+    work: crate::agent_sdk::Hash,
+    transition: crate::agent_sdk::Hash,
+    before: crate::agent_sdk::proof::ProofLaneRoots,
+    after: crate::agent_sdk::proof::ProofLaneRoots,
+    publication: crate::agent_sdk::Hash,
+    execution: Hash,
+    projection: ReplayTransitionProofProjection,
+}
+
+/// Provenance of the exact public tuple consumed by replay.
+///
+/// `Prepared` means the publication coordinator staged a new immutable AJPT
+/// closure for this attempt. `Published` means the provider reconstructed an
+/// existing authoritative journal record, so a Merge rebuild/fence may reuse
+/// it without resigning or creating another record. Storage does not trust
+/// this tag on its own: it matches `Prepared` to a thin staged capability and
+/// `Published` to the exact predecessor index record/live projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplayTransitionProofProjection {
+    Prepared,
+    Published,
+}
+
+/// Whether one replay step may create a new proof tuple or must resolve an
+/// already-published tuple from authoritative journal state.
+///
+/// Historical materialization and a Shared Ordered publication which merely
+/// preserves its physical Merge frontier are read-only proof projections.
+/// Passing that restriction into execution prevents a missing/corrupt proof
+/// record from running the application, proving, or staging bytes before the
+/// replay layer eventually rejects the step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplayTransitionProofAccess {
+    PublishedOnly,
+    PrepareAllowed,
+}
+
+impl ReplayTransitionProofBinding {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        input: &ReplayInput,
+        before_state: &RuntimeState,
+        position: ReplayPosition,
+        replay_transition: &ReplayTransition,
+        runtime_transition: &crate::agent_sdk::RuntimeTransition,
+        key: crate::agent_sdk::proof::TransitionProofKey,
+        before: crate::agent_sdk::proof::ProofLaneRoots,
+        after: crate::agent_sdk::proof::ProofLaneRoots,
+        publication: crate::agent_sdk::Hash,
+        projection: ReplayTransitionProofProjection,
+    ) -> Option<Self> {
+        let expected_work = canonical_attested_runtime_work(input, before_state)
+            .and_then(|work| work.encode().ok())
+            .map(|work| crate::agent_sdk::proof::TransitionProofStatement::work_commitment(&work));
+        let transition =
+            canonical_attested_transition_commitment(input, replay_transition, runtime_transition)?;
+        (input.id() != ReplayInputId::ZERO
+            && !matches!(position, ReplayPosition::Genesis)
+            && key.validate()
+            && attested_transition_invocation(input) == Some(key.invocation)
+            && expected_work.is_some_and(|work| {
+                crate::agent_sdk::proof::TransitionProofStatement::execution_commitment(
+                    work, before,
+                ) == key.execution
+            })
+            && transition != crate::agent_sdk::Hash::ZERO
+            && before.validate()
+            && after.validate()
+            && publication != crate::agent_sdk::Hash::ZERO
+            && replay_transition.result.is_none()
+            && replay_transition.products.is_empty()
+            && replay_transition.next_runtime == input.runtime)
+            .then_some(Self {
+                input: input.id(),
+                position,
+                key,
+                work: expected_work.expect("validated exact Attested work commitment"),
+                transition,
+                before,
+                after,
+                publication,
+                execution: transition_proof_execution_commitment(
+                    input,
+                    before_state,
+                    replay_transition,
+                ),
+                projection,
+            })
+    }
+
+    pub(crate) const fn input(self) -> ReplayInputId {
+        self.input
+    }
+
+    pub(crate) const fn position(self) -> ReplayPosition {
+        self.position
+    }
+
+    pub(crate) const fn key(self) -> crate::agent_sdk::proof::TransitionProofKey {
+        self.key
+    }
+
+    pub(crate) const fn work(self) -> crate::agent_sdk::Hash {
+        self.work
+    }
+
+    pub(crate) const fn transition(self) -> crate::agent_sdk::Hash {
+        self.transition
+    }
+
+    pub(crate) const fn before(self) -> crate::agent_sdk::proof::ProofLaneRoots {
+        self.before
+    }
+
+    pub(crate) const fn after(self) -> crate::agent_sdk::proof::ProofLaneRoots {
+        self.after
+    }
+
+    pub(crate) const fn publication(self) -> crate::agent_sdk::Hash {
+        self.publication
+    }
+
+    pub(crate) const fn execution(self) -> Hash {
+        self.execution
+    }
+
+    pub(crate) const fn projection(self) -> ReplayTransitionProofProjection {
+        self.projection
+    }
+}
+
 /// Validated output of one exact runtime execution.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplayTransition {
@@ -237,6 +388,214 @@ pub struct ReplayTransition {
     /// successfully applied `UpgradeRuntime` management entry.
     pub next_runtime: RuntimeBinding,
     pub products: ReplayProducts,
+    /// Commitment of the exact canonical SDK transition returned by a fresh
+    /// Attested execution. Replay checks this against both the accepted
+    /// transition semantics and the one-shot verified proof binding. Direct
+    /// and retained-recovery transitions must leave it absent.
+    pub attested_transition: Option<crate::agent_sdk::Hash>,
+}
+
+fn sdk_runtime_state(state: &RuntimeState) -> crate::agent_sdk::RuntimeState {
+    crate::agent_sdk::RuntimeState {
+        control: state.control.clone(),
+        linear: state.linear.clone(),
+        merge: state.merge.clone(),
+        local: state.local.clone(),
+    }
+}
+
+fn canonical_attested_runtime_work(
+    input: &ReplayInput,
+    before: &RuntimeState,
+) -> Option<crate::agent_sdk::RuntimeWork> {
+    let state = sdk_runtime_state(before);
+    match &input.operation {
+        ReplayOperation::CleanInvoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+            work,
+            authorization,
+            observed_slot,
+        } => Some(crate::agent_sdk::RuntimeWork::Invoke {
+            context: match &input.operation {
+                ReplayOperation::CleanInvoke { context, .. } => *context,
+                _ => unreachable!(),
+            },
+            state,
+            invocation: alloc::boxed::Box::new(work.clone()),
+            authorization: alloc::boxed::Box::new(authorization.clone()),
+            observed_slot: *observed_slot,
+        }),
+        ReplayOperation::CleanResume {
+            context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+            work,
+            yielded,
+            ..
+        } => Some(crate::agent_sdk::RuntimeWork::Resume {
+            context: match &input.operation {
+                ReplayOperation::CleanResume { context, .. } => *context,
+                _ => unreachable!(),
+            },
+            state,
+            resume: alloc::boxed::Box::new(crate::agent_sdk::ResumeWork {
+                invocation: yielded.invocation,
+                actor: yielded.actor,
+                incarnation: yielded.incarnation,
+                deployment: yielded.deployment,
+                program: yielded.program,
+                mode: yielded.mode,
+                continuation: yielded.continuation.clone(),
+                ready_sequence: yielded.ready_sequence,
+                installation_data: yielded.installation_data.clone(),
+                availability: work.availability.clone(),
+                input: None,
+            }),
+        }),
+        ReplayOperation::Management { .. }
+        | ReplayOperation::CleanManage { .. }
+        | ReplayOperation::Invoke { .. }
+        | ReplayOperation::CleanInvoke { .. }
+        | ReplayOperation::CleanResume { .. }
+        | ReplayOperation::CleanAcknowledge { .. }
+        | ReplayOperation::Acknowledge { .. }
+        | ReplayOperation::SealMerge => None,
+    }
+}
+
+fn canonical_attested_transition_commitment(
+    input: &ReplayInput,
+    replay: &ReplayTransition,
+    transition: &crate::agent_sdk::RuntimeTransition,
+) -> Option<crate::agent_sdk::Hash> {
+    use crate::agent_sdk::{RuntimeOutcome, RuntimeTransition};
+
+    let work = match &input.operation {
+        ReplayOperation::CleanInvoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+            work,
+            ..
+        }
+        | ReplayOperation::CleanResume {
+            context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+            work,
+            ..
+        } => work,
+        _ => return None,
+    };
+    let outcome_matches = match &transition.outcome {
+        RuntimeOutcome::Completed(Ok(reply)) => {
+            reply.invocation == work.invocation
+                && reply.actor == work.actor
+                && reply.incarnation == work.incarnation
+                && reply.deployment == work.deployment
+                && reply.mode == work.mode
+                && reply.lane == work.mode.write_lane()
+                && reply.gas_remaining <= work.gas
+        }
+        RuntimeOutcome::Completed(Err(_)) => true,
+        RuntimeOutcome::Yielded(yielded) => {
+            yielded.invocation == work.invocation
+                && yielded.actor == work.actor
+                && yielded.incarnation == work.incarnation
+                && yielded.deployment == work.deployment
+                && yielded.program == work.program
+                && yielded.mode == work.mode
+                && yielded.installation_data == work.installation_data
+                && yielded.required
+                    == work
+                        .availability
+                        .iter()
+                        .map(|blob| blob.reference.clone())
+                        .collect::<Vec<_>>()
+                && match &input.operation {
+                    ReplayOperation::CleanResume {
+                        yielded: previous, ..
+                    } => yielded.ready_sequence > previous.ready_sequence,
+                    ReplayOperation::CleanInvoke { .. } => true,
+                    _ => false,
+                }
+        }
+        RuntimeOutcome::Management(_) | RuntimeOutcome::Acknowledged(_) => false,
+    };
+    let disposition = match &transition.outcome {
+        RuntimeOutcome::Completed(Ok(reply)) => match reply.status {
+            crate::agent_sdk::InvocationStatus::Done => ReplayDisposition::Applied,
+            crate::agent_sdk::InvocationStatus::Forbidden => ReplayDisposition::Forbidden,
+            crate::agent_sdk::InvocationStatus::Panicked => ReplayDisposition::Panicked,
+            crate::agent_sdk::InvocationStatus::OutOfGas => ReplayDisposition::OutOfGas,
+        },
+        RuntimeOutcome::Completed(Err(_)) => ReplayDisposition::Rejected,
+        RuntimeOutcome::Yielded(_) => ReplayDisposition::Applied,
+        RuntimeOutcome::Management(_) | RuntimeOutcome::Acknowledged(_) => return None,
+    };
+    if !transition.validate()
+        || !outcome_matches
+        || transition.state != sdk_runtime_state(&replay.state)
+        || disposition != replay.disposition
+        || replay.result.is_some()
+        || !replay.products.is_empty()
+        || replay.next_runtime != input.runtime
+    {
+        return None;
+    }
+    let canonical = RuntimeTransition {
+        state: transition.state.clone(),
+        outcome: transition.outcome.clone(),
+    }
+    .encode()
+    .ok()?;
+    let commitment =
+        crate::agent_sdk::proof::TransitionProofStatement::transition_commitment(&canonical);
+    (replay.attested_transition == Some(commitment)).then_some(commitment)
+}
+
+fn replay_state_commitment(state: &RuntimeState) -> Hash {
+    let control = Hash::digest(
+        b"vos/agent/replay/proof-state/control/v1",
+        &[&state.control],
+    );
+    let linear = Hash::digest(b"vos/agent/replay/proof-state/linear/v1", &[&state.linear]);
+    let merge = Hash::digest(b"vos/agent/replay/proof-state/merge/v1", &[&state.merge]);
+    let local = Hash::digest(b"vos/agent/replay/proof-state/local/v1", &[&state.local]);
+    Hash::digest(
+        b"vos/agent/replay/proof-state/v1",
+        &[
+            control.as_bytes(),
+            linear.as_bytes(),
+            merge.as_bytes(),
+            local.as_bytes(),
+        ],
+    )
+}
+
+fn transition_proof_execution_commitment(
+    input: &ReplayInput,
+    before: &RuntimeState,
+    transition: &ReplayTransition,
+) -> Hash {
+    let before = replay_state_commitment(before);
+    let after = replay_state_commitment(&transition.state);
+    let disposition = match transition.disposition {
+        ReplayDisposition::Applied => [0],
+        ReplayDisposition::Rejected => [1],
+        ReplayDisposition::Forbidden => [2],
+        ReplayDisposition::Panicked => [3],
+        ReplayDisposition::OutOfGas => [4],
+    };
+    let runtime = transition.next_runtime.commitment();
+    let proof_transition = transition
+        .attested_transition
+        .unwrap_or(crate::agent_sdk::Hash::ZERO);
+    Hash::digest(
+        b"vos/agent/replay/transition-proof-execution/v1",
+        &[
+            input.id().as_bytes(),
+            before.as_bytes(),
+            after.as_bytes(),
+            &disposition,
+            runtime.as_bytes(),
+            proof_transition.as_bytes(),
+        ],
+    )
 }
 
 /// One live authority execution selected by replay provenance. The guest
@@ -315,6 +674,22 @@ pub trait ReplayExecutor {
         position: ReplayPosition,
     ) -> Result<ReplayTransition, Self::Error>;
 
+    /// Consume the exact already-verified public binding produced while an
+    /// Attested transition was executed. Replay calls this only after the
+    /// transition itself has passed native validation and requires a binding
+    /// for every applied Attested Invoke/Resume. Implementations must return
+    /// `None` for Direct work. Keeping this separate from `ReplayTransition`
+    /// prevents proof transport metadata from becoming runtime semantics.
+    fn take_transition_proof_binding(
+        &mut self,
+        _input: &ReplayInput,
+        _before: &RuntimeState,
+        _position: ReplayPosition,
+        _transition: &ReplayTransition,
+    ) -> Result<Option<ReplayTransitionProofBinding>, Self::Error> {
+        Ok(None)
+    }
+
     /// Prove that a clean management transition came from a decoded SDK
     /// `RuntimeOutcome::Management` for this exact input. The generic replay
     /// layer cannot reconstruct custom-runtime state, so implementations must
@@ -337,6 +712,7 @@ pub trait ReplayExecutor {
         input: &ReplayInput,
         before: &RuntimeState,
         position: ReplayPosition,
+        _transition_proof_access: ReplayTransitionProofAccess,
         journal_context: Option<RuntimeJournalContext>,
     ) -> Result<ReplayTransition, Self::Error> {
         let _ = journal_context;
@@ -1356,6 +1732,9 @@ pub struct ReplayStep {
     sealed_outcomes: Vec<ReplaySealedOutcome>,
     system_authority_write: Option<ReplaySystemAuthorityWrite>,
     merge_authenticated: bool,
+    transition_proof: Option<ReplayTransitionProofBinding>,
+    stale_transition_proof: Option<ReplayTransitionProofStale>,
+    final_transition_proof_ack: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -3180,12 +3559,181 @@ pub struct ReplaySealedPublication {
     anchor: ReplayPublicationAnchor,
     outcomes: Vec<ReplaySealedOutcome>,
     history_plans: Vec<InvocationHistoryWritePlan>,
+    proof_requirements: Vec<ReplayTransitionProofRequirement>,
+    transition_proof_retirements: Vec<ReplayTransitionProofRetirement>,
+    transition_proof_actions: Vec<ReplayTransitionProofAction>,
+    /// Replay-authenticated live projection at the newest Merge fence (or
+    /// checkpoint when no later fence exists). Storage uses this private,
+    /// non-wire boundary together with the canonical retained suffix to
+    /// independently re-derive every ordered proof action.
+    transition_proof_boundary: ReplayTransitionProofShadow,
     checkpoint: Option<ReplaySealedCheckpoint>,
     shared_merge_projection: Option<ReplaySealedSharedMergeProjection>,
     shared_ordered_commit: Option<ReplaySealedSharedOrderedCommit>,
     system_authority_write: Option<ReplaySystemAuthorityWrite>,
+    #[cfg(feature = "std")]
+    transition_proof_batch: Option<StagedTransitionProofBatch>,
     fence_ancestry: FenceAncestryEvidence,
     mode: ReplayPublicationMode,
+}
+
+/// Exact replay positions which executed in Attested mode and therefore must
+/// be covered, in canonical execution order, by the thin staged proof batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReplayTransitionProofRequirement {
+    binding: ReplayTransitionProofBinding,
+    intent: ReplayTransitionProofIntent,
+    lifecycle: ReplayTransitionProofLifecycle,
+    projection_action: ReplayTransitionProofProjectionAction,
+}
+
+/// Replay-sealed authority to retire one exact live proof edge. Merge events
+/// only contribute this value while an Ordered fence is finalizing their
+/// canonical replay; provisional Merge publication therefore cannot mint an
+/// irreversible acknowledgement tombstone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReplayTransitionProofRetirement {
+    input: ReplayInputId,
+    position: ReplayPosition,
+    key: crate::agent_sdk::proof::TransitionProofKey,
+}
+
+/// An Applied acknowledgement in an unfenced Merge suffix. It consumes the
+/// logical proof edge for subsequent canonical replay, but cannot remove the
+/// physical live pointer or mint permanent retirement history until an
+/// Ordered fence finalizes the suffix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReplayTransitionProofAcknowledgement {
+    input: ReplayInputId,
+    position: ReplayPosition,
+    key: crate::agent_sdk::proof::TransitionProofKey,
+}
+
+impl ReplayTransitionProofAcknowledgement {
+    pub(crate) const fn input(self) -> ReplayInputId {
+        self.input
+    }
+
+    pub(crate) const fn position(self) -> ReplayPosition {
+        self.position
+    }
+
+    pub(crate) const fn key(self) -> crate::agent_sdk::proof::TransitionProofKey {
+        self.key
+    }
+}
+
+impl ReplayTransitionProofRetirement {
+    pub(crate) const fn input(self) -> ReplayInputId {
+        self.input
+    }
+
+    pub(crate) const fn position(self) -> ReplayPosition {
+        self.position
+    }
+
+    pub(crate) const fn key(self) -> crate::agent_sdk::proof::TransitionProofKey {
+        self.key
+    }
+}
+
+/// Replay-owned meaning of one proof-index projection change. Lifecycle
+/// publications bind the exact condition encoded by their input. A Merge
+/// rebuild instead consumes whatever exact live edge is authenticated by the
+/// CAS predecessor; the staged batch may report that value but cannot choose
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplayTransitionProofIntent {
+    FirstPublication,
+    Resume(crate::agent_sdk::proof::TransitionProofKey),
+    Recanonicalize,
+}
+
+/// Exact lifecycle condition carried by the replay input. It remains explicit
+/// during Merge recanonicalization even though storage derives the concrete
+/// live edge to replace from the authenticated CAS predecessor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplayTransitionProofLifecycle {
+    Invoke,
+    Resume(crate::agent_sdk::proof::TransitionProofKey),
+    Acknowledge(crate::agent_sdk::proof::TransitionProofKey),
+}
+
+/// An Attested lifecycle operation whose encoded live-edge condition did not
+/// match the authenticated boundary-relative proof projection. Replay emits
+/// a deterministic no-op without running the guest or consulting a proof
+/// provider; storage re-derives the mismatch from the same canonical suffix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReplayTransitionProofStale {
+    input: ReplayInputId,
+    position: ReplayPosition,
+    lifecycle: ReplayTransitionProofLifecycle,
+}
+
+impl ReplayTransitionProofStale {
+    pub(crate) const fn input(self) -> ReplayInputId {
+        self.input
+    }
+
+    pub(crate) const fn position(self) -> ReplayPosition {
+        self.position
+    }
+
+    pub(crate) const fn lifecycle(self) -> ReplayTransitionProofLifecycle {
+        self.lifecycle
+    }
+}
+
+/// Canonical transition-proof lifecycle effects in exact replay order. A
+/// single Merge/fence CAS may interleave publications, acknowledgements, and
+/// stale no-ops for the same invocation; separate per-kind vectors cannot
+/// authenticate that sequence without changing its meaning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplayTransitionProofAction {
+    Requirement(ReplayTransitionProofRequirement),
+    Acknowledgement(ReplayTransitionProofAcknowledgement),
+    Retirement(ReplayTransitionProofRetirement),
+    Stale(ReplayTransitionProofStale),
+}
+
+/// Effect an authenticated requirement may have on the proof live map.
+/// Shared Ordered preservation replays the pinned Merge dependency only to
+/// validate its existing records; changing live pointers there would roll the
+/// physical Merge frontier back from G to the older pinned frontier F.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplayTransitionProofProjectionAction {
+    UpdateLive,
+    ValidateOnly,
+}
+
+impl ReplayTransitionProofRequirement {
+    pub(crate) const fn input(self) -> super::journal::ReplayInputId {
+        self.binding.input()
+    }
+
+    pub(crate) const fn position(self) -> ReplayPosition {
+        self.binding.position()
+    }
+
+    pub(crate) const fn binding(self) -> ReplayTransitionProofBinding {
+        self.binding
+    }
+
+    pub(crate) const fn intent(self) -> ReplayTransitionProofIntent {
+        self.intent
+    }
+
+    pub(crate) const fn lifecycle(self) -> ReplayTransitionProofLifecycle {
+        self.lifecycle
+    }
+
+    pub(crate) const fn projection_action(self) -> ReplayTransitionProofProjectionAction {
+        self.projection_action
+    }
+
+    pub(crate) const fn projection(self) -> ReplayTransitionProofProjection {
+        self.binding.projection()
+    }
 }
 
 /// Replay-authenticated pre-transition Merge(F) projection retained as an
@@ -3555,12 +4103,291 @@ pub struct ReplayMaterialization {
     merge_boundary_ancestry: BTreeSet<MergeEventId>,
     merge_boundary_state: Vec<u8>,
     merge_boundary_invocations: InvocationIndexId,
+    /// Exact live transition-proof projection at the newest authenticated
+    /// Merge fence (or at the checkpoint/genesis replay boundary when no
+    /// newer fence exists). Merge rebuilds start here rather than trusting
+    /// the current physical projection, which already contains the old
+    /// canonical suffix being replaced.
+    merge_boundary_transition_proofs: ReplayTransitionProofShadow,
     merge_ancestry: BTreeSet<MergeEventId>,
     fence: Option<MergeFence>,
     artifacts: ArtifactClosure,
     suffix_budget: ReplaySuffixBudget,
     replay_boundary: OrderedBase,
     fence_ancestry: FenceAncestryEvidence,
+    /// Complete proof index authenticated by `heads.transition_proofs`.
+    /// The boundary shadow is replayed to this exact live projection while
+    /// materializing the bounded suffix; immutable records remain storage
+    /// authority and are not duplicated in the shadow.
+    transition_proofs: TransitionProofIndexManifest,
+    transition_proof_shadow: ReplayTransitionProofShadow,
+    /// Canonical Merge acknowledgement projection to install at the next
+    /// authenticated fence. It may differ from the physical AJP3 live map
+    /// while an Applied acknowledgement remains provisional; checkpointing
+    /// is forbidden until the two projections converge.
+    pending_transition_proof_final_shadow: ReplayTransitionProofShadow,
+}
+
+/// Private replay projection of the one-live-proof-per-invocation map.
+///
+/// This deliberately carries no caller-provided record IDs. It is seeded
+/// only from a decoded AJP3 manifest and advanced by replay-validated
+/// lifecycle steps. Storage independently derives the same projection from
+/// the authenticated predecessor index before accepting the head CAS.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReplayTransitionProofShadow {
+    genesis: AgentJournalGenesisId,
+    /// Purpose-tagged cumulative terminal-invocation history authenticated by
+    /// the AJP3 image at this exact replay boundary. Membership is loaded only
+    /// for the bounded lifecycle inputs about to be replayed.
+    retired_root: Option<InvocationHistoryNodeId>,
+    states: BTreeMap<crate::agent_sdk::InvocationId, ReplayTransitionProofState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReplayTransitionProofState {
+    key: Option<crate::agent_sdk::proof::TransitionProofKey>,
+    origin: ReplayTransitionProofOrigin,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplayTransitionProofOrigin {
+    Boundary,
+    Position(ReplayPosition),
+}
+
+impl ReplayTransitionProofShadow {
+    fn from_manifest(manifest: &TransitionProofIndexManifest) -> Self {
+        Self {
+            genesis: manifest.genesis,
+            retired_root: manifest.retired_root(),
+            states: manifest
+                .live_entries()
+                .iter()
+                .map(|key| {
+                    (
+                        key.invocation,
+                        ReplayTransitionProofState {
+                            key: Some(*key),
+                            origin: ReplayTransitionProofOrigin::Boundary,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn live(
+        &self,
+        invocation: crate::agent_sdk::InvocationId,
+    ) -> Option<crate::agent_sdk::proof::TransitionProofKey> {
+        self.states.get(&invocation).and_then(|state| state.key)
+    }
+
+    pub(crate) const fn retired_root(&self) -> Option<InvocationHistoryNodeId> {
+        self.retired_root
+    }
+
+    fn with_retired_root(mut self, retired_root: Option<InvocationHistoryNodeId>) -> Self {
+        self.retired_root = retired_root;
+        self
+    }
+
+    pub(crate) fn live_entries(
+        &self,
+    ) -> impl Iterator<Item = crate::agent_sdk::proof::TransitionProofKey> + '_ {
+        self.states.values().filter_map(|state| state.key)
+    }
+
+    fn live_matches_manifest(&self, manifest: &TransitionProofIndexManifest) -> bool {
+        self.genesis == manifest.genesis
+            && self
+                .states
+                .values()
+                .filter(|state| state.key.is_some())
+                .count()
+                == manifest.live_entries().len()
+            && manifest
+                .live_entries()
+                .iter()
+                .all(|key| self.live(key.invocation) == Some(*key))
+    }
+
+    fn matches_manifest(&self, manifest: &TransitionProofIndexManifest) -> bool {
+        self.retired_root == manifest.retired_root() && self.live_matches_manifest(manifest)
+    }
+
+    /// Compare the logical live/tombstone projection without treating its
+    /// replay provenance as durable state. Origins decide how a later Merge
+    /// suffix is reconciled, but two shadows have converged for checkpoint
+    /// purposes when they carry the same exact key (including explicit
+    /// tombstones) for every invocation.
+    fn projection_eq(&self, other: &Self) -> bool {
+        self.genesis == other.genesis
+            && self.retired_root == other.retired_root
+            && self.states.len() == other.states.len()
+            && self.states.iter().all(|(invocation, state)| {
+                other
+                    .states
+                    .get(invocation)
+                    .is_some_and(|other| other.key == state.key)
+            })
+    }
+
+    fn lifecycle(
+        input: &ReplayInput,
+    ) -> Option<(
+        crate::agent_sdk::InvocationId,
+        ReplayTransitionProofLifecycle,
+    )> {
+        match &input.operation {
+            ReplayOperation::CleanInvoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+                work,
+                ..
+            } => Some((work.invocation, ReplayTransitionProofLifecycle::Invoke)),
+            ReplayOperation::CleanResume {
+                context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+                expected_live: Some(expected),
+                work,
+                ..
+            } if expected.invocation == work.invocation => Some((
+                work.invocation,
+                ReplayTransitionProofLifecycle::Resume(*expected),
+            )),
+            ReplayOperation::CleanAcknowledge {
+                context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+                expected_live: Some(expected),
+                work,
+                ..
+            } if expected.invocation == work.invocation => Some((
+                work.invocation,
+                ReplayTransitionProofLifecycle::Acknowledge(*expected),
+            )),
+            _ => None,
+        }
+    }
+
+    fn admits(
+        &self,
+        invocation: crate::agent_sdk::InvocationId,
+        lifecycle: ReplayTransitionProofLifecycle,
+    ) -> bool {
+        match lifecycle {
+            // An explicit None is an authenticated post-boundary tombstone,
+            // not the never-published absence which admits Invoke. This
+            // distinction prevents a replaced Merge suffix from running the
+            // guest/provider for an invocation retired by a later
+            // Ordered/Local publication.
+            ReplayTransitionProofLifecycle::Invoke => !self.states.contains_key(&invocation),
+            ReplayTransitionProofLifecycle::Resume(expected)
+            | ReplayTransitionProofLifecycle::Acknowledge(expected) => {
+                self.live(invocation) == Some(expected)
+            }
+        }
+    }
+
+    fn install(
+        &mut self,
+        key: crate::agent_sdk::proof::TransitionProofKey,
+        position: ReplayPosition,
+    ) {
+        self.states.insert(
+            key.invocation,
+            ReplayTransitionProofState {
+                key: Some(key),
+                origin: ReplayTransitionProofOrigin::Position(position),
+            },
+        );
+    }
+
+    fn retire(
+        &mut self,
+        key: crate::agent_sdk::proof::TransitionProofKey,
+        position: ReplayPosition,
+    ) -> bool {
+        if self.live(key.invocation) != Some(key) {
+            return false;
+        }
+        self.states.insert(
+            key.invocation,
+            ReplayTransitionProofState {
+                key: None,
+                origin: ReplayTransitionProofOrigin::Position(position),
+            },
+        );
+        true
+    }
+
+    fn seed_terminal(
+        &mut self,
+        key: crate::agent_sdk::proof::TransitionProofKey,
+    ) -> Result<(), ReplayValidationError> {
+        if !key.validate() || key.invocation == crate::agent_sdk::InvocationId::ZERO {
+            return Err(ReplayError::InvalidRecord);
+        }
+        if self.live(key.invocation).is_some() {
+            return Err(ReplayError::InvalidRecord);
+        }
+        self.states
+            .entry(key.invocation)
+            .or_insert(ReplayTransitionProofState {
+                key: None,
+                origin: ReplayTransitionProofOrigin::Boundary,
+            });
+        Ok(())
+    }
+
+    /// Start a canonical Merge rebuild at its fence projection while
+    /// preserving proof edges created by later Ordered/Local publications.
+    /// Merge-origin edges belong to the suffix being replayed and therefore
+    /// must not make their own boundary-relative lifecycle inputs stale.
+    fn with_external_edges_from(mut self, current: &Self) -> Self {
+        for (invocation, state) in &current.states {
+            if !matches!(
+                state.origin,
+                ReplayTransitionProofOrigin::Position(ReplayPosition::Merge { .. })
+            ) {
+                self.states.insert(*invocation, *state);
+            }
+        }
+        self
+    }
+
+    /// Reconcile a boundary-relative canonical Merge result with the current
+    /// physical projection. Ordered/Local edges published after the boundary
+    /// are outside the replaced Merge suffix and therefore win; boundary and
+    /// prior-Merge edges are replaced by the newly derived net projection.
+    fn reconcile_merge(current: &Self, merge_net: &Self) -> Self {
+        let mut reconciled = merge_net.clone();
+        for (invocation, state) in &current.states {
+            if matches!(
+                state.origin,
+                ReplayTransitionProofOrigin::Position(ReplayPosition::Ordered { .. })
+                    | ReplayTransitionProofOrigin::Position(ReplayPosition::Local { .. })
+            ) {
+                reconciled.states.insert(*invocation, *state);
+            }
+        }
+        reconciled
+    }
+
+    fn as_fence_boundary(&self) -> Self {
+        let mut boundary = self.clone();
+        for state in boundary.states.values_mut() {
+            state.origin = ReplayTransitionProofOrigin::Boundary;
+        }
+        boundary
+    }
+
+    fn as_checkpoint_boundary(&self) -> Self {
+        let mut boundary = self.as_fence_boundary();
+        // A checkpoint is the only boundary which may compact explicit
+        // tombstones. Its authenticated retired_root lazily restores exactly
+        // the bounded InvocationIds consulted by later replay.
+        boundary.states.retain(|_, state| state.key.is_some());
+        boundary
+    }
 }
 
 impl ReplayMaterialization {
@@ -3589,6 +4416,26 @@ impl ReplayMaterialization {
 
     pub(crate) const fn replay_boundary(&self) -> OrderedBase {
         self.replay_boundary
+    }
+
+    /// Whether an exact prospective delta fits the authenticated composite
+    /// post-checkpoint dependency budget. Callers supply encoded record bytes;
+    /// the opaque materialization remains the sole authority for already
+    /// charged Ordered, Local, Merge, frontier, and seal dependencies.
+    pub(crate) fn has_suffix_headroom(
+        &self,
+        additional_entries: usize,
+        additional_bytes: usize,
+    ) -> bool {
+        self.suffix_budget
+            .entries
+            .checked_add(additional_entries)
+            .is_some_and(|entries| entries <= MAX_REPLAY_SUFFIX_ENTRIES)
+            && self
+                .suffix_budget
+                .bytes
+                .checked_add(additional_bytes)
+                .is_some_and(|bytes| bytes <= MAX_REPLAY_SUFFIX_BYTES)
     }
 
     pub const fn merge_frontier(&self) -> MergeFrontierId {
@@ -3735,6 +4582,73 @@ impl ReplayCommittedRecovery {
 
 #[cfg(feature = "std")]
 impl<'store, S: AgentJournalStore> ReplayPreparedPublication<'store, S> {
+    #[cfg(test)]
+    fn with_staged_transition_proofs_for_test(
+        self,
+        staged: Vec<StagedTransitionProof>,
+    ) -> Result<Self, JournalStoreError>
+    where
+        S: TransitionProofPublicationStore,
+    {
+        let batch = JournalVerifiedTransitionPublisher::new(&mut *self.store)
+            .stage_apply_batch(&self.sealed, staged)?;
+        self.with_transition_proof_batch(batch)
+    }
+
+    /// Attach the store-staged proof delta to both halves of the prepared
+    /// publication. The successor materialization is returned to callers
+    /// after CAS, so updating only the sealed envelope would expose stale
+    /// heads even though storage durably installed the new AJP3 root.
+    pub(crate) fn with_transition_proof_batch(
+        mut self,
+        batch: StagedTransitionProofBatch,
+    ) -> Result<Self, JournalStoreError> {
+        if self.successor.heads != self.sealed.next
+            || self.successor.heads_id != self.sealed.next.id()
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let next_transition_proofs = batch.next().clone();
+        let next_shadow = self
+            .successor
+            .transition_proof_shadow
+            .clone()
+            .with_retired_root(next_transition_proofs.retired_root());
+        if !next_shadow.matches_manifest(&next_transition_proofs) {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        let installs_fence = matches!(
+            self.sealed.anchor(),
+            ReplayPublicationAnchor::Ordered(entry) if entry.merge_seal.is_some()
+        );
+        self.sealed = self.sealed.with_transition_proof_batch(batch)?;
+        self.successor.heads = self.sealed.next.clone();
+        self.successor.heads_id = self.successor.heads.id();
+        self.successor.transition_proofs = next_transition_proofs;
+        self.successor.transition_proof_shadow = next_shadow;
+        self.successor.pending_transition_proof_final_shadow = self
+            .successor
+            .pending_transition_proof_final_shadow
+            .clone()
+            .with_retired_root(self.successor.transition_proofs.retired_root());
+        if matches!(self.sealed.anchor(), ReplayPublicationAnchor::Checkpoint(_)) {
+            self.successor.transition_proof_shadow = self
+                .successor
+                .transition_proof_shadow
+                .as_checkpoint_boundary();
+            self.successor.merge_boundary_transition_proofs =
+                self.successor.transition_proof_shadow.clone();
+            self.successor.pending_transition_proof_final_shadow =
+                self.successor.transition_proof_shadow.clone();
+        } else if installs_fence {
+            self.successor.merge_boundary_transition_proofs =
+                self.successor.transition_proof_shadow.as_fence_boundary();
+            self.successor.pending_transition_proof_final_shadow =
+                self.successor.transition_proof_shadow.as_fence_boundary();
+        }
+        Ok(self)
+    }
+
     pub fn publish(
         self,
     ) -> Result<
@@ -3756,9 +4670,10 @@ impl<'store, S: AgentJournalStore> ReplayPreparedPublication<'store, S> {
     }
 }
 
-/// Owned, read-only-derived Shared checkpoint plan. Candidate construction
-/// writes nothing; only a quorum-verified snapshot capability can stage its
-/// content-addressed lane blobs and cross the journal-head CAS.
+/// Owned Shared checkpoint plan. Candidate construction may stage the
+/// immutable predecessor-head snapshot and compact proof-index object needed
+/// by the eventual CAS. Lane blobs and the mutable head remain untouched;
+/// only a quorum-verified snapshot capability may publish them.
 #[cfg(feature = "std")]
 pub(crate) struct PreparedSharedCheckpoint {
     sealed: ReplaySealedPublication,
@@ -3768,6 +4683,36 @@ pub(crate) struct PreparedSharedCheckpoint {
 
 #[cfg(feature = "std")]
 impl PreparedSharedCheckpoint {
+    pub(crate) fn with_transition_proof_batch(
+        mut self,
+        batch: StagedTransitionProofBatch,
+    ) -> Result<Self, JournalStoreError> {
+        if self.successor.heads != self.sealed.next
+            || self.successor.heads_id != self.sealed.next.id()
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        let next_transition_proofs = batch.next().clone();
+        let next_shadow = self
+            .successor
+            .transition_proof_shadow
+            .clone()
+            .with_retired_root(next_transition_proofs.retired_root());
+        if !next_shadow.matches_manifest(&next_transition_proofs) {
+            return Err(JournalStoreError::NonCanonical);
+        }
+        self.sealed = self.sealed.with_transition_proof_batch(batch)?;
+        self.successor.heads = self.sealed.next.clone();
+        self.successor.heads_id = self.successor.heads.id();
+        self.successor.transition_proofs = next_transition_proofs;
+        self.successor.transition_proof_shadow = next_shadow.as_checkpoint_boundary();
+        self.successor.merge_boundary_transition_proofs =
+            self.successor.transition_proof_shadow.clone();
+        self.successor.pending_transition_proof_final_shadow =
+            self.successor.transition_proof_shadow.clone();
+        Ok(self)
+    }
+
     pub(crate) fn predecessor_heads(&self) -> JournalHeadsId {
         self.sealed.expected
     }
@@ -3878,6 +4823,26 @@ pub(crate) struct PreparedSharedOrderedPublication<'store, S: AgentJournalStore>
 
 #[cfg(feature = "std")]
 impl<'store, S: AgentJournalStore> PreparedSharedOrderedPublication<'store, S> {
+    #[cfg(test)]
+    fn with_staged_transition_proofs_for_test(
+        mut self,
+        staged: Vec<StagedTransitionProof>,
+    ) -> Result<Self, JournalStoreError>
+    where
+        S: TransitionProofPublicationStore,
+    {
+        self.inner = self.inner.with_staged_transition_proofs_for_test(staged)?;
+        Ok(self)
+    }
+
+    pub(crate) fn with_transition_proof_batch(
+        mut self,
+        batch: StagedTransitionProofBatch,
+    ) -> Result<Self, JournalStoreError> {
+        self.inner = self.inner.with_transition_proof_batch(batch)?;
+        Ok(self)
+    }
+
     pub(crate) fn publish_shared(
         self,
     ) -> Result<
@@ -6101,6 +7066,37 @@ pub enum ReplayPreparation<'store, S: AgentJournalStore> {
     AlreadyCommitted(ReplayCommittedRecovery),
 }
 
+/// Test-only description of the private ordered proof-action stream. This
+/// keeps storage adversarial tests on the same sealed interpreter used by
+/// production without adding a durable wire or a caller-facing constructor.
+#[cfg(all(test, feature = "std"))]
+pub(crate) enum ReplayTransitionProofTestAction {
+    Requirement {
+        input: ReplayInputId,
+        position: ReplayPosition,
+        intent: ReplayTransitionProofIntent,
+        lifecycle: ReplayTransitionProofLifecycle,
+        projection_action: ReplayTransitionProofProjectionAction,
+        projection: ReplayTransitionProofProjection,
+        record: crate::agent_sdk::proof::TransitionProofRecord,
+    },
+    Acknowledgement {
+        input: ReplayInputId,
+        position: ReplayPosition,
+        key: crate::agent_sdk::proof::TransitionProofKey,
+    },
+    Retirement {
+        input: ReplayInputId,
+        position: ReplayPosition,
+        key: crate::agent_sdk::proof::TransitionProofKey,
+    },
+    Stale {
+        input: ReplayInputId,
+        position: ReplayPosition,
+        lifecycle: ReplayTransitionProofLifecycle,
+    },
+}
+
 /// Shared apply keeps its post-publication receipt explicit, including on an
 /// authenticated response-loss retry, without widening the Local preparation
 /// API or allowing generic publication of a Shared splice.
@@ -6114,6 +7110,423 @@ pub(crate) enum SharedReplayPreparation<'store, S: AgentJournalStore> {
 }
 
 impl ReplaySealedPublication {
+    #[cfg(all(test, feature = "std"))]
+    fn transition_proof_test_action(
+        action: ReplayTransitionProofTestAction,
+    ) -> Result<ReplayTransitionProofAction, ReplayValidationError> {
+        match action {
+            ReplayTransitionProofTestAction::Requirement {
+                input,
+                position,
+                intent,
+                lifecycle,
+                projection_action,
+                projection,
+                record,
+            } => {
+                let publication = record
+                    .verified_publication_commitment()
+                    .map_err(|_| ReplayError::InvalidRecord)?;
+                if input == ReplayInputId::ZERO
+                    || matches!(position, ReplayPosition::Genesis)
+                    || !record.statement.key().validate()
+                    || record.statement.transition == crate::agent_sdk::Hash::ZERO
+                    || !record.statement.before.validate()
+                    || !record.statement.after.validate()
+                    || publication == crate::agent_sdk::Hash::ZERO
+                {
+                    return Err(ReplayError::InvalidRecord);
+                }
+                Ok(ReplayTransitionProofAction::Requirement(
+                    ReplayTransitionProofRequirement {
+                        binding: ReplayTransitionProofBinding {
+                            input,
+                            position,
+                            key: record.statement.key(),
+                            work: record.statement.work,
+                            transition: record.statement.transition,
+                            before: record.statement.before,
+                            after: record.statement.after,
+                            publication,
+                            execution: Hash::digest(
+                                b"vos/agent/replay/test-transition-proof-execution",
+                                &[input.as_bytes()],
+                            ),
+                            projection,
+                        },
+                        intent,
+                        lifecycle,
+                        projection_action,
+                    },
+                ))
+            }
+            ReplayTransitionProofTestAction::Acknowledgement {
+                input,
+                position,
+                key,
+            } => Ok(ReplayTransitionProofAction::Acknowledgement(
+                ReplayTransitionProofAcknowledgement {
+                    input,
+                    position,
+                    key,
+                },
+            )),
+            ReplayTransitionProofTestAction::Retirement {
+                input,
+                position,
+                key,
+            } => Ok(ReplayTransitionProofAction::Retirement(
+                ReplayTransitionProofRetirement {
+                    input,
+                    position,
+                    key,
+                },
+            )),
+            ReplayTransitionProofTestAction::Stale {
+                input,
+                position,
+                lifecycle,
+            } => Ok(ReplayTransitionProofAction::Stale(
+                ReplayTransitionProofStale {
+                    input,
+                    position,
+                    lifecycle,
+                },
+            )),
+        }
+    }
+
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) fn merge_transition_proof_test_publication(
+        current: &JournalHeads,
+        event: MergeEvent,
+        frontier: MergeFrontier,
+        next: JournalHeads,
+        boundary: &TransitionProofIndexManifest,
+        checkpoint_base: OrderedBase,
+        actions: Vec<ReplayTransitionProofTestAction>,
+    ) -> Result<Self, ReplayValidationError> {
+        if current.validate_successor(&next).is_err()
+            || current.transition_proofs != next.transition_proofs
+            || event.genesis != current.genesis
+            || frontier.genesis != current.genesis
+            || frontier.id() != next.merge_frontier
+            || !frontier.events.contains(&event.id())
+            || boundary.genesis != current.genesis
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+        let canonical_head = OrderedBase {
+            index: next.ordered_index,
+            head: next.ordered_head,
+        };
+        let mut publication = Self {
+            expected: current.id(),
+            next: next.clone(),
+            anchor: ReplayPublicationAnchor::Merge { event, frontier },
+            outcomes: Vec::new(),
+            history_plans: Vec::new(),
+            proof_requirements: Vec::new(),
+            transition_proof_retirements: Vec::new(),
+            transition_proof_actions: Vec::new(),
+            transition_proof_boundary: ReplayTransitionProofShadow::from_manifest(boundary),
+            checkpoint: None,
+            shared_merge_projection: None,
+            shared_ordered_commit: None,
+            system_authority_write: None,
+            transition_proof_batch: None,
+            fence_ancestry: FenceAncestryEvidence {
+                genesis: next.genesis,
+                checkpoint_base,
+                canonical_head,
+                fence: next.merge_fence,
+                ordered_anchor: Hash::digest(
+                    b"vos/agent/replay/test-merge-transition-proof-ancestry",
+                    &[current.id().as_bytes(), next.id().as_bytes()],
+                ),
+            },
+            mode: ReplayPublicationMode::Canonical,
+        };
+        publication.replace_transition_proof_actions(
+            actions
+                .into_iter()
+                .map(Self::transition_proof_test_action)
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
+        Ok(publication)
+    }
+
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) fn with_transition_proof_test_actions(
+        mut self,
+        boundary: &TransitionProofIndexManifest,
+        actions: Vec<ReplayTransitionProofTestAction>,
+    ) -> Result<Self, ReplayValidationError> {
+        if boundary.genesis != self.next.genesis {
+            return Err(ReplayError::InvalidRecord);
+        }
+        self.transition_proof_boundary = ReplayTransitionProofShadow::from_manifest(boundary);
+        self.replace_transition_proof_actions(
+            actions
+                .into_iter()
+                .map(Self::transition_proof_test_action)
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
+        Ok(self)
+    }
+
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) fn ordered_transition_proof_test_publication(
+        current: &JournalHeads,
+        entry: OrderedEntry,
+        next: JournalHeads,
+        requirements: Vec<(
+            super::journal::ReplayInputId,
+            ReplayPosition,
+            ReplayTransitionProofIntent,
+            crate::agent_sdk::proof::TransitionProofRecord,
+        )>,
+        transition_proof_retirement: Option<crate::agent_sdk::proof::TransitionProofKey>,
+    ) -> Result<Self, ReplayValidationError> {
+        Self::ordered_transition_proof_test_publication_at_boundary(
+            current,
+            entry,
+            next,
+            requirements,
+            transition_proof_retirement,
+            OrderedBase::post_genesis(),
+        )
+    }
+
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) fn ordered_transition_proof_test_publication_at_boundary(
+        current: &JournalHeads,
+        entry: OrderedEntry,
+        next: JournalHeads,
+        requirements: Vec<(
+            super::journal::ReplayInputId,
+            ReplayPosition,
+            ReplayTransitionProofIntent,
+            crate::agent_sdk::proof::TransitionProofRecord,
+        )>,
+        transition_proof_retirement: Option<crate::agent_sdk::proof::TransitionProofKey>,
+        checkpoint_base: OrderedBase,
+    ) -> Result<Self, ReplayValidationError> {
+        if current.validate_successor(&next).is_err()
+            || current.transition_proofs != next.transition_proofs
+            || entry.genesis != current.genesis
+            || entry.id() != next.ordered_head.ok_or(ReplayError::InvalidRecord)?
+            || entry.index != next.ordered_index
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+        let transition_proof_retirements = transition_proof_retirement
+            .map(|key| {
+                let ReplayOperation::CleanAcknowledge {
+                    context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+                    expected_live: Some(expected),
+                    work,
+                    ..
+                } = &entry.input.operation
+                else {
+                    return Err(ReplayError::InvalidRecord);
+                };
+                if *expected != key || key.invocation != work.invocation {
+                    return Err(ReplayError::InvalidRecord);
+                }
+                Ok(ReplayTransitionProofRetirement {
+                    input: entry.input.id(),
+                    position: ReplayPosition::Ordered {
+                        id: entry.id(),
+                        index: entry.index,
+                        merge_frontier: entry.merge_frontier,
+                        merge_seal: entry.merge_seal,
+                    },
+                    key,
+                })
+            })
+            .into_iter()
+            .collect::<Result<Vec<_>, ReplayValidationError>>()?;
+        let mut publication = Self {
+            expected: current.id(),
+            next: next.clone(),
+            anchor: ReplayPublicationAnchor::Ordered(entry),
+            outcomes: Vec::new(),
+            history_plans: Vec::new(),
+            proof_requirements: Vec::new(),
+            transition_proof_retirements,
+            transition_proof_actions: Vec::new(),
+            transition_proof_boundary: ReplayTransitionProofShadow::from_manifest(
+                &TransitionProofIndexManifest::empty(current.genesis),
+            ),
+            checkpoint: None,
+            shared_merge_projection: None,
+            shared_ordered_commit: None,
+            system_authority_write: None,
+            transition_proof_batch: None,
+            fence_ancestry: FenceAncestryEvidence {
+                genesis: next.genesis,
+                checkpoint_base,
+                canonical_head: OrderedBase {
+                    index: next.ordered_index,
+                    head: next.ordered_head,
+                },
+                fence: next.merge_fence,
+                ordered_anchor: Hash::digest(
+                    b"vos/agent/replay/test-transition-proof-ancestry",
+                    &[current.id().as_bytes(), next.id().as_bytes()],
+                ),
+            },
+            mode: ReplayPublicationMode::Canonical,
+        };
+        publication.replace_proof_requirements(
+            requirements
+                .into_iter()
+                .map(|(input, position, intent, record)| {
+                    let publication = record
+                        .verified_publication_commitment()
+                        .map_err(|_| ReplayError::InvalidRecord)?;
+                    (input != ReplayInputId::ZERO
+                        && !matches!(position, ReplayPosition::Genesis)
+                        && record.statement.key().validate()
+                        && record.statement.transition != crate::agent_sdk::Hash::ZERO
+                        && record.statement.before.validate()
+                        && record.statement.after.validate()
+                        && publication != crate::agent_sdk::Hash::ZERO)
+                        .then_some(ReplayTransitionProofBinding {
+                            input,
+                            position,
+                            key: record.statement.key(),
+                            work: record.statement.work,
+                            transition: record.statement.transition,
+                            before: record.statement.before,
+                            after: record.statement.after,
+                            publication,
+                            execution: Hash::digest(
+                                b"vos/agent/replay/test-transition-proof-execution",
+                                &[input.as_bytes()],
+                            ),
+                            projection: ReplayTransitionProofProjection::Prepared,
+                        })
+                        .map(|binding| ReplayTransitionProofRequirement {
+                            binding,
+                            lifecycle: match intent {
+                                ReplayTransitionProofIntent::Resume(expected) => {
+                                    ReplayTransitionProofLifecycle::Resume(expected)
+                                }
+                                ReplayTransitionProofIntent::FirstPublication
+                                | ReplayTransitionProofIntent::Recanonicalize => {
+                                    ReplayTransitionProofLifecycle::Invoke
+                                }
+                            },
+                            intent,
+                            projection_action: ReplayTransitionProofProjectionAction::UpdateLive,
+                        })
+                        .ok_or(ReplayError::InvalidRecord)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
+        Ok(publication)
+    }
+
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) fn checkpoint_transition_proof_test_publication(
+        current: &JournalHeads,
+        manifest: CheckpointManifest,
+        next: JournalHeads,
+        lanes: Vec<(CheckpointLane, LaneStateManifest)>,
+        artifacts: ArtifactClosure,
+        invocation_indexes: Vec<(InvocationIndexId, InvocationIndexManifest)>,
+    ) -> Result<Self, ReplayValidationError> {
+        let canonical_head = OrderedBase {
+            index: next.ordered_index,
+            head: next.ordered_head,
+        };
+        let fence_ancestry = FenceAncestryEvidence {
+            genesis: next.genesis,
+            checkpoint_base: canonical_head,
+            canonical_head,
+            fence: next.merge_fence,
+            ordered_anchor: Hash::digest(
+                b"vos/agent/replay/test-checkpoint-transition-proof-ancestry",
+                &[current.id().as_bytes(), next.id().as_bytes()],
+            ),
+        };
+        let local_cursors = lanes
+            .iter()
+            .filter_map(|(lane, state)| match (&lane.lane, &state.cursor) {
+                (
+                    PersistedLane::Local,
+                    LaneCursor::Local {
+                        node,
+                        revision,
+                        head,
+                    },
+                ) if lane.node == Some(*node) => Some((*node, *revision, *head)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if current.validate_successor(&next).is_err()
+            || current.transition_proofs != next.transition_proofs
+            || next.checkpoint != Some(manifest.id())
+            || manifest.transition_proofs != current.transition_proofs
+            || manifest.genesis != current.genesis
+            || manifest.publication_revision != current.publication_revision
+            || manifest.ordered_index != next.ordered_index
+            || manifest.ordered_head != next.ordered_head
+            || artifacts.id() != manifest.artifacts
+            || lanes.len() != manifest.lanes.len()
+            || !lanes
+                .iter()
+                .zip(&manifest.lanes)
+                .all(|((lane, state), expected)| lane == expected && state.id() == lane.state)
+            || local_cursors.len() != 1
+            || !fence_ancestry.validate()
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+        Ok(Self {
+            expected: current.id(),
+            next,
+            anchor: ReplayPublicationAnchor::Checkpoint(manifest.clone()),
+            outcomes: Vec::new(),
+            history_plans: Vec::new(),
+            proof_requirements: Vec::new(),
+            transition_proof_retirements: Vec::new(),
+            transition_proof_actions: Vec::new(),
+            transition_proof_boundary: ReplayTransitionProofShadow::from_manifest(
+                &TransitionProofIndexManifest::empty(current.genesis),
+            ),
+            checkpoint: Some(ReplaySealedCheckpoint {
+                manifest,
+                lanes,
+                artifacts,
+                invocation_indexes,
+                local_cursors,
+                fence_ancestry: fence_ancestry.clone(),
+            }),
+            shared_merge_projection: None,
+            shared_ordered_commit: None,
+            system_authority_write: None,
+            transition_proof_batch: None,
+            fence_ancestry,
+            mode: ReplayPublicationMode::Canonical,
+        })
+    }
+
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) fn with_published_transition_proof_requirements_for_test(mut self) -> Self {
+        for requirement in &mut self.proof_requirements {
+            requirement.binding.projection = ReplayTransitionProofProjection::Published;
+        }
+        for action in &mut self.transition_proof_actions {
+            if let ReplayTransitionProofAction::Requirement(requirement) = action {
+                requirement.binding.projection = ReplayTransitionProofProjection::Published;
+            }
+        }
+        self
+    }
+
     pub const fn expected(&self) -> JournalHeadsId {
         self.expected
     }
@@ -6138,6 +7551,234 @@ impl ReplaySealedPublication {
         &self.history_plans
     }
 
+    pub(crate) fn proof_requirements(&self) -> &[ReplayTransitionProofRequirement] {
+        &self.proof_requirements
+    }
+
+    /// Compatibility view used by the pre-mixed storage implementation. A
+    /// plural retirement deliberately exposes an invalid sentinel: the old
+    /// validator then rejects both an omitted batch and every valid singular
+    /// retirement instead of publishing a partial lifecycle mutation. The
+    /// mixed-batch implementation consumes the full ordered slice below.
+    pub(crate) fn transition_proof_retirement(
+        &self,
+    ) -> Option<crate::agent_sdk::proof::TransitionProofKey> {
+        match self.transition_proof_retirements.as_slice() {
+            [] => None,
+            [retirement] => Some(retirement.key()),
+            [_, _, ..] => Some(crate::agent_sdk::proof::TransitionProofKey {
+                invocation: crate::agent_sdk::InvocationId::ZERO,
+                execution: crate::agent_sdk::Hash::ZERO,
+            }),
+        }
+    }
+
+    pub(crate) fn transition_proof_retirements(&self) -> &[ReplayTransitionProofRetirement] {
+        &self.transition_proof_retirements
+    }
+
+    pub(crate) fn transition_proof_actions(&self) -> &[ReplayTransitionProofAction] {
+        &self.transition_proof_actions
+    }
+
+    pub(crate) fn transition_proof_boundary(&self) -> &ReplayTransitionProofShadow {
+        &self.transition_proof_boundary
+    }
+
+    fn replace_transition_proof_actions(
+        &mut self,
+        actions: Vec<ReplayTransitionProofAction>,
+    ) -> Result<(), ReplayValidationError> {
+        if actions.len() > super::journal::MAX_REPLAY_SUFFIX_ENTRIES
+            || actions.iter().enumerate().any(|(index, action)| {
+                let position = match action {
+                    ReplayTransitionProofAction::Requirement(requirement) => requirement.position(),
+                    ReplayTransitionProofAction::Acknowledgement(acknowledgement) => {
+                        acknowledgement.position()
+                    }
+                    ReplayTransitionProofAction::Retirement(retirement) => retirement.position(),
+                    ReplayTransitionProofAction::Stale(stale) => stale.position(),
+                };
+                actions[..index].iter().any(|prior| match prior {
+                    ReplayTransitionProofAction::Requirement(requirement) => {
+                        requirement.position() == position
+                    }
+                    ReplayTransitionProofAction::Acknowledgement(acknowledgement) => {
+                        acknowledgement.position() == position
+                    }
+                    ReplayTransitionProofAction::Retirement(retirement) => {
+                        retirement.position() == position
+                    }
+                    ReplayTransitionProofAction::Stale(stale) => stale.position() == position,
+                })
+            })
+        {
+            return Err(ReplayError::ReplayLimit);
+        }
+        let mut requirements = Vec::new();
+        let mut retirements = Vec::new();
+        requirements
+            .try_reserve(actions.len())
+            .map_err(|_| ReplayError::ReplayLimit)?;
+        retirements
+            .try_reserve(actions.len())
+            .map_err(|_| ReplayError::ReplayLimit)?;
+        for action in &actions {
+            match *action {
+                ReplayTransitionProofAction::Requirement(requirement) => {
+                    requirements.push(requirement)
+                }
+                ReplayTransitionProofAction::Acknowledgement(acknowledgement) => {
+                    if !acknowledgement.key().validate()
+                        || acknowledgement.input() == ReplayInputId::ZERO
+                        || !matches!(acknowledgement.position(), ReplayPosition::Merge { .. })
+                    {
+                        return Err(ReplayError::InvalidRecord);
+                    }
+                }
+                ReplayTransitionProofAction::Retirement(retirement) => {
+                    if !retirement.key().validate()
+                        || retirements
+                            .iter()
+                            .any(|prior: &ReplayTransitionProofRetirement| {
+                                prior.key() == retirement.key()
+                            })
+                    {
+                        return Err(ReplayError::InvalidRecord);
+                    }
+                    retirements.push(retirement);
+                }
+                ReplayTransitionProofAction::Stale(stale) => {
+                    if stale.input() == ReplayInputId::ZERO
+                        || matches!(stale.position(), ReplayPosition::Genesis)
+                    {
+                        return Err(ReplayError::InvalidRecord);
+                    }
+                }
+            }
+        }
+        self.proof_requirements = requirements;
+        self.transition_proof_retirements = retirements;
+        self.transition_proof_actions = actions;
+        Ok(())
+    }
+
+    fn prepend_transition_proof_actions(
+        &mut self,
+        mut actions: Vec<ReplayTransitionProofAction>,
+    ) -> Result<(), ReplayValidationError> {
+        if actions
+            .len()
+            .checked_add(self.transition_proof_actions.len())
+            .is_none_or(|combined| combined > super::journal::MAX_REPLAY_SUFFIX_ENTRIES)
+        {
+            return Err(ReplayError::ReplayLimit);
+        }
+        actions
+            .try_reserve(self.transition_proof_actions.len())
+            .map_err(|_| ReplayError::ReplayLimit)?;
+        actions.extend_from_slice(&self.transition_proof_actions);
+        self.replace_transition_proof_actions(actions)
+    }
+
+    fn prepend_proof_requirements(
+        &mut self,
+        mut requirements: Vec<ReplayTransitionProofRequirement>,
+    ) -> Result<(), ReplayValidationError> {
+        let combined = requirements
+            .len()
+            .checked_add(self.proof_requirements.len())
+            .ok_or(ReplayError::ReplayLimit)?;
+        if combined > super::journal::MAX_REPLAY_SUFFIX_ENTRIES {
+            return Err(ReplayError::ReplayLimit);
+        }
+        requirements
+            .try_reserve(self.proof_requirements.len())
+            .map_err(|_| ReplayError::ReplayLimit)?;
+        requirements.extend_from_slice(&self.proof_requirements);
+        self.replace_proof_requirements(requirements)
+    }
+
+    fn replace_proof_requirements(
+        &mut self,
+        requirements: Vec<ReplayTransitionProofRequirement>,
+    ) -> Result<(), ReplayValidationError> {
+        if requirements
+            .len()
+            .checked_add(self.transition_proof_retirements.len())
+            .is_none_or(|combined| combined > super::journal::MAX_REPLAY_SUFFIX_ENTRIES)
+            || requirements.iter().enumerate().any(|(index, requirement)| {
+                requirements[..index]
+                    .iter()
+                    .any(|prior| prior.position() == requirement.position())
+            })
+        {
+            return Err(ReplayError::ReplayLimit);
+        }
+        self.proof_requirements = requirements;
+        self.transition_proof_actions = self
+            .proof_requirements
+            .iter()
+            .copied()
+            .map(ReplayTransitionProofAction::Requirement)
+            .chain(
+                self.transition_proof_retirements
+                    .iter()
+                    .copied()
+                    .map(ReplayTransitionProofAction::Retirement),
+            )
+            .collect();
+        Ok(())
+    }
+
+    /// Prepend final Merge acknowledgements in canonical replay order. The
+    /// current Ordered/Local acknowledgement, when present, remains last
+    /// because it executes after the finalized Merge suffix.
+    fn prepend_transition_proof_retirements(
+        &mut self,
+        mut retirements: Vec<ReplayTransitionProofRetirement>,
+    ) -> Result<(), ReplayValidationError> {
+        let combined = retirements
+            .len()
+            .checked_add(self.transition_proof_retirements.len())
+            .ok_or(ReplayError::ReplayLimit)?;
+        if combined
+            .checked_add(self.proof_requirements.len())
+            .is_none_or(|total| total > super::journal::MAX_REPLAY_SUFFIX_ENTRIES)
+        {
+            return Err(ReplayError::ReplayLimit);
+        }
+        retirements
+            .try_reserve(self.transition_proof_retirements.len())
+            .map_err(|_| ReplayError::ReplayLimit)?;
+        retirements.extend_from_slice(&self.transition_proof_retirements);
+        if retirements
+            .iter()
+            .any(|retirement| !retirement.key().validate())
+            || retirements.iter().enumerate().any(|(index, retirement)| {
+                retirements[..index]
+                    .iter()
+                    .any(|prior| prior.key() == retirement.key())
+            })
+        {
+            return Err(ReplayError::ReplayLimit);
+        }
+        self.transition_proof_retirements = retirements;
+        self.transition_proof_actions = self
+            .proof_requirements
+            .iter()
+            .copied()
+            .map(ReplayTransitionProofAction::Requirement)
+            .chain(
+                self.transition_proof_retirements
+                    .iter()
+                    .copied()
+                    .map(ReplayTransitionProofAction::Retirement),
+            )
+            .collect();
+        Ok(())
+    }
+
     pub(crate) const fn fence_ancestry(&self) -> &FenceAncestryEvidence {
         &self.fence_ancestry
     }
@@ -6157,6 +7798,43 @@ impl ReplaySealedPublication {
     /// content-addressed dependency closure.
     pub(crate) const fn system_authority_write(&self) -> Option<&ReplaySystemAuthorityWrite> {
         self.system_authority_write.as_ref()
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) const fn transition_proof_batch(&self) -> Option<&StagedTransitionProofBatch> {
+        self.transition_proof_batch.as_ref()
+    }
+
+    /// Bind a store-staged proof-index mutation into this exact replay result.
+    /// The returned token is the only API which may change the proof root;
+    /// storage still replays the thin batch and installs its history plan
+    /// before performing the existing anchor/head CAS.
+    #[cfg(feature = "std")]
+    pub(crate) fn with_transition_proof_batch(
+        mut self,
+        batch: StagedTransitionProofBatch,
+    ) -> Result<Self, JournalStoreError> {
+        if batch.predecessor() != self.expected
+            || batch.previous() != self.next.transition_proofs
+            || batch.next().genesis != self.next.genesis
+        {
+            return Err(JournalStoreError::Conflict);
+        }
+        self.next.transition_proofs = batch.next().id();
+        if let ReplayPublicationAnchor::Checkpoint(manifest) = &mut self.anchor {
+            let sealed = self
+                .checkpoint
+                .as_mut()
+                .ok_or(JournalStoreError::NonCanonical)?;
+            if sealed.manifest != *manifest {
+                return Err(JournalStoreError::Corrupt);
+            }
+            manifest.transition_proofs = batch.next().id();
+            sealed.manifest = manifest.clone();
+            self.next.checkpoint = Some(manifest.id());
+        }
+        self.transition_proof_batch = Some(batch);
+        Ok(self)
     }
 
     pub(crate) const fn mode(&self) -> ReplayPublicationMode {
@@ -6417,6 +8095,9 @@ pub struct ReplayMachine<Ownership> {
     runtime_history: BTreeMap<OrderedBase, RuntimeBinding>,
     ownership: Ownership,
     fence: Option<MergeFence>,
+    transition_proof_shadow: Option<ReplayTransitionProofShadow>,
+    transition_proof_projection: Option<ReplayTransitionProofShadow>,
+    transition_proof_final_projection: Option<ReplayTransitionProofShadow>,
 }
 
 impl ReplayMachine<GenesisInvocationOwnership> {
@@ -6440,6 +8121,15 @@ impl ReplayMachine<GenesisInvocationOwnership> {
                 outcomes: BTreeMap::new(),
             },
             fence: None,
+            transition_proof_shadow: Some(ReplayTransitionProofShadow::from_manifest(
+                &TransitionProofIndexManifest::empty(genesis),
+            )),
+            transition_proof_projection: Some(ReplayTransitionProofShadow::from_manifest(
+                &TransitionProofIndexManifest::empty(genesis),
+            )),
+            transition_proof_final_projection: Some(ReplayTransitionProofShadow::from_manifest(
+                &TransitionProofIndexManifest::empty(genesis),
+            )),
         })
     }
 
@@ -6466,6 +8156,12 @@ impl ReplayMachine<GenesisInvocationOwnership> {
 }
 
 impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
+    fn reset_transition_proof_shadows(&mut self, shadow: ReplayTransitionProofShadow) {
+        self.transition_proof_shadow = Some(shadow.clone());
+        self.transition_proof_projection = Some(shadow.clone());
+        self.transition_proof_final_projection = Some(shadow);
+    }
+
     fn from_materialization(
         materialization: &ReplayMaterialization,
         ownership: Ownership,
@@ -6494,6 +8190,11 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 .collect(),
             ownership,
             fence: materialization.fence.clone(),
+            transition_proof_shadow: Some(materialization.transition_proof_shadow.clone()),
+            transition_proof_projection: Some(materialization.transition_proof_shadow.clone()),
+            transition_proof_final_projection: Some(
+                materialization.transition_proof_shadow.clone(),
+            ),
         })
     }
 
@@ -6535,6 +8236,9 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             runtime_history: BTreeMap::from([(ordered_base, runtime)]),
             ownership,
             fence,
+            transition_proof_shadow: None,
+            transition_proof_projection: None,
+            transition_proof_final_projection: None,
         })
     }
 
@@ -6747,7 +8451,15 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         before: &RuntimeState,
         position: ReplayPosition,
     ) -> Result<ReplayStep, ReplayError<SourceError, E::Error>> {
-        self.apply_with_unseen_capacity(executor, input, before, position, None)
+        self.apply_with_unseen_capacity_and_proof_access(
+            executor,
+            input,
+            before,
+            position,
+            None,
+            ReplayTransitionProofAccess::PublishedOnly,
+            true,
+        )
     }
 
     /// Live preparation supplies a read-only capacity decision derived from
@@ -6762,6 +8474,27 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         before: &RuntimeState,
         position: ReplayPosition,
         unseen_admission: Option<UnseenInvocationAdmission>,
+    ) -> Result<ReplayStep, ReplayError<SourceError, E::Error>> {
+        self.apply_with_unseen_capacity_and_proof_access(
+            executor,
+            input,
+            before,
+            position,
+            unseen_admission,
+            ReplayTransitionProofAccess::PrepareAllowed,
+            true,
+        )
+    }
+
+    fn apply_with_unseen_capacity_and_proof_access<E: ReplayExecutor, SourceError>(
+        &mut self,
+        executor: &mut E,
+        input: &ReplayInput,
+        before: &RuntimeState,
+        position: ReplayPosition,
+        unseen_admission: Option<UnseenInvocationAdmission>,
+        transition_proof_access: ReplayTransitionProofAccess,
+        finalize_transition_proof_ack: bool,
     ) -> Result<ReplayStep, ReplayError<SourceError, E::Error>> {
         if input.validate().is_err() {
             return Err(ReplayError::InvalidRecord);
@@ -6804,6 +8537,37 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 if event_stub.index < fence.ordered_index && !fence.sealed_ancestry.contains(&id) {
                     return Err(ReplayError::StalePreFenceEvent(id));
                 }
+            }
+        }
+
+        // The proof lifecycle condition is checked only after caller/event
+        // authentication, but before ownership shortcuts, guest execution,
+        // or proof-provider access. During Merge rebuild this shadow starts
+        // at the authenticated fence boundary and is advanced in canonical
+        // suffix order, so the old final AJP3 projection cannot make a valid
+        // boundary-relative Resume look stale (or let a stale one execute).
+        let transition_proof_lifecycle = ReplayTransitionProofShadow::lifecycle(input);
+        if let Some((invocation, lifecycle)) = transition_proof_lifecycle {
+            let admitted = self
+                .transition_proof_shadow
+                .as_ref()
+                .ok_or(ReplayError::InvalidRecord)?
+                .admits(invocation, lifecycle);
+            if !admitted {
+                self.advance_noop_position(position, &execution_runtime);
+                let mut step = noop_replay_step(
+                    input,
+                    before,
+                    execution_runtime,
+                    position,
+                    ReplayStepOutcome::ExactDuplicate,
+                );
+                step.stale_transition_proof = Some(ReplayTransitionProofStale {
+                    input: input.id(),
+                    position,
+                    lifecycle,
+                });
+                return Ok(step);
             }
         }
 
@@ -6985,6 +8749,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 result: None,
                 next_runtime: execution_runtime.clone(),
                 products: ReplayProducts::default(),
+                attested_transition: None,
             }
         } else if matches!(input.operation, ReplayOperation::SealMerge) {
             ReplayTransition {
@@ -6993,6 +8758,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 result: None,
                 next_runtime: execution_runtime.clone(),
                 products: ReplayProducts::default(),
+                attested_transition: None,
             }
         } else if retained_recovery {
             retained_exact_transition(
@@ -7011,6 +8777,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                     input,
                     before,
                     position,
+                    transition_proof_access,
                     system_authority_execution.map(|execution| execution.context),
                 )
                 .map_err(ReplayError::Executor)?
@@ -7058,6 +8825,60 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             return Err(ReplayError::InvocationOwnership(
                 InvocationOwnershipError::Unauthenticated,
             ));
+        }
+        let transition_proof =
+            if !retained_recovery && attested_transition_invocation(input).is_some() {
+                let binding = executor
+                    .take_transition_proof_binding(input, before, position, &transition)
+                    .map_err(ReplayError::Executor)?
+                    .ok_or(ReplayError::InvalidRecord)?;
+                if binding.input() != input.id()
+                    || binding.position() != position
+                    || Some(binding.key().invocation) != attested_transition_invocation(input)
+                    || Some(binding.transition()) != transition.attested_transition
+                    || binding.execution()
+                        != transition_proof_execution_commitment(input, before, &transition)
+                {
+                    return Err(ReplayError::InvalidRecord);
+                }
+                Some(binding)
+            } else {
+                None
+            };
+        if let Some(binding) = transition_proof {
+            for shadow in [
+                &mut self.transition_proof_shadow,
+                &mut self.transition_proof_projection,
+                &mut self.transition_proof_final_projection,
+            ] {
+                shadow
+                    .as_mut()
+                    .ok_or(ReplayError::InvalidRecord)?
+                    .install(binding.key(), position);
+            }
+        } else if transition.disposition == ReplayDisposition::Applied
+            && let Some((_, ReplayTransitionProofLifecycle::Acknowledge(expected))) =
+                transition_proof_lifecycle
+        {
+            if !self
+                .transition_proof_shadow
+                .as_mut()
+                .ok_or(ReplayError::InvalidRecord)?
+                .retire(expected, position)
+                || !self
+                    .transition_proof_final_projection
+                    .as_mut()
+                    .ok_or(ReplayError::InvalidRecord)?
+                    .retire(expected, position)
+                || finalize_transition_proof_ack
+                    && !self
+                        .transition_proof_projection
+                        .as_mut()
+                        .ok_or(ReplayError::InvalidRecord)?
+                        .retire(expected, position)
+            {
+                return Err(ReplayError::InvalidRecord);
+            }
         }
         if let Some((key, request, operation)) = invocation_owner {
             let mutation = match (operation, prior_owner) {
@@ -7128,7 +8949,9 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                     };
                     Some(InvocationIndexBatchOperation::PutLive { key, value })
                 }
-                (InvocationOwnershipOperation::Acknowledge, Some(mut existing)) => {
+                (InvocationOwnershipOperation::Acknowledge, Some(mut existing))
+                    if transition.disposition == ReplayDisposition::Applied =>
+                {
                     let disposition =
                         existing
                             .disposition()
@@ -7167,6 +8990,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                         }
                     }
                 }
+                (InvocationOwnershipOperation::Acknowledge, Some(_)) => None,
                 (InvocationOwnershipOperation::Invoke, Some(_)) if replaying_pending_source => None,
                 (InvocationOwnershipOperation::Invoke, Some(_)) => None,
                 (InvocationOwnershipOperation::Acknowledge, None) => {
@@ -7210,6 +9034,9 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             sealed_outcomes,
             system_authority_write,
             merge_authenticated: false,
+            transition_proof,
+            stale_transition_proof: None,
+            final_transition_proof_ack: finalize_transition_proof_ack,
         })
     }
 
@@ -7221,7 +9048,16 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         event: &MergeEvent,
         before: &RuntimeState,
     ) -> Result<ReplayStep, ReplayError<SourceError, E::Error>> {
-        self.verify_and_apply_merge_with_unseen_capacity(executor, ordered, id, event, before, None)
+        self.verify_and_apply_merge_with_unseen_capacity(
+            executor,
+            ordered,
+            id,
+            event,
+            before,
+            None,
+            ReplayTransitionProofAccess::PublishedOnly,
+            false,
+        )
     }
 
     fn verify_and_apply_merge_with_unseen_capacity<E: ReplayExecutor, SourceError>(
@@ -7232,6 +9068,8 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         event: &MergeEvent,
         before: &RuntimeState,
         unseen_admission: Option<UnseenInvocationAdmission>,
+        transition_proof_access: ReplayTransitionProofAccess,
+        finalize_transition_proof_ack: bool,
     ) -> Result<ReplayStep, ReplayError<SourceError, E::Error>> {
         validate_runtime_state_bound(before)?;
         if event.validate().is_err()
@@ -7271,10 +9109,13 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                     sealed_outcomes: Vec::new(),
                     system_authority_write: None,
                     merge_authenticated: true,
+                    transition_proof: None,
+                    stale_transition_proof: None,
+                    final_transition_proof_ack: false,
                 });
             }
         }
-        let mut step = self.apply_with_unseen_capacity(
+        let mut step = self.apply_with_unseen_capacity_and_proof_access(
             executor,
             &event.input,
             before,
@@ -7284,6 +9125,8 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 ordered_base: event.ordered_base,
             },
             unseen_admission,
+            transition_proof_access,
+            finalize_transition_proof_ack,
         )?;
         step.merge_authenticated = true;
         Ok(step)
@@ -7703,7 +9546,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             outcomes.push(outcome.clone());
         }
         let fence_ancestry = successor_fence_ancestry(materialization, &next, false, Some(entry))?;
-        Ok(ReplaySealedPublication {
+        let mut sealed = ReplaySealedPublication {
             expected: current.id(),
             next,
             anchor: ReplayPublicationAnchor::Ordered(entry.clone()),
@@ -7712,13 +9555,26 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 .ownership
                 .history_write_plans()
                 .map_err(ReplayError::InvocationOwnership)?,
+            proof_requirements: Vec::new(),
+            transition_proof_retirements: Vec::new(),
+            transition_proof_actions: Vec::new(),
+            transition_proof_boundary: materialization.merge_boundary_transition_proofs.clone(),
             checkpoint: None,
             shared_merge_projection: None,
             shared_ordered_commit: None,
             system_authority_write: step.system_authority_write.clone(),
+            #[cfg(feature = "std")]
+            transition_proof_batch: None,
             fence_ancestry,
             mode: ReplayPublicationMode::Canonical,
-        })
+        };
+        let mut actions = Vec::new();
+        collect_transition_proof_action(
+            &mut actions,
+            transition_proof_action(&entry.input, step)?,
+        )?;
+        sealed.replace_transition_proof_actions(actions)?;
+        Ok(sealed)
     }
 
     /// Mint the storage authority for a Raft-committed Shared Ordered splice.
@@ -7944,12 +9800,16 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             ));
         }
         let fence_ancestry = successor_fence_ancestry(materialization, &next, false, Some(entry))?;
-        Ok(ReplaySealedPublication {
+        let mut sealed = ReplaySealedPublication {
             expected: current.id(),
             next,
             anchor: ReplayPublicationAnchor::Ordered(entry.clone()),
             outcomes,
             history_plans,
+            proof_requirements: Vec::new(),
+            transition_proof_retirements: Vec::new(),
+            transition_proof_actions: Vec::new(),
+            transition_proof_boundary: materialization.merge_boundary_transition_proofs.clone(),
             checkpoint: None,
             shared_merge_projection: Some(ReplaySealedSharedMergeProjection {
                 manifest: pinned_merge_manifest.clone(),
@@ -7961,9 +9821,18 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 raft_payload_commitment,
             }),
             system_authority_write: step.system_authority_write.clone(),
+            #[cfg(feature = "std")]
+            transition_proof_batch: None,
             fence_ancestry,
             mode,
-        })
+        };
+        let mut actions = Vec::new();
+        collect_transition_proof_action(
+            &mut actions,
+            transition_proof_action(&entry.input, step)?,
+        )?;
+        sealed.replace_transition_proof_actions(actions)?;
+        Ok(sealed)
     }
 
     /// Mint the only authority accepted by storage for a node-local CAS.
@@ -8034,7 +9903,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
             return Err(ReplayError::InvalidRecord);
         }
         let fence_ancestry = successor_fence_ancestry(materialization, &next, false, None)?;
-        Ok(ReplaySealedPublication {
+        let mut sealed = ReplaySealedPublication {
             expected: current.id(),
             next,
             anchor: ReplayPublicationAnchor::Local(entry.clone()),
@@ -8043,13 +9912,26 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 .ownership
                 .history_write_plans()
                 .map_err(ReplayError::InvocationOwnership)?,
+            proof_requirements: Vec::new(),
+            transition_proof_retirements: Vec::new(),
+            transition_proof_actions: Vec::new(),
+            transition_proof_boundary: materialization.merge_boundary_transition_proofs.clone(),
             checkpoint: None,
             shared_merge_projection: None,
             shared_ordered_commit: None,
             system_authority_write: None,
+            #[cfg(feature = "std")]
+            transition_proof_batch: None,
             fence_ancestry,
             mode: ReplayPublicationMode::Canonical,
-        })
+        };
+        let mut actions = Vec::new();
+        collect_transition_proof_action(
+            &mut actions,
+            transition_proof_action(&entry.input, step)?,
+        )?;
+        sealed.replace_transition_proof_actions(actions)?;
+        Ok(sealed)
     }
 
     /// Mint the only authority accepted by storage for one canonical Merge
@@ -8103,7 +9985,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
         }
         self.validate_publication_indexes(current, &next, step.ownership_delta)?;
         let fence_ancestry = successor_fence_ancestry(materialization, &next, false, None)?;
-        Ok(ReplaySealedPublication {
+        let mut sealed = ReplaySealedPublication {
             expected: current.id(),
             next,
             anchor: ReplayPublicationAnchor::Merge {
@@ -8115,13 +9997,31 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 .ownership
                 .history_write_plans()
                 .map_err(ReplayError::InvocationOwnership)?,
+            proof_requirements: Vec::new(),
+            // Merge outcomes are provisional until an Ordered fence replays
+            // and finalizes the entire canonical suffix. A permanent proof
+            // tombstone cannot be emitted at import time because a later
+            // concurrent event may change this acknowledgement's outcome or
+            // its expected live proof.
+            transition_proof_retirements: Vec::new(),
+            transition_proof_actions: Vec::new(),
+            transition_proof_boundary: materialization.merge_boundary_transition_proofs.clone(),
             checkpoint: None,
             shared_merge_projection: None,
             shared_ordered_commit: None,
             system_authority_write: None,
+            #[cfg(feature = "std")]
+            transition_proof_batch: None,
             fence_ancestry,
             mode: ReplayPublicationMode::Canonical,
-        })
+        };
+        let mut actions = Vec::new();
+        collect_transition_proof_action(
+            &mut actions,
+            transition_proof_action(&event.input, step)?,
+        )?;
+        sealed.replace_transition_proof_actions(actions)?;
+        Ok(sealed)
     }
 
     fn validate_publication_indexes(
@@ -8162,6 +10062,7 @@ fn validate_publication_envelope(
     if current.genesis != genesis
         || current.validate().is_err()
         || current.validate_successor(next).is_err()
+        || current.transition_proofs != next.transition_proofs
     {
         return Err(ReplayError::InvalidRecord);
     }
@@ -8302,6 +10203,8 @@ fn derive_genesis_artifact_closure(
         ReplayOperation::CleanManage { .. }
         | ReplayOperation::Invoke { .. }
         | ReplayOperation::CleanInvoke { .. }
+        | ReplayOperation::CleanResume { .. }
+        | ReplayOperation::CleanAcknowledge { .. }
         | ReplayOperation::Acknowledge { .. }
         | ReplayOperation::SealMerge => return Err(ReplayError::InvalidRecord),
     };
@@ -8347,6 +10250,8 @@ fn derive_successor_artifact_closure(
         }
         ReplayOperation::Invoke { .. }
         | ReplayOperation::CleanInvoke { .. }
+        | ReplayOperation::CleanResume { .. }
+        | ReplayOperation::CleanAcknowledge { .. }
         | ReplayOperation::Acknowledge { .. }
         | ReplayOperation::SealMerge => current.clone(),
     };
@@ -8519,6 +10424,317 @@ fn validate_system_authority_side_product<SourceError, ExecutorError>(
     }
 }
 
+fn attested_transition_invocation(input: &ReplayInput) -> Option<crate::agent_sdk::InvocationId> {
+    match &input.operation {
+        ReplayOperation::CleanInvoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+            work,
+            ..
+        }
+        | ReplayOperation::CleanResume {
+            context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+            work,
+            ..
+        } => Some(work.invocation),
+        ReplayOperation::Management { .. }
+        | ReplayOperation::CleanManage { .. }
+        | ReplayOperation::Invoke { .. }
+        | ReplayOperation::CleanInvoke { .. }
+        | ReplayOperation::CleanResume { .. }
+        | ReplayOperation::CleanAcknowledge { .. }
+        | ReplayOperation::Acknowledge { .. }
+        | ReplayOperation::SealMerge => None,
+    }
+}
+
+fn successful_transition_proof_retirement(
+    input: &ReplayInput,
+    step: &ReplayStep,
+) -> Option<ReplayTransitionProofRetirement> {
+    let ReplayOperation::CleanAcknowledge {
+        context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+        expected_live: Some(expected_live),
+        work,
+        ..
+    } = &input.operation
+    else {
+        return None;
+    };
+    (expected_live.invocation == work.invocation
+        && !matches!(step.position, ReplayPosition::Genesis)
+        && step.input == input.id()
+        && step.final_transition_proof_ack
+        && step.outcome == ReplayStepOutcome::Applied(ReplayDisposition::Applied))
+    .then_some(ReplayTransitionProofRetirement {
+        input: input.id(),
+        position: step.position,
+        key: *expected_live,
+    })
+}
+
+fn successful_provisional_transition_proof_acknowledgement(
+    input: &ReplayInput,
+    step: &ReplayStep,
+) -> Option<ReplayTransitionProofAcknowledgement> {
+    let ReplayOperation::CleanAcknowledge {
+        context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+        expected_live: Some(expected_live),
+        work,
+        ..
+    } = &input.operation
+    else {
+        return None;
+    };
+    (expected_live.invocation == work.invocation
+        && matches!(step.position, ReplayPosition::Merge { .. })
+        && step.input == input.id()
+        && !step.final_transition_proof_ack
+        && step.outcome == ReplayStepOutcome::Applied(ReplayDisposition::Applied))
+    .then_some(ReplayTransitionProofAcknowledgement {
+        input: input.id(),
+        position: step.position,
+        key: *expected_live,
+    })
+}
+
+fn collect_successful_transition_proof_retirement(
+    retirements: &mut Vec<ReplayTransitionProofRetirement>,
+    input: &ReplayInput,
+    step: &ReplayStep,
+) -> Result<(), ReplayValidationError> {
+    let Some(retirement) = successful_transition_proof_retirement(input, step) else {
+        return Ok(());
+    };
+    if retirements
+        .iter()
+        .any(|prior| prior.key() == retirement.key())
+    {
+        return Err(ReplayError::InvalidRecord);
+    }
+    if retirements.len() >= super::journal::MAX_REPLAY_SUFFIX_ENTRIES {
+        return Err(ReplayError::ReplayLimit);
+    }
+    retirements
+        .try_reserve(1)
+        .map_err(|_| ReplayError::ReplayLimit)?;
+    retirements.push(retirement);
+    Ok(())
+}
+
+fn collect_transition_proof_requirement(
+    requirements: &mut Vec<ReplayTransitionProofRequirement>,
+    requirement: Option<ReplayTransitionProofRequirement>,
+) -> Result<(), ReplayValidationError> {
+    let Some(requirement) = requirement else {
+        return Ok(());
+    };
+    if requirements.len() >= super::journal::MAX_REPLAY_SUFFIX_ENTRIES {
+        return Err(ReplayError::ReplayLimit);
+    }
+    requirements
+        .try_reserve(1)
+        .map_err(|_| ReplayError::ReplayLimit)?;
+    requirements.push(requirement);
+    Ok(())
+}
+
+fn collect_transition_proof_action(
+    actions: &mut Vec<ReplayTransitionProofAction>,
+    action: Option<ReplayTransitionProofAction>,
+) -> Result<(), ReplayValidationError> {
+    let Some(action) = action else {
+        return Ok(());
+    };
+    if actions.len() >= super::journal::MAX_REPLAY_SUFFIX_ENTRIES {
+        return Err(ReplayError::ReplayLimit);
+    }
+    actions
+        .try_reserve(1)
+        .map_err(|_| ReplayError::ReplayLimit)?;
+    actions.push(action);
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ReplayTransitionProofRequirementContext {
+    Lifecycle,
+    Recanonicalize,
+    Preserve,
+}
+
+fn transition_proof_action(
+    input: &ReplayInput,
+    step: &ReplayStep,
+) -> Result<Option<ReplayTransitionProofAction>, ReplayValidationError> {
+    transition_proof_action_in(
+        input,
+        step,
+        ReplayTransitionProofRequirementContext::Lifecycle,
+    )
+}
+
+fn transition_proof_action_in(
+    input: &ReplayInput,
+    step: &ReplayStep,
+    requirement_context: ReplayTransitionProofRequirementContext,
+) -> Result<Option<ReplayTransitionProofAction>, ReplayValidationError> {
+    if let Some(stale) = step.stale_transition_proof {
+        if stale.input() != input.id()
+            || stale.position() != step.position
+            || step.transition_proof.is_some()
+            || matches!(step.outcome, ReplayStepOutcome::Applied(_))
+            || ReplayTransitionProofShadow::lifecycle(input)
+                .is_none_or(|(_, lifecycle)| lifecycle != stale.lifecycle())
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+        return Ok(Some(ReplayTransitionProofAction::Stale(stale)));
+    }
+    if let Some(requirement) = transition_proof_requirement_in(input, step, requirement_context)? {
+        return Ok(Some(ReplayTransitionProofAction::Requirement(requirement)));
+    }
+    if let Some(retirement) = successful_transition_proof_retirement(input, step) {
+        return Ok(Some(ReplayTransitionProofAction::Retirement(retirement)));
+    }
+    Ok(
+        successful_provisional_transition_proof_acknowledgement(input, step)
+            .map(ReplayTransitionProofAction::Acknowledgement),
+    )
+}
+
+fn transition_proof_requirement(
+    input: &ReplayInput,
+    step: &ReplayStep,
+) -> Result<Option<ReplayTransitionProofRequirement>, ReplayValidationError> {
+    transition_proof_requirement_in(
+        input,
+        step,
+        ReplayTransitionProofRequirementContext::Lifecycle,
+    )
+}
+
+fn recanonicalized_transition_proof_requirement(
+    input: &ReplayInput,
+    step: &ReplayStep,
+) -> Result<Option<ReplayTransitionProofRequirement>, ReplayValidationError> {
+    transition_proof_requirement_in(
+        input,
+        step,
+        ReplayTransitionProofRequirementContext::Recanonicalize,
+    )
+}
+
+fn preserved_transition_proof_requirement(
+    input: &ReplayInput,
+    step: &ReplayStep,
+) -> Result<Option<ReplayTransitionProofRequirement>, ReplayValidationError> {
+    transition_proof_requirement_in(
+        input,
+        step,
+        ReplayTransitionProofRequirementContext::Preserve,
+    )
+}
+
+fn transition_proof_requirement_in(
+    input: &ReplayInput,
+    step: &ReplayStep,
+    requirement_context: ReplayTransitionProofRequirementContext,
+) -> Result<Option<ReplayTransitionProofRequirement>, ReplayValidationError> {
+    if !matches!(step.outcome, ReplayStepOutcome::Applied(_)) {
+        if step.transition_proof.is_some() {
+            return Err(ReplayError::InvalidRecord);
+        }
+        return Ok(None);
+    }
+    let (context, lifecycle) = match &input.operation {
+        ReplayOperation::CleanInvoke { context, .. } => {
+            (*context, ReplayTransitionProofLifecycle::Invoke)
+        }
+        ReplayOperation::CleanResume {
+            context,
+            expected_live: Some(expected_live),
+            ..
+        } => (
+            *context,
+            ReplayTransitionProofLifecycle::Resume(*expected_live),
+        ),
+        ReplayOperation::CleanResume {
+            context: crate::agent_sdk::RuntimeExecutionContext::Attested { .. },
+            expected_live: None,
+            ..
+        } => return Err(ReplayError::InvalidRecord),
+        ReplayOperation::CleanResume {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            expected_live: None,
+            ..
+        } => {
+            if step.transition_proof.is_some() {
+                return Err(ReplayError::InvalidRecord);
+            }
+            return Ok(None);
+        }
+        ReplayOperation::Management { .. }
+        | ReplayOperation::CleanManage { .. }
+        | ReplayOperation::Invoke { .. }
+        | ReplayOperation::CleanAcknowledge { .. }
+        | ReplayOperation::Acknowledge { .. }
+        | ReplayOperation::SealMerge => {
+            if step.transition_proof.is_some() {
+                return Err(ReplayError::InvalidRecord);
+            }
+            return Ok(None);
+        }
+    };
+    if !matches!(
+        context,
+        crate::agent_sdk::RuntimeExecutionContext::Attested { .. }
+    ) {
+        if step.transition_proof.is_some() {
+            return Err(ReplayError::InvalidRecord);
+        }
+        return Ok(None);
+    }
+    let binding = step.transition_proof.ok_or(ReplayError::InvalidRecord)?;
+    if binding.input() != step.input || binding.position() != step.position {
+        return Err(ReplayError::InvalidRecord);
+    }
+    let (intent, projection_action) = match requirement_context {
+        ReplayTransitionProofRequirementContext::Recanonicalize => (
+            ReplayTransitionProofIntent::Recanonicalize,
+            ReplayTransitionProofProjectionAction::UpdateLive,
+        ),
+        ReplayTransitionProofRequirementContext::Preserve => {
+            if binding.projection() != ReplayTransitionProofProjection::Published {
+                return Err(ReplayError::InvalidRecord);
+            }
+            (
+                ReplayTransitionProofIntent::Recanonicalize,
+                ReplayTransitionProofProjectionAction::ValidateOnly,
+            )
+        }
+        ReplayTransitionProofRequirementContext::Lifecycle => {
+            let intent = match lifecycle {
+                ReplayTransitionProofLifecycle::Invoke => {
+                    ReplayTransitionProofIntent::FirstPublication
+                }
+                ReplayTransitionProofLifecycle::Resume(expected) => {
+                    ReplayTransitionProofIntent::Resume(expected)
+                }
+                ReplayTransitionProofLifecycle::Acknowledge(_) => {
+                    return Err(ReplayError::InvalidRecord);
+                }
+            };
+            (intent, ReplayTransitionProofProjectionAction::UpdateLive)
+        }
+    };
+    Ok(Some(ReplayTransitionProofRequirement {
+        binding,
+        intent,
+        lifecycle,
+        projection_action,
+    }))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InvocationOwnershipOperation {
     Invoke,
@@ -8542,6 +10758,8 @@ fn invocation_identity(
         ReplayOperation::Management { .. }
         | ReplayOperation::CleanManage { .. }
         | ReplayOperation::CleanInvoke { .. }
+        | ReplayOperation::CleanResume { .. }
+        | ReplayOperation::CleanAcknowledge { .. }
         | ReplayOperation::SealMerge => None,
     }
 }
@@ -8623,6 +10841,8 @@ fn validate_retained_outcome(
         ReplayOperation::Management { .. }
         | ReplayOperation::CleanManage { .. }
         | ReplayOperation::CleanInvoke { .. }
+        | ReplayOperation::CleanResume { .. }
+        | ReplayOperation::CleanAcknowledge { .. }
         | ReplayOperation::SealMerge => {
             return Err(InvocationOwnershipError::Unauthenticated);
         }
@@ -8677,6 +10897,9 @@ fn noop_replay_step(
         sealed_outcomes: Vec::new(),
         system_authority_write: None,
         merge_authenticated: false,
+        transition_proof: None,
+        stale_transition_proof: None,
+        final_transition_proof_ack: false,
     }
 }
 
@@ -8743,6 +10966,7 @@ fn retained_exact_transition<SourceError, ExecutorError>(
         result: Some(outcome.result.clone()),
         next_runtime: runtime.clone(),
         products: ReplayProducts::default(),
+        attested_transition: None,
     })
 }
 
@@ -8853,7 +11077,9 @@ fn validate_transition<SourceError, ExecutorError>(
                 return Err(ReplayError::InvalidRecord);
             }
         }
-        ReplayOperation::CleanInvoke { .. } => {
+        ReplayOperation::CleanInvoke { .. }
+        | ReplayOperation::CleanResume { .. }
+        | ReplayOperation::CleanAcknowledge { .. } => {
             if transition.result.is_some() || transition.next_runtime != *current_runtime {
                 return Err(ReplayError::TerminalMutation);
             }
@@ -9225,9 +11451,13 @@ fn validate_clean_management_lanes<SourceError, ExecutorError>(
     let linear = crate::agent_sdk::LaneSet::of(crate::agent_sdk::StateLane::Linear).bits();
     let merge = crate::agent_sdk::LaneSet::of(crate::agent_sdk::StateLane::Merge).bits();
     let local = crate::agent_sdk::LaneSet::of(crate::agent_sdk::StateLane::Local).bits();
-    if (after.linear != before.linear && allowed & linear == 0)
-        || (after.merge != before.merge && allowed & merge == 0)
-        || (after.local != before.local && allowed & local == 0)
+    let canonical_create_initialization = disposition == ReplayDisposition::Applied
+        && matches!(request, crate::agent_sdk::ManagementRequest::Create(_))
+        && super::wire::clean_create_initializes_only_empty_lanes(before, after);
+    if !canonical_create_initialization
+        && ((after.linear != before.linear && allowed & linear == 0)
+            || (after.merge != before.merge && allowed & merge == 0)
+            || (after.local != before.local && allowed & local == 0))
     {
         return Err(ReplayError::CrossLaneMutation);
     }
@@ -9337,6 +11567,7 @@ pub fn derive_checkpoint<SourceError, ExecutorError>(
     merge_seal: Option<MergeSealId>,
     ordered_invocations: InvocationIndexId,
     merge_invocations: InvocationIndexId,
+    transition_proofs: TransitionProofIndexId,
     lanes: Vec<CheckpointLane>,
     artifacts: ArtifactClosureId,
 ) -> Result<CheckpointManifest, ReplayError<SourceError, ExecutorError>> {
@@ -9352,6 +11583,7 @@ pub fn derive_checkpoint<SourceError, ExecutorError>(
         merge_seal,
         ordered_invocations,
         merge_invocations,
+        transition_proofs,
         lanes,
         artifacts,
     };
@@ -9392,6 +11624,41 @@ mod aggregate {
     pub(crate) type RecoveryError =
         MaterializeError<core::convert::Infallible, core::convert::Infallible>;
 
+    fn seed_transition_proof_retirements<S, ResolverError, ExecutorError>(
+        store: &S,
+        shadow: &mut ReplayTransitionProofShadow,
+        invocations: &BTreeSet<crate::agent_sdk::InvocationId>,
+    ) -> Result<(), MaterializeError<ResolverError, ExecutorError>>
+    where
+        S: AgentJournalStore,
+    {
+        if invocations.len() > MAX_REPLAY_SUFFIX_ENTRIES {
+            return Err(ReplayError::ReplayLimit);
+        }
+        for invocation in invocations {
+            if let Some(key) = transition_proof_retirement_for_invocation(
+                store,
+                shadow.genesis,
+                shadow.retired_root(),
+                *invocation,
+            )
+            .map_err(journal)?
+            {
+                shadow.seed_terminal(key).map_err(lift_validation)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_transition_proof_invocation(
+        invocations: &mut BTreeSet<crate::agent_sdk::InvocationId>,
+        input: &ReplayInput,
+    ) {
+        if let Some((invocation, _)) = ReplayTransitionProofShadow::lifecycle(input) {
+            invocations.insert(invocation);
+        }
+    }
+
     struct ReplayBase {
         state: RuntimeState,
         artifacts: Option<ArtifactClosure>,
@@ -9405,6 +11672,7 @@ mod aggregate {
         ordered_invocations: InvocationIndexId,
         merge_invocations: InvocationIndexId,
         local_invocations: InvocationIndexId,
+        transition_proof_boundary: TransitionProofIndexManifest,
         genesis_input: Option<ReplayInput>,
         fence_ancestry: FenceAncestryEvidence,
     }
@@ -9642,6 +11910,13 @@ mod aggregate {
         {
             return Err(ReplayError::InvalidRecord);
         }
+        let transition_proofs: TransitionProofIndexManifest =
+            require_record(store, checkpoint.transition_proofs)?;
+        if transition_proofs.id() != checkpoint.transition_proofs
+            || transition_proofs.genesis != checkpoint.genesis
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
 
         let ordered = OrderedBase {
             index: checkpoint.ordered_index,
@@ -9779,6 +12054,7 @@ mod aggregate {
             ordered_invocations: checkpoint.ordered_invocations,
             merge_invocations: checkpoint.merge_invocations,
             local_invocations,
+            transition_proof_boundary: transition_proofs,
             genesis_input: None,
             fence_ancestry: FenceAncestryEvidence::from_published_local_checkpoint(
                 heads,
@@ -9806,6 +12082,14 @@ mod aggregate {
             || genesis.id() != heads.genesis
             || genesis.runtime().space != heads.runtime.space
             || genesis.runtime().agent != heads.runtime.agent
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
+        let expected_transition_proofs = TransitionProofIndexManifest::empty(heads.genesis);
+        let transition_proofs: TransitionProofIndexManifest =
+            require_record(store, expected_transition_proofs.id())?;
+        if transition_proofs != expected_transition_proofs
+            || transition_proofs.id() != expected_transition_proofs.id()
         {
             return Err(ReplayError::InvalidRecord);
         }
@@ -9872,6 +12156,7 @@ mod aggregate {
                 InvocationOwnershipScope::Local(heads.node),
             )
             .id(),
+            transition_proof_boundary: transition_proofs,
             genesis_input: Some(genesis.create),
             fence_ancestry: FenceAncestryEvidence::post_genesis(heads.genesis)
                 .map_err(lift_validation)?,
@@ -10235,8 +12520,51 @@ mod aggregate {
             index: heads.ordered_index,
             head: heads.ordered_head,
         };
+        let transition_proofs: TransitionProofIndexManifest =
+            require_record(store, heads.transition_proofs)?;
+        if transition_proofs.id() != heads.transition_proofs
+            || transition_proofs.genesis != heads.genesis
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
         let replay_boundary = base.ordered;
         let mut fence_ancestry = base.fence_ancestry.clone();
+        let mut initial_transition_proof_shadow =
+            ReplayTransitionProofShadow::from_manifest(&base.transition_proof_boundary);
+        let latest_fence_transition_proofs =
+            transition_proof_index_at_replay_boundary(store, &heads, heads.merge_fence)
+                .map_err(journal)?;
+        let mut boundary_retirement_invocations = BTreeSet::new();
+        if let Some(input) = base.genesis_input.as_ref() {
+            collect_transition_proof_invocation(&mut boundary_retirement_invocations, input);
+        }
+        for action in &plan.actions {
+            match action {
+                MaterializationAction::Merge { replay, .. } => {
+                    for (_, event) in replay.events() {
+                        collect_transition_proof_invocation(
+                            &mut boundary_retirement_invocations,
+                            &event.input,
+                        );
+                    }
+                }
+                MaterializationAction::Local(_, entry) => collect_transition_proof_invocation(
+                    &mut boundary_retirement_invocations,
+                    &entry.input,
+                ),
+                MaterializationAction::Ordered { entry, .. } => {
+                    collect_transition_proof_invocation(
+                        &mut boundary_retirement_invocations,
+                        &entry.input,
+                    );
+                }
+            }
+        }
+        seed_transition_proof_retirements::<S, R::Error, E::Error>(
+            store,
+            &mut initial_transition_proof_shadow,
+            &boundary_retirement_invocations,
+        )?;
         let indexes = InvocationIndexes::open(
             store,
             base.ordered_invocations,
@@ -10265,6 +12593,9 @@ mod aggregate {
                 .collect(),
             ownership: indexes,
             fence: base.fence.take(),
+            transition_proof_shadow: Some(initial_transition_proof_shadow.clone()),
+            transition_proof_projection: Some(initial_transition_proof_shadow.clone()),
+            transition_proof_final_projection: Some(initial_transition_proof_shadow.clone()),
         };
         let mut artifacts = base.artifacts.take();
         let mut state = base.state;
@@ -10281,6 +12612,15 @@ mod aggregate {
         let mut merge_boundary_ancestry = base.merge_ancestry.clone();
         let mut merge_boundary_state = state.merge.clone();
         let mut merge_boundary_invocations = base.merge_invocations;
+        let mut merge_boundary_transition_proofs = initial_transition_proof_shadow.clone();
+        let mut current_transition_proof_shadow = initial_transition_proof_shadow;
+        // The canonical Merge walk has a logical projection (every admitted
+        // acknowledgement consumes its edge) and a final projection (only
+        // the next authenticated fence may make those retirements durable).
+        // Keep both continuations across unrelated Local/Ordered entries;
+        // those entries themselves are admitted against the physical map.
+        let mut pending_merge_logical_transition_proofs = current_transition_proof_shadow.clone();
+        let mut pending_merge_final_transition_proofs = current_transition_proof_shadow.clone();
         let mut current_roots = base.merge.roots().to_vec();
         let mut current_ancestry = base.merge_ancestry;
         let mut local_revision = base.local_revision;
@@ -10369,6 +12709,21 @@ mod aggregate {
                             runtime_history,
                             ownership: indexes,
                             fence,
+                            transition_proof_shadow: Some(
+                                merge_boundary_transition_proofs
+                                    .clone()
+                                    .with_external_edges_from(&current_transition_proof_shadow),
+                            ),
+                            transition_proof_projection: Some(
+                                merge_boundary_transition_proofs
+                                    .clone()
+                                    .with_external_edges_from(&current_transition_proof_shadow),
+                            ),
+                            transition_proof_final_projection: Some(
+                                merge_boundary_transition_proofs
+                                    .clone()
+                                    .with_external_edges_from(&current_transition_proof_shadow),
+                            ),
                         };
                         if InvocationOwnership::unfinalized(
                             &machine.ownership,
@@ -10384,6 +12739,17 @@ mod aggregate {
                         state.merge = merge_boundary_state.clone();
                         current_frontier = merge_boundary_frontier;
                         merge_facts.clear();
+                    } else {
+                        // Resume the canonical Merge lifecycle shadow after
+                        // an intervening physical Local/non-fence Ordered
+                        // publication. Its external edge still wins in the
+                        // physical projection and in either canonical view.
+                        machine.transition_proof_shadow =
+                            Some(pending_merge_logical_transition_proofs.clone());
+                        machine.transition_proof_projection =
+                            Some(current_transition_proof_shadow.clone());
+                        machine.transition_proof_final_projection =
+                            Some(pending_merge_final_transition_proofs.clone());
                     }
                     if replay.checkpoint_frontier != current_frontier {
                         return Err(ReplayError::ChainMismatch);
@@ -10431,6 +12797,35 @@ mod aggregate {
                         state.merge = step.state.merge;
                         validate_runtime_state_bound(&state)?;
                     }
+                    let merge_projection = machine
+                        .transition_proof_projection
+                        .as_ref()
+                        .ok_or(ReplayError::InvalidRecord)?
+                        .clone();
+                    let merge_logical_projection = machine
+                        .transition_proof_shadow
+                        .as_ref()
+                        .ok_or(ReplayError::InvalidRecord)?
+                        .clone();
+                    let merge_final_projection = machine
+                        .transition_proof_final_projection
+                        .as_ref()
+                        .ok_or(ReplayError::InvalidRecord)?
+                        .clone();
+                    current_transition_proof_shadow = ReplayTransitionProofShadow::reconcile_merge(
+                        &current_transition_proof_shadow,
+                        &merge_projection,
+                    );
+                    pending_merge_logical_transition_proofs =
+                        ReplayTransitionProofShadow::reconcile_merge(
+                            &current_transition_proof_shadow,
+                            &merge_logical_projection,
+                        );
+                    pending_merge_final_transition_proofs =
+                        ReplayTransitionProofShadow::reconcile_merge(
+                            &current_transition_proof_shadow,
+                            &merge_final_projection,
+                        );
                     current_frontier = replay.frontier_id;
                     current_roots = roots;
                     current_ancestry = ancestry;
@@ -10458,6 +12853,7 @@ mod aggregate {
                     machine
                         .runtime_history
                         .insert(entry.ordered_base, snapshot.runtime.clone());
+                    machine.reset_transition_proof_shadows(current_transition_proof_shadow.clone());
                     let before = RuntimeState {
                         control: snapshot.control,
                         linear: snapshot.linear,
@@ -10479,6 +12875,21 @@ mod aggregate {
                         )
                         .map_err(historical_replay_error)?;
                     state.local = step.state.local;
+                    current_transition_proof_shadow = machine
+                        .transition_proof_projection
+                        .as_ref()
+                        .ok_or(ReplayError::InvalidRecord)?
+                        .clone();
+                    pending_merge_logical_transition_proofs =
+                        ReplayTransitionProofShadow::reconcile_merge(
+                            &current_transition_proof_shadow,
+                            &pending_merge_logical_transition_proofs,
+                        );
+                    pending_merge_final_transition_proofs =
+                        ReplayTransitionProofShadow::reconcile_merge(
+                            &current_transition_proof_shadow,
+                            &pending_merge_final_transition_proofs,
+                        );
                     validate_runtime_state_bound(&state)?;
                     local_revision = entry.revision;
                     local_head = Some(id);
@@ -10506,6 +12917,14 @@ mod aggregate {
                         None if entry.merge_seal.is_none() => None,
                         None => return Err(ReplayError::InvalidFence),
                     };
+                    if next_fence.is_some() {
+                        current_transition_proof_shadow =
+                            ReplayTransitionProofShadow::reconcile_merge(
+                                &current_transition_proof_shadow,
+                                &pending_merge_final_transition_proofs,
+                            );
+                    }
+                    machine.reset_transition_proof_shadows(current_transition_proof_shadow.clone());
                     if let Some(seal) = entry.merge_seal {
                         machine
                             .finalize_merge_outcomes(id, seal, &merge_facts)
@@ -10542,6 +12961,23 @@ mod aggregate {
                             });
                     }
                     state = step.state;
+                    current_transition_proof_shadow = machine
+                        .transition_proof_projection
+                        .as_ref()
+                        .ok_or(ReplayError::InvalidRecord)?
+                        .clone();
+                    if next_fence.is_none() {
+                        pending_merge_logical_transition_proofs =
+                            ReplayTransitionProofShadow::reconcile_merge(
+                                &current_transition_proof_shadow,
+                                &pending_merge_logical_transition_proofs,
+                            );
+                        pending_merge_final_transition_proofs =
+                            ReplayTransitionProofShadow::reconcile_merge(
+                                &current_transition_proof_shadow,
+                                &pending_merge_final_transition_proofs,
+                            );
+                    }
                     artifacts = Some(next_artifacts);
                     validate_runtime_state_bound(&state)?;
                     current_ordered = OrderedBase {
@@ -10577,6 +13013,22 @@ mod aggregate {
                             InvocationOwnershipScope::Merge,
                         )
                         .map_err(ReplayError::InvocationOwnership)?;
+                        current_transition_proof_shadow =
+                            current_transition_proof_shadow.as_fence_boundary();
+                        if current_ordered == heads.merge_fence {
+                            current_transition_proof_shadow = current_transition_proof_shadow
+                                .with_retired_root(latest_fence_transition_proofs.retired_root());
+                            if !current_transition_proof_shadow
+                                .matches_manifest(&latest_fence_transition_proofs)
+                            {
+                                return Err(ReplayError::InvalidRecord);
+                            }
+                        }
+                        merge_boundary_transition_proofs = current_transition_proof_shadow.clone();
+                        pending_merge_logical_transition_proofs =
+                            current_transition_proof_shadow.clone();
+                        pending_merge_final_transition_proofs =
+                            current_transition_proof_shadow.clone();
                         merge_facts.clear();
                     }
                 }
@@ -10589,6 +13041,8 @@ mod aggregate {
         let ids = machine
             .ownership_ids(heads.node)
             .map_err(ReplayError::InvocationOwnership)?;
+        current_transition_proof_shadow =
+            current_transition_proof_shadow.with_retired_root(transition_proofs.retired_root());
         if ids
             != (
                 heads.ordered_invocations,
@@ -10602,6 +13056,7 @@ mod aggregate {
             || machine.runtime != heads.runtime
             || current_roots != plan.final_roots
             || current_ancestry != plan.final_ancestry
+            || !current_transition_proof_shadow.matches_manifest(&transition_proofs)
         {
             return Err(ReplayError::InvalidRecord);
         }
@@ -10655,12 +13110,16 @@ mod aggregate {
             merge_boundary_ancestry,
             merge_boundary_state,
             merge_boundary_invocations,
+            merge_boundary_transition_proofs,
             merge_ancestry: current_ancestry,
             fence,
             artifacts,
             suffix_budget: plan.suffix_budget,
             replay_boundary,
             fence_ancestry,
+            transition_proofs,
+            transition_proof_shadow: current_transition_proof_shadow,
+            pending_transition_proof_final_shadow: pending_merge_final_transition_proofs,
         })
     }
 
@@ -11400,6 +13859,7 @@ mod aggregate {
         Ok(next)
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     fn authenticated_materialization<ResolverError, ExecutorError>(
         materialization: &ReplayMaterialization,
     ) -> Result<(), MaterializeError<ResolverError, ExecutorError>> {
@@ -11654,6 +14114,8 @@ mod aggregate {
             ReplayOperation::Management { .. }
             | ReplayOperation::CleanManage { .. }
             | ReplayOperation::CleanInvoke { .. }
+            | ReplayOperation::CleanResume { .. }
+            | ReplayOperation::CleanAcknowledge { .. }
             | ReplayOperation::SealMerge => {
                 return Err(ReplayError::InvalidPosition);
             }
@@ -12115,6 +14577,24 @@ mod aggregate {
             canonical_merge_events
                 .sort_unstable_by_key(|(event_id, event)| (event.causal_height, *event_id));
         }
+        let mut current_proof_shadow = materialization.transition_proof_shadow.clone();
+        let mut current_retirement_invocations = BTreeSet::new();
+        collect_transition_proof_invocation(&mut current_retirement_invocations, &entry.input);
+        seed_transition_proof_retirements::<S, core::convert::Infallible, E::Error>(
+            store,
+            &mut current_proof_shadow,
+            &current_retirement_invocations,
+        )?;
+        let mut boundary_proof_shadow = materialization.merge_boundary_transition_proofs.clone();
+        let mut boundary_retirement_invocations = current_retirement_invocations.clone();
+        for (_, event) in &canonical_merge_events {
+            collect_transition_proof_invocation(&mut boundary_retirement_invocations, &event.input);
+        }
+        seed_transition_proof_retirements::<S, core::convert::Infallible, E::Error>(
+            store,
+            &mut boundary_proof_shadow,
+            &boundary_retirement_invocations,
+        )?;
         let mut snapshots = materialization.ordered_snapshots.clone();
         let starting_merge_index = if entry.merge_seal.is_some() {
             materialization.merge_boundary_invocations
@@ -12168,13 +14648,29 @@ mod aggregate {
                     .collect(),
                 ownership: indexes,
                 fence: materialization.fence.clone(),
+                transition_proof_shadow: Some(
+                    boundary_proof_shadow
+                        .clone()
+                        .with_external_edges_from(&current_proof_shadow),
+                ),
+                transition_proof_projection: Some(
+                    boundary_proof_shadow
+                        .clone()
+                        .with_external_edges_from(&current_proof_shadow),
+                ),
+                transition_proof_final_projection: Some(
+                    boundary_proof_shadow.with_external_edges_from(&current_proof_shadow),
+                ),
             }
         } else {
-            ReplayMachine::from_materialization(materialization, indexes)
-                .map_err(ReplayError::InvocationOwnership)?
+            let mut machine = ReplayMachine::from_materialization(materialization, indexes)
+                .map_err(ReplayError::InvocationOwnership)?;
+            machine.reset_transition_proof_shadows(current_proof_shadow.clone());
+            machine
         };
         let mut finalized_outcomes = Vec::new();
         let mut finalized_executions = Vec::new();
+        let mut merge_proof_actions = Vec::new();
         let mut finalized_delta = InvocationIndexDelta::NONE;
         if let Some(seal) = entry.merge_seal {
             if InvocationOwnership::unfinalized(&machine.ownership, InvocationOwnershipScope::Merge)
@@ -12212,11 +14708,30 @@ mod aggregate {
                     local: materialization.state.local.clone(),
                 };
                 let replayed = machine
-                    .verify_and_apply_merge::<
+                    .verify_and_apply_merge_with_unseen_capacity::<
                         E,
                         ReplayMaterializationSourceError<core::convert::Infallible>,
-                    >(executor, &ordered, *event_id, event, &before)
+                    >(
+                        executor,
+                        &ordered,
+                        *event_id,
+                        event,
+                        &before,
+                        None,
+                        ReplayTransitionProofAccess::PrepareAllowed,
+                        true,
+                    )
                     .map_err(historical_replay_error)?;
+                collect_transition_proof_action(
+                    &mut merge_proof_actions,
+                    transition_proof_action_in(
+                        &event.input,
+                        &replayed,
+                        ReplayTransitionProofRequirementContext::Recanonicalize,
+                    )
+                    .map_err(lift_validation)?,
+                )
+                .map_err(lift_validation)?;
                 merge_state = replayed.state.merge.clone();
                 if facts
                     .insert(
@@ -12248,12 +14763,23 @@ mod aggregate {
                 InvocationOwnershipScope::Merge,
             )
             .map_err(ReplayError::InvocationOwnership)?;
-            if matches!(entry.input.operation, ReplayOperation::SealMerge) && unfinalized == 0 {
+            if matches!(entry.input.operation, ReplayOperation::SealMerge)
+                && unfinalized == 0
+                && canonical_merge_events.is_empty()
+            {
                 return Err(ReplayError::InvalidFence);
             }
             (finalized_delta, finalized_outcomes, finalized_executions) = machine
                 .finalize_merge_outcomes(id, seal, &facts)
                 .map_err(lift_validation)?;
+            let merge_net = machine
+                .transition_proof_projection
+                .as_ref()
+                .ok_or(ReplayError::InvalidRecord)?;
+            machine.reset_transition_proof_shadows(ReplayTransitionProofShadow::reconcile_merge(
+                &current_proof_shadow,
+                merge_net,
+            ));
         }
         let next_fence = match fence_dependency.as_ref() {
             Some(dependency) => Some(authenticate_action_fence(
@@ -12309,11 +14835,27 @@ mod aggregate {
             };
             next.merge_seal = Some(fence.seal);
         }
-        let sealed = machine
+        let mut sealed = machine
             .seal_ordered_publication(current, entry, next.clone(), &step, materialization)
+            .map_err(lift_validation)?;
+        sealed
+            .prepend_transition_proof_actions(merge_proof_actions)
             .map_err(lift_validation)?;
         let fence_ancestry = sealed.fence_ancestry.clone();
         let fence = machine.fence.clone();
+        let successor_transition_proof_shadow = machine
+            .transition_proof_projection
+            .as_ref()
+            .ok_or(ReplayError::InvalidRecord)?
+            .clone();
+        let successor_pending_transition_proof_final_shadow = if entry.merge_seal.is_some() {
+            successor_transition_proof_shadow.as_fence_boundary()
+        } else {
+            ReplayTransitionProofShadow::reconcile_merge(
+                &successor_transition_proof_shadow,
+                &materialization.pending_transition_proof_final_shadow,
+            )
+        };
         drop(machine);
         let mut executions = vec![step.execution_result(true)];
         executions.extend(finalized_executions);
@@ -12383,12 +14925,25 @@ mod aggregate {
                 merge_boundary_ancestry,
                 merge_boundary_state,
                 merge_boundary_invocations,
+                merge_boundary_transition_proofs: if entry.merge_seal.is_some() {
+                    successor_transition_proof_shadow.as_fence_boundary()
+                } else {
+                    materialization.merge_boundary_transition_proofs.clone()
+                },
                 merge_ancestry: materialization.merge_ancestry.clone(),
                 fence,
                 artifacts,
                 suffix_budget,
                 replay_boundary: materialization.replay_boundary,
                 fence_ancestry,
+                transition_proofs: materialization.transition_proofs.clone(),
+                transition_proof_shadow: if entry.merge_seal.is_some() {
+                    successor_transition_proof_shadow.as_fence_boundary()
+                } else {
+                    successor_transition_proof_shadow
+                },
+                pending_transition_proof_final_shadow:
+                    successor_pending_transition_proof_final_shadow,
             },
             executions,
         }))
@@ -12653,6 +15208,24 @@ mod aggregate {
         let pinned_base = successor_merge_base(&boundary, &pinned).map_err(lift_validation)?;
         let mut pinned_ancestry = materialization.merge_boundary_ancestry.clone();
         pinned_ancestry.extend(pinned.ancestry.iter().copied());
+        let mut current_proof_shadow = materialization.transition_proof_shadow.clone();
+        let mut current_retirement_invocations = BTreeSet::new();
+        collect_transition_proof_invocation(&mut current_retirement_invocations, &entry.input);
+        seed_transition_proof_retirements::<S, R::Error, E::Error>(
+            store,
+            &mut current_proof_shadow,
+            &current_retirement_invocations,
+        )?;
+        let mut boundary_proof_shadow = materialization.merge_boundary_transition_proofs.clone();
+        let mut boundary_retirement_invocations = current_retirement_invocations.clone();
+        for (_, event) in pinned.events() {
+            collect_transition_proof_invocation(&mut boundary_retirement_invocations, &event.input);
+        }
+        seed_transition_proof_retirements::<S, R::Error, E::Error>(
+            store,
+            &mut boundary_proof_shadow,
+            &boundary_retirement_invocations,
+        )?;
 
         // The current ownership schema has no durable `StaleAfterFence`
         // archive.  Dropping an active G-only pending owner would make its
@@ -12719,6 +15292,19 @@ mod aggregate {
                 .collect(),
             ownership: indexes,
             fence: materialization.fence.clone(),
+            transition_proof_shadow: Some(
+                boundary_proof_shadow
+                    .clone()
+                    .with_external_edges_from(&current_proof_shadow),
+            ),
+            transition_proof_projection: Some(
+                boundary_proof_shadow
+                    .clone()
+                    .with_external_edges_from(&current_proof_shadow),
+            ),
+            transition_proof_final_projection: Some(
+                boundary_proof_shadow.with_external_edges_from(&current_proof_shadow),
+            ),
         };
         if InvocationOwnership::unfinalized(&machine.ownership, InvocationOwnershipScope::Merge)
             .map_err(ReplayError::InvocationOwnership)?
@@ -12738,6 +15324,7 @@ mod aggregate {
         let mut pinned_state = materialization.state.clone();
         pinned_state.merge = materialization.merge_boundary_state.clone();
         let mut facts = BTreeMap::new();
+        let mut merge_proof_actions = Vec::new();
         for (event_id, event) in pinned.events() {
             if event.ordered_base.index > current.ordered_index
                 || (event.ordered_base.index == current.ordered_index
@@ -12765,10 +15352,35 @@ mod aggregate {
                 local: materialization.state.local.clone(),
             };
             let replayed = machine
-                .verify_and_apply_merge::<E, ReplayMaterializationSourceError<R::Error>>(
-                    executor, &ordered, *event_id, event, &before,
+                .verify_and_apply_merge_with_unseen_capacity::<
+                    E,
+                    ReplayMaterializationSourceError<R::Error>,
+                >(
+                    executor,
+                    &ordered,
+                    *event_id,
+                    event,
+                    &before,
+                    None,
+                    if entry.merge_seal.is_some() {
+                        ReplayTransitionProofAccess::PrepareAllowed
+                    } else {
+                        ReplayTransitionProofAccess::PublishedOnly
+                    },
+                    entry.merge_seal.is_some(),
                 )
                 .map_err(historical_replay_error)?;
+            let proof_context = if entry.merge_seal.is_some() {
+                ReplayTransitionProofRequirementContext::Recanonicalize
+            } else {
+                ReplayTransitionProofRequirementContext::Preserve
+            };
+            collect_transition_proof_action(
+                &mut merge_proof_actions,
+                transition_proof_action_in(&event.input, &replayed, proof_context)
+                    .map_err(lift_validation)?,
+            )
+            .map_err(lift_validation)?;
             pinned_state.merge = replayed.state.merge.clone();
             if facts
                 .insert(
@@ -12856,7 +15468,10 @@ mod aggregate {
                     InvocationOwnershipScope::Merge,
                 )
                 .map_err(ReplayError::InvocationOwnership)?;
-                if matches!(entry.input.operation, ReplayOperation::SealMerge) && unfinalized == 0 {
+                if matches!(entry.input.operation, ReplayOperation::SealMerge)
+                    && unfinalized == 0
+                    && pinned.events().is_empty()
+                {
                     return Err(ReplayError::InvalidFence);
                 }
                 (finalized_delta, finalized_outcomes, finalized_executions) = machine
@@ -12874,6 +15489,18 @@ mod aggregate {
             None if entry.merge_seal.is_none() => None,
             None => return Err(ReplayError::InvalidFence),
         };
+        let proof_projection = if entry.merge_seal.is_some() {
+            ReplayTransitionProofShadow::reconcile_merge(
+                &current_proof_shadow,
+                machine
+                    .transition_proof_projection
+                    .as_ref()
+                    .ok_or(ReplayError::InvalidRecord)?,
+            )
+        } else {
+            current_proof_shadow.clone()
+        };
+        machine.reset_transition_proof_shadows(proof_projection);
         let execution_before = pinned_state.clone();
         let mut step = machine
             .apply_with_unseen_capacity::<_, ReplayMaterializationSourceError<R::Error>>(
@@ -13000,7 +15627,7 @@ mod aggregate {
         )
         .map_err(|_| ReplayError::InvalidRecord)?;
 
-        let sealed = machine
+        let mut sealed = machine
             .seal_shared_ordered_publication(
                 current,
                 entry,
@@ -13016,8 +15643,24 @@ mod aggregate {
                 mode,
             )
             .map_err(lift_validation)?;
+        sealed
+            .prepend_transition_proof_actions(merge_proof_actions)
+            .map_err(lift_validation)?;
         let fence_ancestry = sealed.fence_ancestry.clone();
         let fence = machine.fence.clone();
+        let successor_transition_proof_shadow = machine
+            .transition_proof_projection
+            .as_ref()
+            .ok_or(ReplayError::InvalidRecord)?
+            .clone();
+        let successor_pending_transition_proof_final_shadow = if installing_fence {
+            successor_transition_proof_shadow.as_fence_boundary()
+        } else {
+            ReplayTransitionProofShadow::reconcile_merge(
+                &successor_transition_proof_shadow,
+                &materialization.pending_transition_proof_final_shadow,
+            )
+        };
         drop(machine);
         let artifacts = successor_artifacts::<S, R::Error, E>(
             store,
@@ -13093,12 +15736,25 @@ mod aggregate {
                         merge_boundary_ancestry,
                         merge_boundary_state,
                         merge_boundary_invocations,
+                        merge_boundary_transition_proofs: if installing_fence {
+                            successor_transition_proof_shadow.as_fence_boundary()
+                        } else {
+                            materialization.merge_boundary_transition_proofs.clone()
+                        },
                         merge_ancestry,
                         fence,
                         artifacts,
                         suffix_budget,
                         replay_boundary: materialization.replay_boundary,
                         fence_ancestry,
+                        transition_proofs: materialization.transition_proofs.clone(),
+                        transition_proof_shadow: if installing_fence {
+                            successor_transition_proof_shadow.as_fence_boundary()
+                        } else {
+                            successor_transition_proof_shadow
+                        },
+                        pending_transition_proof_final_shadow:
+                            successor_pending_transition_proof_final_shadow,
                     },
                     executions,
                 },
@@ -13156,6 +15812,14 @@ mod aggregate {
         }
         let mut suffix_budget = materialization.suffix_budget.clone();
         suffix_budget.local(id, entry).map_err(lift_validation)?;
+        let mut proof_shadow = materialization.transition_proof_shadow.clone();
+        let mut retirement_invocations = BTreeSet::new();
+        collect_transition_proof_invocation(&mut retirement_invocations, &entry.input);
+        seed_transition_proof_retirements::<S, core::convert::Infallible, E::Error>(
+            store,
+            &mut proof_shadow,
+            &retirement_invocations,
+        )?;
         let indexes = InvocationIndexes::open(
             store,
             current.ordered_invocations,
@@ -13187,6 +15851,7 @@ mod aggregate {
         let unseen_capacity = has_unseen_invocation_capacity(&indexes, &entry.input, position)?;
         let mut machine = ReplayMachine::from_materialization(materialization, indexes)
             .map_err(ReplayError::InvocationOwnership)?;
+        machine.reset_transition_proof_shadows(proof_shadow);
         let step = machine
             .apply_with_unseen_capacity::<
                 _,
@@ -13211,6 +15876,16 @@ mod aggregate {
             .seal_local_publication(current, entry, next.clone(), &step, materialization)
             .map_err(lift_validation)?;
         let fence_ancestry = sealed.fence_ancestry.clone();
+        let successor_transition_proof_shadow = machine
+            .transition_proof_projection
+            .as_ref()
+            .ok_or(ReplayError::InvalidRecord)?
+            .clone();
+        let successor_pending_transition_proof_final_shadow =
+            ReplayTransitionProofShadow::reconcile_merge(
+                &successor_transition_proof_shadow,
+                &materialization.pending_transition_proof_final_shadow,
+            );
         drop(machine);
         let execution = step.execution_result(true);
         let mut state = materialization.state.clone();
@@ -13239,12 +15914,19 @@ mod aggregate {
                 merge_boundary_ancestry: materialization.merge_boundary_ancestry.clone(),
                 merge_boundary_state: materialization.merge_boundary_state.clone(),
                 merge_boundary_invocations: materialization.merge_boundary_invocations,
+                merge_boundary_transition_proofs: materialization
+                    .merge_boundary_transition_proofs
+                    .clone(),
                 merge_ancestry: materialization.merge_ancestry.clone(),
                 fence: materialization.fence.clone(),
                 artifacts,
                 suffix_budget,
                 replay_boundary: materialization.replay_boundary,
                 fence_ancestry,
+                transition_proofs: materialization.transition_proofs.clone(),
+                transition_proof_shadow: successor_transition_proof_shadow,
+                pending_transition_proof_final_shadow:
+                    successor_pending_transition_proof_final_shadow,
             },
             executions: vec![execution],
         }))
@@ -13423,6 +16105,19 @@ mod aggregate {
         canonical_events.push((id, event.clone()));
         canonical_events
             .sort_unstable_by_key(|(event_id, retained)| (retained.causal_height, *event_id));
+        let mut boundary_proof_shadow = materialization.merge_boundary_transition_proofs.clone();
+        let mut boundary_retirement_invocations = BTreeSet::new();
+        for (_, retained) in &canonical_events {
+            collect_transition_proof_invocation(
+                &mut boundary_retirement_invocations,
+                &retained.input,
+            );
+        }
+        seed_transition_proof_retirements::<S, R::Error, E::Error>(
+            store,
+            &mut boundary_proof_shadow,
+            &boundary_retirement_invocations,
+        )?;
 
         // The canonical rebuild starts from the sealed Merge boundary, but
         // admission capacity belongs to the current authenticated Merge
@@ -13468,6 +16163,20 @@ mod aggregate {
                 .collect(),
             ownership: indexes,
             fence: materialization.fence.clone(),
+            transition_proof_shadow: Some(
+                boundary_proof_shadow
+                    .clone()
+                    .with_external_edges_from(&materialization.transition_proof_shadow),
+            ),
+            transition_proof_projection: Some(
+                boundary_proof_shadow
+                    .clone()
+                    .with_external_edges_from(&materialization.transition_proof_shadow),
+            ),
+            transition_proof_final_projection: Some(
+                boundary_proof_shadow
+                    .with_external_edges_from(&materialization.transition_proof_shadow),
+            ),
         };
         let ordered = OrderedReplay {
             genesis: current.genesis,
@@ -13479,6 +16188,7 @@ mod aggregate {
         let mut state = materialization.state.clone();
         state.merge = materialization.merge_boundary_state.clone();
         let mut imported_step = None;
+        let mut merge_proof_actions = Vec::new();
         for (event_id, retained) in &canonical_events {
             let snapshot = resolve_snapshot::<R, E>(
                 resolver,
@@ -13514,6 +16224,8 @@ mod aggregate {
                     } else {
                         None
                     },
+                    ReplayTransitionProofAccess::PrepareAllowed,
+                    false,
                 )
                 .map_err(|error| {
                     if *event_id == id {
@@ -13522,6 +16234,17 @@ mod aggregate {
                         historical_replay_error(error)
                     }
                 })?;
+            let requirement_context = if *event_id == id {
+                ReplayTransitionProofRequirementContext::Lifecycle
+            } else {
+                ReplayTransitionProofRequirementContext::Recanonicalize
+            };
+            collect_transition_proof_action(
+                &mut merge_proof_actions,
+                transition_proof_action_in(&retained.input, &step, requirement_context)
+                    .map_err(lift_validation)?,
+            )
+            .map_err(lift_validation)?;
             state.merge = step.state.merge.clone();
             validate_runtime_state_bound(&state)?;
             if *event_id == id {
@@ -13537,7 +16260,7 @@ mod aggregate {
         next.ordered_invocations = ordered_invocations;
         next.merge_invocations = merge_invocations;
         next.local_invocations = local_invocations;
-        let sealed = machine
+        let mut sealed = machine
             .seal_merge_publication(
                 current,
                 event,
@@ -13547,7 +16270,30 @@ mod aggregate {
                 materialization,
             )
             .map_err(lift_validation)?;
+        // Reordering one Merge import re-executes the complete canonical
+        // post-boundary suffix. Every Attested step must therefore be covered
+        // by Preserve or Publish/Replace in the same head CAS, in that exact
+        // canonical execution order. The imported step alone is insufficient
+        // when an earlier same-height event is inserted.
+        sealed
+            .replace_transition_proof_actions(merge_proof_actions)
+            .map_err(lift_validation)?;
         let fence_ancestry = sealed.fence_ancestry.clone();
+        let successor_transition_proof_shadow = ReplayTransitionProofShadow::reconcile_merge(
+            &materialization.transition_proof_shadow,
+            machine
+                .transition_proof_projection
+                .as_ref()
+                .ok_or(ReplayError::InvalidRecord)?,
+        );
+        let successor_pending_transition_proof_final_shadow =
+            ReplayTransitionProofShadow::reconcile_merge(
+                &materialization.transition_proof_shadow,
+                machine
+                    .transition_proof_final_projection
+                    .as_ref()
+                    .ok_or(ReplayError::InvalidRecord)?,
+            );
         drop(machine);
         let artifacts = successor_artifacts::<S, R::Error, E>(
             store,
@@ -13585,12 +16331,19 @@ mod aggregate {
                 merge_boundary_ancestry: materialization.merge_boundary_ancestry.clone(),
                 merge_boundary_state: materialization.merge_boundary_state.clone(),
                 merge_boundary_invocations: materialization.merge_boundary_invocations,
+                merge_boundary_transition_proofs: materialization
+                    .merge_boundary_transition_proofs
+                    .clone(),
                 merge_ancestry: ancestry,
                 fence: materialization.fence.clone(),
                 artifacts,
                 suffix_budget,
                 replay_boundary: materialization.replay_boundary,
                 fence_ancestry,
+                transition_proofs: materialization.transition_proofs.clone(),
+                transition_proof_shadow: successor_transition_proof_shadow,
+                pending_transition_proof_final_shadow:
+                    successor_pending_transition_proof_final_shadow,
             },
             // A Merge CAS admits only the event. Its apparent disposition is
             // not final because a later same-height event can precede it in
@@ -13614,10 +16367,11 @@ mod aggregate {
         Ok(compacted)
     }
 
-    /// Build a complete Shared checkpoint without writing any object, blob,
-    /// or head. The caller combines its exact roots with the V2 ledger
-    /// context, obtains voter signatures, and returns the verified capability
-    /// to `PreparedSharedCheckpoint::publish_shared`.
+    /// Build a complete Shared checkpoint and stage its immutable proof-index
+    /// compaction closure. The caller combines the resulting exact roots with
+    /// the V2 ledger context, obtains voter signatures, and returns the
+    /// verified capability to `PreparedSharedCheckpoint::publish_shared`.
+    /// No lane blob, mutable head, or ledger cursor changes here.
     pub(crate) fn prepare_shared_checkpoint<S>(
         store: &mut S,
         materialization: &ReplayMaterialization,
@@ -13626,9 +16380,21 @@ mod aggregate {
         MaterializeError<core::convert::Infallible, core::convert::Infallible>,
     >
     where
-        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+        S: AgentJournalStore
+            + ReplaySource<Error = JournalStoreError>
+            + TransitionProofPublicationStore,
     {
         require_current_materialization(store, materialization)?;
+        if !materialization
+            .pending_transition_proof_final_shadow
+            .projection_eq(&materialization.transition_proof_shadow)
+        {
+            // A provisional Merge acknowledgement has changed the logical
+            // final projection without yet changing physical AJP3. A
+            // checkpoint would erase the replay suffix needed to finalize
+            // that difference and strand the live proof forever.
+            return Err(ReplayError::InvalidRecord);
+        }
         let current = &materialization.heads;
         let genesis = require_genesis(store, current.genesis)?;
         let clean_generation = match &genesis.create.operation {
@@ -13659,6 +16425,8 @@ mod aggregate {
             ReplayOperation::CleanManage { .. }
             | ReplayOperation::Invoke { .. }
             | ReplayOperation::CleanInvoke { .. }
+            | ReplayOperation::CleanResume { .. }
+            | ReplayOperation::CleanAcknowledge { .. }
             | ReplayOperation::Acknowledge { .. }
             | ReplayOperation::SealMerge => return Err(ReplayError::InvalidRecord),
         };
@@ -13751,6 +16519,7 @@ mod aggregate {
             current.merge_seal,
             current.ordered_invocations,
             current.merge_invocations,
+            current.transition_proofs,
             lanes,
             artifacts.id(),
         )
@@ -13793,10 +16562,18 @@ mod aggregate {
             anchor: ReplayPublicationAnchor::Checkpoint(manifest),
             outcomes: Vec::new(),
             history_plans: Vec::new(),
+            proof_requirements: Vec::new(),
+            transition_proof_retirements: Vec::new(),
+            transition_proof_actions: Vec::new(),
+            transition_proof_boundary: materialization
+                .transition_proof_shadow
+                .as_checkpoint_boundary(),
             checkpoint: Some(checkpoint),
             shared_merge_projection: None,
             shared_ordered_commit: None,
             system_authority_write: None,
+            #[cfg(feature = "std")]
+            transition_proof_batch: None,
             fence_ancestry: fence_ancestry.clone(),
             mode: ReplayPublicationMode::Canonical,
         };
@@ -13821,7 +16598,10 @@ mod aggregate {
                 .retain(|event| checkpoint_roots.contains(event));
         }
         let checkpoint_merge_state = state.merge.clone();
-        Ok(PreparedSharedCheckpoint {
+        let batch = JournalVerifiedTransitionPublisher::new(store)
+            .stage_checkpoint_compaction()
+            .map_err(journal)?;
+        PreparedSharedCheckpoint {
             sealed,
             successor: ReplayMaterialization {
                 heads_id: next.id(),
@@ -13835,15 +16615,27 @@ mod aggregate {
                 merge_boundary_ancestry: checkpoint_roots.clone(),
                 merge_boundary_state: checkpoint_merge_state,
                 merge_boundary_invocations: current.merge_invocations,
+                merge_boundary_transition_proofs: materialization
+                    .transition_proof_shadow
+                    .as_checkpoint_boundary(),
                 merge_ancestry: checkpoint_roots,
                 fence: checkpoint_fence,
                 artifacts,
                 suffix_budget: ReplaySuffixBudget::default(),
                 replay_boundary: ordered,
                 fence_ancestry,
+                transition_proofs: materialization.transition_proofs.clone(),
+                transition_proof_shadow: materialization
+                    .transition_proof_shadow
+                    .as_checkpoint_boundary(),
+                pending_transition_proof_final_shadow: materialization
+                    .transition_proof_shadow
+                    .as_checkpoint_boundary(),
             },
             lane_blobs,
-        })
+        }
+        .with_transition_proof_batch(batch)
+        .map_err(journal)
     }
 
     /// Revalidate a checkpoint already visible at the durable Shared head.
@@ -13868,6 +16660,7 @@ mod aggregate {
             || checkpoint.ordered_head != claim.ordered().ordered().head
             || checkpoint.ordered_invocations != claim.ordered_invocations()
             || checkpoint.merge_invocations != claim.merge_invocations()
+            || checkpoint.transition_proofs != current.transition_proofs
             || checkpoint.artifacts != claim.artifacts()
         {
             return Err(ReplayError::InvalidRecord);
@@ -13962,6 +16755,7 @@ mod aggregate {
             ordered_invocations: checkpoint.ordered_invocations,
             merge_invocations: checkpoint.merge_invocations,
             local_invocations: claim.local_invocations(),
+            transition_proofs: checkpoint.transition_proofs,
             local_head,
             local_revision,
             checkpoint: Some(claim.checkpoint()),
@@ -13991,9 +16785,17 @@ mod aggregate {
         MaterializeError<core::convert::Infallible, core::convert::Infallible>,
     >
     where
-        S: AgentJournalStore + ReplaySource<Error = JournalStoreError>,
+        S: AgentJournalStore
+            + ReplaySource<Error = JournalStoreError>
+            + TransitionProofPublicationStore,
     {
         require_current_materialization(store, materialization)?;
+        if !materialization
+            .pending_transition_proof_final_shadow
+            .projection_eq(&materialization.transition_proof_shadow)
+        {
+            return Err(ReplayError::InvalidRecord);
+        }
         let current = &materialization.heads;
         let genesis = require_genesis(store, current.genesis)?;
         let clean_generation = match &genesis.create.operation {
@@ -14027,6 +16829,8 @@ mod aggregate {
             ReplayOperation::CleanManage { .. }
             | ReplayOperation::Invoke { .. }
             | ReplayOperation::CleanInvoke { .. }
+            | ReplayOperation::CleanResume { .. }
+            | ReplayOperation::CleanAcknowledge { .. }
             | ReplayOperation::Acknowledge { .. }
             | ReplayOperation::SealMerge => return Err(ReplayError::InvalidRecord),
         };
@@ -14120,6 +16924,7 @@ mod aggregate {
             current.merge_seal,
             current.ordered_invocations,
             current.merge_invocations,
+            current.transition_proofs,
             lanes,
             artifacts.id(),
         )
@@ -14162,10 +16967,18 @@ mod aggregate {
             anchor: ReplayPublicationAnchor::Checkpoint(manifest),
             outcomes: Vec::new(),
             history_plans: Vec::new(),
+            proof_requirements: Vec::new(),
+            transition_proof_retirements: Vec::new(),
+            transition_proof_actions: Vec::new(),
+            transition_proof_boundary: materialization
+                .transition_proof_shadow
+                .as_checkpoint_boundary(),
             checkpoint: Some(checkpoint),
             shared_merge_projection: None,
             shared_ordered_commit: None,
             system_authority_write: None,
+            #[cfg(feature = "std")]
+            transition_proof_batch: None,
             fence_ancestry: fence_ancestry.clone(),
             mode: ReplayPublicationMode::Canonical,
         };
@@ -14190,7 +17003,10 @@ mod aggregate {
                 .retain(|event| checkpoint_roots.contains(event));
         }
         let checkpoint_merge_state = state.merge.clone();
-        Ok(ReplayPreparedPublication {
+        let batch = JournalVerifiedTransitionPublisher::new(store)
+            .stage_checkpoint_compaction()
+            .map_err(journal)?;
+        ReplayPreparedPublication {
             store,
             sealed,
             successor: ReplayMaterialization {
@@ -14205,15 +17021,27 @@ mod aggregate {
                 merge_boundary_ancestry: checkpoint_roots.clone(),
                 merge_boundary_state: checkpoint_merge_state,
                 merge_boundary_invocations: current.merge_invocations,
+                merge_boundary_transition_proofs: materialization
+                    .transition_proof_shadow
+                    .as_checkpoint_boundary(),
                 merge_ancestry: checkpoint_roots,
                 fence: checkpoint_fence,
                 artifacts,
                 suffix_budget: ReplaySuffixBudget::default(),
                 replay_boundary: ordered,
                 fence_ancestry,
+                transition_proofs: materialization.transition_proofs.clone(),
+                transition_proof_shadow: materialization
+                    .transition_proof_shadow
+                    .as_checkpoint_boundary(),
+                pending_transition_proof_final_shadow: materialization
+                    .transition_proof_shadow
+                    .as_checkpoint_boundary(),
             },
             executions: Vec::new(),
-        })
+        }
+        .with_transition_proof_batch(batch)
+        .map_err(journal)
     }
 }
 
@@ -14287,6 +17115,8 @@ pub(crate) mod tests {
     use crate::agent::system_authority::{
         SystemAuthorityDecisionProof, SystemAuthorityFinalize, SystemAuthorityGenesis,
     };
+    #[cfg(feature = "std")]
+    use crate::agent::transition_proof_host::VerifiedTransitionPublisher;
     use crate::agent::{
         AgentConfig, AgentIdentity, AgentProfile, AgentReplica, LaneSet,
         LifecycleAuthorityAdmission, ReplicaRole, RuntimeCapabilities,
@@ -14423,6 +17253,13 @@ pub(crate) mod tests {
             Ok(Some(self.heads.clone()))
         }
 
+        fn historical_heads(
+            &self,
+            id: JournalHeadsId,
+        ) -> Result<Option<JournalHeads>, JournalStoreError> {
+            self.inner.historical_heads(id)
+        }
+
         fn put<R: CanonicalJournalRecord>(
             &mut self,
             record: &R,
@@ -14529,6 +17366,19 @@ pub(crate) mod tests {
                 object_created,
                 heads_advanced: true,
             })
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl TransitionProofPublicationStore for LinearReplayStore {
+        fn stage_proof_predecessor(
+            &mut self,
+            heads: &JournalHeads,
+        ) -> Result<bool, JournalStoreError> {
+            if self.heads.id() != heads.id() || self.heads != *heads {
+                return Err(JournalStoreError::Conflict);
+            }
+            self.inner.persist_historical_heads_for_test(heads)
         }
     }
 
@@ -14742,6 +17592,7 @@ pub(crate) mod tests {
                 runtime_deployment: DeploymentId([0x34; 32]),
                 runtime_program: ProgramId([0x35; 32]),
                 runtime_producer: ProducerId([0x36; 32]),
+                transition_producer: ProducerId([0x37; 32]),
             },
             creation_nonce,
             authority: authority(),
@@ -14985,6 +17836,7 @@ pub(crate) mod tests {
                 runtime_deployment: DeploymentId([0x94; 32]),
                 runtime_program: ProgramId([0x95; 32]),
                 runtime_producer: ProducerId([0x96; 32]),
+                transition_producer: ProducerId([0x97; 32]),
             },
             creation_nonce,
             authority: admitted_authority(),
@@ -15048,6 +17900,9 @@ pub(crate) mod tests {
                 ),
                 runtime_program: crate::agent_sdk::ProgramId(config.identity.runtime_program.0),
                 runtime_producer: crate::agent_sdk::ProducerId(config.identity.runtime_producer.0),
+                transition_producer: crate::agent_sdk::ProducerId(
+                    config.identity.transition_producer.0,
+                ),
             },
             creation_nonce: crate::agent_sdk::Hash(config.creation_nonce.0),
             authority: crate::agent_sdk::authority::AgentAuthorityBinding {
@@ -15175,6 +18030,7 @@ pub(crate) mod tests {
                 runtime_deployment: DeploymentId([0x21; 32]),
                 runtime_program: ProgramId([0x22; 32]),
                 runtime_producer: ProducerId([0x23; 32]),
+                transition_producer: ProducerId([0x24; 32]),
             },
             creation_nonce: nonce,
             authority: target_authority,
@@ -15480,6 +18336,7 @@ pub(crate) mod tests {
         ReplayInput {
             runtime: runtime.clone(),
             operation: ReplayOperation::CleanInvoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                 work,
                 authorization,
                 observed_slot,
@@ -15550,6 +18407,8 @@ pub(crate) mod tests {
             ReplayOperation::Management { .. }
             | ReplayOperation::CleanManage { .. }
             | ReplayOperation::CleanInvoke { .. }
+            | ReplayOperation::CleanResume { .. }
+            | ReplayOperation::CleanAcknowledge { .. }
             | ReplayOperation::SealMerge => {
                 panic!("test divergence requires an invocation")
             }
@@ -15633,6 +18492,7 @@ pub(crate) mod tests {
                 runtime_deployment: crate::agent_sdk::DeploymentId([0x36; 32]),
                 runtime_program: crate::agent_sdk::ProgramId([0x37; 32]),
                 runtime_producer: crate::agent_sdk::ProducerId([0x38; 32]),
+                transition_producer: crate::agent_sdk::ProducerId([0x39; 32]),
             },
             creation_nonce: nonce,
             authority: CleanAuthorityBinding {
@@ -15900,6 +18760,7 @@ pub(crate) mod tests {
                 result: None,
                 next_runtime,
                 products: ReplayProducts::default(),
+                attested_transition: None,
             })
         }
 
@@ -16060,6 +18921,7 @@ pub(crate) mod tests {
     #[derive(Default)]
     struct ExactCreateRejectInvocations {
         executions: usize,
+        transition_proof_requests: usize,
         merge_verifications: usize,
         merge_execution_order: Vec<MergeEventId>,
         clean_descriptor: Option<crate::agent_sdk::AgentDescriptor>,
@@ -16135,6 +18997,13 @@ pub(crate) mod tests {
                     work,
                     authorization,
                     observed_slot,
+                    ..
+                }
+                | ReplayOperation::CleanResume {
+                    work,
+                    authorization,
+                    observed_slot,
+                    ..
                 } => match authorization {
                     crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(authority) => {
                         authority
@@ -16149,6 +19018,24 @@ pub(crate) mod tests {
                         .matches_invoke(work, *observed_slot)
                         .then_some(())
                         .ok_or(()),
+                },
+                ReplayOperation::CleanAcknowledge {
+                    work,
+                    authorization,
+                    ..
+                } => match authorization {
+                    crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(authority) => {
+                        authority
+                            .signature
+                            .first()
+                            .copied()
+                            .filter(|byte| *byte == 0xaa)
+                            .map(|_| ())
+                            .ok_or(())
+                    }
+                    crate::agent_sdk::InvocationAuthorization::PublicPreflight(_) => {
+                        authorization.matches_work(work).then_some(()).ok_or(())
+                    }
                 },
                 ReplayOperation::CleanManage {
                     request,
@@ -16202,6 +19089,7 @@ pub(crate) mod tests {
                     result: None,
                     next_runtime: input.runtime.clone(),
                     products: ReplayProducts::default(),
+                    attested_transition: None,
                 });
             }
             if let ReplayOperation::CleanManage { request, .. } = &input.operation {
@@ -16252,6 +19140,7 @@ pub(crate) mod tests {
                     result: None,
                     next_runtime: input.runtime.clone(),
                     products: ReplayProducts::default(),
+                    attested_transition: None,
                 });
             }
             if let ReplayOperation::CleanInvoke { work, .. } = &input.operation {
@@ -16271,6 +19160,7 @@ pub(crate) mod tests {
                     result: None,
                     next_runtime: input.runtime.clone(),
                     products: ReplayProducts::default(),
+                    attested_transition: None,
                 });
             }
             Ok(ReplayTransition {
@@ -16279,7 +19169,19 @@ pub(crate) mod tests {
                 result: Some(Err(ActorExecutionError::NotFound)),
                 next_runtime: input.runtime.clone(),
                 products: ReplayProducts::default(),
+                attested_transition: None,
             })
+        }
+
+        fn take_transition_proof_binding(
+            &mut self,
+            _input: &ReplayInput,
+            _before: &RuntimeState,
+            _position: ReplayPosition,
+            _transition: &ReplayTransition,
+        ) -> Result<Option<ReplayTransitionProofBinding>, Self::Error> {
+            self.transition_proof_requests += 1;
+            Ok(None)
         }
 
         fn validates_clean_management_transition(
@@ -16303,6 +19205,7 @@ pub(crate) mod tests {
             input: &ReplayInput,
             before: &RuntimeState,
             position: ReplayPosition,
+            _transition_proof_access: ReplayTransitionProofAccess,
             journal_context: Option<RuntimeJournalContext>,
         ) -> Result<ReplayTransition, Self::Error> {
             let Some(context) = journal_context else {
@@ -16325,6 +19228,7 @@ pub(crate) mod tests {
                 result: None,
                 next_runtime: input.runtime.clone(),
                 products: ReplayProducts::default(),
+                attested_transition: None,
             })
         }
     }
@@ -16500,6 +19404,348 @@ pub(crate) mod tests {
             .unwrap();
         assert!(store.initialize_ordinary_for_test(&sealed).unwrap());
         store
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn genesis_materialization_requires_the_exact_empty_transition_proof_index() {
+        let mut store = initialized_replay_store();
+        let proof_root = store.heads().unwrap().unwrap().transition_proofs;
+        assert!(store.remove_transition_proof_index_for_test(proof_root));
+
+        let mut executor = ExactCreateRejectInvocations::default();
+        assert!(matches!(
+            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases),
+            Err(ReplayError::Source(
+                ReplayMaterializationSourceError::Journal(JournalStoreError::MissingObject)
+            ))
+        ));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn ordinary_replay_publication_refuses_a_transition_proof_root_change() {
+        let store = initialized_replay_store();
+        let current = store.heads().unwrap().unwrap();
+        let next = JournalHeads {
+            publication_revision: current.publication_revision + 1,
+            previous: Some(current.id()),
+            transition_proofs: TransitionProofIndexId([0xd7; 32]),
+            ..current.clone()
+        };
+        next.validate().unwrap();
+        assert_eq!(
+            validate_publication_envelope(current.genesis, &current, &next),
+            Err(ReplayError::InvalidRecord)
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn attested_binding_rejects_a_different_canonical_transition_with_same_replay_shape() {
+        let runtime = runtime();
+        let mut input = clean_admitted_invocation(&runtime, MethodMode::Linear, 0xd6);
+        let ReplayOperation::CleanInvoke { context, work, .. } = &mut input.operation else {
+            unreachable!()
+        };
+        *context = crate::agent_sdk::RuntimeExecutionContext::Attested {
+            proof_system: crate::agent_sdk::Hash([0xd7; 32]),
+        };
+        let invocation = work.invocation;
+        input.validate().unwrap();
+        let before = RuntimeState {
+            control: vec![0xd8],
+            linear: vec![0xd9],
+            merge: Vec::new(),
+            local: Vec::new(),
+        };
+        let sdk_state = sdk_runtime_state(&before);
+        let transition_a = crate::agent_sdk::RuntimeTransition {
+            state: sdk_state.clone(),
+            outcome: crate::agent_sdk::RuntimeOutcome::Completed(Err(
+                crate::agent_sdk::InvocationError::NotFound,
+            )),
+        };
+        let transition_b = crate::agent_sdk::RuntimeTransition {
+            state: sdk_state,
+            outcome: crate::agent_sdk::RuntimeOutcome::Completed(Err(
+                crate::agent_sdk::InvocationError::InvalidAuthorization,
+            )),
+        };
+        let transition_b_bytes = transition_b.encode().unwrap();
+        let transition_b_commitment =
+            crate::agent_sdk::proof::TransitionProofStatement::transition_commitment(
+                &transition_b_bytes,
+            );
+        let replay = ReplayTransition {
+            state: before.clone(),
+            disposition: ReplayDisposition::Rejected,
+            result: None,
+            next_runtime: input.runtime.clone(),
+            products: ReplayProducts::default(),
+            attested_transition: Some(transition_b_commitment),
+        };
+        let work = canonical_attested_runtime_work(&input, &before).unwrap();
+        let work_bytes = work.encode().unwrap();
+        let roots = crate::agent_sdk::proof::ProofLaneRoots {
+            control: crate::agent_sdk::Hash([0xda; 32]),
+            linear: Some(crate::agent_sdk::Hash([0xdb; 32])),
+            merge: None,
+            local: None,
+        };
+        let work_commitment =
+            crate::agent_sdk::proof::TransitionProofStatement::work_commitment(&work_bytes);
+        let key = crate::agent_sdk::proof::TransitionProofKey {
+            invocation,
+            execution: crate::agent_sdk::proof::TransitionProofStatement::execution_commitment(
+                work_commitment,
+                roots,
+            ),
+        };
+        let position = ReplayPosition::Ordered {
+            id: OrderedEntryId([0xdc; 32]),
+            index: 1,
+            merge_frontier: MergeFrontierId([0xdd; 32]),
+            merge_seal: None,
+        };
+
+        let binding = ReplayTransitionProofBinding::new(
+            &input,
+            &before,
+            position,
+            &replay,
+            &transition_b,
+            key,
+            roots,
+            roots,
+            crate::agent_sdk::Hash([0xde; 32]),
+            ReplayTransitionProofProjection::Prepared,
+        )
+        .expect("the exact returned transition binds");
+        assert_eq!(binding.transition(), transition_b_commitment);
+        let prepared_step = ReplayStep {
+            state: replay.state.clone(),
+            runtime: replay.next_runtime.clone(),
+            outcome: ReplayStepOutcome::Applied(replay.disposition),
+            result: None,
+            products: ReplayProducts::default(),
+            input: input.id(),
+            position,
+            ownership_delta: InvocationIndexDelta::NONE,
+            sealed_outcomes: Vec::new(),
+            system_authority_write: None,
+            merge_authenticated: true,
+            transition_proof: Some(binding),
+            stale_transition_proof: None,
+            final_transition_proof_ack: false,
+        };
+        let first = transition_proof_requirement(&input, &prepared_step)
+            .unwrap()
+            .expect("fresh lifecycle execution requires the staged tuple");
+        assert_eq!(
+            first.intent(),
+            ReplayTransitionProofIntent::FirstPublication
+        );
+        assert_eq!(
+            first.projection(),
+            ReplayTransitionProofProjection::Prepared
+        );
+        assert_eq!(first.lifecycle(), ReplayTransitionProofLifecycle::Invoke);
+        assert_eq!(
+            first.projection_action(),
+            ReplayTransitionProofProjectionAction::UpdateLive
+        );
+        let replacement = recanonicalized_transition_proof_requirement(&input, &prepared_step)
+            .unwrap()
+            .expect("changed retained execution requires a replacement tuple");
+        assert_eq!(
+            replacement.intent(),
+            ReplayTransitionProofIntent::Recanonicalize
+        );
+        assert_eq!(
+            replacement.projection(),
+            ReplayTransitionProofProjection::Prepared
+        );
+        assert_eq!(
+            replacement.projection_action(),
+            ReplayTransitionProofProjectionAction::UpdateLive
+        );
+        assert_eq!(
+            preserved_transition_proof_requirement(&input, &prepared_step),
+            Err(ReplayError::InvalidRecord),
+            "a read-only Shared projection cannot be regenerated"
+        );
+        assert!(
+            ReplayTransitionProofBinding::new(
+                &input,
+                &before,
+                position,
+                &replay,
+                &transition_a,
+                key,
+                roots,
+                roots,
+                crate::agent_sdk::Hash([0xde; 32]),
+                ReplayTransitionProofProjection::Prepared,
+            )
+            .is_none()
+        );
+
+        let published_binding = ReplayTransitionProofBinding::new(
+            &input,
+            &before,
+            position,
+            &replay,
+            &transition_b,
+            key,
+            roots,
+            roots,
+            crate::agent_sdk::Hash([0xde; 32]),
+            ReplayTransitionProofProjection::Published,
+        )
+        .expect("the authoritative retained tuple binds exact execution");
+        let published_step = ReplayStep {
+            state: replay.state.clone(),
+            runtime: replay.next_runtime.clone(),
+            outcome: ReplayStepOutcome::Applied(replay.disposition),
+            result: None,
+            products: ReplayProducts::default(),
+            input: input.id(),
+            position,
+            ownership_delta: InvocationIndexDelta::NONE,
+            sealed_outcomes: Vec::new(),
+            system_authority_write: None,
+            merge_authenticated: true,
+            transition_proof: Some(published_binding),
+            stale_transition_proof: None,
+            final_transition_proof_ack: false,
+        };
+        let recurring = transition_proof_requirement(&input, &published_step)
+            .unwrap()
+            .expect("an exact recurring lifecycle execution reuses its published tuple");
+        assert_eq!(
+            recurring.intent(),
+            ReplayTransitionProofIntent::FirstPublication
+        );
+        assert_eq!(
+            recurring.projection(),
+            ReplayTransitionProofProjection::Published
+        );
+        let reused = recanonicalized_transition_proof_requirement(&input, &published_step)
+            .unwrap()
+            .expect("retained Merge replay reuses the authoritative tuple");
+        assert_eq!(reused.intent(), ReplayTransitionProofIntent::Recanonicalize);
+        assert_eq!(
+            reused.projection(),
+            ReplayTransitionProofProjection::Published
+        );
+        let preserved = preserved_transition_proof_requirement(&input, &published_step)
+            .unwrap()
+            .expect("Shared Ordered preservation validates the exact published record");
+        assert_eq!(
+            preserved.projection_action(),
+            ReplayTransitionProofProjectionAction::ValidateOnly
+        );
+        assert_eq!(
+            preserved.lifecycle(),
+            ReplayTransitionProofLifecycle::Invoke
+        );
+
+        let mut spliced = replay;
+        spliced.attested_transition = Some(
+            crate::agent_sdk::proof::TransitionProofStatement::transition_commitment(
+                &transition_a.encode().unwrap(),
+            ),
+        );
+        assert_ne!(
+            binding.execution(),
+            transition_proof_execution_commitment(&input, &before, &spliced),
+            "ReplayMachine's independent commitment rejects an A-proof/B-transition splice",
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn external_transition_proof_tombstone_stales_merge_invoke_before_execution_or_provider() {
+        let genesis = AgentJournalGenesisId([0xe7; 32]);
+        let runtime = admitted_runtime();
+        let mut input = clean_admitted_invocation(&runtime, MethodMode::Merge, 0xe8);
+        let ReplayOperation::CleanInvoke { context, work, .. } = &mut input.operation else {
+            unreachable!()
+        };
+        *context = crate::agent_sdk::RuntimeExecutionContext::Attested {
+            proof_system: crate::agent_sdk::Hash([0xe9; 32]),
+        };
+        let invocation = work.invocation;
+        input.validate().unwrap();
+
+        let boundary = ReplayTransitionProofShadow::from_manifest(
+            &TransitionProofIndexManifest::empty(genesis),
+        );
+        let mut current = boundary.clone();
+        current.states.insert(
+            invocation,
+            ReplayTransitionProofState {
+                key: None,
+                origin: ReplayTransitionProofOrigin::Position(ReplayPosition::Local {
+                    id: LocalEntryId([0xea; 32]),
+                    node: NodeId([0xeb; 32]),
+                    revision: 1,
+                    ordered_base: OrderedBase::post_genesis(),
+                    merge_frontier: MergeFrontierId([0xec; 32]),
+                }),
+            },
+        );
+        let seeded = boundary.with_external_edges_from(&current);
+        assert!(!seeded.admits(invocation, ReplayTransitionProofLifecycle::Invoke));
+
+        let mut machine = ReplayMachine::from_genesis(genesis, runtime).unwrap();
+        machine.reset_transition_proof_shadows(seeded);
+        let before = RuntimeState {
+            control: Vec::new(),
+            linear: Vec::new(),
+            merge: Vec::new(),
+            local: Vec::new(),
+        };
+        let position = ReplayPosition::Merge {
+            id: MergeEventId([0xed; 32]),
+            causal_height: 1,
+            ordered_base: OrderedBase::post_genesis(),
+        };
+        let mut executor = ExactCreateRejectInvocations::default();
+        let step = machine
+            .apply::<_, ()>(&mut executor, &input, &before, position)
+            .unwrap();
+        assert_eq!(executor.executions, 0);
+        assert_eq!(executor.transition_proof_requests, 0);
+        assert_eq!(step.state, before);
+        assert!(matches!(step.outcome, ReplayStepOutcome::ExactDuplicate));
+        let stale = step
+            .stale_transition_proof
+            .expect("the authenticated tombstone seals a stale no-op");
+        assert_eq!(stale.input(), input.id());
+        assert_eq!(stale.position(), position);
+        assert_eq!(stale.lifecycle(), ReplayTransitionProofLifecycle::Invoke);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn checkpoint_materialization_requires_its_authenticated_transition_proof_index() {
+        let mut store = initialized_replay_store();
+        let mut executor = ExactCreateRejectInvocations::default();
+        let materialized =
+            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        let prepared = prepare_checkpoint(&mut store, &materialized).unwrap();
+        let (_, checkpointed, _) = prepared.publish().unwrap();
+        let proof_root = checkpointed.heads().transition_proofs;
+        assert!(store.remove_transition_proof_index_for_test(proof_root));
+
+        assert!(matches!(
+            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases),
+            Err(ReplayError::Source(
+                ReplayMaterializationSourceError::Journal(JournalStoreError::MissingObject)
+            ))
+        ));
     }
 
     #[cfg(feature = "std")]
@@ -17090,7 +20336,9 @@ pub(crate) mod tests {
             let signature: &[u8] = match &input.operation {
                 ReplayOperation::Invoke { authority, .. }
                 | ReplayOperation::Acknowledge { authority, .. } => authority.signature.as_slice(),
-                ReplayOperation::CleanInvoke { authorization, .. } => {
+                ReplayOperation::CleanInvoke { authorization, .. }
+                | ReplayOperation::CleanResume { authorization, .. }
+                | ReplayOperation::CleanAcknowledge { authorization, .. } => {
                     let crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(authority) =
                         authorization
                     else {
@@ -17123,6 +20371,7 @@ pub(crate) mod tests {
                 result: Some(Err(ActorExecutionError::NotFound)),
                 next_runtime: input.runtime.clone(),
                 products: ReplayProducts::default(),
+                attested_transition: None,
             })
         }
     }
@@ -17163,6 +20412,7 @@ pub(crate) mod tests {
                 result: Some(Err(ActorExecutionError::NotFound)),
                 next_runtime: input.runtime.clone(),
                 products: ReplayProducts::default(),
+                attested_transition: None,
             })
         }
     }
@@ -17227,6 +20477,7 @@ pub(crate) mod tests {
                     effects: self.emit_products,
                     ..ReplayProducts::default()
                 },
+                attested_transition: None,
             })
         }
     }
@@ -17264,6 +20515,7 @@ pub(crate) mod tests {
                     effects: true,
                     ..ReplayProducts::default()
                 },
+                attested_transition: None,
             })
         }
     }
@@ -17926,6 +21178,7 @@ pub(crate) mod tests {
                 result: Some(Ok(reply)),
                 next_runtime: input.runtime.clone(),
                 products: ReplayProducts::default(),
+                attested_transition: None,
             };
             assert!(
                 validate_transition::<(), ()>(
@@ -17960,6 +21213,7 @@ pub(crate) mod tests {
                 result: Some(Err(error)),
                 next_runtime: input.runtime.clone(),
                 products: ReplayProducts::default(),
+                attested_transition: None,
             };
             assert!(
                 validate_transition::<(), ()>(
@@ -17994,6 +21248,7 @@ pub(crate) mod tests {
                 result: Some(Err(error)),
                 next_runtime: input.runtime.clone(),
                 products: ReplayProducts::default(),
+                attested_transition: None,
             };
             assert!(matches!(
                 validate_transition::<(), ()>(
@@ -20497,6 +23752,282 @@ pub(crate) mod tests {
 
     #[cfg(all(feature = "std", feature = "storage"))]
     #[test]
+    fn shared_ordered_transition_proof_admission_uses_active_not_pinned_projection() {
+        let mut store = initialized_shared_replay_store();
+        let mut bootstrap = ExactCreateRejectInvocations::default();
+        let base = materialize_current(&mut store, &mut bootstrap, &NoPrunedOrderedBases).unwrap();
+
+        // F is the proof projection at the pinned Shared frontier.
+        let invoke_input = attested_merge_invoke_input(base.runtime(), 0x75);
+        let invoke = clean_merge_event(&base, invoke_input.clone(), 0x75);
+        let pinned_frontier = MergeFrontier {
+            genesis: base.heads().genesis,
+            events: vec![invoke.id()],
+        };
+        let proof_f =
+            attested_replay_proof_fixture(base.heads().genesis, &invoke_input, base.state(), 0x75);
+        let key_f = proof_f.prepared.key();
+        let staged_f = stage_replay_attested_merge_proof(&mut store, &invoke, &proof_f, None);
+        let mut executor = CleanMergeAcknowledgementExecutor {
+            acknowledgement_before: base.state().clone(),
+            proof: Some(proof_f.clone()),
+            proof_projection: Some(ReplayTransitionProofProjection::Prepared),
+            clean_descriptor: bootstrap.clean_descriptor.clone(),
+            ..CleanMergeAcknowledgementExecutor::default()
+        };
+        let prepared = match prepare_merge(
+            &mut store,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &base,
+            &invoke,
+        )
+        .unwrap()
+        {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+        };
+        let (_, after_f, _) = prepared
+            .with_staged_transition_proofs_for_test(vec![staged_f])
+            .unwrap()
+            .publish()
+            .unwrap();
+
+        // Import an independent event which sorts before F. Replaying F at
+        // the changed before-state installs G while the older F frontier
+        // remains an authenticated pinned projection.
+        let (earlier_discriminator, earlier) = (1_u8..=u8::MAX)
+            .map(|discriminator| {
+                let event = MergeEvent {
+                    genesis: base.heads().genesis,
+                    committee: None,
+                    author: base.heads().node,
+                    ordered_base: base.ordered_base(),
+                    causal_height: 1,
+                    parents: Vec::new(),
+                    input: clean_admitted_invocation(
+                        base.runtime(),
+                        MethodMode::Merge,
+                        discriminator,
+                    ),
+                    signature: vec![discriminator; ED25519_SIGNATURE_BYTES],
+                };
+                (discriminator, event)
+            })
+            .find(|(_, event)| event.id() < invoke.id())
+            .expect("fixture must find an event which sorts before F");
+        earlier.validate().unwrap();
+        let mut before_g = base.state().clone();
+        before_g.merge.push(earlier_discriminator);
+        let proof_g =
+            attested_replay_proof_fixture(base.heads().genesis, &invoke_input, &before_g, 0x76);
+        let key_g = proof_g.prepared.key();
+        assert_ne!(key_f, key_g);
+        executor.proof = Some(proof_g.clone());
+        executor.proof_projection = Some(ReplayTransitionProofProjection::Prepared);
+        let staged_g =
+            stage_replay_attested_merge_proof(&mut store, &invoke, &proof_g, Some(key_f));
+        let prepared = match prepare_merge(
+            &mut store,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &after_f,
+            &earlier,
+        )
+        .unwrap()
+        {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+        };
+        let (_, active, _) = prepared
+            .with_staged_transition_proofs_for_test(vec![staged_g])
+            .unwrap()
+            .publish()
+            .unwrap();
+        let active_index = store
+            .get::<TransitionProofIndexManifest>(active.heads().transition_proofs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(active_index.live(key_f.invocation), Some(key_g));
+
+        // A no-fence Shared Ordered splice validates pinned F, then admits
+        // its current input against physical G. It must not retarget the
+        // durable proof root back to F.
+        executor.proof = Some(proof_f);
+        executor.proof_projection = Some(ReplayTransitionProofProjection::Published);
+        let mut stale_input = clean_admitted_invocation(active.runtime(), MethodMode::Linear, 0x77);
+        let ReplayOperation::CleanInvoke {
+            context,
+            work,
+            authorization,
+            observed_slot,
+        } = &mut stale_input.operation
+        else {
+            unreachable!()
+        };
+        *context = crate::agent_sdk::RuntimeExecutionContext::Attested {
+            proof_system: crate::agent_sdk::Hash([0xf0; 32]),
+        };
+        work.invocation = key_g.invocation;
+        *authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+            crate::agent_sdk::PublicPreflight::for_work(work, *observed_slot),
+        );
+        stale_input.validate().unwrap();
+        let entry = OrderedEntry {
+            genesis: active.heads().genesis,
+            index: active.heads().ordered_index.checked_add(1).unwrap(),
+            parent: active.heads().ordered_head,
+            merge_frontier: pinned_frontier.id(),
+            merge_seal: None,
+            input: stale_input,
+        };
+        let executions_before_preserve = executor.executions;
+        let proof_requests_before_preserve = executor.proof_requests;
+        let committed =
+            committed_shared_for_test(entry.clone(), &active, store.instance_id()).unwrap();
+        let prepared = match prepare_shared_ordered(
+            &mut store,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &active,
+            committed,
+        )
+        .unwrap()
+        {
+            SharedReplayPreparation::Ready(prepared) => prepared,
+            SharedReplayPreparation::AlreadyCommitted { .. } => unreachable!(),
+        };
+        let (_, preserved, _, receipt) = prepared.publish_shared().unwrap();
+        assert_eq!(executor.executions, executions_before_preserve + 1);
+        assert_eq!(executor.proof_requests, proof_requests_before_preserve + 1);
+        assert_eq!(
+            preserved.heads().transition_proofs,
+            active.heads().transition_proofs
+        );
+        let preserved_index = store
+            .get::<TransitionProofIndexManifest>(preserved.heads().transition_proofs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(preserved_index.live(key_f.invocation), Some(key_g));
+
+        let executions_before_retry = executor.executions;
+        let retry =
+            committed_shared_for_test(entry.clone(), &preserved, store.instance_id()).unwrap();
+        match prepare_shared_ordered(
+            &mut store,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &preserved,
+            retry,
+        )
+        .unwrap()
+        {
+            SharedReplayPreparation::AlreadyCommitted { publication, .. } => {
+                assert_eq!(publication.claim(), receipt.claim());
+                assert_eq!(publication.successor(), receipt.successor());
+            }
+            SharedReplayPreparation::Ready(_) => panic!("exact retry re-executed Shared Ordered"),
+        }
+        assert_eq!(executor.executions, executions_before_retry);
+
+        // A canonical Merge Ack against physical G remains provisional. Its
+        // following Shared Ordered fence is the sole terminal publication.
+        executor.proof = Some(proof_g);
+        executor.proof_projection = Some(ReplayTransitionProofProjection::Published);
+        executor.acknowledgement_before = preserved.state().clone();
+        let mut parents = preserved
+            .merge_roots
+            .iter()
+            .map(|root| root.id)
+            .collect::<Vec<_>>();
+        parents.sort_unstable();
+        let ack = MergeEvent {
+            genesis: preserved.heads().genesis,
+            committee: None,
+            author: preserved.heads().node,
+            ordered_base: preserved.ordered_base(),
+            causal_height: preserved
+                .merge_roots
+                .iter()
+                .map(|root| root.causal_height)
+                .max()
+                .unwrap()
+                .checked_add(1)
+                .unwrap(),
+            parents,
+            input: clean_attested_merge_acknowledgement(&invoke_input, key_g),
+            signature: vec![0x79; ED25519_SIGNATURE_BYTES],
+        };
+        ack.validate().unwrap();
+        let prepared = match prepare_merge(
+            &mut store,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &preserved,
+            &ack,
+        )
+        .unwrap()
+        {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+        };
+        assert!(prepared.sealed.transition_proof_retirements().is_empty());
+        let (_, provisional_ack, _) = prepared.publish().unwrap();
+        let provisional_index = store
+            .get::<TransitionProofIndexManifest>(provisional_ack.heads().transition_proofs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(provisional_index.live(key_f.invocation), Some(key_g));
+
+        let seal = persist_merge_seal(&mut store, &provisional_ack);
+        let fence = OrderedEntry {
+            genesis: provisional_ack.heads().genesis,
+            index: provisional_ack
+                .heads()
+                .ordered_index
+                .checked_add(1)
+                .unwrap(),
+            parent: provisional_ack.heads().ordered_head,
+            merge_frontier: provisional_ack.merge_frontier(),
+            merge_seal: Some(seal),
+            input: ReplayInput {
+                runtime: provisional_ack.runtime().clone(),
+                operation: ReplayOperation::SealMerge,
+            },
+        };
+        let committed =
+            committed_shared_for_test(fence.clone(), &provisional_ack, store.instance_id())
+                .unwrap();
+        let prepared = match prepare_shared_ordered(
+            &mut store,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &provisional_ack,
+            committed,
+        )
+        .unwrap()
+        {
+            SharedReplayPreparation::Ready(prepared) => prepared,
+            SharedReplayPreparation::AlreadyCommitted { .. } => unreachable!(),
+        };
+        let (_, acknowledged, _, _) = prepared
+            .with_staged_transition_proofs_for_test(Vec::new())
+            .unwrap()
+            .publish_shared()
+            .unwrap();
+        let acknowledged_index = store
+            .get::<TransitionProofIndexManifest>(acknowledged.heads().transition_proofs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(acknowledged_index.live(key_f.invocation), None);
+        assert_ne!(
+            acknowledged.heads().transition_proofs,
+            preserved.heads().transition_proofs
+        );
+    }
+
+    #[cfg(all(feature = "std", feature = "storage"))]
+    #[test]
     fn shared_ordered_missing_or_noncausal_pinned_frontier_fails_closed() {
         let mut store = initialized_shared_replay_store();
         let mut executor = ExactCreateRejectInvocations::default();
@@ -20808,5 +24339,1022 @@ pub(crate) mod tests {
         assert_eq!(reopened.merge_roots.len(), 2);
         assert!(reopened.merge_ancestry.contains(&left.id()));
         assert!(reopened.merge_ancestry.contains(&right.id()));
+    }
+
+    #[cfg(feature = "std")]
+    #[derive(Clone)]
+    struct ReplayAttestedProofFixture {
+        prepared: PreparedVerifiedTransition,
+        transition: crate::agent_sdk::RuntimeTransition,
+        artifacts: ArtifactClosure,
+        runtime_package: Vec<u8>,
+        actor_package: Vec<u8>,
+    }
+
+    #[cfg(feature = "std")]
+    fn attested_merge_invoke_input(runtime: &RuntimeBinding, discriminator: u8) -> ReplayInput {
+        let mut input = clean_admitted_invocation(runtime, MethodMode::Merge, discriminator);
+        let ReplayOperation::CleanInvoke { context, .. } = &mut input.operation else {
+            unreachable!()
+        };
+        *context = crate::agent_sdk::RuntimeExecutionContext::Attested {
+            proof_system: crate::agent_sdk::Hash([0xf0; 32]),
+        };
+        input.validate().unwrap();
+        input
+    }
+
+    #[cfg(feature = "std")]
+    fn attested_replay_proof_fixture(
+        genesis: AgentJournalGenesisId,
+        input: &ReplayInput,
+        before: &RuntimeState,
+        discriminator: u8,
+    ) -> ReplayAttestedProofFixture {
+        let ReplayOperation::CleanInvoke { context, work, .. } = &input.operation else {
+            panic!("attested replay proof fixture requires CleanInvoke")
+        };
+        let crate::agent_sdk::RuntimeExecutionContext::Attested { proof_system } = *context else {
+            panic!("attested replay proof fixture requires Attested execution")
+        };
+        let after = before.clone();
+        let yielded = crate::agent_sdk::YieldedInvocation {
+            invocation: work.invocation,
+            actor: work.actor,
+            incarnation: work.incarnation,
+            deployment: work.deployment,
+            program: work.program,
+            mode: work.mode,
+            continuation: crate::agent_sdk::BlobRef::of_bytes(&[b'y', discriminator]),
+            ready_sequence: 1,
+            installation_data: work.installation_data.clone(),
+            required: work
+                .availability
+                .iter()
+                .map(|blob| blob.reference.clone())
+                .collect(),
+            reason: crate::agent_sdk::YieldReason::Cooperative,
+        };
+        let transition = crate::agent_sdk::RuntimeTransition {
+            state: sdk_runtime_state(&after),
+            outcome: crate::agent_sdk::RuntimeOutcome::Yielded(yielded),
+        };
+        let canonical_work = canonical_attested_runtime_work(input, before)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let canonical_transition = transition.encode().unwrap();
+        let before_roots = crate::agent_sdk::proof::ProofLaneRoots {
+            control: crate::agent_sdk::Hash([0xc1; 32]),
+            linear: Some(crate::agent_sdk::Hash([0xc2; 32])),
+            merge: Some(crate::agent_sdk::Hash([0xc3; 32])),
+            local: Some(crate::agent_sdk::Hash([0xc4; 32])),
+        };
+        let runtime_package = b"replay-runtime-package".to_vec();
+        assert!(input.runtime.package.matches(&runtime_package));
+        let actor_package = b"replay-transition-proof-actor".to_vec();
+        let actor_package_ref = crate::agent_sdk::BlobRef::of_bytes(&actor_package);
+        let proof_material = vec![0xd1, discriminator];
+        let manifest =
+            crate::agent_sdk::proof::TransitionProofMaterialManifest::for_material(&proof_material)
+                .unwrap();
+        let proof_manifest_bytes = manifest.encode().unwrap();
+        let producer_public_key = [0xd2; 32];
+        let proof_record = crate::agent_sdk::proof::TransitionProofRecord {
+            statement: crate::agent_sdk::proof::TransitionProofStatement {
+                subject: crate::agent_sdk::proof::TransitionProofSubject {
+                    space: work.space,
+                    agent: work.agent,
+                    runtime_deployment: work.runtime_deployment,
+                    runtime_program: crate::agent_sdk::ProgramId(input.runtime.program.0),
+                    runtime_package: crate::agent_sdk::BlobRef {
+                        hash: crate::agent_sdk::Hash(input.runtime.package.hash.0),
+                        len: input.runtime.package.len,
+                    },
+                    actor: work.actor,
+                    incarnation: work.incarnation,
+                    actor_deployment: work.deployment,
+                    actor_program: work.program,
+                    invocation: work.invocation,
+                    method: "replay-attested-fixture".into(),
+                    mode: work.mode,
+                },
+                before: before_roots,
+                after: before_roots,
+                work: crate::agent_sdk::proof::TransitionProofStatement::work_commitment(
+                    &canonical_work,
+                ),
+                transition:
+                    crate::agent_sdk::proof::TransitionProofStatement::transition_commitment(
+                        &canonical_transition,
+                    ),
+                refine_trace: crate::agent_sdk::Hash([0xd3; 32]),
+                public_io: crate::agent_sdk::Hash([0xd4; 32]),
+                proof_system,
+            },
+            proof: crate::agent_sdk::BlobRef::of_bytes(&proof_manifest_bytes),
+            producer: crate::agent_sdk::ProducerId::of_public_key(&producer_public_key),
+            producer_public_key,
+            producer_signature: [0xd5; 64],
+        };
+        let prepared = PreparedVerifiedTransition::from_parts_for_test(
+            canonical_work,
+            canonical_transition,
+            proof_record,
+            proof_manifest_bytes,
+            proof_material,
+            actor_package_ref.clone(),
+        );
+        let mut artifact_refs = vec![
+            input.runtime.package.clone(),
+            BlobRef {
+                hash: Hash(actor_package_ref.hash.0),
+                len: actor_package_ref.len,
+            },
+        ];
+        artifact_refs.sort_by_key(|reference| (reference.hash, reference.len));
+        let artifacts = ArtifactClosure {
+            genesis,
+            artifacts: artifact_refs,
+        };
+        artifacts.validate().unwrap();
+        ReplayAttestedProofFixture {
+            prepared,
+            transition,
+            artifacts,
+            runtime_package,
+            actor_package,
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn stage_replay_attested_merge_proof(
+        store: &mut MemoryAgentJournalStore,
+        event: &MergeEvent,
+        proof: &ReplayAttestedProofFixture,
+        expected_live: Option<crate::agent_sdk::proof::TransitionProofKey>,
+    ) -> StagedTransitionProof {
+        let position = ReplayPosition::Merge {
+            id: event.id(),
+            causal_height: event.causal_height,
+            ordered_base: event.ordered_base,
+        };
+        let expected_heads = store.heads().unwrap().unwrap().id();
+        JournalVerifiedTransitionPublisher::new(store)
+            .stage_verified(
+                &proof.prepared,
+                TransitionProofStageContext {
+                    expected_heads,
+                    input: &event.input,
+                    position,
+                    artifacts: &proof.artifacts,
+                    runtime_package: &proof.runtime_package,
+                    actor_package: &proof.actor_package,
+                    expected_live,
+                },
+            )
+            .unwrap()
+    }
+
+    #[cfg(feature = "std")]
+    #[derive(Default)]
+    struct CleanMergeAcknowledgementExecutor {
+        acknowledgement_before: RuntimeState,
+        merge_outcomes: Vec<(MergeEventId, ReplayDisposition)>,
+        proof: Option<ReplayAttestedProofFixture>,
+        proof_projection: Option<ReplayTransitionProofProjection>,
+        clean_descriptor: Option<crate::agent_sdk::AgentDescriptor>,
+        merge_pop_discriminator: Option<u8>,
+        executions: usize,
+        proof_requests: usize,
+    }
+
+    #[cfg(feature = "std")]
+    impl ReplayExecutor for CleanMergeAcknowledgementExecutor {
+        type Error = ();
+
+        fn verify_merge_event(&mut self, _event: &MergeEvent) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        fn trusted_clean_descriptor(
+            &self,
+            _runtime: &RuntimeBinding,
+        ) -> Result<Option<crate::agent_sdk::AgentDescriptor>, Self::Error> {
+            Ok(self.clean_descriptor.clone())
+        }
+
+        fn authenticate(
+            &mut self,
+            _input: &ReplayInput,
+            _before: &RuntimeState,
+            _position: ReplayPosition,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn execute(
+            &mut self,
+            input: &ReplayInput,
+            before: &RuntimeState,
+            position: ReplayPosition,
+        ) -> Result<ReplayTransition, Self::Error> {
+            self.executions += 1;
+            let (state, disposition) = match &input.operation {
+                ReplayOperation::CleanInvoke { work, .. }
+                    if self.proof.as_ref().is_some_and(|proof| {
+                        proof.prepared.key().invocation == work.invocation
+                    }) =>
+                {
+                    let proof = self.proof.as_ref().ok_or(())?;
+                    let disposition = match &proof.transition.outcome {
+                        crate::agent_sdk::RuntimeOutcome::Yielded(_) => ReplayDisposition::Applied,
+                        crate::agent_sdk::RuntimeOutcome::Completed(Err(_)) => {
+                            ReplayDisposition::Rejected
+                        }
+                        _ => return Err(()),
+                    };
+                    (
+                        RuntimeState {
+                            control: proof.transition.state.control.clone(),
+                            linear: proof.transition.state.linear.clone(),
+                            merge: proof.transition.state.merge.clone(),
+                            local: proof.transition.state.local.clone(),
+                        },
+                        disposition,
+                    )
+                }
+                ReplayOperation::CleanInvoke { work, .. } => {
+                    let mut state = before.clone();
+                    let discriminator = work.message.first().copied().ok_or(())?;
+                    match work.mode {
+                        crate::agent_sdk::MethodMode::Linear => state.linear.push(discriminator),
+                        crate::agent_sdk::MethodMode::Merge => {
+                            if self.merge_pop_discriminator == Some(discriminator) {
+                                state.merge.pop().ok_or(())?;
+                            } else {
+                                state.merge.push(discriminator);
+                            }
+                        }
+                        crate::agent_sdk::MethodMode::Local => state.local.push(discriminator),
+                        crate::agent_sdk::MethodMode::Query
+                        | crate::agent_sdk::MethodMode::LinearizableQuery
+                        | crate::agent_sdk::MethodMode::LocalQuery => {}
+                    }
+                    (state, ReplayDisposition::Applied)
+                }
+                ReplayOperation::CleanAcknowledge { .. } => (
+                    before.clone(),
+                    if before == &self.acknowledgement_before {
+                        ReplayDisposition::Applied
+                    } else {
+                        ReplayDisposition::Rejected
+                    },
+                ),
+                ReplayOperation::SealMerge => (before.clone(), ReplayDisposition::Applied),
+                _ => return Err(()),
+            };
+            if let ReplayPosition::Merge { id, .. } = position {
+                self.merge_outcomes.push((id, disposition));
+            }
+            Ok(ReplayTransition {
+                attested_transition: match (&input.operation, self.proof.as_ref()) {
+                    (ReplayOperation::CleanInvoke { work, .. }, Some(proof))
+                        if proof.prepared.key().invocation == work.invocation =>
+                    {
+                        Some(
+                            crate::agent_sdk::proof::TransitionProofStatement::transition_commitment(
+                                &proof.transition.encode().expect("test transition encodes"),
+                            ),
+                        )
+                    }
+                    _ => None,
+                },
+                state,
+                disposition,
+                result: None,
+                next_runtime: input.runtime.clone(),
+                products: ReplayProducts::default(),
+            })
+        }
+
+        fn take_transition_proof_binding(
+            &mut self,
+            input: &ReplayInput,
+            before: &RuntimeState,
+            position: ReplayPosition,
+            transition: &ReplayTransition,
+        ) -> Result<Option<ReplayTransitionProofBinding>, Self::Error> {
+            let ReplayOperation::CleanInvoke { work, .. } = &input.operation else {
+                return Ok(None);
+            };
+            let Some(proof) = self
+                .proof
+                .as_ref()
+                .filter(|proof| proof.prepared.key().invocation == work.invocation)
+            else {
+                return Ok(None);
+            };
+            self.proof_requests += 1;
+            let record = proof.prepared.proof_record();
+            Ok(ReplayTransitionProofBinding::new(
+                input,
+                before,
+                position,
+                transition,
+                &proof.transition,
+                proof.prepared.key(),
+                record.statement.before,
+                record.statement.after,
+                proof.prepared.expected_fact().publication(),
+                self.proof_projection.ok_or(())?,
+            ))
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn clean_attested_merge_acknowledgement(
+        invoked: &ReplayInput,
+        key: crate::agent_sdk::proof::TransitionProofKey,
+    ) -> ReplayInput {
+        let ReplayOperation::CleanInvoke {
+            work,
+            authorization,
+            ..
+        } = &invoked.operation
+        else {
+            unreachable!()
+        };
+        let input = ReplayInput {
+            runtime: invoked.runtime.clone(),
+            operation: ReplayOperation::CleanAcknowledge {
+                context: crate::agent_sdk::RuntimeExecutionContext::Attested {
+                    proof_system: crate::agent_sdk::Hash([0xf0; 32]),
+                },
+                expected_live: Some(key),
+                work: work.clone(),
+                authorization: authorization.clone(),
+            },
+        };
+        input.validate().unwrap();
+        input
+    }
+
+    #[cfg(feature = "std")]
+    fn clean_merge_event(
+        materialized: &ReplayMaterialization,
+        input: ReplayInput,
+        signature: u8,
+    ) -> MergeEvent {
+        MergeEvent {
+            genesis: materialized.heads().genesis,
+            committee: None,
+            author: materialized.heads().node,
+            ordered_base: materialized.ordered_base(),
+            causal_height: 1,
+            parents: Vec::new(),
+            input,
+            signature: vec![signature; ED25519_SIGNATURE_BYTES],
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn replay_merge_recanonicalization_restores_published_k1_without_restage() {
+        let mut store = initialized_replay_store();
+        let mut bootstrap = ExactCreateRejectInvocations::default();
+        let initialized =
+            materialize_current(&mut store, &mut bootstrap, &NoPrunedOrderedBases).unwrap();
+        let (_, base, _) = prepare_checkpoint(&mut store, &initialized)
+            .unwrap()
+            .publish()
+            .unwrap();
+        let invoke_input = attested_merge_invoke_input(base.runtime(), 0x91);
+        let invoke = clean_merge_event(&base, invoke_input.clone(), 0x91);
+
+        let mut candidates = (1_u8..=u8::MAX)
+            .filter(|discriminator| *discriminator != 0x91)
+            .map(|discriminator| {
+                let event = MergeEvent {
+                    genesis: base.heads().genesis,
+                    committee: None,
+                    author: base.heads().node,
+                    ordered_base: base.ordered_base(),
+                    causal_height: 1,
+                    parents: Vec::new(),
+                    input: clean_admitted_invocation(
+                        base.runtime(),
+                        MethodMode::Merge,
+                        discriminator,
+                    ),
+                    signature: vec![discriminator; ED25519_SIGNATURE_BYTES],
+                };
+                (event.id(), discriminator, event)
+            })
+            .filter(|(id, _, _)| *id < invoke.id())
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|(id, _, _)| *id);
+        let (_, first_discriminator, first) = candidates
+            .first()
+            .cloned()
+            .expect("fixture must find an event before the attested Invoke");
+        let (_, cancel_discriminator, cancel) = candidates
+            .get(1)
+            .cloned()
+            .expect("fixture must find a second event before the attested Invoke");
+        first.validate().unwrap();
+        cancel.validate().unwrap();
+
+        let proof_k1 =
+            attested_replay_proof_fixture(base.heads().genesis, &invoke_input, base.state(), 0x91);
+        let k1 = proof_k1.prepared.key();
+        let staged_k1 = stage_replay_attested_merge_proof(&mut store, &invoke, &proof_k1, None);
+        let mut executor = CleanMergeAcknowledgementExecutor {
+            acknowledgement_before: base.state().clone(),
+            proof: Some(proof_k1.clone()),
+            proof_projection: Some(ReplayTransitionProofProjection::Prepared),
+            clean_descriptor: bootstrap.clean_descriptor.clone(),
+            ..CleanMergeAcknowledgementExecutor::default()
+        };
+        let prepared = match prepare_merge(
+            &mut store,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &base,
+            &invoke,
+        )
+        .unwrap()
+        {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+        };
+        let (_, after_k1, _) = prepared
+            .with_staged_transition_proofs_for_test(vec![staged_k1])
+            .unwrap()
+            .publish()
+            .unwrap();
+
+        // B sorts before the retained Invoke and changes its canonical
+        // before-state, so replay proves and installs K2.
+        let mut before_k2 = base.state().clone();
+        before_k2.merge.push(first_discriminator);
+        let proof_k2 =
+            attested_replay_proof_fixture(base.heads().genesis, &invoke_input, &before_k2, 0x92);
+        let k2 = proof_k2.prepared.key();
+        assert_ne!(k1, k2);
+        executor.proof = Some(proof_k2.clone());
+        executor.proof_projection = Some(ReplayTransitionProofProjection::Prepared);
+        let staged_k2 = stage_replay_attested_merge_proof(&mut store, &invoke, &proof_k2, Some(k1));
+        let prepared = match prepare_merge(
+            &mut store,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &after_k1,
+            &first,
+        )
+        .unwrap()
+        {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+        };
+        let (_, after_k2, _) = prepared
+            .with_staged_transition_proofs_for_test(vec![staged_k2])
+            .unwrap()
+            .publish()
+            .unwrap();
+        let index_k2 = store
+            .get::<TransitionProofIndexManifest>(after_k2.heads().transition_proofs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(index_k2.live(k1.invocation), Some(k2));
+        assert!(index_k2.retired_root().is_none());
+
+        // C sorts between B and the Invoke and cancels B's state effect.
+        // Canonical replay therefore returns to the exact retained K1 tuple;
+        // Published recurrence updates only the live pointer and stages no
+        // proof material, AJPT, signature, or terminal retirement.
+        executor.merge_pop_discriminator = Some(cancel_discriminator);
+        executor.proof = Some(proof_k1);
+        executor.proof_projection = Some(ReplayTransitionProofProjection::Published);
+        let proof_requests_before = executor.proof_requests;
+        let prepared = match prepare_merge(
+            &mut store,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &after_k2,
+            &cancel,
+        )
+        .unwrap()
+        {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+        };
+        assert_eq!(executor.proof_requests, proof_requests_before + 1);
+        let prepared = prepared
+            .with_staged_transition_proofs_for_test(Vec::new())
+            .unwrap();
+        let retry = prepared.sealed.clone();
+        let (_, restored, _) = prepared.publish().unwrap();
+        assert!(!store.publish(&retry).unwrap().heads_advanced);
+        let restored_index = store
+            .get::<TransitionProofIndexManifest>(restored.heads().transition_proofs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored_index.live(k1.invocation), Some(k1));
+        assert_eq!(restored_index.entries().len(), 2);
+        assert!(restored_index.retired_root().is_none());
+
+        // Reopen from the authoritative journal and retry the exact imported
+        // event. The replay layer must recognize it before guest execution or
+        // proof-provider work; the preceding store retry only proves the CAS
+        // publication itself is idempotent.
+        let materialize_executions = executor.executions;
+        let materialize_proof_requests = executor.proof_requests;
+        let reopened =
+            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        assert_eq!(reopened.heads(), restored.heads());
+        assert_eq!(
+            reopened.transition_proof_shadow.live(k1.invocation),
+            Some(k1)
+        );
+        let executions_before_retry = executor.executions;
+        let proof_requests_before_retry = executor.proof_requests;
+        assert!(matches!(
+            prepare_merge(
+                &mut store,
+                &mut executor,
+                &NoPrunedOrderedBases,
+                &reopened,
+                &cancel,
+            )
+            .unwrap(),
+            ReplayPreparation::AlreadyCommitted(_)
+        ));
+        assert_eq!(executor.executions, executions_before_retry);
+        assert_eq!(executor.proof_requests, proof_requests_before_retry);
+        assert!(executor.executions >= materialize_executions);
+        assert!(executor.proof_requests >= materialize_proof_requests);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn attested_merge_ack_retirement_is_deferred_and_uses_final_replay_outcome() {
+        let mut store = initialized_replay_store();
+        let mut materializer = ExactCreateRejectInvocations::default();
+        let initialized =
+            materialize_current(&mut store, &mut materializer, &NoPrunedOrderedBases).unwrap();
+        let (_, base, _) = prepare_checkpoint(&mut store, &initialized)
+            .unwrap()
+            .publish()
+            .unwrap();
+        let invoke_input = attested_merge_invoke_input(base.runtime(), 0xe1);
+        let invoke = clean_merge_event(&base, invoke_input.clone(), 0xe1);
+        let proof =
+            attested_replay_proof_fixture(base.heads().genesis, &invoke_input, base.state(), 0xe1);
+        let key = proof.prepared.key();
+        let staged = stage_replay_attested_merge_proof(&mut store, &invoke, &proof, None);
+        let acknowledgement_before = RuntimeState {
+            control: proof.transition.state.control.clone(),
+            linear: proof.transition.state.linear.clone(),
+            merge: proof.transition.state.merge.clone(),
+            local: proof.transition.state.local.clone(),
+        };
+        let mut executor = CleanMergeAcknowledgementExecutor {
+            acknowledgement_before,
+            proof: Some(proof),
+            proof_projection: Some(ReplayTransitionProofProjection::Prepared),
+            clean_descriptor: materializer.clean_descriptor.clone(),
+            ..CleanMergeAcknowledgementExecutor::default()
+        };
+
+        let prepared = match prepare_merge(
+            &mut store,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &base,
+            &invoke,
+        )
+        .unwrap()
+        {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+        };
+        let prepared = prepared
+            .with_staged_transition_proofs_for_test(vec![staged])
+            .unwrap();
+        let (_, after_invoke, _) = prepared.publish().unwrap();
+        executor.proof_projection = Some(ReplayTransitionProofProjection::Published);
+        let invoke_index = store
+            .get::<TransitionProofIndexManifest>(after_invoke.heads().transition_proofs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(invoke_index.live(key.invocation), Some(key));
+
+        let ack_input = clean_attested_merge_acknowledgement(&invoke_input, key);
+        let acknowledgement = MergeEvent {
+            genesis: after_invoke.heads().genesis,
+            committee: None,
+            author: after_invoke.heads().node,
+            ordered_base: after_invoke.ordered_base(),
+            causal_height: invoke.causal_height.checked_add(1).unwrap(),
+            parents: vec![invoke.id()],
+            input: ack_input,
+            signature: vec![0xe2; ED25519_SIGNATURE_BYTES],
+        };
+        acknowledgement.validate().unwrap();
+        let acknowledgement_id = acknowledgement.id();
+        executor.merge_outcomes.clear();
+        let prepared = match prepare_merge(
+            &mut store,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &after_invoke,
+            &acknowledgement,
+        )
+        .unwrap()
+        {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+        };
+        assert!(
+            executor
+                .merge_outcomes
+                .contains(&(acknowledgement_id, ReplayDisposition::Applied))
+        );
+        assert!(prepared.sealed.transition_proof_retirements().is_empty());
+        let (_, after_acknowledgement, _) = prepared.publish().unwrap();
+        let provisional_index = store
+            .get::<TransitionProofIndexManifest>(after_acknowledgement.heads().transition_proofs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(provisional_index.live(key.invocation), Some(key));
+        assert!(matches!(
+            prepare_checkpoint(&mut store, &after_acknowledgement),
+            Err(ReplayError::InvalidRecord)
+        ));
+        assert!(matches!(
+            prepare_shared_checkpoint(&mut store, &after_acknowledgement),
+            Err(ReplayError::InvalidRecord)
+        ));
+
+        let seal = persist_merge_seal(&mut store, &after_acknowledgement);
+        let fence = OrderedEntry {
+            genesis: after_acknowledgement.heads().genesis,
+            index: after_acknowledgement.heads().ordered_index + 1,
+            parent: after_acknowledgement.heads().ordered_head,
+            merge_frontier: after_acknowledgement.merge_frontier(),
+            merge_seal: Some(seal),
+            input: ReplayInput {
+                runtime: after_acknowledgement.runtime().clone(),
+                operation: ReplayOperation::SealMerge,
+            },
+        };
+        let prepared =
+            match prepare_ordered(&mut store, &mut executor, &after_acknowledgement, &fence)
+                .unwrap()
+            {
+                ReplayPreparation::Ready(prepared) => prepared,
+                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+            };
+        assert_eq!(
+            prepared
+                .sealed
+                .transition_proof_retirements()
+                .iter()
+                .map(|retirement| retirement.key())
+                .collect::<Vec<_>>(),
+            vec![key]
+        );
+        let prepared = prepared
+            .with_staged_transition_proofs_for_test(Vec::new())
+            .unwrap();
+        let retry = prepared.sealed.clone();
+        let (_, finalized, _) = prepared.publish().unwrap();
+        assert_eq!(finalized.heads().merge_fence.index, fence.index);
+        let finalized_index = store
+            .get::<TransitionProofIndexManifest>(finalized.heads().transition_proofs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(finalized_index.live(key.invocation), None);
+        assert!(
+            finalized
+                .transition_proof_shadow
+                .matches_manifest(&finalized_index)
+        );
+        assert!(
+            finalized
+                .pending_transition_proof_final_shadow
+                .projection_eq(&finalized.transition_proof_shadow)
+        );
+        assert!(!store.publish(&retry).unwrap().heads_advanced);
+        let executions_before_reopen = executor.executions;
+        let proof_requests_before_reopen = executor.proof_requests;
+        let reopened =
+            materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        assert_eq!(reopened.heads(), finalized.heads());
+        assert_eq!(reopened.transition_proof_shadow.live(key.invocation), None);
+        assert!(executor.executions > executions_before_reopen);
+        assert!(executor.proof_requests > proof_requests_before_reopen);
+
+        // Advance the same durable fence with a second, independent terminal
+        // lifecycle. Resolving F from the later head must return the first
+        // successor which installed F, not this later cumulative AJP3 root;
+        // otherwise the second acknowledgement would be applied
+        // retroactively before its own retained input.
+        let mut later_input =
+            clean_admitted_invocation(reopened.runtime(), MethodMode::Linear, 0xe6);
+        let ReplayOperation::CleanInvoke { context, .. } = &mut later_input.operation else {
+            unreachable!()
+        };
+        *context = crate::agent_sdk::RuntimeExecutionContext::Attested {
+            proof_system: crate::agent_sdk::Hash([0xf0; 32]),
+        };
+        later_input.validate().unwrap();
+        let later_entry = OrderedEntry {
+            genesis: reopened.heads().genesis,
+            index: reopened.heads().ordered_index.checked_add(1).unwrap(),
+            parent: reopened.heads().ordered_head,
+            merge_frontier: reopened.heads().merge_frontier,
+            merge_seal: None,
+            input: later_input.clone(),
+        };
+        later_entry.validate().unwrap();
+        let later_position = ReplayPosition::Ordered {
+            id: later_entry.id(),
+            index: later_entry.index,
+            merge_frontier: later_entry.merge_frontier,
+            merge_seal: None,
+        };
+        let later_proof = attested_replay_proof_fixture(
+            reopened.heads().genesis,
+            &later_input,
+            reopened.state(),
+            0xe6,
+        );
+        let later_key = later_proof.prepared.key();
+        let later_staged = JournalVerifiedTransitionPublisher::new(&mut store)
+            .stage_verified(
+                &later_proof.prepared,
+                TransitionProofStageContext {
+                    expected_heads: reopened.heads().id(),
+                    input: &later_entry.input,
+                    position: later_position,
+                    artifacts: &later_proof.artifacts,
+                    runtime_package: &later_proof.runtime_package,
+                    actor_package: &later_proof.actor_package,
+                    expected_live: None,
+                },
+            )
+            .unwrap();
+        executor.proof = Some(later_proof);
+        executor.proof_projection = Some(ReplayTransitionProofProjection::Prepared);
+        let prepared =
+            match prepare_ordered(&mut store, &mut executor, &reopened, &later_entry).unwrap() {
+                ReplayPreparation::Ready(prepared) => prepared,
+                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+            };
+        let (_, after_later_invoke, _) = prepared
+            .with_staged_transition_proofs_for_test(vec![later_staged])
+            .unwrap()
+            .publish()
+            .unwrap();
+
+        let later_ack_input = clean_attested_merge_acknowledgement(&later_input, later_key);
+        let later_ack = OrderedEntry {
+            genesis: after_later_invoke.heads().genesis,
+            index: after_later_invoke
+                .heads()
+                .ordered_index
+                .checked_add(1)
+                .unwrap(),
+            parent: after_later_invoke.heads().ordered_head,
+            merge_frontier: after_later_invoke.heads().merge_frontier,
+            merge_seal: None,
+            input: later_ack_input,
+        };
+        later_ack.validate().unwrap();
+        executor.acknowledgement_before = after_later_invoke.state().clone();
+        let prepared =
+            match prepare_ordered(&mut store, &mut executor, &after_later_invoke, &later_ack)
+                .unwrap()
+            {
+                ReplayPreparation::Ready(prepared) => prepared,
+                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+            };
+        let (_, after_later_ack, _) = prepared
+            .with_staged_transition_proofs_for_test(Vec::new())
+            .unwrap()
+            .publish()
+            .unwrap();
+        assert_eq!(
+            after_later_ack.heads().merge_fence,
+            finalized.heads().merge_fence
+        );
+        let fence_index = transition_proof_index_at_replay_boundary(
+            &store,
+            after_later_ack.heads(),
+            finalized.heads().merge_fence,
+        )
+        .unwrap();
+        assert_eq!(fence_index.id(), finalized_index.id());
+        assert!(
+            transition_proof_retirement_for_invocation(
+                &store,
+                finalized.heads().genesis,
+                fence_index.retired_root(),
+                key.invocation,
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            transition_proof_retirement_for_invocation(
+                &store,
+                finalized.heads().genesis,
+                fence_index.retired_root(),
+                later_key.invocation,
+            )
+            .unwrap()
+            .is_none()
+        );
+        let later_index = store
+            .get::<TransitionProofIndexManifest>(after_later_ack.heads().transition_proofs)
+            .unwrap()
+            .unwrap();
+        assert!(
+            transition_proof_retirement_for_invocation(
+                &store,
+                after_later_ack.heads().genesis,
+                later_index.retired_root(),
+                later_key.invocation,
+            )
+            .unwrap()
+            .is_some()
+        );
+
+        let compact = JournalVerifiedTransitionPublisher::new(&mut store)
+            .stage_checkpoint_compaction()
+            .unwrap();
+        assert!(
+            after_later_ack
+                .transition_proof_shadow
+                .as_checkpoint_boundary()
+                .matches_manifest(compact.next())
+        );
+        let checkpoint = prepare_checkpoint(&mut store, &after_later_ack).unwrap();
+        let (_, checkpointed, _) = checkpoint.publish().unwrap();
+        assert!(checkpointed.heads().checkpoint.is_some());
+        assert_eq!(
+            JournalVerifiedTransitionPublisher::new(&mut store)
+                .load_retired(key)
+                .unwrap()
+                .map(|retired| retired.key()),
+            Some(key),
+        );
+
+        // The checkpoint has compacted the non-live AJPT record, but its
+        // logical retirement history remains authoritative. A later Invoke
+        // for the same logical invocation is stale before guest execution or
+        // proof-provider work even when its prospective execution differs.
+        let mut different_execution = attested_merge_invoke_input(checkpointed.runtime(), 0xe3);
+        let ReplayOperation::CleanInvoke {
+            work,
+            authorization,
+            observed_slot,
+            ..
+        } = &mut different_execution.operation
+        else {
+            unreachable!()
+        };
+        work.invocation = key.invocation;
+        *authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+            crate::agent_sdk::PublicPreflight::for_work(work, *observed_slot),
+        );
+        different_execution.validate().unwrap();
+        let stale_invoke = MergeEvent {
+            genesis: checkpointed.heads().genesis,
+            committee: None,
+            author: checkpointed.heads().node,
+            ordered_base: checkpointed.ordered_base(),
+            causal_height: acknowledgement.causal_height.checked_add(1).unwrap(),
+            parents: vec![acknowledgement.id()],
+            input: different_execution,
+            signature: vec![0xe3; ED25519_SIGNATURE_BYTES],
+        };
+        stale_invoke.validate().unwrap();
+        let executions_before_stale = executor.executions;
+        let proof_requests_before_stale = executor.proof_requests;
+        let prepared = match prepare_merge(
+            &mut store,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &checkpointed,
+            &stale_invoke,
+        )
+        .unwrap()
+        {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+        };
+        assert!(matches!(
+            prepared.sealed.transition_proof_actions(),
+            [ReplayTransitionProofAction::Stale(stale)]
+                if stale.lifecycle() == ReplayTransitionProofLifecycle::Invoke
+        ));
+        assert_eq!(executor.executions, executions_before_stale);
+        assert_eq!(executor.proof_requests, proof_requests_before_stale);
+        let (_, after_stale_invoke, _) = prepared.publish().unwrap();
+
+        // The exact finally-acknowledged execution is equally terminal. The
+        // second canonical walk also replays the preceding stale Invoke, and
+        // neither operation reaches the executor/provider.
+        let stale_ack = MergeEvent {
+            genesis: after_stale_invoke.heads().genesis,
+            committee: None,
+            author: after_stale_invoke.heads().node,
+            ordered_base: after_stale_invoke.ordered_base(),
+            causal_height: stale_invoke.causal_height.checked_add(1).unwrap(),
+            parents: vec![stale_invoke.id()],
+            input: clean_attested_merge_acknowledgement(&invoke_input, key),
+            signature: vec![0xe4; ED25519_SIGNATURE_BYTES],
+        };
+        stale_ack.validate().unwrap();
+        let prepared = match prepare_merge(
+            &mut store,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &after_stale_invoke,
+            &stale_ack,
+        )
+        .unwrap()
+        {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+        };
+        assert!(
+            prepared
+                .sealed
+                .transition_proof_actions()
+                .iter()
+                .all(|action| matches!(action, ReplayTransitionProofAction::Stale(_)))
+        );
+        assert_eq!(executor.executions, executions_before_stale);
+        assert_eq!(executor.proof_requests, proof_requests_before_stale);
+        let (_, after_stale_ack, _) = prepared.publish().unwrap();
+
+        // Retirement is scoped to the logical invocation, not the entire
+        // agent. A distinct invocation still executes and publishes its
+        // independently verified proof through the same retained suffix.
+        let distinct_input = attested_merge_invoke_input(after_stale_ack.runtime(), 0xe5);
+        let distinct = MergeEvent {
+            genesis: after_stale_ack.heads().genesis,
+            committee: None,
+            author: after_stale_ack.heads().node,
+            ordered_base: after_stale_ack.ordered_base(),
+            causal_height: stale_ack.causal_height.checked_add(1).unwrap(),
+            parents: vec![stale_ack.id()],
+            input: distinct_input.clone(),
+            signature: vec![0xe5; ED25519_SIGNATURE_BYTES],
+        };
+        distinct.validate().unwrap();
+        let distinct_proof = attested_replay_proof_fixture(
+            after_stale_ack.heads().genesis,
+            &distinct_input,
+            after_stale_ack.state(),
+            0xe5,
+        );
+        let distinct_key = distinct_proof.prepared.key();
+        assert_ne!(distinct_key.invocation, key.invocation);
+        let staged =
+            stage_replay_attested_merge_proof(&mut store, &distinct, &distinct_proof, None);
+        executor.proof = Some(distinct_proof);
+        executor.proof_projection = Some(ReplayTransitionProofProjection::Prepared);
+        let prepared = match prepare_merge(
+            &mut store,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &after_stale_ack,
+            &distinct,
+        )
+        .unwrap()
+        {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+        };
+        assert_eq!(executor.executions, executions_before_stale + 1);
+        assert_eq!(executor.proof_requests, proof_requests_before_stale + 1);
+        let (_, after_distinct, _) = prepared
+            .with_staged_transition_proofs_for_test(vec![staged])
+            .unwrap()
+            .publish()
+            .unwrap();
+        let distinct_index = store
+            .get::<TransitionProofIndexManifest>(after_distinct.heads().transition_proofs)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            distinct_index.live(distinct_key.invocation),
+            Some(distinct_key)
+        );
     }
 }

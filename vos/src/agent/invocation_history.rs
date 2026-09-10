@@ -24,9 +24,10 @@ pub(crate) const MAX_INVOCATION_HISTORY_PATH: usize = 256;
 /// One inserted fact can create one leaf, one split, and one replacement node
 /// for every branch on its authenticated path.
 pub(crate) const MAX_INVOCATION_HISTORY_NODES_PER_INSERT: usize = MAX_INVOCATION_HISTORY_PATH + 2;
-/// One ordered publication can archive a bounded Merge import plus its direct
-/// ordered operation.
-pub(crate) const MAX_INVOCATION_HISTORY_INSERTIONS: usize = 257;
+/// One publication can archive a bounded Merge import or retire every exact
+/// proof edge replaced by the largest replay-sealed Merge batch.
+pub(crate) const MAX_INVOCATION_HISTORY_INSERTIONS: usize =
+    super::journal::MAX_REPLAY_SUFFIX_ENTRIES;
 /// Maximum nodes retained by one cumulative publication overlay.
 pub(crate) const MAX_INVOCATION_HISTORY_PLAN_NODES: usize =
     MAX_INVOCATION_HISTORY_INSERTIONS * MAX_INVOCATION_HISTORY_NODES_PER_INSERT;
@@ -105,6 +106,10 @@ impl<E: fmt::Debug> core::error::Error for InvocationHistoryError<E> {}
 pub(crate) struct InvocationHistorySummary {
     min: InvocationId,
     max: InvocationId,
+    /// Authenticated tree-wide purpose. Branch construction requires both
+    /// children to agree, so inspecting the root proves the history class
+    /// without an unbounded full-tree walk.
+    transition_proof: bool,
 }
 
 impl InvocationHistorySummary {
@@ -112,6 +117,7 @@ impl InvocationHistorySummary {
         Self {
             min: fact.key().invocation,
             max: fact.key().invocation,
+            transition_proof: fact.is_transition_proof_retirement(),
         }
     }
 
@@ -175,6 +181,7 @@ impl InvocationHistoryNode {
             Self::Branch { left, right, .. } => InvocationHistorySummary {
                 min: left.summary.min,
                 max: right.summary.max,
+                transition_proof: left.summary.transition_proof,
             },
         }
     }
@@ -200,6 +207,7 @@ impl InvocationHistoryNode {
                 if prefix_of(prefix, bit) != *prefix
                     || left.id == right.id
                     || left.summary.max >= right.summary.min
+                    || left.summary.transition_proof != right.summary.transition_proof
                     || !summary_matches_partition(left.summary, prefix, bit, false)
                     || !summary_matches_partition(right.summary, prefix, bit, true)
                 {
@@ -216,7 +224,7 @@ impl InvocationHistoryNode {
 }
 
 impl ServiceWire for InvocationHistoryNode {
-    const MAGIC: [u8; 4] = *b"AIHN";
+    const MAGIC: [u8; 4] = *b"AIH2";
 
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
@@ -709,6 +717,83 @@ impl<'a, S: InvocationHistoryStore> InvocationHistory<'a, S> {
         self.root
     }
 
+    /// Return the root-authenticated purpose of this cumulative history.
+    /// Every descendant path repeats the same purpose in its child summary,
+    /// so lookup/insertion also verifies it lazily at each bounded hop.
+    pub(crate) fn is_transition_proof_history(
+        &self,
+    ) -> Result<Option<bool>, InvocationHistoryError<S::Error>> {
+        let Some(root) = self.root else {
+            return Ok(None);
+        };
+        let (node, _) = self.load_node(root)?;
+        self.validate_context(&node)?;
+        Ok(Some(node.summary().transition_proof))
+    }
+
+    pub(crate) fn require_history_purpose(
+        &self,
+        transition_proof: bool,
+    ) -> Result<(), InvocationHistoryError<S::Error>> {
+        if self
+            .is_transition_proof_history()?
+            .is_some_and(|actual| actual != transition_proof)
+        {
+            Err(InvocationHistoryError::InvalidFact)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Audit the complete immutable closure below the opened root.
+    ///
+    /// This is an operator/test diagnostic, not a production reopen gate:
+    /// cumulative history has no protocol cardinality ceiling. Production
+    /// lookup and mutation authenticate the root purpose and every summary on
+    /// the one bounded Patricia path they traverse. `maximum_nodes` keeps an
+    /// explicitly requested diagnostic from becoming an unbounded walk.
+    pub(crate) fn validate_complete(
+        &self,
+        maximum_nodes: usize,
+        mut accepts: impl FnMut(InvocationAcknowledgedFact) -> bool,
+    ) -> Result<usize, InvocationHistoryError<S::Error>> {
+        if maximum_nodes == 0 {
+            return Err(InvocationHistoryError::NodeLimit);
+        }
+        let Some(root) = self.root else {
+            return Ok(0);
+        };
+        let mut stack = Vec::new();
+        stack.push((root, None, None));
+        let mut visited = BTreeSet::new();
+        while let Some((id, parent_bit, expected_summary)) = stack.pop() {
+            if !visited.insert(id) {
+                return Err(InvocationHistoryError::Cycle);
+            }
+            if visited.len() > maximum_nodes {
+                return Err(InvocationHistoryError::NodeLimit);
+            }
+            let (node, _) = self.load_node(id)?;
+            self.validate_context(&node)?;
+            validate_path_summary(&node, expected_summary)?;
+            match node {
+                InvocationHistoryNode::Leaf(fact) => {
+                    if !accepts(fact) {
+                        return Err(InvocationHistoryError::InvalidFact);
+                    }
+                }
+                InvocationHistoryNode::Branch {
+                    bit, left, right, ..
+                } => {
+                    enforce_increasing_bit(parent_bit, bit)?;
+                    stack.push((right.id, Some(bit), Some(right.summary)));
+                    stack.push((left.id, Some(bit), Some(left.summary)));
+                }
+            }
+        }
+        Ok(visited.len())
+    }
+
     /// Authenticated membership/nonmembership lookup against the current
     /// global-plus-overlay root.
     pub(crate) fn lookup(
@@ -1173,12 +1258,14 @@ fn decode_scope(decoder: &mut Decoder<'_>) -> Result<InvocationOwnershipScope, D
 }
 
 fn encode_summary(encoder: &mut Encoder<'_>, summary: InvocationHistorySummary) {
+    encoder.bool(summary.transition_proof);
     encoder.fixed(&summary.min.0);
     encoder.fixed(&summary.max.0);
 }
 
 fn decode_summary(decoder: &mut Decoder<'_>) -> Result<InvocationHistorySummary, DecodeError> {
     let summary = InvocationHistorySummary {
+        transition_proof: decoder.bool()?,
         min: InvocationId(decoder.fixed()?),
         max: InvocationId(decoder.fixed()?),
     };
@@ -1331,6 +1418,21 @@ mod tests {
         InvocationAcknowledgedFact::from_owner(genesis, key, owner).unwrap()
     }
 
+    fn retirement_fact(genesis: AgentJournalGenesisId, number: u16) -> InvocationAcknowledgedFact {
+        let mut invocation = [0x71; 32];
+        invocation[30..].copy_from_slice(&number.to_be_bytes());
+        let mut execution = [0x72; 32];
+        execution[30..].copy_from_slice(&number.to_be_bytes());
+        InvocationAcknowledgedFact::for_transition_proof_retirement(
+            genesis,
+            crate::agent_sdk::proof::TransitionProofKey {
+                invocation: crate::agent_sdk::InvocationId(invocation),
+                execution: crate::agent_sdk::Hash(execution),
+            },
+        )
+        .unwrap()
+    }
+
     fn commit(store: &mut MemoryHistoryStore, plan: &InvocationHistoryWritePlan) {
         for write in plan.node_writes() {
             match store.nodes.get(&write.id()) {
@@ -1383,6 +1485,93 @@ mod tests {
         let reopened = InvocationHistory::open(&store, genesis, scope, root).unwrap();
         assert_eq!(reopened.lookup(first.key()).unwrap(), Some(first));
         assert_eq!(reopened.lookup(key(scope, 2)).unwrap(), None,);
+    }
+
+    #[test]
+    fn complete_audit_rejects_a_cross_purpose_history_root() {
+        let mut store = MemoryHistoryStore::default();
+        let genesis = genesis();
+        let scope = InvocationOwnershipScope::Ordered;
+
+        let ordinary = fact(genesis, scope, 1, 10);
+        let mut ordinary_history = InvocationHistory::open(&store, genesis, scope, None).unwrap();
+        ordinary_history.insert(ordinary).unwrap();
+        let ordinary_plan = ordinary_history.write_plan().unwrap();
+        commit(&mut store, &ordinary_plan);
+        let ordinary_history =
+            InvocationHistory::open(&store, genesis, scope, ordinary_plan.root()).unwrap();
+        assert!(matches!(
+            ordinary_history.validate_complete(4, |fact| {
+                fact.transition_proof_retirement_key().is_some()
+            }),
+            Err(InvocationHistoryError::InvalidFact)
+        ));
+        ordinary_history.require_history_purpose(false).unwrap();
+        assert_eq!(
+            ordinary_history.require_history_purpose(true),
+            Err(InvocationHistoryError::InvalidFact)
+        );
+
+        let mut retirement_history = InvocationHistory::open(&store, genesis, scope, None).unwrap();
+        for byte in [0x31, 0x32] {
+            retirement_history
+                .insert(
+                    InvocationAcknowledgedFact::for_transition_proof_retirement(
+                        genesis,
+                        crate::agent_sdk::proof::TransitionProofKey {
+                            invocation: crate::agent_sdk::InvocationId([byte; 32]),
+                            execution: crate::agent_sdk::Hash([byte.wrapping_add(1); 32]),
+                        },
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let retirement_plan = retirement_history.write_plan().unwrap();
+        commit(&mut store, &retirement_plan);
+        let retirement_history =
+            InvocationHistory::open(&store, genesis, scope, retirement_plan.root()).unwrap();
+        retirement_history.require_history_purpose(true).unwrap();
+        assert_eq!(
+            retirement_history.require_history_purpose(false),
+            Err(InvocationHistoryError::InvalidFact)
+        );
+        assert_eq!(
+            retirement_history
+                .validate_complete(4, |fact| {
+                    fact.transition_proof_retirement_key().is_some()
+                })
+                .unwrap(),
+            3
+        );
+        assert!(matches!(
+            retirement_history.validate_complete(2, |_| true),
+            Err(InvocationHistoryError::NodeLimit)
+        ));
+
+        let logical = crate::agent_sdk::InvocationId([0x41; 32]);
+        let first = InvocationAcknowledgedFact::for_transition_proof_retirement(
+            genesis,
+            crate::agent_sdk::proof::TransitionProofKey {
+                invocation: logical,
+                execution: crate::agent_sdk::Hash([0x42; 32]),
+            },
+        )
+        .unwrap();
+        let conflicting = InvocationAcknowledgedFact::for_transition_proof_retirement(
+            genesis,
+            crate::agent_sdk::proof::TransitionProofKey {
+                invocation: logical,
+                execution: crate::agent_sdk::Hash([0x43; 32]),
+            },
+        )
+        .unwrap();
+        let mut terminal = InvocationHistory::open(&store, genesis, scope, None).unwrap();
+        assert!(terminal.insert(first).unwrap().inserted());
+        assert_eq!(
+            terminal.insert(conflicting),
+            Err(InvocationHistoryError::Conflict)
+        );
     }
 
     #[test]
@@ -1540,6 +1729,43 @@ mod tests {
                 .map(|_| ()),
             Err(InvocationHistoryError::ScopeMismatch)
         );
+
+        let mut predecessor_wire = plan.overlay_nodes()[0].bytes().to_vec();
+        predecessor_wire[..4].copy_from_slice(b"AIHN");
+        assert!(InvocationHistoryNode::decode(&predecessor_wire).is_err());
+    }
+
+    #[test]
+    fn cumulative_retirement_history_exceeds_one_publication_limit() {
+        let mut store = MemoryHistoryStore::default();
+        let genesis = genesis();
+        let scope = InvocationOwnershipScope::Ordered;
+
+        let mut first = InvocationHistory::open(&store, genesis, scope, None).unwrap();
+        for number in 1..=MAX_INVOCATION_HISTORY_INSERTIONS as u16 {
+            first.insert(retirement_fact(genesis, number)).unwrap();
+        }
+        let first_plan = first.write_plan().unwrap();
+        assert_eq!(first_plan.insertions(), MAX_INVOCATION_HISTORY_INSERTIONS);
+        commit(&mut store, &first_plan);
+
+        let mut second =
+            InvocationHistory::open(&store, genesis, scope, first_plan.root()).unwrap();
+        second.require_history_purpose(true).unwrap();
+        let beyond_one_publication = MAX_INVOCATION_HISTORY_INSERTIONS as u16 + 1;
+        let final_fact = retirement_fact(genesis, beyond_one_publication);
+        second.insert(final_fact).unwrap();
+        let second_plan = second.write_plan().unwrap();
+        assert_eq!(second_plan.insertions(), 1);
+        commit(&mut store, &second_plan);
+
+        let reopened = InvocationHistory::open(&store, genesis, scope, second_plan.root()).unwrap();
+        reopened.require_history_purpose(true).unwrap();
+        assert_eq!(
+            reopened.lookup(retirement_fact(genesis, 1).key()).unwrap(),
+            Some(retirement_fact(genesis, 1))
+        );
+        assert_eq!(reopened.lookup(final_fact.key()).unwrap(), Some(final_fact));
     }
 
     #[test]

@@ -451,15 +451,17 @@ impl<'a, S: InvocationOutcomeStore> InvocationIndex<'a, S> {
     {
         let manifest = load_manifest(store, id)?;
         validate_manifest_root(store, id, &manifest)?;
-        let history_plan = InvocationHistory::open(
+        let history = InvocationHistory::open(
             &*store,
             manifest.genesis,
             manifest.scope,
             manifest.history_root,
         )
-        .map_err(map_history_error)?
-        .write_plan()
         .map_err(map_history_error)?;
+        history
+            .require_history_purpose(false)
+            .map_err(map_history_error)?;
+        let history_plan = history.write_plan().map_err(map_history_error)?;
         Ok(Self {
             store,
             manifest,
@@ -1452,15 +1454,17 @@ fn initial_history_plan<S>(
 where
     S: InvocationOutcomeStore + InvocationHistoryStore<Error = <S as InvocationIndexStore>::Error>,
 {
-    InvocationHistory::open(
+    let history = InvocationHistory::open(
         store,
         manifest.genesis,
         manifest.scope,
         manifest.history_root,
     )
-    .map_err(map_history_error)?
-    .write_plan()
-    .map_err(map_history_error)
+    .map_err(map_history_error)?;
+    history
+        .require_history_purpose(false)
+        .map_err(map_history_error)?;
+    history.write_plan().map_err(map_history_error)
 }
 
 fn lookup_in_manifest<S: InvocationOutcomeStore>(
@@ -1489,6 +1493,9 @@ where
     }
     let history =
         InvocationHistory::open_with_plan(store, history_plan).map_err(map_history_error)?;
+    history
+        .require_history_purpose(false)
+        .map_err(map_history_error)?;
     let archived = history.lookup(key).map_err(map_history_error)?;
     match (live, archived) {
         (Some(_), Some(_)) => Err(InvocationIndexError::CorruptHistory),
@@ -1639,13 +1646,16 @@ where
             authenticate_leaf_reference(store, &leaf)?;
         }
     }
-    InvocationHistory::open(
+    let history = InvocationHistory::open(
         store,
         manifest.genesis,
         manifest.scope,
         manifest.history_root,
     )
     .map_err(map_history_error)?;
+    history
+        .require_history_purpose(false)
+        .map_err(map_history_error)?;
     Ok(())
 }
 

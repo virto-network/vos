@@ -23,6 +23,7 @@ use super::execution::{
     MAX_EXECUTION_MESSAGE_BYTES, MAX_EXECUTION_REPLY_BYTES, MAX_RUNTIME_STATE_BYTES, RuntimeBlob,
 };
 use super::genesis::AgentGenesisAdmissionId;
+use super::transition_proof_journal::TransitionProofIndexManifest;
 use super::wire::{RuntimeCall, RuntimeState};
 use super::{InvocationResultStorage, LifecycleRequest, MethodMode, StateLane};
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
@@ -36,7 +37,10 @@ use crate::service::{
 /// A clean invocation retains the complete bounded SDK availability closure
 /// so every replica replays exactly the work authorized by the receipt.
 pub const MAX_REPLAY_INPUT_BYTES: usize =
-    crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES + 1024;
+    crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES + MAX_CLEAN_YIELDED_WIRE_BYTES + 1024;
+/// Maximum canonical empty-state transition used to retain one yielded
+/// continuation selector beside an exact clean resume request.
+const MAX_CLEAN_YIELDED_WIRE_BYTES: usize = 8 * 1024;
 /// Maximum complete ordered, local, or Merge journal record.
 pub const MAX_JOURNAL_RECORD_BYTES: usize = MAX_REPLAY_INPUT_BYTES + 32 * 1024;
 /// Maximum parents on a Merge event and entries in a Merge frontier.
@@ -167,6 +171,8 @@ journal_id_type!(InvocationIndexNodeId, "InvocationIndexNodeId");
 journal_id_type!(InvocationIndexId, "InvocationIndexId");
 journal_id_type!(InvocationHistoryNodeId, "InvocationHistoryNodeId");
 journal_id_type!(InvocationOutcomeId, "InvocationOutcomeId");
+journal_id_type!(TransitionProofEntryId, "TransitionProofEntryId");
+journal_id_type!(TransitionProofIndexId, "TransitionProofIndexId");
 journal_id_type!(CheckpointId, "CheckpointId");
 journal_id_type!(JournalHeadsId, "JournalHeadsId");
 
@@ -195,6 +201,10 @@ pub enum JournalStorageClass {
     /// Permanent insert-only acknowledged-history Patricia nodes. These use
     /// a distinct namespace from mutable live-owner tree generations.
     InvocationHistoryNode = 14,
+    /// One exact replay-position-bound public transition proof tuple.
+    TransitionProof = 15,
+    /// Bounded authenticated map from transition proof keys to proof tuples.
+    TransitionProofIndex = 16,
 }
 
 pub(super) mod sealed {
@@ -533,7 +543,14 @@ impl InvocationOwner {
 /// authenticated independently and resolves this fact by the original
 /// request commitment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InvocationHistoryFactPurpose {
+    Acknowledgement,
+    TransitionProofRetirement,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InvocationAcknowledgedFact {
+    purpose: InvocationHistoryFactPurpose,
     genesis: AgentJournalGenesisId,
     key: InvocationOwnershipKey,
     request_commitment: Hash,
@@ -544,6 +561,68 @@ pub struct InvocationAcknowledgedFact {
 }
 
 impl InvocationAcknowledgedFact {
+    pub(crate) const fn is_transition_proof_retirement(&self) -> bool {
+        matches!(
+            self.purpose,
+            InvocationHistoryFactPurpose::TransitionProofRetirement
+        )
+    }
+
+    /// Canonical leaf representation used by the separate transition-proof
+    /// retirement history. That history deliberately reuses the bounded,
+    /// crash-safe Patricia machinery, but never shares a root with invocation
+    /// acknowledgement history. The logical invocation is the tree key, so one
+    /// permanent leaf makes every execution of that invocation terminal. The
+    /// exact final execution is duplicated in both committed payload fields so
+    /// decoding the leaf back to the acknowledged proof key is unambiguous.
+    pub(crate) fn for_transition_proof_retirement(
+        genesis: AgentJournalGenesisId,
+        key: crate::agent_sdk::proof::TransitionProofKey,
+    ) -> Result<Self, DecodeError> {
+        if !key.validate() {
+            return Err(DecodeError::NonCanonical);
+        }
+        let invocation = InvocationId(*key.invocation.as_bytes());
+        let execution = *key.execution.as_bytes();
+        let fact = Self {
+            purpose: InvocationHistoryFactPurpose::TransitionProofRetirement,
+            genesis,
+            key: InvocationOwnershipKey {
+                scope: InvocationOwnershipScope::Ordered,
+                invocation,
+            },
+            request_commitment: Hash(execution),
+            first_input: ReplayInputId(execution),
+            lane: PersistedLane::Control,
+            node: None,
+            disposition: InvocationDisposition::Applied,
+        };
+        fact.validate_inner()?;
+        Ok(fact)
+    }
+
+    /// Recover an exact key only from the dedicated retirement-history leaf
+    /// shape. Ordinary acknowledgement facts cannot be mistaken for proof
+    /// retirement evidence by merely sharing an InvocationId.
+    pub(crate) fn transition_proof_retirement_key(
+        self,
+    ) -> Option<crate::agent_sdk::proof::TransitionProofKey> {
+        if self.purpose != InvocationHistoryFactPurpose::TransitionProofRetirement
+            || self.key.scope != InvocationOwnershipScope::Ordered
+            || self.lane != PersistedLane::Control
+            || self.node.is_some()
+            || self.disposition != InvocationDisposition::Applied
+            || self.request_commitment.0 != self.first_input.0
+        {
+            return None;
+        }
+        let key = crate::agent_sdk::proof::TransitionProofKey {
+            invocation: crate::agent_sdk::InvocationId(self.key.invocation.0),
+            execution: crate::agent_sdk::Hash(self.first_input.0),
+        };
+        key.validate().then_some(key)
+    }
+
     /// Derive the only canonical permanent fact from an authenticated live
     /// owner. Pending source invocations cannot be acknowledged; a Merge
     /// acknowledgement becomes archivable only after it owns an exact result.
@@ -567,6 +646,7 @@ impl InvocationAcknowledgedFact {
             }
         };
         let fact = Self {
+            purpose: InvocationHistoryFactPurpose::Acknowledgement,
             genesis,
             key,
             request_commitment: owner.request_commitment,
@@ -614,6 +694,18 @@ impl InvocationAcknowledgedFact {
 
     fn validate_inner(&self) -> Result<(), DecodeError> {
         self.key.validate()?;
+        if self.purpose == InvocationHistoryFactPurpose::TransitionProofRetirement {
+            return self
+                .transition_proof_retirement_key()
+                .filter(|key| key.validate())
+                .map(|_| ())
+                .ok_or(DecodeError::NonCanonical)
+                .and_then(|()| {
+                    (self.genesis != AgentJournalGenesisId::ZERO)
+                        .then_some(())
+                        .ok_or(DecodeError::NonCanonical)
+                });
+        }
         let owner_matches_scope = match (self.key.scope, self.lane, self.node) {
             (
                 InvocationOwnershipScope::Ordered,
@@ -640,10 +732,14 @@ impl InvocationAcknowledgedFact {
 }
 
 impl ServiceWire for InvocationAcknowledgedFact {
-    const MAGIC: [u8; 4] = *b"AGHF";
+    const MAGIC: [u8; 4] = *b"AHF3";
 
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
+        encoder.u8(match self.purpose {
+            InvocationHistoryFactPurpose::Acknowledgement => 0,
+            InvocationHistoryFactPurpose::TransitionProofRetirement => 1,
+        });
         encoder.fixed(&self.genesis.0);
         encode_invocation_scope(&mut encoder, self.key.scope);
         encoder.fixed(&self.key.invocation.0);
@@ -657,6 +753,11 @@ impl ServiceWire for InvocationAcknowledgedFact {
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         enforce_complete_bound(decoder, MAX_INVOCATION_HISTORY_FACT_BYTES)?;
         let fact = Self {
+            purpose: match decoder.u8()? {
+                0 => InvocationHistoryFactPurpose::Acknowledgement,
+                1 => InvocationHistoryFactPurpose::TransitionProofRetirement,
+                _ => return Err(DecodeError::InvalidTag),
+            },
             genesis: AgentJournalGenesisId(decoder.fixed()?),
             key: InvocationOwnershipKey {
                 scope: decode_invocation_scope(decoder)?,
@@ -1425,9 +1526,30 @@ pub enum ReplayOperation {
     /// typed authorization remain distinct values even when their initial
     /// caller identity was derived from the same authenticator.
     CleanInvoke {
+        context: crate::agent_sdk::RuntimeExecutionContext,
         work: crate::agent_sdk::InvocationWork,
         authorization: crate::agent_sdk::InvocationAuthorization,
         observed_slot: u64,
+    },
+    /// Resume the exact clean invocation retained in the named yielded FIFO
+    /// record. The original work and authorization are retained verbatim;
+    /// replay derives `ResumeWork` from guest state and never trusts a caller
+    /// supplied method, artifact list, or continuation body.
+    CleanResume {
+        context: crate::agent_sdk::RuntimeExecutionContext,
+        expected_live: Option<crate::agent_sdk::proof::TransitionProofKey>,
+        work: crate::agent_sdk::InvocationWork,
+        authorization: crate::agent_sdk::InvocationAuthorization,
+        yielded: crate::agent_sdk::YieldedInvocation,
+        observed_slot: u64,
+    },
+    /// Retire the exact clean terminal result. This is deliberately distinct
+    /// from the legacy signed-only acknowledgement variant.
+    CleanAcknowledge {
+        context: crate::agent_sdk::RuntimeExecutionContext,
+        expected_live: Option<crate::agent_sdk::proof::TransitionProofKey>,
+        work: crate::agent_sdk::InvocationWork,
+        authorization: crate::agent_sdk::InvocationAuthorization,
     },
     /// Retire the exact result produced by `invocation`. Keeping the complete
     /// invocation and receipt makes its owning result lane independently
@@ -1453,7 +1575,9 @@ impl ReplayOperation {
             Self::Invoke { invocation, .. } | Self::Acknowledge { invocation, .. } => {
                 PersistedLane::from_result_storage(invocation.mode.result_storage())
             }
-            Self::CleanInvoke { work, .. } => match work.mode.result_storage() {
+            Self::CleanInvoke { work, .. }
+            | Self::CleanResume { work, .. }
+            | Self::CleanAcknowledge { work, .. } => match work.mode.result_storage() {
                 crate::agent_sdk::InvocationResultStorage::Control => PersistedLane::Control,
                 crate::agent_sdk::InvocationResultStorage::Lane(
                     crate::agent_sdk::StateLane::Linear,
@@ -1512,15 +1636,66 @@ impl ReplayInput {
                 validate_invocation_receipt(&self.runtime, invocation, authority)?;
             }
             ReplayOperation::CleanInvoke {
+                context,
                 work,
                 authorization,
                 observed_slot,
-            } => validate_clean_invocation_authorization(
-                &self.runtime,
+            } => {
+                if !context.is_valid() {
+                    return Err(DecodeError::NonCanonical);
+                }
+                validate_clean_invocation_authorization(
+                    &self.runtime,
+                    work,
+                    authorization,
+                    *observed_slot,
+                )?;
+            }
+            ReplayOperation::CleanResume {
+                context,
+                expected_live,
                 work,
                 authorization,
-                *observed_slot,
-            )?,
+                yielded,
+                observed_slot,
+            } => {
+                if !context.is_valid() {
+                    return Err(DecodeError::NonCanonical);
+                }
+                validate_transition_proof_lifecycle_condition(*context, *expected_live, work)?;
+                validate_clean_invocation_authorization(
+                    &self.runtime,
+                    work,
+                    authorization,
+                    *observed_slot,
+                )?;
+                if !yielded.validate()
+                    || yielded.invocation != work.invocation
+                    || yielded.actor != work.actor
+                    || yielded.incarnation != work.incarnation
+                    || yielded.deployment != work.deployment
+                    || yielded.program != work.program
+                    || yielded.mode != work.mode
+                    || yielded.installation_data != work.installation_data
+                    || yielded.required
+                        != work
+                            .availability
+                            .iter()
+                            .map(|blob| blob.reference.clone())
+                            .collect::<Vec<_>>()
+                {
+                    return Err(DecodeError::NonCanonical);
+                }
+            }
+            ReplayOperation::CleanAcknowledge {
+                context,
+                expected_live,
+                work,
+                authorization,
+            } => {
+                validate_transition_proof_lifecycle_condition(*context, *expected_live, work)?;
+                validate_clean_exact_request(&self.runtime, work, authorization)?;
+            }
             ReplayOperation::Acknowledge {
                 invocation,
                 authority,
@@ -1532,7 +1707,7 @@ impl ReplayInput {
 }
 
 impl ServiceWire for ReplayInput {
-    const MAGIC: [u8; 4] = *b"AGJI";
+    const MAGIC: [u8; 4] = *b"AJI4";
 
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
@@ -1564,7 +1739,7 @@ impl CanonicalJournalRecord for ReplayInput {
     }
 
     fn id(&self) -> Self::Id {
-        ReplayInputId(content_id(b"vos/agent/journal/replay-input", self))
+        ReplayInputId(content_id(b"vos/agent/journal/replay-input/v3", self))
     }
 }
 
@@ -1609,6 +1784,8 @@ impl AgentJournalGenesis {
             ReplayOperation::CleanManage { .. }
             | ReplayOperation::Invoke { .. }
             | ReplayOperation::CleanInvoke { .. }
+            | ReplayOperation::CleanResume { .. }
+            | ReplayOperation::CleanAcknowledge { .. }
             | ReplayOperation::Acknowledge { .. }
             | ReplayOperation::SealMerge => return Err(DecodeError::NonCanonical),
         };
@@ -1636,6 +1813,8 @@ impl AgentJournalGenesis {
             ReplayOperation::CleanManage { .. }
             | ReplayOperation::Invoke { .. }
             | ReplayOperation::CleanInvoke { .. }
+            | ReplayOperation::CleanResume { .. }
+            | ReplayOperation::CleanAcknowledge { .. }
             | ReplayOperation::Acknowledge { .. }
             | ReplayOperation::SealMerge => return Err(DecodeError::NonCanonical),
         };
@@ -1688,6 +1867,8 @@ impl AgentJournalGenesis {
             ReplayOperation::CleanManage { .. }
             | ReplayOperation::Invoke { .. }
             | ReplayOperation::CleanInvoke { .. }
+            | ReplayOperation::CleanResume { .. }
+            | ReplayOperation::CleanAcknowledge { .. }
             | ReplayOperation::Acknowledge { .. }
             | ReplayOperation::SealMerge => return Err(DecodeError::NonCanonical),
         }
@@ -2433,6 +2614,8 @@ pub struct CheckpointManifest {
     /// Checkpoint-authenticated ownership roots for shared ordering domains.
     pub ordered_invocations: InvocationIndexId,
     pub merge_invocations: InvocationIndexId,
+    /// Exact authenticated live transition-proof map at this checkpoint.
+    pub transition_proofs: TransitionProofIndexId,
     /// Control, Linear, Merge, then zero or more node-sorted Local states.
     pub lanes: Vec<CheckpointLane>,
     pub artifacts: ArtifactClosureId,
@@ -2455,6 +2638,7 @@ impl CheckpointManifest {
             || self.merge_seal == Some(MergeSealId::ZERO)
             || self.ordered_invocations == InvocationIndexId::ZERO
             || self.merge_invocations == InvocationIndexId::ZERO
+            || self.transition_proofs == TransitionProofIndexId::ZERO
             || ((self.merge_fence == OrderedBase::post_genesis()) != self.merge_seal.is_none())
             || self.merge_fence.index > self.ordered_index
             || (self.merge_fence.index == self.ordered_index
@@ -2482,7 +2666,7 @@ impl CheckpointManifest {
 }
 
 impl ServiceWire for CheckpointManifest {
-    const MAGIC: [u8; 4] = *b"AJC2";
+    const MAGIC: [u8; 4] = *b"AJC3";
 
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
@@ -2497,6 +2681,7 @@ impl ServiceWire for CheckpointManifest {
         encoder.option(&self.merge_seal, |encoder, seal| encoder.fixed(&seal.0));
         encoder.fixed(&self.ordered_invocations.0);
         encoder.fixed(&self.merge_invocations.0);
+        encoder.fixed(&self.transition_proofs.0);
         encoder.list(&self.lanes, |encoder, lane| {
             encoder.u8(lane.lane as u8);
             encoder.option(&lane.node, |encoder, node| encoder.fixed(&node.0));
@@ -2519,6 +2704,7 @@ impl ServiceWire for CheckpointManifest {
         let merge_seal = decoder.option(|decoder| Ok(MergeSealId(decoder.fixed()?)))?;
         let ordered_invocations = InvocationIndexId(decoder.fixed()?);
         let merge_invocations = InvocationIndexId(decoder.fixed()?);
+        let transition_proofs = TransitionProofIndexId(decoder.fixed()?);
         let count = decoder.u32()? as usize;
         if count > MAX_CHECKPOINT_LOCAL_LANES + 3 {
             return Err(DecodeError::LimitExceeded);
@@ -2547,6 +2733,7 @@ impl ServiceWire for CheckpointManifest {
             merge_seal,
             ordered_invocations,
             merge_invocations,
+            transition_proofs,
             lanes,
             artifacts: ArtifactClosureId(decoder.fixed()?),
         };
@@ -2568,7 +2755,7 @@ impl CanonicalJournalRecord for CheckpointManifest {
     }
 
     fn id(&self) -> Self::Id {
-        CheckpointId(content_id(b"vos/agent/journal/checkpoint/v2", self))
+        CheckpointId(content_id(b"vos/agent/journal/checkpoint/v3", self))
     }
 }
 
@@ -2600,6 +2787,9 @@ pub struct JournalHeads {
     pub merge_invocations: InvocationIndexId,
     /// Current physical node's Local ownership index.
     pub local_invocations: InvocationIndexId,
+    /// Authenticated live transition-proof map. Ordinary journal and
+    /// checkpoint publications preserve this root exactly.
+    pub transition_proofs: TransitionProofIndexId,
     pub local_head: Option<LocalEntryId>,
     pub local_revision: u64,
     pub checkpoint: Option<CheckpointId>,
@@ -2620,6 +2810,7 @@ impl JournalHeads {
             InvocationIndexManifest::empty(genesis, InvocationOwnershipScope::Merge).id();
         let local_invocations =
             InvocationIndexManifest::empty(genesis, InvocationOwnershipScope::Local(node)).id();
+        let transition_proofs = TransitionProofIndexManifest::empty(genesis).id();
         Self {
             genesis,
             admission,
@@ -2635,6 +2826,7 @@ impl JournalHeads {
             ordered_invocations,
             merge_invocations,
             local_invocations,
+            transition_proofs,
             local_head: None,
             local_revision: 0,
             checkpoint: None,
@@ -2656,6 +2848,7 @@ impl JournalHeads {
             || self.ordered_invocations == InvocationIndexId::ZERO
             || self.merge_invocations == InvocationIndexId::ZERO
             || self.local_invocations == InvocationIndexId::ZERO
+            || self.transition_proofs == TransitionProofIndexId::ZERO
             || ((self.merge_fence == OrderedBase::post_genesis()) != self.merge_seal.is_none())
             || self.merge_fence.index > self.ordered_index
             || (self.merge_fence.index == self.ordered_index
@@ -2689,7 +2882,8 @@ impl JournalHeads {
                         self.genesis,
                         InvocationOwnershipScope::Local(self.node),
                     )
-                    .id())
+                    .id()
+                || self.transition_proofs != TransitionProofIndexManifest::empty(self.genesis).id())
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -2720,7 +2914,7 @@ impl JournalHeads {
 }
 
 impl ServiceWire for JournalHeads {
-    const MAGIC: [u8; 4] = *b"AJH2";
+    const MAGIC: [u8; 4] = *b"AJH3";
 
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
@@ -2740,6 +2934,7 @@ impl ServiceWire for JournalHeads {
         encoder.fixed(&self.ordered_invocations.0);
         encoder.fixed(&self.merge_invocations.0);
         encoder.fixed(&self.local_invocations.0);
+        encoder.fixed(&self.transition_proofs.0);
         encoder.option(&self.local_head, |encoder, head| encoder.fixed(&head.0));
         encoder.u64(self.local_revision);
         encoder.option(&self.checkpoint, |encoder, checkpoint| {
@@ -2764,6 +2959,7 @@ impl ServiceWire for JournalHeads {
             ordered_invocations: InvocationIndexId(decoder.fixed()?),
             merge_invocations: InvocationIndexId(decoder.fixed()?),
             local_invocations: InvocationIndexId(decoder.fixed()?),
+            transition_proofs: TransitionProofIndexId(decoder.fixed()?),
             local_head: decoder.option(|decoder| Ok(LocalEntryId(decoder.fixed()?)))?,
             local_revision: decoder.u64()?,
             checkpoint: decoder.option(|decoder| Ok(CheckpointId(decoder.fixed()?)))?,
@@ -2786,7 +2982,7 @@ impl CanonicalJournalRecord for JournalHeads {
     }
 
     fn id(&self) -> Self::Id {
-        JournalHeadsId(content_id(b"vos/agent/journal/heads/v2", self))
+        JournalHeadsId(content_id(b"vos/agent/journal/heads/v3", self))
     }
 }
 
@@ -2830,6 +3026,30 @@ fn decode_runtime_binding(decoder: &mut Decoder<'_>) -> Result<RuntimeBinding, D
     Ok(binding)
 }
 
+fn encode_transition_proof_lifecycle_key(
+    encoder: &mut Encoder<'_>,
+    key: &Option<crate::agent_sdk::proof::TransitionProofKey>,
+) {
+    encoder.option(key, |encoder, key| {
+        encoder.fixed(key.invocation.as_bytes());
+        encoder.fixed(key.execution.as_bytes());
+    });
+}
+
+fn decode_transition_proof_lifecycle_key(
+    decoder: &mut Decoder<'_>,
+) -> Result<Option<crate::agent_sdk::proof::TransitionProofKey>, DecodeError> {
+    decoder.option(|decoder| {
+        let key = crate::agent_sdk::proof::TransitionProofKey {
+            invocation: crate::agent_sdk::InvocationId(decoder.fixed()?),
+            execution: crate::agent_sdk::Hash(decoder.fixed()?),
+        };
+        key.validate()
+            .then_some(key)
+            .ok_or(DecodeError::NonCanonical)
+    })
+}
+
 fn encode_replay_operation(encoder: &mut Encoder<'_>, operation: &ReplayOperation) {
     match operation {
         ReplayOperation::Management { request } => {
@@ -2868,13 +3088,14 @@ fn encode_replay_operation(encoder: &mut Encoder<'_>, operation: &ReplayOperatio
             encoder.u64(*observed_slot);
         }
         ReplayOperation::CleanInvoke {
+            context,
             work,
             authorization,
             observed_slot,
         } => {
             encoder.u8(4);
             let canonical = crate::agent_sdk::RuntimeWork::Invoke {
-                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                context: *context,
                 state: crate::agent_sdk::RuntimeState::default(),
                 invocation: alloc::boxed::Box::new(work.clone()),
                 authorization: alloc::boxed::Box::new(authorization.clone()),
@@ -2883,6 +3104,52 @@ fn encode_replay_operation(encoder: &mut Encoder<'_>, operation: &ReplayOperatio
             .encode()
             .expect("validated CleanInvoke must have a canonical SDK encoding");
             encoder.bytes(&canonical);
+        }
+        ReplayOperation::CleanResume {
+            context,
+            expected_live,
+            work,
+            authorization,
+            yielded,
+            observed_slot,
+        } => {
+            encoder.u8(6);
+            let canonical = crate::agent_sdk::RuntimeWork::Invoke {
+                context: *context,
+                state: crate::agent_sdk::RuntimeState::default(),
+                invocation: alloc::boxed::Box::new(work.clone()),
+                authorization: alloc::boxed::Box::new(authorization.clone()),
+                observed_slot: *observed_slot,
+            }
+            .encode()
+            .expect("validated CleanResume must have a canonical exact-work encoding");
+            encoder.bytes(&canonical);
+            let yielded = crate::agent_sdk::RuntimeTransition {
+                state: crate::agent_sdk::RuntimeState::default(),
+                outcome: crate::agent_sdk::RuntimeOutcome::Yielded(yielded.clone()),
+            }
+            .encode()
+            .expect("validated CleanResume must have a canonical yielded selector");
+            encoder.bytes(&yielded);
+            encode_transition_proof_lifecycle_key(encoder, expected_live);
+        }
+        ReplayOperation::CleanAcknowledge {
+            context,
+            expected_live,
+            work,
+            authorization,
+        } => {
+            encoder.u8(7);
+            let canonical = crate::agent_sdk::RuntimeWork::Acknowledge {
+                context: *context,
+                state: crate::agent_sdk::RuntimeState::default(),
+                invocation: alloc::boxed::Box::new(work.clone()),
+                authorization: alloc::boxed::Box::new(authorization.clone()),
+            }
+            .encode()
+            .expect("validated CleanAcknowledge must have a canonical SDK encoding");
+            encoder.bytes(&canonical);
+            encode_transition_proof_lifecycle_key(encoder, expected_live);
         }
         ReplayOperation::Acknowledge {
             invocation,
@@ -2925,11 +3192,13 @@ fn decode_replay_operation(decoder: &mut Decoder<'_>) -> Result<ReplayOperation,
         }),
         3 => Ok(ReplayOperation::SealMerge),
         4 => {
-            let canonical = crate::agent_sdk::RuntimeWork::decode(bounded_bytes_ref(
-                decoder,
-                crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES,
-            )?)
-            .map_err(|_| DecodeError::NonCanonical)?;
+            let encoded =
+                bounded_bytes_ref(decoder, crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES)?;
+            let canonical = crate::agent_sdk::RuntimeWork::decode(encoded)
+                .map_err(|_| DecodeError::NonCanonical)?;
+            if canonical.encode().map_err(|_| DecodeError::NonCanonical)? != encoded {
+                return Err(DecodeError::NonCanonical);
+            }
             let crate::agent_sdk::RuntimeWork::Invoke {
                 context,
                 state,
@@ -2940,10 +3209,11 @@ fn decode_replay_operation(decoder: &mut Decoder<'_>) -> Result<ReplayOperation,
             else {
                 return Err(DecodeError::NonCanonical);
             };
-            if !context.is_direct() || !state.is_empty() {
+            if !context.is_valid() || !state.is_empty() {
                 return Err(DecodeError::NonCanonical);
             }
             Ok(ReplayOperation::CleanInvoke {
+                context,
                 work: *invocation,
                 authorization: *authorization,
                 observed_slot,
@@ -2985,7 +3255,113 @@ fn decode_replay_operation(decoder: &mut Decoder<'_>) -> Result<ReplayOperation,
                 observed_slot,
             })
         }
+        6 => {
+            let encoded =
+                bounded_bytes_ref(decoder, crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES)?;
+            let canonical = crate::agent_sdk::RuntimeWork::decode(encoded)
+                .map_err(|_| DecodeError::NonCanonical)?;
+            if canonical.encode().map_err(|_| DecodeError::NonCanonical)? != encoded {
+                return Err(DecodeError::NonCanonical);
+            }
+            let crate::agent_sdk::RuntimeWork::Invoke {
+                context,
+                state,
+                invocation,
+                authorization,
+                observed_slot,
+            } = canonical
+            else {
+                return Err(DecodeError::NonCanonical);
+            };
+            if !context.is_valid() || !state.is_empty() {
+                return Err(DecodeError::NonCanonical);
+            }
+            let yielded_encoded = bounded_bytes_ref(decoder, MAX_CLEAN_YIELDED_WIRE_BYTES)?;
+            let yielded_transition = crate::agent_sdk::RuntimeTransition::decode(yielded_encoded)
+                .map_err(|_| DecodeError::NonCanonical)?;
+            if yielded_transition
+                .encode()
+                .map_err(|_| DecodeError::NonCanonical)?
+                != yielded_encoded
+                || !yielded_transition.state.is_empty()
+            {
+                return Err(DecodeError::NonCanonical);
+            }
+            let crate::agent_sdk::RuntimeOutcome::Yielded(yielded) = yielded_transition.outcome
+            else {
+                return Err(DecodeError::NonCanonical);
+            };
+            let expected_live = decode_transition_proof_lifecycle_key(decoder)?;
+            Ok(ReplayOperation::CleanResume {
+                context,
+                expected_live,
+                work: *invocation,
+                authorization: *authorization,
+                yielded,
+                observed_slot,
+            })
+        }
+        7 => {
+            let encoded =
+                bounded_bytes_ref(decoder, crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES)?;
+            let canonical = crate::agent_sdk::RuntimeWork::decode(encoded)
+                .map_err(|_| DecodeError::NonCanonical)?;
+            if canonical.encode().map_err(|_| DecodeError::NonCanonical)? != encoded {
+                return Err(DecodeError::NonCanonical);
+            }
+            let crate::agent_sdk::RuntimeWork::Acknowledge {
+                context,
+                state,
+                invocation,
+                authorization,
+            } = canonical
+            else {
+                return Err(DecodeError::NonCanonical);
+            };
+            if !context.is_valid() || !state.is_empty() {
+                return Err(DecodeError::NonCanonical);
+            }
+            let expected_live = decode_transition_proof_lifecycle_key(decoder)?;
+            Ok(ReplayOperation::CleanAcknowledge {
+                context,
+                expected_live,
+                work: *invocation,
+                authorization: *authorization,
+            })
+        }
         _ => Err(DecodeError::InvalidTag),
+    }
+}
+
+fn validate_clean_exact_request(
+    runtime: &RuntimeBinding,
+    work: &crate::agent_sdk::InvocationWork,
+    authorization: &crate::agent_sdk::InvocationAuthorization,
+) -> Result<(), DecodeError> {
+    if !work.validate()
+        || !authorization.matches_work(work)
+        || work.space.0 != runtime.space.0
+        || work.agent.0 != runtime.agent.0
+        || work.runtime_deployment.0 != runtime.deployment.0
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(())
+}
+
+fn validate_transition_proof_lifecycle_condition(
+    context: crate::agent_sdk::RuntimeExecutionContext,
+    expected_live: Option<crate::agent_sdk::proof::TransitionProofKey>,
+    work: &crate::agent_sdk::InvocationWork,
+) -> Result<(), DecodeError> {
+    match (context, expected_live) {
+        (crate::agent_sdk::RuntimeExecutionContext::Direct, None) => Ok(()),
+        (crate::agent_sdk::RuntimeExecutionContext::Attested { .. }, Some(expected))
+            if expected.validate() && expected.invocation == work.invocation =>
+        {
+            Ok(())
+        }
+        _ => Err(DecodeError::NonCanonical),
     }
 }
 
@@ -3740,6 +4116,7 @@ mod tests {
                 runtime_deployment: DeploymentId([4; 32]),
                 runtime_program: ProgramId([5; 32]),
                 runtime_producer: ProducerId([6; 32]),
+                transition_producer: ProducerId([16; 32]),
             },
             creation_nonce,
             authority: authority_binding(),
@@ -3919,6 +4296,7 @@ mod tests {
         ReplayInput {
             runtime,
             operation: ReplayOperation::CleanInvoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                 work,
                 authorization: crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
                     authority,
@@ -3934,6 +4312,7 @@ mod tests {
             work,
             authorization,
             observed_slot,
+            ..
         } = &mut input.operation
         else {
             unreachable!()
@@ -4039,6 +4418,10 @@ mod tests {
         scope: InvocationOwnershipScope,
     ) -> InvocationIndexId {
         InvocationIndexManifest::empty(genesis, scope).id()
+    }
+
+    fn empty_transition_proof_index(genesis: AgentJournalGenesisId) -> TransitionProofIndexId {
+        TransitionProofIndexManifest::empty(genesis).id()
     }
 
     fn ownership_leaf(
@@ -4722,6 +5105,56 @@ mod tests {
     }
 
     #[test]
+    fn transition_proof_retirement_facts_bind_the_exact_key_and_wire_purpose() {
+        let genesis = AgentJournalGenesis {
+            admission: genesis_admission(),
+            create: create_input(),
+        }
+        .id();
+        let invocation = crate::agent_sdk::InvocationId([0xd1; 32]);
+        let first_key = crate::agent_sdk::proof::TransitionProofKey {
+            invocation,
+            execution: crate::agent_sdk::Hash([0xd2; 32]),
+        };
+        let second_key = crate::agent_sdk::proof::TransitionProofKey {
+            invocation,
+            execution: crate::agent_sdk::Hash([0xd3; 32]),
+        };
+        let first = InvocationAcknowledgedFact::for_transition_proof_retirement(genesis, first_key)
+            .unwrap();
+        let second =
+            InvocationAcknowledgedFact::for_transition_proof_retirement(genesis, second_key)
+                .unwrap();
+
+        assert_eq!(first.transition_proof_retirement_key(), Some(first_key));
+        assert_eq!(second.transition_proof_retirement_key(), Some(second_key));
+        assert_eq!(first.key(), second.key());
+        assert_eq!(first.key().invocation.0, invocation.0);
+        assert_eq!(first.request_commitment().0, first_key.execution.0);
+        assert_eq!(first.first_input().0, first_key.execution.0);
+        assert_ne!(first.encode(), second.encode());
+        roundtrip(&first);
+        roundtrip(&second);
+
+        // Neither the pre-purpose fact nor the prior work-key generation is
+        // upgraded implicitly.
+        for magic in [b"AGHF", b"AHF2"] {
+            let mut predecessor_wire = first.encode();
+            predecessor_wire[..4].copy_from_slice(magic);
+            assert!(InvocationAcknowledgedFact::decode(&predecessor_wire).is_err());
+        }
+
+        // A purpose-tag substitution can only produce an ordinary fact. It
+        // cannot be queried as retirement evidence or admitted to the
+        // transition-proof history root.
+        let mut cross_purpose = first.encode();
+        cross_purpose[4 + 32] = 0;
+        let cross_purpose = InvocationAcknowledgedFact::decode(&cross_purpose).unwrap();
+        assert_eq!(cross_purpose.transition_proof_retirement_key(), None);
+        assert_ne!(cross_purpose.encode(), first.encode());
+    }
+
+    #[test]
     fn empty_invocation_indexes_are_explicit_and_scope_separated() {
         let genesis = AgentJournalGenesis {
             admission: genesis_admission(),
@@ -4862,6 +5295,7 @@ mod tests {
 
         let input = clean_replay_input(crate::agent_sdk::MethodMode::Merge);
         let ReplayOperation::CleanInvoke {
+            context,
             work,
             authorization,
             observed_slot,
@@ -4870,7 +5304,7 @@ mod tests {
             unreachable!()
         };
         let hidden_state = crate::agent_sdk::RuntimeWork::Invoke {
-            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            context,
             state: crate::agent_sdk::RuntimeState {
                 control: vec![1],
                 ..crate::agent_sdk::RuntimeState::default()
@@ -4906,6 +5340,181 @@ mod tests {
         };
         *observed_slot -= 1;
         assert_eq!(regressed.validate(), Err(DecodeError::NonCanonical));
+    }
+
+    #[test]
+    fn clean_resume_and_acknowledgement_replay_inputs_are_exact_bounded_and_state_free() {
+        let invoked = public_clean_replay_input(crate::agent_sdk::MethodMode::Linear);
+        let ReplayOperation::CleanInvoke {
+            context,
+            work,
+            authorization,
+            observed_slot,
+        } = &invoked.operation
+        else {
+            unreachable!()
+        };
+        let yielded = crate::agent_sdk::YieldedInvocation {
+            invocation: work.invocation,
+            actor: work.actor,
+            incarnation: work.incarnation,
+            deployment: work.deployment,
+            program: work.program,
+            mode: work.mode,
+            continuation: crate::agent_sdk::BlobRef::of_bytes(b"durable-clean-continuation"),
+            ready_sequence: 3,
+            installation_data: work.installation_data.clone(),
+            required: work
+                .availability
+                .iter()
+                .map(|blob| blob.reference.clone())
+                .collect(),
+            reason: crate::agent_sdk::YieldReason::Cooperative,
+        };
+        let resume = ReplayInput {
+            runtime: invoked.runtime.clone(),
+            operation: ReplayOperation::CleanResume {
+                context: *context,
+                expected_live: None,
+                work: work.clone(),
+                authorization: authorization.clone(),
+                yielded: yielded.clone(),
+                observed_slot: observed_slot + 1,
+            },
+        };
+        resume.validate().unwrap();
+        assert_eq!(resume.persisted_lane(), PersistedLane::Linear);
+        assert!(resume.encode().len() <= MAX_REPLAY_INPUT_BYTES);
+        roundtrip(&resume);
+
+        let acknowledgement = ReplayInput {
+            runtime: invoked.runtime.clone(),
+            operation: ReplayOperation::CleanAcknowledge {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                expected_live: None,
+                work: work.clone(),
+                authorization: authorization.clone(),
+            },
+        };
+        acknowledgement.validate().unwrap();
+        assert_eq!(acknowledgement.persisted_lane(), PersistedLane::Linear);
+        assert!(acknowledgement.encode().len() <= MAX_REPLAY_INPUT_BYTES);
+        roundtrip(&acknowledgement);
+
+        let expected_live = crate::agent_sdk::proof::TransitionProofKey {
+            invocation: work.invocation,
+            execution: crate::agent_sdk::Hash([0xa1; 32]),
+        };
+        let mut attested_resume = resume.clone();
+        let ReplayOperation::CleanResume {
+            context,
+            expected_live: retained,
+            ..
+        } = &mut attested_resume.operation
+        else {
+            unreachable!()
+        };
+        *context = crate::agent_sdk::RuntimeExecutionContext::Attested {
+            proof_system: crate::agent_sdk::Hash([0xa2; 32]),
+        };
+        *retained = Some(expected_live);
+        attested_resume.validate().unwrap();
+        roundtrip(&attested_resume);
+
+        let mut attested_acknowledgement = acknowledgement.clone();
+        let ReplayOperation::CleanAcknowledge {
+            context,
+            expected_live: retained,
+            ..
+        } = &mut attested_acknowledgement.operation
+        else {
+            unreachable!()
+        };
+        *context = crate::agent_sdk::RuntimeExecutionContext::Attested {
+            proof_system: crate::agent_sdk::Hash([0xa2; 32]),
+        };
+        *retained = Some(expected_live);
+        attested_acknowledgement.validate().unwrap();
+        roundtrip(&attested_acknowledgement);
+
+        let substituted_live = crate::agent_sdk::proof::TransitionProofKey {
+            invocation: work.invocation,
+            execution: crate::agent_sdk::Hash([0xa3; 32]),
+        };
+        let ReplayOperation::CleanResume { expected_live, .. } = &mut attested_resume.operation
+        else {
+            unreachable!()
+        };
+        *expected_live = Some(substituted_live);
+        assert_ne!(attested_resume.id(), resume.id());
+        // The substituted key remains a structurally valid *different*
+        // request; storage must compare it to the staged proof capability.
+        attested_resume.validate().unwrap();
+
+        for magic in [b"AJI2", b"AJI3"] {
+            let mut predecessor_wire = resume.encode();
+            predecessor_wire[..4].copy_from_slice(magic);
+            assert!(ReplayInput::decode(&predecessor_wire).is_err());
+        }
+
+        let mut substituted = resume.clone();
+        let ReplayOperation::CleanResume {
+            yielded: substituted_yielded,
+            ..
+        } = &mut substituted.operation
+        else {
+            unreachable!()
+        };
+        substituted_yielded.actor = crate::agent_sdk::ActorId([0xd1; 32]);
+        assert_eq!(substituted.validate(), Err(DecodeError::NonCanonical));
+
+        let hidden_invoke = crate::agent_sdk::RuntimeWork::Invoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            state: crate::agent_sdk::RuntimeState {
+                linear: vec![1],
+                ..crate::agent_sdk::RuntimeState::default()
+            },
+            invocation: Box::new(work.clone()),
+            authorization: Box::new(authorization.clone()),
+            observed_slot: observed_slot + 1,
+        }
+        .encode()
+        .unwrap();
+        let yielded_bytes = crate::agent_sdk::RuntimeTransition {
+            state: crate::agent_sdk::RuntimeState::default(),
+            outcome: crate::agent_sdk::RuntimeOutcome::Yielded(yielded.clone()),
+        }
+        .encode()
+        .unwrap();
+        let mut hidden_resume = Vec::new();
+        let mut encoder = Encoder(&mut hidden_resume);
+        encoder.u8(6);
+        encoder.bytes(&hidden_invoke);
+        encoder.bytes(&yielded_bytes);
+        assert_eq!(
+            decode_replay_operation(&mut Decoder::new(&hidden_resume)),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let hidden_acknowledgement = crate::agent_sdk::RuntimeWork::Acknowledge {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            state: crate::agent_sdk::RuntimeState {
+                control: vec![1],
+                ..crate::agent_sdk::RuntimeState::default()
+            },
+            invocation: Box::new(work.clone()),
+            authorization: Box::new(authorization.clone()),
+        }
+        .encode()
+        .unwrap();
+        let mut hidden_ack = Vec::new();
+        let mut encoder = Encoder(&mut hidden_ack);
+        encoder.u8(7);
+        encoder.bytes(&hidden_acknowledgement);
+        assert_eq!(
+            decode_replay_operation(&mut Decoder::new(&hidden_ack)),
+            Err(DecodeError::NonCanonical)
+        );
     }
 
     #[test]
@@ -5473,6 +6082,7 @@ mod tests {
             merge_seal: None,
             ordered_invocations: empty_index(genesis, InvocationOwnershipScope::Ordered),
             merge_invocations: empty_index(genesis, InvocationOwnershipScope::Merge),
+            transition_proofs: empty_transition_proof_index(genesis),
             lanes: vec![CheckpointLane {
                 lane: PersistedLane::Control,
                 node: None,
@@ -5486,25 +6096,27 @@ mod tests {
         assert_eq!(
             *checkpoint.id().as_bytes(),
             [
-                117, 97, 34, 156, 77, 36, 185, 221, 58, 50, 138, 89, 196, 4, 232, 134, 162, 247,
-                79, 30, 243, 77, 195, 80, 43, 194, 27, 183, 191, 190, 199, 26,
+                50, 219, 202, 44, 21, 122, 5, 138, 152, 104, 111, 28, 74, 58, 191, 196, 223, 125,
+                27, 78, 153, 184, 239, 201, 89, 169, 148, 14, 246, 164, 43, 2,
             ]
         );
         let legacy_id = content_id(b"vos/agent/journal/checkpoint", &checkpoint);
         assert_eq!(
             legacy_id,
             [
-                134, 118, 245, 80, 152, 193, 127, 41, 187, 120, 207, 122, 147, 229, 74, 38, 201,
-                111, 215, 181, 185, 202, 17, 248, 43, 152, 52, 73, 66, 122, 33, 186,
+                61, 33, 28, 40, 186, 2, 239, 81, 52, 176, 197, 27, 145, 7, 123, 95, 78, 208, 197,
+                227, 93, 97, 221, 207, 246, 71, 153, 137, 99, 229, 6, 154,
             ]
         );
         assert_ne!(*checkpoint.id().as_bytes(), legacy_id);
-        let mut legacy_wire = checkpoint.encode();
-        legacy_wire[..4].copy_from_slice(b"AGJC");
-        assert_eq!(
-            CheckpointManifest::decode(&legacy_wire),
-            Err(DecodeError::InvalidTag)
-        );
+        for predecessor_magic in [b"AJC2", b"AGJC"] {
+            let mut predecessor_wire = checkpoint.encode();
+            predecessor_wire[..4].copy_from_slice(predecessor_magic);
+            assert_eq!(
+                CheckpointManifest::decode(&predecessor_wire),
+                Err(DecodeError::InvalidTag)
+            );
+        }
     }
 
     #[test]
@@ -5569,6 +6181,7 @@ mod tests {
             merge_seal: None,
             ordered_invocations: empty_index(genesis, InvocationOwnershipScope::Ordered),
             merge_invocations: empty_index(genesis, InvocationOwnershipScope::Merge),
+            transition_proofs: empty_transition_proof_index(genesis),
             lanes: vec![CheckpointLane {
                 lane: PersistedLane::Control,
                 node: None,
@@ -5600,6 +6213,7 @@ mod tests {
             merge_seal: None,
             ordered_invocations: empty_index(genesis, InvocationOwnershipScope::Ordered),
             merge_invocations: empty_index(genesis, InvocationOwnershipScope::Merge),
+            transition_proofs: empty_transition_proof_index(genesis),
             lanes: vec![CheckpointLane {
                 lane: PersistedLane::Control,
                 node: None,
@@ -5672,25 +6286,27 @@ mod tests {
         assert_eq!(
             *initial.id().as_bytes(),
             [
-                251, 119, 149, 246, 179, 246, 31, 70, 99, 204, 248, 22, 183, 46, 95, 204, 76, 43,
-                105, 77, 159, 43, 43, 253, 160, 211, 207, 109, 22, 142, 42, 190,
+                55, 139, 211, 250, 70, 100, 5, 70, 234, 126, 191, 241, 199, 225, 192, 71, 111, 44,
+                247, 122, 41, 236, 100, 54, 125, 65, 123, 24, 76, 78, 193, 187,
             ]
         );
         let legacy_id = content_id(b"vos/agent/journal/heads", &initial);
         assert_eq!(
             legacy_id,
             [
-                61, 164, 53, 12, 63, 161, 3, 52, 204, 173, 60, 64, 45, 87, 35, 101, 231, 101, 20,
-                89, 5, 217, 214, 203, 154, 218, 212, 93, 99, 30, 217, 249,
+                16, 164, 170, 25, 55, 150, 91, 23, 39, 69, 163, 124, 120, 80, 129, 133, 249, 241,
+                169, 49, 50, 253, 70, 251, 11, 88, 99, 203, 41, 5, 29, 109,
             ]
         );
         assert_ne!(*initial.id().as_bytes(), legacy_id);
-        let mut legacy_wire = initial.encode();
-        legacy_wire[..4].copy_from_slice(b"AGJH");
-        assert_eq!(
-            JournalHeads::decode(&legacy_wire),
-            Err(DecodeError::InvalidTag)
-        );
+        for predecessor_magic in [b"AJH2", b"AGJH"] {
+            let mut predecessor_wire = initial.encode();
+            predecessor_wire[..4].copy_from_slice(predecessor_magic);
+            assert_eq!(
+                JournalHeads::decode(&predecessor_wire),
+                Err(DecodeError::InvalidTag)
+            );
+        }
         assert_eq!(initial.runtime, runtime_binding());
         assert_eq!(
             initial.ordered_invocations,
@@ -5704,6 +6320,35 @@ mod tests {
             initial.local_invocations,
             empty_index(genesis, InvocationOwnershipScope::Local(NodeId([7; 32])))
         );
+        assert_eq!(
+            initial.transition_proofs,
+            empty_transition_proof_index(genesis)
+        );
+
+        let mut zero_proof_root = initial.clone();
+        zero_proof_root.transition_proofs = TransitionProofIndexId::ZERO;
+        assert_eq!(zero_proof_root.validate(), Err(DecodeError::NonCanonical));
+        let nonempty_proof_root =
+            super::super::transition_proof_journal::TransitionProofIndexManifest::empty(genesis)
+                .publish(
+                    super::super::transition_proof_journal::TransitionProofIndexEntry {
+                        key: crate::agent_sdk::proof::TransitionProofKey {
+                            invocation: crate::agent_sdk::InvocationId([0xeb; 32]),
+                            execution: crate::agent_sdk::Hash([0xec; 32]),
+                        },
+                        record: TransitionProofEntryId([0xed; 32]),
+                        proof_material_bytes: 1,
+                    },
+                    None,
+                )
+                .unwrap()
+                .id();
+        let mut nonempty_initial_root = initial.clone();
+        nonempty_initial_root.transition_proofs = nonempty_proof_root;
+        assert_eq!(
+            nonempty_initial_root.validate(),
+            Err(DecodeError::NonCanonical)
+        );
 
         let next = JournalHeads {
             publication_revision: 1,
@@ -5714,6 +6359,18 @@ mod tests {
         };
         initial.validate_successor(&next).unwrap();
         roundtrip(&next);
+
+        // Generic envelope validation permits the dedicated proof publisher to
+        // advance only this authenticated root. Ordinary publication
+        // validators enforce preservation for their own record classes.
+        let proof_successor = JournalHeads {
+            publication_revision: 1,
+            previous: Some(initial.id()),
+            transition_proofs: nonempty_proof_root,
+            ..initial.clone()
+        };
+        initial.validate_successor(&proof_successor).unwrap();
+        roundtrip(&proof_successor);
 
         let mut wrong = next;
         wrong.previous = Some(JournalHeadsId([0xff; 32]));
