@@ -74,7 +74,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let mut node =
         VosNode::with_prefix(local_prefix).with_program_blobs_dir(blob_store::cache_dir());
     configure_ingress_attester(&mut node, &daemon_keypair)?;
-    let operator_keypair = configure_operator(&mut node);
+    let operator_keypair = configure_operator(&mut node)?;
 
     let registry_config = AgentConfig::new(registry_pvm.clone())
         .with_name(vos::node::REGISTRY_AGENT_NAME)
@@ -87,6 +87,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     require_boot_registry_handshake(vos::block_on(registry.protocol(&mut &node)))?;
     anchor_space_id(&node, &registry, space_id)?;
     reject_legacy_registry_rows(&node, &registry)?;
+    require_space_root(&node, &registry, &operator_keypair)?;
 
     if !entry.hyperspace.is_empty() {
         let replication_id = derive_hyperspace_id(&entry.hyperspace);
@@ -99,13 +100,21 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     }
 
     node.attach_network(network);
+    #[cfg(target_os = "linux")]
+    super::clean_startup::start_clean_system_agent(
+        &mut node,
+        &data_dir,
+        space_id,
+        &operator_keypair,
+        &daemon_keypair,
+    )?;
     let extension_caps = register_extensions_from_local(
         &mut node,
         &local,
         &data_dir,
         local_prefix,
         &space_id,
-        operator_keypair.as_ref(),
+        Some(&operator_keypair),
     )?;
     register_http_ingress_from_local(&mut node, &local)?;
     register_ssh_ingress_from_local(&mut node, &local, &data_dir)?;
@@ -197,14 +206,9 @@ fn configure_ingress_attester(
     .map_err(|error| anyhow::anyhow!("configure ingress node attester: {error}"))
 }
 
-fn configure_operator(node: &mut VosNode) -> Option<libp2p::identity::Keypair> {
-    let keypair = match crate::identity::load_or_create() {
-        Ok(keypair) => keypair,
-        Err(error) => {
-            tracing::warn!("operator identity unavailable: {error}");
-            return None;
-        }
-    };
+fn configure_operator(node: &mut VosNode) -> anyhow::Result<libp2p::identity::Keypair> {
+    let keypair = crate::identity::load_or_create()
+        .map_err(|error| anyhow::anyhow!("load required Space operator identity: {error}"))?;
     let peer = libp2p::PeerId::from(keypair.public()).to_bytes();
     node.set_operator_peer(peer.clone());
     let signer = keypair.clone();
@@ -212,7 +216,23 @@ fn configure_operator(node: &mut VosNode) -> Option<libp2p::identity::Keypair> {
         let signature: [u8; 64] = signer.sign(canonical).ok()?.as_slice().try_into().ok()?;
         Some(vos::registry::pack_auth(&peer, &signature))
     });
-    Some(keypair)
+    Ok(keypair)
+}
+
+fn require_space_root(
+    node: &VosNode,
+    registry: &RegistryRef,
+    operator: &libp2p::identity::Keypair,
+) -> anyhow::Result<()> {
+    let root = vos::block_on(registry.root(&mut &*node))
+        .map_err(|error| anyhow::anyhow!("read immutable Space root: {error}"))?;
+    let expected = operator.public().to_peer_id().to_bytes();
+    if root != expected {
+        anyhow::bail!(
+            "local operator identity is not this Space's immutable root; clean system-Agent bootstrap cannot use an ambient substitute"
+        );
+    }
+    Ok(())
 }
 
 fn require_boot_registry_handshake(

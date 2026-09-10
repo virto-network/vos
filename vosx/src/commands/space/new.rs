@@ -128,6 +128,11 @@ pub(crate) fn scaffold(
             .unwrap_or(0),
     ));
     std::fs::create_dir_all(&temp_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&temp_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     std::fs::create_dir_all(temp_dir.join("agents"))?;
     let mut temp_guard = TempDirGuard(Some(temp_dir.clone()));
 

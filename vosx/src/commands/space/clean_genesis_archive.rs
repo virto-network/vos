@@ -19,6 +19,8 @@ use vos::agent::committee::{
     SystemAgentGenesisClaim, SystemAgentGenesisEvidence,
 };
 use vos::agent::execution::RuntimeBlob;
+use vos::agent::journal::ReplayOperation;
+use vos::agent::sdk::Hash as SdkHash;
 use vos::agent::sdk::RUNTIME_ABI_ID;
 use vos::service::{AgentId, Hash, NodeId, SpaceId};
 use vos::service::{BlobRef, ServiceWire as _};
@@ -80,7 +82,7 @@ impl CleanSystemAgentGenesisArchive {
     /// visible. This is the callback passed to `prepare_root_authorized`.
     pub(crate) fn certify_fresh(
         &self,
-        root_certification: Hash,
+        root_certification: SdkHash,
         proposal: &SystemAgentGenesisProposal,
         catalog: &[RuntimeBlob],
     ) -> Result<SystemAgentGenesisProvision, SystemAgentGenesisProviderError> {
@@ -90,7 +92,7 @@ impl CleanSystemAgentGenesisArchive {
         validate_system_agent_genesis_catalog(proposal, catalog)
             .map_err(|_| SystemAgentGenesisProviderError::Corrupt)?;
         let locator = proposal.locator();
-        if root_certification == Hash::ZERO
+        if root_certification == SdkHash::ZERO
             || locator.space != self.space
             || locator.agent != self.agent
             || locator.node != self.node
@@ -115,7 +117,7 @@ impl CleanSystemAgentGenesisArchive {
             self.space,
             self.agent,
             self.authority_binding,
-            root_certification,
+            Hash(root_certification.0),
             committee,
         )
         .map_err(|_| SystemAgentGenesisProviderError::Corrupt)?;
@@ -156,6 +158,21 @@ impl CleanSystemAgentGenesisArchive {
             catalog: catalog.to_vec(),
         };
         self.publish_candidate(candidate)
+    }
+
+    /// Recover the exact logical slot which already crossed the root archive
+    /// publication point. This makes the archive-before-plan crash boundary
+    /// reproducible without freezing the node's live logical clock.
+    pub(crate) fn stored_observed_slot(
+        &self,
+    ) -> Result<Option<u64>, SystemAgentGenesisProviderError> {
+        let Some(archive) = self.load_archive()? else {
+            return Ok(None);
+        };
+        match &archive.provision.proposal().create().operation {
+            ReplayOperation::CleanManage { observed_slot, .. } => Ok(Some(*observed_slot)),
+            _ => Err(SystemAgentGenesisProviderError::Corrupt),
+        }
     }
 
     fn load_archive(&self) -> Result<Option<ArchiveImage>, SystemAgentGenesisProviderError> {

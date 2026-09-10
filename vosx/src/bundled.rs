@@ -29,6 +29,10 @@ use vos::agent::sdk::{BlobRef, ProducerId, RuntimeCapabilities};
 const BUNDLED_REGISTRY_ELF: &[u8] = include_bytes!(env!("VOSX_BUNDLED_REGISTRY_ELF"));
 const BUNDLED_SPACE_AUTHORITY_PVM: &[u8] = include_bytes!(env!("VOSX_BUNDLED_SPACE_AUTHORITY_PVM"));
 const BUNDLED_AGENT_RUNTIME_PVM: &[u8] = include_bytes!(env!("VOSX_BUNDLED_AGENT_RUNTIME_PVM"));
+const BUNDLED_SYSTEM_AUTHORITY_PACKAGE: &[u8] =
+    include_bytes!(env!("VOSX_BUNDLED_SYSTEM_AUTHORITY_PACKAGE"));
+const BUNDLED_SYSTEM_CATALOG_PACKAGE: &[u8] =
+    include_bytes!(env!("VOSX_BUNDLED_SYSTEM_CATALOG_PACKAGE"));
 const BUNDLED_AGENT_RUNTIME_PACKAGE_NAME: &str = "standard-agent-runtime";
 
 /// Returns the bundled space-registry ELF bytes, or `None` if
@@ -60,6 +64,14 @@ pub fn space_authority_pvm() -> Option<&'static [u8]> {
 /// Returns the canonical bundled standard agent runtime.
 pub fn agent_runtime_pvm() -> &'static [u8] {
     BUNDLED_AGENT_RUNTIME_PVM
+}
+
+pub(crate) fn system_authority_package_template() -> &'static [u8] {
+    BUNDLED_SYSTEM_AUTHORITY_PACKAGE
+}
+
+pub(crate) fn system_catalog_package_template() -> &'static [u8] {
+    BUNDLED_SYSTEM_CATALOG_PACKAGE
 }
 
 /// Construct and admit the bundled standard AgentRuntime package signed by an

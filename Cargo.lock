@@ -6921,6 +6921,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "system-authority"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek 2.2.0",
+ "vos",
+]
+
+[[package]]
+name = "system-catalog"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek 2.2.0",
+ "vos",
+]
+
+[[package]]
 name = "system-configuration"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7855,6 +7871,8 @@ dependencies = [
  "serde_json",
  "space-registry",
  "ssh-key",
+ "system-authority",
+ "system-catalog",
  "time",
  "toml 0.8.23",
  "tracing",
@@ -7863,6 +7881,7 @@ dependencies = [
  "vos",
  "vos-pvm",
  "vos-pvm-compiler",
+ "zeroize",
 ]
 
 [[package]]

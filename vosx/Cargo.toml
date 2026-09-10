@@ -16,10 +16,14 @@ include = [
     "blobs/space_registry.elf",
     "blobs/space_authority.pvm",
     "blobs/agent_runtime.pvm",
+    "blobs/system_authority.vos",
+    "blobs/system_catalog.vos",
 ]
 
 [dependencies]
-vos = { path = "../vos", version = "0.1.0", features = ["std", "http-client", "http-ingress", "ssh-ingress", "storage", "network"] }
+vos = { path = "../vos", version = "0.1.0", features = ["std", "http-client", "http-ingress", "ssh-ingress", "storage", "network", "private-agent-crypto"] }
+system-authority = { path = "../actors/system-authority", default-features = false }
+system-catalog = { path = "../actors/system-catalog", default-features = false }
 ssh-key = "=0.7.0-rc.10"
 # `vosx zk pin` transpiles the provable ELF here and delegates the heavy
 # vos-pvm-proof measurement to the prover extension's `measure_catalog` handler, so
@@ -53,6 +57,7 @@ getrandom = "0.2"
 fs2 = "0.4"
 # Streaming BLAKE2b-256 for multi-GiB redb/image backup verification.
 blake2b_simd = { version = "1", default-features = false }
+zeroize = { version = "1", default-features = false }
 
 # CLI / serde
 clap = { version = "4", features = ["derive"] }

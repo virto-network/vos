@@ -7,6 +7,8 @@
 use clap::Subcommand;
 use std::path::PathBuf;
 
+#[cfg(target_os = "linux")]
+pub(crate) mod authority_projection_authenticator;
 pub mod backup;
 pub mod caps;
 // The hardened store depends on Unix dirfd, no-follow, ownership, link-count,
@@ -17,6 +19,8 @@ pub mod caps;
 pub(crate) mod clean_genesis_archive;
 #[allow(dead_code)]
 pub(crate) mod clean_identity;
+#[cfg(target_os = "linux")]
+pub(crate) mod clean_startup;
 #[cfg(unix)]
 #[allow(dead_code)]
 pub(crate) mod clean_store;
