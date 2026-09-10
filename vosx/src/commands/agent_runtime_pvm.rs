@@ -124,12 +124,8 @@ mod tests {
     }
 
     #[test]
-    fn prior_bundled_runtime_is_rejected_until_its_outer_surface_is_regenerated() {
-        let error = validate_agent_runtime_pvm(crate::bundled::agent_runtime_pvm())
-            .expect_err("the checked-in predecessor artifact contains DEBUG_WRITE");
-        assert!(
-            error.to_string().contains("UnsupportedHostCall(118)"),
-            "unexpected rejection: {error:#}"
-        );
+    fn bundled_runtime_has_the_current_clean_outer_surface() {
+        validate_agent_runtime_pvm(crate::bundled::agent_runtime_pvm())
+            .expect("the checked-in runtime uses only the current clean outer surface");
     }
 }

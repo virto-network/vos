@@ -998,7 +998,7 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
     );
     assert!(
         PRODUCTION_ARTIFACT_PROVENANCE.contains(
-            "agent_runtime_source_revision = \"b108d7b4fe397235de31313fe1cd3ffdfafdc204\""
+            "agent_runtime_source_revision = \"06aef5ca46ce40483ba9e209d2c5398990e8aee2\""
         )
     );
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains("guest_toolchain = \"nightly-2026-03-20\""));
@@ -1019,13 +1019,13 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
         "authority_pvm_blake2b_256 = \"f91f993dd459a6a8107b85dc3a0b12776191faaf9cab494a443d12b92c745ac6\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "agent_runtime_program_id = \"18316e0f5b12b63e39e679b13ddb8e5f378c3269303fe21b9cd000b5d5238f01\""
+        "agent_runtime_program_id = \"91a42b982aa299b9e5801641f70b88d972e1c14832fc0f115d19fc5a70a7da59\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "agent_runtime_elf_blake2b_256 = \"e99a18989880ac997a841217270592dc6d46d6f0fcf70288f93e7f139bf3234b\""
+        "agent_runtime_elf_blake2b_256 = \"26fc2eb083237f1db8eb5d6fd7388d2efb32df65e5a8b0cc1da0121b0095f25b\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "agent_runtime_pvm_blake2b_256 = \"dde6d20cfd7721347f9143309e3f1039aa5c3b94993a25e5aa0e15810f282aea\""
+        "agent_runtime_pvm_blake2b_256 = \"426df6a54f250480d56b12fa7ac9a6c7eadfb8d2c03351cfd2433ca98586012c\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
         "registry_elf_blake2b_256 = \"461f2b368dd653698c8650b07800b81634b3072b37fd7a5f3708581021bbbd32\""
