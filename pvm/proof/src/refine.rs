@@ -32,7 +32,8 @@ pub const MAX_REFINE_CHILD_COMPONENTS: usize = u32::BITS as usize;
 /// Stwo's canonical tree count: preprocessed, main, interaction, composition.
 pub const REFINE_CHILD_COMMITMENT_COUNT: usize = crate::proof::PROOF_COMMITMENT_TREE_COUNT;
 /// Aggregate post-decode heap payload accepted across all child proofs.
-/// Transports still must cap serialized bytes before Serde allocation.
+/// Production transports use the recursively bounded codec in
+/// [`crate::refine_codec`], never direct Serde decoding.
 pub const MAX_REFINE_CHILD_PROOF_BYTES: usize = 512 * 1024 * 1024;
 
 /// Collision-resistant identity of exact canonical program artifact bytes.
@@ -130,11 +131,12 @@ pub struct RefineProofSlice {
 ///
 /// # Untrusted decoding
 ///
-/// The derived Serde representation is an in-memory interchange shape, not a
-/// bounded wire decoder. A transport MUST reject serialized input above its
-/// configured aggregate proof-byte ceiling before deserializing this type.
-/// [`refine_bundle_cardinality_is_valid`] is a second, post-decode shape check;
-/// it cannot prevent allocations already requested by a Serde decoder.
+/// The derived Serde representation is an in-memory interchange shape only.
+/// Untrusted material must enter through
+/// [`crate::decode_refine_proof_bundle`], which rejects the complete input
+/// against the authenticated runtime ceiling and charges every nested Stwo
+/// allocation before reserve. [`refine_bundle_cardinality_is_valid`] remains
+/// the final post-decode structural preflight.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RefineProofBundle {
     pub format_version: u32,
@@ -274,6 +276,104 @@ pub fn refine_bundle_commitment(bundle: &RefineProofBundle) -> [u8; 32] {
     crate::page_merkle::blake2b256(&bytes)
 }
 
+#[derive(Clone, Copy)]
+struct RefineExecutionSlice {
+    order: u32,
+    identity: RefineMachineId,
+    entry_state: [u8; 32],
+    observed_exit_state: [u8; 32],
+    exit: RefineSliceExit,
+}
+
+/// Commitment to the exact nested execution transcript, independent of the
+/// proof system's serialization and Fiat-Shamir payload.
+///
+/// A tentative executor can commit this value before proof production. A
+/// verifier recomputes the same value from the public proof bundle after it
+/// has checked every child proof and replayed all native Refine boundaries.
+/// Keeping this separate from [`refine_bundle_commitment`] avoids a circular
+/// dependency between the statement (which names the trace) and proof bytes
+/// produced for that statement.
+pub fn refine_bundle_execution_commitment(bundle: &RefineProofBundle) -> [u8; 32] {
+    refine_execution_commitment(
+        bundle.outer_program,
+        bundle.arguments_commitment,
+        bundle.gas_limit,
+        bundle.result,
+        bundle.slices.len(),
+        bundle.slices.iter().map(|slice| RefineExecutionSlice {
+            order: slice.order,
+            identity: slice.identity,
+            entry_state: slice.entry_state,
+            observed_exit_state: slice.observed_exit_state,
+            exit: slice.exit,
+        }),
+        &bundle.host_boundaries,
+    )
+}
+
+/// Read the public-I/O hash from the proved terminal outer-machine halt.
+///
+/// This helper performs only the local terminal-shape check. Callers handling
+/// untrusted material must first use the bounded Refine codec and must accept
+/// this value only after complete child-proof verification and deterministic
+/// native-boundary replay. The final registers are bound by the PVM AIR; the
+/// standard runtime places its exact work/transition commitment in a2..a5.
+pub fn refine_bundle_terminal_public_io(bundle: &RefineProofBundle) -> Option<[u8; 32]> {
+    let terminal = bundle.slices.last()?;
+    if bundle.result != RefineSliceExit::Halt
+        || terminal.exit != RefineSliceExit::Halt
+        || !matches!(terminal.identity, RefineMachineId::Outer { program } if program == bundle.outer_program)
+    {
+        return None;
+    }
+    Some(terminal.proof.public_io_hash())
+}
+
+fn refine_execution_commitment(
+    outer_program: RefineProgramId,
+    arguments_commitment: [u8; 32],
+    gas_limit: u64,
+    result: RefineSliceExit,
+    slice_count: usize,
+    slices: impl IntoIterator<Item = RefineExecutionSlice>,
+    host_boundaries: &[RefineHostBoundary],
+) -> [u8; 32] {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"vos/pvm/refine-execution-transcript/v1\0");
+    bytes.extend_from_slice(&outer_program.0);
+    bytes.extend_from_slice(&arguments_commitment);
+    put_u64(&mut bytes, gas_limit);
+    put_exit(&mut bytes, result);
+    put_u32(&mut bytes, slice_count as u32);
+    for slice in slices {
+        put_u32(&mut bytes, slice.order);
+        put_machine_id(&mut bytes, slice.identity);
+        bytes.extend_from_slice(&slice.entry_state);
+        bytes.extend_from_slice(&slice.observed_exit_state);
+        put_exit(&mut bytes, slice.exit);
+    }
+    put_u32(&mut bytes, host_boundaries.len() as u32);
+    for boundary in host_boundaries {
+        put_refine_host_boundary(&mut bytes, boundary);
+    }
+    crate::page_merkle::blake2b256(&bytes)
+}
+
+fn put_refine_host_boundary(bytes: &mut Vec<u8>, boundary: &RefineHostBoundary) {
+    bytes.push(boundary.call);
+    put_u32(bytes, boundary.slices_before);
+    put_u32(bytes, boundary.slices_after);
+    bytes.extend_from_slice(&boundary.state_before);
+    bytes.extend_from_slice(&boundary.state_after);
+    for &register in &boundary.registers_before {
+        put_u64(bytes, register);
+    }
+    for &register in &boundary.registers_after {
+        put_u64(bytes, register);
+    }
+}
+
 fn put_u32(bytes: &mut Vec<u8>, value: u32) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }
@@ -385,10 +485,24 @@ mod prover {
         pub result: RefineSliceExit,
     }
 
+    /// Exact output and public-I/O registers captured with one observed trace.
+    ///
+    /// Construction succeeds only for a normal halt whose complete output
+    /// window is readable and no larger than the caller's ceiling. The trace,
+    /// bytes, and register commitment therefore always describe the same sole
+    /// interpreter run; a caller cannot accidentally pair a proved trace with
+    /// output recovered by a second execution.
+    pub struct RefineObservedRun {
+        pub trace: RefineTraceBundle,
+        pub output: Vec<u8>,
+        pub public_io: [u8; 32],
+    }
+
     #[derive(Debug)]
     pub enum RefineTraceError {
         Load(vos_pvm::refine::RefineError),
         Observation(String),
+        OutputUnavailable,
         Prove(ProvingError),
         ReplayMismatch(&'static str),
         Verify(String),
@@ -401,6 +515,9 @@ mod prover {
                 Self::Observation(error) => {
                     write!(formatter, "invalid Refine observation: {error}")
                 }
+                Self::OutputUnavailable => formatter.write_str(
+                    "Refine did not halt with a readable output inside the configured ceiling",
+                ),
                 Self::Prove(error) => write!(formatter, "cannot prove Refine slice: {error}"),
                 Self::ReplayMismatch(field) => {
                     write!(formatter, "Refine replay differs at {field}")
@@ -937,7 +1054,7 @@ mod prover {
         outer_program: &[u8],
         args: &[u8],
         gas: Gas,
-    ) -> Result<(Collector, RefineSliceExit), RefineTraceError> {
+    ) -> Result<(Collector, vos_pvm::refine::Invocation), RefineTraceError> {
         let outer_id = refine_program_id(outer_program);
         let context = RefineContext::load_with(outer_program, args, gas, MemoryModel::Sparse)?;
         let mut collector = Collector::new(outer_id);
@@ -950,7 +1067,7 @@ mod prover {
                 "unterminated machine or host boundary".to_string(),
             ));
         }
-        Ok((collector, exit_kind(&invocation.exit)))
+        Ok((collector, invocation))
     }
 
     #[cfg(test)]
@@ -979,15 +1096,101 @@ mod prover {
         gas: Gas,
     ) -> Result<RefineTraceBundle, RefineTraceError> {
         let outer_id = refine_program_id(outer_program);
-        let (collector, result) = run_refine_collector(outer_program, args, gas)?;
+        let (collector, invocation) = run_refine_collector(outer_program, args, gas)?;
         Ok(RefineTraceBundle {
             outer_program: outer_id,
             arguments_commitment: refine_arguments_commitment(args),
             gas_limit: gas,
             slices: collector.slices,
             host_boundaries: collector.boundaries,
-            result,
+            result: exit_kind(&invocation.exit),
         })
+    }
+
+    /// Execute and trace one complete standard Refine invocation, returning
+    /// the exact halted output from that same observed run.
+    ///
+    /// The guest-controlled output length is rejected before allocation when
+    /// it exceeds `maximum_output_bytes`.
+    ///
+    /// `None` means the invocation did not reach a normal halt with a fully
+    /// readable, bounded output window. Callers must reject it when a
+    /// canonical output is required; no second unobserved execution is needed
+    /// to recover the tentative transition.
+    pub fn trace_refine_with_output(
+        outer_program: &[u8],
+        args: &[u8],
+        gas: Gas,
+        maximum_output_bytes: usize,
+    ) -> Result<(RefineTraceBundle, Option<Vec<u8>>), RefineTraceError> {
+        let outer_id = refine_program_id(outer_program);
+        let (collector, invocation) = run_refine_collector(outer_program, args, gas)?;
+        let output = invocation.output_bounded(maximum_output_bytes);
+        Ok((
+            RefineTraceBundle {
+                outer_program: outer_id,
+                arguments_commitment: refine_arguments_commitment(args),
+                gas_limit: gas,
+                slices: collector.slices,
+                host_boundaries: collector.boundaries,
+                result: exit_kind(&invocation.exit),
+            },
+            output,
+        ))
+    }
+
+    /// Execute and trace one complete standard Refine invocation exactly
+    /// once, requiring its bounded halted output and public-I/O registers.
+    ///
+    /// This is the production preparation seam for a tentative transition.
+    /// Output length and readability are validated by
+    /// [`vos_pvm::refine::Invocation::output_bounded`] before allocation.
+    pub fn trace_refine_observed(
+        outer_program: &[u8],
+        args: &[u8],
+        gas: Gas,
+        maximum_output_bytes: usize,
+    ) -> Result<RefineObservedRun, RefineTraceError> {
+        let outer_id = refine_program_id(outer_program);
+        let (collector, invocation) = run_refine_collector(outer_program, args, gas)?;
+        let output = invocation
+            .output_bounded(maximum_output_bytes)
+            .ok_or(RefineTraceError::OutputUnavailable)?;
+        let public_io = crate::proof::public_io_hash_from_registers(&invocation.registers);
+        Ok(RefineObservedRun {
+            trace: RefineTraceBundle {
+                outer_program: outer_id,
+                arguments_commitment: refine_arguments_commitment(args),
+                gas_limit: gas,
+                slices: collector.slices,
+                host_boundaries: collector.boundaries,
+                result: exit_kind(&invocation.exit),
+            },
+            output,
+            public_io,
+        })
+    }
+
+    /// Pre-proof commitment to the exact execution metadata observed in a
+    /// [`RefineTraceBundle`]. This equals
+    /// [`refine_bundle_execution_commitment`] for the proof produced from the
+    /// trace.
+    pub fn refine_trace_execution_commitment(trace: &RefineTraceBundle) -> [u8; 32] {
+        refine_execution_commitment(
+            trace.outer_program,
+            trace.arguments_commitment,
+            trace.gas_limit,
+            trace.result,
+            trace.slices.len(),
+            trace.slices.iter().map(|slice| RefineExecutionSlice {
+                order: slice.order,
+                identity: slice.identity,
+                entry_state: slice.entry_state,
+                observed_exit_state: slice.observed_exit_state,
+                exit: slice.exit,
+            }),
+            &trace.host_boundaries,
+        )
     }
 
     /// Prove every directly observed machine slice and authenticate the
@@ -1388,8 +1591,9 @@ mod prover {
 
 #[cfg(feature = "prover")]
 pub use prover::{
-    RefineTraceBundle, RefineTraceError, RefineTraceSlice, prove_refine, trace_refine,
-    verify_refine_bundle_replayed,
+    RefineObservedRun, RefineTraceBundle, RefineTraceError, RefineTraceSlice, prove_refine,
+    refine_trace_execution_commitment, trace_refine, trace_refine_observed,
+    trace_refine_with_output, verify_refine_bundle_replayed,
 };
 
 #[cfg(all(test, feature = "prover"))]
@@ -1541,6 +1745,46 @@ mod tests {
         );
         assert_ne!(trace.outer_program, refine_program_id(&arguments));
         assert_ne!(gas, gas + 1);
+    }
+
+    #[test]
+    fn observed_trace_returns_the_exact_same_run_output() {
+        const RW_BASE: u32 = 2 * vos_pvm::PVM_ZONE_SIZE;
+        let [b0, b1, b2, _] = RW_BASE.to_le_bytes();
+        // a0 <- RW_BASE, a1 <- 3, a2..a5 <- 1..=4, halt.
+        let code = [
+            51, 7, b0, b1, b2, 51, 8, 3, 0, 0, 51, 9, 1, 0, 0, 51, 10, 2, 0, 0, 51, 11, 3, 0, 0,
+            51, 12, 4, 0, 0, 50, 0,
+        ];
+        let outer = standard_program_with_rw(&code, &[0, 5, 10, 15, 20, 25, 30], b"out");
+
+        let observed = trace_refine_observed(&outer, b"args", 1_000_000, 3).unwrap();
+        let mut expected_public_io = [0u8; 32];
+        for (index, word) in [1u64, 2, 3, 4].iter().enumerate() {
+            expected_public_io[index * 8..index * 8 + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        assert_eq!(observed.trace.result, RefineSliceExit::Halt);
+        assert_eq!(observed.output, b"out");
+        assert_eq!(observed.public_io, expected_public_io);
+        assert!(matches!(
+            trace_refine_observed(&outer, b"args", 1_000_000, 2),
+            Err(RefineTraceError::OutputUnavailable)
+        ));
+
+        let (trace, output) = trace_refine_with_output(&outer, b"args", 1_000_000, 3).unwrap();
+
+        assert_eq!(trace.result, RefineSliceExit::Halt);
+        assert_eq!(output.as_deref(), Some(b"out".as_slice()));
+        assert_ne!(refine_trace_execution_commitment(&trace), [0; 32]);
+
+        let (bounded_trace, bounded_output) =
+            trace_refine_with_output(&outer, b"args", 1_000_000, 2).unwrap();
+        assert_eq!(bounded_output, None);
+        assert_eq!(
+            refine_trace_execution_commitment(&bounded_trace),
+            refine_trace_execution_commitment(&trace),
+            "the allocation ceiling must not change the observed execution",
+        );
     }
 
     #[test]

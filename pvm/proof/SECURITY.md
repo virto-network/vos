@@ -50,14 +50,17 @@ arguments/gas, every inner `(slot, generation, program-hash)` identity, child
 proof format/shape/commitments, sparse state/page commitments, calls 9 through
 14 with their before/after registers and state hashes, and the final exit.
 
-`RefineProofBundle` derives Serde for in-memory interchange, but Serde is not a
-bounded hostile-input decoder. A network or artifact transport **must cap the
-aggregate serialized byte length before deserialization**. The 1024-slice and
-boundary/component limits are post-decode verifier preflights. Each child also
-has a checked 16 MiB nested-vector payload ceiling and the child closure has a
-512 MiB aggregate ceiling before any child clone, transcript hash, resolver
-callback, or cryptographic verification. These limits bound work after decode;
-they cannot undo allocations made while deserializing an unbounded byte stream.
+`RefineProofBundle` derives Serde for in-memory interchange only. Production
+artifacts use `encode_refine_proof_bundle` / `decode_refine_proof_bundle`. The
+decoder rejects bytes above the authenticated runtime proof-material ceiling
+before parsing and charges every recursively declared Stwo vector against a
+derived generation-capped allocation budget before reserve. Serde, bincode,
+and postcard are not production proof-bundle decoders. The 1024-slice and
+boundary/component limits are also enforced while lengths are read, followed
+by the existing structural proof preflight. Each child retains its checked
+16 MiB nested-vector payload ceiling and the child closure its 512 MiB
+aggregate post-decode ceiling before any child clone, transcript hash,
+resolver callback, or cryptographic verification.
 
 `verify_refine_bundle_authenticated` also requires a trusted external mapping
 from every exact machine/program identity, proof format, component shape, and

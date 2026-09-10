@@ -1116,6 +1116,8 @@ mod tests {
         InstallationId, InvocationId, InvocationOrigin, InvocationRoleClaims, NodeId, PrincipalId,
         ProducerId, ProgramId, PublicPreflight, ReplicaRole, RuntimeRequirements, SpaceId,
     };
+    use vos_pvm::ExitReason;
+    use vos_pvm::refine_host::RefineContext;
     use vos_pvm_compiler::assembler::{Assembler, Reg};
 
     use super::*;
@@ -1155,6 +1157,7 @@ mod tests {
                     runtime_deployment: DeploymentId([0x17; 32]),
                     runtime_program: ProgramId([0x18; 32]),
                     runtime_producer: ProducerId([0x19; 32]),
+                    transition_producer: ProducerId([0x1a; 32]),
                 },
                 creation_nonce,
                 authority: AgentAuthorityBinding {
@@ -1175,7 +1178,11 @@ mod tests {
                 replicas: vec![AgentReplica {
                     node: NodeId([0x1c; 32]),
                     principal: owner,
-                    role: ReplicaRole::Voter,
+                    role: if profile == AgentProfile::Private {
+                        ReplicaRole::Observer
+                    } else {
+                        ReplicaRole::Voter
+                    },
                 }],
             };
             descriptor.validate().unwrap();
@@ -1342,6 +1349,71 @@ mod tests {
         let transition = RuntimeTransition::decode(&output).unwrap();
         assert_eq!(transition.encode().unwrap(), output);
         transition
+    }
+
+    fn compiled_runtime_pvm() -> Vec<u8> {
+        let elf = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/riscv64em-vos/release/custom_linear_agent_runtime.elf");
+        let elf = std::fs::read(&elf).unwrap_or_else(|error| {
+            panic!(
+                "read freshly built custom runtime ELF {}: {error}; run `cargo actor` first",
+                elf.display()
+            )
+        });
+        let pvm = vos_pvm_compiler::link_elf_spi(&elf)
+            .expect("link custom runtime through the clean standard-program ABI");
+        vos_pvm::spi::validate_refine_host_calls(&pvm)
+            .expect("custom runtime uses only the clean outer Refine allowlist");
+        pvm
+    }
+
+    fn dispatch_compiled(pvm: &[u8], work: RuntimeWork) -> RuntimeTransition {
+        let input = work.encode().expect("encode physical RuntimeWork");
+        let execution = RefineContext::load(pvm, &input, 2_000_000_000)
+            .expect("load compiled custom runtime")
+            .run();
+        assert_eq!(
+            execution.exit,
+            ExitReason::Halt,
+            "compiled custom runtime failed at pc {} with registers {:?}",
+            execution.pc,
+            execution.registers,
+        );
+        let output = execution
+            .output_bounded(RuntimeTransition::MAX_ENCODED_BYTES)
+            .expect("compiled custom runtime published an output window");
+        let transition = RuntimeTransition::decode(&output)
+            .expect("compiled custom runtime returned a canonical transition");
+        assert_eq!(transition.encode().unwrap(), output);
+        transition
+    }
+
+    fn acknowledge_work(
+        state: RuntimeState,
+        invocation: InvocationWork,
+        authorization: InvocationAuthorization,
+    ) -> RuntimeWork {
+        RuntimeWork::Acknowledge {
+            context: RuntimeExecutionContext::Direct,
+            state,
+            invocation: Box::new(invocation),
+            authorization: Box::new(authorization),
+        }
+    }
+
+    fn invoke_work(
+        state: RuntimeState,
+        invocation: InvocationWork,
+        authorization: InvocationAuthorization,
+        observed_slot: u64,
+    ) -> RuntimeWork {
+        RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
+            state,
+            invocation: Box::new(invocation),
+            authorization: Box::new(authorization),
+            observed_slot,
+        }
     }
 
     fn created_and_installed(fixture: &Fixture) -> (InstallActor, RuntimeState) {
@@ -1694,6 +1766,176 @@ mod tests {
         assert_eq!(
             rejected.outcome,
             RuntimeOutcome::Completed(Err(InvocationError::InvalidInput))
+        );
+    }
+
+    /// This is an explicit artifact gate rather than part of ordinary unit
+    /// testing: `just test-custom-agent-runtime` first builds the deterministic
+    /// riscv64 ELF and then selects this ignored test. Every transition is
+    /// compared with the host-native model so the compiled outer ABI cannot
+    /// silently implement different scheduling or retry semantics.
+    #[test]
+    #[ignore = "requires a freshly built riscv64 custom runtime artifact"]
+    fn compiled_runtime_executes_scheduling_and_rejects_attested_context() {
+        let pvm = compiled_runtime_pvm();
+        assert_eq!(pvm, compiled_runtime_pvm(), "linking must be reproducible");
+        assert_ne!(ProgramId::of_pvm(&pvm), ProgramId::ZERO);
+
+        for profile in [AgentProfile::Local, AgentProfile::Shared] {
+            let fixture = Fixture::for_profile(profile);
+            let physical = |work: RuntimeWork| {
+                let expected = dispatch(work.clone());
+                let actual = dispatch_compiled(&pvm, work);
+                assert_eq!(actual, expected, "compiled/native transition mismatch");
+                actual
+            };
+
+            let created = physical(fixture.create(RuntimeState::default(), 5));
+            let install = fixture.install();
+            let installed = physical(fixture.install_work(created.state, install.clone()));
+
+            let interval = ScheduleId([0x71; 32]);
+            let schedule = fixture.invocation_message(
+                &install,
+                0x72,
+                schedule_interval_message(interval, 10, 2, 3, 2).unwrap(),
+            );
+            let schedule_authorization =
+                InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&schedule, 5));
+            let scheduled = physical(invoke_work(
+                installed.state,
+                schedule.clone(),
+                schedule_authorization.clone(),
+                5,
+            ));
+            assert_eq!(completed_value(&scheduled), 0);
+            let acknowledged = physical(acknowledge_work(
+                scheduled.state,
+                schedule,
+                schedule_authorization,
+            ));
+
+            // A second far-future timer is durably installed and then
+            // cancelled. It must not be resurrected by restart/handoff.
+            let cancelled_id = ScheduleId([0x73; 32]);
+            let future = fixture.invocation_message(
+                &install,
+                0x74,
+                schedule_once_message(cancelled_id, 100, 1, 99).unwrap(),
+            );
+            let future_authorization =
+                InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&future, 6));
+            let future_scheduled = physical(invoke_work(
+                acknowledged.state,
+                future.clone(),
+                future_authorization.clone(),
+                6,
+            ));
+            let future_acknowledged = physical(acknowledge_work(
+                future_scheduled.state,
+                future,
+                future_authorization,
+            ));
+            let cancel = fixture.invocation_message(
+                &install,
+                0x75,
+                cancel_schedule_message(cancelled_id).unwrap(),
+            );
+            let cancel_authorization =
+                InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&cancel, 7));
+            let cancelled = physical(invoke_work(
+                future_acknowledged.state,
+                cancel.clone(),
+                cancel_authorization.clone(),
+                7,
+            ));
+            let cancel_acknowledged = physical(acknowledge_work(
+                cancelled.state,
+                cancel,
+                cancel_authorization,
+            ));
+
+            let tick = fixture.invocation_message(&install, 0x76, tick_message());
+            let tick_authorization =
+                InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&tick, 17));
+            let fired = physical(invoke_work(
+                cancel_acknowledged.state,
+                tick.clone(),
+                tick_authorization.clone(),
+                17,
+            ));
+            assert_eq!(completed_value(&fired), 6);
+            let model = CustomState::decode(&fired.state).unwrap();
+            assert_eq!(model.linear.scheduler.last_observation(), Some(17));
+            assert_eq!(model.linear.scheduler.entries().len(), 1);
+            assert_eq!(model.linear.scheduler.entries()[0].schedule, interval);
+            assert_eq!(model.linear.scheduler.entries()[0].due_slot, 19);
+
+            // A new PVM instance receiving the serialized state models both a
+            // process restart and a Shared-leader handoff. Exact retry at a
+            // later observation recovers the retained transition unchanged.
+            let recovered_state = RuntimeTransition::decode(&fired.encode().unwrap())
+                .unwrap()
+                .state;
+            let retried = dispatch_compiled(
+                &pvm,
+                invoke_work(
+                    recovered_state,
+                    tick.clone(),
+                    tick_authorization.clone(),
+                    99,
+                ),
+            );
+            assert_eq!(retried, fired);
+            let tick_acknowledged =
+                physical(acknowledge_work(fired.state, tick, tick_authorization));
+
+            let next_tick = fixture.invocation_message(&install, 0x77, tick_message());
+            let next_authorization =
+                InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&next_tick, 20));
+            let next = physical(invoke_work(
+                tick_acknowledged.state,
+                next_tick,
+                next_authorization,
+                20,
+            ));
+            assert_eq!(completed_value(&next), 8);
+            let model = CustomState::decode(&next.state).unwrap();
+            assert_eq!(model.linear.scheduler.entries().len(), 1);
+            assert_eq!(model.linear.scheduler.entries()[0].due_slot, 22);
+        }
+
+        // This scheduling runtime is intentionally Local/Shared-only. Prove
+        // that the compiled artifact rejects a Private descriptor before it
+        // can create state (and therefore before it can retain a timer).
+        let private = Fixture::for_profile(AgentProfile::Private);
+        let private_work = private.create(RuntimeState::default(), 5);
+        let expected = dispatch(private_work.clone());
+        let rejected = dispatch_compiled(&pvm, private_work);
+        assert_eq!(rejected, expected);
+        assert_eq!(rejected.state, RuntimeState::default());
+        assert_eq!(
+            rejected.outcome,
+            RuntimeOutcome::Management(Err(ManagementError::InvalidRequest))
+        );
+
+        let fixture = Fixture::new();
+        let mut attested = fixture.create(RuntimeState::default(), 5);
+        let RuntimeWork::Manage { context, .. } = &mut attested else {
+            unreachable!()
+        };
+        *context = RuntimeExecutionContext::Attested {
+            proof_system: Hash([0xa3; 32]),
+        };
+        let input = attested.encode().unwrap();
+        let rejected = RefineContext::load(&pvm, &input, 2_000_000_000)
+            .expect("load attested rejection probe")
+            .run();
+        assert_ne!(rejected.exit, ExitReason::Halt);
+        assert!(
+            rejected
+                .output_bounded(RuntimeTransition::MAX_ENCODED_BYTES)
+                .is_none()
         );
     }
 

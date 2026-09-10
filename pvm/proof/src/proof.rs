@@ -338,12 +338,21 @@ impl Proof {
     /// `compute_io_hash` equality check, the intended "unbound proof"
     /// rejection.
     pub fn public_io_hash(&self) -> [u8; 32] {
-        let mut out = [0u8; 32];
-        for (i, word) in self.final_state.registers[9..13].iter().enumerate() {
-            out[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
-        }
-        out
+        public_io_hash_from_registers(&self.final_state.registers)
     }
+}
+
+/// Exact inverse of the standard guest a2..a5 public-I/O register encoding.
+///
+/// Kept shared between finished proofs and the prover's same-run Refine
+/// observation so those two paths cannot silently disagree about word order
+/// or endianness.
+pub(crate) fn public_io_hash_from_registers(registers: &[u64; 13]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (index, word) in registers[9..13].iter().enumerate() {
+        out[index * 8..index * 8 + 8].copy_from_slice(&word.to_le_bytes());
+    }
+    out
 }
 
 /// Transport-independent hostile-proof preflight shared by the prover-enabled

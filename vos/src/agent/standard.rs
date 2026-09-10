@@ -21,6 +21,11 @@ use crate::service::{
 
 pub const MAX_DIRECTORY_PAGE: u16 = 256;
 pub const MAX_INVOCATION_RESULTS_PER_LANE: usize = 32;
+/// Maximum delivered-result retirement facts retained in each independently
+/// persisted result component. Positive facts are never evicted: a full
+/// component rejects the next acknowledgement before retiring its terminal
+/// result, preserving exact retry evidence without an unbounded tombstone log.
+pub const MAX_INVOCATION_ACKNOWLEDGEMENTS_PER_LANE: usize = MAX_INVOCATION_RESULTS_PER_LANE;
 pub const MAX_INVOCATION_RESULT_BYTES_PER_LANE: usize = 64 * 1024;
 pub const MAX_AUTHORITY_DISPOSITIONS: usize = 256;
 /// Continuations are bounded independently of the encoded runtime image so a
@@ -132,6 +137,13 @@ struct ManagedActor {
     record: ActorRecord,
     /// Non-structural durable work. Child debt is derived from the directory.
     debt: ActorLifecycleDebt,
+    /// Exact portable package compatibility admitted for a clean actor.
+    /// Legacy actors deliberately carry no such binding.
+    clean_package: Option<StandardCleanActorPackage>,
+    /// Immutable exact SDK install-time binding. Unlike `clean_package`, this
+    /// is never rewritten by an in-place actor upgrade and therefore remains
+    /// the authority for `InstallationId` replay equality.
+    clean_installation: Option<StandardCleanActorInstallation>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -161,6 +173,11 @@ pub struct StandardAgentRuntime {
     retired_installation_ids: BTreeSet<InstallationId>,
     lane_state: StandardLaneState,
     invocation_results: BTreeMap<(InvocationScope, InvocationId), StandardInvocationResult>,
+    /// Bounded, insertion-ordered facts for successfully retired clean
+    /// results. These are guest state (not host retry cache), survive journal
+    /// checkpoints, and are encoded in the same physical component as the
+    /// result they replaced.
+    clean_invocation_acknowledgements: Vec<crate::agent_sdk::InvocationAcknowledgement>,
     /// Cooperative actor slices ordered by `(owning component, ready_sequence)`.
     /// A yielded slice moves to the tail of its component queue on every
     /// subsequent yield, providing deterministic FIFO round-robin behavior.
@@ -191,10 +208,20 @@ pub struct StandardRuntimeState {
     pub private_management_dispositions: Vec<StandardPrivateManagementDisposition>,
     pub system_authority: Option<super::system_authority::SystemAuthorityState>,
     pub actors: Vec<StandardActorState>,
+    /// Exact portable package compatibility, ordered by actor identity.
+    /// `None` denotes a legacy image; every clean image, including an empty
+    /// directory, carries `Some` so old images cannot silently regain a
+    /// collapsed boolean proof capability after restart.
+    pub clean_actor_packages: Option<Vec<StandardCleanActorPackage>>,
+    /// Immutable exact SDK install-time bindings, ordered by actor identity.
+    /// This is separate from `clean_actor_packages`, whose requirements track
+    /// the currently installed deployment and may change on `UpgradeActor`.
+    pub clean_actor_installations: Option<Vec<StandardCleanActorInstallation>>,
     /// Strictly ordered grow-only tombstones for removed installations.
     pub retired_installation_ids: Vec<InstallationId>,
     pub lane_state: StandardLaneState,
     pub invocation_results: Vec<StandardInvocationResult>,
+    pub clean_invocation_acknowledgements: Vec<crate::agent_sdk::InvocationAcknowledgement>,
     pub(crate) machine_continuations: Vec<StandardMachineContinuation>,
     pub lane_revisions: StandardLaneRevisions,
     pub control_authority_slot: Option<u64>,
@@ -685,6 +712,9 @@ pub(crate) fn clean_descriptor_to_legacy_config(
             ),
             runtime_program: crate::service::ProgramId(descriptor.identity.runtime_program.0),
             runtime_producer: crate::service::ProducerId(descriptor.identity.runtime_producer.0),
+            transition_producer: crate::service::ProducerId(
+                descriptor.identity.transition_producer.0,
+            ),
         },
         creation_nonce: Hash(descriptor.creation_nonce.0),
         authority: super::authority::AgentAuthorityBinding {
@@ -788,7 +818,7 @@ fn clean_entry_to_legacy(entry: &crate::agent_sdk::ActorEntry) -> super::ActorEn
     }
 }
 
-fn legacy_entry_to_clean(entry: &super::ActorEntry) -> crate::agent_sdk::ActorEntry {
+pub(crate) fn legacy_entry_to_clean(entry: &super::ActorEntry) -> crate::agent_sdk::ActorEntry {
     crate::agent_sdk::ActorEntry {
         actor: crate::agent_sdk::ActorId(entry.actor.0),
         name: entry.name.clone(),
@@ -821,6 +851,17 @@ fn legacy_entry_to_clean(entry: &super::ActorEntry) -> crate::agent_sdk::ActorEn
     }
 }
 
+pub(crate) fn legacy_actor_record_to_clean(
+    record: &ActorRecord,
+) -> crate::agent_sdk::ActorDirectoryRecord {
+    crate::agent_sdk::ActorDirectoryRecord {
+        entry: legacy_entry_to_clean(&record.entry),
+        incarnation: crate::agent_sdk::Hash(record.state_generation.0),
+        installation_id: crate::agent_sdk::InstallationId(record.installation_id.0),
+        registry_reservation: crate::agent_sdk::Hash(record.registry_reservation.0),
+    }
+}
+
 fn clean_install_to_legacy(install: &crate::agent_sdk::InstallActor) -> super::InstallActor {
     super::InstallActor {
         installation_id: crate::service::InstallationId(install.installation_id.0),
@@ -841,6 +882,17 @@ fn clean_install_to_legacy(install: &crate::agent_sdk::InstallActor) -> super::I
         state_layout: Hash(install.state_layout.0),
         contract: clean_actor_contract_to_legacy(install.contract),
         requirements: clean_requirements_to_legacy(install.requirements),
+    }
+}
+
+pub(crate) fn clean_installation_binding(
+    install: &crate::agent_sdk::InstallActor,
+) -> StandardCleanActorInstallation {
+    StandardCleanActorInstallation {
+        actor: install.entry.actor,
+        commitment: install.lineage_commitment(),
+        contract: install.contract,
+        requirements: install.requirements,
     }
 }
 
@@ -874,6 +926,7 @@ fn legacy_identity_to_clean(identity: &super::AgentIdentity) -> crate::agent_sdk
         runtime_deployment: crate::agent_sdk::DeploymentId(identity.runtime_deployment.0),
         runtime_program: crate::agent_sdk::ProgramId(identity.runtime_program.0),
         runtime_producer: crate::agent_sdk::ProducerId(identity.runtime_producer.0),
+        transition_producer: crate::agent_sdk::ProducerId(identity.transition_producer.0),
     }
 }
 
@@ -920,6 +973,130 @@ const fn clean_method_mode(mode: crate::agent_sdk::MethodMode) -> super::MethodM
         crate::agent_sdk::MethodMode::Merge => super::MethodMode::Merge,
         crate::agent_sdk::MethodMode::Local => super::MethodMode::Local,
     }
+}
+
+fn valid_clean_invocation_acknowledgements(
+    acknowledgements: &[crate::agent_sdk::InvocationAcknowledgement],
+) -> bool {
+    acknowledgements.len() <= MAX_INVOCATION_ACKNOWLEDGEMENTS_PER_LANE * 4
+        && acknowledgements
+            .iter()
+            .all(crate::agent_sdk::InvocationAcknowledgement::validate)
+        && acknowledgements.iter().enumerate().all(|(index, item)| {
+            let scope = clean_method_mode(item.mode).invocation_scope();
+            acknowledgements[..index].iter().all(|prior| {
+                prior.invocation != item.invocation
+                    || clean_method_mode(prior.mode).invocation_scope() != scope
+            })
+        })
+        && acknowledgements.windows(2).all(|pair| {
+            clean_acknowledgement_storage_tag(pair[0].mode)
+                <= clean_acknowledgement_storage_tag(pair[1].mode)
+        })
+        && [
+            InvocationResultStorage::Control,
+            InvocationResultStorage::Lane(StateLane::Linear),
+            InvocationResultStorage::Lane(StateLane::Merge),
+            InvocationResultStorage::Lane(StateLane::Local),
+        ]
+        .into_iter()
+        .all(|storage| {
+            acknowledgements
+                .iter()
+                .filter(|item| clean_method_mode(item.mode).result_storage() == storage)
+                .count()
+                <= MAX_INVOCATION_ACKNOWLEDGEMENTS_PER_LANE
+        })
+}
+
+const fn clean_acknowledgement_storage_tag(mode: crate::agent_sdk::MethodMode) -> u8 {
+    match clean_method_mode(mode).result_storage() {
+        InvocationResultStorage::Control => 0,
+        InvocationResultStorage::Lane(StateLane::Linear) => 1,
+        InvocationResultStorage::Lane(StateLane::Merge) => 2,
+        InvocationResultStorage::Lane(StateLane::Local) => 3,
+    }
+}
+
+/// Authenticated system-authority projections are read-only and carry their
+/// complete replay binding inside the signed query. Their ordered journal
+/// acknowledgement is therefore the durable retirement fact; retaining a
+/// second positive acknowledgement forever in guest state would exhaust the
+/// generic 32-result lane after 32 inventory pages. No other clean invocation
+/// is eligible for this compaction.
+fn is_system_authority_projection_query(
+    descriptor: &crate::agent_sdk::AgentDescriptor,
+    work: &crate::agent_sdk::InvocationWork,
+    authorization: &crate::agent_sdk::InvocationAuthorization,
+) -> bool {
+    use crate::actors::codec::{Decode as _, Encode as _};
+    use crate::actors::value::{Msg, TAG_DYNAMIC, Value};
+    use crate::agent_sdk::authority::{
+        AuthorityActorTarget, AuthorityProjectionQuery, AuthorityProjectionSelector,
+    };
+    use crate::agent_sdk::wire::CanonicalWire as _;
+
+    if descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared
+        || work.mode != crate::agent_sdk::MethodMode::Query
+        || !matches!(
+            authorization,
+            crate::agent_sdk::InvocationAuthorization::PublicPreflight(_)
+        )
+        || work.space != descriptor.identity.space
+        || work.agent != descriptor.identity.agent
+        || work.actor != descriptor.authority.issuer.actor
+        || work.deployment != descriptor.authority.issuer.deployment
+        || work.program != descriptor.authority.issuer.program
+        || work.origin.principal.is_some()
+        || work.origin.credential.is_some()
+        || work.origin.actor.is_some()
+        || work.origin.capability.is_some()
+        || work.roles != crate::agent_sdk::InvocationRoleClaims::none()
+    {
+        return false;
+    }
+    let Some(message) = work
+        .message
+        .strip_prefix(&[TAG_DYNAMIC])
+        .and_then(Msg::try_decode)
+    else {
+        return false;
+    };
+    if message.args.0.len() != 1 {
+        return false;
+    }
+    let Some(Value::Bytes(query_bytes)) = message.args.get("query") else {
+        return false;
+    };
+    let Ok(query) = AuthorityProjectionQuery::decode(query_bytes) else {
+        return false;
+    };
+    let expected_method = match query.selector {
+        AuthorityProjectionSelector::Credential => "credential_projection",
+        AuthorityProjectionSelector::Agents { .. } => "agent_projection_page",
+        AuthorityProjectionSelector::AgentReplicas { .. } => "agent_replica_projection_page",
+        AuthorityProjectionSelector::Actors { .. } => "actor_projection_page",
+    };
+    query.validate_shape().is_ok()
+        && query.encode().ok().as_deref() == Some(query_bytes.as_slice())
+        && message.name == expected_method
+        && query.authority
+            == (AuthorityActorTarget {
+                space: descriptor.identity.space,
+                system_agent: descriptor.identity.agent,
+                system_runtime_deployment: descriptor.identity.runtime_deployment,
+                binding: descriptor.authority,
+            })
+        && query.attesting_node() == work.origin.transport_node
+        && work.invocation
+            == crate::agent_sdk::InvocationId(
+                crate::agent_sdk::Hash::digest(
+                    b"vos/system-authority/projection-invocation/v2",
+                    &[query.commitment().as_bytes()],
+                )
+                .0,
+            )
+        && message.encode() == work.message[1..]
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -988,6 +1165,29 @@ pub struct StandardActorState {
     pub debt: ActorLifecycleDebt,
 }
 
+/// Exact SDK package contract and runtime requirements retained for one
+/// clean actor. These fields cannot be reconstructed from the legacy
+/// compatibility projection because that projection collapses proof-system
+/// identities to a boolean.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StandardCleanActorPackage {
+    pub actor: crate::agent_sdk::ActorId,
+    pub contract: crate::agent_sdk::contract::ActorPackageContract,
+    pub requirements: crate::agent_sdk::RuntimeRequirements,
+}
+
+/// Exact SDK fields which the legacy install record cannot retain. The
+/// exact binding commitment combines the immutable legacy request commitment
+/// with the contract and non-collapsed requirements, making replay equality
+/// checkable after an actor upgrade without retaining constructor bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StandardCleanActorInstallation {
+    pub actor: crate::agent_sdk::ActorId,
+    pub commitment: crate::agent_sdk::Hash,
+    pub contract: crate::agent_sdk::contract::ActorPackageContract,
+    pub requirements: crate::agent_sdk::RuntimeRequirements,
+}
+
 /// One independently keyed physical lane entry. Active entries are selected
 /// by the directory's exact `(actor, state_generation)` pair. Nonmatching
 /// entries are historical and remain authenticated until checkpoint-only
@@ -1034,6 +1234,7 @@ impl StandardAgentRuntime {
                 local: Vec::new(),
             },
             invocation_results: BTreeMap::new(),
+            clean_invocation_acknowledgements: Vec::new(),
             machine_continuations: Vec::new(),
             lane_revisions: StandardLaneRevisions {
                 linear: 0,
@@ -1066,6 +1267,30 @@ impl StandardAgentRuntime {
 
     pub fn actor(&self, actor: ActorId) -> Option<&ActorEntry> {
         self.actors.get(&actor).map(|actor| &actor.record.entry)
+    }
+
+    /// Project one exact clean actor record from this already validated
+    /// runtime image. Physical hosts use this only while they retain their
+    /// exclusive image/journal ownership; it does not resolve catalog bytes
+    /// and therefore cannot by itself make a route ready.
+    pub(crate) fn clean_actor_record(
+        &self,
+        actor: crate::agent_sdk::ActorId,
+    ) -> Option<crate::agent_sdk::ActorDirectoryRecord> {
+        self.actors
+            .get(&ActorId(actor.0))
+            .map(|managed| legacy_actor_record_to_clean(&managed.record))
+    }
+
+    /// Return the immutable SDK install lineage retained separately from the
+    /// actor's upgradeable directory/package facts.
+    pub(crate) fn clean_actor_installation(
+        &self,
+        actor: crate::agent_sdk::ActorId,
+    ) -> Option<StandardCleanActorInstallation> {
+        self.actors
+            .get(&ActorId(actor.0))
+            .and_then(|managed| managed.clean_installation)
     }
 
     pub fn actor_record(&self, actor: ActorId) -> Option<&ActorRecord> {
@@ -1104,9 +1329,22 @@ impl StandardAgentRuntime {
                     debt: actor.debt,
                 })
                 .collect(),
+            clean_actor_packages: self.clean_descriptor.as_ref().and_then(|_| {
+                self.actors
+                    .values()
+                    .map(|actor| actor.clean_package)
+                    .collect()
+            }),
+            clean_actor_installations: self.clean_descriptor.as_ref().and_then(|_| {
+                self.actors
+                    .values()
+                    .map(|actor| actor.clean_installation)
+                    .collect()
+            }),
             retired_installation_ids: self.retired_installation_ids.iter().copied().collect(),
             lane_state: self.lane_state.clone(),
             invocation_results: self.invocation_results.values().cloned().collect(),
+            clean_invocation_acknowledgements: self.clean_invocation_acknowledgements.clone(),
             machine_continuations: self.machine_continuations.clone(),
             lane_revisions: self.lane_revisions,
             control_authority_slot: self.control_authority_slot,
@@ -1142,6 +1380,8 @@ impl StandardAgentRuntime {
         let clean_decision_sequence_high_water = state.clean_decision_sequence_high_water;
         let clean_acknowledged_through = state.clean_acknowledged_through;
         let clean_management_dispositions = state.clean_management_dispositions.clone();
+        let clean_actor_packages = state.clean_actor_packages.clone();
+        let clean_actor_installations = state.clean_actor_installations.clone();
         let active_resource_policy = state.active_resource_policy;
         let private_runtime_control_commitment = state.private_runtime_control_commitment;
         let private_runtime_control_sequence = state.private_runtime_control_sequence;
@@ -1162,10 +1402,13 @@ impl StandardAgentRuntime {
                 && state.private_authority_epoch_high_water.is_none()
                 && state.private_control_slot_high_water.is_none()
                 && state.private_management_dispositions.is_empty()
+                && state.clean_actor_packages.is_none()
+                && state.clean_actor_installations.is_none()
                 && state.retired_installation_ids.is_empty()
                 && state.system_authority.is_none()
                 && state.lane_state == StandardLaneState::default()
                 && state.invocation_results.is_empty()
+                && state.clean_invocation_acknowledgements.is_empty()
                 && state.machine_continuations.is_empty()
                 && state.lane_revisions == StandardLaneRevisions::default()
                 && state.control_authority_slot.is_none()
@@ -1205,6 +1448,7 @@ impl StandardAgentRuntime {
             || state.invocation_results.windows(2).any(|pair| {
                 (pair[0].scope, pair[0].invocation) >= (pair[1].scope, pair[1].invocation)
             })
+            || !valid_clean_invocation_acknowledgements(&state.clean_invocation_acknowledgements)
             || state.machine_continuations.len() > MAX_MACHINE_CONTINUATIONS
             || state
                 .machine_continuations
@@ -1241,7 +1485,9 @@ impl StandardAgentRuntime {
                 if clean_authority_epoch_high_water.is_none()
                     && clean_decision_sequence_high_water.is_none()
                     && clean_acknowledged_through == 0
-                    && clean_management_dispositions.is_empty() => {}
+                    && clean_management_dispositions.is_empty()
+                    && clean_actor_packages.is_none()
+                    && clean_actor_installations.is_none() => {}
             (Some(creation), Some(current))
                 if creation.validate().is_ok()
                     && current.validate().is_ok()
@@ -1288,7 +1534,45 @@ impl StandardAgentRuntime {
                         state
                             .authority_slot_high_water
                             .is_some_and(|high_water| item.observed_slot <= high_water)
-                    }) => {}
+                    })
+                    && clean_actor_packages.as_ref().is_some_and(|packages| {
+                        packages.len() == state.actors.len()
+                            && packages
+                                .windows(2)
+                                .all(|pair| pair[0].actor < pair[1].actor)
+                            && packages.iter().zip(&state.actors).all(|(package, actor)| {
+                                package.actor.0 == actor.record.entry.actor.0
+                                    && package.contract.is_valid()
+                                    && package.requirements.supported_by(current.identity.profile)
+                                    && current.runtime_contract.supports(package.contract)
+                                    && current.capabilities.satisfies(package.requirements)
+                                    && actor.record.contract
+                                        == clean_actor_contract_to_legacy(package.contract)
+                                    && actor.record.requirements
+                                        == clean_requirements_to_legacy(package.requirements)
+                            })
+                    })
+                    && clean_actor_installations
+                        .as_ref()
+                        .is_some_and(|installations| {
+                            installations.len() == state.actors.len()
+                                && installations
+                                    .windows(2)
+                                    .all(|pair| pair[0].actor < pair[1].actor)
+                                && installations.iter().zip(&state.actors).all(
+                                    |(installation, actor)| {
+                                        installation.actor.0 == actor.record.entry.actor.0
+                                            && installation.commitment
+                                                != crate::agent_sdk::Hash::ZERO
+                                            && installation.contract.is_valid()
+                                            && installation
+                                                .requirements
+                                                .supported_by(current.identity.profile)
+                                            && installation.requirements.lanes.bits()
+                                                == actor.record.entry.lanes.bits()
+                                    },
+                                )
+                        }) => {}
             _ => return Err(LifecycleError::InvalidRequest),
         }
 
@@ -1447,6 +1731,22 @@ impl StandardAgentRuntime {
                 record.entry.suspended = false;
             }
             let actor_id = record.entry.actor;
+            let clean_package = clean_actor_packages.as_ref().and_then(|packages| {
+                packages
+                    .binary_search_by_key(&crate::agent_sdk::ActorId(actor_id.0), |item| item.actor)
+                    .ok()
+                    .map(|index| packages[index])
+            });
+            let clean_installation = clean_actor_installations
+                .as_ref()
+                .and_then(|installations| {
+                    installations
+                        .binary_search_by_key(&crate::agent_sdk::ActorId(actor_id.0), |item| {
+                            item.actor
+                        })
+                        .ok()
+                        .map(|index| installations[index])
+                });
             let config = runtime.created()?;
             if record.installation_id == InstallationId::ZERO
                 || record.registry_reservation == Hash::ZERO
@@ -1504,9 +1804,15 @@ impl StandardAgentRuntime {
                     .chain([&record.package, &record.agent_schema, &record.role_policies])
                     .chain(record.installation_data.iter()),
             )?;
-            runtime
-                .actors
-                .insert(actor_id, ManagedActor { record, debt });
+            runtime.actors.insert(
+                actor_id,
+                ManagedActor {
+                    record,
+                    debt,
+                    clean_package,
+                    clean_installation,
+                },
+            );
         }
         runtime.retired_installation_ids = state.retired_installation_ids.into_iter().collect();
         for (actor, expected_deployment) in suspended {
@@ -1569,6 +1875,22 @@ impl StandardAgentRuntime {
             runtime
                 .invocation_results
                 .insert((result.scope, result.invocation), result);
+        }
+        if runtime.clean_descriptor.is_none() && !state.clean_invocation_acknowledgements.is_empty()
+        {
+            return Err(LifecycleError::InvalidRequest);
+        }
+        for acknowledgement in state.clean_invocation_acknowledgements {
+            let key = (
+                clean_method_mode(acknowledgement.mode).invocation_scope(),
+                InvocationId(acknowledgement.invocation.0),
+            );
+            if runtime.invocation_results.contains_key(&key) {
+                return Err(LifecycleError::InvalidRequest);
+            }
+            runtime
+                .clean_invocation_acknowledgements
+                .push(acknowledgement);
         }
         for continuation in state.machine_continuations {
             let actor = runtime.actors.get(&continuation.actor);
@@ -1684,7 +2006,45 @@ impl StandardAgentRuntime {
         self.config.as_ref().ok_or(LifecycleError::NotCreated)
     }
 
+    fn clean_actor_packages_are_exact(&self) -> bool {
+        match self.clean_descriptor.as_ref() {
+            None => self
+                .actors
+                .values()
+                .all(|actor| actor.clean_package.is_none() && actor.clean_installation.is_none()),
+            Some(descriptor) => self.actors.values().all(|actor| {
+                actor.clean_package.as_ref().is_some_and(|package| {
+                    package.actor.0 == actor.record.entry.actor.0
+                        && package.contract.is_valid()
+                        && package
+                            .requirements
+                            .supported_by(descriptor.identity.profile)
+                        && descriptor.runtime_contract.supports(package.contract)
+                        && descriptor.capabilities.satisfies(package.requirements)
+                        && actor.record.contract == clean_actor_contract_to_legacy(package.contract)
+                        && actor.record.requirements
+                            == clean_requirements_to_legacy(package.requirements)
+                }) && actor
+                    .clean_installation
+                    .as_ref()
+                    .is_some_and(|installation| {
+                        installation.actor.0 == actor.record.entry.actor.0
+                            && installation.commitment != crate::agent_sdk::Hash::ZERO
+                            && installation.contract.is_valid()
+                            && installation
+                                .requirements
+                                .supported_by(descriptor.identity.profile)
+                            && installation.requirements.lanes.bits()
+                                == actor.record.entry.lanes.bits()
+                    })
+            }),
+        }
+    }
+
     fn validate_signed_state_resource(&self) -> Result<(), LifecycleError> {
+        if !self.clean_actor_packages_are_exact() {
+            return Err(LifecycleError::InvalidRequest);
+        }
         let config = self.created()?;
         let limit = config.runtime_contract.resources.max_runtime_state_bytes as usize;
         let state = super::wire::encode_standard_runtime_state(&self.snapshot());
@@ -2044,6 +2404,8 @@ impl StandardAgentRuntime {
                     requirements: install.requirements,
                 },
                 debt: ActorLifecycleDebt::default(),
+                clean_package: None,
+                clean_installation: None,
             },
         );
         Ok(LifecycleReply::Installed(entry))
@@ -2103,7 +2465,6 @@ impl StandardAgentRuntime {
     /// canonical work commitment and complete typed-authorization commitment
     /// must match the immutable acceptance record; a legacy result with the
     /// same invocation key is deliberately divergent rather than adaptable.
-    #[cfg(feature = "pvm")]
     pub(crate) fn recover_clean_execution(
         &mut self,
         work: &crate::agent_sdk::InvocationWork,
@@ -2547,7 +2908,6 @@ impl StandardAgentRuntime {
         Ok(Some((record.ready_sequence, record.continuation.clone())))
     }
 
-    #[cfg(feature = "pvm")]
     pub(crate) fn recover_clean_yield(
         &self,
         work: &crate::agent_sdk::InvocationWork,
@@ -2930,6 +3290,141 @@ impl StandardAgentRuntime {
         schema_blob: &crate::agent_sdk::RuntimeBlob,
         policy_blob: &crate::agent_sdk::RuntimeBlob,
     ) -> Result<bool, super::execution::ActorExecutionError> {
+        self.authorize_clean_execution_with_proof(
+            work,
+            authorization,
+            schema_blob,
+            policy_blob,
+            None,
+        )
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn authorize_clean_attested_execution(
+        &self,
+        authenticated: &super::transition_proof_host::AuthenticatedAttestedTransition,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        schema_blob: &crate::agent_sdk::RuntimeBlob,
+        policy_blob: &crate::agent_sdk::RuntimeBlob,
+    ) -> Result<bool, super::execution::ActorExecutionError> {
+        use super::execution::ActorExecutionError;
+
+        let descriptor = self
+            .clean_descriptor
+            .as_ref()
+            .ok_or(ActorExecutionError::InvalidAvailability)?;
+        let actor = self
+            .actors
+            .get(&ActorId(work.actor.0))
+            .ok_or(ActorExecutionError::NotFound)?;
+        let runtime_contract = authenticated
+            .runtime_contract()
+            .ok_or(ActorExecutionError::InvalidAvailability)?;
+        let runtime_capabilities = authenticated
+            .runtime_capabilities()
+            .ok_or(ActorExecutionError::InvalidAvailability)?;
+        let actor_entry = authenticated
+            .actor_entry()
+            .ok_or(ActorExecutionError::InvalidAvailability)?;
+        let actor_contract = authenticated
+            .actor_contract()
+            .ok_or(ActorExecutionError::InvalidAvailability)?;
+        let actor_requirements = authenticated
+            .actor_requirements()
+            .ok_or(ActorExecutionError::InvalidAvailability)?;
+        let clean_package = actor
+            .clean_package
+            .as_ref()
+            .ok_or(ActorExecutionError::InvalidAvailability)?;
+        if descriptor.identity.space != authenticated.space()
+            || descriptor.identity.agent != authenticated.agent()
+            || descriptor.identity.runtime_deployment != authenticated.runtime_deployment()
+            || descriptor.identity.runtime_program != authenticated.runtime_program()
+            || &descriptor.runtime_package != authenticated.runtime_package()
+            || descriptor.runtime_contract != runtime_contract
+            || descriptor.capabilities != runtime_capabilities
+            || actor.record.entry != clean_entry_to_legacy(actor_entry)
+            || clean_package.actor.0 != actor.record.entry.actor.0
+            || clean_package.contract != actor_contract
+            || clean_package.requirements != actor_requirements
+            || actor.record.contract != clean_actor_contract_to_legacy(clean_package.contract)
+            || actor.record.requirements != clean_requirements_to_legacy(clean_package.requirements)
+            || !runtime_contract.supports(actor_contract)
+            || !runtime_capabilities.satisfies(actor_requirements)
+            || !runtime_capabilities
+                .proof_systems
+                .contains(authenticated.proof_system())
+            || !actor_requirements
+                .proof_systems
+                .contains(authenticated.proof_system())
+        {
+            return Err(ActorExecutionError::InvalidAvailability);
+        }
+        self.authorize_clean_execution_with_proof(
+            work,
+            authorization,
+            schema_blob,
+            policy_blob,
+            Some(authenticated.proof_system()),
+        )
+    }
+
+    /// Guest half of proof-host attested admission.
+    ///
+    /// The host has already authenticated the exact runtime package,
+    /// program, actor package and work in an unforgeable capability before it
+    /// starts this bundled PVM. The guest independently re-resolves the
+    /// installed package requirements and exact AMP2 method policy from its
+    /// committed state. Keeping this entry proof-system-only prevents a
+    /// caller-controlled copy of the host capability from entering the PVM
+    /// ABI while still enforcing Required{same proof system} in the runtime.
+    #[cfg(feature = "pvm")]
+    pub(crate) fn authorize_clean_proof_host_execution(
+        &self,
+        proof_system: crate::agent_sdk::Hash,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        schema_blob: &crate::agent_sdk::RuntimeBlob,
+        policy_blob: &crate::agent_sdk::RuntimeBlob,
+    ) -> Result<bool, super::execution::ActorExecutionError> {
+        use super::execution::ActorExecutionError;
+
+        let descriptor = self
+            .clean_descriptor
+            .as_ref()
+            .ok_or(ActorExecutionError::InvalidAvailability)?;
+        let actor = self
+            .actors
+            .get(&ActorId(work.actor.0))
+            .ok_or(ActorExecutionError::NotFound)?;
+        let package = actor
+            .clean_package
+            .as_ref()
+            .ok_or(ActorExecutionError::InvalidAvailability)?;
+        if proof_system == crate::agent_sdk::Hash::ZERO
+            || !descriptor.capabilities.proof_systems.contains(proof_system)
+            || !package.requirements.proof_systems.contains(proof_system)
+        {
+            return Err(ActorExecutionError::InvalidAvailability);
+        }
+        self.authorize_clean_execution_with_proof(
+            work,
+            authorization,
+            schema_blob,
+            policy_blob,
+            Some(proof_system),
+        )
+    }
+
+    fn authorize_clean_execution_with_proof(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        schema_blob: &crate::agent_sdk::RuntimeBlob,
+        policy_blob: &crate::agent_sdk::RuntimeBlob,
+        attested_proof_system: Option<crate::agent_sdk::Hash>,
+    ) -> Result<bool, super::execution::ActorExecutionError> {
         use super::execution::ActorExecutionError;
         use crate::actors::codec::Decode as _;
         use crate::actors::value::{Msg, TAG_DYNAMIC};
@@ -2962,7 +3457,15 @@ impl StandardAgentRuntime {
         let policy = policies
             .method(&message.name)
             .ok_or(ActorExecutionError::UnsupportedMethod)?;
-        if policy.mode != work.mode || policy.attestation != AttestationRequirement::None {
+        let attestation_matches = match (policy.attestation, attested_proof_system) {
+            (AttestationRequirement::None, None) => true,
+            (AttestationRequirement::Required { proof_system }, Some(attested_proof_system)) => {
+                proof_system == attested_proof_system
+            }
+            (AttestationRequirement::None, Some(_))
+            | (AttestationRequirement::Required { .. }, None) => false,
+        };
+        if policy.mode != work.mode || !attestation_matches {
             return Err(ActorExecutionError::UnsupportedMethod);
         }
         Ok(match authorization {
@@ -3309,6 +3812,38 @@ impl StandardAgentRuntime {
     /// Retire one exact clean terminal result after re-authenticating the
     /// original work and typed authorization. No clock or state is touched until every
     /// comparison has succeeded.
+    pub(crate) fn recover_clean_acknowledgement(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+    ) -> Result<
+        Option<crate::agent_sdk::InvocationAcknowledgement>,
+        crate::agent_sdk::InvocationError,
+    > {
+        use crate::agent_sdk::InvocationError;
+
+        if !work.validate() || !authorization.matches_acknowledgement(work) {
+            return Err(InvocationError::InvalidAuthorization);
+        }
+        let scope = clean_method_mode(work.mode).invocation_scope();
+        let Some(retained) = self.clean_invocation_acknowledgements.iter().find(|item| {
+            item.invocation == work.invocation
+                && clean_method_mode(item.mode).invocation_scope() == scope
+        }) else {
+            return Ok(None);
+        };
+        if retained.actor != work.actor
+            || retained.incarnation != work.incarnation
+            || retained.deployment != work.deployment
+            || retained.mode != work.mode
+            || retained.work != work.commitment()
+            || retained.authorization != authorization.commitment()
+        {
+            return Err(InvocationError::DivergentInvocation);
+        }
+        Ok(Some(*retained))
+    }
+
     pub(crate) fn acknowledge_clean_invocation(
         &mut self,
         work: &crate::agent_sdk::InvocationWork,
@@ -3316,6 +3851,10 @@ impl StandardAgentRuntime {
     ) -> Result<crate::agent_sdk::InvocationAcknowledgement, crate::agent_sdk::InvocationError>
     {
         use crate::agent_sdk::{InvocationAcknowledgement, InvocationError};
+
+        if let Some(retained) = self.recover_clean_acknowledgement(work, authorization)? {
+            return Ok(retained);
+        }
 
         let authorization_slot = match authorization {
             crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(_) => 0,
@@ -3363,7 +3902,36 @@ impl StandardAgentRuntime {
             work: binding.work,
             authorization: binding.authorization.commitment(),
         };
+        if self.clean_descriptor.as_ref().is_some_and(|descriptor| {
+            is_system_authority_projection_query(descriptor, work, authorization)
+        }) {
+            // Replay of the ordered acknowledgement reconstructs this same
+            // transition before the result disappears. A later whole-query
+            // retry is safe because the signed request is read-only and
+            // response-bound, while no positive guest fact or live proof edge
+            // remains to consume bounded lifecycle capacity.
+            self.invocation_results.remove(&key);
+            return Ok(acknowledgement);
+        }
+        let storage = clean_method_mode(work.mode).result_storage();
+        if self
+            .clean_invocation_acknowledgements
+            .iter()
+            .filter(|item| clean_method_mode(item.mode).result_storage() == storage)
+            .count()
+            >= MAX_INVOCATION_ACKNOWLEDGEMENTS_PER_LANE
+        {
+            return Err(InvocationError::ResultCapacity);
+        }
         self.invocation_results.remove(&key);
+        let storage_tag = clean_acknowledgement_storage_tag(acknowledgement.mode);
+        let insertion = self
+            .clean_invocation_acknowledgements
+            .iter()
+            .position(|item| clean_acknowledgement_storage_tag(item.mode) > storage_tag)
+            .unwrap_or(self.clean_invocation_acknowledgements.len());
+        self.clean_invocation_acknowledgements
+            .insert(insertion, acknowledgement);
         Ok(acknowledgement)
     }
 
@@ -3648,6 +4216,7 @@ impl StandardAgentRuntime {
         package: crate::service::BlobRef,
         contract: super::contract::RuntimePackageContract,
         capabilities: super::RuntimeCapabilities,
+        allow_outer_proofs: bool,
     ) -> Result<LifecycleReply, LifecycleError> {
         let config = self.created()?;
         let intrinsic = super::RuntimeCapabilities::standard();
@@ -3658,12 +4227,13 @@ impl StandardAgentRuntime {
             || to_deployment == DeploymentId::ZERO
             || to_program == ProgramId::ZERO
             || producer == ProducerId::ZERO
+            || producer == config.identity.transition_producer
             || package.hash == Hash::ZERO
             || package.len == 0
             || capabilities.max_actors > intrinsic.max_actors
             || capabilities.lanes.bits() & !intrinsic.lanes.bits() != 0
             || (capabilities.scheduling && !intrinsic.scheduling)
-            || (capabilities.proofs && !intrinsic.proofs)
+            || (capabilities.proofs && !intrinsic.proofs && !allow_outer_proofs)
             || capabilities.max_actors < self.actors.len() as u32
             || !capabilities.lanes.supported_by(config.identity.profile)
             || self.actors.values().any(|actor| {
@@ -3902,10 +4472,13 @@ impl StandardAgentRuntime {
                     || descriptor.capabilities.max_actors > intrinsic.max_actors
                     || descriptor.capabilities.lanes.bits() & !intrinsic.lanes.bits() != 0
                     || (descriptor.capabilities.scheduling && !intrinsic.scheduling)
-                    || !descriptor.capabilities.proof_systems.is_empty()
                 {
                     return Err(ManagementError::UnsupportedRuntime);
                 }
+                // Proof systems are implemented by the outer proof host, not
+                // by the deterministic Standard guest. Their exact bounded
+                // set remains authenticated by the pinned runtime package
+                // descriptor and is enforced again for every attested slice.
                 let config = clean_descriptor_to_legacy_config(descriptor)
                     .map_err(legacy_management_error)?;
                 validate_artifact_resources(
@@ -3938,20 +4511,48 @@ impl StandardAgentRuntime {
                         }
                         _ => ManagementError::InvalidRequest,
                     })?;
-                if !descriptor.runtime_contract.supports(install.contract)
-                    || !descriptor.capabilities.satisfies(install.requirements)
-                {
-                    return Err(ManagementError::UnsupportedRuntime);
-                }
                 let actor = crate::service::ActorId(install.entry.actor.0);
+                let exact_package = StandardCleanActorPackage {
+                    actor: install.entry.actor,
+                    contract: install.contract,
+                    requirements: install.requirements,
+                };
+                let exact_installation = clean_installation_binding(install);
+                let existing = self
+                    .actors
+                    .values()
+                    .find(|managed| managed.record.installation_id.0 == install.installation_id.0);
                 let generation = derive_state_generation(
                     Hash(authority.0),
                     observed_slot,
                     Hash(request.commitment().0),
                     actor,
                 );
+                if let Some(existing) = existing {
+                    if existing.clean_installation.as_ref() != Some(&exact_installation) {
+                        return Err(ManagementError::InvalidRequest);
+                    }
+                    return match self.install(clean_install_to_legacy(install), generation) {
+                        Ok(LifecycleReply::Installed(entry)) => {
+                            Ok(ManagementReply::Installed(legacy_entry_to_clean(&entry)))
+                        }
+                        Ok(_) => Err(ManagementError::InvalidRequest),
+                        Err(error) => Err(legacy_management_error(error)),
+                    };
+                }
+                if !descriptor.runtime_contract.supports(install.contract)
+                    || !descriptor.capabilities.satisfies(install.requirements)
+                {
+                    return Err(ManagementError::UnsupportedRuntime);
+                }
                 match self.install(clean_install_to_legacy(install), generation) {
                     Ok(LifecycleReply::Installed(entry)) => {
+                        let managed = self
+                            .actors
+                            .get_mut(&actor)
+                            .ok_or(ManagementError::InvalidRequest)?;
+                        managed.clean_package = Some(exact_package);
+                        managed.clean_installation = Some(exact_installation);
                         Ok(ManagementReply::Installed(legacy_entry_to_clean(&entry)))
                     }
                     Ok(_) => Err(ManagementError::InvalidRequest),
@@ -3976,6 +4577,14 @@ impl StandardAgentRuntime {
                 }
                 match self.upgrade_actor(clean_upgrade_to_legacy(upgrade)) {
                     Ok(LifecycleReply::Upgraded(entry)) => {
+                        self.actors
+                            .get_mut(&crate::service::ActorId(upgrade.actor.0))
+                            .expect("successfully upgraded actor remains installed")
+                            .clean_package = Some(StandardCleanActorPackage {
+                            actor: upgrade.actor,
+                            contract: upgrade.contract,
+                            requirements: upgrade.requirements,
+                        });
                         Ok(ManagementReply::Upgraded(legacy_entry_to_clean(&entry)))
                     }
                     Ok(_) => Err(ManagementError::InvalidRequest),
@@ -4024,7 +4633,12 @@ impl StandardAgentRuntime {
                 Err(error) => Err(legacy_management_error(error)),
             },
             ManagementRequest::UpgradeRuntime(upgrade) => {
-                if upgrade.capabilities.proof_systems.len() != 0 {
+                if !self.actors.values().all(|actor| {
+                    actor.clean_package.as_ref().is_some_and(|package| {
+                        upgrade.contract.supports(package.contract)
+                            && upgrade.capabilities.satisfies(package.requirements)
+                    })
+                }) {
                     return Err(ManagementError::UnsupportedRuntime);
                 }
                 if self.active_resource_policy.is_none_or(|policy| {
@@ -4048,6 +4662,7 @@ impl StandardAgentRuntime {
                     clean_blob_to_legacy(&upgrade.package),
                     clean_runtime_contract_to_legacy(upgrade.contract),
                     legacy_capabilities,
+                    true,
                 )
                 .map_err(legacy_management_error)?;
                 let current = self
@@ -4171,16 +4786,44 @@ impl StandardAgentRuntime {
                         }
                         _ => ManagementError::InvalidRequest,
                     })?;
+                let actor = crate::service::ActorId(install.entry.actor.0);
+                let exact_package = StandardCleanActorPackage {
+                    actor: install.entry.actor,
+                    contract: install.contract,
+                    requirements: install.requirements,
+                };
+                let exact_installation = clean_installation_binding(install);
+                let existing = self
+                    .actors
+                    .values()
+                    .find(|managed| managed.record.installation_id.0 == install.installation_id.0);
+                let generation =
+                    derive_state_generation(Hash(control.0), observed_slot, Hash(request.0), actor);
+                if let Some(existing) = existing {
+                    if existing.clean_installation.as_ref() != Some(&exact_installation) {
+                        return Err(ManagementError::InvalidRequest);
+                    }
+                    return match self.install(clean_install_to_legacy(install), generation) {
+                        Ok(LifecycleReply::Installed(entry)) => {
+                            Ok(ManagementReply::Installed(legacy_entry_to_clean(&entry)))
+                        }
+                        Ok(_) => Err(ManagementError::InvalidRequest),
+                        Err(error) => Err(legacy_management_error(error)),
+                    };
+                }
                 if !descriptor.runtime_contract.supports(install.contract)
                     || !descriptor.capabilities.satisfies(install.requirements)
                 {
                     return Err(ManagementError::UnsupportedRuntime);
                 }
-                let actor = crate::service::ActorId(install.entry.actor.0);
-                let generation =
-                    derive_state_generation(Hash(control.0), observed_slot, Hash(request.0), actor);
                 match self.install(clean_install_to_legacy(install), generation) {
                     Ok(LifecycleReply::Installed(entry)) => {
+                        let managed = self
+                            .actors
+                            .get_mut(&actor)
+                            .ok_or(ManagementError::InvalidRequest)?;
+                        managed.clean_package = Some(exact_package);
+                        managed.clean_installation = Some(exact_installation);
                         Ok(ManagementReply::Installed(legacy_entry_to_clean(&entry)))
                     }
                     Ok(_) => Err(ManagementError::InvalidRequest),
@@ -4201,6 +4844,14 @@ impl StandardAgentRuntime {
                 }
                 match self.upgrade_actor(clean_upgrade_to_legacy(upgrade)) {
                     Ok(LifecycleReply::Upgraded(entry)) => {
+                        self.actors
+                            .get_mut(&crate::service::ActorId(upgrade.actor.0))
+                            .expect("successfully upgraded actor remains installed")
+                            .clean_package = Some(StandardCleanActorPackage {
+                            actor: upgrade.actor,
+                            contract: upgrade.contract,
+                            requirements: upgrade.requirements,
+                        });
                         Ok(ManagementReply::Upgraded(legacy_entry_to_clean(&entry)))
                     }
                     Ok(_) => Err(ManagementError::InvalidRequest),
@@ -5128,6 +5779,7 @@ impl StandardAgentRuntime {
                 package,
                 contract,
                 capabilities,
+                false,
             ),
             LifecycleRequest::Inspect { .. }
             | LifecycleRequest::AcknowledgeInvocation { .. }
@@ -5431,6 +6083,7 @@ mod tests {
                 runtime_deployment: DeploymentId([4; 32]),
                 runtime_program: ProgramId([5; 32]),
                 runtime_producer: ProducerId([17; 32]),
+                transition_producer: ProducerId([18; 32]),
             },
             creation_nonce,
             authority: crate::agent::authority::AgentAuthorityBinding {
@@ -5623,6 +6276,7 @@ mod tests {
                 runtime_deployment: DeploymentId([0x21; 32]),
                 runtime_program: ProgramId([0x22; 32]),
                 runtime_producer: ProducerId([0x23; 32]),
+                transition_producer: ProducerId([0x24; 32]),
             },
             creation_nonce: nonce,
             authority: system.authority.clone(),
@@ -8412,6 +9066,24 @@ mod tests {
             contract: config.runtime_contract,
             capabilities: config.capabilities,
         };
+        let mut reused_signer_request = request.clone();
+        let LifecycleRequest::UpgradeRuntime { producer, .. } = &mut reused_signer_request else {
+            unreachable!();
+        };
+        *producer = config.identity.transition_producer;
+        let mut rejecting_runtime = StandardAgentRuntime::new();
+        create_authorized(&mut rejecting_runtime, &config, 1).unwrap();
+        assert_eq!(
+            rejecting_runtime.apply(authorized(
+                &config,
+                CredentialId([0x73; 32]),
+                2,
+                2,
+                reused_signer_request,
+            )),
+            Err(LifecycleError::UnsupportedRuntime),
+        );
+
         let mut runtime = StandardAgentRuntime::new();
         create_authorized(&mut runtime, &config, 1).unwrap();
         let upgraded = runtime
@@ -8421,11 +9093,16 @@ mod tests {
             &upgraded,
             LifecycleReply::RuntimeUpgraded(identity)
                 if identity.runtime_deployment == DeploymentId([0x75; 32])
+                    && identity.transition_producer == config.identity.transition_producer
         ));
 
         let encoded = super::super::wire::encode_standard_runtime_state(&runtime.snapshot());
         let decoded = super::super::wire::decode_standard_runtime_state(&encoded).unwrap();
         let mut reopened = StandardAgentRuntime::restore(decoded).unwrap();
+        assert_eq!(
+            reopened.config().unwrap().identity.transition_producer,
+            config.identity.transition_producer,
+        );
         assert_eq!(
             reopened
                 .apply(authorized(&config, credential, 2, 2, request))
@@ -9117,6 +9794,29 @@ mod tests {
             Err(LifecycleError::UnsupportedRuntime)
         );
 
+        let mut unbacked_proofs = config.capabilities;
+        unbacked_proofs.proofs = true;
+        assert_eq!(
+            apply_authorized(
+                &mut runtime,
+                &config,
+                LifecycleRequest::UpgradeRuntime {
+                    from_deployment: config.identity.runtime_deployment,
+                    to_deployment: DeploymentId([0xb5; 32]),
+                    to_program: ProgramId([0xb6; 32]),
+                    producer: ProducerId([0xb7; 32]),
+                    package: BlobRef {
+                        hash: Hash([0xb8; 32]),
+                        len: 100,
+                    },
+                    contract: config.runtime_contract,
+                    capabilities: unbacked_proofs,
+                },
+            ),
+            Err(LifecycleError::UnsupportedRuntime),
+            "legacy runtime upgrades cannot mint an untyped outer proof capability",
+        );
+
         let mut higher = config.runtime_contract;
         higher.resources.max_artifact_referenced_bytes = 500;
         let upgraded = apply_authorized(
@@ -9463,6 +10163,7 @@ mod tests {
                 package.clone(),
                 config.runtime_contract,
                 config.capabilities,
+                false,
             )
             .unwrap();
         let direct_bytes = super::super::wire::encode_standard_runtime_state(&direct.snapshot())

@@ -1,17 +1,17 @@
 //! Kernel-free refine-style execution of GP standard programs (SPI).
 //!
-//! [`execute`] loads a GP standard-program blob exactly the way
-//! `InvocationKernel::new_standard` does — same memory image, page
+//! [`execute`] loads a GP standard-program blob directly into the plain
+//! [`Interpreter`] with the specification-defined memory image, page
 //! permissions, register file, standard memory latency, and per-page init-gas
-//! charge — but runs it on the plain [`Interpreter`] with no capability
-//! microkernel and no hostcall dispatch. The whole path is `no_std`, so an
+//! charge. It has no capability microkernel or hostcall dispatch. The whole
+//! path is `no_std`, so an
 //! embedder (e.g. a wasm32 runtime) can perform pure refine invocations:
 //! any `ecalli` surfaces as [`ExitReason::HostCall`] in the returned
 //! [`Invocation`] for the embedder to reject or handle itself. Execution
 //! always uses the interpreter — never the kernel or the recompiler — on
 //! every target, which is the cross-machine determinism guarantee.
 //!
-//! Semantic-identity notes (pinned by unit tests against the kernel path):
+//! Standard-program semantic notes (pinned by the direct-execution tests):
 //! - Memory image (GP eq A.42): read-only data at `Z_Z`, read-write data
 //!   plus zeroed heap pages after a zone gap, a zeroed stack just below the
 //!   argument zone, and the argument bytes in the top input zone. Pages in
@@ -19,22 +19,22 @@
 //! - Page permissions: the read-only and argument regions are mapped
 //!   read-only; the read-write+heap and stack regions are read-write. This
 //!   is a 1:1 map of [`crate::spi::SpiRegion::writable`], matching the
-//!   `init_access` the kernel derives in `spi::to_manifest_blob`.
+//!   standard-program region permissions.
 //! - Registers (GP eq A.43): φ0 = the halt address, φ1 = stack top,
 //!   φ7/φ8 = argument base/length; entry is at instruction counter 0 (the
 //!   refine / is-authorized entry point).
-//! - ISA: [`crate::IsaMode::Conformance`], like the kernel's SPI path —
-//!   opcode 3 (`Ecall`, the jar capability surface) panics.
+//! - ISA: [`crate::IsaMode::Conformance`]. Opcode 3 (`Ecall`, the retired JAR
+//!   capability surface) is rejected by the standard-program decoder.
 //! - Standard load/store latency is the fixed 25 cycles specified by Gray
 //!   Paper v0.8.0, independently of declared page count. Page-tier latency is
 //!   confined to the capability/JAR service profile. The init charge still
 //!   derives from *declared* mapped pages, never from allocated bytes, so it
 //!   is independent of the memory representation.
 //! - Gas: [`GAS_PER_PAGE`] is charged per mapped page up front (the
-//!   kernel's init charge); a budget below that charge fails with
+//!   standard initialization charge); a budget below that charge fails with
 //!   [`RefineError::OutOfGas`] before executing anything. `gas_used`
-//!   includes the init charge, so `budget - gas_used` equals the kernel
-//!   VM's remaining gas.
+//!   includes the init charge, so `budget - gas_used` equals the
+//!   interpreter's remaining gas.
 //!
 //! 32-bit embedders: the flat image of a real SPI program spans ~4 GiB
 //! (GP maps the stack and argument regions just below 2³²), which cannot
@@ -108,8 +108,7 @@ pub struct Invocation {
     /// this harness dispatches nothing.
     pub exit: ExitReason,
     /// Total gas consumed: the per-page init charge plus execution gas.
-    /// The budget minus this equals the kernel VM's remaining gas for the
-    /// same blob/args/budget.
+    /// The budget minus this equals the interpreter's remaining gas.
     pub gas_used: Gas,
     /// The register file φ at exit.
     pub registers: [u64; PVM_REGISTER_COUNT],
@@ -382,20 +381,27 @@ impl Invocation {
     /// The output bytes designated by φ7/φ8 at a normal halt, per GP:
     /// `o = μ[φ7 .. φ7+φ8]`.
     ///
+    /// Read the designated output only when its guest-controlled length is at
+    /// most `maximum`. The bound is checked before reserving output memory;
+    /// allocation failure is reported as `None` rather than aborting a host.
     /// Returns `None` unless the exit is [`ExitReason::Halt`] and the whole
-    /// range lies on readable pages (GP treats an unreadable output range
-    /// at halt as a panic ☇ — that judgement is the embedder's). A
-    /// zero-length range is trivially readable.
-    pub fn output(&self) -> Option<Vec<u8>> {
+    /// range lies on readable pages (GP treats an unreadable output range at
+    /// halt as a panic ☇ — that judgement is the embedder's). A zero-length
+    /// range is trivially readable.
+    pub fn output_bounded(&self, maximum: usize) -> Option<Vec<u8>> {
         if self.exit != ExitReason::Halt {
             return None;
         }
         let ptr = u32::try_from(self.registers[7]).ok()? as u64;
         let len = u32::try_from(self.registers[8]).ok()? as u64;
+        let len = usize::try_from(len).ok()?;
+        if len > maximum {
+            return None;
+        }
         if len == 0 {
             return Some(Vec::new());
         }
-        let end = ptr + len;
+        let end = ptr + len as u64;
         if end > self.mem.span() {
             return None;
         }
@@ -404,7 +410,9 @@ impl Invocation {
         if self.mem.page_perms()[first..=last].contains(&PERM_NONE) {
             return None;
         }
-        let mut out = vec![0u8; len as usize];
+        let mut out = Vec::new();
+        out.try_reserve_exact(len).ok()?;
+        out.resize(len, 0);
         self.mem.read_bytes(ptr as u32, &mut out);
         Some(out)
     }
@@ -422,7 +430,7 @@ impl Invocation {
 /// ([`MemoryModel::Auto`]).
 ///
 /// Parses the canonical bare `spi_blob`, builds the GP memory image and
-/// register file for `args`, charges the kernel's per-page init gas, and runs
+/// register file for `args`, charges the standard per-page init gas, and runs
 /// the interpreter from instruction counter 0 (the refine entry) until it
 /// exits. Metadata-prefixed predecessor blobs are rejected. No hostcalls are
 /// handled: an `ecalli` ends the invocation with [`ExitReason::HostCall`].
@@ -448,8 +456,8 @@ mod tests {
     use crate::PVM_ZONE_SIZE;
 
     /// Wrap raw code + a memory profile in a bare GP standard-program blob
-    /// (no metadata prefix). Mirrors the kernel tests' builder; sizes stay
-    /// small so every length nat is a single byte.
+    /// (no metadata prefix). Sizes stay small so every length nat is a
+    /// single byte.
     fn build_standard_program(
         ro: &[u8],
         rw: &[u8],
@@ -592,7 +600,11 @@ mod tests {
                 assert_eq!(f.exit, s.exit, "exit reasons agree");
                 assert_eq!(f.gas_used, s.gas_used, "gas agrees");
                 assert_eq!(f.registers, s.registers, "registers agree");
-                assert_eq!(f.output(), s.output(), "outputs agree");
+                assert_eq!(
+                    f.output_bounded(PVM_PAGE_SIZE as usize),
+                    s.output_bounded(PVM_PAGE_SIZE as usize),
+                    "outputs agree"
+                );
                 assert_eq!(f.memory().span(), s.memory().span(), "spans agree");
                 let span = f.memory().span();
                 let page = PVM_PAGE_SIZE as u64;
@@ -624,7 +636,7 @@ mod tests {
         let inv = execute(&round_trip_blob(), &ARGS, 1_000_000).expect("executes");
         assert_eq!(inv.exit, ExitReason::Halt);
         assert_eq!(
-            inv.output().as_deref(),
+            inv.output_bounded(ARGS.len()).as_deref(),
             Some(&ARGS[..4]),
             "output reflects the args"
         );
@@ -649,7 +661,7 @@ mod tests {
     fn tiny_budget_exits_out_of_gas() {
         let inv = execute(&round_trip_blob(), &ARGS, INIT_GAS + 1).expect("init charge covered");
         assert_eq!(inv.exit, ExitReason::OutOfGas);
-        assert_eq!(inv.output(), None);
+        assert_eq!(inv.output_bounded(0), None);
     }
 
     #[test]
@@ -657,7 +669,7 @@ mod tests {
         let blob = build_standard_program(&[], &[], 0, 4096, &[0], &[1]);
         let inv = execute(&blob, &[], 1_000_000).expect("executes");
         assert_eq!(inv.exit, ExitReason::Panic);
-        assert_eq!(inv.output(), None);
+        assert_eq!(inv.output_bounded(0), None);
     }
 
     #[test]
@@ -682,7 +694,11 @@ mod tests {
         let arg_base = (1u64 << 32) - (1 << 16) - PVM_INIT_INPUT_SIZE as u64;
         assert_eq!(inv.registers[7], arg_base);
         assert_eq!(inv.registers[8], ARGS.len() as u64);
-        assert_eq!(inv.output(), None, "no output without a halt");
+        assert_eq!(
+            inv.output_bounded(ARGS.len()),
+            None,
+            "no output without a halt"
+        );
     }
 
     #[test]
@@ -719,7 +735,30 @@ mod tests {
         let blob = build_standard_program(&[], &[], 1, 4096, &code, &bits);
         let inv = execute(&blob, &[], 1_000_000).expect("executes");
         assert_eq!(inv.exit, ExitReason::Halt);
-        assert_eq!(inv.output(), None, "unreadable output range");
+        assert_eq!(
+            inv.output_bounded(PVM_PAGE_SIZE as usize),
+            None,
+            "unreadable output range"
+        );
+    }
+
+    #[test]
+    fn guest_output_length_is_bounded_before_allocation() {
+        let (mut code, mut bits) = (Vec::new(), Vec::new());
+        let [b0, b1, b2, _] = RW_BASE.to_le_bytes();
+        asm(&mut code, &mut bits, &[51, 7, b0, b1, b2]); // φ7 = RW_BASE
+        asm(&mut code, &mut bits, &[51, 8, 0, 0x10]); // φ8 = one 4 KiB page
+        asm(&mut code, &mut bits, &[50, 0]); // halt
+        let blob = build_standard_program(&[], &[], 1, 4096, &code, &bits);
+        let inv = execute_with(&blob, &[], 1_000_000, MemoryModel::Sparse).expect("executes");
+
+        assert_eq!(inv.exit, ExitReason::Halt);
+        assert_eq!(inv.output_bounded(64), None);
+        assert_eq!(
+            inv.output_bounded(PVM_PAGE_SIZE as usize),
+            Some(vec![0; PVM_PAGE_SIZE as usize]),
+            "the same readable output remains available under an exact bound",
+        );
     }
 
     #[test]
@@ -729,7 +768,7 @@ mod tests {
         let blob = build_standard_program(&[], &[], 0, 4096, &[50, 0], &[1, 0]);
         let inv = execute(&blob, &[], 1_000_000).expect("executes");
         assert_eq!(inv.exit, ExitReason::Halt);
-        assert_eq!(inv.output(), Some(Vec::new()));
+        assert_eq!(inv.output_bounded(0), Some(Vec::new()));
     }
 
     #[test]
@@ -918,7 +957,7 @@ mod tests {
         assert_eq!(inv.registers[3], 0x11223344, "stack round-trip");
         assert_eq!(inv.registers[5], 0x11223344, "rw round-trip");
         assert_eq!(
-            inv.output(),
+            inv.output_bounded(core::mem::size_of::<u64>()),
             Some(0x11223344u64.to_le_bytes().to_vec()),
             "output reads back through the stack region"
         );
@@ -929,46 +968,5 @@ mod tests {
             allocated < 16 << 20,
             "sparse allocation stays bounded ({allocated} bytes)"
         );
-    }
-
-    /// Semantic-identity anchor: the same blob/args/budget through
-    /// `InvocationKernel::new_standard` (std, interpreter backend) reaches
-    /// the same exit, register file, remaining gas, and memory image.
-    /// Together with the flat↔sparse differentials above this anchors the
-    /// sparse representation to the kernel too.
-    #[cfg(feature = "std")]
-    #[test]
-    fn matches_kernel_execution() {
-        use crate::kernel::{InvocationKernel, KernelResult};
-        use crate::vm_pool::VmState;
-
-        let blob = round_trip_blob();
-        let budget = 1_000_000u64;
-
-        let inv =
-            execute_with(&blob, &ARGS, budget, MemoryModel::Flat).expect("refine harness executes");
-        assert_eq!(inv.exit, ExitReason::Halt);
-
-        let mut kernel = InvocationKernel::new_standard(
-            &blob,
-            &ARGS,
-            budget,
-            crate::backend::PvmBackend::ForceInterpreter,
-        )
-        .expect("kernel loads the same blob");
-        kernel
-            .vm_arena
-            .vm_mut(0)
-            .transition(VmState::Running)
-            .unwrap();
-        assert!(matches!(kernel.run(), KernelResult::Halt));
-
-        let vm = kernel.vm_arena.vm(0);
-        assert_eq!(&inv.registers, vm.regs(), "register files agree");
-        assert_eq!(budget - inv.gas_used, vm.gas(), "gas accounting agrees");
-        let (kernel_mem, _, _) = kernel.extract_flat_mem();
-        let flat = inv.memory().as_flat().expect("flat was requested");
-        assert_eq!(flat, &kernel_mem[..], "memory images agree");
-        assert_eq!(inv.output().as_deref(), Some(&ARGS[..4]));
     }
 }

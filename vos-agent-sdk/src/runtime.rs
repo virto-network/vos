@@ -926,6 +926,34 @@ impl RuntimeTransition {
     }
 }
 
+/// Public-I/O commitment for one exact canonical runtime execution.
+///
+/// `canonical_work` must be the complete [`RuntimeWork`] wire bytes supplied
+/// to the guest, and `canonical_transition` must be the complete
+/// [`RuntimeTransition`] wire bytes returned by that same execution. The
+/// guest boundary and the physical host independently establish canonicality;
+/// this allocation-free primitive only commits the two already-canonical
+/// byte strings.
+///
+/// Work and transition use distinct leaf domains before the fixed-width
+/// leaves are combined. This makes their boundary and roles unambiguous even
+/// though [`Hash::digest`] accepts an unframed list of byte slices.
+pub fn runtime_transition_public_io(canonical_work: &[u8], canonical_transition: &[u8]) -> Hash {
+    let work = Hash::digest(b"vos/agent/runtime-public-io/work/v1", &[canonical_work]);
+    let transition = Hash::digest(
+        b"vos/agent/runtime-public-io/transition/v1",
+        &[canonical_transition],
+    );
+    Hash::digest(
+        b"vos/agent/runtime-public-io/v1",
+        &[
+            crate::RUNTIME_ABI_ID.as_bytes(),
+            work.as_bytes(),
+            transition.as_bytes(),
+        ],
+    )
+}
+
 /// Host-independent contract implemented by every custom AgentRuntime.
 pub trait AgentRuntime {
     fn capabilities(&self) -> RuntimeCapabilities;
@@ -935,6 +963,35 @@ pub trait AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_transition_public_io_is_domain_stable_and_role_sensitive() {
+        let commitment = runtime_transition_public_io(b"work", b"transition");
+        assert_eq!(
+            commitment,
+            Hash([
+                0x1b, 0x56, 0xd8, 0x21, 0xe8, 0xb8, 0x91, 0x30, 0x5c, 0x81, 0xf4, 0xf4, 0x1e, 0x6c,
+                0x0f, 0xa2, 0x63, 0xd0, 0x3c, 0x64, 0xa8, 0xe0, 0xe9, 0xec, 0xe4, 0x9f, 0xe1, 0xc5,
+                0x33, 0x8f, 0x53, 0x0f,
+            ])
+        );
+        assert_ne!(
+            commitment,
+            runtime_transition_public_io(b"transition", b"work")
+        );
+        assert_ne!(
+            commitment,
+            runtime_transition_public_io(b"wor", b"ktransition")
+        );
+        assert_ne!(
+            commitment,
+            runtime_transition_public_io(b"work!", b"transition")
+        );
+        assert_ne!(
+            commitment,
+            runtime_transition_public_io(b"work", b"transition!")
+        );
+    }
 
     #[test]
     fn management_authority_metadata_is_derived_from_the_typed_request() {

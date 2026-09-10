@@ -42,12 +42,9 @@ use crate::side_note::CompactTrace;
 ///
 /// Returns `None` if the blob isn't parseable or lacks a CODE cap.
 pub fn interpreter_from_blob(blob: &[u8], gas: u64) -> Option<(Interpreter, Vec<u8>)> {
-    // This adapter parses only the transitional capability-manifest
-    // container. Its encoded instructions therefore use the frozen Jar
-    // profile, not the standard v0.8 numbering.
-    if !vos_pvm::spi::is_jar_manifest(blob) {
-        return None;
-    }
+    // This legacy proof adapter parses only the capability-manifest
+    // container. `program::parse_blob` rejects bare standard programs; clean
+    // nested Refine proofs use `crate::refine` and never fall back here.
     let parsed = program::parse_blob(blob)?;
 
     let mut code_data = None;

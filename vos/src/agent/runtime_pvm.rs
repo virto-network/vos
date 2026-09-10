@@ -37,7 +37,8 @@ pub(crate) fn execute_service_wire<T: ServiceWire>(
     gas: Gas,
     input: &[u8],
 ) -> Result<T, RuntimePvmExecutionError> {
-    let output = execute_to_halted_output(runtime_pvm, gas, input)?;
+    let output =
+        execute_to_halted_output(runtime_pvm, gas, input, crate::service::wire::MAX_BYTES)?;
     T::decode(&output).map_err(|_| RuntimePvmExecutionError::Decode)
 }
 
@@ -47,7 +48,7 @@ pub(crate) fn execute_canonical_wire<T: AgentCanonicalWire>(
     gas: Gas,
     input: &[u8],
 ) -> Result<T, RuntimePvmExecutionError> {
-    let output = execute_to_halted_output(runtime_pvm, gas, input)?;
+    let output = execute_to_halted_output(runtime_pvm, gas, input, T::MAX_ENCODED_BYTES)?;
     T::decode(&output).map_err(|_| RuntimePvmExecutionError::Decode)
 }
 
@@ -55,6 +56,7 @@ fn execute_to_halted_output(
     runtime_pvm: &[u8],
     gas: Gas,
     input: &[u8],
+    maximum_output_bytes: usize,
 ) -> Result<Vec<u8>, RuntimePvmExecutionError> {
     let invocation = RefineContext::load(runtime_pvm, input, gas)
         .map_err(|_| RuntimePvmExecutionError::Load)?
@@ -66,7 +68,7 @@ fn execute_to_halted_output(
         });
     }
     invocation
-        .output()
+        .output_bounded(maximum_output_bytes)
         .ok_or(RuntimePvmExecutionError::MissingOutput)
 }
 
@@ -120,6 +122,14 @@ mod tests {
                 b"canonical input",
             ),
             Ok(canonical)
+        );
+    }
+
+    #[test]
+    fn halted_output_is_rejected_above_the_callers_wire_ceiling() {
+        assert_eq!(
+            execute_to_halted_output(&returning_program(b"123456789"), TEST_GAS, b"input", 8),
+            Err(RuntimePvmExecutionError::MissingOutput),
         );
     }
 

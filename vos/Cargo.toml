@@ -25,6 +25,10 @@ native-extension-client = ["pvm"]
 # service runtime, but it uses only the standard PVM inner-machine surface.
 # Keep its larger transient arena out of ordinary application actors.
 agent-runtime = ["pvm", "dep:ed25519-dalek"]
+# Host-side same-run Standard Refine execution, proving, bounded proof
+# material, and deterministic replay verification. Kept opt-in so ordinary
+# hosts and every no_std guest avoid the prover dependency graph.
+agent-transition-proof = ["std", "pvm", "dep:vos-pvm-proof"]
 # Host-only cryptography and strict control-chain verification for Private
 # agents. Keeping this separate from `std` avoids linking key material and
 # cipher implementations into hosts which do not serve Private agents.
@@ -72,7 +76,7 @@ http-ingress = [
 ]
 # Built-in authenticated SSH ingress and semantic space shell. The SSH
 # transport is node-owned infrastructure; actor packages never link it.
-ssh-ingress = ["std", "dep:s4-server", "dep:tokio"]
+ssh-ingress = ["std", "dep:s4-server", "dep:ssh-key", "dep:tokio"]
 # Enables redb-backed extension state persistence in the extension host.
 storage = ["dep:redb", "dep:merkle-crdt", "dep:futures-executor", "dep:futures-channel", "dep:vos-raft"]
 # Enables the libp2p-backed networking layer (peer transport, identity,
@@ -97,6 +101,7 @@ vos-pvm-program = { workspace = true }
 # std-only: workspace-owned PVM runtime and compiler dependencies.
 vos-pvm = { workspace = true, optional = true }
 vos-pvm-compiler = { workspace = true, optional = true }
+vos-pvm-proof = { workspace = true, optional = true }
 # Host-side execution of the vos-pvm-proof Ristretto/scalar precompile ECALLs, so
 # a pvm-precompile actor (cipher-clerk crypto) runs LIVE in the runtime
 # bit-identically to the prover's tracer — the `ristretto` feature's
@@ -171,6 +176,7 @@ rustls-pemfile = { version = "2", optional = true }
 # Exact companion revision carrying stable principal/credential separation
 # and strict host-key persistence for the built-in space shell.
 s4-server = { git = "https://codeberg.org/Virto/s4.git", rev = "70f90315ae59031023aedc9459bac72cb79725d8", optional = true }
+ssh-key = { version = "=0.7.0-rc.10", optional = true }
 # Drives vos-raft's async Storage / Transport futures from inside
 # the existing sync Network::set_raft_handler / RaftCommit code
 # paths. Std-only — gated behind the `storage` feature so no_std
@@ -216,8 +222,9 @@ clerk-settle = { path = "../actors/clerk-settle", default-features = false }
 prover-extension = { path = "../extensions/prover" }
 # vos-pvm-proof canonical prover + segmentation — the `voucher_check_commitment_
 # drift_guard` re-derives the pinned VOUCHER_CHECK_COMMITMENTS by proving
-# two canonical segments. Already in the dev-dep graph via prover-extension;
-# named directly here so the guard can call it.
+# two canonical segments. The optional normal dependency above is used only
+# by production physical transition hosts; retaining this dev dependency
+# keeps the pre-existing default test gate intact.
 vos-pvm-proof = { workspace = true }
 # Host-side cipher-clerk with `signing` so tests can build
 # signed CreateAccount events to push through the ledger. Pulls in

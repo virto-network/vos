@@ -221,7 +221,10 @@ pub struct InvocationKernel {
     /// Backend selection for CODE cap compilation.
     pub backend: crate::backend::PvmBackend,
     /// ISA profile for CODE cap compilation and execution.
-    pub isa_mode: crate::IsaMode,
+    // Every production constructor is capability-manifest/JAR-only. Keeping
+    // the profile private prevents callers from mutating a legacy kernel into
+    // a substitute standard outer executor.
+    isa_mode: crate::IsaMode,
     /// Commitment to the canonical invocation program/layout inputs.
     invocation_layout_hash: [u8; 32],
     /// Protocol call whose result has not yet been injected.
@@ -282,20 +285,6 @@ impl InvocationKernel {
         Self::new_inner(blob, _args, gas, backend, crate::IsaMode::Jar, &[], None)
     }
 
-    /// Create a new kernel with a specific backend and ISA profile.
-    ///
-    /// `IsaMode::Conformance` executes under the graypaper-strict ISA:
-    /// opcode 3 (`Ecall`, the jar capability-kernel surface) panics.
-    pub fn new_with_backend_and_mode(
-        blob: &[u8],
-        args: &[u8],
-        gas: u64,
-        backend: crate::backend::PvmBackend,
-        isa_mode: crate::IsaMode,
-    ) -> Result<Self, KernelError> {
-        Self::new_inner(blob, args, gas, backend, isa_mode, &[], None)
-    }
-
     /// Create an invocation with canonical programs preinstalled as idle VMs.
     ///
     /// This is invocation setup, not a host-call extension. Each imported VM
@@ -318,44 +307,6 @@ impl InvocationKernel {
             programs,
             None,
         )
-    }
-
-    /// Create a kernel from a GP **standard program** blob (the graypaper
-    /// v0.7.2 format the `gp072_*` vectors use), the parallel init path to the
-    /// native `JAR\x02` manifest.
-    ///
-    /// The blob is parsed by [`crate::spi`], translated to an equivalent
-    /// manifest, and loaded through [`Self::new_inner`] under the
-    /// graypaper-strict ISA ([`crate::IsaMode::Conformance`]): host calls are
-    /// `ecalli`, and the JAR capability surface (`Ecall`) is rejected. The GP
-    /// argument registers `φ[7]`/`φ[8]` are then installed unconditionally, per
-    /// GP eq A.43 (the manifest args convention only sets them for non-empty
-    /// arguments).
-    pub fn new_standard(
-        blob: &[u8],
-        args: &[u8],
-        gas: u64,
-        backend: crate::backend::PvmBackend,
-    ) -> Result<Self, KernelError> {
-        let prog = crate::spi::parse_standard_program(blob).ok_or(KernelError::InvalidBlob)?;
-        let layout = prog.layout(args).ok_or(KernelError::InvalidBlob)?;
-        let manifest = crate::spi::to_manifest_blob(&prog, args).ok_or(KernelError::InvalidBlob)?;
-        // The args bytes are carried as the manifest's argument DATA cap, so
-        // pass no IPC args to `new_inner` (it would otherwise re-derive φ[7]).
-        let mut kernel = Self::new_inner(
-            &manifest,
-            &[],
-            gas,
-            backend,
-            crate::IsaMode::Conformance,
-            &[],
-            None,
-        )?;
-        let vm = kernel.vm_arena.vm_mut(0);
-        vm.set_reg(1, layout.registers[1]); // φ[1] = SP (stack top)
-        vm.set_reg(7, layout.registers[7]); // φ[7] = argument base
-        vm.set_reg(8, layout.registers[8]); // φ[8] = argument length
-        Ok(kernel)
     }
 
     fn new_inner(
@@ -516,11 +467,9 @@ impl InvocationKernel {
             }
         }
 
-        // Create VM 0. GP standard program initialization: the host owns SP,
-        // so the kernel installs φ[1]=stack_top here (the blob carries no SP
-        // preamble). Arguments follow the GP register ABI: φ[7]=args address,
-        // φ[8]=args length. Entry dispatch is by instruction counter (IC 0 =
-        // refine, IC 5 = accumulate) via `set_entry_ic`, not a φ[7] selector.
+        // Create legacy manifest VM 0. The host installs the manifest-owned
+        // stack and argument registers; standard outer programs use
+        // `RefineContext` instead and never enter this kernel.
         let mut vm0 = VmInstance::new(
             invoke_code_id,
             0, // entry_index (set by caller via CALL)
@@ -820,27 +769,10 @@ impl InvocationKernel {
         backend: crate::backend::PvmBackend,
         cache: Option<&mut CodeCache>,
     ) -> Result<Self, SnapshotError> {
-        Self::restore_inner(blob, &[], snapshot, backend, cache)
-    }
-
-    /// Restore a strict Gray Paper standard-program invocation. The standard
-    /// blob and arguments are deterministically translated to the same
-    /// canonical manifest used by [`Self::new_standard`] before immutable
-    /// program/layout commitments are checked.
-    pub fn restore_standard(
-        blob: &[u8],
-        args: &[u8],
-        snapshot: &KernelSnapshot,
-        backend: crate::backend::PvmBackend,
-    ) -> Result<Self, SnapshotError> {
-        if snapshot.isa_mode != SnapshotIsaMode::Conformance {
+        if snapshot.isa_mode != SnapshotIsaMode::Jar {
             return Err(SnapshotError::ProgramMismatch);
         }
-        let program =
-            crate::spi::parse_standard_program(blob).ok_or(SnapshotError::ProgramMismatch)?;
-        let manifest =
-            crate::spi::to_manifest_blob(&program, args).ok_or(SnapshotError::ProgramMismatch)?;
-        Self::restore_inner(&manifest, &[], snapshot, backend, None)
+        Self::restore_inner(blob, &[], snapshot, backend, cache)
     }
 
     /// Restore a portable snapshot against the complete canonical invocation
@@ -851,6 +783,9 @@ impl InvocationKernel {
         snapshot: &KernelSnapshot,
         backend: crate::backend::PvmBackend,
     ) -> Result<Self, SnapshotError> {
+        if snapshot.isa_mode != SnapshotIsaMode::Jar {
+            return Err(SnapshotError::ProgramMismatch);
+        }
         Self::restore_inner(blob, programs, snapshot, backend, None)
     }
 
@@ -4085,11 +4020,10 @@ mod tests {
     }
 
     #[test]
-    fn test_ecall_isa_modes() {
+    fn jar_kernel_dispatches_its_private_dynamic_ecall() {
         // LoadImm64 φ[12] = empty-slot subject, then Ecall, then Trap.
-        // Jar mode dispatches the ecall (unresolvable subject → WHAT,
-        // continue) and panics at the Trap (pc 11); full Conformance Ψ
-        // normalizes the invalid Ecall panic counter to zero.
+        // The remaining legacy kernel dispatches the ecall (unresolvable
+        // subject → WHAT, continue) and panics at the Trap (pc 11).
         let mut code = vec![20, 12]; // LoadImm64 φ[12]
         code.extend_from_slice(&(200u64 << 32).to_le_bytes()); // subject = slot 200 (empty)
         code.push(3); // PC 10: Ecall
@@ -4108,23 +4042,6 @@ mod tests {
             kernel.vm_arena.vm(kernel.active_vm).pc,
             11,
             "Jar mode dispatches the ecall and panics at the following Trap"
-        );
-
-        let mut kernel = InvocationKernel::new_with_backend_and_mode(
-            &blob,
-            &[],
-            100_000,
-            crate::backend::PvmBackend::Default,
-            crate::IsaMode::Conformance,
-        )
-        .unwrap();
-        let _ = kernel.vm_arena.vm_mut(0).transition(VmState::Running);
-        let result = kernel.run();
-        assert!(matches!(result, KernelResult::Panic));
-        assert_eq!(
-            kernel.vm_arena.vm(kernel.active_vm).pc,
-            0,
-            "Conformance panic exits normalize the counter"
         );
     }
 
@@ -5384,6 +5301,18 @@ mod tests {
             Err(SnapshotError::ProgramMismatch)
         ));
 
+        let mut retired_standard_profile = snapshot.clone();
+        retired_standard_profile.isa_mode = SnapshotIsaMode::Conformance;
+        assert!(matches!(
+            InvocationKernel::restore(
+                &blob,
+                &retired_standard_profile,
+                crate::backend::PvmBackend::ForceInterpreter,
+                None,
+            ),
+            Err(SnapshotError::ProgramMismatch)
+        ));
+
         let mut corrupt_memory = snapshot.clone();
         corrupt_memory.blocks[0].bytes[0] ^= 1;
         assert!(matches!(
@@ -5513,639 +5442,6 @@ mod tests {
                 restored.vm_arena.vm(0).cap_table.get(67),
                 Some(Cap::Data(data)) if data.mapped_runs() == vec![(1, 1), (3, 1)]
             ));
-        }
-    }
-
-    fn nested_failed_host_snapshot(
-        root: &[u8],
-        actor: &[u8],
-        backend: crate::backend::PvmBackend,
-    ) -> KernelSnapshot {
-        let programs = [DormantProgram {
-            blob: actor,
-            handle_slot: 100,
-        }];
-        let mut kernel = InvocationKernel::new_inner(
-            root,
-            &[],
-            1_000_000,
-            backend,
-            crate::IsaMode::Conformance,
-            &programs,
-            None,
-        )
-        .unwrap();
-        kernel
-            .vm_arena
-            .vm_mut(1)
-            .cap_table
-            .set(7, Cap::Protocol(ProtocolCap { id: 7 }));
-        let child_block_cost = match &kernel.code_caps[1].compiled {
-            crate::backend::CompiledProgram::Interpreter(program) => program.block_gas_costs[0],
-            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-            crate::backend::CompiledProgram::Recompiler(program) => program.block_gas_costs[0],
-        };
-        let child_limit = u64::from(child_block_cost) + 9;
-        let Some(Cap::Handle(handle)) = kernel.vm_arena.vm_mut(0).cap_table.get_mut(100) else {
-            panic!("root must own the imported actor handle");
-        };
-        handle.max_gas = Some(child_limit);
-        kernel
-            .vm_arena
-            .vm_mut(0)
-            .transition(VmState::Running)
-            .unwrap();
-
-        // The child funds its PVM block, then has only nine gas left for the
-        // kernel dispatch charge. It faults without acknowledging ecalli(7),
-        // returns that nine gas exactly once, and the root reaches its own
-        // host boundary.
-        assert!(matches!(
-            kernel.run(),
-            KernelResult::ProtocolCall { slot: 7 }
-        ));
-        assert_eq!(kernel.active_vm, 0);
-        let child = kernel.vm_arena.vm(1);
-        assert_eq!(child.state, VmState::Faulted);
-        assert_eq!(child.gas(), 0, "returned gas must not remain duplicated");
-        assert_eq!(
-            child.pending_host_call(),
-            Some(crate::PendingHostCall {
-                id: 7,
-                cause_pc: 0,
-                resume_pc: 2,
-            })
-        );
-        kernel.snapshot().unwrap()
-    }
-
-    #[test]
-    fn failed_child_host_dispatch_snapshot_resumes_exactly_without_gas_duplication() {
-        // Root: CALL imported child; then surface protocol 7; finally halt.
-        let root = make_blob_with(
-            &[10, 100, 10, 7, 50, 0, 0, 0, 0, 0],
-            &[1, 0, 1, 0, 1, 0, 0, 0, 0, 0],
-            &[],
-        );
-        // Child: protocol 7, then REPLY to its suspended caller.
-        let actor = make_blob_with(&[10, 7, 10, 0], &[1, 0, 1, 0], &[]);
-        let interpreter = nested_failed_host_snapshot(
-            &root,
-            &actor,
-            crate::backend::PvmBackend::ForceInterpreter,
-        );
-        let recompiler =
-            nested_failed_host_snapshot(&root, &actor, crate::backend::PvmBackend::ForceRecompiler);
-        assert_eq!(interpreter.to_bytes(), recompiler.to_bytes());
-
-        let programs = [DormantProgram {
-            blob: &actor,
-            handle_slot: 100,
-        }];
-        for backend in [
-            crate::backend::PvmBackend::ForceInterpreter,
-            crate::backend::PvmBackend::ForceRecompiler,
-        ] {
-            let mut restored = InvocationKernel::restore_with_dormant_programs(
-                &root,
-                &programs,
-                &interpreter,
-                backend,
-            )
-            .unwrap();
-            restored.resume_protocol_call(0, 0).unwrap();
-            assert!(matches!(
-                restored.handle_resume(100),
-                DispatchResult::Continue
-            ));
-            assert_eq!(restored.active_vm, 1);
-
-            // A full JIT context rebuild must reproduce the child's original
-            // host id (not HostCall(0)) and must not recharge its block.
-            let before_retry = restored.active_gas();
-            assert!(matches!(
-                restored.run(),
-                KernelResult::ProtocolCall { slot: 7 }
-            ));
-            assert_eq!(restored.active_gas(), before_retry - 10);
-            restored.resume_protocol_call(41, 0).unwrap();
-            assert!(matches!(restored.run(), KernelResult::Halt));
-            assert_eq!(restored.vm_arena.vm(1).gas(), 0);
-        }
-
-        let mut overflow = interpreter.clone();
-        overflow.arena.slots[0].vm.as_mut().unwrap().gas = u64::MAX;
-        overflow.arena.slots[1].vm.as_mut().unwrap().gas = 1;
-        assert!(matches!(
-            InvocationKernel::restore_with_dormant_programs(
-                &root,
-                &programs,
-                &overflow,
-                crate::backend::PvmBackend::ForceInterpreter,
-            ),
-            Err(SnapshotError::InvalidScheduler)
-        ));
-    }
-
-    // === GP standard-program (SPI) init path =================================
-
-    /// Wrap raw code + a memory profile in a bare GP standard-program blob
-    /// (no metadata prefix). Sizes are kept small so every length nat is a
-    /// single byte; `ro`/`rw` are placed verbatim.
-    fn build_standard_program(
-        ro: &[u8],
-        rw: &[u8],
-        heap_pages: u16,
-        stack_size: u32,
-        code: &[u8],
-        bitmask: &[u8],
-    ) -> Vec<u8> {
-        assert!(code.len() < 128, "test code must fit a 1-byte nat");
-        // Code sub-blob, compact deblob: E(|j|=0) ‖ z=1 ‖ E(|c|) ‖ code ‖ bitmask.
-        let mut cb = vec![0u8, 1u8, code.len() as u8];
-        cb.extend_from_slice(code);
-        let mut packed = vec![0u8; code.len().div_ceil(8)];
-        for (i, &b) in bitmask.iter().enumerate() {
-            if b != 0 {
-                packed[i / 8] |= 1 << (i % 8);
-            }
-        }
-        cb.extend_from_slice(&packed);
-
-        let mut blob = Vec::new();
-        blob.extend_from_slice(&(ro.len() as u32).to_le_bytes()[..3]); // E₃(|o|)
-        blob.extend_from_slice(&(rw.len() as u32).to_le_bytes()[..3]); // E₃(|w|)
-        blob.extend_from_slice(&heap_pages.to_le_bytes()); // E₂(z)
-        blob.extend_from_slice(&stack_size.to_le_bytes()[..3]); // E₃(s)
-        blob.extend_from_slice(ro);
-        blob.extend_from_slice(rw);
-        blob.extend_from_slice(&(cb.len() as u32).to_le_bytes()); // E₄(|c|)
-        blob.extend_from_slice(&cb);
-        blob
-    }
-
-    fn run_standard(blob: &[u8], args: &[u8], backend: crate::backend::PvmBackend) -> KernelResult {
-        let mut kernel = InvocationKernel::new_standard(blob, args, 1_000_000, backend).unwrap();
-        let _ = kernel.vm_arena.vm_mut(0).transition(VmState::Running);
-        kernel.run()
-    }
-
-    const SPI_BACKENDS: [crate::backend::PvmBackend; 2] = [
-        crate::backend::PvmBackend::ForceInterpreter,
-        crate::backend::PvmBackend::ForceRecompiler,
-    ];
-
-    // Standard-program memory landmarks for stack_size == one page.
-    const SPI_STACK_TOP: u64 = (1u64 << 32) - 2 * (1 << 16) - (1 << 24);
-    const SPI_ARG_BASE: u64 = (1u64 << 32) - (1 << 16) - (1 << 24);
-    const SPI_RO_BASE: u64 = 1 << 16;
-
-    #[test]
-    fn spi_standard_program_halts() {
-        // JumpInd RA, 0 → φ[0] (halt address) → halt.
-        let code = [50u8, 0, 0, 0, 0, 0];
-        let bitmask = [1u8, 0, 0, 0, 0, 0];
-        let blob = build_standard_program(&[], &[], 0, 4096, &code, &bitmask);
-        for be in SPI_BACKENDS {
-            assert!(
-                matches!(run_standard(&blob, &[], be), KernelResult::Halt),
-                "a trivial standard program must load and halt on {be:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn spi_standard_sets_gp_registers() {
-        let code = [50u8, 0, 0, 0, 0, 0];
-        let bitmask = [1u8, 0, 0, 0, 0, 0];
-        let blob = build_standard_program(&[], &[], 0, 4096, &code, &bitmask);
-        let args = [0xABu8; 5];
-        let kernel = InvocationKernel::new_standard(
-            &blob,
-            &args,
-            1_000_000,
-            crate::backend::PvmBackend::ForceInterpreter,
-        )
-        .unwrap();
-        let vm = kernel.vm_arena.vm(0);
-        assert_eq!(vm.reg(0), crate::PVM_HALT_ADDR, "φ[0] = RA (halt)");
-        assert_eq!(vm.reg(1), SPI_STACK_TOP, "φ[1] = SP (stack top)");
-        assert_eq!(vm.reg(7), SPI_ARG_BASE, "φ[7] = argument base");
-        assert_eq!(vm.reg(8), args.len() as u64, "φ[8] = argument length");
-    }
-
-    #[test]
-    fn spi_standard_maps_stack_writable() {
-        // Store into the base of the stack page; a correctly mapped writable
-        // stack halts, an unmapped/read-only one faults.
-        let stack_bottom = (SPI_STACK_TOP - 4096) as u32;
-        let (code, bitmask) = store_at_program(stack_bottom);
-        let blob = build_standard_program(&[], &[], 0, 4096, &code, &bitmask);
-        for be in SPI_BACKENDS {
-            assert!(
-                matches!(run_standard(&blob, &[], be), KernelResult::Halt),
-                "the stack region must be mapped writable at its GP address on {be:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn spi_standard_maps_ro_readable() {
-        // Load from the read-only region; a correct mapping halts.
-        let ro = [0x11u8, 0x22, 0x33, 0x44];
-        let (code, bitmask) = load_at_program(SPI_RO_BASE as u32);
-        let blob = build_standard_program(&ro, &[], 0, 4096, &code, &bitmask);
-        for be in SPI_BACKENDS {
-            assert!(
-                matches!(run_standard(&blob, &[], be), KernelResult::Halt),
-                "the read-only region must be mapped readable at Z_Z on {be:?}"
-            );
-        }
-    }
-
-    fn standard_protocol_snapshot(
-        blob: &[u8],
-        backend: crate::backend::PvmBackend,
-    ) -> KernelSnapshot {
-        let mut kernel = InvocationKernel::new_standard(blob, &[], 10_000, backend).unwrap();
-        kernel
-            .vm_arena
-            .vm_mut(0)
-            .transition(VmState::Running)
-            .unwrap();
-        assert!(matches!(
-            kernel.run(),
-            KernelResult::ProtocolCall { slot: 7 }
-        ));
-        let vm = kernel.vm_arena.vm(0);
-        assert_eq!(vm.pc, 0);
-        assert!(vm.gas_charged());
-        assert_eq!(
-            vm.pending_host_call(),
-            Some(crate::PendingHostCall {
-                id: 7,
-                cause_pc: 0,
-                resume_pc: 2,
-            })
-        );
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        crate::recompiler::signal::SIGNAL_STATE.with(|cell| assert!(cell.get().is_null()));
-        kernel.snapshot().unwrap()
-    }
-
-    #[test]
-    fn standard_protocol_snapshot_preserves_exact_host_ack_boundary() {
-        let code = [10, 7, 50, 0, 0, 0, 0, 0];
-        let bitmask = [1, 0, 1, 0, 0, 0, 0, 0];
-        let blob = build_standard_program(&[], &[], 0, 4096, &code, &bitmask);
-        let interpreter =
-            standard_protocol_snapshot(&blob, crate::backend::PvmBackend::ForceInterpreter);
-        let recompiler =
-            standard_protocol_snapshot(&blob, crate::backend::PvmBackend::ForceRecompiler);
-        assert_eq!(interpreter.to_bytes(), recompiler.to_bytes());
-
-        let pending = interpreter.pending_call.unwrap();
-        assert_eq!(pending.host_call_id, 7);
-        assert_eq!((pending.cause_pc, pending.resume_pc), (0, 2));
-        assert!(pending.gas_charged);
-
-        // Snapshot v5 is the unreleased standard cutover format. Lock both
-        // suspended host-ID fields to the full machine-register width; the
-        // capability adapter may later reject this value, but the portable
-        // boundary must never truncate it while encoding or decoding state.
-        let mut wide_id_snapshot = interpreter.clone();
-        wide_id_snapshot.pending_call.as_mut().unwrap().host_call_id = u64::MAX;
-        wide_id_snapshot.arena.slots[0]
-            .vm
-            .as_mut()
-            .unwrap()
-            .pending_host_call
-            .as_mut()
-            .unwrap()
-            .id = u64::MAX;
-        let wide_id_snapshot = KernelSnapshot::from_bytes(&wide_id_snapshot.to_bytes()).unwrap();
-        assert_eq!(
-            wide_id_snapshot.pending_call.unwrap().host_call_id,
-            u64::MAX
-        );
-        assert_eq!(
-            wide_id_snapshot.arena.slots[0]
-                .vm
-                .as_ref()
-                .unwrap()
-                .pending_host_call
-                .unwrap()
-                .id,
-            u64::MAX
-        );
-
-        for backend in SPI_BACKENDS {
-            let mut restored =
-                InvocationKernel::restore_standard(&blob, &[], &interpreter, backend).unwrap();
-            assert_eq!(restored.snapshot().unwrap(), interpreter);
-            let funded_gas = restored.active_gas();
-            restored.resume_protocol_call(11, 13).unwrap();
-            assert_eq!(restored.vm_arena.vm(0).pc, 2);
-            assert!(restored.vm_arena.vm(0).gas_charged());
-            assert!(matches!(restored.run(), KernelResult::Halt));
-            assert_eq!(restored.active_gas(), funded_gas);
-            assert_eq!(restored.active_reg(7), 11);
-            assert_eq!(restored.active_reg(8), 13);
-        }
-
-        let expect_invalid = |snapshot: &KernelSnapshot| {
-            assert!(matches!(
-                InvocationKernel::restore_standard(
-                    &blob,
-                    &[],
-                    snapshot,
-                    crate::backend::PvmBackend::ForceInterpreter,
-                ),
-                Err(SnapshotError::InvalidScheduler)
-            ));
-        };
-
-        let mut wrong_resume = interpreter.clone();
-        wrong_resume.pending_call.as_mut().unwrap().resume_pc = 3;
-        wrong_resume.arena.slots[0]
-            .vm
-            .as_mut()
-            .unwrap()
-            .pending_host_call
-            .as_mut()
-            .unwrap()
-            .resume_pc = 3;
-        expect_invalid(&wrong_resume);
-
-        let mut unfunded = interpreter.clone();
-        unfunded.pending_call.as_mut().unwrap().gas_charged = false;
-        unfunded.arena.slots[0].vm.as_mut().unwrap().gas_charged = false;
-        expect_invalid(&unfunded);
-
-        let mut wrong_route = interpreter.clone();
-        wrong_route.pending_call.as_mut().unwrap().slot = 8;
-        expect_invalid(&wrong_route);
-
-        let mut wrong_profile = interpreter.clone();
-        wrong_profile.isa_mode = SnapshotIsaMode::Jar;
-        assert!(matches!(
-            InvocationKernel::restore_standard(
-                &blob,
-                &[],
-                &wrong_profile,
-                crate::backend::PvmBackend::ForceInterpreter,
-            ),
-            Err(SnapshotError::ProgramMismatch)
-        ));
-    }
-
-    fn standard_page_fault_snapshot(
-        blob: &[u8],
-        stack_bottom: u32,
-        backend: crate::backend::PvmBackend,
-    ) -> KernelSnapshot {
-        let mut kernel = InvocationKernel::new_standard(blob, &[], 10_000, backend).unwrap();
-        let stack_page = stack_bottom / crate::PVM_PAGE_SIZE;
-        let mut removed = false;
-        for slot in 0..=255u8 {
-            if let Some(Cap::Data(data)) = kernel.vm_arena.vm_mut(0).cap_table.get_mut(slot)
-                && let Some(base) = data.base_offset
-                && stack_page >= base
-                && stack_page < base + data.page_count
-            {
-                data.unmap_pages(stack_page - base, 1);
-                removed = true;
-                break;
-            }
-        }
-        assert!(removed, "standard stack capability must exist");
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        unsafe {
-            // new_standard eagerly mapped the initial stack into window 0;
-            // keep native mappings in lockstep with the metadata mutation.
-            BackingStore::unmap_pages(kernel.active_window_base(), stack_page, 1);
-        }
-        kernel
-            .vm_arena
-            .vm_mut(0)
-            .transition(VmState::Running)
-            .unwrap();
-        let result = kernel.run();
-        assert!(
-            matches!(result, KernelResult::PageFault(address) if address == stack_bottom),
-            "unexpected {backend:?} result: {result:?}"
-        );
-        let vm = kernel.vm_arena.vm(0);
-        assert_eq!(vm.pc, 6, "the store is the exact retry cause");
-        let loaded_address = stack_bottom as i32 as i64 as u64;
-        assert_eq!(vm.reg(2), loaded_address, "earlier mutation survives");
-        assert!(vm.gas_charged());
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        crate::recompiler::signal::SIGNAL_STATE.with(|cell| assert!(cell.get().is_null()));
-        kernel.snapshot().unwrap()
-    }
-
-    #[test]
-    fn standard_page_fault_snapshot_retries_once_without_recharge() {
-        let stack_bottom = (SPI_STACK_TOP - 4096) as u32;
-        let (code, bitmask) = store_at_program(stack_bottom);
-        let blob = build_standard_program(&[], &[], 0, 4096, &code, &bitmask);
-        let interpreter = standard_page_fault_snapshot(
-            &blob,
-            stack_bottom,
-            crate::backend::PvmBackend::ForceInterpreter,
-        );
-        let recompiler = standard_page_fault_snapshot(
-            &blob,
-            stack_bottom,
-            crate::backend::PvmBackend::ForceRecompiler,
-        );
-        assert_eq!(interpreter.to_bytes(), recompiler.to_bytes());
-
-        for backend in SPI_BACKENDS {
-            let mut restored =
-                InvocationKernel::restore_standard(&blob, &[], &interpreter, backend).unwrap();
-            let stack_page = stack_bottom / crate::PVM_PAGE_SIZE;
-            let mut repaired = false;
-            for slot in 0..=255u8 {
-                if let Some(Cap::Data(data)) = restored.vm_arena.vm_mut(0).cap_table.get_mut(slot)
-                    && let (Some(base), Some(access)) = (data.base_offset, data.access)
-                    && stack_page >= base
-                    && stack_page < base + data.page_count
-                {
-                    repaired = data.map_pages(base, access, stack_page - base, 1);
-                    break;
-                }
-            }
-            assert!(repaired);
-            let funded_gas = restored.active_gas();
-            restored.resume_page_fault().unwrap();
-            assert!(matches!(restored.run(), KernelResult::Halt));
-            assert_eq!(restored.active_gas(), funded_gas);
-            assert_eq!(restored.active_reg(2), stack_bottom as i32 as i64 as u64);
-            assert_eq!(
-                restored.read_data_cap_window(stack_bottom, 4).as_deref(),
-                Some(stack_bottom.to_le_bytes().as_slice())
-            );
-            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-            crate::recompiler::signal::SIGNAL_STATE.with(|cell| assert!(cell.get().is_null()));
-        }
-
-        let expect_invalid = |snapshot: &KernelSnapshot| {
-            assert!(matches!(
-                InvocationKernel::restore_standard(
-                    &blob,
-                    &[],
-                    snapshot,
-                    crate::backend::PvmBackend::ForceInterpreter,
-                ),
-                Err(SnapshotError::InvalidScheduler)
-            ));
-        };
-        let mut unaligned = interpreter.clone();
-        unaligned.pending_fault.as_mut().unwrap().address += 1;
-        unaligned.arena.slots[0]
-            .vm
-            .as_mut()
-            .unwrap()
-            .pending_page_fault = Some(stack_bottom + 1);
-        expect_invalid(&unaligned);
-
-        let mut wrong_page = interpreter.clone();
-        let forged_page = stack_bottom.wrapping_sub(crate::PVM_PAGE_SIZE);
-        wrong_page.pending_fault.as_mut().unwrap().address = forged_page;
-        wrong_page.arena.slots[0]
-            .vm
-            .as_mut()
-            .unwrap()
-            .pending_page_fault = Some(forged_page);
-        expect_invalid(&wrong_page);
-
-        let mut non_memory_cause = interpreter.clone();
-        non_memory_cause.pending_fault.as_mut().unwrap().cause_pc = 0;
-        non_memory_cause.arena.slots[0].vm.as_mut().unwrap().pc = 0;
-        expect_invalid(&non_memory_cause);
-
-        let mut unfunded = interpreter.clone();
-        unfunded.pending_fault.as_mut().unwrap().gas_charged = false;
-        unfunded.arena.slots[0].vm.as_mut().unwrap().gas_charged = false;
-        expect_invalid(&unfunded);
-    }
-
-    #[test]
-    fn cyclic_pending_fault_validation_rejects_wrapped_low_page() {
-        const ADDRESS: u32 = 0xffff_fffc;
-        const HIGH_PAGE: u32 = 0xffff_f000 / crate::PVM_PAGE_SIZE;
-        // store_ind_u64 [r3],r2 with a zero offset, then standard Panic.
-        let code = [123, 2 + 16 * 3, 0];
-        let bitmask = [1, 0, 1];
-        let blob = build_standard_program(&[], &[], 0, 4096, &code, &bitmask);
-        let mut kernel = InvocationKernel::new_standard(
-            &blob,
-            &[],
-            10_000,
-            crate::backend::PvmBackend::ForceInterpreter,
-        )
-        .unwrap();
-
-        let backing_offset = (0..=255u8)
-            .find_map(|slot| match kernel.vm_arena.vm(0).cap_table.get(slot) {
-                Some(Cap::Data(data)) => Some(data.backing_offset),
-                _ => None,
-            })
-            .expect("standard layout must own a DATA backing page");
-        let mut high = DataCap::new(backing_offset, 1);
-        high.map(HIGH_PAGE, Access::RW);
-        kernel
-            .vm_arena
-            .vm_mut(0)
-            .cap_table
-            .set(253, Cap::Data(high));
-        kernel.vm_arena.vm_mut(0).set_reg(3, u64::from(ADDRESS));
-
-        let wrapped_low = PendingPageFault {
-            vm_index: 0,
-            address: 0,
-            cause_pc: 0,
-            gas_charged: true,
-        };
-        let high_fault = PendingPageFault {
-            address: 0xffff_f000,
-            ..wrapped_low
-        };
-        let vm = kernel.vm_arena.vm(0);
-        assert!(
-            !kernel.pending_page_fault_matches_vm(vm, wrapped_low),
-            "accessible high tail reaches the low-zone Panic, never PF(0)"
-        );
-        assert!(
-            !kernel.pending_page_fault_matches_vm(vm, high_fault),
-            "an accessible high tail cannot claim a high-page fault either"
-        );
-
-        let Some(Cap::Data(high)) = kernel.vm_arena.vm_mut(0).cap_table.get_mut(253) else {
-            unreachable!()
-        };
-        high.unmap_all();
-        let vm = kernel.vm_arena.vm(0);
-        assert!(
-            kernel.pending_page_fault_matches_vm(vm, high_fault),
-            "the inaccessible high tail is the first ordered exception"
-        );
-
-        // The process-local JAR adapter keeps its frozen overflowing-range
-        // retry marker until that profile is retired.
-        let jar_blob = make_blob_with(&code, &bitmask, &[]);
-        let mut jar = InvocationKernel::new_with_backend_and_mode(
-            &jar_blob,
-            &[],
-            10_000,
-            crate::backend::PvmBackend::ForceInterpreter,
-            crate::IsaMode::Jar,
-        )
-        .unwrap();
-        let backing_offset = match jar.vm_arena.vm(0).cap_table.get(65) {
-            Some(Cap::Data(data)) => data.backing_offset,
-            _ => unreachable!(),
-        };
-        let mut high = DataCap::new(backing_offset, 1);
-        high.map(HIGH_PAGE, Access::RW);
-        jar.vm_arena.vm_mut(0).cap_table.set(253, Cap::Data(high));
-        jar.vm_arena.vm_mut(0).set_reg(3, u64::from(ADDRESS));
-        assert!(jar.pending_page_fault_matches_vm(jar.vm_arena.vm(0), wrapped_low));
-    }
-
-    #[test]
-    fn standard_kernel_dispatch_oog_does_not_acknowledge_host_successor() {
-        let code = [10, 7, 0];
-        let bitmask = [1, 0, 1];
-        let blob = build_standard_program(&[], &[], 0, 4096, &code, &bitmask);
-        for backend in SPI_BACKENDS {
-            let probe = InvocationKernel::new_standard(&blob, &[], 10_000, backend).unwrap();
-            let block_cost = match &probe.code_caps[0].compiled {
-                crate::backend::CompiledProgram::Interpreter(program) => program.block_gas_costs[0],
-                #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-                crate::backend::CompiledProgram::Recompiler(program) => program.block_gas_costs[0],
-            };
-            let mut kernel = InvocationKernel::new_standard(&blob, &[], 10_000, backend).unwrap();
-            kernel.vm_arena.vm_mut(0).set_gas(u64::from(block_cost) + 9);
-            kernel
-                .vm_arena
-                .vm_mut(0)
-                .transition(VmState::Running)
-                .unwrap();
-            assert!(matches!(kernel.run(), KernelResult::OutOfGas));
-            let vm = kernel.vm_arena.vm(0);
-            assert_eq!(vm.pc, 0);
-            assert_eq!(vm.gas(), 9);
-            assert_eq!(
-                vm.pending_host_call(),
-                Some(crate::PendingHostCall {
-                    id: 7,
-                    cause_pc: 0,
-                    resume_pc: 2,
-                })
-            );
         }
     }
 }

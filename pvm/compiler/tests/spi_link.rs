@@ -1,8 +1,8 @@
 //! `link_elf_spi` end-to-end: transpile hand-assembled rv64em ELFs into GP
 //! standard-program (SPI) blobs and validate them against vos_pvm — the parser
 //! (`spi::parse_standard_program`), the GP layout (`StandardProgram::layout`),
-//! the kernel-free refine harness (`vos_pvm::refine`), and, differentially, the
-//! `JAR\x02` manifest path (`link_elf` + `InvocationKernel`).
+//! and the kernel-free Refine harness (`vos_pvm::refine`). The retired
+//! JAR/capability-kernel profile is deliberately not an oracle or fallback.
 //!
 //! The guests follow the zero-hostcall refine convention, which is
 //! backend-portable: arguments arrive as `φ7 = ptr` / `φ8 = len`, output is
@@ -12,7 +12,7 @@
 use vos_pvm::refine::{self, MemoryModel};
 use vos_pvm::spi::parse_standard_program;
 use vos_pvm::{ExitReason, PVM_HALT_ADDR, PVM_INIT_INPUT_SIZE, PVM_ZONE_SIZE};
-use vos_pvm_compiler::{TranspileError, link_elf, link_elf_spi};
+use vos_pvm_compiler::{TranspileError, link_elf_spi};
 
 const GAS: u64 = 10_000_000;
 
@@ -306,8 +306,8 @@ fn spi_blob_round_trips_and_lays_out_per_gp() {
 
     // Sections and header fields carry the linker's values (§ the mapping
     // documented on `link_elf_spi`): ro linked exactly at Z_Z needs no
-    // padding; the stack byte capacity equals the manifest's stack_pages
-    // worth; the heap page count is the linker's default 16.
+    // padding; the stack byte capacity equals the standard program's declared
+    // stack size; the heap page count is the linker's default 16.
     assert_eq!(prog.ro_data, RO_CONST.to_le_bytes());
     assert!(prog.rw_data.is_empty());
     assert_eq!(prog.stack_size as u64, z_z);
@@ -345,7 +345,7 @@ fn branch_target_preserves_each_predecessors_live_immediate() {
     for (argument, offset) in [(1u8, 0x1e0u64), (0, 0x2d0)] {
         let invocation = refine::execute(&blob, &[argument], GAS).expect("diamond executes");
         assert_eq!(invocation.exit, ExitReason::Halt);
-        assert_eq!(invocation.output().as_deref(), Some(&[0x5a][..]));
+        assert_eq!(invocation.output_bounded(1).as_deref(), Some(&[0x5a][..]));
         assert_eq!(
             invocation.registers[7],
             invocation.registers[1] - offset,
@@ -364,7 +364,7 @@ fn stripped_direct_and_data_pointer_entries_preserve_live_inputs() {
         let blob = link_elf_spi(&elf).expect("stripped call links");
         let invocation = refine::execute(&blob, &[], GAS).expect("stripped call executes");
         assert_eq!(invocation.exit, ExitReason::Halt);
-        assert_eq!(invocation.output().as_deref(), Some(&[0x5a][..]));
+        assert_eq!(invocation.output_bounded(1).as_deref(), Some(&[0x5a][..]));
         assert_eq!(
             invocation.registers[7],
             invocation.registers[1] - 0x1e0,
@@ -403,14 +403,16 @@ fn ro_linked_above_base_gets_leading_padding() {
 
     let inv = refine::execute(&blob, &[], GAS).expect("executes");
     assert_eq!(inv.exit, ExitReason::Halt);
-    assert_eq!(inv.output().as_deref(), Some(&RO_CONST.to_le_bytes()[..]));
+    assert_eq!(
+        inv.output_bounded(core::mem::size_of::<u64>()).as_deref(),
+        Some(&RO_CONST.to_le_bytes()[..])
+    );
 }
 
 /// `.data` is re-based to the GP rw base `2·Z_Z + zone_round(|o|)`: the
 /// linker's inter-section padding is stripped, the section keeps its vaddr,
-/// and the region is writable. (This zone placement exists only in the SPI
-/// container — the manifest maps rw right after ro — which is why data-in-rw
-/// guests are exercised SPI-only.)
+/// and the region is writable. This test pins the standard-program zone
+/// placement independently of the retired capability-manifest layout.
 #[test]
 fn rw_data_lands_at_linked_vaddr_under_spi() {
     let rw_vaddr = 3 * PVM_ZONE_SIZE as u64; // 0x3_0000 (|o| = 8 → one ro zone)
@@ -440,7 +442,10 @@ fn rw_data_lands_at_linked_vaddr_under_spi() {
 
     let inv = refine::execute(&blob, &[], GAS).expect("executes");
     assert_eq!(inv.exit, ExitReason::Halt);
-    assert_eq!(inv.output().as_deref(), Some(&rw_const.to_le_bytes()[..]));
+    assert_eq!(
+        inv.output_bounded(core::mem::size_of::<u64>()).as_deref(),
+        Some(&rw_const.to_le_bytes()[..])
+    );
 }
 
 #[test]
@@ -486,8 +491,6 @@ fn data_linked_below_gp_bases_is_rejected() {
         matches!(&err, TranspileError::InvalidSection(m) if m.contains("read-only")),
         "unexpected error: {err:?}"
     );
-    link_elf(&ro_low).expect("the manifest container still accepts it");
-
     let rw_low = build_elf(
         TEXT_VADDR,
         &[
@@ -505,57 +508,7 @@ fn data_linked_below_gp_bases_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// (b) Differential: the same ELF through both containers behaves the same.
-// ---------------------------------------------------------------------------
-
-/// The same hostcall-free ELF built as a `JAR\x02` manifest (run under the
-/// capability kernel) and as an SPI blob (run under `vos_pvm::refine`) reaches
-/// the same halt with the same register file — except the two host-owned,
-/// layout-determined registers: φ1 (SP: manifest stack top vs GP stack top)
-/// and φ7 (derived SP-relative output pointer). Both are asserted to hold
-/// the *same SP-relative value*, and the designated output bytes are
-/// asserted byte-equal.
-#[test]
-fn manifest_and_spi_executions_agree() {
-    let elf = checksum_guest_elf();
-    let spi_blob = link_elf_spi(&elf).expect("SPI links");
-    let manifest_blob = link_elf(&elf).expect("manifest links");
-
-    // SPI path: the kernel-free refine harness (interpreter-only).
-    let inv = refine::execute_with(&spi_blob, &ARGS, GAS, MemoryModel::Auto).expect("SPI executes");
-    assert_eq!(inv.exit, ExitReason::Halt);
-
-    // Manifest path: the capability kernel.
-    let mut kernel =
-        vos_pvm::kernel::InvocationKernel::new(&manifest_blob, &ARGS, GAS).expect("kernel loads");
-    assert!(
-        matches!(kernel.run(), vos_pvm::kernel::KernelResult::Halt),
-        "kernel run halts"
-    );
-    let kregs = *kernel.vm_arena.vm(0).regs();
-
-    // Register files agree except the layout-determined φ1/φ7.
-    for (i, (s, k)) in inv.registers.iter().zip(kregs.iter()).enumerate() {
-        if i == 1 || i == 7 {
-            continue;
-        }
-        assert_eq!(s, k, "φ{i} diverges between SPI and manifest");
-    }
-    assert_eq!(inv.registers[7], inv.registers[1] - 8, "SPI output at SP-8");
-    assert_eq!(kregs[7], kregs[1] - 8, "manifest output at SP-8");
-    assert_eq!(inv.registers[9], SUM, "φ9 holds the checksum");
-
-    // Output bytes agree: refine's φ7/φ8 accessor vs the kernel's memory.
-    let spi_out = inv.output().expect("SPI output readable");
-    let (kmem, _, _) = kernel.extract_flat_mem();
-    let kptr = kregs[7] as usize;
-    let kout = &kmem[kptr..kptr + kregs[8] as usize];
-    assert_eq!(spi_out, kout, "output bytes agree");
-    assert_eq!(spi_out, SUM.to_le_bytes());
-}
-
-// ---------------------------------------------------------------------------
-// (c) Refine-convention smoke under the refine harness, both memory models.
+// Refine-convention smoke under the standard harness, both memory models.
 // ---------------------------------------------------------------------------
 
 /// The refine-convention contract end-to-end on the SPI backend: args in via
@@ -570,7 +523,7 @@ fn refine_convention_guest_round_trips_args() {
         let inv = refine::execute_with(&blob, &ARGS, GAS, model).expect("executes");
         assert_eq!(inv.exit, ExitReason::Halt, "{model:?}");
         assert_eq!(
-            inv.output().as_deref(),
+            inv.output_bounded(core::mem::size_of::<u64>()).as_deref(),
             Some(&SUM.to_le_bytes()[..]),
             "{model:?}: output is RO_CONST + args[0]"
         );
@@ -584,5 +537,8 @@ fn refine_convention_guest_round_trips_args() {
     // garbage registers. (This guest reads args[0], so give it one byte.)
     let inv = refine::execute(&blob, &[0], GAS).expect("executes");
     assert_eq!(inv.exit, ExitReason::Halt);
-    assert_eq!(inv.output().as_deref(), Some(&RO_CONST.to_le_bytes()[..]));
+    assert_eq!(
+        inv.output_bounded(core::mem::size_of::<u64>()).as_deref(),
+        Some(&RO_CONST.to_le_bytes()[..])
+    );
 }

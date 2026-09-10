@@ -2,26 +2,17 @@
 //!
 //! Portable byte parsing and memory layout live in `vos-pvm-program`, shared
 //! with the compiler and guest agent runtimes. This module adds executor
-//! opcode validation and the temporary capability-manifest adapter used by
-//! the pre-agent kernel path.
+//! opcode validation and exact static host-call admission for standard outer
+//! runtimes. Standard programs are never projected through the legacy
+//! capability-manifest kernel in production.
 
 use alloc::vec::Vec;
 
 use crate::args::{Args, decode_args};
-use crate::cap::Access;
 use crate::instruction::Opcode;
-use crate::program::{
-    CapEntryType, CapManifestEntry, ParsedCodeBlob, build_blob, encode_code_blob,
-};
+use crate::program::ParsedCodeBlob;
 
 pub use vos_pvm_program::{Region as SpiRegion, StandardLayout, StandardProgram, read_nat};
-
-/// Cap-table slot for the standard program's CODE cap.
-pub(crate) const SPI_CODE_SLOT: u8 = 64;
-const SPI_RO_SLOT: u8 = 65;
-const SPI_RW_SLOT: u8 = 66;
-const SPI_STACK_SLOT: u8 = 67;
-const SPI_ARGS_SLOT: u8 = 68;
 
 /// The complete host-call surface implemented by [`crate::refine_host`].
 ///
@@ -40,17 +31,6 @@ pub enum HostCallInspectionError {
     /// An `ecalli` instruction names a call the selected host does not
     /// implement. The full decoded immediate is retained for diagnostics.
     UnsupportedHostCall(u64),
-}
-
-/// `true` if `blob` begins with the retired capability-manifest magic.
-///
-/// This remains only while the old host kernel is being replaced by the
-/// guest agent runtime.
-pub fn is_jar_manifest(blob: &[u8]) -> bool {
-    blob.get(..4)
-        .and_then(|bytes| bytes.try_into().ok())
-        .map(u32::from_le_bytes)
-        == Some(crate::program::JAR_MAGIC)
 }
 
 /// Decode the canonical compact code blob used by the standard `machine`
@@ -186,71 +166,6 @@ pub fn validate_standard_program_host_calls(
 /// serviced by [`crate::refine_host::RefineContext`].
 pub fn validate_refine_host_calls(blob: &[u8]) -> Result<(), HostCallInspectionError> {
     validate_standard_program_host_calls(blob, &REFINE_HOST_CALL_ALLOWLIST)
-}
-
-/// Translate a standard program into the temporary manifest representation
-/// used by the old capability kernel.
-pub(crate) fn to_manifest_blob(prog: &StandardProgram, args: &[u8]) -> Option<Vec<u8>> {
-    let layout = prog.layout(args)?;
-    let code_data = encode_code_blob(&prog.code.code, &prog.code.bitmask, &prog.code.jump_table);
-
-    let mut data_section = Vec::new();
-    data_section.extend_from_slice(&code_data);
-    let ro_off = data_section.len() as u32;
-    data_section.extend_from_slice(&prog.ro_data);
-    let rw_off = data_section.len() as u32;
-    data_section.extend_from_slice(&prog.rw_data);
-    let args_off = data_section.len() as u32;
-    data_section.extend_from_slice(args);
-
-    let base_page = |addr: u64| (addr / u64::from(crate::PVM_PAGE_SIZE)) as u32;
-    let page_count = |size: u64| (size / u64::from(crate::PVM_PAGE_SIZE)) as u32;
-    let mut caps = alloc::vec![CapManifestEntry {
-        cap_index: SPI_CODE_SLOT,
-        cap_type: CapEntryType::Code,
-        base_page: 0,
-        page_count: 0,
-        init_access: Access::RO,
-        data_offset: 0,
-        data_len: code_data.len() as u32,
-    }];
-
-    let mut push_region = |slot: u8, region: SpiRegion, data_off: u32, data_len: u32| {
-        if region.size == 0 {
-            return;
-        }
-        caps.push(CapManifestEntry {
-            cap_index: slot,
-            cap_type: CapEntryType::Data,
-            base_page: base_page(region.base),
-            page_count: page_count(region.size),
-            init_access: if region.writable {
-                Access::RW
-            } else {
-                Access::RO
-            },
-            data_offset: data_off,
-            data_len,
-        });
-    };
-
-    push_region(SPI_RO_SLOT, layout.ro, ro_off, prog.ro_data.len() as u32);
-    push_region(SPI_RW_SLOT, layout.rw, rw_off, prog.rw_data.len() as u32);
-    push_region(SPI_STACK_SLOT, layout.stack, 0, 0);
-    push_region(SPI_ARGS_SLOT, layout.args, args_off, args.len() as u32);
-
-    let memory_pages = caps
-        .iter()
-        .filter(|cap| cap.cap_type == CapEntryType::Data)
-        .map(|cap| cap.page_count)
-        .sum();
-    Some(build_blob(
-        memory_pages,
-        SPI_CODE_SLOT,
-        layout.registers[1] as u32,
-        &caps,
-        &data_section,
-    ))
 }
 
 #[cfg(test)]
@@ -410,13 +325,5 @@ mod tests {
         assert!(parse_compact_code_blob(&bytes).is_some());
         bytes.push(0);
         assert!(parse_compact_code_blob(&bytes).is_none());
-    }
-
-    #[test]
-    fn jar_manifest_is_detected_during_cutover() {
-        let manifest = crate::program::build_simple_blob(&[0], &[1], &[]);
-        assert!(is_jar_manifest(&manifest));
-        let standard = standard_blob(&[], &[], 0, 0, &[0], &[1]);
-        assert!(!is_jar_manifest(&standard));
     }
 }

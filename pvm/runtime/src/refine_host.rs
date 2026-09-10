@@ -579,7 +579,10 @@ mod tests {
         assert_eq!(observed.pc, expected.pc);
         assert_eq!(observed.registers, expected.registers);
         assert_eq!(observed.gas_used, expected.gas_used);
-        assert_eq!(observed.output(), expected.output());
+        assert_eq!(
+            observed.output_bounded(crate::PVM_PAGE_SIZE as usize),
+            expected.output_bounded(crate::PVM_PAGE_SIZE as usize)
+        );
         let inner = RefineMachineIdentity::Inner(InnerMachineIdentity {
             slot: 0,
             generation: 0,
@@ -666,13 +669,14 @@ mod tests {
     }
 
     #[test]
-    fn machine_reports_full_before_reading_an_invalid_outer_pointer() {
+    fn sixty_third_machine_is_admitted_and_sixty_fourth_is_full_before_read() {
         let outer = standard_program(&[0], &[0]);
         let mut context = RefineContext::load(&outer, &[], 10_000_000).unwrap();
         let inner = inner_program();
         for expected in 0..MAX_INNER_MACHINES as u32 {
             assert_eq!(context.inner.create(&inner, 0), Ok(expected));
         }
+        assert_eq!(context.inner.len(), 63);
         let registers = context.outer.registers_mut();
         registers[7] = u64::MAX;
         registers[8] = 1;

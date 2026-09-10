@@ -3,7 +3,8 @@ use vos_pvm_proof::{
     REFINE_BUNDLE_FORMAT_VERSION, RefineHostBoundary, RefineMachineId, RefineProgramId,
     RefineProofBundle, RefineSliceExit, RefineTraceError, production_pcs_config_mobile,
     prove_refine, refine_arguments_commitment, refine_bundle_cardinality_is_valid,
-    refine_bundle_commitment, refine_program_id, trace_refine, verify_refine_bundle_replayed,
+    refine_bundle_commitment, refine_bundle_execution_commitment, refine_program_id,
+    refine_trace_execution_commitment, trace_refine, verify_refine_bundle_replayed,
 };
 use vos_pvm_proof_verifier::{
     CommitmentHash, RefineBundleVerification, RefineProgramCommitmentResolver,
@@ -168,8 +169,31 @@ fn oversized_boundaries_reject_before_hashing_or_resolving_without_proofs() {
 #[test]
 fn nested_bundle_verifies_only_with_replay_and_rejects_hostile_edits() {
     let (outer, arguments, gas) = nested_fixture();
-    let bundle = prove_refine(trace_refine(&outer, &arguments, gas).unwrap())
-        .expect("prove nested Refine closure");
+    let trace = trace_refine(&outer, &arguments, gas).unwrap();
+    let execution_commitment = refine_trace_execution_commitment(&trace);
+    let bundle = prove_refine(trace).expect("prove nested Refine closure");
+    assert_eq!(
+        refine_bundle_execution_commitment(&bundle),
+        execution_commitment,
+        "tentative execution and public proof must name one exact nested trace",
+    );
+    let mut changed_proof_encoding = bundle.clone();
+    changed_proof_encoding.slices[0].proof.format_version = changed_proof_encoding.slices[0]
+        .proof
+        .format_version
+        .wrapping_add(1);
+    assert_eq!(
+        refine_bundle_execution_commitment(&changed_proof_encoding),
+        execution_commitment,
+        "execution identity must not depend on proof serialization or Fiat-Shamir payload",
+    );
+    let mut changed_execution = bundle.clone();
+    changed_execution.host_boundaries[0].registers_after[0] ^= 1;
+    assert_ne!(
+        refine_bundle_execution_commitment(&changed_execution),
+        execution_commitment,
+        "a changed native Refine boundary must name a different execution",
+    );
     let mut changed_order = bundle.clone();
     changed_order.slices[0].order = changed_order.slices[0].order.wrapping_add(1);
     assert_ne!(

@@ -317,6 +317,7 @@ dependencies = [
  "vos",
  "vos-agent-runtime-guest",
  "vos-agent-sdk",
+ "vos-pvm",
  "vos-pvm-compiler",
 ]
 

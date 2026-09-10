@@ -87,7 +87,9 @@ pub struct TranslationContext {
     /// Last immediate loaded into t0 (x5) — used for ecalli cap slot.
     last_t0_imm: Option<i32>,
     /// CSR marker for ecall/ecalli distinction.
-    /// 0x800 = next ecall → PVM ecall, 0x801 = next ecall → PVM ecalli.
+    /// 0x800 = next ecall → legacy-manifest PVM ecall, 0x801 = next ecall →
+    /// standard PVM ecalli. The standard profile rejects 0x800 rather than
+    /// emitting the retired dynamic-capability opcode.
     ecall_marker: Option<u32>,
     /// RISC-V code address ranges (lo, hi) — used to detect function pointers
     /// loaded via auipc+addi that need jump table entries.
@@ -301,9 +303,21 @@ impl TranslationContext {
                             0 => {
                                 // ECALL — dispatch based on CSR marker
                                 match self.ecall_marker.take() {
-                                    Some(0x800) => {
-                                        // CSR 0x800 → PVM ecall (management ops)
+                                    Some(0x800)
+                                        if self.opcode_encoding
+                                            == OpcodeEncoding::CapabilityManifest =>
+                                    {
+                                        // Legacy JAR services retain dynamic
+                                        // capability management until their
+                                        // daemon path is removed.
                                         self.emit_ecall();
+                                    }
+                                    Some(0x800) => {
+                                        return Err(TranspileError::UnsupportedInstruction {
+                                            offset: _addr as usize,
+                                            detail: "dynamic ecall is not part of the standard PVM profile"
+                                                .into(),
+                                        });
                                     }
                                     Some(0x801) => {
                                         // CSR 0x801 → PVM ecalli (CALL a cap)
@@ -1850,7 +1864,8 @@ impl TranslationContext {
         self.emit_var_imm(id as i32);
     }
 
-    /// Emit PVM ecall (opcode 3, NoArgs). Management ops + dynamic CALL.
+    /// Emit the legacy-manifest PVM ecall (opcode 3, NoArgs).
+    /// Management ops + dynamic CALL; never emitted for standard programs.
     /// φ[11]=op, φ[12]=subject|object — all operands in registers.
     pub(crate) fn emit_ecall(&mut self) {
         self.emit_inst(3);
@@ -2291,6 +2306,29 @@ mod tests {
         ctx.translate_instruction(&0x0000_0073_u32.to_le_bytes(), 0, 0)
             .unwrap();
         assert_eq!(ctx.code, [0], "unmarked ECALL must compile to trap");
+    }
+
+    #[test]
+    fn marked_dynamic_ecall_is_legacy_manifest_only() {
+        // csrw 0x800, zero; ecall
+        let marker = 0x8000_1073_u32;
+        let ecall = 0x0000_0073_u32;
+
+        let mut standard = TranslationContext::new(true);
+        standard.translate_one(marker, 0).unwrap();
+        assert!(matches!(
+            standard.translate_one(ecall, 4),
+            Err(TranspileError::UnsupportedInstruction { offset: 4, detail })
+                if detail.contains("dynamic ecall")
+        ));
+        assert!(standard.code.is_empty());
+
+        let mut legacy =
+            TranslationContext::with_opcode_encoding(true, OpcodeEncoding::CapabilityManifest);
+        legacy.translate_one(marker, 0).unwrap();
+        legacy.translate_one(ecall, 4).unwrap();
+        assert_eq!(legacy.code, [3]);
+        assert_eq!(legacy.bitmask, [1]);
     }
 
     #[test]

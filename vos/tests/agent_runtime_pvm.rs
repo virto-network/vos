@@ -73,15 +73,24 @@ fn artifact(bytes: &[u8]) -> PackageArtifact {
 }
 
 fn runtime_package_bytes() -> Vec<u8> {
+    runtime_package_bytes_for(AGENT_RUNTIME_PVM, None)
+}
+
+fn runtime_package_bytes_for(runtime_pvm: &[u8], proof_system: Option<Hash>) -> Vec<u8> {
+    let mut capabilities = RuntimeCapabilities::standard();
+    if let Some(proof_system) = proof_system {
+        capabilities.proof_systems =
+            sdk::ProofSystemSet::from_sorted(&[proof_system]).expect("one canonical proof system");
+    }
     sign_package(PackageEnvelope {
         manifest: PackageManifest::AgentRuntime(AgentRuntimePackageManifest {
             name: "standard-local-runtime".into(),
-            outer_program: BlobRef::of_bytes(AGENT_RUNTIME_PVM),
+            outer_program: BlobRef::of_bytes(runtime_pvm),
             contract: RuntimePackageContract::canonical(),
-            capabilities: RuntimeCapabilities::standard(),
+            capabilities,
             signing: package_signing(),
         }),
-        artifacts: vec![artifact(AGENT_RUNTIME_PVM)],
+        artifacts: vec![artifact(runtime_pvm)],
     })
     .encode()
     .expect("encode signed VOS3 runtime package")
@@ -89,6 +98,11 @@ fn runtime_package_bytes() -> Vec<u8> {
 
 fn admitted_runtime() -> AdmittedRuntimePackage {
     admit_runtime_package(&runtime_package_bytes()).expect("admit bundled VOS3 runtime")
+}
+
+fn admitted_runtime_for(runtime_pvm: &[u8], proof_system: Hash) -> AdmittedRuntimePackage {
+    admit_runtime_package(&runtime_package_bytes_for(runtime_pvm, Some(proof_system)))
+        .expect("admit proof-capable bundled VOS3 runtime")
 }
 
 fn authority_key() -> SigningKey {
@@ -110,6 +124,7 @@ fn descriptor(runtime: &AdmittedRuntimePackage, discriminator: u8) -> AgentDescr
             runtime_deployment: runtime.deployment(),
             runtime_program: runtime.program(),
             runtime_producer: runtime.producer(),
+            transition_producer: ProducerId([discriminator.wrapping_add(0x60); 32]),
         },
         creation_nonce,
         authority: AgentAuthorityBinding {
@@ -276,8 +291,12 @@ fn invocation_receipt(
 }
 
 fn apply_runtime(work: RuntimeWork) -> RuntimeTransition {
+    apply_runtime_program(AGENT_RUNTIME_PVM, work, GAS)
+}
+
+fn apply_runtime_program(runtime_pvm: &[u8], work: RuntimeWork, gas: u64) -> RuntimeTransition {
     let input = work.encode().expect("encode canonical r7 RuntimeWork");
-    let invocation = RefineContext::load(AGENT_RUNTIME_PVM, &input, GAS)
+    let invocation = RefineContext::load(runtime_pvm, &input, gas)
         .expect("load bundled AgentRuntime")
         .run();
     assert_eq!(
@@ -289,7 +308,7 @@ fn apply_runtime(work: RuntimeWork) -> RuntimeTransition {
     );
     RuntimeTransition::decode(
         &invocation
-            .output()
+            .output_bounded(RuntimeTransition::MAX_ENCODED_BYTES)
             .expect("bundled AgentRuntime published an output window"),
     )
     .expect("decode canonical r7 RuntimeTransition")
@@ -302,21 +321,43 @@ fn apply_management(
     authority: Option<AuthorityReceipt>,
     observed_slot: u64,
 ) -> RuntimeTransition {
+    apply_management_program(
+        AGENT_RUNTIME_PVM,
+        descriptor,
+        state,
+        request,
+        authority,
+        observed_slot,
+    )
+}
+
+fn apply_management_program(
+    runtime_pvm: &[u8],
+    descriptor: &AgentDescriptor,
+    state: RuntimeState,
+    request: ManagementRequest,
+    authority: Option<AuthorityReceipt>,
+    observed_slot: u64,
+) -> RuntimeTransition {
     let runtime_deployment = authority
         .as_ref()
         .map_or(descriptor.identity.runtime_deployment, |receipt| {
             receipt.selector.runtime_deployment
         });
-    apply_runtime(RuntimeWork::Manage {
-        context: RuntimeExecutionContext::Direct,
-        space: descriptor.identity.space,
-        agent: descriptor.identity.agent,
-        runtime_deployment,
-        state,
-        request: Box::new(request),
-        authority: authority.map(Box::new),
-        observed_slot,
-    })
+    apply_runtime_program(
+        runtime_pvm,
+        RuntimeWork::Manage {
+            context: RuntimeExecutionContext::Direct,
+            space: descriptor.identity.space,
+            agent: descriptor.identity.agent,
+            runtime_deployment,
+            state,
+            request: Box::new(request),
+            authority: authority.map(Box::new),
+            observed_slot,
+        },
+        GAS,
+    )
 }
 
 fn restart(transition: &RuntimeTransition) -> RuntimeTransition {
@@ -330,10 +371,20 @@ fn restart(transition: &RuntimeTransition) -> RuntimeTransition {
 
 fn create_agent(discriminator: u8) -> (AdmittedRuntimePackage, AgentDescriptor, RuntimeState) {
     let runtime = admitted_runtime();
+    let (descriptor, state) = create_agent_with_runtime(AGENT_RUNTIME_PVM, &runtime, discriminator);
+    (runtime, descriptor, state)
+}
+
+fn create_agent_with_runtime(
+    runtime_pvm: &[u8],
+    runtime: &AdmittedRuntimePackage,
+    discriminator: u8,
+) -> (AgentDescriptor, RuntimeState) {
     let descriptor = descriptor(&runtime, discriminator);
     let request = ManagementRequest::Create(Box::new(descriptor.clone()));
     let receipt = management_receipt(&descriptor, &request, 1, 1, 2);
-    let created = apply_management(
+    let created = apply_management_program(
+        runtime_pvm,
         &descriptor,
         RuntimeState::default(),
         request,
@@ -345,7 +396,7 @@ fn create_agent(discriminator: u8) -> (AdmittedRuntimePackage, AgentDescriptor, 
         RuntimeOutcome::Management(Ok(ManagementReply::Created(descriptor.identity.clone())))
     );
     assert!(!created.state.is_empty());
-    (runtime, descriptor, restart(&created).state)
+    (descriptor, restart(&created).state)
 }
 
 fn static_actor_program() -> Vec<u8> {
@@ -430,6 +481,13 @@ fn yielding_actor_program() -> Vec<u8> {
 }
 
 fn admitted_actor_program(program: Vec<u8>) -> AdmittedActorPackage {
+    admitted_actor_program_for(program, None)
+}
+
+fn admitted_actor_program_for(
+    program: Vec<u8>,
+    proof_system: Option<Hash>,
+) -> AdmittedActorPackage {
     let schema = ParsedSchema {
         constructor: ConstructorContract::Forbidden,
         fields: vec![ParsedField::Inline(ParsedInlineField {
@@ -455,7 +513,9 @@ fn admitted_actor_program(program: Vec<u8>) -> AdmittedActorPackage {
             return_type_identity: "core::primitive::u8".into(),
             authorization_policy: AuthorizationPolicySelector::Public,
             idempotency: IdempotencyRequirement::Required,
-            attestation: AttestationRequirement::None,
+            attestation: proof_system.map_or(AttestationRequirement::None, |proof_system| {
+                AttestationRequirement::Required { proof_system }
+            }),
         }],
     };
     let policy_bytes = policies.encode().expect("encode actor method policy");
@@ -498,7 +558,10 @@ fn admitted_actor_program(program: Vec<u8>) -> AdmittedActorPackage {
             requirements: RuntimeRequirements {
                 lanes: LaneSet::of(StateLane::Linear),
                 scheduling: false,
-                proof_systems: sdk::ProofSystemSet::EMPTY,
+                proof_systems: proof_system.map_or(sdk::ProofSystemSet::EMPTY, |proof_system| {
+                    sdk::ProofSystemSet::from_sorted(&[proof_system])
+                        .expect("one canonical proof-system requirement")
+                }),
             },
             signing: package_signing(),
         }),
@@ -547,7 +610,16 @@ fn install_request(
 }
 
 fn inspect_actor(descriptor: &AgentDescriptor, state: RuntimeState) -> ActorDirectoryRecord {
-    let inspected = apply_management(
+    inspect_actor_with_runtime(AGENT_RUNTIME_PVM, descriptor, state)
+}
+
+fn inspect_actor_with_runtime(
+    runtime_pvm: &[u8],
+    descriptor: &AgentDescriptor,
+    state: RuntimeState,
+) -> ActorDirectoryRecord {
+    let inspected = apply_management_program(
+        runtime_pvm,
         descriptor,
         state,
         ManagementRequest::InspectActors {
@@ -617,18 +689,36 @@ fn install_actor(
     state: RuntimeState,
     package: &AdmittedActorPackage,
 ) -> (RuntimeState, ManagementRequest, RuntimeOutcome) {
+    install_actor_with_runtime(AGENT_RUNTIME_PVM, runtime, descriptor, state, package)
+}
+
+fn install_actor_with_runtime(
+    runtime_pvm: &[u8],
+    runtime: &AdmittedRuntimePackage,
+    descriptor: &AgentDescriptor,
+    state: RuntimeState,
+    package: &AdmittedActorPackage,
+) -> (RuntimeState, ManagementRequest, RuntimeOutcome) {
     package
         .require_runtime(AgentProfile::Local, runtime)
         .expect("actor package is compatible with the admitted runtime");
     let request = install_request(descriptor, package);
     let receipt = management_receipt(descriptor, &request, 2, 2, 2);
-    let installed = apply_management(descriptor, state, request.clone(), Some(receipt.clone()), 2);
+    let installed = apply_management_program(
+        runtime_pvm,
+        descriptor,
+        state,
+        request.clone(),
+        Some(receipt.clone()),
+        2,
+    );
     assert!(matches!(
         installed.outcome,
         RuntimeOutcome::Management(Ok(ManagementReply::Installed(_)))
     ));
 
-    let retried = apply_management(
+    let retried = apply_management_program(
+        runtime_pvm,
         descriptor,
         restart(&installed).state,
         request.clone(),
@@ -1012,4 +1102,97 @@ fn bundled_runtime_persists_and_resumes_fifo_continuations() {
     };
     assert_eq!(reply.status, InvocationStatus::Done);
     assert_eq!(reply.reply, [2]);
+}
+
+/// This regression consumes a freshly compiled `agent-runtime` PVM rather
+/// than the checked-in pin. Keeping it ignored makes the source/guest ABI
+/// check explicit without silently blessing or rewriting the release pin.
+#[cfg(feature = "agent-transition-proof")]
+#[test]
+#[ignore = "set VOS_AGENT_RUNTIME_PVM to a freshly compiled bundled guest PVM"]
+fn compiled_bundled_runtime_attested_invoke_and_resume_bind_exact_public_output() {
+    let runtime_path = std::env::var_os("VOS_AGENT_RUNTIME_PVM")
+        .expect("VOS_AGENT_RUNTIME_PVM names the freshly compiled guest PVM");
+    let runtime_pvm = std::fs::read(runtime_path).expect("read freshly compiled guest PVM");
+    let proof_system = Hash::digest(
+        b"vos/agent/standard-refine-proof-system/v1",
+        &[
+            sdk::RUNTIME_ABI_ID.as_bytes(),
+            &vos_pvm_proof::PROOF_FORMAT_VERSION.to_le_bytes(),
+            &vos_pvm_proof::REFINE_BUNDLE_FORMAT_VERSION.to_le_bytes(),
+            &vos_pvm_proof::REFINE_PROOF_BUNDLE_CODEC_VERSION.to_le_bytes(),
+        ],
+    );
+    let runtime = admitted_runtime_for(&runtime_pvm, proof_system);
+    let (descriptor, created) = create_agent_with_runtime(&runtime_pvm, &runtime, 4);
+    let actor_package = admitted_actor_program_for(yielding_actor_program(), Some(proof_system));
+    let (installed, _, _) =
+        install_actor_with_runtime(&runtime_pvm, &runtime, &descriptor, created, &actor_package);
+    let record = inspect_actor_with_runtime(&runtime_pvm, &descriptor, installed.clone());
+    let invocation = actor_invocation(&descriptor, &record, &actor_package, 0xc1);
+    let authorization = invocation_receipt(&descriptor, &invocation, 3, 3);
+    let invoke = RuntimeWork::Invoke {
+        context: RuntimeExecutionContext::Attested { proof_system },
+        state: installed,
+        invocation: Box::new(invocation.clone()),
+        authorization: Box::new(InvocationAuthorization::AuthorityReceipt(authorization)),
+        observed_slot: 3,
+    };
+    let invoke_bytes = invoke.encode().expect("canonical attested Invoke");
+    let invoke_observed = vos_pvm_proof::trace_refine_observed(
+        &runtime_pvm,
+        &invoke_bytes,
+        GAS.checked_add(invocation.gas).expect("bounded Invoke gas"),
+        RuntimeTransition::MAX_ENCODED_BYTES,
+    )
+    .expect("trace the compiled guest Attested Invoke exactly once");
+    let invoke_transition = RuntimeTransition::decode(&invoke_observed.output)
+        .expect("canonical observed Invoke transition");
+    assert_eq!(invoke_transition.encode().unwrap(), invoke_observed.output);
+    assert_eq!(
+        invoke_observed.public_io,
+        sdk::runtime_transition_public_io(&invoke_bytes, &invoke_observed.output).0
+    );
+    let RuntimeOutcome::Yielded(first) = &invoke_transition.outcome else {
+        panic!("compiled guest Attested Invoke did not yield")
+    };
+
+    let mut substituted_transition = invoke_transition.clone();
+    substituted_transition.state.linear.push(0xff);
+    assert_ne!(
+        invoke_observed.public_io,
+        sdk::runtime_transition_public_io(&invoke_bytes, &substituted_transition.encode().unwrap())
+            .0
+    );
+    let mut substituted_work = invoke_bytes.clone();
+    *substituted_work.last_mut().unwrap() ^= 1;
+    assert_ne!(
+        invoke_observed.public_io,
+        sdk::runtime_transition_public_io(&substituted_work, &invoke_observed.output).0
+    );
+
+    let resume = RuntimeWork::Resume {
+        context: RuntimeExecutionContext::Attested { proof_system },
+        state: restart(&invoke_transition).state,
+        resume: Box::new(resume_work(first, invocation.availability)),
+    };
+    let resume_bytes = resume.encode().expect("canonical attested Resume");
+    let resume_observed = vos_pvm_proof::trace_refine_observed(
+        &runtime_pvm,
+        &resume_bytes,
+        GAS.saturating_add(GAS),
+        RuntimeTransition::MAX_ENCODED_BYTES,
+    )
+    .expect("trace the compiled guest Attested Resume exactly once");
+    let resume_transition = RuntimeTransition::decode(&resume_observed.output)
+        .expect("canonical observed Resume transition");
+    assert_eq!(resume_transition.encode().unwrap(), resume_observed.output);
+    assert_eq!(
+        resume_observed.public_io,
+        sdk::runtime_transition_public_io(&resume_bytes, &resume_observed.output).0
+    );
+    assert!(matches!(
+        resume_transition.outcome,
+        RuntimeOutcome::Yielded(_)
+    ));
 }

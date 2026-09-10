@@ -1309,7 +1309,9 @@ mod tests {
 
         assert_eq!(invocation.exit, ExitReason::Halt);
         assert_eq!(
-            invocation.output().as_deref(),
+            invocation
+                .output_bounded(core::mem::size_of::<u64>())
+                .as_deref(),
             Some(&LIMIT.to_le_bytes()[..]),
             "the callee must observe the LUI value before control transfers"
         );

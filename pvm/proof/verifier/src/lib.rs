@@ -40,7 +40,7 @@ pub use vos_pvm_proof::refine::{
     REFINE_BUNDLE_FORMAT_VERSION, REFINE_CHILD_COMMITMENT_COUNT, RefineBundleVerification,
     RefineMachineId, RefineProgramId, RefineProofBundle, RefineSliceExit,
     refine_arguments_commitment, refine_bundle_cardinality_is_valid, refine_bundle_commitment,
-    refine_program_id,
+    refine_bundle_execution_commitment, refine_bundle_terminal_public_io, refine_program_id,
 };
 pub use vos_pvm_proof::{PROOF_FORMAT_VERSION, Proof};
 // PcsPolicy floor — see SECURITY.md "Proof shape". `check_min_security` /

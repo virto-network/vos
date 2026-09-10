@@ -134,6 +134,7 @@ pub mod framework_access;
 mod lookups;
 pub mod proof;
 pub mod refine;
+pub mod refine_codec;
 pub mod segment;
 pub mod sparse_memory;
 pub mod trace;
@@ -551,12 +552,19 @@ pub use refine::{
     REFINE_BUNDLE_FORMAT_VERSION, REFINE_CHILD_COMMITMENT_COUNT, RefineBundleVerification,
     RefineHostBoundary, RefineMachineId, RefineProgramId, RefineProofBundle, RefineProofSlice,
     RefineSliceExit, refine_arguments_commitment, refine_bundle_cardinality_is_valid,
-    refine_bundle_commitment, refine_program_id,
+    refine_bundle_commitment, refine_bundle_execution_commitment, refine_bundle_terminal_public_io,
+    refine_program_id,
 };
 #[cfg(feature = "prover")]
 pub use refine::{
-    RefineTraceBundle, RefineTraceError, RefineTraceSlice, prove_refine, trace_refine,
-    verify_refine_bundle_replayed,
+    RefineObservedRun, RefineTraceBundle, RefineTraceError, RefineTraceSlice, prove_refine,
+    refine_trace_execution_commitment, trace_refine, trace_refine_observed,
+    trace_refine_with_output, verify_refine_bundle_replayed,
+};
+pub use refine_codec::{
+    MAX_REFINE_PROOF_BUNDLE_ALLOCATION_BYTES, MAX_REFINE_PROOF_BUNDLE_WIRE_BYTES,
+    REFINE_PROOF_BUNDLE_CODEC_VERSION, RefineProofCodecError, decode_refine_proof_bundle,
+    encode_refine_proof_bundle,
 };
 pub use sparse_memory::{SPARSE_MEMORY_PAGE_SIZE, SparseMemoryImage, SparseMemoryPage};
 // The per-policy FRI floor constants + the policy checker: used by callers

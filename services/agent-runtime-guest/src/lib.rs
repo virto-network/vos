@@ -3,7 +3,8 @@
 //! This crate deliberately knows nothing about a host, filesystem, network,
 //! or the bundled standard runtime. A guest supplies an explicit
 //! [`AgentRuntime`], while this boundary owns the canonical `RuntimeWork` /
-//! `RuntimeTransition` framing and the RISC-V output-window ABI.
+//! `RuntimeTransition` framing, the RISC-V output window, and its proof-bound
+//! public-I/O register commitment.
 
 #![no_std]
 
@@ -11,6 +12,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+#[cfg(target_arch = "riscv64")]
+use vos_agent_sdk::runtime_transition_public_io;
 use vos_agent_sdk::wire::CanonicalWire as _;
 use vos_agent_sdk::{AgentRuntime, RuntimeTransition, RuntimeWork};
 
@@ -141,13 +144,8 @@ pub fn validate_output(output: &[u8]) -> Result<RuntimeTransition, DispatchError
     Ok(transition)
 }
 
-/// Output window returned through the standard PVM refine ABI.
 #[cfg(target_arch = "riscv64")]
-#[repr(C)]
-pub struct OutputWindow {
-    address: u64,
-    len: u64,
-}
+const PVM_HALT_ADDR: u64 = 0xffff_0000;
 
 /// Run one default-constructed runtime through the PVM argument/output ABI.
 ///
@@ -159,20 +157,40 @@ pub struct OutputWindow {
 pub unsafe fn dispatch_guest<R: AgentRuntime + Default>(
     arguments: *const u8,
     arguments_len: usize,
-) -> OutputWindow {
+) -> ! {
     // SAFETY: required by this function's contract and supplied by the PVM
     // loader for the duration of the invocation.
     let input = unsafe { core::slice::from_raw_parts(arguments, arguments_len) };
     let mut runtime = R::default();
     let output = dispatch(&mut runtime, input).unwrap_or_else(|_| fail_closed());
-    let window = OutputWindow {
-        address: output.as_ptr() as u64,
-        len: output.len() as u64,
-    };
-    // The PVM halts immediately after `_start` returns. Keep the allocation
-    // alive until the host copies the output window.
-    core::mem::forget(output);
-    window
+    let public_io = runtime_transition_public_io(input, &output);
+    halt_with_output_bound(&output, public_io.as_bytes())
+}
+
+/// Halt with the canonical transition in a0/a1 and its public-I/O commitment
+/// in a2..a5 (the PVM final-state register window phi[9..13]).
+#[cfg(target_arch = "riscv64")]
+fn halt_with_output_bound(output: &[u8], public_io: &[u8; 32]) -> ! {
+    let mut words = [0u64; 4];
+    for (word, bytes) in words.iter_mut().zip(public_io.chunks_exact(8)) {
+        *word = u64::from_le_bytes(bytes.try_into().expect("exact hash word"));
+    }
+    // SAFETY: this is the terminal standard-PVM halt jump. `output` stays
+    // live because the asm never returns; the host copies exactly a0/a1 and
+    // the proof closing state binds a2..a5.
+    unsafe {
+        core::arch::asm!(
+            "jr t0",
+            in("a0") output.as_ptr() as u64,
+            in("a1") output.len() as u64,
+            in("a2") words[0],
+            in("a3") words[1],
+            in("a4") words[2],
+            in("a5") words[3],
+            in("t0") PVM_HALT_ADDR,
+            options(noreturn),
+        )
+    }
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -198,17 +216,14 @@ macro_rules! export_agent_runtime {
                 ".global _start",
                 ".type _start, @function",
                 "_start:",
-                "mv s0, ra",
-                "jal ra, __vos_agent_runtime_dispatch",
-                "mv ra, s0",
-                "ret",
+                "j __vos_agent_runtime_dispatch",
             );
 
             #[unsafe(no_mangle)]
             extern "C" fn __vos_agent_runtime_dispatch(
                 arguments: *const u8,
                 arguments_len: usize,
-            ) -> $crate::OutputWindow {
+            ) -> ! {
                 // SAFETY: `_start` is entered only by the VOS PVM loader,
                 // which supplies the complete read-only argument mapping.
                 unsafe { $crate::dispatch_guest::<$runtime>(arguments, arguments_len) }

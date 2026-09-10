@@ -49,6 +49,7 @@ poseidon2-channel = []
 
 [dependencies]
 vos-pvm-proof-derive = { workspace = true }
+vos-agent-sdk = { workspace = true }
 vos-pvm = { workspace = true, optional = true }
 stwo = { workspace = true }
 stwo-constraint-framework = { workspace = true }

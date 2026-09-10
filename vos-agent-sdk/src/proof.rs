@@ -11,14 +11,193 @@ use vos_protocol::wire::{DecodeError, Decoder, Encoder};
 
 use crate::wire::{CanonicalWire, WireError};
 use crate::{
-    ActorId, AgentId, BlobRef, DeploymentId, Hash, InvocationId, MethodMode, ProducerId, ProgramId,
-    SpaceId, StateLane,
+    ActorId, AgentId, BlobRef, DeploymentId, Hash, InvocationId, InvocationResultStorage,
+    MethodMode, ProducerId, ProgramId, SpaceId, StateLane,
 };
 
 pub const MAX_PROOF_METHOD_BYTES: usize = 128;
 pub const PROOF_PUBLIC_KEY_BYTES: usize = 32;
 pub const PROOF_SIGNATURE_BYTES: usize = 64;
 pub const MAX_TRANSITION_PROOF_RECORD_BYTES: usize = 4 * 1024;
+/// Canonical public proof chunks use the same per-object ceiling as every
+/// other authenticated catalog artifact.
+pub const TRANSITION_PROOF_MATERIAL_CHUNK_BYTES: u64 = crate::MAX_CATALOG_ARTIFACT_BYTES;
+/// The global proof-material ceiling is an exact multiple of the chunk size,
+/// but keep the formula correct if either protocol constant changes later.
+pub const MAX_TRANSITION_PROOF_MATERIAL_CHUNKS: usize = crate::MAX_TRANSITION_PROOF_MATERIAL_BYTES
+    .div_ceil(TRANSITION_PROOF_MATERIAL_CHUNK_BYTES)
+    as usize;
+pub const MAX_TRANSITION_PROOF_MATERIAL_MANIFEST_BYTES: usize = 1_024;
+
+/// Stable identity of one exact invocation transition.
+///
+/// A logical invocation may yield and later resume more than once. Its
+/// [`InvocationId`] therefore identifies the workflow, while `execution`
+/// commits to both the canonical work and the exact predecessor lane roots.
+/// Exact retries retain both values and resolve to the same key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TransitionProofKey {
+    pub invocation: InvocationId,
+    pub execution: Hash,
+}
+
+impl TransitionProofKey {
+    pub fn validate(self) -> bool {
+        self.invocation != InvocationId::ZERO && self.execution != Hash::ZERO
+    }
+}
+
+/// Canonical content-addressed root for one proof system's public material.
+///
+/// A bounded proof backend sets [`TransitionProofRecord::proof`] to the
+/// encoded manifest rather than an unbounded monolithic proof. `material`
+/// names the exact concatenation of `chunks`; it is a synthetic aggregate
+/// reference and need not itself be stored as one CAS object. Every non-final
+/// chunk is exactly
+/// [`TRANSITION_PROOF_MATERIAL_CHUNK_BYTES`] bytes, making the representation
+/// unique rather than allowing one proof to be rechunked under many roots.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransitionProofMaterialManifest {
+    pub material: BlobRef,
+    pub chunks: Vec<BlobRef>,
+}
+
+impl TransitionProofMaterialManifest {
+    pub fn for_material(material: &[u8]) -> Result<Self, WireError> {
+        let material_len = u64::try_from(material.len()).map_err(|_| WireError::LimitExceeded)?;
+        if material_len == 0 {
+            return Err(WireError::InvalidValue);
+        }
+        if material_len > crate::MAX_TRANSITION_PROOF_MATERIAL_BYTES {
+            return Err(WireError::LimitExceeded);
+        }
+        let chunk_bytes = usize::try_from(TRANSITION_PROOF_MATERIAL_CHUNK_BYTES)
+            .map_err(|_| WireError::LimitExceeded)?;
+        let value = Self {
+            material: BlobRef::of_bytes(material),
+            chunks: material
+                .chunks(chunk_bytes)
+                .map(BlobRef::of_bytes)
+                .collect(),
+        };
+        value
+            .validate()
+            .then_some(value)
+            .ok_or(WireError::InvalidValue)
+    }
+
+    pub fn validate(&self) -> bool {
+        if self.material.hash == Hash::ZERO
+            || self.material.len == 0
+            || self.material.len > crate::MAX_TRANSITION_PROOF_MATERIAL_BYTES
+        {
+            return false;
+        }
+        let expected_chunks = self
+            .material
+            .len
+            .div_ceil(TRANSITION_PROOF_MATERIAL_CHUNK_BYTES);
+        if usize::try_from(expected_chunks).ok() != Some(self.chunks.len())
+            || self.chunks.is_empty()
+            || self.chunks.len() > MAX_TRANSITION_PROOF_MATERIAL_CHUNKS
+        {
+            return false;
+        }
+        self.chunks.iter().enumerate().all(|(index, chunk)| {
+            let Some(offset) = (index as u64).checked_mul(TRANSITION_PROOF_MATERIAL_CHUNK_BYTES)
+            else {
+                return false;
+            };
+            let expected = self
+                .material
+                .len
+                .saturating_sub(offset)
+                .min(TRANSITION_PROOF_MATERIAL_CHUNK_BYTES);
+            chunk.hash != Hash::ZERO && chunk.len == expected && expected != 0
+        })
+    }
+
+    /// Verify the aggregate identity and every canonical chunk without
+    /// trusting a caller-supplied manifest constructor.
+    pub fn matches_material(&self, material: &[u8]) -> bool {
+        if !self.validate() || !self.material.matches(material) {
+            return false;
+        }
+        let Ok(chunk_bytes) = usize::try_from(TRANSITION_PROOF_MATERIAL_CHUNK_BYTES) else {
+            return false;
+        };
+        self.chunks
+            .iter()
+            .zip(material.chunks(chunk_bytes))
+            .all(|(reference, bytes)| reference.matches(bytes))
+    }
+
+    /// Validate an authenticated runtime ceiling before a resolver fetches
+    /// any chunk and return the only aggregate allocation size it may use.
+    pub fn bounded_material_len(&self, maximum: u64) -> Result<usize, WireError> {
+        if !self.validate() {
+            return Err(WireError::InvalidValue);
+        }
+        if maximum == 0
+            || maximum > crate::MAX_TRANSITION_PROOF_MATERIAL_BYTES
+            || self.material.len > maximum
+        {
+            return Err(WireError::LimitExceeded);
+        }
+        usize::try_from(self.material.len).map_err(|_| WireError::LimitExceeded)
+    }
+
+    /// Reassemble exact ordered chunks beneath a caller's authenticated
+    /// runtime-policy ceiling. Missing, additional, reordered, or substituted
+    /// chunks are rejected before the aggregate is returned.
+    pub fn assemble_bounded<'a, I>(&self, chunks: I, maximum: u64) -> Result<Vec<u8>, WireError>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        let material_len = self.bounded_material_len(maximum)?;
+        let mut material = Vec::new();
+        material
+            .try_reserve_exact(material_len)
+            .map_err(|_| WireError::LimitExceeded)?;
+        let mut supplied = chunks.into_iter();
+        for reference in &self.chunks {
+            let bytes = supplied.next().ok_or(WireError::InvalidValue)?;
+            if !reference.matches(bytes) {
+                return Err(WireError::InvalidValue);
+            }
+            material.extend_from_slice(bytes);
+        }
+        if supplied.next().is_some() || !self.material.matches(&material) {
+            return Err(WireError::InvalidValue);
+        }
+        Ok(material)
+    }
+}
+
+impl CanonicalWire for TransitionProofMaterialManifest {
+    const MAGIC: [u8; 4] = *b"APM1";
+    const MAX_ENCODED_BYTES: usize = MAX_TRANSITION_PROOF_MATERIAL_MANIFEST_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.validate()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_blob(encoder, &self.material);
+        encoder.list(&self.chunks, encode_blob);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            material: decode_blob(decoder)?,
+            chunks: decoder.list_bounded(MAX_TRANSITION_PROOF_MATERIAL_CHUNKS, decode_blob)?,
+        };
+        value
+            .validate()
+            .then_some(value)
+            .ok_or(DecodeError::NonCanonical)
+    }
+}
 
 /// State roots observed by one runtime transition. Control is always present;
 /// an absent state-lane root means the agent has not provisioned that lane.
@@ -62,6 +241,8 @@ pub struct TransitionProofSubject {
     pub agent: AgentId,
     pub runtime_deployment: DeploymentId,
     pub runtime_program: ProgramId,
+    /// Exact authenticated runtime package carrying the program and contract.
+    pub runtime_package: BlobRef,
     pub actor: ActorId,
     pub incarnation: Hash,
     pub actor_deployment: DeploymentId,
@@ -77,6 +258,9 @@ impl TransitionProofSubject {
             && self.agent != AgentId::ZERO
             && self.runtime_deployment != DeploymentId::ZERO
             && self.runtime_program != ProgramId::ZERO
+            && self.runtime_package.hash != Hash::ZERO
+            && self.runtime_package.len != 0
+            && self.runtime_package.len <= crate::MAX_CATALOG_ARTIFACT_BYTES
             && self.actor != ActorId::ZERO
             && self.incarnation != Hash::ZERO
             && self.actor_deployment != DeploymentId::ZERO
@@ -97,9 +281,11 @@ pub struct TransitionProofStatement {
     pub work: Hash,
     /// Domain-separated digest of the exact canonical RuntimeTransition bytes.
     pub transition: Hash,
-    /// Commitment of the complete nested standard Refine trace. This is the
-    /// transcript commitment authenticated by the physical proof, not a
-    /// producer-private witness or a legacy service attestation.
+    /// Proof-independent execution commitment for the complete nested standard
+    /// Refine trace. A verifier recomputes it from the proof bundle only after
+    /// verifying every child proof and deterministically replaying the native
+    /// boundaries. It is not a commitment to serialized proof bytes, a
+    /// producer-private witness, or a legacy service attestation.
     pub refine_trace: Hash,
     /// Public I/O commitment carried by the physical proof.
     pub public_io: Hash,
@@ -122,11 +308,11 @@ impl TransitionProofStatement {
             return false;
         }
 
-        let writable = self.subject.mode.write_lane();
+        let storage = self.subject.mode.result_storage();
         for lane in [StateLane::Linear, StateLane::Merge, StateLane::Local] {
             let before = self.before.lane(lane);
             let after = self.after.lane(lane);
-            if Some(lane) == writable {
+            if storage == InvocationResultStorage::Lane(lane) {
                 if before.is_none() || after.is_none() {
                     return false;
                 }
@@ -136,7 +322,29 @@ impl TransitionProofStatement {
                 return false;
             }
         }
+        if storage != InvocationResultStorage::Control && self.before.control != self.after.control
+        {
+            return false;
+        }
         true
+    }
+
+    /// Exact retry/publication key for this transition slice.
+    pub fn key(&self) -> TransitionProofKey {
+        TransitionProofKey {
+            invocation: self.subject.invocation,
+            execution: Self::execution_commitment(self.work, self.before),
+        }
+    }
+
+    /// Commitment identifying one execution of canonical work from exact
+    /// predecessor lane roots.
+    pub fn execution_commitment(work: Hash, before: ProofLaneRoots) -> Hash {
+        let mut bytes = Vec::new();
+        let mut encoder = Encoder(&mut bytes);
+        encoder.fixed(work.as_bytes());
+        encode_roots(&mut encoder, before);
+        Hash::digest(b"vos/agent/proof/runtime-execution/v1", &[&bytes])
     }
 
     pub fn commitment(&self) -> Result<Hash, WireError> {
@@ -185,9 +393,9 @@ impl TransitionProofStatement {
 }
 
 impl CanonicalWire for TransitionProofStatement {
-    // Generation 2 adds the nested Refine transcript commitment. The old
-    // unversioned APST shape is deliberately not decoded as this statement.
-    const MAGIC: [u8; 4] = *b"APS2";
+    // Generation 4 gives the derived transition key predecessor-state
+    // semantics. Prior statement generations are not upgraded implicitly.
+    const MAGIC: [u8; 4] = *b"APS4";
     const MAX_ENCODED_BYTES: usize = 1_024;
 
     fn validate_wire(&self) -> bool {
@@ -219,7 +427,7 @@ impl TransitionProofRecord {
         self.statement.validate()
             && self.proof.hash != Hash::ZERO
             && self.proof.len != 0
-            && self.proof.len <= crate::MAX_CATALOG_ARTIFACT_BYTES
+            && self.proof.len <= MAX_TRANSITION_PROOF_MATERIAL_MANIFEST_BYTES as u64
             && self.producer != ProducerId::ZERO
             && self.producer_public_key != [0; PROOF_PUBLIC_KEY_BYTES]
             && ProducerId::of_public_key(&self.producer_public_key) == self.producer
@@ -238,7 +446,7 @@ impl TransitionProofRecord {
             return Err(WireError::InvalidValue);
         }
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"vos/agent/transition-proof-record/v2");
+        bytes.extend_from_slice(b"vos/agent/transition-proof-record/v4");
         bytes.extend_from_slice(crate::RUNTIME_ABI_ID.as_bytes());
         let statement = self.statement.encode()?;
         let mut encoder = Encoder(&mut bytes);
@@ -256,15 +464,66 @@ impl TransitionProofRecord {
         ))
     }
 
+    /// Canonical commitment of one verified transition publication.
+    ///
+    /// This is the durable journal identity for the exact retry key,
+    /// transition, signed proof record, and before/after lane roots. It does
+    /// not itself assert that verification occurred; only the verifier-owned
+    /// publication capability may authorize persistence. Once persisted, a
+    /// no-std replay reader can recompute this value from the canonical proof
+    /// record and reject substituted journal metadata.
+    pub fn verified_publication_commitment(&self) -> Result<Hash, WireError> {
+        if !self.validate_shape() {
+            return Err(WireError::InvalidValue);
+        }
+        let proof_record = self.commitment()?;
+        let key = self.statement.key();
+        let mut bytes = Vec::new();
+        let mut encoder = Encoder(&mut bytes);
+        encoder.fixed(key.invocation.as_bytes());
+        encoder.fixed(key.execution.as_bytes());
+        encoder.fixed(self.statement.transition.as_bytes());
+        encoder.fixed(proof_record.as_bytes());
+        encode_roots(&mut encoder, self.statement.before);
+        encode_roots(&mut encoder, self.statement.after);
+        Ok(Hash::digest(
+            b"vos/agent/verified-transition-publication/v3",
+            &[&bytes],
+        ))
+    }
+
+    /// Verify the signed manifest root and the exact bounded proof material it
+    /// names. Callers must fetch and canonically assemble the manifest chunks
+    /// before entering this method; physical verifiers never receive manifest
+    /// bytes in place of a proof.
     pub fn verify<V: TransitionProofVerifier>(
         &self,
-        proof_bytes: &[u8],
+        manifest_bytes: &[u8],
+        proof_material: &[u8],
+        verifier: &V,
+    ) -> Result<(), ProofRecordError> {
+        self.verify_material_and_producer(manifest_bytes, proof_material, verifier)?;
+        if !verifier.verify_transition(&self.statement, proof_material) {
+            return Err(ProofRecordError::InvalidProof);
+        }
+        Ok(())
+    }
+
+    fn verify_material_and_producer<V: TransitionProofVerifier>(
+        &self,
+        manifest_bytes: &[u8],
+        proof_material: &[u8],
         verifier: &V,
     ) -> Result<(), ProofRecordError> {
         if !self.validate_shape() {
             return Err(ProofRecordError::InvalidRecord);
         }
-        if !self.proof.matches(proof_bytes) {
+        if !self.proof.matches(manifest_bytes) {
+            return Err(ProofRecordError::WrongProof);
+        }
+        let manifest = TransitionProofMaterialManifest::decode(manifest_bytes)
+            .map_err(|_| ProofRecordError::WrongProof)?;
+        if !manifest.matches_material(proof_material) {
             return Err(ProofRecordError::WrongProof);
         }
         let signing_bytes = self
@@ -277,20 +536,22 @@ impl TransitionProofRecord {
         ) {
             return Err(ProofRecordError::InvalidProducerSignature);
         }
-        if !verifier.verify_transition(&self.statement, proof_bytes) {
-            return Err(ProofRecordError::InvalidProof);
-        }
         Ok(())
     }
 
     /// Verify both the public proof record and its exact clean Agent
     /// execution binding. This is the follower-facing verification path: it
     /// needs canonical work, canonical transition, and public proof bytes,
-    /// but never the producer-private witness.
+    /// but never the producer-private witness. `before` and `after` are
+    /// expected roots: an authoritative replay/materialization caller must
+    /// recompute both independently rather than copying them from
+    /// `self.statement`. Physical proof verification does not authenticate a
+    /// journal's choice of state roots on its own.
     #[allow(clippy::too_many_arguments)]
     pub fn verify_exact<V: TransitionProofVerifier>(
         &self,
-        proof_bytes: &[u8],
+        manifest_bytes: &[u8],
+        proof_material: &[u8],
         subject: &TransitionProofSubject,
         before: ProofLaneRoots,
         after: ProofLaneRoots,
@@ -317,14 +578,23 @@ impl TransitionProofRecord {
         if self.producer != producer {
             return Err(ProofRecordError::WrongProducer);
         }
-        self.verify(proof_bytes, verifier)
+        self.verify_material_and_producer(manifest_bytes, proof_material, verifier)?;
+        if !verifier.verify_transition_exact(
+            &self.statement,
+            canonical_work,
+            canonical_transition,
+            proof_material,
+        ) {
+            return Err(ProofRecordError::InvalidProof);
+        }
+        Ok(())
     }
 }
 
 impl CanonicalWire for TransitionProofRecord {
-    // Generation 2 signs a statement that commits the complete nested
-    // Refine transcript. No legacy record is upgraded implicitly.
-    const MAGIC: [u8; 4] = *b"APR2";
+    // Generation 4 signs the predecessor-bound execution-key semantics.
+    // No predecessor record is upgraded implicitly.
+    const MAGIC: [u8; 4] = *b"APR4";
     const MAX_ENCODED_BYTES: usize = MAX_TRANSITION_PROOF_RECORD_BYTES;
 
     fn validate_wire(&self) -> bool {
@@ -362,7 +632,9 @@ impl CanonicalWire for TransitionProofRecord {
 
 /// Independent verifier for one public transition-proof record.
 ///
-/// `verify_transition` must validate the complete physical proof for the
+/// `verify_transition` receives assembled material whose manifest and chunk
+/// identities were already checked by [`TransitionProofRecord::verify`]. It
+/// must validate that complete physical proof for the
 /// statement's exact `proof_system`. For the standard nested Refine backend,
 /// accepting child proofs alone is insufficient: verification must perform
 /// the required deterministic boundary replay and bind its transcript
@@ -376,7 +648,28 @@ pub trait TransitionProofVerifier {
         signature: &[u8; PROOF_SIGNATURE_BYTES],
     ) -> bool;
 
-    fn verify_transition(&self, statement: &TransitionProofStatement, proof_bytes: &[u8]) -> bool;
+    fn verify_transition(
+        &self,
+        statement: &TransitionProofStatement,
+        proof_material: &[u8],
+    ) -> bool;
+
+    /// Verify a physical proof against the exact canonical execution bytes.
+    ///
+    /// The default preserves verifier compatibility while allowing physical
+    /// backends to bind proof inputs and terminal public I/O without trying
+    /// to invert the statement's commitments. Production Refine verifiers
+    /// override this method; callers which only have a statement must remain
+    /// fail-closed for such a verifier.
+    fn verify_transition_exact(
+        &self,
+        statement: &TransitionProofStatement,
+        _canonical_work: &[u8],
+        _canonical_transition: &[u8],
+        proof_material: &[u8],
+    ) -> bool {
+        self.verify_transition(statement, proof_material)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -465,6 +758,7 @@ fn encode_subject(encoder: &mut Encoder<'_>, subject: &TransitionProofSubject) {
     encoder.fixed(subject.agent.as_bytes());
     encoder.fixed(subject.runtime_deployment.as_bytes());
     encoder.fixed(subject.runtime_program.as_bytes());
+    encode_blob(encoder, &subject.runtime_package);
     encoder.fixed(subject.actor.as_bytes());
     encoder.fixed(subject.incarnation.as_bytes());
     encoder.fixed(subject.actor_deployment.as_bytes());
@@ -480,6 +774,7 @@ fn decode_subject(decoder: &mut Decoder<'_>) -> Result<TransitionProofSubject, D
         agent: AgentId(decoder.fixed()?),
         runtime_deployment: DeploymentId(decoder.fixed()?),
         runtime_program: ProgramId(decoder.fixed()?),
+        runtime_package: decode_blob(decoder)?,
         actor: ActorId(decoder.fixed()?),
         incarnation: Hash(decoder.fixed()?),
         actor_deployment: DeploymentId(decoder.fixed()?),
@@ -538,6 +833,193 @@ fn decode_blob(decoder: &mut Decoder<'_>) -> Result<BlobRef, DecodeError> {
 mod tests {
     use super::*;
     use alloc::string::ToString;
+    use alloc::vec;
+
+    #[test]
+    fn proof_material_manifest_round_trips_and_binds_exact_bytes() {
+        let material = b"serialized nested Refine proof";
+        let manifest = TransitionProofMaterialManifest::for_material(material).unwrap();
+        assert_eq!(manifest.material, BlobRef::of_bytes(material));
+        assert_eq!(manifest.chunks, vec![BlobRef::of_bytes(material)]);
+        assert!(manifest.matches_material(material));
+        assert!(!manifest.matches_material(b"substituted nested Refine proof"));
+        assert_eq!(
+            manifest
+                .assemble_bounded([material.as_slice()], material.len() as u64)
+                .unwrap(),
+            material
+        );
+        assert_eq!(
+            manifest.assemble_bounded(core::iter::empty(), material.len() as u64),
+            Err(WireError::InvalidValue)
+        );
+        assert_eq!(
+            manifest.assemble_bounded(
+                [material.as_slice(), b"extra".as_slice()],
+                material.len() as u64,
+            ),
+            Err(WireError::InvalidValue)
+        );
+        assert_eq!(
+            manifest.assemble_bounded([material.as_slice()], material.len() as u64 - 1),
+            Err(WireError::LimitExceeded)
+        );
+
+        let encoded = manifest.encode().unwrap();
+        assert!(encoded.len() <= MAX_TRANSITION_PROOF_MATERIAL_MANIFEST_BYTES);
+        assert_eq!(
+            TransitionProofMaterialManifest::decode(&encoded),
+            Ok(manifest)
+        );
+    }
+
+    #[test]
+    fn proof_material_manifest_requires_one_canonical_chunking() {
+        let chunk = TRANSITION_PROOF_MATERIAL_CHUNK_BYTES;
+        let valid = TransitionProofMaterialManifest {
+            material: BlobRef {
+                hash: Hash([1; 32]),
+                len: chunk + 1,
+            },
+            chunks: vec![
+                BlobRef {
+                    hash: Hash([2; 32]),
+                    len: chunk,
+                },
+                BlobRef {
+                    hash: Hash([3; 32]),
+                    len: 1,
+                },
+            ],
+        };
+        assert!(valid.validate());
+
+        let mut short_first = valid.clone();
+        short_first.chunks[0].len -= 1;
+        assert!(!short_first.validate());
+        let mut joined = valid.clone();
+        joined.chunks = vec![BlobRef {
+            hash: Hash([4; 32]),
+            len: chunk + 1,
+        }];
+        assert!(!joined.validate());
+        let mut empty_final = valid;
+        empty_final.material.len = chunk;
+        assert!(!empty_final.validate());
+
+        let maximum = TransitionProofMaterialManifest {
+            material: BlobRef {
+                hash: Hash([5; 32]),
+                len: crate::MAX_TRANSITION_PROOF_MATERIAL_BYTES,
+            },
+            chunks: (0..MAX_TRANSITION_PROOF_MATERIAL_CHUNKS)
+                .map(|index| BlobRef {
+                    hash: Hash([index as u8 + 1; 32]),
+                    len: chunk,
+                })
+                .collect(),
+        };
+        assert!(maximum.validate());
+    }
+
+    #[test]
+    fn proof_material_manifest_assembles_real_boundary_chunks_exactly() {
+        let chunk = TRANSITION_PROOF_MATERIAL_CHUNK_BYTES as usize;
+        let mut material = vec![0x5a; chunk + 1];
+        material[chunk] = 0x6b;
+        let manifest = TransitionProofMaterialManifest::for_material(&material).unwrap();
+        assert_eq!(manifest.chunks.len(), 2);
+        assert_eq!(manifest.chunks[0].len, chunk as u64);
+        assert_eq!(manifest.chunks[1].len, 1);
+        assert_eq!(
+            manifest
+                .assemble_bounded(
+                    [&material[..chunk], &material[chunk..]],
+                    material.len() as u64,
+                )
+                .unwrap(),
+            material,
+        );
+        assert_eq!(
+            manifest.assemble_bounded(
+                [&material[chunk..], &material[..chunk]],
+                material.len() as u64,
+            ),
+            Err(WireError::InvalidValue),
+        );
+        assert_eq!(
+            TransitionProofMaterialManifest::for_material(&material[..chunk])
+                .unwrap()
+                .chunks
+                .len(),
+            1,
+            "an exact 8 MiB boundary has no empty trailing chunk",
+        );
+    }
+
+    #[test]
+    fn proof_material_manifest_rejects_empty_oversized_and_hostile_lists() {
+        assert_eq!(
+            TransitionProofMaterialManifest::for_material(&[]),
+            Err(WireError::InvalidValue)
+        );
+        let oversized = TransitionProofMaterialManifest {
+            material: BlobRef {
+                hash: Hash([1; 32]),
+                len: crate::MAX_TRANSITION_PROOF_MATERIAL_BYTES + 1,
+            },
+            chunks: vec![BlobRef {
+                hash: Hash([2; 32]),
+                len: TRANSITION_PROOF_MATERIAL_CHUNK_BYTES,
+            }],
+        };
+        assert!(!oversized.validate());
+
+        let mut encoded = TransitionProofMaterialManifest::for_material(b"proof")
+            .unwrap()
+            .encode()
+            .unwrap();
+        let list_length_offset = 4 + 32 + 32 + 8;
+        encoded[list_length_offset..list_length_offset + 4]
+            .copy_from_slice(&((MAX_TRANSITION_PROOF_MATERIAL_CHUNKS + 1) as u32).to_le_bytes());
+        assert!(matches!(
+            TransitionProofMaterialManifest::decode(&encoded),
+            Err(WireError::Decode(DecodeError::LimitExceeded))
+        ));
+
+        let mut zero_chunk = TransitionProofMaterialManifest::for_material(b"proof")
+            .unwrap()
+            .encode()
+            .unwrap();
+        let first_chunk_hash = list_length_offset + 4;
+        zero_chunk[first_chunk_hash..first_chunk_hash + 32].fill(0);
+        assert!(TransitionProofMaterialManifest::decode(&zero_chunk).is_err());
+
+        let mut truncated = TransitionProofMaterialManifest::for_material(b"proof")
+            .unwrap()
+            .encode()
+            .unwrap();
+        truncated.pop();
+        assert_eq!(
+            TransitionProofMaterialManifest::decode(&truncated),
+            Err(WireError::Decode(DecodeError::Truncated))
+        );
+    }
+
+    #[test]
+    fn proof_material_manifest_rejects_noncanonical_envelopes() {
+        let manifest = TransitionProofMaterialManifest::for_material(b"proof").unwrap();
+        let mut wrong_magic = manifest.encode().unwrap();
+        wrong_magic[0..4].copy_from_slice(b"APM0");
+        assert!(TransitionProofMaterialManifest::decode(&wrong_magic).is_err());
+
+        let mut trailing = manifest.encode().unwrap();
+        trailing.push(0);
+        assert_eq!(
+            TransitionProofMaterialManifest::decode(&trailing),
+            Err(WireError::Decode(DecodeError::TrailingBytes))
+        );
+    }
 
     fn roots(linear: u8, merge: u8, local: u8) -> ProofLaneRoots {
         ProofLaneRoots {
@@ -555,6 +1037,7 @@ mod tests {
                 agent: AgentId([3; 32]),
                 runtime_deployment: DeploymentId([4; 32]),
                 runtime_program: ProgramId([5; 32]),
+                runtime_package: BlobRef::of_bytes(b"signed runtime package"),
                 actor: ActorId([6; 32]),
                 incarnation: Hash([7; 32]),
                 actor_deployment: DeploymentId([8; 32]),
@@ -573,11 +1056,19 @@ mod tests {
         }
     }
 
-    fn record(proof_bytes: &[u8]) -> TransitionProofRecord {
+    fn proof_manifest(proof_material: &[u8]) -> Vec<u8> {
+        TransitionProofMaterialManifest::for_material(proof_material)
+            .unwrap()
+            .encode()
+            .unwrap()
+    }
+
+    fn record(proof_material: &[u8]) -> TransitionProofRecord {
         let public_key = [17; 32];
+        let manifest = proof_manifest(proof_material);
         TransitionProofRecord {
             statement: statement(),
-            proof: BlobRef::of_bytes(proof_bytes),
+            proof: BlobRef::of_bytes(&manifest),
             producer: ProducerId::of_public_key(&public_key),
             producer_public_key: public_key,
             producer_signature: [18; 64],
@@ -593,7 +1084,7 @@ mod tests {
             message: &[u8],
             signature: &[u8; 64],
         ) -> bool {
-            message.starts_with(b"vos/agent/transition-proof-record/v2") && *signature == [18; 64]
+            message.starts_with(b"vos/agent/transition-proof-record/v4") && *signature == [18; 64]
         }
 
         fn verify_transition(
@@ -602,6 +1093,40 @@ mod tests {
             proof_bytes: &[u8],
         ) -> bool {
             statement.proof_system == Hash([16; 32]) && proof_bytes == b"physical proof"
+        }
+    }
+
+    struct ExactOnly;
+
+    impl TransitionProofVerifier for ExactOnly {
+        fn verify_producer(
+            &self,
+            _public_key: &[u8; 32],
+            message: &[u8],
+            signature: &[u8; 64],
+        ) -> bool {
+            message.starts_with(b"vos/agent/transition-proof-record/v4") && *signature == [18; 64]
+        }
+
+        fn verify_transition(
+            &self,
+            _statement: &TransitionProofStatement,
+            _proof_bytes: &[u8],
+        ) -> bool {
+            false
+        }
+
+        fn verify_transition_exact(
+            &self,
+            statement: &TransitionProofStatement,
+            canonical_work: &[u8],
+            canonical_transition: &[u8],
+            proof_bytes: &[u8],
+        ) -> bool {
+            statement.proof_system == Hash([16; 32])
+                && canonical_work == b"canonical work"
+                && canonical_transition == b"canonical transition"
+                && proof_bytes == b"physical proof"
         }
     }
 
@@ -615,6 +1140,9 @@ mod tests {
         let commitment = statement.commitment().unwrap();
         let mut changed = statement.clone();
         changed.subject.runtime_program = ProgramId([99; 32]);
+        assert_ne!(changed.commitment().unwrap(), commitment);
+        let mut changed = statement.clone();
+        changed.subject.runtime_package = BlobRef::of_bytes(b"substituted runtime package");
         assert_ne!(changed.commitment().unwrap(), commitment);
         let mut changed = statement.clone();
         changed.subject.method = "decrement".to_string();
@@ -631,6 +1159,41 @@ mod tests {
     }
 
     #[test]
+    fn execution_key_is_stable_and_binds_work_and_before_roots_only() {
+        let statement = statement();
+        let key = statement.key();
+        assert_eq!(key.invocation, statement.subject.invocation);
+        assert_eq!(
+            key.execution,
+            Hash([
+                0xc5, 0x68, 0x34, 0x4e, 0x58, 0x28, 0xb8, 0x6f, 0x8f, 0x7a, 0xd6, 0xdf, 0xce, 0xcc,
+                0xd5, 0xb3, 0xf4, 0x79, 0x1a, 0x50, 0xc2, 0x80, 0x13, 0x28, 0xe7, 0x59, 0xfd, 0x34,
+                0xec, 0xd6, 0xd2, 0x90,
+            ])
+        );
+        let reopened = TransitionProofStatement::decode(&statement.encode().unwrap()).unwrap();
+        assert_eq!(reopened.work, statement.work);
+        assert_eq!(reopened.before, statement.before);
+        assert_eq!(reopened.key(), key);
+
+        let mut changed = statement.clone();
+        changed.work = Hash([22; 32]);
+        assert_ne!(changed.key(), key);
+
+        let mut changed = statement.clone();
+        changed.before.linear = Some(Hash([23; 32]));
+        assert_ne!(changed.key(), key);
+
+        let mut changed = statement.clone();
+        changed.before.linear = None;
+        assert_ne!(changed.key(), key);
+
+        let mut changed = statement;
+        changed.after.linear = Some(Hash([24; 32]));
+        assert_eq!(changed.key(), key);
+    }
+
+    #[test]
     fn statement_rejects_mutation_outside_the_declared_lane() {
         let mut invalid = statement();
         invalid.after.merge = Some(Hash([90; 32]));
@@ -639,6 +1202,14 @@ mod tests {
         invalid = statement();
         invalid.subject.mode = MethodMode::Query;
         assert!(!invalid.validate());
+
+        invalid = statement();
+        invalid.after.control = Hash([89; 32]);
+        assert!(!invalid.validate());
+
+        let mut linearizable_query = statement();
+        linearizable_query.subject.mode = MethodMode::LinearizableQuery;
+        assert!(linearizable_query.validate());
 
         invalid = statement();
         invalid.before.linear = None;
@@ -654,15 +1225,77 @@ mod tests {
             bytes: sentinel.to_vec(),
         };
         let record = record(b"physical proof");
+        let manifest = proof_manifest(b"physical proof");
         let encoded = record.encode().unwrap();
         assert_eq!(TransitionProofRecord::decode(&encoded).unwrap(), record);
-        assert!(record.verify(b"physical proof", &AcceptExact).is_ok());
+        assert!(
+            record
+                .verify(&manifest, b"physical proof", &AcceptExact)
+                .is_ok()
+        );
         assert!(
             !encoded
                 .windows(sentinel.len())
                 .any(|window| window == sentinel)
         );
         assert_eq!(witness.bytes, sentinel);
+    }
+
+    #[test]
+    fn verified_publication_commitment_is_stable_and_binds_every_journal_field() {
+        let record = record(b"physical proof");
+        let commitment = record.verified_publication_commitment().unwrap();
+        assert_eq!(
+            commitment.0,
+            [
+                0xbd, 0x63, 0x21, 0x0a, 0x24, 0xe2, 0x73, 0xf9, 0x5c, 0x62, 0x5f, 0x5f, 0x7f, 0x9d,
+                0x00, 0x55, 0x2a, 0x70, 0xb2, 0x99, 0x01, 0x72, 0x08, 0x7c, 0x72, 0xf0, 0xa4, 0xe5,
+                0x9d, 0xd4, 0x35, 0xee,
+            ]
+        );
+
+        let mut changed = record.clone();
+        changed.statement.subject.invocation = InvocationId([21; 32]);
+        assert_ne!(
+            changed.verified_publication_commitment().unwrap(),
+            commitment
+        );
+        let mut changed = record.clone();
+        changed.statement.work = Hash([22; 32]);
+        assert_ne!(
+            changed.verified_publication_commitment().unwrap(),
+            commitment
+        );
+        let mut changed = record.clone();
+        changed.statement.transition = Hash([23; 32]);
+        assert_ne!(
+            changed.verified_publication_commitment().unwrap(),
+            commitment
+        );
+        let mut changed = record.clone();
+        changed.producer_signature[0] ^= 1;
+        assert_ne!(
+            changed.verified_publication_commitment().unwrap(),
+            commitment
+        );
+        let mut changed = record.clone();
+        changed.statement.before.linear = Some(Hash([24; 32]));
+        assert_ne!(
+            changed.verified_publication_commitment().unwrap(),
+            commitment
+        );
+        let mut changed = record;
+        changed.statement.after.linear = Some(Hash([25; 32]));
+        assert_ne!(
+            changed.verified_publication_commitment().unwrap(),
+            commitment
+        );
+
+        changed.producer_signature = [0; PROOF_SIGNATURE_BYTES];
+        assert_eq!(
+            changed.verified_publication_commitment(),
+            Err(WireError::InvalidValue)
+        );
     }
 
     #[test]
@@ -677,20 +1310,25 @@ mod tests {
     #[test]
     fn proof_content_producer_signature_and_backend_fail_independently() {
         let record = record(b"physical proof");
+        let manifest = proof_manifest(b"physical proof");
         assert_eq!(
-            record.verify(b"wrong proof", &AcceptExact),
+            record.verify(b"wrong manifest", b"physical proof", &AcceptExact),
+            Err(ProofRecordError::WrongProof)
+        );
+        assert_eq!(
+            record.verify(&manifest, b"wrong proof", &AcceptExact),
             Err(ProofRecordError::WrongProof)
         );
         let mut wrong_signature = record.clone();
         wrong_signature.producer_signature[0] ^= 1;
         assert_eq!(
-            wrong_signature.verify(b"physical proof", &AcceptExact),
+            wrong_signature.verify(&manifest, b"physical proof", &AcceptExact),
             Err(ProofRecordError::InvalidProducerSignature)
         );
         let mut wrong_system = record;
         wrong_system.statement.proof_system = Hash([19; 32]);
         assert_eq!(
-            wrong_system.verify(b"physical proof", &AcceptExact),
+            wrong_system.verify(&manifest, b"physical proof", &AcceptExact),
             Err(ProofRecordError::InvalidProof)
         );
     }
@@ -698,6 +1336,7 @@ mod tests {
     #[test]
     fn follower_exact_verification_rejects_every_external_binding_substitution() {
         let record = record(b"physical proof");
+        let manifest = proof_manifest(b"physical proof");
         let statement = &record.statement;
         let verify = |subject: &TransitionProofSubject,
                       before: ProofLaneRoots,
@@ -709,6 +1348,7 @@ mod tests {
                       proof_system: Hash,
                       producer: ProducerId| {
             record.verify_exact(
+                &manifest,
                 b"physical proof",
                 subject,
                 before,
@@ -719,7 +1359,7 @@ mod tests {
                 public_io,
                 proof_system,
                 producer,
-                &AcceptExact,
+                &ExactOnly,
             )
         };
         assert!(
@@ -849,7 +1489,7 @@ mod tests {
             Err(WireError::Decode(DecodeError::TrailingBytes))
         ));
 
-        for magic in [*b"APRF", *b"PRF1"] {
+        for magic in [*b"APRF", *b"PRF1", *b"APR2", *b"APR3"] {
             let mut old = record.encode().unwrap();
             old[..4].copy_from_slice(&magic);
             assert!(matches!(
@@ -859,8 +1499,8 @@ mod tests {
         }
 
         let mut unknown_mode = record.statement.encode().unwrap();
-        // Header + nine fixed identities + method length + method bytes.
-        let mode = 4 + 32 + 9 * 32 + 4 + record.statement.subject.method.len();
+        // Header + nine fixed identities + runtime package ref + method.
+        let mode = 4 + 32 + 9 * 32 + 32 + 8 + 4 + record.statement.subject.method.len();
         unknown_mode[mode] = 0xff;
         assert!(matches!(
             TransitionProofStatement::decode(&unknown_mode),
@@ -872,10 +1512,20 @@ mod tests {
         // decoder which could silently reinterpret public I/O as a trace.
         let statement = statement();
         let mut previous_layout = Vec::new();
-        previous_layout.extend_from_slice(b"APST");
+        previous_layout.extend_from_slice(b"APS2");
         previous_layout.extend_from_slice(crate::RUNTIME_ABI_ID.as_bytes());
         let mut encoder = Encoder(&mut previous_layout);
-        encode_subject(&mut encoder, &statement.subject);
+        encoder.fixed(statement.subject.space.as_bytes());
+        encoder.fixed(statement.subject.agent.as_bytes());
+        encoder.fixed(statement.subject.runtime_deployment.as_bytes());
+        encoder.fixed(statement.subject.runtime_program.as_bytes());
+        encoder.fixed(statement.subject.actor.as_bytes());
+        encoder.fixed(statement.subject.incarnation.as_bytes());
+        encoder.fixed(statement.subject.actor_deployment.as_bytes());
+        encoder.fixed(statement.subject.actor_program.as_bytes());
+        encoder.fixed(statement.subject.invocation.as_bytes());
+        encoder.string(&statement.subject.method);
+        encode_mode(&mut encoder, statement.subject.mode);
         encode_roots(&mut encoder, statement.before);
         encode_roots(&mut encoder, statement.after);
         encoder.fixed(statement.work.as_bytes());
@@ -887,8 +1537,15 @@ mod tests {
             Err(WireError::Decode(DecodeError::InvalidTag))
         ));
 
+        let mut previous_statement_magic = statement.encode().unwrap();
+        previous_statement_magic[..4].copy_from_slice(b"APS3");
+        assert!(matches!(
+            TransitionProofStatement::decode(&previous_statement_magic),
+            Err(WireError::Decode(DecodeError::InvalidTag))
+        ));
+
         let mut previous_signing_domain = record.signing_bytes().unwrap();
-        previous_signing_domain[b"vos/agent/transition-proof-record/v".len()] = b'1';
+        previous_signing_domain[b"vos/agent/transition-proof-record/v".len()] = b'3';
         assert!(!AcceptExact.verify_producer(
             &record.producer_public_key,
             &previous_signing_domain,

@@ -83,7 +83,7 @@ fn refine_harness_starts_canonical_real_service_program() {
         "gas accounting: init charge plus execution (used {})",
         inv.gas_used
     );
-    assert_eq!(inv.output(), None, "no output without a halt");
+    assert_eq!(inv.output_bounded(0), None, "no output without a halt");
 }
 
 /// The flat and sparse memory representations are indistinguishable on the

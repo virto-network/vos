@@ -55,6 +55,8 @@ fn canonical_agent_runtime_pvm(elf: &[u8]) -> anyhow::Result<Vec<u8>> {
 }
 
 fn validate_agent_runtime_pvm(pvm: &[u8]) -> anyhow::Result<()> {
+    vos_pvm::spi::validate_refine_host_calls(pvm)
+        .map_err(|error| anyhow!("agent-runtime outer host-call surface is invalid: {error:?}"))?;
     let probe = RuntimeWork::Manage {
         context: RuntimeExecutionContext::Direct,
         space: SpaceId([1; 32]),
@@ -79,7 +81,7 @@ fn validate_agent_runtime_pvm(pvm: &[u8]) -> anyhow::Result<()> {
         invocation.exit
     );
     let output = invocation
-        .output()
+        .output_bounded(RuntimeTransition::MAX_ENCODED_BYTES)
         .ok_or_else(|| anyhow!("agent-runtime ABI probe returned an invalid output window"))?;
     let output = RuntimeTransition::decode(&output)
         .map_err(|error| anyhow!("decode clean agent-runtime ABI probe: {error}"))?;
@@ -107,7 +109,27 @@ mod tests {
     }
 
     #[test]
-    fn bundled_runtime_implements_the_clean_management_probe() {
-        validate_agent_runtime_pvm(crate::bundled::agent_runtime_pvm()).unwrap();
+    fn rejects_retired_jar_and_vos_only_outer_host_calls() {
+        use vos_pvm_compiler::assembler::Assembler;
+
+        let mut legacy = Assembler::new();
+        assert!(validate_agent_runtime_pvm(&legacy.trap().build()).is_err());
+
+        let mut vos_only = Assembler::new();
+        let vos_only = vos_only
+            .trap()
+            .ecalli(vos::abi::hostcall::DEBUG_WRITE)
+            .build_standard();
+        assert!(validate_agent_runtime_pvm(&vos_only).is_err());
+    }
+
+    #[test]
+    fn prior_bundled_runtime_is_rejected_until_its_outer_surface_is_regenerated() {
+        let error = validate_agent_runtime_pvm(crate::bundled::agent_runtime_pvm())
+            .expect_err("the checked-in predecessor artifact contains DEBUG_WRITE");
+        assert!(
+            error.to_string().contains("UnsupportedHostCall(118)"),
+            "unexpected rejection: {error:#}"
+        );
     }
 }

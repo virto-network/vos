@@ -19,6 +19,7 @@ vos-agent-sdk = { path = "../../../vos-agent-sdk" }
 [dev-dependencies]
 ed25519-dalek = { version = "2", default-features = false }
 vos = { path = "../../../vos", default-features = false, features = ["std", "pvm"] }
+vos-pvm = { path = "../../../pvm/runtime" }
 vos-pvm-compiler = { path = "../../../pvm/compiler" }
 
 [profile.release]
