@@ -54,20 +54,17 @@ The VOS client feature is opt-in so actors that do not use native extensions
 keep their existing PVM identity. This crate declares its generated extension
 handle with `#[messages(extension)]`.
 
-The corresponding service entry in the space recipe must opt into the bounded
-authority explicitly:
+The node-local extension is configured directly in the Space data directory's
+`local.toml`:
 
 ```toml
-[[agent]]
-name = "chain-reader"
-path = "target/vos/chain-reader.vos"
-consistency = "local"
-intra_caps = ["substrate:member"]
-
 [[extension]]
 name = "substrate"
 path = "target/release/libsubstrate_extension.so"
 ```
+
+The current `vosx` clean-cutover surface loads this extension but does not
+offer package installation or dynamic actor invocation.
 
 The node-local route permits at most eight calls per Refine and 64 KiB per
 request or reply. It is installed only for roots using `consistency = "local"`:
@@ -83,10 +80,8 @@ four minutes of inactivity (up to 16 live references); arbitrary references,
 references owned by another caller, and references lost on reload or reconnect
 return `Stale`.
 
-Transaction methods accept trusted local system calls. PVM actors require a
-matching host-side `[[agent]] intra_caps` entry for the Substrate target at
-`Member` or higher;
-the host binds that bounded grant to the actor identity. Network peers and
+Transaction methods accept trusted local system calls. The host binds a
+bounded grant to the exact actor identity. Network peers and
 credential-backed ingress callers likewise require at least a `Member` space
 grant; Noise transport identity by itself is not authorization. Signing
 request IDs and map cursors are non-sequential capabilities bound to the caller

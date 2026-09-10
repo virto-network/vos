@@ -1,34 +1,13 @@
-//! `vosx space *` — per-space lifecycle, daemon control,
-//! and registry-mediated agent management.
+//! `vosx space *` — local space lifecycle and daemon control.
 //!
-//! Three groups of commands:
-//!
-//! - **Offline**: `new`, `list`, `info`, `delete`, `export`
-//!   (read-only). Operate on `~/.config/vosx/spaces.toml` and
-//!   per-space data dirs without contacting a daemon. Joining a
-//!   remote space is folded into `space up <token>`.
-//! - **Daemon**: `up` runs the libp2p server that owns the
-//!   redb. One daemon per space, identified by an
-//!   `<data_dir>/.endpoint` file.
-//! - **Client**: `publish`, `install`, `uninstall`,
-//!   `unpublish`, `programs`, `agents`, `members`, `call`.
-//!   Each spawns a tiny libp2p peer, dials the daemon's
-//!   endpoint, sends one registry invoke, and exits. Same
-//!   plumbing under `DaemonClient` — `call` is the floor
-//!   primitive, the rest are typed sugar.
-//!   `upgrade` is retained only as a pre-dial, fail-closed migration guard
-//!   directing operators to the Agent lifecycle.
+//! Clean-generation Agent administration is deliberately absent. The CLI
+//! exposes only local lifecycle, verified backup/restore, and local extension
+//! capability inspection until system authority/catalog bootstrap is wired.
 
 use clap::Subcommand;
 use std::path::PathBuf;
 
-pub mod access;
-mod agent_authority;
-pub mod agents;
-pub mod apply;
-mod authority_socket;
 pub mod backup;
-pub mod call;
 pub mod caps;
 // The hardened store depends on Unix dirfd, no-follow, ownership, link-count,
 // and durable-directory semantics. It is intentionally unavailable where
@@ -36,367 +15,90 @@ pub mod caps;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)] // Wired by the clean native startup owner in this chapter.
 pub(crate) mod clean_genesis_archive;
-#[allow(dead_code)] // Deliberately unwired until clean space genesis owns these capabilities.
+#[allow(dead_code)]
 pub(crate) mod clean_identity;
 #[cfg(unix)]
-#[allow(dead_code)] // Deliberately unwired until the subsequent bootstrap cutover slice.
+#[allow(dead_code)]
 pub(crate) mod clean_store;
 pub mod client;
 pub mod common;
-pub mod describe;
 pub mod down;
 pub mod endpoint;
-pub mod export;
 pub mod forget;
 pub mod info;
-pub mod install;
-pub mod invite;
 pub mod list;
-pub mod members;
+pub mod local_config;
 pub mod new;
 pub mod op_sign;
-mod production_trust;
-pub mod programs;
-pub mod publish;
-pub mod raft_status;
 pub mod reconcile;
-pub mod role;
 mod space_lock;
-pub mod subscriptions;
-pub mod uninstall;
-pub mod unpublish;
 pub mod up;
-pub mod upgrade;
 pub mod verify;
 
 #[derive(Subcommand, Debug)]
 pub enum SpaceCommand {
-    /// Create a new space — scaffold identity, initial data
-    /// dir, and add to the local spaces index. Doesn't run
-    /// any daemon; `space up` is what binds a network. Set
-    /// the daemon's persistent listen addrs by editing the
-    /// per-space `local.toml`'s `listen = […]`, or pass
-    /// `--listen` to `space up` per-run.
+    /// Create a local space identity and data directory.
     New {
-        /// Short name for the space. Used in listings and as the
-        /// default lookup key.
         name: String,
-        /// Source for the space-registry actor blob: file path,
-        /// 64-hex content hash (cache lookup), `ipfs:<cid>`, or
-        /// `https://…`. Optional — falls back to the registry
-        /// blob bundled into the vosx binary at build time.
+        /// Registry blob source: path, hash, `ipfs:<cid>`, or `https://…`.
         #[arg(long, value_name = "SOURCE")]
         registry: Option<String>,
-        /// Override the per-space data directory (default:
-        /// `~/.local/share/vosx/<space_id>`).
+        /// Override the per-space data directory.
         #[arg(long, value_name = "DIR")]
         data_dir: Option<PathBuf>,
-        /// Optional recipe TOML to apply on the space's first `space
-        /// up` (recorded as the pending recipe — a one-shot genesis
-        /// apply, not a boot-time reconcile).
-        #[arg(long, value_name = "FILE")]
-        recipe: Option<PathBuf>,
     },
     /// List spaces in the local index.
     List,
-    /// Show details for a single space (by id-prefix or name).
-    Info {
-        /// Space id (full hex) or name.
-        space: String,
-    },
-    /// Mint a `vos-…` invite token for a running space. Requires the
-    /// operator to hold ADMIN. The joiner redeems it with `space up
-    /// <token>`. Tokens grant `member` or `developer`; promote admins
-    /// explicitly with `space role grant` after admission. Subcommands:
-    /// `list` shows recorded invites (rows appear on redemption or
-    /// revocation), `revoke <token_pub-prefix>` invalidates one; bare
-    /// `space invite <space>` mints.
-    Invite {
-        /// Space id (full hex) or name.
-        space: String,
-        /// Role the token grants: `member` (default) | `developer`.
-        /// Mint only.
-        #[arg(long)]
-        role: Option<String>,
-        /// Expiry window: `7d` (default) / `24h` / `30m` / `90s` /
-        /// bare seconds. Mint only.
-        #[arg(long)]
-        expires: Option<String>,
-        /// Bootnode multiaddr(s) to embed. Repeatable. Defaults to the
-        /// running daemon's published listen addrs. Mint only.
-        #[arg(long, value_name = "MULTIADDR")]
-        bootnode: Vec<String>,
-        /// `list` / `revoke <token_pub-prefix>`; omit to mint.
-        #[command(subcommand)]
-        command: Option<invite::InviteCommand>,
-    },
-    /// Issue, list, or revoke protocol-neutral access tokens for built-in
-    /// ingress listeners. Bearer secrets are printed once and never stored by
-    /// vosx or the authority.
-    Access {
-        /// Space id (full hex) or name.
-        space: String,
-        #[command(subcommand)]
-        command: access::AccessCommand,
-    },
-    /// Boot a space — THE onboarding command. The positional is
-    /// trivalent: an existing `.toml` recipe path (create-if-missing +
-    /// one-shot genesis apply + boot), a `vos-…` invite token
-    /// (join-if-needed + boot + auto-redeem), or a space name / id
-    /// (boot a known space). `-` reads a token from stdin. Loads the
-    /// registry from cache, registers it as `ServiceId::REGISTRY`, and
-    /// runs forever.
+    /// Show local details for a space.
+    Info { space: String },
+    /// Run a known space's registry/platform daemon.
     Up {
-        /// Recipe path, `vos-…` token, `-` (token via stdin), or a
-        /// known space id (full hex) / name.
+        /// Known space id (full hex) or name.
         space: String,
         /// Exit when the registry goes idle (smoke-test mode).
         #[arg(long)]
         once: bool,
-        /// libp2p multiaddr to listen on. Repeatable. Overrides
-        /// the saved `listen` field on the spaces.toml entry
-        /// for this run.
+        /// Listen multiaddr. Repeatable and overrides saved addresses.
         #[arg(long, value_name = "MULTIADDR")]
         listen: Vec<String>,
-        /// libp2p multiaddr to dial at startup. Repeatable.
-        /// Extends the saved `bootnodes` field on the
-        /// spaces.toml entry for this run.
+        /// Startup peer multiaddr. Repeatable.
         #[arg(long, value_name = "MULTIADDR")]
         connect: Vec<String>,
-        /// Exact protocol-pinned generic service PVM used by installed `.vos`
-        /// service packages. Without it, service rows remain installed but are skipped.
-        #[arg(long, value_name = "FILE")]
-        service_pvm: Option<PathBuf>,
-        /// Unix socket for the fail-closed service platform/consensus trust authority.
-        /// When set, all service roots use the production profile.
-        #[arg(
-            long,
-            value_name = "SOCKET",
-            requires = "service_pvm",
-            conflicts_with = "allow_conformance"
-        )]
-        production_trust_socket: Option<PathBuf>,
-        /// Explicitly run signed service roots under the conformance-only trust
-        /// seam. This is for development and protocol tests; production
-        /// operators must supply --production-trust-socket instead.
-        #[arg(
-            long,
-            requires = "service_pvm",
-            conflicts_with = "production_trust_socket"
-        )]
-        allow_conformance: bool,
-        /// Canonical RootAnchorPins wire file independently provisioned for
-        /// this space's Local system Agent.
-        #[arg(long, value_name = "FILE", requires = "agent_authority_socket")]
-        agent_root_pins: Option<PathBuf>,
-        /// Generation-2 authority/archive Unix socket for the Local system
-        /// Agent. This must always be paired with --agent-root-pins.
-        #[arg(long, value_name = "SOCKET", requires = "agent_root_pins")]
-        agent_authority_socket: Option<PathBuf>,
     },
-    /// Stop a running `space up` daemon by signalling its PID.
-    /// SIGTERM by default (daemon flushes state, removes the
-    /// endpoint file, exits); `--force` upgrades to SIGKILL if
-    /// the daemon doesn't exit within `--grace` seconds.
+    /// Stop a running local daemon.
     Down {
-        /// Space id (full hex) or name.
         space: String,
-        /// Skip the SIGTERM grace window and SIGKILL immediately.
         #[arg(long)]
         force: bool,
-        /// Seconds to wait for graceful shutdown before
-        /// (optionally, with `--force`) escalating.
         #[arg(long, default_value_t = 5)]
         grace: u64,
     },
     /// Create a verified offline backup of one space.
-    /// The current clean-break format is registry-only and refuses live
-    /// Agent/service generations until their authenticated portable exporters
-    /// exist. Node secret material is never archived and must be retained
-    /// separately.
-    Backup {
-        /// Space id or name from the local spaces index.
-        space: String,
-        /// New directory to create. Existing paths are never overwritten.
-        output: PathBuf,
-    },
-    /// Verify and restore a `space backup` directory. Existing state is
-    /// preserved under a recoverable sibling path when `--replace` is used.
+    Backup { space: String, output: PathBuf },
+    /// Verify and restore a `space backup` directory.
     Restore {
-        /// Backup directory containing `manifest.json`.
         backup: PathBuf,
-        /// Separately retained per-space node key. Its canonical PeerId must
-        /// exactly match the public recovery identity in the manifest.
+        /// Separately retained per-space node key.
         #[arg(long, value_name = "FILE", required = true)]
         node_key: PathBuf,
-        /// Destination data directory. Defaults to the normal XDG path for
-        /// the archived space id, not the source machine's absolute path.
         #[arg(long, value_name = "DIR")]
         data_dir: Option<PathBuf>,
-        /// Replace an existing destination after verification. The previous
-        /// directory is renamed aside and reported; it is never deleted.
+        /// Preserve the previous destination under a recoverable sibling path.
         #[arg(long)]
         replace: bool,
-        /// Override the archived display name in the local spaces index.
         #[arg(long)]
         name: Option<String>,
     },
-    /// Query a space's registry and emit a round-trippable
-    /// TOML recipe to stdout.
-    Export {
-        /// Space id (full hex) or name.
-        space: String,
-    },
-    /// Apply a recipe TOML to a running space: publish + install any
-    /// missing agents (the replicated half → the registry) and project
-    /// the recipe's node-local policy into `local.toml`.
-    /// Idempotent — a re-apply of the same recipe is all-skips.
-    Apply {
-        /// Space id (full hex) or name.
-        space: String,
-        /// Recipe TOML path.
-        recipe: PathBuf,
-        /// Print the plan (create / skip / replacement-required + local.toml
-        /// changes) and exit without mutating anything.
-        #[arg(long)]
-        diff: bool,
-        /// Compatibility guard for the retired service-upgrade path. Fails
-        /// before writes and directs replacements to the Agent lifecycle.
-        #[arg(long)]
-        upgrade: bool,
-    },
-    /// Point a catalog name at a content-addressed program package.
-    Publish {
-        /// Space id or name.
-        space: String,
-        /// Catalog name.
-        program_ref: String,
-        /// Blob source: file path, hash, ipfs:<cid>, or URL.
-        source: String,
-    },
-    /// Remove a program from the catalog. Errors if any
-    /// installed agent still references its package.
-    Unpublish {
-        space: String,
-        /// Catalog name.
-        program_ref: String,
-    },
-    /// List programs in the catalog.
-    Programs { space: String },
-    /// Instantiate a published program as an installed agent.
-    Install {
-        /// Space id or name.
-        space: String,
-        /// Published program name.
-        program_ref: String,
-        /// Override the install/instance name. Defaults to
-        /// the program's `name`.
-        #[arg(long)]
-        name: Option<String>,
-        /// Consistency mode: local, crdt, or raft.
-        #[arg(long, default_value = "local")]
-        consistency: String,
-        /// Optional explicit replication id (64 hex). Default:
-        /// blake2b("vos-replication-id" || instance_name ||
-        /// 0 || program_hash).
-        #[arg(long, value_name = "HEX")]
-        replication_id: Option<String>,
-        /// Serving-side sync floor: public | member | private.
-        #[arg(long, default_value = "member")]
-        sync: String,
-    },
-    /// Tombstone an installed agent.
-    Uninstall { space: String, instance: String },
-    /// Reject the retired legacy service-upgrade path and show the Agent
-    /// lifecycle migration guidance.
-    Upgrade {
-        space: String,
-        instance: String,
-        /// Published program name.
-        program_ref: String,
-    },
-    /// List installed agents.
-    Agents { space: String },
-    /// Show an installed agent's schema — message names, arg
-    /// types, and constructor params. Pulls the `.vos_meta`
-    /// blob the registry has on file (same data the worker
-    /// serves at `GET /__schema/<agent>`). Use `--format json`
-    /// for machine consumption.
-    Describe {
-        space: String,
-        /// Instance name as it appears in `vosx space agents`.
-        instance: String,
-    },
-    /// Show the effective relay `intra_caps` the running daemon
-    /// loaded for each service extension — the per-target role
-    /// ceilings an extension may relay (deny-all when empty).
-    /// Daemon-local host policy, read from the endpoint descriptor.
-    /// Pass an instance to filter; `--format json` for machine
-    /// consumption.
+    /// Show local extension relay capability ceilings.
     Caps {
         space: String,
-        /// Optional extension instance name to filter to.
         instance: Option<String>,
     },
-    /// Show the connected daemon's view of a Raft agent's group —
-    /// role, term, leader, and member node prefixes. Reads the
-    /// existing `RaftStatusReq` plumbing; use it to find the leader
-    /// before an Operator-gated write and to watch failover.
-    /// `--format json` for machine consumption.
-    RaftStatus {
-        space: String,
-        /// Raft agent instance name (as in `vosx space agents`).
-        instance: String,
-    },
-    /// Manage Node + Identity members. Subcommands: list,
-    /// add-node, remove-node, add-identity, remove-identity.
-    /// Bare `space members <space>` lists.
-    Members {
-        space: String,
-        #[command(subcommand)]
-        command: Option<members::MembersCommand>,
-    },
-    /// Manage custom capability roles and member assignments in the canonical
-    /// space authority. Bare `space role <space>` lists both catalogues.
-    Role {
-        space: String,
-        #[command(subcommand)]
-        command: Option<role::RoleCommand>,
-    },
-    /// Drop the local copy of a space — wipes the per-space
-    /// data dir and the spaces.toml entry. The shared blob
-    /// cache is kept and the space stays alive on its peers;
-    /// this is purely a local operation.
+    /// Remove the local copy of a stopped space.
     Forget {
         space: String,
-        /// Skip the confirmation prompt.
         #[arg(long)]
         yes: bool,
-    },
-    /// Per-node subscription filter. Empty filter (the default)
-    /// = sync every installed agent; non-empty = sync only the
-    /// listed instances. Stored in `<data_dir>/local.toml`.
-    /// Bare `space subs <space>` lists.
-    Subs {
-        space: String,
-        #[command(subcommand)]
-        command: Option<subscriptions::SubsCommand>,
-    },
-    /// Invoke any agent on the running daemon. Generic floor
-    /// primitive; `publish` / `install` / etc. are typed sugar
-    /// wrappers around the same plumbing.
-    ///
-    /// `target` accepts:
-    /// - `registry` — the well-known per-space registry
-    /// - `<instance_name>` — an installed agent (resolved via
-    ///   the daemon's registry)
-    Call {
-        space: String,
-        target: String,
-        method: String,
-        /// Positional `key=value` args. Numbers and booleans
-        /// are auto-typed; everything else is a string.
-        args: Vec<String>,
     },
 }
 
@@ -406,49 +108,23 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             name,
             registry,
             data_dir,
-            recipe,
         } => new::run(new::Args {
             name,
             registry,
             data_dir,
-            recipe,
         }),
         SpaceCommand::List => list::run(),
         SpaceCommand::Info { space } => info::run(&space),
-        SpaceCommand::Invite {
-            space,
-            role,
-            expires,
-            bootnode,
-            command,
-        } => invite::run(invite::Args {
-            space,
-            role,
-            expires,
-            bootnode,
-            command,
-        }),
-        SpaceCommand::Access { space, command } => access::run(access::Args { space, command }),
         SpaceCommand::Up {
             space,
             once,
             listen,
             connect,
-            service_pvm,
-            production_trust_socket,
-            allow_conformance,
-            agent_root_pins,
-            agent_authority_socket,
         } => up::run(up::Args {
             query: space,
             once,
             listen,
             connect,
-            service_pvm,
-            production_trust_socket,
-            allow_conformance,
-            agent_root_pins,
-            agent_authority_socket,
         }),
         SpaceCommand::Down {
             space,
@@ -473,74 +149,7 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             replace,
             name.as_deref(),
         ),
-        SpaceCommand::Export { space } => export::run(export::Args { query: space }),
-        SpaceCommand::Apply {
-            space,
-            recipe,
-            diff,
-            upgrade,
-        } => apply::run(apply::Args {
-            space,
-            recipe,
-            diff,
-            upgrade,
-        }),
-        SpaceCommand::Publish {
-            space,
-            program_ref,
-            source,
-        } => publish::run(publish::Args {
-            space,
-            program_ref,
-            source,
-        }),
-        SpaceCommand::Unpublish { space, program_ref } => {
-            unpublish::run(unpublish::Args { space, program_ref })
-        }
-        SpaceCommand::Programs { space } => programs::run(&space),
-        SpaceCommand::Install {
-            space,
-            program_ref,
-            name,
-            consistency,
-            replication_id,
-            sync,
-        } => install::run(install::Args {
-            space,
-            program_ref,
-            name,
-            consistency,
-            replication_id,
-            sync,
-        }),
-        SpaceCommand::Uninstall { space, instance } => uninstall::run(&space, &instance),
-        SpaceCommand::Upgrade {
-            space,
-            instance,
-            program_ref,
-        } => upgrade::run(upgrade::Args {
-            space,
-            instance,
-            program_ref,
-        }),
-        SpaceCommand::Agents { space } => agents::run(&space),
-        SpaceCommand::Describe { space, instance } => describe::run(&space, &instance),
         SpaceCommand::Caps { space, instance } => caps::run(&space, instance.as_deref()),
-        SpaceCommand::RaftStatus { space, instance } => raft_status::run(&space, &instance),
-        SpaceCommand::Members { space, command } => members::run(members::Args { space, command }),
-        SpaceCommand::Role { space, command } => role::run(role::Args { space, command }),
         SpaceCommand::Forget { space, yes } => forget::run(forget::Args { space, yes }),
-        SpaceCommand::Call {
-            space,
-            target,
-            method,
-            args,
-        } => call::run(call::Args {
-            space,
-            target,
-            method,
-            args,
-        }),
-        SpaceCommand::Subs { space, command } => subscriptions::run(&space, command),
     }
 }

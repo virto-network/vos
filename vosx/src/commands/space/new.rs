@@ -37,9 +37,6 @@ pub struct Args {
     pub name: String,
     pub registry: Option<String>,
     pub data_dir: Option<PathBuf>,
-    /// Recipe TOML recorded as `pending_recipe` — applied once on the
-    /// space's first `space up` (a one-shot genesis apply).
-    pub recipe: Option<PathBuf>,
 }
 
 /// The result of scaffolding a fresh space — the index entry (already
@@ -55,21 +52,6 @@ pub(crate) struct Scaffolded {
 
 pub fn run(args: Args) -> anyhow::Result<()> {
     let s = scaffold(&args.name, args.registry.as_deref(), args.data_dir)?;
-
-    // Record a pending recipe so the first `space up` genesis-applies it
-    // (agents → registry, node-local → local.toml). Absolute so the boot
-    // re-reads it regardless of cwd.
-    if let Some(recipe) = &args.recipe {
-        let abs = std::fs::canonicalize(recipe)
-            .unwrap_or_else(|_| recipe.clone())
-            .to_string_lossy()
-            .to_string();
-        let mut index = spaces_index::LockedSpacesIndex::acquire()?;
-        if let Some(entry) = index.spaces.iter_mut().find(|e| e.id == s.entry.id) {
-            entry.pending_recipe = abs;
-            index.save()?;
-        }
-    }
 
     let space_id_hex = s.entry.id.clone();
     if output::is_json() {
@@ -111,7 +93,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 /// moving the directory into place, persisting the node key, and upserting
 /// the spaces-index entry.
 /// The registry is *not* left running — the caller boots it via `space
-/// up`. Reused by the `space up <recipe>` create-if-unknown path.
+/// up`.
 pub(crate) fn scaffold(
     name: &str,
     registry: Option<&str>,

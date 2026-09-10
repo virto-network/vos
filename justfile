@@ -23,8 +23,8 @@ build-extensions:
 build-wasm:
     cd tests/fixtures/wasm/echo; cargo build --target wasm32-unknown-unknown --release
 
-# Build the service and the actors used by examples and integration tests.
-build-pvm: verify-agent-runtime-release build-vos-service build-examples build-registry-fixtures
+# Build the retained runtime and actor examples.
+build-pvm: verify-agent-runtime-release build-examples (build-actor "space-registry")
 
 # Build the small maintained public Agent example set.
 build-examples:
@@ -34,45 +34,24 @@ build-examples:
     cd examples/actors; cargo +nightly actor -p local-signer
     cd examples/agent-runtimes/custom-linear; cargo actor
 
-# Build only programs consumed by package/registry integration tests.
-build-registry-fixtures:
-    cd tests/fixtures/actors/service-counter; cargo +nightly actor
-    cd tests/fixtures/actors/crdt-counter; cargo +nightly actor
+# Build the one retained physical PVM fixture.
+build-pvm-test-artifacts: build-probe-fixture
 
-# Build the protocol-pinned generic VOS service guest.
-build-vos-service:
-    scripts/build-production-artifacts.sh service
-
-# Build the package/service pair consumed by the physical daemon-root test.
-build-daemon-root-artifacts: build-vos-service
-    cd tests/fixtures/actors/service-counter; cargo +nightly actor
-    cd vos/tests/fixtures/counter-upgrade; cargo +nightly actor
-
-# Build every guest consumed by the physical service gate.
-build-pvm-test-artifacts: build-daemon-root-artifacts build-registry-fixtures (build-actor "space-authority") (build-actor "clerk-ledger") (build-actor "clerk-bridge") build-clerk-apply build-workflow-fixture
-    cd vos/tests/fixtures/greeter; cargo +nightly actor
+build-probe-fixture:
     cd vos/tests/fixtures/probe; cargo +nightly actor
-    cd vos/tests/fixtures/tally; cargo +nightly actor
-    cd vos/tests/fixtures/crdt-counter; cargo +nightly actor
-    cd vos/tests/fixtures/cycle; cargo +nightly actor
-
-# Build the workflow guest shared by the physical and extension hostcall tests.
-build-workflow-fixture:
-    cd vos/tests/fixtures/workflow; cargo +nightly actor
 
 # Build a single built-in PVM actor by name (e.g., just build-actor space-registry).
 build-actor name:
     cd actors/{{name}}; cargo +nightly actor
 
 # Build all generated artifacts consumed by the test suite.
-build-test-artifacts: build-extensions build-pvm build-pvm-test-artifacts build-actors build-voucher-check
+build-test-artifacts: build-extensions build-pvm build-probe-fixture build-actors build-voucher-check
     cargo build
 
 # Build all built-in actors used by host tests.
 build-actors: (build-actor "space-registry") \
-              (build-actor "space-authority") \
               (build-actor "clerk-bridge") \
-              (build-actor "clerk-settle") build-clerk-apply
+              (build-actor "clerk-settle")
     cargo build -p prover-extension
     cargo build -p prover-extension --release
 
@@ -101,12 +80,6 @@ build-clerk-apply:
 build-clerk-package signer:
     scripts/build-production-artifacts.sh clerk "{{signer}}"
 
-# Build current sources only as an explicit release candidate. This never
-# replaces the committed production PVM or the pinned fresh-build fixture.
-build-vos-service-candidate:
-    cd services/vos-service; cargo actor
-    @echo "candidate ELF: services/vos-service/target/riscv64em-vos/release/vos_service.elf"
-
 # Build and physically validate the bundled standard agent runtime without
 # replacing its committed release artifact.
 build-agent-runtime-candidate:
@@ -125,18 +98,6 @@ verify-agent-runtime-release: build-agent-runtime-candidate
 # Refresh the bundled registry from the pinned source and toolchain.
 refresh-bundled-registry:
     VOS_REPIN_ARTIFACTS=1 scripts/build-production-artifacts.sh registry
-
-# Build a deliberately distinct, contract-compatible authority PVM for the
-# physical UpgradeActor rehearsal. Canonical release builds never enable
-# `upgrade-fixture` and must not be replaced through this recipe.
-build-authority-upgrade-candidate:
-    cd actors/space-authority; cargo +nightly actor --features upgrade-fixture
-    cargo run -p vosx -- build \
-      actors/space-authority/target/riscv64em-vos/release/space_authority.elf \
-      --name space-authority \
-      --out-dir target/bundled-space-authority
-    @echo "candidate: target/bundled-space-authority/space-authority.pvm"
-    @echo "install only through a reviewed UpgradeActor operation"
 
 # Reproduce the canonical authority through vosx's checkout-independent actor
 # build and require exact identity with the committed release artifact.
@@ -197,42 +158,16 @@ test-custom-agent-runtime:
     cd examples/agent-runtimes/custom-linear; cargo test --lib tests::compiled_runtime_executes_scheduling_and_rejects_attested_context -- --ignored --exact --test-threads=1
 
 # Run extension tests.
-test-extensions: build-extensions build-workflow-fixture
+test-extensions: build-extensions
     cargo test -p vos extension -- --nocapture
     cargo test -p substrate-extension
     cargo check -p substrate-extension --no-default-features
-
-# Run the physical service integration tests.
-test-pvm: build-test-artifacts
-    cargo test -p vos --test service_pvm -- --nocapture --test-threads=1
 
 # Run the checked-in v0.8 semantic and ROB-gas corpus on both
 # runtime backends. This is intentionally an integration test, so workspace
 # `--lib` checks do not cover it implicitly.
 test-pvm-vectors:
     cargo test -p vos-pvm --test pvm_vectors
-
-# Run the signed-package → daemon → offline backup → fresh-directory restore
-# → durable-reopen release-operations acceptance path.
-test-daemon-root: build-daemon-root-artifacts
-    cargo test -p vosx --test onboarding_e2e signed_service_package_runs_and_reopens_through_the_space_daemon -- --nocapture --test-threads=1
-
-# Exercise a stopped production voter moving to fresh machine roots and then
-# rejoining/catching up under the same full node identity.
-test-production-raft-relocation: build-daemon-root-artifacts
-    cargo test -p vosx --test onboarding_e2e production_raft_root_survives_voter_join_leader_loss_and_backup_relocation -- --nocapture --test-threads=1
-
-# Stable release check: exact artifact bundle + Local offline restore +
-# production Raft voter relocation/failover.
-test-release-operations: test-daemon-root test-production-raft-relocation
-
-# Run the production-profile daemon gates against independent VTA1/VTR1
-# authority sidecars, including fail-closed recovery, two-node CRDT sync, and
-# three-voter Raft failover/catch-up through follower-facing calls.
-test-production-daemon: build-daemon-root-artifacts build-registry-fixtures build-authority-upgrade-candidate
-    cargo test -p vosx --test onboarding_e2e signed_service_roots_run_under_production_trust_and_recover -- --nocapture --test-threads=1
-    cargo test -p vosx --test onboarding_e2e production_crdt_root_converges_across_enrolled_daemons_and_restart -- --nocapture --test-threads=1
-    cargo test -p vosx --test onboarding_e2e production_raft_root_survives_voter_join_leader_loss_and_backup_relocation -- --nocapture --test-threads=1
 
 # Run a single test by name.
 test-one name: build-extensions
@@ -285,11 +220,18 @@ check-all:
     just test-pvm-vectors
     just verify-voucher-check-release
     just build-pvm
-    just build-pvm-test-artifacts
-    cargo test -p vos --test service_pvm -- --nocapture --test-threads=1
+    just build-probe-fixture
     just test-examples
-    just test-release-operations
-    just test-production-daemon
+    just clean-break-check
+
+# Serial clean-cutover regression and negative-surface gate. C3's release
+# check invokes this recipe verbatim.
+clean-break-check:
+    cargo test -p vos --lib agent::clean_bootstrap -- --test-threads=1
+    cargo test -p vos --lib agent::production_owner -- --test-threads=1
+    cargo test -p vos --lib agent::supervisor_adapters -- --test-threads=1
+    cargo test -p vosx --bin vosx commands::space::clean -- --test-threads=1
+    bash scripts/check-agent-clean-break.sh
 
 # Lint with clippy.
 lint:

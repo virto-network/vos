@@ -1,109 +1,55 @@
 # Getting started
 
-The released `vosx` binary contains the standard AgentRuntime and the system
-authority and catalog actors. No external runtime program is needed.
+The current `vosx` surface deliberately separates buildable clean-generation
+primitives from lifecycle operations that are not connected yet. You can
+create and run a local Space, author AgentActor packages, inspect local
+extension policy, and perform verified offline backup/restore. There is no
+compatibility fallback for creating or operating Agents.
 
-## Create a Space
+## Create and run a Space
 
 ```bash
 vosx space new demo
+vosx space list
+vosx space info demo
 vosx space up demo
 ```
 
-`space up` runs the node in the foreground. Keep it running and use a second
-terminal for the remaining commands.
-
-## Create an empty Agent
+`space up` runs in the foreground. From another terminal, stop it cleanly:
 
 ```bash
-vosx agent create demo notes --profile shared
-vosx agent list demo
-vosx agent show demo/notes
+vosx space down demo
 ```
 
-The Agent is useful before it contains an actor: it already has a stable
-`AgentId`, immutable profile, runtime, resource policy, and replica set.
-Creation authority is profile-specific:
+Use `space up --once` only as an idle-exit smoke mode. Listen and startup peer
+addresses are accepted through repeatable `--listen` and `--connect` options.
+Persistent listen addresses, native extensions, and ingress listeners live in
+the Space data directory's node-local `local.toml`.
 
-- Members may create Private Agents.
-- Developers may create Private and Local Agents.
-- Admins may create Private, Local, and Shared Agents.
-
-## Author and install an actor
+## Author a portable AgentActor
 
 ```bash
 vosx actor new board
 vosx actor build board --name board
-vosx actor install demo/notes board/dist/board.vos --name board
-vosx agent show demo/notes
 ```
 
-The generated actor uses the public lane-aware SDK:
+The scaffold uses the public lane-aware SDK. `actor build` creates a signed
+`VOS3` package with exact program, schema, policy, dependency, capability, and
+producer identities. Building a package does not install it; operational Agent
+and actor lifecycle commands remain unavailable until the clean authority and
+catalog bootstrap is wired.
 
-```rust,ignore
-use vos::prelude::*;
-
-#[actor(agent)]
-pub struct Counter {
-    value: u64,
-}
-
-#[messages(agent)]
-impl Counter {
-    fn new() -> Self {
-        Self { value: 0 }
-    }
-
-    #[msg(linear)]
-    fn add(&mut self, amount: u64) -> u64 {
-        self.value = self.value.saturating_add(amount);
-        self.value
-    }
-
-    #[msg]
-    fn value(&self) -> u64 {
-        self.value
-    }
-}
-```
-
-`actor build` writes one signed `VOS3` package containing the program and its
-exact schemas, policies, dependencies, capabilities, producer identity, and
-signature.
-
-## Call and manage the actor
+## Back up a stopped Space
 
 ```bash
-vosx call demo/notes/board add --amount 3
-
-vosx actor suspend demo/notes/board
-vosx actor resume demo/notes/board
-vosx actor upgrade demo/notes/board board/dist/board-new.vos
-vosx actor remove demo/notes/board
+vosx space backup demo /var/backups/vos/demo-2026-09-10
+vosx space restore /var/backups/vos/demo-2026-09-10 \
+  --node-key /secure/demo-node.key
 ```
 
-Removal succeeds only when the actor is a leaf and has no queued work,
-continuation, messages, retained result, proof artifact, or other lifecycle
-debt.
+Backup is fail-closed and never archives the node identity secret. Retain that
+key separately. The command refuses unsupported live Agent/service generations
+rather than copying opaque stores as if they were portable.
 
-## Try the other profiles
-
-```bash
-vosx agent create demo scratch --profile local
-vosx agent create demo companion --profile private
-```
-
-A Local Agent stays on one exact Node. A Shared Agent is discoverable and can
-combine Raft-ordered Linear state, convergent Merge state, and replica-local
-state. A Private Agent is owner-only, absent from the shared catalog, encrypted
-at rest and in synchronization, and accepts only Merge and Local actor state.
-
-To add or remove one of the owner's exact Nodes:
-
-```bash
-vosx agent invite-node demo/companion --node <full-NodeId>
-vosx agent revoke-node demo/companion --node <full-NodeId>
-```
-
-See [Actors and packages](actors.md) for state lanes and custom runtimes, and
-[Operations](operations.md) for backups, recovery, and release checks.
+See [Actors and packages](actors.md) for the package boundary and
+[Operations](operations.md) for the current operational gate.

@@ -134,10 +134,11 @@ pub const PLATFORM_ID: Hash = Hash(*b"vos-platform-canonical-20260827!");
 /// entry before applying a different physical snapshot.
 pub const HOST_STATE_MACHINE_ID: Hash = Hash(*b"vos-host-sm-canonical-ssh-rui!!!");
 
-/// Program identity of the canonical [`vos-service.pvm`](../../../services/vos-service/vos-service.pvm).
+/// Frozen program identity retained by the internal service-wire contracts.
 ///
-/// This is protocol infrastructure, not a locally derived cache key. A fresh
-/// service build must match both the committed bytes and this identity.
+/// The clean public host has no selectable generic-service executable. This
+/// constant remains only so persisted compatibility structures keep one exact
+/// identity while their platform internals are retired separately.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
     0x38, 0x20, 0x74, 0x80, 0x73, 0x1d, 0x47, 0xaf, 0x51, 0x94, 0xa3, 0xe1, 0xe6, 0x1b, 0x0f, 0x96,
     0x67, 0x98, 0x3e, 0xdb, 0xbf, 0x16, 0xc9, 0x0f, 0x2b, 0xde, 0x7d, 0x21, 0x53, 0xde, 0x44, 0x81,

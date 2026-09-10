@@ -53,13 +53,6 @@ Operators may replace the complete parachain and relay specifications through
 host-local init configuration:
 
 ```toml
-[[agent]]
-name = "chain-reader"
-path = "target/vos/chain-reader.vos"
-consistency = "local"
-# Node-local authority granted to this service root. Omit to deny calls.
-intra_caps = ["substrate:member"]
-
 [[extension]]
 name = "substrate"
 path = "target/release/libsubstrate_extension.so"
@@ -134,11 +127,10 @@ when a persisted nested type changes incompatibly, for example
 `#[actor(state_version = 2)]`.
 
 Transaction preparation, submission, and cancellation accept trusted local
-system calls. A service actor needs an explicit matching `[[agent]]`
-`intra_caps` entry for the Substrate target at `Member` or higher; the host
-binds that bounded grant to the service actor identity. Network peers and
-credential-backed ingress callers also
-need at least a `Member` space grant; a Noise-authenticated peer identity alone
-does not authorize nonce reservations or signing capabilities. Signing request
-IDs and map snapshot IDs are non-sequential and caller-bound; unauthenticated
-map reads use bearer cursors and share one anonymous caller quota.
+system calls. The host binds any caller grant to its exact actor identity;
+Noise transport identity alone does not authorize nonce reservations or
+signing capabilities. The current `vosx` cutover can load and persist an
+extension but exposes no actor-installation or dynamic-invocation command.
+Signing request IDs and map snapshot IDs remain non-sequential and
+caller-bound; unauthenticated map reads use bearer cursors and share one
+anonymous caller quota.

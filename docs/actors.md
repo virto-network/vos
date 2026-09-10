@@ -84,13 +84,9 @@ An Agent starts with an empty forest. Managers install top-level actors;
 actors may spawn package-authorized owned children. Stable actor identity is
 separate from its mutable name and current deployment.
 
-```bash
-vosx actor install demo/notes board.vos --name board
-vosx actor upgrade demo/notes/board board-new.vos
-vosx actor suspend demo/notes/board
-vosx actor resume demo/notes/board
-vosx actor remove demo/notes/board
-```
+The current CLI authors packages with `vosx actor new` and `vosx actor build`.
+It intentionally does not expose install, upgrade, suspend, resume, or remove:
+those operations return only with the clean system authority/catalog path.
 
 Upgrade preserves identity while changing the exact deployment under a signed
 lifecycle transition. Removal is rejected unless the actor is a leaf and has
@@ -104,10 +100,6 @@ chain would exceed the limit, it records a continuation and resumes in a later
 slice.
 
 ## Calls and exactly-once results
-
-```bash
-vosx call demo/notes/board add-task --id 1 --text "Ship it"
-```
 
 Calls bind the full Space, Agent, actor incarnation and deployment, method,
 mode, authenticated Principal, Node provenance, and invocation identity. An

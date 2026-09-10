@@ -32,25 +32,13 @@ The listener is host-local. It is neither replicated nor advertised as an
 actor. Compile embedders with `vos/http-ingress`; the standard `vosx` binary
 already enables it.
 
-## Issue access
+## Authorization boundary
 
-Members may add another bearer credential for themselves. A member holding
-`space.credentials.manage` may add one for another member.
-
-```bash
-TOKEN=$(vosx space access demo issue --expires 24h)
-vosx space access demo list
-curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/openapi.json
-vosx space access demo revoke <credential-prefix>
-```
-
-The bearer secret is printed and durably written to the reported mode-0600
-recovery file before the authority is asked to activate it. A lost CLI or
-daemon response therefore cannot leave an active credential whose bearer is
-unrecoverable. The authority stores only a
-domain-separated credential identifier, its stable member subject, expiry,
-issuer, and revocation state. Roles remain member-owned. Every request asks
-the live authority, so revocation and role changes take effect immediately.
+The listener requires credentials admitted by the clean Space authority. The
+current `vosx` cutover does not issue, list, or revoke credentials, so merely
+adding this listener to `local.toml` does not create usable production access.
+Embedders may provision authority state through the typed host interfaces; a
+public operator command returns only with the clean system bootstrap.
 
 ## Routes
 

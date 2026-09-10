@@ -11,6 +11,36 @@ use vos::node::Consistency;
 use vos::registry::PublicationId;
 use vos::service::InstallationId;
 
+/// Resolve an optional space selector for commands that can safely infer a
+/// single local space. This is shared by non-space namespaces such as `zk`
+/// without reviving the retired dynamic command dispatcher.
+pub(crate) fn resolve_space(arg: Option<&str>) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+
+    if let Some(space) = arg {
+        return Ok(space.to_string());
+    }
+    if let Ok(space) = std::env::var("VOSX_SPACE")
+        && !space.is_empty()
+    {
+        return Ok(space);
+    }
+    let index = crate::spaces_index::load().context("loading spaces index")?;
+    match index.spaces.as_slice() {
+        [only] => Ok(only.name.clone()),
+        [] => anyhow::bail!(
+            "no spaces registered; create one with `vosx space new <name>` or pass `--space <name>`"
+        ),
+        many => anyhow::bail!(
+            "multiple spaces registered: {}; pass `--space <name>` or set VOSX_SPACE",
+            many.iter()
+                .map(|space| space.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    }
+}
+
 fn mint_nonzero_registry_nonce(label: &str) -> anyhow::Result<[u8; 32]> {
     loop {
         let mut bytes = [0u8; 32];

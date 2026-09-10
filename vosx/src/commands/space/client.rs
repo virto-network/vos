@@ -1,328 +1,26 @@
-//! Tiny libp2p client peer that dials a running `space up`
-//! daemon and remote-invokes its registry.
+//! Bounded one-shot client for a running local Space daemon.
 //!
-//! The daemon owns the registry database. Every other `space *` command is a
-//! one-shot client that sends one libp2p request and exits.
-//!
-//! Use `DaemonClient::with_connect(query, |c| …)` for the common
-//! "connect, do one thing, shut down" shape — shutdown runs
-//! on both the success and error paths. The typed wrappers
-//! (`programs`, `agents`, `publish`, …) hide the
-//! `vos::block_on(reg.X(&mut &node))` boilerplate.
+//! The retained client supports daemon liveness and the explicit `zk`
+//! namespace's native-extension calls. It contains no catalog, membership, or
+//! legacy service-management wrappers.
 
 use std::str::FromStr;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use vos::abi::service::ServiceId;
 use vos::node::VosNode;
-use vos::registry::{
-    AgentRow, MemberRow, ProgramRow, ProgramTag, PublicationId, RegistryRef, Status,
-};
-use vos::service::InstallationId;
+use vos::registry::{ProgramRow, RegistryRef};
 
-use crate::commands::space::common::instance_service_id;
-use crate::commands::space::endpoint;
-use crate::commands::space::op_sign::op_auth;
-use crate::spaces_index::{self, SpaceEntry};
+use super::{common::instance_service_id, endpoint};
+use crate::spaces_index;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-// The default Raft configuration alone permits an invocation to spend 35
-// seconds authenticating, staging private input, crossing a read barrier, and
-// committing genesis/admission/apply. Keep the CLI outside that legitimate
-// operation budget so it never reports failure while the service can still
-// commit the request.
-const INVOKE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(60);
-/// A role-authorized service call may wait for a Raft authority read barrier and
-/// decision commit before the Local target executes. Match the libp2p
-/// request-response budget unless the operator supplied an explicit override.
-const ROLE_AUTHORIZED_INVOKE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(300);
-
-/// Resolve the per-invoke timeout, honouring an env override.
-/// `VOSX_INVOKE_TIMEOUT_MS` lets the e2e suite shorten the wait
-/// when it intentionally talks to a handler that doesn't reply
-/// (extension dispatch before `stop`/`status` handlers are
-/// wired). Production callers never set it, so the default
-/// stays at 60s.
-fn invoke_timeout() -> Duration {
-    std::env::var("VOSX_INVOKE_TIMEOUT_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(INVOKE_TIMEOUT_DEFAULT)
-}
-
-fn invoke_timeout_for_policy(policy: Option<&vos::service::MethodPolicy>) -> Duration {
-    let configured = invoke_timeout();
-    if std::env::var_os("VOSX_INVOKE_TIMEOUT_MS").is_some() {
-        return configured;
-    }
-    if policy.is_some_and(|policy| {
-        !policy.public
-            && policy.actor_role.is_none()
-            && (policy.space_role.is_some() || policy.capability.is_some())
-    }) {
-        ROLE_AUTHORIZED_INVOKE_TIMEOUT_DEFAULT
-    } else {
-        configured
-    }
-}
+const INVOKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct DaemonClient {
     node: VosNode,
-    /// The operator's libp2p identity key — signs the `auth`
-    /// blob on every gated registry mutation. The same key drives the
-    /// libp2p dial below, so the daemon sees a `Caller::Peer` whose
-    /// role it can check AND a signature its registry actor verifies.
-    signer: libp2p::identity::Keypair,
-    /// Cached so command handlers can access the entry the
-    /// query resolved to (e.g. for printing the space name).
-    pub entry: SpaceEntry,
-    /// The endpoint descriptor read at connect time. Retained so
-    /// handlers can read daemon-published diagnostics (e.g. each
-    /// extension's effective `intra_caps`) without re-reading the
-    /// file.
-    pub endpoint: endpoint::Endpoint,
+    endpoint: endpoint::Endpoint,
     daemon_prefix: u16,
-    /// Service actor identities and signed method policies learned while resolving
-    /// an installed package name. Registry and extension targets use their explicit
-    /// control-plane wire instead.
-    service_targets: Mutex<std::collections::HashMap<u32, ServiceTarget>>,
-}
-
-#[derive(Clone)]
-struct ServiceTarget {
-    actor: vos::service::ActorId,
-    methods: std::collections::HashMap<String, vos::service::MethodPolicy>,
-}
-
-/// The exact catalog mutation whose embedded authorization is being authored.
-/// Keeping the canonical field order in one typed helper makes every CLI
-/// wrapper sign the same logical arguments it passes to `RegistryRef`, without
-/// decoding or re-encoding the eventual wire payload.
-enum CatalogMutation<'a> {
-    PublishServiceProgram {
-        name: &'a str,
-        hash: &'a [u8],
-        crdt: bool,
-        publication_id: &'a [u8],
-        expected_publication_id: &'a [u8],
-        expected_hash: &'a [u8],
-    },
-    PublishAgentActorProgram {
-        name: &'a str,
-        hash: &'a [u8],
-        publication_id: &'a [u8],
-        expected_publication_id: &'a [u8],
-        expected_hash: &'a [u8],
-    },
-    UnpublishServiceProgram {
-        name: &'a str,
-        expected_publication_id: &'a [u8],
-        expected_hash: &'a [u8],
-    },
-    UnpublishAgentActorProgram {
-        name: &'a str,
-        expected_publication_id: &'a [u8],
-        expected_hash: &'a [u8],
-    },
-    InstallServiceActor {
-        instance_name: &'a str,
-        program_name: &'a str,
-        program_hash: &'a [u8],
-        program_publication_id: &'a [u8],
-        installation_id: &'a [u8],
-        replication_id: &'a [u8],
-        consistency: u8,
-        network_reachable: bool,
-        sync_role: u8,
-    },
-    UninstallServiceActor {
-        instance_name: &'a str,
-        installation_id: &'a [u8],
-        expected_revision: u64,
-        expected_program_hash: &'a [u8],
-        expected_program_publication_id: &'a [u8],
-    },
-    RegisterMeta {
-        program_hash: &'a [u8],
-        blob: &'a [u8],
-    },
-    #[allow(dead_code)]
-    RegisterExtensionMeta {
-        instance_name: &'a str,
-        blob: &'a [u8],
-    },
-}
-
-fn catalog_mutation_auth(
-    signer: &libp2p::identity::Keypair,
-    space_id: &[u8; 32],
-    mutation: CatalogMutation<'_>,
-) -> anyhow::Result<Vec<u8>> {
-    match mutation {
-        CatalogMutation::PublishServiceProgram {
-            name,
-            hash,
-            crdt,
-            publication_id,
-            expected_publication_id,
-            expected_hash,
-        } => op_auth(
-            signer,
-            space_id,
-            "publish_service_program",
-            &[
-                name.as_bytes(),
-                hash,
-                &[crdt as u8],
-                publication_id,
-                expected_publication_id,
-                expected_hash,
-            ],
-        ),
-        CatalogMutation::PublishAgentActorProgram {
-            name,
-            hash,
-            publication_id,
-            expected_publication_id,
-            expected_hash,
-        } => op_auth(
-            signer,
-            space_id,
-            "publish_agent_actor_program",
-            &[
-                name.as_bytes(),
-                hash,
-                publication_id,
-                expected_publication_id,
-                expected_hash,
-            ],
-        ),
-        CatalogMutation::UnpublishServiceProgram {
-            name,
-            expected_publication_id,
-            expected_hash,
-        } => op_auth(
-            signer,
-            space_id,
-            "unpublish_service_program",
-            &[name.as_bytes(), expected_publication_id, expected_hash],
-        ),
-        CatalogMutation::UnpublishAgentActorProgram {
-            name,
-            expected_publication_id,
-            expected_hash,
-        } => op_auth(
-            signer,
-            space_id,
-            "unpublish_agent_actor_program",
-            &[name.as_bytes(), expected_publication_id, expected_hash],
-        ),
-        CatalogMutation::InstallServiceActor {
-            instance_name,
-            program_name,
-            program_hash,
-            program_publication_id,
-            installation_id,
-            replication_id,
-            consistency,
-            network_reachable,
-            sync_role,
-        } => op_auth(
-            signer,
-            space_id,
-            "install_service_actor",
-            &[
-                instance_name.as_bytes(),
-                program_name.as_bytes(),
-                program_hash,
-                program_publication_id,
-                installation_id,
-                replication_id,
-                &[consistency],
-                &[network_reachable as u8],
-                &[sync_role],
-            ],
-        ),
-        CatalogMutation::UninstallServiceActor {
-            instance_name,
-            installation_id,
-            expected_revision,
-            expected_program_hash,
-            expected_program_publication_id,
-        } => op_auth(
-            signer,
-            space_id,
-            "uninstall_service_actor",
-            &[
-                instance_name.as_bytes(),
-                installation_id,
-                &expected_revision.to_le_bytes(),
-                expected_program_hash,
-                expected_program_publication_id,
-            ],
-        ),
-        CatalogMutation::RegisterMeta { program_hash, blob } => {
-            op_auth(signer, space_id, "register_meta", &[program_hash, blob])
-        }
-        CatalogMutation::RegisterExtensionMeta {
-            instance_name,
-            blob,
-        } => op_auth(
-            signer,
-            space_id,
-            "register_extension_meta",
-            &[instance_name.as_bytes(), blob],
-        ),
-    }
-}
-
-fn encode_service_invocation(
-    target: &ServiceTarget,
-    invocation: vos::service::InvocationId,
-    msg: &vos::value::Msg,
-    arguments: Vec<u8>,
-) -> anyhow::Result<Vec<u8>> {
-    use vos::service::ServiceWire;
-
-    let policy = target
-        .methods
-        .get(&msg.name)
-        .ok_or_else(|| anyhow::anyhow!("service package has no method named '{}'", msg.name))?;
-    if policy.attested {
-        anyhow::bail!(
-            "attested method '{}' requires the proof-producing transport path, which space call does not attach yet",
-            msg.name,
-        );
-    }
-    if !policy.public
-        && (policy.actor_role.is_some()
-            || policy.space_role.is_some() == policy.capability.is_some())
-    {
-        anyhow::bail!(
-            "actor-local or malformed authorization policy on '{}' requires a bound-handle credential",
-            msg.name,
-        );
-    }
-    Ok(vos::service::RootTreeInvocation {
-        invocation,
-        target: target.actor,
-        method: msg.name.clone(),
-        arguments,
-        proof_requested: false,
-    }
-    .encode())
-}
-
-fn is_reserved_host_operation(method: &str) -> bool {
-    matches!(method, "__stop" | "__describe")
-}
-
-pub(crate) fn legacy_service_upgrade_cutover_error() -> anyhow::Error {
-    anyhow::anyhow!(
-        "service-actor upgrade is unavailable after the Agent Architecture clean cutover; use the Agent lifecycle upgrade path (no guest mutation was attempted)"
-    )
 }
 
 fn require_daemon_registry_handshake(
@@ -334,105 +32,65 @@ fn require_daemon_registry_handshake(
 }
 
 impl DaemonClient {
-    fn daemon_peer_id(&self) -> anyhow::Result<libp2p::PeerId> {
-        libp2p::PeerId::from_str(&self.endpoint.peer_id)
-            .map_err(|error| anyhow::anyhow!("invalid daemon PeerId in endpoint: {error}"))
-    }
-
-    /// Resolve `query` to a space, read its endpoint file, and
-    /// dial the running daemon. Errors fast if no daemon is
-    /// running or the dial fails.
     pub fn connect(query: &str) -> anyhow::Result<Self> {
         let index = spaces_index::load()?;
         let entry = spaces_index::find(&index, query)?.clone();
         let data_dir = std::path::PathBuf::from(&entry.data_dir);
-
-        let ep = endpoint::read(&data_dir)?.ok_or_else(|| {
+        let endpoint = endpoint::read(&data_dir)?.ok_or_else(|| {
             anyhow::anyhow!(
-                "no daemon running for space '{}'. Start it with `vosx space up {}`.",
+                "no daemon running for space '{}'; start it with `vosx space up {}`",
                 entry.name,
                 entry.name,
             )
         })?;
-        if !endpoint::is_alive(&ep) {
-            // Daemon crashed without cleaning up. Remove the stale
-            // file so the next `space up` doesn't trip over it, and
-            // report no-daemon-running so the user just retries.
-            tracing::info!(
-                pid = ep.pid,
-                path = %endpoint::path(&data_dir).display(),
-                "removing stale endpoint file (pid not running)",
-            );
-            endpoint::delete(&data_dir);
+        if !endpoint::is_alive(&endpoint) {
+            super::endpoint::delete(&data_dir);
             anyhow::bail!(
-                "no daemon running for space '{}' (cleaned up stale endpoint from pid {}). \
-                 Start it with `vosx space up {}`.",
+                "no daemon running for space '{}' (removed stale endpoint from pid {})",
                 entry.name,
-                ep.pid,
-                entry.name,
+                endpoint.pid,
             );
         }
 
-        let bootstrap_str = ep
+        let bootstrap_text = endpoint
             .multiaddrs
             .first()
-            .ok_or_else(|| anyhow::anyhow!("daemon endpoint advertises no multiaddrs"))?;
-        let bootstrap: libp2p::Multiaddr = libp2p::Multiaddr::from_str(bootstrap_str)
-            .map_err(|e| anyhow::anyhow!("bad daemon multiaddr '{bootstrap_str}': {e}"))?;
-
-        // Load the operator's persistent libp2p identity from
-        // $XDG_CONFIG_HOME/vosx/identity.key (auto-create on first
-        // call). The daemon recognises the same PeerId across
-        // invocations and consults its members ACL table.
+            .ok_or_else(|| anyhow::anyhow!("daemon endpoint advertises no addresses"))?;
+        let bootstrap = libp2p::Multiaddr::from_str(bootstrap_text).map_err(|error| {
+            anyhow::anyhow!("invalid daemon address '{bootstrap_text}': {error}")
+        })?;
         let keypair = crate::identity::load_or_create()?;
-        let peer_id = libp2p::PeerId::from(keypair.public());
-        let local_prefix = vos::network::derive_node_prefix(&peer_id);
-        // Retain the key for signing registry mutations; the clone
-        // below is consumed by the libp2p stack.
-        let signer = keypair.clone();
-
-        let net = vos::network::Network::start(vos::network::NetworkConfig {
+        let local_prefix =
+            vos::network::derive_node_prefix(&libp2p::PeerId::from(keypair.public()));
+        let network = vos::network::Network::start(vos::network::NetworkConfig {
             keypair,
             local_prefix,
-            listen: vec![],
+            listen: Vec::new(),
             bootstrap: vec![bootstrap],
-            // One-shot client peer: only the known daemon
-            // bootstrap address matters. Skipping mDNS auto-dial
-            // avoids spurious "outgoing connection failed" logs
-            // when unrelated libp2p apps are on the LAN.
             auto_dial_mdns: false,
         });
-
         let mut node = VosNode::with_prefix(local_prefix);
-        node.attach_network(net);
+        node.attach_network(network);
 
-        // Wait for the prefix routing table to know about the daemon.
-        let net_arc = node.network().expect("network was just attached");
+        let network = node.network().expect("network was attached");
         let deadline = Instant::now() + CONNECT_TIMEOUT;
-        while Instant::now() < deadline {
-            if net_arc.peer_for_prefix(ep.prefix).is_some() {
-                break;
-            }
+        while Instant::now() < deadline && network.peer_for_prefix(endpoint.prefix).is_none() {
             std::thread::sleep(Duration::from_millis(25));
         }
-        if net_arc.peer_for_prefix(ep.prefix).is_none() {
+        if network.peer_for_prefix(endpoint.prefix).is_none() {
             node.shutdown();
             let _ = node.collect();
             anyhow::bail!(
-                "couldn't reach daemon (prefix {:#06x}) at {} within {:?}",
-                ep.prefix,
-                bootstrap_str,
+                "could not reach daemon prefix {:#06x} within {:?}",
+                endpoint.prefix,
                 CONNECT_TIMEOUT,
             );
         }
 
         let client = Self {
             node,
-            signer,
-            entry,
-            daemon_prefix: ep.prefix,
-            endpoint: ep,
-            service_targets: Mutex::new(std::collections::HashMap::new()),
+            daemon_prefix: endpoint.prefix,
+            endpoint,
         };
         if let Err(error) = require_daemon_registry_handshake(vos::block_on(
             client.registry().protocol(&mut &client.node),
@@ -443,850 +101,89 @@ impl DaemonClient {
         Ok(client)
     }
 
-    /// Connect, run `f`, shut down — even on error or panic.
-    /// The common shape of every client subcommand: a single
-    /// registry round-trip wrapped in a connect/shutdown pair.
-    ///
-    /// Shutdown runs inside an RAII guard's `Drop`, so a panic
-    /// inside `f` still tears down the libp2p peer cleanly
-    /// rather than leaking the network thread.
-    pub fn with_connect<T, F>(query: &str, f: F) -> anyhow::Result<T>
-    where
-        F: FnOnce(&Self) -> anyhow::Result<T>,
-    {
+    pub fn with_connect<T>(
+        query: &str,
+        operation: impl FnOnce(&Self) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
         struct Guard(Option<DaemonClient>);
         impl Drop for Guard {
             fn drop(&mut self) {
-                if let Some(c) = self.0.take() {
-                    let _ = c.shutdown();
+                if let Some(client) = self.0.take() {
+                    let _ = client.shutdown();
                 }
             }
         }
         let guard = Guard(Some(Self::connect(query)?));
-        let client = guard
-            .0
-            .as_ref()
-            .expect("guard always holds Some after connect");
-        f(client)
+        operation(guard.0.as_ref().expect("guard contains client"))
     }
 
-    /// Dynamic-dispatch registry client pointed at the daemon's
-    /// registry. Internal — every typed wrapper goes through here.
     fn registry(&self) -> RegistryRef {
-        RegistryRef::at(self.registry_id())
+        RegistryRef::at(ServiceId::new(
+            self.daemon_prefix,
+            ServiceId::REGISTRY.local_id(),
+        ))
     }
 
-    /// The daemon's registry `ServiceId` — `(daemon_prefix, 0)`.
-    fn registry_id(&self) -> ServiceId {
-        ServiceId::new(self.daemon_prefix, ServiceId::REGISTRY.local_id())
-    }
-
-    /// The connected daemon's 16-bit node prefix. Stable per
-    /// node (derived from its libp2p `PeerId`), useful as a
-    /// per-identity discriminator — e.g. when minting a default
-    /// branch name like `ai/<prefix>/suggested` so two nodes
-    /// suggesting changes to the same project never collide on
-    /// the branch ref.
-    pub fn daemon_prefix(&self) -> u16 {
-        self.daemon_prefix
-    }
-
-    /// Resolve a user-supplied target string to a daemon-side
-    /// `ServiceId`. Three forms are supported, in lookup order:
-    ///
-    /// - `"registry"` — the well-known per-space registry.
-    /// - `"<instance_name>"` of an installed PVM agent — looks
-    ///   the agent up in the daemon's registry, then derives
-    ///   its per-node ServiceId via `instance_service_id` (the
-    ///   same function `space up` uses to register installed
-    ///   agents, so the derived id matches the actual registration).
-    /// - `"<instance_name>"` of a recipe-installed extension —
-    ///   the reconciler now installs extensions at the same
-    ///   deterministic `instance_service_id(name, prefix)` shape,
-    ///   so the fallback path simply confirms the name exists in
-    ///   `extension_metas` (via `meta_for_instance`) and returns
-    ///   the same derivation. The two namespaces share an id
-    ///   formula but the registry guarantees their names are
-    ///   distinct (agent-first lookup in `meta_for_instance`).
+    /// Resolve only the registry and extensions the daemon explicitly
+    /// published in its endpoint. Registry catalog rows are not executable CLI
+    /// targets after the clean cutover.
     pub fn resolve_target(&self, target: &str) -> anyhow::Result<ServiceId> {
         if target == "registry" {
-            return Ok(self.registry_id());
+            return Ok(self.registry().id());
         }
-        if let Some(agent) = self.agent(target)? {
-            debug_assert_eq!(agent.instance_name, target);
-            let route = instance_service_id(target, self.daemon_prefix);
-            self.remember_service_target(route, &agent)?;
-            return Ok(route);
-        }
-        // Not an installed agent — try the extension fallback.
-        // `meta_for_instance` returns non-empty bytes for any
-        // name with a registered schema, including extensions.
-        let meta_blob = self.meta_for_instance(target)?;
-        if !meta_blob.is_empty() {
+        super::common::parse_instance_name(target)?;
+        if self
+            .endpoint
+            .extensions
+            .iter()
+            .any(|extension| extension.name == target)
+        {
             return Ok(instance_service_id(target, self.daemon_prefix));
         }
-        anyhow::bail!(
-            "no agent or extension named '{target}' is installed in this space \
-             (use `vosx space agents <space>` to list installed agents)",
-        )
+        anyhow::bail!("no local extension named '{target}' is loaded")
     }
 
-    /// Generic invoke — send `msg` to `target` on the daemon
-    /// and return the decoded reply `Value`. Foundation under
-    /// every `space *` command that talks to the registry, and
-    /// the engine for `space call` against arbitrary agents.
     pub fn invoke_dyn(
         &self,
         target: ServiceId,
-        msg: &vos::value::Msg,
+        message: &vos::value::Msg,
     ) -> anyhow::Result<vos::value::Value> {
-        let timeout = self
-            .service_targets
-            .lock()
-            .ok()
-            .and_then(|targets| targets.get(&target.0).cloned())
-            .and_then(|target| target.methods.get(&msg.name).cloned());
-        self.invoke_dyn_with_timeout(target, msg, invoke_timeout_for_policy(timeout.as_ref()))
+        self.invoke_dyn_with_timeout(target, message, INVOKE_TIMEOUT)
     }
 
-    /// Invoke one service mutation under an identity derived from the exact
-    /// authenticated operator, target, and message. Repeating the same CLI
-    /// command after a lost response therefore recovers the original durable
-    /// result; changing any bound input produces a different invocation.
-    /// Invoke a durable mutation under a caller-owned operation key. Reusing
-    /// the key recovers the committed reply; using it for different work is
-    /// rejected by the root service.
-    pub fn invoke_dyn_idempotent(
-        &self,
-        target: ServiceId,
-        msg: &vos::value::Msg,
-        operation_key: &str,
-    ) -> anyhow::Result<vos::value::Value> {
-        use vos::Encode as _;
-
-        let service_target = self
-            .service_targets
-            .lock()
-            .map_err(|_| anyhow::anyhow!("service target cache is unavailable"))?
-            .get(&target.0)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("target is not a canonical root service"))?;
-        let encoded = msg.encode();
-        let mut payload = Vec::with_capacity(encoded.len() + 1);
-        payload.push(vos::value::TAG_DYNAMIC);
-        payload.extend_from_slice(&encoded);
-        if operation_key.is_empty() || operation_key.len() > 128 {
-            anyhow::bail!("operation key must contain 1..=128 bytes");
-        }
-        let subject = vos::service::SubjectId::of_authenticated_peer(
-            &libp2p::PeerId::from(self.signer.public()).to_bytes(),
-        );
-        let invocation = vos::service::InvocationId::for_ingress_idempotency(
-            subject,
-            service_target.actor,
-            "vosx",
-            operation_key.as_bytes(),
-        );
-        let wire = encode_service_invocation(&service_target, invocation, msg, payload)?;
-        let timeout = invoke_timeout_for_policy(service_target.methods.get(&msg.name));
-        let reply = self
-            .node
-            .invoke_with_timeout(target, wire, timeout)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "daemon at {target} did not resolve the idempotent invocation within {timeout:?}",
-                )
-            })?;
-        if reply.is_empty() {
-            return Ok(vos::value::Value::Unit);
-        }
-        Ok(vos::Decode::decode(&reply))
-    }
-
-    /// Like [`Self::invoke_dyn`] but with an explicit per-call timeout, for the
-    /// rare handler that legitimately runs far past the 10s default — e.g.
-    /// `vosx zk pin`'s `measure_catalog`, a minutes-long trace + prove. The
-    /// extension runs on its own thread, so a long wait here doesn't stall the
-    /// node's other services.
     pub fn invoke_dyn_with_timeout(
         &self,
         target: ServiceId,
-        msg: &vos::value::Msg,
+        message: &vos::value::Msg,
         timeout: Duration,
     ) -> anyhow::Result<vos::value::Value> {
-        let reply = self.invoke_dyn_bytes_with_timeout(target, msg, timeout)?;
-        if reply.is_empty() {
-            return Ok(vos::value::Value::Unit);
-        }
-        Ok(vos::Decode::decode(&reply))
-    }
+        use vos::Encode as _;
 
-    /// Like [`Self::invoke_dyn`] but returns the RAW reply bytes (empty when
-    /// the reply is empty), with an explicit per-call timeout. Callers that
-    /// need to distinguish the daemon's 5-byte forbidden-refusal envelope from
-    /// a normal reply use this — [`Self::invoke_dyn`] decodes blindly and would
-    /// mis-handle a refusal.
-    pub fn invoke_dyn_bytes_with_timeout(
-        &self,
-        target: ServiceId,
-        msg: &vos::value::Msg,
-        timeout: Duration,
-    ) -> anyhow::Result<Vec<u8>> {
-        use vos::Encode;
-        let encoded = msg.encode();
-        let mut payload = Vec::with_capacity(1 + encoded.len());
+        let encoded = message.encode();
+        let mut payload = Vec::with_capacity(encoded.len() + 1);
         payload.push(vos::value::TAG_DYNAMIC);
         payload.extend_from_slice(&encoded);
-
-        let service_target = self
-            .service_targets
-            .lock()
-            .map_err(|_| anyhow::anyhow!("service target cache is unavailable"))?
-            .get(&target.0)
-            .cloned();
-        let is_service_invocation =
-            service_target.is_some() && !is_reserved_host_operation(&msg.name);
-        let payload = if let Some(service_target) =
-            service_target.filter(|_| !is_reserved_host_operation(&msg.name))
-        {
-            let mut nonce = [0; 32];
-            getrandom::getrandom(&mut nonce)
-                .map_err(|error| anyhow::anyhow!("mint service invocation ID: {error}"))?;
-            encode_service_invocation(
-                &service_target,
-                vos::service::InvocationId::derive(b"vosx/daemon-invocation/service", &nonce),
-                msg,
-                payload,
-            )?
-        } else {
-            payload
-        };
-
         let reply = self
             .node
             .invoke_with_timeout(target, payload, timeout)
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "daemon at {target} didn't reply within {timeout:?} (target unreachable or timed out)",
-                )
+                anyhow::anyhow!("daemon target {target} did not reply within {timeout:?}")
             })?;
-        if is_service_invocation && reply.is_empty() {
-            anyhow::bail!("service target at {target} refused the invocation or is not attached");
+        if reply.is_empty() {
+            return Ok(vos::value::Value::Unit);
         }
-        Ok(reply)
+        Ok(vos::Decode::decode(&reply))
     }
 
-    fn remember_service_target(&self, route: ServiceId, agent: &AgentRow) -> anyhow::Result<()> {
-        let service_target = self.service_target_for_agent(agent)?;
-        self.service_targets
-            .lock()
-            .map_err(|_| anyhow::anyhow!("service target cache is unavailable"))?
-            .insert(route.0, service_target);
-        Ok(())
+    /// Lightweight registry round-trip used by `space info`.
+    pub fn programs(&self) -> anyhow::Result<Vec<ProgramRow>> {
+        vos::block_on(self.registry().programs_all(&mut &self.node))
+            .map_err(|error| anyhow::anyhow!("registry liveness probe failed: {error}"))
     }
 
-    fn service_target_for_agent(&self, agent: &AgentRow) -> anyhow::Result<ServiceTarget> {
-        use vos::service::ServiceWire;
-
-        let hash = crate::blob_store::BlobHash(agent.program_hash);
-        let Some(exact_package) = crate::blob_store::cache_get(&hash)? else {
-            anyhow::bail!(
-                "installed package for '{}' is missing from the local content store",
-                agent.instance_name
-            );
-        };
-        if exact_package.get(..4) != Some(b"VOSP") {
-            anyhow::bail!(
-                "installed catalog entry '{}' does not contain a signed service package",
-                agent.instance_name
-            );
-        }
-        let package = vos::service::VosPackage::decode(&exact_package)
-            .map_err(|error| anyhow::anyhow!("decode installed service package: {error}"))?;
-        package
-            .validate()
-            .map_err(|error| anyhow::anyhow!("validate installed service package: {error}"))?;
-        if package.encode() != exact_package {
-            anyhow::bail!("installed service package wire is not canonical");
-        }
-        let policies = vos::service::PackageRolePolicies::decode(&package.role_policies)
-            .map_err(|error| anyhow::anyhow!("decode installed service policies: {error}"))?;
-        let space = vos::service::SpaceId(
-            self.entry
-                .id_bytes()
-                .ok_or_else(|| anyhow::anyhow!("space ID is not canonical hex"))?,
-        );
-        let service = crate::commands::space::common::service_root_service_id(
-            space,
-            &agent.instance_name,
-            agent.replication_id,
-        );
-        Ok(ServiceTarget {
-            actor: crate::commands::space::common::service_root_actor_id(
-                service,
-                &agent.instance_name,
-            ),
-            methods: policies
-                .methods
-                .into_iter()
-                .map(|policy| (policy.method.clone(), policy))
-                .collect(),
-        })
-    }
-
-    /// Tear down the libp2p peer. Always call before exiting
-    /// so background threads drain cleanly. Most callers go
-    /// through `with_connect`, which calls this for them.
     pub fn shutdown(self) -> anyhow::Result<()> {
         self.node.shutdown();
         let _ = self.node.collect();
-        Ok(())
-    }
-
-    // ── Typed registry wrappers ──────────────────────────────
-    //
-    // Each is a one-line wrapper around
-    // `vos::block_on(reg.X(&mut &self.node, ...))` that converts
-    // the registry's error type into `anyhow` with a recognisable
-    // prefix. Per-command status decoding stays at the call site.
-
-    pub fn programs(&self) -> anyhow::Result<Vec<ProgramRow>> {
-        vos::block_on(self.registry().programs_all(&mut &self.node))
-            .map_err(|e| anyhow::anyhow!("registry.programs(): {e}"))
-    }
-
-    pub fn program(&self, name: &str) -> anyhow::Result<Option<ProgramRow>> {
-        super::common::parse_program_name(name)?;
-        vos::block_on(self.registry().program(&mut &self.node, name.to_string()))
-            .map_err(|e| anyhow::anyhow!("registry.program('{name}'): {e}"))
-    }
-
-    pub fn agents(&self) -> anyhow::Result<Vec<AgentRow>> {
-        vos::block_on(self.registry().agents_all(&mut &self.node))
-            .map_err(|e| anyhow::anyhow!("registry.agents(): {e}"))
-    }
-
-    pub fn agent(&self, instance_name: &str) -> anyhow::Result<Option<AgentRow>> {
-        super::common::parse_instance_name(instance_name)?;
-        vos::block_on(
-            self.registry()
-                .agent(&mut &self.node, instance_name.to_string()),
-        )
-        .map_err(|e| anyhow::anyhow!("registry.agent('{instance_name}'): {e}"))
-    }
-
-    /// Ask the connected daemon for its view of a Raft group
-    /// (identified by `replication_id`) via a `RaftStatusReq` frame —
-    /// role, term, leader hint, and member prefixes. Errors if the
-    /// daemon peer isn't reachable or doesn't answer in time; a
-    /// `present = false` reply (daemon isn't running that group) is
-    /// returned as-is for the caller to report.
-    pub fn raft_status(
-        &self,
-        replication_id: [u8; 32],
-    ) -> anyhow::Result<vos::network::RaftStatusReply> {
-        let net = self
-            .node
-            .network()
-            .ok_or_else(|| anyhow::anyhow!("client has no network attached"))?;
-        // The endpoint records the full identity we dialled. Never resolve
-        // this management request through the collision-prone prefix map.
-        let peer = self.daemon_peer_id()?;
-        net.send_raft_status_req(peer, replication_id)
-            .recv_timeout(invoke_timeout())
-            .map_err(|_| anyhow::anyhow!("no raft-status reply from daemon within timeout"))
-    }
-
-    /// Drive one idempotent production voter replacement through the daemon.
-    /// A follower proxies to its exact authenticated leader while preserving
-    /// this client's Noise-authenticated operator identity.
-    pub fn replace_raft_voter(
-        &self,
-        replication_id: [u8; 32],
-        old: &MemberRow,
-        replacement: &MemberRow,
-        operation_epoch: u64,
-    ) -> anyhow::Result<vos::network::RaftReplaceVoterResult> {
-        let net = self
-            .node
-            .network()
-            .ok_or_else(|| anyhow::anyhow!("client has no network attached"))?;
-        let daemon = self.daemon_peer_id()?;
-        let operator = libp2p::PeerId::from(self.signer.public());
-        let signed = vos::registry::raft_voter_replacement_signed_bytes(
-            &self.registry_space_id()?,
-            &replication_id,
-            old.prefix,
-            &old.key,
-            replacement.prefix,
-            &replacement.key,
-            operation_epoch,
-        );
-        let operator_signature: [u8; vos::registry::OP_SIG_LEN] = self
-            .signer
-            .sign(&signed)
-            .map_err(|error| anyhow::anyhow!("sign Raft voter replacement: {error}"))?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("operator produced a non-Ed25519 signature"))?;
-        net.send_raft_replace_voter_req(
-            daemon,
-            replication_id,
-            old.prefix,
-            old.key.clone(),
-            replacement.prefix,
-            replacement.key.clone(),
-            operator.to_bytes(),
-            operation_epoch,
-            operator_signature,
-        )
-        .recv_timeout(Duration::from_secs(60))
-        .map_err(|_| anyhow::anyhow!("no Raft voter-replacement reply within 60 seconds"))
-    }
-
-    /// Fetch the raw `.vos_meta` blob the registry has on file
-    /// for the agent's program. Empty means no schema is registered.
-    pub fn meta_for_instance(&self, instance_name: &str) -> anyhow::Result<Vec<u8>> {
-        super::common::parse_instance_name(instance_name)?;
-        vos::block_on(
-            self.registry()
-                .meta_for_instance(&mut &self.node, instance_name.to_string()),
-        )
-        .map_err(|e| anyhow::anyhow!("registry.meta_for_instance('{instance_name}'): {e}"))
-    }
-
-    pub fn members(&self) -> anyhow::Result<Vec<MemberRow>> {
-        // The registry pages the roster (nodes then identities);
-        // `members_all` drains every page into one Vec.
-        vos::block_on(self.registry().members_all(&mut &self.node))
-            .map_err(|e| anyhow::anyhow!("registry.members(): {e}"))
-    }
-
-    // Catalog mutations are authored here with the same persistent identity
-    // that authenticates this client's Noise connection. The daemon forwards
-    // the payload byte-for-byte; the registry actor verifies the embedded
-    // signature again on every causal replay.
-    pub fn publish_service_program(
-        &self,
-        name: String,
-        hash: [u8; 32],
-        crdt: bool,
-        publication_id: PublicationId,
-        expected_current: Option<ProgramTag>,
-    ) -> anyhow::Result<Status> {
-        super::common::parse_program_name(&name)?;
-        let expected_publication_id = expected_current
-            .map(|tag| tag.publication_id.into_bytes().to_vec())
-            .unwrap_or_default();
-        let expected_hash = expected_current
-            .map(|tag| tag.hash.to_vec())
-            .unwrap_or_default();
-        let auth = catalog_mutation_auth(
-            &self.signer,
-            &self.registry_space_id()?,
-            CatalogMutation::PublishServiceProgram {
-                name: &name,
-                hash: &hash,
-                crdt,
-                publication_id: publication_id.as_bytes(),
-                expected_publication_id: &expected_publication_id,
-                expected_hash: &expected_hash,
-            },
-        )?;
-        vos::block_on(self.registry().publish_service_program(
-            &mut &self.node,
-            name,
-            hash,
-            crdt,
-            publication_id,
-            expected_current,
-            auth,
-        ))
-        .map_err(|e| anyhow::anyhow!("registry.publish_service_program(): {e}"))
-    }
-
-    pub fn publish_agent_actor_program(
-        &self,
-        name: String,
-        hash: [u8; 32],
-        publication_id: PublicationId,
-        expected_current: Option<ProgramTag>,
-    ) -> anyhow::Result<Status> {
-        super::common::parse_program_name(&name)?;
-        let expected_publication_id = expected_current
-            .map(|tag| tag.publication_id.into_bytes().to_vec())
-            .unwrap_or_default();
-        let expected_hash = expected_current
-            .map(|tag| tag.hash.to_vec())
-            .unwrap_or_default();
-        let auth = catalog_mutation_auth(
-            &self.signer,
-            &self.registry_space_id()?,
-            CatalogMutation::PublishAgentActorProgram {
-                name: &name,
-                hash: &hash,
-                publication_id: publication_id.as_bytes(),
-                expected_publication_id: &expected_publication_id,
-                expected_hash: &expected_hash,
-            },
-        )?;
-        vos::block_on(self.registry().publish_agent_actor_program(
-            &mut &self.node,
-            name,
-            hash,
-            publication_id,
-            expected_current,
-            auth,
-        ))
-        .map_err(|e| anyhow::anyhow!("registry.publish_agent_actor_program(): {e}"))
-    }
-
-    /// Forward a program's `.vos_meta` schema blob to the registry,
-    /// keyed by its program hash, so `meta_for_instance` (and thus
-    /// schema-aware dynamic dispatch) resolves for agents installed off
-    /// this program. Mirrors what the recipe reconciler does.
-    pub fn register_meta(
-        &self,
-        program_hash: Vec<u8>,
-        meta_blob: Vec<u8>,
-    ) -> anyhow::Result<Status> {
-        let auth = catalog_mutation_auth(
-            &self.signer,
-            &self.registry_space_id()?,
-            CatalogMutation::RegisterMeta {
-                program_hash: &program_hash,
-                blob: &meta_blob,
-            },
-        )?;
-        vos::block_on(
-            self.registry()
-                .register_meta(&mut &self.node, program_hash, meta_blob, auth),
-        )
-        .map_err(|e| anyhow::anyhow!("registry.register_meta(): {e}"))
-    }
-
-    /// Register or remove a native extension's schema metadata. Like every
-    /// other catalog mutation, the exact instance name and blob are bound into
-    /// the caller's embedded signature before the request leaves this client.
-    #[allow(dead_code)]
-    pub fn register_extension_meta(
-        &self,
-        instance_name: String,
-        meta_blob: Vec<u8>,
-    ) -> anyhow::Result<Status> {
-        super::common::parse_instance_name(&instance_name)?;
-        let auth = catalog_mutation_auth(
-            &self.signer,
-            &self.registry_space_id()?,
-            CatalogMutation::RegisterExtensionMeta {
-                instance_name: &instance_name,
-                blob: &meta_blob,
-            },
-        )?;
-        vos::block_on(self.registry().register_extension_meta(
-            &mut &self.node,
-            instance_name,
-            meta_blob,
-            auth,
-        ))
-        .map_err(|e| anyhow::anyhow!("registry.register_extension_meta(): {e}"))
-    }
-
-    pub fn unpublish_service_program(
-        &self,
-        name: String,
-        expected_current: ProgramTag,
-    ) -> anyhow::Result<Status> {
-        super::common::parse_program_name(&name)?;
-        let auth = catalog_mutation_auth(
-            &self.signer,
-            &self.registry_space_id()?,
-            CatalogMutation::UnpublishServiceProgram {
-                name: &name,
-                expected_publication_id: expected_current.publication_id.as_bytes(),
-                expected_hash: &expected_current.hash,
-            },
-        )?;
-        vos::block_on(self.registry().unpublish_service_program(
-            &mut &self.node,
-            name,
-            expected_current,
-            auth,
-        ))
-        .map_err(|e| anyhow::anyhow!("registry.unpublish_service_program(): {e}"))
-    }
-
-    pub fn unpublish_agent_actor_program(
-        &self,
-        name: String,
-        expected_current: ProgramTag,
-    ) -> anyhow::Result<Status> {
-        super::common::parse_program_name(&name)?;
-        let auth = catalog_mutation_auth(
-            &self.signer,
-            &self.registry_space_id()?,
-            CatalogMutation::UnpublishAgentActorProgram {
-                name: &name,
-                expected_publication_id: expected_current.publication_id.as_bytes(),
-                expected_hash: &expected_current.hash,
-            },
-        )?;
-        vos::block_on(self.registry().unpublish_agent_actor_program(
-            &mut &self.node,
-            name,
-            expected_current,
-            auth,
-        ))
-        .map_err(|e| anyhow::anyhow!("registry.unpublish_agent_actor_program(): {e}"))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn install_service_actor(
-        &self,
-        instance_name: String,
-        program_name: String,
-        program: ProgramTag,
-        installation_id: InstallationId,
-        replication_id: [u8; 32],
-        consistency: u8,
-        network_reachable: bool,
-        sync_role: vos::registry::SyncFloor,
-    ) -> anyhow::Result<Status> {
-        super::common::parse_instance_name(&instance_name)?;
-        super::common::parse_program_name(&program_name)?;
-        if replication_id == [0; 32] {
-            anyhow::bail!("replication_id must be nonzero");
-        }
-        let auth = catalog_mutation_auth(
-            &self.signer,
-            &self.registry_space_id()?,
-            CatalogMutation::InstallServiceActor {
-                instance_name: &instance_name,
-                program_name: &program_name,
-                program_hash: &program.hash,
-                program_publication_id: program.publication_id.as_bytes(),
-                installation_id: installation_id.as_bytes(),
-                replication_id: &replication_id,
-                consistency,
-                network_reachable,
-                sync_role: sync_role as u8,
-            },
-        )?;
-        vos::block_on(self.registry().install_service_actor(
-            &mut &self.node,
-            instance_name,
-            program_name,
-            program,
-            installation_id,
-            replication_id,
-            consistency,
-            network_reachable,
-            sync_role,
-            auth,
-        ))
-        .map_err(|e| anyhow::anyhow!("registry.install_service_actor(): {e}"))
-    }
-
-    pub fn upgrade_service_actor(
-        &self,
-        instance_name: String,
-        new_program_name: String,
-        new_program: ProgramTag,
-    ) -> anyhow::Result<Status> {
-        let _ = (self, instance_name, new_program_name, new_program);
-        Err(legacy_service_upgrade_cutover_error())
-    }
-
-    pub fn uninstall_service_actor(
-        &self,
-        instance_name: String,
-        installation_id: InstallationId,
-        expected_revision: u64,
-        expected_program: ProgramTag,
-    ) -> anyhow::Result<Status> {
-        super::common::parse_instance_name(&instance_name)?;
-        let auth = catalog_mutation_auth(
-            &self.signer,
-            &self.registry_space_id()?,
-            CatalogMutation::UninstallServiceActor {
-                instance_name: &instance_name,
-                installation_id: installation_id.as_bytes(),
-                expected_revision,
-                expected_program_hash: &expected_program.hash,
-                expected_program_publication_id: expected_program.publication_id.as_bytes(),
-            },
-        )?;
-        vos::block_on(self.registry().uninstall_service_actor(
-            &mut &self.node,
-            instance_name,
-            installation_id,
-            expected_revision,
-            expected_program,
-            auth,
-        ))
-        .map_err(|e| anyhow::anyhow!("registry.uninstall_service_actor(): {e}"))
-    }
-
-    pub fn add_node(&self, prefix: u32, peer_id: Vec<u8>, role: u8) -> anyhow::Result<Status> {
-        let auth = op_auth(
-            &self.signer,
-            &self.registry_space_id()?,
-            "add_node",
-            &[&prefix.to_le_bytes(), &peer_id, &[role]],
-        )?;
-        vos::block_on(
-            self.registry()
-                .add_node(&mut &self.node, prefix, peer_id, role, auth),
-        )
-        .map_err(|e| anyhow::anyhow!("registry.add_node(): {e}"))
-    }
-
-    pub fn remove_node(&self, prefix: u32) -> anyhow::Result<Status> {
-        let auth = op_auth(
-            &self.signer,
-            &self.registry_space_id()?,
-            "remove_node",
-            &[&prefix.to_le_bytes()],
-        )?;
-        vos::block_on(self.registry().remove_node(&mut &self.node, prefix, auth))
-            .map_err(|e| anyhow::anyhow!("registry.remove_node(): {e}"))
-    }
-
-    pub fn add_identity(
-        &self,
-        public_key: Vec<u8>,
-        proof_kind: u8,
-        proof_data: Vec<u8>,
-    ) -> anyhow::Result<Status> {
-        let auth = op_auth(
-            &self.signer,
-            &self.registry_space_id()?,
-            "add_identity",
-            &[&public_key, &[proof_kind], &proof_data],
-        )?;
-        vos::block_on(self.registry().add_identity(
-            &mut &self.node,
-            public_key,
-            proof_kind,
-            proof_data,
-            auth,
-        ))
-        .map_err(|e| anyhow::anyhow!("registry.add_identity(): {e}"))
-    }
-
-    pub fn remove_identity(&self, public_key: Vec<u8>) -> anyhow::Result<Status> {
-        let auth = op_auth(
-            &self.signer,
-            &self.registry_space_id()?,
-            "remove_identity",
-            &[&public_key],
-        )?;
-        vos::block_on(
-            self.registry()
-                .remove_identity(&mut &self.node, public_key, auth),
-        )
-        .map_err(|e| anyhow::anyhow!("registry.remove_identity(): {e}"))
-    }
-
-    pub fn role_authority_id(&self) -> anyhow::Result<Option<[u8; 32]>> {
-        let marker = vos::block_on(self.registry().role_authority(&mut &self.node))
-            .map_err(|error| anyhow::anyhow!("registry.role_authority(): {error}"))?;
-        if marker.is_empty() {
-            return Ok(None);
-        }
-        let marker: [u8; 32] = marker
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("registry role-authority marker is corrupt"))?;
-        if marker == [0; 32] {
-            anyhow::bail!("registry role-authority marker is zero");
-        }
-        Ok(Some(marker))
-    }
-
-    fn registry_space_id(&self) -> anyhow::Result<[u8; 32]> {
-        let space_id = self
-            .entry
-            .id_bytes()
-            .ok_or_else(|| anyhow::anyhow!("space ID is not canonical hex"))?;
-        if space_id == [0; 32] {
-            anyhow::bail!("space ID is zero");
-        }
-        Ok(space_id)
-    }
-
-    fn service_space_id(&self) -> anyhow::Result<vos::service::SpaceId> {
-        self.registry_space_id().map(vos::service::SpaceId)
-    }
-
-    /// Bootstrap invite authorization still comes from the registry's
-    /// enrolled-node tier. User-facing actor authorization is owned by the
-    /// capability authority and does not use this value.
-    pub fn peer_role(&self, peer_id: Vec<u8>) -> anyhow::Result<u8> {
-        vos::block_on(self.registry().peer_role(&mut &self.node, peer_id))
-            .map_err(|error| anyhow::anyhow!("registry.peer_role(): {error}"))
-    }
-
-    // ── Invites ─────────────────────────────────────────────────
-
-    /// Drain every page of the invites table into one Vec. `RegistryRef`
-    /// enforces the last-scanned-token cursor, ordering, progress, and finite
-    /// whole-table bounds before any rows reach this CLI boundary.
-    pub fn invites(&self) -> anyhow::Result<Vec<vos::registry::InviteRow>> {
-        vos::block_on(self.registry().invites_all(&mut &self.node))
-            .map_err(|e| anyhow::anyhow!("registry.invites(): {e}"))
-    }
-
-    /// Flip an invite's `revoked` flag (grow-only, idempotent). The
-    /// canonical is just `("revoke_invite", [token_pub])` — no epoch,
-    /// unlike grant/revoke_role.
-    pub fn revoke_invite(&self, token_pub: Vec<u8>) -> anyhow::Result<Status> {
-        self.role_authority_id()?
-            .ok_or_else(|| anyhow::anyhow!("the space role authority is unavailable"))?;
-        let token: [u8; 32] = token_pub
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("invite token public key is not 32 bytes"))?;
-        self.commit_service_invite_revocation(token)?;
-        let auth = op_auth(
-            &self.signer,
-            &self.registry_space_id()?,
-            "revoke_invite",
-            &[&token_pub],
-        )?;
-        vos::block_on(
-            self.registry()
-                .revoke_invite(&mut &self.node, token_pub, auth),
-        )
-        .map_err(|e| anyhow::anyhow!("registry.revoke_invite(): {e}"))
-    }
-
-    fn commit_service_invite_revocation(&self, token_pub: [u8; 32]) -> anyhow::Result<()> {
-        use vos::service::ServiceWire;
-
-        let revocation = vos::service::RoleAuthorityInviteRevocation {
-            space: self.service_space_id()?,
-            token_pub,
-            admin_peer_id: libp2p::PeerId::from(self.signer.public()).to_bytes(),
-        };
-        let signature = self
-            .signer
-            .sign(&revocation.encode())
-            .map_err(|error| anyhow::anyhow!("sign service invite revocation: {error}"))?;
-        if signature.len() != vos::registry::OP_SIG_LEN {
-            anyhow::bail!("service role authority requires an Ed25519 admin identity");
-        }
-        let target = self.resolve_target(vos::service::ROLE_AUTHORITY_INSTANCE_)?;
-        if !self.service_targets.lock().unwrap().contains_key(&target.0) {
-            anyhow::bail!("canonical space-authority package is unavailable to the CLI");
-        }
-        let reply = self.invoke_dyn(
-            target,
-            &vos::value::Msg::new(vos::service::ROLE_AUTHORITY_INVITE_REVOKE_METHOD_)
-                .with("revocation", revocation.encode())
-                .with("signature", signature),
-        )?;
-        if reply.as_bool() != Some(true) {
-            anyhow::bail!("space-authority rejected the signed invite revocation");
-        }
         Ok(())
     }
 }
@@ -1294,314 +191,12 @@ impl DaemonClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use space_registry::verify_op_sig;
-    use vos::registry::{OP_SIG_LEN, registry_mutation_signed_bytes};
-    use vos::service::ServiceWire;
-
-    fn target(method: &str, public: bool, attested: bool) -> ServiceTarget {
-        let policy = vos::service::MethodPolicy {
-            method: method.to_string(),
-            schema: vos::service::Hash([1; 32]),
-            policy: vos::service::Hash([2; 32]),
-            public,
-            attested,
-            capability: None,
-            space_role: None,
-            actor_role: None,
-        };
-        ServiceTarget {
-            actor: vos::service::ActorId([0x41; 32]),
-            methods: [(method.to_string(), policy)].into_iter().collect(),
-        }
-    }
 
     #[test]
-    fn service_ingress_preserves_typed_identity_and_actor_message() {
-        let target = target("increment", true, false);
-        let invocation = vos::service::InvocationId([0x17; 32]);
-        let msg = vos::value::Msg::new("increment").with("by", 3u64);
-        let mut arguments = vec![vos::value::TAG_DYNAMIC];
-        arguments.extend_from_slice(&vos::Encode::encode(&msg));
-
-        let encoded =
-            encode_service_invocation(&target, invocation, &msg, arguments.clone()).unwrap();
-        let decoded = vos::service::RootTreeInvocation::decode(&encoded).unwrap();
-
-        assert_eq!(decoded.invocation, invocation);
-        assert_eq!(decoded.target, target.actor);
-        assert_eq!(decoded.method, "increment");
-        assert_eq!(decoded.arguments, arguments);
-        assert!(!decoded.proof_requested);
-    }
-
-    #[test]
-    fn daemon_ingress_admits_space_roles_but_refuses_unwired_authorization_paths() {
-        let invocation = vos::service::InvocationId([0x18; 32]);
-        let msg = vos::value::Msg::new("claim");
-        let arguments = vec![vos::value::TAG_DYNAMIC, 1];
-
-        let attested = encode_service_invocation(
-            &target("claim", true, true),
-            invocation,
-            &msg,
-            arguments.clone(),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(attested.contains("proof-producing transport"));
-
-        let mut space_role = target("claim", false, false);
-        space_role.methods.get_mut("claim").unwrap().space_role =
-            Some(vos::SpaceRole::Member.as_u8());
-        assert!(
-            encode_service_invocation(&space_role, invocation, &msg, arguments.clone(),).is_ok(),
-            "the daemon obtains an invocation-scoped assertion from the installed authority",
-        );
-        assert_eq!(
-            invoke_timeout_for_policy(space_role.methods.get("claim")),
-            ROLE_AUTHORIZED_INVOKE_TIMEOUT_DEFAULT,
-        );
-
-        let mut actor_role = target("claim", false, false);
-        actor_role.methods.get_mut("claim").unwrap().actor_role = Some(1);
-        let protected = encode_service_invocation(&actor_role, invocation, &msg, arguments)
-            .unwrap_err()
-            .to_string();
-        assert!(protected.contains("bound-handle credential"));
-    }
-
-    #[test]
-    fn default_invoke_timeout_covers_the_default_raft_operation_budget() {
-        assert!(INVOKE_TIMEOUT_DEFAULT >= Duration::from_secs(35));
-    }
-
-    #[test]
-    fn reserved_lifecycle_operations_bypass_actor_package_dispatch() {
-        assert!(is_reserved_host_operation("__stop"));
-        assert!(is_reserved_host_operation("__describe"));
-        assert!(!is_reserved_host_operation("stop"));
-        assert!(!is_reserved_host_operation("value"));
-    }
-
-    #[test]
-    fn legacy_service_upgrade_fails_before_any_transport_path() {
-        let error = legacy_service_upgrade_cutover_error().to_string();
-        assert!(error.contains("clean cutover"), "{error}");
-        assert!(error.contains("Agent lifecycle"), "{error}");
-        assert!(error.contains("no guest mutation"), "{error}");
-    }
-
-    #[test]
-    fn daemon_handshake_context_preserves_protocol_failure() {
-        assert!(
-            require_daemon_registry_handshake(Ok(vos::registry::RegistryProtocol::CURRENT)).is_ok()
-        );
+    fn daemon_registry_handshake_is_fail_closed() {
         let error =
-            require_daemon_registry_handshake(Err(vos::actors::client::ClientError::Decode))
-                .unwrap_err()
-                .to_string();
-        assert!(error.contains("daemon registry protocol handshake failed"));
-        assert!(error.contains("failed to decode reply"));
-    }
-
-    #[test]
-    fn every_catalog_mutation_auth_is_nonempty_and_actor_verifiable() {
-        let signer = libp2p::identity::Keypair::generate_ed25519();
-        let expected_peer = libp2p::PeerId::from(signer.public()).to_bytes();
-        let space_id = [0x10; 32];
-        let hash = [0x21; 32];
-        let replacement = [0x32; 32];
-        let replication = [0x43; 32];
-        let publication = [0x64; 32];
-        let expected_publication = [0x75; 32];
-        let installation = [0x86; 32];
-        let expected_revision = 7u64;
-        let meta = [0x54, 0x65, 0x76];
-
-        let cases = [
-            (
-                catalog_mutation_auth(
-                    &signer,
-                    &space_id,
-                    CatalogMutation::PublishServiceProgram {
-                        name: "mailbox",
-                        hash: &hash,
-                        crdt: true,
-                        publication_id: &publication,
-                        expected_publication_id: &expected_publication,
-                        expected_hash: &replacement,
-                    },
-                )
-                .unwrap(),
-                registry_mutation_signed_bytes(
-                    &space_id,
-                    "publish_service_program",
-                    &[
-                        b"mailbox",
-                        &hash,
-                        &[1],
-                        &publication,
-                        &expected_publication,
-                        &replacement,
-                    ],
-                ),
-            ),
-            (
-                catalog_mutation_auth(
-                    &signer,
-                    &space_id,
-                    CatalogMutation::PublishAgentActorProgram {
-                        name: "mailbox-agent",
-                        hash: &hash,
-                        publication_id: &publication,
-                        expected_publication_id: &expected_publication,
-                        expected_hash: &replacement,
-                    },
-                )
-                .unwrap(),
-                registry_mutation_signed_bytes(
-                    &space_id,
-                    "publish_agent_actor_program",
-                    &[
-                        b"mailbox-agent",
-                        &hash,
-                        &publication,
-                        &expected_publication,
-                        &replacement,
-                    ],
-                ),
-            ),
-            (
-                catalog_mutation_auth(
-                    &signer,
-                    &space_id,
-                    CatalogMutation::UnpublishServiceProgram {
-                        name: "mailbox",
-                        expected_publication_id: &expected_publication,
-                        expected_hash: &hash,
-                    },
-                )
-                .unwrap(),
-                registry_mutation_signed_bytes(
-                    &space_id,
-                    "unpublish_service_program",
-                    &[b"mailbox", &expected_publication, &hash],
-                ),
-            ),
-            (
-                catalog_mutation_auth(
-                    &signer,
-                    &space_id,
-                    CatalogMutation::UnpublishAgentActorProgram {
-                        name: "mailbox-agent",
-                        expected_publication_id: &expected_publication,
-                        expected_hash: &hash,
-                    },
-                )
-                .unwrap(),
-                registry_mutation_signed_bytes(
-                    &space_id,
-                    "unpublish_agent_actor_program",
-                    &[b"mailbox-agent", &expected_publication, &hash],
-                ),
-            ),
-            (
-                catalog_mutation_auth(
-                    &signer,
-                    &space_id,
-                    CatalogMutation::InstallServiceActor {
-                        instance_name: "inbox",
-                        program_name: "mailbox",
-                        program_hash: &hash,
-                        program_publication_id: &expected_publication,
-                        installation_id: &installation,
-                        replication_id: &replication,
-                        consistency: 2,
-                        network_reachable: true,
-                        sync_role: vos::registry::SyncFloor::Private as u8,
-                    },
-                )
-                .unwrap(),
-                registry_mutation_signed_bytes(
-                    &space_id,
-                    "install_service_actor",
-                    &[
-                        b"inbox",
-                        b"mailbox",
-                        &hash,
-                        &expected_publication,
-                        &installation,
-                        &replication,
-                        &[2],
-                        &[1],
-                        &[vos::registry::SyncFloor::Private as u8],
-                    ],
-                ),
-            ),
-            (
-                catalog_mutation_auth(
-                    &signer,
-                    &space_id,
-                    CatalogMutation::UninstallServiceActor {
-                        instance_name: "inbox",
-                        installation_id: &installation,
-                        expected_revision,
-                        expected_program_hash: &hash,
-                        expected_program_publication_id: &expected_publication,
-                    },
-                )
-                .unwrap(),
-                registry_mutation_signed_bytes(
-                    &space_id,
-                    "uninstall_service_actor",
-                    &[
-                        b"inbox",
-                        &installation,
-                        &expected_revision.to_le_bytes(),
-                        &hash,
-                        &expected_publication,
-                    ],
-                ),
-            ),
-            (
-                catalog_mutation_auth(
-                    &signer,
-                    &space_id,
-                    CatalogMutation::RegisterMeta {
-                        program_hash: &hash,
-                        blob: &meta,
-                    },
-                )
-                .unwrap(),
-                registry_mutation_signed_bytes(&space_id, "register_meta", &[&hash, &meta]),
-            ),
-            (
-                catalog_mutation_auth(
-                    &signer,
-                    &space_id,
-                    CatalogMutation::RegisterExtensionMeta {
-                        instance_name: "native-worker",
-                        blob: &meta,
-                    },
-                )
-                .unwrap(),
-                registry_mutation_signed_bytes(
-                    &space_id,
-                    "register_extension_meta",
-                    &[b"native-worker", &meta],
-                ),
-            ),
-        ];
-
-        for (auth, canonical) in cases {
-            assert!(auth.len() > OP_SIG_LEN, "auth must include a signer");
-            let (peer, signature) = auth.split_at(auth.len() - OP_SIG_LEN);
-            assert_eq!(peer, expected_peer);
-            let signature: [u8; OP_SIG_LEN] = signature.try_into().unwrap();
-            assert!(
-                verify_op_sig(peer, &canonical, &signature),
-                "catalog auth must verify under the registry actor",
-            );
-        }
+            require_daemon_registry_handshake(Err(vos::actors::client::ClientError::Unreachable))
+                .expect_err("unreachable daemon must fail");
+        assert!(error.to_string().contains("protocol handshake failed"));
     }
 }

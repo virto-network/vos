@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use crate::commands::space::client::DaemonClient;
 use crate::commands::space::endpoint::{self, Endpoint};
-use crate::commands::space::subscriptions::{self, LocalConfig};
+use crate::commands::space::local_config::{self, LocalConfig};
 use crate::output;
 use crate::spaces_index::{self, SpaceEntry};
 
@@ -21,9 +21,7 @@ struct InfoView<'a> {
     data_dir: &'a str,
     listen: &'a [String],
     bootnodes: &'a [String],
-    subscriptions: &'a [String],
     daemon: DaemonState,
-    agents_on_disk: usize,
 }
 
 #[derive(Serialize)]
@@ -52,12 +50,9 @@ pub fn run(query: &str) -> anyhow::Result<()> {
     let index = spaces_index::load()?;
     let entry = spaces_index::find(&index, query)?;
     let data_dir = PathBuf::from(&entry.data_dir);
-    let local_cfg = subscriptions::load(&data_dir).unwrap_or_default();
+    let local_cfg = local_config::load(&data_dir).unwrap_or_default();
 
     if output::is_json() {
-        let agents_on_disk = std::fs::read_dir(data_dir.join("agents"))
-            .map(|rd| rd.flatten().count())
-            .unwrap_or(0);
         let daemon = match endpoint::read(&data_dir)? {
             Some(ep) if endpoint::is_alive(&ep) => running_state(query, ep),
             Some(ep) => DaemonState::Stale { pid: ep.pid },
@@ -70,9 +65,7 @@ pub fn run(query: &str) -> anyhow::Result<()> {
             data_dir: &entry.data_dir,
             listen: &local_cfg.listen,
             bootnodes: &entry.bootnodes,
-            subscriptions: &local_cfg.subscriptions,
             daemon,
-            agents_on_disk,
         };
         output::print_json(&view);
         return Ok(());
@@ -107,15 +100,6 @@ fn print_text(
         for b in &entry.bootnodes {
             println!("  {b}");
         }
-    }
-
-    if local_cfg.is_filtering() {
-        println!("subscriptions ({})", local_cfg.subscriptions.len());
-        for s in &local_cfg.subscriptions {
-            println!("  {s}");
-        }
-    } else {
-        println!("subscriptions  (none — syncing all installed agents)");
     }
 
     // Live endpoint info — only present while `space up` is
@@ -154,13 +138,6 @@ fn print_text(
             println!("daemon      not running");
         }
     }
-
-    let agents_dir = data_dir.join("agents");
-    let count = match std::fs::read_dir(&agents_dir) {
-        Ok(rd) => rd.flatten().count(),
-        Err(_) => 0,
-    };
-    println!("agents      {count} on disk (in {})", agents_dir.display());
 
     Ok(())
 }

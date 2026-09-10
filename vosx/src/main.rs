@@ -1,20 +1,18 @@
-//! `vosx` — service platform-aligned PVM executor + space orchestrator.
+//! `vosx` — AgentActor authoring and local space orchestration.
 //!
 //! Top-level surface is intentionally tiny: every space-related
 //! operation lives under `vosx space *`. Top-level commands build canonical
 //! packages and manage platform artifacts.
 //!
-//! A recipe is applied into a space's registry either at
-//! genesis — `space new <name> --recipe <file>` or the one-shot
-//! `space up <recipe.toml>` on a space's first boot — or via
-//! `space apply` against an already-running space.
+//! Operational Agent installation is intentionally not exposed by this
+//! clean-generation CLI until the system authority and catalog bootstrap
+//! path is complete.
 
 use clap::{Args as ClapArgs, CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
 
 mod blob_store;
 mod bundled;
-mod cli_cache;
 mod commands;
 mod help_schema;
 mod identity;
@@ -23,7 +21,6 @@ mod paths;
 mod secure_file;
 mod shutdown;
 mod spaces_index;
-mod token;
 
 use output::Format;
 use spaces_index::IndexError;
@@ -239,53 +236,6 @@ fn main() {
     }
     commands::build::maybe_run_canonical_rustc_wrapper();
 
-    // Pre-parser: peek argv and decide whether to enter the
-    // dynamic-dispatch path before handing off to clap. clap's
-    // Subcommand derive only knows the built-in verbs; a
-    // `vosx worker stop` invocation is routed to the dynamic actor client.
-    //
-    // The verb is the first non-flag argv token. We route to the
-    // dynamic dispatcher when:
-    //
-    //   * the verb exists,
-    //   * it's not a built-in (`space`, `help-schema`, `help`).
-    //
-    // Anything else falls through to `Cli::parse()` so clap's
-    // own --help / --version / parse-error machinery stays intact.
-    let raw_argv: Vec<String> = std::env::args().skip(1).collect();
-
-    // Top-level `vosx --help` / `vosx -h` / `vosx help` gets a
-    // post-script with cache-discovered targets so a user
-    // skimming the help can see e.g. `worker`, `math`,
-    // `counter` listed alongside the built-in subcommands.
-    // Subcommand help (`vosx space --help`) is unchanged —
-    // clap handles those before we'd see them.
-    if is_top_level_help(&raw_argv) {
-        let mut cmd = Cli::command();
-        let _ = cmd.print_help();
-        println!();
-        if let Some(summary) = cli_cache::render_summary() {
-            println!();
-            print!("{summary}");
-        }
-        return;
-    }
-
-    if should_dynamic_dispatch(&raw_argv) {
-        // Mirror the global-flag side-effects clap would have
-        // applied. Verbose + format are read off the same argv
-        // since the pre-parser hasn't consumed them.
-        let verbose = raw_argv.iter().any(|a| a == "-v" || a == "--verbose");
-        init_tracing(verbose);
-        if let Some(fmt) = extract_format_flag(&raw_argv) {
-            output::set(fmt);
-        }
-        if let Err(e) = commands::dynamic::dispatch(&raw_argv) {
-            report_error(e);
-        }
-        return;
-    }
-
     let cli = Cli::parse();
     init_tracing(cli.verbose);
     output::set(cli.format);
@@ -364,120 +314,6 @@ fn main() {
     }
 }
 
-/// `true` when argv is asking for the top-level `--help` /
-/// `-h` and nothing else of substance — so we can intercept,
-/// print clap's standard help, and append the cache-derived
-/// "discovered targets" section. Subcommand help
-/// (`vosx space --help`) is excluded so clap's own help
-/// machinery handles it cleanly.
-fn is_top_level_help(argv: &[String]) -> bool {
-    let mut saw_help = false;
-    let mut i = 0;
-    while i < argv.len() {
-        match argv[i].as_str() {
-            "--help" | "-h" | "help" => saw_help = true,
-            // Global no-value flags we tolerate alongside --help.
-            "-v" | "--verbose" => {}
-            // Global value-taking flags — skip the value too.
-            // `--space` rides here too: `vosx --space demo --help`
-            // is a legitimate "show me what `demo` knows about"
-            // request; we don't currently filter the cache
-            // listing to that space, but we shouldn't bail out as
-            // if the user typed garbage.
-            "--format" | "--space" => i += 1,
-            s if s.starts_with("--format=") || s.starts_with("--space=") => {}
-            // Anything else (built-in subcommand, dynamic verb,
-            // unknown flag) → not a pure top-level help.
-            _ => return false,
-        }
-        i += 1;
-    }
-    saw_help
-}
-
-/// Names that must reach clap instead of dynamic actor dispatch.
-///
-/// `agent` is reserved for the operational Agent surface. The retired
-/// authoring spellings stay here solely so clap rejects them as unknown
-/// subcommands instead of treating them as remotely dispatchable actors.
-const CLAP_ROUTED_VERBS: &[&str] = &[
-    "actor",
-    "agent",
-    "agent-runtime-pvm",
-    "release",
-    "space",
-    "zk",
-    "help-schema",
-    "help",
-    "whoami",
-    "new",
-    "build",
-    "service-pvm",
-];
-
-/// Decide whether argv should bypass clap into the dynamic dispatcher. The
-/// first non-flag token is the candidate verb; active, reserved, and retired
-/// clap-routed names fall back to clap.
-fn should_dynamic_dispatch(argv: &[String]) -> bool {
-    // Skip global flags; `--format` / `--out` take a value, the
-    // rest are boolean-shaped. `--out` is a dynamic-only flag but
-    // we skip its value here (rather than `return true`) so its path
-    // isn't mistaken for the verb — a builtin after it still routes to
-    // clap (which then rejects the stray `--out`, fine — it's
-    // meaningless for builtins). `--space` we do force dynamic on —
-    // its presence is a strong "user wants dynamic dispatch" signal.
-    let mut i = 0;
-    while i < argv.len() {
-        let a = &argv[i];
-        match a.as_str() {
-            "--format" | "--out" => {
-                i += 2;
-                continue;
-            }
-            s if s.starts_with("--format=") || s.starts_with("--out=") => {}
-            "--space" => return true,
-            s if s.starts_with("--space=") => return true,
-            "-v" | "--verbose" => {}
-            "--help" | "-h" | "--version" | "-V" => return false,
-            _ => {
-                if a.starts_with('-') {
-                    // Unknown flag — let clap surface the error.
-                    return false;
-                }
-                if CLAP_ROUTED_VERBS.contains(&a.as_str()) {
-                    return false;
-                }
-                return true;
-            }
-        }
-        i += 1;
-    }
-    false
-}
-
-/// Pluck `--format <value>` / `--format=<value>` out of argv
-/// without disturbing the rest. clap would also handle these
-/// but only on the path through `Cli::parse`; the dynamic path
-/// re-implements just enough flag parsing to honor the same
-/// global flag.
-fn extract_format_flag(argv: &[String]) -> Option<Format> {
-    use clap::ValueEnum;
-    let mut i = 0;
-    while i < argv.len() {
-        match argv[i].as_str() {
-            "--format" => {
-                let v = argv.get(i + 1)?;
-                return Format::from_str(v, true).ok();
-            }
-            s if s.starts_with("--format=") => {
-                return Format::from_str(s.trim_start_matches("--format="), true).ok();
-            }
-            _ => i += 1,
-        }
-    }
-    None
-}
-
 /// Print an error and exit with the appropriate code. In JSON
 /// mode the error envelope goes to stderr too — tools parsing
 /// stdout get nothing on the failure path, and structured
@@ -510,14 +346,8 @@ fn exit_code_for(e: &anyhow::Error) -> i32 {
 
 #[cfg(test)]
 mod routing_tests {
-    use super::{
-        ActorCommand, Cli, Command, is_top_level_help, parse_proof_system, should_dynamic_dispatch,
-    };
+    use super::{ActorCommand, Cli, Command, parse_proof_system};
     use clap::{CommandFactory, Parser, error::ErrorKind};
-
-    fn s(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
-    }
 
     #[test]
     fn proof_system_identity_is_exact_lowercase_hex_and_nonzero() {
@@ -530,32 +360,6 @@ mod routing_tests {
             "00".repeat(32),
         ] {
             assert!(parse_proof_system(&invalid).is_err());
-        }
-    }
-
-    #[test]
-    fn empty_argv_uses_clap_path() {
-        // Lets clap's "no command" error surface as-is.
-        assert!(!should_dynamic_dispatch(&s(&[])));
-    }
-
-    #[test]
-    fn active_reserved_and_retired_verbs_use_clap_path() {
-        for v in [
-            "actor",
-            "new",
-            "build",
-            "agent",
-            "service-pvm",
-            "agent-runtime-pvm",
-            "release",
-            "space",
-            "zk",
-            "help-schema",
-            "help",
-            "whoami",
-        ] {
-            assert!(!should_dynamic_dispatch(&s(&[v])), "verb={v}");
         }
     }
 
@@ -597,110 +401,5 @@ mod routing_tests {
             );
         }
         assert!(names.iter().any(|name| name == "agent-runtime-pvm"));
-    }
-
-    #[test]
-    fn standalone_help_flag_uses_clap_path() {
-        // `vosx --help` and `vosx --version` are handled by clap.
-        assert!(!should_dynamic_dispatch(&s(&["--help"])));
-        assert!(!should_dynamic_dispatch(&s(&["-h"])));
-        assert!(!should_dynamic_dispatch(&s(&["--version"])));
-        assert!(!should_dynamic_dispatch(&s(&["-V"])));
-    }
-
-    #[test]
-    fn unknown_flag_falls_back_to_clap() {
-        // Clap surfaces the better error message for unknown flags.
-        assert!(!should_dynamic_dispatch(&s(&["--unknown"])));
-    }
-
-    #[test]
-    fn non_builtin_word_triggers_dynamic_dispatch() {
-        // Dynamic dispatch for extension instances.
-        assert!(should_dynamic_dispatch(&s(&["worker"])));
-        assert!(should_dynamic_dispatch(&s(&["worker", "stop"])));
-        assert!(should_dynamic_dispatch(&s(&["math", "add", "a=2", "b=3"])));
-    }
-
-    #[test]
-    fn global_flags_with_values_skip_correctly() {
-        // `--format json worker stop` — the json value isn't a verb.
-        assert!(should_dynamic_dispatch(&s(&["--format", "json", "worker"])));
-        assert!(should_dynamic_dispatch(&s(&["--format=json", "worker"])));
-        assert!(should_dynamic_dispatch(&s(&["-v", "worker"])));
-    }
-
-    #[test]
-    fn out_flag_value_is_skipped_not_taken_as_verb() {
-        // `--out path` before the target: the path must not be
-        // mistaken for the verb, and a builtin still reaches clap.
-        assert!(should_dynamic_dispatch(&s(&[
-            "--out", "f.bin", "prover", "get_blob"
-        ])));
-        assert!(should_dynamic_dispatch(&s(&["--out=f.bin", "prover"])));
-        assert!(!should_dynamic_dispatch(&s(&[
-            "--out", "f.bin", "space", "export"
-        ])));
-    }
-
-    #[test]
-    fn space_flag_alone_forces_dynamic() {
-        // `--space` only makes sense in the dynamic path; its
-        // presence is a strong signal even before the verb.
-        assert!(should_dynamic_dispatch(&s(&["--space", "demo"])));
-        assert!(should_dynamic_dispatch(&s(&["--space=demo", "worker"])));
-    }
-
-    #[test]
-    fn format_before_builtin_verb_still_uses_clap() {
-        // `--format json space agents demo` — clap can handle it.
-        assert!(!should_dynamic_dispatch(&s(&["--format", "json", "space"])));
-    }
-
-    #[test]
-    fn top_level_help_recognises_flag_variants() {
-        // The intercept point in `main` keys on this to decide
-        // whether to render the extended help (clap output +
-        // cache-derived target list).
-        assert!(is_top_level_help(&s(&["--help"])));
-        assert!(is_top_level_help(&s(&["-h"])));
-        assert!(is_top_level_help(&s(&["help"])));
-    }
-
-    #[test]
-    fn top_level_help_tolerates_globals() {
-        // `vosx --format json --help` is still a top-level
-        // help request; we want the JSON-mode help output too.
-        assert!(is_top_level_help(&s(&["--format", "json", "--help"])));
-        assert!(is_top_level_help(&s(&["-v", "--help"])));
-        assert!(is_top_level_help(&s(&["--format=json", "-h"])));
-    }
-
-    #[test]
-    fn top_level_help_excludes_subcommand_help() {
-        // `vosx space --help` is subcommand help — clap should
-        // handle that path, not our extended renderer.
-        assert!(!is_top_level_help(&s(&["space", "--help"])));
-    }
-
-    #[test]
-    fn top_level_help_tolerates_space_flag() {
-        // `vosx --space demo --help` was previously rejected by
-        // the help-detection arm, falling through to the
-        // dynamic dispatcher which errored "no target". The
-        // user's intent is clearly help-with-context, not a
-        // missing verb.
-        assert!(is_top_level_help(&s(&["--space", "demo", "--help"])));
-        assert!(is_top_level_help(&s(&["--space=demo", "-h"])));
-        assert!(is_top_level_help(&s(&["help", "--space", "demo"])));
-    }
-
-    #[test]
-    fn top_level_help_without_flag_is_not_help() {
-        // Just to make sure tolerating globals didn't accidentally
-        // treat plain `--format json` as a help request.
-        assert!(!is_top_level_help(&s(&[])));
-        assert!(!is_top_level_help(&s(&["--format", "json"])));
-        assert!(!is_top_level_help(&s(&["-v"])));
     }
 }

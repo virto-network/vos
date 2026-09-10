@@ -6,9 +6,8 @@ categories = ["command-line-utilities", "network-programming", "wasm"]
 version = "0.1.0"
 edition = "2024"
 authors = ["Daniel Olano <daniel@olanod.com>"]
-# Ship the platform actors inside the crate so `cargo install vosx` has the
-# exact registry and authority programs available out of the
-# box. The checked artifacts are refreshed by their corresponding just tasks.
+# Keep the current protocol artifacts in published packages while the next
+# release slice replaces their provenance and system-actor bundle atomically.
 include = [
     "src/**/*",
     "tests/**/*",
@@ -22,7 +21,6 @@ include = [
 [dependencies]
 vos = { path = "../vos", version = "0.1.0", features = ["std", "http-client", "http-ingress", "ssh-ingress", "storage", "network"] }
 ssh-key = "=0.7.0-rc.10"
-space-authority = { path = "../actors/space-authority", version = "0.1.0", default-features = false }
 # `vosx zk pin` transpiles the provable ELF here and delegates the heavy
 # vos-pvm-proof measurement to the prover extension's `measure_catalog` handler, so
 # vosx pulls no vos-pvm-proof/stwo.
@@ -36,10 +34,6 @@ vos-pvm = { workspace = true }
 # and `Hash` sources, only `Cid` and `Url` resolution touch
 # external services.
 hex = "0.4"
-# base58 (Bitcoin alphabet) for the `vos-…` invite token string —
-# compact, unambiguous, double-click-selectable. Only used by
-# `token.rs`.
-bs58 = "0.5"
 # anyhow is the existing project's only convenience-error crate;
 # the new `space *` commands return Result for clean error
 # bubbling through the clap dispatcher.
@@ -52,9 +46,6 @@ redb = "2"
 # `kill -0` to detect stale endpoint files left by a crashed
 # `space up` daemon.
 libc = "0.2"
-# Bounded Unix-domain connect for the production trust sidecar. Reads and
-# writes use shrinking std socket timeouts against the same absolute deadline.
-socket2 = "0.6"
 # OS entropy for keys, tokens, and atomic file updates.
 getrandom = "0.2"
 # Cross-process advisory lock shared by daemon startup and offline

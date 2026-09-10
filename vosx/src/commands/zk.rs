@@ -41,8 +41,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use vos::value::{Msg, Value};
 use vos::zk::{ProgramPin, ProvableCatalog, bytes_to_hex, witness_addr};
 
-use crate::commands::dynamic::resolve_space;
 use crate::commands::space::client::DaemonClient;
+use crate::commands::space::common::resolve_space;
 
 /// Generous trace-gas ceiling — matches the prover extension's budget so a
 /// program that traces there traces here.

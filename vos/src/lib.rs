@@ -1,15 +1,13 @@
 //! # vos
 //!
-//! Actor SDK and host runtime for signed VOS applications.
-//!
-//! Each installed package runs behind the generic service guest. The service
-//! authenticates work, invokes the actor, and commits its state and effects
-//! through Local, Raft, or CRDT ordering.
+//! Actor SDK and host runtime for signed VOS applications. Clean-generation
+//! Agents execute actors through an explicit AgentRuntime; retained service
+//! modules are internal compatibility contracts, not a selectable executable.
 //!
 //! ## Architecture
 //!
 //! ```text
-//! Client → node → root service → actor tree → durable state
+//! Client → node → AgentRuntime → actor forest → durable state
 //! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]

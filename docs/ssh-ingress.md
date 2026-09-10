@@ -36,17 +36,13 @@ The host key is per node and included in an offline whole-space backup. It is
 not the node's network identity and not a certificate authority. Symlinks,
 non-regular files, and insecure existing modes are rejected.
 
-## Authorize a key
+## Authorization boundary
 
-```bash
-vosx space access demo issue-ssh ~/.ssh/id_ed25519.pub --expires 30d
-s4 127.0.0.1:2222
-```
-
-The public key is one credential for the caller's stable Principal. An
-administrator can add a device for another Principal with `--principal <hex>`.
-Several keys and bearer tokens may name the same Principal; connection and
-session quotas are charged to that Principal, not evaded by rotating keys.
+SSH keys must already be admitted by the clean Space authority. The current
+`vosx` cutover has no credential-management command, so configuring the
+listener alone does not create production access. Embedders may provision
+authority state through typed host interfaces while the public operator path
+remains fail-closed.
 
 Every Agent action revalidates the exact key credential and stable Principal
 against the live authority. Revoking the key or changing any role in
