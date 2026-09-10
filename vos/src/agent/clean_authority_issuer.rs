@@ -260,15 +260,46 @@ impl AuthorizedCleanManagementDecision {
         encode_authorized_decision(self)
     }
 
-    pub(crate) fn from_bootstrap_canonical_bytes(
-        bytes: &[u8],
+    /// Recover one previously persisted, fully validated decision. This stays
+    /// crate-private so decoding durable bootstrap state cannot become a
+    /// public authority-minting surface.
+    pub(crate) fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        decode_authorized_decision(bytes)
+    }
+
+    /// Mint one of the two decisions certified by the independently signed
+    /// first-system root bootstrap. The root-certification commitment binds
+    /// the complete bootstrap material and remains part of every receipt.
+    pub(crate) fn from_root_bootstrap(
+        authorization_id: NonZeroU64,
         descriptor: &crate::agent::sdk::AgentDescriptor,
-    ) -> Result<Self, DecodeError> {
-        let decision = decode_authorized_decision(bytes)?;
-        decision
-            .matches_creation(descriptor)
-            .then_some(decision)
-            .ok_or(DecodeError::NonCanonical)
+        request: &ManagementRequest,
+        root_certification: Hash,
+        valid_from: u64,
+        expires_at: u64,
+    ) -> Result<Self, CleanManagementDecisionError> {
+        if root_certification == Hash::ZERO || valid_from > expires_at {
+            return Err(CleanManagementDecisionError::InvalidDecision);
+        }
+        Self::from_verified_approval_parts(
+            authorization_id,
+            CleanManagementDecisionContext {
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                runtime_deployment: descriptor.identity.runtime_deployment,
+                evidence: AuthorityEvidence {
+                    package: None,
+                    proof: None,
+                    commitment: root_certification,
+                },
+                lane_roots: AuthorityLaneRoots::default(),
+                epoch: descriptor.authority.initial_epoch,
+                valid_from,
+                expires_at,
+            },
+            request,
+            None,
+        )
     }
 
     pub(crate) fn matches_creation(&self, descriptor: &crate::agent::sdk::AgentDescriptor) -> bool {

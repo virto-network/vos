@@ -38,7 +38,7 @@ use super::sdk::wire::{
     CanonicalWire, MAX_AGENT_DESCRIPTOR_WIRE_BYTES, MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES,
     MAX_AUTHORITY_PROJECTION_QUERY_WIRE_BYTES, MAX_AUTHORITY_RECEIPT_WIRE_BYTES,
     MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES, MAX_MANAGEMENT_APPROVAL_WIRE_BYTES,
-    MAX_RUNTIME_WORK_WIRE_BYTES,
+    MAX_MANAGEMENT_REQUEST_WIRE_BYTES, MAX_RUNTIME_WORK_WIRE_BYTES,
 };
 use super::sdk::{
     ActorId, AgentDescriptor, AgentId, AgentProfile, BlobRef, Hash, InvocationAuthorization,
@@ -50,7 +50,8 @@ use crate::service::wire::ServiceWire;
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 use super::bootstrap::{
     SystemAgentGenesisLocator, SystemAgentGenesisProposal, SystemAgentGenesisProvider,
-    validate_prepared_system_agent_genesis_root,
+    SystemAgentGenesisProviderError, SystemAgentGenesisProvision,
+    validate_prepared_system_agent_genesis_root, validate_system_agent_genesis_catalog,
 };
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 use super::driver::{AgentTrustProvider, SdkManagementArtifacts};
@@ -72,7 +73,7 @@ use super::shared_raft::CommitteeChangeAuthorityBinding;
 use crate::network::{Network, SharedAgentNetworkHost};
 
 const CLEAN_SYSTEM_AGENT_PINS_MAGIC: [u8; 4] = *b"CSP2";
-const CLEAN_SYSTEM_AGENT_PLAN_MAGIC: [u8; 4] = *b"CBP2";
+const CLEAN_SYSTEM_AGENT_PLAN_MAGIC: [u8; 4] = *b"CBP3";
 const CLEAN_SYSTEM_AGENT_BOOTSTRAP_MAGIC: [u8; 4] = *b"CSB2";
 const CLEAN_SYSTEM_AGENT_BOOTSTRAP_VERSION: u8 = 3;
 
@@ -84,7 +85,7 @@ const MAX_CLEAN_SYSTEM_AGENT_PLAN_BYTES: usize = 3 * MAX_PACKAGE_ENCODED_BYTES
     + MAX_CLEAN_SYSTEM_AGENT_PINS_BYTES
     + 2 * MAX_AUTHORIZED_DECISION_BYTES
     + MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES
-    + 2 * MAX_RUNTIME_WORK_WIRE_BYTES
+    + 2 * MAX_MANAGEMENT_REQUEST_WIRE_BYTES
     + 8 * 1024;
 pub const MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES: usize = MAX_CLEAN_SYSTEM_AGENT_PLAN_BYTES
     + 3 * MAX_AUTHORITY_RECEIPT_WIRE_BYTES
@@ -288,7 +289,234 @@ pub struct AuthorizedCleanSystemAgentBootstrap {
     invocation_gas: u64,
 }
 
+/// Independently held root-certification boundary for first-system startup.
+/// A successful result must bind `root_certification` in its root record and
+/// certify the exact replay-derived proposal. The preparation seam verifies
+/// both before it mints a reusable bootstrap plan.
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+pub trait CleanSystemAgentRootCertifier {
+    fn certify(
+        &mut self,
+        root_certification: Hash,
+        proposal: &SystemAgentGenesisProposal,
+        catalog: &[RuntimeBlob],
+    ) -> Result<SystemAgentGenesisProvision, SystemAgentGenesisProviderError>;
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+impl<F> CleanSystemAgentRootCertifier for F
+where
+    F: FnMut(
+        Hash,
+        &SystemAgentGenesisProposal,
+        &[RuntimeBlob],
+    ) -> Result<SystemAgentGenesisProvision, SystemAgentGenesisProviderError>,
+{
+    fn certify(
+        &mut self,
+        root_certification: Hash,
+        proposal: &SystemAgentGenesisProposal,
+        catalog: &[RuntimeBlob],
+    ) -> Result<SystemAgentGenesisProvision, SystemAgentGenesisProviderError> {
+        self(root_certification, proposal, catalog)
+    }
+}
+
+/// Complete fresh-start result. The caller durably archives `provision` and
+/// `catalog`; the owner then receives `plan` through its empty-store factory.
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+#[derive(Clone)]
+pub struct PreparedCleanSystemAgentBootstrap {
+    plan: AuthorizedCleanSystemAgentBootstrap,
+    provision: SystemAgentGenesisProvision,
+    catalog: Vec<RuntimeBlob>,
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+impl PreparedCleanSystemAgentBootstrap {
+    pub const fn plan(&self) -> &AuthorizedCleanSystemAgentBootstrap {
+        &self.plan
+    }
+
+    pub const fn provision(&self) -> &SystemAgentGenesisProvision {
+        &self.provision
+    }
+
+    pub fn catalog(&self) -> &[RuntimeBlob] {
+        &self.catalog
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        AuthorizedCleanSystemAgentBootstrap,
+        SystemAgentGenesisProvision,
+        Vec<RuntimeBlob>,
+    ) {
+        (self.plan, self.provision, self.catalog)
+    }
+}
+
 impl AuthorizedCleanSystemAgentBootstrap {
+    /// Prepare every replay-derived and root-certified input required by one
+    /// fresh system-Agent bootstrap. The first two management decisions are
+    /// minted only inside `vos`; callers receive neither their constructor nor
+    /// the replay-prepared capability used to derive the proposal.
+    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_root_authorized<S, C>(
+        descriptor: AgentDescriptor,
+        runtime_package_bytes: Vec<u8>,
+        replicas: AgentReplicaCommittee,
+        observed_slot: u64,
+        authority_package_bytes: Vec<u8>,
+        authority_request: ManagementRequest,
+        catalog_package_bytes: Vec<u8>,
+        catalog_request: ManagementRequest,
+        catalog_call: AuthorityCredentialCall,
+        invocation_gas: u64,
+        signer: &mut S,
+        root_certifier: &mut C,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+    ) -> Result<PreparedCleanSystemAgentBootstrap, CleanSystemAgentBootstrapError>
+    where
+        S: CleanManagementReceiptSigner,
+        C: CleanSystemAgentRootCertifier,
+    {
+        let runtime = admit_runtime_package(&runtime_package_bytes)
+            .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidRuntimePackage))?;
+        let authority = admit_actor_package(&authority_package_bytes)
+            .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidActorPackage))?;
+        let catalog_package = admit_actor_package(&catalog_package_bytes)
+            .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidActorPackage))?;
+        validate_root_bootstrap_materials(
+            &descriptor,
+            &replicas,
+            observed_slot,
+            invocation_gas,
+            &runtime,
+            &authority,
+            &authority_request,
+            &catalog_package,
+            &catalog_request,
+            &catalog_call,
+        )?;
+        let root_certification = root_bootstrap_certification_commitment(
+            &descriptor,
+            &runtime_package_bytes,
+            &replicas,
+            observed_slot,
+            &authority_package_bytes,
+            &authority_request,
+            &catalog_package_bytes,
+            &catalog_request,
+            &catalog_call,
+            invocation_gas,
+        )?;
+        let create_request = ManagementRequest::Create(alloc::boxed::Box::new(descriptor.clone()));
+        let valid_from = catalog_call.requested_valid_from;
+        let expires_at = catalog_call.requested_expires_at;
+        let create_decision = AuthorizedCleanManagementDecision::from_root_bootstrap(
+            core::num::NonZeroU64::new(1).expect("one is nonzero"),
+            &descriptor,
+            &create_request,
+            root_certification,
+            valid_from,
+            expires_at,
+        )
+        .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidDecision))?;
+        let authority_decision = AuthorizedCleanManagementDecision::from_root_bootstrap(
+            core::num::NonZeroU64::new(2).expect("two is nonzero"),
+            &descriptor,
+            &authority_request,
+            root_certification,
+            valid_from,
+            expires_at,
+        )
+        .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidDecision))?;
+
+        let mut planning_issuer = DurableCleanManagementIssuer::open(
+            CleanSystemAgentPlanningIssuerStore::default(),
+            descriptor.authority,
+            descriptor.identity.space,
+            descriptor.identity.agent,
+        )
+        .map_err(map_issuer_open_error)?;
+        let create_receipt = planning_issuer
+            .issue(&create_decision, signer)
+            .map_err(map_issuer_issue_error)?;
+        let (create, genesis_catalog) =
+            LocalJournalAgentDriver::<FileAgentJournalStore>::clean_shared_system_genesis_input(
+                descriptor.clone(),
+                &runtime,
+                create_receipt,
+                observed_slot,
+                &trust,
+                &merge,
+            )
+            .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidDecision))?;
+        let [member] = replicas.members() else {
+            return Err(rejected(
+                CleanSystemAgentBootstrapRejection::InvalidDescriptor,
+            ));
+        };
+        let prepared = LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_system_genesis(
+            create,
+            member.replica(),
+            &genesis_catalog,
+            Arc::clone(&trust),
+            Arc::clone(&merge),
+        )
+        .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidDecision))?;
+        let proposal = SystemAgentGenesisProposal::from_prepared(
+            SystemAgentGenesisLocator {
+                space: crate::service::SpaceId(descriptor.identity.space.0),
+                agent: crate::service::AgentId(descriptor.identity.agent.0),
+                node: member.replica().node,
+            },
+            &prepared,
+        )
+        .map_err(CleanSystemAgentBootstrapError::Bootstrap)?;
+        let provision = root_certifier
+            .certify(root_certification, &proposal, &genesis_catalog)
+            .map_err(CleanSystemAgentBootstrapError::Genesis)?;
+        provision
+            .validate()
+            .map_err(CleanSystemAgentBootstrapError::Bootstrap)?;
+        validate_system_agent_genesis_catalog(&proposal, &genesis_catalog)
+            .map_err(CleanSystemAgentBootstrapError::Bootstrap)?;
+        let root = provision.root();
+        if provision.proposal() != &proposal
+            || root.record().root_certification().0 != root_certification.0
+            || root.record().initial_committee().members().len() != 1
+            || root.record().initial_committee().voter_count() != 1
+        {
+            return Err(rejected(CleanSystemAgentBootstrapRejection::WrongAuthority));
+        }
+        let plan = Self::new(
+            descriptor,
+            runtime_package_bytes,
+            replicas,
+            root.clone(),
+            observed_slot,
+            create_decision,
+            authority_package_bytes,
+            authority_request,
+            authority_decision,
+            catalog_package_bytes,
+            catalog_request,
+            catalog_call,
+            invocation_gas,
+        )
+        .map_err(CleanSystemAgentBootstrapError::Rejected)?;
+        Ok(PreparedCleanSystemAgentBootstrap {
+            plan,
+            provision,
+            catalog: genesis_catalog,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         descriptor: AgentDescriptor,
@@ -448,7 +676,7 @@ impl AuthorizedCleanSystemAgentBootstrap {
 
     fn commitment(&self) -> Hash {
         Hash::digest(
-            b"vos/clean-system-agent-bootstrap-plan/v2",
+            b"vos/clean-system-agent-bootstrap-plan/v3",
             &[&self.canonical_bytes()],
         )
     }
@@ -462,10 +690,20 @@ impl AuthorizedCleanSystemAgentBootstrap {
         encode_large_bytes(&mut encoder, &self.runtime_package_bytes);
         encoder.bytes(&self.create_decision.canonical_bytes());
         encode_large_bytes(&mut encoder, &self.authority_package_bytes);
-        encoder.fixed(self.authority_request.commitment().as_bytes());
+        encoder.bytes(
+            &self
+                .authority_request
+                .encode()
+                .expect("validated authority management request"),
+        );
         encoder.bytes(&self.authority_decision.canonical_bytes());
         encode_large_bytes(&mut encoder, &self.catalog_package_bytes);
-        encoder.fixed(self.catalog_request.commitment().as_bytes());
+        encoder.bytes(
+            &self
+                .catalog_request
+                .encode()
+                .expect("validated catalog management request"),
+        );
         encoder.bytes(
             &self
                 .catalog_call
@@ -474,6 +712,238 @@ impl AuthorizedCleanSystemAgentBootstrap {
         );
         encoder.u64(self.invocation_gas);
         bytes
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() > MAX_CLEAN_SYSTEM_AGENT_PLAN_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let mut decoder = Decoder::new(bytes);
+        if decoder.take(4)? != CLEAN_SYSTEM_AGENT_PLAN_MAGIC {
+            return Err(DecodeError::InvalidTag);
+        }
+        if Hash(decoder.fixed()?) != super::sdk::RUNTIME_ABI_ID {
+            return Err(DecodeError::InvalidPlatform);
+        }
+        let value = Self {
+            pins: CleanSystemAgentPins::decode(
+                &decoder.bytes_bounded(MAX_CLEAN_SYSTEM_AGENT_PINS_BYTES)?,
+            )?,
+            runtime_package_bytes: decode_large_bytes(&mut decoder, MAX_PACKAGE_ENCODED_BYTES)?,
+            create_decision: AuthorizedCleanManagementDecision::from_canonical_bytes(
+                &decoder.bytes_bounded(MAX_AUTHORIZED_DECISION_BYTES)?,
+            )?,
+            authority_package_bytes: decode_large_bytes(&mut decoder, MAX_PACKAGE_ENCODED_BYTES)?,
+            authority_request: ManagementRequest::decode(
+                &decoder.bytes_bounded(MAX_MANAGEMENT_REQUEST_WIRE_BYTES)?,
+            )
+            .map_err(|_| DecodeError::NonCanonical)?,
+            authority_decision: AuthorizedCleanManagementDecision::from_canonical_bytes(
+                &decoder.bytes_bounded(MAX_AUTHORIZED_DECISION_BYTES)?,
+            )?,
+            catalog_package_bytes: decode_large_bytes(&mut decoder, MAX_PACKAGE_ENCODED_BYTES)?,
+            catalog_request: ManagementRequest::decode(
+                &decoder.bytes_bounded(MAX_MANAGEMENT_REQUEST_WIRE_BYTES)?,
+            )
+            .map_err(|_| DecodeError::NonCanonical)?,
+            catalog_call: AuthorityCredentialCall::decode(
+                &decoder.bytes_bounded(MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES)?,
+            )
+            .map_err(|_| DecodeError::NonCanonical)?,
+            invocation_gas: decoder.u64()?,
+        };
+        if !decoder.exhausted() || value.validate().is_err() || value.canonical_bytes() != bytes {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+fn validate_root_bootstrap_materials(
+    descriptor: &AgentDescriptor,
+    replicas: &AgentReplicaCommittee,
+    observed_slot: u64,
+    invocation_gas: u64,
+    runtime: &AdmittedRuntimePackage,
+    authority: &AdmittedActorPackage,
+    authority_request: &ManagementRequest,
+    catalog_package: &AdmittedActorPackage,
+    catalog_request: &ManagementRequest,
+    catalog_call: &AuthorityCredentialCall,
+) -> Result<(), CleanSystemAgentBootstrapError> {
+    let [descriptor_replica] = descriptor.replicas.as_slice() else {
+        return Err(rejected(
+            CleanSystemAgentBootstrapRejection::InvalidDescriptor,
+        ));
+    };
+    let [member] = replicas.members() else {
+        return Err(rejected(
+            CleanSystemAgentBootstrapRejection::InvalidDescriptor,
+        ));
+    };
+    if observed_slot == 0
+        || invocation_gas == 0
+        || descriptor.validate().is_err()
+        || descriptor.identity.profile != AgentProfile::Shared
+        || descriptor_replica.role != super::sdk::ReplicaRole::Voter
+        || replicas.validate().is_err()
+        || replicas.profile() != super::AgentProfile::Shared
+        || replicas.voter_count() != 1
+        || replicas.space().0 != descriptor.identity.space.0
+        || replicas.agent().0 != descriptor.identity.agent.0
+        || member.replica().node.0 != descriptor_replica.node.0
+        || member.replica().principal.0 != descriptor_replica.principal.0
+        || member.replica().role != super::ReplicaRole::Voter
+        || runtime.exact_bytes().len() > MAX_PACKAGE_ENCODED_BYTES
+        || runtime.package_ref() != &descriptor.runtime_package
+        || runtime.deployment() != descriptor.identity.runtime_deployment
+        || runtime.program() != descriptor.identity.runtime_program
+        || runtime.producer() != descriptor.identity.runtime_producer
+        || runtime.manifest().contract != descriptor.runtime_contract
+        || runtime.capabilities() != descriptor.capabilities
+    {
+        return Err(rejected(
+            CleanSystemAgentBootstrapRejection::InvalidDescriptor,
+        ));
+    }
+    validate_actor_install(descriptor, authority_request, authority)
+        .map_err(CleanSystemAgentBootstrapError::Rejected)?;
+    validate_actor_install(descriptor, catalog_request, catalog_package)
+        .map_err(CleanSystemAgentBootstrapError::Rejected)?;
+    let ManagementRequest::Install(authority_install) = authority_request else {
+        return Err(rejected(
+            CleanSystemAgentBootstrapRejection::InvalidDecision,
+        ));
+    };
+    let ManagementRequest::Install(catalog_install) = catalog_request else {
+        return Err(rejected(
+            CleanSystemAgentBootstrapRejection::InvalidDecision,
+        ));
+    };
+    let issuer = descriptor.authority.issuer;
+    let authority_target = AuthorityActorTarget {
+        space: descriptor.identity.space,
+        system_agent: descriptor.identity.agent,
+        system_runtime_deployment: descriptor.identity.runtime_deployment,
+        binding: descriptor.authority,
+    };
+    let managed_target = ManagedAgentTarget {
+        space: descriptor.identity.space,
+        agent: descriptor.identity.agent,
+        owner: descriptor.identity.owner,
+        profile: descriptor.identity.profile,
+        runtime_deployment: descriptor.identity.runtime_deployment,
+        transition_producer: descriptor.identity.transition_producer,
+    };
+    if authority_install.entry.actor != issuer.actor
+        || authority_install.entry.deployment != issuer.deployment
+        || authority_install.entry.program != issuer.program
+        || authority_install.producer != issuer.producer
+        || authority_install.entry.actor == catalog_install.entry.actor
+        || catalog_call.validate_shape().is_err()
+        || catalog_call.authority != authority_target
+        || catalog_call.managed != managed_target
+        || catalog_call.authenticated_node != Some(NodeId(member.replica().node.0))
+        || catalog_call.request_sequence.get() != 1
+        || catalog_call.requested_valid_from > observed_slot
+        || catalog_call.requested_expires_at < observed_slot
+        || !catalog_call.plan.matches_request(catalog_request)
+        || !RawCredentialVerifier.verify(
+            &catalog_call.credential_public_key,
+            &catalog_call.signing_bytes(),
+            &catalog_call.signature,
+        )
+    {
+        return Err(rejected(
+            CleanSystemAgentBootstrapRejection::InvalidDecision,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+fn root_bootstrap_certification_commitment(
+    descriptor: &AgentDescriptor,
+    runtime_package_bytes: &[u8],
+    replicas: &AgentReplicaCommittee,
+    observed_slot: u64,
+    authority_package_bytes: &[u8],
+    authority_request: &ManagementRequest,
+    catalog_package_bytes: &[u8],
+    catalog_request: &ManagementRequest,
+    catalog_call: &AuthorityCredentialCall,
+    invocation_gas: u64,
+) -> Result<Hash, CleanSystemAgentBootstrapError> {
+    let descriptor = descriptor
+        .encode()
+        .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidDescriptor))?;
+    let authority_request = authority_request
+        .encode()
+        .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidDecision))?;
+    let catalog_request = catalog_request
+        .encode()
+        .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidDecision))?;
+    let catalog_call = catalog_call
+        .encode()
+        .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidDecision))?;
+    let mut material = Vec::new();
+    material.extend_from_slice(b"CSRC1");
+    let mut encoder = Encoder(&mut material);
+    encoder.fixed(super::sdk::RUNTIME_ABI_ID.as_bytes());
+    encoder.bytes(&descriptor);
+    encoder.bytes(&replicas.encode());
+    encoder.u64(observed_slot);
+    encoder.fixed(
+        Hash::digest(
+            b"vos/clean-system-agent-bootstrap/runtime-package/v1",
+            &[runtime_package_bytes],
+        )
+        .as_bytes(),
+    );
+    encoder.fixed(
+        Hash::digest(
+            b"vos/clean-system-agent-bootstrap/authority-package/v1",
+            &[authority_package_bytes],
+        )
+        .as_bytes(),
+    );
+    encoder.bytes(&authority_request);
+    encoder.fixed(
+        Hash::digest(
+            b"vos/clean-system-agent-bootstrap/catalog-package/v1",
+            &[catalog_package_bytes],
+        )
+        .as_bytes(),
+    );
+    encoder.bytes(&catalog_request);
+    encoder.bytes(&catalog_call);
+    encoder.u64(invocation_gas);
+    Ok(Hash::digest(
+        b"vos/clean-system-agent-root-certification/v1",
+        &[&material],
+    ))
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+#[derive(Default)]
+struct CleanSystemAgentPlanningIssuerStore {
+    image: Option<Vec<u8>>,
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+impl CleanManagementIssuerStore for CleanSystemAgentPlanningIssuerStore {
+    type Error = core::convert::Infallible;
+
+    fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(self.image.clone())
+    }
+
+    fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+        self.image = Some(image.to_vec());
+        Ok(())
     }
 }
 
@@ -673,7 +1143,7 @@ impl CleanSystemAgentBootstrapRecord {
             || self.plan_commitment == Hash::ZERO
             || self.plan.len() > MAX_CLEAN_SYSTEM_AGENT_PLAN_BYTES
             || self.plan.get(..4) != Some(&CLEAN_SYSTEM_AGENT_PLAN_MAGIC)
-            || Hash::digest(b"vos/clean-system-agent-bootstrap-plan/v2", &[&self.plan])
+            || Hash::digest(b"vos/clean-system-agent-bootstrap-plan/v3", &[&self.plan])
                 != self.plan_commitment
         {
             return false;
@@ -785,7 +1255,11 @@ impl CleanSystemAgentBootstrapRecord {
                 MAX_PENDING_AUTHORITY_PROJECTION_BYTES,
             )?,
         };
-        if !decoder.exhausted() || !value.is_valid() || value.encode() != bytes {
+        let valid_plan =
+            AuthorizedCleanSystemAgentBootstrap::decode(&value.plan).is_ok_and(|plan| {
+                plan.pins.commitment() == value.pins_commitment && value.matches_plan(&plan)
+            });
+        if !decoder.exhausted() || !value.is_valid() || !valid_plan || value.encode() != bytes {
             return Err(DecodeError::NonCanonical);
         }
         Ok(value)
@@ -894,6 +1368,89 @@ where
     R: CleanSystemAgentBootstrapStore,
     I: CleanManagementIssuerStore,
 {
+    /// Reopen from the exact durable plan, or create a fresh plan only when
+    /// both bootstrap stores and the host root are empty. Partial or malformed
+    /// durable state is rejected without consulting `fresh_plan`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_or_bootstrap_with_factory<S, F>(
+        mut pins_store: P,
+        mut record_store: R,
+        issuer_store: I,
+        signer: &mut S,
+        fresh_plan: F,
+        shared_host_root: impl AsRef<Path>,
+        stable_lock_path: impl AsRef<Path>,
+        expected_space: SpaceId,
+        expected_node: NodeId,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        finality: Arc<dyn AgentGenesisFinalityVerifier>,
+        genesis: Arc<dyn SystemAgentGenesisProvider>,
+        network: Arc<Network>,
+    ) -> Result<Self, CleanSystemAgentBootstrapError>
+    where
+        S: CleanManagementReceiptSigner,
+        F: FnOnce() -> Result<AuthorizedCleanSystemAgentBootstrap, CleanSystemAgentBootstrapError>,
+    {
+        let shared_host_root = shared_host_root.as_ref();
+        let stable_lock_path = stable_lock_path.as_ref();
+        let loaded_pins = pins_store
+            .load(MAX_CLEAN_SYSTEM_AGENT_PINS_BYTES)
+            .map_err(|_| CleanSystemAgentBootstrapError::PinsStorage)?;
+        let loaded_record = record_store
+            .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
+            .map_err(|_| CleanSystemAgentBootstrapError::RecordStorage)?;
+        let plan = match (loaded_pins.as_deref(), loaded_record.as_deref()) {
+            (None, Some(_)) => {
+                return Err(rejected(CleanSystemAgentBootstrapRejection::MissingPins));
+            }
+            (Some(_), None) => {
+                return Err(rejected(CleanSystemAgentBootstrapRejection::MissingRecord));
+            }
+            (Some(pins), Some(record)) => {
+                let pins = CleanSystemAgentPins::decode(pins)
+                    .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidPins))?;
+                let record = CleanSystemAgentBootstrapRecord::decode(record)
+                    .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidRecord))?;
+                let plan = AuthorizedCleanSystemAgentBootstrap::decode(&record.plan)
+                    .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidRecord))?;
+                if plan.pins() != &pins {
+                    return Err(rejected(CleanSystemAgentBootstrapRejection::DivergentPins));
+                }
+                if !record.matches_plan(&plan) {
+                    return Err(rejected(
+                        CleanSystemAgentBootstrapRejection::DivergentRecord,
+                    ));
+                }
+                plan
+            }
+            (None, None) => {
+                if host_root_exists(shared_host_root)? {
+                    return Err(rejected(
+                        CleanSystemAgentBootstrapRejection::PreexistingHost,
+                    ));
+                }
+                fresh_plan()?
+            }
+        };
+        Self::open_or_bootstrap(
+            pins_store,
+            record_store,
+            issuer_store,
+            signer,
+            &plan,
+            shared_host_root,
+            stable_lock_path,
+            expected_space,
+            expected_node,
+            trust,
+            merge,
+            finality,
+            genesis,
+            network,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn open_or_bootstrap<S: CleanManagementReceiptSigner>(
         mut pins_store: P,
@@ -2624,6 +3181,7 @@ mod tests {
     mod physical {
         use alloc::boxed::Box;
         use core::num::NonZeroU64;
+        use std::cell::Cell;
         use std::path::PathBuf;
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -4992,6 +5550,7 @@ mod tests {
         fn root_provision(
             proposal: SystemAgentGenesisProposal,
             descriptor: &AgentDescriptor,
+            root_certification: HostHash,
         ) -> (
             RootAnchorPins,
             super::super::super::bootstrap::SystemAgentGenesisProvision,
@@ -5016,7 +5575,7 @@ mod tests {
                 HostSpaceId(descriptor.identity.space.0),
                 HostAgentId(descriptor.identity.agent.0),
                 HostHash(descriptor.authority.commitment().0),
-                HostHash([0xb2; 32]),
+                root_certification,
                 committee.clone(),
             )
             .unwrap();
@@ -5078,22 +5637,6 @@ mod tests {
                 runtime.catalog_approval.plan_commitment,
                 runtime.catalog_request.commitment()
             );
-            let create_request = ManagementRequest::Create(Box::new(runtime.descriptor.clone()));
-            let create_decision = decision(&runtime.descriptor, &create_request, 1, 0x71);
-            let authority_decision =
-                decision(&runtime.descriptor, &runtime.authority_request, 2, 0x72);
-
-            let mut receipt_signer = CountingSigner::new();
-            let mut temporary_issuer = DurableCleanManagementIssuer::open(
-                IssuerMemoryStore::default(),
-                runtime.descriptor.authority,
-                runtime.descriptor.identity.space,
-                runtime.descriptor.identity.agent,
-            )
-            .unwrap();
-            let create_receipt = temporary_issuer
-                .issue(&create_decision, &mut receipt_signer)
-                .unwrap();
             let host_authority = host_authority_binding(&runtime.descriptor);
             let trust: Arc<dyn AgentTrustProvider> = Arc::new(PhysicalTrust {
                 authority: host_authority,
@@ -5103,49 +5646,37 @@ mod tests {
                 key: node_key,
                 node,
             });
-            let (create, catalog) =
-                LocalJournalAgentDriver::<FileAgentJournalStore>::clean_shared_system_genesis_input(
-                    runtime.descriptor.clone(),
-                    &runtime.runtime,
-                    create_receipt,
-                    LOGICAL_SLOT,
-                    &trust,
-                    &merge,
-                )
-                .unwrap();
-            let replica = runtime.replicas.members()[0].replica();
-            let prepared =
-                LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_system_genesis(
-                    create,
-                    replica,
-                    &catalog,
-                    Arc::clone(&trust),
-                    Arc::clone(&merge),
-                )
-                .unwrap();
-            let locator = SystemAgentGenesisLocator {
-                space: HostSpaceId(runtime.descriptor.identity.space.0),
-                agent: HostAgentId(runtime.descriptor.identity.agent.0),
-                node,
-            };
-            let proposal = SystemAgentGenesisProposal::from_prepared(locator, &prepared).unwrap();
-            let (root, provision) = root_provision(proposal, &runtime.descriptor);
-            let plan = AuthorizedCleanSystemAgentBootstrap::new(
+            let certifier_descriptor = runtime.descriptor.clone();
+            let mut root_certifier =
+                |root_certification: Hash,
+                 proposal: &SystemAgentGenesisProposal,
+                 _catalog: &[RuntimeBlob]| {
+                    Ok(root_provision(
+                        proposal.clone(),
+                        &certifier_descriptor,
+                        HostHash(root_certification.0),
+                    )
+                    .1)
+                };
+            let mut receipt_signer = CountingSigner::new();
+            let prepared = AuthorizedCleanSystemAgentBootstrap::prepare_root_authorized(
                 runtime.descriptor,
                 runtime.runtime.exact_bytes().to_vec(),
                 runtime.replicas,
-                root,
                 LOGICAL_SLOT,
-                create_decision,
                 runtime.authority_package.exact_bytes().to_vec(),
                 runtime.authority_request,
-                authority_decision,
                 runtime.catalog_package.exact_bytes().to_vec(),
                 runtime.catalog_request,
                 runtime.catalog_call,
                 1_000_000,
+                &mut receipt_signer,
+                &mut root_certifier,
+                Arc::clone(&trust),
+                Arc::clone(&merge),
             )
             .unwrap();
+            let (plan, provision, catalog) = prepared.into_parts();
             PhysicalFixture {
                 plan,
                 provision,
@@ -5248,21 +5779,6 @@ mod tests {
             let catalog_request = install_request(agent, &catalog_package, 0xa8, None);
             let (catalog_call, _) =
                 credential_call_and_approval(&descriptor, &catalog_request, &credential_key);
-            let create_request = ManagementRequest::Create(Box::new(descriptor.clone()));
-            let create_decision = decision(&descriptor, &create_request, 1, 0xb1);
-            let authority_decision = decision(&descriptor, &authority_request, 2, 0xb2);
-
-            let mut receipt_signer = CountingSigner::new();
-            let mut temporary_issuer = DurableCleanManagementIssuer::open(
-                IssuerMemoryStore::default(),
-                descriptor.authority,
-                descriptor.identity.space,
-                descriptor.identity.agent,
-            )
-            .unwrap();
-            let create_receipt = temporary_issuer
-                .issue(&create_decision, &mut receipt_signer)
-                .unwrap();
             let host_authority = host_authority_binding(&descriptor);
             let logical_slot = Arc::new(AtomicU64::new(LOGICAL_SLOT));
             let trust: Arc<dyn AgentTrustProvider> = Arc::new(NativePhysicalTrust {
@@ -5274,48 +5790,37 @@ mod tests {
                 key: node_key,
                 node,
             });
-            let (create, catalog) =
-                LocalJournalAgentDriver::<FileAgentJournalStore>::clean_shared_system_genesis_input(
-                    descriptor.clone(),
-                    &runtime,
-                    create_receipt,
-                    LOGICAL_SLOT,
-                    &trust,
-                    &merge,
-                )
-                .unwrap();
-            let prepared =
-                LocalJournalAgentDriver::<FileAgentJournalStore>::prepare_system_genesis(
-                    create,
-                    replicas.members()[0].replica(),
-                    &catalog,
-                    Arc::clone(&trust),
-                    Arc::clone(&merge),
-                )
-                .unwrap();
-            let locator = SystemAgentGenesisLocator {
-                space: HostSpaceId(descriptor.identity.space.0),
-                agent: HostAgentId(descriptor.identity.agent.0),
-                node,
-            };
-            let proposal = SystemAgentGenesisProposal::from_prepared(locator, &prepared).unwrap();
-            let (root, provision) = root_provision(proposal, &descriptor);
-            let plan = AuthorizedCleanSystemAgentBootstrap::new(
+            let certifier_descriptor = descriptor.clone();
+            let mut root_certifier =
+                |root_certification: Hash,
+                 proposal: &SystemAgentGenesisProposal,
+                 _catalog: &[RuntimeBlob]| {
+                    Ok(root_provision(
+                        proposal.clone(),
+                        &certifier_descriptor,
+                        HostHash(root_certification.0),
+                    )
+                    .1)
+                };
+            let mut receipt_signer = CountingSigner::new();
+            let prepared = AuthorizedCleanSystemAgentBootstrap::prepare_root_authorized(
                 descriptor,
                 runtime.exact_bytes().to_vec(),
                 replicas,
-                root,
                 LOGICAL_SLOT,
-                create_decision,
                 authority_package.exact_bytes().to_vec(),
                 authority_request,
-                authority_decision,
                 catalog_package.exact_bytes().to_vec(),
                 catalog_request,
                 catalog_call,
                 10_000_000,
+                &mut receipt_signer,
+                &mut root_certifier,
+                Arc::clone(&trust),
+                Arc::clone(&merge),
             )
             .unwrap();
+            let (plan, provision, catalog) = prepared.into_parts();
             PhysicalFixture {
                 plan,
                 provision,
@@ -5587,6 +6092,48 @@ mod tests {
                 issuer,
                 signer,
                 &fixture.plan,
+                directory.host(),
+                directory.lock(),
+                fixture.plan.pins.space,
+                fixture.plan.pins.node,
+                Arc::clone(&fixture.trust),
+                Arc::clone(&fixture.merge),
+                Arc::clone(&fixture.finality),
+                provider,
+                network,
+            )
+        }
+
+        fn open_owner_with_factory<F>(
+            fixture: &PhysicalFixture,
+            directory: &TestDirectory,
+            pins: BootstrapMemoryStore,
+            record: BootstrapMemoryStore,
+            issuer: IssuerMemoryStore,
+            signer: &mut CountingSigner,
+            fresh_plan: F,
+            provider: Arc<MemoryProvider>,
+            network: Arc<Network>,
+        ) -> Result<
+            CleanSystemAgentBootstrapOwner<
+                BootstrapMemoryStore,
+                BootstrapMemoryStore,
+                IssuerMemoryStore,
+            >,
+            CleanSystemAgentBootstrapError,
+        >
+        where
+            F: FnOnce() -> Result<
+                AuthorizedCleanSystemAgentBootstrap,
+                CleanSystemAgentBootstrapError,
+            >,
+        {
+            CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_factory(
+                pins,
+                record,
+                issuer,
+                signer,
+                fresh_plan,
                 directory.host(),
                 directory.lock(),
                 fixture.plan.pins.space,
@@ -5882,6 +6429,220 @@ mod tests {
         fn physical_current_abi_shared_bootstrap_restarts_after_every_phase_without_duplicate_slots()
          {
             exercise_restart_mode(RecordFailure::AfterEveryPhase, "after-every-phase");
+        }
+
+        #[test]
+        fn clean_break_plan_roundtrips_full_requests_and_rejects_recommitted_tampering() {
+            let fixture = physical_fixture();
+            let bytes = fixture.plan.canonical_bytes();
+            assert_eq!(bytes.get(..4), Some(b"CBP3".as_slice()));
+
+            let decoded = AuthorizedCleanSystemAgentBootstrap::decode(&bytes).unwrap();
+            assert_eq!(
+                decoded.authority_request(),
+                fixture.plan.authority_request()
+            );
+            assert_eq!(decoded.catalog_request(), fixture.plan.catalog_request());
+            assert_eq!(decoded.canonical_bytes(), bytes);
+
+            let mut previous_generation = bytes;
+            previous_generation[..4].copy_from_slice(b"CBP2");
+            assert!(AuthorizedCleanSystemAgentBootstrap::decode(&previous_generation).is_err());
+
+            let authority_wire = fixture.plan.authority_request().encode().unwrap();
+            assert_eq!(
+                ManagementRequest::decode(&authority_wire).unwrap(),
+                fixture.plan.authority_request().clone()
+            );
+            let mut record = CleanSystemAgentBootstrapRecord::intent(&fixture.plan);
+            let request_offset = record
+                .plan
+                .windows(authority_wire.len())
+                .position(|window| window == authority_wire)
+                .unwrap();
+            // Keep a canonical, nonzero Install identifier but break its exact
+            // link to the already-authorized decision.
+            record.plan[request_offset + 4 + 32 + 1] ^= 1;
+            record.plan_commitment =
+                Hash::digest(b"vos/clean-system-agent-bootstrap-plan/v3", &[&record.plan]);
+            assert!(CleanSystemAgentBootstrapRecord::decode(&record.encode()).is_err());
+        }
+
+        #[test]
+        fn factory_is_called_once_for_fresh_bootstrap_and_never_on_exact_restart() {
+            let fixture = physical_fixture();
+            let directory = TestDirectory::new("factory-exact-restart");
+            let pins = BootstrapMemoryStore::default();
+            let record = BootstrapMemoryStore::default();
+            let issuer = IssuerMemoryStore::default();
+            let provider = Arc::new(MemoryProvider::new(fixture.provision.clone()));
+            let network = network(NODE_SEED);
+            let mut signer = CountingSigner::new();
+            let factory_calls = Cell::new(0_usize);
+
+            let owner = open_owner_with_factory(
+                &fixture,
+                &directory,
+                pins.clone(),
+                record.clone(),
+                issuer.clone(),
+                &mut signer,
+                || {
+                    factory_calls.set(factory_calls.get() + 1);
+                    Ok(fixture.plan.clone())
+                },
+                Arc::clone(&provider),
+                Arc::clone(&network),
+            )
+            .unwrap();
+            assert_eq!(factory_calls.get(), 1);
+            assert_eq!(signer.calls, 4);
+            drop(owner);
+
+            let reopened = open_owner_with_factory(
+                &fixture,
+                &directory,
+                pins,
+                record,
+                issuer,
+                &mut signer,
+                || {
+                    factory_calls.set(factory_calls.get() + 1);
+                    Err(rejected(
+                        CleanSystemAgentBootstrapRejection::InvalidDecision,
+                    ))
+                },
+                provider,
+                Arc::clone(&network),
+            )
+            .unwrap();
+            assert_eq!(factory_calls.get(), 1);
+            assert_eq!(signer.calls, 4, "exact restart must not sign again");
+            assert_eq!(reopened.ordered_index_for_test().unwrap(), 4);
+            drop(reopened);
+            stop_network(network);
+        }
+
+        #[test]
+        fn factory_rejects_partial_preexisting_and_tampered_state_without_fresh_material() {
+            let fixture = physical_fixture();
+            let provider = Arc::new(MemoryProvider::new(fixture.provision.clone()));
+            let network = network(NODE_SEED);
+            let mut signer = CountingSigner::new();
+            let factory_calls = Cell::new(0_usize);
+
+            let only_pins = BootstrapMemoryStore::default();
+            only_pins
+                .clone()
+                .commit(&fixture.plan.pins.encode())
+                .unwrap();
+            let directory = TestDirectory::new("factory-partial-pins");
+            assert!(matches!(
+                open_owner_with_factory(
+                    &fixture,
+                    &directory,
+                    only_pins,
+                    BootstrapMemoryStore::default(),
+                    IssuerMemoryStore::default(),
+                    &mut signer,
+                    || {
+                        factory_calls.set(factory_calls.get() + 1);
+                        Ok(fixture.plan.clone())
+                    },
+                    Arc::clone(&provider),
+                    Arc::clone(&network),
+                ),
+                Err(CleanSystemAgentBootstrapError::Rejected(
+                    CleanSystemAgentBootstrapRejection::MissingRecord
+                ))
+            ));
+
+            let only_record = BootstrapMemoryStore::default();
+            only_record
+                .clone()
+                .commit(&CleanSystemAgentBootstrapRecord::intent(&fixture.plan).encode())
+                .unwrap();
+            let directory = TestDirectory::new("factory-partial-record");
+            assert!(matches!(
+                open_owner_with_factory(
+                    &fixture,
+                    &directory,
+                    BootstrapMemoryStore::default(),
+                    only_record,
+                    IssuerMemoryStore::default(),
+                    &mut signer,
+                    || {
+                        factory_calls.set(factory_calls.get() + 1);
+                        Ok(fixture.plan.clone())
+                    },
+                    Arc::clone(&provider),
+                    Arc::clone(&network),
+                ),
+                Err(CleanSystemAgentBootstrapError::Rejected(
+                    CleanSystemAgentBootstrapRejection::MissingPins
+                ))
+            ));
+
+            let pins = BootstrapMemoryStore::default();
+            pins.clone().commit(&fixture.plan.pins.encode()).unwrap();
+            let record = BootstrapMemoryStore::default();
+            let mut tampered = CleanSystemAgentBootstrapRecord::intent(&fixture.plan);
+            let authority_wire = fixture.plan.authority_request().encode().unwrap();
+            let request_offset = tampered
+                .plan
+                .windows(authority_wire.len())
+                .position(|window| window == authority_wire)
+                .unwrap();
+            tampered.plan[request_offset + 4 + 32 + 1] ^= 1;
+            tampered.plan_commitment = Hash::digest(
+                b"vos/clean-system-agent-bootstrap-plan/v3",
+                &[&tampered.plan],
+            );
+            record.clone().commit(&tampered.encode()).unwrap();
+            let directory = TestDirectory::new("factory-tampered-record");
+            assert!(matches!(
+                open_owner_with_factory(
+                    &fixture,
+                    &directory,
+                    pins,
+                    record,
+                    IssuerMemoryStore::default(),
+                    &mut signer,
+                    || {
+                        factory_calls.set(factory_calls.get() + 1);
+                        Ok(fixture.plan.clone())
+                    },
+                    Arc::clone(&provider),
+                    Arc::clone(&network),
+                ),
+                Err(CleanSystemAgentBootstrapError::Rejected(
+                    CleanSystemAgentBootstrapRejection::InvalidRecord
+                ))
+            ));
+
+            let directory = TestDirectory::new("factory-preexisting-host");
+            std::fs::create_dir(directory.host()).unwrap();
+            assert!(matches!(
+                open_owner_with_factory(
+                    &fixture,
+                    &directory,
+                    BootstrapMemoryStore::default(),
+                    BootstrapMemoryStore::default(),
+                    IssuerMemoryStore::default(),
+                    &mut signer,
+                    || {
+                        factory_calls.set(factory_calls.get() + 1);
+                        Ok(fixture.plan.clone())
+                    },
+                    provider,
+                    Arc::clone(&network),
+                ),
+                Err(CleanSystemAgentBootstrapError::Rejected(
+                    CleanSystemAgentBootstrapRejection::PreexistingHost
+                ))
+            ));
+            assert_eq!(factory_calls.get(), 0);
+            stop_network(network);
         }
 
         #[test]

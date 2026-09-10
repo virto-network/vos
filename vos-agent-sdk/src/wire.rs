@@ -86,6 +86,15 @@ pub const MAX_PRIVATE_RUNTIME_CONTROL_WIRE_BYTES: usize = HEADER_BYTES
 /// may contain the canonical constructor argument preimage.
 pub const MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES: usize =
     HEADER_BYTES + crate::MAX_INSTALLATION_DATA_BYTES + 4 * MAX_ACTOR_ENTRY_WIRE_BYTES;
+/// One complete, nonrecursive management request. `PrivateControl` is the
+/// largest admitted shape because it frames both bounded canonical PCTL and
+/// private-runtime mutation values.
+pub const MAX_MANAGEMENT_REQUEST_WIRE_BYTES: usize = HEADER_BYTES
+    + 1
+    + 4
+    + MAX_PRIVATE_RUNTIME_CONTROL_WIRE_BYTES
+    + 4
+    + MAX_PRIVATE_RUNTIME_MUTATION_WIRE_BYTES;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WireError {
@@ -3318,6 +3327,23 @@ fn decode_management_request(decoder: &mut Decoder<'_>) -> Result<ManagementRequ
         .ok_or(DecodeError::NonCanonical)
 }
 
+impl CanonicalWire for ManagementRequest {
+    const MAGIC: [u8; 4] = *b"AMRQ";
+    const MAX_ENCODED_BYTES: usize = MAX_MANAGEMENT_REQUEST_WIRE_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        management_request_valid(self)
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encode_management_request(encoder, self);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        decode_management_request(decoder)
+    }
+}
+
 pub(crate) fn management_request_commitment(value: &ManagementRequest) -> Hash {
     if let ManagementRequest::PrivateControl { control, .. } = value {
         return control.commitment();
@@ -6163,6 +6189,15 @@ mod tests {
         };
         let with_data = ManagementRequest::Install(alloc::boxed::Box::new(install.clone()));
         assert!(management_request_valid(&with_data));
+        let standalone = with_data.encode().unwrap();
+        assert!(standalone.len() <= MAX_MANAGEMENT_REQUEST_WIRE_BYTES);
+        assert_eq!(
+            ManagementRequest::decode(&standalone),
+            Ok(with_data.clone())
+        );
+        let mut trailing = standalone;
+        trailing.push(0);
+        assert!(ManagementRequest::decode(&trailing).is_err());
 
         let mut without_data = install.clone();
         without_data.entry.installation_data = None;
