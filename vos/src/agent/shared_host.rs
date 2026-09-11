@@ -1354,6 +1354,19 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
+    pub(crate) fn prepare_bootstrap_invocation(
+        &self,
+        agent: AgentId,
+        request: super::shared_journal_driver::CleanInvocationReplayRequest,
+    ) -> Result<super::shared_journal_driver::PreparedCleanOrdered, SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .prepare_bootstrap_invocation(request)
+            .map_err(map_driver_error)
+    }
+
     pub(crate) fn prepare_reserved_projection_operation(
         &self,
         agent: AgentId,
@@ -2178,6 +2191,7 @@ fn map_provision_verification_error(
 }
 
 fn map_driver_error(error: SharedJournalDriverError) -> SharedAgentHostError {
+    tracing::warn!(?error, "Shared journal operation failed");
     match error {
         SharedJournalDriverError::Ledger(error) => map_ledger_error(error),
         SharedJournalDriverError::Artifact(error) => map_artifact_error(error),

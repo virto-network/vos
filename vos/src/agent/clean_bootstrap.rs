@@ -598,7 +598,10 @@ impl AuthorizedCleanSystemAgentBootstrap {
     }
 
     fn validate(&self) -> Result<(), CleanSystemAgentBootstrapRejection> {
-        if !self.pins.is_valid() || self.invocation_gas == 0 {
+        if !self.pins.is_valid()
+            || self.invocation_gas == 0
+            || self.invocation_gas > super::execution::MAX_EXECUTION_GAS
+        {
             return Err(CleanSystemAgentBootstrapRejection::InvalidDescriptor);
         }
         let runtime = self.runtime()?;
@@ -785,6 +788,7 @@ fn validate_root_bootstrap_materials(
     };
     if observed_slot == 0
         || invocation_gas == 0
+        || invocation_gas > super::execution::MAX_EXECUTION_GAS
         || descriptor.validate().is_err()
         || descriptor.identity.profile != AgentProfile::Shared
         || descriptor_replica.role != super::sdk::ReplicaRole::Voter
@@ -2838,19 +2842,34 @@ fn apply_actor_install(
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 fn invocation_availability(
     install: &super::sdk::InstallActor,
+    package: &AdmittedActorPackage,
 ) -> Result<Vec<super::sdk::RuntimeBlob>, CleanSystemAgentBootstrapError> {
+    let mut blobs = [
+        package.program_bytes(),
+        package.state_lane_schema_bytes(),
+        package.method_policy_bytes(),
+    ]
+    .into_iter()
+    .map(|bytes| super::sdk::RuntimeBlob {
+        reference: BlobRef::of_bytes(bytes),
+        bytes: bytes.to_vec(),
+    })
+    .collect::<Vec<_>>();
     match (&install.entry.installation_data, &install.installation_data) {
-        (None, None) => Ok(Vec::new()),
+        (None, None) => {}
         (Some(expected), Some(data))
             if expected == &data.reference && expected.matches(&data.bytes) =>
         {
-            Ok(vec![super::sdk::RuntimeBlob {
+            blobs.push(super::sdk::RuntimeBlob {
                 reference: data.reference.clone(),
                 bytes: data.bytes.clone(),
-            }])
+            });
         }
-        _ => Err(rejected(CleanSystemAgentBootstrapRejection::WrongOutcome)),
+        _ => return Err(rejected(CleanSystemAgentBootstrapRejection::WrongOutcome)),
     }
+    blobs.sort_unstable_by(|left, right| left.reference.cmp(&right.reference));
+    blobs.dedup_by(|left, right| left.reference == right.reference);
+    Ok(blobs)
 }
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
@@ -2880,7 +2899,10 @@ fn invoke_actor(
         roles: super::sdk::InvocationRoleClaims::none(),
         message,
         installation_data: actor.entry.installation_data.clone(),
-        availability: invocation_availability(install)?,
+        availability: invocation_availability(
+            install,
+            &plan.authority_package().map_err(rejected)?,
+        )?,
         gas: plan.invocation_gas,
         recovery_only: false,
     };
@@ -2894,13 +2916,19 @@ fn invoke_actor(
         super::sdk::PublicPreflight::for_work(&work, plan.pins.observed_slot),
     );
     let submission = network_host
-        .invoke_clean(
+        .invoke_bootstrap(
             crate::service::AgentId(plan.pins.agent.0),
             work.clone(),
             authorization,
         )
         .map_err(CleanSystemAgentBootstrapError::Host)?;
     let super::sdk::RuntimeOutcome::Completed(Ok(reply)) = submission.outcome else {
+        match &submission.outcome {
+            super::sdk::RuntimeOutcome::Completed(Err(error)) => {
+                tracing::warn!(?error, "system bootstrap invocation failed");
+            }
+            _ => tracing::warn!("system bootstrap invocation did not complete"),
+        }
         return Err(rejected(CleanSystemAgentBootstrapRejection::WrongOutcome));
     };
     if reply.invocation != work.invocation
@@ -2956,10 +2984,17 @@ fn invoke_authorize(
         ),
     )?;
     let crate::actors::value::Value::Bytes(bytes) = value else {
+        tracing::warn!("system bootstrap authorization returned a non-bytes reply");
         return Err(rejected(CleanSystemAgentBootstrapRejection::WrongOutcome));
     };
-    let approval = ManagementApproval::decode(&bytes)
-        .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::WrongOutcome))?;
+    let approval = ManagementApproval::decode(&bytes).map_err(|error| {
+        tracing::warn!(
+            ?error,
+            reply_len = bytes.len(),
+            "system bootstrap authorization returned no valid approval"
+        );
+        rejected(CleanSystemAgentBootstrapRejection::WrongOutcome)
+    })?;
     validate_approval(plan, &approval)?;
     Ok(approval)
 }
@@ -3506,11 +3541,16 @@ mod tests {
 
         struct PhysicalTrust {
             authority: super::super::super::authority::AgentAuthorityBinding,
+            logical_slot: Option<Arc<AtomicU64>>,
         }
 
         impl AgentTrustProvider for PhysicalTrust {
             fn current_logical_slot(&self) -> Option<u64> {
-                Some(LOGICAL_SLOT)
+                Some(
+                    self.logical_slot
+                        .as_ref()
+                        .map_or(LOGICAL_SLOT, |slot| slot.load(Ordering::Acquire)),
+                )
             }
 
             fn authority_for_space(
@@ -5105,7 +5145,26 @@ mod tests {
             origin: InvocationOrigin,
             message: Vec<u8>,
             installation_data: &InstallationData,
+            package: &AdmittedActorPackage,
         ) -> InvocationWork {
+            let mut availability = vec![crate::agent::sdk::RuntimeBlob {
+                reference: installation_data.reference.clone(),
+                bytes: installation_data.bytes.clone(),
+            }];
+            availability.extend(
+                [
+                    package.program_bytes(),
+                    package.state_lane_schema_bytes(),
+                    package.method_policy_bytes(),
+                ]
+                .into_iter()
+                .map(|bytes| crate::agent::sdk::RuntimeBlob {
+                    reference: BlobRef::of_bytes(bytes),
+                    bytes: bytes.to_vec(),
+                }),
+            );
+            availability.sort_unstable_by(|left, right| left.reference.cmp(&right.reference));
+            availability.dedup_by(|left, right| left.reference == right.reference);
             InvocationWork {
                 space: descriptor.identity.space,
                 agent: descriptor.identity.agent,
@@ -5120,10 +5179,7 @@ mod tests {
                 roles: InvocationRoleClaims::none(),
                 message,
                 installation_data: record.entry.installation_data.clone(),
-                availability: vec![crate::agent::sdk::RuntimeBlob {
-                    reference: installation_data.reference.clone(),
-                    bytes: installation_data.bytes.clone(),
-                }],
+                availability,
                 gas: 1_000_000,
                 recovery_only: false,
             }
@@ -5396,6 +5452,7 @@ mod tests {
                     crate::actors::value::Value::Bytes(placeholder_call.encode().unwrap()),
                 ),
                 placeholder_data,
+                &authority_package,
             );
             let mut authorize = invoke_case(
                 authority_state.clone(),
@@ -5448,6 +5505,7 @@ mod tests {
                     crate::actors::value::Value::Bytes(acknowledgement.encode().unwrap()),
                 ),
                 placeholder_data,
+                &authority_package,
             );
             let mut finalize = invoke_case(
                 catalog_state.clone(),
@@ -5473,8 +5531,54 @@ mod tests {
                 finalize,
                 inspect_case(&finalized_state, &catalog_page),
             ];
-            let runtime =
-                admitted_scripted_runtime_for_test("system-bootstrap-current-abi", 0x64, cases);
+            // The scripted guest copies installation bytes at a fixed offset.
+            // Keep their position in sorted availability stable when replacing
+            // the placeholder runtime identity with the signed fixture identity.
+            let data_rank = |reference: &BlobRef| {
+                [
+                    authority_package.program_bytes(),
+                    authority_package.state_lane_schema_bytes(),
+                    authority_package.method_policy_bytes(),
+                ]
+                .into_iter()
+                .filter(|bytes| BlobRef::of_bytes(bytes) < *reference)
+                .count()
+            };
+            let placeholder_rank = data_rank(&placeholder_data.reference);
+            let runtime = (1..=u8::MAX)
+                .find_map(|seed| {
+                    let copied_cases = cases
+                        .iter()
+                        .map(|case| ScriptedRuntimeCase {
+                            input: case.input.clone(),
+                            output: case.output.clone(),
+                            copies: case
+                                .copies
+                                .iter()
+                                .map(|copy| ScriptedRuntimeCopy {
+                                    input_offset: copy.input_offset,
+                                    output_offset: copy.output_offset,
+                                    len: copy.len,
+                                })
+                                .collect(),
+                        })
+                        .collect();
+                    let candidate = admitted_scripted_runtime_for_test(
+                        "system-bootstrap-current-abi",
+                        seed,
+                        copied_cases,
+                    );
+                    let candidate_descriptor =
+                        descriptor(&candidate, space, agent, owner, nonce, &member, authority);
+                    let (_, approval) = credential_call_and_approval(
+                        &candidate_descriptor,
+                        &catalog_request,
+                        &credential_key,
+                    );
+                    (data_rank(&BlobRef::of_bytes(&approval_value(&approval))) == placeholder_rank)
+                        .then_some(candidate)
+                })
+                .expect("fixture signer preserving sorted installation-data position");
             let descriptor = descriptor(&runtime, space, agent, owner, nonce, &member, authority);
             let (catalog_call, catalog_approval) =
                 credential_call_and_approval(&descriptor, &catalog_request, &credential_key);
@@ -5640,6 +5744,7 @@ mod tests {
             let host_authority = host_authority_binding(&runtime.descriptor);
             let trust: Arc<dyn AgentTrustProvider> = Arc::new(PhysicalTrust {
                 authority: host_authority,
+                logical_slot: None,
             });
             let (node_key, _, _, node) = node_material();
             let merge: Arc<dyn LocalMergeAuthenticator> = Arc::new(SigningMerge {
@@ -6301,7 +6406,12 @@ mod tests {
         }
 
         fn exercise_restart_mode(failure: RecordFailure, label: &str) {
-            let fixture = physical_fixture();
+            let mut fixture = physical_fixture();
+            let clock = Arc::new(AtomicU64::new(LOGICAL_SLOT));
+            fixture.trust = Arc::new(PhysicalTrust {
+                authority: host_authority_binding(&fixture.plan.pins.descriptor),
+                logical_slot: Some(Arc::clone(&clock)),
+            });
             let directory = TestDirectory::new(label);
             let pins = BootstrapMemoryStore::default();
             let record = BootstrapMemoryStore::with_failure(failure);
@@ -6323,7 +6433,9 @@ mod tests {
                     Arc::clone(&network),
                 ) {
                     Ok(owner) => break owner,
-                    Err(CleanSystemAgentBootstrapError::RecordStorage) => {}
+                    Err(CleanSystemAgentBootstrapError::RecordStorage) => {
+                        clock.fetch_add(1, Ordering::AcqRel);
+                    }
                     Err(error) => {
                         let phase = record
                             .image()
@@ -6338,6 +6450,66 @@ mod tests {
                 }
             };
             assert_eq!(owner.ordered_index_for_test().unwrap(), 4);
+            // Inspect a fresh proposal without applying it: preflight and
+            // journal observation must use one current slot, not genesis time.
+            let actor =
+                ensure_actor_installed(&owner.host, &fixture.plan, &fixture.plan.authority_request)
+                    .unwrap();
+            let install = super::super::install_request(&fixture.plan.authority_request).unwrap();
+            let package = fixture.plan.authority_package().unwrap();
+            let probe = invocation_work(
+                &fixture.plan.pins.descriptor,
+                &actor,
+                InvocationId([0xfd; 32]),
+                InvocationOrigin::anonymous(),
+                vec![1],
+                install.installation_data.as_ref().unwrap(),
+                &package,
+            );
+            let prepared = owner
+                .host
+                .lock()
+                .unwrap()
+                .prepare_bootstrap_invocation(
+                    crate::service::AgentId(fixture.plan.pins.agent.0),
+                    crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Invoke {
+                        context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                        authorization: InvocationAuthorization::PublicPreflight(
+                            crate::agent_sdk::PublicPreflight::for_work(&probe, LOGICAL_SLOT),
+                        ),
+                        work: probe.clone(),
+                    },
+                )
+                .unwrap();
+            let crate::agent::shared_journal_driver::PreparedCleanOrdered::Proposal {
+                payload, ..
+            } = prepared
+            else {
+                panic!("fresh probe must propose")
+            };
+            let crate::agent::shared_raft::AgentRaftCommand::Ordered { entry, .. } =
+                crate::agent::shared_raft::AgentRaftCommand::decode(&payload).unwrap()
+            else {
+                panic!("expected ordered probe")
+            };
+            let crate::agent::journal::ReplayOperation::CleanInvoke {
+                work,
+                authorization,
+                observed_slot,
+                ..
+            } = entry.input.operation
+            else {
+                panic!("expected invocation")
+            };
+            assert_eq!(work, probe);
+            assert_eq!(observed_slot, clock.load(Ordering::Acquire));
+            assert!(observed_slot > LOGICAL_SLOT);
+            assert_eq!(
+                authorization,
+                InvocationAuthorization::PublicPreflight(
+                    crate::agent_sdk::PublicPreflight::for_work(&probe, observed_slot)
+                )
+            );
             assert_eq!(owner.issuer_sequence_high_water(), 3);
             assert_eq!(owner.issuer_acknowledged_through(), 3);
             assert_eq!(signer.calls, 4);
@@ -6432,8 +6604,44 @@ mod tests {
         }
 
         #[test]
+        fn bootstrap_invocations_carry_the_executable_authority_closure() {
+            let fixture = runtime_fixture();
+            let install = super::super::install_request(&fixture.authority_request).unwrap();
+            let blobs = invocation_availability(install, &fixture.authority_package).unwrap();
+            for bytes in [
+                fixture.authority_package.program_bytes(),
+                fixture.authority_package.state_lane_schema_bytes(),
+                fixture.authority_package.method_policy_bytes(),
+                install.installation_data.as_ref().unwrap().bytes.as_slice(),
+            ] {
+                assert_eq!(
+                    blobs
+                        .iter()
+                        .filter(|blob| blob.reference.matches(bytes))
+                        .count(),
+                    1
+                );
+            }
+            assert!(
+                blobs
+                    .windows(2)
+                    .all(|pair| pair[0].reference < pair[1].reference)
+            );
+            let mut invalid = install.clone();
+            invalid.installation_data.as_mut().unwrap().bytes.push(0);
+            assert!(invocation_availability(&invalid, &fixture.authority_package).is_err());
+        }
+
+        #[test]
         fn clean_break_plan_roundtrips_full_requests_and_rejects_recommitted_tampering() {
             let fixture = physical_fixture();
+            let mut excessive_gas = fixture.plan.clone();
+            excessive_gas.invocation_gas = crate::agent::execution::MAX_EXECUTION_GAS + 1;
+            assert!(excessive_gas.validate().is_err());
+            assert!(
+                AuthorizedCleanSystemAgentBootstrap::decode(&excessive_gas.canonical_bytes())
+                    .is_err()
+            );
             let bytes = fixture.plan.canonical_bytes();
             assert_eq!(bytes.get(..4), Some(b"CBP3".as_slice()));
 

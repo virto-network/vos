@@ -44,7 +44,8 @@ pub(crate) const STANDARD_INVOKE_GAS_OVERHEAD: u64 = DEFAULT_MANAGEMENT_GAS;
 ///
 /// Resume carries no fresh caller gas field, so the clean runtime contract
 /// reserves the maximum inner execution budget in addition to management
-/// overhead. This equals `2_000_000_000` for the current v21 contract.
+/// overhead. The current host allowance is `6_000_000_000`; the inner actor
+/// execution cap remains `1_000_000_000`.
 pub(crate) const STANDARD_RESUME_GAS_LIMIT: u64 =
     DEFAULT_MANAGEMENT_GAS.saturating_add(MAX_EXECUTION_GAS);
 

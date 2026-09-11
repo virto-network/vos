@@ -3011,6 +3011,11 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         let invocation = RefineContext::load(runtime_pvm, input, gas)
             .map_err(|_| LocalReplayExecutorError::RuntimeOutput)?
             .run();
+        tracing::debug!(
+            gas_limit = gas,
+            gas_used = invocation.gas_used,
+            "physical Agent runtime execution"
+        );
         if invocation.exit != ExitReason::Halt {
             return Err(LocalReplayExecutorError::RuntimeExit {
                 reason: invocation.exit,

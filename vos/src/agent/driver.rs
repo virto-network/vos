@@ -33,7 +33,10 @@ use super::{
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 use crate::service::{ActorId, BlobRef, CapabilityId, DeploymentId, Hash, ProgramId};
 
-pub const DEFAULT_MANAGEMENT_GAS: Gas = 1_000_000_000;
+/// Bounded outer-runtime allowance, separate from an actor's instruction cap.
+/// The bundled Authority's signed authorization path exceeds the former
+/// one-billion overhead when executed through the physical runtime.
+pub const DEFAULT_MANAGEMENT_GAS: Gas = 5_000_000_000;
 const MAX_STORED_PACKAGE_BYTES: usize = if super::package::MAX_ENCODED_PACKAGE_BYTES
     > crate::agent_sdk::package::MAX_PACKAGE_ENCODED_BYTES
 {

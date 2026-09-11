@@ -76,6 +76,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             s.registry_label, s.entry.registry_hash,
         );
         println!("  peer_id      = {}", s.peer_id);
+        println!(
+            "  config       = {}",
+            super::local_config::path(std::path::Path::new(&s.entry.data_dir)).display()
+        );
+        println!("  ingress      = HTTP 127.0.0.1:8080, SSH 127.0.0.1:2222 (on startup)");
+        println!("  bundled packages prepared; system installation runs during space up");
+        println!("  edit local.toml for other ports or non-local access");
         println!();
         println!("next: `vosx space up {} [--listen <multiaddr>]`", args.name);
         println!("the bootnode hint <space_id>@<multiaddr>/p2p/<peer_id> is");
@@ -153,6 +160,11 @@ pub(crate) fn scaffold(
     //    signing root. No signed mutation can precede the space-id anchor,
     //    whose value is necessarily derived from this sequence-zero node.
     let operator_kp = crate::identity::load_or_create()?;
+    crate::bundled::prepare_system_packages(&operator_kp)?;
+    super::local_config::save(
+        &temp_dir,
+        &super::local_config::LocalConfig::for_new_space(),
+    )?;
     let operator_peer_id = libp2p::PeerId::from(operator_kp.public()).to_bytes();
     let reg = RegistryRef::at(ServiceId::REGISTRY);
 

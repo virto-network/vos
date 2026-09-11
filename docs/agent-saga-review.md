@@ -195,3 +195,74 @@ security fixes, protocol-generation bumps, and repins bisectable. Advance a
 review branch only after its base and head are immutable, all named tests run
 with a nonzero count, `git diff --check` is clean, and generated artifacts are
 absent or isolated in their own reproducibility-reviewed commit.
+
+### Chapter 08 first-start acceptance
+
+The new-space UX belongs to the native startup batch in Chapter 08. It does
+not introduce another review endpoint. Before advancing `saga/agents`, verify:
+
+1. `space new` prepares the root-signed bundled runtime and system actor
+   artifacts and writes `local.toml` with HTTP and SSH ingress enabled.
+   Default listeners are `127.0.0.1:8080` and `127.0.0.1:2222`; operators can
+   edit the addresses for multiple spaces or remote access.
+2. The first `space up` automatically finishes durable system Agent,
+   Authority, and Catalog installation before reporting readiness and
+   serving ingress. Cached packages alone do not satisfy this requirement.
+3. A subsequent restart reopens the same installed system actors without
+   duplicate installation or manual bootstrap commands. Verify this and
+   actual HTTP/SSH listener availability on a host that permits sockets.
+
+Creating an arbitrary application Agent is a later user action on the running
+space, not a required action of `space new` or `space up`. This distinction
+does not waive the saga's existing Agent lifecycle or finality release gates.
+
+Current checkpoint (2026-09-11): configuration and bundled-package compatibility
+tests pass. Bootstrap now supplies Authority program/schema/policy blobs in
+addition to installation data. Its internal admission path samples the trusted
+clock for a new invocation and recovers exact authorization from the journal
+on retry. Both crash-before/after-every-phase tests pass with an advancing
+clock and no duplicate slots. The bootstrap suite excluding inventory passes
+12 tests. The 152 vosx tests, six gas/budget tests, and the physical Refine
+proof/replay regression also pass. The large inventory/release gates have not
+been rerun here.
+
+The original real-artifact failure was `Replay(Executor(RuntimeExit { reason: OutOfGas,
+pc: 440679 }))`, surfaced by the host as `CorruptResidue`, during Catalog
+authorization with a 2-billion outer allowance. The bounded outer-runtime
+allowance is now 5 billion plus the actor's unchanged maximum of 1 billion;
+bootstrap explicitly selects the actor cap, not the outer allowance. Fresh
+physical bootstrap reached durable `Complete`, with Authority and Catalog
+installed and finalized. Measured authorization/finalization executions used
+about 1.78–1.80 billion outer gas. A development build without interpreter
+optimization timed out during production-route reconciliation, after system
+bootstrap completed. Development/test profiles now optimize the interpreter
+without disabling debug assertions or changing guest artifacts or gas accounting.
+The optimized recovery attempt also exceeded the roughly 12-minute smoke
+limit during production reconciliation. It continued executing authenticated
+queries/replay but never reported `Space daemon ready`; the harness stopped
+its disposable daemon and retained the data. HTTP/SSH probes and the subsequent
+normal restart were therefore not reached. This is not deployment readiness.
+
+The release batch must include the changed host/proof gas allowance in its
+reproducibility and compatibility review. A separate custom-runtime host test
+also failed in `supervisor_invocation_material` with `CorruptResidue`, before
+the new admission check; its opaque-runtime material lookup needs triage.
+
+Retained disposable evidence in the native worktree:
+
+- `target/task-tmp/native-admission-restart.log`: underlying runtime failure.
+- `target/native-admission-smoke`: interrupted space, config and blob cache.
+- `target/task-tmp/bootstrap-focused-suite.log`: 12 passing bootstrap tests.
+- `target/task-tmp/bootstrap-restart-clock-test.log`: advancing-clock crash tests.
+- `target/task-tmp/native-ready-first.log`: completed real system bootstrap;
+  unoptimized production reconciliation timed out.
+- `target/task-tmp/native-ready-recovered.log`: optimized recovery also timed
+  out during reconciliation; no listener-readiness claim.
+- `target/task-tmp/physical-proof-budget-test.log`: passing physical proof test.
+
+Next startup acceptance steps: profile repeated physical replay/inspection in
+the production inventory/projection path and finish reconciliation without
+weakening authenticated admission or recovery checks. Then verify HTTP/SSH
+listeners and restart the same space without duplicate system installations.
+Keep the ordinary-Agent finality
+adapter and other existing Chapter 08 release gates in the original wrap-up.

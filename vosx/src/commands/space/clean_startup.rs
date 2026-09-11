@@ -20,7 +20,7 @@ use vos::agent::bootstrap::SystemAgentGenesisProvider;
 use vos::agent::clean_bootstrap::{
     AuthorizedCleanSystemAgentBootstrap, CleanSystemAgentBootstrapOwner,
 };
-use vos::agent::driver::{AgentTrustProvider, DEFAULT_MANAGEMENT_GAS};
+use vos::agent::driver::AgentTrustProvider;
 use vos::agent::genesis::{
     AgentGenesisFinalityError, AgentGenesisFinalityVerifier, AgentReplicaCommittee,
     AgentReplicaMember, derive_replica_raft_slot,
@@ -344,7 +344,7 @@ pub(crate) fn start_clean_system_agent(
             catalog_package.exact_bytes().to_vec(),
             catalog_request,
             catalog_call,
-            DEFAULT_MANAGEMENT_GAS,
+            vos::agent::execution::MAX_EXECUTION_GAS,
             &mut planning_signer,
             &mut root_certifier,
             plan_trust,

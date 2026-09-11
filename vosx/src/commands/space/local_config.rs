@@ -25,6 +25,31 @@ pub struct LocalConfig {
     pub extensions: Vec<ExtensionLocal>,
 }
 
+impl LocalConfig {
+    /// Explicit defaults for newly created spaces; existing spaces keep their config.
+    pub fn for_new_space() -> Self {
+        Self {
+            listen: vec!["/ip4/127.0.0.1/tcp/0".into()],
+            ingress: IngressLocal {
+                http: vec![HttpIngressLocal {
+                    name: "http".into(),
+                    listen: "127.0.0.1:8080".into(),
+                    tls_cert: None,
+                    tls_key: None,
+                    max_connections: default_http_max_connections(),
+                }],
+                ssh: vec![SshIngressLocal {
+                    name: "ssh".into(),
+                    listen: "127.0.0.1:2222".into(),
+                    max_connections: default_ssh_max_connections(),
+                    max_sessions_per_member: default_ssh_max_sessions_per_member(),
+                }],
+            },
+            extensions: Vec::new(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct IngressLocal {
@@ -124,6 +149,16 @@ pub fn save(data_dir: &Path, config: &LocalConfig) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_space_listeners_roundtrip_without_changing_missing_config_defaults() {
+        let config = LocalConfig::for_new_space();
+        let encoded = toml::to_string_pretty(&config).unwrap();
+        assert_eq!(toml::from_str::<LocalConfig>(&encoded).unwrap(), config);
+        assert_eq!(config.ingress.http[0].listen, "127.0.0.1:8080");
+        assert_eq!(config.ingress.ssh[0].listen, "127.0.0.1:2222");
+        assert!(LocalConfig::default().ingress.is_empty());
+    }
 
     #[test]
     fn rejects_retired_agent_policy_fields() {

@@ -1016,7 +1016,7 @@ impl SharedRouteHandler {
         request: crate::agent::shared_journal_driver::CleanInvocationReplayRequest,
         terminal_only: bool,
     ) -> Result<CleanOrderedSubmission, SharedAgentHostError> {
-        self.submit_clean_ordered_operation_with_admission(request, terminal_only, None)
+        self.submit_clean_ordered_operation_with_admission(request, terminal_only, None, false)
     }
 
     fn submit_reserved_clean_ordered_operation(
@@ -1025,7 +1025,7 @@ impl SharedRouteHandler {
         terminal_only: bool,
     ) -> Result<CleanOrderedSubmission, SharedAgentHostError> {
         let key = ProjectionPairKey::new(request.work(), request.authorization());
-        self.submit_clean_ordered_operation_with_admission(request, terminal_only, Some(key))
+        self.submit_clean_ordered_operation_with_admission(request, terminal_only, Some(key), false)
     }
 
     fn submit_clean_ordered_operation_with_admission(
@@ -1033,6 +1033,7 @@ impl SharedRouteHandler {
         request: crate::agent::shared_journal_driver::CleanInvocationReplayRequest,
         terminal_only: bool,
         reservation: Option<ProjectionPairKey>,
+        bootstrap: bool,
     ) -> Result<CleanOrderedSubmission, SharedAgentHostError> {
         let proposal = self
             .proposal
@@ -1056,7 +1057,9 @@ impl SharedRouteHandler {
                 .lock()
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
             drain_committed(&mut host, self.agent, &self.ordered_replies)?;
-            let prepared = if reservation.is_some() {
+            let prepared = if bootstrap {
+                host.prepare_bootstrap_invocation(self.agent, request)?
+            } else if reservation.is_some() {
                 host.prepare_reserved_projection_operation(self.agent, request, terminal_only)?
             } else if terminal_only {
                 host.prepare_terminal_clean_ordered_operation(self.agent, request)?
@@ -3074,6 +3077,35 @@ impl SharedAgentNetworkHost {
         attached
             .coordinator
             .submit_clean_ordered(work, authorization)
+    }
+
+    /// Internal root bootstrap only; ordinary routed calls retain their exact
+    /// caller-supplied authorization and use `invoke_clean`.
+    pub(crate) fn invoke_bootstrap(
+        &self,
+        agent: crate::service::AgentId,
+        work: crate::agent_sdk::InvocationWork,
+        authorization: crate::agent_sdk::InvocationAuthorization,
+    ) -> Result<CleanOrderedSubmission, SharedAgentHostError> {
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        if attached.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        attached
+            .coordinator
+            .submit_clean_ordered_operation_with_admission(
+                crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Invoke {
+                    context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                    work,
+                    authorization,
+                },
+                false,
+                None,
+                true,
+            )
     }
 
     fn invoke_clean_operation(

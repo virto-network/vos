@@ -35,6 +35,33 @@ const BUNDLED_SYSTEM_CATALOG_PACKAGE: &[u8] =
     include_bytes!(env!("VOSX_BUNDLED_SYSTEM_CATALOG_PACKAGE"));
 const BUNDLED_AGENT_RUNTIME_PACKAGE_NAME: &str = "standard-agent-runtime";
 
+/// Prepare the complete, root-signed package closure used by native bootstrap.
+/// Caching is availability only: installation still requires Authority approval.
+pub(crate) fn prepare_system_packages(root: &Keypair) -> anyhow::Result<()> {
+    let runtime = root_signed_agent_runtime_package(root)?;
+    let authority = root_signed_actor_package(
+        system_authority_package_template(),
+        "system-authority",
+        root,
+    )?;
+    let catalog =
+        root_signed_actor_package(system_catalog_package_template(), "system-catalog", root)?;
+    authority.require_runtime(vos::agent::sdk::AgentProfile::Shared, &runtime)?;
+    catalog.require_runtime(vos::agent::sdk::AgentProfile::Shared, &runtime)?;
+    for bytes in [
+        runtime.exact_bytes(),
+        authority.exact_bytes(),
+        catalog.exact_bytes(),
+    ] {
+        let envelope = PackageEnvelope::decode(bytes)?;
+        for artifact in envelope.artifacts {
+            crate::blob_store::cache_put(&artifact.bytes)?;
+        }
+        crate::blob_store::cache_put(bytes)?;
+    }
+    Ok(())
+}
+
 /// Returns the bundled space-registry ELF bytes, or `None` if
 /// vosx was built without the actor pre-built.
 pub fn registry_elf() -> Option<&'static [u8]> {
@@ -197,6 +224,28 @@ mod tests {
 
     fn space_root() -> Keypair {
         Keypair::ed25519_from_bytes(SPACE_ROOT_SEED).expect("valid Ed25519 fixture seed")
+    }
+
+    #[test]
+    fn bundled_system_actors_match_new_space_runtime() {
+        let root = space_root();
+        let runtime = root_signed_agent_runtime_package(&root).unwrap();
+        for (name, template) in [
+            ("system-authority", system_authority_package_template()),
+            ("system-catalog", system_catalog_package_template()),
+        ] {
+            let actor = root_signed_actor_package(template, name, &root).unwrap();
+            actor
+                .require_runtime(vos::agent::sdk::AgentProfile::Shared, &runtime)
+                .unwrap();
+            assert_eq!(actor.producer(), runtime.producer());
+            assert_eq!(
+                actor.exact_bytes(),
+                root_signed_actor_package(template, name, &root)
+                    .unwrap()
+                    .exact_bytes()
+            );
+        }
     }
 
     #[test]
