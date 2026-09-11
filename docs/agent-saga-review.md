@@ -313,7 +313,7 @@ The verified r14 native-startup checkpoint remains `f212f278` on
 `saga/ch08-c2-native`. The follow-up source correction is isolated on
 `wip/ch08-runtime-directory`; this is internal work in the existing startup
 and artifact batches, not another review endpoint. Do not deploy this worktree
-with its still-r14 bundled programs.
+until its system templates and first-start/restart gates have also been updated.
 
 The physical custom-runtime host regression reproduced `CorruptResidue` because
 Shared invocation preparation decoded Standard-private state to recover install
@@ -343,13 +343,17 @@ or zero lineage, and reject the previous ABI. Verification on this source:
 
 The candidate is 935415 bytes, ProgramId
 `6bcc6da44743202942746bfede64db263bbca704fc11c6d2e8f783bfa55c1df0`.
-It has NOT replaced a release artifact or passed checkout-independent
-reproducibility. Evidence lives under the native worktree's disk-backed
+Its ELF reproduced byte-for-byte from an independent immutable export of
+`78434a4f2d213badf1769f8ba4ec5d251d617a0d`; the runtime blob and digest pins
+are now updated in this isolated worktree. All four active bundled-runtime
+integration tests pass (one explicit candidate test remains ignored by default).
+This is not yet a complete release-artifact reproduction gate. Evidence lives
+under the native worktree's disk-backed
 `target/task-tmp/r15-*.log`; the candidate is
 `target/task-tmp/r15-agent-runtime-candidate.pvm`, and its ELF is under
 `target/r15-guest/riscv64em-vos/release/agent_runtime.elf`.
 
-Next: reproduce and repin the r15 runtime, rebuild the system package templates
+Next: rebuild and independently reproduce the system package templates
 and custom-runtime example with current ABI tooling, then rerun physical,
 proof, bootstrap, and real first-start/restart gates before integrating this
 work into the native startup branch. The old r14 CLI correctly rejects the r15

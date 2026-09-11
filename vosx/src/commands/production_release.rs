@@ -28,6 +28,15 @@ const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Subcommand)]
 pub enum ReleaseCommand {
+    /// Build reproducible system-package templates, never operator credentials.
+    BuildSystemTemplates {
+        /// Exact source checkout/export containing actors/system-{authority,catalog}.
+        #[arg(long)]
+        source: PathBuf,
+        /// Fresh candidate output directory; existing paths are rejected.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Materialize the programs pinned inside this binary and their manifest.
     Bundle {
         /// New output directory. Existing paths are never overwritten.
@@ -70,6 +79,9 @@ enum ReleaseArtifactKind {
 
 pub fn run(command: ReleaseCommand) -> anyhow::Result<()> {
     match command {
+        ReleaseCommand::BuildSystemTemplates { source, out } => {
+            build_system_templates(&source, &out)
+        }
         ReleaseCommand::Bundle { out } => bundle(&out),
         ReleaseCommand::Verify { directory } => verify(&directory).map(|manifest| {
             println!(
@@ -79,6 +91,57 @@ pub fn run(command: ReleaseCommand) -> anyhow::Result<()> {
             );
         }),
     }
+}
+
+fn system_template_signer() -> anyhow::Result<libp2p::identity::Keypair> {
+    // PUBLIC, NON-AUTHORITATIVE reproducibility seed. These envelopes are
+    // pinned by source and digest, not trusted because of this signature.
+    // Space creation re-signs them with the actual root. Never persist this
+    // key as an operator identity or use it to authorize a space operation.
+    libp2p::identity::Keypair::ed25519_from_bytes([0x54; 32])
+        .context("construct public system-template signer")
+}
+
+fn build_system_templates(source: &Path, out: &Path) -> anyhow::Result<()> {
+    let source = fs::canonicalize(source).context("resolve system-template source")?;
+    for name in ["system-authority", "system-catalog"] {
+        if !source
+            .join("actors")
+            .join(name)
+            .join("Cargo.toml")
+            .is_file()
+        {
+            bail!("system-template source is missing actor {name}");
+        }
+    }
+    if path_exists(out)? {
+        bail!(
+            "template output {} already exists; choose a new directory",
+            out.display()
+        );
+    }
+    fs::create_dir_all(nonempty_parent(out))?;
+    fs::create_dir(out).context("create fresh system-template output")?;
+    let signer = system_template_signer()?;
+    for name in ["system-authority", "system-catalog"] {
+        super::build::run_with_signer(
+            super::build::Args {
+                program: source.join("actors").join(name),
+                name: Some(name.into()),
+                out_dir: out.to_path_buf(),
+                method_policy: None,
+                schemas: None,
+                agent_schema: None,
+                agent_authorizations: None,
+                tasks: Vec::new(),
+                crdt: false,
+                scheduling: false,
+                proof_system: None,
+            },
+            &signer,
+        )?;
+    }
+    Ok(())
 }
 
 fn bundle(output: &Path) -> anyhow::Result<()> {
@@ -398,6 +461,38 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn system_template_signing_is_public_and_deterministic() {
+        let first = system_template_signer().unwrap();
+        let second = system_template_signer().unwrap();
+        assert_eq!(first.public(), second.public());
+        let message = b"non-authoritative system-template fixture";
+        assert_eq!(first.sign(message).unwrap(), second.sign(message).unwrap());
+        assert!(
+            first
+                .public()
+                .verify(message, &first.sign(message).unwrap())
+        );
+    }
+
+    #[test]
+    fn system_templates_reject_existing_output_without_modifying_it() {
+        let out = TestDir::new("templates-existing");
+        let sentinel = out.0.join("keep");
+        fs::write(&sentinel, b"unchanged").unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        assert!(build_system_templates(source, &out.0).is_err());
+        assert_eq!(fs::read(sentinel).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn system_templates_validate_source_before_creating_output() {
+        let source = TestDir::new("templates-missing-source");
+        let out = source.0.join("output");
+        assert!(build_system_templates(&source.0, &out).is_err());
+        assert!(!out.exists());
     }
 
     #[test]

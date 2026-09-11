@@ -12,6 +12,8 @@ const RUSTC_WRAPPER_MODE: &str = "VOSX_CANONICAL_RUSTC_WRAPPER";
 const RUSTC_WRAPPER_SOURCE_ROOT: &str = "VOSX_CANONICAL_SOURCE_ROOT";
 const RUSTC_WRAPPER_TARGET_ROOT: &str = "VOSX_CANONICAL_TARGET_ROOT";
 const RUSTC_UNIT_METADATA_DOMAIN: &[u8] = b"vos/rustc-unit-metadata/actor";
+// Canonical actor identities must not depend on the mutable nightly alias.
+const CANONICAL_GUEST_TOOLCHAIN: &str = "+nightly-2026-03-20";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct RustcUnitIdentity {
@@ -53,7 +55,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     run_with_signer(args, &keypair)
 }
 
-fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::Result<()> {
+pub(super) fn run_with_signer(
+    args: Args,
+    keypair: &libp2p::identity::Keypair,
+) -> anyhow::Result<()> {
     if args.tasks.len() > sdk::task::MAX_TASK_DEPENDENCIES {
         bail!(
             "actor package has {} Task dependencies; the canonical maximum is {}",
@@ -635,7 +640,7 @@ fn resolve_task_input(input: &Path) -> anyhow::Result<PathBuf> {
     let mut command = Command::new("cargo");
     command
         .args([
-            "+nightly",
+            CANONICAL_GUEST_TOOLCHAIN,
             "build",
             "--release",
             "--message-format=json-render-diagnostics",
@@ -739,7 +744,7 @@ fn resolve_program_input(input: &Path) -> anyhow::Result<PathBuf> {
     // checkout path of the preceding `cargo actor` invocation.
     let target_dir = canonical_target_dir(&build_root)?;
     let mut command = Command::new("cargo");
-    command.args(["+nightly", "actor"]);
+    command.args([CANONICAL_GUEST_TOOLCHAIN, "actor"]);
     if build_root != project {
         command.args(["-p", &package_name]);
     }
@@ -788,7 +793,7 @@ fn canonical_target_dir(build_root: &Path) -> anyhow::Result<PathBuf> {
     let wrapper_bytes = std::fs::read(&wrapper)
         .with_context(|| format!("read canonical rustc wrapper {}", wrapper.display()))?;
     let toolchain = Command::new("rustc")
-        .args(["+nightly", "--version", "--verbose"])
+        .args([CANONICAL_GUEST_TOOLCHAIN, "--version", "--verbose"])
         .output()
         .context("query the canonical nightly rustc identity")?;
     if !toolchain.status.success() {

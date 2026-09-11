@@ -760,7 +760,7 @@ fn bundled_runtime_identity_and_vos3_package_are_exactly_pinned() {
     );
     assert_eq!(
         sdk::RUNTIME_ABI_ID,
-        Hash(*b"vos-agent-runtime-abi-260910-r14")
+        Hash(*b"vos-agent-runtime-abi-260911-r15")
     );
 
     let mut previous_generation = bytes;
