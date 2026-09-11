@@ -76,11 +76,13 @@ previous release generation, symlinks, special files, unexpected entries,
 digest or program-identity mismatches, and any artifact that differs from the
 binary's protocol pins.
 
-During the Chapter 08 cutover, the `package-production-release` prerequisite
-recipes still need migration from the retired authority/registry builders.
-Direct `vosx release bundle --out FRESH_DIRECTORY` and `release verify` now use
-the new system packages, but do not replace the outstanding reproducibility
-and deployment gates.
+The `package-production-release` prerequisites reproduce the runtime and both
+system packages with `scripts/build-agent-release-artifacts.sh`, using the
+immutable source and builder revisions recorded in the provenance manifest.
+Build evidence is retained under `target/agent-release-reproduction/` (not
+`/tmp`); failures never overwrite committed pins. Direct `vosx release bundle
+--out FRESH_DIRECTORY` and `release verify` check the embedded bytes but do not
+replace those source-reproduction or deployment gates.
 
 Before distribution, run the workspace checks, Clippy, formatting, docs,
 examples, all feature combinations, standard-program conformance and parity,

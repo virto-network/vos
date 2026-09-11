@@ -99,26 +99,23 @@ verify-agent-runtime-release: build-agent-runtime-candidate
 refresh-bundled-registry:
     VOS_REPIN_ARTIFACTS=1 scripts/build-production-artifacts.sh registry
 
-# Reproduce the canonical authority through vosx's checkout-independent actor
-# build and require exact identity with the committed release artifact.
-build-authority-release:
-    scripts/build-production-artifacts.sh authority
+# Reproduce both complete system packages with pinned source and tooling.
+build-system-release:
+    bash scripts/build-agent-release-artifacts.sh system
 
-# Reproduce the canonical system-catalog actor source artifact. `vosx release
-# bundle` deterministically links these checked ELF bytes into the standard
-# program included in the release directory.
-build-catalog-release:
-    scripts/build-production-artifacts.sh registry
+build-authority-release: build-system-release
+
+build-catalog-release: build-system-release
 
 # Reproduce the standard agent runtime from its separately pinned source
 # revision and require exact identity with the committed release artifact.
 build-agent-runtime-release:
-    scripts/build-production-artifacts.sh agent-runtime
+    bash scripts/build-agent-release-artifacts.sh runtime
 
 # Assemble the standard AgentRuntime and both system actors embedded in vosx.
 # The command refuses external program paths and never replaces an existing
 # directory, so a release cannot silently select or mutate a different pin.
-package-production-release out="target/production-release": build-authority-release build-catalog-release build-agent-runtime-release verify-voucher-check-release
+package-production-release out="target/production-release": build-system-release build-agent-runtime-release verify-voucher-check-release
     cargo run -p vosx -- release bundle --out "{{out}}"
     cargo run -p vosx -- release verify "{{out}}"
 

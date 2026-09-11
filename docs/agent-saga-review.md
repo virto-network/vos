@@ -383,7 +383,10 @@ not the retired root-authority PVM and linked registry renamed as system actors.
 Format `VOS-AGENT-RELEASE-2` binds full package bytes and enclosed program IDs;
 verification admits the packages, checks canonical runtime compatibility, and
 rejects the old format and legacy programs. The top-level release build recipes
-still need migration, followed by the full production gates.
+now invoke the Agent-only reproduction script, which builds the pinned builder
+from an immutable export and compares runtime and complete system-package
+bytes against the committed pins. Full reproduction and production gates must
+still pass before release.
 Verification: all 156 active vosx tests pass (one explicit candidate test is
 ignored by default), including 18 release tests. The rebuilt CLI successfully
 bundled and verified `target/task-tmp/r15-release-v2-smoke` under the native
