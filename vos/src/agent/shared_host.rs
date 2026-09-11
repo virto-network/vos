@@ -1065,6 +1065,13 @@ impl SharedAgentHost {
                 || directory.descriptor != descriptor
                 || directory.actors.len() != authority.actors().len()
             {
+                tracing::warn!(
+                    descriptor_matches = descriptor == *authority.descriptor(),
+                    directory_matches = directory.descriptor == descriptor,
+                    physical_actors = directory.actors.len(),
+                    projected_actors = authority.actors().len(),
+                    "Shared authority projection directory mismatch"
+                );
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
             for actor in authority.actors() {
@@ -1090,6 +1097,19 @@ impl SharedAgentHost {
                     authority.descriptor(),
                     actor,
                 ) {
+                    tracing::warn!(
+                        entry_matches = material.actor.entry == actor.entry,
+                        installation_matches =
+                            material.actor.installation_id == actor.installation_id,
+                        reservation_matches =
+                            material.actor.registry_reservation == actor.registry_reservation,
+                        request_matches = material.install_request == actor.install_request,
+                        producer_matches = material.producer == actor.producer,
+                        contract_matches = material.contract == actor.contract,
+                        requirements_match = material.requirements == actor.requirements,
+                        root_matches = material.root_provenance == actor.root_provenance,
+                        "Shared authority projection actor mismatch"
+                    );
                     return Err(SharedAgentHostError::ScopeMismatch);
                 }
                 if !actor.entry.suspended {

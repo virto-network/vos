@@ -87,6 +87,15 @@ opt-level = 3
 [profile.test.package.vos-pvm]
 opt-level = 3
 
+# Authenticated journal/catalog reads repeatedly hash retained artifact bytes.
+# A native startup profile showed unoptimized BLAKE2 SIMD operations dominating
+# CPU time even with the interpreter optimized. Keep every validation intact;
+# optimize the hash implementation without disabling its debug assertions.
+[profile.dev.package.blake2b_simd]
+opt-level = 3
+[profile.test.package.blake2b_simd]
+opt-level = 3
+
 # `cargo test` builds Stwo's SIMD prover and the vos-pvm-proof trace/constraint
 # code at opt-level 0, where the prover runs several times slower and holds
 # its multi-GB FRI working set for longer. Optimize just the proving-hot

@@ -1340,6 +1340,10 @@ where
     pins: CleanSystemAgentPins,
     creation_receipt: AuthorityReceipt,
     root_lineage: super::invocation_preparation::PhysicalRootLineage,
+    // The protected Authority actor predates its managed inventory. Its
+    // install is authorized by the root-certified bootstrap plan, not by an
+    // Authority inventory row or by whatever happens to be installed now.
+    authority_install: super::sdk::InstallActor,
     invocation_gas: u64,
 }
 
@@ -1904,6 +1908,7 @@ where
             pins: plan.pins.clone(),
             creation_receipt: create_receipt,
             root_lineage,
+            authority_install: install_request(plan.authority_request())?.clone(),
             invocation_gas: plan.invocation_gas,
         };
         // Reconstruct volatile admission from the durable exact pending work
@@ -2116,8 +2121,38 @@ where
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
+        let authority = &self.authority_install;
+        let mut actors = projection[0].actors().to_vec();
+        // Authority explicitly forbids managing its own protected actor.
+        // Never let an inventory response replace that independent root pin.
+        let index = actors
+            .binary_search_by_key(&authority.entry.actor, |actor| actor.entry.actor)
+            .err()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        actors.insert(
+            index,
+            super::sdk::authority::AuthorityActorProjection {
+                agent: self.pins.agent,
+                entry: authority.entry.clone(),
+                producer: authority.producer,
+                contract: authority.contract,
+                requirements: authority.requirements,
+                root_provenance: false,
+                installation_id: authority.installation_id,
+                registry_reservation: authority.registry_reservation,
+                install_request: authority.lineage_commitment(),
+            },
+        );
+        let complete = super::supervisor_adapters::AgentAuthorityRouteProjection::new(
+            projection[0].replica_generation(),
+            projection[0].descriptor().clone(),
+            actors,
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        // The normal physical audit still checks the complete directory and
+        // exact package/install material, including the pinned Authority row.
         self._network_host
-            .audit_authority_projection(head, projection, Some(&self.root_lineage))
+            .audit_authority_projection(head, &[complete], Some(&self.root_lineage))
     }
 
     /// Drain the exact authenticated operation retained before a failed
@@ -6601,6 +6636,82 @@ mod tests {
         fn physical_current_abi_shared_bootstrap_restarts_after_every_phase_without_duplicate_slots()
          {
             exercise_restart_mode(RecordFailure::AfterEveryPhase, "after-every-phase");
+        }
+
+        #[test]
+        fn system_projection_audits_protected_authority_against_root_pinned_install() {
+            use crate::agent::sdk::authority::AuthorityActorProjection;
+            use crate::agent::supervisor_adapters::AgentAuthorityRouteProjection;
+
+            let mut harness = NativeProjectionOwnerHarness::new("root-authority-projection");
+            let owner = harness.owner.as_mut().unwrap();
+            let catalog =
+                super::super::install_request(harness.fixture.plan.catalog_request()).unwrap();
+            let row = AuthorityActorProjection {
+                agent: owner.pins.agent,
+                entry: catalog.entry.clone(),
+                producer: catalog.producer,
+                contract: catalog.contract,
+                requirements: catalog.requirements,
+                root_provenance: true,
+                installation_id: catalog.installation_id,
+                registry_reservation: catalog.registry_reservation,
+                install_request: catalog.lineage_commitment(),
+            };
+            let projection = AgentAuthorityRouteProjection::new(
+                owner.pins.descriptor.replica_generation(),
+                owner.pins.descriptor.clone(),
+                vec![row.clone()],
+            )
+            .unwrap();
+            let head = placeholder_credential_projection().head;
+            let before = owner.ordered_index_for_test().unwrap();
+            let audit = owner
+                .audit_authority_projection(head, &[projection.clone()])
+                .unwrap();
+            let crate::agent::shared_host::SharedAuthorityProjectionAudit::Ready(identities) =
+                audit
+            else {
+                panic!("the Catalog inventory plus root-pinned Authority must be ready");
+            };
+            assert_eq!(identities.len(), 2);
+            assert!(
+                identities
+                    .iter()
+                    .any(|identity| identity.key().actor() == owner.pins.authority.issuer.actor)
+            );
+
+            // A response cannot claim the protected root actor, even with
+            // otherwise valid fields. It must come from the retained plan.
+            let mut injected = row;
+            injected.entry = owner.authority_install.entry.clone();
+            injected.producer = owner.authority_install.producer;
+            injected.contract = owner.authority_install.contract;
+            injected.requirements = owner.authority_install.requirements;
+            injected.root_provenance = false;
+            injected.installation_id = owner.authority_install.installation_id;
+            injected.registry_reservation = owner.authority_install.registry_reservation;
+            injected.install_request = owner.authority_install.lineage_commitment();
+            let forged = AgentAuthorityRouteProjection::new(
+                projection.replica_generation(),
+                projection.descriptor().clone(),
+                vec![injected],
+            )
+            .unwrap();
+            assert!(matches!(
+                owner.audit_authority_projection(head, &[forged]),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+
+            // Root trust is not an exemption from comparing physical bytes.
+            owner.authority_install.entry.program = ProgramId([0xab; 32]);
+            assert!(
+                owner
+                    .audit_authority_projection(head, &[projection])
+                    .is_err()
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            harness.stop();
         }
 
         #[test]

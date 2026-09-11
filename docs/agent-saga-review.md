@@ -260,9 +260,49 @@ Retained disposable evidence in the native worktree:
   out during reconciliation; no listener-readiness claim.
 - `target/task-tmp/physical-proof-budget-test.log`: passing physical proof test.
 
-Next startup acceptance steps: profile repeated physical replay/inspection in
-the production inventory/projection path and finish reconciliation without
-weakening authenticated admission or recovery checks. Then verify HTTP/SSH
-listeners and restart the same space without duplicate system installations.
-Keep the ordinary-Agent finality
-adapter and other existing Chapter 08 release gates in the original wrap-up.
+Follow-up profiling identified unoptimized host BLAKE2 SIMD hashing as the
+dominant CPU cost (three-minute profile retained at
+`target/task-tmp/native-reconcile.perf`). Development/test profiles now optimize
+`blake2b_simd`, retaining debug assertions and every authenticated read/check.
+Eight hash cross-check tests pass. Reconciliation now schedules its next run
+from completion, preventing slow queries from making the next run immediately
+overdue; all three production-owner tests pass, including that regression.
+
+With hashing optimized, the retained smoke reached a concrete `InvalidProjection`
+instead of timing out. Diagnostics confirmed equal descriptors but two physical
+actors versus one projected actor. This is the protected Authority actor:
+Authority intentionally excludes itself from managed inventory. The system
+bootstrap owner now adds its exact root-certified Authority install before the
+ordinary full physical audit. It never derives this exception from an inventory
+response or from whatever bytes happen to be installed. Inventory attempts to
+claim Authority are rejected; physical package/install mismatches remain fatal.
+No actor schema, package template, guest artifact, or admission limit changed.
+The new positive/hostile root-pinning test passes, and the bootstrap suite
+excluding inventory now passes 13 tests. Diagnostic evidence is retained in
+`target/task-tmp/native-ready-projection-recovered.log`.
+
+A fresh `native-first-ready-smoke` space completed automatic system installation
+and the full route audit. Its first listener bind failed because the existing
+IPFS daemon owns HTTP port 8080. Only the disposable space's `local.toml` was
+changed to HTTP `127.0.0.1:18080`; SSH remained `127.0.0.1:2222`, and the IPFS
+daemon was left untouched. Reopening that space reached `Space daemon ready`,
+returned HTTP 401 for an unauthenticated request, and completed an SSH host-key
+handshake. Its clean shutdown succeeded. This is listener/authentication-boundary
+evidence, not an authenticated arbitrary-Agent lifecycle test. Development
+startup still takes minutes; release/performance gates remain outstanding.
+Evidence: `target/task-tmp/native-ready-root-first.log` (port collision),
+`target/task-tmp/native-ready-root-ports-recovered.log` and sibling HTTP/SSH
+probe files (successful readiness). The same-space restart also reached readiness,
+returned HTTP 401, completed SSH key exchange with the identical host key, and
+shut down successfully. Its bootstrap phase remained `Complete`; the restart
+reopened the installed actors through the normal authenticated bootstrap/audit
+path. Evidence is in `target/task-tmp/native-ready-root-ports-restart.log` and
+its sibling probe files. The bounded lifecycle script exited zero, and neither
+test listener remained afterward. The successful reopen took about 3m45s and
+the normal restart about 5m18s in the development build, so this is not a
+performance sign-off. All 152 vosx tests also pass on this checkpoint.
+
+Keep the ordinary-Agent finality adapter, custom-runtime material lookup,
+portable recovery crash closure, reproducible artifacts, and final release gates
+in the existing three Chapter 08 batches. These startup fixes alone do not make
+the complete saga deploy-ready or authorize advancing `saga/agents`/`master`.

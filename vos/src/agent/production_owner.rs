@@ -1,6 +1,8 @@
 //! Node-owned production reconciliation for authenticated clean Agent routes.
 //!
-//! The installed system authority is the only inventory source. Every bounded
+//! The installed system authority is the only managed inventory source. Its
+//! own protected install is independently root-pinned by the system bootstrap
+//! owner and checked during the physical route audit. Every bounded
 //! page is response-bound to a fresh authenticated query and the same durable
 //! authority head is assembled completely before a physical host or supervisor
 //! publication is touched.
@@ -479,7 +481,11 @@ impl AgentProductionOwner {
             return Ok(false);
         }
         self.reconcile()?;
-        self.reconcile_after = now
+        // Physical inventory queries may take longer than the interval. Start
+        // the next interval after completion, not at this run's admission, so
+        // an overrun cannot keep the node in back-to-back reconciliation.
+        self.reconcile_after = Instant::now()
+            .max(now)
             .checked_add(self.reconcile_interval)
             .ok_or(AgentProductionOwnerError::InvalidConfiguration)?;
         Ok(true)
@@ -648,7 +654,8 @@ fn reconcile_slot(
                     *slot = OwnedRouteSlot::Pending(attachment);
                     return Ok(());
                 }
-                Err(_) => {
+                Err(error) => {
+                    tracing::warn!(?error, "Agent production projection authorization failed");
                     return retire_pending_after_error(
                         attachment,
                         AgentProductionOwnerError::InvalidProjection,
@@ -676,6 +683,11 @@ fn reconcile_slot(
                 Err(error) => return retire_pending_after_error(attachment, error),
             };
             if identities != actual {
+                tracing::warn!(
+                    authorized_routes = identities.len(),
+                    physical_routes = actual.len(),
+                    "Agent production route identities mismatch"
+                );
                 return retire_pending_after_error(
                     attachment,
                     AgentProductionOwnerError::InvalidProjection,
@@ -1134,6 +1146,44 @@ mod tests {
             }),
             Box::new(TestAuthenticator { ordinal: 0 }),
         )
+    }
+
+    #[test]
+    fn reconciliation_overrun_waits_a_full_interval_before_running_again() {
+        let node = NodeId([0x31; 32]);
+        let descriptor = descriptor(1, AgentProfile::Shared, node);
+        let actor = actor(&descriptor, true);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let interval = Duration::from_secs(60);
+        // Model an overdue admission without sleeping or depending on query
+        // speed. The old start-based deadline would already be in the past.
+        let admitted = Instant::now().checked_sub(interval * 2).unwrap();
+        let mut owner = AgentProductionOwner {
+            node,
+            system_agent: descriptor.identity.agent,
+            supervisor: Some(
+                AgentSupervisorOwner::start(AgentSupervisorLimits::default()).unwrap(),
+            ),
+            system: OwnedRouteSlot::Empty,
+            local: OwnedRouteSlot::Empty,
+            shared: OwnedRouteSlot::Empty,
+            source: Box::new(client(
+                vec![descriptor],
+                vec![actor],
+                head(1),
+                calls.clone(),
+            )),
+            accepted_head: None,
+            reconcile_interval: interval,
+            reconcile_after: admitted,
+        };
+        let before = Instant::now();
+        assert_eq!(owner.drive_if_due(admitted), Ok(true));
+        assert!(owner.reconcile_after >= before + interval);
+        assert_eq!(calls.lock().unwrap().len(), 4);
+        assert_eq!(owner.drive_if_due(before), Ok(false));
+        assert_eq!(calls.lock().unwrap().len(), 4);
+        owner.shutdown_and_join().unwrap();
     }
 
     #[test]
