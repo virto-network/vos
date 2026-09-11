@@ -66,12 +66,21 @@ just package-production-release
 vosx release verify target/production-release
 ```
 
-The release directory contains exactly the standard AgentRuntime, authority
-actor, catalog actor, and strict manifest embedded by the checked `vosx`
-binary. Bundling accepts no external program path. Verification rejects the
+The version-2 release directory contains exactly `standard-runtime.pvm`,
+`system-authority.vos`, `system-catalog.vos`, and `manifest.json` embedded by
+the checked `vosx` binary. The actor files are complete, non-authoritative
+package templates; new spaces re-sign them with their own root. Their manifest
+program IDs identify the enclosed PVM, while file digests bind the entire signed
+package. Bundling accepts no external program path. Verification rejects the
 previous release generation, symlinks, special files, unexpected entries,
 digest or program-identity mismatches, and any artifact that differs from the
 binary's protocol pins.
+
+During the Chapter 08 cutover, the `package-production-release` prerequisite
+recipes still need migration from the retired authority/registry builders.
+Direct `vosx release bundle --out FRESH_DIRECTORY` and `release verify` now use
+the new system packages, but do not replace the outstanding reproducibility
+and deployment gates.
 
 Before distribution, run the workspace checks, Clippy, formatting, docs,
 examples, all feature combinations, standard-program conformance and parity,

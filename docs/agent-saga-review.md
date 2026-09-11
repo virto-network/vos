@@ -375,8 +375,19 @@ The builder selects the dated guest toolchain; set `TMPDIR` to disk-backed
 storage. Compare both output `.vos` files against the manifest digests. Current
 two-export evidence is in `target/task-tmp/r15-system-templates-{first,second}`
 and the corresponding logs under the native worktree. Host-tool independent
-reproduction and the production release bundle's legacy-actor cutover remain
-separate outstanding gates; package reproduction alone does not close them.
+reproduction remains a separate outstanding gate; package reproduction alone
+does not close it.
+
+The release bundle now exports the actual Authority and Catalog VOS3 templates,
+not the retired root-authority PVM and linked registry renamed as system actors.
+Format `VOS-AGENT-RELEASE-2` binds full package bytes and enclosed program IDs;
+verification admits the packages, checks canonical runtime compatibility, and
+rejects the old format and legacy programs. The top-level release build recipes
+still need migration, followed by the full production gates.
+Verification: all 156 active vosx tests pass (one explicit candidate test is
+ignored by default), including 18 release tests. The rebuilt CLI successfully
+bundled and verified `target/task-tmp/r15-release-v2-smoke` under the native
+worktree. This proves the release-directory cutover, not deployment readiness.
 
 Next: rebuild the custom-runtime example with current ABI tooling, then rerun physical,
 proof, bootstrap, and real first-start/restart gates before integrating this

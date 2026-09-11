@@ -18,11 +18,11 @@ use vos::agent::sdk::ProgramId as AgentProgramId;
 
 use crate::bundled;
 
-const RELEASE_FORMAT: &str = "VOS-AGENT-RELEASE-1";
+const RELEASE_FORMAT: &str = "VOS-AGENT-RELEASE-2";
 const MANIFEST_FILE: &str = "manifest.json";
 const STANDARD_RUNTIME_FILE: &str = "standard-runtime.pvm";
-const AUTHORITY_FILE: &str = "system-authority.pvm";
-const CATALOG_FILE: &str = "system-catalog.pvm";
+const AUTHORITY_FILE: &str = "system-authority.vos";
+const CATALOG_FILE: &str = "system-catalog.vos";
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -74,7 +74,7 @@ struct ReleaseArtifact {
 #[serde(rename_all = "snake_case")]
 enum ReleaseArtifactKind {
     AgentRuntime,
-    Actor,
+    ActorPackageTemplate,
 }
 
 pub fn run(command: ReleaseCommand) -> anyhow::Result<()> {
@@ -153,12 +153,11 @@ fn bundle(output: &Path) -> anyhow::Result<()> {
     }
     let standard_runtime = bundled::agent_runtime_pvm();
     validate_standard_runtime(standard_runtime)?;
-    let authority = bundled::space_authority_pvm()
-        .context("this vosx build does not contain the frozen production authority")?;
+    let authority = bundled::system_authority_package_template();
     validate_authority(authority)?;
-    let catalog = canonical_catalog_pvm()?;
+    let catalog = bundled::system_catalog_package_template();
     validate_catalog(&catalog)?;
-    let manifest = manifest_for(standard_runtime, authority, &catalog);
+    let manifest = manifest_for(standard_runtime, authority, catalog)?;
 
     let parent = nonempty_parent(output);
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -226,7 +225,7 @@ fn validate_manifest(
     authority: &[u8],
     catalog: &[u8],
 ) -> anyhow::Result<()> {
-    let expected = manifest_for(standard_runtime, authority, catalog);
+    let expected = manifest_for(standard_runtime, authority, catalog)?;
     if manifest != &expected {
         bail!("release manifest does not describe the exact pinned artifacts");
     }
@@ -234,12 +233,11 @@ fn validate_manifest(
 }
 
 fn validate_authority(bytes: &[u8]) -> anyhow::Result<()> {
-    let canonical = bundled::space_authority_pvm()
-        .context("this vosx build does not contain the frozen production authority")?;
+    let canonical = bundled::system_authority_package_template();
     if bytes != canonical {
-        bail!("authority PVM does not match the canonical release bytes");
+        bail!("authority package does not match the canonical release bytes");
     }
-    validate_actor_program(bytes, "system-authority actor")?;
+    validate_actor_package(bytes, "system-authority")?;
     Ok(())
 }
 
@@ -261,19 +259,12 @@ fn validate_standard_runtime(bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn canonical_catalog_pvm() -> anyhow::Result<Vec<u8>> {
-    let elf = bundled::registry_elf()
-        .context("this vosx build does not contain the frozen production catalog")?;
-    vos_pvm_compiler::link_elf(elf)
-        .map_err(|error| anyhow::anyhow!("link canonical system-catalog actor: {error:?}"))
-}
-
 fn validate_catalog(bytes: &[u8]) -> anyhow::Result<()> {
-    let canonical = canonical_catalog_pvm()?;
+    let canonical = bundled::system_catalog_package_template();
     if bytes != canonical {
-        bail!("catalog PVM does not match the canonical release bytes");
+        bail!("catalog package does not match the canonical release bytes");
     }
-    validate_actor_program(bytes, "system-catalog actor")
+    validate_actor_package(bytes, "system-catalog")
 }
 
 fn validate_standard_runtime_program(bytes: &[u8]) -> anyhow::Result<()> {
@@ -282,14 +273,36 @@ fn validate_standard_runtime_program(bytes: &[u8]) -> anyhow::Result<()> {
     })
 }
 
-fn validate_actor_program(bytes: &[u8], label: &str) -> anyhow::Result<()> {
-    vos_pvm::program::parse_blob(bytes)
+fn validate_actor_package(bytes: &[u8], label: &str) -> anyhow::Result<()> {
+    let actor = vos::agent::package_admission::admit_actor_package(bytes)
+        .with_context(|| format!("admit {label} package template"))?;
+    if actor.manifest().name != label {
+        bail!("system package template has the wrong actor name");
+    }
+    if !actor
+        .requirements()
+        .supported_by(vos::agent::sdk::AgentProfile::Shared)
+    {
+        bail!("system package template requires an unsupported profile");
+    }
+    actor
+        .envelope()
+        .require_compatible_with(
+            vos::agent::sdk::contract::RuntimePackageContract::canonical(),
+            vos::agent::sdk::RuntimeCapabilities::standard(),
+        )
+        .context("system package template is incompatible with the standard runtime")?;
+    vos_pvm::spi::parse_standard_program(actor.program_bytes())
         .ok_or_else(|| anyhow::anyhow!("{label} is not a canonical actor PVM program"))?;
     Ok(())
 }
 
-fn manifest_for(standard_runtime: &[u8], authority: &[u8], catalog: &[u8]) -> ReleaseManifest {
-    ReleaseManifest {
+fn manifest_for(
+    standard_runtime: &[u8],
+    authority: &[u8],
+    catalog: &[u8],
+) -> anyhow::Result<ReleaseManifest> {
+    Ok(ReleaseManifest {
         format: RELEASE_FORMAT.into(),
         agent_execution_semantics: hex::encode(vos::agent::EXECUTION_SEMANTICS_ID.0),
         standard_runtime: artifact(
@@ -297,9 +310,18 @@ fn manifest_for(standard_runtime: &[u8], authority: &[u8], catalog: &[u8]) -> Re
             STANDARD_RUNTIME_FILE,
             standard_runtime,
         ),
-        authority_actor: artifact(ReleaseArtifactKind::Actor, AUTHORITY_FILE, authority),
-        catalog_actor: artifact(ReleaseArtifactKind::Actor, CATALOG_FILE, catalog),
-    }
+        authority_actor: package_artifact(AUTHORITY_FILE, authority)?,
+        catalog_actor: package_artifact(CATALOG_FILE, catalog)?,
+    })
+}
+
+fn package_artifact(file: &str, bytes: &[u8]) -> anyhow::Result<ReleaseArtifact> {
+    let package = vos::agent::package_admission::admit_actor_package(bytes)
+        .context("admit release package template")?;
+    let mut result = artifact(ReleaseArtifactKind::ActorPackageTemplate, file, bytes);
+    // Identity belongs to the enclosed program, not the signed envelope.
+    result.program_id = hex::encode(AgentProgramId::of_pvm(package.program_bytes()).0);
+    Ok(result)
 }
 
 fn artifact(kind: ReleaseArtifactKind, file: &str, bytes: &[u8]) -> ReleaseArtifact {
@@ -497,7 +519,7 @@ mod tests {
 
     #[test]
     fn manifest_binds_execution_semantics_kinds_and_all_artifacts() {
-        let manifest = manifest_for(b"standard runtime", b"authority", b"catalog");
+        let manifest = fixture_manifest();
         assert_eq!(manifest.format, RELEASE_FORMAT);
         assert_eq!(
             manifest.agent_execution_semantics,
@@ -509,9 +531,15 @@ mod tests {
             ReleaseArtifactKind::AgentRuntime
         );
         assert_eq!(manifest.authority_actor.file, AUTHORITY_FILE);
-        assert_eq!(manifest.authority_actor.kind, ReleaseArtifactKind::Actor);
+        assert_eq!(
+            manifest.authority_actor.kind,
+            ReleaseArtifactKind::ActorPackageTemplate
+        );
         assert_eq!(manifest.catalog_actor.file, CATALOG_FILE);
-        assert_eq!(manifest.catalog_actor.kind, ReleaseArtifactKind::Actor);
+        assert_eq!(
+            manifest.catalog_actor.kind,
+            ReleaseArtifactKind::ActorPackageTemplate
+        );
         assert_ne!(
             manifest.standard_runtime.blake2b_256,
             manifest.authority_actor.blake2b_256
@@ -524,7 +552,7 @@ mod tests {
 
     #[test]
     fn release_manifest_rejects_retired_root_service_shape() {
-        let manifest = manifest_for(b"standard runtime", b"authority", b"catalog");
+        let manifest = fixture_manifest();
         let mut value = serde_json::to_value(manifest)
             .expect("serialize manifest")
             .as_object()
@@ -547,31 +575,43 @@ mod tests {
 
     #[test]
     fn release_manifest_rejects_the_previous_agent_semantics() {
-        let mut manifest = manifest_for(b"standard runtime", b"authority", b"catalog");
+        let mut manifest = fixture_manifest();
         manifest.agent_execution_semantics = hex::encode(*b"vos-pvm-41d31e6-standard-gas-r02");
         assert!(
-            validate_manifest(&manifest, b"standard runtime", b"authority", b"catalog").is_err(),
+            validate_manifest(
+                &manifest,
+                bundled::agent_runtime_pvm(),
+                bundled::system_authority_package_template(),
+                bundled::system_catalog_package_template()
+            )
+            .is_err(),
             "a release produced for the immediately previous Agent semantics must fail closed",
         );
     }
 
     #[test]
     fn release_manifest_uses_one_program_identity_domain() {
-        let runtime = b"agent runtime";
-        let authority = b"authority actor";
-        let catalog = b"catalog actor";
-        let manifest = manifest_for(runtime, authority, catalog);
+        let runtime = bundled::agent_runtime_pvm();
+        let authority = vos::agent::package_admission::admit_actor_package(
+            bundled::system_authority_package_template(),
+        )
+        .unwrap();
+        let catalog = vos::agent::package_admission::admit_actor_package(
+            bundled::system_catalog_package_template(),
+        )
+        .unwrap();
+        let manifest = fixture_manifest();
         assert_eq!(
             manifest.standard_runtime.program_id,
             hex::encode(AgentProgramId::of_pvm(runtime).0),
         );
         assert_eq!(
             manifest.authority_actor.program_id,
-            hex::encode(AgentProgramId::of_pvm(authority).0),
+            hex::encode(AgentProgramId::of_pvm(authority.program_bytes()).0),
         );
         assert_eq!(
             manifest.catalog_actor.program_id,
-            hex::encode(AgentProgramId::of_pvm(catalog).0),
+            hex::encode(AgentProgramId::of_pvm(catalog.program_bytes()).0),
         );
     }
 
@@ -582,7 +622,7 @@ mod tests {
 
     #[test]
     fn bundled_authority_matches_the_runtime_release_pins() {
-        let authority = bundled::space_authority_pvm().expect("bundled authority");
+        let authority = bundled::system_authority_package_template();
         validate_authority(authority).expect("build-time and runtime authority pins must agree");
     }
 
@@ -620,9 +660,35 @@ mod tests {
     }
 
     #[test]
-    fn bundled_catalog_links_to_the_exact_release_pin() {
-        let catalog = canonical_catalog_pvm().expect("link bundled catalog");
-        validate_catalog(&catalog).expect("linked and release catalog pins must agree");
+    fn bundled_catalog_matches_the_exact_release_pin() {
+        let catalog = bundled::system_catalog_package_template();
+        validate_catalog(catalog).expect("bundled and release catalog pins must agree");
+    }
+
+    fn fixture_manifest() -> ReleaseManifest {
+        manifest_for(
+            bundled::agent_runtime_pvm(),
+            bundled::system_authority_package_template(),
+            bundled::system_catalog_package_template(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn release_rejects_legacy_programs_and_previous_format() {
+        assert!(validate_authority(bundled::space_authority_pvm().unwrap()).is_err());
+        assert!(validate_catalog(bundled::registry_elf().unwrap()).is_err());
+        let mut manifest = fixture_manifest();
+        manifest.format = "VOS-AGENT-RELEASE-1".into();
+        assert!(
+            validate_manifest(
+                &manifest,
+                bundled::agent_runtime_pvm(),
+                bundled::system_authority_package_template(),
+                bundled::system_catalog_package_template()
+            )
+            .is_err()
+        );
     }
 
     #[test]
