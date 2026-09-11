@@ -353,8 +353,32 @@ under the native worktree's disk-backed
 `target/task-tmp/r15-agent-runtime-candidate.pvm`, and its ELF is under
 `target/r15-guest/riscv64em-vos/release/agent_runtime.elf`.
 
-Next: rebuild and independently reproduce the system package templates
-and custom-runtime example with current ABI tooling, then rerun physical,
+The Authority and Catalog templates now also reproduce byte-for-byte (both
+raw PVM and signed VOS3 envelope) across two independent source-export paths.
+Their committed blobs and build-time digests are updated. Provenance, including
+the immutable source and builder revisions, is in
+`support/production-artifacts.toml`. The public template-signing seed is not an
+operator credential: new spaces re-sign these templates with their own root.
+The template builder never loads or creates an operator identity and rejects
+existing output paths; all three focused safety tests pass.
+
+To reproduce templates, build `vosx` from the pinned builder revision using
+the pinned host toolchain, export the pinned template source revision into a
+fresh disk-backed directory, and create an empty `.git` directory in that
+export as the canonical source-root marker. Then run:
+
+```sh
+vosx release build-system-templates --source SOURCE_EXPORT --out FRESH_OUTPUT
+```
+
+The builder selects the dated guest toolchain; set `TMPDIR` to disk-backed
+storage. Compare both output `.vos` files against the manifest digests. Current
+two-export evidence is in `target/task-tmp/r15-system-templates-{first,second}`
+and the corresponding logs under the native worktree. Host-tool independent
+reproduction and the production release bundle's legacy-actor cutover remain
+separate outstanding gates; package reproduction alone does not close them.
+
+Next: rebuild the custom-runtime example with current ABI tooling, then rerun physical,
 proof, bootstrap, and real first-start/restart gates before integrating this
 work into the native startup branch. The old r14 CLI correctly rejects the r15
 candidate ABI; use the current CLI or its explicit

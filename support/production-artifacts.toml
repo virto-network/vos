@@ -10,6 +10,14 @@ agent_runtime_source_revision = "78434a4f2d213badf1769f8ba4ec5d251d617a0d"
 guest_toolchain = "nightly-2026-03-20"
 host_toolchain = "nightly-2025-05-09"
 
+# Public, non-authoritative signed templates. Space creation re-signs these
+# packages with its actual root; this signer is never an operator credential.
+system_templates_source_revision = "78434a4f2d213badf1769f8ba4ec5d251d617a0d"
+system_templates_builder_revision = "73f3514adc0acd4e9e2636a6ed2c3eb8ef14f1ee"
+system_templates_public_signing_seed_hex = "5454545454545454545454545454545454545454545454545454545454545454"
+system_authority_package_blake2b_256 = "33828001bd25c4922e700b6818971db25135d41dc55e0786667c24c8c06dd8ab"
+system_catalog_package_blake2b_256 = "06e5e10718ad8b1bb4a3f8994107acacf0f82dc15c038d5d24dc2237ea02de63"
+
 service_program_id = "38207480731d47af5194a3e1e61b0f9667983edbbf16c90f2bde7d2153de4481"
 service_elf_blake2b_256 = "e7b9a82d22702e8522e8b36faa1118fcced759cb6632b4377f4d8475890a32f0"
 service_pvm_blake2b_256 = "1911c5b7f5ee746cfe231a81f9ec2d5355e725faad7c578514b5580e5baf1cc6"
