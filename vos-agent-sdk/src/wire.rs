@@ -842,6 +842,7 @@ fn encode_directory_record(encoder: &mut Encoder<'_>, value: &ActorDirectoryReco
     encoder.fixed(value.incarnation.as_bytes());
     encoder.fixed(value.installation_id.as_bytes());
     encoder.fixed(value.registry_reservation.as_bytes());
+    encoder.fixed(value.install_request.as_bytes());
 }
 
 fn decode_directory_record(decoder: &mut Decoder<'_>) -> Result<ActorDirectoryRecord, DecodeError> {
@@ -850,6 +851,7 @@ fn decode_directory_record(decoder: &mut Decoder<'_>) -> Result<ActorDirectoryRe
         incarnation: Hash(decoder.fixed()?),
         installation_id: InstallationId(decoder.fixed()?),
         registry_reservation: Hash(decoder.fixed()?),
+        install_request: Hash(decoder.fixed()?),
     };
     value
         .validate()
@@ -5436,8 +5438,9 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/acc3-golden", &[&call_bytes]).0,
             [
-                109, 220, 216, 104, 90, 240, 128, 79, 28, 116, 232, 203, 170, 119, 180, 209, 68, 2,
-                203, 154, 96, 192, 2, 12, 31, 138, 111, 225, 45, 172, 163, 90,
+                0xbc, 0x57, 0x79, 0xc8, 0x10, 0xf6, 0x2a, 0x20, 0x7d, 0x40, 0x5b, 0xb2, 0x46, 0x0c,
+                0x57, 0xaf, 0x8b, 0x1a, 0xdb, 0x0a, 0x20, 0xf8, 0x64, 0x5d, 0xa5, 0x35, 0x58, 0xb7,
+                0x30, 0xe8, 0xc8, 0x85,
             ]
         );
 
@@ -5449,8 +5452,9 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/map2-golden", &[&approval_bytes]).0,
             [
-                73, 134, 235, 123, 175, 7, 118, 129, 88, 164, 11, 136, 116, 245, 4, 196, 18, 128,
-                163, 48, 229, 13, 10, 139, 30, 197, 97, 4, 19, 103, 63, 205,
+                0x4b, 0xfe, 0x9a, 0xb9, 0xe4, 0xda, 0x20, 0x8e, 0x46, 0x5d, 0xae, 0xc8, 0xdb, 0x11,
+                0x69, 0xf6, 0xdc, 0xd2, 0xa5, 0x6b, 0xd7, 0x37, 0x15, 0xcb, 0x91, 0x34, 0xac, 0xb4,
+                0x70, 0x50, 0x50, 0xe5,
             ]
         );
 
@@ -5465,8 +5469,9 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/maa2-golden", &[&acknowledgement_bytes]).0,
             [
-                71, 54, 101, 155, 44, 36, 104, 229, 254, 101, 82, 4, 207, 201, 199, 59, 49, 247,
-                190, 238, 204, 144, 42, 180, 154, 143, 176, 136, 227, 15, 243, 240,
+                0x4e, 0xd5, 0xbf, 0x38, 0xd0, 0x1e, 0x7d, 0x28, 0x6c, 0x64, 0x62, 0x12, 0x09, 0x74,
+                0xef, 0x92, 0x06, 0x7d, 0xec, 0x4b, 0x16, 0x71, 0x2d, 0xaf, 0x27, 0x11, 0xe4, 0x6f,
+                0x73, 0xe5, 0xf1, 0x1f,
             ]
         );
     }
@@ -5481,8 +5486,9 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/aad4-golden", &[&bytes]).0,
             [
-                172, 84, 165, 31, 32, 87, 124, 198, 82, 18, 206, 207, 179, 107, 122, 245, 42, 125,
-                97, 213, 124, 95, 17, 242, 128, 97, 16, 215, 13, 200, 59, 10,
+                0x65, 0xd5, 0x9d, 0xe3, 0xd2, 0x08, 0x8a, 0x37, 0xcf, 0x36, 0xab, 0x73, 0xd9, 0x1d,
+                0xe3, 0x7e, 0x23, 0xca, 0xf4, 0x56, 0xb0, 0x45, 0xb5, 0xab, 0x34, 0x9c, 0xe5, 0x6e,
+                0x93, 0xfe, 0x71, 0x79,
             ]
         );
 
@@ -5497,8 +5503,9 @@ mod tests {
         assert_eq!(
             Hash::digest(b"vos/test/aar4-golden", &[&result_bytes]).0,
             [
-                99, 113, 41, 1, 224, 22, 194, 248, 15, 247, 62, 79, 183, 54, 251, 30, 104, 106,
-                146, 16, 169, 66, 0, 218, 126, 179, 149, 159, 4, 57, 120, 215,
+                0x8b, 0xb5, 0x83, 0x53, 0xbc, 0x54, 0x67, 0x8a, 0x2e, 0xe4, 0x76, 0x22, 0xca, 0x12,
+                0x6f, 0x65, 0x87, 0x71, 0xd8, 0xd9, 0x03, 0x93, 0xf7, 0x5d, 0x1e, 0x1b, 0x44, 0x7a,
+                0x9d, 0x71, 0xf7, 0xa7,
             ]
         );
         assert_ne!(call.commitment(), result.commitment());
@@ -6143,18 +6150,36 @@ mod tests {
                     incarnation: Hash([20; 32]),
                     installation_id: InstallationId([21; 32]),
                     registry_reservation: Hash([22; 32]),
+                    install_request: Hash([26; 32]),
                 },
                 ActorDirectoryRecord {
                     entry: actor(2),
                     incarnation: Hash([23; 32]),
                     installation_id: InstallationId([24; 32]),
                     registry_reservation: Hash([25; 32]),
+                    install_request: Hash([27; 32]),
                 },
             ],
             next: Some(ActorId([2; 32])),
         };
         let encoded = page.encode().unwrap();
-        assert_eq!(ActorDirectoryPage::decode(&encoded), Ok(page));
+        assert_eq!(ActorDirectoryPage::decode(&encoded), Ok(page.clone()));
+        // Four fixed-width identities follow the actor entry; pin the new
+        // lineage field independently of the round-trip encoder/decoder.
+        let lineage_offset = HEADER_BYTES
+            + 4
+            + (page.entries[0].entry.encode().unwrap().len() - HEADER_BYTES)
+            + 3 * 32;
+        assert_eq!(&encoded[lineage_offset..lineage_offset + 32], &[26; 32]);
+        let mut missing_lineage = encoded.clone();
+        missing_lineage.drain(lineage_offset..lineage_offset + 32);
+        assert!(ActorDirectoryPage::decode(&missing_lineage).is_err());
+        let mut zero_lineage = encoded.clone();
+        zero_lineage[lineage_offset..lineage_offset + 32].fill(0);
+        assert!(ActorDirectoryPage::decode(&zero_lineage).is_err());
+        let mut previous_generation = encoded;
+        previous_generation[4..HEADER_BYTES].copy_from_slice(b"vos-agent-runtime-abi-260910-r14");
+        assert!(ActorDirectoryPage::decode(&previous_generation).is_err());
 
         let mut oversized = actor(3);
         oversized.name = alloc::string::String::from_utf8(alloc::vec![b'x'; 129]).unwrap();
@@ -6363,8 +6388,9 @@ mod tests {
         assert_eq!(
             golden.0,
             [
-                113, 26, 117, 6, 49, 208, 110, 209, 195, 62, 16, 108, 163, 70, 19, 201, 86, 123,
-                231, 215, 225, 144, 160, 66, 134, 75, 26, 152, 124, 210, 131, 12,
+                0xea, 0xb4, 0x04, 0x2b, 0x62, 0x1b, 0x49, 0xb8, 0x0b, 0xed, 0x0e, 0x48, 0x36, 0xcc,
+                0x8b, 0x48, 0xfe, 0x0c, 0x91, 0x9e, 0x03, 0xf1, 0x6e, 0x57, 0x79, 0x32, 0x44, 0xa9,
+                0xc6, 0xaa, 0x73, 0xd7,
             ]
         );
 
@@ -6619,7 +6645,7 @@ mod tests {
     }
 
     #[test]
-    fn acknowledgement_work_and_outcome_have_one_r14_canonical_wire() {
+    fn acknowledgement_work_and_outcome_have_one_r15_canonical_wire() {
         let invocation = invocation();
         let authority = receipt_for(&invocation);
         let work = RuntimeWork::Acknowledge {

@@ -4945,6 +4945,7 @@ mod tests {
                 incarnation: Hash([incarnation; 32]),
                 installation_id: install.installation_id,
                 registry_reservation: install.registry_reservation,
+                install_request: install.lineage_commitment(),
             }
         }
 

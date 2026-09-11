@@ -476,6 +476,7 @@ fn apply_management(
                     incarnation: actor_incarnation(&install),
                     installation_id: install.installation_id,
                     registry_reservation: install.registry_reservation,
+                    install_request: install.lineage_commitment(),
                 });
             }
             transition(

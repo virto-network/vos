@@ -5535,6 +5535,30 @@ pub(crate) mod tests {
             original_installation,
             "the immutable install-time proof requirements survive the upgrade",
         );
+        let inspected = apply_clean_management_test(
+            actor_upgraded.state.clone(),
+            &descriptor,
+            ManagementRequest::InspectActors {
+                after: None,
+                limit: 1,
+            },
+            None,
+            3,
+        );
+        assert_eq!(inspected.state, actor_upgraded.state);
+        let RuntimeOutcome::Management(Ok(ManagementReply::Actors(directory))) = inspected.outcome
+        else {
+            panic!("upgraded actor must remain visible through the canonical directory ABI");
+        };
+        assert_eq!(directory.entries.len(), 1);
+        assert_eq!(
+            directory.entries[0].entry.deployment,
+            actor_upgrade.to_deployment
+        );
+        assert_eq!(
+            directory.entries[0].install_request,
+            original_install.lineage_commitment()
+        );
 
         let exact_retry = apply_clean_management_test(
             actor_upgraded.state,

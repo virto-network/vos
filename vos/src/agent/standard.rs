@@ -853,12 +853,14 @@ pub(crate) fn legacy_entry_to_clean(entry: &super::ActorEntry) -> crate::agent_s
 
 pub(crate) fn legacy_actor_record_to_clean(
     record: &ActorRecord,
+    install_request: crate::agent_sdk::Hash,
 ) -> crate::agent_sdk::ActorDirectoryRecord {
     crate::agent_sdk::ActorDirectoryRecord {
         entry: legacy_entry_to_clean(&record.entry),
         incarnation: crate::agent_sdk::Hash(record.state_generation.0),
         installation_id: crate::agent_sdk::InstallationId(record.installation_id.0),
         registry_reservation: crate::agent_sdk::Hash(record.registry_reservation.0),
+        install_request,
     }
 }
 
@@ -1277,9 +1279,12 @@ impl StandardAgentRuntime {
         &self,
         actor: crate::agent_sdk::ActorId,
     ) -> Option<crate::agent_sdk::ActorDirectoryRecord> {
-        self.actors
-            .get(&ActorId(actor.0))
-            .map(|managed| legacy_actor_record_to_clean(&managed.record))
+        self.actors.get(&ActorId(actor.0)).and_then(|managed| {
+            Some(legacy_actor_record_to_clean(
+                &managed.record,
+                managed.clean_installation?.commitment,
+            ))
+        })
     }
 
     /// Return the immutable SDK install lineage retained separately from the
@@ -5099,17 +5104,13 @@ impl StandardAgentRuntime {
                         entries: page
                             .entries
                             .into_iter()
-                            .map(|record| crate::agent_sdk::ActorDirectoryRecord {
-                                entry: legacy_entry_to_clean(&record.entry),
-                                incarnation: crate::agent_sdk::Hash(record.incarnation.0),
-                                installation_id: crate::agent_sdk::InstallationId(
-                                    record.installation_id.0,
-                                ),
-                                registry_reservation: crate::agent_sdk::Hash(
-                                    record.registry_reservation.0,
-                                ),
+                            .map(|record| {
+                                self.clean_actor_record(crate::agent_sdk::ActorId(
+                                    record.entry.actor.0,
+                                ))
+                                .ok_or(ManagementError::InvalidRequest)
                             })
-                            .collect(),
+                            .collect::<Result<Vec<_>, _>>()?,
                         next: page.next.map(|value| crate::agent_sdk::ActorId(value.0)),
                     };
                     page.validate()

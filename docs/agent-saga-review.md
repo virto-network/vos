@@ -306,3 +306,60 @@ Keep the ordinary-Agent finality adapter, custom-runtime material lookup,
 portable recovery crash closure, reproducible artifacts, and final release gates
 in the existing three Chapter 08 batches. These startup fixes alone do not make
 the complete saga deploy-ready or authorize advancing `saga/agents`/`master`.
+
+### Chapter 08 opaque-runtime directory correction (isolated r15 work)
+
+The verified r14 native-startup checkpoint remains `f212f278` on
+`saga/ch08-c2-native`. The follow-up source correction is isolated on
+`wip/ch08-runtime-directory`; this is internal work in the existing startup
+and artifact batches, not another review endpoint. Do not deploy this worktree
+with its still-r14 bundled programs.
+
+The physical custom-runtime host regression reproduced `CorruptResidue` because
+Shared invocation preparation decoded Standard-private state to recover install
+lineage. Custom runtimes own an opaque state representation. ABI
+`vos-agent-runtime-abi-260911-r15` therefore adds a required nonzero immutable
+`install_request` commitment to `ActorDirectoryRecord`. Standard projects its
+retained original install commitment (not the upgradeable entry), and the
+custom Linear example returns its original install commitment. Shared preparation
+now executes the canonical read-only directory query and admits the exact signed
+package/artifact closure without decoding Standard-private state. Supervisor
+checks require the directory and prepared material to agree on lineage.
+
+The control-schema pin and ABI-dependent golden commitments were regenerated.
+Directory tests independently check the field's byte position, reject missing
+or zero lineage, and reject the previous ABI. Verification on this source:
+
+- 160 SDK tests pass.
+- 28 supervisor-adapter tests pass.
+- The formerly failing physical opaque-runtime management/material/reopen test
+  passes and checks the returned install commitment.
+- Standard actor-upgrade coverage checks that the directory reports the new
+  deployment but retains the original install lineage, without mutating state.
+- The maintained custom Linear example passes 10 normal tests; its compiled
+  scheduling/attestation test remains ignored until its artifact is rebuilt.
+- A newly built Standard-runtime ELF passed the current CLI physical ABI probe;
+  its PVM passed the explicit physical create/install/exact-retry/directory test.
+
+The candidate is 935415 bytes, ProgramId
+`6bcc6da44743202942746bfede64db263bbca704fc11c6d2e8f783bfa55c1df0`.
+It has NOT replaced a release artifact or passed checkout-independent
+reproducibility. Evidence lives under the native worktree's disk-backed
+`target/task-tmp/r15-*.log`; the candidate is
+`target/task-tmp/r15-agent-runtime-candidate.pvm`, and its ELF is under
+`target/r15-guest/riscv64em-vos/release/agent_runtime.elf`.
+
+Next: reproduce and repin the r15 runtime, rebuild the system package templates
+and custom-runtime example with current ABI tooling, then rerun physical,
+proof, bootstrap, and real first-start/restart gates before integrating this
+work into the native startup branch. The old r14 CLI correctly rejects the r15
+candidate ABI; use the current CLI or its explicit
+`compiled_runtime_candidate_uses_current_abi` candidate test with
+`VOS_AGENT_RUNTIME_ELF` and `VOS_AGENT_RUNTIME_CANDIDATE_OUT`.
+The integration test
+`compiled_runtime_directory_reports_exact_install_lineage_after_restart` uses
+`VOS_AGENT_RUNTIME_PVM` and must be run explicitly with `--ignored`.
+The existing ordinary-Agent finality, recovery crash-closure, and release gates
+remain open. The Standard-specific management-disposition lookup used only for
+classifying projection lag also remains to be audited for opaque runtimes;
+successful material lookup alone does not prove every custom-runtime lifecycle.

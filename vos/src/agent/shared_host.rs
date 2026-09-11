@@ -3095,6 +3095,7 @@ mod tests {
             incarnation: crate::agent_sdk::Hash([0x93; 32]),
             installation_id: install_body.installation_id,
             registry_reservation: install_body.registry_reservation,
+            install_request: install_body.lineage_commitment(),
         };
         let inspect = crate::agent_sdk::ManagementRequest::InspectActors {
             after: None,
@@ -4544,6 +4545,14 @@ mod tests {
             .unwrap();
         assert_eq!(physical.descriptor, current_descriptor);
         assert_eq!(physical.actor.entry, entry);
+        let crate::agent_sdk::ManagementRequest::Install(installed_request) = &install else {
+            unreachable!()
+        };
+        assert_eq!(
+            physical.actor.install_request,
+            installed_request.lineage_commitment()
+        );
+        assert_eq!(physical.install_request, physical.actor.install_request);
         assert_eq!(physical.program.bytes, actor_package.program_bytes());
         assert_eq!(
             physical.schema.bytes,

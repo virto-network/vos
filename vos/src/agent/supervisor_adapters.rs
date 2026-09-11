@@ -715,6 +715,7 @@ fn prepare_from_physical_material(
         || identity.agent != expected.key().agent()
         || identity.runtime_deployment != expected.runtime_deployment()
         || material.actor.validate().is_err()
+        || material.actor.install_request != material.install_request
         || material
             .actor
             .entry
@@ -795,6 +796,7 @@ fn physical_material_matches_identity(
     let identity = &material.descriptor.identity;
     material.descriptor.validate().is_ok()
         && material.actor.validate().is_ok()
+        && material.actor.install_request == material.install_request
         && identity.space == expected.key().space()
         && identity.agent == expected.key().agent()
         && identity.profile == expected.profile()
@@ -843,6 +845,7 @@ pub(crate) fn physical_material_matches_authority(
     material.descriptor == *descriptor
         && material.descriptor.validate().is_ok()
         && material.actor.validate().is_ok()
+        && material.actor.install_request == material.install_request
         && material.actor.entry == actor.entry
         && material.actor.installation_id == actor.installation_id
         && material.actor.registry_reservation == actor.registry_reservation
@@ -4200,6 +4203,7 @@ mod tests {
             incarnation: Hash([seed.wrapping_add(13); 32]),
             installation_id: InstallationId([seed.wrapping_add(14); 32]),
             registry_reservation: Hash([seed.wrapping_add(15); 32]),
+            install_request: Hash([seed.wrapping_add(17); 32]),
         };
         record.validate().unwrap();
         let material = PhysicalInvocationMaterial {
@@ -6015,6 +6019,7 @@ mod tests {
                 incarnation: Hash([seed.wrapping_add(20); 32]),
                 installation_id: actor.installation_id,
                 registry_reservation: actor.registry_reservation,
+                install_request: actor.install_request,
             },
             install_request: actor.install_request,
             producer: actor.producer,

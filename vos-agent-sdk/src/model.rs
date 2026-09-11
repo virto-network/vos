@@ -633,6 +633,10 @@ pub struct ActorDirectoryRecord {
     pub incarnation: Hash,
     pub installation_id: InstallationId,
     pub registry_reservation: Hash,
+    /// Immutable canonical install-plan commitment, preserved across upgrades.
+    /// Physical hosts obtain this through the runtime ABI, never by decoding
+    /// a runtime's private state representation.
+    pub install_request: Hash,
 }
 
 impl ActorDirectoryRecord {
@@ -641,6 +645,7 @@ impl ActorDirectoryRecord {
         if self.incarnation == Hash::ZERO
             || self.installation_id == InstallationId::ZERO
             || self.registry_reservation == Hash::ZERO
+            || self.install_request == Hash::ZERO
         {
             return Err(ModelError::InvalidActor);
         }

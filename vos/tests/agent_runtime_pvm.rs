@@ -1113,6 +1113,28 @@ fn bundled_runtime_persists_and_resumes_fifo_continuations() {
 /// This regression consumes a freshly compiled `agent-runtime` PVM rather
 /// than the checked-in pin. Keeping it ignored makes the source/guest ABI
 /// check explicit without silently blessing or rewriting the release pin.
+#[test]
+#[ignore = "set VOS_AGENT_RUNTIME_PVM to a freshly compiled bundled guest PVM"]
+fn compiled_runtime_directory_reports_exact_install_lineage_after_restart() {
+    let path = std::env::var_os("VOS_AGENT_RUNTIME_PVM").expect("candidate PVM path");
+    let pvm = std::fs::read(path).expect("read candidate PVM");
+    let runtime = admit_runtime_package(&runtime_package_bytes_for(&pvm, None)).unwrap();
+    let (descriptor, created) = create_agent_with_runtime(&pvm, &runtime, 8);
+    let actor_package = admitted_actor_program(static_actor_program());
+    // This helper also round-trips the installed transition and retries the
+    // exact install, requiring unchanged state and the same retained reply.
+    let (installed, request, _) =
+        install_actor_with_runtime(&pvm, &runtime, &descriptor, created, &actor_package);
+    let ManagementRequest::Install(install) = request else {
+        unreachable!()
+    };
+    let record = inspect_actor_with_runtime(&pvm, &descriptor, installed);
+    assert_eq!(record.entry, install.entry);
+    assert_eq!(record.installation_id, install.installation_id);
+    assert_eq!(record.registry_reservation, install.registry_reservation);
+    assert_eq!(record.install_request, install.lineage_commitment());
+}
+
 #[cfg(feature = "agent-transition-proof")]
 #[test]
 #[ignore = "set VOS_AGENT_RUNTIME_PVM to a freshly compiled bundled guest PVM"]

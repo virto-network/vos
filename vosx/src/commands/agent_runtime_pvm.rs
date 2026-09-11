@@ -124,6 +124,17 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "set VOS_AGENT_RUNTIME_ELF and VOS_AGENT_RUNTIME_CANDIDATE_OUT for a freshly built guest"]
+    fn compiled_runtime_candidate_uses_current_abi() {
+        let elf = std::env::var_os("VOS_AGENT_RUNTIME_ELF").expect("candidate ELF path");
+        let out =
+            std::env::var_os("VOS_AGENT_RUNTIME_CANDIDATE_OUT").expect("candidate output path");
+        // Use the production conversion and physical ABI probe without
+        // replacing or silently accepting the checked-in release pin.
+        run(Some(Path::new(&elf)), Some(PathBuf::from(out))).unwrap();
+    }
+
+    #[test]
     fn bundled_runtime_has_the_current_clean_outer_surface() {
         validate_agent_runtime_pvm(crate::bundled::agent_runtime_pvm())
             .expect("the checked-in runtime uses only the current clean outer surface");

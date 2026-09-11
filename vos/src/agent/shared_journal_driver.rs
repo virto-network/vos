@@ -1112,39 +1112,13 @@ where
         {
             return Err(SharedJournalDriverError::InvalidProfile);
         }
-        let runtime_state =
-            super::wire::decode_standard_runtime_state(self.materialization.state())
-                .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
-        let physical_record = runtime_state
-            .actors
-            .binary_search_by_key(&target.0, |candidate| candidate.record.entry.actor.0)
-            .ok()
-            .and_then(|index| runtime_state.actors.get(index))
-            .map(|candidate| &candidate.record)
-            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
-        let durable_actor = super::standard::legacy_actor_record_to_clean(physical_record);
-        let installation = runtime_state
-            .clean_actor_installations
-            .as_ref()
-            .and_then(|installations| {
-                installations
-                    .binary_search_by_key(&target, |candidate| candidate.actor)
-                    .ok()
-                    .and_then(|index| installations.get(index))
-            })
-            .copied()
-            .filter(|installation| {
-                installation.actor == target
-                    && installation.commitment != crate::agent_sdk::Hash::ZERO
-            })
-            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        // The admitted runtime owns its opaque state representation. Obtain
+        // directory facts, including immutable install lineage, by executing
+        // the canonical read-only ABI against the authenticated current state.
         // `InspectActors` is exclusive-after and the directory is ordered by
         // the actor's canonical bytes. Query from the immediate predecessor
         // with a one-record limit so one invocation never walks the global
         // directory (or lets unrelated actor count become backpressure).
-        if target == crate::agent_sdk::ActorId::ZERO {
-            return Err(SharedJournalDriverError::CrossStoreMismatch);
-        }
         let after = exclusive_actor_predecessor(target);
         let outcome =
             self.inspect_clean_management(&crate::agent_sdk::ManagementRequest::InspectActors {
@@ -1165,7 +1139,6 @@ where
         }
         let actor = page.entries[0].clone();
         if actor.validate().is_err()
-            || actor != durable_actor
             || require_ready && actor.entry.suspended
             || actor
                 .entry
@@ -1233,16 +1206,16 @@ where
                 .runtime_contract
                 .supports(package.manifest().contract)
             || !descriptor.capabilities.satisfies(package.requirements())
-            || package.producer().0 != physical_record.producer.0
         {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
         let program_bytes = package.program_bytes().to_vec();
         let observed_slot = self.executor.current_logical_slot()?;
+        let install_request = actor.install_request;
         Ok(super::invocation_preparation::PhysicalInvocationMaterial {
             descriptor,
             actor,
-            install_request: installation.commitment,
+            install_request,
             producer: package.producer(),
             contract: package.manifest().contract,
             requirements: package.requirements(),
