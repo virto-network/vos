@@ -31,10 +31,11 @@ review endpoints for individual fixes:
 
 1. **C1 — recovery:** preserve the integrated portable-recovery fixes. Host-owned
    management evidence now survives checkpoint/GC/reopen and feeds the Shared
-   projection comparator. Finish physical Shared snapshot/QC and one-ack-lag
-   substitution coverage, and close remaining Standard-state dependencies in
-   production Local recovery. Neither a private-state decoder nor a volatile
-   cache is a runtime-independent recovery proof.
+   projection comparator. Physical Shared certified snapshot/compaction and
+   substituted-evidence reopen checks now pass. Finish portable cross-store
+   restore and one-ack-lag projection coverage for the new evidence, and close
+   remaining Standard-state dependencies in the production Local path. Neither
+   a private-state decoder nor a volatile cache is a runtime-independent proof.
 2. **C2 — native lifecycle:** replace the deliberately unavailable ordinary-
    Agent finality adapter with authenticated live system-Agent decision
    publication and independent replay verification, including reopen. A
@@ -906,3 +907,35 @@ Still required: physical Shared checkpoint certificate/snapshot import and
 tampering coverage for the new evidence, production Local opaque recovery,
 ordinary-Agent finality, and final frozen-source release gates. Earlier startup
 and artifact reproduction evidence is not a final AJC4 daemon smoke result.
+
+### Physical Shared management-evidence snapshot verification
+
+The custom-runtime physical host regression now creates and installs an actual
+quorum-certified snapshot after actor installation, completes bounded physical
+compaction, and closes the host. It resolves exactly the certified AJC4 file
+and independently substitutes five validly encoded variants: receipt commitment,
+request commitment, sequence, result, and removal of the evidence. Each changes
+the checkpoint identity and prevents cold host reopen under the original
+certificate. Restoring the original file restores normal cold reopen with the
+exact management disposition and actor material; the subsequent runtime work
+still succeeds.
+
+For each variant the test also rewrites the certificate's checkpoint reference
+to the substituted identity while retaining its signatures. The altered
+certificate decodes canonically, but signature verification against its own
+altered claim fails. This exercises content-address substitution and signature
+binding separately; it is not a claim of cross-store portable import coverage.
+The final selection passes **8/8 tests**, with no failures or ignored tests
+(`r16-shared-management-certificate-final.log`, 5.44s): the physical opaque
+snapshot regression, cross-store/node/generation certificate isolation, and
+all six Shared commit tests. Formatting and diff checks pass. No guest blobs,
+runtime ABI, or production source paths were changed by this test checkpoint.
+
+The remaining Local issue is broader than only checkpoint metadata:
+`LocalAgentHost` uses the image-backed `AgentDriver`, whose clean Create and
+management paths require exact equality with a natively reconstructed Standard
+transition. Descriptor and physical-material recovery also decode Standard
+private state. The transitional Local journal's opaque-runtime tests do not
+prove that production image-backed host supports an opaque runtime. Closing
+that production boundary remains required; removing its guards without replacing
+their authenticated public-state invariants is not a valid fix.

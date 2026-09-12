@@ -4543,6 +4543,15 @@ mod tests {
         fixture: &CleanFixture,
         slot: Arc<AtomicU64>,
     ) -> SharedAgentHost {
+        try_open_clean_host(directory, fixture, slot).unwrap()
+    }
+
+    #[cfg(feature = "pvm")]
+    fn try_open_clean_host(
+        directory: &TempDirectory,
+        fixture: &CleanFixture,
+        slot: Arc<AtomicU64>,
+    ) -> Result<SharedAgentHost, SharedAgentHostError> {
         let node = fixture.shared.provision.replicas().members()[0]
             .replica()
             .node;
@@ -4561,7 +4570,6 @@ mod tests {
             Arc::new(SigningMerge(merge_key)),
             Arc::new(AcceptFinality),
         )
-        .unwrap()
     }
 
     fn open_host_on_node(
@@ -5207,7 +5215,80 @@ mod tests {
             Ok(crate::agent_sdk::ManagementReply::Installed(entry.clone()))
         );
 
+        // Cross the real quorum-certified snapshot and physical compaction
+        // boundary before testing cold recovery of opaque management evidence.
+        let candidate = host
+            .request_snapshot_compaction(fixture.shared.agent)
+            .unwrap();
+        let certificate = snapshot_certificate(&candidate, &fixture.shared);
+        host.install_snapshot(fixture.shared.agent, &certificate)
+            .unwrap();
+        let mut compacted = false;
+        for _ in 0..256 {
+            if host
+                .compact_snapshot(fixture.shared.agent, compaction_limits(16))
+                .unwrap()
+                .complete
+            {
+                compacted = true;
+                break;
+            }
+        }
+        assert!(compacted);
         drop(host);
+
+        use crate::agent::journal::{CanonicalJournalRecord as _, CheckpointManifest};
+        let checkpoints = physical_bytes(&directory)
+            .into_iter()
+            .filter_map(|(path, bytes)| {
+                let checkpoint = CheckpointManifest::decode(&bytes).ok()?;
+                (checkpoint.id() == candidate.claim().checkpoint())
+                    .then_some((path, bytes, checkpoint))
+            })
+            .collect::<Vec<_>>();
+        let [(checkpoint_path, original_bytes, checkpoint)] = checkpoints.as_slice() else {
+            panic!("expected exactly one certified checkpoint file");
+        };
+        assert!(checkpoint.clean_management.is_some());
+        for mutation in 0..5 {
+            let mut substituted = checkpoint.clone();
+            let evidence = substituted.clean_management.as_mut().unwrap();
+            match mutation {
+                0 => evidence.authority = crate::agent_sdk::Hash([0xf1; 32]),
+                1 => evidence.request = crate::agent_sdk::Hash([0xf2; 32]),
+                2 => evidence.sequence += 1,
+                3 => evidence.result = Err(crate::agent_sdk::ManagementError::NotFound),
+                _ => substituted.clean_management = None,
+            }
+            substituted.validate().unwrap();
+            assert_ne!(substituted.id(), candidate.claim().checkpoint());
+            let mut forged_bytes = certificate.encode();
+            let offsets = forged_bytes
+                .windows(32)
+                .enumerate()
+                .filter_map(|(offset, bytes)| {
+                    (bytes == candidate.claim().checkpoint().as_bytes()).then_some(offset)
+                })
+                .collect::<Vec<_>>();
+            let [offset] = offsets.as_slice() else {
+                panic!("expected one checkpoint reference in the canonical certificate");
+            };
+            forged_bytes[*offset..*offset + 32].copy_from_slice(substituted.id().as_bytes());
+            let forged = SharedAgentSnapshotCertificate::decode(&forged_bytes).unwrap();
+            assert_eq!(forged.claim().checkpoint(), substituted.id());
+            assert!(
+                forged
+                    .verify(candidate.claim().active_committee(), forged.claim())
+                    .is_err(),
+                "old signatures authorized substituted checkpoint evidence {mutation}"
+            );
+            fs::write(directory.0.join(checkpoint_path), substituted.encode()).unwrap();
+            assert!(
+                try_open_clean_host(&directory, &fixture, Arc::clone(&slot)).is_err(),
+                "substituted management evidence {mutation} reopened under the old certificate"
+            );
+        }
+        fs::write(directory.0.join(checkpoint_path), original_bytes).unwrap();
         let mut host = open_clean_host(&directory, &fixture, Arc::clone(&slot));
         assert_eq!(
             host.agents[&fixture.shared.agent]
