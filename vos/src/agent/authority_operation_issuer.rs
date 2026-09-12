@@ -3611,13 +3611,20 @@ mod tests {
         let application = private_application(&private_call, 24, 1);
         let mut application_bytes = Vec::new();
         encode_application_fact(&mut Encoder(&mut application_bytes), &application);
+        let mut managed_bytes = Vec::new();
+        encode_managed_target(&mut Encoder(&mut managed_bytes), application.managed);
+        let operation_offset = managed_bytes.len();
         assert_eq!(
-            application_bytes[96],
+            &application_bytes[..operation_offset],
+            managed_bytes.as_slice()
+        );
+        assert_eq!(
+            application_bytes[operation_offset],
             AuthorityOperationKind::InvitePrivateNode as u8
         );
         for hostile_operation in [AuthorityOperationKind::InvokeActor as u8, u8::MAX] {
             let mut hostile = application_bytes.clone();
-            hostile[96] = hostile_operation;
+            hostile[operation_offset] = hostile_operation;
             assert!(matches!(
                 decode_application_fact(&mut Decoder::new(&hostile)),
                 Err(DecodeError::InvalidTag)

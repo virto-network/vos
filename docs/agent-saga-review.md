@@ -502,3 +502,18 @@ That exact test then passed with socket access (1.22s), without code changes.
 Evidence: `integrated-shared-host-suite.log` and
 `integrated-merge-pump-network.log`. The full final serial gate must run in a
 socket-capable environment; the sandboxed suite's exit status was not green.
+
+The broader integrated library run (socket-capable, `pvm,private-agent-store`,
+serial, excluding only the separately verified inventory test) completed with
+1649 passed and 14 failed in 1754.83s. Full evidence and failure details are in
+`integrated-vos-library-suite.log`. This is a failed release gate. Failures span
+issuer hostile-tag offsets, driver preflight, journal/shared-commit golden
+identities, three Local SDK host physical tests, three wire tests, and two node
+authorization tests. In particular, restore accepted mutated exact install
+requirements and accepted-invocation provenance; do not dismiss these as golden
+fixture churn or weaken the rejection assertions.
+
+The issuer hostile-tag test was corrected to locate its operation byte after
+the encoded managed target (instead of stale offset 96); its exact rerun passes
+in `integrated-issuer-hostile-offset.log`. The other 13 failures remain open.
+Workspace formatting validation passed before this test-only correction.
