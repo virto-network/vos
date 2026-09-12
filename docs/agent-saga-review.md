@@ -479,3 +479,14 @@ runtime tests, and 6 tests selected by `portable`, all with the same explicit
 features. Evidence logs are `c1-private-store-suite.log`,
 `c1-private-runtime-suite.log`, and `c1-portable-suite.log`. The integrated
 portable run is tracked separately in `integrated-portable-suite.log`.
+That integrated run passes all 6 selected tests. The integrated Private host
+suite is tracked separately in `integrated-private-host-suite.log` and still
+requires a terminal passing result.
+
+Ordinary-genesis integration remains functional work, not just a release flag:
+`clean_startup.rs` still installs `UnavailableAgentFinality`. The canonical
+`system_authority.rs` decision/QC and historical-provision verification logic
+exists, but `verify_historical_provision` currently has only test callers. A
+production adapter must bind a provision to authenticated live-system replay,
+including reopen and historical committee evidence; accepting a provision's
+self-consistency or a standalone membership proof is not an adequate substitute.
