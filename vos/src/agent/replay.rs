@@ -395,6 +395,33 @@ pub struct ReplayTransition {
     pub attested_transition: Option<crate::agent_sdk::Hash>,
 }
 
+/// Carry decoded management semantics across the executor/replay boundary.
+/// The executor authenticates the input and checks the exact guest reply;
+/// replay independently requires its success/failure to match the accepted
+/// disposition. A transition-only executor cannot synthesize this evidence.
+fn validated_clean_management_result<E: ReplayExecutor, SourceError>(
+    executor: &E,
+    input: &ReplayInput,
+    transition: &ReplayTransition,
+) -> Result<
+    Option<Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>>,
+    ReplayError<SourceError, E::Error>,
+> {
+    if !matches!(input.operation, ReplayOperation::CleanManage { .. }) {
+        return Ok(None);
+    }
+    let result = executor
+        .clean_management_transition_result(input, transition)
+        .ok_or(ReplayError::InvalidManagementTransition)?;
+    if !matches!(
+        (&result, transition.disposition),
+        (Ok(_), ReplayDisposition::Applied) | (Err(_), ReplayDisposition::Rejected)
+    ) {
+        return Err(ReplayError::InvalidManagementTransition);
+    }
+    Ok(Some(result))
+}
+
 fn sdk_runtime_state(state: &RuntimeState) -> crate::agent_sdk::RuntimeState {
     crate::agent_sdk::RuntimeState {
         control: state.control.clone(),
@@ -690,17 +717,17 @@ pub trait ReplayExecutor {
         Ok(None)
     }
 
-    /// Prove that a clean management transition came from a decoded SDK
+    /// Return the exact result of a decoded SDK
     /// `RuntimeOutcome::Management` for this exact input. The generic replay
     /// layer cannot reconstruct custom-runtime state, so implementations must
     /// retain the canonical guest outcome they just decoded. The fail-closed
     /// default prevents a transition-only executor from admitting CleanManage.
-    fn validates_clean_management_transition(
+    fn clean_management_transition_result(
         &self,
         _input: &ReplayInput,
         _transition: &ReplayTransition,
-    ) -> bool {
-        false
+    ) -> Option<Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>> {
+        None
     }
 
     /// Execute with replay-authenticated journal context. Executors which do
@@ -1725,6 +1752,8 @@ pub struct ReplayStep {
     runtime: RuntimeBinding,
     outcome: ReplayStepOutcome,
     result: Option<Result<ActorExecutionReply, ActorExecutionError>>,
+    clean_management_result:
+        Option<Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>>,
     products: ReplayProducts,
     input: super::journal::ReplayInputId,
     position: ReplayPosition,
@@ -1766,10 +1795,20 @@ impl ReplayStep {
         self.result.as_ref()
     }
 
+    /// Exact decoded management result for this authenticated replay step.
+    /// This is independent of the runtime's private state representation.
+    /// It is not, by itself, durable checkpoint or publication evidence.
+    pub fn clean_management_result(
+        &self,
+    ) -> Option<&Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>> {
+        self.clean_management_result.as_ref()
+    }
+
     fn execution_result(&self, expose_result: bool) -> ReplayExecutionResult {
         ReplayExecutionResult {
             outcome: self.outcome,
             result: expose_result.then(|| self.result.clone()).flatten(),
+            clean_management_result: self.clean_management_result.clone(),
             products: self.products,
             input: self.input,
             position: self.position,
@@ -1970,11 +2009,7 @@ impl ReplayPreparedGenesis {
         let transition = executor
             .execute(&create, &before, ReplayPosition::Genesis)
             .map_err(ReplayError::Executor)?;
-        if matches!(create.operation, ReplayOperation::CleanManage { .. })
-            && !executor.validates_clean_management_transition(&create, &transition)
-        {
-            return Err(ReplayError::InvalidManagementTransition);
-        }
+        validated_clean_management_result(executor, &create, &transition)?;
         validate_runtime_state_bound(&transition.state)?;
         let system_authority_write = validate_transition(
             &create,
@@ -4516,19 +4551,31 @@ pub struct ReplayPreparedPublication<'store, S: AgentJournalStore> {
 }
 
 /// Authenticated execution facts carried by a prepared journal publication.
-/// The durable reply itself remains in the scoped invocation-result state of
-/// the returned successor materialization; these fields tell the driver
-/// exactly which result to recover without re-executing the input.
+/// Durable invocation replies remain in the scoped invocation-result state
+/// of the returned successor materialization. Management replies are carried
+/// directly for the synchronous publication handoff; these execution facts
+/// are not a substitute for authenticated checkpoint recovery evidence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplayExecutionResult {
     outcome: ReplayStepOutcome,
     result: Option<Result<ActorExecutionReply, ActorExecutionError>>,
+    clean_management_result:
+        Option<Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>>,
     products: ReplayProducts,
     input: super::journal::ReplayInputId,
     position: ReplayPosition,
 }
 
 impl ReplayExecutionResult {
+    /// Exact management reply carried across publication, without consulting
+    /// private runtime state or an executor's bounded result cache. Checkpoint
+    /// persistence is a separate boundary and is not implied by this accessor.
+    pub fn clean_management_result(
+        &self,
+    ) -> Option<&Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>> {
+        self.clean_management_result.as_ref()
+    }
+
     pub const fn outcome(&self) -> ReplayStepOutcome {
         self.outcome
     }
@@ -8782,11 +8829,8 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 )
                 .map_err(ReplayError::Executor)?
         };
-        if matches!(input.operation, ReplayOperation::CleanManage { .. })
-            && !executor.validates_clean_management_transition(input, &transition)
-        {
-            return Err(ReplayError::InvalidManagementTransition);
-        }
+        let clean_management_result =
+            validated_clean_management_result(executor, input, &transition)?;
         if prior_owner.is_none()
             && matches!(
                 invocation_owner,
@@ -9027,6 +9071,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                 ReplayStepOutcome::Applied(transition.disposition)
             },
             result: transition.result,
+            clean_management_result,
             products: transition.products,
             input: input.id(),
             position,
@@ -9095,6 +9140,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                     ordered_base: event.ordered_base,
                 };
                 return Ok(ReplayStep {
+                    clean_management_result: None,
                     state: before.clone(),
                     runtime: self
                         .runtime_at(event.ordered_base)
@@ -9286,6 +9332,7 @@ impl<Ownership: InvocationOwnership> ReplayMachine<Ownership> {
                             .insert(
                                 key,
                                 ReplayExecutionResult {
+                                    clean_management_result: None,
                                     outcome: ReplayStepOutcome::Applied(replay_disposition(
                                         record.disposition(),
                                     )),
@@ -10886,6 +10933,7 @@ fn noop_replay_step(
     outcome: ReplayStepOutcome,
 ) -> ReplayStep {
     ReplayStep {
+        clean_management_result: None,
         state: before.clone(),
         runtime,
         outcome,
@@ -18764,21 +18812,74 @@ pub(crate) mod tests {
             })
         }
 
-        fn validates_clean_management_transition(
+        fn clean_management_transition_result(
             &self,
             input: &ReplayInput,
             transition: &ReplayTransition,
-        ) -> bool {
+        ) -> Option<Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>>
+        {
             self.last
                 .as_ref()
-                .is_some_and(|(id, outcome, state, runtime, disposition)| {
-                    *id == input.id()
+                .and_then(|(id, outcome, state, runtime, disposition)| {
+                    let crate::agent_sdk::RuntimeOutcome::Management(result) = outcome else {
+                        return None;
+                    };
+                    (*id == input.id()
                         && matches!(outcome, crate::agent_sdk::RuntimeOutcome::Management(_))
                         && state == &transition.state
                         && runtime == &transition.next_runtime
-                        && disposition == &transition.disposition
+                        && disposition == &transition.disposition)
+                        .then(|| result.clone())
                 })
         }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn decoded_clean_management_result_is_required_and_disposition_bound() {
+        let (create, descriptor, _, _) = opaque_clean_fixture();
+        let mut executor = OpaqueCleanReplayExecutor::default();
+        let before = RuntimeState::default();
+        executor
+            .authenticate(&create, &before, ReplayPosition::Genesis)
+            .unwrap();
+        let mut transition = executor
+            .execute(&create, &before, ReplayPosition::Genesis)
+            .unwrap();
+        let expected = Ok(crate::agent_sdk::ManagementReply::Created(
+            descriptor.identity,
+        ));
+        assert_eq!(
+            validated_clean_management_result::<_, ()>(&executor, &create, &transition).unwrap(),
+            Some(expected),
+        );
+
+        // Even an executor which agrees with the altered transition must not
+        // turn a decoded success into a durable rejection (or vice versa).
+        transition.disposition = ReplayDisposition::Rejected;
+        executor.last.as_mut().unwrap().4 = ReplayDisposition::Rejected;
+        assert!(matches!(
+            validated_clean_management_result::<_, ()>(&executor, &create, &transition),
+            Err(ReplayError::InvalidManagementTransition),
+        ));
+        executor.last.as_mut().unwrap().1 = crate::agent_sdk::RuntimeOutcome::Management(Err(
+            crate::agent_sdk::ManagementError::NotFound,
+        ));
+        assert_eq!(
+            validated_clean_management_result::<_, ()>(&executor, &create, &transition).unwrap(),
+            Some(Err(crate::agent_sdk::ManagementError::NotFound)),
+        );
+        transition.disposition = ReplayDisposition::Applied;
+        executor.last.as_mut().unwrap().4 = ReplayDisposition::Applied;
+        assert!(matches!(
+            validated_clean_management_result::<_, ()>(&executor, &create, &transition),
+            Err(ReplayError::InvalidManagementTransition),
+        ));
+        executor.last = None;
+        assert!(matches!(
+            validated_clean_management_result::<_, ()>(&executor, &create, &transition),
+            Err(ReplayError::InvalidManagementTransition),
+        ));
     }
 
     #[cfg(feature = "std")]
@@ -18863,7 +18964,16 @@ pub(crate) mod tests {
             ReplayPreparation::Ready(prepared) => prepared,
             ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
         };
-        let (_, upgraded, _) = prepared.publish().unwrap();
+        let (_, upgraded, executions) = prepared.publish().unwrap();
+        let execution = executions
+            .iter()
+            .find(|item| item.input() == first.input.id())
+            .unwrap();
+        assert!(matches!(
+            execution.clean_management_result(),
+            Some(Ok(crate::agent_sdk::ManagementReply::RuntimeUpgraded(identity)))
+                if identity.runtime_deployment.0 == [0x41; 32]
+        ));
         assert_eq!(upgraded.heads().ordered_index, 1);
         assert_eq!(upgraded.runtime().deployment.0, [0x41; 32]);
         assert_eq!(upgraded.state().control, b"OPAQUE-CONTROL-V2");
@@ -18895,7 +19005,15 @@ pub(crate) mod tests {
             ReplayPreparation::Ready(prepared) => prepared,
             ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
         };
-        let (_, retried, _) = prepared.publish().unwrap();
+        let (_, retried, retry_executions) = prepared.publish().unwrap();
+        assert_eq!(
+            retry_executions
+                .iter()
+                .find(|item| item.input() == retry.input.id())
+                .unwrap()
+                .clean_management_result(),
+            execution.clean_management_result(),
+        );
         assert_eq!(retried.heads().ordered_index, 2);
         assert_eq!(retried.state(), &before_retry);
         assert_eq!(retried.runtime(), upgraded.runtime());
@@ -19184,18 +19302,23 @@ pub(crate) mod tests {
             Ok(None)
         }
 
-        fn validates_clean_management_transition(
+        fn clean_management_transition_result(
             &self,
             input: &ReplayInput,
             transition: &ReplayTransition,
-        ) -> bool {
-            self.last_clean_management.as_ref().is_some_and(
+        ) -> Option<Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>>
+        {
+            self.last_clean_management.as_ref().and_then(
                 |(id, outcome, state, runtime, disposition)| {
-                    *id == input.id()
+                    let crate::agent_sdk::RuntimeOutcome::Management(result) = outcome else {
+                        return None;
+                    };
+                    (*id == input.id()
                         && matches!(outcome, crate::agent_sdk::RuntimeOutcome::Management(_))
                         && state == &transition.state
                         && runtime == &transition.next_runtime
-                        && disposition == &transition.disposition
+                        && disposition == &transition.disposition)
+                        .then(|| result.clone())
                 },
             )
         }
@@ -19524,6 +19647,7 @@ pub(crate) mod tests {
         .expect("the exact returned transition binds");
         assert_eq!(binding.transition(), transition_b_commitment);
         let prepared_step = ReplayStep {
+            clean_management_result: None,
             state: replay.state.clone(),
             runtime: replay.next_runtime.clone(),
             outcome: ReplayStepOutcome::Applied(replay.disposition),
@@ -19605,6 +19729,7 @@ pub(crate) mod tests {
         )
         .expect("the authoritative retained tuple binds exact execution");
         let published_step = ReplayStep {
+            clean_management_result: None,
             state: replay.state.clone(),
             runtime: replay.next_runtime.clone(),
             outcome: ReplayStepOutcome::Applied(replay.disposition),

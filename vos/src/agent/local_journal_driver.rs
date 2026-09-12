@@ -3187,20 +3187,21 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
         Ok(Some(binding))
     }
 
-    fn validates_clean_management_transition(
+    fn clean_management_transition_result(
         &self,
         input: &ReplayInput,
         transition: &ReplayTransition,
-    ) -> bool {
+    ) -> Option<Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>> {
         let Some(crate::agent_sdk::RuntimeOutcome::Management(result)) =
             self.recent_clean_management_results.get(&input.id())
         else {
-            return false;
+            return None;
         };
         matches!(
             (result, transition.disposition),
             (Ok(_), ReplayDisposition::Applied) | (Err(_), ReplayDisposition::Rejected)
         )
+        .then(|| result.clone())
     }
 
     fn seed_genesis(
@@ -5438,11 +5439,16 @@ where
             {
                 return Err(LocalJournalDriverError::InvalidResult);
             }
-            let outcome = self
-                .core
-                .executor
-                .take_clean_invocation_result(input_id)
+            let outcome = executions
+                .iter()
+                .find(|execution| execution.input() == input_id)
+                .and_then(|execution| execution.clean_management_result())
+                .cloned()
+                .map(crate::agent_sdk::RuntimeOutcome::Management)
                 .ok_or(LocalJournalDriverError::InvalidResult)?;
+            // Publication carries the authoritative synchronous result. The
+            // executor cache remains only a bounded retry/transport handoff.
+            let _ = self.core.executor.take_clean_invocation_result(input_id);
             if outcome != preview.outcome {
                 return Err(LocalJournalDriverError::InvalidResult);
             }

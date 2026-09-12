@@ -827,3 +827,36 @@ pass (`r16-sdk-layout-tests.log`). No runtime representation or canonical wire
 change was made by the attributes/tests. The integrated library run has passed
 the coordinator capacity test and advanced into issuer tests; it remains live
 as session 11706, not a completed gate.
+
+### Exact management result carried through replay publication
+
+The full integrated library run described above subsequently completed with
+1,663 passing tests; see the current closeout section for its exact source and
+excluded test. No test process from that run remains active.
+
+The opaque-runtime recovery work now preserves the exact decoded SDK management
+result across the executor/replay boundary, rather than reducing it to a boolean
+and discarding the reply. `ReplayExecutor::clean_management_transition_result`
+defaults to no evidence; replay rejects missing results and mismatched
+success/failure dispositions. Validated `ReplayStep` and publication execution
+results retain the reply independently of runtime-private state. The Local
+management path now reads its freshly published result from those execution
+facts, while retaining the bounded cache for the existing retry/transport paths.
+
+All 53 replay tests pass (`r16-replay-management-result-suite.log`), including
+new missing-result/disposition-mismatch coverage and exact opaque-runtime upgrade
+and retry publication results. An initial exact-name command selected zero
+tests and is not verification evidence. These are host-side changes: no SDK
+wire generation or guest artifact was changed.
+
+The combined final rerun passes all **63 replay and Local SDK host tests**,
+with no failures, ignored tests or selected tests filtered internally
+(`r16-management-publication-final.log`, 14.36s; 1,602 unrelated library tests
+were filtered). This includes physical lifecycle, exact retry and restart paths
+using the publication-carried management reply. Formatting and diff checks pass.
+
+This is the first part of C1's opaque-runtime closure, not completion: the exact
+reply still needs request/receipt-bound host evidence in replay materialization,
+canonical checkpoint authentication, pruning/reopen recovery, and consumption
+by the Shared/Local projection audits. Do not replace those audits with the
+volatile cache or treat publication result accessors as durable checkpoint proof.
