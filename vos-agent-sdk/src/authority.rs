@@ -1268,7 +1268,7 @@ impl AuthorityCredentialProjection {
             || self.principal == PrincipalId::ZERO
             || self.space_roles.len() + self.actor_roles.len() + self.capabilities.len()
                 > MAX_AUTHORITY_PRINCIPAL_GRANTS
-            || self.space_roles.iter().any(|role| *role == RoleId::ZERO)
+            || self.space_roles.contains(&RoleId::ZERO)
             || self.space_roles.windows(2).any(|pair| pair[0] >= pair[1])
             || self.actor_roles.iter().any(|grant| !grant.is_valid())
             || self.actor_roles.windows(2).any(|pair| pair[0] >= pair[1])

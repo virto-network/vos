@@ -749,3 +749,16 @@ The broad library rerun remains active as session 11706, against source
 execution, and socket access. Only the separately tracked long inventory test
 is filtered. Evidence is `r16-integrated-library.log`; poll the existing session
 before scheduling another run. No final result has been recorded yet.
+
+### Portable SDK lint follow-up
+
+Strict SDK linting (`cargo clippy -p vos-agent-sdk --all-targets
+--no-default-features -- -D warnings`) initially reported three manual-contains
+and three large-enum-variant errors. The equivalent `contains` checks replace
+the three zero-ID searches; all 161 SDK tests still pass
+(`r16-sdk-contains-tests.log`). Strict lint remains failed on the three enum
+layout warnings (`r16-sdk-clippy-remaining.log`): AuthorityOperationIntent,
+InvocationAuthorization, and PrivateRuntimeMutation. No warning suppression or
+public allocation/layout change was made. These source-only cleanup edits are
+newer than the pinned artifact source and the running full-library checkpoint;
+final frozen-source artifact/gate verification remains required.

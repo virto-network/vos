@@ -180,10 +180,7 @@ impl PrivateRecoveryAuthorityProof {
             || self.superseded_authority_head == Some(Hash::ZERO)
             || self.replacement_nodes.is_empty()
             || self.replacement_nodes.len() > MAX_PRIVATE_NODES
-            || self
-                .replacement_nodes
-                .iter()
-                .any(|node| *node == NodeId::ZERO)
+            || self.replacement_nodes.contains(&NodeId::ZERO)
             || !self
                 .replacement_nodes
                 .windows(2)
@@ -818,7 +815,7 @@ pub fn private_member_set_commitment(nodes: impl Iterator<Item = NodeId>) -> Opt
     let nodes: Vec<NodeId> = nodes.collect();
     if nodes.is_empty()
         || nodes.len() > MAX_PRIVATE_NODES
-        || nodes.iter().any(|node| *node == NodeId::ZERO)
+        || nodes.contains(&NodeId::ZERO)
         || !nodes.windows(2).all(|pair| pair[0] < pair[1])
     {
         return None;
