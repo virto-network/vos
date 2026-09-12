@@ -400,9 +400,12 @@ impl LocalAgentHost {
     ) -> Result<bool, LocalAgentHostError> {
         let mut physical = Vec::with_capacity(self.agents.len());
         for (agent, hosted) in &self.agents {
-            let state =
-                super::wire::decode_standard_runtime_state(&hosted.driver.image().runtime_state)
-                    .map_err(|_| LocalAgentHostError::Corrupt)?;
+            let history = hosted
+                .driver
+                .image()
+                .clean_management
+                .as_ref()
+                .ok_or(LocalAgentHostError::Corrupt)?;
             let directory = hosted
                 .driver
                 .inspect_sdk_actor_directory(&hosted.descriptor)?;
@@ -422,7 +425,16 @@ impl LocalAgentHost {
                 super::supervisor_adapters::PhysicalAuthorityRouteProjection {
                     descriptor: hosted.descriptor.clone(),
                     actors,
-                    disposition: state.clean_management_dispositions.last().cloned(),
+                    disposition: history.latest().map(|record| {
+                        super::standard::StandardCleanManagementDisposition {
+                            authority: record.authority,
+                            request: record.request,
+                            epoch: record.epoch,
+                            sequence: record.sequence,
+                            observed_slot: record.observed_slot,
+                            result: record.result.clone(),
+                        }
+                    }),
                 },
             );
         }
@@ -2337,6 +2349,51 @@ mod tests {
                 .join("packages")
                 .join(format!("{}.next", "a".repeat(64)))
                 .exists()
+        );
+    }
+
+    #[test]
+    fn physical_reopen_rejects_substituted_host_management_history() {
+        use super::super::driver::AgentImageStore as _;
+        use super::super::local_management::LocalManagementHistory;
+        use crate::service::wire::ServiceWire as _;
+        let directory = TestDirectory::new("management-history-binding");
+        let root = directory.child("agents");
+        let (_, trust) = clock_trust(1);
+        let mut host = LocalAgentHost::create(&root, space(), node(), trust.clone()).unwrap();
+        let runtime = admitted_runtime();
+        let descriptor = descriptor(&runtime, 8, AgentProfile::Local, space(), node());
+        let agent = host
+            .create_agent(runtime, descriptor.clone(), create_receipt(&descriptor, 10))
+            .unwrap();
+        let original = host.agents.get(&agent).unwrap().driver.image().clone();
+        drop(host);
+        let reopened = LocalAgentHost::open(&root, space(), node(), trust.clone()).unwrap();
+        assert_eq!(
+            reopened.agents.get(&agent).unwrap().driver.image(),
+            &original
+        );
+        drop(reopened);
+
+        let mut substituted = original.clone();
+        let mut bytes = substituted.clean_management.as_ref().unwrap().encode();
+        // LMH1 header (36), acknowledgement (8), count (4), first receipt
+        // commitment (32): change the first request commitment, keeping this
+        // history canonical but inconsistent with the validated guest state.
+        bytes[80] ^= 1;
+        substituted.clean_management = Some(LocalManagementHistory::decode(&bytes).unwrap());
+        substituted.revision += 1;
+        let mut store = FileAgentStore::new(image_path(&root.join(encode_agent_id(agent))));
+        store.commit(Some(original.revision), &substituted).unwrap();
+        assert!(LocalAgentHost::open(&root, space(), node(), trust.clone()).is_err());
+
+        let mut restored = original;
+        restored.revision = substituted.revision + 1;
+        store.commit(Some(substituted.revision), &restored).unwrap();
+        let reopened = LocalAgentHost::open(&root, space(), node(), trust).unwrap();
+        assert_eq!(
+            reopened.agents.get(&agent).unwrap().driver.image(),
+            &restored
         );
     }
 

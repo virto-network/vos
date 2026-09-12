@@ -6667,6 +6667,11 @@ pub(crate) mod tests {
             super::super::standard::clean_descriptor_to_legacy_config(&descriptor).unwrap();
         let image = super::super::driver::AgentImage {
             clean_descriptor: Some(descriptor.clone()),
+            clean_management: Some(
+                super::super::local_management::LocalManagementHistory::from_standard_fixture(
+                    &decoded,
+                ),
+            ),
             revision: 1,
             runtime_program: crate::service::ProgramId(descriptor.identity.runtime_program.0),
             config: projected,

@@ -41,6 +41,57 @@ pub struct LocalManagementHistory {
 }
 
 impl LocalManagementHistory {
+    pub(crate) fn validates_initial_epoch(&self, initial_epoch: u64) -> bool {
+        self.validate().is_ok()
+            && self
+                .records
+                .first()
+                .is_some_and(|record| record.epoch >= initial_epoch)
+    }
+    pub(crate) fn matches_standard_state(
+        &self,
+        state: &super::standard::StandardRuntimeState,
+    ) -> bool {
+        self.acknowledged_through == state.clean_acknowledged_through
+            && self.latest().map(|record| record.epoch) == state.clean_authority_epoch_high_water
+            && self.latest().map(|record| record.sequence)
+                == state.clean_decision_sequence_high_water
+            && self.records.len() == state.clean_management_dispositions.len()
+            && self
+                .records
+                .iter()
+                .zip(&state.clean_management_dispositions)
+                .all(|(record, prior)| {
+                    record.authority == prior.authority
+                        && record.request == prior.request
+                        && record.epoch == prior.epoch
+                        && record.sequence == prior.sequence
+                        && record.observed_slot == prior.observed_slot
+                        && record.result == prior.result
+                })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_standard_fixture(state: &super::standard::StandardRuntimeState) -> Self {
+        let history = Self {
+            acknowledged_through: state.clean_acknowledged_through,
+            records: state
+                .clean_management_dispositions
+                .iter()
+                .map(|record| LocalManagementRecord {
+                    authority: record.authority,
+                    request: record.request,
+                    epoch: record.epoch,
+                    sequence: record.sequence,
+                    observed_slot: record.observed_slot,
+                    result: record.result.clone(),
+                })
+                .collect(),
+        };
+        history.validate().unwrap();
+        history
+    }
+
     pub fn latest(&self) -> Option<&LocalManagementRecord> {
         self.records.last()
     }

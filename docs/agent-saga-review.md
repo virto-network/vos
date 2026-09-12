@@ -14,9 +14,9 @@ Implementation is in `.worktrees/ch08-runtime-directory` on
 Use only an isolated, disposable environment for bootstrap/ingress testing.
 Fresh-space first start and restart with bundled system actors and HTTP/SSH
 have passed; ordinary-agent creation is not yet a usable production path.
-Those ingress checks predate the new AJC4 checkpoint and AGI2 Local image
+Those ingress checks predate the new AJC4 checkpoint and AGI3 Local image
 formats. A newly built CLI needs a fresh disposable data directory and another
-smoke run; AJC3 checkpoints and AGIM images are deliberately rejected, with no
+smoke run; AJC3 checkpoints and AGIM/AGI2 images are deliberately rejected, with no
 in-place migration provided.
 
 The integrated library run at `37d6a5720e7e45e4a19850a16a531e6cb316e299`
@@ -1114,3 +1114,39 @@ comparison. Reopen must reject missing or inconsistent history. Then exercise
 those paths through the physical host before removing any remaining Standard
 validation boundary. No image format, guest artifact or deployment-readiness
 claim changes in this checkpoint.
+
+### Atomic Local management history integration
+
+The **AGI3** image now stores descriptor, bounded LMH1 management history and
+all runtime lanes atomically. Verified Create initializes the history;
+management advances it from the independently checked request/transition,
+including state-changing denials. Invocation/acknowledgement and other
+state-only commits preserve it. Clean images without nonempty, canonical
+history in the descriptor's authority epoch range are rejected. AGIM and AGI2
+predecessors are rejected with no migration.
+
+Production Local retry classification now uses persisted public history rather
+than decoding Standard state. The Local one-ack-ahead projection comparator
+likewise obtains its exact disposition from that history. Reopen retains an
+explicit comparison of every retained record and acknowledgement/epoch/decision
+frontier against Standard state until runtime-independent lifecycle validation
+is complete; no permissive fallback or history reconstruction is used there.
+The old private-state retry helper survives only as a test fixture adapter.
+
+**107/107 history, driver, Local-host and wire tests pass**
+(`r16-local-management-image-final.log`, 29.10s). A new physical Create/reopen
+regression persists a canonically encoded substituted request commitment,
+confirms cold reopen refuses it, restores the original history and confirms
+reopen succeeds again. Opaque image codec tests reject missing/empty history
+and both predecessor formats. Existing physical lifecycle, expired retries,
+staged-create reconciliation and FIFO resume tests pass. Initial compilation
+found three test-only module paths needing another `super`; these were fixed
+before the passing run. Formatting and diff checks pass.
+Clean-space CLI checks also pass **31/31**
+(`r16-local-management-image-cli.log`, 0.21s).
+
+This closes persistence and production consumption of Local management
+history, not general custom-runtime Create/reopen. The remaining Local work is
+replacing Standard admission/transition/reopen checks with authenticated public
+invariants, then proving an opaque runtime's full production lifecycle.
+Ordinary-Agent finality and final-source release/smoke gates remain open.
