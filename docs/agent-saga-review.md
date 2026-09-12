@@ -517,3 +517,25 @@ The issuer hostile-tag test was corrected to locate its operation byte after
 the encoded managed target (instead of stale offset 96); its exact rerun passes
 in `integrated-issuer-hostile-offset.log`. The other 13 failures remain open.
 Workspace formatting validation passed before this test-only correction.
+
+### Standard original-install validation correction (source ahead of bundle)
+
+Do not deploy the current source worktree with its existing runtime blob. The
+source now retains `CompactInstallActor` in Standard's `SCI2` private-state
+installation table, replacing `SCAI`. Restore recomputes the original SDK
+lineage commitment and requires exact contract/requirements plus stable
+installation and reservation identities. This preserves original facts across
+upgrades without retaining constructor bytes. The runtime must be rebuilt,
+independently reproduced, repinned, and physically retested before release.
+
+The exact install-state regression passes, including substitution of both
+requirement copies without changing the signed lineage and rejection of the old
+state marker. Upgrade/restart and historical-retry wire tests also pass. Fixture
+builders which synthesize initial installations now update their original plan;
+production rejection checks were not relaxed. The oversized nested-authority
+test now encodes the current prefix and reaches the intended length bound.
+
+The latest wire suite result is 65 passed, 1 failed in
+`install-plan-wire-verified.log`: accepted-invocation provenance is still an open
+failure. That remaining failure, the other full-library failures, finality, and
+opaque-runtime projection recovery are not waived by the install-state fix.

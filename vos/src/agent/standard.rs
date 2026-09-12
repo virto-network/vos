@@ -895,6 +895,14 @@ pub(crate) fn clean_installation_binding(
         commitment: install.lineage_commitment(),
         contract: install.contract,
         requirements: install.requirements,
+        original: crate::agent_sdk::authority::CompactInstallActor {
+            installation_id: install.installation_id,
+            registry_reservation: install.registry_reservation,
+            entry: install.entry.clone(),
+            producer: install.producer,
+            contract: install.contract,
+            requirements: install.requirements,
+        },
     }
 }
 
@@ -1178,16 +1186,28 @@ pub struct StandardCleanActorPackage {
     pub requirements: crate::agent_sdk::RuntimeRequirements,
 }
 
-/// Exact SDK fields which the legacy install record cannot retain. The
-/// exact binding commitment combines the immutable legacy request commitment
-/// with the contract and non-collapsed requirements, making replay equality
-/// checkable after an actor upgrade without retaining constructor bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Original compact install facts retained independently of upgradeable actor
+/// metadata. Recomputing the SDK lineage commitment binds the exact contract
+/// and requirements even after upgrade, without retaining constructor bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StandardCleanActorInstallation {
     pub actor: crate::agent_sdk::ActorId,
     pub commitment: crate::agent_sdk::Hash,
     pub contract: crate::agent_sdk::contract::ActorPackageContract,
     pub requirements: crate::agent_sdk::RuntimeRequirements,
+    pub original: crate::agent_sdk::authority::CompactInstallActor,
+}
+
+impl StandardCleanActorInstallation {
+    fn validates_original(&self, record: &ActorRecord) -> bool {
+        self.original.is_valid()
+            && self.original.entry.actor == self.actor
+            && self.original.installation_id.0 == record.installation_id.0
+            && self.original.registry_reservation.0 == record.registry_reservation.0
+            && self.original.contract == self.contract
+            && self.original.requirements == self.requirements
+            && self.original.lineage_commitment() == self.commitment
+    }
 }
 
 /// One independently keyed physical lane entry. Active entries are selected
@@ -1282,7 +1302,7 @@ impl StandardAgentRuntime {
         self.actors.get(&ActorId(actor.0)).and_then(|managed| {
             Some(legacy_actor_record_to_clean(
                 &managed.record,
-                managed.clean_installation?.commitment,
+                managed.clean_installation.as_ref()?.commitment,
             ))
         })
     }
@@ -1295,7 +1315,7 @@ impl StandardAgentRuntime {
     ) -> Option<StandardCleanActorInstallation> {
         self.actors
             .get(&ActorId(actor.0))
-            .and_then(|managed| managed.clean_installation)
+            .and_then(|managed| managed.clean_installation.clone())
     }
 
     pub fn actor_record(&self, actor: ActorId) -> Option<&ActorRecord> {
@@ -1343,7 +1363,7 @@ impl StandardAgentRuntime {
             clean_actor_installations: self.clean_descriptor.as_ref().and_then(|_| {
                 self.actors
                     .values()
-                    .map(|actor| actor.clean_installation)
+                    .map(|actor| actor.clean_installation.clone())
                     .collect()
             }),
             retired_installation_ids: self.retired_installation_ids.iter().copied().collect(),
@@ -1567,6 +1587,7 @@ impl StandardAgentRuntime {
                                 && installations.iter().zip(&state.actors).all(
                                     |(installation, actor)| {
                                         installation.actor.0 == actor.record.entry.actor.0
+                                            && installation.validates_original(&actor.record)
                                             && installation.commitment
                                                 != crate::agent_sdk::Hash::ZERO
                                             && installation.contract.is_valid()
@@ -1750,7 +1771,7 @@ impl StandardAgentRuntime {
                             item.actor
                         })
                         .ok()
-                        .map(|index| installations[index])
+                        .map(|index| installations[index].clone())
                 });
             let config = runtime.created()?;
             if record.installation_id == InstallationId::ZERO
@@ -2034,6 +2055,7 @@ impl StandardAgentRuntime {
                     .as_ref()
                     .is_some_and(|installation| {
                         installation.actor.0 == actor.record.entry.actor.0
+                            && installation.validates_original(&actor.record)
                             && installation.commitment != crate::agent_sdk::Hash::ZERO
                             && installation.contract.is_valid()
                             && installation

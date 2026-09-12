@@ -459,7 +459,7 @@ fn decode_bounded_list<T>(
 
 const MAX_CLEAN_MANAGEMENT_RESULT_BYTES: usize = 8 * 1024;
 const STANDARD_CLEAN_ACTOR_PACKAGES_MAGIC: [u8; 4] = *b"SCAP";
-const STANDARD_CLEAN_ACTOR_INSTALLATIONS_MAGIC: [u8; 4] = *b"SCAI";
+const STANDARD_CLEAN_ACTOR_INSTALLATIONS_MAGIC: [u8; 4] = *b"SCI2";
 
 fn encode_clean_management_result(
     result: &Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>,
@@ -669,6 +669,7 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
             .0
             .extend_from_slice(&STANDARD_CLEAN_ACTOR_INSTALLATIONS_MAGIC);
         encoder.list(installations, |encoder, installation| {
+            use crate::agent_sdk::wire::CanonicalWire as _;
             encoder.fixed(installation.actor.as_bytes());
             encoder.fixed(installation.commitment.as_bytes());
             encoder.u32(installation.contract.actor_abi);
@@ -678,6 +679,10 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
                 installation.requirements.proof_systems.as_slice(),
                 |encoder, proof_system| encoder.fixed(proof_system.as_bytes()),
             );
+            let plan = crate::agent_sdk::authority::ManagementAuthorizationPlan::Install(
+                alloc::boxed::Box::new(installation.original.clone()),
+            );
+            encoder.bytes(&plan.encode().expect("valid original install plan"));
         });
     }
     RuntimeState {
@@ -1055,6 +1060,25 @@ pub fn decode_standard_runtime_state(
                         lanes,
                         scheduling,
                         proof_systems,
+                    },
+                    original: {
+                        use crate::agent_sdk::wire::CanonicalWire as _;
+                        let bytes = decoder.bytes_ref()?;
+                        if bytes.len()
+                            > crate::agent_sdk::wire::MAX_MANAGEMENT_AUTHORIZATION_PLAN_WIRE_BYTES
+                        {
+                            return Err(DecodeError::LimitExceeded);
+                        }
+                        match crate::agent_sdk::authority::ManagementAuthorizationPlan::decode(
+                            bytes,
+                        )
+                        .map_err(|_| DecodeError::NonCanonical)?
+                        {
+                            crate::agent_sdk::authority::ManagementAuthorizationPlan::Install(
+                                plan,
+                            ) => *plan,
+                            _ => return Err(DecodeError::NonCanonical),
+                        }
                     },
                 })
             },
@@ -4620,18 +4644,29 @@ pub(crate) mod tests {
                 proof_systems: crate::agent_sdk::ProofSystemSet::EMPTY,
             },
         }]);
+        let record = &state.actors[0].record;
+        let original = crate::agent_sdk::authority::CompactInstallActor {
+            installation_id: crate::agent_sdk::InstallationId(record.installation_id.0),
+            registry_reservation: crate::agent_sdk::Hash(record.registry_reservation.0),
+            entry: super::super::standard::legacy_actor_record_to_clean(
+                record,
+                crate::agent_sdk::Hash::ZERO,
+            )
+            .entry,
+            producer: crate::agent_sdk::ProducerId(record.producer.0),
+            contract: crate::agent_sdk::contract::ActorPackageContract::canonical(),
+            requirements: state.clean_actor_packages.as_ref().unwrap()[0].requirements,
+        };
         state.clean_actor_installations = Some(vec![StandardCleanActorInstallation {
             actor: crate::agent_sdk::ActorId(actor.0),
-            commitment: crate::agent_sdk::Hash::digest(
-                b"vos/test/clean-install-lineage",
-                &[actor.as_bytes()],
-            ),
+            commitment: original.lineage_commitment(),
             contract: crate::agent_sdk::contract::ActorPackageContract::canonical(),
             requirements: crate::agent_sdk::RuntimeRequirements {
                 lanes: crate::agent_sdk::LaneSet::ALL,
                 scheduling: false,
                 proof_systems: crate::agent_sdk::ProofSystemSet::EMPTY,
             },
+            original,
         }]);
         state.active_resource_policy = Some(descriptor.initial_resource_policy());
         state.clean_authority_epoch_high_water = Some(1);
@@ -5360,6 +5395,32 @@ pub(crate) mod tests {
             decode_standard_runtime_state(&encode_standard_runtime_state(&corrupt_installation)),
             Err(DecodeError::NonCanonical),
             "install-time exact fields must match their durable binding commitment",
+        );
+        corrupt_installation
+            .clean_actor_installations
+            .as_mut()
+            .unwrap()[0]
+            .original
+            .requirements = corrupt_installation
+            .clean_actor_installations
+            .as_ref()
+            .unwrap()[0]
+            .requirements;
+        assert_eq!(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&corrupt_installation)),
+            Err(DecodeError::NonCanonical),
+            "changing both exact requirement copies cannot change the original lineage",
+        );
+        let mut previous_format = encode_standard_runtime_state(&persisted_state);
+        let marker = previous_format
+            .control
+            .windows(4)
+            .position(|bytes| bytes == STANDARD_CLEAN_ACTOR_INSTALLATIONS_MAGIC)
+            .unwrap();
+        previous_format.control[marker..marker + 4].copy_from_slice(b"SCAI");
+        assert_eq!(
+            decode_standard_runtime_state(&previous_format),
+            Err(DecodeError::NonCanonical)
         );
         let mut collapsed = persisted_state.clone();
         collapsed.clean_actor_packages.as_mut().unwrap()[0]
@@ -7971,6 +8032,9 @@ pub(crate) mod tests {
         state.clean_actor_installations.as_mut().unwrap()[0]
             .requirements
             .proof_systems = proof_systems;
+        let installation = &mut state.clean_actor_installations.as_mut().unwrap()[0];
+        installation.original.requirements = installation.requirements;
+        installation.commitment = installation.original.lineage_commitment();
         state
             .clean_creation_descriptor
             .as_mut()
@@ -8080,6 +8144,17 @@ pub(crate) mod tests {
         if let AttestationRequirement::Required { proof_system } = attestation {
             enable_clean_test_proof_system(&mut state, proof_system);
         }
+        // This fixture synthesizes a new initial installation rather than
+        // applying an upgrade. Keep its original compact plan consistent
+        // with the schema/policy/requirements selected above.
+        let record = &state.actors[0].record;
+        let installation = &mut state.clean_actor_installations.as_mut().unwrap()[0];
+        installation.original.entry =
+            super::super::standard::legacy_actor_record_to_clean(record, installation.commitment)
+                .entry;
+        installation.original.contract = installation.contract;
+        installation.original.requirements = installation.requirements;
+        installation.commitment = installation.original.lineage_commitment();
         (StandardAgentRuntime::restore(state).unwrap(), work)
     }
 
@@ -10646,7 +10721,18 @@ pub(crate) mod tests {
         {
             let mut encoder = Encoder(&mut control);
             encoder.fixed(&super::super::RUNTIME_ABI_ID.0);
-            encoder.bool(false);
+            // Absent config, clean creation/current descriptors, and clean
+            // epoch/sequence high-water marks precede system authority.
+            for _ in 0..5 {
+                encoder.bool(false);
+            }
+            encoder.u64(0); // clean acknowledged-through
+            encoder.u32(0); // clean management dispositions
+            // Active policy and four Private control/high-water options.
+            for _ in 0..5 {
+                encoder.bool(false);
+            }
+            encoder.u32(0); // Private management dispositions
             encoder.bool(true);
             encoder.u32(u32::try_from(state_maximum + 1).unwrap());
         }
