@@ -14,17 +14,19 @@ Implementation is in `.worktrees/ch08-runtime-directory` on
 Use only an isolated, disposable environment for bootstrap/ingress testing.
 Fresh-space first start and restart with bundled system actors and HTTP/SSH
 have passed; ordinary-agent creation is not yet a usable production path.
-Those ingress checks predate the new AJC4 host checkpoint format. A newly built
-CLI needs a fresh disposable data directory and another smoke run; AJC3
-checkpoints are deliberately rejected, with no in-place migration provided.
+Those ingress checks predate the new AJC4 checkpoint and AGI2 Local image
+formats. A newly built CLI needs a fresh disposable data directory and another
+smoke run; AJC3 checkpoints and AGIM images are deliberately rejected, with no
+in-place migration provided.
 
 The integrated library run at `37d6a5720e7e45e4a19850a16a531e6cb316e299`
 completed: **1,663 passed, zero failed, one filtered**, in 1,771.43 seconds.
 It used `pvm,private-agent-store`, serial tests and socket access. Evidence:
 `.worktrees/ch08-c2-native/target/task-tmp/r16-integrated-library.log` (path
 relative to the main checkout). The filtered large inventory test still needs
-a final-source run. Later SDK lint-only edits have separate passing SDK tests
-and strict clippy, not a completed full-library rerun on those edits.
+a final-source run. Later SDK and host persistence/recovery edits have separate
+passing targeted checks documented below, not a completed full-library rerun
+on the current source.
 
 Keep the remaining work in three scoped Chapter 08 batches, without adding
 review endpoints for individual fixes:
@@ -1022,3 +1024,33 @@ This removes the private actor-table lookup, not every private-state dependency:
 the descriptor is still recovered from Standard state before material loading,
 and image reopen, management history and transition-oracle comparisons still
 need closure. Guest artifacts, ABI and deployment-readiness claims are unchanged.
+
+### Local public descriptor persistence
+
+The image-backed Local driver now persists the canonical SDK descriptor as
+bounded public metadata, atomically with configuration and all runtime state
+lanes. The new **AGI2** envelope validates the descriptor, its exact configuration
+projection and runtime program identity without decoding guest-private state.
+Local descriptor reads and physical material lookup use this metadata; public
+directory inspection additionally requires the exact stored descriptor.
+Management commits update the descriptor together with the state. Old AGIM
+images are deliberately rejected; there is no in-place migration.
+
+The storage regression round-trips opaque state through the image codec and
+store, and rejects missing metadata, changed configuration, mismatched runtime
+identity and the predecessor envelope. The driver/Local/wire run passed
+**103/103** (`r16-local-descriptor-image-final.log`, 25.40s). After adding the
+exact directory metadata binding, driver and Local host tests passed **37/37**
+(`r16-local-descriptor-binding-final.log`, 10.04s); clean-space CLI tests passed
+**31/31** (`r16-local-descriptor-cli.log`, 0.43s).
+The final **37/37** rerun (`r16-local-descriptor-commit.log`, 9.04s) also
+covers refusal of directory inspection without stored metadata. Descriptor-only
+changes now trigger a commit as well. Formatting and diff checks pass.
+
+This is storage-format closure, not production opaque-runtime lifecycle
+support. Reopen deliberately retains the Standard-state descriptor consistency
+check. Create, management history, acknowledgement/invocation validation and
+transition-oracle comparisons still need runtime-independent replacements;
+removing the existing checks alone would weaken admission. Ordinary-Agent
+finality also remains open. The current CLI smoke predates AGI2 and AJC4 and
+must be repeated on fresh disposable data after the implementation is complete.

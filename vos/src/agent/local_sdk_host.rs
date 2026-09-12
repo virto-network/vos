@@ -825,9 +825,11 @@ fn runtime_matches_descriptor(
 fn descriptor_from_driver(
     driver: &AgentDriver<FileAgentStore>,
 ) -> Result<AgentDescriptor, LocalAgentHostError> {
-    let state = super::wire::decode_standard_runtime_state(&driver.image().runtime_state)
-        .map_err(|_| LocalAgentHostError::Corrupt)?;
-    state.clean_descriptor.ok_or(LocalAgentHostError::Corrupt)
+    driver
+        .image()
+        .clean_descriptor
+        .clone()
+        .ok_or(LocalAgentHostError::Corrupt)
 }
 
 fn image_path(slot: &Path) -> PathBuf {

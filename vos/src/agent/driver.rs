@@ -133,19 +133,29 @@ fn clean_management_receipt_history(
     Ok(CleanManagementReceiptHistory::Unseen)
 }
 
-fn clean_projected_config_from_state(
-    state: &RuntimeState,
-) -> Result<AgentConfig, AgentDriverError> {
-    let descriptor = clean_descriptor_from_state(state)?;
-    super::standard::clean_descriptor_to_legacy_config(&descriptor)
-        .map_err(AgentDriverError::Lifecycle)
+fn image_config_is_valid(image: &AgentImage) -> bool {
+    match image.clean_descriptor.as_ref() {
+        Some(descriptor) => {
+            descriptor.validate().is_ok()
+                && super::standard::clean_descriptor_to_legacy_config(descriptor)
+                    .is_ok_and(|projected| projected == image.config)
+        }
+        None => image.config.validate().is_ok(),
+    }
 }
 
-fn image_config_is_valid(config: &AgentConfig, state: &RuntimeState) -> bool {
-    match clean_projected_config_from_state(state) {
-        Ok(projected) => projected == *config,
-        Err(_) => config.validate().is_ok(),
+fn clean_image_descriptor(
+    image: &AgentImage,
+) -> Result<crate::agent_sdk::AgentDescriptor, AgentDriverError> {
+    if !image_config_is_valid(image)
+        || image.config.identity.runtime_program != image.runtime_program
+    {
+        return Err(AgentDriverError::InvalidRuntime);
     }
+    image
+        .clean_descriptor
+        .clone()
+        .ok_or(AgentDriverError::InvalidRuntime)
 }
 
 fn validate_clean_standard_descriptor(
@@ -795,8 +805,11 @@ pub trait AgentTrustProvider: Send + Sync {
 /// their decoder from allocating the generic service-wire maximum first.
 pub const MAX_AGENT_CONFIG_BYTES: usize = 64 * 1024;
 /// Maximum complete persisted image, including the fixed envelope and
-/// length-prefix overhead around the bounded config and runtime state.
-pub const MAX_AGENT_IMAGE_BYTES: usize = MAX_AGENT_CONFIG_BYTES + MAX_RUNTIME_STATE_BYTES + 1024;
+/// length-prefix overhead around the bounded config, SDK descriptor and state.
+pub const MAX_AGENT_IMAGE_BYTES: usize = MAX_AGENT_CONFIG_BYTES
+    + MAX_RUNTIME_STATE_BYTES
+    + crate::agent_sdk::wire::MAX_AGENT_DESCRIPTOR_WIRE_BYTES
+    + 1024;
 const MAX_AGENT_IMAGE_REPLICAS: usize = 512;
 
 /// Complete guest-owned catalog provenance for one committed agent image.
@@ -926,6 +939,9 @@ impl CatalogKeep {
 /// One atomically persisted agent revision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentImage {
+    /// Host-owned public SDK metadata. Clean images require this descriptor;
+    /// legacy in-crate images use None. It is committed atomically with state.
+    pub clean_descriptor: Option<crate::agent_sdk::AgentDescriptor>,
     pub revision: u64,
     pub runtime_program: ProgramId,
     pub config: AgentConfig,
@@ -933,7 +949,7 @@ pub struct AgentImage {
 }
 
 impl ServiceWire for AgentImage {
-    const MAGIC: [u8; 4] = *b"AGIM";
+    const MAGIC: [u8; 4] = *b"AGI2";
 
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
@@ -941,6 +957,11 @@ impl ServiceWire for AgentImage {
         encoder.u64(self.revision);
         encoder.fixed(&self.runtime_program.0);
         encoder.bytes(&self.config.encode());
+        encoder.option(&self.clean_descriptor, |encoder, descriptor| {
+            // Invalid public values remain un-decodable rather than causing
+            // the infallible host envelope encoder to panic.
+            encoder.bytes(&descriptor.encode().unwrap_or_default());
+        });
         encoder.bytes(&self.runtime_state.control);
         encoder.bytes(&self.runtime_state.linear);
         encoder.bytes(&self.runtime_state.merge);
@@ -957,6 +978,13 @@ impl ServiceWire for AgentImage {
         if config_bytes.len() > MAX_AGENT_CONFIG_BYTES {
             return Err(DecodeError::LimitExceeded);
         }
+        let clean_descriptor = decoder.option(|decoder| {
+            let bytes = decoder.bytes_ref()?;
+            if bytes.len() > crate::agent_sdk::wire::MAX_AGENT_DESCRIPTOR_WIRE_BYTES {
+                return Err(DecodeError::LimitExceeded);
+            }
+            crate::agent_sdk::AgentDescriptor::decode(bytes).map_err(|_| DecodeError::NonCanonical)
+        })?;
         // Borrow every component first and check their aggregate before any
         // potentially large Vec is allocated.
         let control = decoder.bytes_ref()?;
@@ -978,22 +1006,19 @@ impl ServiceWire for AgentImage {
             merge: merge.to_vec(),
             local: local.to_vec(),
         };
-        let config = match AgentConfig::decode(config_bytes) {
-            Ok(config) => config,
-            Err(_) => {
-                // Clean SDK identities and historical in-crate identities
-                // intentionally use different hash domains. Admit this
-                // internal projection only when the fully validated clean
-                // state reconstructs the exact persisted config bytes.
-                let projected = clean_projected_config_from_state(&runtime_state)
+        let config = match clean_descriptor.as_ref() {
+            Some(descriptor) => {
+                let projected = super::standard::clean_descriptor_to_legacy_config(descriptor)
                     .map_err(|_| DecodeError::NonCanonical)?;
                 if projected.encode().as_slice() != config_bytes {
                     return Err(DecodeError::NonCanonical);
                 }
                 projected
             }
+            None => AgentConfig::decode(config_bytes)?,
         };
         let image = Self {
+            clean_descriptor,
             revision,
             runtime_program,
             config,
@@ -1010,7 +1035,7 @@ impl ServiceWire for AgentImage {
                     .resources
                     .max_runtime_state_bytes as usize
             || image.config.replicas.len() > MAX_AGENT_IMAGE_REPLICAS
-            || !image_config_is_valid(&image.config, &image.runtime_state)
+            || !image_config_is_valid(&image)
             || image.config.identity.runtime_program != image.runtime_program
         {
             return Err(DecodeError::NonCanonical);
@@ -2259,6 +2284,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         validate_state_size(&runtime_state, &config.runtime_contract)?;
         let runtime_program = ProgramId(runtime_package.program().0);
         let image = AgentImage {
+            clean_descriptor: Some(descriptor.clone()),
             revision: 1,
             runtime_program,
             config,
@@ -2294,7 +2320,12 @@ impl<S: AgentImageStore> AgentDriver<S> {
         trust: Arc<dyn AgentTrustProvider>,
     ) -> Result<Self, AgentDriverError> {
         let image = store.load()?.ok_or(AgentStoreError::Unavailable)?;
-        let descriptor = clean_descriptor_from_state(&image.runtime_state)?;
+        let descriptor = clean_image_descriptor(&image)?;
+        // Retain the existing Standard consistency boundary until the clean
+        // Local transition checks are replaced by public runtime validation.
+        if clean_descriptor_from_state(&image.runtime_state)? != descriptor {
+            return Err(AgentDriverError::InvalidRuntime);
+        }
         validate_sdk_process_local_profile(descriptor.identity.profile)?;
         let projected = super::standard::clean_descriptor_to_legacy_config(&descriptor)
             .map_err(AgentDriverError::Lifecycle)?;
@@ -2374,6 +2405,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         }
         validate_state_size(&output.state, &config.runtime_contract)?;
         let image = AgentImage {
+            clean_descriptor: None,
             revision: 1,
             runtime_program,
             config,
@@ -2453,6 +2485,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
     ) -> Result<Vec<crate::agent_sdk::ActorDirectoryRecord>, AgentDriverError> {
         use crate::agent_sdk::{ManagementReply, ManagementRequest, RuntimeOutcome, RuntimeWork};
         if descriptor.validate().is_err()
+            || self.image.clean_descriptor.as_ref() != Some(descriptor)
             || descriptor.identity.runtime_program.0 != self.image.runtime_program.0
             || super::standard::clean_descriptor_to_legacy_config(descriptor)
                 .map_err(AgentDriverError::Lifecycle)?
@@ -2543,7 +2576,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         actor: crate::agent_sdk::ActorId,
         require_ready: bool,
     ) -> Result<super::invocation_preparation::PhysicalInvocationMaterial, AgentDriverError> {
-        let descriptor = clean_descriptor_from_state(&self.image.runtime_state)?;
+        let descriptor = clean_image_descriptor(&self.image)?;
         validate_sdk_process_local_profile(descriptor.identity.profile)?;
         let projected = super::standard::clean_descriptor_to_legacy_config(&descriptor)
             .map_err(AgentDriverError::Lifecycle)?;
@@ -2734,6 +2767,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             .checked_add(1)
             .ok_or(AgentDriverError::InvalidRuntime)?;
         let next = AgentImage {
+            clean_descriptor: self.image.clean_descriptor.clone(),
             revision: next_revision,
             runtime_program: self.image.runtime_program,
             config: self.image.config.clone(),
@@ -3399,7 +3433,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
         authority: Option<crate::agent_sdk::authority::AuthorityReceipt>,
         artifacts: SdkManagementArtifacts<'_>,
     ) -> Result<crate::agent_sdk::RuntimeOutcome, AgentDriverError> {
-        let current = clean_descriptor_from_state(&self.image.runtime_state)?;
+        let current = clean_image_descriptor(&self.image)?;
         let read_only = matches!(
             &request,
             crate::agent_sdk::ManagementRequest::InspectActors { .. }
@@ -3554,6 +3588,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             return Err(AgentDriverError::InvalidRuntime);
         }
         let changed = next_state != self.image.runtime_state
+            || self.image.clean_descriptor.as_ref() != Some(&next_descriptor)
             || next_config != self.image.config
             || next_program != self.image.runtime_program;
         if changed {
@@ -3565,6 +3600,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 }
             };
             let next = AgentImage {
+                clean_descriptor: Some(next_descriptor.clone()),
                 revision,
                 runtime_program: next_program,
                 config: next_config,
@@ -4279,6 +4315,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             return Err(AgentDriverError::InvalidRuntime);
         }
         let next = AgentImage {
+            clean_descriptor: self.image.clean_descriptor.clone(),
             revision: self
                 .image
                 .revision
@@ -4304,7 +4341,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             &self.image.runtime_state,
             &self.image.config.runtime_contract,
         )?;
-        if let Ok(descriptor) = clean_descriptor_from_state(&self.image.runtime_state) {
+        if let Some(descriptor) = self.image.clean_descriptor.clone() {
             return self.clean_catalog_references(&descriptor);
         }
         let mut actors = Vec::new();
@@ -4632,7 +4669,7 @@ fn encode_valid_image(image: &AgentImage) -> Result<Vec<u8>, AgentStoreError> {
     if image.revision == 0
         || image.runtime_program == ProgramId::ZERO
         || image.config.replicas.len() > MAX_AGENT_IMAGE_REPLICAS
-        || !image_config_is_valid(&image.config, &image.runtime_state)
+        || !image_config_is_valid(image)
         || image.config.identity.runtime_program != image.runtime_program
         || image.runtime_state.is_empty()
         || image
@@ -5275,6 +5312,7 @@ mod tests {
         let mut driver = AgentDriver {
             runtime_pvm: runtime_package.program_bytes().to_vec(),
             image: AgentImage {
+                clean_descriptor: Some(descriptor.clone()),
                 revision: 2,
                 runtime_program: ProgramId(descriptor.identity.runtime_program.0),
                 config: super::super::standard::clean_descriptor_to_legacy_config(&descriptor)
@@ -5947,8 +5985,57 @@ mod tests {
     }
 
     #[test]
+    fn clean_image_descriptor_roundtrips_without_decoding_opaque_state() {
+        let (state, _, _) = super::super::wire::tests::completed_clean_policy_fixture(
+            crate::agent_sdk::Hash([0xe7; 32]),
+        );
+        let descriptor = clean_descriptor_from_state(&sdk_state_as_legacy(&state)).unwrap();
+        let config =
+            super::super::standard::clean_descriptor_to_legacy_config(&descriptor).unwrap();
+        let image = AgentImage {
+            clean_descriptor: Some(descriptor.clone()),
+            revision: 1,
+            runtime_program: config.identity.runtime_program,
+            config,
+            runtime_state: RuntimeState {
+                control: b"opaque-image-control".to_vec(),
+                linear: vec![1],
+                merge: vec![2],
+                local: vec![3],
+            },
+        };
+        assert!(clean_descriptor_from_state(&image.runtime_state).is_err());
+        assert_eq!(AgentImage::decode(&image.encode()).unwrap(), image);
+        assert_eq!(clean_image_descriptor(&image).unwrap(), descriptor);
+        let mut store = MemoryAgentStore::default();
+        store.commit(None, &image).unwrap();
+        assert_eq!(store.load().unwrap(), Some(image.clone()));
+
+        let mut absent = image.clone();
+        absent.clean_descriptor = None;
+        assert!(AgentImage::decode(&absent.encode()).is_err());
+        let mut substituted = image.clone();
+        substituted.config.identity.owner = crate::service::PrincipalId([0xef; 32]);
+        assert!(AgentImage::decode(&substituted.encode()).is_err());
+        let mut wrong_runtime = image.clone();
+        wrong_runtime.runtime_program = ProgramId([0xee; 32]);
+        assert!(AgentImage::decode(&wrong_runtime.encode()).is_err());
+        assert_eq!(
+            clean_image_descriptor(&wrong_runtime),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+        let mut predecessor = image.encode();
+        predecessor[..4].copy_from_slice(b"AGIM");
+        assert_eq!(
+            AgentImage::decode(&predecessor),
+            Err(DecodeError::InvalidTag)
+        );
+    }
+
+    #[test]
     fn image_wire_rejects_empty_runtime_state() {
         let bytes = AgentImage {
+            clean_descriptor: None,
             revision: 1,
             runtime_program: ProgramId([1; 32]),
             config: invalid_config(),
@@ -6344,6 +6431,7 @@ mod tests {
         // without repinning the bundled blob.
         let runtime_program = config.identity.runtime_program;
         let image = AgentImage {
+            clean_descriptor: Some(descriptor.clone()),
             revision: 1,
             runtime_program,
             config: config.clone(),
@@ -6456,6 +6544,7 @@ mod tests {
             let driver = AgentDriver {
                 runtime_pvm: package.program_bytes().to_vec(),
                 image: AgentImage {
+                    clean_descriptor: Some(descriptor.clone()),
                     revision: 1,
                     runtime_program: config.identity.runtime_program,
                     config,
@@ -6469,6 +6558,14 @@ mod tests {
             let result = driver.inspect_sdk_actor_directory(&descriptor);
             if mutation == 0 {
                 assert_eq!(result, Ok(Vec::new()));
+                let mut driver = driver;
+                driver.image.clean_descriptor = None;
+                assert_eq!(
+                    driver.inspect_sdk_actor_directory(&descriptor),
+                    Err(AgentDriverError::InvalidRuntime)
+                );
+                assert_eq!(driver.image.runtime_state, sdk_state_as_legacy(&opaque));
+                continue;
             } else {
                 assert_eq!(
                     result,
@@ -6623,6 +6720,7 @@ mod tests {
         }];
         assert_eq!(config.validate(), Ok(()));
         AgentImage {
+            clean_descriptor: None,
             revision,
             runtime_program: config.identity.runtime_program,
             config,
