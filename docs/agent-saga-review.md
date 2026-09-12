@@ -1,7 +1,7 @@
 # Reviewing the Agent architecture saga
 
-Current Ch08 WIP warning: `wip/ch08-runtime-directory` has newly built r16
-bundles, but independent reproduction and startup validation are still pending.
+Current Ch08 WIP warning: `wip/ch08-runtime-directory` has independently
+reproduced r16 bundles, but fresh-space startup validation is still pending.
 See the latest checkpoint sections below for failures and release work.
 
 The Agent architecture work is integrated on `saga/agents`. It is reviewed
@@ -681,3 +681,26 @@ Independent artifact reproduction is running via
 60130 at this checkpoint; poll it rather than launching another reproduction.
 Its completion is not yet claimed. Finality, opaque-runtime recovery, CLI /
 fresh-space checks, and final full release gates still prevent landing.
+
+### Independent r16 reproduction passed
+
+The above reproduction completed successfully: runtime ELF, runtime PVM /
+ProgramId, and both signed system templates match their pins and staged bytes
+from independent immutable exports. `r16-independent-reproduction.log` ends
+with `verified Agent-generation all artifacts from immutable sources`; session
+60130 is terminal and must not be resumed or restarted for this checkpoint.
+
+The first current-source CLI test build exposed three stale digest arrays in
+`vosx/build.rs`. These have been updated to the independently reproduced r16
+hashes; the digest checks themselves are unchanged. CLI tests now pass 156,
+with one opt-in physical candidate test ignored (`r16-vosx-pins-tests.log`).
+Normal CLI rebuilding and that explicit physical candidate test are tracked
+separately; no fresh-space startup result is claimed by this test suite.
+
+The normal current-source CLI rebuild completed (`r16-current-cli-build.log`).
+Its real `release bundle` and `release verify` commands passed against
+`target/r16-release.ziYI98/release-bundle`. The opt-in compiled-runtime candidate
+test also passed (`r16-cli-physical-candidate.log`), and its emitted candidate
+is byte-identical to the bundled runtime. Thus the ignored test above has a
+separate successful explicit run. These checks do not substitute for daemon
+startup/restart or ordinary-agent finality integration.
