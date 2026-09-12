@@ -1,7 +1,9 @@
 # Reviewing the Agent architecture saga
 
 Current Ch08 WIP warning: `wip/ch08-runtime-directory` has independently
-reproduced r16 bundles, but fresh-space startup validation is still pending.
+reproduced r16 bundles and passing fresh-space startup/restart ingress checks,
+but ordinary-agent finality, opaque-runtime recovery, and full release gates
+remain open. This is not a master-ready branch.
 See the latest checkpoint sections below for failures and release work.
 
 The Agent architecture work is integrated on `saga/agents`. It is reviewed
@@ -704,3 +706,30 @@ test also passed (`r16-cli-physical-candidate.log`), and its emitted candidate
 is byte-identical to the bundled runtime. Thus the ignored test above has a
 separate successful explicit run. These checks do not substitute for daemon
 startup/restart or ordinary-agent finality integration.
+
+### Fresh r16 first-start and restart ingress evidence
+
+The rebuilt CLI created a fresh isolated `r16-startup` space under
+`target/r16-startup.jQHfbi`. Creation prepared the bundled packages and generated
+HTTP/SSH-enabled `local.toml`. Only the disposable HTTP port was changed from
+8080 (already occupied) to 18080; SSH used 2222. Scratch files remained on disk.
+
+First startup reached `Space daemon ready` at 2026-09-12 22:03:30 UTC (about
+78 seconds); restart reached readiness at 22:05:30 UTC (about 120 seconds).
+Both returned HTTP 401 to the unauthenticated probe and completed the SSH
+host-key handshake. The startup path installs/audits the clean system Agent
+before publishing readiness. The script stopped both daemons cleanly; a
+socket-capable `ss -ltn` check confirmed neither test ingress port remained
+listening, while the pre-existing listeners were untouched.
+
+The original smoke command exited 1 at its final byte-for-byte key-file
+comparison: ssh-keyscan banner comments were interleaved differently, while
+the actual ed25519 host-key record was identical. The corrected check requires
+an actual ed25519 record in each file, filters comments, sorts key records, and
+compares them; this check passed on the captured outputs. The disposable script
+was corrected for subsequent runs. This is a verified startup/restart and key
+persistence result, not a claim that the original script exited successfully.
+
+This checkpoint supports isolated system-bootstrap/ingress testing. It does
+not establish ordinary-agent creation/finality, opaque-runtime recovery, full
+library/regression closure on this head, or production performance readiness.
