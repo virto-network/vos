@@ -474,3 +474,8 @@ All 63 Private host tests passed on the recovery checkpoint with
 `--features pvm,private-agent-store` (`c1-private-host-store-suite.log`, 318s).
 Combined-source verification is required before considering these results
 release evidence for the integrated tree. No review endpoint or master advanced.
+The recovery checkpoint additionally passes 40 Private store tests, 21 Private
+runtime tests, and 6 tests selected by `portable`, all with the same explicit
+features. Evidence logs are `c1-private-store-suite.log`,
+`c1-private-runtime-suite.log`, and `c1-portable-suite.log`. The integrated
+portable run is tracked separately in `integrated-portable-suite.log`.
