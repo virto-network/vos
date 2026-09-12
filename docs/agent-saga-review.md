@@ -656,3 +656,28 @@ With the r16 runtime candidate, Local SDK host tests pass 9 and fail 1
 failure from the earlier full-library run, not the last release requirement.
 Artifact reproduction, current-source CLI rebuild/startup, finality, opaque
 recovery, and the complete release gates remain open.
+
+### Ordinary resume host validation corrected
+
+The remaining Local host failure was in the host's Yielded-response validator:
+ordinary `resume_sdk` supplies no optional original InvocationWork, but the
+validator required it even though ResumeWork carries the exact availability
+fields needed for this check. It now compares the yielded installation-data
+marker and required references with the actual Invoke/Resume input. Identity,
+mode, increasing ready sequence, guest validation, and Standard preflight /
+persisted-continuation verification are retained. This is a host-only fix;
+the r16 guest artifacts do not need another rebuild for it.
+
+All 10 Local SDK host tests pass (`r16-local-host-resume-final.log`, 28.40s).
+The resume regression now reopens the host between both yielded slices and
+rejects tampered availability before continuing to the exact terminal reply.
+All originally observed library failures have targeted passing reruns, but
+the complete integrated library gate has not yet been rerun.
+
+Independent artifact reproduction is running via
+`scripts/build-agent-release-artifacts.sh all`; evidence log is
+`r16-independent-reproduction.log`, with fresh exports under
+`target/agent-release-reproduction/run.TYpSBz`. The active command session is
+60130 at this checkpoint; poll it rather than launching another reproduction.
+Its completion is not yet claimed. Finality, opaque-runtime recovery, CLI /
+fresh-space checks, and final full release gates still prevent landing.

@@ -2531,7 +2531,7 @@ mod tests {
         let directory = TestDirectory::new("physical-resume");
         let root = directory.child("agents");
         let (slot, trust) = clock_trust(1);
-        let mut host = LocalAgentHost::create(&root, space(), node(), trust).unwrap();
+        let mut host = LocalAgentHost::create(&root, space(), node(), trust.clone()).unwrap();
         let runtime = admitted_runtime();
         let descriptor = descriptor(&runtime, 8, AgentProfile::Local, space(), node());
         let agent = host
@@ -2580,29 +2580,37 @@ mod tests {
         };
         assert_eq!(first.reason, sdk::YieldReason::Cooperative);
         assert_eq!(first.ready_sequence, 1);
-        let outcome = host
-            .resume(
-                agent,
-                ResumeWork {
-                    invocation: first.invocation,
-                    actor: first.actor,
-                    incarnation: first.incarnation,
-                    deployment: first.deployment,
-                    program: first.program,
-                    mode: first.mode,
-                    continuation: first.continuation,
-                    ready_sequence: first.ready_sequence,
-                    installation_data: first.installation_data,
-                    availability: work.availability.clone(),
-                    input: None,
-                },
-            )
-            .unwrap();
+        drop(host);
+        let mut host = LocalAgentHost::open(&root, space(), node(), trust.clone()).unwrap();
+        let resume = ResumeWork {
+            invocation: first.invocation,
+            actor: first.actor,
+            incarnation: first.incarnation,
+            deployment: first.deployment,
+            program: first.program,
+            mode: first.mode,
+            continuation: first.continuation,
+            ready_sequence: first.ready_sequence,
+            installation_data: first.installation_data,
+            availability: work.availability.clone(),
+            input: None,
+        };
+        let mut tampered = resume.clone();
+        tampered.availability[0].bytes[0] ^= 1;
+        assert!(matches!(
+            host.resume(agent, tampered),
+            Err(LocalAgentHostError::Driver(
+                AgentDriverError::InvalidRuntime
+            ))
+        ));
+        let outcome = host.resume(agent, resume).unwrap();
         let RuntimeOutcome::Yielded(second) = outcome else {
             panic!("first resume did not yield: {outcome:?}")
         };
         assert_eq!(second.reason, sdk::YieldReason::Cooperative);
         assert_eq!(second.ready_sequence, 2);
+        drop(host);
+        let mut host = LocalAgentHost::open(&root, space(), node(), trust).unwrap();
         let outcome = host
             .resume(
                 agent,

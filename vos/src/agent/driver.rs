@@ -3820,19 +3820,25 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 {
                     return Err(AgentDriverError::InvalidRuntime);
                 }
-                let accepted = match &work {
+                let (installation_data, availability) = match &work {
                     crate::agent_sdk::RuntimeWork::Invoke { invocation, .. } => {
-                        Some(invocation.as_ref())
+                        (&invocation.installation_data, &invocation.availability)
                     }
-                    crate::agent_sdk::RuntimeWork::Resume { .. } => exact_work,
+                    crate::agent_sdk::RuntimeWork::Resume { resume, .. } => {
+                        // Ordinary resume does not carry a second copy of the
+                        // original invocation. The guest checks its supplied
+                        // availability against the persisted continuation;
+                        // Standard also performs that check in preflight.
+                        (&resume.installation_data, &resume.availability)
+                    }
                     crate::agent_sdk::RuntimeWork::Manage { .. }
-                    | crate::agent_sdk::RuntimeWork::Acknowledge { .. } => None,
-                }
-                .ok_or(AgentDriverError::InvalidRuntime)?;
-                if yielded.installation_data != accepted.installation_data
+                    | crate::agent_sdk::RuntimeWork::Acknowledge { .. } => {
+                        return Err(AgentDriverError::InvalidRuntime);
+                    }
+                };
+                if &yielded.installation_data != installation_data
                     || yielded.required
-                        != accepted
-                            .availability
+                        != availability
                             .iter()
                             .map(|blob| blob.reference.clone())
                             .collect::<Vec<_>>()
