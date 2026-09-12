@@ -611,3 +611,20 @@ shared commit 5 passed / 1 failed (`r16-shared-commit-tests.log`). Their observe
 hashes match those from the earlier r15 run; they are not new r16 regressions.
 They remain open pending accounting for their underlying encoding changes, as
 do the three physical Local SDK host failures and architectural release gaps.
+
+### Journal and Shared commit fixture closure
+
+The four remaining identity-expectation failures are corrected without changing
+production encoders. Their fixtures contain BlobRefs, whose hash domain changed
+from `vos/blob/service` to `vos/blob` in `4e7d974d`; their old expected hashes
+predate that change. Journal pins also predated later runtime binding changes.
+Both current-domain and retired-domain comparison hashes were refreshed;
+predecessor wire rejection and domain inequality assertions remain intact.
+
+All 38 journal tests pass (`journal-pins-final.log`), and all 6 shared-commit
+tests pass (`shared-commit-pins-final.log`), including signature and quorum
+validation. Formatting and diff checks pass. The three physical Local SDK host
+failures are now the only unaddressed failures from the original broad library
+run, but that whole run has not been repeated. r16 artifact rebuild/reproduction,
+ordinary-agent finality, opaque-runtime recovery, and all final release gates
+remain required; passing these fixture suites is not deployment readiness.

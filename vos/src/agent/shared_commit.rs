@@ -2273,15 +2273,15 @@ mod tests {
 
         assert_eq!(
             hex(claim.commitment()),
-            "a6bcfb4ae7b3e4275ab1b2ee3631d18e18bf9507cab2bd0d030222b1a8e4e403"
+            "8b3d2a46999ed5e842ba3c0137398f43e89437aed0996bbdc747ef53f1ffcc37"
         );
         assert_eq!(
             hex(certificate.message()),
-            "2aa6c311191fc053604d415db8ba81f34f2b866b69c65ce902bca4e3593fbf1c"
+            "e36d4baf70049f9bf4967b5e97b529ed88b8725a58a6f9181a76dbe6b7751be1"
         );
         assert_eq!(
             hex(certificate.commitment()),
-            "03e0ffb9d2f06e8850850a79fe6a78910d4610bcd92229fb77678d29403b40c6"
+            "98e10adc9f04b784683b7c7d835a0c96df28f5f43009ed804b0189add8b883b3"
         );
     }
 
