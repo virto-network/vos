@@ -2,7 +2,7 @@
 
 Current Ch08 WIP warning: `wip/ch08-runtime-directory` has independently
 reproduced r16 bundles and passing fresh-space startup/restart ingress checks,
-but ordinary-agent finality, opaque-runtime recovery, and full release gates
+but ordinary-agent finality, cross-runtime actor lifecycle, and full release gates
 remain open. This is not a master-ready branch.
 See the current closeout plan below; later checkpoint sections retain historical
 results, including failures that have since been fixed.
@@ -36,9 +36,10 @@ review endpoints for individual fixes:
    projection comparator. Physical Shared certified snapshot/compaction and
    substituted-evidence reopen checks now pass, as do portable evidence
    preservation and the post-snapshot one-ack-lag projection checks described
-   below. Close remaining Standard-state dependencies in the production Local
-   path. Neither a private-state decoder nor a volatile cache is a
-   runtime-independent proof.
+   below. Production Local opaque-runtime management Create/reopen now uses
+   public metadata and durable history. Finish its actor installation,
+   invocation/recovery and lane-transition checks and tests. Neither a private-
+   state decoder nor a volatile cache is a runtime-independent proof.
 2. **C2 — native lifecycle:** replace the deliberately unavailable ordinary-
    Agent finality adapter with authenticated live system-Agent decision
    publication and independent replay verification, including reopen. A
@@ -1150,3 +1151,39 @@ history, not general custom-runtime Create/reopen. The remaining Local work is
 replacing Standard admission/transition/reopen checks with authenticated public
 invariants, then proving an opaque runtime's full production lifecycle.
 Ordinary-Agent finality and final-source release/smoke gates remain open.
+
+### Production Local opaque-runtime management lifecycle
+
+Image-backed Local Create, management and reopen now distinguish the bundled
+Standard runtime's additional native parity checks from the public validation
+required for every admitted runtime. Custom-runtime state is no longer sent
+through the Standard decoder/oracle at those boundaries. Signed receipt and
+exact package admission, typed reply binding, persisted descriptor/history,
+state bounds, exact retry consistency and management lane isolation remain
+mandatory. As in the Local file-store model, the private host-owned image is
+the durable metadata authority; its hashes alone are not an external finality
+proof. Reopen re-admits the exact signed package/program and catalog closure.
+
+Create now also runs bounded public actor-directory inspection **before**
+writing the package or image and requires an empty, state-preserving directory.
+That prevents a runtime from publishing preinstalled actors through the Create
+reply. The same bounded scanner serves later physical directory queries.
+
+A new physical scripted-PVM regression uses the real `LocalAgentHost` and file
+store, not a manually constructed driver or the transitional journal host.
+It rejects a forged Create receipt without publishing an Agent, creates an
+opaque-state Agent, durably records a management denial, cold-reopens, and
+recovers both expired management and original Create receipts without changing
+the persisted revision/state/history. Native decoding of its stored state is
+explicitly shown to fail. **42/42 driver, Local-host and history tests pass**
+(`r16-local-opaque-lifecycle-final.log`, 10.28s); clean-space CLI tests pass
+**31/31** (`r16-local-opaque-lifecycle-cli.log`, 0.17s). Formatting and diff
+checks pass. Existing Standard parity and substituted-history refusal remain
+covered. No guest artifact or wire format is changed by this checkpoint.
+
+This proves production opaque management Create/reopen/retry, not the complete
+custom actor lifecycle. Next prove signed actor installation, invocation and
+continuation/acknowledgement recovery through this same host, and reconcile
+management lane-transition rules with the public ABI for initialization and
+migration. Ordinary-Agent finality and the final release gates remain open;
+the branch is not yet master-ready.

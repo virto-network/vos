@@ -2353,6 +2353,193 @@ mod tests {
     }
 
     #[test]
+    fn physical_opaque_runtime_create_management_and_expired_retry_reopen() {
+        use super::super::package_admission::{
+            ScriptedRuntimeCase, ScriptedRuntimeCopy, admitted_scripted_runtime_for_test,
+        };
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        use crate::agent_sdk::{
+            ActorDirectoryPage, RuntimeExecutionContext, RuntimeState, RuntimeTransition,
+            RuntimeWork,
+        };
+        let template = descriptor(&admitted_runtime(), 9, AgentProfile::Local, space(), node());
+        let create = ManagementRequest::Create(Box::new(template.clone()));
+        let denied = ManagementRequest::RemoveLeaf {
+            actor: ActorId::top_level(template.identity.agent, "absent"),
+            expected_deployment: sdk::DeploymentId([0xc1; 32]),
+        };
+        let inspect = ManagementRequest::InspectActors {
+            after: None,
+            limit: sdk::MAX_DIRECTORY_PAGE_ENTRIES as u16,
+        };
+        let state = |tag| RuntimeState {
+            control: vec![tag],
+            ..Default::default()
+        };
+        let mut identity = Vec::new();
+        identity.extend_from_slice(template.identity.space.as_bytes());
+        identity.extend_from_slice(template.identity.agent.as_bytes());
+        identity.extend_from_slice(template.identity.owner.as_bytes());
+        identity.push(template.identity.profile as u8);
+        identity.extend_from_slice(template.identity.runtime_deployment.as_bytes());
+        identity.extend_from_slice(template.identity.runtime_program.as_bytes());
+        identity.extend_from_slice(template.identity.runtime_producer.as_bytes());
+        identity.extend_from_slice(template.identity.transition_producer.as_bytes());
+        let offset = |bytes: &[u8]| {
+            bytes
+                .windows(identity.len())
+                .position(|part| part == identity)
+                .unwrap()
+        };
+        let mut cases = Vec::new();
+        for tag in [0, 0xa1, 0xa2] {
+            let input = RuntimeWork::Manage {
+                context: RuntimeExecutionContext::Direct,
+                space: space(),
+                agent: template.identity.agent,
+                runtime_deployment: template.identity.runtime_deployment,
+                state: if tag == 0 {
+                    RuntimeState::default()
+                } else {
+                    state(tag)
+                },
+                request: Box::new(create.clone()),
+                authority: Some(Box::new(create_receipt(&template, 10))),
+                observed_slot: 1,
+            }
+            .encode()
+            .unwrap();
+            let output = RuntimeTransition {
+                state: state(if tag == 0 { 0xa1 } else { tag }),
+                outcome: RuntimeOutcome::Management(Ok(ManagementReply::Created(
+                    template.identity.clone(),
+                ))),
+            }
+            .encode()
+            .unwrap();
+            let copy = ScriptedRuntimeCopy {
+                input_offset: offset(&input),
+                output_offset: offset(&output),
+                len: identity.len(),
+            };
+            cases.push(ScriptedRuntimeCase {
+                input,
+                output,
+                copies: vec![copy],
+            });
+        }
+        for tag in [0xa1, 0xa2] {
+            for request in [&inspect, &denied] {
+                let inspection = request == &inspect;
+                let input = RuntimeWork::Manage {
+                    context: RuntimeExecutionContext::Direct,
+                    space: space(),
+                    agent: template.identity.agent,
+                    runtime_deployment: template.identity.runtime_deployment,
+                    state: state(tag),
+                    request: Box::new(request.clone()),
+                    authority: (!inspection)
+                        .then(|| Box::new(management_receipt(&template, request, 2, 1, 10))),
+                    observed_slot: 2,
+                }
+                .encode()
+                .unwrap();
+                let output = RuntimeTransition {
+                    state: state(if inspection { tag } else { 0xa2 }),
+                    outcome: RuntimeOutcome::Management(if inspection {
+                        Ok(ManagementReply::Actors(ActorDirectoryPage {
+                            entries: Vec::new(),
+                            next: None,
+                        }))
+                    } else {
+                        Err(sdk::ManagementError::NotFound)
+                    }),
+                }
+                .encode()
+                .unwrap();
+                cases.push(ScriptedRuntimeCase {
+                    input,
+                    output,
+                    copies: Vec::new(),
+                });
+            }
+        }
+        let runtime =
+            admitted_scripted_runtime_for_test("local-opaque-image-lifecycle", 0xc2, cases);
+        let descriptor = descriptor(&runtime, 9, AgentProfile::Local, space(), node());
+        let directory = TestDirectory::new("opaque-image-lifecycle");
+        let root = directory.child("agents");
+        let (slot, trust) = clock_trust(1);
+        let mut host = LocalAgentHost::create(&root, space(), node(), trust.clone()).unwrap();
+        let receipt = create_receipt(&descriptor, 10);
+        let mut forged = receipt.clone();
+        forged.signature[0] ^= 1;
+        assert!(
+            host.create_agent(runtime.clone(), descriptor.clone(), forged)
+                .is_err()
+        );
+        assert!(host.list().unwrap().is_empty());
+        let agent = host
+            .create_agent(runtime.clone(), descriptor.clone(), receipt.clone())
+            .unwrap();
+        assert!(
+            crate::agent::wire::decode_standard_runtime_state(
+                &host
+                    .agents
+                    .get(&agent)
+                    .unwrap()
+                    .driver
+                    .image()
+                    .runtime_state
+            )
+            .is_err()
+        );
+        slot.store(2, Ordering::SeqCst);
+        let denial_receipt = management_receipt(&descriptor, &denied, 2, 1, 10);
+        let outcome = host
+            .manage(
+                agent,
+                denied.clone(),
+                Some(denial_receipt.clone()),
+                SdkManagementArtifacts::None,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            RuntimeOutcome::Management(Err(sdk::ManagementError::NotFound))
+        );
+        let before = host.agents.get(&agent).unwrap().driver.image().clone();
+        assert_eq!(
+            before
+                .clean_management
+                .as_ref()
+                .unwrap()
+                .latest()
+                .unwrap()
+                .sequence,
+            2
+        );
+        drop(host);
+        slot.store(50, Ordering::SeqCst);
+        let mut host = LocalAgentHost::open(&root, space(), node(), trust).unwrap();
+        assert_eq!(
+            host.manage(
+                agent,
+                denied,
+                Some(denial_receipt),
+                SdkManagementArtifacts::None
+            )
+            .unwrap(),
+            outcome
+        );
+        assert_eq!(
+            host.create_agent(runtime, descriptor, receipt).unwrap(),
+            agent
+        );
+        assert_eq!(host.agents.get(&agent).unwrap().driver.image(), &before);
+    }
+
+    #[test]
     fn physical_reopen_rejects_substituted_host_management_history() {
         use super::super::driver::AgentImageStore as _;
         use super::super::local_management::LocalManagementHistory;

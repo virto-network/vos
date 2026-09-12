@@ -1,10 +1,11 @@
 //! Host driver for one durable agent-runtime instance.
 //!
 //! The image store persists a small descriptor and runtime-state bytes.
-//! Portable directory inspection uses the runtime ABI, but clean Local
-//! creation, transition validation and material recovery still contain
-//! Standard-specific checks. Those paths are not yet a general opaque-runtime
-//! host; changing private state layouts requires closing those dependencies.
+//! Clean Local lifecycle metadata and directory inspection use the public
+//! runtime ABI. The bundled Standard implementation also receives native
+//! parity checks; other admitted runtimes own their private state layout.
+//! Cross-runtime actor lifecycle and lane-transition coverage remains a
+//! separate release requirement from management Create/reopen support.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
@@ -2303,13 +2304,17 @@ impl<S: AgentImageStore> AgentDriver<S> {
         let encoded = work
             .encode()
             .map_err(|_| AgentDriverError::InvalidRuntime)?;
-        let expected = expected_standard_sdk_management_transition(&work)?;
+        let expected = (runtime_package.program().0 == super::STANDARD_RUNTIME_PROGRAM_ID.0)
+            .then(|| expected_standard_sdk_management_transition(&work))
+            .transpose()?;
         let transition: crate::agent_sdk::RuntimeTransition = execute_runtime_canonical(
             runtime_package.program_bytes(),
             DEFAULT_MANAGEMENT_GAS,
             &encoded,
         )?;
-        if transition != expected
+        if expected
+            .as_ref()
+            .is_some_and(|expected| transition != *expected)
             || transition.outcome
                 != crate::agent_sdk::RuntimeOutcome::Management(Ok(
                     crate::agent_sdk::ManagementReply::Created(descriptor.identity.clone()),
@@ -2318,7 +2323,9 @@ impl<S: AgentImageStore> AgentDriver<S> {
         {
             return Err(AgentDriverError::InvalidRuntime);
         }
-        validate_clean_standard_descriptor(&transition.state, &descriptor)?;
+        if expected.is_some() {
+            validate_clean_standard_descriptor(&transition.state, &descriptor)?;
+        }
         let config = super::standard::clean_descriptor_to_legacy_config(&descriptor)
             .map_err(AgentDriverError::Lifecycle)?;
         let runtime_state = sdk_state_as_legacy(&transition.state);
@@ -2336,6 +2343,17 @@ impl<S: AgentImageStore> AgentDriver<S> {
             config,
             runtime_state,
         };
+        if !Self::inspect_sdk_actor_directory_image(
+            runtime_package.program_bytes(),
+            DEFAULT_MANAGEMENT_GAS,
+            &image,
+            &descriptor,
+            observed_slot,
+        )?
+        .is_empty()
+        {
+            return Err(AgentDriverError::InvalidRuntime);
+        }
         let package_reference = sdk_blob_as_legacy(runtime_package.package_ref());
         let created_package =
             store.put_package(&package_reference, runtime_package.exact_bytes())?;
@@ -2367,19 +2385,22 @@ impl<S: AgentImageStore> AgentDriver<S> {
     ) -> Result<Self, AgentDriverError> {
         let image = store.load()?.ok_or(AgentStoreError::Unavailable)?;
         let descriptor = clean_image_descriptor(&image)?;
-        // Retain the existing Standard consistency boundary until the clean
-        // Local transition checks are replaced by public runtime validation.
-        if clean_descriptor_from_state(&image.runtime_state)? != descriptor {
-            return Err(AgentDriverError::InvalidRuntime);
-        }
-        let standard = super::wire::decode_standard_runtime_state(&image.runtime_state)
-            .map_err(|_| AgentDriverError::InvalidRuntime)?;
-        if !image
-            .clean_management
-            .as_ref()
-            .is_some_and(|history| history.matches_standard_state(&standard))
-        {
-            return Err(AgentDriverError::InvalidRuntime);
+        // The bundled implementation has an additional native parity check.
+        // Other admitted runtimes own their private layout; the persisted
+        // public envelope and exact package closure remain mandatory.
+        if image.runtime_program == super::STANDARD_RUNTIME_PROGRAM_ID {
+            if clean_descriptor_from_state(&image.runtime_state)? != descriptor {
+                return Err(AgentDriverError::InvalidRuntime);
+            }
+            let standard = super::wire::decode_standard_runtime_state(&image.runtime_state)
+                .map_err(|_| AgentDriverError::InvalidRuntime)?;
+            if !image
+                .clean_management
+                .as_ref()
+                .is_some_and(|history| history.matches_standard_state(&standard))
+            {
+                return Err(AgentDriverError::InvalidRuntime);
+            }
         }
         validate_sdk_process_local_profile(descriptor.identity.profile)?;
         let projected = super::standard::clean_descriptor_to_legacy_config(&descriptor)
@@ -2539,20 +2560,34 @@ impl<S: AgentImageStore> AgentDriver<S> {
         &self,
         descriptor: &crate::agent_sdk::AgentDescriptor,
     ) -> Result<Vec<crate::agent_sdk::ActorDirectoryRecord>, AgentDriverError> {
+        Self::inspect_sdk_actor_directory_image(
+            &self.runtime_pvm,
+            self.management_gas,
+            &self.image,
+            descriptor,
+            self.trust
+                .current_logical_slot()
+                .ok_or(AgentDriverError::TrustUnavailable)?,
+        )
+    }
+
+    fn inspect_sdk_actor_directory_image(
+        runtime_pvm: &[u8],
+        management_gas: Gas,
+        image: &AgentImage,
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+        observed_slot: u64,
+    ) -> Result<Vec<crate::agent_sdk::ActorDirectoryRecord>, AgentDriverError> {
         use crate::agent_sdk::{ManagementReply, ManagementRequest, RuntimeOutcome, RuntimeWork};
         if descriptor.validate().is_err()
-            || self.image.clean_descriptor.as_ref() != Some(descriptor)
-            || descriptor.identity.runtime_program.0 != self.image.runtime_program.0
+            || image.clean_descriptor.as_ref() != Some(descriptor)
+            || descriptor.identity.runtime_program.0 != image.runtime_program.0
             || super::standard::clean_descriptor_to_legacy_config(descriptor)
                 .map_err(AgentDriverError::Lifecycle)?
-                != self.image.config
+                != image.config
         {
             return Err(AgentDriverError::InvalidRuntime);
         }
-        let observed_slot = self
-            .trust
-            .current_logical_slot()
-            .ok_or(AgentDriverError::TrustUnavailable)?;
         let limit = crate::agent_sdk::MAX_DIRECTORY_PAGE_ENTRIES as u16;
         let maximum = descriptor.capabilities.max_actors as usize;
         let mut actors = Vec::new();
@@ -2563,7 +2598,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 space: descriptor.identity.space,
                 agent: descriptor.identity.agent,
                 runtime_deployment: descriptor.identity.runtime_deployment,
-                state: legacy_state_as_sdk(&self.image.runtime_state),
+                state: legacy_state_as_sdk(&image.runtime_state),
                 request: Box::new(ManagementRequest::InspectActors { after, limit }),
                 authority: None,
                 observed_slot,
@@ -2572,8 +2607,8 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 .encode()
                 .map_err(|_| AgentDriverError::InvalidRuntime)?;
             let returned: crate::agent_sdk::RuntimeTransition =
-                execute_runtime_canonical(&self.runtime_pvm, self.management_gas, &encoded)?;
-            if returned.state != legacy_state_as_sdk(&self.image.runtime_state) {
+                execute_runtime_canonical(runtime_pvm, management_gas, &encoded)?;
+            if returned.state != legacy_state_as_sdk(&image.runtime_state) {
                 return Err(AgentDriverError::InvalidRuntime);
             }
             let RuntimeOutcome::Management(Ok(ManagementReply::Actors(page))) = returned.outcome
@@ -3575,7 +3610,10 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 return Err(AgentDriverError::InvalidRuntime);
             }
         };
-        let expected = match expected_standard_sdk_management_transition(&work) {
+        let expected = match (self.image.runtime_program == super::STANDARD_RUNTIME_PROGRAM_ID)
+            .then(|| expected_standard_sdk_management_transition(&work))
+            .transpose()
+        {
             Ok(expected) => expected,
             Err(error) => {
                 staged.rollback(&mut self.store);
@@ -3590,7 +3628,9 @@ impl<S: AgentImageStore> AgentDriver<S> {
                     return Err(error);
                 }
             };
-        if returned != expected
+        if expected
+            .as_ref()
+            .is_some_and(|expected| returned != *expected)
             || !matches!(
                 &returned.outcome,
                 crate::agent_sdk::RuntimeOutcome::Management(_)
