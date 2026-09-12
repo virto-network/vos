@@ -419,6 +419,13 @@ separate gate omission: `agent::clean_bootstrap::tests::physical` requires the
 `pvm` feature, so the default-feature inventory command selected zero tests.
 The clean-break recipe now explicitly enables `pvm`; the corrected large
 inventory rotation test must pass before that gate is considered closed.
+With that feature enabled, all 13 other bootstrap tests pass, including
+physical restart before and after every bootstrap phase and root-pinned
+Authority auditing (`r15-bootstrap-physical-suite.log` under the native
+worktree's disk-backed task logs). `cargo check -p vos-agent-sdk
+--no-default-features` also passes (`r15-sdk-no-std.log`). The separate large
+inventory test is still running in session 89491; its log is
+`r15-inventory-rotation-physical.log`, and its result is not yet a pass.
 
 Next: finish the corrected inventory regression, then rerun physical,
 proof, bootstrap, and real first-start/restart gates before integrating this
