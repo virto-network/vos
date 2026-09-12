@@ -407,11 +407,20 @@ Fresh r15 space `r15-startup` reached ready on its first startup at
 created config enabled both ingress types; only the disposable HTTP port was
 changed from occupied 8080 to 18080. HTTP returned 401 without credentials and
 SSH returned its host key. The smoke script then cleanly stopped the daemon and
-started the same space again; restart verification is still pending. Evidence
-is under this worktree's `target/r15-startup.oEbkfJ`, with the live smoke process
-tracked by session 78038. Do not restart it merely because the log is quiet.
+started the same space again. Restart reached ready at 07:12:15 UTC (about
+4m03s), passed HTTP 401 and SSH handshake again, and retained the same SSH key.
+The smoke script exited successfully and both test listeners were absent
+afterward; the existing IPFS listeners were untouched. Evidence is under this
+worktree's `target/r15-startup.oEbkfJ`. This is a development-build correctness
+check, not a startup-performance sign-off or an ordinary-Agent creation test.
 
-Next: finish restart verification, then rerun physical,
+The static clean-break/retained CLI check also passes. Inspection caught a
+separate gate omission: `agent::clean_bootstrap::tests::physical` requires the
+`pvm` feature, so the default-feature inventory command selected zero tests.
+The clean-break recipe now explicitly enables `pvm`; the corrected large
+inventory rotation test must pass before that gate is considered closed.
+
+Next: finish the corrected inventory regression, then rerun physical,
 proof, bootstrap, and real first-start/restart gates before integrating this
 work into the native startup branch. The old r14 CLI correctly rejects the r15
 candidate ABI; use the current CLI or its explicit

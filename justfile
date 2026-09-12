@@ -224,7 +224,7 @@ check-all:
 # Serial clean-cutover regression and negative-surface gate. C3's release
 # check invokes this recipe verbatim.
 clean-break-check:
-    cargo test -p vos --lib agent::clean_bootstrap -- --test-threads=1
+    cargo test -p vos --features pvm --lib agent::clean_bootstrap -- --test-threads=1
     cargo test -p vos --lib agent::production_owner -- --test-threads=1
     cargo test -p vos --lib agent::supervisor_adapters -- --test-threads=1
     cargo test -p vosx --bin vosx commands::space::clean -- --test-threads=1
