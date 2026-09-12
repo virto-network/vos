@@ -998,3 +998,27 @@ comparisons remain private-layout dependencies. The module overview now states
 that limitation instead of incorrectly claiming this driver never decodes
 runtime internals. Continue replacing those dependencies with authenticated
 public metadata and runtime ABI checks; do not simply remove their validation.
+
+### Local physical actor material from the public directory
+
+The production image-backed driver's actor-material loader now resolves the
+actor record, immutable install-plan commitment, installation ID and reservation
+through the public directory query instead of constructing a native Standard
+runtime to inspect its internal actor/installation tables. Runtime package
+admission and program-byte identity, signed actor package admission, schema,
+policy, installation-data references, runtime capability checks and suspended
+actor refusal remain enforced. The producer comes from the verified signed
+actor package and is still compared with authority projection during route
+validation.
+
+The existing material-recovery test now uses the bundled physical runtime
+instead of a scripted stub that could not answer inspection queries. It is
+explicitly PVM-gated and verifies immutable installation lineage, package
+producer, exact reopen, missing artifacts and substituted process/runtime/policy
+bytes. **36/36 driver and Local SDK host tests pass**
+(`r16-local-public-material-final.log`, 8.95s); formatting and diff checks pass.
+
+This removes the private actor-table lookup, not every private-state dependency:
+the descriptor is still recovered from Standard state before material loading,
+and image reopen, management history and transition-oracle comparisons still
+need closure. Guest artifacts, ABI and deployment-readiness claims are unchanged.

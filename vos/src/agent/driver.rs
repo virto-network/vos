@@ -2566,21 +2566,10 @@ impl<S: AgentImageStore> AgentDriver<S> {
         if runtime_pvm != runtime_package.program_bytes() || runtime_pvm != self.runtime_pvm {
             return Err(AgentDriverError::RuntimeProgramMismatch);
         }
-        let state = super::wire::decode_standard_runtime_state(&self.image.runtime_state)
-            .map_err(|_| AgentDriverError::InvalidRuntime)?;
-        let runtime = super::standard::StandardAgentRuntime::restore(state)
-            .map_err(|_| AgentDriverError::InvalidRuntime)?;
-        if runtime.clean_descriptor() != Some(&descriptor) {
-            return Err(AgentDriverError::InvalidRuntime);
-        }
-        let physical_record = runtime.actor_record(ActorId(actor.0)).cloned().ok_or(
-            AgentDriverError::SdkManagement(crate::agent_sdk::ManagementError::NotFound),
-        )?;
-        let installation = runtime
-            .clean_actor_installation(actor)
-            .ok_or(AgentDriverError::InvalidRuntime)?;
-        let record = runtime
-            .clean_actor_record(actor)
+        let record = self
+            .inspect_sdk_actor_directory(&descriptor)?
+            .into_iter()
+            .find(|record| record.entry.actor == actor)
             .ok_or(AgentDriverError::SdkManagement(
                 crate::agent_sdk::ManagementError::NotFound,
             ))?;
@@ -2597,11 +2586,8 @@ impl<S: AgentImageStore> AgentDriver<S> {
         )?;
         let actor_package = super::package_admission::admit_actor_package(&actor_package_bytes)
             .map_err(AgentDriverError::PackageAdmission)?;
-        if physical_record.entry.actor.0 != actor.0
-            || installation.actor != actor
-            || installation.commitment == crate::agent_sdk::Hash::ZERO
+        if record.install_request == crate::agent_sdk::Hash::ZERO
             || actor_package.package_ref() != &record.entry.package
-            || actor_package.producer() != crate::agent_sdk::ProducerId(physical_record.producer.0)
         {
             return Err(AgentDriverError::InvalidRuntime);
         }
@@ -2645,8 +2631,8 @@ impl<S: AgentImageStore> AgentDriver<S> {
             .ok_or(AgentDriverError::TrustUnavailable)?;
         Ok(super::invocation_preparation::PhysicalInvocationMaterial {
             descriptor,
+            install_request: record.install_request,
             actor: record,
-            install_request: installation.commitment,
             producer: actor_package.producer(),
             contract: actor_package.manifest().contract,
             requirements: actor_package.requirements(),
@@ -5063,6 +5049,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "pvm")]
     #[test]
     fn physical_invocation_material_uses_only_authenticated_image_and_catalog_state() {
         use crate::agent_sdk::authority::{
@@ -5093,14 +5080,9 @@ mod tests {
 
         let authority_key = SigningKey::from_bytes(&[0x51; 32]);
         let authority_public_key = authority_key.verifying_key().to_bytes();
-        let runtime_package = super::super::package_admission::admitted_scripted_runtime_for_test(
+        let runtime_package = super::super::package_admission::admitted_standard_runtime_for_test(
             "physical-runtime",
             0x52,
-            vec![super::super::package_admission::ScriptedRuntimeCase {
-                input: vec![0],
-                output: vec![0],
-                copies: Vec::new(),
-            }],
         );
         let space = crate::agent_sdk::SpaceId([0x53; 32]);
         let owner = crate::agent_sdk::PrincipalId([0x54; 32]);
@@ -5309,6 +5291,23 @@ mod tests {
 
         let prepared = driver.physical_invocation_material(actor).unwrap();
         assert_eq!(prepared.descriptor, descriptor);
+        let crate::agent_sdk::ManagementRequest::Install(original_install) = &install else {
+            unreachable!()
+        };
+        assert_eq!(
+            prepared.install_request,
+            original_install.lineage_commitment()
+        );
+        assert_eq!(prepared.actor.install_request, prepared.install_request);
+        assert_eq!(
+            prepared.actor.installation_id,
+            original_install.installation_id
+        );
+        assert_eq!(
+            prepared.actor.registry_reservation,
+            original_install.registry_reservation
+        );
+        assert_eq!(prepared.producer, package.producer());
         assert_eq!(prepared.observed_slot, 7);
         assert_eq!(prepared.actor.entry.actor, actor);
         assert_eq!(prepared.actor.entry.deployment, package.deployment());
