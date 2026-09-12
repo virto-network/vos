@@ -387,6 +387,14 @@ now invoke the Agent-only reproduction script, which builds the pinned builder
 from an immutable export and compares runtime and complete system-package
 bytes against the committed pins. Full reproduction and production gates must
 still pass before release.
+The Agent-only script's full `all` run now passes, including an independently
+rebuilt pinned host tool, exact Authority/Catalog package comparisons, the
+runtime ELF digest, the physical runtime ABI conversion probe, runtime ProgramId,
+and committed PVM comparison. Evidence is in the native worktree's
+`target/task-tmp/r15-immutable-release-reproduction.log`; immutable exports are
+retained in this worktree's `target/agent-release-reproduction/run.xi2Xa1`.
+This closes the source/tool reproduction gate for these three artifacts, not
+the other release, recovery, custom-runtime, or deployment gates.
 Verification: all 156 active vosx tests pass (one explicit candidate test is
 ignored by default), including 18 release tests. The rebuilt CLI successfully
 bundled and verified `target/task-tmp/r15-release-v2-smoke` under the native
