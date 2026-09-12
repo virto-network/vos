@@ -32,10 +32,11 @@ review endpoints for individual fixes:
 1. **C1 — recovery:** preserve the integrated portable-recovery fixes. Host-owned
    management evidence now survives checkpoint/GC/reopen and feeds the Shared
    projection comparator. Physical Shared certified snapshot/compaction and
-   substituted-evidence reopen checks now pass. Finish portable cross-store
-   restore and one-ack-lag projection coverage for the new evidence, and close
-   remaining Standard-state dependencies in the production Local path. Neither
-   a private-state decoder nor a volatile cache is a runtime-independent proof.
+   substituted-evidence reopen checks now pass, as do portable evidence
+   preservation and the post-snapshot one-ack-lag projection checks described
+   below. Close remaining Standard-state dependencies in the production Local
+   path. Neither a private-state decoder nor a volatile cache is a
+   runtime-independent proof.
 2. **C2 — native lifecycle:** replace the deliberately unavailable ordinary-
    Agent finality adapter with authenticated live system-Agent decision
    publication and independent replay verification, including reopen. A
@@ -939,3 +940,33 @@ private state. The transitional Local journal's opaque-runtime tests do not
 prove that production image-backed host supports an opaque runtime. Closing
 that production boundary remains required; removing its guards without replacing
 their authenticated public-state invariants is not a valid fix.
+
+### Portable evidence and post-snapshot projection checks
+
+The final focused run passes **3/3 tests**
+(`r16-portable-management-and-projection.log`, 7.71s), covering:
+
+- The physical singleton-system portable backup path preserves the exact
+  management evidence in a different physical store, on subsequent reopen,
+  and through all four existing interrupted-restore boundaries (canonical
+  marker, staged marker, staged heads, and promoted heads before Raft recovery).
+  This fixture uses the Standard-shaped system runtime and the existing
+  root-authorized singleton backup protocol.
+- The opaque-runtime journal test exports after the original mutation entry
+  has actually been collected, initializes a distinct store with its required
+  genesis runtime artifact, imports the portable closure, and restores the
+  exact evidence and opaque state with an empty executor result cache. Its
+  first new import attempt exposed a missing genesis artifact in the test
+  setup; adding that required bootstrap artifact fixed the fixture, without
+  weakening import checks.
+- After certified snapshot/compaction and reopen, the physical custom-runtime
+  Shared host's actual projection comparator recognizes the one-installation
+  acknowledgement gap and rejects an authority head whose sequence predates
+  the installation. It does so without interpreting Standard private state.
+
+These are complementary boundary tests, not a newly supported portable backup
+protocol for ordinary or multi-replica Shared Agents. That existing explicit
+restriction remains unchanged. Formatting and diff checks pass; this checkpoint
+adds tests and a test-only evidence accessor, not production behavior or guest
+artifact changes. Production Local custom-runtime support and ordinary-Agent
+finality remain implementation work, followed by the final release gates.

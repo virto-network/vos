@@ -1497,6 +1497,22 @@ impl SharedAgentHost {
         Ok(hosted.driver.journal_store_instance_for_test())
     }
 
+    #[cfg(test)]
+    pub(crate) fn management_evidence_for_test(
+        &self,
+        agent: AgentId,
+    ) -> Result<Option<super::journal::CleanManagementEvidence>, SharedAgentHostError> {
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        Ok(hosted
+            .driver
+            .materialization()
+            .clean_management_evidence()
+            .cloned())
+    }
+
     pub(crate) fn prepare_clean_ordered(
         &self,
         agent: AgentId,
@@ -5296,6 +5312,41 @@ mod tests {
                 .latest_clean_management_disposition()
                 .unwrap(),
             Some(management_evidence)
+        );
+        let before_install_projection =
+            super::super::supervisor_adapters::AgentAuthorityRouteProjection::new(
+                current_descriptor.replica_generation(),
+                current_descriptor.clone(),
+                Vec::new(),
+            )
+            .unwrap();
+        let head = crate::agent_sdk::authority::AuthorityProjectionHead {
+            state_revision: core::num::NonZeroU64::new(3).unwrap(),
+            epoch: core::num::NonZeroU64::new(1).unwrap(),
+            authorization_sequence: core::num::NonZeroU64::new(3).unwrap(),
+            administration_generation: core::num::NonZeroU64::new(1).unwrap(),
+            state_commitment: crate::agent_sdk::Hash([0xc1; 32]),
+        };
+        assert!(
+            host.physical_projection_is_one_ack_ahead(
+                head,
+                core::slice::from_ref(&before_install_projection),
+                None,
+            )
+            .unwrap()
+        );
+        let stale_head = crate::agent_sdk::authority::AuthorityProjectionHead {
+            authorization_sequence: core::num::NonZeroU64::new(2).unwrap(),
+            ..head
+        };
+        assert!(
+            !host
+                .physical_projection_is_one_ack_ahead(
+                    stale_head,
+                    core::slice::from_ref(&before_install_projection),
+                    None,
+                )
+                .unwrap()
         );
         assert_eq!(
             host.supervisor_invocation_material(fixture.shared.agent, entry.actor)

@@ -7859,7 +7859,7 @@ mod tests {
                 max_bytes: 64 * 1024 * 1024,
             };
             let signing_key = SigningKey::from_bytes(&[NODE_SEED; 32]);
-            let (backup, source_store, source_position, source_snapshot) = {
+            let (backup, source_store, source_position, source_snapshot, management_evidence) = {
                 let mut source = source_host.lock().unwrap();
                 let candidate = source.request_snapshot_compaction(agent).unwrap();
                 let signature = crate::agent::shared_commit::ReplicaCommitSignature::new(
@@ -7894,6 +7894,7 @@ mod tests {
                     source.journal_store_instance_for_test(agent).unwrap(),
                     source.journal_position(agent).unwrap(),
                     source.snapshot_state_for_test(agent).unwrap(),
+                    source.management_evidence_for_test(agent).unwrap().unwrap(),
                 )
             };
             assert!(
@@ -7932,6 +7933,10 @@ mod tests {
             let restored_status = restored.restore_portable_backup(&backup, limits).unwrap();
             let destination_store = restored.journal_store_instance_for_test(agent).unwrap();
             assert_ne!(source_store, destination_store);
+            assert_eq!(
+                restored.management_evidence_for_test(agent).unwrap(),
+                Some(management_evidence.clone())
+            );
             assert_eq!(restored.journal_position(agent).unwrap(), source_position);
             let (
                 crate::agent::shared_host::SharedAgentSnapshotState::Installed {
@@ -7964,6 +7969,10 @@ mod tests {
             let reopened = open_destination();
             assert_eq!(reopened.show(agent).unwrap().unwrap(), stable_status);
             assert_eq!(reopened.journal_position(agent).unwrap(), source_position);
+            assert_eq!(
+                reopened.management_evidence_for_test(agent).unwrap(),
+                Some(management_evidence.clone())
+            );
             assert_eq!(
                 reopened.journal_store_instance_for_test(agent).unwrap(),
                 destination_store
@@ -8044,6 +8053,10 @@ mod tests {
                 assert_ne!(recovered_store, source_store);
                 assert_ne!(recovered_store, destination_store);
                 assert_eq!(recovered.journal_position(agent).unwrap(), source_position);
+                assert_eq!(
+                    recovered.management_evidence_for_test(agent).unwrap(),
+                    Some(management_evidence.clone())
+                );
                 assert!(matches!(
                     recovered.snapshot_state_for_test(agent).unwrap(),
                     crate::agent::shared_host::SharedAgentSnapshotState::Installed {

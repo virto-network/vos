@@ -19166,6 +19166,52 @@ pub(crate) mod tests {
         );
         assert_eq!(reopened_executor.descriptor.as_ref(), Some(&descriptor));
         assert!(decode_standard_runtime_state(reopened.state()).is_err());
+
+        // The portable object closure carries the same evidence into a new
+        // store, even after the original mutation entry has been collected.
+        use crate::agent::journal_store::{
+            PortableJournalLimits, export_portable_journal_checkpoint,
+        };
+        let portable = export_portable_journal_checkpoint(
+            &reopened_store,
+            PortableJournalLimits {
+                max_objects: 4096,
+                max_blobs: 4096,
+                max_index_nodes: 4096,
+                max_bytes: 64 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let mut destination =
+            MemoryAgentJournalStore::new(AgentId(descriptor.identity.agent.0), replica.node)
+                .unwrap();
+        destination
+            .put_blob(
+                JournalBlobClass::CatalogArtifact,
+                &sealed.genesis().runtime().package,
+                initial_runtime_bytes,
+            )
+            .unwrap();
+        destination
+            .initialize_raw_for_test(sealed.genesis())
+            .unwrap();
+        assert_ne!(destination.instance_id(), reopened_store.instance_id());
+        destination
+            .install_portable_checkpoint(&portable, 4096)
+            .unwrap();
+        let mut destination_executor = OpaqueCleanReplayExecutor::default();
+        let restored = materialize_current(
+            &mut destination,
+            &mut destination_executor,
+            &NoPrunedOrderedBases,
+        )
+        .unwrap();
+        assert_eq!(restored.state(), reopened.state());
+        assert_eq!(
+            restored.clean_management_evidence(),
+            Some(&expected_management)
+        );
+        assert!(destination_executor.last.is_none());
     }
 
     #[cfg(feature = "std")]
