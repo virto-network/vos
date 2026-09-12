@@ -21,6 +21,14 @@ vosx space up demo
 vosx space down demo
 ```
 
+`space new` prepares the bundled runtime and system actor packages, signed by
+the Space root, and creates `local.toml` with HTTP on `127.0.0.1:8080` and SSH
+on `127.0.0.1:2222`. The first `space up` installs Authority and Catalog before
+reporting readiness; restart reopens those installations. No manual system
+package installation is needed. If either port is already occupied, change
+that listener in the Space's `local.toml` before starting it. The default
+listeners are local-only, and enabling ingress does not grant anonymous access.
+
 Use `space up --once` only as an idle-exit smoke mode. Listen and startup peer
 addresses are accepted through repeatable `--listen` and `--connect` options.
 Persistent listen addresses, native extensions, and ingress listeners live in
@@ -36,8 +44,9 @@ vosx actor build board --name board
 The scaffold uses the public lane-aware SDK. `actor build` creates a signed
 `VOS3` package with exact program, schema, policy, dependency, capability, and
 producer identities. Building a package does not install it; operational Agent
-and actor lifecycle commands remain unavailable until the clean authority and
-catalog bootstrap is wired.
+and actor lifecycle commands remain unavailable until ordinary-Agent genesis
+issuance/finality and lifecycle wiring are complete. Automatic system bootstrap
+does not create an application Agent or remove that current limitation.
 
 ## Back up a stopped Space
 
