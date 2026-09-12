@@ -1,9 +1,10 @@
 //! Host driver for one durable agent-runtime instance.
 //!
-//! The node persists a small descriptor and an opaque runtime state. It never
-//! decodes actor directories or runtime-internal scheduling data. A custom
-//! runtime is therefore free to change those internals while preserving the
-//! stable lifecycle ABI.
+//! The image store persists a small descriptor and runtime-state bytes.
+//! Portable directory inspection uses the runtime ABI, but clean Local
+//! creation, transition validation and material recovery still contain
+//! Standard-specific checks. Those paths are not yet a general opaque-runtime
+//! host; changing private state layouts requires closing those dependencies.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
@@ -2441,6 +2442,79 @@ impl<S: AgentImageStore> AgentDriver<S> {
 
     pub fn image(&self) -> &AgentImage {
         &self.image
+    }
+
+    /// Read the complete portable actor directory from one immutable image.
+    /// No native runtime-state decoder participates in this query. Every
+    /// page must preserve all state lanes and advance a bounded SDK cursor.
+    pub(crate) fn inspect_sdk_actor_directory(
+        &self,
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+    ) -> Result<Vec<crate::agent_sdk::ActorDirectoryRecord>, AgentDriverError> {
+        use crate::agent_sdk::{ManagementReply, ManagementRequest, RuntimeOutcome, RuntimeWork};
+        if descriptor.validate().is_err()
+            || descriptor.identity.runtime_program.0 != self.image.runtime_program.0
+            || super::standard::clean_descriptor_to_legacy_config(descriptor)
+                .map_err(AgentDriverError::Lifecycle)?
+                != self.image.config
+        {
+            return Err(AgentDriverError::InvalidRuntime);
+        }
+        let observed_slot = self
+            .trust
+            .current_logical_slot()
+            .ok_or(AgentDriverError::TrustUnavailable)?;
+        let limit = crate::agent_sdk::MAX_DIRECTORY_PAGE_ENTRIES as u16;
+        let maximum = descriptor.capabilities.max_actors as usize;
+        let mut actors = Vec::new();
+        let mut after = None;
+        for _ in 0..maximum.div_ceil(usize::from(limit)).saturating_add(1) {
+            let work = RuntimeWork::Manage {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                runtime_deployment: descriptor.identity.runtime_deployment,
+                state: legacy_state_as_sdk(&self.image.runtime_state),
+                request: Box::new(ManagementRequest::InspectActors { after, limit }),
+                authority: None,
+                observed_slot,
+            };
+            let encoded = work
+                .encode()
+                .map_err(|_| AgentDriverError::InvalidRuntime)?;
+            let returned: crate::agent_sdk::RuntimeTransition =
+                execute_runtime_canonical(&self.runtime_pvm, self.management_gas, &encoded)?;
+            if returned.state != legacy_state_as_sdk(&self.image.runtime_state) {
+                return Err(AgentDriverError::InvalidRuntime);
+            }
+            let RuntimeOutcome::Management(Ok(ManagementReply::Actors(page))) = returned.outcome
+            else {
+                return Err(AgentDriverError::InvalidRuntime);
+            };
+            if page.validate().is_err()
+                || page.entries.len() > usize::from(limit)
+                || page
+                    .entries
+                    .first()
+                    .is_some_and(|record| after.is_some_and(|cursor| record.entry.actor <= cursor))
+                || actors
+                    .len()
+                    .checked_add(page.entries.len())
+                    .is_none_or(|count| count > maximum)
+                || (page.next.is_some() && page.entries.len() != usize::from(limit))
+            {
+                return Err(AgentDriverError::InvalidRuntime);
+            }
+            actors.extend(page.entries);
+            let Some(next) = page.next else {
+                return Ok(actors);
+            };
+            if after == Some(next) {
+                return Err(AgentDriverError::InvalidRuntime);
+            }
+            after = Some(next);
+        }
+        Err(AgentDriverError::InvalidRuntime)
     }
 
     /// Resolve one invocation's complete immutable input closure from this
@@ -6299,6 +6373,112 @@ mod tests {
             "the production driver commits the guest's exact retirement successor",
         );
         assert_eq!(driver.image().revision, 2);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn public_directory_query_accepts_opaque_state_and_rejects_mutating_replies() {
+        use super::super::package_admission::{
+            ScriptedRuntimeCase, admitted_scripted_runtime_for_test,
+        };
+        use crate::agent_sdk::{ManagementReply, ManagementRequest, RuntimeOutcome, RuntimeWork};
+        let (retained, _, _) = super::super::wire::tests::completed_clean_policy_fixture(
+            crate::agent_sdk::Hash([0xe7; 32]),
+        );
+        let template = clean_descriptor_from_state(&sdk_state_as_legacy(&retained)).unwrap();
+        let opaque = crate::agent_sdk::RuntimeState {
+            control: b"opaque-local-directory-control".to_vec(),
+            linear: vec![1],
+            merge: vec![2],
+            local: vec![3],
+        };
+        assert!(
+            super::super::wire::decode_standard_runtime_state(&sdk_state_as_legacy(&opaque))
+                .is_err()
+        );
+        for mutation in 0..6 {
+            let mut returned = crate::agent_sdk::RuntimeTransition {
+                state: opaque.clone(),
+                outcome: RuntimeOutcome::Management(Ok(ManagementReply::Actors(
+                    crate::agent_sdk::ActorDirectoryPage {
+                        entries: Vec::new(),
+                        next: None,
+                    },
+                ))),
+            };
+            match mutation {
+                0 => {}
+                1 => returned.state.control.push(9),
+                2 => returned.state.linear.push(9),
+                3 => returned.state.merge.push(9),
+                4 => returned.state.local.push(9),
+                _ => {
+                    returned.outcome =
+                        RuntimeOutcome::Management(Err(crate::agent_sdk::ManagementError::NotFound))
+                }
+            }
+            let work = RuntimeWork::Manage {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                space: template.identity.space,
+                agent: template.identity.agent,
+                runtime_deployment: template.identity.runtime_deployment,
+                state: opaque.clone(),
+                request: Box::new(ManagementRequest::InspectActors {
+                    after: None,
+                    limit: crate::agent_sdk::MAX_DIRECTORY_PAGE_ENTRIES as u16,
+                }),
+                authority: None,
+                observed_slot: 1,
+            };
+            let package = admitted_scripted_runtime_for_test(
+                "opaque-local-directory",
+                0xb1 + mutation,
+                vec![ScriptedRuntimeCase {
+                    input: work.encode().unwrap(),
+                    output: returned.encode().unwrap(),
+                    copies: Vec::new(),
+                }],
+            );
+            let mut descriptor = template.clone();
+            descriptor.identity.runtime_deployment = package.deployment();
+            descriptor.identity.runtime_program = package.program();
+            descriptor.identity.runtime_producer = package.producer();
+            descriptor.runtime_package = package.package_ref().clone();
+            descriptor.runtime_contract = package.manifest().contract;
+            descriptor.capabilities = package.capabilities();
+            let config =
+                super::super::standard::clean_descriptor_to_legacy_config(&descriptor).unwrap();
+            let trust = Arc::new(AnchorTrust {
+                space: config.identity.space,
+                authority: config.authority.clone(),
+            });
+            // Exercise the post-construction query only. Production custom
+            // Create/reopen is a separate, still-unfinished boundary.
+            let driver = AgentDriver {
+                runtime_pvm: package.program_bytes().to_vec(),
+                image: AgentImage {
+                    revision: 1,
+                    runtime_program: config.identity.runtime_program,
+                    config,
+                    runtime_state: sdk_state_as_legacy(&opaque),
+                },
+                store: MemoryAgentStore::default(),
+                management_gas: DEFAULT_MANAGEMENT_GAS,
+                catalog_cleanup_pending: false,
+                trust,
+            };
+            let result = driver.inspect_sdk_actor_directory(&descriptor);
+            if mutation == 0 {
+                assert_eq!(result, Ok(Vec::new()));
+            } else {
+                assert_eq!(
+                    result,
+                    Err(AgentDriverError::InvalidRuntime),
+                    "mutation {mutation}"
+                );
+            }
+            assert_eq!(driver.image.runtime_state, sdk_state_as_legacy(&opaque));
+        }
     }
 
     #[test]

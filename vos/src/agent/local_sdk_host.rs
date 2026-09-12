@@ -364,10 +364,10 @@ impl LocalAgentHost {
             {
                 return Err(LocalAgentHostError::InvalidDescriptor);
             }
-            let state =
-                super::wire::decode_standard_runtime_state(&hosted.driver.image().runtime_state)
-                    .map_err(|_| LocalAgentHostError::Corrupt)?;
-            if state.actors.len() != authority.actors().len() {
+            let directory = hosted
+                .driver
+                .inspect_sdk_actor_directory(&hosted.descriptor)?;
+            if directory.len() != authority.actors().len() {
                 return Err(LocalAgentHostError::InvalidDescriptor);
             }
             for actor in authority.actors() {
@@ -403,14 +403,14 @@ impl LocalAgentHost {
             let state =
                 super::wire::decode_standard_runtime_state(&hosted.driver.image().runtime_state)
                     .map_err(|_| LocalAgentHostError::Corrupt)?;
-            let mut actors = Vec::with_capacity(state.actors.len());
-            for actor in &state.actors {
-                let material =
-                    hosted
-                        .driver
-                        .physical_authority_material(crate::agent_sdk::ActorId(
-                            actor.record.entry.actor.0,
-                        ))?;
+            let directory = hosted
+                .driver
+                .inspect_sdk_actor_directory(&hosted.descriptor)?;
+            let mut actors = Vec::with_capacity(directory.len());
+            for actor in &directory {
+                let material = hosted
+                    .driver
+                    .physical_authority_material(actor.entry.actor)?;
                 if material.descriptor != hosted.descriptor
                     || material.descriptor.identity.agent != *agent
                 {
@@ -2396,6 +2396,15 @@ mod tests {
             panic!("inspect did not return the canonical directory")
         };
         let record = page.entries.first().unwrap().clone();
+        let before_inspection = host.agents[&agent].driver.image().clone();
+        assert_eq!(
+            host.agents[&agent]
+                .driver
+                .inspect_sdk_actor_directory(&descriptor)
+                .unwrap(),
+            page.entries
+        );
+        assert_eq!(host.agents[&agent].driver.image(), &before_inspection);
 
         let work = invocation(&descriptor, &record, &actor_package, 0xa1);
         let authority = invocation_receipt(&descriptor, &work, 50, 50);

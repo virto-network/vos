@@ -970,3 +970,31 @@ restriction remains unchanged. Formatting and diff checks pass; this checkpoint
 adds tests and a test-only evidence accessor, not production behavior or guest
 artifact changes. Production Local custom-runtime support and ordinary-Agent
 finality remain implementation work, followed by the final release gates.
+
+### Production Local public directory inspection
+
+`AgentDriver::inspect_sdk_actor_directory` now reads bounded canonical SDK
+directory pages from one immutable image through the physical runtime. It
+checks the supplied descriptor against the image's public configuration and
+runtime identity, fixes the observation slot for the whole scan, rejects
+state changes in every lane, bounds page/cumulative counts and cursor progress,
+and rejects non-directory outcomes. Local exact-projection actor counting and
+one-ack-lag actor enumeration now use this interface instead of interpreting
+the Standard actor table. Exact physical-material and management-disposition
+checks remain in place.
+
+**11/11 tests pass** (`r16-local-public-directory-final.log`, 8.22s): all ten
+Local SDK host tests plus a physical scripted-PVM regression which accepts an
+opaque state image and rejects changes to each of its four lanes and a
+non-directory management result. The lifecycle/restart test compares the query
+to the canonical management page and verifies the stored image is unchanged.
+The scripted test deliberately constructs the post-admission driver directly;
+it does not prove production custom-runtime Create/reopen. Formatting and diff
+checks pass; guest artifacts and SDK ABI are unchanged.
+
+The Local work is still incomplete: descriptor persistence/reopen, physical
+actor-material loading, management history, and Standard transition-oracle
+comparisons remain private-layout dependencies. The module overview now states
+that limitation instead of incorrectly claiming this driver never decodes
+runtime internals. Continue replacing those dependencies with authenticated
+public metadata and runtime ABI checks; do not simply remove their validation.
