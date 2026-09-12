@@ -6893,7 +6893,7 @@ mod tests {
             // generation byte. A process loss at that first durable boundary
             // resumes into the same logical state with another fresh physical
             // store identity, then retires the recovery authority.
-            for staged in [false, true] {
+            for crash_boundary in 0..4 {
                 let interrupted_destination =
                     TestDirectory::new("portable-shared-system-marker-crash");
                 let open_interrupted_destination = || {
@@ -6910,12 +6910,21 @@ mod tests {
                 };
                 {
                     let mut interrupted = open_interrupted_destination();
-                    assert_eq!(
-                        interrupted
-                            .retain_portable_restore_marker_for_test(&backup, limits)
-                            .unwrap(),
-                        agent
-                    );
+                    if crash_boundary >= 2 {
+                        assert_eq!(
+                            interrupted.restore_portable_backup_through_heads_stage_for_test(
+                                &backup, limits
+                            ),
+                            Err(crate::agent::shared_host::SharedAgentHostError::Unavailable)
+                        );
+                    } else {
+                        assert_eq!(
+                            interrupted
+                                .retain_portable_restore_marker_for_test(&backup, limits)
+                                .unwrap(),
+                            agent
+                        );
+                    }
                     assert!(interrupted.is_empty());
                 }
                 let marker = interrupted_destination.host().join(format!(
@@ -6927,12 +6936,29 @@ mod tests {
                         .collect::<String>()
                 ));
                 let staged_marker = marker.with_extension("shared-portable-restore.next");
-                if staged {
+                let journal = marker.with_extension("agent");
+                let staged_heads = if crash_boundary >= 2 {
+                    let bytes = std::fs::read(journal.join("heads.next")).unwrap();
+                    assert_ne!(bytes, std::fs::read(journal.join("heads")).unwrap());
+                    if crash_boundary == 3 {
+                        // Journal promotion committed, but the independently
+                        // locked Raft ledger still has its genesis state.
+                        std::fs::rename(journal.join("heads.next"), journal.join("heads")).unwrap();
+                    }
+                    Some(bytes)
+                } else {
+                    None
+                };
+                if crash_boundary == 1 {
                     std::fs::rename(&marker, &staged_marker).unwrap();
                 }
                 let recovered = open_interrupted_destination();
                 assert!(!marker.exists());
                 assert!(!staged_marker.exists());
+                if let Some(expected) = staged_heads {
+                    assert_eq!(std::fs::read(journal.join("heads")).unwrap(), expected);
+                    assert!(!journal.join("heads.next").exists());
+                }
                 let recovered_store = recovered.journal_store_instance_for_test(agent).unwrap();
                 assert_ne!(recovered_store, source_store);
                 assert_ne!(recovered_store, destination_store);

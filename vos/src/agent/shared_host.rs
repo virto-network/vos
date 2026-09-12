@@ -2541,6 +2541,16 @@ impl SharedAgentHost {
         .map_err(map_driver_error)?;
         install_host_record(&self.exposure_path(agent), intent.id().as_bytes())?;
         if let Some(recovery) = portable_restore {
+            #[cfg(test)]
+            if recovery.stage_heads_only_for_test {
+                driver
+                    .stage_portable_checkpoint_for_test(
+                        &recovery.bundle.journal,
+                        recovery.maximum_index_nodes,
+                    )
+                    .map_err(map_driver_error)?;
+                return Err(SharedAgentHostError::Unavailable);
+            }
             driver
                 .restore_portable_checkpoint(
                     &recovery.bundle.journal,

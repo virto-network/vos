@@ -2870,11 +2870,7 @@ impl
             .install_portable_checkpoint(image, maximum_index_nodes)?;
         self.materialization =
             materialize_current(&mut self.store, &mut self.executor, &NoPrunedOrderedBases)?;
-        validate_portable_materialization(
-            &self.store,
-            &self.materialization,
-            certificate.claim(),
-        )?;
+        validate_portable_materialization(&self.store, &self.materialization, certificate.claim())?;
         let installed = self
             .ledger
             .restore_portable_snapshot(certificate, verified)?;
@@ -2887,6 +2883,17 @@ impl
             self.ledger.journal_store(),
             &audit,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stage_portable_checkpoint_for_test(
+        &mut self,
+        image: &PortableJournalCheckpoint,
+        maximum_index_nodes: usize,
+    ) -> Result<(), SharedJournalDriverError> {
+        self.store
+            .stage_portable_checkpoint_for_test(image, maximum_index_nodes)?;
+        Ok(())
     }
 
     #[cfg(test)]

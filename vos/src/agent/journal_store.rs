@@ -11382,6 +11382,25 @@ impl FileAgentJournalStore {
         image: &PortableJournalCheckpoint,
         maximum_index_nodes: usize,
     ) -> Result<(), JournalStoreError> {
+        self.install_portable_checkpoint_inner(image, maximum_index_nodes, false)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn stage_portable_checkpoint_for_test(
+        &mut self,
+        image: &PortableJournalCheckpoint,
+        maximum_index_nodes: usize,
+    ) -> Result<(), JournalStoreError> {
+        self.install_portable_checkpoint_inner(image, maximum_index_nodes, true)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn install_portable_checkpoint_inner(
+        &mut self,
+        image: &PortableJournalCheckpoint,
+        maximum_index_nodes: usize,
+        stop_after_heads_stage: bool,
+    ) -> Result<(), JournalStoreError> {
         image.validate_shape()?;
         self.verify_lock()?;
         let current = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
@@ -11421,6 +11440,9 @@ impl FileAgentJournalStore {
 
         let root = self.directory("")?;
         create_synced_stage_at(root, "heads.next", &image.heads.encode())?;
+        if stop_after_heads_stage {
+            return Ok(());
+        }
         // Read the canonical file directly while the portable jump is staged.
         // Generic recovery intentionally rejects this non-successor `next`;
         // the exclusive generation lock and exact preflight above are the

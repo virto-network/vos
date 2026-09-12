@@ -211,3 +211,13 @@ Evidence: native worktree `target/task-tmp/c1-portable-marker-staged-verificatio
 (one explicitly selected test, passed). This does not establish every cross-store
 crash boundary or the Private recovery gates, and this older recovery worktree
 still needs integration with the r15 native/artifact work before final release.
+
+The same physical test now also passes two cross-store interruption cases:
+`heads.next` durably staged before promotion, and heads promoted while the
+Raft ledger is still at genesis. The previously unused stop hook now reaches
+the actual file-store publication boundary. Assertions prove staged heads
+existed and differed from committed heads, reopen promotes exactly those bytes,
+the stage disappears, and journal position/snapshot/store identity survive
+another reopen. Evidence is `c1-portable-heads-stage-verification.log` in the
+same disk-backed log directory. The broader Private host suite is separately
+running with `pvm,private-agent-store`; it is not yet signed off.
