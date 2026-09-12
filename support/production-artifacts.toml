@@ -6,17 +6,17 @@ format = 1
 # toolchains. A Clerk `.vos` signature is operator-specific, so this manifest
 # pins its signed content rather than one repository-global wrapper.
 source_revision = "54ec5cca7dc5be3fc80f2f89247233719f790b95"
-agent_runtime_source_revision = "78434a4f2d213badf1769f8ba4ec5d251d617a0d"
+agent_runtime_source_revision = "42f3f3bf2362e5189f094a1e39c7288e7a26eea7"
 guest_toolchain = "nightly-2026-03-20"
 host_toolchain = "nightly-2025-05-09"
 
 # Public, non-authoritative signed templates. Space creation re-signs these
 # packages with its actual root; this signer is never an operator credential.
-system_templates_source_revision = "78434a4f2d213badf1769f8ba4ec5d251d617a0d"
-system_templates_builder_revision = "73f3514adc0acd4e9e2636a6ed2c3eb8ef14f1ee"
+system_templates_source_revision = "42f3f3bf2362e5189f094a1e39c7288e7a26eea7"
+system_templates_builder_revision = "42f3f3bf2362e5189f094a1e39c7288e7a26eea7"
 system_templates_public_signing_seed_hex = "5454545454545454545454545454545454545454545454545454545454545454"
-system_authority_package_blake2b_256 = "33828001bd25c4922e700b6818971db25135d41dc55e0786667c24c8c06dd8ab"
-system_catalog_package_blake2b_256 = "06e5e10718ad8b1bb4a3f8994107acacf0f82dc15c038d5d24dc2237ea02de63"
+system_authority_package_blake2b_256 = "118ff55e59a7c993fd2e99060030797e7e4268860dda65c47e3b5be8c3ffd648"
+system_catalog_package_blake2b_256 = "b219c45487c9ed939a7abbbacd83840c676fa846aa9e0d9d991ee9ffc40298b5"
 
 service_program_id = "38207480731d47af5194a3e1e61b0f9667983edbbf16c90f2bde7d2153de4481"
 service_elf_blake2b_256 = "e7b9a82d22702e8522e8b36faa1118fcced759cb6632b4377f4d8475890a32f0"
@@ -25,9 +25,9 @@ service_pvm_blake2b_256 = "1911c5b7f5ee746cfe231a81f9ec2d5355e725faad7c578514b55
 authority_program_id = "da1c25f9b2c18144a0ef346b873930a53e881429fd11cdbcbf3a3182189aba79"
 authority_pvm_blake2b_256 = "f91f993dd459a6a8107b85dc3a0b12776191faaf9cab494a443d12b92c745ac6"
 
-agent_runtime_program_id = "6bcc6da44743202942746bfede64db263bbca704fc11c6d2e8f783bfa55c1df0"
-agent_runtime_elf_blake2b_256 = "9e78b31dad97d0471de801189feaec25060cca03908dca992b7f68c4bc758994"
-agent_runtime_pvm_blake2b_256 = "b2d400d20c760ac6b24299f4b7c844926df61961ace162248a9b70f6bfe12373"
+agent_runtime_program_id = "1152a50e0117033569ddf9e7a71869adb8650184a63e3473a8ab88c72254cb00"
+agent_runtime_elf_blake2b_256 = "8bd1f0e6c5dd2b40f2bdebd441c26f6954cd675f8a92ab30622a0c588cce8746"
+agent_runtime_pvm_blake2b_256 = "db4a1b273612689c3e49db267af775462f38bae3671b9669d9eae64372b2edd7"
 
 registry_elf_blake2b_256 = "461f2b368dd653698c8650b07800b81634b3072b37fd7a5f3708581021bbbd32"
 

@@ -1,8 +1,8 @@
 # Reviewing the Agent architecture saga
 
-Current Ch08 WIP warning: `wip/ch08-runtime-directory` is source-ahead of its
-bundles (runtime ABI r16). Do not deploy its existing r15 artifacts with current
-source. See the latest checkpoint sections below for failures and release work.
+Current Ch08 WIP warning: `wip/ch08-runtime-directory` has newly built r16
+bundles, but independent reproduction and startup validation are still pending.
+See the latest checkpoint sections below for failures and release work.
 
 The Agent architecture work is integrated on `saga/agents`. It is reviewed
 as a stack of larger, single-theme chapters; `master` receives only the
@@ -628,3 +628,31 @@ failures are now the only unaddressed failures from the original broad library
 run, but that whole run has not been repeated. r16 artifact rebuild/reproduction,
 ordinary-agent finality, opaque-runtime recovery, and all final release gates
 remain required; passing these fixture suites is not deployment readiness.
+
+### Initial r16 artifacts and exact-retry host correction
+
+Runtime and system templates were built from immutable source
+`42f3f3bf2362e5189f094a1e39c7288e7a26eea7`, with the builder from that same
+revision and the pinned guest/host toolchains. Candidate evidence is under
+`target/r16-release.ziYI98`; scratch data stayed on disk. The committed blob
+candidates and production manifest now name r16. The runtime passed the physical
+ABI probe with ProgramId
+`1152a50e0117033569ddf9e7a71869adb8650184a63e3473a8ab88c72254cb00`.
+This was one build, not independent reproduction or startup signoff. The normal
+CLI binary was built before the new blobs were staged and must be rebuilt.
+
+Host preflight incorrectly checked the current time for an exact retained
+management retry, although the guest recovers that result before current-expiry
+checks. Retained history now carries its recorded acceptance slot; only exact
+retries authenticate against that slot. Other receipts still use the current
+window, and signature/request/runtime checks remain unchanged. This host-only
+change is newer than the guest artifact source. The exact preflight regression
+passes (`r16-retry-preflight.log`).
+
+With the r16 runtime candidate, Local SDK host tests pass 9 and fail 1
+(`r16-local-host-tests.log`): both expired-retry failures are resolved, while
+`physical_resume_boundary_replays_persisted_fifo_continuations` still returns
+`Driver(InvalidRuntime)` at the first resume. This is the last unaddressed
+failure from the earlier full-library run, not the last release requirement.
+Artifact reproduction, current-source CLI rebuild/startup, finality, opaque
+recovery, and the complete release gates remain open.

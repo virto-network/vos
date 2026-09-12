@@ -82,7 +82,7 @@ fn clean_descriptor_from_state(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CleanManagementReceiptHistory {
-    Retained,
+    Retained { observed_slot: u64 },
     Consumed,
     RejectedUnseen,
     Unseen,
@@ -107,7 +107,9 @@ fn clean_management_receipt_history(
             {
                 CleanManagementReceiptHistory::Consumed
             } else {
-                CleanManagementReceiptHistory::Retained
+                CleanManagementReceiptHistory::Retained {
+                    observed_slot: disposition.observed_slot,
+                }
             },
         );
     }
@@ -3349,10 +3351,14 @@ impl<S: AgentImageStore> AgentDriver<S> {
             }
             None => CleanManagementReceiptHistory::Unseen,
         };
-        let exact_retry = receipt_history == CleanManagementReceiptHistory::Retained;
+        let exact_retry = matches!(
+            receipt_history,
+            CleanManagementReceiptHistory::Retained { .. }
+        );
         let allow_historical_runtime = matches!(
             receipt_history,
-            CleanManagementReceiptHistory::Retained | CleanManagementReceiptHistory::Consumed
+            CleanManagementReceiptHistory::Retained { .. }
+                | CleanManagementReceiptHistory::Consumed
         );
         let skip_artifact_staging = receipt_history != CleanManagementReceiptHistory::Unseen;
         let observed_slot = match self.trust.current_logical_slot() {
@@ -3367,11 +3373,18 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 None,
             ) => {}
             (_, Some(receipt)) => {
+                // An exact durable retry recovers an already accepted result;
+                // its signed window is checked at that acceptance, not now.
+                // Other receipts still require a live current observation.
+                let authorization_slot = match receipt_history {
+                    CleanManagementReceiptHistory::Retained { observed_slot } => observed_slot,
+                    _ => observed_slot,
+                };
                 verify_clean_management_receipt(
                     &current,
                     &request,
                     receipt,
-                    observed_slot,
+                    authorization_slot,
                     allow_historical_runtime,
                 )?;
             }
@@ -5748,7 +5761,7 @@ mod tests {
         );
         assert_eq!(
             clean_management_receipt_history(&runtime_state, &request, &receipt),
-            Ok(CleanManagementReceiptHistory::Retained)
+            Ok(CleanManagementReceiptHistory::Retained { observed_slot: 2 })
         );
         assert_eq!(request.replay_commitment(), request.commitment());
         assert_eq!(
