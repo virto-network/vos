@@ -1082,3 +1082,35 @@ cache alone cannot replace that history. Standard Create/reopen and runtime
 transition checks must then be replaced with public authenticated invariants,
 with an opaque runtime tested through the production host lifecycle. Neither
 that implementation work nor ordinary-Agent finality is closed by these tests.
+
+### Local management history component
+
+`local_management` now defines a bounded host-owned history and strict LMH1
+codec without any private runtime-state decoding. Its retained records include
+the complete receipt and request commitments, epoch, decision sequence,
+original observation slot and exact SDK result. The latest retained record
+preserves the decision/epoch high-water marks; acknowledgement pruning never
+leaves an empty history with a nonzero acknowledged frontier.
+
+The transition operation explicitly requires prior independent authentication
+and guest-result validation. It rejects changed state or a changed result on
+an exact retry, preserves failed unconsumed admissions, refuses consumed
+sequences that mutate state, and enforces bounded retention and canonical
+clocks. Empty/opaque guest bytes are never interpreted. Codec checks reject
+oversized counts before allocating record storage and bound individual results.
+
+The two component regressions pass (`r16-local-management-history.log`, 0.20s):
+codec round-trip, late retries, skipped/acknowledged sequences, invalid
+acknowledgements, exact-result substitution, full-journal refusal and legitimate
+acknowledgement headroom, duplicate commitments and noncanonical clocks.
+The combined driver, Local host and history run passes **40/40**
+(`r16-local-management-history-final.log`, 8.71s). Formatting and diff checks pass.
+
+This component is not yet wired into `AgentImage` or `manage_sdk`; it does not
+close production recovery. Next, persist it atomically with clean Local images,
+derive it from verified Create/management transitions, preserve it through
+state-only commits, and use it for retry classification and Local projection
+comparison. Reopen must reject missing or inconsistent history. Then exercise
+those paths through the physical host before removing any remaining Standard
+validation boundary. No image format, guest artifact or deployment-readiness
+claim changes in this checkpoint.

@@ -55,6 +55,8 @@ pub(crate) mod local_journal_driver;
 #[cfg(all(feature = "std", feature = "network"))]
 pub use local_journal_driver::Ed25519NodeMergeAuthenticator;
 #[cfg(feature = "std")]
+pub mod local_management;
+#[cfg(feature = "std")]
 pub mod local_sdk_host;
 #[cfg(feature = "pvm")]
 pub mod machine;
