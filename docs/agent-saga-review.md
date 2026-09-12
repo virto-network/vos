@@ -1,5 +1,9 @@
 # Reviewing the Agent architecture saga
 
+Current Ch08 WIP warning: `wip/ch08-runtime-directory` is source-ahead of its
+bundles (runtime ABI r16). Do not deploy its existing r15 artifacts with current
+source. See the latest checkpoint sections below for failures and release work.
+
 The Agent architecture work is integrated on `saga/agents`. It is reviewed
 as a stack of larger, single-theme chapters; `master` receives only the
 completed clean cutover after the release gate passes.
@@ -563,3 +567,31 @@ run fresh-space startup/restart and final release gates; then fold the work
 into the three scoped review batches. The integrated WIP is not ready to land
 on master or deploy with the currently bundled runtime. No branch was pushed
 or merged to `saga/agents` or master by these fixture corrections.
+
+### r16 accepted-invocation provenance correction (source only)
+
+The remaining wire restore failure was a real binding gap: retained accepted
+metadata contained availability references, but the signed work hash included
+their preimages, so restore could not reconstruct and compare the signed work.
+The SDK invocation commitment now encodes every invocation field and the exact
+ordered BlobRefs, omitting only preimages. Admission still validates each blob's
+bytes against its reference. Standard reconstructs that same commitment from
+retained metadata before accepting either receipt or PublicPreflight bindings
+for continuations and terminal results. It does not retain caller-sized blobs
+or prohibit legitimate signed actor origins.
+
+This changes the clean protocol to `vos-agent-runtime-abi-260912-r16`, with
+control schema `0dd3107d1168fb23f2c1e6be24a57146b6d858908f4ffd57622716d2ff767c3e`.
+All runtime/system packages and protocol golden expectations must be regenerated
+and checked for this ABI; old bundles have not been repinned or rebuilt here.
+
+The final wire suite passes all 66 tests in 20.83s (`r16-wire-final.log`),
+including forged origin/message/gas/reference rejection, terminal-result origin
+rejection, and a correctly signed actor origin surviving restore. The SDK adds
+a regression showing reference binding and independent preimage validation.
+SDK tests currently pass 153 and fail 8 ABI-dependent golden-hash tests
+(`r16-sdk-final.log`); this remains a failed gate, not a waiver or a completed
+golden refresh. SDK no-default-features and workspace formatting checks pass.
+Seven of the original full-library failures remain unaddressed, in addition to
+these r16 pin updates, ordinary-agent finality, opaque-runtime recovery, and
+the final artifact/physical/release gates. No deployment readiness is claimed.

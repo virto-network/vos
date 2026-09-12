@@ -3635,6 +3635,14 @@ fn decode_required_refs(
 }
 
 fn encode_invocation_work(encoder: &mut Encoder<'_>, value: &InvocationWork) {
+    encode_invocation_work_with_availability(encoder, value, true);
+}
+
+fn encode_invocation_work_with_availability(
+    encoder: &mut Encoder<'_>,
+    value: &InvocationWork,
+    include_preimages: bool,
+) {
     encoder.fixed(value.space.as_bytes());
     encoder.fixed(value.agent.as_bytes());
     encoder.fixed(value.runtime_deployment.as_bytes());
@@ -3648,7 +3656,13 @@ fn encode_invocation_work(encoder: &mut Encoder<'_>, value: &InvocationWork) {
     encode_invocation_roles(encoder, value.roles);
     encoder.bytes(&value.message);
     encode_optional_blob(encoder, &value.installation_data);
-    encoder.list(&value.availability, encode_runtime_blob);
+    if include_preimages {
+        encoder.list(&value.availability, encode_runtime_blob);
+    } else {
+        encoder.list(&value.availability, |encoder, blob| {
+            encode_blob(encoder, &blob.reference);
+        });
+    }
     encoder.u64(value.gas);
     encoder.bool(value.recovery_only);
 }
@@ -3693,7 +3707,9 @@ pub(crate) fn invocation_work_commitment(value: &InvocationWork) -> Hash {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"AINV");
     bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
-    encode_invocation_work(&mut Encoder(&mut bytes), value);
+    // Validated content-addressed references bind the preimages without
+    // requiring continuations and terminal results to retain caller-sized data.
+    encode_invocation_work_with_availability(&mut Encoder(&mut bytes), value, false);
     Hash::digest(b"vos/agent/invocation", &[&bytes])
 }
 
@@ -6459,6 +6475,48 @@ mod tests {
         let mut role_and_capability = context;
         role_and_capability.origin.capability = Some(CapabilityId([50; 32]));
         assert_eq!(role_and_capability.encode(), Err(WireError::InvalidValue));
+    }
+
+    #[test]
+    fn invocation_commitment_binds_references_and_admission_checks_preimages() {
+        let mut work = invocation();
+        let bytes = alloc::vec![1, 2, 3];
+        work.availability.push(RuntimeBlob {
+            reference: BlobRef::of_bytes(&bytes),
+            bytes,
+        });
+        assert!(work.validate());
+        let commitment = work.commitment();
+        let mut references_only = work.clone();
+        references_only.availability[0].bytes.clear();
+        assert_eq!(references_only.commitment(), commitment);
+        assert!(!references_only.validate());
+        let mut corrupt = work.clone();
+        corrupt.availability[0].bytes[0] ^= 1;
+        assert_eq!(corrupt.commitment(), commitment);
+        assert!(!corrupt.validate(), "hashing never replaces byte admission");
+        let mut changed = work.clone();
+        changed.availability[0].reference.hash = Hash([0xef; 32]);
+        assert_ne!(changed.commitment(), commitment);
+        changed = work.clone();
+        changed.availability[0].reference.len += 1;
+        assert_ne!(changed.commitment(), commitment);
+        changed = work.clone();
+        changed.availability.clear();
+        assert_ne!(changed.commitment(), commitment);
+        changed = work.clone();
+        changed.availability.push(work.availability[0].clone());
+        assert_ne!(changed.commitment(), commitment);
+        assert!(!changed.validate());
+
+        let mut old_bytes = Vec::new();
+        old_bytes.extend_from_slice(b"AINV");
+        old_bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+        encode_invocation_work(&mut Encoder(&mut old_bytes), &work);
+        assert_ne!(
+            Hash::digest(b"vos/agent/invocation", &[&old_bytes]),
+            commitment
+        );
     }
 
     #[test]

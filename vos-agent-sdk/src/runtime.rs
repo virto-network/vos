@@ -279,7 +279,9 @@ impl InvocationWork {
             && self.gas != 0
     }
 
-    /// Commitment matched by an Invoke authority selector.
+    /// Commitment matched by an Invoke authority selector. Binds all metadata
+    /// and the exact ordered availability references, not their preimages.
+    /// Admission must separately call `validate()` to authenticate blob bytes.
     pub fn commitment(&self) -> Hash {
         crate::wire::invocation_work_commitment(self)
     }

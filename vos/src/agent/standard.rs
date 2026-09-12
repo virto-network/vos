@@ -372,6 +372,22 @@ pub(crate) struct StandardAcceptedInvocation {
 }
 
 impl StandardAcceptedInvocation {
+    fn commitment(&self) -> crate::agent_sdk::Hash {
+        // Only references enter the SDK commitment. These payload-free blobs
+        // reconstruct its canonical input; they must never be executed or
+        // treated as validated availability.
+        self.with_availability(
+            self.required
+                .iter()
+                .map(|reference| crate::agent_sdk::RuntimeBlob {
+                    reference: reference.clone(),
+                    bytes: Vec::new(),
+                })
+                .collect(),
+        )
+        .commitment()
+    }
+
     pub(crate) fn from_work(work: &crate::agent_sdk::InvocationWork) -> Self {
         Self {
             space: work.space,
@@ -576,6 +592,10 @@ fn clean_authorization_matches_accepted(
 ) -> bool {
     use crate::agent_sdk::InvocationAuthorization;
     use crate::agent_sdk::authority::AuthorityOperationKind;
+
+    if accepted.commitment().0 != expected_work.0 {
+        return false;
+    }
 
     match authorization {
         InvocationAuthorization::AuthorityReceipt(receipt) => {

@@ -7886,9 +7886,24 @@ pub(crate) mod tests {
         crate::agent_sdk::authority::AuthorityReceipt,
         crate::agent_sdk::YieldedInvocation,
     ) {
-        let (mut runtime, work) = clean_policy_fixture(
+        clean_pending_fixture_with_origin(None)
+    }
+
+    #[cfg(feature = "pvm")]
+    fn clean_pending_fixture_with_origin(
+        origin: Option<crate::agent_sdk::InvocationOrigin>,
+    ) -> (
+        crate::agent_sdk::RuntimeState,
+        crate::agent_sdk::InvocationWork,
+        crate::agent_sdk::authority::AuthorityReceipt,
+        crate::agent_sdk::YieldedInvocation,
+    ) {
+        let (mut runtime, mut work) = clean_policy_fixture(
             crate::agent_sdk::method_policy::AuthorizationPolicySelector::Public,
         );
+        if let Some(origin) = origin {
+            work.origin = origin;
+        }
         let state = runtime.snapshot();
         let config = state.config.as_ref().unwrap().clone();
         let (invocation, ..) = runtime.resolve_clean_invocation(&work).unwrap();
@@ -9533,6 +9548,20 @@ pub(crate) mod tests {
         let (state, _, _, _) = clean_terminal_fixture();
         let decoded = decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap();
 
+        let mut wrong_origin = decoded.clone();
+        wrong_origin.invocation_results[0]
+            .clean
+            .as_mut()
+            .unwrap()
+            .accepted
+            .origin
+            .actor = Some(crate::agent_sdk::ActorId([0xf3; 32]));
+        assert_eq!(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&wrong_origin)),
+            Err(DecodeError::NonCanonical),
+            "terminal results must reconstruct the signed invocation metadata too"
+        );
+
         let mut wrong_slot = decoded.clone();
         wrong_slot.invocation_results[0]
             .clean
@@ -9660,6 +9689,39 @@ pub(crate) mod tests {
     #[test]
     fn restored_clean_continuation_rejects_a_forged_accepted_receipt() {
         let (state, _, _, _) = clean_pending_fixture();
+        let (_, original, _, _) = clean_pending_fixture();
+        let mut actor_origin = original.origin;
+        actor_origin.actor = Some(crate::agent_sdk::ActorId([0xf1; 32]));
+        let (legitimate, _, _, _) = clean_pending_fixture_with_origin(Some(actor_origin));
+        assert!(
+            StandardAgentRuntime::restore(
+                decode_standard_runtime_state(&clean_state_to_legacy(&legitimate)).unwrap()
+            )
+            .is_ok(),
+            "an actor origin bound by the original signature remains supported"
+        );
+        let mutations: &[fn(&mut super::super::standard::StandardAcceptedInvocation)] = &[
+            |accepted| accepted.origin.principal = Some(crate::agent_sdk::PrincipalId([0xf2; 32])),
+            |accepted| accepted.origin.transport_node = Some(crate::agent_sdk::NodeId([0xf2; 32])),
+            |accepted| {
+                accepted.origin.credential = Some(crate::agent_sdk::CredentialId([0xf2; 32]))
+            },
+            |accepted| accepted.message.push(0xf2),
+            |accepted| accepted.gas += 1,
+            |accepted| accepted.required[0].hash = crate::agent_sdk::Hash([0xf2; 32]),
+        ];
+        for mutate in mutations {
+            let mut decoded =
+                decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap();
+            mutate(decoded.machine_continuations[0].accepted.as_mut().unwrap());
+            assert!(
+                matches!(
+                    StandardAgentRuntime::restore(decoded),
+                    Err(super::super::LifecycleError::InvalidRequest)
+                ),
+                "persisted metadata must reconstruct the signed invocation commitment"
+            );
+        }
         let mut decoded = decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap();
         decoded.machine_continuations[0]
             .accepted
