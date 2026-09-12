@@ -762,3 +762,15 @@ InvocationAuthorization, and PrivateRuntimeMutation. No warning suppression or
 public allocation/layout change was made. These source-only cleanup edits are
 newer than the pinned artifact source and the running full-library checkpoint;
 final frozen-source artifact/gate verification remains required.
+
+The three SDK enum layout warnings now have scoped `expect` attributes with
+explicit allocation/API rationale. Inline representation is intentionally
+preserved: boxing public variants would change constructors and add guest
+allocation paths solely for lint. Two regression tests guard inline growth
+(authorization <= 1 KiB; intent and Private mutation <= 2 KiB); they are not
+wire limits, heap bounds, or performance signoff. Strict all-target/no-default-
+features SDK clippy passes (`r16-sdk-clippy-final.log`), and all 163 SDK tests
+pass (`r16-sdk-layout-tests.log`). No runtime representation or canonical wire
+change was made by the attributes/tests. The integrated library run has passed
+the coordinator capacity test and advanced into issuer tests; it remains live
+as session 11706, not a completed gate.

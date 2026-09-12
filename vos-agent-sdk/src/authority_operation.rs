@@ -255,6 +255,10 @@ impl PrivateRecoveryAuthorityProof {
 /// materialize a receipt selector while matching the original canonical
 /// operation preimage at the eventual consumer.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "keep bounded operation records inline; boxing changes the public API and guest allocation path"
+)]
 pub enum AuthorityOperationIntent {
     InvokeActor {
         managed: ManagedAgentTarget,
@@ -3168,6 +3172,12 @@ impl CanonicalWire for PrivateControlApplicationRetirementAck {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn operation_intent_inline_footprint_remains_bounded() {
+        // Inline footprint only, not a replacement for canonical wire bounds.
+        assert!(core::mem::size_of::<super::AuthorityOperationIntent>() <= 2 * 1024);
+    }
+
     use alloc::string::ToString;
     use alloc::vec;
 

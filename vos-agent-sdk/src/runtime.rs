@@ -334,6 +334,10 @@ impl PublicPreflight {
 /// deliberately unsigned and is useful only after the runtime resolves the
 /// installed AMP2 method selector as Public.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "retain inline receipt verification without adding an allocation to every authorization"
+)]
 pub enum InvocationAuthorization {
     AuthorityReceipt(AuthorityReceipt),
     PublicPreflight(PublicPreflight),
@@ -486,6 +490,10 @@ impl ManagementRequest {
 /// contain a [`ManagementRequest`], preventing recursive envelopes and
 /// keeping the PCTL-to-runtime binding finite and canonical.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "keep finite Private mutation records inline without changing their public allocation contract"
+)]
 pub enum PrivateRuntimeMutation {
     SetResourcePolicy(RuntimeResourcePolicy),
     Install(InstallActor),
@@ -965,6 +973,13 @@ pub trait AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authorization_and_private_mutation_inline_footprints_remain_bounded() {
+        // These guard inline layout growth, not heap data or wire limits.
+        assert!(core::mem::size_of::<InvocationAuthorization>() <= 1024);
+        assert!(core::mem::size_of::<PrivateRuntimeMutation>() <= 2 * 1024);
+    }
 
     #[test]
     fn runtime_transition_public_io_is_domain_stable_and_role_sensitive() {
