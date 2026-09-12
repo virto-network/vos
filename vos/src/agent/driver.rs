@@ -595,6 +595,69 @@ pub(crate) fn sdk_management_reply_matches(
     }
 }
 
+/// Derive public metadata from an already authorized management transition.
+/// Retained replies describe the original operation, not a new mutation of
+/// today's descriptor. Guest-state validation remains a separate boundary.
+fn sdk_descriptor_after_management(
+    current: &crate::agent_sdk::AgentDescriptor,
+    request: &crate::agent_sdk::ManagementRequest,
+    outcome: &crate::agent_sdk::RuntimeOutcome,
+    exact_retry: bool,
+) -> Result<crate::agent_sdk::AgentDescriptor, AgentDriverError> {
+    use crate::agent_sdk::{ManagementRequest, RuntimeOutcome};
+    if current.validate().is_err()
+        || !request.is_valid()
+        || !sdk_management_reply_matches(current, request, outcome)
+    {
+        return Err(AgentDriverError::InvalidRuntime);
+    }
+    if exact_retry || matches!(outcome, RuntimeOutcome::Management(Err(_))) {
+        return Ok(current.clone());
+    }
+    let mut next = current.clone();
+    match request {
+        ManagementRequest::UpgradeRuntime(upgrade) => {
+            if current.identity.runtime_deployment != upgrade.from_deployment {
+                return Err(AgentDriverError::InvalidRuntime);
+            }
+            next.identity.runtime_deployment = upgrade.to_deployment;
+            next.identity.runtime_program = upgrade.to_program;
+            next.identity.runtime_producer = upgrade.producer;
+            next.runtime_package = upgrade.package.clone();
+            next.runtime_contract = upgrade.contract;
+            next.capabilities = upgrade.capabilities;
+        }
+        ManagementRequest::ChangeReplicas {
+            expected_generation,
+            replicas,
+        } => {
+            if *expected_generation != current.replica_generation() {
+                return Err(AgentDriverError::InvalidRuntime);
+            }
+            next.replicas = replicas.clone();
+        }
+        ManagementRequest::Create(descriptor) if descriptor.as_ref() != current => {
+            return Err(AgentDriverError::InvalidRuntime);
+        }
+        // This image-backed entry point is Local-only, not a Private control
+        // host. Do not silently accept future descriptor-changing controls.
+        ManagementRequest::PrivateControl { .. } => {
+            return Err(AgentDriverError::InvalidRuntime);
+        }
+        ManagementRequest::Create(_)
+        | ManagementRequest::InspectActors { .. }
+        | ManagementRequest::InspectResources
+        | ManagementRequest::Install(_)
+        | ManagementRequest::UpgradeActor(_)
+        | ManagementRequest::Suspend { .. }
+        | ManagementRequest::Resume { .. }
+        | ManagementRequest::RemoveLeaf { .. } => {}
+    }
+    next.validate()
+        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    Ok(next)
+}
+
 fn expected_standard_sdk_management_transition(
     work: &crate::agent_sdk::RuntimeWork,
 ) -> Result<crate::agent_sdk::RuntimeTransition, AgentDriverError> {
@@ -3547,7 +3610,12 @@ impl<S: AgentImageStore> AgentDriver<S> {
         }
 
         let next_state = sdk_state_as_legacy(&returned.state);
-        let next_descriptor = match clean_descriptor_from_state(&next_state) {
+        let next_descriptor = match sdk_descriptor_after_management(
+            &current,
+            &request,
+            &returned.outcome,
+            exact_retry,
+        ) {
             Ok(descriptor) => descriptor,
             Err(error) => {
                 staged.rollback(&mut self.store);
@@ -5981,6 +6049,103 @@ mod tests {
         assert_eq!(
             verify_authority_anchor(&trust, &config),
             Err(AgentDriverError::Authority(AuthorityError::WrongAuthority))
+        );
+    }
+
+    #[test]
+    fn public_descriptor_transitions_preserve_current_metadata_on_historical_retry() {
+        use crate::agent_sdk::{
+            ManagementError, ManagementReply, ManagementRequest, RuntimeOutcome,
+        };
+        let (state, _, _) = super::super::wire::tests::completed_clean_policy_fixture(
+            crate::agent_sdk::Hash([0xe7; 32]),
+        );
+        let current = clean_descriptor_from_state(&sdk_state_as_legacy(&state)).unwrap();
+        let mut expected = current.clone();
+        expected.identity.runtime_deployment = crate::agent_sdk::DeploymentId([0xe1; 32]);
+        expected.identity.runtime_program = crate::agent_sdk::ProgramId([0xe2; 32]);
+        expected.identity.runtime_producer = crate::agent_sdk::ProducerId([0xe3; 32]);
+        expected.runtime_package = crate::agent_sdk::BlobRef::of_bytes(b"new-runtime-package");
+        expected.capabilities.max_actors -= 1;
+        expected.validate().unwrap();
+        let request =
+            ManagementRequest::UpgradeRuntime(Box::new(crate::agent_sdk::RuntimeUpgrade {
+                from_deployment: current.identity.runtime_deployment,
+                to_deployment: expected.identity.runtime_deployment,
+                to_program: expected.identity.runtime_program,
+                producer: expected.identity.runtime_producer,
+                package: expected.runtime_package.clone(),
+                contract: expected.runtime_contract,
+                capabilities: expected.capabilities,
+            }));
+        let outcome = RuntimeOutcome::Management(Ok(ManagementReply::RuntimeUpgraded(
+            expected.identity.clone(),
+        )));
+        assert_eq!(
+            sdk_descriptor_after_management(&current, &request, &outcome, false),
+            Ok(expected.clone())
+        );
+        assert_eq!(
+            sdk_descriptor_after_management(
+                &current,
+                &request,
+                &RuntimeOutcome::Management(Err(ManagementError::ResourceLimit)),
+                false
+            ),
+            Ok(current.clone())
+        );
+
+        // The same retained successful reply can arrive after a later upgrade.
+        // Recovering it must neither roll back metadata nor check its old
+        // predecessor as though this were an unseen operation.
+        let mut later = expected.clone();
+        later.identity.runtime_deployment = crate::agent_sdk::DeploymentId([0xe4; 32]);
+        later.identity.runtime_program = crate::agent_sdk::ProgramId([0xe5; 32]);
+        later.runtime_package = crate::agent_sdk::BlobRef::of_bytes(b"later-runtime-package");
+        assert_eq!(
+            sdk_descriptor_after_management(&later, &request, &outcome, true),
+            Ok(later.clone())
+        );
+        assert_eq!(
+            sdk_descriptor_after_management(&later, &request, &outcome, false),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+        let mut wrong_identity = expected.identity.clone();
+        wrong_identity.owner = crate::agent_sdk::PrincipalId([0xe6; 32]);
+        assert_eq!(
+            sdk_descriptor_after_management(
+                &current,
+                &request,
+                &RuntimeOutcome::Management(Ok(ManagementReply::RuntimeUpgraded(wrong_identity))),
+                false
+            ),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+
+        let mut replicas = current.replicas.clone();
+        replicas.last_mut().unwrap().node = crate::agent_sdk::NodeId([0xe8; 32]);
+        let replica_request = ManagementRequest::ChangeReplicas {
+            expected_generation: current.replica_generation(),
+            replicas: replicas.clone(),
+        };
+        let mut changed = current.clone();
+        changed.replicas = replicas;
+        let replica_reply = RuntimeOutcome::Management(Ok(ManagementReply::ReplicasChanged {
+            generation: changed.replica_generation(),
+        }));
+        assert_eq!(
+            sdk_descriptor_after_management(&current, &replica_request, &replica_reply, false),
+            Ok(changed.clone())
+        );
+        assert_eq!(
+            sdk_descriptor_after_management(&changed, &replica_request, &replica_reply, false),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+        let mut later_roster = changed.clone();
+        later_roster.replicas.last_mut().unwrap().node = crate::agent_sdk::NodeId([0xe9; 32]);
+        assert_eq!(
+            sdk_descriptor_after_management(&later_roster, &replica_request, &replica_reply, true),
+            Ok(later_roster)
         );
     }
 

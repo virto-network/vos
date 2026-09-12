@@ -1054,3 +1054,31 @@ transition-oracle comparisons still need runtime-independent replacements;
 removing the existing checks alone would weaken admission. Ordinary-Agent
 finality also remains open. The current CLI smoke predates AGI2 and AJC4 and
 must be repeated on fresh disposable data after the implementation is complete.
+
+### Local descriptor transitions from public management inputs
+
+Local management now derives its next persisted descriptor from the authorized
+SDK request and validated reply rather than decoding the returned Standard
+state. Runtime upgrades replace only their selected runtime fields; replica
+changes require the exact predecessor generation. Other supported operations
+leave the descriptor unchanged. Denials and authenticated retained retries
+preserve current metadata, including when a retained upgrade or roster-change
+reply predates a newer deployment or roster. Immutable identity substitutions,
+wrong reply shapes and invalid descriptors fail closed. The existing exact
+Standard transition comparison remains enforced as a separate safety boundary.
+
+All **38/38 driver and Local host tests pass**
+(`r16-local-descriptor-transition-final.log`), including physical Local
+lifecycle/restart tests and the new public-metadata transition regression.
+The first run's new fixture was rejected because its replica list was unsorted;
+the fixture now preserves canonical ordering, without weakening validation.
+Formatting and diff checks pass. No guest artifact or wire-format change is
+introduced in this checkpoint.
+
+Next Local recovery work remains durable management history: exact retained
+results, acknowledged-through and decision/epoch high-water marks, and original
+observation slots must be host-owned and atomically persisted. A latest-receipt
+cache alone cannot replace that history. Standard Create/reopen and runtime
+transition checks must then be replaced with public authenticated invariants,
+with an opaque runtime tested through the production host lifecycle. Neither
+that implementation work nor ordinary-Agent finality is closed by these tests.
