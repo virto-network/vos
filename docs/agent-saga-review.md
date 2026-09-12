@@ -4,9 +4,62 @@ Current Ch08 WIP warning: `wip/ch08-runtime-directory` has independently
 reproduced r16 bundles and passing fresh-space startup/restart ingress checks,
 but ordinary-agent finality, opaque-runtime recovery, and full release gates
 remain open. This is not a master-ready branch.
-See the latest checkpoint sections below for failures and release work.
+See the current closeout plan below; later checkpoint sections retain historical
+results, including failures that have since been fixed.
 
-The Agent architecture work is integrated on `saga/agents`. It is reviewed
+## Current closeout plan
+
+Implementation is in `.worktrees/ch08-runtime-directory` on
+`wip/ch08-runtime-directory`, not yet in the root `saga/agents` checkout.
+Use only an isolated, disposable environment for bootstrap/ingress testing.
+Fresh-space first start and restart with bundled system actors and HTTP/SSH
+have passed; ordinary-agent creation is not yet a usable production path.
+
+The integrated library run at `37d6a5720e7e45e4a19850a16a531e6cb316e299`
+completed: **1,663 passed, zero failed, one filtered**, in 1,771.43 seconds.
+It used `pvm,private-agent-store`, serial tests and socket access. Evidence:
+`.worktrees/ch08-c2-native/target/task-tmp/r16-integrated-library.log` (path
+relative to the main checkout). The filtered large inventory test still needs
+a final-source run. Later SDK lint-only edits have separate passing SDK tests
+and strict clippy, not a completed full-library rerun on those edits.
+
+Keep the remaining work in three scoped Chapter 08 batches, without adding
+review endpoints for individual fixes:
+
+1. **C1 — recovery:** preserve the integrated portable-recovery fixes. Finish
+   opaque-runtime management evidence across checkpoint, pruning and reopen;
+   projection recovery must not decode Standard-runtime private state or rely
+   solely on a volatile result cache. Require exact one-ack-lag recovery and
+   rejection of substituted evidence with a custom runtime.
+2. **C2 — native lifecycle:** replace the deliberately unavailable ordinary-
+   Agent finality adapter with authenticated live system-Agent decision
+   publication and independent replay verification, including reopen. A
+   self-consistent provision or a permissive verifier is not sufficient.
+   Prove ordinary-agent creation, actor installation and restart end to end.
+3. **C3 — release:** after those implementation changes, freeze source, rebuild
+   and independently reproduce artifacts, run the final feature, physical,
+   inventory, docs/examples and release checks, and repeat the fresh-space
+   smoke. Fold internal checkpoints into the scoped review batches and only
+   then advance the integration/review branches toward master.
+
+The broad regression result closes the fourteen previously observed library
+failures. It does not close either implementation gap or certify master
+readiness. Avoid another full build/artifact repin before those changes are
+ready, and keep temporary build data on disk under `target`, not RAM-backed
+`/tmp`.
+
+The nested system actor libraries also pass on `ae66a058`: Authority **58/58**
+and Catalog **10/10**, with no ignored or filtered tests. Evidence beside the
+library log: `r16-authority-actor-final.log` and `r16-catalog-actor-final.log`.
+The commands used locked, offline dependencies and disk-backed scratch space.
+The root workspace does not execute these nested workspaces' unit tests, so
+`agent-system-actors-check` now explicitly includes both in `clean-break-check`.
+The recipe expansion was checked; its two underlying test commands passed
+individually. The full composite release recipe has not been rerun. SDK
+`cargo check --no-default-features` also passes after the lint-only edits
+(`r16-sdk-no-std-final.log`).
+
+The completed Agent architecture chapters are integrated on `saga/agents`. They are reviewed
 as a stack of larger, single-theme chapters; `master` receives only the
 completed clean cutover after the release gate passes.
 

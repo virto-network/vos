@@ -229,8 +229,15 @@ clean-break-check:
     cargo test -p vos --lib agent::supervisor_adapters -- --test-threads=1
     cargo test -p vosx --bin vosx commands::space::clean -- --test-threads=1
     just agent-recovery-check
+    just agent-system-actors-check
     just agent-sdk-doc-check
     bash scripts/check-agent-clean-break.sh
+
+# System actors are nested workspaces: the root workspace tests do not run
+# their unit tests, even though vosx links their libraries for bootstrap.
+agent-system-actors-check:
+    bash -eu -c 'mkdir -p target/task-tmp; TMPDIR="{{justfile_directory()}}/target/task-tmp" cargo test --locked --manifest-path actors/system-authority/Cargo.toml --lib -- --test-threads=1'
+    bash -eu -c 'mkdir -p target/task-tmp; TMPDIR="{{justfile_directory()}}/target/task-tmp" cargo test --locked --manifest-path actors/system-catalog/Cargo.toml --lib -- --test-threads=1'
 
 # Check the public portable SDK documentation without relying on host features.
 # This is an SDK intra-doc-link gate, not a whole-book or external-link audit.
