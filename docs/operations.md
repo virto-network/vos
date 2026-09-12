@@ -56,7 +56,8 @@ just clean-break-check
 ```
 
 It runs the clean bootstrap/production-owner/supervisor-adapter suites, CLI
-tests, and a static negative check proving that retired executables, paths,
+tests, the explicit-feature `agent-recovery-check` (Private host/store/runtime
+and portable recovery), and a static negative check proving that retired executables, paths,
 commands, flags, and operational documentation have not returned.
 
 ## Release artifacts

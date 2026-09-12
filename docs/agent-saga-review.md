@@ -479,9 +479,11 @@ runtime tests, and 6 tests selected by `portable`, all with the same explicit
 features. Evidence logs are `c1-private-store-suite.log`,
 `c1-private-runtime-suite.log`, and `c1-portable-suite.log`. The integrated
 portable run is tracked separately in `integrated-portable-suite.log`.
-That integrated run passes all 6 selected tests. The integrated Private host
-suite is tracked separately in `integrated-private-host-suite.log` and still
-requires a terminal passing result.
+That integrated run passes all 6 selected tests. The integrated Private host,
+store, and runtime suites also pass 63, 40, and 21 tests respectively; evidence
+is in `integrated-private-{host,store,runtime}-suite.log`. The serial release
+gate now invokes `agent-recovery-check` with `pvm,private-agent-store` explicitly,
+so disabled Private modules cannot silently bypass these suites.
 
 Ordinary-genesis integration remains functional work, not just a release flag:
 `clean_startup.rs` still installs `UnavailableAgentFinality`. The canonical

@@ -228,7 +228,16 @@ clean-break-check:
     cargo test -p vos --lib agent::production_owner -- --test-threads=1
     cargo test -p vos --lib agent::supervisor_adapters -- --test-threads=1
     cargo test -p vosx --bin vosx commands::space::clean -- --test-threads=1
+    just agent-recovery-check
     bash scripts/check-agent-clean-break.sh
+
+# Private host/store modules are absent without private-agent-store. Keep the
+# feature explicit so successful zero-test runs cannot stand in for recovery.
+agent-recovery-check:
+    cargo test -p vos --features pvm,private-agent-store --lib agent::private_host::tests -- --test-threads=1
+    cargo test -p vos --features pvm,private-agent-store --lib agent::private_store::tests -- --test-threads=1
+    cargo test -p vos --features pvm,private-agent-store --lib agent::private_runtime::tests -- --test-threads=1
+    cargo test -p vos --features pvm,private-agent-store --lib portable -- --test-threads=1
 
 # Lint with clippy.
 lint:
