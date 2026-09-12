@@ -524,6 +524,7 @@ impl PrivateAgentHost {
         let mut staged = replay_replica_controls(
             &stage,
             staged,
+            &source.backup,
             &source.rows,
             plan.route,
             plan.authority,
@@ -1290,7 +1291,7 @@ fn authenticate_replica_source<V: PrivateNodeAuthorityVerifier>(
     }
 
     // This first parse is explicitly not a trust boundary. The signed Create
-    // descriptor below closes the recovery-key binding after PVB3 has proved
+    // descriptor below closes the recovery-key binding after PVB4 has proved
     // the complete internally consistent Store/control chain.
     let claim = encrypted_backup_genesis_claim(&archive.store)?;
     let backup = verify_encrypted_backup(
@@ -2018,6 +2019,7 @@ fn replica_stage_has_runtime_state(stage: &Path) -> Result<bool, PrivateAgentHos
 fn replay_replica_controls<V: PrivateNodeAuthorityVerifier>(
     stage: &Path,
     mut staged: StagedPrivateReplicaRuntime,
+    backup: &VerifiedEncryptedBackup,
     rows: &[VerifiedReplicaReplayRow],
     route: ManagedAgentTarget,
     authority: AuthorityActorTarget,
@@ -2027,7 +2029,16 @@ fn replay_replica_controls<V: PrivateNodeAuthorityVerifier>(
     node_authority: &V,
     stop: ReplicaEstablishmentStop,
 ) -> Result<StagedPrivateReplicaRuntime, PrivateAgentHostError> {
-    for row in rows {
+    for (position, row) in rows.iter().enumerate() {
+        import_replica_objects_at_frontier(
+            stage,
+            &mut staged,
+            backup,
+            u32::try_from(position).map_err(|_| PrivateAgentHostError::LimitExceeded)?,
+            local_node,
+            node_key,
+            stop,
+        )?;
         let exists = staged.store.control_is_exact(
             row.control.commitment(),
             &row.control
@@ -2576,19 +2587,92 @@ fn import_replica_objects(
     node_key: &PrivateNodeDecryptionKey,
     stop: ReplicaEstablishmentStop,
 ) -> Result<(), PrivateAgentHostError> {
-    require_resolved_runtime_application_head(&staged.store)?;
-    let objects = source.backup.objects();
-    for (position, object) in objects.iter().enumerate() {
-        staged.store.put_object(object)?;
-        if position == 0 && objects.len() > 1 {
-            replica_establishment_stop(stop, ReplicaEstablishmentStop::AfterObjectPrefix)?;
-        }
-    }
+    let frontier = u32::try_from(staged.store.indexed_controls().len())
+        .map_err(|_| PrivateAgentHostError::LimitExceeded)?;
+    import_replica_objects_at_frontier(
+        stage,
+        staged,
+        &source.backup,
+        frontier,
+        local_node,
+        node_key,
+        stop,
+    )?;
     if staged.store.core_position()? != source.final_target {
         return Err(PrivateAgentHostError::Corrupt);
     }
-    // Rebind once after the complete object batch. `reopen_staged_replica`
-    // also repairs any strict object-growth prefix left by a crash.
+    authenticate_runtime_application_lineage(
+        &staged.store,
+        &staged.descriptor,
+        &staged.runtime_image,
+        local_node,
+        node_key,
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn import_replica_objects_at_frontier(
+    stage: &Path,
+    staged: &mut StagedPrivateReplicaRuntime,
+    backup: &VerifiedEncryptedBackup,
+    frontier: u32,
+    local_node: &PrivateNodeIdentity,
+    node_key: &PrivateNodeDecryptionKey,
+    stop: ReplicaEstablishmentStop,
+) -> Result<(), PrivateAgentHostError> {
+    let current_frontier = u32::try_from(staged.store.indexed_controls().len())
+        .map_err(|_| PrivateAgentHostError::LimitExceeded)?;
+    if current_frontier < frontier {
+        return Err(PrivateAgentHostError::Corrupt);
+    }
+    let scheduled = backup
+        .objects_with_index()
+        .filter(|(entry, _)| entry.control_frontier == frontier)
+        .count();
+    if scheduled == 0 {
+        return Ok(());
+    }
+    if current_frontier == frontier {
+        require_resolved_runtime_application_head(&staged.store)?;
+    }
+    let mut imported = 0_usize;
+    for (entry, object) in backup.objects_with_index() {
+        if entry.control_frontier != frontier {
+            continue;
+        }
+        imported = imported
+            .checked_add(1)
+            .ok_or(PrivateAgentHostError::LimitExceeded)?;
+        if current_frontier == frontier {
+            staged.store.put_object(object)?;
+        }
+        let key = PrivateObjectKey::from_object(object);
+        let local_entry = staged
+            .store
+            .indexed_objects()
+            .binary_search_by_key(&key, |candidate| candidate.key)
+            .ok()
+            .and_then(|position| staged.store.indexed_objects().get(position))
+            .ok_or(PrivateAgentHostError::Corrupt)?;
+        let wire = object
+            .encode()
+            .map_err(|_| PrivateAgentHostError::Corrupt)?;
+        if local_entry.control_frontier != frontier || !staged.store.object_is_exact(key, &wire)? {
+            return Err(PrivateAgentHostError::Corrupt);
+        }
+        if imported == 1 && scheduled > 1 {
+            replica_establishment_stop(stop, ReplicaEstablishmentStop::AfterObjectPrefix)?;
+        }
+    }
+    if current_frontier > frontier {
+        return Ok(());
+    }
+
+    // Object growth leaves runtime state and its stable projection unchanged,
+    // but the destination PVRI must follow the exact Store position before a
+    // subsequent PAPL is built. Reopening repairs the same boundary if a crash
+    // lands between the Store insertion and this sidecar replacement.
     let successor = staged
         .runtime_image
         .rebind_store_objects(staged.store.core_position()?)
@@ -2608,8 +2692,7 @@ fn import_replica_objects(
         &staged.runtime_image,
         local_node,
         node_key,
-    )?;
-    Ok(())
+    )
 }
 
 fn publish_completed_replica_establishment<V: PrivateNodeAuthorityVerifier>(

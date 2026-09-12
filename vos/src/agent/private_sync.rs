@@ -3294,7 +3294,7 @@ mod tests {
             );
         }
         for forbidden_magic in [
-            b"PAP1", b"PVI1", b"PVI2", b"PVI3", b"PVR3", b"PCR3", b"PSP1",
+            b"PAP1", b"PVI1", b"PVI2", b"PVI3", b"PVI4", b"PVR3", b"PCR3", b"PSP1",
         ] {
             assert!(
                 !frame

@@ -175,6 +175,15 @@ impl InvocationHistoryNode {
         }
     }
 
+    pub(crate) const fn child_ids(
+        &self,
+    ) -> Option<(InvocationHistoryNodeId, InvocationHistoryNodeId)> {
+        match self {
+            Self::Leaf(_) => None,
+            Self::Branch { left, right, .. } => Some((left.id, right.id)),
+        }
+    }
+
     fn summary(&self) -> InvocationHistorySummary {
         match self {
             Self::Leaf(fact) => InvocationHistorySummary::from_fact(fact),

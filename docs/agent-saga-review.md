@@ -440,3 +440,37 @@ The existing ordinary-Agent finality, recovery crash-closure, and release gates
 remain open. The Standard-specific management-disposition lookup used only for
 classifying projection lag also remains to be audited for opaque runtimes;
 successful material lookup alone does not prove every custom-runtime lifecycle.
+
+### Chapter 08 portable restore-marker verification
+
+On the isolated `wip/ch08-c1-portable-recovery` worktree, the physical
+`singleton_system_agent_portable_backup_is_authenticated_fresh_and_restartable`
+test passes with `--features pvm`. It covers authenticated fresh-store restore,
+occupied-destination rejection, restart, and process loss with either the
+canonical restore marker or its staged `.next` file. Both marker forms must be
+retired after recovery, and subsequent reopen preserves the fresh store identity
+and journal position. Ten temporary portable-recovery diagnostic prints were
+removed without changing error propagation or validation order.
+
+Evidence: native worktree `target/task-tmp/c1-portable-marker-staged-verification.log`
+(one explicitly selected test, passed). This does not establish every cross-store
+crash boundary or the Private recovery gates, and this older recovery worktree
+still needs integration with the r15 native/artifact work before final release.
+
+The same physical test now also passes two cross-store interruption cases:
+`heads.next` durably staged before promotion, and heads promoted while the
+Raft ledger is still at genesis. The previously unused stop hook now reaches
+the actual file-store publication boundary. Assertions prove staged heads
+existed and differed from committed heads, reopen promotes exactly those bytes,
+the stage disappears, and journal position/snapshot/store identity survive
+another reopen. Evidence is `c1-portable-heads-stage-verification.log` in the
+same disk-backed log directory. The broader Private host suite is separately
+running with `pvm,private-agent-store`; it is not yet signed off.
+
+Integration checkpoint: the recovery source is now combined with the r15
+native/artifact work on the internal runtime-directory branch. The only merge
+conflict was this additive handoff document; both evidence sections are retained.
+All 63 Private host tests passed on the recovery checkpoint with
+`--features pvm,private-agent-store` (`c1-private-host-store-suite.log`, 318s).
+Combined-source verification is required before considering these results
+release evidence for the integrated tree. No review endpoint or master advanced.

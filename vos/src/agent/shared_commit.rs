@@ -40,6 +40,10 @@ const VERIFIED_ORDERED_SNAPSHOT_DOMAIN: &[u8] = b"vos/agent/shared/verified-orde
 const AGENT_SNAPSHOT_CLAIM_DOMAIN: &[u8] = b"vos/agent/shared/snapshot-claim/v1";
 const AGENT_SNAPSHOT_MESSAGE_DOMAIN: &[u8] = b"vos/agent/shared/snapshot-signature/v1";
 const AGENT_SNAPSHOT_CERTIFICATE_DOMAIN: &[u8] = b"vos/agent/shared/snapshot-certificate/v1";
+const PORTABLE_SNAPSHOT_CLAIM_DOMAIN: &[u8] = b"vos/agent/shared/portable-snapshot-claim/v1";
+const PORTABLE_SNAPSHOT_MESSAGE_DOMAIN: &[u8] = b"vos/agent/shared/portable-snapshot-signature/v1";
+const PORTABLE_SNAPSHOT_CERTIFICATE_DOMAIN: &[u8] =
+    b"vos/agent/shared/portable-snapshot-certificate/v1";
 
 /// Maximum complete canonical lane projection.
 pub const MAX_SHARED_LANE_PROJECTION_BYTES: usize = 128;
@@ -62,6 +66,14 @@ pub const MAX_SHARED_AGENT_SNAPSHOT_CLAIM_BYTES: usize =
 pub const MAX_SHARED_AGENT_SNAPSHOT_CERTIFICATE_BYTES: usize = MAX_SHARED_AGENT_SNAPSHOT_CLAIM_BYTES
     + MAX_REPLICA_COMMIT_SIGNATURES * MAX_REPLICA_COMMIT_SIGNATURE_BYTES
     + 1024;
+/// Maximum complete source-instance-independent recovery claim.
+pub const MAX_SHARED_AGENT_PORTABLE_SNAPSHOT_CLAIM_BYTES: usize =
+    MAX_ORDERED_COMMIT_CLAIM_BYTES + super::genesis::MAX_AGENT_REPLICA_COMMITTEE_BYTES + 2 * 1024;
+/// Maximum complete quorum certificate over one portable recovery claim.
+pub const MAX_SHARED_AGENT_PORTABLE_SNAPSHOT_CERTIFICATE_BYTES: usize =
+    MAX_SHARED_AGENT_PORTABLE_SNAPSHOT_CLAIM_BYTES
+        + MAX_REPLICA_COMMIT_SIGNATURES * MAX_REPLICA_COMMIT_SIGNATURE_BYTES
+        + 1024;
 
 /// Exact content-addressed state materialization for one shared lane.
 ///
@@ -1165,6 +1177,424 @@ pub struct VerifiedSharedAgentSnapshot {
 
 impl VerifiedSharedAgentSnapshot {
     pub const fn claim(&self) -> &SharedAgentSnapshotClaim {
+        &self.claim
+    }
+
+    pub const fn certificate_commitment(&self) -> Hash {
+        self.certificate_commitment
+    }
+}
+
+/// Source-instance-independent identity of one portable Shared recovery point.
+///
+/// Unlike [`SharedAgentSnapshotClaim`], this claim deliberately contains no
+/// `JournalStoreInstanceId`, physical Raft audit root, or source-local
+/// publication capability. It instead commits the complete canonical journal
+/// closure which an importer must validate against independently supplied
+/// genesis/root pins before constructing a new physical generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedAgentPortableSnapshotClaim {
+    genesis_intent: Hash,
+    root_pins: Hash,
+    ordered: OrderedCommitClaim,
+    active_committee: AgentReplicaCommittee,
+    authority_epoch: u64,
+    ordered_successor: JournalHeadsId,
+    checkpoint_predecessor: JournalHeadsId,
+    journal_heads: JournalHeadsId,
+    checkpoint: CheckpointId,
+    local_node: NodeId,
+    control: LaneStateId,
+    linear: LaneStateId,
+    merge: LaneStateId,
+    local: LaneStateId,
+    ordered_invocations: InvocationIndexId,
+    merge_invocations: InvocationIndexId,
+    local_invocations: InvocationIndexId,
+    artifacts: ArtifactClosureId,
+    journal_image: Hash,
+}
+
+impl SharedAgentPortableSnapshotClaim {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        genesis_intent: Hash,
+        root_pins: Hash,
+        ordered: OrderedCommitClaim,
+        active_committee: AgentReplicaCommittee,
+        authority_epoch: u64,
+        ordered_successor: JournalHeadsId,
+        checkpoint_predecessor: JournalHeadsId,
+        journal_heads: JournalHeadsId,
+        checkpoint: CheckpointId,
+        local_node: NodeId,
+        control: LaneStateId,
+        linear: LaneStateId,
+        merge: LaneStateId,
+        local: LaneStateId,
+        ordered_invocations: InvocationIndexId,
+        merge_invocations: InvocationIndexId,
+        local_invocations: InvocationIndexId,
+        artifacts: ArtifactClosureId,
+        journal_image: Hash,
+    ) -> Result<Self, SharedCommitError> {
+        let claim = Self {
+            genesis_intent,
+            root_pins,
+            ordered,
+            active_committee,
+            authority_epoch,
+            ordered_successor,
+            checkpoint_predecessor,
+            journal_heads,
+            checkpoint,
+            local_node,
+            control,
+            linear,
+            merge,
+            local,
+            ordered_invocations,
+            merge_invocations,
+            local_invocations,
+            artifacts,
+            journal_image,
+        };
+        claim.validate()?;
+        Ok(claim)
+    }
+
+    pub const fn genesis_intent(&self) -> Hash {
+        self.genesis_intent
+    }
+
+    pub const fn root_pins(&self) -> Hash {
+        self.root_pins
+    }
+
+    pub const fn ordered(&self) -> &OrderedCommitClaim {
+        &self.ordered
+    }
+
+    pub const fn active_committee(&self) -> &AgentReplicaCommittee {
+        &self.active_committee
+    }
+
+    pub const fn authority_epoch(&self) -> u64 {
+        self.authority_epoch
+    }
+
+    pub const fn ordered_successor(&self) -> JournalHeadsId {
+        self.ordered_successor
+    }
+
+    pub const fn checkpoint_predecessor(&self) -> JournalHeadsId {
+        self.checkpoint_predecessor
+    }
+
+    pub const fn journal_heads(&self) -> JournalHeadsId {
+        self.journal_heads
+    }
+
+    pub const fn checkpoint(&self) -> CheckpointId {
+        self.checkpoint
+    }
+
+    pub const fn local_node(&self) -> NodeId {
+        self.local_node
+    }
+
+    pub const fn control(&self) -> LaneStateId {
+        self.control
+    }
+
+    pub const fn linear(&self) -> LaneStateId {
+        self.linear
+    }
+
+    pub const fn merge(&self) -> LaneStateId {
+        self.merge
+    }
+
+    pub const fn local(&self) -> LaneStateId {
+        self.local
+    }
+
+    pub const fn ordered_invocations(&self) -> InvocationIndexId {
+        self.ordered_invocations
+    }
+
+    pub const fn merge_invocations(&self) -> InvocationIndexId {
+        self.merge_invocations
+    }
+
+    pub const fn local_invocations(&self) -> InvocationIndexId {
+        self.local_invocations
+    }
+
+    pub const fn artifacts(&self) -> ArtifactClosureId {
+        self.artifacts
+    }
+
+    pub const fn journal_image(&self) -> Hash {
+        self.journal_image
+    }
+
+    pub const fn raft_index(&self) -> u64 {
+        self.ordered.raft_index
+    }
+
+    pub const fn raft_term(&self) -> u64 {
+        self.ordered.raft_term
+    }
+
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(PORTABLE_SNAPSHOT_CLAIM_DOMAIN, &[&self.encode()])
+    }
+
+    pub fn validate(&self) -> Result<(), SharedCommitError> {
+        self.ordered.validate()?;
+        self.active_committee
+            .validate()
+            .map_err(|_| SharedCommitError::InvalidCommittee)?;
+        if self.genesis_intent == Hash::ZERO
+            || self.root_pins == Hash::ZERO
+            || self.active_committee.profile() != AgentProfile::Shared
+            || self.active_committee.space() != self.ordered.space
+            || self.active_committee.agent() != self.ordered.agent
+            || self.active_committee.id() != self.ordered.committee
+            || self
+                .active_committee
+                .member_by_node(self.local_node)
+                .is_none()
+            || self.authority_epoch == 0
+            || self.ordered_successor == JournalHeadsId::ZERO
+            || self.checkpoint_predecessor == JournalHeadsId::ZERO
+            || self.journal_heads == JournalHeadsId::ZERO
+            || self.checkpoint == CheckpointId::ZERO
+            || self.local_node == NodeId::ZERO
+            || self.control == LaneStateId::ZERO
+            || self.linear == LaneStateId::ZERO
+            || self.merge == LaneStateId::ZERO
+            || self.local == LaneStateId::ZERO
+            || self.ordered_invocations == InvocationIndexId::ZERO
+            || self.merge_invocations == InvocationIndexId::ZERO
+            || self.local_invocations == InvocationIndexId::ZERO
+            || self.artifacts == ArtifactClosureId::ZERO
+            || self.journal_image == Hash::ZERO
+        {
+            return Err(SharedCommitError::InvalidSnapshotClaim);
+        }
+        enforce_encoded_bound(self, MAX_SHARED_AGENT_PORTABLE_SNAPSHOT_CLAIM_BYTES)
+    }
+}
+
+impl ServiceWire for SharedAgentPortableSnapshotClaim {
+    const MAGIC: [u8; 4] = *b"AGP1";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(&self.genesis_intent.0);
+        encoder.fixed(&self.root_pins.0);
+        encoder.bytes(&self.ordered.encode());
+        encoder.bytes(&self.active_committee.encode());
+        encoder.u64(self.authority_epoch);
+        encoder.fixed(self.ordered_successor.as_bytes());
+        encoder.fixed(self.checkpoint_predecessor.as_bytes());
+        encoder.fixed(self.journal_heads.as_bytes());
+        encoder.fixed(self.checkpoint.as_bytes());
+        encoder.fixed(&self.local_node.0);
+        encoder.fixed(self.control.as_bytes());
+        encoder.fixed(self.linear.as_bytes());
+        encoder.fixed(self.merge.as_bytes());
+        encoder.fixed(self.local.as_bytes());
+        encoder.fixed(self.ordered_invocations.as_bytes());
+        encoder.fixed(self.merge_invocations.as_bytes());
+        encoder.fixed(self.local_invocations.as_bytes());
+        encoder.fixed(self.artifacts.as_bytes());
+        encoder.fixed(&self.journal_image.0);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_SHARED_AGENT_PORTABLE_SNAPSHOT_CLAIM_BYTES)?;
+        let claim = Self {
+            genesis_intent: Hash(decoder.fixed()?),
+            root_pins: Hash(decoder.fixed()?),
+            ordered: decode_nested::<OrderedCommitClaim>(decoder, MAX_ORDERED_COMMIT_CLAIM_BYTES)?,
+            active_committee: decode_nested::<AgentReplicaCommittee>(
+                decoder,
+                super::genesis::MAX_AGENT_REPLICA_COMMITTEE_BYTES,
+            )?,
+            authority_epoch: decoder.u64()?,
+            ordered_successor: JournalHeadsId(decoder.fixed()?),
+            checkpoint_predecessor: JournalHeadsId(decoder.fixed()?),
+            journal_heads: JournalHeadsId(decoder.fixed()?),
+            checkpoint: CheckpointId(decoder.fixed()?),
+            local_node: NodeId(decoder.fixed()?),
+            control: LaneStateId(decoder.fixed()?),
+            linear: LaneStateId(decoder.fixed()?),
+            merge: LaneStateId(decoder.fixed()?),
+            local: LaneStateId(decoder.fixed()?),
+            ordered_invocations: InvocationIndexId(decoder.fixed()?),
+            merge_invocations: InvocationIndexId(decoder.fixed()?),
+            local_invocations: InvocationIndexId(decoder.fixed()?),
+            artifacts: ArtifactClosureId(decoder.fixed()?),
+            journal_image: Hash(decoder.fixed()?),
+        };
+        claim.validate().map_err(map_decode_error)?;
+        Ok(claim)
+    }
+}
+
+/// Voter-majority authority for one exact portable Shared recovery image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedAgentPortableSnapshotCertificate {
+    claim: SharedAgentPortableSnapshotClaim,
+    signatures: Vec<ReplicaCommitSignature>,
+}
+
+impl SharedAgentPortableSnapshotCertificate {
+    pub fn new(
+        claim: SharedAgentPortableSnapshotClaim,
+        signatures: Vec<ReplicaCommitSignature>,
+    ) -> Result<Self, SharedCommitError> {
+        let certificate = Self { claim, signatures };
+        certificate.validate_shape()?;
+        Ok(certificate)
+    }
+
+    pub const fn claim(&self) -> &SharedAgentPortableSnapshotClaim {
+        &self.claim
+    }
+
+    pub fn signatures(&self) -> &[ReplicaCommitSignature] {
+        &self.signatures
+    }
+
+    pub(crate) fn signing_message(committee: AgentReplicaCommitteeId, claim: Hash) -> Hash {
+        Hash::digest(
+            PORTABLE_SNAPSHOT_MESSAGE_DOMAIN,
+            &[committee.as_bytes(), &claim.0],
+        )
+    }
+
+    fn message(&self) -> Hash {
+        Self::signing_message(self.claim.active_committee.id(), self.claim.commitment())
+    }
+
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(PORTABLE_SNAPSHOT_CERTIFICATE_DOMAIN, &[&self.encode()])
+    }
+
+    pub fn verify(
+        &self,
+        trusted_committee: &AgentReplicaCommittee,
+        expected_claim: &SharedAgentPortableSnapshotClaim,
+    ) -> Result<VerifiedSharedAgentPortableSnapshot, SharedCommitError> {
+        trusted_committee
+            .validate()
+            .map_err(|_| SharedCommitError::InvalidCommittee)?;
+        self.validate_shape()?;
+        expected_claim.validate()?;
+        if &self.claim != expected_claim {
+            return Err(SharedCommitError::WrongSnapshotClaim);
+        }
+        if trusted_committee != self.claim.active_committee()
+            || trusted_committee.id() != self.claim.ordered.committee
+        {
+            return Err(SharedCommitError::WrongCommittee);
+        }
+        if self.signatures.len() < trusted_committee.quorum_threshold() {
+            return Err(SharedCommitError::InsufficientQuorum);
+        }
+        let message = self.message();
+        for signature in &self.signatures {
+            let member = trusted_committee
+                .member_by_node(signature.signer)
+                .ok_or(SharedCommitError::UnknownSigner)?;
+            if member.replica().role != ReplicaRole::Voter {
+                return Err(SharedCommitError::ObserverSignature);
+            }
+            if !verify_ed25519(
+                member.ed25519_public_key(),
+                &message.0,
+                &signature.signature,
+            ) {
+                return Err(SharedCommitError::InvalidSignature);
+            }
+        }
+        Ok(VerifiedSharedAgentPortableSnapshot {
+            claim: self.claim.clone(),
+            certificate_commitment: self.commitment(),
+        })
+    }
+
+    fn validate_shape(&self) -> Result<(), SharedCommitError> {
+        self.claim.validate()?;
+        if self.signatures.is_empty() {
+            return Err(SharedCommitError::InsufficientQuorum);
+        }
+        if self.signatures.len() > MAX_REPLICA_COMMIT_SIGNATURES {
+            return Err(SharedCommitError::CertificateTooLarge);
+        }
+        for (index, signature) in self.signatures.iter().enumerate() {
+            signature.validate()?;
+            if let Some(previous) = index.checked_sub(1).map(|index| &self.signatures[index])
+                && previous.signer >= signature.signer
+            {
+                return Err(SharedCommitError::NonCanonicalOrder);
+            }
+        }
+        enforce_encoded_bound(self, MAX_SHARED_AGENT_PORTABLE_SNAPSHOT_CERTIFICATE_BYTES)
+    }
+}
+
+impl ServiceWire for SharedAgentPortableSnapshotCertificate {
+    const MAGIC: [u8; 4] = *b"AGX1";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.bytes(&self.claim.encode());
+        encoder.u32(self.signatures.len() as u32);
+        for signature in &self.signatures {
+            encode_replica_signature(&mut encoder, signature);
+        }
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(
+            decoder,
+            MAX_SHARED_AGENT_PORTABLE_SNAPSHOT_CERTIFICATE_BYTES,
+        )?;
+        let claim = decode_nested::<SharedAgentPortableSnapshotClaim>(
+            decoder,
+            MAX_SHARED_AGENT_PORTABLE_SNAPSHOT_CLAIM_BYTES,
+        )?;
+        let count = decoder.u32()? as usize;
+        if count > MAX_REPLICA_COMMIT_SIGNATURES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let mut signatures = Vec::new();
+        signatures
+            .try_reserve_exact(count)
+            .map_err(|_| DecodeError::LimitExceeded)?;
+        for _ in 0..count {
+            signatures.push(decode_replica_signature(decoder)?);
+        }
+        let certificate = Self { claim, signatures };
+        certificate.validate_shape().map_err(map_decode_error)?;
+        Ok(certificate)
+    }
+}
+
+/// Process-local result of exact portable claim/quorum verification.
+#[derive(Clone, Debug)]
+pub struct VerifiedSharedAgentPortableSnapshot {
+    claim: SharedAgentPortableSnapshotClaim,
+    certificate_commitment: Hash,
+}
+
+impl VerifiedSharedAgentPortableSnapshot {
+    pub const fn claim(&self) -> &SharedAgentPortableSnapshotClaim {
         &self.claim
     }
 
