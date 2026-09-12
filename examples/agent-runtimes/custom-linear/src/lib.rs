@@ -1471,6 +1471,10 @@ mod tests {
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].entry, install.entry);
         assert_eq!(page.entries[0].incarnation, actor_incarnation(&install));
+        assert_eq!(
+            page.entries[0].install_request,
+            install.lineage_commitment()
+        );
         assert_eq!(inspected.state, installed.state);
     }
 
@@ -1794,6 +1798,32 @@ mod tests {
             let created = physical(fixture.create(RuntimeState::default(), 5));
             let install = fixture.install();
             let installed = physical(fixture.install_work(created.state, install.clone()));
+
+            // A fresh interpreter must expose original install lineage via
+            // the public directory ABI, without access to private state.
+            let inspected = physical(RuntimeWork::Manage {
+                context: RuntimeExecutionContext::Direct,
+                space: fixture.descriptor.identity.space,
+                agent: fixture.descriptor.identity.agent,
+                runtime_deployment: fixture.descriptor.identity.runtime_deployment,
+                state: installed.state.clone(),
+                request: Box::new(ManagementRequest::InspectActors {
+                    after: None,
+                    limit: 1,
+                }),
+                authority: None,
+                observed_slot: 100,
+            });
+            let RuntimeOutcome::Management(Ok(ManagementReply::Actors(page))) = inspected.outcome
+            else {
+                panic!("expected physical actor directory");
+            };
+            assert_eq!(page.entries.len(), 1);
+            assert_eq!(
+                page.entries[0].install_request,
+                install.lineage_commitment()
+            );
+            assert_eq!(inspected.state, installed.state);
 
             let interval = ScheduleId([0x71; 32]);
             let schedule = fixture.invocation_message(

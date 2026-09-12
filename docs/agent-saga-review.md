@@ -336,8 +336,10 @@ or zero lineage, and reject the previous ABI. Verification on this source:
   passes and checks the returned install commitment.
 - Standard actor-upgrade coverage checks that the directory reports the new
   deployment but retains the original install lineage, without mutating state.
-- The maintained custom Linear example passes 10 normal tests; its compiled
-  scheduling/attestation test remains ignored until its artifact is rebuilt.
+- The maintained custom Linear example passes 10 normal tests. Its r15 guest
+  artifact has now been rebuilt, and the explicitly selected compiled
+  scheduling/attestation test passes for Local and Shared profiles. Both native
+  and physical directory checks assert the original immutable install lineage.
 - A newly built Standard-runtime ELF passed the current CLI physical ABI probe;
   its PVM passed the explicit physical create/install/exact-retry/directory test.
 
@@ -400,7 +402,16 @@ ignored by default), including 18 release tests. The rebuilt CLI successfully
 bundled and verified `target/task-tmp/r15-release-v2-smoke` under the native
 worktree. This proves the release-directory cutover, not deployment readiness.
 
-Next: rebuild the custom-runtime example with current ABI tooling, then rerun physical,
+Fresh r15 space `r15-startup` reached ready on its first startup at
+2026-09-12 07:08:09 UTC (about 2m16s after network startup). Its automatically
+created config enabled both ingress types; only the disposable HTTP port was
+changed from occupied 8080 to 18080. HTTP returned 401 without credentials and
+SSH returned its host key. The smoke script then cleanly stopped the daemon and
+started the same space again; restart verification is still pending. Evidence
+is under this worktree's `target/r15-startup.oEbkfJ`, with the live smoke process
+tracked by session 78038. Do not restart it merely because the log is quiet.
+
+Next: finish restart verification, then rerun physical,
 proof, bootstrap, and real first-start/restart gates before integrating this
 work into the native startup branch. The old r14 CLI correctly rejects the r15
 candidate ABI; use the current CLI or its explicit
