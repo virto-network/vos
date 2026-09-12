@@ -595,3 +595,19 @@ golden refresh. SDK no-default-features and workspace formatting checks pass.
 Seven of the original full-library failures remain unaddressed, in addition to
 these r16 pin updates, ordinary-agent finality, opaque-runtime recovery, and
 the final artifact/physical/release gates. No deployment readiness is claimed.
+
+### r16 SDK golden refresh
+
+All 161 SDK tests now pass (`r16-sdk-pins-final.log`). Fifteen expected digest
+arrays were refreshed for the r16 wire generation across authority operations,
+catalog, proof publication, runtime public I/O, and invocation context. The
+canonical decoding, bounds, domain separation, and tampering assertions remain
+unchanged. A separate Python hashlib calculation agrees with the r16 control
+schema and runtime-public-I/O fixture digest. No bundle was rebuilt or repinned.
+
+Current journal and shared-commit reruns reproduce the four earlier identity
+expectation failures: journal 35 passed / 3 failed (`r16-journal-tests.log`),
+shared commit 5 passed / 1 failed (`r16-shared-commit-tests.log`). Their observed
+hashes match those from the earlier r15 run; they are not new r16 regressions.
+They remain open pending accounting for their underlying encoding changes, as
+do the three physical Local SDK host failures and architectural release gaps.
