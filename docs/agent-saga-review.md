@@ -539,3 +539,27 @@ The latest wire suite result is 65 passed, 1 failed in
 `install-plan-wire-verified.log`: accepted-invocation provenance is still an open
 failure. That remaining failure, the other full-library failures, finality, and
 opaque-runtime projection recovery are not waived by the install-state fix.
+
+### Integrated fixture corrections after the install-state checkpoint
+
+The two node authorization failures were outdated registry stubs: enrollment
+now requires a full authenticated peer roster row, not a prefix-only role byte.
+The fixtures now answer the real `members` probe, reject unexpected probes, and
+also assert that a different peer cannot borrow enrollment for sync or blobs.
+Production authorization was not changed. All 120 node tests pass with socket
+access (`integrated-node-roster-socket-suite.log`); the sandbox run passed 119
+and failed only the listener-bind test (`integrated-node-roster-suite.log`).
+
+The driver historical-receipt fixture now explicitly supplies the two empty
+clean actor tables required for an initialized runtime. Its exact regression
+passes (`integrated-driver-preflight-fixture.log`). These three corrections
+leave eight of the original 14 full-library failures unaddressed: accepted
+invocation provenance, three physical Local SDK host tests, and four journal /
+shared-commit identity expectations. The full library gate has not been rerun.
+
+The release path remains: fix the remaining runtime and ordinary-genesis /
+opaque-runtime recovery blockers; rebuild and reproduce matching artifacts;
+run fresh-space startup/restart and final release gates; then fold the work
+into the three scoped review batches. The integrated WIP is not ready to land
+on master or deploy with the currently bundled runtime. No branch was pushed
+or merged to `saga/agents` or master by these fixture corrections.

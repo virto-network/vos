@@ -21382,13 +21382,35 @@ mod tests {
         (routes, handle)
     }
 
-    /// A stub registry that answers `peer_role` and `node_role` with
-    /// DIFFERENT bytes — so a test can model a peer that is enrolled as a
-    /// node but holds no auth grant (or vice versa).
+    #[cfg(feature = "network")]
+    fn stub_enrolled_members(peer: Option<libp2p::PeerId>) -> crate::value::Value {
+        use crate::actors::codec::Encode;
+        crate::value::Value::Bytes(
+            crate::registry::MemberPage {
+                members: peer
+                    .map(|peer| crate::registry::MemberRow {
+                        kind: crate::registry::MEMBER_KIND_NODE,
+                        key: peer.to_bytes(),
+                        prefix: crate::network::derive_node_prefix(&peer),
+                        role: crate::registry::NODE_ROLE_VOTER,
+                        proof_kind: 0,
+                        proof_data: Vec::new(),
+                    })
+                    .into_iter()
+                    .collect(),
+                next_kind: crate::registry::MEMBER_KIND_IDENTITY,
+                next_key: Vec::new(),
+                more: false,
+            }
+            .encode(),
+        )
+    }
+
+    /// Model grants independently from full authenticated node enrollment.
     #[cfg(feature = "network")]
     fn spawn_stub_role_registry(
         peer_role: u8,
-        node_role: u8,
+        enrolled_peer: Option<libp2p::PeerId>,
     ) -> (InvokeRoutes, thread::JoinHandle<()>) {
         use crate::actors::codec::Encode;
         use crate::value::Value;
@@ -21397,15 +21419,13 @@ mod tests {
         routes.lock().unwrap().insert(ServiceId::REGISTRY.0, tx);
         let handle = thread::spawn(move || {
             while let Ok(req) = rx.recv() {
-                let byte = match intercepted_method_name(&req.msg).as_deref() {
-                    Some("node_role") => node_role,
-                    _ => peer_role,
+                let value = match intercepted_method_name(&req.msg).as_deref() {
+                    Some("members") => stub_enrolled_members(enrolled_peer),
+                    Some("peer_role") => Value::U8(peer_role),
+                    other => panic!("unexpected registry probe: {other:?}"),
                 };
-                let reply = encode_invoke_envelope(
-                    crate::actors::run::STATUS_DONE,
-                    &[],
-                    &Value::U8(byte).encode(),
-                );
+                let reply =
+                    encode_invoke_envelope(crate::actors::run::STATUS_DONE, &[], &value.encode());
                 let _ = req.reply.send(reply);
             }
         });
@@ -21460,7 +21480,7 @@ mod tests {
     #[cfg(feature = "network")]
     fn spawn_stub_blob_registry(
         peer_role: u8,
-        node_role: u8,
+        enrolled_peer: Option<libp2p::PeerId>,
         authorized: bool,
     ) -> (InvokeRoutes, thread::JoinHandle<()>) {
         use crate::actors::codec::Encode;
@@ -21471,7 +21491,7 @@ mod tests {
         let handle = thread::spawn(move || {
             while let Ok(req) = rx.recv() {
                 let value = match intercepted_method_name(&req.msg).as_deref() {
-                    Some("node_role") => Value::U8(node_role),
+                    Some("members") => stub_enrolled_members(enrolled_peer),
                     Some("program_blob_authorized") => Value::Bytes(
                         crate::registry::ProgramBlobAuthorization {
                             protocol: crate::registry::RegistryProtocol::CURRENT,
@@ -21479,7 +21499,8 @@ mod tests {
                         }
                         .encode(),
                     ),
-                    _ => Value::U8(peer_role),
+                    Some("peer_role") => Value::U8(peer_role),
+                    other => panic!("unexpected registry probe: {other:?}"),
                 };
                 let reply =
                     encode_invoke_envelope(crate::actors::run::STATUS_DONE, &[], &value.encode());
@@ -21498,8 +21519,8 @@ mod tests {
     fn sync_serve_allowed_member_admits_grants_and_enrolled_nodes() {
         use crate::registry::SyncFloor;
         let peer = libp2p::PeerId::random();
-        let check = |peer_role: u8, node_role: u8| -> bool {
-            let (routes, _reg) = spawn_stub_role_registry(peer_role, node_role);
+        let check = |peer_role: u8, enrolled_peer: Option<libp2p::PeerId>| -> bool {
+            let (routes, _reg) = spawn_stub_role_registry(peer_role, enrolled_peer);
             let svc = lifecycle_service(
                 routes,
                 Arc::new(Mutex::new(HashMap::new())),
@@ -21514,16 +21535,23 @@ mod tests {
             svc.sync_serve_allowed(Some(&peer), "counter")
         };
         assert!(
-            !check(AUTH_ROLE_NONE, 0),
+            !check(AUTH_ROLE_NONE, None),
             "a stranger is refused a Member replica"
         );
-        assert!(check(AUTH_ROLE_READONLY, 0), "a granted member is served");
         assert!(
-            check(AUTH_ROLE_NONE, NODE_ROLE_REPLY_VOTER),
+            check(AUTH_ROLE_READONLY, None),
+            "a granted member is served"
+        );
+        assert!(
+            check(AUTH_ROLE_NONE, Some(peer)),
             "an enrolled voter is served before a grant lands",
         );
         // Anonymous (no peer id) is refused for a non-Public floor.
-        let (routes, _reg) = spawn_stub_role_registry(AUTH_ROLE_READONLY, NODE_ROLE_REPLY_VOTER);
+        assert!(
+            !check(AUTH_ROLE_NONE, Some(libp2p::PeerId::random())),
+            "another node's enrollment does not authorize the caller",
+        );
+        let (routes, _reg) = spawn_stub_role_registry(AUTH_ROLE_READONLY, Some(peer));
         let svc = lifecycle_service(
             routes,
             Arc::new(Mutex::new(HashMap::new())),
@@ -21558,8 +21586,9 @@ mod tests {
         let hash = crate::crypto::blake2b_hash::<32>(&[], &[&bytes]);
         std::fs::write(dir.join(proof_blob_filename(&hash)), &bytes).unwrap();
 
-        let make = |peer_role, node_role, authorized| {
-            let (routes, _reg) = spawn_stub_blob_registry(peer_role, node_role, authorized);
+        let peer = libp2p::PeerId::random();
+        let make = |peer_role, enrolled_peer, authorized| {
+            let (routes, _reg) = spawn_stub_blob_registry(peer_role, enrolled_peer, authorized);
             let mut svc = lifecycle_service(
                 routes,
                 Arc::new(Mutex::new(HashMap::new())),
@@ -21569,7 +21598,7 @@ mod tests {
             svc
         };
 
-        let member = make(AUTH_ROLE_READONLY, 0, true);
+        let member = make(AUTH_ROLE_READONLY, None, true);
         assert_eq!(
             member
                 .get_program_blob(Some(libp2p::PeerId::random()), &hash)
@@ -21577,16 +21606,20 @@ mod tests {
             Some(bytes.as_slice()),
             "a member gets an authorized ELF",
         );
-        let enrolled = make(AUTH_ROLE_NONE, NODE_ROLE_REPLY_VOTER, true);
+        let enrolled = make(AUTH_ROLE_NONE, Some(peer), true);
         assert_eq!(
-            enrolled
-                .get_program_blob(Some(libp2p::PeerId::random()), &hash)
-                .as_deref(),
+            enrolled.get_program_blob(Some(peer), &hash).as_deref(),
             Some(bytes.as_slice()),
             "an enrolled node gets an authorized ELF",
         );
         assert!(
-            make(AUTH_ROLE_NONE, 0, true)
+            enrolled
+                .get_program_blob(Some(libp2p::PeerId::random()), &hash)
+                .is_none(),
+            "another peer cannot borrow the enrolled node's access",
+        );
+        assert!(
+            make(AUTH_ROLE_NONE, None, true)
                 .get_program_blob(Some(libp2p::PeerId::random()), &hash)
                 .is_none(),
             "a stranger is refused",
@@ -21596,7 +21629,7 @@ mod tests {
             "an anonymous caller is refused",
         );
         assert!(
-            make(AUTH_ROLE_READONLY, 0, false)
+            make(AUTH_ROLE_READONLY, None, false)
                 .get_program_blob(Some(libp2p::PeerId::random()), &hash)
                 .is_none(),
             "an unauthorized hash is refused even when cached",

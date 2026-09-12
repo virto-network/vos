@@ -5716,6 +5716,8 @@ mod tests {
                 ),
                 clean_creation_descriptor: Some(descriptor.clone()),
                 clean_descriptor: Some(descriptor.clone()),
+                clean_actor_packages: Some(Vec::new()),
+                clean_actor_installations: Some(Vec::new()),
                 clean_authority_epoch_high_water: Some(1),
                 clean_decision_sequence_high_water: Some(2),
                 clean_acknowledged_through: 0,
