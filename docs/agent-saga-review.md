@@ -733,3 +733,19 @@ persistence result, not a claim that the original script exited successfully.
 This checkpoint supports isolated system-bootstrap/ingress testing. It does
 not establish ordinary-agent creation/finality, opaque-runtime recovery, full
 library/regression closure on this head, or production performance readiness.
+
+### SDK documentation release check
+
+The retained-CLI/negative-surface clean-break script passes on the r16 tree.
+There is no generic `doc-check` recipe in this branch; an attempted invocation
+was not a successful documentation gate. The new `agent-sdk-doc-check` recipe
+builds the public SDK docs with no default features and treats broken intra-doc
+links as errors. Its explicit run passes (`r16-sdk-doc-gate.log`), and
+`clean-break-check` now invokes it. Scratch files use the disk-backed target
+directory. This does not claim whole-book or external-link validation.
+
+The broad library rerun remains active as session 11706, against source
+`37d6a5720e7e45e4a19850a16a531e6cb316e299`, with `pvm,private-agent-store`, serial
+execution, and socket access. Only the separately tracked long inventory test
+is filtered. Evidence is `r16-integrated-library.log`; poll the existing session
+before scheduling another run. No final result has been recorded yet.
