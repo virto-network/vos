@@ -195,3 +195,19 @@ security fixes, protocol-generation bumps, and repins bisectable. Advance a
 review branch only after its base and head are immutable, all named tests run
 with a nonzero count, `git diff --check` is clean, and generated artifacts are
 absent or isolated in their own reproducibility-reviewed commit.
+
+### Chapter 08 portable restore-marker verification
+
+On the isolated `wip/ch08-c1-portable-recovery` worktree, the physical
+`singleton_system_agent_portable_backup_is_authenticated_fresh_and_restartable`
+test passes with `--features pvm`. It covers authenticated fresh-store restore,
+occupied-destination rejection, restart, and process loss with either the
+canonical restore marker or its staged `.next` file. Both marker forms must be
+retired after recovery, and subsequent reopen preserves the fresh store identity
+and journal position. Ten temporary portable-recovery diagnostic prints were
+removed without changing error propagation or validation order.
+
+Evidence: native worktree `target/task-tmp/c1-portable-marker-staged-verification.log`
+(one explicitly selected test, passed). This does not establish every cross-store
+crash boundary or the Private recovery gates, and this older recovery worktree
+still needs integration with the r15 native/artifact work before final release.

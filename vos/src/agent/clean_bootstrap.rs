@@ -6893,55 +6893,72 @@ mod tests {
             // generation byte. A process loss at that first durable boundary
             // resumes into the same logical state with another fresh physical
             // store identity, then retires the recovery authority.
-            let interrupted_destination = TestDirectory::new("portable-shared-system-marker-crash");
-            let open_interrupted_destination = || {
-                SharedAgentHost::open_with_root(
-                    interrupted_destination.host(),
-                    interrupted_destination.lock(),
-                    scope,
-                    Arc::clone(&harness.fixture.trust),
-                    Arc::clone(&harness.fixture.merge),
-                    Arc::clone(&harness.fixture.finality),
-                    harness.fixture.plan.pins.root.clone(),
-                )
-                .unwrap()
-            };
-            {
-                let mut interrupted = open_interrupted_destination();
-                assert_eq!(
-                    interrupted
-                        .retain_portable_restore_marker_for_test(&backup, limits)
-                        .unwrap(),
+            for staged in [false, true] {
+                let interrupted_destination =
+                    TestDirectory::new("portable-shared-system-marker-crash");
+                let open_interrupted_destination = || {
+                    SharedAgentHost::open_with_root(
+                        interrupted_destination.host(),
+                        interrupted_destination.lock(),
+                        scope,
+                        Arc::clone(&harness.fixture.trust),
+                        Arc::clone(&harness.fixture.merge),
+                        Arc::clone(&harness.fixture.finality),
+                        harness.fixture.plan.pins.root.clone(),
+                    )
+                    .unwrap()
+                };
+                {
+                    let mut interrupted = open_interrupted_destination();
+                    assert_eq!(
+                        interrupted
+                            .retain_portable_restore_marker_for_test(&backup, limits)
+                            .unwrap(),
+                        agent
+                    );
+                    assert!(interrupted.is_empty());
+                }
+                let marker = interrupted_destination.host().join(format!(
+                    "{}.shared-portable-restore",
                     agent
+                        .0
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                ));
+                let staged_marker = marker.with_extension("shared-portable-restore.next");
+                if staged {
+                    std::fs::rename(&marker, &staged_marker).unwrap();
+                }
+                let recovered = open_interrupted_destination();
+                assert!(!marker.exists());
+                assert!(!staged_marker.exists());
+                let recovered_store = recovered.journal_store_instance_for_test(agent).unwrap();
+                assert_ne!(recovered_store, source_store);
+                assert_ne!(recovered_store, destination_store);
+                assert_eq!(recovered.journal_position(agent).unwrap(), source_position);
+                assert!(matches!(
+                    recovered.snapshot_state_for_test(agent).unwrap(),
+                    crate::agent::shared_host::SharedAgentSnapshotState::Installed {
+                        raft_index,
+                        raft_term,
+                        ..
+                    } if (raft_index, raft_term) == (source_index, source_term)
+                ));
+                drop(recovered);
+                let recovered_again = open_interrupted_destination();
+                assert_eq!(
+                    recovered_again
+                        .journal_store_instance_for_test(agent)
+                        .unwrap(),
+                    recovered_store
                 );
-                assert!(interrupted.is_empty());
+                assert_eq!(
+                    recovered_again.journal_position(agent).unwrap(),
+                    source_position
+                );
+                drop(recovered_again);
             }
-            let recovered = open_interrupted_destination();
-            let recovered_store = recovered.journal_store_instance_for_test(agent).unwrap();
-            assert_ne!(recovered_store, source_store);
-            assert_ne!(recovered_store, destination_store);
-            assert_eq!(recovered.journal_position(agent).unwrap(), source_position);
-            assert!(matches!(
-                recovered.snapshot_state_for_test(agent).unwrap(),
-                crate::agent::shared_host::SharedAgentSnapshotState::Installed {
-                    raft_index,
-                    raft_term,
-                    ..
-                } if (raft_index, raft_term) == (source_index, source_term)
-            ));
-            drop(recovered);
-            let recovered_again = open_interrupted_destination();
-            assert_eq!(
-                recovered_again
-                    .journal_store_instance_for_test(agent)
-                    .unwrap(),
-                recovered_store
-            );
-            assert_eq!(
-                recovered_again.journal_position(agent).unwrap(),
-                source_position
-            );
-            drop(recovered_again);
             drop(source_host);
             harness.stop();
         }

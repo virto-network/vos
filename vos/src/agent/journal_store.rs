@@ -11382,24 +11382,9 @@ impl FileAgentJournalStore {
         image: &PortableJournalCheckpoint,
         maximum_index_nodes: usize,
     ) -> Result<(), JournalStoreError> {
-        let shape = image.validate_shape();
-        #[cfg(test)]
-        if let Err(error) = &shape {
-            eprintln!("portable durable image shape failed: {error:?}");
-        }
-        shape?;
-        let lock = self.verify_lock();
-        #[cfg(test)]
-        if let Err(error) = &lock {
-            eprintln!("portable durable lock failed: {error:?}");
-        }
-        lock?;
-        let loaded_heads = self.heads();
-        #[cfg(test)]
-        if let Err(error) = &loaded_heads {
-            eprintln!("portable durable current heads failed: {error:?}");
-        }
-        let current = loaded_heads?.ok_or(JournalStoreError::NotInitialized)?;
+        image.validate_shape()?;
+        self.verify_lock()?;
+        let current = self.heads()?.ok_or(JournalStoreError::NotInitialized)?;
         if current == image.heads {
             return validate_portable_journal_closure(self, image, maximum_index_nodes);
         }
@@ -11416,20 +11401,12 @@ impl FileAgentJournalStore {
             return Err(JournalStoreError::Conflict);
         }
         for blob in &image.blobs {
-            if let Err(error) = self.persist_blob(blob.class, &blob.reference, &blob.bytes) {
-                #[cfg(test)]
-                eprintln!("portable blob {:?} failed: {error:?}", blob.class);
-                return Err(error);
-            }
+            self.persist_blob(blob.class, &blob.reference, &blob.bytes)?;
         }
         for object in &image.objects {
-            if let Err(error) = self.persist_portable_object(object) {
-                #[cfg(test)]
-                eprintln!("portable object {:?} failed: {error:?}", object.class);
-                return Err(error);
-            }
+            self.persist_portable_object(object)?;
         }
-        let checkpoint_validation = validate_checkpoint_closure(
+        validate_checkpoint_closure(
             self,
             &self
                 .get::<CheckpointManifest>(
@@ -11439,18 +11416,8 @@ impl FileAgentJournalStore {
                         .ok_or(JournalStoreError::NonCanonical)?,
                 )?
                 .ok_or(JournalStoreError::MissingObject)?,
-        );
-        #[cfg(test)]
-        if let Err(error) = &checkpoint_validation {
-            eprintln!("portable checkpoint closure failed: {error:?}");
-        }
-        checkpoint_validation?;
-        let head_validation = validate_head_targets(self, &image.heads);
-        #[cfg(test)]
-        if let Err(error) = &head_validation {
-            eprintln!("portable head targets failed: {error:?}");
-        }
-        head_validation?;
+        )?;
+        validate_head_targets(self, &image.heads)?;
 
         let root = self.directory("")?;
         create_synced_stage_at(root, "heads.next", &image.heads.encode())?;
@@ -11468,12 +11435,7 @@ impl FileAgentJournalStore {
         root.sync_all()
             .map_err(|_| JournalStoreError::Unavailable)?;
         self.verify_lock()?;
-        let closure = validate_portable_journal_closure(self, image, maximum_index_nodes);
-        #[cfg(test)]
-        if let Err(error) = &closure {
-            eprintln!("portable final closure failed: {error:?}");
-        }
-        closure
+        validate_portable_journal_closure(self, image, maximum_index_nodes)
     }
 
     fn initialize_ordinary<T: ReplaySealedOrdinaryGenesis>(

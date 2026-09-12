@@ -2868,23 +2868,13 @@ impl
         }
         self.store
             .install_portable_checkpoint(image, maximum_index_nodes)?;
-        let materialization =
-            materialize_current(&mut self.store, &mut self.executor, &NoPrunedOrderedBases);
-        #[cfg(test)]
-        if let Err(error) = &materialization {
-            eprintln!("portable durable materialization failed: {error:?}");
-        }
-        self.materialization = materialization?;
-        let validation = validate_portable_materialization(
+        self.materialization =
+            materialize_current(&mut self.store, &mut self.executor, &NoPrunedOrderedBases)?;
+        validate_portable_materialization(
             &self.store,
             &self.materialization,
             certificate.claim(),
-        );
-        #[cfg(test)]
-        if let Err(error) = &validation {
-            eprintln!("portable durable claim validation failed: {error:?}");
-        }
-        validation?;
+        )?;
         let installed = self
             .ledger
             .restore_portable_snapshot(certificate, verified)?;
