@@ -1775,6 +1775,44 @@ struct MergeExecutionFact {
 }
 
 impl ReplayStep {
+    fn management_evidence(
+        &self,
+        input: &ReplayInput,
+        before: &RuntimeState,
+    ) -> Option<super::journal::CleanManagementEvidence> {
+        // Exact retained retries must not replace the provenance of the
+        // latest physical mutation with an older receipt or a new clock.
+        if self.state == *before && self.runtime == input.runtime {
+            return None;
+        }
+        let ReplayOperation::CleanManage {
+            request,
+            authority,
+            observed_slot,
+        } = &input.operation
+        else {
+            return None;
+        };
+        let ordered = match self.position {
+            ReplayPosition::Genesis => OrderedBase::post_genesis(),
+            ReplayPosition::Ordered { id, index, .. } => OrderedBase {
+                index,
+                head: Some(id),
+            },
+            _ => return None,
+        };
+        Some(super::journal::CleanManagementEvidence {
+            input: self.input,
+            ordered,
+            authority: authority.commitment(),
+            request: request.replay_commitment(),
+            epoch: authority.selector.epoch,
+            sequence: authority.selector.decision_sequence,
+            observed_slot: *observed_slot,
+            result: self.clean_management_result.clone()?,
+        })
+    }
+
     pub fn state(&self) -> &RuntimeState {
         &self.state
     }
@@ -4123,6 +4161,7 @@ impl ReplaySuffixBudget {
 /// state bytes or cursors when preparing a publication.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplayMaterialization {
+    clean_management: Option<super::journal::CleanManagementEvidence>,
     heads_id: JournalHeadsId,
     heads: JournalHeads,
     replayed_root: Option<ReplayedRootJournalIdentity>,
@@ -4426,6 +4465,12 @@ impl ReplayTransitionProofShadow {
 }
 
 impl ReplayMaterialization {
+    pub(crate) fn clean_management_evidence(
+        &self,
+    ) -> Option<&super::journal::CleanManagementEvidence> {
+        self.clean_management.as_ref()
+    }
+
     pub const fn heads_id(&self) -> JournalHeadsId {
         self.heads_id
     }
@@ -11618,8 +11663,10 @@ pub fn derive_checkpoint<SourceError, ExecutorError>(
     transition_proofs: TransitionProofIndexId,
     lanes: Vec<CheckpointLane>,
     artifacts: ArtifactClosureId,
+    clean_management: Option<super::journal::CleanManagementEvidence>,
 ) -> Result<CheckpointManifest, ReplayError<SourceError, ExecutorError>> {
     let checkpoint = CheckpointManifest {
+        clean_management,
         genesis,
         admission,
         runtime,
@@ -11708,6 +11755,7 @@ mod aggregate {
     }
 
     struct ReplayBase {
+        clean_management: Option<crate::agent::journal::CleanManagementEvidence>,
         state: RuntimeState,
         artifacts: Option<ArtifactClosure>,
         ordered: OrderedBase,
@@ -12043,6 +12091,9 @@ mod aggregate {
                 ..
             }
         );
+        if clean_checkpoint != checkpoint.clean_management.is_some() {
+            return Err(ReplayError::InvalidRecord);
+        }
         let exact_artifacts = if clean_checkpoint {
             artifacts.genesis == checkpoint.genesis
                 && artifacts.artifacts.contains(&checkpoint.runtime.package)
@@ -12091,6 +12142,7 @@ mod aggregate {
         .map_err(lift_validation)?;
         Ok(ReplayBase {
             state,
+            clean_management: checkpoint.clean_management.clone(),
             artifacts: Some(artifacts),
             ordered,
             local_revision,
@@ -12175,6 +12227,7 @@ mod aggregate {
         }
         Ok(ReplayBase {
             state: RuntimeState::default(),
+            clean_management: None,
             artifacts: None,
             ordered: OrderedBase::post_genesis(),
             local_revision: 0,
@@ -12675,6 +12728,7 @@ mod aggregate {
         let mut local_head = base.local_head;
         let mut merge_facts = BTreeMap::new();
         let mut final_system_authority_write = None;
+        let mut clean_management = base.clean_management;
 
         if InvocationOwnership::unfinalized(&machine.ownership, InvocationOwnershipScope::Merge)
             .map_err(ReplayError::InvocationOwnership)?
@@ -12694,6 +12748,7 @@ mod aggregate {
                     ReplayPosition::Genesis,
                 )
                 .map_err(historical_replay_error)?;
+            clean_management = step.management_evidence(&input, &state);
             state = step.state;
             validate_runtime_state_bound(&state)?;
             if step.runtime != input.runtime {
@@ -13008,6 +13063,9 @@ mod aggregate {
                                 }
                             });
                     }
+                    if let Some(evidence) = step.management_evidence(&entry.input, &state) {
+                        clean_management = Some(evidence);
+                    }
                     state = step.state;
                     current_transition_proof_shadow = machine
                         .transition_proof_projection
@@ -13147,6 +13205,7 @@ mod aggregate {
             return Err(ReplayError::InvalidFence);
         }
         Ok(ReplayMaterialization {
+            clean_management,
             heads_id: heads.id(),
             heads,
             replayed_root,
@@ -13912,6 +13971,11 @@ mod aggregate {
         materialization: &ReplayMaterialization,
     ) -> Result<(), MaterializeError<ResolverError, ExecutorError>> {
         validate_runtime_state_bound(&materialization.state)?;
+        if let Some(evidence) = &materialization.clean_management {
+            evidence
+                .validate_at(materialization.ordered_base())
+                .map_err(|_| ReplayError::InvalidRecord)?;
+        }
         materialization
             .suffix_budget
             .validate()
@@ -14957,6 +15021,9 @@ mod aggregate {
             store,
             sealed,
             successor: ReplayMaterialization {
+                clean_management: step
+                    .management_evidence(&entry.input, &materialization.state)
+                    .or_else(|| materialization.clean_management.clone()),
                 heads_id: next.id(),
                 heads: next,
                 replayed_root: materialization.replayed_root,
@@ -15768,6 +15835,9 @@ mod aggregate {
                     store,
                     sealed,
                     successor: ReplayMaterialization {
+                        clean_management: step
+                            .management_evidence(&entry.input, &execution_before)
+                            .or_else(|| materialization.clean_management.clone()),
                         heads_id: next.id(),
                         heads: next,
                         replayed_root: materialization.replayed_root,
@@ -15951,6 +16021,7 @@ mod aggregate {
             store,
             sealed,
             successor: ReplayMaterialization {
+                clean_management: materialization.clean_management.clone(),
                 heads_id: next.id(),
                 heads: next,
                 replayed_root: materialization.replayed_root,
@@ -16368,6 +16439,7 @@ mod aggregate {
             store,
             sealed,
             successor: ReplayMaterialization {
+                clean_management: materialization.clean_management.clone(),
                 heads_id: next.id(),
                 heads: next,
                 replayed_root: materialization.replayed_root,
@@ -16570,6 +16642,7 @@ mod aggregate {
             current.transition_proofs,
             lanes,
             artifacts.id(),
+            materialization.clean_management.clone(),
         )
         .map_err(lift_validation)?;
         let id = manifest.id();
@@ -16652,6 +16725,7 @@ mod aggregate {
         PreparedSharedCheckpoint {
             sealed,
             successor: ReplayMaterialization {
+                clean_management: materialization.clean_management.clone(),
                 heads_id: next.id(),
                 heads: next,
                 replayed_root: materialization.replayed_root,
@@ -16975,6 +17049,7 @@ mod aggregate {
             current.transition_proofs,
             lanes,
             artifacts.id(),
+            materialization.clean_management.clone(),
         )
         .map_err(lift_validation)?;
         let id = manifest.id();
@@ -17058,6 +17133,7 @@ mod aggregate {
             store,
             sealed,
             successor: ReplayMaterialization {
+                clean_management: materialization.clean_management.clone(),
                 heads_id: next.id(),
                 heads: next,
                 replayed_root: materialization.replayed_root,
@@ -19018,9 +19094,58 @@ pub(crate) mod tests {
         assert_eq!(retried.state(), &before_retry);
         assert_eq!(retried.runtime(), upgraded.runtime());
 
+        // Move the lifecycle fence past the original mutation, so GC can
+        // retire that input's source entry while keeping its compact proof.
+        let later_retry = OrderedEntry {
+            index: 3,
+            parent: Some(retry.id()),
+            merge_seal: Some(persist_merge_seal(&mut store, &retried)),
+            ..retry.clone()
+        };
+        let prepared =
+            match prepare_ordered(&mut store, &mut executor, &retried, &later_retry).unwrap() {
+                ReplayPreparation::Ready(prepared) => prepared,
+                ReplayPreparation::AlreadyCommitted(_) => unreachable!(),
+            };
+        let (_, retried, _) = prepared.publish().unwrap();
         let checkpoint = prepare_checkpoint(&mut store, &retried).unwrap();
         let (_, checkpointed, _) = checkpoint.publish().unwrap();
         let mut reopened_store = store.clone();
+        let expected_management = retried.clean_management_evidence().unwrap().clone();
+        assert_eq!(expected_management.input, first.input.id());
+        assert_eq!(expected_management.ordered.head, Some(first.id()));
+        assert_eq!(
+            retried.clean_management_evidence(),
+            upgraded.clean_management_evidence()
+        );
+        assert_eq!(
+            expected_management.result.as_ref().ok(),
+            execution.clean_management_result().unwrap().as_ref().ok()
+        );
+        assert_eq!(
+            checkpointed.clean_management_evidence(),
+            Some(&expected_management)
+        );
+        let gc = reopened_store
+            .collect_garbage(
+                checkpointed.heads_id(),
+                GcLimits {
+                    max_index_nodes: 10_000,
+                    max_marked_objects: 10_000,
+                    max_marked_blobs: 10_000,
+                    max_scanned_files: 10_000,
+                    max_scanned_bytes: 64 * 1024 * 1024,
+                    max_unlinks_per_run: 10_000,
+                },
+            )
+            .unwrap();
+        assert!(gc.complete);
+        assert!(
+            reopened_store
+                .get::<OrderedEntry>(first.id())
+                .unwrap()
+                .is_none()
+        );
         let mut reopened_executor = OpaqueCleanReplayExecutor::default();
         let reopened = materialize_current(
             &mut reopened_store,
@@ -19030,7 +19155,15 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(reopened.state(), checkpointed.state());
         assert_eq!(reopened.runtime(), checkpointed.runtime());
-        assert_eq!(reopened.heads().ordered_index, 2);
+        assert_eq!(reopened.heads().ordered_index, 3);
+        assert!(
+            reopened_executor.last.is_none(),
+            "checkpoint recovery must not need executor result caches"
+        );
+        assert_eq!(
+            reopened.clean_management_evidence(),
+            Some(&expected_management)
+        );
         assert_eq!(reopened_executor.descriptor.as_ref(), Some(&descriptor));
         assert!(decode_standard_runtime_state(reopened.state()).is_err());
     }

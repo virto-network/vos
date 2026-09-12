@@ -14,6 +14,9 @@ Implementation is in `.worktrees/ch08-runtime-directory` on
 Use only an isolated, disposable environment for bootstrap/ingress testing.
 Fresh-space first start and restart with bundled system actors and HTTP/SSH
 have passed; ordinary-agent creation is not yet a usable production path.
+Those ingress checks predate the new AJC4 host checkpoint format. A newly built
+CLI needs a fresh disposable data directory and another smoke run; AJC3
+checkpoints are deliberately rejected, with no in-place migration provided.
 
 The integrated library run at `37d6a5720e7e45e4a19850a16a531e6cb316e299`
 completed: **1,663 passed, zero failed, one filtered**, in 1,771.43 seconds.
@@ -26,11 +29,12 @@ and strict clippy, not a completed full-library rerun on those edits.
 Keep the remaining work in three scoped Chapter 08 batches, without adding
 review endpoints for individual fixes:
 
-1. **C1 — recovery:** preserve the integrated portable-recovery fixes. Finish
-   opaque-runtime management evidence across checkpoint, pruning and reopen;
-   projection recovery must not decode Standard-runtime private state or rely
-   solely on a volatile result cache. Require exact one-ack-lag recovery and
-   rejection of substituted evidence with a custom runtime.
+1. **C1 — recovery:** preserve the integrated portable-recovery fixes. Host-owned
+   management evidence now survives checkpoint/GC/reopen and feeds the Shared
+   projection comparator. Finish physical Shared snapshot/QC and one-ack-lag
+   substitution coverage, and close remaining Standard-state dependencies in
+   production Local recovery. Neither a private-state decoder nor a volatile
+   cache is a runtime-independent recovery proof.
 2. **C2 — native lifecycle:** replace the deliberately unavailable ordinary-
    Agent finality adapter with authenticated live system-Agent decision
    publication and independent replay verification, including reopen. A
@@ -860,3 +864,45 @@ reply still needs request/receipt-bound host evidence in replay materialization,
 canonical checkpoint authentication, pruning/reopen recovery, and consumption
 by the Shared/Local projection audits. Do not replace those audits with the
 volatile cache or treat publication result accessors as durable checkpoint proof.
+
+### Host-owned management evidence in AJC4 checkpoints
+
+`CleanManagementEvidence` now binds the latest state-changing portable management
+input and its Ordered position to the signed receipt commitment, replay request
+commitment, epoch/sequence, observed slot and exact decoded result. Replay
+materialization carries it through both Local and Shared publication and
+checkpoint construction. State/runtime-preserving retries keep the original
+mutation evidence, so an older retry cannot replace it or change its clock.
+
+The canonical checkpoint is now **AJC4**, with checkpoint identity domain
+`vos/agent/journal/checkpoint/v4`; AJC3, AJC2 and AGJC are rejected. Clean-genesis
+checkpoint reopen requires the evidence. Its fields and bounded canonical SDK
+reply are included in the checkpoint identity (and therefore an authenticated
+Shared checkpoint claim), not an unbound sidecar. The two checkpoint digest
+fixtures were refreshed for the new format/domain, preserving predecessor
+rejection and domain-separation checks. This is a host checkpoint generation
+change, not an SDK ABI bump; committed guest blobs were not replaced.
+
+Shared projection-lag recovery now obtains its disposition from authenticated
+replay/checkpoint evidence without decoding Standard private state. The common
+comparator still uses the legacy-named disposition value type; this change does
+not claim that all Standard-state dependencies in the Local image host are gone.
+
+Verification: **199 passed, zero failed** in
+`r16-checkpoint-management-final.log` (40.05s; journal, journal store, replay,
+Local SDK host, and physical custom-runtime Shared host selection). The initial
+run failed only the expected checkpoint identity fixtures before their update.
+A strengthened physical-state-independent regression separately passed in
+`r16-checkpoint-management-pruned-source.log`: after another exact retry advances
+the fence, GC actually removes the original mutation's Ordered entry, and a
+fresh executor with an empty management-result cache reopens the same exact
+evidence from the checkpoint. The Shared physical test also verifies the exact
+installation receipt/request/result before and after reopen.
+The affected CLI clean-space selection also passes **31/31**
+(`r16-checkpoint-management-cli.log`); formatting and diff checks pass. These
+test builds did not replace the preserved r14 normal CLI binary.
+
+Still required: physical Shared checkpoint certificate/snapshot import and
+tampering coverage for the new evidence, production Local opaque recovery,
+ordinary-Agent finality, and final frozen-source release gates. Earlier startup
+and artifact reproduction evidence is not a final AJC4 daemon smoke result.

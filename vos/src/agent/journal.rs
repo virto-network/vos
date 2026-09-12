@@ -2593,9 +2593,53 @@ impl CheckpointLane {
     }
 }
 
+/// Latest replay-validated portable management mutation at an Ordered boundary.
+/// Authentication comes from the enclosing checkpoint or replayed input, not
+/// from decoding this public record. No private runtime-state layout is used.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CleanManagementEvidence {
+    pub input: ReplayInputId,
+    pub ordered: OrderedBase,
+    pub authority: crate::agent_sdk::Hash,
+    pub request: crate::agent_sdk::Hash,
+    pub epoch: u64,
+    pub sequence: u64,
+    pub observed_slot: u64,
+    pub result: Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>,
+}
+
+impl CleanManagementEvidence {
+    pub(crate) fn validate_at(&self, boundary: OrderedBase) -> Result<(), DecodeError> {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        self.ordered.validate()?;
+        boundary.validate()?;
+        if self.input == ReplayInputId::ZERO
+            || self.authority == crate::agent_sdk::Hash::ZERO
+            || self.request == crate::agent_sdk::Hash::ZERO
+            || self.epoch == 0
+            || self.sequence == 0
+            || self.ordered.index > boundary.index
+            || (self.ordered.index == boundary.index && self.ordered != boundary)
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        let bytes = crate::agent_sdk::RuntimeTransition {
+            state: crate::agent_sdk::RuntimeState::default(),
+            outcome: crate::agent_sdk::RuntimeOutcome::Management(self.result.clone()),
+        }
+        .encode()
+        .map_err(|_| DecodeError::NonCanonical)?;
+        if bytes.len() > super::wire::MAX_CLEAN_MANAGEMENT_RESULT_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        Ok(())
+    }
+}
+
 /// Coherent aggregate checkpoint across every materialized lane.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointManifest {
+    pub clean_management: Option<CleanManagementEvidence>,
     pub genesis: AgentJournalGenesisId,
     /// Immutable tagged Agent-genesis admission inherited from genesis.
     pub admission: AgentGenesisAdmissionId,
@@ -2625,6 +2669,12 @@ impl CheckpointManifest {
     fn validate_inner(&self) -> Result<(), DecodeError> {
         self.runtime.validate()?;
         self.merge_fence.validate()?;
+        if let Some(evidence) = &self.clean_management {
+            evidence.validate_at(OrderedBase {
+                index: self.ordered_index,
+                head: self.ordered_head,
+            })?;
+        }
         let local_count = self
             .lanes
             .iter()
@@ -2666,7 +2716,7 @@ impl CheckpointManifest {
 }
 
 impl ServiceWire for CheckpointManifest {
-    const MAGIC: [u8; 4] = *b"AJC3";
+    const MAGIC: [u8; 4] = *b"AJC4";
 
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
@@ -2689,6 +2739,18 @@ impl ServiceWire for CheckpointManifest {
             encoder.option(&lane.invocations, |encoder, index| encoder.fixed(&index.0));
         });
         encoder.fixed(&self.artifacts.0);
+        encoder.option(&self.clean_management, |encoder, evidence| {
+            encoder.fixed(evidence.input.as_bytes());
+            encode_ordered_base(encoder, evidence.ordered);
+            encoder.fixed(evidence.authority.as_bytes());
+            encoder.fixed(evidence.request.as_bytes());
+            encoder.u64(evidence.epoch);
+            encoder.u64(evidence.sequence);
+            encoder.u64(evidence.observed_slot);
+            encoder.bytes(&super::wire::encode_clean_management_result(
+                &evidence.result,
+            ));
+        });
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -2736,6 +2798,30 @@ impl ServiceWire for CheckpointManifest {
             transition_proofs,
             lanes,
             artifacts: ArtifactClosureId(decoder.fixed()?),
+            clean_management: decoder.option(|decoder| {
+                let input = ReplayInputId(decoder.fixed()?);
+                let ordered = decode_ordered_base(decoder)?;
+                let authority = crate::agent_sdk::Hash(decoder.fixed()?);
+                let request = crate::agent_sdk::Hash(decoder.fixed()?);
+                let epoch = decoder.u64()?;
+                let sequence = decoder.u64()?;
+                let observed_slot = decoder.u64()?;
+                let bytes = decoder.bytes_ref()?;
+                if bytes.len() > super::wire::MAX_CLEAN_MANAGEMENT_RESULT_BYTES {
+                    return Err(DecodeError::LimitExceeded);
+                }
+                let result = super::wire::decode_clean_management_result(bytes)?;
+                Ok(CleanManagementEvidence {
+                    input,
+                    ordered,
+                    authority,
+                    request,
+                    epoch,
+                    sequence,
+                    observed_slot,
+                    result,
+                })
+            })?,
         };
         manifest.validate_inner()?;
         Ok(manifest)
@@ -2755,7 +2841,7 @@ impl CanonicalJournalRecord for CheckpointManifest {
     }
 
     fn id(&self) -> Self::Id {
-        CheckpointId(content_id(b"vos/agent/journal/checkpoint/v3", self))
+        CheckpointId(content_id(b"vos/agent/journal/checkpoint/v4", self))
     }
 }
 
@@ -6071,6 +6157,7 @@ mod tests {
         roundtrip(&closure);
 
         let checkpoint = CheckpointManifest {
+            clean_management: None,
             genesis,
             admission: genesis_admission(),
             runtime: runtime_binding(),
@@ -6093,23 +6180,53 @@ mod tests {
         };
         checkpoint.validate().unwrap();
         roundtrip(&checkpoint);
+        let mut with_evidence = checkpoint.clone();
+        with_evidence.clean_management = Some(CleanManagementEvidence {
+            input: ReplayInputId([0x71; 32]),
+            ordered: OrderedBase {
+                index: 1,
+                head: Some(ordered_head),
+            },
+            authority: crate::agent_sdk::Hash([0x72; 32]),
+            request: crate::agent_sdk::Hash([0x73; 32]),
+            epoch: 1,
+            sequence: 2,
+            observed_slot: 10,
+            result: Ok(crate::agent_sdk::ManagementReply::Removed(
+                crate::agent_sdk::ActorId([0x74; 32]),
+            )),
+        });
+        roundtrip(&with_evidence);
+        assert_ne!(with_evidence.id(), checkpoint.id());
+        let mut substituted = with_evidence.clone();
+        substituted.clean_management.as_mut().unwrap().request = crate::agent_sdk::Hash([0x75; 32]);
+        assert_ne!(substituted.id(), with_evidence.id());
+        substituted.clean_management.as_mut().unwrap().authority = crate::agent_sdk::Hash::ZERO;
+        assert!(substituted.validate().is_err());
+        let mut future = with_evidence.clone();
+        future.clean_management.as_mut().unwrap().ordered.index = 2;
+        assert!(future.validate().is_err());
+        let mut wrong_head = with_evidence.clone();
+        wrong_head.clean_management.as_mut().unwrap().ordered.head =
+            Some(OrderedEntryId([0x76; 32]));
+        assert!(wrong_head.validate().is_err());
         assert_eq!(
             *checkpoint.id().as_bytes(),
             [
-                178, 96, 244, 226, 214, 109, 224, 107, 124, 12, 210, 54, 140, 91, 133, 15, 119,
-                187, 253, 15, 49, 159, 227, 201, 20, 31, 72, 245, 172, 6, 114, 247,
+                161, 174, 35, 10, 111, 12, 202, 156, 167, 99, 174, 146, 191, 35, 252, 61, 214, 238,
+                121, 138, 157, 62, 104, 143, 140, 36, 106, 14, 113, 101, 235, 189,
             ]
         );
         let legacy_id = content_id(b"vos/agent/journal/checkpoint", &checkpoint);
         assert_eq!(
             legacy_id,
             [
-                251, 160, 131, 136, 154, 3, 79, 39, 174, 124, 98, 106, 1, 7, 133, 74, 129, 76, 248,
-                205, 60, 182, 1, 230, 180, 243, 105, 152, 141, 40, 174, 158,
+                212, 45, 120, 182, 125, 38, 68, 204, 173, 57, 164, 38, 42, 217, 36, 53, 159, 10,
+                234, 17, 33, 167, 73, 76, 69, 154, 139, 241, 245, 66, 129, 176,
             ]
         );
         assert_ne!(*checkpoint.id().as_bytes(), legacy_id);
-        for predecessor_magic in [b"AJC2", b"AGJC"] {
+        for predecessor_magic in [b"AJC3", b"AJC2", b"AGJC"] {
             let mut predecessor_wire = checkpoint.encode();
             predecessor_wire[..4].copy_from_slice(predecessor_magic);
             assert_eq!(
@@ -6171,6 +6288,7 @@ mod tests {
         closure.validate().unwrap();
         let checkpoint = CheckpointManifest {
             genesis,
+            clean_management: None,
             admission: genesis_admission(),
             runtime: runtime_binding(),
             publication_revision: 0,
@@ -6202,6 +6320,7 @@ mod tests {
         }
         .id();
         let base = CheckpointManifest {
+            clean_management: None,
             genesis,
             admission: genesis_admission(),
             runtime: runtime_binding(),

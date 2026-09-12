@@ -1351,9 +1351,22 @@ where
         &self,
     ) -> Result<Option<super::standard::StandardCleanManagementDisposition>, SharedJournalDriverError>
     {
-        let state = super::wire::decode_standard_runtime_state(self.materialization.state())
-            .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
-        Ok(state.clean_management_dispositions.last().cloned())
+        // The common projection comparator still accepts this legacy-named
+        // value type, but its source is host-owned authenticated replay and
+        // checkpoint evidence, never a decoded private runtime-state image.
+        Ok(self
+            .materialization
+            .clean_management_evidence()
+            .map(
+                |evidence| super::standard::StandardCleanManagementDisposition {
+                    authority: evidence.authority,
+                    request: evidence.request,
+                    epoch: evidence.epoch,
+                    sequence: evidence.sequence,
+                    observed_slot: evidence.observed_slot,
+                    result: evidence.result.clone(),
+                },
+            ))
     }
 
     /// Return the number of durable Ordered records still required by an

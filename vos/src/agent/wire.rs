@@ -457,11 +457,11 @@ fn decode_bounded_list<T>(
     Ok(values)
 }
 
-const MAX_CLEAN_MANAGEMENT_RESULT_BYTES: usize = 8 * 1024;
+pub(crate) const MAX_CLEAN_MANAGEMENT_RESULT_BYTES: usize = 8 * 1024;
 const STANDARD_CLEAN_ACTOR_PACKAGES_MAGIC: [u8; 4] = *b"SCAP";
 const STANDARD_CLEAN_ACTOR_INSTALLATIONS_MAGIC: [u8; 4] = *b"SCI2";
 
-fn encode_clean_management_result(
+pub(crate) fn encode_clean_management_result(
     result: &Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>,
 ) -> Vec<u8> {
     use crate::agent_sdk::wire::CanonicalWire as _;
@@ -473,7 +473,7 @@ fn encode_clean_management_result(
     .expect("persisted clean management result is canonical")
 }
 
-fn decode_clean_management_result(
+pub(crate) fn decode_clean_management_result(
     bytes: &[u8],
 ) -> Result<Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>, DecodeError>
 {

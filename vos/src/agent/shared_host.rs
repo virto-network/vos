@@ -5119,6 +5119,7 @@ mod tests {
         let install = clean_install_request(current_descriptor.identity.agent, actor_package);
         let install_receipt =
             clean_management_receipt(&current_descriptor, &install, 3, &fixture.authority_key);
+        let install_receipt_commitment = install_receipt.commitment();
         slot.store(23, Ordering::SeqCst);
         let install_prepared = host
             .prepare_clean_management(
@@ -5194,8 +5195,27 @@ mod tests {
         );
         assert_eq!(physical.policies.bytes, actor_package.method_policy_bytes());
 
+        let management_evidence = host.agents[&fixture.shared.agent]
+            .driver
+            .latest_clean_management_disposition()
+            .unwrap()
+            .unwrap();
+        assert_eq!(management_evidence.authority, install_receipt_commitment);
+        assert_eq!(management_evidence.request, install.replay_commitment());
+        assert_eq!(
+            management_evidence.result,
+            Ok(crate::agent_sdk::ManagementReply::Installed(entry.clone()))
+        );
+
         drop(host);
         let mut host = open_clean_host(&directory, &fixture, Arc::clone(&slot));
+        assert_eq!(
+            host.agents[&fixture.shared.agent]
+                .driver
+                .latest_clean_management_disposition()
+                .unwrap(),
+            Some(management_evidence)
+        );
         assert_eq!(
             host.supervisor_invocation_material(fixture.shared.agent, entry.actor)
                 .unwrap()

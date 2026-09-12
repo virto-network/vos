@@ -15431,6 +15431,7 @@ mod tests {
             },
         ];
         let manifest = CheckpointManifest {
+            clean_management: None,
             genesis: genesis.id(),
             admission: genesis.admission,
             runtime: heads.runtime.clone(),
@@ -20269,6 +20270,7 @@ mod tests {
         };
         store.put(&closure).unwrap();
         let checkpoint = CheckpointManifest {
+            clean_management: None,
             genesis: genesis.id(),
             admission: genesis.admission,
             runtime: runtime_binding(),
@@ -20724,6 +20726,7 @@ mod tests {
         };
         store.put(&artifacts).unwrap();
         let checkpoint = CheckpointManifest {
+            clean_management: None,
             genesis: genesis.id(),
             admission: genesis.admission,
             runtime: boundary_heads.runtime.clone(),
