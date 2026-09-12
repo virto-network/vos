@@ -424,8 +424,11 @@ physical restart before and after every bootstrap phase and root-pinned
 Authority auditing (`r15-bootstrap-physical-suite.log` under the native
 worktree's disk-backed task logs). `cargo check -p vos-agent-sdk
 --no-default-features` also passes (`r15-sdk-no-std.log`). The separate large
-inventory test is still running in session 89491; its log is
-`r15-inventory-rotation-physical.log`, and its result is not yet a pass.
+inventory test has now passed: one selected test, 514 authenticated queries,
+and suffix rotation past 1,024 entries. Its log is
+`r15-inventory-rotation-physical.log`; elapsed test time was 11334.20s (about
+3h09m), not a performance sign-off. This run predates recovery integration,
+so the final combined release gate still needs to run against its frozen head.
 
 Next: finish the corrected inventory regression, then rerun physical,
 proof, bootstrap, and real first-start/restart gates before integrating this
@@ -492,3 +495,10 @@ exists, but `verify_historical_provision` currently has only test callers. A
 production adapter must bind a provision to authenticated live-system replay,
 including reopen and historical committee evidence; accepting a provision's
 self-consistency or a standalone membership proof is not an adequate substitute.
+
+Integrated Shared host verification: 15 of 16 tests passed in the sandbox;
+the network convergence test failed waiting for a local listening address.
+That exact test then passed with socket access (1.22s), without code changes.
+Evidence: `integrated-shared-host-suite.log` and
+`integrated-merge-pump-network.log`. The full final serial gate must run in a
+socket-capable environment; the sandboxed suite's exit status was not green.
