@@ -18,7 +18,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use fs2::FileExt as _;
 use vos::agent::bootstrap::MAX_SYSTEM_AGENT_GENESIS_PROVISION_BYTES;
 use vos::agent::clean_authority_issuer::{
-    CleanManagementIssuerStore, MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
+    CleanManagementIssuerStore, MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES,
+    MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
 };
 use vos::agent::clean_bootstrap::{
     CleanSystemAgentBootstrapStore, MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES,
@@ -42,6 +43,17 @@ const ISSUER_FILE: &str = "system-agent.management-issuer";
 const ISSUER_STAGE_FILE: &str = "system-agent.management-issuer.next";
 const GENESIS_FILE: &str = "system-agent.genesis-archive";
 const GENESIS_STAGE_FILE: &str = "system-agent.genesis-archive.next";
+const INTENT_FILE: &str = "management.intent";
+const INTENT_STAGE_FILE: &str = "management.intent.next";
+const LIFECYCLE_ISSUER_FILE: &str = "management.issuer";
+const LIFECYCLE_ISSUER_STAGE_FILE: &str = "management.issuer.next";
+const LIFECYCLE_ENTRIES: [&str; 5] = [
+    LOCK_FILE,
+    INTENT_FILE,
+    INTENT_STAGE_FILE,
+    LIFECYCLE_ISSUER_FILE,
+    LIFECYCLE_ISSUER_STAGE_FILE,
+];
 
 pub(crate) const MAX_CLEAN_SYSTEM_AGENT_GENESIS_ARCHIVE_BYTES: usize =
     MAX_SYSTEM_AGENT_GENESIS_PROVISION_BYTES + MAX_PACKAGE_ENCODED_BYTES + 1024;
@@ -120,6 +132,8 @@ enum StoreRole {
     Bootstrap = 2,
     ManagementIssuer = 3,
     GenesisArchive = 4,
+    ManagementIntent = 5,
+    LifecycleIssuer = 6,
 }
 
 impl StoreRole {
@@ -129,6 +143,8 @@ impl StoreRole {
             Self::Bootstrap => BOOTSTRAP_FILE,
             Self::ManagementIssuer => ISSUER_FILE,
             Self::GenesisArchive => GENESIS_FILE,
+            Self::ManagementIntent => INTENT_FILE,
+            Self::LifecycleIssuer => LIFECYCLE_ISSUER_FILE,
         }
     }
 
@@ -138,6 +154,8 @@ impl StoreRole {
             Self::Bootstrap => BOOTSTRAP_STAGE_FILE,
             Self::ManagementIssuer => ISSUER_STAGE_FILE,
             Self::GenesisArchive => GENESIS_STAGE_FILE,
+            Self::ManagementIntent => INTENT_STAGE_FILE,
+            Self::LifecycleIssuer => LIFECYCLE_ISSUER_STAGE_FILE,
         }
     }
 
@@ -147,6 +165,8 @@ impl StoreRole {
             Self::Bootstrap => MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES,
             Self::ManagementIssuer => MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
             Self::GenesisArchive => MAX_CLEAN_SYSTEM_AGENT_GENESIS_ARCHIVE_BYTES,
+            Self::ManagementIntent => MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES,
+            Self::LifecycleIssuer => MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
         }
     }
 
@@ -156,6 +176,8 @@ impl StoreRole {
             2 => Some(Self::Bootstrap),
             3 => Some(Self::ManagementIssuer),
             4 => Some(Self::GenesisArchive),
+            5 => Some(Self::ManagementIntent),
+            6 => Some(Self::LifecycleIssuer),
             _ => None,
         }
     }
@@ -222,6 +244,51 @@ pub(crate) struct CleanSystemAgentBootstrapFile(ExactFileStore);
 pub(crate) struct CleanManagementIssuerFile(ExactFileStore);
 pub(crate) struct CleanSystemAgentGenesisFile(ExactFileStore);
 
+/// One per-agent lifecycle directory with a shared exclusive writer lease.
+/// The coordinator must validate the signed intent and issuer binding against
+/// its configured Space/Agent; the file envelope is integrity, not authority.
+pub(crate) struct CleanManagementLifecycleFiles {
+    intent: CleanManagementIntentFile,
+    issuer: CleanManagementIssuerFile,
+}
+
+impl CleanManagementLifecycleFiles {
+    pub(crate) fn open_or_create(root: impl AsRef<Path>) -> Result<Self, CleanFileStoreError> {
+        let root = Arc::new(StoreRoot::open_with_entries(
+            root.as_ref(),
+            &LIFECYCLE_ENTRIES,
+        )?);
+        Ok(Self {
+            intent: CleanManagementIntentFile(ExactFileStore::new(
+                Arc::clone(&root),
+                StoreRole::ManagementIntent,
+            )),
+            issuer: CleanManagementIssuerFile(ExactFileStore::new(
+                root,
+                StoreRole::LifecycleIssuer,
+            )),
+        })
+    }
+
+    pub(crate) fn into_parts(self) -> (CleanManagementIntentFile, CleanManagementIssuerFile) {
+        (self.intent, self.issuer)
+    }
+}
+
+pub(crate) struct CleanManagementIntentFile(ExactFileStore);
+
+impl CleanManagementIssuerStore for CleanManagementIntentFile {
+    type Error = CleanFileStoreError;
+
+    fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.0.load(MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES)
+    }
+
+    fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+        self.0.commit(image)
+    }
+}
+
 impl CleanSystemAgentGenesisFile {
     pub(crate) fn load(&mut self) -> Result<Option<Vec<u8>>, CleanFileStoreError> {
         self.0.load(MAX_CLEAN_SYSTEM_AGENT_GENESIS_ARCHIVE_BYTES)
@@ -269,6 +336,7 @@ impl CleanManagementIssuerStore for CleanManagementIssuerFile {
 }
 
 struct StoreRoot {
+    allowed_entries: &'static [&'static str],
     parent_path: PathBuf,
     parent: File,
     path: PathBuf,
@@ -279,6 +347,13 @@ struct StoreRoot {
 
 impl StoreRoot {
     fn open_or_create(path: &Path) -> Result<Self, CleanFileStoreError> {
+        Self::open_with_entries(path, &ALLOWED_ENTRIES)
+    }
+
+    fn open_with_entries(
+        path: &Path,
+        allowed_entries: &'static [&'static str],
+    ) -> Result<Self, CleanFileStoreError> {
         validate_new_path(path)?;
         let parent_path = path.parent().ok_or(CleanFileStoreError::InvalidPath)?;
         let parent = open_private_directory(parent_path, true)?;
@@ -295,7 +370,7 @@ impl StoreRoot {
             directory.sync_all()?;
             parent.sync_all()?;
         }
-        audit_named_entries(path)?;
+        audit_named_entries(path, allowed_entries)?;
         let lock = open_lock(&directory, path)?;
         match lock.try_lock_exclusive() {
             Ok(()) => {}
@@ -305,6 +380,7 @@ impl StoreRoot {
             Err(error) => return Err(error.into()),
         }
         let root = Self {
+            allowed_entries,
             parent_path: parent_path.to_path_buf(),
             parent,
             path: path.to_path_buf(),
@@ -356,7 +432,7 @@ impl StoreRoot {
 
     fn audit_entries(&self) -> Result<(), CleanFileStoreError> {
         self.validate_path()?;
-        audit_named_entries(&self.path)?;
+        audit_named_entries(&self.path, self.allowed_entries)?;
         self.validate_path()
     }
 
@@ -882,14 +958,14 @@ fn validate_private_regular_metadata(metadata: &fs::Metadata) -> Result<(), Clea
     Ok(())
 }
 
-fn audit_named_entries(root: &Path) -> Result<(), CleanFileStoreError> {
+fn audit_named_entries(root: &Path, allowed_entries: &[&str]) -> Result<(), CleanFileStoreError> {
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let name = entry
             .file_name()
             .into_string()
             .map_err(|_| CleanFileStoreError::UnexpectedResidue)?;
-        if !ALLOWED_ENTRIES.contains(&name.as_str()) {
+        if !allowed_entries.contains(&name.as_str()) {
             return Err(CleanFileStoreError::UnexpectedResidue);
         }
         validate_private_regular_metadata(&fs::symlink_metadata(entry.path())?)?;
@@ -1125,6 +1201,83 @@ mod tests {
         let staged = decode_envelope(store.role, &encoded, payload.len()).expect("decode stage");
         store.write_stage(&encoded).expect("write stage");
         staged
+    }
+
+    #[test]
+    fn lifecycle_files_reopen_independently_and_share_the_writer_lease() {
+        let fixture = Fixture::new("lifecycle-reopen");
+        let stores = CleanManagementLifecycleFiles::open_or_create(&fixture.root).unwrap();
+        let (mut intent, mut issuer) = stores.into_parts();
+        assert_eq!(intent.load().unwrap(), None);
+        assert_eq!(issuer.load().unwrap(), None);
+        intent.commit(b"pending-intent").unwrap();
+        issuer.commit(b"issued-receipt").unwrap();
+        let predecessor = intent
+            .0
+            .reconcile(MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES)
+            .unwrap()
+            .unwrap();
+        stage(
+            &intent.0,
+            Some(predecessor.commitment()),
+            b"prepared-finalization",
+        );
+        drop(intent);
+        assert!(matches!(
+            CleanManagementLifecycleFiles::open_or_create(&fixture.root),
+            Err(CleanFileStoreError::Busy)
+        ));
+        drop(issuer);
+        let (mut intent, mut issuer) = CleanManagementLifecycleFiles::open_or_create(&fixture.root)
+            .unwrap()
+            .into_parts();
+        assert_eq!(
+            intent.load().unwrap().as_deref(),
+            Some(b"prepared-finalization".as_slice())
+        );
+        assert_eq!(
+            issuer.load().unwrap().as_deref(),
+            Some(b"issued-receipt".as_slice())
+        );
+        assert!(!fixture.root.join(INTENT_STAGE_FILE).exists());
+        assert!(matches!(
+            intent.commit(&vec![0; MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES + 1]),
+            Err(CleanFileStoreError::Oversized)
+        ));
+        assert!(matches!(
+            issuer.commit(&vec![0; MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES + 1]),
+            Err(CleanFileStoreError::Oversized)
+        ));
+    }
+
+    #[test]
+    fn lifecycle_files_reject_bootstrap_names_and_cross_role_envelopes() {
+        let fixture = Fixture::new("lifecycle-role");
+        let (mut intent, mut issuer) = CleanManagementLifecycleFiles::open_or_create(&fixture.root)
+            .unwrap()
+            .into_parts();
+        issuer.commit(b"issuer").unwrap();
+        let bytes = fs::read(fixture.root.join(LIFECYCLE_ISSUER_FILE)).unwrap();
+        write_private(&fixture.root.join(INTENT_FILE), &bytes);
+        assert!(matches!(
+            intent.load(),
+            Err(CleanFileStoreError::WrongStoreRole)
+        ));
+        drop(intent);
+        drop(issuer);
+        assert!(matches!(
+            CleanSystemAgentFileStores::open_or_create(&fixture.root),
+            Err(CleanFileStoreError::UnexpectedResidue)
+        ));
+
+        let fixture = Fixture::new("lifecycle-bootstrap-refusal");
+        let (mut pins, bootstrap, issuer) = fixture.stores().into_parts();
+        pins.commit(b"pins").unwrap();
+        drop((pins, bootstrap, issuer));
+        assert!(matches!(
+            CleanManagementLifecycleFiles::open_or_create(&fixture.root),
+            Err(CleanFileStoreError::UnexpectedResidue)
+        ));
     }
 
     #[test]

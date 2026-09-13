@@ -29,6 +29,13 @@ pub const MAX_CLEAN_MANAGEMENT_ISSUER_DECISIONS: usize =
     super::standard::MAX_AUTHORITY_DISPOSITIONS;
 /// Maximum complete canonical issuer image accepted from durable storage.
 pub const MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES: usize = 512 * 1024;
+
+/// Physical storage bound for the independently persisted native lifecycle
+/// intent. The intent codec and its policy boundary remain crate-private.
+pub const MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES: usize = 64
+    + crate::agent_sdk::wire::MAX_MANAGEMENT_REQUEST_WIRE_BYTES
+    + crate::agent_sdk::wire::MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES
+    + 2 * crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES;
 // Create retains its authority binding in addition to the full authenticated
 // application context. That valid combination exceeds the old 1 KiB bound.
 // Keep a bounded frame large enough for every fixed-width optional field.

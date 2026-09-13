@@ -15,10 +15,8 @@ use crate::agent_sdk::{
 };
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 
-pub(crate) const MAX_INTENT_BYTES: usize = 64
-    + crate::agent_sdk::wire::MAX_MANAGEMENT_REQUEST_WIRE_BYTES
-    + crate::agent_sdk::wire::MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES
-    + 2 * crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES;
+pub(crate) const MAX_INTENT_BYTES: usize =
+    super::clean_authority_issuer::MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CleanManagementIntent {

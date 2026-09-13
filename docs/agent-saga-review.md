@@ -1659,3 +1659,30 @@ Create/finalize adapters and authenticated publication. Shared genesis claim
 publication, independent verification and restart remain explicit required work,
 not waived by a successful Local path. This audit did not modify production
 code, rerun release gates, or establish deployment readiness.
+
+### Native lifecycle file stores
+
+`CleanManagementLifecycleFiles` now provides a dedicated per-agent directory
+with independent `management.intent` and `management.issuer` images under one
+shared exclusive writer lease. It reuses the existing exact-file persistence
+implementation: private directories/files, no alias or hard-link acceptance,
+role-bound integrity envelopes, predecessor-bound staging, atomic publication
+and directory synchronization. New envelope roles 5/6 distinguish these files
+from bootstrap roles 1–4. Separate directory allowlists reject bootstrap files
+inside lifecycle storage and vice versa; existing bootstrap envelopes are
+unchanged.
+
+The intent storage limit is exported from the host library and reused by CMI3
+and the physical store, without exposing the private intent codec or granting
+issuance authority. The enclosing coordinator must still verify configured
+Space/Agent bindings when opening signed intent and issuer images. File-envelope
+integrity alone is not identity authorization.
+
+**28/28 native file-store tests pass**, including both new lifecycle tests, in
+0.38s (`r16-lifecycle-file-stores.log`, locked/offline `vosx` test binary, disk
+scratch). Coverage includes independently preserved issuer bytes during staged
+intent recovery, shared lock lifetime after dropping one handle, payload bounds,
+cross-role swaps and incompatible directory namespaces. These tests use opaque
+payload bytes; they do not yet exercise a native lifecycle command with CMI3/CIS2.
+The stores are implemented but not wired to startup or management ingress. No
+guest artifact was rebuilt, and the three review batches are unchanged.
