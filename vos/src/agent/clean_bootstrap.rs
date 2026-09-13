@@ -2578,6 +2578,52 @@ where
                 }
             }
         })?;
+        let retained = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+        if let Some((receipt, acknowledgement)) = issuer
+            .recover_finalized_application(
+                target,
+                managed,
+                retained.request(),
+                retained.call(),
+                &RawCredentialVerifier,
+            )
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+        {
+            // A finalized issuer record replaces repeated authority dispatch,
+            // never physical application evidence or route publication. Missing
+            // lifecycle envelopes or a missing/substituted Local image fail shut.
+            let Some(RuntimeWork::Invoke { observed_slot, .. }) = slot
+                .authorization_work()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            else {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            };
+            let Some(RuntimeWork::Invoke { invocation, .. }) = slot
+                .finalization_work()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            else {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            };
+            if acknowledgement.applied_at < *observed_slot
+                || invocation.message
+                    != super::clean_management_intent::CleanManagementIntent::finalization_message(
+                        &acknowledgement,
+                    )
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            let agent = descriptor.identity.agent;
+            let observation = local
+                .observe_management_application(agent, retained.request(), &receipt)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let recovered = issuer
+                .observe_local_application(&observation, signer)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            if recovered != acknowledgement {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            return Ok((agent, acknowledgement));
+        }
         let (agent, acknowledgement) = self.create_local_from_management_intent(
             &mut slot,
             managed,
@@ -7752,6 +7798,33 @@ mod tests {
                 assert_eq!(signer.calls, 2);
                 let finalized = owner.ordered_index_for_test().unwrap();
                 assert!(finalized > before);
+                let mut missing_local = crate::agent::local_sdk_host::LocalAgentHost::create(
+                    &harness._directory.0.join("missing-finalized-local"),
+                    descriptor.identity.space,
+                    owner.pins.node,
+                    harness.fixture.trust.clone(),
+                )
+                .unwrap();
+                let saved_intent = store.image.lock().unwrap().clone();
+                let saved_issuer = issuer_store.image.lock().unwrap().clone();
+                assert!(matches!(
+                    owner.create_local_agent(
+                        store.clone(),
+                        issuer_store.clone(),
+                        descriptor.clone(),
+                        call.clone(),
+                        &mut missing_local,
+                        runtime.clone(),
+                        &mut signer,
+                    ),
+                    Err(SharedAgentHostError::Unavailable)
+                ));
+                assert!(missing_local.show(descriptor.identity.agent).is_err());
+                assert_eq!(*store.image.lock().unwrap(), saved_intent);
+                assert_eq!(*issuer_store.image.lock().unwrap(), saved_issuer);
+                assert_eq!(owner.ordered_index_for_test().unwrap(), finalized);
+                assert_eq!(signer.calls, 2);
+                drop(missing_local);
                 drop(local);
                 harness
                     .fixture

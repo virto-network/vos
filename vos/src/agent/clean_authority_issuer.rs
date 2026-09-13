@@ -1427,6 +1427,76 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         Ok(true)
     }
 
+    /// Recover only an already finalized exact lifecycle. This is durable
+    /// delivery evidence, not a new policy decision: it cannot issue a receipt,
+    /// advance a sequence, or complete an unfinished actor transition. Callers
+    /// must still reopen the managed Agent and verify its physical application.
+    pub(crate) fn recover_finalized_application<V: AuthorityCredentialVerifier>(
+        &self,
+        authority: AuthorityActorTarget,
+        managed: ManagedAgentTarget,
+        request: &ManagementRequest,
+        call: &AuthorityCredentialCall,
+        verifier: &V,
+    ) -> Result<
+        Option<(AuthorityReceipt, ManagementApplicationAck)>,
+        CleanManagementIssuerError<B::Error>,
+    > {
+        self.ensure_live()?;
+        let invalid = || {
+            CleanManagementIssuerError::Rejected(CleanManagementIssuerRejection::InvalidObservation)
+        };
+        if call.authority != authority
+            || call.managed != managed
+            || authority.binding != self.image.binding
+            || managed.space != self.image.space
+            || managed.agent != self.image.agent
+            || !call.plan.matches_request(request)
+            || call.verify_with(verifier).is_err()
+        {
+            return Err(invalid());
+        }
+        let Some(record) = &self.image.acknowledged else {
+            return Ok(None);
+        };
+        if !record.application_finalized {
+            return Ok(None);
+        }
+        let decision = decode_authorized_decision(&record.decision)
+            .map_err(|_| CleanManagementIssuerError::InvalidState)?;
+        let Some(application) = decision.application else {
+            return Ok(None);
+        };
+        if application.credential_call != call.commitment() {
+            return Ok(None);
+        }
+        let approval = ManagementApproval::from_call(
+            call,
+            decision.authorization_id,
+            decision.evidence.clone(),
+            decision.lane_roots,
+            decision.epoch,
+            decision.valid_from,
+            decision.expires_at,
+        )
+        .map_err(|_| invalid())?;
+        let expected = AuthorizedCleanManagementDecision::from_approval(
+            authority, managed, request, call, &approval, verifier,
+        )
+        .map_err(|_| invalid())?;
+        if expected != decision {
+            return Err(invalid());
+        }
+        let acknowledgement = ManagementApplicationAck::decode(
+            record.application_ack.as_deref().ok_or_else(invalid)?,
+        )
+        .map_err(|_| invalid())?;
+        if !self.application_finalization_status(&acknowledgement)? {
+            return Err(invalid());
+        }
+        Ok(Some((acknowledgement.receipt.clone(), acknowledgement)))
+    }
+
     /// Validate the exact retained signed acknowledgement without advancing
     /// its finalization barrier. A false result is not actor-application proof.
     pub(crate) fn application_finalization_status(
@@ -3041,6 +3111,97 @@ mod tests {
             .unwrap()
             .application_finalized = false;
         assert!(CleanManagementIssuerImage::decode(&rolled_back_barrier.encode()).is_err());
+    }
+
+    #[test]
+    fn finalized_application_recovery_requires_exact_signed_call_and_durable_barrier() {
+        let store = MemoryImageStore::default();
+        let mut signer = CountingSigner::new(0x28);
+        let fixture = fixture(&signer);
+        let request = request(0x2c);
+        let (call, approval) = approved_call(&fixture, 1, &request);
+        let decision = AuthorizedCleanManagementDecision::from_approval(
+            call.authority,
+            call.managed,
+            &request,
+            &call,
+            &approval,
+            &TestCredentialVerifier,
+        )
+        .unwrap();
+        let mut issuer = open(store.clone(), &fixture);
+        let recover = |issuer: &DurableCleanManagementIssuer<MemoryImageStore>| {
+            issuer.recover_finalized_application(
+                call.authority,
+                call.managed,
+                &request,
+                &call,
+                &TestCredentialVerifier,
+            )
+        };
+        assert_eq!(recover(&issuer).unwrap(), None);
+        let receipt = issuer.issue(&decision, &mut signer).unwrap();
+        assert_eq!(recover(&issuer).unwrap(), None);
+        let ack = issuer
+            .observe_durable_application(
+                &receipt,
+                &application(&request),
+                Hash([0x2e; 32]),
+                fixture.context.valid_from,
+                &mut signer,
+            )
+            .unwrap();
+        assert_eq!(recover(&issuer).unwrap(), None);
+        issuer.observe_durable_actor_finalization(&ack).unwrap();
+        drop(issuer);
+        let mut issuer = open(store.clone(), &fixture);
+        let before = store.image();
+        let calls = signer.calls;
+        assert_eq!(recover(&issuer).unwrap(), Some((receipt, ack)));
+
+        let mut forged = call.clone();
+        forged.signature[0] ^= 1;
+        assert!(
+            issuer
+                .recover_finalized_application(
+                    call.authority,
+                    call.managed,
+                    &request,
+                    &forged,
+                    &TestCredentialVerifier
+                )
+                .is_err()
+        );
+        let mut wrong_managed = call.managed;
+        wrong_managed.agent = AgentId([0xfa; 32]);
+        assert!(
+            issuer
+                .recover_finalized_application(
+                    call.authority,
+                    wrong_managed,
+                    &request,
+                    &call,
+                    &TestCredentialVerifier
+                )
+                .is_err()
+        );
+        let (later_call, _) = approved_call(&fixture, 2, &request);
+        assert_eq!(
+            issuer
+                .recover_finalized_application(
+                    later_call.authority,
+                    later_call.managed,
+                    &request,
+                    &later_call,
+                    &TestCredentialVerifier
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.image(), before);
+        assert_eq!(signer.calls, calls);
+        issuer.poisoned = true;
+        assert!(recover(&issuer).is_err());
     }
 
     #[test]

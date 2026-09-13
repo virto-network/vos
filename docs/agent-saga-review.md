@@ -2322,6 +2322,40 @@ repeats, then verify bounded completion with the updated native binary. Do not
 replace durable authorization or remove physical/Authority verification to make
 the HTTP test pass.
 
+### Finalized Create retry recovery
+
+The issuer can now recover its latest already-finalized application for an
+exact signed credential call. It reconstructs and compares the complete stored
+decision, validates the canonical signed acknowledgement through the existing
+finalization check, and returns no result for an incomplete barrier or a different
+call. This path never issues a new receipt or advances a sequence.
+
+The Local Create coordinator uses that result only when both persisted lifecycle
+envelopes exist, the finalization message matches the exact acknowledgement,
+and the observed slots are consistent. It then reopens the physical Local image
+and verifies the applied result against the retained receipt/acknowledgement.
+A missing Local image fails without recreating it, signing, or mutating the
+intent/issuer. The production owner still performs route reconciliation; the
+durable marker does not replace physical or publication evidence.
+
+All **12 issuer tests pass** in 4.04 seconds (`r16-finalized-create-issuer.log`),
+including exact signed-call recovery across issuer reopen, unfinished-barrier,
+forged-call, wrong-target, different-call, and poisoned-store cases. All **10
+native lifecycle tests pass** in 47.42 seconds (`r16-finalized-create-native.log`),
+including a missing-image retry that preserves both stores and the system journal.
+The updated CLI build passes in 21.69 seconds
+(`r16-finalized-create-cli-build.log`). Logs are under
+`.worktrees/ch08-c2-native/target/task-tmp`, relative to the main checkout.
+Formatting and diff checks pass; no guest artifact or wire format changed.
+
+The previous resume smoke stopped with exit 1 and removed its endpoint. The
+updated CLI is now being tested by `target/native-clock-smoke.GLMaE7/fast-resume-smoke.sh`
+against the same retained request. Its logs use the distinct `fast-resume-` prefix;
+earlier evidence is preserved. A successful native acknowledgement is still
+unproven at this checkpoint. Initial Create latency, journal capacity/retirement,
+Install/invoke, ordinary Shared finality, and the full C1/C2/C3 release gates
+remain open.
+
 ### Durable immutable Local Create request storage
 
 `CleanLocalCreateRequestFile` stores one signed HTTP-compatible LCQ1 submission
