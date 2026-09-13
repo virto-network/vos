@@ -1395,6 +1395,7 @@ where
         finality: Arc<dyn AgentGenesisFinalityVerifier>,
         genesis: Arc<dyn SystemAgentGenesisProvider>,
         network: Arc<Network>,
+        lifecycle: Option<&super::local_lifecycle::LocalLifecycleStartupAdmission>,
     ) -> Result<Self, CleanSystemAgentBootstrapError>
     where
         S: CleanManagementReceiptSigner,
@@ -1433,6 +1434,9 @@ where
                 plan
             }
             (None, None) => {
+                if lifecycle.is_some_and(|admission| !admission.retirements.is_empty()) {
+                    return Err(rejected(CleanSystemAgentBootstrapRejection::InvalidRecord));
+                }
                 if host_root_exists(shared_host_root)? {
                     return Err(rejected(
                         CleanSystemAgentBootstrapRejection::PreexistingHost,
@@ -1441,7 +1445,7 @@ where
                 fresh_plan()?
             }
         };
-        Self::open_or_bootstrap(
+        Self::open_or_bootstrap_with_admission(
             pins_store,
             record_store,
             issuer_store,
@@ -1456,11 +1460,48 @@ where
             finality,
             genesis,
             network,
+            lifecycle,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn open_or_bootstrap<S: CleanManagementReceiptSigner>(
+        pins_store: P,
+        record_store: R,
+        issuer_store: I,
+        signer: &mut S,
+        plan: &AuthorizedCleanSystemAgentBootstrap,
+        shared_host_root: impl AsRef<Path>,
+        stable_lock_path: impl AsRef<Path>,
+        expected_space: SpaceId,
+        expected_node: NodeId,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        finality: Arc<dyn AgentGenesisFinalityVerifier>,
+        genesis: Arc<dyn SystemAgentGenesisProvider>,
+        network: Arc<Network>,
+    ) -> Result<Self, CleanSystemAgentBootstrapError> {
+        Self::open_or_bootstrap_with_admission(
+            pins_store,
+            record_store,
+            issuer_store,
+            signer,
+            plan,
+            shared_host_root,
+            stable_lock_path,
+            expected_space,
+            expected_node,
+            trust,
+            merge,
+            finality,
+            genesis,
+            network,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_or_bootstrap_with_admission<S: CleanManagementReceiptSigner>(
         mut pins_store: P,
         mut record_store: R,
         issuer_store: I,
@@ -1475,9 +1516,13 @@ where
         finality: Arc<dyn AgentGenesisFinalityVerifier>,
         genesis: Arc<dyn SystemAgentGenesisProvider>,
         network: Arc<Network>,
+        lifecycle: Option<&super::local_lifecycle::LocalLifecycleStartupAdmission>,
     ) -> Result<Self, CleanSystemAgentBootstrapError> {
         plan.validate()
             .map_err(CleanSystemAgentBootstrapError::Rejected)?;
+        if lifecycle.is_some_and(|admission| admission.authority != plan.authority_target()) {
+            return Err(rejected(CleanSystemAgentBootstrapRejection::WrongAuthority));
+        }
         let current_slot = validate_plan_scope(
             plan,
             expected_space,
@@ -1512,6 +1557,13 @@ where
             .map(CleanSystemAgentBootstrapRecord::decode)
             .transpose()
             .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidRecord))?;
+        if lifecycle.is_some_and(|admission| !admission.retirements.is_empty())
+            && existing_record
+                .as_ref()
+                .is_none_or(|record| record.phase != CleanSystemAgentBootstrapPhase::Complete)
+        {
+            return Err(rejected(CleanSystemAgentBootstrapRejection::InvalidRecord));
+        }
         if existing_record
             .as_ref()
             .is_some_and(|record| !record.matches_plan(plan))
@@ -1706,7 +1758,20 @@ where
                 record = cleared;
             }
         }
-        let network_host = if let Some(pending) = &record.pending_projection {
+        let retirements = lifecycle.filter(|admission| !admission.retirements.is_empty());
+        if retirements.is_some() && record.pending_projection.is_some() {
+            return Err(CleanSystemAgentBootstrapError::Host(
+                SharedAgentHostError::Conflict,
+            ));
+        }
+        let network_host = if let Some(admission) = retirements {
+            SharedAgentNetworkHost::attach_recovering_management_retirement_set(
+                Arc::clone(&host),
+                network,
+                crate::service::AgentId(plan.pins.agent.0),
+                admission.retirements.clone(),
+            )
+        } else if let Some(pending) = &record.pending_projection {
             let (work, authorization) = pending
                 .invocation()
                 .ok_or_else(|| rejected(CleanSystemAgentBootstrapRejection::DivergentRecord))?;
@@ -3262,7 +3327,7 @@ where
     }
 
     #[cfg(test)]
-    fn ordered_index_for_test(&self) -> Result<u64, SharedAgentHostError> {
+    pub(crate) fn ordered_index_for_test(&self) -> Result<u64, SharedAgentHostError> {
         self.host
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?
@@ -7055,6 +7120,7 @@ mod tests {
                 Arc::clone(&fixture.finality),
                 provider,
                 network,
+                None,
             )
         }
 
@@ -7064,12 +7130,21 @@ mod tests {
             IssuerMemoryStore,
         >;
 
+        type TestLocalLifecycle<F> = crate::agent::local_lifecycle::LocalLifecycleController<
+            BootstrapMemoryStore,
+            BootstrapMemoryStore,
+            IssuerMemoryStore,
+            F,
+            CountingSigner,
+        >;
+
         struct NativeProjectionOwnerHarness {
             owner: Option<MemoryBootstrapOwner>,
             fixture: PhysicalFixture,
             record: BootstrapMemoryStore,
             _directory: TestDirectory,
             network: Arc<Network>,
+            provider: Arc<MemoryProvider>,
         }
 
         impl NativeProjectionOwnerHarness {
@@ -7082,6 +7157,7 @@ mod tests {
                 let network = network(NODE_SEED);
                 let mut signer = CountingSigner::new();
                 let record = BootstrapMemoryStore::default();
+                let provider = Arc::new(MemoryProvider::new(fixture.provision.clone()));
                 let owner = seed_complete_native_projection_owner(
                     &fixture,
                     &directory,
@@ -7089,7 +7165,7 @@ mod tests {
                     record.clone(),
                     IssuerMemoryStore::default(),
                     &mut signer,
-                    Arc::new(MemoryProvider::new(fixture.provision.clone())),
+                    provider.clone(),
                     Arc::clone(&network),
                 );
                 Self {
@@ -7098,6 +7174,7 @@ mod tests {
                     record,
                     _directory: directory,
                     network,
+                    provider,
                 }
             }
 
@@ -7428,6 +7505,11 @@ mod tests {
         #[test]
         fn native_local_lifecycle_controller_adopts_recovery_leases() {
             native_local_management_lifecycle(8);
+        }
+
+        #[test]
+        fn native_local_lifecycle_startup_retires_before_route_publication() {
+            native_local_management_lifecycle(9);
         }
 
         #[test]
@@ -7882,7 +7964,7 @@ mod tests {
                 harness.stop();
                 return;
             }
-            if matches!(coordinated, 2 | 3 | 8) {
+            if matches!(coordinated, 2 | 3 | 8 | 9) {
                 struct LeasedStore {
                     inner: IssuerMemoryStore,
                     active: Arc<AtomicUsize>,
@@ -8076,13 +8158,112 @@ mod tests {
                     .unwrap()
                     .store(LOGICAL_SLOT + 20, Ordering::Release);
                 assert_eq!(
-                    controller.create(descriptor, call, runtime).unwrap(),
+                    controller
+                        .create(descriptor.clone(), call.clone(), runtime.clone())
+                        .unwrap(),
                     result
                 );
                 assert_eq!(opens.load(Ordering::SeqCst), 1);
                 assert_eq!(active.load(Ordering::SeqCst), 2);
                 routes.retire().unwrap();
                 system.retire().unwrap();
+                if coordinated == 9 {
+                    #[inline(never)]
+                    fn restart<F: crate::agent::local_lifecycle::LocalLifecycleStoreFactory>(
+                        controller: TestLocalLifecycle<F>,
+                        harness: &NativeProjectionOwnerHarness,
+                        root: &Path,
+                        descriptor: &AgentDescriptor,
+                        restart: usize,
+                    ) -> TestLocalLifecycle<F> {
+                        let (old_owner, old_local, mut stores, mut signer) =
+                            controller.into_parts_for_test();
+                        let before = old_owner.ordered_index_for_test().unwrap();
+                        let pins = old_owner._pins_store.clone();
+                        let record = old_owner.record_store.clone();
+                        let bootstrap_issuer = old_owner.issuer.into_store();
+                        drop(old_owner._network_host);
+                        drop(old_owner.host);
+                        drop(old_local);
+                        let recovery =
+                            crate::agent::local_lifecycle::discover_local_lifecycle_recovery(
+                                &mut stores,
+                                harness.fixture.plan.authority_target(),
+                                1,
+                            )
+                            .unwrap();
+                        let admission = recovery.startup_admission().unwrap();
+                        assert_eq!(admission.retirements.len(), usize::from(restart == 0));
+                        let mut reopened =
+                            CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_factory(
+                                pins,
+                                record,
+                                bootstrap_issuer,
+                                &mut signer,
+                                || panic!("recovery cannot make a fresh bootstrap plan"),
+                                harness._directory.host(),
+                                harness._directory.lock(),
+                                harness.fixture.plan.pins.space,
+                                harness.fixture.plan.pins.node,
+                                harness.fixture.trust.clone(),
+                                harness.fixture.merge.clone(),
+                                harness.fixture.finality.clone(),
+                                harness.provider.clone(),
+                                harness.network.clone(),
+                                Some(&admission),
+                            )
+                            .unwrap();
+                        assert_eq!(reopened.ordered_index_for_test().unwrap(), before);
+                        if restart == 0 {
+                            let (query, authorization) = fresh_projection_pair(&reopened, 0xe9);
+                            assert!(matches!(
+                                reopened._network_host.reserve_projection_pair(
+                                    HostAgentId(reopened.pins.agent.0),
+                                    &query,
+                                    &authorization,
+                                    false
+                                ),
+                                Err(SharedAgentHostError::Conflict)
+                            ));
+                        }
+                        let local = crate::agent::local_sdk_host::LocalAgentHost::open(
+                            &root,
+                            descriptor.identity.space,
+                            harness.fixture.plan.pins.node,
+                            harness.fixture.trust.clone(),
+                        )
+                        .unwrap();
+                        let controller =
+                            crate::agent::local_lifecycle::LocalLifecycleController::with_recovery(
+                                reopened, local, stores, signer, recovery,
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            controller.ordered_index_for_test().unwrap(),
+                            before + if restart == 0 { 2 } else { 0 }
+                        );
+                        controller
+                    }
+                    for attempt in 0..2 {
+                        // Startup has its own normal-sized thread stack, not
+                        // the large multiphase setup fixture's live frames.
+                        controller = std::thread::scope(|scope| {
+                            scope
+                                .spawn(|| {
+                                    restart(controller, &harness, &root, &descriptor, attempt)
+                                })
+                                .join()
+                                .unwrap()
+                        });
+                        assert_eq!(
+                            controller
+                                .create(descriptor.clone(), call.clone(), runtime.clone())
+                                .unwrap(),
+                            result
+                        );
+                        assert_eq!(active.load(Ordering::SeqCst), 2);
+                    }
+                }
                 drop(controller);
                 assert_eq!(active.load(Ordering::SeqCst), 0);
                 harness.stop();
@@ -8463,6 +8644,15 @@ mod tests {
             assert_eq!(entry.intent.retirement_complete().unwrap(), retired);
             assert_eq!(entry.finalized.is_some(), finalized);
             assert!(entry.issuer.sequence_high_water() > 0);
+            if finalized {
+                let admission = recovery.startup_admission().unwrap();
+                assert_eq!(admission.retirements.len(), usize::from(!retired));
+            } else {
+                assert!(matches!(
+                    recovery.startup_admission(),
+                    Err(SharedAgentHostError::Conflict)
+                ));
+            }
             drop(recovery);
             assert_eq!(stores.opens, 1);
             stores.agents = vec![agent, agent];

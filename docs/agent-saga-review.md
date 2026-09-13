@@ -27,6 +27,12 @@ AJC3 checkpoints and AGIM/AGI2 images are deliberately rejected, with no in-plac
 migration provided; do not point this clean-break build at valuable old data.
 Current host lifecycle images additionally require CMI4/CMR2 with pre-dispatch
 journal anchors; earlier CMI3/CMR1 images are rejected, not migrated.
+Startup now discovers lifecycle stores before system attachment and retires
+verified finalized work before normal routes. Interrupted work with a prepared
+envelope but no finalized issuer acknowledgement currently stops startup,
+preserving its stores. Automatic incomplete-phase recovery and coexistence with
+an unfinished projection remain implementation blockers, not deployment-ready
+behavior. Do not delete those stores to bypass the recovery check.
 
 The integrated library run at `37d6a5720e7e45e4a19850a16a531e6cb316e299`
 completed: **1,663 passed, zero failed, one filtered**, in 1,771.43 seconds.
@@ -3070,6 +3076,52 @@ corrected clock branches (241.53s, `r16-lifecycle-leases-native.log`), and **10
 Formatting and diff checks pass. Logs are in the shared disk-backed
 `target/task-tmp` directory documented above. This is targeted source coverage,
 not a rebuilt-CLI deployment smoke, full-library run or release approval.
+
+### Startup discovery before attachment and finalized-result retirement
+
+Native `vosx` startup now discovers and exclusively leases all Local lifecycle
+store candidates before constructing the system owner. A bounded opaque
+admission value is derived from the independently verified set and checked
+against the durable bootstrap Authority target. Existing finalized work cannot
+cause fresh bootstrap planning or attach against an incomplete bootstrap record.
+Unretired finalized envelope pairs seed the complete network retirement set
+before worker/route publication; that attachment never checkpoints away the
+required Linear evidence. Durable CMR2-completed entries need no journal suffix.
+
+The recovering controller first rechecks every finalized acknowledgement against
+its actual Local image and durable application observation. It then acknowledges
+and commits retirement markers under the restored admission restriction before
+normal lifecycle and projection routes are started. All original store handles
+transfer into the controller. Marker-complete entries are verified but not
+released against another intent's pending reservation.
+
+This is a production startup integration, but not complete crash recovery.
+Prepared incomplete phases currently reject startup before system attachment;
+they are not silently omitted, replayed without protection, or erased. A remaining
+pending projection combined with management retirement also rejects attachment.
+Continuous live protection, incomplete-phase recovery/extension, combined pending
+projection recovery, exhausted-capacity recovery and subsequent install/invoke
+still must be finished. A successful ordinary Create may now be retired on its
+next startup; this does not yet enable continuous live retirement.
+
+The native restart fixture uses the original genesis archive, physical Shared
+and Local host stores, and the normal factory/controller startup APIs. It checks
+pre-cleanup projection rejection, a first reopen that publishes CMR2, a second
+reopen without pending retirement, and exact Create retry after each. Lifecycle
+images in this fixture remain lease-tracked memory stores; real filesystem
+discovery/lease tests are separate. No cross-process CLI smoke is implied.
+
+Final verification: **13 native tests passed** (251.39s,
+`r16-startup-retirement-native-final.log`), **2 bootstrap factory tests passed**
+(2.25s, `r16-startup-retirement-factory.log`), and **10 filesystem lifecycle
+tests passed** (0.12s, `r16-startup-retirement-files-verified.log`). Formatting
+and diff checks pass. Logs remain in shared disk scratch. The dedicated restart
+case also passed separately (18.94s, `r16-startup-retirement-isolated.log`).
+Earlier fixture attempts failed with stack overflow and a mistakenly fresh
+empty genesis archive. The corrected fixture retains its original archive and
+runs restart on a separate default-sized thread stack, without raising stack
+limits. The first cleanup adds exactly two Ordered acknowledgements; the second
+adds none. No new bundled artifacts or rebuilt-CLI smoke is claimed here.
 
 ### Durable client acknowledgement before completion
 

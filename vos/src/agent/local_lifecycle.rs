@@ -254,6 +254,13 @@ pub struct LocalLifecycleRecovery<I: CleanManagementIssuerStore, J: CleanManagem
     pub(crate) entries: Vec<LocalLifecycleRecoveryEntry<I, J>>,
 }
 
+/// Startup admission derived only from verified, still-leased lifecycle stores.
+/// This is not a substitute for recovery of incomplete management phases.
+pub struct LocalLifecycleStartupAdmission {
+    pub(crate) authority: super::sdk::authority::AuthorityActorTarget,
+    pub(crate) retirements: Vec<[super::sdk::RuntimeWork; 2]>,
+}
+
 pub(crate) struct LocalLifecycleRecoveryEntry<
     I: CleanManagementIssuerStore,
     J: CleanManagementIssuerStore,
@@ -265,6 +272,45 @@ pub(crate) struct LocalLifecycleRecoveryEntry<
 }
 
 impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycleRecovery<I, J> {
+    pub fn startup_admission(
+        &self,
+    ) -> Result<LocalLifecycleStartupAdmission, SharedAgentHostError> {
+        let mut retirements = Vec::new();
+        for entry in &self.entries {
+            if entry
+                .intent
+                .retirement_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            {
+                continue;
+            }
+            let authorization = entry
+                .intent
+                .authorization_work()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let finalization = entry
+                .intent
+                .finalization_work()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            match (authorization, finalization, &entry.finalized) {
+                (None, None, None)
+                    if entry.issuer.sequence_high_water() == 0
+                        && !entry.issuer.has_pending_decision()
+                        && entry.issuer.retained_decisions() == 0 => {}
+                (Some(authorization), Some(finalization), Some(_)) => {
+                    retirements.push([authorization.clone(), finalization.clone()]);
+                }
+                // Do not expose ordinary traffic or checkpoint away anchors
+                // while incomplete-phase startup recovery is still unwired.
+                _ => return Err(SharedAgentHostError::Conflict),
+            }
+        }
+        Ok(LocalLifecycleStartupAdmission {
+            authority: self.authority,
+            retirements,
+        })
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -501,16 +547,80 @@ where
     /// Adopt stores previously verified against independently selected pins.
     /// This transfers leases without opening their paths again. The caller
     /// must separately seed system-network recovery before publishing routes;
-    /// adopting store handles does not establish journal admission protection.
+    /// this constructor then rechecks physical Local application and retires
+    /// finalized results before returning normal lifecycle/route access.
     pub fn with_recovery(
-        system: CleanSystemAgentBootstrapOwner<P, R, I>,
+        mut system: CleanSystemAgentBootstrapOwner<P, R, I>,
         local: LocalAgentHost,
         stores: F,
-        signer: S,
-        recovery: LocalLifecycleRecovery<F::Intent, F::Issuer>,
+        mut signer: S,
+        mut recovery: LocalLifecycleRecovery<F::Intent, F::Issuer>,
     ) -> Result<Self, SharedAgentHostError> {
-        if recovery.authority != system.authority_target() {
+        if recovery.authority != system.authority_target()
+            || local.space() != system.pins().space()
+            || local.node() != system.pins().node()
+        {
             return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        // Validate the entire set before retiring any member. Incomplete
+        // phases require their own protected recovery protocol, not omission.
+        recovery.startup_admission()?;
+        for entry in &mut recovery.entries {
+            if let Some(acknowledgement) = &entry.finalized {
+                let request = entry
+                    .intent
+                    .intent()
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                let (receipt, recovered) = entry
+                    .issuer
+                    .recover_finalized_application(
+                        recovery.authority,
+                        request.call().managed,
+                        request.request(),
+                        request.call(),
+                        &super::clean_bootstrap::RawCredentialVerifier,
+                    )
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                if &recovered != acknowledgement {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                // A finalized issuer cannot replace the actual Local image.
+                let observation = local
+                    .observe_management_application(entry.agent, request.request(), &receipt)
+                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+                if entry
+                    .issuer
+                    .observe_local_application(&observation, &mut signer)
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                    != *acknowledgement
+                {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+            }
+        }
+        for entry in &mut recovery.entries {
+            if entry
+                .intent
+                .retirement_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            {
+                continue;
+            }
+            if let Some(acknowledgement) = &entry.finalized {
+                let managed = entry
+                    .intent
+                    .intent()
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?
+                    .call()
+                    .managed;
+                system.finish_management_intent_retirement(
+                    &mut entry.intent,
+                    managed,
+                    acknowledgement,
+                    &entry.issuer,
+                )?;
+            }
         }
         let mut controller = Self::new(system, local, stores, signer)?;
         for entry in recovery.entries {
@@ -546,6 +656,44 @@ where
             self.local.clone(),
             capacity,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ordered_index_for_test(&self) -> Result<u64, SharedAgentHostError> {
+        self.system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .ordered_index_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_parts_for_test(
+        self,
+    ) -> (
+        CleanSystemAgentBootstrapOwner<P, R, I>,
+        LocalAgentHost,
+        F,
+        S,
+    ) {
+        let Self {
+            system,
+            local,
+            stores,
+            retained_stores,
+            signer,
+        } = self;
+        drop(retained_stores);
+        let system = Arc::try_unwrap(system)
+            .ok()
+            .expect("retire system route workers first")
+            .into_inner()
+            .unwrap();
+        let local = Arc::try_unwrap(local)
+            .ok()
+            .expect("retire local route workers first")
+            .into_inner()
+            .unwrap();
+        (system, local, stores, signer)
     }
 
     /// Complete Create/application/finalization, retaining evidence for later

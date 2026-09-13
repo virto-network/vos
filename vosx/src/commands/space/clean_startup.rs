@@ -60,6 +60,7 @@ const SHARED_AGENT_HOST_DIRECTORY: &str = "agent-host";
 const LOCAL_AGENT_HOST_DIRECTORY: &str = "local-agent-host";
 const LOCAL_LIFECYCLE_DIRECTORY: &str = "local-agent-lifecycle";
 const PROJECTION_ROUTE_QUEUE_CAPACITY: usize = 64;
+const LOCAL_LIFECYCLE_RECOVERY_LIMIT: usize = 1_024;
 const PROJECTION_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Shared immutable bootstrap derivation for startup and fresh CLI requests.
@@ -381,6 +382,18 @@ pub(crate) fn start_clean_system_agent(
         )
         .map(|prepared| prepared.into_parts().0)
     };
+    let mut lifecycle_stores = CleanManagementLifecycleStoreFactory::open_or_create(
+        data_dir.join(LOCAL_LIFECYCLE_DIRECTORY),
+        space,
+    )?;
+    let lifecycle_recovery = vos::agent::local_lifecycle::discover_local_lifecycle_recovery(
+        &mut lifecycle_stores,
+        authority_target,
+        LOCAL_LIFECYCLE_RECOVERY_LIMIT,
+    )
+    .map_err(|error| anyhow::anyhow!("verify Local lifecycle stores before startup: {error:?}"))?;
+    let lifecycle_admission = lifecycle_recovery.startup_admission()
+        .map_err(|error| anyhow::anyhow!("Local lifecycle requires incomplete-phase recovery before startup; preserved all stores: {error:?}"))?;
     let owner = CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_factory(
         pins_store,
         record_store,
@@ -396,6 +409,7 @@ pub(crate) fn start_clean_system_agent(
         finality,
         genesis,
         network,
+        Some(&lifecycle_admission),
     )?;
     let local_root = data_dir.join(LOCAL_AGENT_HOST_DIRECTORY);
     let local = match std::fs::symlink_metadata(&local_root) {
@@ -415,15 +429,12 @@ pub(crate) fn start_clean_system_agent(
         }
         Err(error) => return Err(error.into()),
     };
-    let lifecycle_stores = CleanManagementLifecycleStoreFactory::open_or_create(
-        data_dir.join(LOCAL_LIFECYCLE_DIRECTORY),
-        space,
-    )?;
-    let lifecycle = vos::agent::local_lifecycle::LocalLifecycleController::new(
+    let lifecycle = vos::agent::local_lifecycle::LocalLifecycleController::with_recovery(
         owner,
         local,
         lifecycle_stores,
         OwnedCleanOperatorIdentitySigner::new(operator.clone())?,
+        lifecycle_recovery,
     )?;
     node.start_clean_local_agent_production(
         clean_node,
