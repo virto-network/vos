@@ -6859,9 +6859,38 @@ mod tests {
             1
         );
 
+        #[cfg(feature = "http-ingress")]
+        {
+            let credential = crate::ingress::ApiAccessCredential::from_seed([0x71; 32]).unwrap();
+            let before = inventory.queries.load(Ordering::Acquire);
+            for nonce in [Hash([0x72; 32]), Hash([0x73; 32])] {
+                let projection = ingress.authenticate_clean_api(&credential, nonce).unwrap();
+                assert_eq!(projection.query.authority, target);
+                assert_eq!(projection.query.nonce, nonce);
+                assert_eq!(projection.query.credential, credential.credential_id());
+                assert_eq!(
+                    projection.query.selector,
+                    AuthorityProjectionSelector::Credential
+                );
+                projection
+                    .query
+                    .verify_api_with(&crate::agent::clean_bootstrap::RawCredentialVerifier)
+                    .unwrap();
+            }
+            assert_eq!(inventory.queries.load(Ordering::Acquire), before + 2);
+        }
+
         node.shutdown();
         assert!(node.clean_agent_supervisor().is_none());
         assert!(ingress.clean_agent_supervisor().is_none());
+        #[cfg(feature = "http-ingress")]
+        assert_eq!(
+            ingress.authenticate_clean_api(
+                &crate::ingress::ApiAccessCredential::from_seed([0x71; 32]).unwrap(),
+                Hash([0x74; 32])
+            ),
+            Err(crate::node::IngressAuthenticationError::AuthorityUnavailable)
+        );
         node.collect_checked().unwrap();
         assert!(system_route.retired.load(Ordering::Acquire));
         assert!(!supervisor.is_running());

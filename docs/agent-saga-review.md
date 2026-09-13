@@ -20,9 +20,11 @@ acknowledgement after native route reconciliation. Exact repeated delivery now
 passes after recovering a recorded HTTP timeout; first-response latency remains
 high. The fresh signed-denial / valid-successor / exact-retry campaign also
 passes at `8abbe363`, but requires two HTTP 504 retries for the valid Create.
-Install delivery has passed exact recovery after restart, but actual actor
-method invocation through ingress remains unproven. This is not yet a usable
-ordinary-agent production path.
+Install delivery has passed exact recovery after restart. A Public Catalog
+query on the installed Local actor now passes through clean HTTP preparation,
+invocation, retained delivery and an exact HTTP retry. Invocation after restart
+is running; protected/non-Public and mutating actor workflows remain open.
+This is not yet a usable ordinary-agent production path.
 The native Local Install application and startup-recovery phases now pass
 physical tests from prepared authorization through retirement, including
 pristine client-retry admission. Native Install controller handoff, retry and
@@ -30,9 +32,9 @@ restart now pass; the production-owner wrapper requires an exact active Local
 route after reconciliation. Install now has signed-frame, bounded native queue
 and HTTP server wiring, plus retained-request and fresh managed CLI commands.
 Fresh Install discovery/preparation/credential allocation is wired; managed
-resume and a fresh successor Install now pass live. Actual actor method
-invocation remains unproven. Do not treat command availability as an
-end-to-end invocation pass.
+resume and a fresh successor Install now pass live. A Public actor query now
+passes live, but this does not prove protected/mutating invocation or the full
+restart workflow. Do not treat command availability as an end-to-end pass.
 The first fresh Install campaign on saved disposable state failed all four
 HTTP waits (604.30s total test time), then shut down cleanly after route
 reconciliation finished. No client MAA2 was retained in that failed campaign.
@@ -4871,6 +4873,40 @@ daemon rebuild passes in 18.76s (`r16-preparation-clean-auth-build.log`). A new
 live run is in progress with `invocation-clean-auth-*` logs, leaving both prior
 campaigns intact. The test result is still pending; inspect that existing run
 before starting another. Formatting and diff checks pass.
+
+The attached-owner test additionally exercises `authenticate_clean_api` through
+the published node ingress handle: two distinct nonces reach the selected clean
+Authority, their exact target/credential/selector and raw API signatures verify,
+and shutdown makes authentication unavailable. It passes once in 0.03s
+(`r16-clean-api-attached-authority.log`). This is trusted-adapter wiring
+coverage, not a substitute for the running physical campaign.
+
+### Live Public Catalog invocation passed
+
+The clean-auth campaign is terminal and passed: start 16:53:24Z, readiness
+16:59:22Z, client completion 16:59:56Z, clean shutdown 17:00:08Z and endpoint
+removal. The live test passed once in 13.15s after 21.53s of harness compilation
+(`invocation-clean-auth-client-test.log`). It authenticated physical preparation,
+selected the installed `page` policy, retained ASQ1 before submission, decoded
+a successful empty Catalog page with exact target/namespace, saved bound ASR1,
+and matched a second real HTTP response. This is not just cached local delivery.
+
+The two records are retained under
+`target/native-denial-head-reuse.XoaplU/space/agent-client/invocation-smoke/`.
+Their CSF1 file SHA-256 values before restart are
+`fa487b4a948b65e55c23592d1ebf737125d0b4482d860529551a986c950b3980`
+(request) and
+`e7ef5f5048ae0a83dc70fc32642bf80cadf2bc7bae3accc5b610fb59ef27ff37`
+(response).
+A new campaign with separate `invocation-restart-*` logs is running against
+the same stopped/reopened state and exact saved request. The harness forces
+HTTP even when local ASR1 exists, so restart is not passed by an offline cache
+check. That campaign remains pending; inspect its existing process first.
+
+This closes a live Public Query delivery check only. It does not prove mutation,
+protected Authority-operation issuance, continuation/acknowledgement delivery,
+attested execution, ordinary Shared finality, or the remaining release matrix.
+Startup still took about 358 seconds in this campaign and remains a UX issue.
 
 ### Durable client acknowledgement before completion
 
