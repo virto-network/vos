@@ -9746,8 +9746,8 @@ mod tests {
         #[test]
         fn native_operation_dispatch_executes_bundled_policy_with_exact_journal_binding() {
             use crate::agent::authority_operation_coordinator::tests::unenrolled_native_dispatch;
+            use crate::agent::clean_bootstrap::operation_dispatch::RetainedAuthorityOperationDispatch;
             use crate::agent::clean_bootstrap::operation_dispatch::matches_operation_envelope;
-            use crate::agent::clean_management_intent::ManagementJournalAnchor;
             use crate::value::Value;
             use std::io::Write as _;
             let mut harness = NativeProjectionOwnerHarness::with_fixture(
@@ -9766,38 +9766,62 @@ mod tests {
                 .prepare_authority_operation_dispatch(&request)
                 .unwrap();
             assert!(matches_operation_envelope(&request, &envelope));
-            let agent = HostAgentId(owner.pins.agent.0);
-            // Persist the entire pre-dispatch input while native admission is
-            // held. This test-only file is not the eventual startup format.
-            owner
-                ._network_host
-                .capture_management_pending(agent, &envelope, |(anchor, work)| {
-                    let mut bytes = Vec::new();
-                    let mut encoder = vos_protocol::wire::Encoder(&mut bytes);
-                    encoder.bytes(&anchor.encode());
-                    encoder.bytes(&work.encode().unwrap());
-                    let mut file = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&saved_path)
-                        .unwrap();
-                    file.write_all(&bytes).unwrap();
-                    file.sync_all().unwrap();
-                    std::fs::File::open(saved_path.parent().unwrap())
-                        .unwrap()
-                        .sync_all()
-                        .unwrap();
+            let before_capture = owner.ordered_index_for_test().unwrap();
+            // An ambiguous callback result after durable publication must
+            // retain admission and exactly reproduce the original record.
+            let capture = owner.capture_authority_operation_dispatch(&request, |retained| {
+                let bytes = retained.encode().unwrap();
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&saved_path)
+                    .unwrap();
+                file.write_all(&bytes).unwrap();
+                file.sync_all().unwrap();
+                std::fs::File::open(saved_path.parent().unwrap())
+                    .unwrap()
+                    .sync_all()
+                    .unwrap();
+                Err(SharedAgentHostError::Unavailable)
+            });
+            assert!(matches!(capture, Err(SharedAgentHostError::Unavailable)));
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before_capture);
+            let saved = std::fs::read(&saved_path).unwrap();
+            let retained = RetainedAuthorityOperationDispatch::decode(&saved).unwrap();
+            assert_eq!(retained.encode().unwrap(), saved);
+            assert_eq!(retained.request(), &request);
+            let repeated_capture = owner
+                .capture_authority_operation_dispatch(&request, |candidate| {
+                    assert_eq!(candidate.encode().unwrap(), saved);
                     Ok(())
                 })
                 .unwrap();
-            let saved = std::fs::read(&saved_path).unwrap();
-            let mut decoder = vos_protocol::wire::Decoder::new(&saved);
-            let anchor =
-                ManagementJournalAnchor::decode(&decoder.bytes_bounded(1024).unwrap()).unwrap();
-            let persisted =
-                RuntimeWork::decode(&decoder.bytes_bounded(MAX_RUNTIME_WORK_WIRE_BYTES).unwrap())
-                    .unwrap();
-            assert!(decoder.exhausted());
+            assert_eq!(repeated_capture, retained);
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before_capture);
+            let anchor = retained.anchor().clone();
+            let persisted = retained.envelope().clone();
+            for end in [0, 3, saved.len() - 1] {
+                assert!(RetainedAuthorityOperationDispatch::decode(&saved[..end]).is_err());
+            }
+            let mut trailing = saved.clone();
+            trailing.push(0);
+            assert!(RetainedAuthorityOperationDispatch::decode(&trailing).is_err());
+            let mut wrong_domain = saved.clone();
+            wrong_domain[0] ^= 1;
+            assert!(RetainedAuthorityOperationDispatch::decode(&wrong_domain).is_err());
+            let method_offset = 4 + crate::agent_sdk::RUNTIME_ABI_ID.as_bytes().len();
+            for tag in [1, 255] {
+                let mut wrong_method = saved.clone();
+                wrong_method[method_offset] = tag;
+                assert!(RetainedAuthorityOperationDispatch::decode(&wrong_method).is_err());
+            }
+            let mut wrong_abi = saved.clone();
+            wrong_abi[4] ^= 1;
+            assert!(RetainedAuthorityOperationDispatch::decode(&wrong_abi).is_err());
+            let mut oversized_request = saved.clone();
+            oversized_request[method_offset + 1..method_offset + 5]
+                .copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(RetainedAuthorityOperationDispatch::decode(&oversized_request).is_err());
             assert_eq!(persisted, envelope);
             let before = owner.ordered_index_for_test().unwrap();
             let mut changed = request.clone();

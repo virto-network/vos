@@ -6,6 +6,133 @@ use super::*;
 use crate::agent::authority_operation_coordinator::{
     AuthorityOperationActorDispatch, AuthorityOperationActorMethod, AuthorityOperationActorResult,
 };
+use crate::agent::clean_management_intent::ManagementJournalAnchor;
+use crate::agent::sdk::authority_operation::{
+    AuthorityOperationCall, AuthorityOperationIssuanceAck, MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES,
+    MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES,
+};
+
+const MAX_DISPATCH_REQUEST_BYTES: usize =
+    if MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES > MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES {
+        MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES
+    } else {
+        MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES
+    };
+const MAX_DISPATCH_ANCHOR_BYTES: usize = 1024;
+
+/// Immutable native input retained before operation policy or AOI1 execution.
+/// A valid record is not its own trust anchor: reopening/execution must still
+/// authenticate its pinned Authority and journal admission through the owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RetainedAuthorityOperationDispatch {
+    request: AuthorityOperationActorDispatch,
+    envelope: RuntimeWork,
+    anchor: ManagementJournalAnchor,
+}
+
+impl RetainedAuthorityOperationDispatch {
+    fn new(
+        request: AuthorityOperationActorDispatch,
+        envelope: RuntimeWork,
+        anchor: ManagementJournalAnchor,
+    ) -> Result<Self, SharedAgentHostError> {
+        let record = Self {
+            request,
+            envelope,
+            anchor,
+        };
+        record
+            .validate_wire()
+            .then_some(record)
+            .ok_or(SharedAgentHostError::ScopeMismatch)
+    }
+
+    pub(crate) fn request(&self) -> &AuthorityOperationActorDispatch {
+        &self.request
+    }
+
+    pub(crate) fn envelope(&self) -> &RuntimeWork {
+        &self.envelope
+    }
+
+    pub(crate) fn anchor(&self) -> &ManagementJournalAnchor {
+        &self.anchor
+    }
+}
+
+impl CanonicalWire for RetainedAuthorityOperationDispatch {
+    const MAGIC: [u8; 4] = *b"NOD1";
+    const MAX_ENCODED_BYTES: usize =
+        64 + MAX_DISPATCH_REQUEST_BYTES + MAX_RUNTIME_WORK_WIRE_BYTES + MAX_DISPATCH_ANCHOR_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        matches_operation_envelope(&self.request, &self.envelope)
+            && self.envelope.validate_wire()
+            && self.request.request.len() <= MAX_DISPATCH_REQUEST_BYTES
+            && ManagementJournalAnchor::decode(&self.anchor.encode())
+                .is_ok_and(|anchor| anchor == self.anchor)
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encoder.u8(self.request.method as u8);
+        encoder.bytes(&self.request.request);
+        encoder.bytes(
+            &self
+                .envelope
+                .encode()
+                .expect("validated native operation work"),
+        );
+        encoder.bytes(&self.anchor.encode());
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let method = match decoder.u8()? {
+            0 => AuthorityOperationActorMethod::AuthorizeOperation,
+            1 => AuthorityOperationActorMethod::AcknowledgeIssuance,
+            _ => return Err(DecodeError::InvalidTag),
+        };
+        let bytes = decoder.bytes_bounded(MAX_DISPATCH_REQUEST_BYTES)?;
+        let target = match method {
+            AuthorityOperationActorMethod::AuthorizeOperation => {
+                AuthorityOperationCall::decode(&bytes)
+                    .map_err(|_| DecodeError::NonCanonical)?
+                    .authority
+            }
+            AuthorityOperationActorMethod::AcknowledgeIssuance => {
+                AuthorityOperationIssuanceAck::decode(&bytes)
+                    .map_err(|_| DecodeError::NonCanonical)?
+                    .authority
+            }
+        };
+        let envelope = RuntimeWork::decode(&decoder.bytes_bounded(MAX_RUNTIME_WORK_WIRE_BYTES)?)
+            .map_err(|_| DecodeError::NonCanonical)?;
+        let anchor =
+            ManagementJournalAnchor::decode(&decoder.bytes_bounded(MAX_DISPATCH_ANCHOR_BYTES)?)
+                .map_err(|_| DecodeError::NonCanonical)?;
+        let RuntimeWork::Invoke {
+            invocation,
+            observed_slot,
+            ..
+        } = &envelope
+        else {
+            return Err(DecodeError::NonCanonical);
+        };
+        let request = AuthorityOperationActorDispatch {
+            target,
+            method,
+            context: crate::agent_sdk::InvocationContext {
+                invocation: invocation.invocation,
+                actor: invocation.actor,
+                mode: invocation.mode,
+                origin: invocation.origin,
+                roles: invocation.roles,
+                observed_slot: *observed_slot,
+            },
+            request: bytes,
+        };
+        Self::new(request, envelope, anchor).map_err(|_| DecodeError::NonCanonical)
+    }
+}
 
 fn operation_message(request: &AuthorityOperationActorDispatch) -> Vec<u8> {
     dynamic_message(
@@ -64,6 +191,39 @@ where
     R: CleanSystemAgentBootstrapStore,
     I: CleanManagementIssuerStore,
 {
+    /// Reserve and durably retain the first exact operation invocation before
+    /// it is given to the coordinator. The callback runs under admission and
+    /// must sync the record without re-entering this owner. A callback error
+    /// retains the reservation; retry/reopen must resolve the saved evidence.
+    /// Once a record exists, use it directly: do not call fresh preparation
+    /// after the observed clock or installed material has advanced.
+    pub(crate) fn capture_authority_operation_dispatch<F>(
+        &mut self,
+        request: &AuthorityOperationActorDispatch,
+        persist: F,
+    ) -> Result<RetainedAuthorityOperationDispatch, SharedAgentHostError>
+    where
+        F: FnOnce(&RetainedAuthorityOperationDispatch) -> Result<(), SharedAgentHostError>,
+    {
+        if request.method != AuthorityOperationActorMethod::AuthorizeOperation {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let proposed = self.prepare_authority_operation_dispatch(request)?;
+        self._network_host.capture_management_pending(
+            crate::service::AgentId(self.pins.agent.0),
+            &proposed,
+            |(anchor, envelope)| {
+                let retained = RetainedAuthorityOperationDispatch::new(
+                    request.clone(),
+                    envelope.clone(),
+                    anchor.clone(),
+                )?;
+                persist(&retained)?;
+                Ok(retained)
+            },
+        )
+    }
+
     /// Prepare only fresh work. Recovery must use the saved whole envelope,
     /// never current installation data or a regenerated authorization clock.
     pub(crate) fn prepare_authority_operation_dispatch(
