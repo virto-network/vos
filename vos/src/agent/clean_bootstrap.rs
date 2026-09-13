@@ -19,8 +19,9 @@ pub use operation_controller::{
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 pub use operation_dispatch::{
-    MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES, NativeAuthorityOperationJournalStore,
-    NativeAuthorityOperationStartupAdmission, native_operation_record_matches,
+    MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES, NativeAuthorityOperationCompletionSigner,
+    NativeAuthorityOperationJournalStore, NativeAuthorityOperationStartupAdmission,
+    native_operation_record_matches,
 };
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
@@ -1500,7 +1501,7 @@ where
         let loaded_record = record_store
             .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
             .map_err(|_| CleanSystemAgentBootstrapError::RecordStorage)?;
-        if operations.is_some_and(|admission| !admission.pending.is_empty())
+        if operations.is_some_and(|admission| !admission.is_empty())
             && loaded_record.as_deref().is_none_or(|bytes| {
                 !CleanSystemAgentBootstrapRecord::decode(bytes)
                     .is_ok_and(|record| record.phase == CleanSystemAgentBootstrapPhase::Complete)
@@ -1863,13 +1864,21 @@ where
             }
         }
         let management = lifecycle.filter(|admission| !admission.is_empty());
-        let operations = operations.filter(|admission| !admission.pending.is_empty());
+        let operations = operations.filter(|admission| !admission.is_empty());
         if (management.is_some() || operations.is_some()) && record.pending_projection.is_some() {
             return Err(CleanSystemAgentBootstrapError::Host(
                 SharedAgentHostError::Conflict,
             ));
         }
         let network_host = if management.is_some() || operations.is_some() {
+            let mut retirements = management
+                .map(|admission| admission.retirements.clone())
+                .unwrap_or_default();
+            retirements.extend(
+                operations
+                    .into_iter()
+                    .flat_map(|admission| admission.retirements.iter().cloned()),
+            );
             let mut pending: Vec<_> = management
                 .into_iter()
                 .flat_map(|admission| admission.pending.iter().flatten().cloned())
@@ -1884,9 +1893,7 @@ where
                 network,
                 crate::service::AgentId(plan.pins.agent.0),
                 pending,
-                management
-                    .map(|admission| admission.retirements.clone())
-                    .unwrap_or_default(),
+                retirements,
             )
         } else if let Some(pending) = &record.pending_projection {
             let (work, authorization) = pending
@@ -9970,6 +9977,20 @@ mod tests {
             struct Signer {
                 key: SigningKey,
                 calls: usize,
+                completion_calls: usize,
+            }
+            impl NativeAuthorityOperationCompletionSigner for Signer {
+                type Error = core::convert::Infallible;
+                fn public_key(&self) -> [u8; 32] {
+                    self.key.verifying_key().to_bytes()
+                }
+                fn sign_native_operation_completion(
+                    &mut self,
+                    bytes: &[u8],
+                ) -> Result<[u8; 64], Self::Error> {
+                    self.completion_calls += 1;
+                    Ok(self.key.sign(bytes).to_bytes())
+                }
             }
             impl AuthorityOperationEvidenceSigner for Signer {
                 type Error = core::convert::Infallible;
@@ -10129,6 +10150,7 @@ mod tests {
             let mut signer = Signer {
                 key: SigningKey::from_bytes(&[RECEIPT_SEED; 32]),
                 calls: 0,
+                completion_calls: 0,
             };
             let before = owner.ordered_index_for_test().unwrap();
             let issued = operations
@@ -10170,7 +10192,7 @@ mod tests {
                     fixture.trust.clone(),
                     fixture.merge.clone(),
                     fixture.finality.clone(),
-                    provider,
+                    provider.clone(),
                     network.clone(),
                     None,
                     Some(&admission),
@@ -10215,12 +10237,82 @@ mod tests {
                 .verify_native_operation_completion(&authorization, &acknowledgement, &issued)
                 .unwrap();
             assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+            let completion_path = directory.0.join("operation-completion");
+            assert!(matches!(
+                owner.retain_native_operation_completion(&completion, &mut signer, |bytes| {
+                    write_operation_test_image(&completion_path, bytes).unwrap();
+                    Err(SharedAgentHostError::Unavailable)
+                }),
+                Err(SharedAgentHostError::Unavailable)
+            ));
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+            let certificate = std::fs::read(&completion_path).unwrap();
+            let completion = owner
+                .retain_native_operation_completion(&completion, &mut signer, |bytes| {
+                    assert_eq!(bytes, certificate);
+                    std::fs::File::open(&completion_path)
+                        .unwrap()
+                        .sync_all()
+                        .unwrap();
+                    std::fs::File::open(completion_path.parent().unwrap())
+                        .unwrap()
+                        .sync_all()
+                        .unwrap();
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(signer.completion_calls, 2);
+            for end in [0, 3, certificate.len() - 1] {
+                assert!(
+                    owner
+                        .restore_native_operation_completion(
+                            &authorization,
+                            &acknowledgement,
+                            &certificate[..end]
+                        )
+                        .is_err()
+                );
+            }
+            let mut invalid_certificate = certificate.clone();
+            *invalid_certificate.last_mut().unwrap() ^= 1;
+            assert!(
+                owner
+                    .restore_native_operation_completion(
+                        &authorization,
+                        &acknowledgement,
+                        &invalid_certificate
+                    )
+                    .is_err()
+            );
+            let mut trailing = certificate.clone();
+            trailing.push(0);
+            assert!(
+                owner
+                    .restore_native_operation_completion(
+                        &authorization,
+                        &acknowledgement,
+                        &trailing
+                    )
+                    .is_err()
+            );
+            assert!(
+                owner
+                    .restore_native_operation_completion(
+                        &acknowledgement,
+                        &authorization,
+                        &certificate
+                    )
+                    .is_err()
+            );
             assert!(
                 owner
                     .acknowledge_native_operation_completion(&completion)
                     .unwrap()
             );
             assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
+            let completion = owner
+                .restore_native_operation_completion(&authorization, &acknowledgement, &certificate)
+                .unwrap();
             assert!(
                 !owner
                     .acknowledge_native_operation_completion(&completion)
@@ -10239,6 +10331,82 @@ mod tests {
                 Some(acknowledgement_bytes)
             );
             let (query, query_auth) = fresh_projection_pair(&owner, 0xd7);
+            assert!(matches!(
+                owner._network_host.reserve_projection_pair(
+                    HostAgentId(owner.pins.agent.0),
+                    &query,
+                    &query_auth,
+                    false,
+                ),
+                Err(SharedAgentHostError::Conflict)
+            ));
+            let pins = owner._pins_store.clone();
+            let record = owner.record_store.clone();
+            let issuer = owner.issuer.into_store();
+            drop(owner._network_host);
+            drop(owner.host);
+            fixture
+                .logical_slot
+                .as_ref()
+                .unwrap()
+                .store(slot + 6, Ordering::Release);
+            let invocations = [
+                call.invocation,
+                issued.issuance_ack.acknowledgement_invocation,
+            ];
+            assert!(
+                NativeAuthorityOperationStartupAdmission::load_with_completions(
+                    &mut journal,
+                    authority,
+                    &invocations,
+                    &[certificate.clone(), certificate.clone()],
+                )
+                .is_err()
+            );
+            let admission = NativeAuthorityOperationStartupAdmission::load_with_completions(
+                &mut journal,
+                authority,
+                &invocations,
+                &[std::fs::read(&completion_path).unwrap()],
+            )
+            .unwrap();
+            assert!(admission.pending.is_empty());
+            assert_eq!(admission.retirements.len(), 1);
+            let mut owner =
+                CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+                    pins,
+                    record,
+                    issuer,
+                    &mut CountingSigner::new(),
+                    || panic!("retirement must reopen"),
+                    directory.host(),
+                    directory.lock(),
+                    fixture.plan.pins.space,
+                    fixture.plan.pins.node,
+                    fixture.trust.clone(),
+                    fixture.merge.clone(),
+                    fixture.finality.clone(),
+                    provider,
+                    network.clone(),
+                    None,
+                    Some(&admission),
+                )
+                .unwrap();
+            drop(admission);
+            let restored = owner
+                .restore_native_operation_completion(
+                    &authorization,
+                    &acknowledgement,
+                    &std::fs::read(&completion_path).unwrap(),
+                )
+                .unwrap();
+            assert!(
+                !owner
+                    .acknowledge_native_operation_completion(&restored)
+                    .unwrap()
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
+            let (query, query_auth) = fresh_projection_pair(&owner, 0xd8);
             assert!(matches!(
                 owner._network_host.reserve_projection_pair(
                     HostAgentId(owner.pins.agent.0),

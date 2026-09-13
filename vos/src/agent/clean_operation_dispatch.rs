@@ -3,6 +3,8 @@
 //! execution, and retain admission until coordinator/issuer recovery retires it.
 
 use super::*;
+#[path = "clean_operation_completion.rs"]
+mod completion;
 use crate::agent::authority_operation_coordinator::{
     AuthorityOperationActorDispatch, AuthorityOperationActorDispatcher,
     AuthorityOperationActorMethod, AuthorityOperationActorResult,
@@ -12,6 +14,8 @@ use crate::agent::sdk::authority_operation::{
     AuthorityOperationApproval, AuthorityOperationCall, AuthorityOperationIssuanceAck,
     MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES, MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES,
 };
+pub use completion::NativeAuthorityOperationCompletionSigner;
+pub(crate) use completion::RetainedNativeOperationCompletion;
 
 const MAX_DISPATCH_REQUEST_BYTES: usize =
     if MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES > MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES {
@@ -54,6 +58,7 @@ pub trait NativeAuthorityOperationJournalStore {
 pub struct NativeAuthorityOperationStartupAdmission<'a> {
     pub(super) authority: AuthorityActorTarget,
     pub(super) pending: Vec<(ManagementJournalAnchor, RuntimeWork)>,
+    pub(super) retirements: Vec<[RuntimeWork; 2]>,
     _lease: core::marker::PhantomData<&'a mut ()>,
 }
 
@@ -65,8 +70,24 @@ impl<'a> NativeAuthorityOperationStartupAdmission<'a> {
         authority: AuthorityActorTarget,
         invocations: &[InvocationId],
     ) -> Result<Self, SharedAgentHostError> {
+        Self::load_with_completions(journal, authority, invocations, &[])
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.pending.is_empty() && self.retirements.is_empty()
+    }
+
+    /// Signed continuations classify exact pairs as retiring, never released.
+    /// The caller must retain the completion store's lease alongside the journal.
+    pub fn load_with_completions<J: NativeAuthorityOperationJournalStore>(
+        journal: &'a mut J,
+        authority: AuthorityActorTarget,
+        invocations: &[InvocationId],
+        certificates: &[Vec<u8>],
+    ) -> Result<Self, SharedAgentHostError> {
         let maximum = 2 * crate::agent::authority_operation_coordinator::MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS;
-        if !authority.is_valid() || invocations.len() > maximum {
+        if !authority.is_valid() || invocations.len() > maximum || certificates.len() > maximum / 2
+        {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         let mut records = std::collections::BTreeMap::new();
@@ -104,12 +125,33 @@ impl<'a> NativeAuthorityOperationStartupAdmission<'a> {
                 }
             }
         }
+        let mut retiring = std::collections::BTreeSet::new();
+        let mut retirements = Vec::new();
+        for certificate in certificates {
+            let [authorization, acknowledgement] = completion::completion_invocations(certificate)?;
+            if !retiring.insert(authorization) || !retiring.insert(acknowledgement) {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            let authorization = records
+                .get(&authorization)
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            let acknowledgement = records
+                .get(&acknowledgement)
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            completion::restore_completion(authority, authorization, acknowledgement, certificate)?;
+            retirements.push([
+                authorization.envelope.clone(),
+                acknowledgement.envelope.clone(),
+            ]);
+        }
         Ok(Self {
             authority,
             pending: records
                 .into_values()
+                .filter(|record| !retiring.contains(&record.request.context.invocation))
                 .map(|record| (record.anchor, record.envelope))
                 .collect(),
+            retirements,
             _lease: core::marker::PhantomData,
         })
     }
@@ -304,8 +346,8 @@ pub(crate) struct RetainedAuthorityOperationDispatch {
 }
 
 /// Ephemeral proof produced only by replaying both successful native phases.
-/// Deliberately not deserializable: restart needs a durable terminal-proof
-/// protocol before this can authorize retirement after either result is gone.
+/// It must be signed and durably retained before either result is acknowledged.
+#[derive(Clone)]
 pub(crate) struct VerifiedNativeOperationCompletion {
     target: AuthorityActorTarget,
     authorization: RetainedAuthorityOperationDispatch,
@@ -530,8 +572,9 @@ where
     /// and recovered. It deliberately never calls complete/release retirement.
     pub(crate) fn acknowledge_native_operation_completion(
         &mut self,
-        completion: &VerifiedNativeOperationCompletion,
+        retained: &RetainedNativeOperationCompletion,
     ) -> Result<bool, SharedAgentHostError> {
+        let completion = &retained.completion;
         if completion.target != self.authority_target() {
             return Err(SharedAgentHostError::ScopeMismatch);
         }

@@ -177,7 +177,9 @@ Keep these as work within C2, not new review batches:
    after owner reopen now pass for an installed executable query fixture.
    This does not prove protected application or terminal result retirement.
    Native acknowledgement of the successful result pair now passes while
-   deliberately retaining admission; durable terminal proof/release is still open.
+   deliberately retaining admission. Signed completion continuation and owner
+   reopen after both acknowledgements now pass; production continuation storage,
+   partial-retirement crash coverage and final durable release remain open.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
    retirement and restart through native ingress; then expose the same
    preparation/authorization flow in the user-facing client. A Public query
@@ -5559,6 +5561,53 @@ result retirement; restart classification and exact release; then application
 and ingress integration. This is not terminal recovery closure, protected
 mutation coverage or permission to delete retained stores. No guest artifacts
 changed. Evidence logs remain in shared disk-backed `target/task-tmp`.
+
+### Signed completion continuation and retirement-class reopen
+
+Native result acknowledgement now requires `RetainedNativeOperationCompletion`,
+not the ephemeral completion-verification value alone. The native owner signs
+canonical, ABI-bound NOC1 continuation evidence only from its verified success
+pair and invokes the caller's durable retention callback before returning the
+retained value. The configured Authority key signs a distinct completion domain
+binding both invocation IDs and hashes of the complete immutable NOD1 inputs,
+including their journal anchors. Exact signing/retention retries are idempotent.
+
+Recovery verifies the configured key, both exact source-record commitments,
+signed request domains, authorization/issuance linkage and canonical encoding.
+Malformed, truncated, trailing, signature-substituted and phase-swapped evidence
+is rejected. NOC1 attests successful native phase observation; it is neither an
+application receipt, guest quorum/finality proof nor a claim that either result
+has already been acknowledged. Native acknowledgement evidence is still checked
+independently, and this record cannot release admission.
+
+`NativeAuthorityOperationStartupAdmission::load_with_completions` validates
+bounded signed continuation records against its discovered NOD1 set, rejects
+duplicate/cross-pair identities, and classifies verified pairs as retiring rather
+than pending. Owner startup merges that class with existing lifecycle retirement
+admission before attachment. Retiring-only recovery also requires a completed
+bootstrap and remains incompatible with unfinished projection work.
+
+The focused physical test passes in **21.11s**
+(`r16-native-operation-completion-reopen.log`). It persists NOC1 to a synced
+test file, injects an error after publication, verifies no result acknowledgement
+occurred, and retries with identical certificate bytes. Both results are then
+acknowledged. Recovery reconstructs the continuation from disk, closes/reopens
+the native owner with retirement-class admission, and retries acknowledgement
+without any new transition. Unrelated projection admission remains blocked.
+The preceding same-owner certificate test passed in **18.28s**
+(`r16-native-operation-completion-certificate.log`).
+
+The combined native operation regression passes: **four passed, zero failed**,
+in **41.71s** (`r16-native-operation-completion-regression.log`). All **212 CLI
+tests pass, zero fail, five ignored**, in **10.45s**
+(`r16-native-operation-completion-cli.log`). Formatting and diff checks pass.
+
+Production hardened completion storage/discovery and controller adoption are
+still missing; this uses synced test-file retention. The crash case after only
+one positive result acknowledgement, durable final retirement/release markers
+and release retries remain required. Do not wire retirement into the daemon
+until those are closed. No guest artifacts changed. Logs remain in shared
+disk-backed `target/task-tmp`.
 
 ### Durable client acknowledgement before completion
 
