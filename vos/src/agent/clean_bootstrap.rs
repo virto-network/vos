@@ -9131,9 +9131,93 @@ mod tests {
             ), Err(SharedAgentHostError::ScopeMismatch)));
             owner._network_host = crate::network::shared_agent::SharedAgentNetworkHost::attach_recovering_management_set(
                 Arc::clone(&owner.host), Arc::clone(&network), agent,
-                extra.iter().map(|work| (management_anchor_for_test(&first_anchor), work.clone())).collect(),
+                extra[..3].iter().map(|work| (management_anchor_for_test(&first_anchor), work.clone())).collect(),
                 vec![[original[0].clone(), original[1].clone()]],
             ).unwrap();
+            let predecessor = (management_anchor_for_test(&first_anchor), extra[2].clone());
+            let before_extension = owner.ordered_index_for_test().unwrap();
+            let mut saved = None;
+            assert!(matches!(
+                owner._network_host.extend_management_pending(
+                    agent,
+                    &predecessor,
+                    &extra[3],
+                    |candidate| {
+                        saved = Some(candidate.clone());
+                        Err::<(), _>(SharedAgentHostError::Unavailable)
+                    },
+                ),
+                Err(SharedAgentHostError::Unavailable)
+            ));
+            let saved = saved.unwrap();
+            assert_eq!(
+                saved,
+                (management_anchor_for_test(&first_anchor), extra[3].clone())
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before_extension);
+            // The callback failure must preserve the new member through a
+            // generation refresh, without permitting a new clock on retry.
+            assert!(owner._network_host.mark_stale_for_test(agent));
+            owner._network_host.refresh().unwrap();
+            let mut later = extra[3].clone();
+            let RuntimeWork::Invoke {
+                invocation,
+                authorization,
+                observed_slot,
+                ..
+            } = &mut later
+            else {
+                unreachable!()
+            };
+            *observed_slot += 1;
+            **authorization = InvocationAuthorization::PublicPreflight(
+                crate::agent_sdk::PublicPreflight::for_work(invocation, *observed_slot),
+            );
+            owner
+                ._network_host
+                .extend_management_pending(agent, &predecessor, &later, |candidate| {
+                    assert_eq!(candidate, &saved);
+                    Ok(())
+                })
+                .unwrap();
+            let mut wrong_predecessor = predecessor.clone();
+            wrong_predecessor.0.ordered.index += 1;
+            assert!(matches!(
+                owner._network_host.extend_management_pending(
+                    agent,
+                    &wrong_predecessor,
+                    &later,
+                    |_| -> Result<(), SharedAgentHostError> {
+                        panic!("substituted predecessor reached storage")
+                    },
+                ),
+                Err(SharedAgentHostError::Conflict)
+            ));
+            let RuntimeWork::Invoke {
+                invocation,
+                authorization,
+                observed_slot,
+                ..
+            } = &mut later
+            else {
+                unreachable!()
+            };
+            invocation.actor = crate::agent_sdk::ActorId([0xf3; 32]);
+            **authorization = InvocationAuthorization::PublicPreflight(
+                crate::agent_sdk::PublicPreflight::for_work(invocation, *observed_slot),
+            );
+            assert!(matches!(
+                owner._network_host.extend_management_pending(
+                    agent,
+                    &predecessor,
+                    &later,
+                    |_| -> Result<(), SharedAgentHostError> {
+                        panic!("substituted next phase reached storage")
+                    },
+                ),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before_extension);
             owner
                 ._network_host
                 .reserve_management_retirement(agent, original)

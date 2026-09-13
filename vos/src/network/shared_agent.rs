@@ -1150,6 +1150,139 @@ impl SharedRouteHandler {
         )
     }
 
+    /// Extend an existing recovery reservation before publishing an intent
+    /// image. A failed callback may have committed: retain the exact candidate
+    /// in both admission and the attachment's refresh image even on failure.
+    fn extend_management_pending<F, T>(
+        &self,
+        pending: &mut Vec<PendingManagement>,
+        retiring: &[[crate::agent_sdk::RuntimeWork; 2]],
+        predecessor: &PendingManagement,
+        proposed: &crate::agent_sdk::RuntimeWork,
+        record: F,
+    ) -> Result<T, SharedAgentHostError>
+    where
+        F: FnOnce(&PendingManagement) -> Result<T, SharedAgentHostError>,
+    {
+        let key = management_envelope_key(self.agent, proposed)?;
+        let mut proposal = self
+            .proposal
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if proposal.projection_pair.is_some()
+            || proposal.management_pending.as_ref()
+                != Some(&pending_management_keys(self.agent, pending)?)
+            || !pending.contains(predecessor)
+            || management_envelope_key(self.agent, &predecessor.1)?.invocation == key.invocation
+        {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let retiring_keys = if retiring.is_empty() {
+            None
+        } else {
+            Some(management_retirement_set_keys(
+                self.agent,
+                &retirement_pair_refs(retiring),
+            )?)
+        };
+        if proposal.management_retirement != retiring_keys
+            || retiring_keys.as_ref().is_some_and(|pairs| {
+                pairs
+                    .iter()
+                    .flatten()
+                    .any(|old| old.invocation == key.invocation)
+            })
+        {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        // After an ambiguous write, the caller may propose a later clock.
+        // Reuse the reserved envelope, never replace its signed-call identity
+        // or authorization clock. Canonical envelope validation is above and
+        // in pending_management_keys for both candidates.
+        let existing = pending.iter().find(|(_, work)| {
+            management_envelope_key(self.agent, work)
+                .is_ok_and(|old| old.invocation == key.invocation)
+        });
+        if let Some((_, saved)) = existing {
+            let (
+                crate::agent_sdk::RuntimeWork::Invoke {
+                    invocation: saved, ..
+                },
+                crate::agent_sdk::RuntimeWork::Invoke {
+                    invocation: proposed,
+                    ..
+                },
+            ) = (saved, proposed)
+            else {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            };
+            if saved != proposed {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+        }
+        let worker = self
+            .worker
+            .as_ref()
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        if !self.has_local_proposer(worker) {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        let barrier = futures_executor::block_on(worker.snapshot())
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        if barrier.role != vos_raft::Role::Leader || barrier.commit_index != barrier.last_log_index
+        {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        let mut host = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        drain_committed(&mut host, self.agent, &self.ordered_replies)?;
+        let status = host
+            .show(self.agent)?
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        if status.applied_slots != barrier.commit_index {
+            return Err(SharedAgentHostError::CorruptResidue);
+        }
+        let candidate = if let Some(existing) = existing {
+            existing.clone()
+        } else {
+            let position = host.journal_position(self.agent)?;
+            (
+                crate::agent::clean_management_intent::ManagementJournalAnchor {
+                    genesis: position.genesis,
+                    admission: position.admission,
+                    runtime: position.runtime.commitment(),
+                    ordered: crate::agent::journal::OrderedBase {
+                        index: position.ordered_index,
+                        head: position.ordered_head,
+                    },
+                },
+                proposed.clone(),
+            )
+        };
+        let mut combined = pending.clone();
+        if existing.is_none() {
+            combined.push(candidate.clone());
+        }
+        let keys = pending_management_keys(self.agent, &combined)?;
+        let required = host
+            .management_recovery_admission_requirement(
+                self.agent,
+                &pending_management_refs(&combined),
+                &retiring.iter().flatten().collect::<Vec<_>>(),
+            )?
+            .ok_or(SharedAgentHostError::CapacityExhausted)?;
+        if status.remaining_slots < required as u64 + 1 {
+            return Err(SharedAgentHostError::CapacityExhausted);
+        }
+        proposal.management_pending = Some(keys);
+        *pending = combined;
+        // Like anchor publication, the callback may only write the independent
+        // intent store and must not re-enter the host/coordinator.
+        record(&candidate)
+    }
+
     fn reserve_management_retirement_set(
         &self,
         pairs: &[[&crate::agent_sdk::RuntimeWork; 2]],
@@ -2575,6 +2708,45 @@ impl SharedAgentNetworkHost {
         attached
             .coordinator
             .record_management_anchor(envelope, record)
+    }
+
+    /// The caller must authenticate the phase transition and pledge the exact
+    /// returned envelope/anchor, including when retrying an ambiguous commit.
+    pub(crate) fn extend_management_pending<F, T>(
+        &mut self,
+        agent: crate::service::AgentId,
+        predecessor: &PendingManagement,
+        proposed: &crate::agent_sdk::RuntimeWork,
+        record: F,
+    ) -> Result<T, SharedAgentHostError>
+    where
+        F: FnOnce(&PendingManagement) -> Result<T, SharedAgentHostError>,
+    {
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        let live = attached
+            .lifecycle
+            .read()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if !*live || attached.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        let pending = self
+            .management_pending
+            .get_mut(&agent)
+            .ok_or(SharedAgentHostError::Conflict)?;
+        attached.coordinator.extend_management_pending(
+            pending,
+            self.management_retirements
+                .get(&agent)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            predecessor,
+            proposed,
+            record,
+        )
     }
 
     pub(crate) fn reserve_management_retirement_set(

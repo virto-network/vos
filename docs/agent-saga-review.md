@@ -3216,6 +3216,41 @@ with a debugger (`r16-saved-finalization-stack.log`). Fixture bootstrap now runs
 on its own default-sized thread stack; stack limits were not increased. No guest
 artifact rebuild, full-library run or fresh CLI deployment smoke is claimed.
 
+### Protected pending-phase extension prerequisite
+
+The network attachment can now extend an existing verified management-pending
+reservation before invoking the independent intent-store callback. It verifies
+the exact reserved predecessor and both refresh/admission images, excludes
+projection work and retirement identity collisions, then jointly budgets the
+expanded pending set and existing retirement pairs under the serialized leader,
+full-commit and journal-drain barrier. Insufficient capacity fails without
+checkpointing or publishing a new image.
+
+Both the proposal gate and its attachment-refresh image retain the candidate
+before the callback runs. An ambiguous callback failure does not release it.
+A retry may propose a later preflight clock, but receives the original exact
+envelope and anchor; changed invocation contents are rejected. The caller must
+authenticate the phase transition and persist the returned pair, not its newly
+proposed envelope. This is an internal prerequisite, **not yet wired into
+production lifecycle startup**. Earlier missing-finalization startup remains
+fail-closed; no release gate is declared closed by this change.
+
+Next integration remains within C2: admit an acknowledged application with only
+its saved authorization envelope; use protected extension when preparing its
+missing finalization; build retirement pairs from the resulting durable slots;
+test interruption before preparation and ambiguous intent writes across restart.
+Do not enable earlier authorization/application phases or continuous live
+retirement merely because this lower-level operation exists.
+
+Verification: the native bundled-Authority lifecycle regression passed (1 test,
+108.70s, `r16-pending-extension-native.log`), now including mixed pending/retiring
+extension, a failed callback, attachment refresh, original-clock retry and
+substituted predecessor/next-work rejection. The 7 adjacent network tests passed
+(0.36s, `r16-pending-extension-network.log`). Logs are in shared disk scratch.
+Formatting and diff checks pass. This uses a test callback rather than actual
+filesystem write-fault injection; no full-library rerun, rebuilt guest artifacts
+or new CLI smoke is claimed.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its
