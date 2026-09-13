@@ -7633,6 +7633,18 @@ mod tests {
             authority_package: AdmittedActorPackage,
             configuration: Option<fn(&AgentDescriptor) -> Vec<u8>>,
         ) -> PhysicalFixture {
+            native_physical_fixture_with_catalog(
+                authority_package,
+                configuration,
+                admitted_standard_actor_for_test("root-catalog", StateLane::Linear, 0xa5),
+            )
+        }
+
+        fn native_physical_fixture_with_catalog(
+            authority_package: AdmittedActorPackage,
+            configuration: Option<fn(&AgentDescriptor) -> Vec<u8>>,
+            catalog_package: AdmittedActorPackage,
+        ) -> PhysicalFixture {
             let receipt_key = SigningKey::from_bytes(&[RECEIPT_SEED; 32]);
             let credential_key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
             let runtime = shape_only_runtime();
@@ -7641,8 +7653,6 @@ mod tests {
             let nonce = Hash([0x33; 32]);
             let agent = AgentId::derive(space, owner, nonce.as_bytes());
             let (replicas, member) = replica_member(space, agent);
-            let catalog_package =
-                admitted_standard_actor_for_test("root-catalog", StateLane::Linear, 0xa5);
             let authority = authority_binding(agent, &authority_package, &receipt_key);
             let descriptor = descriptor(&runtime, space, agent, owner, nonce, &member, authority);
             let authority_request = install_request(
@@ -9755,6 +9765,10 @@ mod tests {
         }
 
         fn native_bundled_authority_fixture() -> PhysicalFixture {
+            native_bundled_authority_fixture_with_query_catalog(false)
+        }
+
+        fn native_bundled_authority_fixture_with_query_catalog(query: bool) -> PhysicalFixture {
             fn configuration(descriptor: &AgentDescriptor) -> Vec<u8> {
                 use system_authority::{
                     AuthorityBindingState, AuthorityBlobRow, AuthorityIssuerState,
@@ -9826,7 +9840,19 @@ mod tests {
             package.manifest.signing_mut().signature =
                 key.sign(&package.signing_bytes().unwrap()).to_bytes();
             let package = admit_actor_package(&package.encode().unwrap()).unwrap();
-            native_physical_fixture_with_authority_configuration(package, Some(configuration))
+            if query {
+                native_physical_fixture_with_catalog(
+                    package,
+                    Some(configuration),
+                    crate::agent::package_admission::admitted_standard_query_actor_for_test(
+                        "root-catalog",
+                        StateLane::Linear,
+                        0xa5,
+                    ),
+                )
+            } else {
+                native_physical_fixture_with_authority_configuration(package, Some(configuration))
+            }
         }
 
         // Test-only durable backends. Production uses hardened CSF1 stores;
@@ -9930,6 +9956,238 @@ mod tests {
                 }
                 write_operation_test_image(&self.path(invocation), record)
             }
+        }
+
+        #[test]
+        fn native_operation_approved_issuance_reopens_without_new_signatures() {
+            use crate::Encode as _;
+            use crate::agent::authority_operation_issuer::AuthorityOperationEvidenceSigner;
+            use crate::agent::sdk::authority::AuthorityIngressAuthentication;
+            use crate::agent::sdk::authority_operation::{
+                AuthorityOperationCall, AuthorityOperationIntent,
+            };
+            use crate::agent::sdk::{InvocationContext, InvocationOrigin, InvocationWork};
+            struct Signer {
+                key: SigningKey,
+                calls: usize,
+            }
+            impl AuthorityOperationEvidenceSigner for Signer {
+                type Error = core::convert::Infallible;
+                fn public_key(&self) -> [u8; 32] {
+                    self.key.verifying_key().to_bytes()
+                }
+                fn sign_authority_receipt(
+                    &mut self,
+                    bytes: &[u8],
+                ) -> Result<[u8; 64], Self::Error> {
+                    self.calls += 1;
+                    Ok(self.key.sign(bytes).to_bytes())
+                }
+                fn sign_issuance_ack(&mut self, bytes: &[u8]) -> Result<[u8; 64], Self::Error> {
+                    self.calls += 1;
+                    Ok(self.key.sign(bytes).to_bytes())
+                }
+            }
+            let fixture = native_bundled_authority_fixture_with_query_catalog(true);
+            let directory = TestDirectory::new("native-approved-operation");
+            let network = network(NODE_SEED);
+            let provider = Arc::new(MemoryProvider::new(fixture.provision.clone()));
+            // Unlike denial fixtures, perform the entire native bootstrap:
+            // the real Authority must authorize and register the query actor.
+            let pins = BootstrapMemoryStore::default();
+            let record = BootstrapMemoryStore::default();
+            let bootstrap_issuer = IssuerMemoryStore::default();
+            let mut bootstrap_signer = CountingSigner::new();
+            let mut opened = None;
+            let mut previous_phase = CleanSystemAgentBootstrapPhase::Intent;
+            // This fixture has a manually advanced clock. Management writes
+            // need later slots than the preceding journal boundary; retry the
+            // exact durable bootstrap with a later slot, never fabricated state.
+            for step in 1..=3 {
+                fixture
+                    .logical_slot
+                    .as_ref()
+                    .unwrap()
+                    .store(LOGICAL_SLOT + step, Ordering::Release);
+                match open_owner(
+                    &fixture,
+                    &directory,
+                    pins.clone(),
+                    record.clone(),
+                    bootstrap_issuer.clone(),
+                    &mut bootstrap_signer,
+                    provider.clone(),
+                    network.clone(),
+                ) {
+                    Ok(owner) => {
+                        opened = Some(owner);
+                        break;
+                    }
+                    Err(CleanSystemAgentBootstrapError::Rejected(
+                        CleanSystemAgentBootstrapRejection::GuestDenied,
+                    )) => {
+                        let image = record.image().unwrap();
+                        let phase = CleanSystemAgentBootstrapRecord::decode(&image)
+                            .unwrap()
+                            .phase;
+                        assert!(
+                            phase > previous_phase,
+                            "bootstrap made no progress: {phase:?}"
+                        );
+                        previous_phase = phase;
+                    }
+                    Err(error) => panic!("native bootstrap failed: {error:?}"),
+                }
+            }
+            let mut owner = opened.expect("native bootstrap must complete with advancing slots");
+            let authority = owner.authority_target();
+            let ManagementRequest::Install(catalog) = &fixture.plan.catalog_request else {
+                panic!("catalog install")
+            };
+            let material = owner
+                .supervisor_invocation_material(owner.pins.agent, catalog.entry.actor)
+                .unwrap();
+            let slot = material.observed_slot;
+            let (node_key, _, _, node) = node_material();
+            let public = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32])
+                .verifying_key()
+                .to_bytes();
+            let origin = InvocationOrigin {
+                principal: Some(owner.pins.descriptor.identity.owner),
+                credential: Some(CredentialId::of_public_key(&public)),
+                transport_node: Some(NodeId(node.0)),
+                actor: None,
+                capability: None,
+            };
+            let mut availability = vec![material.program, material.schema, material.policies];
+            availability.extend(material.installation_data);
+            availability.sort_unstable_by(|a, b| a.reference.cmp(&b.reference));
+            let mut message = vec![crate::actors::value::TAG_DYNAMIC];
+            message.extend(crate::actors::value::Msg::new("read").encode());
+            let work = InvocationWork {
+                space: authority.space,
+                agent: authority.system_agent,
+                runtime_deployment: authority.system_runtime_deployment,
+                invocation: InvocationId([0xb1; 32]),
+                actor: material.actor.entry.actor,
+                incarnation: material.actor.incarnation,
+                deployment: material.actor.entry.deployment,
+                program: material.actor.entry.program,
+                mode: MethodMode::Query,
+                origin,
+                roles: InvocationRoleClaims::none(),
+                message,
+                installation_data: material.actor.entry.installation_data,
+                availability,
+                gas: owner.invocation_gas,
+                recovery_only: false,
+            };
+            let mut call = AuthorityOperationCall {
+                invocation: InvocationId::ZERO,
+                authority,
+                principal: origin.principal.unwrap(),
+                credential: origin.credential.unwrap(),
+                request_sequence: NonZeroU64::new(1).unwrap(),
+                authentication: AuthorityIngressAuthentication::SshNodeAttestation {
+                    credential_public_key: public,
+                    node: NodeId(node.0),
+                    request_binding: Hash([0xb2; 32]),
+                    signature: [1; 64],
+                },
+                requested_valid_from: slot,
+                requested_expires_at: slot + 10,
+                intent: AuthorityOperationIntent::invoke(fixture.plan.managed_target(), &work)
+                    .unwrap(),
+            };
+            call.invocation = call.expected_invocation();
+            let signature = node_key.sign(&call.signing_bytes()).to_bytes();
+            if let AuthorityIngressAuthentication::SshNodeAttestation {
+                signature: saved, ..
+            } = &mut call.authentication
+            {
+                *saved = signature;
+            }
+            call.verify_ssh_node_attestation_with(
+                &node_key.verifying_key().to_bytes(),
+                &RawCredentialVerifier,
+            )
+            .unwrap();
+            let context = InvocationContext {
+                invocation: call.invocation,
+                actor: authority.binding.issuer.actor,
+                mode: MethodMode::Linear,
+                origin,
+                roles: InvocationRoleClaims::none(),
+                observed_slot: slot,
+            };
+            let mut operations = NativeAuthorityOperationController::new(
+                authority,
+                OperationTestImageFile(directory.0.join("coordinator")),
+                OperationTestImageFile(directory.0.join("issuer")),
+                OperationTestJournal(directory.0.clone()),
+            );
+            let mut signer = Signer {
+                key: SigningKey::from_bytes(&[RECEIPT_SEED; 32]),
+                calls: 0,
+            };
+            let before = owner.ordered_index_for_test().unwrap();
+            let issued = operations
+                .coordinate(&mut owner, &call, context, slot, &mut signer)
+                .unwrap();
+            assert_eq!(signer.calls, 2);
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+            issued
+                .issuance_ack
+                .verify_with(authority.binding, &RawCredentialVerifier)
+                .unwrap();
+            let pins = owner._pins_store.clone();
+            let record = owner.record_store.clone();
+            let issuer = owner.issuer.into_store();
+            drop(owner._network_host);
+            drop(owner.host);
+            fixture
+                .logical_slot
+                .as_ref()
+                .unwrap()
+                .store(slot + 5, Ordering::Release);
+            let admission = operations
+                .startup_admission(&[
+                    call.invocation,
+                    issued.issuance_ack.acknowledgement_invocation,
+                ])
+                .unwrap();
+            let mut owner =
+                CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+                    pins,
+                    record,
+                    issuer,
+                    &mut CountingSigner::new(),
+                    || panic!("must reopen"),
+                    directory.host(),
+                    directory.lock(),
+                    fixture.plan.pins.space,
+                    fixture.plan.pins.node,
+                    fixture.trust.clone(),
+                    fixture.merge.clone(),
+                    fixture.finality.clone(),
+                    provider,
+                    network.clone(),
+                    None,
+                    Some(&admission),
+                )
+                .unwrap();
+            drop(admission);
+            assert_eq!(
+                operations
+                    .coordinate(&mut owner, &call, context, slot, &mut signer)
+                    .unwrap(),
+                issued
+            );
+            assert_eq!(signer.calls, 2);
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+            drop(operations);
+            drop(owner);
+            stop_network(network);
         }
 
         #[test]

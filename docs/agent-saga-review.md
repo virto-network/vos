@@ -173,6 +173,9 @@ Keep these as work within C2, not new review batches:
    and coexist safely with pending management/projection work. Do not route a
    mutating operation through the read-only `pending_projection` record or
    replace actor policy with host-side signing.
+   Real bundled-Authority approval, AOI1 consumption and exact issuance retry
+   after owner reopen now pass for an installed executable query fixture.
+   This does not prove protected application or terminal result retirement.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
    retirement and restart through native ingress; then expose the same
    preparation/authorization flow in the user-facing client. A Public query
@@ -5477,6 +5480,46 @@ compatibility, not live pending-operation recovery. The saved request, response
 and progress hashes remain exactly those from the earlier retirement campaign.
 Startup still takes roughly 4m22s; this does not close the latency gate or make
 the branch master-ready.
+
+### Genuine native approval and issuance recovery
+
+`native_operation_approved_issuance_reopens_without_new_signatures` performs
+the complete native bootstrap rather than seeding a completed bootstrap image.
+The bundled Authority PVM authorizes and registers an installed query actor,
+then evaluates a real enrolled-credential SSH-node-attested AOC5 for that actor.
+The native coordinator retains authorization work, obtains the guest's AOP5,
+issues the signed receipt/AOI1 and observes successful native AOI1 consumption.
+Exactly two operation transitions and two signature calls occur.
+
+The test closes the native owner, advances the host clock and reopens it with
+both retained NOD1 records. The same operation returns byte-identical issuance
+without further signatures or transitions. This is positive native policy and
+issuance/recovery evidence, not a scripted approval and not a host signer
+shortcut. It uses the native Standard host fixture and an executable public
+query actor fixture, not a full CLI/HTTP protected mutation campaign. The
+authorized query itself is not executed in this test; operation result
+retirement remains pending and must not be bypassed to enable application.
+
+The focused test passes in **12.67s**
+(`r16-native-operation-approved-bootstrap.log`). The first runtime attempt
+stopped with `GuestDenied` during bootstrap under the fixture's fixed logical
+clock (`r16-native-operation-approved-native.log`, 2.01s). The passing fixture
+advances the clock across bounded retries of the same durable bootstrap stores,
+requiring strict phase progress on any such denial. No approval/finalization
+state is fabricated. Two intermediate fixture compile errors (installed actor
+lookup and memory-store accessor) were corrected; their logs are preserved as
+`r16-native-operation-approved.log` and `r16-native-operation-approved-clock.log`.
+Logs remain under shared disk-backed `target/task-tmp`.
+
+The combined native operation regression also passes: **four passed, zero
+failed**, in **29.51s** (`r16-native-operation-approved-regression.log`), covering
+both approval and denial paths plus physical dispatch and reopen. Formatting
+and diff checks pass.
+
+Only test fixtures and coverage changed; no production code or guest artifacts
+were modified. The next required work remains terminal operation retirement,
+retained operation ingress/client wiring and a protected Local mutation with
+restart, followed by the existing broader C2 and C3 gates.
 
 ### Durable client acknowledgement before completion
 
