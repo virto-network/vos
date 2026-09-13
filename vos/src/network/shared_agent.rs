@@ -1287,15 +1287,19 @@ impl SharedRouteHandler {
         &self,
         pairs: &[[&crate::agent_sdk::RuntimeWork; 2]],
     ) -> Result<(), SharedAgentHostError> {
-        self.transition_management_retirement_set(pairs, false)
+        self.transition_management_retirement_set(pairs, None)
     }
 
     fn transition_management_retirement_set(
         &self,
         pairs: &[[&crate::agent_sdk::RuntimeWork; 2]],
-        handoff_pending: bool,
+        remaining_pending: Option<&[PendingManagement]>,
     ) -> Result<(), SharedAgentHostError> {
         let keys = management_retirement_set_keys(self.agent, pairs)?;
+        let remaining_keys = match remaining_pending {
+            Some(pending) if !pending.is_empty() => pending_management_keys(self.agent, pending)?,
+            _ => Vec::new(),
+        };
         let mut proposal = self
             .proposal
             .lock()
@@ -1303,7 +1307,7 @@ impl SharedRouteHandler {
         if proposal.projection_pair.is_some() {
             return Err(SharedAgentHostError::Conflict);
         }
-        if !handoff_pending
+        if remaining_pending.is_none()
             && proposal
                 .management_retirement
                 .as_ref()
@@ -1311,27 +1315,34 @@ impl SharedRouteHandler {
         {
             return Ok(());
         }
-        match (&proposal.management_pending, handoff_pending) {
-            (None, false) => {}
-            (Some(pending), true)
+        // Preserve every reservation exactly once. Remaining work also keeps
+        // its original anchor; already-retiring pairs cannot be regrouped.
+        match (&proposal.management_pending, remaining_pending) {
+            (None, None) => {}
+            (Some(pending), Some(_))
                 if pending.len()
                     + proposal
                         .management_retirement
                         .as_ref()
                         .map_or(0, |set| set.len() * 2)
-                    == keys.len() * 2
+                    == keys.len() * 2 + remaining_keys.len()
                     && proposal
                         .management_retirement
                         .as_ref()
                         .is_none_or(|set| set.iter().all(|pair| keys.contains(pair)))
-                    && pending
+                    && remaining_keys.iter().all(|entry| pending.contains(entry))
+                    && remaining_keys
                         .iter()
-                        .all(|(key, _)| keys.iter().flatten().any(|expected| expected == key)) => {}
+                        .all(|(key, _)| !keys.iter().flatten().any(|expected| expected == key))
+                    && pending.iter().all(|entry| {
+                        remaining_keys.contains(entry)
+                            || keys.iter().flatten().any(|expected| expected == &entry.0)
+                    }) => {}
             _ => return Err(SharedAgentHostError::Conflict),
         }
         match &proposal.management_retirement {
             Some(existing) if keys.iter().all(|pair| existing.contains(pair)) => return Ok(()),
-            Some(_) if !handoff_pending => return Err(SharedAgentHostError::Conflict),
+            Some(_) if remaining_pending.is_none() => return Err(SharedAgentHostError::Conflict),
             Some(_) => {}
             None => {}
         }
@@ -1360,8 +1371,9 @@ impl SharedRouteHandler {
             return Err(SharedAgentHostError::CorruptResidue);
         }
         let required = host
-            .management_retirement_set_admission_requirement(
+            .management_recovery_admission_requirement(
                 self.agent,
+                &pending_management_refs(remaining_pending.unwrap_or(&[])),
                 &pairs.iter().flatten().copied().collect::<Vec<_>>(),
             )?
             .ok_or(SharedAgentHostError::CapacityExhausted)?;
@@ -1369,7 +1381,7 @@ impl SharedRouteHandler {
             return Err(SharedAgentHostError::CapacityExhausted);
         }
         proposal.management_retirement = Some(keys);
-        proposal.management_pending = None;
+        proposal.management_pending = (!remaining_keys.is_empty()).then_some(remaining_keys);
         Ok(())
     }
 
@@ -2777,14 +2789,27 @@ impl SharedAgentNetworkHost {
         Ok(())
     }
 
-    /// Transfer the entire verified pending set without opening admission
+    /// Transfer finished pairs from the verified pending set without opening admission
     /// between invocation recovery and positive-acknowledgement retirement.
-    /// Existing retirement pairs are preserved; supply only newly finished pairs.
+    /// Preserve existing retirement pairs and every remaining anchored pending
+    /// envelope; supply only newly finished pairs, which may be a strict subset.
     pub(crate) fn handoff_management_pending_to_retirement(
         &mut self,
         agent: crate::service::AgentId,
         pairs: &[[&crate::agent_sdk::RuntimeWork; 2]],
     ) -> Result<(), SharedAgentHostError> {
+        let moved = management_retirement_set_keys(agent, pairs)?;
+        let pending = self
+            .management_pending
+            .get(&agent)
+            .ok_or(SharedAgentHostError::Conflict)?;
+        let pending_keys = pending_management_keys(agent, pending)?;
+        let remaining: Vec<_> = pending
+            .iter()
+            .zip(pending_keys.iter())
+            .filter(|(_, (key, _))| !moved.iter().flatten().any(|expected| expected == key))
+            .map(|(entry, _)| entry.clone())
+            .collect();
         let mut combined = self
             .management_retirements
             .get(&agent)
@@ -2802,11 +2827,16 @@ impl SharedAgentNetworkHost {
         if !*live || attached.stale.load(Ordering::Acquire) {
             return Err(SharedAgentHostError::TransportNotAttached);
         }
-        attached
-            .coordinator
-            .transition_management_retirement_set(&retirement_pair_refs(&combined), true)?;
+        attached.coordinator.transition_management_retirement_set(
+            &retirement_pair_refs(&combined),
+            Some(&remaining),
+        )?;
         self.management_retirements.insert(agent, combined);
-        self.management_pending.remove(&agent);
+        if remaining.is_empty() {
+            self.management_pending.remove(&agent);
+        } else {
+            self.management_pending.insert(agent, remaining);
+        }
         Ok(())
     }
 

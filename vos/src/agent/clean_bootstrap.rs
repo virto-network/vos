@@ -9560,15 +9560,15 @@ mod tests {
                         .is_err()
                     );
                     drop(host);
+                    // Move only the completed first pair. The second pair is
+                    // still unaccepted and must retain its exact anchors and
+                    // its Invoke/Ack budget across this handoff and refresh.
                     owner
                         ._network_host
-                        .retire_attachment_for_test(agent)
+                        .handoff_management_pending_to_retirement(agent, &[[&extra[0], &extra[1]]])
                         .unwrap();
-                    owner._network_host = crate::network::shared_agent::SharedAgentNetworkHost::attach_recovering_management_set(
-                        Arc::clone(&owner.host), Arc::clone(&network), agent,
-                        extra[2..].iter().map(|work| (anchor.clone(), work.clone())).collect(),
-                        vec![[extra[0].clone(), extra[1].clone()]],
-                    ).unwrap();
+                    assert!(owner._network_host.mark_stale_for_test(agent));
+                    owner._network_host.refresh().unwrap();
                     let RuntimeWork::Invoke {
                         invocation,
                         authorization,
@@ -10082,8 +10082,8 @@ mod tests {
                 assert!(matches!(
                     owner
                         ._network_host
-                        .handoff_management_pending_to_retirement(agent, &pairs[..1]),
-                    Err(SharedAgentHostError::Conflict)
+                        .handoff_management_pending_to_retirement(agent, &[[&extra[0], &extra[0]]]),
+                    Err(SharedAgentHostError::ScopeMismatch)
                 ));
                 assert!(matches!(
                     owner._network_host.record_management_anchor(
@@ -10180,7 +10180,7 @@ mod tests {
             }
             owner
                 ._network_host
-                .handoff_management_pending_to_retirement(agent, &pairs)
+                .handoff_management_pending_to_retirement(agent, &pairs[..1])
                 .unwrap();
             assert!(matches!(
                 owner._network_host.record_management_anchor(
@@ -10208,13 +10208,20 @@ mod tests {
                 ._network_host
                 .retire_attachment_for_test(agent)
                 .unwrap();
-            owner._network_host = crate::network::shared_agent::SharedAgentNetworkHost::attach_recovering_management_retirement_set(
+            owner._network_host = crate::network::shared_agent::SharedAgentNetworkHost::attach_recovering_management_set(
                 Arc::clone(&owner.host), network, agent,
-                vec![[extra[0].clone(), extra[1].clone()], [extra[2].clone(), extra[3].clone()]],
+                extra[2..].iter().map(|work| (anchor.clone(), work.clone())).collect(),
+                vec![[extra[0].clone(), extra[1].clone()]],
             ).unwrap();
             assert_eq!(owner.ordered_index_for_test().unwrap(), before);
             let (query, query_auth) = fresh_projection_pair(owner, 0xed);
             for (pair_index, pair) in pairs.into_iter().enumerate() {
+                if pair_index == 1 {
+                    owner
+                        ._network_host
+                        .handoff_management_pending_to_retirement(agent, &[pair])
+                        .unwrap();
+                }
                 assert!(matches!(
                     owner
                         ._network_host
@@ -10287,11 +10294,20 @@ mod tests {
                     .complete_management_retirement(agent, pair, || Ok(()))
                     .unwrap();
                 if pair_index == 0 {
-                    // An old completion cannot clear a different pending pair.
+                    // Releasing the completed pair again is a no-op when only
+                    // another pending (not retiring) pair remains. It must not
+                    // release that pair's admission gate or refresh image.
+                    owner
+                        ._network_host
+                        .release_completed_management_retirement(agent, pair)
+                        .unwrap();
                     assert!(matches!(
-                        owner
-                            ._network_host
-                            .release_completed_management_retirement(agent, pair),
+                        owner._network_host.reserve_projection_pair(
+                            agent,
+                            &query,
+                            &query_auth,
+                            false
+                        ),
                         Err(SharedAgentHostError::Conflict)
                     ));
                 }

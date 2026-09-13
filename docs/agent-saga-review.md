@@ -3425,6 +3425,43 @@ last guard; it is not a final full-library or release-matrix run. Formatting and
 diff checks pass; logs remain in shared disk scratch. No guest artifacts or CLI
 deployment smoke were refreshed.
 
+### Partial pending-to-retirement handoff prerequisite
+
+The network owner can now move a strict subset of finished management pairs
+into retirement while keeping the rest pending. Under the serialized leader,
+full-commit and journal-drain barrier, it validates exact coverage of the old
+reservation set: every member is either still pending with its original anchor
+or belongs to a completed retiring pair. Existing retirement pair grouping is
+preserved. Joint suffix/physical capacity includes the remaining pending work,
+not just the pairs being retired. Both proposal admission and refresh images
+retain the remaining set.
+
+The native mixed-management fixture now uses the live partial handoff instead
+of manually rebuilding the mixed attachment after its first pair completes.
+It also acknowledges and completes one pair while a second remains pending,
+including callback failure, refresh, successful completion, repeated no-op
+release, another refresh, and eventual completion of the second pair. Query
+admission remains excluded until the remaining pair is retired. Unaccepted work
+and invalid pair identities still cannot be moved into retirement.
+
+The same-credential startup guard remains in place. Next integration must order
+pending intents by credential request sequence and complete each lifecycle's
+retirement before authorizing the next dependent call, with a reversed-agent-ID
+multi-intent native restart test. The current controller still batches its
+phases; partial network handoff alone does not close dependent-set recovery or
+continuous live admission protection. No release gate or deployment readiness
+is claimed by this prerequisite.
+
+Verification: the native bundled-Authority management regression passed (1 test,
+104.02s, `r16-partial-retirement-native-final.log`) and 7 adjacent network tests
+passed (0.47s, `r16-partial-retirement-network.log`). The initial native run failed
+an old assertion expecting repeated release to conflict when another pair was
+retiring. That pair is now pending, so release is a harmless no-op; the corrected
+test instead verifies that query admission and refresh remain protected. No
+production release behavior was weakened to satisfy the assertion. Formatting
+and diff checks pass; logs remain in shared disk scratch. No broad native/full
+library rerun, guest rebuild or CLI smoke is claimed for this prerequisite.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its
