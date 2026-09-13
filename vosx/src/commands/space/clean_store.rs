@@ -47,6 +47,9 @@ const INTENT_FILE: &str = "management.intent";
 const INTENT_STAGE_FILE: &str = "management.intent.next";
 const LIFECYCLE_ISSUER_FILE: &str = "management.issuer";
 const LIFECYCLE_ISSUER_STAGE_FILE: &str = "management.issuer.next";
+const LOCAL_REQUEST_FILE: &str = "local-create.request";
+const LOCAL_REQUEST_STAGE_FILE: &str = "local-create.request.next";
+const LOCAL_REQUEST_ENTRIES: [&str; 3] = [LOCK_FILE, LOCAL_REQUEST_FILE, LOCAL_REQUEST_STAGE_FILE];
 const LIFECYCLE_ENTRIES: [&str; 5] = [
     LOCK_FILE,
     INTENT_FILE,
@@ -97,6 +100,7 @@ pub(crate) enum CleanFileStoreError {
     Corrupt,
     AmbiguousPublication,
     StageCollision,
+    RequestConflict,
     LockPoisoned,
     Io(io::Error),
 }
@@ -134,6 +138,7 @@ enum StoreRole {
     GenesisArchive = 4,
     ManagementIntent = 5,
     LifecycleIssuer = 6,
+    LocalCreateRequest = 7,
 }
 
 impl StoreRole {
@@ -145,6 +150,7 @@ impl StoreRole {
             Self::GenesisArchive => GENESIS_FILE,
             Self::ManagementIntent => INTENT_FILE,
             Self::LifecycleIssuer => LIFECYCLE_ISSUER_FILE,
+            Self::LocalCreateRequest => LOCAL_REQUEST_FILE,
         }
     }
 
@@ -156,6 +162,7 @@ impl StoreRole {
             Self::GenesisArchive => GENESIS_STAGE_FILE,
             Self::ManagementIntent => INTENT_STAGE_FILE,
             Self::LifecycleIssuer => LIFECYCLE_ISSUER_STAGE_FILE,
+            Self::LocalCreateRequest => LOCAL_REQUEST_STAGE_FILE,
         }
     }
 
@@ -167,6 +174,7 @@ impl StoreRole {
             Self::GenesisArchive => MAX_CLEAN_SYSTEM_AGENT_GENESIS_ARCHIVE_BYTES,
             Self::ManagementIntent => MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES,
             Self::LifecycleIssuer => MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
+            Self::LocalCreateRequest => 1024 * 1024,
         }
     }
 
@@ -178,6 +186,7 @@ impl StoreRole {
             4 => Some(Self::GenesisArchive),
             5 => Some(Self::ManagementIntent),
             6 => Some(Self::LifecycleIssuer),
+            7 => Some(Self::LocalCreateRequest),
             _ => None,
         }
     }
@@ -276,6 +285,54 @@ impl CleanManagementLifecycleFiles {
 }
 
 pub(crate) struct CleanManagementIntentFile(ExactFileStore);
+
+/// One immutable signed submission in its own leased private directory.
+/// Keep this lease until submission finishes; ambiguous outcomes retain the
+/// same request for restart. This does not allocate a credential sequence.
+#[cfg(target_os = "linux")]
+pub(crate) struct CleanLocalCreateRequestFile(ExactFileStore);
+
+#[cfg(target_os = "linux")]
+impl CleanLocalCreateRequestFile {
+    pub(crate) fn open_or_create(root: impl AsRef<Path>) -> Result<Self, CleanFileStoreError> {
+        let root = Arc::new(StoreRoot::open_with_entries(
+            root.as_ref(),
+            &LOCAL_REQUEST_ENTRIES,
+        )?);
+        Ok(Self(ExactFileStore::new(
+            root,
+            StoreRole::LocalCreateRequest,
+        )))
+    }
+
+    pub(crate) fn load(&mut self) -> Result<Option<Vec<u8>>, CleanFileStoreError> {
+        let bytes = self.0.load(StoreRole::LocalCreateRequest.maximum_bytes())?;
+        if let Some(bytes) = &bytes {
+            Self::validate(bytes)?;
+            // A prior publication may have renamed successfully but failed
+            // its directory sync. Re-establish durability before a retry sends.
+            self.0.commit_with_replacement(bytes, false)?;
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn publish(&mut self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
+        Self::validate(bytes)?;
+        self.0.commit_with_replacement(bytes, false)
+    }
+
+    fn validate(bytes: &[u8]) -> Result<(), CleanFileStoreError> {
+        if bytes.len() > StoreRole::LocalCreateRequest.maximum_bytes() {
+            return Err(CleanFileStoreError::Oversized);
+        }
+        let submission = vos::agent::local_lifecycle::LocalCreateSubmission::decode(bytes)
+            .map_err(|_| CleanFileStoreError::Corrupt)?;
+        if submission.into_parts().1.authenticated_node.is_some() {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        Ok(())
+    }
+}
 
 /// A configured private directory for per-agent lifecycle images. Keeping the
 /// opened directory pins its physical identity across factory calls; image
@@ -536,6 +593,14 @@ impl ExactFileStore {
     }
 
     fn commit(&mut self, image: &[u8]) -> Result<(), CleanFileStoreError> {
+        self.commit_with_replacement(image, true)
+    }
+
+    fn commit_with_replacement(
+        &mut self,
+        image: &[u8],
+        replace: bool,
+    ) -> Result<(), CleanFileStoreError> {
         if image.len() > self.role.maximum_bytes() {
             return Err(CleanFileStoreError::Oversized);
         }
@@ -547,6 +612,9 @@ impl ExactFileStore {
         {
             self.sync_named(self.role.file())?;
             return self.root.sync();
+        }
+        if !replace && current.is_some() {
+            return Err(CleanFileStoreError::RequestConflict);
         }
         let predecessor = current.as_ref().map(StoredImage::commitment);
         let encoded = encode_envelope(self.role, predecessor, image)?;
@@ -561,6 +629,14 @@ impl ExactFileStore {
         self.root.audit_entries()?;
         let canonical = self.read_optional(self.role.file(), maximum_bytes)?;
         let staged = self.read_optional(self.role.stage_file(), maximum_bytes)?;
+        if self.role == StoreRole::LocalCreateRequest
+            && canonical
+                .iter()
+                .chain(staged.iter())
+                .any(|image| image.predecessor.is_some())
+        {
+            return Err(CleanFileStoreError::RequestConflict);
+        }
         let resolved = match (canonical, staged) {
             (None, None) => None,
             (Some(canonical), None) => Some(canonical),
@@ -1276,6 +1352,111 @@ mod tests {
         let staged = decode_envelope(store.role, &encoded, payload.len()).expect("decode stage");
         store.write_stage(&encoded).expect("write stage");
         staged
+    }
+
+    #[cfg(target_os = "linux")]
+    fn local_request(sequence: u64) -> Vec<u8> {
+        let (operator, authority, descriptor, runtime) =
+            super::super::local_create::tests::fixture();
+        super::super::local_create::prepare(
+            &operator,
+            authority,
+            descriptor,
+            runtime,
+            std::num::NonZeroU64::new(sequence).unwrap(),
+            10,
+            30,
+        )
+        .unwrap()
+        .encode()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_request_is_immutable_durable_and_exclusively_leased() {
+        let fixture = Fixture::new("local-request");
+        let first = local_request(2);
+        let second = local_request(3);
+        let mut store = CleanLocalCreateRequestFile::open_or_create(&fixture.root).unwrap();
+        assert!(store.load().unwrap().is_none());
+        assert!(matches!(
+            CleanLocalCreateRequestFile::open_or_create(&fixture.root),
+            Err(CleanFileStoreError::Busy)
+        ));
+        assert!(store.publish(b"LCQ1").is_err());
+        assert!(store.load().unwrap().is_none());
+        store.publish(&first).unwrap();
+        let envelope = fs::read(fixture.root.join(LOCAL_REQUEST_FILE)).unwrap();
+        store.publish(&first).unwrap();
+        assert!(matches!(
+            store.publish(&second),
+            Err(CleanFileStoreError::RequestConflict)
+        ));
+        assert_eq!(
+            fs::read(fixture.root.join(LOCAL_REQUEST_FILE)).unwrap(),
+            envelope
+        );
+        drop(store);
+        let mut store = CleanLocalCreateRequestFile::open_or_create(&fixture.root).unwrap();
+        assert_eq!(store.load().unwrap(), Some(first));
+        assert!(!fixture.root.join(LOCAL_REQUEST_STAGE_FILE).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_request_recovers_first_publication_but_refuses_staged_replacement() {
+        let fixture = Fixture::new("local-request-stage");
+        let first = local_request(2);
+        let second = local_request(3);
+        let store = CleanLocalCreateRequestFile::open_or_create(&fixture.root).unwrap();
+        let original = stage(&store.0, None, &first);
+        drop(store);
+        let mut store = CleanLocalCreateRequestFile::open_or_create(&fixture.root).unwrap();
+        assert_eq!(store.load().unwrap(), Some(first));
+        let envelope = fs::read(fixture.root.join(LOCAL_REQUEST_FILE)).unwrap();
+        stage(&store.0, Some(original.commitment()), &second);
+        drop(store);
+        let mut store = CleanLocalCreateRequestFile::open_or_create(&fixture.root).unwrap();
+        assert!(matches!(
+            store.load(),
+            Err(CleanFileStoreError::RequestConflict)
+        ));
+        assert!(store.publish(&second).is_err());
+        assert_eq!(
+            fs::read(fixture.root.join(LOCAL_REQUEST_FILE)).unwrap(),
+            envelope
+        );
+        assert!(fixture.root.join(LOCAL_REQUEST_STAGE_FILE).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_request_preserves_incomplete_or_wrong_role_evidence() {
+        let fixture = Fixture::new("local-request-incomplete");
+        let first = local_request(2);
+        let mut store = CleanLocalCreateRequestFile::open_or_create(&fixture.root).unwrap();
+        write_private(&fixture.root.join(LOCAL_REQUEST_STAGE_FILE), b"CSF1");
+        assert!(store.load().is_err());
+        assert!(store.publish(&first).is_err());
+        assert_eq!(
+            fs::read(fixture.root.join(LOCAL_REQUEST_STAGE_FILE)).unwrap(),
+            b"CSF1"
+        );
+        assert!(!fixture.root.join(LOCAL_REQUEST_FILE).exists());
+
+        let other = Fixture::new("local-request-wrong-role");
+        let mut store = CleanLocalCreateRequestFile::open_or_create(&other.root).unwrap();
+        let wrong = encode_envelope(StoreRole::ManagementIntent, None, &first).unwrap();
+        write_private(&other.root.join(LOCAL_REQUEST_FILE), &wrong);
+        assert!(matches!(
+            store.load(),
+            Err(CleanFileStoreError::WrongStoreRole)
+        ));
+        assert!(store.publish(&first).is_err());
+        assert_eq!(
+            fs::read(other.root.join(LOCAL_REQUEST_FILE)).unwrap(),
+            wrong
+        );
     }
 
     #[test]

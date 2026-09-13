@@ -1967,3 +1967,35 @@ sequence and refuses another pending application. Do not silently choose a fresh
 sequence, nonce or window after an ambiguous response. Descriptor/Authority
 discovery, safe sequence allocation, request-file publication and bounded HTTP
 submission/ack verification remain necessary before the native Create smoke.
+
+### Durable immutable Local Create request storage
+
+`CleanLocalCreateRequestFile` stores one signed HTTP-compatible LCQ1 submission
+in a dedicated private directory with an exclusive writer lease. It reuses the
+existing no-follow directory-relative file operations, role-bound integrity
+envelope, staged publication and file/directory syncing. New CSF1 role 7 and its
+three-entry directory profile do not alter existing bootstrap or lifecycle file
+roles. The caller must retain the lease while sending; this is not yet a
+credential-wide sequence allocator or a CLI subcommand.
+
+Publication validates the signed request and 1 MiB cap before writing. Identical
+publication is an exact retry; different bytes are refused without replacing the
+stored request. A complete initial stage can be recovered, but an attempted
+replacement with a predecessor is refused even during reopen. Incomplete and
+wrong-role evidence remains untouched for diagnosis. Loading validates the
+signature/runtime binding again and re-syncs the exact file and directory before
+returning retry bytes, including after an ambiguous earlier directory sync.
+
+Remaining CLI work is unchanged in scope: discover the pinned descriptor and
+Authority, allocate the next credential sequence safely, retain this request
+before transmission, submit it through bounded HTTP, verify the exact returned
+acknowledgement, and prove native Create/publication and restart/retry. No new
+daemon smoke, artifact reproduction or master-readiness claim accompanies this
+storage checkpoint.
+
+**35/35 file-store and Local Create preparation tests pass** in 0.62s
+(`r16-local-create-request-store-final.log`, locked/offline `vosx` binary tests,
+disk scratch). The new cases cover immutable/exclusive publication and reopen,
+initial-stage recovery, staged replacement refusal, incomplete-stage retention
+and cross-role rejection. Existing bootstrap/lifecycle store regressions remain
+green. Formatting and diff checks pass.

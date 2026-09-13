@@ -66,7 +66,7 @@ pub(crate) fn prepare(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use vos::agent::sdk::authority::{AgentAuthorityBinding, AuthorityIssuer};
     use vos::agent::sdk::{
@@ -74,7 +74,7 @@ mod tests {
         ProducerId, ProgramId, ReplicaRole, SpaceId,
     };
 
-    fn fixture() -> (
+    pub(crate) fn fixture() -> (
         Keypair,
         AuthorityActorTarget,
         AgentDescriptor,
