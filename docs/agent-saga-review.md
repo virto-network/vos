@@ -20,8 +20,9 @@ acknowledgement after native route reconciliation. Exact repeated delivery now
 passes after recovering a recorded HTTP timeout; first-response latency remains
 high. The fresh signed-denial / valid-successor / exact-retry campaign also
 passes at `8abbe363`, but requires two HTTP 504 retries for the valid Create.
-Install/invoke remains unproven, so this
-is not yet a usable ordinary-agent production path.
+Install delivery has passed exact recovery after restart, but actual actor
+method invocation through ingress remains unproven. This is not yet a usable
+ordinary-agent production path.
 The native Local Install application and startup-recovery phases now pass
 physical tests from prepared authorization through retirement, including
 pristine client-retry admission. Native Install controller handoff, retry and
@@ -29,12 +30,15 @@ restart now pass; the production-owner wrapper requires an exact active Local
 route after reconciliation. Install now has signed-frame, bounded native queue
 and HTTP server wiring, plus retained-request and fresh managed CLI commands.
 Fresh Install discovery/preparation/credential allocation is wired; managed
-resume passes, but fresh live installation and actual actor method invocation
-remain unproven. Do not treat command availability as an end-to-end pass.
+resume and a fresh successor Install now pass live. Actual actor method
+invocation remains unproven. Do not treat command availability as an
+end-to-end invocation pass.
 The first fresh Install campaign on saved disposable state failed all four
 HTTP waits (604.30s total test time), then shut down cleanly after route
 reconciliation finished. No client MAA2 was retained in that failed campaign.
-Subsequent exact resume after restart now passes and retains verified MAA2;
+Subsequent exact resume after restart now passes and retains verified MAA2.
+A second fresh actor Install on the same Agent passes in 394.01s after two
+HTTP 504 responses, followed by exact retained retry and clean shutdown;
 first-response latency and invocation remain open. See the live results below.
 The native Local-controller wiring at `ee047d48` passed fresh-data startup and
 restart using the rebuilt CLI (`target/native-local-smoke.DATNas`, details below).
@@ -109,8 +113,8 @@ review endpoints for individual fixes:
    in targeted tests. One live resume returned a verified acknowledgement after
    route reconciliation. The latest live test recovered a timeout and then
    returned two identical verified responses; initial latency remains high.
-   Install ingress also
-   remains open. Prove
+   Install ingress and retained CLI delivery are now wired, with live exact
+   recovery passing; fresh completion latency and invocation remain open. Prove
    authorization, durable issuance, physical application, acknowledgement and
    route publication as one restartable workflow. Replace the deliberately unavailable ordinary-Agent
    finality adapter with authenticated live system-Agent decision publication
@@ -4644,6 +4648,50 @@ fresh delivery within the original retry window, actor method execution, or a
 post-delivery invocation/restart campaign. The previous four-timeout failure
 remains release evidence. The newly committed permission optimization was not
 in this daemon and still requires rebuilt-binary performance measurement.
+
+### Rebuilt interpreter: startup measurement and successor Install
+
+The CLI rebuilt from `2ce0c358` passed (`r16-permission-optimized-cli-build.log`,
+8.94s). The optimized retained-resume campaign started at 15:57:59Z, reached
+readiness at 15:59:19Z (about 80s), and completed with clean daemon shutdown and
+endpoint removal at 15:59:23Z. The live test passed in 0.51s. Evidence under
+`target/native-denial-head-reuse.XoaplU`: `install-permission-run.log`,
+`install-permission-daemon.log`, and `install-permission-client-test.log`.
+
+This is not a controlled comparison against the earlier 545s reopen: saved
+state, journal and cache history differ. The client already had a persisted
+MAA2, so 0.51s measures retained local completion/reservation validation, not a
+fresh HTTP Install. Initial inventory took 62.115s and route reconciliation
+66.684s; this does not resolve first-response latency.
+
+The ignored live harness now accepts `VOSX_INSTALL_SMOKE_NAME` and derives a
+valid Catalog constructor from either the preceding completed Create or
+completed Install. This allows a different actor installation on the same
+Agent without resetting credential history. Ordinary vosx regression remains
+191 passed, zero failed, three ignored in 8.56s
+(`r16-second-install-harness-tests.log`).
+
+The successor campaign started at 16:00:59Z and reached readiness at 16:03:10Z.
+It uses actor name `install-smoke-catalog-second`, constructor
+`install-second-constructor.bin`, and separate `install-second-*` logs in the
+same disposable directory. The campaign is now terminal: one live test passed
+in 394.01s, after two HTTP 504 responses and identical retained retries. The
+client verified and persisted MAA2, completed the credential reservation, and
+confirmed an identical retained completion. Test completion and clean daemon
+shutdown were both at 16:09:44Z; the endpoint was removed. No campaign daemon
+remains running. The changed-head inventory took 116.521s and reconciliation
+121.098s. This proves completed Install-to-Install handoff and fresh delivery
+without restarting the daemon, not acceptable first-response latency or actor
+method invocation. Formatting and diff checks pass.
+
+The next functional gate is clean native actor invocation through ingress,
+then exact retry/restart of that invocation. Existing ordinary HTTP routing
+still resolves legacy `service_actor_routes` and dynamic messages; publication
+in the clean supervisor is not proof that those HTTP calls reach the actor.
+Use the existing typed preparation/dispatch boundary and authenticated origin
+and authorization; do not add a caller-controlled principal/role shortcut.
+After that, address lifecycle expiry/abort resolution and the remaining C1/C2
+gates above before spending a full rebuild on the final C3 release matrix.
 
 ### Durable client acknowledgement before completion
 

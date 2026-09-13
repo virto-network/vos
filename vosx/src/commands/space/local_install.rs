@@ -698,7 +698,8 @@ mod tests {
             &std::fs::read(&package_path).unwrap(),
         )
         .unwrap();
-        let name = "install-smoke-catalog";
+        let name = std::env::var("VOSX_INSTALL_SMOKE_NAME")
+            .unwrap_or_else(|_| "install-smoke-catalog".into());
         let resume = std::env::var_os("VOSX_INSTALL_SMOKE_RESUME").is_some();
         if !resume {
             assert!(
@@ -726,22 +727,36 @@ mod tests {
                     hex::encode(nonce.0)
                 ))
                 .join("request");
-            let request = CleanLocalCreateRequestFile::open_or_create(&root)
-                .unwrap()
-                .load()
-                .unwrap()
-                .unwrap();
-            let (descriptor, _, _) =
+            let previous = if root.join("local-install.request").exists() {
+                let request =
+                    super::super::clean_store::CleanLocalInstallFile::open_or_create(&root)
+                        .unwrap()
+                        .load_request()
+                        .unwrap()
+                        .unwrap();
+                LocalInstallSubmission::decode(&request)
+                    .unwrap()
+                    .into_parts()
+                    .1
+            } else {
+                let request = CleanLocalCreateRequestFile::open_or_create(&root)
+                    .unwrap()
+                    .load()
+                    .unwrap()
+                    .unwrap();
                 vos::agent::local_lifecycle::LocalCreateSubmission::decode(&request)
                     .unwrap()
-                    .into_parts();
-            assert_eq!(descriptor.identity.agent, agent);
-            let binding = descriptor.authority;
+                    .into_parts()
+                    .1
+            };
+            assert_eq!(previous.managed.agent, agent);
+            assert_eq!(previous.managed.space, space);
+            let binding = previous.authority.binding;
             let configuration = system_catalog::SystemCatalogConfiguration {
                 space: space.0,
                 system_agent: agent.0,
-                system_runtime_deployment: descriptor.identity.runtime_deployment.0,
-                actor: vos::agent::sdk::ActorId::top_level(agent, name).0,
+                system_runtime_deployment: previous.managed.runtime_deployment.0,
+                actor: vos::agent::sdk::ActorId::top_level(agent, &name).0,
                 deployment: package.deployment().0,
                 program: package.program().0,
                 authority: system_catalog::CatalogAuthorityState {
