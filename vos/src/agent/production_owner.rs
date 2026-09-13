@@ -396,6 +396,16 @@ impl fmt::Debug for AgentProductionOwner {
 }
 
 impl AgentProductionOwner {
+    pub(crate) fn ingress(&self) -> Result<CleanAgentIngress, AgentProductionOwnerError> {
+        let authority = match &self.system {
+            OwnedRouteSlot::Published { handle, .. } => handle.clone(),
+            _ => return Err(AgentProductionOwnerError::InvalidConfiguration),
+        };
+        Ok(CleanAgentIngress {
+            supervisor: self.handle(),
+            authority,
+        })
+    }
     pub(crate) fn start(
         node: NodeId,
         limits: AgentSupervisorLimits,
@@ -657,6 +667,14 @@ impl AgentProductionOwner {
         }
         result
     }
+}
+
+/// Atomically exposed with the supervisor after authenticated startup; holds
+/// dispatch handles only, never ownership of the physical system host.
+#[derive(Clone)]
+pub(crate) struct CleanAgentIngress {
+    pub(crate) supervisor: AgentSupervisorHandle,
+    pub(crate) authority: AgentRouteHostHandle,
 }
 
 impl Drop for AgentProductionOwner {

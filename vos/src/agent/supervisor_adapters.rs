@@ -2661,6 +2661,18 @@ impl AgentRouteHostHandle {
     }
 
     #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+    pub(crate) fn authority_projection_bounded(
+        &self,
+        query: AuthorityProjectionQuery,
+    ) -> Result<Vec<u8>, AgentRouteError> {
+        let (reply, result) = mpsc::sync_channel(1);
+        self.send(RouteHostCommand::AuthorityProjection { query, reply })?;
+        result
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .unwrap_or(Err(AgentRouteError::Unavailable))
+    }
+
+    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
     pub(crate) fn recover_authority_projection(&self) -> Result<bool, AgentRouteError> {
         let (reply, result) = mpsc::sync_channel(1);
         self.send(RouteHostCommand::RecoverAuthorityProjection(reply))?;

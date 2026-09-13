@@ -218,6 +218,10 @@ async fn handle_request(
         match tokio::task::spawn_blocking(move || {
             let _permit = permit;
             #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            if request.uri().path() == "/__agents/credential" {
+                return handle_clean_credential(&request, &handle);
+            }
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
             if request.uri().path() == "/__agents/local" {
                 return handle_local_create(&request, &handle);
             }
@@ -237,6 +241,45 @@ async fn handle_request(
     inner.metrics.record_response(response.status().as_u16());
     let (parts, body) = response.into_parts();
     Ok(Response::from_parts(parts, Full::new(Bytes::from(body))))
+}
+
+#[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+fn handle_clean_credential(
+    request: &super::types::Request,
+    handle: &IngressHandle,
+) -> super::types::Response {
+    use super::types::{text, with_content_type};
+    use crate::agent::sdk::authority::AuthorityProjectionQuery;
+    use crate::agent::sdk::wire::CanonicalWire as _;
+    if request.method() != http::Method::POST {
+        return text(405, "credential query is POST-only");
+    }
+    if request.uri().query().is_some() {
+        return text(400, "credential query does not accept query parameters");
+    }
+    if request
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        != Some("application/octet-stream")
+    {
+        return text(415, "credential query requires application/octet-stream");
+    }
+    let query = match AuthorityProjectionQuery::decode(request.body()) {
+        Ok(query) => query,
+        Err(_) => return text(400, "invalid clean credential query"),
+    };
+    match handle.query_clean_credential(query) {
+        Ok(projection) => match projection.encode() {
+            Ok(bytes) => with_content_type(200, "application/octet-stream", bytes),
+            Err(_) => text(503, "invalid Authority projection"),
+        },
+        Err(IngressAuthenticationError::Invalid) => text(403, "invalid API credential query"),
+        Err(IngressAuthenticationError::AuthorityUnavailable) => text(
+            503,
+            "clean Authority unavailable; retry the identical signed query",
+        ),
+    }
 }
 
 /// Signed-body authentication: LCQ1 verifies ACC3 locally and the node's live
@@ -465,6 +508,13 @@ mod tests {
 
         #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
         {
+            let query_method = request(port, "/__agents/credential");
+            assert!(query_method.starts_with("HTTP/1.1 405"), "{query_method}");
+            let adjacent_query = request(port, "/__agents/credential/");
+            assert!(
+                adjacent_query.starts_with("HTTP/1.1 401"),
+                "{adjacent_query}"
+            );
             // The exact lifecycle endpoint uses signed-body authentication;
             // adjacent application paths retain the existing bearer gate.
             let wrong_method = request(port, "/__agents/local");

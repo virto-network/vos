@@ -1990,6 +1990,39 @@ the original identity hash formulas, owner/node/producer binding, wrong-root
 packages, zero Space and root/node reuse. The ignored compiled-runtime candidate
 test remains a release gate. Formatting and diff checks pass.
 
+### Clean signed credential-query ingress
+
+`POST /__agents/credential` now accepts a canonical binary Authority projection
+query signed by an API credential. The native ingress boundary restricts the
+selector to that credential's own projection and verifies the API signature
+before worker dispatch. It does not use the older bearer-authentication route.
+The configured system owner checks the Authority target and the live actor
+checks credential enrollment/status; the returned projection must echo the
+exact signed query. Revoked status remains data for the caller to reject before
+preparing a mutation, not implicit authorization to create an Agent.
+
+The system-worker query handle is exposed atomically with the clean supervisor
+only after authenticated startup, and the shared exposure is cleared on
+shutdown. Requests use the existing bounded HTTP worker pool and system-worker
+queue, with a 120-second result wait. A timeout does not cancel a queued query.
+Projection execution has durable host recovery state despite its query
+semantics: after an ambiguous outcome, retry the identical signed query.
+
+**50/50 focused ingress, production-owner and native shutdown-boundary tests
+pass** in 2.67s (`r16-credential-query-ingress-final.log`, locked/offline
+`pvm,private-agent-store,http-ingress`, serial with socket access, disk scratch).
+New checks cover signed admission while unavailable, forged signatures,
+broader-selector refusal and socket routing of the reserved path while adjacent
+paths remain bearer-protected. An initial compile caught placement in the
+connection task; it was corrected to the bounded request worker before this
+passing run. Formatting and diff checks pass.
+
+This is not yet a successful live credential-query smoke. CLI query transport,
+exact query retention, response validation and credential-wide sequence
+reservation remain to be wired before fresh Create. The projection response is
+not an independent signed finality proof. No new native CLI build, artifact
+reproduction or master-readiness claim is made here.
+
 The CLI subcommand is still absent. Next wiring must persist the complete
 submission durably before sending and resend those bytes on retry. Bootstrap
 uses management credential sequence 1; Authority requires the next consecutive

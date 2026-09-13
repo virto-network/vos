@@ -338,4 +338,53 @@ mod tests {
             "one signed projection selector must not authorize another page"
         );
     }
+
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    #[test]
+    fn clean_credential_query_rejects_unsigned_or_broader_queries_before_dispatch() {
+        use crate::agent::sdk::Hash;
+        use crate::agent::sdk::authority::{
+            AuthorityIngressAuthentication, AuthorityProjectionSelector,
+        };
+        use crate::node::IngressAuthenticationError;
+        let node = crate::node::VosNode::new();
+        let handle = node.ingress_handle();
+        let credential = ApiAccessCredential::from_seed([0x5b; 32]).unwrap();
+        let query = credential
+            .sign_projection_query(
+                authority_target(),
+                Hash([0x41; 32]),
+                AuthorityProjectionSelector::Credential,
+            )
+            .unwrap();
+        assert_eq!(
+            handle.query_clean_credential(query.clone()),
+            Err(IngressAuthenticationError::AuthorityUnavailable)
+        );
+        let mut forged = query;
+        let AuthorityIngressAuthentication::ApiCredentialSignature { signature, .. } =
+            &mut forged.authentication
+        else {
+            unreachable!()
+        };
+        signature[0] ^= 1;
+        assert_eq!(
+            handle.query_clean_credential(forged),
+            Err(IngressAuthenticationError::Invalid)
+        );
+        let broader = credential
+            .sign_projection_query(
+                authority_target(),
+                Hash([0x42; 32]),
+                AuthorityProjectionSelector::Agents {
+                    after: None,
+                    limit: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            handle.query_clean_credential(broader),
+            Err(IngressAuthenticationError::Invalid)
+        );
+    }
 }

@@ -1343,7 +1343,7 @@ pub struct VosNode {
     /// stay in `clean_agent_owner`; shutdown clears this slot before joining.
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
     clean_agent_ingress_supervisor:
-        Arc<RwLock<Option<crate::agent::supervisor::AgentSupervisorHandle>>>,
+        Arc<RwLock<Option<crate::agent::production_owner::CleanAgentIngress>>>,
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
     clean_local_lifecycle_queue: Arc<crate::agent::local_lifecycle::LocalLifecycleQueue>,
 }
@@ -2192,7 +2192,7 @@ pub struct IngressHandle {
     #[cfg(feature = "ssh-ingress")]
     ingress_node_attester: Option<IngressNodeAttester>,
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
-    clean_agent_supervisor: Arc<RwLock<Option<crate::agent::supervisor::AgentSupervisorHandle>>>,
+    clean_agent_supervisor: Arc<RwLock<Option<crate::agent::production_owner::CleanAgentIngress>>>,
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
     clean_local_lifecycle_queue: Arc<crate::agent::local_lifecycle::LocalLifecycleQueue>,
 }
@@ -2231,6 +2231,48 @@ impl std::error::Error for IngressNodeAttestationError {}
     allow(dead_code)
 )]
 impl IngressHandle {
+    /// Query only the API credential signing this exact clean projection. The
+    /// live Authority checks enrollment/status; transport verification alone
+    /// is not permission. No legacy bearer credential is consulted here.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    pub fn query_clean_credential(
+        &self,
+        query: crate::agent::sdk::authority::AuthorityProjectionQuery,
+    ) -> Result<
+        crate::agent::sdk::authority::AuthorityCredentialProjection,
+        IngressAuthenticationError,
+    > {
+        use crate::agent::sdk::authority::{
+            AuthorityCredentialProjection, AuthorityProjectionSelector,
+        };
+        use crate::agent::sdk::wire::CanonicalWire as _;
+        if query.selector != AuthorityProjectionSelector::Credential
+            || query
+                .verify_api_with(&crate::agent::clean_bootstrap::RawCredentialVerifier)
+                .is_err()
+        {
+            return Err(IngressAuthenticationError::Invalid);
+        }
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(IngressAuthenticationError::AuthorityUnavailable);
+        }
+        let authority = self
+            .clean_agent_supervisor
+            .read()
+            .ok()
+            .and_then(|ingress| ingress.as_ref().map(|ingress| ingress.authority.clone()))
+            .ok_or(IngressAuthenticationError::AuthorityUnavailable)?;
+        let bytes = authority
+            .authority_projection_bounded(query.clone())
+            .map_err(|_| IngressAuthenticationError::AuthorityUnavailable)?;
+        let projection = AuthorityCredentialProjection::decode(&bytes)
+            .map_err(|_| IngressAuthenticationError::AuthorityUnavailable)?;
+        if projection.query != query {
+            return Err(IngressAuthenticationError::AuthorityUnavailable);
+        }
+        Ok(projection)
+    }
+
     /// Queue one bounded Local Create for the node owner. Queue acceptance is
     /// not authorization or application success: await the returned result.
     /// Disconnecting does not cancel an accepted durable lifecycle operation.
@@ -2266,7 +2308,7 @@ impl IngressHandle {
         self.clean_agent_supervisor
             .read()
             .ok()
-            .and_then(|supervisor| supervisor.clone())
+            .and_then(|ingress| ingress.as_ref().map(|ingress| ingress.supervisor.clone()))
     }
 
     /// Attest one exact clean system-authority projection query after the SSH
@@ -5714,7 +5756,7 @@ impl VosNode {
             let _ = owner.shutdown_and_join();
             return Err(AgentProductionOwnerError::DuplicateHost);
         }
-        let handle = owner.handle();
+        let handle = owner.ingress()?;
         let Ok(mut exposed) = self.clean_agent_ingress_supervisor.write() else {
             let _ = owner.shutdown_and_join();
             return Err(AgentProductionOwnerError::InvalidConfiguration);
@@ -5733,7 +5775,7 @@ impl VosNode {
         self.clean_agent_ingress_supervisor
             .read()
             .ok()
-            .and_then(|supervisor| supervisor.clone())
+            .and_then(|ingress| ingress.as_ref().map(|ingress| ingress.supervisor.clone()))
     }
 
     /// Hand one physical Local worker to the installed production owner. It
