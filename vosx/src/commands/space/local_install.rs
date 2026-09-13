@@ -246,6 +246,100 @@ mod tests {
     }
 
     #[test]
+    fn install_reservation_requires_durable_exact_completion_and_serializes_successors() {
+        use super::super::clean_store::{
+            CleanCredentialReservation, CleanFileStoreError, CleanLocalInstallFile,
+            CredentialReservationStatus, ensure_private_directory,
+        };
+        use std::os::unix::fs::DirBuilderExt as _;
+        let (request, ack, _) = fixture();
+        let (install, call, _) = LocalInstallSubmission::decode(&request)
+            .unwrap()
+            .into_parts();
+        let nonce = Hash(install.installation_id.0);
+        let mut random = [0; 8];
+        getrandom::getrandom(&mut random).unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("vosx-install-reservation-{}", hex::encode(random)));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let claims = directory.join("claims");
+        let _claims = ensure_private_directory(&claims).unwrap();
+        let mut reservation = CleanCredentialReservation::open_or_create(
+            &claims,
+            call.managed.space,
+            call.credential,
+        )
+        .unwrap();
+        assert!(matches!(
+            CleanCredentialReservation::open_or_create(
+                &claims,
+                call.managed.space,
+                call.credential
+            ),
+            Err(CleanFileStoreError::Busy)
+        ));
+        assert_eq!(
+            reservation.reserve(nonce).unwrap(),
+            CredentialReservationStatus::Pending
+        );
+        let successor = Hash([0x71; 32]);
+        assert!(matches!(
+            reservation.reserve(successor),
+            Err(CleanFileStoreError::RequestConflict)
+        ));
+        let mut delivery =
+            CleanLocalInstallFile::open_or_create(directory.join("request")).unwrap();
+        delivery.publish_request(&request).unwrap();
+        assert!(reservation.complete_install(&mut delivery).is_err());
+        assert_eq!(
+            reservation.current().unwrap(),
+            Some((nonce, CredentialReservationStatus::Pending))
+        );
+        delivery
+            .publish_acknowledgement(&ack.encode().unwrap())
+            .unwrap();
+        reservation.complete_install(&mut delivery).unwrap();
+        reservation.complete_install(&mut delivery).unwrap();
+        assert_eq!(
+            reservation.current().unwrap(),
+            Some((nonce, CredentialReservationStatus::Completed))
+        );
+        drop(reservation);
+        let mut reservation = CleanCredentialReservation::open_or_create(
+            &claims,
+            call.managed.space,
+            call.credential,
+        )
+        .unwrap();
+        reservation.complete_install(&mut delivery).unwrap();
+        assert_eq!(
+            reservation.reserve(successor).unwrap(),
+            CredentialReservationStatus::Pending
+        );
+        assert!(reservation.complete_install(&mut delivery).is_err());
+        assert_eq!(
+            reservation.current().unwrap(),
+            Some((successor, CredentialReservationStatus::Pending))
+        );
+        let mut other = CleanCredentialReservation::open_or_create(
+            &claims,
+            vos::agent::sdk::SpaceId([0x72; 32]),
+            call.credential,
+        )
+        .unwrap();
+        other.reserve(nonce).unwrap();
+        assert!(other.complete_install(&mut delivery).is_err());
+        drop(other);
+        drop(reservation);
+        drop(delivery);
+        drop(_claims);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
     fn retained_install_transport_preserves_request_and_verifies_before_completion() {
         use super::super::clean_store::{CleanFileStoreError, CleanLocalInstallFile};
         use std::io::{Read as _, Write as _};

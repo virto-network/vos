@@ -4381,6 +4381,34 @@ credential reservation, followed by real install/invoke/restart testing and
 the still-open denial/expiry/abort/crash/capacity cases. No master promotion or
 ordinary-agent usability claim is made here.
 
+### Shared credential reservation completion for Install
+
+The existing Space/Credential reservation now has an Install completion path
+that reads and re-syncs LIQ1 and verified MAA2 under the delivery store lease.
+It checks the reserved nonce against the signed installation ID and checks the
+Space/Credential before committing a domain-separated Install request commitment
+and exact acknowledgement commitment. Missing delivery evidence, a different
+reserved operation or conflicting terminal evidence cannot release a reservation.
+Create and Install use the same reservation namespace and exclusive lease; this
+does not introduce independent sequence allocation for each operation kind.
+
+All `vosx` binary tests pass: 187 passed, zero failed, two ignored, 7.20s
+(`r16-install-reservation-tests.log`, locked/offline, disk scratch). The added
+case covers exclusive lease contention, refused successor while pending,
+missing acknowledgement, exact completion/reopen, allowed successor after
+completion, refused stale completion and a mismatched Space. Existing Create
+reservation and delivery regressions remain in the passing full suite.
+
+This is the shared completion primitive, not yet a fresh managed Install
+command. That command must reserve the installation ID before preparation and
+hold the credential lease through discovery, publication, delivery and this
+completion. Fresh descriptor discovery is another concrete prerequisite: the
+current HTTP query endpoint exposes only Credential, while the Authority SDK
+provides paged Agents and AgentReplicas. Reconstructing a descriptor requires
+response-bound pages at one exact Authority head; do not invent a descriptor
+from a caller-provided Agent ID or substitute a stale inventory on query errors.
+The full goal and C1/C2/C3 release blockers remain unchanged.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

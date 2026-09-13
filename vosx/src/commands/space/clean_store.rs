@@ -536,6 +536,48 @@ impl CleanCredentialReservation {
         self.store.commit(&completed)
     }
 
+    /// Complete Install only from its durably retained request and MAA2.
+    /// The reserved operation nonce is the Install's signed installation ID.
+    /// This uses the same Space/Credential lease as Create, not a second lane
+    /// of credential sequences. No denial or transport error completes it.
+    pub(crate) fn complete_install(
+        &mut self,
+        delivery: &mut CleanLocalInstallFile,
+    ) -> Result<(), CleanFileStoreError> {
+        use vos::agent::sdk::Hash;
+        let request = delivery
+            .load_request()?
+            .ok_or(CleanFileStoreError::RequestConflict)?;
+        let response = delivery
+            .load_acknowledgement()?
+            .ok_or(CleanFileStoreError::RequestConflict)?;
+        let ack = super::local_install::verify_acknowledgement(&request, &response)
+            .map_err(|_| CleanFileStoreError::Corrupt)?;
+        let (install, call, _) =
+            vos::agent::local_lifecycle::LocalInstallSubmission::decode(&request)
+                .map_err(|_| CleanFileStoreError::Corrupt)?
+                .into_parts();
+        if call.managed.space != self.space || call.credential != self.credential {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        let nonce = Hash(install.installation_id.0);
+        let current = self.load()?.ok_or(CleanFileStoreError::RequestConflict)?;
+        if current[68..100] != nonce.0 {
+            return Err(CleanFileStoreError::RequestConflict);
+        }
+        let completed = self.image(
+            nonce,
+            Some((
+                Hash::digest(b"vos/local-install/retained-request/v1", &[&request]),
+                ack.commitment(),
+            )),
+        );
+        if current[100] != 0 && current != completed {
+            return Err(CleanFileStoreError::RequestConflict);
+        }
+        self.store.commit(&completed)
+    }
+
     /// Re-verify and sync the immutable certificate under its lease before
     /// committing a distinct denied marker. Raw HTTP errors never reach here.
     pub(crate) fn deny(
