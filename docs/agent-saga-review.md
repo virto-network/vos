@@ -4441,6 +4441,33 @@ discover credential and descriptor at one head, prepare and persist the actor
 request, submit it and complete the shared reservation from saved MAA2. The
 live install/invoke/restart campaign and full C1/C2/C3 release gates remain open.
 
+### Package-derived client Install construction
+
+The client now builds Install entries from an admitted actor package, selected
+Agent/name/optional parent, explicitly supplied installation/reservation IDs and
+optional constructor bytes. It derives actor identity, deployment/program,
+package/schema/policy references, constructor ABI, state layout, lane set and
+installation-data reference instead of accepting caller-provided artifact fields.
+Constructor-data presence must match the package schema. Zero target or parent,
+invalid names/IDs and invalid request shape are rejected. The builder does not
+allocate IDs, prove a parent exists, validate guest constructor semantics or
+authorize installation; those are separate workflow/runtime responsibilities.
+
+The signed Install client fixtures now use this builder instead of the private
+system-bootstrap fixture helper, which was removed. The first new negative case
+found that generic request-shape validation alone did not reject a zero parent;
+the client now checks it explicitly. Final full `vosx` tests: 189 passed, zero
+failed, two ignored, 7.71s (`r16-install-builder-final.log`). Coverage includes
+deterministic construction, package/target binding, top-level/child identity,
+required constructor data, invalid name/parent, changed data references, and the
+existing signed delivery/storage/reservation tests using the new construction.
+The synthetic constructor bytes are not evidence of successful PVM execution.
+Formatting and diff checks pass; all scratch remains disk-backed.
+
+The fresh managed command still needs orchestration and user-input wiring.
+This checkpoint does not expose fresh Install UX or close the live invocation
+and full C1/C2/C3 release gates.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

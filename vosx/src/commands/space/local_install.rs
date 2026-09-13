@@ -5,6 +5,82 @@ use vos::agent::local_lifecycle::LocalInstallSubmission;
 use vos::agent::sdk::authority::ManagementApplicationAck;
 use vos::agent::sdk::wire::CanonicalWire as _;
 
+/// Build the exact actor entry from admitted artifacts. IDs must already be
+/// reserved by the caller; this function does not allocate or publish them.
+pub(crate) fn build_install(
+    agent: vos::agent::sdk::AgentId,
+    installation_id: vos::agent::sdk::InstallationId,
+    registry_reservation: vos::agent::sdk::Hash,
+    name: String,
+    parent: Option<vos::agent::sdk::ActorId>,
+    data: Option<Vec<u8>>,
+    package: &vos::agent::package_admission::AdmittedActorPackage,
+) -> anyhow::Result<vos::agent::sdk::InstallActor> {
+    use vos::agent::sdk::{
+        ActorEntry, ActorId, BlobRef, InstallActor, InstallationData, ManagementRequest,
+    };
+    anyhow::ensure!(
+        agent != vos::agent::sdk::AgentId::ZERO && parent != Some(ActorId::ZERO),
+        "invalid target Agent"
+    );
+    let schema = vos::agent::sdk::schema::decode(package.state_lane_schema_bytes())
+        .map_err(|error| anyhow::anyhow!("invalid actor schema: {error:?}"))?;
+    anyhow::ensure!(
+        data.is_some() == schema.requires_installation_data(),
+        "constructor data presence differs from the actor's constructor contract"
+    );
+    let installation_data = data.map(|bytes| InstallationData {
+        reference: BlobRef::of_bytes(&bytes),
+        bytes,
+    });
+    let actor = match parent {
+        Some(parent) => ActorId::owned_child(parent, &name),
+        None => ActorId::top_level(agent, &name),
+    };
+    let constructor_abi = schema
+        .constructor_abi()
+        .map_err(|error| anyhow::anyhow!("constructor ABI: {error:?}"))?;
+    let state_layout = schema
+        .state_layout_hash()
+        .map_err(|error| anyhow::anyhow!("state layout: {error:?}"))?;
+    let entry = ActorEntry {
+        actor,
+        name,
+        parent,
+        deployment: package.deployment(),
+        program: package.program(),
+        package: package.package_ref().clone(),
+        agent_schema: package.manifest().state_lane_schema.clone(),
+        method_policy: package.manifest().method_policy.clone(),
+        constructor_abi,
+        installation_data: installation_data
+            .as_ref()
+            .map(|data| data.reference.clone()),
+        state_layout,
+        lanes: package.requirements().lanes,
+        suspended: false,
+    };
+    let install = InstallActor {
+        installation_id,
+        registry_reservation,
+        entry,
+        producer: package.producer(),
+        package: package.package_ref().clone(),
+        agent_schema: package.manifest().state_lane_schema.clone(),
+        method_policy: package.manifest().method_policy.clone(),
+        constructor_abi,
+        installation_data,
+        state_layout,
+        contract: package.manifest().contract,
+        requirements: package.requirements(),
+    };
+    anyhow::ensure!(
+        ManagementRequest::Install(Box::new(install.clone())).is_valid(),
+        "invalid actor installation"
+    );
+    Ok(install)
+}
+
 /// Discovery must agree with the head used for credential sequence selection.
 /// These response-bound local pages are not a management receipt or finality.
 pub(crate) fn discover_agent(
@@ -246,7 +322,7 @@ mod tests {
         AuthorityEvidence, AuthorityLaneRoots, AuthorityReceipt, AuthorityReceiptSelector,
         ManagementApproval,
     };
-    use vos::agent::sdk::{Hash, ManagementReply, ManagementRequest};
+    use vos::agent::sdk::{Hash, ManagementReply};
 
     fn fixture() -> (Vec<u8>, ManagementApplicationAck, libp2p::identity::Keypair) {
         let (operator, authority, descriptor, _) = super::super::local_create::tests::fixture();
@@ -254,14 +330,18 @@ mod tests {
             "../../../blobs/system_catalog.vos"
         ))
         .unwrap();
-        let ManagementRequest::Install(install) =
-            super::super::clean_startup::install_request_fixture(
+        let install = Box::new(
+            build_install(
                 descriptor.identity.agent,
+                vos::agent::sdk::InstallationId([0x51; 32]),
+                Hash([0x52; 32]),
+                "catalog".into(),
+                None,
+                Some(vec![1]),
                 &package,
             )
-        else {
-            unreachable!()
-        };
+            .unwrap(),
+        );
         let submission = prepare(
             &operator,
             authority,
@@ -352,6 +432,49 @@ mod tests {
             .try_into()
             .unwrap();
         (request, ack, operator)
+    }
+
+    #[test]
+    fn actor_builder_binds_target_and_package_and_requires_constructor_data() {
+        use vos::agent::sdk::{ActorId, InstallationId};
+        let (_, _, descriptor, _) = super::super::local_create::tests::fixture();
+        let package = vos::agent::package_admission::admit_actor_package(include_bytes!(
+            "../../../blobs/system_catalog.vos"
+        ))
+        .unwrap();
+        let build = |name: &str, parent, data| {
+            build_install(
+                descriptor.identity.agent,
+                InstallationId([0x41; 32]),
+                Hash([0x42; 32]),
+                name.into(),
+                parent,
+                data,
+                &package,
+            )
+        };
+        assert!(build("catalog", None, None).is_err());
+        let first = build("catalog", None, Some(vec![1])).unwrap();
+        assert_eq!(first, build("catalog", None, Some(vec![1])).unwrap());
+        assert_eq!(
+            first.entry.actor,
+            ActorId::top_level(descriptor.identity.agent, "catalog")
+        );
+        assert_eq!(first.entry.package, *package.package_ref());
+        assert_eq!(first.entry.deployment, package.deployment());
+        assert_eq!(first.entry.program, package.program());
+        let parent = ActorId([0x43; 32]);
+        let child = build("child", Some(parent), Some(vec![1])).unwrap();
+        assert_eq!(child.entry.actor, ActorId::owned_child(parent, "child"));
+        assert!(build("", None, Some(vec![1])).is_err());
+        assert!(build("child", Some(ActorId::ZERO), Some(vec![1])).is_err());
+        assert_ne!(
+            first.entry.installation_data,
+            build("catalog", None, Some(vec![2]))
+                .unwrap()
+                .entry
+                .installation_data
+        );
     }
 
     #[test]
