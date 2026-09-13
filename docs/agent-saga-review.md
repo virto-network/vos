@@ -3123,6 +3123,48 @@ runs restart on a separate default-sized thread stack, without raising stack
 limits. The first cleanup adds exactly two Ordered acknowledgements; the second
 adds none. No new bundled artifacts or rebuilt-CLI smoke is claimed here.
 
+### Mixed incomplete-work and retirement admission
+
+Shared journal recovery now calculates one prospective Ordered chain for both
+anchored incomplete invocations and older completed calls awaiting retirement.
+The combined entry/byte budget rejects duplicate identities across the two
+classes and an oversized combined set. Checking classes independently could
+allow each to fit while their sum did not. Existing pending-only and retirement-only
+checks now delegate to the same combined calculation.
+
+The network recovery constructor can seed both classes before route publication.
+Only the exact saved anchored Invoke is admitted for pending work; only reserved
+acknowledgements are admitted for retirement work. Ordinary work, new anchor
+publication and projection reservations stay blocked. Refresh retains both
+classes and rechecks the combined budget before and after leader promotion.
+Completing an older retirement leaves pending-work exclusion in place. The
+pending-to-retirement handoff includes every pending identity and preserves all
+existing retirement pairs under the proposal lock, instead of replacing them.
+
+Native fixtures exercise an already acknowledged older pair alongside four
+prepared signed calls, a failed retirement completion callback followed by
+refresh, and successful older-pair completion without releasing pending work.
+After two fresh invocations, two unseen calls plus two retained retirement calls
+require six prospective entries. The fixture reattaches in that mixed state,
+rejects invoking a retirement-only member, executes remaining pending work,
+and transfers it without losing the older pair. Cross-class duplicate identities
+are rejected both by the journal budget and before network attachment.
+
+This is the shared admission mechanism required by incomplete startup recovery;
+it does **not** yet enable that recovery in `vosx`. The next integration remains
+recovery of the durable application acknowledgement and saved finalization call,
+then phase extension for authorization-only work. The startup classifier still
+rejects incomplete phases, and pending projections and exhausted-capacity
+recovery remain open. These fixtures do not prove filesystem cross-process
+recovery or the final release gates.
+
+Verification: **13 native tests passed** (250.47s,
+`r16-mixed-management-native-final.log`) and **7 shared-network tests passed**
+(0.43s, `r16-mixed-management-network.log`). The initial focused native mixed
+recovery run also passed (104.74s, `r16-mixed-management-gate.log`), before the
+last duplicate/retirement-only dispatch assertions were added. Formatting and
+diff checks pass; logs remain in the shared disk-backed scratch directory.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

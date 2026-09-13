@@ -1454,6 +1454,15 @@ where
         &self,
         envelopes: &[&crate::agent_sdk::RuntimeWork],
     ) -> Result<Option<usize>, SharedJournalDriverError> {
+        self.management_recovery_admission_requirement(&[], envelopes)
+    }
+
+    fn management_retirement_delta(
+        &self,
+        envelopes: &[&crate::agent_sdk::RuntimeWork],
+        mut index: u64,
+        mut parent: Option<super::journal::OrderedEntryId>,
+    ) -> Result<(usize, usize), SharedJournalDriverError> {
         use crate::agent_sdk::{
             InvocationAuthorization, MethodMode, RuntimeExecutionContext, RuntimeOutcome,
             RuntimeWork,
@@ -1464,8 +1473,6 @@ where
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
         let heads = self.materialization.heads();
-        let mut index = heads.ordered_index;
-        let mut parent = heads.ordered_head;
         let mut seen = BTreeSet::new();
         let mut entries = 0usize;
         let mut bytes = 0usize;
@@ -1538,10 +1545,7 @@ where
             entries += 1;
             parent = Some(entry.id());
         }
-        Ok(self
-            .materialization
-            .has_suffix_headroom(entries, bytes)
-            .then_some(entries))
+        Ok((entries, bytes))
     }
 
     /// Joint suffix cost for anchored, terminal management invocations and
@@ -1555,8 +1559,26 @@ where
             &crate::agent_sdk::RuntimeWork,
         )],
     ) -> Result<Option<usize>, SharedJournalDriverError> {
+        self.management_recovery_admission_requirement(pending, &[])
+    }
+
+    /// One prospective Ordered chain for incomplete invocations and completed
+    /// results awaiting retirement. Independent per-set checks are insufficient
+    /// because both consume the same suffix entry and byte budgets.
+    pub(crate) fn management_recovery_admission_requirement(
+        &self,
+        pending: &[(
+            &super::clean_management_intent::ManagementJournalAnchor,
+            &crate::agent_sdk::RuntimeWork,
+        )],
+        retiring: &[&crate::agent_sdk::RuntimeWork],
+    ) -> Result<Option<usize>, SharedJournalDriverError> {
         use crate::agent_sdk::{RuntimeOutcome, RuntimeWork};
-        if pending.len() > super::replay::MAX_REPLAY_SUFFIX_ENTRIES {
+        if pending
+            .len()
+            .checked_add(retiring.len())
+            .is_none_or(|len| len > super::replay::MAX_REPLAY_SUFFIX_ENTRIES)
+        {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
         let heads = self.materialization.heads();
@@ -1649,6 +1671,22 @@ where
                 parent = Some(entry.id());
             }
         }
+        for &envelope in retiring {
+            let RuntimeWork::Invoke { invocation, .. } = envelope else {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            };
+            if !seen.insert(invocation.invocation) {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+        }
+        let (retirement_entries, retirement_bytes) =
+            self.management_retirement_delta(retiring, index, parent)?;
+        let entries = entries
+            .checked_add(retirement_entries)
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        let bytes = bytes
+            .checked_add(retirement_bytes)
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
         Ok(self
             .materialization
             .has_suffix_headroom(entries, bytes)

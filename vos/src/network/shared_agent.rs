@@ -1170,11 +1170,27 @@ impl SharedRouteHandler {
         if proposal.projection_pair.is_some() {
             return Err(SharedAgentHostError::Conflict);
         }
+        if !handoff_pending
+            && proposal
+                .management_retirement
+                .as_ref()
+                .is_some_and(|existing| keys.iter().all(|pair| existing.contains(pair)))
+        {
+            return Ok(());
+        }
         match (&proposal.management_pending, handoff_pending) {
             (None, false) => {}
             (Some(pending), true)
-                if proposal.management_retirement.is_none()
-                    && pending.len() == keys.len() * 2
+                if pending.len()
+                    + proposal
+                        .management_retirement
+                        .as_ref()
+                        .map_or(0, |set| set.len() * 2)
+                    == keys.len() * 2
+                    && proposal
+                        .management_retirement
+                        .as_ref()
+                        .is_none_or(|set| set.iter().all(|pair| keys.contains(pair)))
                     && pending
                         .iter()
                         .all(|(key, _)| keys.iter().flatten().any(|expected| expected == key)) => {}
@@ -1182,7 +1198,8 @@ impl SharedRouteHandler {
         }
         match &proposal.management_retirement {
             Some(existing) if keys.iter().all(|pair| existing.contains(pair)) => return Ok(()),
-            Some(_) => return Err(SharedAgentHostError::Conflict),
+            Some(_) if !handoff_pending => return Err(SharedAgentHostError::Conflict),
+            Some(_) => {}
             None => {}
         }
         let worker = self
@@ -1419,7 +1436,22 @@ impl SharedRouteHandler {
             .proposal
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let pending_invoke = if let (Some(pending), InvocationClock::PersistedManagement(anchor)) =
+            (&proposal.management_pending, clock)
+        {
+            let key = ProjectionPairKey::new(request.work(), request.authorization());
+            pending
+                .iter()
+                .any(|(expected, saved)| *expected == key && saved == anchor)
+                && matches!(
+                    &request,
+                    crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Invoke { .. }
+                )
+        } else {
+            false
+        };
         match (proposal.projection_pair, &proposal.management_retirement, reservation) {
+            (None, _, None) if pending_invoke => {},
             (None, None, None) => {}
             (Some(expected), None, Some(ReservedSubmission::Projection(actual))) if expected == actual => {}
             (None, Some(expected), Some(ReservedSubmission::ManagementRetirement(actual)))
@@ -1427,21 +1459,14 @@ impl SharedRouteHandler {
                     && matches!(&request, crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Acknowledge { .. }) => {}
             _ => return Err(SharedAgentHostError::CapacityExhausted),
         }
-        if let Some(pending) = &proposal.management_pending {
-            let InvocationClock::PersistedManagement(anchor) = clock else {
-                return Err(SharedAgentHostError::CapacityExhausted);
-            };
-            let key = ProjectionPairKey::new(request.work(), request.authorization());
-            if !pending
-                .iter()
-                .any(|(expected, saved)| *expected == key && saved == anchor)
-                || !matches!(
-                    &request,
-                    crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Invoke { .. }
-                )
-            {
-                return Err(SharedAgentHostError::CapacityExhausted);
-            }
+        if proposal.management_pending.is_some()
+            && !pending_invoke
+            && !matches!(
+                reservation,
+                Some(ReservedSubmission::ManagementRetirement(_))
+            )
+        {
+            return Err(SharedAgentHostError::CapacityExhausted);
         }
         let worker = self
             .worker
@@ -2310,11 +2335,10 @@ impl SharedAgentNetworkHost {
         agent: crate::service::AgentId,
         pairs: Vec<[crate::agent_sdk::RuntimeWork; 2]>,
     ) -> Result<Self, SharedAgentHostError> {
-        if pairs.is_empty() || pairs.len() > MAX_REPLAY_SUFFIX_ENTRIES / 2 {
+        if pairs.is_empty() {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        management_retirement_set_keys(agent, &retirement_pair_refs(&pairs))?;
-        Self::attach_internal(host, network, None, Some(agent), Some((agent, pairs)), None)
+        Self::attach_recovering_management_set(host, network, agent, vec![], pairs)
     }
 
     /// The caller must independently verify the durable intent set and its
@@ -2327,13 +2351,47 @@ impl SharedAgentNetworkHost {
         pending: Vec<PendingManagement>,
     ) -> Result<Self, SharedAgentHostError> {
         pending_management_keys(agent, &pending)?;
+        Self::attach_recovering_management_set(host, network, agent, pending, vec![])
+    }
+
+    /// Seed both independently verified recovery classes before route
+    /// publication. No identity may belong to both admission classes.
+    pub(crate) fn attach_recovering_management_set(
+        host: Arc<Mutex<SharedAgentHost>>,
+        network: Arc<Network>,
+        agent: crate::service::AgentId,
+        pending: Vec<PendingManagement>,
+        retiring: Vec<[crate::agent_sdk::RuntimeWork; 2]>,
+    ) -> Result<Self, SharedAgentHostError> {
+        if pending.is_empty() && retiring.is_empty() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let mut seen = BTreeSet::new();
+        if !pending.is_empty() {
+            for (key, _) in pending_management_keys(agent, &pending)? {
+                seen.insert(key.invocation);
+            }
+        }
+        if !retiring.is_empty() {
+            for key in management_retirement_set_keys(agent, &retirement_pair_refs(&retiring))?
+                .into_iter()
+                .flatten()
+            {
+                if !seen.insert(key.invocation) {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+            }
+        }
+        if seen.len() > MAX_REPLAY_SUFFIX_ENTRIES {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
         Self::attach_internal(
             host,
             network,
             None,
             Some(agent),
-            None,
-            Some((agent, pending)),
+            (!retiring.is_empty()).then_some((agent, retiring)),
+            (!pending.is_empty()).then_some((agent, pending)),
         )
     }
 
@@ -2549,11 +2607,18 @@ impl SharedAgentNetworkHost {
 
     /// Transfer the entire verified pending set without opening admission
     /// between invocation recovery and positive-acknowledgement retirement.
+    /// Existing retirement pairs are preserved; supply only newly finished pairs.
     pub(crate) fn handoff_management_pending_to_retirement(
         &mut self,
         agent: crate::service::AgentId,
         pairs: &[[&crate::agent_sdk::RuntimeWork; 2]],
     ) -> Result<(), SharedAgentHostError> {
+        let mut combined = self
+            .management_retirements
+            .get(&agent)
+            .cloned()
+            .unwrap_or_default();
+        combined.extend(pairs.iter().map(|pair| [pair[0].clone(), pair[1].clone()]));
         let attached = self
             .generations
             .get(&agent)
@@ -2567,14 +2632,8 @@ impl SharedAgentNetworkHost {
         }
         attached
             .coordinator
-            .transition_management_retirement_set(pairs, true)?;
-        self.management_retirements.insert(
-            agent,
-            pairs
-                .iter()
-                .map(|pair| [pair[0].clone(), pair[1].clone()])
-                .collect(),
-        );
+            .transition_management_retirement_set(&retirement_pair_refs(&combined), true)?;
+        self.management_retirements.insert(agent, combined);
         self.management_pending.remove(&agent);
         Ok(())
     }
@@ -2902,9 +2961,7 @@ impl SharedAgentNetworkHost {
         let agent = status.generation.agent();
         let retirement = self.management_retirements.get(&agent).cloned();
         let pending_management = self.management_pending.get(&agent).cloned();
-        if (retirement.is_some() && recovering.is_some())
-            || (pending_management.is_some() && (retirement.is_some() || recovering.is_some()))
-        {
+        if recovering.is_some() && (retirement.is_some() || pending_management.is_some()) {
             return Err(SharedAgentHostError::Conflict);
         }
         let promotion_barrier = promotion_barrier
@@ -2935,7 +2992,16 @@ impl SharedAgentNetworkHost {
                 .lock()
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
             let required = host
-                .management_pending_admission_requirement(agent, &pending_management_refs(pending))?
+                .management_recovery_admission_requirement(
+                    agent,
+                    &pending_management_refs(pending),
+                    &retirement
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .flatten()
+                        .collect::<Vec<_>>(),
+                )?
                 .ok_or(SharedAgentHostError::CapacityExhausted)?;
             let remaining = host
                 .show(agent)?
@@ -2946,7 +3012,9 @@ impl SharedAgentNetworkHost {
                 return Err(SharedAgentHostError::CapacityExhausted);
             }
         }
-        if let Some(envelopes) = &retirement {
+        if pending_management.is_none()
+            && let Some(envelopes) = &retirement
+        {
             let host = self
                 .host
                 .lock()
@@ -3181,7 +3249,16 @@ impl SharedAgentNetworkHost {
                 .lock()
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
             let required = host
-                .management_pending_admission_requirement(agent, &pending_management_refs(pending))?
+                .management_recovery_admission_requirement(
+                    agent,
+                    &pending_management_refs(pending),
+                    &retirement
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .flatten()
+                        .collect::<Vec<_>>(),
+                )?
                 .ok_or(SharedAgentHostError::CapacityExhausted)?;
             let remaining = host
                 .show(agent)?
@@ -3192,6 +3269,12 @@ impl SharedAgentNetworkHost {
             }
             ProposalAdmission {
                 management_pending: Some(pending_management_keys(agent, pending)?),
+                management_retirement: retirement
+                    .as_ref()
+                    .map(|pairs| {
+                        management_retirement_set_keys(agent, &retirement_pair_refs(pairs))
+                    })
+                    .transpose()?,
                 ..ProposalAdmission::default()
             }
         } else if let Some(envelopes) = &retirement {
