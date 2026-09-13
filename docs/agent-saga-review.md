@@ -4693,6 +4693,47 @@ and authorization; do not add a caller-controlled principal/role shortcut.
 After that, address lifecycle expiry/abort resolution and the remaining C1/C2
 gates above before spending a full rebuild on the final C3 release matrix.
 
+### Clean HTTP invocation transport
+
+`POST /__agents/invoke` now forwards bounded canonical ASQ1 directly to the
+active clean supervisor, selecting the full Space/Agent/Actor key and checking
+the installed identity through `dispatch_encoded_invocation`. It retains exact
+request bytes, including authorization and recovery intent, and only returns
+canonical ASR1 after exact response-commitment verification. HTTP 200 is a
+runtime outcome, not necessarily actor success. Transport failures remain
+unknown outcomes; they do not authorize replacing the invocation identity.
+
+The selected runtime still verifies Authority receipts and installed method
+policy. Unsigned PublicPreflight calls must be completely anonymous; bearer
+headers do not rewrite their claims. Transport-node claims are rejected.
+Attested execution returns 501 before dispatch: the generic dispatcher cannot
+provide the required verified attested delivery capability. No new legacy
+fallback or permissive authorization adapter was added.
+
+HTTP tests pass: four tests in 0.26s (`r16-clean-invoke-http-final.log`),
+including malformed/trailing frames, wrong method/content type, query/body
+limits, unsigned principal/credential/actor/node claims, unchanged behavior
+with a bearer header, unavailable supervisor, pre-dispatch attested rejection,
+exact endpoint versus adjacent bearer-protected paths, and socket saturation.
+These are boundary tests, not successful native actor execution.
+
+The first supervisor regression run found one failure (27 passed): its
+cross-page mismatch fixture kept the already-cached authenticated head. The
+fixture now advances that head and asserts that pagination was exercised,
+preserving its mutation-free failure and ABA cleanup checks. Production
+inventory reuse is unchanged. Initial evidence: `r16-clean-invoke-supervisor.log`.
+The corrected full supervisor-adapter suite passes: 28 tests in 0.03s
+(`r16-clean-invoke-supervisor-final.log`), including canonical frame rejection,
+exact replay/restart, stale route identity, response substitution, and rejection
+of generic attested-response admission. Formatting and diff checks pass.
+
+Still required: client preparation against physical identity/policy, protected
+receipt issuance for non-Public calls, retained invocation submission and
+continuation/acknowledgement transport, friendly HTTP/SSH routing, and the
+fresh installed actor invocation/exact retry/restart campaign. The typed
+endpoint is one implementation step toward that workflow, not a replacement
+for it or for any C1/C2/C3 release gate.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

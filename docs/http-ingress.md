@@ -42,6 +42,32 @@ public operator command returns only with the clean system bootstrap.
 
 ## Routes
 
+### Clean invocation transport (saga branch)
+
+`POST /__agents/invoke` accepts an exact canonical `ASQ1` body with
+`Content-Type: application/octet-stream`, bounded by the HTTP request limit.
+Query parameters are rejected. The Space/Agent/Actor and installed generation
+come from the envelope and must match the active clean supervisor route; there
+is no legacy name or dynamic-message fallback.
+
+Authorization is in the envelope, not a bearer-header rewrite. Authority
+receipts remain signature/policy-verified by the selected runtime. Unsigned
+`PublicPreflight` requests must be anonymous, without principal, credential,
+actor provenance, capability, or roles; the runtime must still resolve the
+installed method policy as Public. HTTP never accepts transport-node claims.
+Attested requests currently return 501 before dispatch because the generic
+dispatcher cannot provide verified attested delivery yet.
+
+A 200 binary response is canonical `ASR1`, bound to the exact request. Inspect
+its runtime outcome: HTTP 200 does not itself mean actor success. On transport
+failure or 503, retain the original bytes; do not assume execution did not
+occur or generate a new invocation identity. This endpoint does not yet supply
+client preparation, receipt issuance, continuation/acknowledgement transport,
+or the friendly JSON route below. A full live invocation/restart campaign is
+still required before ordinary-agent testing is considered ready.
+
+### Existing name-based routes
+
 | Route | Required authority |
 | --- | --- |
 | `GET /__status` | none |

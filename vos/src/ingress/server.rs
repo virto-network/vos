@@ -233,6 +233,10 @@ async fn handle_request(
             if request.uri().path() == "/__agents/local/install" {
                 return handle_local_install(&request, &handle);
             }
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            if request.uri().path() == "/__agents/invoke" {
+                return handle_clean_invocation(&request, &handle);
+            }
             let access = match authenticate(&request, &handle) {
                 Ok(access) => access,
                 Err((status, message)) => return simple_bytes(status, message),
@@ -471,6 +475,95 @@ fn handle_local_install(
     }
 }
 
+/// Forward canonical clean work, never legacy dynamic actor messages. Receipt
+/// authorization remains the selected runtime's responsibility. An unsigned
+/// PublicPreflight is not proof of any caller identity, even for Public methods.
+#[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+fn handle_clean_invocation(
+    request: &super::types::Request,
+    handle: &IngressHandle,
+) -> super::types::Response {
+    use super::types::{text, with_content_type};
+    use crate::agent::sdk::wire::CanonicalWire as _;
+    use crate::agent::sdk::{
+        InvocationAuthorization, InvocationOrigin, InvocationRoleClaims, RuntimeExecutionContext,
+    };
+    use crate::agent::supervisor::AgentRouteKey;
+    use crate::agent::supervisor_adapters::{AgentInvocationRequest, dispatch_encoded_invocation};
+
+    if request.body().len() > MAX_BODY_BYTES {
+        return text(413, "request body too large");
+    }
+    if request.method() != http::Method::POST {
+        return text(405, "clean invocation is POST-only");
+    }
+    if request.uri().query().is_some() {
+        return text(400, "clean invocation does not accept query parameters");
+    }
+    if request
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        != Some("application/octet-stream")
+    {
+        return text(
+            415,
+            "clean invocation requires application/octet-stream ASQ1",
+        );
+    }
+    let invocation = match AgentInvocationRequest::decode(request.body()) {
+        Ok(value) => value,
+        Err(_) => return text(400, "invalid canonical clean invocation"),
+    };
+    // Generic supervisor responses do not carry the sealed proof-verification
+    // capability required for attested delivery. Reject before any execution.
+    if invocation.execution() != RuntimeExecutionContext::Direct {
+        return text(501, "attested HTTP invocation is not yet available");
+    }
+    let work = invocation.work();
+    if work.origin.transport_node.is_some() {
+        return text(403, "HTTP invocation does not accept transport-node claims");
+    }
+    if matches!(
+        invocation.authorization(),
+        InvocationAuthorization::PublicPreflight(_)
+    ) && (work.origin != InvocationOrigin::anonymous()
+        || work.roles != InvocationRoleClaims::none())
+    {
+        return text(
+            403,
+            "unsigned public invocation cannot assert caller identity or roles",
+        );
+    }
+    let Some(supervisor) = handle.clean_agent_supervisor() else {
+        return text(503, "clean agent supervisor unavailable");
+    };
+    let key = match AgentRouteKey::new(work.space, work.agent, work.actor) {
+        Ok(key) => key,
+        Err(_) => return text(400, "invalid clean invocation route"),
+    };
+    let snapshot = match supervisor.snapshot(key) {
+        Ok(snapshot) => snapshot,
+        Err(_) => return text(503, "clean invocation route unavailable"),
+    };
+    // The exact bytes, including authorization and recovery intent, survive
+    // retries. Dispatch checks the live identity and exact response commitment.
+    // Never interpret a transport error as proof that execution did not occur.
+    match dispatch_encoded_invocation(&supervisor, snapshot, request.body()) {
+        Ok(response) => match response.encode() {
+            Ok(bytes) => with_content_type(200, "application/octet-stream", bytes),
+            Err(_) => text(
+                503,
+                "clean invocation response unavailable; retain exact request",
+            ),
+        },
+        Err(_) => text(
+            503,
+            "clean invocation incomplete; retain and retry the exact request",
+        ),
+    }
+}
+
 fn authenticate<B>(
     request: &Request<B>,
     handle: &IngressHandle,
@@ -586,6 +679,10 @@ mod tests {
                 handle_local_create(&request, &handle).status().as_u16(),
                 expected
             );
+            assert_eq!(
+                handle_clean_invocation(&request, &handle).status().as_u16(),
+                expected
+            );
             let (mut parts, mut body) = request.into_parts();
             parts.uri = path
                 .replace("/__agents/local", "/__agents/local/install")
@@ -606,6 +703,126 @@ mod tests {
     use super::*;
     use crate::node::VosNode;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    #[test]
+    fn clean_invocation_rejects_unsigned_identity_before_route_lookup() {
+        use crate::agent::sdk::wire::CanonicalWire as _;
+        use crate::agent::sdk::*;
+        use crate::agent::supervisor_adapters::AgentInvocationRequest;
+
+        let node = VosNode::new();
+        let handle = node.ingress_handle();
+        let origins = [
+            (InvocationOrigin::anonymous(), 503),
+            (
+                InvocationOrigin {
+                    principal: Some(PrincipalId([8; 32])),
+                    ..InvocationOrigin::anonymous()
+                },
+                403,
+            ),
+            (
+                InvocationOrigin {
+                    principal: Some(PrincipalId([8; 32])),
+                    credential: Some(CredentialId([9; 32])),
+                    ..InvocationOrigin::anonymous()
+                },
+                403,
+            ),
+            (
+                InvocationOrigin {
+                    actor: Some(ActorId([8; 32])),
+                    ..InvocationOrigin::anonymous()
+                },
+                403,
+            ),
+            (
+                InvocationOrigin {
+                    transport_node: Some(NodeId([8; 32])),
+                    ..InvocationOrigin::anonymous()
+                },
+                403,
+            ),
+        ];
+        for (origin, expected) in origins {
+            let work = InvocationWork {
+                space: SpaceId([1; 32]),
+                agent: AgentId([2; 32]),
+                runtime_deployment: DeploymentId([3; 32]),
+                invocation: InvocationId([4; 32]),
+                actor: ActorId([5; 32]),
+                incarnation: Hash([6; 32]),
+                deployment: DeploymentId([7; 32]),
+                program: ProgramId([8; 32]),
+                mode: MethodMode::Query,
+                origin,
+                roles: InvocationRoleClaims::none(),
+                message: vec![1],
+                installation_data: None,
+                availability: Vec::new(),
+                gas: 100,
+                recovery_only: false,
+            };
+            let authorization =
+                InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&work, 17));
+            let body =
+                AgentInvocationRequest::new(RuntimeExecutionContext::Direct, work, authorization)
+                    .unwrap()
+                    .encode()
+                    .unwrap();
+            let direct = AgentInvocationRequest::decode(&body).unwrap();
+            let attested = AgentInvocationRequest::new(
+                RuntimeExecutionContext::Attested {
+                    proof_system: Hash([9; 32]),
+                },
+                direct.work().clone(),
+                direct.authorization().clone(),
+            )
+            .unwrap()
+            .encode()
+            .unwrap();
+            let unsupported = http::Request::builder()
+                .method("POST")
+                .uri("/__agents/invoke")
+                .header(http::header::CONTENT_TYPE, "application/octet-stream")
+                .body(attested)
+                .unwrap();
+            assert_eq!(
+                handle_clean_invocation(&unsupported, &handle)
+                    .status()
+                    .as_u16(),
+                501
+            );
+            let request = http::Request::builder()
+                .method("POST")
+                .uri("/__agents/invoke")
+                .header(http::header::CONTENT_TYPE, "application/octet-stream")
+                .body(body.clone())
+                .unwrap();
+            assert_eq!(
+                handle_clean_invocation(&request, &handle).status().as_u16(),
+                expected
+            );
+            // A bearer header must not silently rewrite unsigned request claims.
+            let (mut parts, mut malformed) = request.into_parts();
+            parts.headers.insert(
+                http::header::AUTHORIZATION,
+                "Bearer invalid".parse().unwrap(),
+            );
+            let request = http::Request::from_parts(parts.clone(), malformed.clone());
+            assert_eq!(
+                handle_clean_invocation(&request, &handle).status().as_u16(),
+                expected
+            );
+            malformed.push(0);
+            let request = http::Request::from_parts(parts, malformed);
+            assert_eq!(
+                handle_clean_invocation(&request, &handle).status().as_u16(),
+                400
+            );
+        }
+    }
 
     fn request(port: u16, path: &str) -> String {
         let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -652,6 +869,13 @@ mod tests {
             );
             let inventory = request(port, "/__agents/inventory");
             assert!(inventory.starts_with("HTTP/1.1 405"), "{inventory}");
+            let invoke = request(port, "/__agents/invoke");
+            assert!(invoke.starts_with("HTTP/1.1 405"), "{invoke}");
+            let adjacent_invoke = request(port, "/__agents/invoke/");
+            assert!(
+                adjacent_invoke.starts_with("HTTP/1.1 401"),
+                "{adjacent_invoke}"
+            );
             let adjacent_inventory = request(port, "/__agents/inventory/");
             assert!(
                 adjacent_inventory.starts_with("HTTP/1.1 401"),

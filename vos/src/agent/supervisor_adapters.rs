@@ -6455,11 +6455,16 @@ mod tests {
         let (local_attachment, local_route) = owner_attachment(&local, 2, None, None);
         owner.install_local_host(local_attachment).unwrap();
 
+        // An authenticated unchanged head reuses already-validated inventory.
+        // Advance it so the injected cross-page mismatch is actually queried.
+        inventory.head.store(2, Ordering::Release);
         inventory.consistent.store(false, Ordering::Release);
+        let queries_before_failure = inventory.queries.load(Ordering::Acquire);
         assert_eq!(
             owner.reconcile(),
             Err(AgentProductionOwnerError::InconsistentHead)
         );
+        assert!(inventory.queries.load(Ordering::Acquire) > queries_before_failure + 1);
         let handle = owner.handle();
         assert_eq!(handle.snapshots().unwrap().len(), 1);
         assert!(!local_route.retired.load(Ordering::Acquire));
@@ -6478,20 +6483,20 @@ mod tests {
         owner.reconcile().unwrap();
         let first = owner_snapshot(&handle, local.descriptor().identity.agent);
         *local_route.identity.lock().unwrap() = owner_identity(&local, 3);
-        inventory.head.store(2, Ordering::Release);
+        inventory.head.store(3, Ordering::Release);
         owner.reconcile().unwrap();
         let second = owner_snapshot(&handle, local.descriptor().identity.agent);
         assert_ne!(first.readiness_generation(), second.readiness_generation());
 
         *local_route.identity.lock().unwrap() = owner_identity(&local, 2);
-        inventory.head.store(3, Ordering::Release);
+        inventory.head.store(4, Ordering::Release);
         owner.reconcile().unwrap();
         let third = owner_snapshot(&handle, local.descriptor().identity.agent);
         assert_ne!(first.readiness_generation(), third.readiness_generation());
         assert_ne!(second.readiness_generation(), third.readiness_generation());
 
         local_route.audit.store(false, Ordering::Release);
-        inventory.head.store(4, Ordering::Release);
+        inventory.head.store(5, Ordering::Release);
         assert_eq!(
             owner.reconcile(),
             Err(AgentProductionOwnerError::InvalidProjection)
