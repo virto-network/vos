@@ -255,16 +255,16 @@ pub struct LocalLifecycleRecovery<I: CleanManagementIssuerStore, J: CleanManagem
 }
 
 /// Startup admission derived only from verified, still-leased lifecycle stores.
-/// Covers completed work and prepared finalization, not earlier phases that
-/// still need new management envelopes or a physical application operation.
+/// Covers completed work and observed application acknowledgements, including
+/// those whose finalization envelope still needs protected publication.
 pub struct LocalLifecycleStartupAdmission {
     pub(crate) authority: super::sdk::authority::AuthorityActorTarget,
     pub(crate) retirements: Vec<[super::sdk::RuntimeWork; 2]>,
     pub(crate) pending: Vec<
-        [(
+        Vec<(
             super::clean_management_intent::ManagementJournalAnchor,
             super::sdk::RuntimeWork,
-        ); 2],
+        )>,
     >,
 }
 
@@ -315,21 +315,22 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
                 (Some(authorization), Some(finalization), Some(_)) => {
                     retirements.push([authorization.clone(), finalization.clone()]);
                 }
-                (Some(authorization), Some(finalization), None) if entry.observed.is_some() => {
+                (Some(authorization), finalization, None) if entry.observed.is_some() => {
                     let authorization_anchor = entry
                         .intent
                         .authorization_anchor()
                         .map_err(|_| SharedAgentHostError::Unavailable)?
                         .ok_or(SharedAgentHostError::ScopeMismatch)?;
-                    let finalization_anchor = entry
-                        .intent
-                        .finalization_anchor()
-                        .map_err(|_| SharedAgentHostError::Unavailable)?
-                        .ok_or(SharedAgentHostError::ScopeMismatch)?;
-                    pending.push([
-                        (authorization_anchor.clone(), authorization.clone()),
-                        (finalization_anchor.clone(), finalization.clone()),
-                    ]);
+                    let mut group = vec![(authorization_anchor.clone(), authorization.clone())];
+                    if let Some(finalization) = finalization {
+                        let finalization_anchor = entry
+                            .intent
+                            .finalization_anchor()
+                            .map_err(|_| SharedAgentHostError::Unavailable)?
+                            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                        group.push((finalization_anchor.clone(), finalization.clone()));
+                    }
+                    pending.push(group);
                 }
                 // Earlier phases still need protected phase extension; never
                 // expose traffic or checkpoint away their retained anchors.
@@ -621,8 +622,9 @@ where
     /// Adopt stores previously verified against independently selected pins.
     /// This transfers leases without opening their paths again. The caller
     /// must separately seed system-network recovery before publishing routes;
-    /// this constructor then rechecks physical Local application, replays saved
-    /// finalizations, and retires results before normal lifecycle/route access.
+    /// this constructor then rechecks physical Local application, completes
+    /// finalization under pending admission, and retires results before normal
+    /// lifecycle/route access.
     pub fn with_recovery(
         mut system: CleanSystemAgentBootstrapOwner<P, R, I>,
         local: LocalAgentHost,
@@ -673,33 +675,48 @@ where
                 }
             }
         }
+        let mut recovered_pairs = Vec::new();
         for entry in &mut recovery.entries {
             if entry.finalized.is_none()
                 && let Some(acknowledgement) = &entry.observed
             {
-                // Startup admission requires both saved anchored envelopes;
-                // this must not prepare fresh work or refresh its clock.
+                // Saved work keeps its clock. Missing finalization is reserved
+                // before publication, without releasing the predecessor gate.
                 let managed = entry
                     .intent
                     .intent()
                     .ok_or(SharedAgentHostError::ScopeMismatch)?
                     .call()
                     .managed;
-                system.finalize_management_intent(
+                system.finalize_management_intent_with_admission(
                     &mut entry.intent,
                     managed,
                     acknowledgement,
                     &mut entry.issuer,
+                    true,
                 )?;
                 entry.finalized = Some(acknowledgement.clone());
+                recovered_pairs.push([
+                    entry
+                        .intent
+                        .authorization_work()
+                        .map_err(|_| SharedAgentHostError::Unavailable)?
+                        .ok_or(SharedAgentHostError::ScopeMismatch)?
+                        .clone(),
+                    entry
+                        .intent
+                        .finalization_work()
+                        .map_err(|_| SharedAgentHostError::Unavailable)?
+                        .ok_or(SharedAgentHostError::ScopeMismatch)?
+                        .clone(),
+                ]);
             }
         }
         if !admission.pending.is_empty() {
             system.handoff_recovered_management(
-                &admission
-                    .pending
+                &recovered_pairs
                     .iter()
-                    .map(|pair| [&pair[0].1, &pair[1].1])
+                    .map(|pair| [&pair[0], &pair[1]])
                     .collect::<Vec<_>>(),
             )?;
         }
@@ -771,11 +788,11 @@ where
     }
 
     #[cfg(test)]
-    pub(crate) fn fail_finalization_once_for_test(&mut self, after_accept: bool) {
+    pub(crate) fn fail_finalization_once_for_test(&mut self, phase: u8) {
         self.system
             .lock()
             .unwrap()
-            .fail_finalization_once_for_test(after_accept);
+            .fail_finalization_once_for_test(phase);
     }
 
     #[cfg(test)]

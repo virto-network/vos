@@ -1346,7 +1346,7 @@ where
     authority_install: super::sdk::InstallActor,
     invocation_gas: u64,
     #[cfg(test)]
-    finalization_failure_once: Option<bool>,
+    finalization_failure_once: Option<u8>,
 }
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
@@ -2405,6 +2405,29 @@ where
         B: CleanManagementIssuerStore,
         J: CleanManagementIssuerStore,
     {
+        self.finalize_management_intent_with_admission(
+            slot,
+            managed,
+            acknowledgement,
+            issuer,
+            false,
+        )
+    }
+
+    /// `recovering` requires the independently verified startup pending set to
+    /// have been attached before this owner is exposed to lifecycle recovery.
+    pub(crate) fn finalize_management_intent_with_admission<B, J>(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        managed: ManagedAgentTarget,
+        acknowledgement: &ManagementApplicationAck,
+        issuer: &mut DurableCleanManagementIssuer<J>,
+        recovering: bool,
+    ) -> Result<bool, SharedAgentHostError>
+    where
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+    {
         use crate::actors::codec::Decode as _;
         let target = self.authority_target();
         let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
@@ -2456,6 +2479,11 @@ where
             super::clean_management_intent::CleanManagementIntent::finalization_message(
                 acknowledgement,
             );
+        #[cfg(test)]
+        if self.finalization_failure_once == Some(2) {
+            self.finalization_failure_once = None;
+            return Err(SharedAgentHostError::Unavailable);
+        }
         if slot
             .finalization_work()
             .map_err(|_| SharedAgentHostError::Unavailable)?
@@ -2484,14 +2512,36 @@ where
                 authorization: Box::new(authorization),
                 observed_slot: material.observed_slot,
             };
-            self._network_host.record_management_anchor(
-                crate::service::AgentId(self.pins.agent.0),
-                &envelope,
-                |anchor| {
-                    slot.pledge_finalization_work(envelope.clone(), anchor)
-                        .map_err(|_| SharedAgentHostError::Unavailable)
-                },
-            )?;
+            if recovering {
+                let predecessor = (
+                    slot.authorization_anchor()
+                        .map_err(|_| SharedAgentHostError::Unavailable)?
+                        .ok_or(SharedAgentHostError::ScopeMismatch)?
+                        .clone(),
+                    slot.authorization_work()
+                        .map_err(|_| SharedAgentHostError::Unavailable)?
+                        .ok_or(SharedAgentHostError::ScopeMismatch)?
+                        .clone(),
+                );
+                self._network_host.extend_management_pending(
+                    crate::service::AgentId(self.pins.agent.0),
+                    &predecessor,
+                    &envelope,
+                    |(anchor, work)| {
+                        slot.pledge_finalization_work(work.clone(), anchor.clone())
+                            .map_err(|_| SharedAgentHostError::Unavailable)
+                    },
+                )?;
+            } else {
+                self._network_host.record_management_anchor(
+                    crate::service::AgentId(self.pins.agent.0),
+                    &envelope,
+                    |anchor| {
+                        slot.pledge_finalization_work(envelope.clone(), anchor)
+                            .map_err(|_| SharedAgentHostError::Unavailable)
+                    },
+                )?;
+            }
         }
         let Some(RuntimeWork::Invoke {
             invocation: work,
@@ -2518,7 +2568,7 @@ where
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         #[cfg(test)]
-        if self.finalization_failure_once == Some(false) {
+        if self.finalization_failure_once == Some(0) {
             self.finalization_failure_once = None;
             return Err(SharedAgentHostError::Unavailable);
         }
@@ -2557,7 +2607,7 @@ where
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         #[cfg(test)]
-        if self.finalization_failure_once == Some(true) {
+        if self.finalization_failure_once == Some(1) {
             self.finalization_failure_once = None;
             return Err(SharedAgentHostError::Unavailable);
         }
@@ -2577,8 +2627,8 @@ where
     }
 
     #[cfg(test)]
-    pub(crate) fn fail_finalization_once_for_test(&mut self, after_accept: bool) {
-        self.finalization_failure_once = Some(after_accept);
+    pub(crate) fn fail_finalization_once_for_test(&mut self, phase: u8) {
+        self.finalization_failure_once = Some(phase);
     }
 
     /// Retire both runtime results only after the exact application has a
@@ -7562,6 +7612,11 @@ mod tests {
         }
 
         #[test]
+        fn native_local_lifecycle_startup_prepares_missing_finalization() {
+            native_local_management_lifecycle(12);
+        }
+
+        #[test]
         fn native_node_rejects_lifecycle_start_after_shutdown_without_leaking_hosts() {
             native_local_management_lifecycle(3);
         }
@@ -8013,7 +8068,7 @@ mod tests {
                 harness.stop();
                 return;
             }
-            if matches!(coordinated, 2 | 3 | 8 | 9 | 10 | 11) {
+            if matches!(coordinated, 2 | 3 | 8 | 9 | 10 | 11 | 12) {
                 struct LeasedStore {
                     inner: IssuerMemoryStore,
                     active: Arc<AtomicUsize>,
@@ -8104,9 +8159,10 @@ mod tests {
                 let active = Arc::new(AtomicUsize::new(0));
                 let loads = Arc::new(AtomicUsize::new(0));
                 let fail_after_commit = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                let intent_store = IssuerMemoryStore::default();
                 let mut stores = Stores {
                     scope: (descriptor.identity.space, descriptor.identity.agent),
-                    intent: IssuerMemoryStore::default(),
+                    intent: intent_store.clone(),
                     issuer: issuer_store.clone(),
                     opens: opens.clone(),
                     active: active.clone(),
@@ -8186,7 +8242,7 @@ mod tests {
                 let failed_loads = loads.load(Ordering::SeqCst);
                 let interrupted = coordinated >= 10;
                 if interrupted {
-                    controller.fail_finalization_once_for_test(coordinated == 11);
+                    controller.fail_finalization_once_for_test(coordinated - 10);
                 }
                 let created = controller.create(descriptor.clone(), call.clone(), runtime.clone());
                 let result = if interrupted {
@@ -8261,6 +8317,7 @@ mod tests {
                         restart: usize,
                         interrupted: bool,
                         unaccepted: bool,
+                        missing: bool,
                     ) -> TestLocalLifecycle<F> {
                         let (old_owner, old_local, mut stores, mut signer) =
                             controller.into_parts_for_test();
@@ -8287,6 +8344,14 @@ mod tests {
                             admission.pending.len(),
                             usize::from(restart == 0 && interrupted)
                         );
+                        if restart == 0 && interrupted {
+                            let entry = &recovery.entries[0];
+                            assert_eq!(admission.pending[0].len(), if missing { 1 } else { 2 });
+                            assert_eq!(
+                                entry.intent.finalization_work().ok().unwrap().is_none(),
+                                missing
+                            );
+                        }
                         let mut reopened =
                             CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_factory(
                                 pins,
@@ -8355,7 +8420,8 @@ mod tests {
                                         &descriptor,
                                         attempt,
                                         interrupted,
-                                        coordinated == 10,
+                                        coordinated == 10 || coordinated == 12,
+                                        coordinated == 12,
                                     )
                                 })
                                 .join()
@@ -8372,6 +8438,20 @@ mod tests {
                 }
                 drop(controller);
                 assert_eq!(active.load(Ordering::SeqCst), 0);
+                if coordinated == 12 {
+                    let slot =
+                        crate::agent::clean_management_intent::CleanManagementIntentSlot::open(
+                            intent_store,
+                        )
+                        .unwrap();
+                    assert!(slot.retirement_complete().unwrap());
+                    let Some(RuntimeWork::Invoke { observed_slot, .. }) =
+                        slot.finalization_work().unwrap()
+                    else {
+                        panic!("startup did not persist finalization")
+                    };
+                    assert_eq!(*observed_slot, LOGICAL_SLOT + 20);
+                }
                 harness.stop();
                 return;
             }

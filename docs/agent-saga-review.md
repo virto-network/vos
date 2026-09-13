@@ -27,11 +27,12 @@ AJC3 checkpoints and AGIM/AGI2 images are deliberately rejected, with no in-plac
 migration provided; do not point this clean-break build at valuable old data.
 Current host lifecycle images additionally require CMI4/CMR2 with pre-dispatch
 journal anchors; earlier CMI3/CMR1 images are rejected, not migrated.
-Startup now discovers lifecycle stores before system attachment, recovers saved
-finalization calls from durable application acknowledgements, and retires their
-results before normal routes. Earlier phases without a saved finalization call
-or durable application acknowledgement still stop startup, preserving their
-stores. Continuous live protection and coexistence with an unfinished projection
+Startup now discovers lifecycle stores before system attachment, recovers
+finalization from durable application acknowledgements (including protected
+preparation of a missing finalization envelope), and retires results before
+normal routes. Earlier phases without a durable application acknowledgement
+still stop startup, preserving their stores. Continuous live protection and
+coexistence with an unfinished projection
 remain implementation blockers, not deployment-ready behavior. Do not delete
 those stores to bypass the recovery check.
 
@@ -3250,6 +3251,42 @@ substituted predecessor/next-work rejection. The 7 adjacent network tests passed
 Formatting and diff checks pass. This uses a test callback rather than actual
 filesystem write-fault injection; no full-library rerun, rebuilt guest artifacts
 or new CLI smoke is claimed.
+
+### Startup prepares missing finalization after observed application
+
+The pending-phase extension prerequisite above is now used by production
+lifecycle startup. A verified durable application acknowledgement can enter
+startup with only its saved anchored authorization envelope. The controller
+rechecks every observed application against its physical Local image before
+finalizing any member. It reserves a missing finalization envelope jointly with
+the complete pending/retiring set before pledging its exact envelope and anchor.
+Saved finalizations keep their saved clock; missing finalizations receive the
+current recovery clock. Retirement handoff uses the resulting durable slots,
+not the initial one-envelope admission image, and normal routes remain behind
+controller recovery.
+
+A new native test interrupts after application acknowledgement but before
+finalization preparation. First restart requires one pending authorization,
+adds one finalization Invoke and two positive Acks, and records CMR2. Its saved
+finalization uses the advanced restart clock. A second restart adds no Ordered
+entries and exact Create retry returns the same acknowledgement after both
+restarts. This uses physical host journals/Local images and lease-tracked memory
+lifecycle stores; it is not a cross-process filesystem fault campaign.
+
+Earlier authorization/application recovery, continuous live protection,
+unfinished-projection coexistence, capacity/pruned-evidence recovery and native
+install/invoke remain open. No artifact rebuild, current CLI smoke or full
+release-gate completion is implied.
+
+Verification: the `native_` library filter reported **28 passed** (315.45s,
+`r16-missing-finalization-native-final.log`), including all **16 native bootstrap/
+lifecycle tests**. One unrelated extension test returned early because the
+echo-extension fixture was not built; its green result is not extension
+coverage. The filesystem lifecycle filter passed **10 tests** (0.04s,
+`r16-missing-finalization-files.log`). The first focused startup run passed all
+4 cases (69.57s, `r16-missing-finalization-startup.log`); final clock/CMR2 assertions
+are covered by the later native run. Evidence is in shared disk scratch.
+Formatting and diff checks pass.
 
 ### Durable client acknowledgement before completion
 
