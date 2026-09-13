@@ -2422,6 +2422,38 @@ The recovered response also compares byte-for-byte equal to the earlier
 `fast-resume-result.json`, proving the acknowledgement itself stayed unchanged
 across the intervening daemon restart.
 
+### Finalized management-result retirement phase
+
+The system owner now has a retirement phase for the retained authorization and
+finalization runtime results. It requires the exact signed intent, the issuer's
+durable finalized application acknowledgement, both saved Linear envelopes and
+the current physical Authority route. It rejects an unfinished application or
+substituted acknowledgement before submitting retirement work. Positive runtime
+acknowledgements are checked against the exact work/authorization commitments
+and committed journal evidence. Existing positive acknowledgements are reused;
+the intent, receipt, application acknowledgement and signer count are preserved.
+
+The initial targeted `native_` run passed **22 tests, zero failures**, in 13.08s:
+`.worktrees/ch08-c2-native/target/task-tmp/r16-management-retirement.log`.
+The lifecycle fixture verifies rejection before finalization and for a
+substituted signed acknowledgement, exactly two retirement slots, and no new
+slots on an exact repeat. These fixtures use bundled Authority policy with the
+native outer system runtime; they are not an independent opaque-runtime proof.
+The final-source native lifecycle run passed **10 tests, zero failures**, in
+13.78s, including simulated interruption after the first positive retirement:
+`.worktrees/ch08-c2-native/target/task-tmp/r16-management-retirement-partial.log`.
+The resumed phase adds only the second acknowledgement, and another repeat adds
+none. This is a retained-journal interruption check, not a daemon-restart smoke.
+
+This phase is deliberately **not wired into the production lifecycle yet**.
+It does not clear or replace the retained intent. Joint journal-capacity/GC
+protection and durable intent handoff must be implemented before enabling it;
+the bounded retained acknowledgement suffix alone is not a permanent retirement
+marker. Install remains unavailable through the native lifecycle. Next work
+stays in C2: protected retirement/handoff, then signed Install and real actor
+invocation/restart. C1 recovery and C3 final-source release gates remain open;
+no additional review batch or branch promotion is introduced here.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

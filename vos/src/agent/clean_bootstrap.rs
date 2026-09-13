@@ -2461,6 +2461,141 @@ where
             .map_err(|_| SharedAgentHostError::Unavailable)
     }
 
+    /// Retire both runtime results only after the exact application has a
+    /// durable issuer finalization marker. This phase preserves intent/issuer
+    /// evidence; it does not yet authorize clearing or replacing the intent.
+    /// The enclosing lifecycle must protect journal capacity through retirement.
+    pub(crate) fn retire_management_intent_results<B, J>(
+        &mut self,
+        slot: &super::clean_management_intent::CleanManagementIntentSlot<B>,
+        managed: ManagedAgentTarget,
+        acknowledgement: &ManagementApplicationAck,
+        issuer: &DurableCleanManagementIssuer<J>,
+    ) -> Result<bool, SharedAgentHostError>
+    where
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+    {
+        let target = self.authority_target();
+        let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+        intent
+            .verify(target, managed, &RawCredentialVerifier)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let (_, retained) = issuer
+            .recover_finalized_application(
+                target,
+                managed,
+                intent.request(),
+                intent.call(),
+                &RawCredentialVerifier,
+            )
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        if retained != *acknowledgement || self.record.pending_projection.is_some() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let authorization_work = slot
+            .authorization_work()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let RuntimeWork::Invoke { observed_slot, .. } = authorization_work else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        if acknowledgement.applied_at < *observed_slot {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let finalization_work = slot
+            .finalization_work()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let RuntimeWork::Invoke { invocation, .. } = finalization_work else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        if invocation.message
+            != super::clean_management_intent::CleanManagementIntent::finalization_message(
+                acknowledgement,
+            )
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self._network_host
+            .ensure_reattached(crate::service::AgentId(self.pins.agent.0))?;
+        let mut material =
+            self.supervisor_invocation_material(self.pins.agent, target.binding.issuer.actor)?;
+        material.root_provenance = false;
+        let identity = super::supervisor_adapters::physical_material_identity(&material)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        // Validate both immutable envelopes before retiring either result.
+        for envelope in [authorization_work, finalization_work] {
+            let RuntimeWork::Invoke {
+                invocation,
+                authorization,
+                observed_slot,
+                ..
+            } = envelope
+            else {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            };
+            if invocation.mode != super::sdk::MethodMode::Linear
+                || !super::supervisor_adapters::physical_material_authorizes_reserved_work(
+                    &material,
+                    identity,
+                    RuntimeExecutionContext::Direct,
+                    invocation,
+                    authorization,
+                    *observed_slot,
+                )
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+        }
+        let mut changed = false;
+        let agent = crate::service::AgentId(self.pins.agent.0);
+        for envelope in [authorization_work, finalization_work] {
+            let RuntimeWork::Invoke {
+                invocation,
+                authorization,
+                ..
+            } = envelope
+            else {
+                unreachable!()
+            };
+            if self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .retained_positive_clean_acknowledgement(agent, invocation, authorization)?
+            {
+                continue;
+            }
+            let outcome = self.supervisor_acknowledge(
+                identity,
+                (**invocation).clone(),
+                (**authorization).clone(),
+            )?;
+            let super::sdk::RuntimeOutcome::Acknowledged(Ok(retired)) = outcome else {
+                return Err(SharedAgentHostError::Unavailable);
+            };
+            if retired.invocation != invocation.invocation
+                || retired.actor != invocation.actor
+                || retired.incarnation != invocation.incarnation
+                || retired.deployment != invocation.deployment
+                || retired.mode != invocation.mode
+                || retired.work != invocation.commitment()
+                || retired.authorization != authorization.commitment()
+                || !self
+                    .host
+                    .lock()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                    .retained_positive_clean_acknowledgement(agent, invocation, authorization)?
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            changed = true;
+        }
+        Ok(changed)
+    }
+
     /// Execute the Local Create/application portion of a retained lifecycle
     ///
     /// The public coordinator below is the boundary for native callers.
@@ -7905,6 +8040,7 @@ mod tests {
         ) {
             use crate::agent::clean_management_intent::CleanManagementIntentSlot;
             let owner = harness.owner.as_mut().unwrap();
+            let interrupted_retirement = finalization_clock.is_some();
             let store = IssuerMemoryStore {
                 // Intent, authorization, then finalization envelope.
                 advance_clock_after_commits: finalization_clock.map(|clock| (clock, 3)),
@@ -7998,7 +8134,7 @@ mod tests {
                 .store(LOGICAL_SLOT + 20, Ordering::Release);
             let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
             let mut issuer = DurableCleanManagementIssuer::open(
-                issuer_store,
+                issuer_store.clone(),
                 descriptor.authority,
                 descriptor.identity.space,
                 descriptor.identity.agent,
@@ -8045,6 +8181,16 @@ mod tests {
             );
             assert_eq!(signer.calls, 2);
             drop(local);
+            assert!(matches!(
+                owner.retire_management_intent_results(
+                    &slot,
+                    call.managed,
+                    &acknowledgement,
+                    &issuer
+                ),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            assert_eq!(owner.ordered_index_for_test().unwrap(), applied);
             assert!(
                 !issuer
                     .application_finalization_status(&acknowledgement)
@@ -8148,6 +8294,76 @@ mod tests {
                     .unwrap()
             );
             assert_eq!(owner.ordered_index_for_test().unwrap(), finalized);
+            assert_eq!(signer.calls, 2);
+            let intent_image = slot.intent().unwrap().clone();
+            let issuer_image = issuer_store.image.lock().unwrap().clone();
+            assert!(matches!(
+                owner.retire_management_intent_results(&slot, call.managed, &substituted, &issuer),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            assert_eq!(owner.ordered_index_for_test().unwrap(), finalized);
+            if interrupted_retirement {
+                // Model interruption after the first positive acknowledgement.
+                // Recovery must consume only the remaining finalization result.
+                let material = owner
+                    .supervisor_invocation_material(
+                        owner.pins.agent,
+                        owner.authority_target().binding.issuer.actor,
+                    )
+                    .unwrap();
+                let identity =
+                    crate::agent::supervisor_adapters::physical_material_identity(&material)
+                        .unwrap();
+                let RuntimeWork::Invoke {
+                    invocation,
+                    authorization,
+                    ..
+                } = &envelope
+                else {
+                    unreachable!()
+                };
+                assert!(matches!(
+                    owner
+                        .supervisor_acknowledge(
+                            identity,
+                            (**invocation).clone(),
+                            (**authorization).clone()
+                        )
+                        .unwrap(),
+                    RuntimeOutcome::Acknowledged(Ok(_))
+                ));
+                assert_eq!(owner.ordered_index_for_test().unwrap(), finalized + 1);
+            }
+            assert!(
+                owner
+                    .retire_management_intent_results(
+                        &slot,
+                        call.managed,
+                        &acknowledgement,
+                        &issuer,
+                    )
+                    .unwrap()
+            );
+            let retired = owner.ordered_index_for_test().unwrap();
+            assert_eq!(retired, finalized + 2);
+            assert!(
+                !owner
+                    .retire_management_intent_results(
+                        &slot,
+                        call.managed,
+                        &acknowledgement,
+                        &issuer,
+                    )
+                    .unwrap()
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), retired);
+            assert_eq!(slot.intent(), Some(&intent_image));
+            assert_eq!(slot.authorization_work().unwrap(), Some(&envelope));
+            assert_eq!(
+                slot.finalization_work().unwrap(),
+                Some(&finalization_envelope)
+            );
+            assert_eq!(*issuer_store.image.lock().unwrap(), issuer_image);
             assert_eq!(signer.calls, 2);
             harness.stop();
         }
