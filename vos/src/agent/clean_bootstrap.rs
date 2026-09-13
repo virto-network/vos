@@ -7090,6 +7090,61 @@ mod tests {
             native_local_management_lifecycle(true);
         }
 
+        #[test]
+        fn native_shared_system_owner_survives_route_retirement_and_fails_closed_on_poison() {
+            let mut harness = NativeProjectionOwnerHarness::new("shared-system-owner");
+            let owner = Arc::new(Mutex::new(harness.owner.take().unwrap()));
+            let expected = owner.lock().unwrap().authority_target();
+            let attachment =
+                crate::agent::supervisor_adapters::system_agent_supervisor_attachment_shared(
+                    owner.clone(),
+                    4,
+                )
+                .unwrap();
+            assert_eq!(attachment.handle().authority_target().unwrap(), expected);
+            let guard = owner.lock().unwrap();
+            let handle = attachment.handle();
+            let (sent, received) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || sent.send(handle.authority_target()).unwrap());
+            assert!(matches!(
+                received.recv_timeout(std::time::Duration::from_millis(20)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            drop(guard);
+            assert_eq!(
+                received
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap(),
+                expected
+            );
+            thread.join().unwrap();
+            attachment.retire().unwrap();
+            assert_eq!(owner.lock().unwrap().authority_target(), expected);
+            let attachment =
+                crate::agent::supervisor_adapters::system_agent_supervisor_attachment_shared(
+                    owner.clone(),
+                    4,
+                )
+                .unwrap();
+            let poisoned = owner.clone();
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _guard = poisoned.lock().unwrap();
+                    panic!("injected system lifecycle failure");
+                }))
+                .is_err()
+            );
+            assert_eq!(
+                attachment.handle().authority_target(),
+                Err(crate::agent::supervisor::AgentRouteError::Unavailable)
+            );
+            attachment.retire().unwrap();
+            drop(poisoned);
+            drop(owner);
+            harness.stop();
+        }
+
         fn native_local_management_lifecycle(coordinated: bool) {
             use crate::agent::clean_management_intent::{
                 CleanManagementIntent, CleanManagementIntentSlot,
@@ -7215,6 +7270,14 @@ mod tests {
             call.invocation = call.expected_invocation();
             call.signature = credential_key.sign(&call.signing_bytes()).to_bytes();
             if coordinated {
+                let shared_owner = Arc::new(Mutex::new(harness.owner.take().unwrap()));
+                let attachment =
+                    crate::agent::supervisor_adapters::system_agent_supervisor_attachment_shared(
+                        shared_owner.clone(),
+                        4,
+                    )
+                    .unwrap();
+                let mut owner = shared_owner.lock().unwrap();
                 let store = IssuerMemoryStore::default();
                 let issuer_store = IssuerMemoryStore::default();
                 let root = harness._directory.0.join("coordinated-local");
@@ -7300,6 +7363,9 @@ mod tests {
                 assert_eq!(signer.calls, 2);
                 assert_eq!(owner.ordered_index_for_test().unwrap(), finalized);
                 drop(local);
+                drop(owner);
+                attachment.retire().unwrap();
+                drop(shared_owner);
                 harness.stop();
                 return;
             }

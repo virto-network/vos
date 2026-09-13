@@ -1743,3 +1743,28 @@ unconnected; this is the ownership prerequisite, not a completed native path.
 (`r16-local-shared-owner-final.log`, locked/offline `pvm,private-agent-store`,
 disk scratch). Formatting and diff checks pass. No guest artifact or persisted
 format changed in this checkpoint.
+
+### Shared system-owner access for native coordination
+
+The system route backend now supports a crate-private shared attachment to the
+existing `Arc<Mutex<CleanSystemAgentBootstrapOwner<...>>>`. Every worker operation
+locks that owner, including Authority projection/recovery and physical invocation
+preparation. The existing public move-owned attachment constructor remains
+available and creates the holder internally. No second Shared network owner or
+physical host is constructed.
+
+The complete Local creation coordinator regression now runs while a system route
+worker is attached to that same owner. A separate test checks serialization,
+worker retirement followed by reattachment without losing the owner, and poisoned
+owner refusal. **30/30 native coordinator/system-owner and supervisor-adapter
+tests pass** in 10.13s (`r16-system-shared-owner-final.log`, locked/offline
+`pvm,private-agent-store`, disk scratch). An initial compile needed a mutable
+guard for projection audit; that was fixed before the passing run. Formatting
+and diff checks pass.
+
+Future lifecycle/route integration must release owner locks before waiting on
+route-worker calls, and shutdown must join lifecycle work and drop its retained
+references before expecting network and physical leases to disappear. Native
+startup still uses the move-owned constructor; it does not yet retain or expose
+the shared coordinator. The command interface, CLI file-store connection,
+publication, completion/reservations and Shared finality remain required.

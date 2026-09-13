@@ -3466,7 +3466,7 @@ where
     R: super::clean_bootstrap::CleanSystemAgentBootstrapStore,
     I: super::clean_authority_issuer::CleanManagementIssuerStore,
 {
-    owner: super::clean_bootstrap::CleanSystemAgentBootstrapOwner<P, R, I>,
+    owner: Arc<std::sync::Mutex<super::clean_bootstrap::CleanSystemAgentBootstrapOwner<P, R, I>>>,
 }
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
@@ -3479,6 +3479,8 @@ where
     fn identities(&mut self) -> Result<Vec<AgentRouteIdentity>, AgentRouteError> {
         let projections = self
             .owner
+            .lock()
+            .map_err(|_| AgentRouteError::Unavailable)?
             .supervisor_projections()
             .map_err(map_shared_host_error)?;
         let projection = projections
@@ -3502,6 +3504,8 @@ where
         }
         let response_request = request.clone();
         self.owner
+            .lock()
+            .map_err(|_| AgentRouteError::Unavailable)?
             .supervisor_invoke(identity, request.work, request.authorization)
             .map(|outcome| AgentInvocationResponse::direct(&response_request, outcome))
             .map_err(map_shared_host_error)
@@ -3517,6 +3521,8 @@ where
         }
         let response_request = request.clone();
         self.owner
+            .lock()
+            .map_err(|_| AgentRouteError::Unavailable)?
             .supervisor_resume(
                 identity,
                 request.invocation.work,
@@ -3537,6 +3543,8 @@ where
         }
         let response_request = request.clone();
         self.owner
+            .lock()
+            .map_err(|_| AgentRouteError::Unavailable)?
             .supervisor_acknowledge(
                 identity,
                 request.invocation.work,
@@ -3551,6 +3559,8 @@ where
         identity: AgentRouteIdentity,
     ) -> Result<super::invocation_preparation::PhysicalInvocationMaterial, AgentRouteError> {
         self.owner
+            .lock()
+            .map_err(|_| AgentRouteError::Unavailable)?
             .supervisor_invocation_material(identity.key().agent(), identity.key().actor())
             .map_err(map_shared_host_error)
     }
@@ -3560,7 +3570,11 @@ where
         head: AuthorityProjectionHead,
         projection: &[AgentAuthorityRouteProjection],
     ) -> Result<Vec<AgentRouteIdentity>, AgentRouteError> {
-        match self.owner.audit_authority_projection(head, projection) {
+        let mut owner = self
+            .owner
+            .lock()
+            .map_err(|_| AgentRouteError::Unavailable)?;
+        match owner.audit_authority_projection(head, projection) {
             Ok(super::shared_host::SharedAuthorityProjectionAudit::Ready(identities)) => {
                 Ok(identities)
             }
@@ -3572,7 +3586,11 @@ where
     }
 
     fn authority_target(&mut self) -> Result<AuthorityActorTarget, AgentRouteError> {
-        Ok(self.owner.authority_target())
+        Ok(self
+            .owner
+            .lock()
+            .map_err(|_| AgentRouteError::Unavailable)?
+            .authority_target())
     }
 
     fn authority_projection(
@@ -3580,12 +3598,16 @@ where
         query: AuthorityProjectionQuery,
     ) -> Result<Vec<u8>, AgentRouteError> {
         self.owner
+            .lock()
+            .map_err(|_| AgentRouteError::Unavailable)?
             .invoke_authority_projection(query)
             .map_err(map_shared_host_error)
     }
 
     fn recover_authority_projection(&mut self) -> Result<bool, AgentRouteError> {
         self.owner
+            .lock()
+            .map_err(|_| AgentRouteError::Unavailable)?
             .recover_pending_authority_projection()
             .map_err(map_shared_host_error)
     }
@@ -3596,6 +3618,27 @@ where
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 pub fn system_agent_supervisor_attachment<P, R, I>(
     owner: super::clean_bootstrap::CleanSystemAgentBootstrapOwner<P, R, I>,
+    queue_capacity: usize,
+) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError>
+where
+    P: super::clean_bootstrap::CleanSystemAgentBootstrapStore + Send + 'static,
+    R: super::clean_bootstrap::CleanSystemAgentBootstrapStore + Send + 'static,
+    I: super::clean_authority_issuer::CleanManagementIssuerStore + Send + 'static,
+{
+    system_agent_supervisor_attachment_shared(
+        Arc::new(std::sync::Mutex::new(owner)),
+        queue_capacity,
+    )
+}
+
+/// Share the existing system owner with native lifecycle coordination. All
+/// worker operations serialize on this owner, without a second network host.
+/// Never wait for this worker while holding the owner mutex. Native shutdown
+/// must join lifecycle work and release its reference as well as retiring the
+/// route worker before expecting the physical/network lease to be released.
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+pub(crate) fn system_agent_supervisor_attachment_shared<P, R, I>(
+    owner: Arc<std::sync::Mutex<super::clean_bootstrap::CleanSystemAgentBootstrapOwner<P, R, I>>>,
     queue_capacity: usize,
 ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError>
 where
