@@ -1320,6 +1320,25 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         Ok(acknowledgement)
     }
 
+    /// Local callers cannot substitute an in-memory result for the physical
+    /// host's exact durable observation. Denials are never signed as applied.
+    pub(crate) fn observe_local_application<S: CleanManagementReceiptSigner>(
+        &mut self,
+        observation: &super::local_sdk_host::LocalManagementObservation,
+        signer: &mut S,
+    ) -> Result<ManagementApplicationAck, CleanManagementIssuerError<B::Error, S::Error>> {
+        let application = observation.result().as_ref().map_err(|_| {
+            CleanManagementIssuerError::Rejected(CleanManagementIssuerRejection::InvalidObservation)
+        })?;
+        self.observe_durable_application(
+            observation.receipt(),
+            application,
+            observation.reopened_state(),
+            observation.applied_at(),
+            signer,
+        )
+    }
+
     /// Retire the issuer-side two-phase barrier only after the authority
     /// actor has durably consumed the exact stored acknowledgement. A crash
     /// before this marker is committed is recovered by replaying the same

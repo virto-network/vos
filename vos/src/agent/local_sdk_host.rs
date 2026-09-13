@@ -24,8 +24,8 @@ use crate::agent_sdk::{
 };
 
 use super::driver::{
-    AgentDriver, AgentDriverError, AgentStoreError, AgentTrustProvider, FileAgentStore,
-    SdkManagementArtifacts,
+    AgentDriver, AgentDriverError, AgentImageStore, AgentStoreError, AgentTrustProvider,
+    FileAgentStore, SdkManagementArtifacts,
 };
 use super::package_admission::AdmittedRuntimePackage;
 
@@ -109,6 +109,34 @@ pub enum LocalAgentHostError {
 pub(crate) enum LocalAuthorityProjectionAudit {
     Ready(Vec<super::supervisor::AgentRouteIdentity>),
     Lag,
+}
+
+/// Exact Local application observed by rereading the private image store.
+/// Only the physical host can construct this value. It proves a Local durable
+/// observation, not system-Agent finality or permission to publish a route.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalManagementObservation {
+    receipt: AuthorityReceipt,
+    result: Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>,
+    reopened_state: crate::agent_sdk::Hash,
+    applied_at: u64,
+}
+
+impl LocalManagementObservation {
+    pub fn receipt(&self) -> &AuthorityReceipt {
+        &self.receipt
+    }
+    pub fn result(
+        &self,
+    ) -> &Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError> {
+        &self.result
+    }
+    pub fn reopened_state(&self) -> crate::agent_sdk::Hash {
+        self.reopened_state
+    }
+    pub fn applied_at(&self) -> u64 {
+        self.applied_at
+    }
 }
 
 impl fmt::Display for LocalAgentHostError {
@@ -562,6 +590,63 @@ impl LocalAgentHost {
             hosted.driver.manage_sdk(request, authority, artifacts)
         };
         self.finish_driver_operation(agent, result)
+    }
+
+    /// Reopen the exact durable receipt/result before a lifecycle coordinator
+    /// asks its issuer to sign application evidence. The coordinator must
+    /// persist the resulting acknowledgement before admitting later work;
+    /// a later image has a different state commitment, even for an old retry.
+    pub fn observe_management_application(
+        &self,
+        agent: AgentId,
+        request: &ManagementRequest,
+        receipt: &AuthorityReceipt,
+    ) -> Result<LocalManagementObservation, LocalAgentHostError> {
+        use crate::service::wire::ServiceWire as _;
+        self.verify_root_scope()?;
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(LocalAgentHostError::NotFound)?;
+        let mut store = FileAgentStore::new(image_path(&self.root.join(encode_agent_id(agent))));
+        let image = store
+            .load()
+            .map_err(AgentDriverError::Store)?
+            .ok_or(LocalAgentHostError::Corrupt)?;
+        if &image != hosted.driver.image()
+            || image.clean_descriptor.as_ref() != Some(&hosted.descriptor)
+        {
+            return Err(LocalAgentHostError::Corrupt);
+        }
+        let record = image
+            .clean_management
+            .as_ref()
+            .and_then(|history| history.retained(request, receipt))
+            .ok_or(LocalAgentHostError::NotFound)?;
+        super::driver::verify_clean_management_receipt(
+            &hosted.descriptor,
+            request,
+            receipt,
+            record.observed_slot,
+            true,
+        )?;
+        // Re-admit the persisted package/program and actor catalog as well
+        // as the envelope. Reopen performs its normal catalog reconciliation;
+        // this observation must not bless an image whose required artifacts
+        // have disappeared since the application completed.
+        let reopened = AgentDriver::open_sdk(store, self.trust.clone())?;
+        if reopened.image() != &image {
+            return Err(LocalAgentHostError::Corrupt);
+        }
+        Ok(LocalManagementObservation {
+            receipt: receipt.clone(),
+            result: record.result.clone(),
+            reopened_state: crate::agent_sdk::Hash::digest(
+                b"vos/agent/local/reopened-image/v1",
+                &[&image.encode()],
+            ),
+            applied_at: record.observed_slot,
+        })
     }
 
     pub fn invoke(
@@ -2698,6 +2783,22 @@ mod tests {
             SdkManagementArtifacts::Actor(&actor_package),
         )
         .unwrap();
+        let application = host
+            .observe_management_application(agent, &install_request, &install_receipt)
+            .unwrap();
+        assert_eq!(application.receipt(), &install_receipt);
+        assert_eq!(
+            application.result(),
+            &Ok(ManagementReply::Installed(record.entry.clone()))
+        );
+        assert_eq!(application.applied_at(), 51);
+        assert_ne!(application.reopened_state(), Hash::ZERO);
+        let mut forged_observation = install_receipt.clone();
+        forged_observation.signature[0] ^= 1;
+        assert!(
+            host.observe_management_application(agent, &install_request, &forged_observation)
+                .is_err()
+        );
         let material = host.agents[&agent]
             .driver
             .physical_invocation_material(record.entry.actor)
@@ -2758,7 +2859,7 @@ mod tests {
             host.manage(
                 agent,
                 install_request.clone(),
-                Some(install_receipt),
+                Some(install_receipt.clone()),
                 SdkManagementArtifacts::Actor(&actor_package)
             )
             .unwrap(),
@@ -2775,6 +2876,15 @@ mod tests {
             completed
         );
         assert_eq!(host.agents[&agent].driver.image(), &terminal);
+        let late_observation = host
+            .observe_management_application(agent, &install_request, &install_receipt)
+            .unwrap();
+        assert_eq!(late_observation.result(), application.result());
+        assert_eq!(late_observation.applied_at(), 51);
+        assert_ne!(
+            late_observation.reopened_state(),
+            application.reopened_state()
+        );
     }
 
     #[test]
@@ -2798,8 +2908,6 @@ mod tests {
             reopened.agents.get(&agent).unwrap().driver.image(),
             &original
         );
-        drop(reopened);
-
         let mut substituted = original.clone();
         let mut bytes = substituted.clean_management.as_ref().unwrap().encode();
         // LMH1 header (36), acknowledgement (8), count (4), first receipt
@@ -2810,6 +2918,15 @@ mod tests {
         substituted.revision += 1;
         let mut store = FileAgentStore::new(image_path(&root.join(encode_agent_id(agent))));
         store.commit(Some(original.revision), &substituted).unwrap();
+        assert_eq!(
+            reopened.observe_management_application(
+                agent,
+                &ManagementRequest::Create(Box::new(descriptor.clone())),
+                &create_receipt(&descriptor, 10)
+            ),
+            Err(LocalAgentHostError::Corrupt)
+        );
+        drop(reopened);
         assert!(LocalAgentHost::open(&root, space(), node(), trust.clone()).is_err());
 
         let mut restored = original;

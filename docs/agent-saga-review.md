@@ -1277,3 +1277,40 @@ source. Its acceptance test must start from the same native entry point as
 restart, and repeat exact retries while preserving authority and physical
 state. Keep the existing C1/C2/C3 review grouping. The remaining work is not
 merely final tests or artifact repinning, and the branch is not master-ready.
+
+### Local durable application observation for native coordination
+
+`LocalAgentHost::observe_management_application` now provides the physical
+observation needed before the existing durable issuer signs an application
+acknowledgement. It rereads the private image, requires exact agreement with
+the live descriptor/image, finds the exact retained receipt/request result,
+reverifies the signed receipt at its original observation slot, and reopens
+the admitted runtime/program and actor catalog. Reopen includes normal catalog
+reconciliation. Missing artifacts or divergent durable state cannot be replaced
+by an in-memory success value.
+
+The host alone constructs `LocalManagementObservation`. It carries the exact
+receipt/result, original application slot and a domain-separated commitment to
+the complete AGI3 image. The issuer's crate-private Local entry point accepts
+this observation and forwards successful results to its existing durable
+acknowledgement pledge/sign/retirement machinery; denials are not signed as
+successful applications. An observation is a Local storage fact, not system-
+Agent finality or route-publication authority.
+
+**21/21 Local host, management-history and clean-issuer tests pass**
+(`r16-local-application-observation-final.log`, 13.48s). The physical opaque
+fixture checks exact application result/receipt, forged-receipt refusal,
+original slot preservation on a later retry, and a changed commitment after
+subsequent invocation state. The substituted-history fixture now also verifies
+that an already-open host refuses an out-of-band durable image change before
+any observation escapes. Existing issuer pledge and recovery tests remain
+green; the new Local issuer entry is not yet exercised by a complete native
+authorization-to-finalization workflow. Formatting and diff checks pass.
+
+Next connect that native workflow: persist the exact authorized intent, drive
+physical application, obtain this observation once, durably pledge its MAA2,
+finalize it through the authenticated system authority and publish/reconcile
+routes. Retrying after a later image must recover the already-pledged
+acknowledgement rather than silently sign a different state commitment. The
+Local observation component does not itself complete native provisioning or
+ordinary-Agent finality.

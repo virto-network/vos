@@ -41,6 +41,22 @@ pub struct LocalManagementHistory {
 }
 
 impl LocalManagementHistory {
+    pub(crate) fn retained(
+        &self,
+        request: &ManagementRequest,
+        receipt: &AuthorityReceipt,
+    ) -> Option<&LocalManagementRecord> {
+        matches!(
+            self.classify(request, receipt),
+            LocalReceiptHistory::Retained { .. }
+        )
+        .then(|| {
+            self.records
+                .iter()
+                .find(|record| record.authority == receipt.commitment())
+        })
+        .flatten()
+    }
     pub(crate) fn validates_initial_epoch(&self, initial_epoch: u64) -> bool {
         self.validate().is_ok()
             && self
