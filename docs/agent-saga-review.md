@@ -60,6 +60,9 @@ review endpoints for individual fixes:
    adapters, including fresh journal replay before the issuer's finalization
    marker. These are not yet connected to that native entry point; they do not
    close ordinary-Agent finality or route publication.
+   Implement the Local native entry point first without pretending it replaces
+   the Shared finality gate: image-backed `LocalAgentHost::open` does not use
+   `AgentGenesisFinalityVerifier`. The journal-backed ordinary-Agent path does.
 3. **C3 — release:** after those implementation changes, freeze source, rebuild
    and independently reproduce artifacts, run the final feature, physical,
    inventory, docs/examples and release checks, and repeat the fresh-space
@@ -1621,3 +1624,38 @@ merely because the issuer marker exists: independent ordinary-Agent finality
 and publication still need durable evidence. That completion ordering must be
 resolved in C2. This test-only checkpoint remains part of C1; no new review batch,
 artifact repin or integration-branch move is introduced.
+
+### Native wiring dependency audit after `8e73c140`
+
+Current source distinguishes two completion paths; the unavailable ordinary
+genesis verifier is not a reason to stall all native Local wiring:
+
+- `LocalAgentHost::open` authenticates AGI3 images, runtime/catalog and scope.
+  `LocalAgentRouteBackend` admits invocation against physical material, while
+  `AgentProductionOwner::reconcile` authenticates the Authority descriptor and
+  actor inventory before publication. This path does not consume
+  `AgentGenesisProvision` or its verifier.
+- Journal-backed ordinary admission requires `AgentGenesisProvision`: a full
+  proposal, replica committee, claim-specific quorum certificate and immutable
+  decision. The clean actor's `LatestManagementAckRow` is instead the newest
+  credential acknowledgement; it does not certify that genesis claim and is
+  replaced by later management work. `ManagedAgentRow` holds mutable current
+  metadata, not a permanent genesis decision. Neither is a drop-in replacement
+  for `UnavailableAgentFinality`. The older
+  `SystemAuthorityState::verify_historical_provision` explicitly validates data,
+  not a replay-derived sealing capability.
+- `start_clean_agent_production` moves the system owner into its route worker.
+  That worker has no lifecycle management command. Attaching an empty Local
+  host earlier is not sufficient: `reconcile_slot` retires a pending attachment
+  when both its authenticated projection and identities are empty. A separate
+  lifecycle owner/command boundary must retain exclusive Local-host ownership
+  through Create/application/finalization, then hand it to route publication.
+  Later Install must coordinate that ownership with the already running worker;
+  opening a second writer is not an acceptable shortcut.
+
+Next implementation should establish that native lifecycle command/ownership
+boundary and durable per-agent intent/issuer stores, then connect the tested
+Create/finalize adapters and authenticated publication. Shared genesis claim
+publication, independent verification and restart remain explicit required work,
+not waived by a successful Local path. This audit did not modify production
+code, rerun release gates, or establish deployment readiness.
