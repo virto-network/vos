@@ -1157,7 +1157,7 @@ impl SharedRouteHandler {
         &self,
         pending: &mut Vec<PendingManagement>,
         retiring: &[[crate::agent_sdk::RuntimeWork; 2]],
-        predecessor: &PendingManagement,
+        predecessor: Option<&PendingManagement>,
         proposed: &crate::agent_sdk::RuntimeWork,
         record: F,
     ) -> Result<T, SharedAgentHostError>
@@ -1169,12 +1169,28 @@ impl SharedRouteHandler {
             .proposal
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
-        if proposal.projection_pair.is_some()
-            || proposal.management_pending.as_ref()
-                != Some(&pending_management_keys(self.agent, pending)?)
-            || !pending.contains(predecessor)
-            || management_envelope_key(self.agent, &predecessor.1)?.invocation == key.invocation
+        let pending_keys = if pending.is_empty() {
+            None
+        } else {
+            Some(pending_management_keys(self.agent, pending)?)
+        };
+        if proposal.projection_pair.is_some() || proposal.management_pending != pending_keys {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        if let Some(predecessor) = predecessor {
+            if !pending.contains(predecessor)
+                || management_envelope_key(self.agent, &predecessor.1)?.invocation == key.invocation
+            {
+                return Err(SharedAgentHostError::Conflict);
+            }
+        } else if !retiring.is_empty()
+            || (!pending.is_empty()
+                && (pending.len() != 1
+                    || management_envelope_key(self.agent, &pending[0].1)?.invocation
+                        != key.invocation))
         {
+            // Initial capture may only retry its own single reserved member.
+            // It cannot append another request or bypass a retirement gate.
             return Err(SharedAgentHostError::Conflict);
         }
         let retiring_keys = if retiring.is_empty() {
@@ -2755,10 +2771,53 @@ impl SharedAgentNetworkHost {
                 .get(&agent)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]),
-            predecessor,
+            Some(predecessor),
             proposed,
             record,
         )
+    }
+
+    /// Reserve the initial immutable envelope and its journal anchor before
+    /// publishing the intent. Retain admission after an ambiguous store error;
+    /// an exact retry receives the original clock and anchor. This reserves the
+    /// current phase, not capacity for an as-yet-unprepared finalization.
+    pub(crate) fn capture_management_pending<F, T>(
+        &mut self,
+        agent: crate::service::AgentId,
+        proposed: &crate::agent_sdk::RuntimeWork,
+        record: F,
+    ) -> Result<T, SharedAgentHostError>
+    where
+        F: FnOnce(&PendingManagement) -> Result<T, SharedAgentHostError>,
+    {
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        let live = attached
+            .lifecycle
+            .read()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if !*live || attached.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        let pending = self.management_pending.entry(agent).or_default();
+        let result = attached.coordinator.extend_management_pending(
+            pending,
+            self.management_retirements
+                .get(&agent)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            None,
+            proposed,
+            record,
+        );
+        // Admission failures before reservation must not leave an empty root
+        // refresh record. Callback failures keep the nonempty candidate.
+        if pending.is_empty() {
+            self.management_pending.remove(&agent);
+        }
+        result
     }
 
     pub(crate) fn reserve_management_retirement_set(

@@ -3516,6 +3516,43 @@ No source freeze, guest rebuild, CLI smoke, broad library rerun or release
 readiness is claimed here. Keep this checkpoint within C2, with C1/C2/C3 as the
 three eventual review batches; root `saga/agents` and `master` are not promoted.
 
+### Initial live management capture reservation
+
+`SharedAgentNetworkHost::capture_management_pending` now captures an initial
+envelope and journal anchor under the existing serialized Leader/full-commit,
+drained-host and proposal-admission boundary. It validates current-phase
+slot/byte admission, installs the pending key and root refresh image, and only
+then invokes the independent intent-store callback. A callback failure retains
+that exact reservation. A retry with the same invocation work receives its
+original envelope, clock and anchor; a different request cannot append itself.
+Failures before reservation remove the otherwise-empty root entry. Existing
+protected phase extension shares this machinery with an explicit predecessor;
+initial capture cannot bypass pending projection or retirement admission.
+
+The native bundled-Authority regression now covers a failed capture callback,
+unchanged Ordered position, generation refresh, exact retry despite a later
+proposed clock, and rejection of an overlapping capture, unprotected anchor
+write and projection reservation. It then runs the existing mixed-set extension
+and partial-retirement checks. This is network admission evidence, not a
+filesystem crash campaign or proof of fresh credential-policy sequencing.
+
+Verification: the native regression passed (1 test, 105.60s,
+`r16-initial-capture-native-final.log`), and 7 adjacent network tests passed
+(0.58s, `r16-initial-capture-network.log`). An initial mistyped filter selected
+zero tests (`r16-initial-capture-native.log`); it is not verification evidence.
+Logs remain in shared disk scratch under
+`.worktrees/ch08-c2-native/target/task-tmp` relative to the main checkout.
+
+Production lifecycle callers have **not** switched to this operation yet.
+The current-phase reservation does not prove capacity for the future
+finalization envelope. Next, switch initial capture, protected finalization
+extension, pending-to-retirement handoff and live retirement together; preserve
+exact retry/reopen after each failed store publication, and prove whole-lifecycle
+capacity before dispatch. Switching only capture would strand callers at their
+unprotected finalization step. Continuous live protection, complete dependent
+recovery and the previously listed C1/C2/C3 release gates remain open. This is
+another internal C2 checkpoint, not a new review batch or deployment claim.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

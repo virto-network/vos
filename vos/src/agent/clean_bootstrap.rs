@@ -9697,6 +9697,79 @@ mod tests {
             let extra: Vec<_> = (0..4)
                 .map(|index| prepare_extra_management_call(owner, original[0], intent, index))
                 .collect();
+            let mut captured = None;
+            assert!(matches!(
+                owner
+                    ._network_host
+                    .capture_management_pending(agent, &extra[0], |candidate| {
+                        captured = Some(candidate.clone());
+                        Err::<(), _>(SharedAgentHostError::Unavailable)
+                    }),
+                Err(SharedAgentHostError::Unavailable)
+            ));
+            let captured = captured.unwrap();
+            assert_eq!(
+                captured,
+                (management_anchor_for_test(&first_anchor), extra[0].clone())
+            );
+            assert_eq!(
+                owner.ordered_index_for_test().unwrap(),
+                first_anchor.ordered_index
+            );
+            assert!(owner._network_host.mark_stale_for_test(agent));
+            owner._network_host.refresh().unwrap();
+            let mut later_capture = extra[0].clone();
+            let RuntimeWork::Invoke {
+                invocation,
+                authorization,
+                observed_slot,
+                ..
+            } = &mut later_capture
+            else {
+                unreachable!()
+            };
+            *observed_slot += 1;
+            **authorization = InvocationAuthorization::PublicPreflight(
+                crate::agent_sdk::PublicPreflight::for_work(invocation, *observed_slot),
+            );
+            owner
+                ._network_host
+                .capture_management_pending(agent, &later_capture, |candidate| {
+                    assert_eq!(candidate, &captured);
+                    Ok(())
+                })
+                .unwrap();
+            assert!(matches!(
+                owner._network_host.capture_management_pending(
+                    agent,
+                    &extra[1],
+                    |_| -> Result<(), SharedAgentHostError> {
+                        panic!("overlapping request reached the intent store")
+                    }
+                ),
+                Err(SharedAgentHostError::Conflict)
+            ));
+            assert!(matches!(
+                owner._network_host.record_management_anchor(
+                    agent,
+                    &extra[1],
+                    |_| -> Result<(), SharedAgentHostError> {
+                        panic!("unprotected capture bypassed initial reservation")
+                    }
+                ),
+                Err(SharedAgentHostError::Conflict)
+            ));
+            let (query, query_auth) = fresh_projection_pair(owner, 0xea);
+            assert!(matches!(
+                owner
+                    ._network_host
+                    .reserve_projection_pair(agent, &query, &query_auth, false),
+                Err(SharedAgentHostError::Conflict)
+            ));
+            assert_eq!(
+                owner.ordered_index_for_test().unwrap(),
+                first_anchor.ordered_index
+            );
             owner
                 ._network_host
                 .retire_attachment_for_test(agent)
