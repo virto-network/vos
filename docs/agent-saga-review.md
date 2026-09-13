@@ -40,11 +40,17 @@ review endpoints for individual fixes:
    public metadata and durable history. Finish its actor installation,
    invocation/recovery and lane-transition checks and tests. Neither a private-
    state decoder nor a volatile cache is a runtime-independent proof.
-2. **C2 — native lifecycle:** replace the deliberately unavailable ordinary-
-   Agent finality adapter with authenticated live system-Agent decision
-   publication and independent replay verification, including reopen. A
-   self-consistent provision or a permissive verifier is not sufficient.
-   Prove ordinary-agent creation, actor installation and restart end to end.
+2. **C2 — native lifecycle:** connect ordinary-Agent provisioning to the native
+   owner, not just its existing invocation route workers. Startup currently
+   attaches the system Agent only; the route worker exposes no Create/Install
+   management command. Drive authenticated authorization, durable issuance,
+   physical application, acknowledgement and route publication as one
+   restartable workflow. Replace the deliberately unavailable ordinary-Agent
+   finality adapter with authenticated live system-Agent decision publication
+   and independent replay verification, including reopen. A self-consistent
+   provision or permissive verifier is not sufficient. Prove ordinary-agent
+   creation, actor installation, invocation and restart from the actual native
+   entry point, not a manually prepared library host.
 3. **C3 — release:** after those implementation changes, freeze source, rebuild
    and independently reproduce artifacts, run the final feature, physical,
    inventory, docs/examples and release checks, and repeat the fresh-space
@@ -1235,3 +1241,39 @@ responses are scripted, not proof that it executes the actor's program. It
 does not cover positive acknowledgement retirement or target-runtime migration
 execution. Those lifecycle edges and application-runtime execution evidence
 remain to be closed, alongside ordinary-Agent finality and final release gates.
+
+### Native lifecycle integration audit
+
+After the Local actor recovery regression, the native startup path was traced
+again rather than treating library coverage as deployment evidence:
+
+- `vosx/src/commands/space/clean_startup.rs::start_clean_system_agent` creates
+  the root bootstrap owner and calls `VosNode::start_clean_agent_production`.
+  Its ordinary-Agent `UnavailableAgentFinality` still returns `Unavailable`.
+- `vos/src/node.rs::start_clean_agent_production` constructs the system route
+  attachment and production owner. It does not open/create a Local host or
+  provision ordinary Agents. Separate Local/Shared attachment APIs exist, but
+  no call from the examined `vosx` space startup path supplies an ordinary Local
+  attachment.
+- `RouteHostCommand` in `supervisor_adapters.rs` supports invocation, resume,
+  acknowledgement, material preparation and authority projection/reconciliation;
+  it has no lifecycle Create/Install command. An attachment for already-created
+  physical Agents is not a provisioning workflow.
+- `AgentGenesisFinalityVerifier` requires independently authenticated live
+  system-Agent history. The older `verify_historical_provision` helper's only
+  current call sites are tests, and its documentation explicitly denies that
+  validation alone is a sealing capability. It cannot safely replace the
+  unavailable verifier by itself.
+
+The separate `CleanSystemAgentControl` is read-only, but it is **not** the
+startup attachment used above; its existence is not evidence that all current
+ingress dispatch is read-only. The actual supervisor routes already support
+actor invocation.
+
+This audit changes the next implementation priority: C2 must connect a durable,
+authenticated ordinary lifecycle workflow to the native owner and finality
+source. Its acceptance test must start from the same native entry point as
+`space up`, create an ordinary Agent, install an admitted actor, invoke it,
+restart, and repeat exact retries while preserving authority and physical
+state. Keep the existing C1/C2/C3 review grouping. The remaining work is not
+merely final tests or artifact repinning, and the branch is not master-ready.
