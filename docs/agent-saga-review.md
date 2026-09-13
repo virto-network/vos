@@ -4057,6 +4057,53 @@ installation plus real invocation/restart. Ordinary Shared finality, remaining
 C1 recovery/crash/capacity checks, and C3 final-source release gates remain open.
 No artifact repin, review-branch promotion or master-readiness claim is made.
 
+### Native Local Install application and protected retirement phase
+
+The native owner now has a crate-private `install_local_from_management_intent`
+phase. It derives the managed target from the independently opened Local Agent,
+checks the pinned Authority binding and signed intent, and validates the admitted
+actor package against that descriptor before policy dispatch. It captures live
+pending admission before issuing through the bundled Authority, applies through
+the Local host, then reopens durable application evidence before asking the issuer
+to sign MAA2. The caller still owns exact package retention, protected finalization,
+result retirement and route publication; this method is not an ingress endpoint
+or a completed client response.
+
+The physical `native_local_install_reopens_application_before_acknowledgement`
+regression passed (1 test, 23.85s; `r16-native-local-install-application.log`). It
+creates an ordinary Local Agent using the bundled runtime PVM, hands the retired
+Create intent to a signed Install, and installs the bundled Catalog actor with
+its typed immutable configuration. Incorrect signed runtime scope and an
+incorrect admitted package fail before any new Ordered entry or signature.
+The valid Install obtains a verified application ACK, drops/reopens the Local
+image and intent/issuer stores, and returns the identical ACK without additional
+Ordered entries or signatures. It then performs protected Authority finalization,
+positively acknowledges the runtime results and commits retirement.
+
+Initial attempts exposed two fixture mistakes: omitted required constructor
+configuration and reuse of Create's logical slot for new Install. These were
+corrected without relaxing package validation or strict clock progression.
+The test also caught missing live admission capture in the first implementation;
+Install now uses protected dispatch and protected finalization, and retirement
+passes. Temporary diagnostic prints have been removed. The added `system-catalog`
+dependency is test-only and supplies its typed configuration encoder.
+
+Adjacent regressions also passed: all three live Local Create admission/retry
+tests (67.60s, `r16-native-install-create-regressions.log`) and all seven production
+owner tests (0.10s, `r16-native-install-owner-regressions.log`). Formatting and
+`git diff --check` passed. This is targeted verification, not a full-library or
+final-source release rerun.
+
+This is physical bundled-Authority / bundled-Local-runtime evidence, with the
+existing native outer system fixture and memory-backed intent/issuer stores.
+It does not prove cross-process Install crash recovery, arbitrary actor method
+execution, HTTP/SSH Install submission or ordinary Shared finality. In particular,
+startup lifecycle discovery still assumes retained Create runtimes; before wiring
+Install into the controller, add durable exact actor-package storage and recover
+pending Install/application/finalization from those leased stores. Do not repurpose
+the immutable Create-runtime role or expose this phase directly as client success.
+All work stays in C2, with C1 recovery and C3 final-source release gates unchanged.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

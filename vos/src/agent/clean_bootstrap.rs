@@ -2981,6 +2981,71 @@ where
         Ok((agent, acknowledgement))
     }
 
+    /// Apply a retained signed Install to an independently opened Local Agent.
+    /// The caller retains the exact actor package before policy dispatch and
+    /// owns protected finalization, result retirement and route publication.
+    /// Live pending admission is captured before authorization dispatch and
+    /// remains held after this phase. This phase
+    /// returns only a physically reopened application acknowledgement, not a
+    /// completed native lifecycle response.
+    pub(crate) fn install_local_from_management_intent<B, J, S>(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        local: &mut super::local_sdk_host::LocalAgentHost,
+        package: &AdmittedActorPackage,
+        issuer: &mut DurableCleanManagementIssuer<J>,
+        signer: &mut S,
+    ) -> Result<ManagementApplicationAck, SharedAgentHostError>
+    where
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
+        let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let request = intent.request().clone();
+        if !matches!(request, ManagementRequest::Install(_))
+            || local.space() != self.pins.space
+            || local.node() != self.pins.node
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let descriptor = local
+            .show(intent.call().managed.agent)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if descriptor.authority != self.pins.authority {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let managed = ManagedAgentTarget {
+            space: descriptor.identity.space,
+            agent: descriptor.identity.agent,
+            owner: descriptor.identity.owner,
+            profile: descriptor.identity.profile,
+            runtime_deployment: descriptor.identity.runtime_deployment,
+            transition_producer: descriptor.identity.transition_producer,
+        };
+        intent
+            .verify(self.authority_target(), managed, &RawCredentialVerifier)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        validate_actor_install(descriptor, &request, package)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let receipt =
+            self.issue_management_intent_with_admission(slot, managed, issuer, signer, true)?;
+        local
+            .manage(
+                managed.agent,
+                request.clone(),
+                Some(receipt.clone()),
+                super::driver::SdkManagementArtifacts::Actor(package),
+            )
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let observation = local
+            .observe_management_application(managed.agent, &request, &receipt)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        issuer
+            .observe_local_application(&observation, signer)
+            .map_err(|_| SharedAgentHostError::Unavailable)
+    }
+
     /// Create and finalize one signed Local Agent lifecycle using independent
     /// durable intent and issuer stores. Reload those same stores after any
     /// error; a failed write may already have reached durable storage. Passing
@@ -8203,6 +8268,11 @@ mod tests {
         }
 
         #[test]
+        fn native_local_install_reopens_application_before_acknowledgement() {
+            native_local_management_lifecycle(32);
+        }
+
+        #[test]
         fn native_local_authorization_clock_advance_preserves_receipt_and_intent() {
             native_local_management_lifecycle(6);
         }
@@ -9480,6 +9550,18 @@ mod tests {
             call.authority = owner.authority_target();
             call.invocation = call.expected_invocation();
             call.signature = credential_key.sign(&call.signing_bytes()).to_bytes();
+            if coordinated == 32 {
+                std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            check_local_install_application(&mut harness, descriptor, call, runtime)
+                        })
+                        .join()
+                        .unwrap()
+                });
+                harness.stop();
+                return;
+            }
             if matches!(coordinated, 26 | 27 | 28 | 29 | 30 | 31) {
                 std::thread::scope(|scope| {
                     scope
@@ -11866,6 +11948,232 @@ mod tests {
                 Err(SharedAgentHostError::Unavailable)
             ));
             assert_projection_gate_released(owner, 0xf1);
+        }
+
+        #[inline(never)]
+        fn check_local_install_application(
+            harness: &mut NativeProjectionOwnerHarness,
+            descriptor: AgentDescriptor,
+            call: AuthorityCredentialCall,
+            runtime: AdmittedRuntimePackage,
+        ) {
+            use crate::agent::clean_management_intent::{
+                CleanManagementIntent, CleanManagementIntentSlot,
+            };
+            use crate::agent::local_sdk_host::LocalAgentHost;
+            let owner = harness.owner.as_mut().unwrap();
+            let root = harness._directory.0.join("install-local");
+            let mut local = LocalAgentHost::create(
+                &root,
+                descriptor.identity.space,
+                owner.pins.node,
+                harness.fixture.trust.clone(),
+            )
+            .unwrap();
+            let intent_store = IssuerMemoryStore::default();
+            let issuer_store = IssuerMemoryStore::default();
+            let mut signer = CountingSigner::new();
+            owner
+                .create_local_agent(
+                    intent_store.clone(),
+                    issuer_store.clone(),
+                    descriptor.clone(),
+                    call.clone(),
+                    &mut local,
+                    runtime,
+                    &mut signer,
+                )
+                .unwrap();
+            let package =
+                admit_actor_package(include_bytes!("../../../vosx/blobs/system_catalog.vos"))
+                    .unwrap();
+            // New Local management must observe a later logical slot than
+            // Create; exact retries below deliberately keep this same slot.
+            harness
+                .fixture
+                .logical_slot
+                .as_ref()
+                .unwrap()
+                .fetch_add(1, Ordering::AcqRel);
+            let binding = descriptor.authority;
+            let configuration = system_catalog::SystemCatalogConfiguration {
+                space: descriptor.identity.space.0,
+                system_agent: descriptor.identity.agent.0,
+                system_runtime_deployment: descriptor.identity.runtime_deployment.0,
+                actor: ActorId::top_level(descriptor.identity.agent, &package.manifest().name).0,
+                deployment: package.deployment().0,
+                program: package.program().0,
+                authority: system_catalog::CatalogAuthorityState {
+                    policy: binding.policy.0,
+                    issuer: system_catalog::CatalogIssuerState {
+                        principal: binding.issuer.principal.0,
+                        actor: binding.issuer.actor.0,
+                        deployment: binding.issuer.deployment.0,
+                        program: binding.issuer.program.0,
+                        producer: binding.issuer.producer.0,
+                    },
+                    public_key: binding.public_key,
+                    initial_epoch: binding.initial_epoch,
+                },
+            };
+            assert!(configuration.is_valid());
+            let request = install_request(
+                descriptor.identity.agent,
+                &package,
+                0xb4,
+                Some(configuration.encode()),
+            );
+            validate_actor_install(&descriptor, &request, &package)
+                .expect("bundled catalog must match the independently opened Local runtime");
+            let key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
+            let mut install_call = call.clone();
+            install_call.request_sequence =
+                NonZeroU64::new(call.request_sequence.get() + 1).unwrap();
+            install_call.plan = request.authorization_plan().unwrap();
+            install_call.invocation = install_call.expected_invocation();
+            install_call.signature = key.sign(&install_call.signing_bytes()).to_bytes();
+            let next = CleanManagementIntent::new(
+                owner.authority_target(),
+                install_call.managed,
+                request.clone(),
+                install_call.clone(),
+                &RawCredentialVerifier,
+            )
+            .unwrap();
+            let mut slot = CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
+            let previous = slot.intent().unwrap().clone();
+            assert!(slot.retirement_complete().unwrap());
+            slot.handoff_retired(&previous, next, &RawCredentialVerifier)
+                .unwrap();
+            let mut issuer = DurableCleanManagementIssuer::open(
+                issuer_store.clone(),
+                descriptor.authority,
+                descriptor.identity.space,
+                descriptor.identity.agent,
+            )
+            .unwrap();
+            let before = owner.ordered_index_for_test().unwrap();
+            let signatures = signer.calls;
+            // A valid signature over a caller-selected runtime is not proof
+            // that it names the independently opened Local Agent.
+            let mut substituted = install_call.clone();
+            substituted.managed.runtime_deployment = DeploymentId([0xf1; 32]);
+            substituted.invocation = substituted.expected_invocation();
+            substituted.signature = key.sign(&substituted.signing_bytes()).to_bytes();
+            let mut wrong_slot =
+                CleanManagementIntentSlot::open(IssuerMemoryStore::default()).unwrap();
+            wrong_slot
+                .pledge(
+                    CleanManagementIntent::new(
+                        owner.authority_target(),
+                        substituted.managed,
+                        request.clone(),
+                        substituted,
+                        &RawCredentialVerifier,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            assert!(matches!(
+                owner.install_local_from_management_intent(
+                    &mut wrong_slot,
+                    &mut local,
+                    &package,
+                    &mut issuer,
+                    &mut signer,
+                ),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            assert_eq!(signer.calls, signatures);
+            // Wrong admitted sidecar must fail before policy dispatch or signing.
+            let wrong_package = harness.fixture.plan.authority_package().unwrap();
+            assert!(matches!(
+                owner.install_local_from_management_intent(
+                    &mut slot,
+                    &mut local,
+                    &wrong_package,
+                    &mut issuer,
+                    &mut signer,
+                ),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            assert_eq!(signer.calls, signatures);
+            let ack = owner
+                .install_local_from_management_intent(
+                    &mut slot,
+                    &mut local,
+                    &package,
+                    &mut issuer,
+                    &mut signer,
+                )
+                .unwrap();
+            assert!(ack.verify_with(&RawCredentialVerifier).is_ok());
+            assert_eq!(signer.calls, signatures + 2);
+            assert!(!issuer.application_finalization_status(&ack).unwrap());
+            let receipt = owner
+                .issue_management_intent(&mut slot, install_call.managed, &mut issuer, &mut signer)
+                .unwrap();
+            let observation = local
+                .observe_management_application(descriptor.identity.agent, &request, &receipt)
+                .unwrap();
+            let ManagementRequest::Install(install) = &request else {
+                unreachable!()
+            };
+            assert_eq!(
+                observation.result(),
+                &Ok(ManagementReply::Installed(install.entry.clone()))
+            );
+            assert_eq!(ack.reopened_state, observation.reopened_state());
+            let applied = owner.ordered_index_for_test().unwrap();
+            drop(local);
+            drop(slot);
+            drop(issuer);
+            let mut local = LocalAgentHost::open(
+                &root,
+                descriptor.identity.space,
+                owner.pins.node,
+                harness.fixture.trust.clone(),
+            )
+            .unwrap();
+            let mut slot = CleanManagementIntentSlot::open(intent_store).unwrap();
+            let mut issuer = DurableCleanManagementIssuer::open(
+                issuer_store,
+                descriptor.authority,
+                descriptor.identity.space,
+                descriptor.identity.agent,
+            )
+            .unwrap();
+            assert_eq!(
+                owner
+                    .install_local_from_management_intent(
+                        &mut slot,
+                        &mut local,
+                        &package,
+                        &mut issuer,
+                        &mut signer,
+                    )
+                    .unwrap(),
+                ack
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), applied);
+            assert_eq!(signer.calls, signatures + 2);
+            // An application ACK is not retirement: finish Authority application
+            // publication and positively acknowledge both results explicitly.
+            owner
+                .finalize_management_intent_with_admission(
+                    &mut slot,
+                    install_call.managed,
+                    &ack,
+                    &mut issuer,
+                    true,
+                )
+                .unwrap();
+            owner
+                .finish_live_management_intent(&mut slot, install_call.managed, &ack, &issuer)
+                .unwrap();
+            assert!(slot.retirement_complete().unwrap());
         }
 
         #[inline(never)]

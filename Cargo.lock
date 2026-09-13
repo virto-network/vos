@@ -7689,6 +7689,7 @@ dependencies = [
  "ssh-key",
  "subtle",
  "system-authority",
+ "system-catalog",
  "tokio",
  "tokio-rustls",
  "toml 0.8.23",
