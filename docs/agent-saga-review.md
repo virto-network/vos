@@ -1714,3 +1714,32 @@ intent/approval internals. It does not yet add a route-worker management command
 connect the CLI file stores, publish routes, retire evidence or implement joint
 capacity reservation. Those steps, Install on a running Local host, Shared
 genesis finality and final release gates remain required.
+
+### Serialized Local lifecycle/route ownership
+
+The Local route adapter can now share the lifecycle owner's existing
+`Arc<Mutex<LocalAgentHost>>` through a crate-private attachment constructor.
+There is still one physical host and one filesystem writer lease. Route
+inventory, preparation, projection checks and invocation/resume/acknowledgement
+all take the same mutex; invocation admission and execution stay in one critical
+section. The existing public constructor keeps its move-owned behavior by
+creating the shared holder internally. No public management permission or
+wire command was added.
+
+This resolves the empty-route retirement ownership issue identified above:
+retiring a route worker drops its reference, while the lifecycle coordinator
+can retain the host lease and later attach a worker again. Poisoned access is
+unavailable rather than recovered implicitly. The lifecycle owner must release
+the mutex before waiting for any Local route-worker operation or retirement;
+otherwise it would deadlock with an in-flight route waiting for that mutex.
+
+The physical Local-host regression checks serialized route inventory, lease
+retention after worker retirement, reattachment, poisoned-lock refusal and
+successful disk reopen only after the final owner is dropped. Native lifecycle
+commands, system-owner access, file-store wiring and route publication are still
+unconnected; this is the ownership prerequisite, not a completed native path.
+
+**42/42 Local-host and supervisor-adapter tests pass** in 11.78s
+(`r16-local-shared-owner-final.log`, locked/offline `pvm,private-agent-store`,
+disk scratch). Formatting and diff checks pass. No guest artifact or persisted
+format changed in this checkpoint.

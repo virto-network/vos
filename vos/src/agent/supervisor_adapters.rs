@@ -3039,19 +3039,19 @@ fn collect_actor_directory(
 }
 
 struct LocalAgentRouteBackend {
-    host: super::local_sdk_host::LocalAgentHost,
+    host: Arc<std::sync::Mutex<super::local_sdk_host::LocalAgentHost>>,
 }
 
 impl CleanAgentRouteBackend for LocalAgentRouteBackend {
     fn identities(&mut self) -> Result<Vec<AgentRouteIdentity>, AgentRouteError> {
         let mut identities = Vec::new();
-        let agents = self.host.list().map_err(map_local_host_error)?;
+        let mut host = self.host.lock().map_err(|_| AgentRouteError::Unavailable)?;
+        let agents = host.list().map_err(map_local_host_error)?;
         for agent in agents {
-            let descriptor = self.host.show(agent).map_err(map_local_host_error)?.clone();
+            let descriptor = host.show(agent).map_err(map_local_host_error)?.clone();
             let maximum = descriptor.capabilities.max_actors as usize;
             let records = collect_actor_directory(maximum, |after, limit| {
-                match self
-                    .host
+                match host
                     .manage(
                         agent,
                         super::sdk::ManagementRequest::InspectActors { after, limit },
@@ -3079,8 +3079,8 @@ impl CleanAgentRouteBackend for LocalAgentRouteBackend {
         if !request.execution.is_direct() {
             return Err(AgentRouteError::Rejected);
         }
-        let material = self
-            .host
+        let mut host = self.host.lock().map_err(|_| AgentRouteError::Unavailable)?;
+        let material = host
             .supervisor_invocation_material(identity.key().agent(), identity.key().actor())
             .map_err(map_local_host_error)?;
         if !physical_material_matches_identity(&material, identity) {
@@ -3096,8 +3096,7 @@ impl CleanAgentRouteBackend for LocalAgentRouteBackend {
             return Err(AgentRouteError::Rejected);
         }
         let response_request = request.clone();
-        self.host
-            .invoke(request.work.agent, request.work, request.authorization)
+        host.invoke(request.work.agent, request.work, request.authorization)
             .map(|outcome| AgentInvocationResponse::direct(&response_request, outcome))
             .map_err(map_local_host_error)
     }
@@ -3110,8 +3109,8 @@ impl CleanAgentRouteBackend for LocalAgentRouteBackend {
         if !request.execution().is_direct() {
             return Err(AgentRouteError::Rejected);
         }
-        let material = self
-            .host
+        let mut host = self.host.lock().map_err(|_| AgentRouteError::Unavailable)?;
+        let material = host
             .supervisor_invocation_material(identity.key().agent(), identity.key().actor())
             .map_err(map_local_host_error)?;
         if !physical_material_matches_identity(&material, identity) {
@@ -3127,15 +3126,14 @@ impl CleanAgentRouteBackend for LocalAgentRouteBackend {
             return Err(AgentRouteError::Rejected);
         }
         let response_request = request.clone();
-        self.host
-            .resume_sdk_exact(
-                request.work().agent,
-                request.invocation.work,
-                request.invocation.authorization,
-                request.yielded,
-            )
-            .map(|outcome| AgentResumeResponse::direct(&response_request, outcome))
-            .map_err(map_local_host_error)
+        host.resume_sdk_exact(
+            request.work().agent,
+            request.invocation.work,
+            request.invocation.authorization,
+            request.yielded,
+        )
+        .map(|outcome| AgentResumeResponse::direct(&response_request, outcome))
+        .map_err(map_local_host_error)
     }
 
     fn acknowledge(
@@ -3146,8 +3144,8 @@ impl CleanAgentRouteBackend for LocalAgentRouteBackend {
         if !request.execution().is_direct() {
             return Err(AgentRouteError::Rejected);
         }
-        let material = self
-            .host
+        let mut host = self.host.lock().map_err(|_| AgentRouteError::Unavailable)?;
+        let material = host
             .supervisor_invocation_material(identity.key().agent(), identity.key().actor())
             .map_err(map_local_host_error)?;
         if !physical_material_matches_identity(&material, identity) {
@@ -3163,14 +3161,13 @@ impl CleanAgentRouteBackend for LocalAgentRouteBackend {
             return Err(AgentRouteError::Rejected);
         }
         let response_request = request.clone();
-        self.host
-            .acknowledge_sdk(
-                request.work().agent,
-                request.invocation.work,
-                request.invocation.authorization,
-            )
-            .map(|outcome| AgentAcknowledgementResponse::new(&response_request, outcome))
-            .map_err(map_local_host_error)
+        host.acknowledge_sdk(
+            request.work().agent,
+            request.invocation.work,
+            request.invocation.authorization,
+        )
+        .map(|outcome| AgentAcknowledgementResponse::new(&response_request, outcome))
+        .map_err(map_local_host_error)
     }
 
     fn prepare(
@@ -3178,6 +3175,8 @@ impl CleanAgentRouteBackend for LocalAgentRouteBackend {
         identity: AgentRouteIdentity,
     ) -> Result<super::invocation_preparation::PhysicalInvocationMaterial, AgentRouteError> {
         self.host
+            .lock()
+            .map_err(|_| AgentRouteError::Unavailable)?
             .supervisor_invocation_material(identity.key().agent(), identity.key().actor())
             .map_err(map_local_host_error)
     }
@@ -3188,7 +3187,8 @@ impl CleanAgentRouteBackend for LocalAgentRouteBackend {
         head: AuthorityProjectionHead,
         projection: &[AgentAuthorityRouteProjection],
     ) -> Result<Vec<AgentRouteIdentity>, AgentRouteError> {
-        match self.host.audit_authority_projection(head, projection) {
+        let host = self.host.lock().map_err(|_| AgentRouteError::Unavailable)?;
+        match host.audit_authority_projection(head, projection) {
             Ok(super::local_sdk_host::LocalAuthorityProjectionAudit::Ready(identities)) => {
                 Ok(identities)
             }
@@ -3232,6 +3232,17 @@ fn map_local_host_error(error: super::local_sdk_host::LocalAgentHostError) -> Ag
 /// Move one clean Local host into an exclusively owned bounded route worker.
 pub fn local_agent_supervisor_attachment(
     host: super::local_sdk_host::LocalAgentHost,
+    queue_capacity: usize,
+) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
+    local_agent_supervisor_attachment_shared(Arc::new(std::sync::Mutex::new(host)), queue_capacity)
+}
+
+/// Attach a route worker to the lifecycle owner's existing physical host.
+/// Every route holds the same mutex through admission and execution. The
+/// lifecycle owner must never wait for this worker while holding that mutex.
+/// Retiring a worker drops its reference, not the lifecycle owner's lease.
+pub(crate) fn local_agent_supervisor_attachment_shared(
+    host: Arc<std::sync::Mutex<super::local_sdk_host::LocalAgentHost>>,
     queue_capacity: usize,
 ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
     spawn_backend(

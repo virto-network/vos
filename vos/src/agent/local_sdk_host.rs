@@ -2151,6 +2151,74 @@ mod tests {
     }
 
     #[test]
+    fn shared_route_attachment_preserves_lifecycle_lease_and_serializes_access() {
+        let directory = TestDirectory::new("shared-route-lease");
+        let root = directory.child("agents");
+        let host = Arc::new(std::sync::Mutex::new(
+            LocalAgentHost::create(&root, space(), node(), trust()).unwrap(),
+        ));
+        let attachment =
+            super::super::supervisor_adapters::local_agent_supervisor_attachment_shared(
+                host.clone(),
+                4,
+            )
+            .unwrap();
+        let handle = attachment.handle();
+        let guard = host.lock().unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sent.send(handle.identities()).unwrap();
+        });
+        assert!(matches!(
+            received.recv_timeout(std::time::Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(guard);
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        worker.join().unwrap();
+        attachment.retire().unwrap();
+        assert!(host.lock().unwrap().list().unwrap().is_empty());
+        assert!(matches!(
+            LocalAgentHost::open(&root, space(), node(), trust()),
+            Err(LocalAgentHostError::Busy)
+        ));
+        let attachment =
+            super::super::supervisor_adapters::local_agent_supervisor_attachment_shared(
+                host.clone(),
+                4,
+            )
+            .unwrap();
+        let poisoned = host.clone();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = poisoned.lock().unwrap();
+                panic!("injected lifecycle failure");
+            }))
+            .is_err()
+        );
+        assert_eq!(
+            attachment.handle().identities(),
+            Err(super::super::supervisor::AgentRouteError::Unavailable)
+        );
+        attachment.retire().unwrap();
+        drop(poisoned);
+        drop(host);
+        assert!(
+            LocalAgentHost::open(&root, space(), node(), trust())
+                .unwrap()
+                .list()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn empty_create_reopen_is_exactly_scoped_and_exclusively_locked() {
         let directory = TestDirectory::new("empty");
         let root = directory.child("agents");
