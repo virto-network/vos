@@ -178,8 +178,8 @@ Keep these as work within C2, not new review batches:
    This does not prove protected application or terminal result retirement.
    Native acknowledgement of the successful result pair now passes while
    deliberately retaining admission. Signed completion continuation and owner
-   reopen after both acknowledgements now pass; production continuation storage,
-   partial-retirement crash coverage and final durable release remain open.
+   reopen after either one or both acknowledgements now pass; production
+   continuation storage and final durable release remain open.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
    retirement and restart through native ingress; then expose the same
    preparation/authorization flow in the user-facing client. A Public query
@@ -5608,6 +5608,35 @@ one positive result acknowledgement, durable final retirement/release markers
 and release retries remain required. Do not wire retirement into the daemon
 until those are closed. No guest artifacts changed. Logs remain in shared
 disk-backed `target/task-tmp`.
+
+### Partial operation acknowledgement interruption and reopen
+
+The native acknowledgement loop now has an internal progress-observation
+boundary after each independently verified positive acknowledgement. An
+observer error stops before the next result while retaining the exact retirement
+reservation; normal callers use a no-op observer. The observer cannot substitute
+for acknowledgement verification and must not re-enter the owner or release
+admission.
+
+`native_operation_partial_result_retirement_reopens_exactly` interrupts that
+actual loop immediately after the first positive acknowledgement. It closes the
+native owner, reloads signed NOC1 and both immutable NOD1 records, and reopens
+retirement-class admission with an advanced clock. Completion acknowledges only
+the remaining result; exact retry adds no transition. Receipt/issuance and
+completion-signature counts do not increase, the certificate bytes are unchanged,
+and unrelated projection admission remains blocked. The original both-results
+reopen case is retained as a separate test using the same fixture helper.
+
+The focused case passes in **23.42s**
+(`r16-native-operation-partial-retirement.log`, shared disk-backed
+`target/task-tmp`). This is native owner/journal reopen after an injected
+interruption, not a live daemon process-kill campaign. Production completion
+storage/discovery, durable final retirement/release and daemon adoption remain
+required before enabling this phase in ingress. No guest artifacts changed.
+
+The combined native regression passes: **five passed, zero failed**, in
+**56.37s** (`r16-native-operation-partial-retirement-regression.log`). Formatting
+and diff checks pass. This is targeted coverage, not a new full release run.
 
 ### Durable client acknowledgement before completion
 

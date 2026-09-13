@@ -9967,6 +9967,15 @@ mod tests {
 
         #[test]
         fn native_operation_approved_issuance_reopens_without_new_signatures() {
+            check_native_operation_approved_retirement(false);
+        }
+
+        #[test]
+        fn native_operation_partial_result_retirement_reopens_exactly() {
+            check_native_operation_approved_retirement(true);
+        }
+
+        fn check_native_operation_approved_retirement(partial_retirement: bool) {
             use crate::Encode as _;
             use crate::agent::authority_operation_issuer::AuthorityOperationEvidenceSigner;
             use crate::agent::sdk::authority::AuthorityIngressAuthentication;
@@ -10304,21 +10313,38 @@ mod tests {
                     )
                     .is_err()
             );
-            assert!(
-                owner
-                    .acknowledge_native_operation_completion(&completion)
-                    .unwrap()
-            );
-            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
-            let completion = owner
-                .restore_native_operation_completion(&authorization, &acknowledgement, &certificate)
-                .unwrap();
-            assert!(
-                !owner
-                    .acknowledge_native_operation_completion(&completion)
-                    .unwrap()
-            );
-            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
+            if partial_retirement {
+                let mut observed = 0;
+                assert!(matches!(
+                    owner.acknowledge_native_operation_completion_observing(&completion, || {
+                        observed += 1;
+                        Err(SharedAgentHostError::Unavailable)
+                    }),
+                    Err(SharedAgentHostError::Unavailable)
+                ));
+                assert_eq!(observed, 1);
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before + 3);
+            } else {
+                assert!(
+                    owner
+                        .acknowledge_native_operation_completion(&completion)
+                        .unwrap()
+                );
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
+                let completion = owner
+                    .restore_native_operation_completion(
+                        &authorization,
+                        &acknowledgement,
+                        &certificate,
+                    )
+                    .unwrap();
+                assert!(
+                    !owner
+                        .acknowledge_native_operation_completion(&completion)
+                        .unwrap()
+                );
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
+            }
             assert_eq!(signer.calls, 2);
             assert_eq!(
                 journal.load(call.invocation).unwrap(),
@@ -10400,12 +10426,22 @@ mod tests {
                     &std::fs::read(&completion_path).unwrap(),
                 )
                 .unwrap();
+            assert_eq!(
+                owner
+                    .acknowledge_native_operation_completion(&restored)
+                    .unwrap(),
+                partial_retirement
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
             assert!(
                 !owner
                     .acknowledge_native_operation_completion(&restored)
                     .unwrap()
             );
             assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
+            assert_eq!(signer.calls, 2);
+            assert_eq!(signer.completion_calls, 2);
+            assert_eq!(std::fs::read(&completion_path).unwrap(), certificate);
             let (query, query_auth) = fresh_projection_pair(&owner, 0xd8);
             assert!(matches!(
                 owner._network_host.reserve_projection_pair(

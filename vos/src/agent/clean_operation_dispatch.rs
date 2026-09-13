@@ -574,6 +574,20 @@ where
         &mut self,
         retained: &RetainedNativeOperationCompletion,
     ) -> Result<bool, SharedAgentHostError> {
+        self.acknowledge_native_operation_completion_observing(retained, || Ok(()))
+    }
+
+    /// Observe each independently verified positive acknowledgement. An
+    /// observer failure stops before the next result and preserves reservation.
+    /// The observer must not re-enter the owner or release admission.
+    pub(crate) fn acknowledge_native_operation_completion_observing<F>(
+        &mut self,
+        retained: &RetainedNativeOperationCompletion,
+        mut observed: F,
+    ) -> Result<bool, SharedAgentHostError>
+    where
+        F: FnMut() -> Result<(), SharedAgentHostError>,
+    {
         let completion = &retained.completion;
         if completion.target != self.authority_target() {
             return Err(SharedAgentHostError::ScopeMismatch);
@@ -658,6 +672,7 @@ where
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
             changed = true;
+            observed()?;
         }
         Ok(changed)
     }
