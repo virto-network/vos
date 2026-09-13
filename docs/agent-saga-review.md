@@ -1339,3 +1339,32 @@ it does not connect native Create/Install or provide ordinary-Agent finality by
 itself.
 **19/19 clean-issuer and Local-host tests pass**
 (`r16-local-ack-recovery-final.log`, 14.54s); formatting and diff checks pass.
+
+### Durable native management intent component
+
+`clean_management_intent` now retains the complete canonical management request
+and signed credential call before the future coordinator invokes authority
+policy or allocates a receipt. CMI1 bounds both nested frames, binds the call's
+authorization plan to the exact request, and checks complete Create target and
+authority fields. Construction verifies the credential signature against
+independently selected authority/managed routes. Recovery must explicitly
+reverify those routes and signature; decoding stored bytes is not authorization.
+
+The dedicated single-writer intent slot uses the existing atomic whole-image
+storage contract, but must have a separate physical image from the issuer. An
+identical retry is read-only; a different operation conflicts. Any commit error
+poisons the instance because the write may already be durable, so recovery
+requires reopening the actual store rather than trusting old process state.
+
+**8/8 issuer and intent tests pass** (`r16-management-intent.log`, 3.83s).
+The new regression covers canonical round-trip, wrong-route and forged-call
+refusal, a write that becomes durable before returning an error, poisoned
+in-process retry, exact recovery on reopen, and conflicting-intent refusal
+without changing the stored image. Formatting and diff checks pass.
+
+This is the coordinator's pending-input component, not native provisioning.
+It intentionally does not claim policy approval, issue a receipt, clear a
+completed workflow or publish routes. Next connect its persisted input to the
+authenticated authority dispatcher and existing durable issuer/application
+observation/finalization stages, including completion and restart handling.
+No guest artifact or existing store format is changed by this checkpoint.

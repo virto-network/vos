@@ -2368,6 +2368,80 @@ mod tests {
     }
 
     #[test]
+    fn management_intent_pledge_is_exact_and_recovers_ambiguous_storage() {
+        use super::super::clean_management_intent::{
+            CleanManagementIntent, CleanManagementIntentSlot, IntentSlotError,
+        };
+        use crate::service::wire::ServiceWire as _;
+        let signer = CountingSigner::new(0x39);
+        let fixture = fixture(&signer);
+        let request = request(0x3a);
+        let (call, _) = approved_call(&fixture, 1, &request);
+        let intent = CleanManagementIntent::new(
+            call.authority,
+            call.managed,
+            request.clone(),
+            call.clone(),
+            &TestCredentialVerifier,
+        )
+        .unwrap();
+        assert_eq!(intent.request(), &request);
+        assert_eq!(intent.call(), &call);
+        assert_eq!(
+            CleanManagementIntent::decode(&intent.encode()).unwrap(),
+            intent
+        );
+        let mut wrong_route = call.managed;
+        wrong_route.agent = AgentId([0xef; 32]);
+        assert!(
+            intent
+                .verify(call.authority, wrong_route, &TestCredentialVerifier)
+                .is_err()
+        );
+        let mut forged = call.clone();
+        forged.signature[0] ^= 1;
+        assert!(
+            CleanManagementIntent::new(
+                call.authority,
+                call.managed,
+                request.clone(),
+                forged,
+                &TestCredentialVerifier
+            )
+            .is_err()
+        );
+
+        let store = MemoryImageStore::default();
+        let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
+        assert!(slot.intent().is_none());
+        store.fail_after_commit(1);
+        assert_eq!(
+            slot.pledge(intent.clone()),
+            Err(IntentSlotError::Storage(MemoryStoreError))
+        );
+        assert_eq!(slot.pledge(intent.clone()), Err(IntentSlotError::Poisoned));
+        drop(slot);
+        let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
+        slot.intent()
+            .unwrap()
+            .verify(call.authority, call.managed, &TestCredentialVerifier)
+            .unwrap();
+        let durable = store.image().unwrap();
+        assert_eq!(slot.pledge(intent), Ok(false));
+        let (later_call, _) = approved_call(&fixture, 2, &request);
+        let later = CleanManagementIntent::new(
+            later_call.authority,
+            later_call.managed,
+            request,
+            later_call,
+            &TestCredentialVerifier,
+        )
+        .unwrap();
+        assert_eq!(slot.pledge(later), Err(IntentSlotError::Conflict));
+        assert_eq!(store.image().unwrap(), durable);
+    }
+
+    #[test]
     fn application_ack_is_pledged_after_reopen_and_is_exact_across_restart() {
         let store = MemoryImageStore::default();
         let mut signer = CountingSigner::new(0x28);

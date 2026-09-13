@@ -35,6 +35,8 @@ pub mod clean_bootstrap;
     target_os = "linux"
 ))]
 pub mod clean_control;
+#[cfg(feature = "std")]
+pub(crate) mod clean_management_intent;
 pub mod committee;
 pub mod contract;
 #[cfg(feature = "std")]
