@@ -76,7 +76,7 @@ A 200 binary response is canonical `ASR1`, bound to the exact request. Inspect
 its runtime outcome: HTTP 200 does not itself mean actor success. On transport
 failure or 503, retain the original bytes; do not assume execution did not
 occur or generate a new invocation identity. The transport does not yet supply
-fresh client preparation/receipt issuance or continuation/acknowledgement transport,
+fresh client preparation/receipt issuance or a retained continuation driver,
 or the friendly JSON route below. A full live invocation/restart campaign is
 still required before ordinary-agent testing is considered ready.
 
@@ -97,6 +97,24 @@ on retry. Output is JSON containing the canonical response as hex and a
 outcomes are also responses. Direct reply binding trusts the selected local
 daemon; it is not a signed finality proof. The command does not generate
 authorization or drive a yielded continuation.
+
+The same binary, Direct-only transport also exposes continuation and delivery
+retirement:
+
+| Endpoint | Request | Response |
+| --- | --- | --- |
+| `/__agents/invoke` | ASQ1 | ASR1 |
+| `/__agents/resume` | ARQ3 | ARR3 |
+| `/__agents/acknowledge` | AAQ3 | AAR3 |
+
+Each endpoint rejects frames from the other operation domains. Resume carries
+the original work/authorization and exact yielded selector; the physical host
+reconstructs continuation work from its durable FIFO. Acknowledgement retires
+delivery for the original invocation, not a new actor call. All three preserve
+the same anonymous-Public/receipt boundary, exact live route checks, bounded
+framing and request-bound responses. An HTTP error does not prove non-execution
+or non-retirement. A retained continuation/acknowledgement client and native
+yield/resume/retirement campaign are still required.
 
 ### Existing name-based routes
 

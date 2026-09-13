@@ -234,7 +234,10 @@ async fn handle_request(
                 return handle_local_install(&request, &handle);
             }
             #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
-            if request.uri().path() == "/__agents/invoke" {
+            if matches!(
+                request.uri().path(),
+                "/__agents/invoke" | "/__agents/resume" | "/__agents/acknowledge"
+            ) {
                 return handle_clean_invocation(&request, &handle);
             }
             #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
@@ -479,7 +482,7 @@ fn handle_local_install(
     }
 }
 
-/// Forward canonical clean work, never legacy dynamic actor messages. Receipt
+/// Forward canonical clean lifecycle envelopes around actor messages. Receipt
 /// authorization remains the selected runtime's responsibility. An unsigned
 /// PublicPreflight is not proof of any caller identity, even for Public methods.
 #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
@@ -493,7 +496,10 @@ fn handle_clean_invocation(
         InvocationAuthorization, InvocationOrigin, InvocationRoleClaims, RuntimeExecutionContext,
     };
     use crate::agent::supervisor::AgentRouteKey;
-    use crate::agent::supervisor_adapters::{AgentInvocationRequest, dispatch_encoded_invocation};
+    use crate::agent::supervisor_adapters::{
+        AgentAcknowledgementRequest, AgentInvocationRequest, AgentResumeRequest,
+        dispatch_encoded_acknowledgement, dispatch_encoded_invocation, dispatch_encoded_resume,
+    };
 
     if request.body().len() > MAX_BODY_BYTES {
         return text(413, "request body too large");
@@ -512,27 +518,49 @@ fn handle_clean_invocation(
     {
         return text(
             415,
-            "clean invocation requires application/octet-stream ASQ1",
+            "clean invocation requires application/octet-stream with the endpoint's canonical frame",
         );
     }
-    let invocation = match AgentInvocationRequest::decode(request.body()) {
+    let decoded = match request.uri().path() {
+        "/__agents/resume" => AgentResumeRequest::decode(request.body()).map(|value| {
+            (
+                value.execution(),
+                value.work().clone(),
+                value.authorization().clone(),
+            )
+        }),
+        "/__agents/acknowledge" => {
+            AgentAcknowledgementRequest::decode(request.body()).map(|value| {
+                (
+                    value.execution(),
+                    value.work().clone(),
+                    value.authorization().clone(),
+                )
+            })
+        }
+        _ => AgentInvocationRequest::decode(request.body()).map(|value| {
+            (
+                value.execution(),
+                value.work().clone(),
+                value.authorization().clone(),
+            )
+        }),
+    };
+    let (execution, work, authorization) = match decoded {
         Ok(value) => value,
         Err(_) => return text(400, "invalid canonical clean invocation"),
     };
     // Generic supervisor responses do not carry the sealed proof-verification
     // capability required for attested delivery. Reject before any execution.
-    if invocation.execution() != RuntimeExecutionContext::Direct {
+    if execution != RuntimeExecutionContext::Direct {
         return text(501, "attested HTTP invocation is not yet available");
     }
-    let work = invocation.work();
     if work.origin.transport_node.is_some() {
         return text(403, "HTTP invocation does not accept transport-node claims");
     }
-    if matches!(
-        invocation.authorization(),
-        InvocationAuthorization::PublicPreflight(_)
-    ) && (work.origin != InvocationOrigin::anonymous()
-        || work.roles != InvocationRoleClaims::none())
+    if matches!(authorization, InvocationAuthorization::PublicPreflight(_))
+        && (work.origin != InvocationOrigin::anonymous()
+            || work.roles != InvocationRoleClaims::none())
     {
         return text(
             403,
@@ -553,8 +581,18 @@ fn handle_clean_invocation(
     // The exact bytes, including authorization and recovery intent, survive
     // retries. Dispatch checks the live identity and exact response commitment.
     // Never interpret a transport error as proof that execution did not occur.
-    match dispatch_encoded_invocation(&supervisor, snapshot, request.body()) {
-        Ok(response) => match response.encode() {
+    let response = match request.uri().path() {
+        "/__agents/resume" => dispatch_encoded_resume(&supervisor, snapshot, request.body())
+            .map(|response| response.encode()),
+        "/__agents/acknowledge" => {
+            dispatch_encoded_acknowledgement(&supervisor, snapshot, request.body())
+                .map(|response| response.encode())
+        }
+        _ => dispatch_encoded_invocation(&supervisor, snapshot, request.body())
+            .map(|response| response.encode()),
+    };
+    match response {
+        Ok(response) => match response {
             Ok(bytes) => with_content_type(200, "application/octet-stream", bytes),
             Err(_) => text(
                 503,
@@ -857,6 +895,89 @@ mod tests {
                     .unwrap();
             let direct = AgentInvocationRequest::decode(&body).unwrap();
             let work = direct.work();
+            let yielded = YieldedInvocation {
+                invocation: work.invocation,
+                actor: work.actor,
+                incarnation: work.incarnation,
+                deployment: work.deployment,
+                program: work.program,
+                mode: work.mode,
+                continuation: BlobRef::of_bytes(&[1]),
+                ready_sequence: 1,
+                installation_data: None,
+                required: Vec::new(),
+                reason: YieldReason::Cooperative,
+            };
+            let resume = crate::agent::supervisor_adapters::AgentResumeRequest::new(
+                RuntimeExecutionContext::Direct,
+                None,
+                work.clone(),
+                direct.authorization().clone(),
+                yielded,
+            )
+            .unwrap()
+            .encode()
+            .unwrap();
+            let acknowledge = crate::agent::supervisor_adapters::AgentAcknowledgementRequest::new(
+                RuntimeExecutionContext::Direct,
+                None,
+                work.clone(),
+                direct.authorization().clone(),
+            )
+            .unwrap()
+            .encode()
+            .unwrap();
+            for (path, frame) in [
+                ("/__agents/resume", resume),
+                ("/__agents/acknowledge", acknowledge),
+            ] {
+                let request = http::Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(http::header::CONTENT_TYPE, "application/octet-stream")
+                    .body(frame.clone())
+                    .unwrap();
+                assert_eq!(
+                    handle_clean_invocation(&request, &handle).status().as_u16(),
+                    expected
+                );
+                let mut truncated = frame.clone();
+                truncated.pop();
+                let request = http::Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(http::header::CONTENT_TYPE, "application/octet-stream")
+                    .body(truncated)
+                    .unwrap();
+                assert_eq!(
+                    handle_clean_invocation(&request, &handle).status().as_u16(),
+                    400
+                );
+                let wrong_endpoint = http::Request::builder()
+                    .method("POST")
+                    .uri("/__agents/invoke")
+                    .header(http::header::CONTENT_TYPE, "application/octet-stream")
+                    .body(frame)
+                    .unwrap();
+                assert_eq!(
+                    handle_clean_invocation(&wrong_endpoint, &handle)
+                        .status()
+                        .as_u16(),
+                    400
+                );
+                let wrong_frame = http::Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(http::header::CONTENT_TYPE, "application/octet-stream")
+                    .body(body.clone())
+                    .unwrap();
+                assert_eq!(
+                    handle_clean_invocation(&wrong_frame, &handle)
+                        .status()
+                        .as_u16(),
+                    400
+                );
+            }
             let target =
                 crate::agent::supervisor::AgentRouteKey::new(work.space, work.agent, work.actor)
                     .unwrap();
@@ -986,6 +1107,12 @@ mod tests {
             assert!(inventory.starts_with("HTTP/1.1 405"), "{inventory}");
             let invoke = request(port, "/__agents/invoke");
             assert!(invoke.starts_with("HTTP/1.1 405"), "{invoke}");
+            for path in ["/__agents/resume", "/__agents/acknowledge"] {
+                let wrong_method = request(port, path);
+                assert!(wrong_method.starts_with("HTTP/1.1 405"), "{wrong_method}");
+                let adjacent = request(port, &format!("{path}/"));
+                assert!(adjacent.starts_with("HTTP/1.1 401"), "{adjacent}");
+            }
             let prepare = request(port, "/__agents/prepare");
             assert!(prepare.starts_with("HTTP/1.1 405"), "{prepare}");
             let adjacent_prepare = request(port, "/__agents/prepare/");

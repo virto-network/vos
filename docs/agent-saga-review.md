@@ -22,8 +22,9 @@ high. The fresh signed-denial / valid-successor / exact-retry campaign also
 passes at `8abbe363`, but requires two HTTP 504 retries for the valid Create.
 Install delivery has passed exact recovery after restart. A Public Catalog
 query on the installed Local actor now passes through clean HTTP preparation,
-invocation, retained delivery and an exact HTTP retry. Invocation after restart
-is running; protected/non-Public and mutating actor workflows remain open.
+invocation, retained delivery and an exact HTTP retry. Exact HTTP invocation
+after restart also passes; protected/non-Public and mutating actor workflows
+remain open.
 This is not yet a usable ordinary-agent production path.
 The native Local Install application and startup-recovery phases now pass
 physical tests from prepared authorization through retirement, including
@@ -34,7 +35,7 @@ and HTTP server wiring, plus retained-request and fresh managed CLI commands.
 Fresh Install discovery/preparation/credential allocation is wired; managed
 resume and a fresh successor Install now pass live. A Public actor query now
 passes live, but this does not prove protected/mutating invocation or the full
-restart workflow. Do not treat command availability as an end-to-end pass.
+mutation/recovery workflow. Do not treat command availability as an end-to-end pass.
 The first fresh Install campaign on saved disposable state failed all four
 HTTP waits (604.30s total test time), then shut down cleanly after route
 reconciliation finished. No client MAA2 was retained in that failed campaign.
@@ -4907,6 +4908,37 @@ This closes a live Public Query delivery check only. It does not prove mutation,
 protected Authority-operation issuance, continuation/acknowledgement delivery,
 attested execution, ordinary Shared finality, or the remaining release matrix.
 Startup still took about 358 seconds in this campaign and remains a UX issue.
+
+### Public Query restart passed; continuation transport
+
+The exact restart campaign is terminal and passed: start 17:01:27Z, readiness
+17:03:29Z, client completion 17:03:30Z, clean shutdown 17:03:31Z with endpoint
+removal. The live test passed once in 0.72s
+(`invocation-restart-client-test.log`). It forced a real HTTP request against
+the reopened actor and matched the previously retained ASR1 and decoded Catalog
+page; it did not pass solely through local cached delivery. Both CSF1 hashes
+recorded above are unchanged after restart. No campaign daemon remains running.
+Reopen took about 122s; saved state/checkpoint history differs from the earlier
+358s campaign, so this is not a controlled performance comparison.
+
+HTTP now forwards exact ARQ3 to `/__agents/resume` and AAQ3 to
+`/__agents/acknowledge` through the existing supervisor lifecycle dispatchers.
+Each endpoint requires its own canonical frame and preserves the common body,
+method, content-type, anonymous-Public/receipt and no-transport-node boundaries.
+Attested lifecycle requests are rejected before execution. The selected route
+and response commitment are checked as for Invoke; no ingress-built ResumeWork,
+new availability, or acknowledgement-as-new-invocation fallback is introduced.
+
+Checks pass: four HTTP tests in 0.26s
+(`r16-invocation-continuation-http.log`), now covering valid and hostile
+Resume/Acknowledge frames, wrong endpoint/frame domains, truncation, unsigned
+identity claims and exact/adjacent socket paths; 28 supervisor-adapter tests
+in 0.05s (`r16-invocation-continuation-supervisor.log`), including exact
+lifecycle replay/reopen and response substitution. Formatting/diff checks pass.
+
+This is transport wiring, not a native yielded-work/retirement pass. Durable
+client continuation/acknowledgement, protected non-Public issuance/mutation,
+ordinary Shared finality and all remaining release gates remain required.
 
 ### Durable client acknowledgement before completion
 
