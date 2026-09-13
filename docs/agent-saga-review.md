@@ -50,8 +50,10 @@ review endpoints for individual fixes:
    native entry point. Startup now retains both the system owner and the Local
    lifecycle controller. Signed Local Create has a bounded ingress queue and
    an HTTP submission endpoint and retained-request CLI submission. Fresh CLI
-   preparation/discovery is now wired, but the live Create/publication smoke
-   fails in management authorization; Install ingress also remains open. Prove
+   preparation/discovery is now wired. Management dispatch clock drift is fixed
+   in targeted tests; the latest live Create produced a Local image but timed
+   out before acknowledgement/publication was verified. Install ingress also
+   remains open. Prove
    authorization, durable issuance, physical application, acknowledgement and
    route publication as one restartable workflow. Replace the deliberately unavailable ordinary-Agent
    finality adapter with authenticated live system-Agent decision publication
@@ -2226,6 +2228,57 @@ accepted identity. Do not reuse the query-only reserved projection API for Linea
 management work without its corresponding admission protocol. Then rerun live
 Create, route publication, restart, and exact retry. All other C1/C2/C3 release
 requirements above remain open; no branch promotion is justified yet.
+
+### Persisted management preflight dispatch
+
+Authorization and finalization now use an internal dispatch path that carries
+the observation slot from the durable CMI3 envelope into the ordered input.
+It does not regenerate the envelope or change its work, invocation, authorization,
+or credential sequence. The owner pins the system Authority target; the network
+path requires Linear/PublicPreflight work and the same physical route checks;
+the journal requires Direct invocation, an exact work/preflight binding, and no
+future observation. Normal routed admission still samples the current clock.
+Query-only reserved projection dispatch is unchanged, including its exclusion
+gate, Raft proposal checks, and acknowledgement path.
+
+The clock-advance diagnostic is now a positive regression: a one-slot advance
+after persisting authorization succeeds, and reopening intent/issuer followed
+by an expired-window retry returns the same receipt without a second signature
+or ordered slot. A second test advances the clock after persisting finalization
+and proves exact finalization replay. Wrong actor, Query mode, and future-dated
+management dispatch are refused without appending an ordered slot.
+
+Targeted evidence (logs under `.worktrees/ch08-c2-native/target/task-tmp`, relative
+to the main checkout): **10 native lifecycle tests pass**, 55.39 seconds,
+`r16-management-clock-fix.log`; the existing pending-projection invoke/ack/reopen
+test passes, 4.20 seconds, `r16-management-clock-projection.log`. The native CLI
+build passes in 28.49 seconds, `r16-management-clock-cli-build.log`. No guest
+source, wire format, or bundled artifact changed.
+
+This fixes dispatch clock drift, **not the complete lifecycle admission protocol**.
+Joint capacity reservation, retirement/clear, and prepared-but-unaccepted
+recovery remain open. In particular, an older journal that already recorded the
+failed dispatch is not silently rewritten or given a replacement identity.
+The live test uses new disposable data in `target/native-clock-smoke.GLMaE7`,
+HTTP 18082/SSH 2224; the earlier failed `native-local-smoke.DATNas` is untouched.
+The initial sandbox-denied network attempt was stopped before rerunning with
+socket access; its log is preserved as `sandbox-daemon.log`.
+
+Live progress: the new daemon became ready at `2026-09-13T04:12:32.763161Z`.
+The request was saved at approximately `04:12:51Z`, but the HTTP wait ended with
+504 (`create-client.log`). Unlike the earlier failure, the scope now contains
+both `management.issuer` and an ordinary Local `image`, for Agent
+`c73db0519443e8c5744763a8073ec17781aeda5017cfb8a131ec15e9efb6c866`.
+The issuer file changed again at `04:16:21Z`. No verified client acknowledgement
+has been returned, and route publication is not yet proven. The script requested
+SIGINT after the timeout; at this checkpoint its daemon was still CPU-active
+finishing the in-flight workflow/shutdown. Do not start another daemon on these
+stores until that process has terminated. `resume-smoke.sh` is prepared to start
+the same Space and submit only `--resume`, then compare a second exact retry.
+The lifecycle request SHA-256 is
+`173da629f2e649e485927ca92a2d02b9ab5aa629197645ff6bfbe124aef8862f`;
+no new request or nonce was substituted after the timeout. Debug-build completion
+latency and shutdown latency need assessment alongside the resume result.
 
 ### Durable immutable Local Create request storage
 

@@ -2102,6 +2102,32 @@ where
         self.prepare_clean_ordered_operation_with_policy(request, true, None)
     }
 
+    /// Internal management work whose complete preflight envelope is already
+    /// durable in its lifecycle intent. The intent's observation is immutable;
+    /// neither dispatch latency nor reopening may turn it into a new admission.
+    /// This is not an ingress API or a projection-pair capacity reservation.
+    pub(crate) fn prepare_persisted_management_invocation(
+        &self,
+        request: CleanInvocationReplayRequest,
+    ) -> Result<PreparedCleanOrdered, SharedJournalDriverError> {
+        let CleanInvocationReplayRequest::Invoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            work,
+            authorization: crate::agent_sdk::InvocationAuthorization::PublicPreflight(preflight),
+        } = &request
+        else {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        };
+        if work.mode != crate::agent_sdk::MethodMode::Linear
+            || !preflight.matches_work(work)
+            || preflight.observed_slot > self.executor.current_logical_slot()?
+        {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let observed_slot = preflight.observed_slot;
+        self.prepare_clean_ordered_operation_with_policy(request, true, Some(observed_slot))
+    }
+
     /// Prepare only the exact persisted system-authority projection work
     /// protected by a projection-pair admission. Its PublicPreflight slot was
     /// sampled before the pending bootstrap record became durable, so recovery

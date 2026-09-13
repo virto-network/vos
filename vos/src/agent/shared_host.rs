@@ -1625,6 +1625,19 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
+    pub(crate) fn prepare_persisted_management_invocation(
+        &self,
+        agent: AgentId,
+        request: super::shared_journal_driver::CleanInvocationReplayRequest,
+    ) -> Result<super::shared_journal_driver::PreparedCleanOrdered, SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .prepare_persisted_management_invocation(request)
+            .map_err(map_driver_error)
+    }
+
     pub(crate) fn prepare_bootstrap_invocation(
         &self,
         agent: AgentId,

@@ -2023,6 +2023,26 @@ where
             .supervisor_invoke_terminal(expected, work, authorization)
     }
 
+    fn supervisor_invoke_persisted_management(
+        &self,
+        expected: super::supervisor::AgentRouteIdentity,
+        work: super::sdk::InvocationWork,
+        authorization: super::sdk::InvocationAuthorization,
+    ) -> Result<super::sdk::RuntimeOutcome, SharedAgentHostError> {
+        let target = self.authority_target();
+        if work.space != target.space
+            || work.agent != target.system_agent
+            || work.runtime_deployment != target.system_runtime_deployment
+            || work.actor != target.binding.issuer.actor
+            || work.deployment != target.binding.issuer.deployment
+            || work.program != target.binding.issuer.program
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self._network_host
+            .supervisor_invoke_persisted_management(expected, work, authorization)
+    }
+
     fn supervisor_invoke_terminal_reserved(
         &self,
         expected: super::supervisor::AgentRouteIdentity,
@@ -2223,7 +2243,11 @@ where
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         let outcome = self
-            .supervisor_invoke_terminal(identity, (**work).clone(), (**authorization).clone())
+            .supervisor_invoke_persisted_management(
+                identity,
+                (**work).clone(),
+                (**authorization).clone(),
+            )
             .map_err(|error| {
                 crate::log::warn!("management authorization dispatch failed: {error:?}");
                 error
@@ -2401,8 +2425,11 @@ where
         ) {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        let outcome =
-            self.supervisor_invoke_terminal(identity, (**work).clone(), (**authorization).clone())?;
+        let outcome = self.supervisor_invoke_persisted_management(
+            identity,
+            (**work).clone(),
+            (**authorization).clone(),
+        )?;
         let super::sdk::RuntimeOutcome::Completed(Ok(reply)) = &outcome else {
             return Err(SharedAgentHostError::Unavailable);
         };
@@ -7148,8 +7175,13 @@ mod tests {
         }
 
         #[test]
-        fn native_local_authorization_clock_advance_preserves_rejected_intent() {
+        fn native_local_authorization_clock_advance_preserves_receipt_and_intent() {
             native_local_management_lifecycle(6);
+        }
+
+        #[test]
+        fn native_management_finalization_clock_advance_preserves_exact_replay() {
+            native_local_management_lifecycle(7);
         }
 
         #[inline(never)]
@@ -7163,7 +7195,7 @@ mod tests {
             let managed = intent.call().managed;
             let store = IssuerMemoryStore {
                 // First commit pledges the intent; second saves its preflight.
-                advance_clock_after_commits: Some((clock, 2)),
+                advance_clock_after_commits: Some((clock.clone(), 2)),
                 ..Default::default()
             };
             let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
@@ -7177,10 +7209,10 @@ mod tests {
             )
             .unwrap();
             let mut signer = CountingSigner::new();
-            assert!(matches!(
-                owner.issue_management_intent(&mut slot, managed, &mut issuer, &mut signer),
-                Err(SharedAgentHostError::Unavailable)
-            ));
+            let receipt = owner
+                .issue_management_intent(&mut slot, managed, &mut issuer, &mut signer)
+                .unwrap();
+            let applied = owner.ordered_index_for_test().unwrap();
             let envelope = slot.authorization_work().unwrap().unwrap().clone();
             let image = store.image.lock().unwrap().clone();
             let RuntimeWork::Invoke {
@@ -7198,28 +7230,77 @@ mod tests {
             let identity =
                 crate::agent::supervisor_adapters::physical_material_identity(&material).unwrap();
             let outcome = owner
-                .supervisor_invoke_terminal(
+                .supervisor_invoke_persisted_management(
                     identity,
                     (**invocation).clone(),
                     (**authorization).clone(),
                 )
                 .unwrap();
-            assert_eq!(
-                outcome,
-                RuntimeOutcome::Completed(
-                    Err(crate::agent_sdk::InvocationError::AuthorityExpired,)
-                )
+            assert!(matches!(outcome, RuntimeOutcome::Completed(Ok(_))));
+            check_persisted_management_admission_guards(
+                owner,
+                identity,
+                invocation,
+                clock.load(Ordering::Acquire),
             );
             drop(slot);
             let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
-            assert!(matches!(
-                owner.issue_management_intent(&mut slot, managed, &mut issuer, &mut signer),
-                Err(SharedAgentHostError::Unavailable)
-            ));
+            let mut issuer = DurableCleanManagementIssuer::open(
+                issuer.into_store(),
+                descriptor.authority,
+                descriptor.identity.space,
+                descriptor.identity.agent,
+            )
+            .unwrap();
+            clock.fetch_add(20, Ordering::AcqRel);
+            assert_eq!(
+                owner
+                    .issue_management_intent(&mut slot, managed, &mut issuer, &mut signer)
+                    .unwrap(),
+                receipt
+            );
             assert_eq!(slot.authorization_work().unwrap(), Some(&envelope));
             assert_eq!(*store.image.lock().unwrap(), image);
-            assert_eq!(signer.calls, 0);
-            assert!(issuer_store.image.lock().unwrap().is_none());
+            assert_eq!(signer.calls, 1);
+            assert!(issuer_store.image.lock().unwrap().is_some());
+            assert_eq!(owner.ordered_index_for_test().unwrap(), applied);
+        }
+
+        #[inline(never)]
+        fn check_persisted_management_admission_guards(
+            owner: &MemoryBootstrapOwner,
+            identity: crate::agent::supervisor::AgentRouteIdentity,
+            work: &InvocationWork,
+            observed_slot: u64,
+        ) {
+            let before = owner.ordered_index_for_test().unwrap();
+            let authorization = InvocationAuthorization::PublicPreflight(
+                crate::agent_sdk::PublicPreflight::for_work(work, observed_slot + 1),
+            );
+            assert!(
+                owner
+                    .supervisor_invoke_persisted_management(identity, work.clone(), authorization)
+                    .is_err()
+            );
+            let mut query = work.clone();
+            query.mode = MethodMode::Query;
+            let authorization = InvocationAuthorization::PublicPreflight(
+                crate::agent_sdk::PublicPreflight::for_work(&query, observed_slot),
+            );
+            assert!(matches!(
+                owner.supervisor_invoke_persisted_management(identity, query, authorization),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            let mut other_actor = work.clone();
+            other_actor.actor = ActorId::ZERO;
+            let authorization = InvocationAuthorization::PublicPreflight(
+                crate::agent_sdk::PublicPreflight::for_work(&other_actor, observed_slot),
+            );
+            assert!(matches!(
+                owner.supervisor_invoke_persisted_management(identity, other_actor, authorization),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
         }
 
         #[inline(never)]
@@ -7726,7 +7807,17 @@ mod tests {
                 harness.stop();
                 return;
             }
-            check_local_management_phases(harness, descriptor, call, request, runtime, intent);
+            let finalization_clock =
+                (coordinated == 7).then(|| harness.fixture.logical_slot.as_ref().unwrap().clone());
+            check_local_management_phases(
+                harness,
+                descriptor,
+                call,
+                request,
+                runtime,
+                intent,
+                finalization_clock,
+            );
         }
 
         #[inline(never)]
@@ -7737,10 +7828,15 @@ mod tests {
             request: ManagementRequest,
             runtime: AdmittedRuntimePackage,
             intent: crate::agent::clean_management_intent::CleanManagementIntent,
+            finalization_clock: Option<Arc<AtomicU64>>,
         ) {
             use crate::agent::clean_management_intent::CleanManagementIntentSlot;
             let owner = harness.owner.as_mut().unwrap();
-            let store = IssuerMemoryStore::default();
+            let store = IssuerMemoryStore {
+                // Intent, authorization, then finalization envelope.
+                advance_clock_after_commits: finalization_clock.map(|clock| (clock, 3)),
+                ..Default::default()
+            };
             let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
             slot.pledge(intent).unwrap();
             let issuer_store = IssuerMemoryStore::default();
