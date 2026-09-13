@@ -23,6 +23,8 @@ restart using the rebuilt CLI (`target/native-local-smoke.DATNas`, details below
 This is bootstrap/ingress coverage, not ordinary-Agent creation/installation.
 AJC3 checkpoints and AGIM/AGI2 images are deliberately rejected, with no in-place
 migration provided; do not point this clean-break build at valuable old data.
+Current host lifecycle images additionally require CMI4/CMR2 with pre-dispatch
+journal anchors; earlier CMI3/CMR1 images are rejected, not migrated.
 
 The integrated library run at `37d6a5720e7e45e4a19850a16a531e6cb316e299`
 completed: **1,663 passed, zero failed, one filtered**, in 1,771.43 seconds.
@@ -2863,6 +2865,48 @@ The pre-dispatch position is not yet persisted in the intent image; no intent
 wire format changed at this checkpoint. Durable anchor capture under admission
 exclusion and startup adoption remain required before incomplete lifecycle
 recovery can use this primitive.
+
+### Durable pre-dispatch anchors in CMI4/CMR2
+
+Both native authorization and finalization preparation now persist the exact
+invocation envelope together with its pre-dispatch journal anchor. The network
+coordinator holds proposal exclusion, requires a local leader with a fully
+committed log, drains the committed suffix and verifies the exact apply cursor.
+It then validates envelope scope and captures the journal position while
+holding the host lock through the independent intent-store write. The callback
+must not re-enter the host or coordinator. Existing projection/retirement
+reservations reject anchor publication before the callback runs.
+
+MJA1 records the genesis, genesis-admission ID, runtime commitment and exact
+Ordered index/head. CMI4 requires an anchor for each retained envelope; CMR2
+preserves the same complete anchored body on retirement. Anchors must be
+well-shaped, and finalization cannot regress or substitute the authorization
+anchor's genesis/admission/runtime scope. Re-pledging an envelope with a
+different anchor conflicts. Ambiguous writes poison the in-memory slot; reopen
+recovers the same envelope and anchor rather than sampling a new position.
+The bounded host image allowance grew by 512 bytes for the two anchors.
+
+This intentionally rejects CMI3/CMR1 images. No migration or empty-anchor
+fallback exists, and no guest ABI or bundled PVM artifact changed. Use fresh
+disposable lifecycle data when testing a rebuilt CLI from this source.
+
+Final-source verification: **11 native bootstrap/lifecycle tests passed**
+(107.02s, `r16-durable-anchor-native-final.log`), **12 issuer tests passed**
+(3.85s, `r16-durable-anchor-issuer.log`) and **9 vosx filesystem lifecycle tests
+passed** (0.11s, `r16-durable-anchor-stores.log`). Native fixtures verify exact
+pre-dispatch indices and scope, retained anchors after reopen, rejection while
+retirement admission is reserved, host-lock ownership during publication and
+lock release after a callback error. Issuer fixtures cover malformed anchors,
+changed-anchor retries, cross-phase scope substitution, ambiguous writes and
+legacy-image rejection. Formatting and diff checks pass. Logs use disk scratch;
+no fresh CLI build/smoke, migration, or full release validation is claimed.
+
+The capture exclusion ends when the store callback returns. This is not yet
+the full lifecycle reservation lasting through dispatch, retirement and restart.
+Startup must still authenticate the retained anchors against the opened journal,
+adopt and protect incomplete work before publishing routes, and reconcile it
+with pending projections. No real-daemon incomplete recovery or release-ready
+claim follows from persisting the anchors alone.
 
 ### Durable client acknowledgement before completion
 

@@ -1037,6 +1037,68 @@ impl SharedRouteHandler {
         Ok(())
     }
 
+    /// Capture and durably record a pre-dispatch anchor while proposals and
+    /// checkpoint selection are excluded. The callback may only write the
+    /// independent intent store; it must not re-enter this host or coordinator.
+    fn record_management_anchor<F, T>(
+        &self,
+        envelope: &crate::agent_sdk::RuntimeWork,
+        record: F,
+    ) -> Result<T, SharedAgentHostError>
+    where
+        F: FnOnce(
+            crate::agent::clean_management_intent::ManagementJournalAnchor,
+        ) -> Result<T, SharedAgentHostError>,
+    {
+        let proposal = self
+            .proposal
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if proposal.is_reserved() {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let worker = self
+            .worker
+            .as_ref()
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        if !self.has_local_proposer(worker) {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        let barrier = futures_executor::block_on(worker.snapshot())
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        if barrier.role != vos_raft::Role::Leader || barrier.commit_index != barrier.last_log_index
+        {
+            return Err(SharedAgentHostError::Unavailable);
+        }
+        let mut host = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        drain_committed(&mut host, self.agent, &self.ordered_replies)?;
+        if host
+            .show(self.agent)?
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .applied_slots
+            != barrier.commit_index
+        {
+            return Err(SharedAgentHostError::CorruptResidue);
+        }
+        let position = host.journal_position(self.agent)?;
+        // Validate envelope scope without executing policy or the runtime.
+        host.management_invocation_after(self.agent, &position, envelope)?;
+        record(
+            crate::agent::clean_management_intent::ManagementJournalAnchor {
+                genesis: position.genesis,
+                admission: position.admission,
+                runtime: position.runtime.commitment(),
+                ordered: crate::agent::journal::OrderedBase {
+                    index: position.ordered_index,
+                    head: position.ordered_head,
+                },
+            },
+        )
+    }
+
     fn reserve_management_retirement_set(
         &self,
         pairs: &[[&crate::agent_sdk::RuntimeWork; 2]],
@@ -2257,6 +2319,33 @@ impl SharedAgentNetworkHost {
         envelopes: [&crate::agent_sdk::RuntimeWork; 2],
     ) -> Result<(), SharedAgentHostError> {
         self.reserve_management_retirement_set(agent, &[envelopes])
+    }
+
+    pub(crate) fn record_management_anchor<F, T>(
+        &self,
+        agent: crate::service::AgentId,
+        envelope: &crate::agent_sdk::RuntimeWork,
+        record: F,
+    ) -> Result<T, SharedAgentHostError>
+    where
+        F: FnOnce(
+            crate::agent::clean_management_intent::ManagementJournalAnchor,
+        ) -> Result<T, SharedAgentHostError>,
+    {
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        let live = attached
+            .lifecycle
+            .read()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if !*live || attached.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        attached
+            .coordinator
+            .record_management_anchor(envelope, record)
     }
 
     pub(crate) fn reserve_management_retirement_set(

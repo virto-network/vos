@@ -2212,14 +2212,21 @@ where
             ) {
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
-            slot.pledge_authorization_work(RuntimeWork::Invoke {
+            let envelope = RuntimeWork::Invoke {
                 context: RuntimeExecutionContext::Direct,
                 state: RuntimeState::default(),
                 invocation: Box::new(work),
                 authorization: Box::new(authorization),
                 observed_slot: material.observed_slot,
-            })
-            .map_err(|_| SharedAgentHostError::Unavailable)?;
+            };
+            self._network_host.record_management_anchor(
+                crate::service::AgentId(self.pins.agent.0),
+                &envelope,
+                |anchor| {
+                    slot.pledge_authorization_work(envelope.clone(), anchor)
+                        .map_err(|_| SharedAgentHostError::Unavailable)
+                },
+            )?;
         }
         let Some(RuntimeWork::Invoke {
             invocation: work,
@@ -2307,7 +2314,7 @@ where
     }
 
     /// Finalize only the exact durable application acknowledgement. The work
-    /// receives its own current preflight, persisted in CMI3 before dispatch.
+    /// receives its own current preflight, persisted in CMI4 before dispatch.
     /// Retries reuse that envelope without refreshing its accepted clock.
     pub(crate) fn finalize_management_intent<B, J>(
         &mut self,
@@ -2392,14 +2399,21 @@ where
             ) {
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
-            slot.pledge_finalization_work(RuntimeWork::Invoke {
+            let envelope = RuntimeWork::Invoke {
                 context: RuntimeExecutionContext::Direct,
                 state: RuntimeState::default(),
                 invocation: Box::new(work),
                 authorization: Box::new(authorization),
                 observed_slot: material.observed_slot,
-            })
-            .map_err(|_| SharedAgentHostError::Unavailable)?;
+            };
+            self._network_host.record_management_anchor(
+                crate::service::AgentId(self.pins.agent.0),
+                &envelope,
+                |anchor| {
+                    slot.pledge_finalization_work(envelope.clone(), anchor)
+                        .map_err(|_| SharedAgentHostError::Unavailable)
+                },
+            )?;
         }
         let Some(RuntimeWork::Invoke {
             invocation: work,
@@ -8433,7 +8447,7 @@ mod tests {
                     let mut slot = CleanManagementIntentSlot::open(FailingStore {
                         inner: store.clone(),
                         after,
-                        magic: b"CMR1",
+                        magic: b"CMR2",
                     })
                     .unwrap();
                     assert!(matches!(
@@ -8467,7 +8481,7 @@ mod tests {
             );
             assert!(slot.retirement_complete().unwrap());
             let retired = store.image.lock().unwrap().clone().unwrap();
-            assert!(retired.starts_with(b"CMR1"));
+            assert!(retired.starts_with(b"CMR2"));
             assert_eq!(retired.len(), original.as_ref().unwrap().len());
             assert_eq!(&retired[4..], &original.as_ref().unwrap()[4..]);
             drop(slot);
@@ -8534,7 +8548,7 @@ mod tests {
                     let mut slot = CleanManagementIntentSlot::open(FailingStore {
                         inner: store.clone(),
                         after,
-                        magic: b"CMI3",
+                        magic: b"CMI4",
                     })
                     .unwrap();
                     assert!(matches!(
@@ -8571,7 +8585,7 @@ mod tests {
                     .unwrap()
                     .as_ref()
                     .unwrap()
-                    .starts_with(b"CMI3")
+                    .starts_with(b"CMI4")
             );
             check_lifecycle_recovery_scan(
                 owner.authority_target(),
@@ -8984,6 +8998,16 @@ mod tests {
                 ._network_host
                 .reserve_management_retirement_set(agent, &pairs)
                 .unwrap();
+            assert!(matches!(
+                owner._network_host.record_management_anchor(
+                    agent,
+                    &extra[0],
+                    |_| -> Result<(), SharedAgentHostError> {
+                        panic!("retirement exclusion must reject anchor publication")
+                    }
+                ),
+                Err(SharedAgentHostError::Conflict)
+            ));
             // Reserving a member is idempotent and must not replace the set.
             owner
                 ._network_host
@@ -9094,6 +9118,23 @@ mod tests {
             }
             assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
             assert_projection_gate_released(owner, 0xee);
+            let host = Arc::clone(&owner.host);
+            assert!(matches!(
+                owner._network_host.record_management_anchor(
+                    agent,
+                    &extra[0],
+                    |anchor| -> Result<(), SharedAgentHostError> {
+                        assert!(
+                            host.try_lock().is_err(),
+                            "journal lock must span durable anchor publication"
+                        );
+                        assert_eq!(anchor.ordered.index, before + 4);
+                        Err(SharedAgentHostError::Unavailable)
+                    }
+                ),
+                Err(SharedAgentHostError::Unavailable)
+            ));
+            assert_projection_gate_released(owner, 0xf1);
         }
 
         #[inline(never)]
@@ -9135,6 +9176,19 @@ mod tests {
             let applied = owner.ordered_index_for_test().unwrap();
             assert!(applied > before);
             let envelope = slot.authorization_work().unwrap().unwrap().clone();
+            let authorization_anchor = slot.authorization_anchor().unwrap().unwrap().clone();
+            assert_eq!(authorization_anchor.ordered.index, before);
+            assert_eq!(
+                authorization_anchor.runtime,
+                owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .journal_position(HostAgentId(owner.pins.agent.0))
+                    .unwrap()
+                    .runtime
+                    .commitment()
+            );
             let local_root = harness._directory.0.join("ordinary-local");
             let mut local = crate::agent::local_sdk_host::LocalAgentHost::create(
                 &local_root,
@@ -9304,6 +9358,24 @@ mod tests {
             let finalized = owner.ordered_index_for_test().unwrap();
             assert!(finalized > applied);
             let finalization_envelope = slot.finalization_work().unwrap().unwrap().clone();
+            let finalization_anchor = slot.finalization_anchor().unwrap().unwrap().clone();
+            assert_eq!(finalization_anchor.ordered.index, applied);
+            assert_eq!(finalization_anchor.genesis, authorization_anchor.genesis);
+            assert_eq!(
+                finalization_anchor.admission,
+                authorization_anchor.admission
+            );
+            assert_eq!(finalization_anchor.runtime, authorization_anchor.runtime);
+            let reopened_slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
+            assert_eq!(
+                reopened_slot.authorization_anchor().unwrap(),
+                Some(&authorization_anchor)
+            );
+            assert_eq!(
+                reopened_slot.finalization_anchor().unwrap(),
+                Some(&finalization_anchor)
+            );
+            drop(reopened_slot);
             drop(slot);
             let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
             assert_eq!(

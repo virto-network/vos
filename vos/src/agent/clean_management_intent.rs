@@ -18,12 +18,68 @@ use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 pub(crate) const MAX_INTENT_BYTES: usize =
     super::clean_authority_issuer::MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES;
 
+/// Host-owned pre-dispatch position, not a credential approval. Recovery must
+/// authenticate it against the independently opened system journal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ManagementJournalAnchor {
+    pub(crate) genesis: super::journal::AgentJournalGenesisId,
+    pub(crate) admission: super::genesis::AgentGenesisAdmissionId,
+    pub(crate) runtime: crate::service::Hash,
+    pub(crate) ordered: super::journal::OrderedBase,
+}
+
+impl ManagementJournalAnchor {
+    fn validate(&self) -> Result<(), DecodeError> {
+        if self.genesis == super::journal::AgentJournalGenesisId::ZERO
+            || self.admission == super::genesis::AgentGenesisAdmissionId::ZERO
+            || self.runtime == crate::service::Hash::ZERO
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        self.ordered.validate()
+    }
+}
+
+impl ServiceWire for ManagementJournalAnchor {
+    const MAGIC: [u8; 4] = *b"MJA1";
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.fixed(&self.genesis.0);
+        encoder.fixed(self.admission.as_bytes());
+        encoder.fixed(&self.runtime.0);
+        encoder.u64(self.ordered.index);
+        encoder.bool(self.ordered.head.is_some());
+        if let Some(head) = self.ordered.head {
+            encoder.fixed(&head.0);
+        }
+    }
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let result = Self {
+            genesis: super::journal::AgentJournalGenesisId(decoder.fixed()?),
+            admission: super::genesis::AgentGenesisAdmissionId::from_bytes(decoder.fixed()?),
+            runtime: crate::service::Hash(decoder.fixed()?),
+            ordered: super::journal::OrderedBase {
+                index: decoder.u64()?,
+                head: if decoder.bool()? {
+                    Some(super::journal::OrderedEntryId(decoder.fixed()?))
+                } else {
+                    None
+                },
+            },
+        };
+        result.validate()?;
+        Ok(result)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CleanManagementIntent {
     request: ManagementRequest,
     call: AuthorityCredentialCall,
     authorization_work: Option<RuntimeWork>,
     finalization_work: Option<RuntimeWork>,
+    authorization_anchor: Option<ManagementJournalAnchor>,
+    finalization_anchor: Option<ManagementJournalAnchor>,
 }
 
 impl CleanManagementIntent {
@@ -39,6 +95,8 @@ impl CleanManagementIntent {
             call,
             authorization_work: None,
             finalization_work: None,
+            authorization_anchor: None,
+            finalization_anchor: None,
         };
         intent.verify(authority, managed, verifier)?;
         Ok(intent)
@@ -138,6 +196,29 @@ impl CleanManagementIntent {
         if self.finalization_work.is_some() && self.authorization_work.is_none() {
             return Err(DecodeError::NonCanonical);
         }
+        if self.authorization_work.is_some() != self.authorization_anchor.is_some()
+            || self.finalization_work.is_some() != self.finalization_anchor.is_some()
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        for anchor in self
+            .authorization_anchor
+            .iter()
+            .chain(self.finalization_anchor.iter())
+        {
+            anchor.validate()?;
+        }
+        if let (Some(first), Some(last)) = (&self.authorization_anchor, &self.finalization_anchor) {
+            if first.genesis != last.genesis
+                || first.admission != last.admission
+                || first.runtime != last.runtime
+                || first.ordered.index > last.ordered.index
+                || (first.ordered.index == last.ordered.index
+                    && first.ordered.head != last.ordered.head)
+            {
+                return Err(DecodeError::NonCanonical);
+            }
+        }
         for (work, finalization) in self
             .authorization_work
             .iter()
@@ -223,7 +304,7 @@ impl CleanManagementIntent {
 }
 
 impl ServiceWire for CleanManagementIntent {
-    const MAGIC: [u8; 4] = *b"CMI3";
+    const MAGIC: [u8; 4] = *b"CMI4";
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
         encoder.bytes(&self.request.encode().unwrap_or_default());
@@ -235,6 +316,12 @@ impl ServiceWire for CleanManagementIntent {
         encoder.bool(self.finalization_work.is_some());
         if let Some(work) = &self.finalization_work {
             encoder.bytes(&work.encode().unwrap_or_default());
+        }
+        for anchor in [&self.authorization_anchor, &self.finalization_anchor] {
+            encoder.bool(anchor.is_some());
+            if let Some(anchor) = anchor {
+                encoder.bytes(&anchor.encode());
+            }
         }
     }
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -269,6 +356,16 @@ impl ServiceWire for CleanManagementIntent {
             } else {
                 None
             },
+            authorization_anchor: if decoder.bool()? {
+                Some(ManagementJournalAnchor::decode(decoder.bytes_ref()?)?)
+            } else {
+                None
+            },
+            finalization_anchor: if decoder.bool()? {
+                Some(ManagementJournalAnchor::decode(decoder.bytes_ref()?)?)
+            } else {
+                None
+            },
         };
         intent.validate()?;
         Ok(intent)
@@ -289,7 +386,7 @@ pub(crate) enum IntentSlotError<E> {
 struct RetiredManagementIntent(CleanManagementIntent);
 
 impl ServiceWire for RetiredManagementIntent {
-    const MAGIC: [u8; 4] = *b"CMR1";
+    const MAGIC: [u8; 4] = *b"CMR2";
 
     fn encode_body(&self, output: &mut Vec<u8>) {
         self.0.encode_body(output);
@@ -442,13 +539,38 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
             .and_then(|intent| intent.authorization_work.as_ref()))
     }
 
+    pub(crate) fn authorization_anchor(
+        &self,
+    ) -> Result<Option<&ManagementJournalAnchor>, IntentSlotError<B::Error>> {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        Ok(self
+            .intent
+            .as_ref()
+            .and_then(|intent| intent.authorization_anchor.as_ref()))
+    }
+
+    pub(crate) fn finalization_anchor(
+        &self,
+    ) -> Result<Option<&ManagementJournalAnchor>, IntentSlotError<B::Error>> {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        Ok(self
+            .intent
+            .as_ref()
+            .and_then(|intent| intent.finalization_anchor.as_ref()))
+    }
+
     /// Persist the exact physically prepared envelope before dispatch. A
     /// retry must reuse it, including its original preflight observation.
     pub(crate) fn pledge_authorization_work(
         &mut self,
         work: RuntimeWork,
+        anchor: ManagementJournalAnchor,
     ) -> Result<bool, IntentSlotError<B::Error>> {
-        self.pledge_work(work, false)
+        self.pledge_work(work, anchor, false)
     }
 
     pub(crate) fn finalization_work(
@@ -466,32 +588,40 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
     pub(crate) fn pledge_finalization_work(
         &mut self,
         work: RuntimeWork,
+        anchor: ManagementJournalAnchor,
     ) -> Result<bool, IntentSlotError<B::Error>> {
-        self.pledge_work(work, true)
+        self.pledge_work(work, anchor, true)
     }
 
     fn pledge_work(
         &mut self,
         work: RuntimeWork,
+        anchor: ManagementJournalAnchor,
         finalization: bool,
     ) -> Result<bool, IntentSlotError<B::Error>> {
         if self.poisoned {
             return Err(IntentSlotError::Poisoned);
         }
         let mut intent = self.intent.clone().ok_or(IntentSlotError::Invalid)?;
+        let pending_anchor = if finalization {
+            &mut intent.finalization_anchor
+        } else {
+            &mut intent.authorization_anchor
+        };
         let pending = if finalization {
             &mut intent.finalization_work
         } else {
             &mut intent.authorization_work
         };
         if let Some(existing) = pending {
-            return if *existing == work {
+            return if *existing == work && pending_anchor.as_ref() == Some(&anchor) {
                 Ok(false)
             } else {
                 Err(IntentSlotError::Conflict)
             };
         }
         *pending = Some(work);
+        *pending_anchor = Some(anchor);
         intent.validate().map_err(|_| IntentSlotError::Invalid)?;
         let bytes = intent.encode();
         if bytes.len() > MAX_INTENT_BYTES {

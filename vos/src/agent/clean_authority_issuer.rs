@@ -32,7 +32,7 @@ pub const MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES: usize = 512 * 1024;
 
 /// Physical storage bound for the independently persisted native lifecycle
 /// intent. The intent codec and its policy boundary remain crate-private.
-pub const MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES: usize = 64
+pub const MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES: usize = 576
     + crate::agent_sdk::wire::MAX_MANAGEMENT_REQUEST_WIRE_BYTES
     + crate::agent_sdk::wire::MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES
     + 2 * crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES;
@@ -2477,7 +2477,7 @@ mod tests {
         assert_eq!(intent.call(), &call);
         // A retirement tag cannot make an unexecuted intent complete.
         let mut premature = intent.encode();
-        premature[..4].copy_from_slice(b"CMR1");
+        premature[..4].copy_from_slice(b"CMR2");
         let mut premature_store = MemoryImageStore::default();
         premature_store.commit(&premature).unwrap();
         assert!(CleanManagementIntentSlot::open(premature_store).is_err());
@@ -2651,14 +2651,27 @@ mod tests {
             observed_slot: slot,
         };
         let work = envelope(invocation.clone(), 10);
+        let anchor = super::super::clean_management_intent::ManagementJournalAnchor {
+            genesis: super::super::journal::AgentJournalGenesisId([0xa1; 32]),
+            admission: super::super::genesis::AgentGenesisAdmissionId::from_bytes([0xa2; 32]),
+            runtime: crate::service::Hash([0xa3; 32]),
+            ordered: super::super::journal::OrderedBase::post_genesis(),
+        };
         let store = MemoryImageStore::default();
         let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
         assert_eq!(
-            slot.pledge_authorization_work(work.clone()),
+            slot.pledge_authorization_work(work.clone(), anchor.clone()),
             Err(IntentSlotError::Invalid)
         );
         slot.pledge(intent.clone()).unwrap();
         let before = store.image();
+        let mut invalid_anchor = anchor.clone();
+        invalid_anchor.runtime = crate::service::Hash::ZERO;
+        assert_eq!(
+            slot.pledge_authorization_work(work.clone(), invalid_anchor),
+            Err(IntentSlotError::Invalid)
+        );
+        assert_eq!(store.image(), before);
         for mutation in 0..5 {
             let mut wrong = invocation.clone();
             match mutation {
@@ -2669,33 +2682,44 @@ mod tests {
                 _ => wrong.recovery_only = true,
             }
             assert_eq!(
-                slot.pledge_authorization_work(envelope(wrong, 10)),
+                slot.pledge_authorization_work(envelope(wrong, 10), anchor.clone()),
                 Err(IntentSlotError::Invalid)
             );
             assert_eq!(store.image(), before);
         }
         store.fail_after_commit(1);
         assert_eq!(
-            slot.pledge_authorization_work(work.clone()),
+            slot.pledge_authorization_work(work.clone(), anchor.clone()),
             Err(IntentSlotError::Storage(MemoryStoreError))
         );
         assert_eq!(slot.authorization_work(), Err(IntentSlotError::Poisoned));
+        assert_eq!(slot.authorization_anchor(), Err(IntentSlotError::Poisoned));
         assert_eq!(
-            slot.pledge_authorization_work(work.clone()),
+            slot.pledge_authorization_work(work.clone(), anchor.clone()),
             Err(IntentSlotError::Poisoned)
         );
         drop(slot);
         let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
         assert_eq!(slot.authorization_work().unwrap(), Some(&work));
+        assert_eq!(slot.authorization_anchor().unwrap(), Some(&anchor));
+        let mut changed_anchor = anchor.clone();
+        changed_anchor.runtime = crate::service::Hash([0xaf; 32]);
+        assert_eq!(
+            slot.pledge_authorization_work(work.clone(), changed_anchor.clone()),
+            Err(IntentSlotError::Conflict)
+        );
         let durable = store.image();
         assert_eq!(slot.pledge(intent), Ok(false));
-        assert_eq!(slot.pledge_authorization_work(work), Ok(false));
         assert_eq!(
-            slot.pledge_authorization_work(envelope(invocation.clone(), 11)),
+            slot.pledge_authorization_work(work, anchor.clone()),
+            Ok(false)
+        );
+        assert_eq!(
+            slot.pledge_authorization_work(envelope(invocation.clone(), 11), anchor.clone()),
             Err(IntentSlotError::Conflict)
         );
         assert_eq!(store.image(), durable);
-        for magic in [b"CMI1", b"CMI2"] {
+        for magic in [b"CMI1", b"CMI2", b"CMI3", b"CMR1"] {
             let mut previous = durable.clone().unwrap();
             previous[..4].copy_from_slice(magic);
             assert!(CleanManagementIntent::decode(&previous).is_err());
@@ -2706,30 +2730,39 @@ mod tests {
         finalization.message = CleanManagementIntent::finalization_message(&ack);
         let final_slot = ack.applied_at + 1;
         let final_work = envelope(finalization.clone(), final_slot);
+        assert_eq!(
+            slot.pledge_finalization_work(final_work.clone(), changed_anchor),
+            Err(IntentSlotError::Invalid)
+        );
+        assert_eq!(store.image(), durable);
         let mut wrong = finalization.clone();
         wrong.message.push(1);
         assert_eq!(
-            slot.pledge_finalization_work(envelope(wrong, final_slot)),
+            slot.pledge_finalization_work(envelope(wrong, final_slot), anchor.clone()),
             Err(IntentSlotError::Invalid)
         );
         assert_eq!(store.image(), durable);
         store.fail_after_commit(1);
         assert_eq!(
-            slot.pledge_finalization_work(final_work.clone()),
+            slot.pledge_finalization_work(final_work.clone(), anchor.clone()),
             Err(IntentSlotError::Storage(MemoryStoreError))
         );
         assert_eq!(slot.finalization_work(), Err(IntentSlotError::Poisoned));
         assert_eq!(
-            slot.pledge_finalization_work(final_work.clone()),
+            slot.pledge_finalization_work(final_work.clone(), anchor.clone()),
             Err(IntentSlotError::Poisoned)
         );
         drop(slot);
         let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
         assert_eq!(slot.finalization_work().unwrap(), Some(&final_work));
+        assert_eq!(slot.finalization_anchor().unwrap(), Some(&anchor));
         let durable = store.image();
-        assert_eq!(slot.pledge_finalization_work(final_work), Ok(false));
         assert_eq!(
-            slot.pledge_finalization_work(envelope(finalization, final_slot + 1)),
+            slot.pledge_finalization_work(final_work, anchor.clone()),
+            Ok(false)
+        );
+        assert_eq!(
+            slot.pledge_finalization_work(envelope(finalization, final_slot + 1), anchor.clone()),
             Err(IntentSlotError::Conflict)
         );
         assert_eq!(store.image(), durable);
