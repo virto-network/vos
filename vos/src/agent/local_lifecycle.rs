@@ -261,7 +261,8 @@ impl LocalLifecycleQueue {
 /// the same exclusive lifecycle lease on every retry. Implementors derive paths
 /// from the configured Space and Agent, never caller path strings.
 pub trait LocalLifecycleStoreFactory {
-    type Intent: super::clean_authority_issuer::CleanManagementRuntimeStore;
+    type Intent: super::clean_authority_issuer::CleanManagementRuntimeStore
+        + super::clean_authority_issuer::CleanManagementActorStore;
     type Issuer: CleanManagementIssuerStore;
     type Error;
 
@@ -980,7 +981,52 @@ where
             }
         }
         let mut runtimes = BTreeMap::new();
+        let mut actors = BTreeMap::new();
         for (index, entry) in recovery.entries.iter_mut().enumerate() {
+            if entry.issued.is_some()
+                && matches!(
+                    entry.intent.intent().map(|intent| intent.request()),
+                    Some(ManagementRequest::Install(_))
+                )
+            {
+                let package = entry
+                    .intent
+                    .load_actor()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                    .ok_or(SharedAgentHostError::Unavailable)?;
+                let descriptor = local
+                    .show(entry.agent)
+                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+                let managed = super::sdk::authority::ManagedAgentTarget {
+                    space: descriptor.identity.space,
+                    agent: descriptor.identity.agent,
+                    owner: descriptor.identity.owner,
+                    profile: descriptor.identity.profile,
+                    runtime_deployment: descriptor.identity.runtime_deployment,
+                    transition_producer: descriptor.identity.transition_producer,
+                };
+                let intent = entry
+                    .intent
+                    .intent()
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                if descriptor.authority != system.authority_target().binding {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                intent
+                    .verify(
+                        system.authority_target(),
+                        managed,
+                        &super::clean_bootstrap::RawCredentialVerifier,
+                    )
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                super::driver::validate_sdk_management_artifacts(
+                    descriptor,
+                    intent.request(),
+                    super::driver::SdkManagementArtifacts::Actor(&package),
+                )
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                actors.insert(index, package);
+            }
             if entry.unissued_creation
                 || (entry.issued.is_some()
                     && entry.observed.is_none()
@@ -996,7 +1042,7 @@ where
         // Its saved finalization clock was checked against every unissued
         // authorization by startup_admission; no envelope is rewritten.
         if !admission.order.is_empty() {
-            for entry in &recovery.entries {
+            for (index, entry) in recovery.entries.iter().enumerate() {
                 if let Some(receipt) = &entry.issued {
                     if entry.observed.is_none()
                         && matches!(
@@ -1006,17 +1052,20 @@ where
                     {
                         continue;
                     }
-                    local
-                        .observe_management_application(
-                            entry.agent,
-                            entry
-                                .intent
-                                .intent()
-                                .ok_or(SharedAgentHostError::ScopeMismatch)?
-                                .request(),
-                            receipt,
-                        )
-                        .map_err(|_| SharedAgentHostError::Unavailable)?;
+                    let observation = local.observe_management_application(
+                        entry.agent,
+                        entry
+                            .intent
+                            .intent()
+                            .ok_or(SharedAgentHostError::ScopeMismatch)?
+                            .request(),
+                        receipt,
+                    );
+                    if !matches!(observation, Err(super::local_sdk_host::LocalAgentHostError::NotFound)
+                        if entry.observed.is_none() && actors.contains_key(&index))
+                    {
+                        observation.map_err(|_| SharedAgentHostError::Unavailable)?;
+                    }
                 }
             }
         }
@@ -1094,6 +1143,7 @@ where
         }
         let mut observations = Vec::new();
         let mut creates = Vec::new();
+        let mut installs = Vec::new();
         for (index, entry) in recovery.entries.iter_mut().enumerate() {
             if let Some(receipt) = &entry.issued {
                 let request = entry
@@ -1118,10 +1168,18 @@ where
                     continue;
                 }
                 // A finalized issuer cannot replace the actual Local image.
-                let observation = local
-                    .observe_management_application(entry.agent, &request, receipt)
-                    .map_err(|_| SharedAgentHostError::Unavailable)?;
-                observations.push((index, observation));
+                match local.observe_management_application(entry.agent, &request, receipt) {
+                    Ok(observation) => observations.push((index, observation)),
+                    Err(super::local_sdk_host::LocalAgentHostError::NotFound)
+                        if entry.observed.is_none() && actors.contains_key(&index) =>
+                    {
+                        let package = actors
+                            .remove(&index)
+                            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                        installs.push((index, request, receipt.clone(), package));
+                    }
+                    Err(_) => return Err(SharedAgentHostError::Unavailable),
+                }
             }
         }
         for (index, runtime, descriptor, receipt) in creates {
@@ -1132,6 +1190,21 @@ where
                     crate::log::warn!("Local lifecycle recovery Create failed: {error:?}");
                     SharedAgentHostError::Unavailable
                 })?;
+            let observation = local
+                .observe_management_application(agent, &request, &receipt)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            observations.push((index, observation));
+        }
+        for (index, request, receipt, package) in installs {
+            let agent = recovery.entries[index].agent;
+            local
+                .manage(
+                    agent,
+                    request.clone(),
+                    Some(receipt.clone()),
+                    super::driver::SdkManagementArtifacts::Actor(&package),
+                )
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
             let observation = local
                 .observe_management_application(agent, &request, &receipt)
                 .map_err(|_| SharedAgentHostError::Unavailable)?;

@@ -8297,6 +8297,26 @@ mod tests {
         }
 
         #[test]
+        fn native_local_install_startup_applies_issued_receipt() {
+            native_local_management_lifecycle(33);
+        }
+
+        #[test]
+        fn native_local_install_startup_observes_applied_image() {
+            native_local_management_lifecycle(34);
+        }
+
+        #[test]
+        fn native_local_install_startup_finalizes_saved_acknowledgement() {
+            native_local_management_lifecycle(35);
+        }
+
+        #[test]
+        fn native_local_install_startup_preserves_missing_artifact_failure() {
+            native_local_management_lifecycle(36);
+        }
+
+        #[test]
         fn native_local_authorization_clock_advance_preserves_receipt_and_intent() {
             native_local_management_lifecycle(6);
         }
@@ -9574,11 +9594,17 @@ mod tests {
             call.authority = owner.authority_target();
             call.invocation = call.expected_invocation();
             call.signature = credential_key.sign(&call.signing_bytes()).to_bytes();
-            if coordinated == 32 {
+            if (32..=36).contains(&coordinated) {
                 std::thread::scope(|scope| {
                     scope
                         .spawn(|| {
-                            check_local_install_application(&mut harness, descriptor, call, runtime)
+                            check_local_install_application(
+                                &mut harness,
+                                descriptor,
+                                call,
+                                runtime,
+                                coordinated,
+                            )
                         })
                         .join()
                         .unwrap()
@@ -9716,6 +9742,16 @@ mod tests {
                     }
                     fn commit_runtime(&mut self, bytes: &[u8]) -> Result<(), MemoryError> {
                         crate::agent::clean_authority_issuer::CleanManagementRuntimeStore::commit_runtime(&mut self.inner, bytes)
+                    }
+                }
+                impl crate::agent::clean_authority_issuer::CleanManagementActorStore for LeasedStore {
+                    fn load_actor(&mut self) -> Result<Option<Vec<u8>>, MemoryError> {
+                        crate::agent::clean_authority_issuer::CleanManagementActorStore::load_actor(
+                            &mut self.inner,
+                        )
+                    }
+                    fn commit_actor(&mut self, bytes: &[u8]) -> Result<(), MemoryError> {
+                        crate::agent::clean_authority_issuer::CleanManagementActorStore::commit_actor(&mut self.inner, bytes)
                     }
                 }
                 struct Stores {
@@ -11975,11 +12011,170 @@ mod tests {
         }
 
         #[inline(never)]
+        fn check_install_startup(
+            harness: &mut NativeProjectionOwnerHarness,
+            root: &Path,
+            descriptor: AgentDescriptor,
+            call: AuthorityCredentialCall,
+            request: ManagementRequest,
+            intent: IssuerMemoryStore,
+            issuer: IssuerMemoryStore,
+            mut signer: CountingSigner,
+            scenario: u8,
+        ) {
+            use crate::agent::local_lifecycle::{
+                LocalLifecycleController, LocalLifecycleStoreFactory,
+                discover_local_lifecycle_recovery,
+            };
+            struct Stores {
+                space: SpaceId,
+                agent: AgentId,
+                intent: IssuerMemoryStore,
+                issuer: IssuerMemoryStore,
+            }
+            impl LocalLifecycleStoreFactory for Stores {
+                type Intent = IssuerMemoryStore;
+                type Issuer = IssuerMemoryStore;
+                type Error = ();
+                fn discover(&mut self, space: SpaceId, maximum: usize) -> Result<Vec<AgentId>, ()> {
+                    if space != self.space || maximum < 1 {
+                        return Err(());
+                    }
+                    Ok(vec![self.agent])
+                }
+                fn open(
+                    &mut self,
+                    _: SpaceId,
+                    _: AgentId,
+                ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                    panic!("startup must not create a lifecycle store")
+                }
+                fn open_existing(
+                    &mut self,
+                    space: SpaceId,
+                    agent: AgentId,
+                ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                    if space != self.space || agent != self.agent {
+                        return Err(());
+                    }
+                    Ok((self.intent.clone(), self.issuer.clone()))
+                }
+            }
+            let mut stores = Stores {
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                intent: intent.clone(),
+                issuer: issuer.clone(),
+            };
+            let authority = harness.owner.as_ref().unwrap().authority_target();
+            let mut old_owner = harness.owner.take().unwrap();
+            let mut previous_ack = None;
+            for restart in 0..2 {
+                let before = old_owner.ordered_index_for_test().unwrap();
+                let signatures = signer.calls;
+                let intent_before = intent.image.lock().unwrap().clone();
+                let issuer_before = issuer.image.lock().unwrap().clone();
+                let pins = old_owner._pins_store.clone();
+                let record = old_owner.record_store.clone();
+                let bootstrap_issuer = old_owner.issuer.into_store();
+                drop(old_owner._network_host);
+                drop(old_owner.host);
+                let recovery =
+                    discover_local_lifecycle_recovery(&mut stores, authority, 1).unwrap();
+                let admission = recovery.startup_admission().unwrap();
+                assert_eq!(admission.pending.len(), usize::from(restart == 0));
+                let reopened = CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_factory(
+                    pins,
+                    record,
+                    bootstrap_issuer,
+                    &mut signer,
+                    || panic!("Install recovery cannot recreate bootstrap"),
+                    harness._directory.host(),
+                    harness._directory.lock(),
+                    harness.fixture.plan.pins.space,
+                    harness.fixture.plan.pins.node,
+                    harness.fixture.trust.clone(),
+                    harness.fixture.merge.clone(),
+                    harness.fixture.finality.clone(),
+                    harness.provider.clone(),
+                    harness.network.clone(),
+                    Some(&admission),
+                )
+                .unwrap();
+                assert_eq!(reopened.ordered_index_for_test().unwrap(), before);
+                let local = crate::agent::local_sdk_host::LocalAgentHost::open(
+                    root,
+                    descriptor.identity.space,
+                    harness.fixture.plan.pins.node,
+                    harness.fixture.trust.clone(),
+                )
+                .unwrap();
+                let result = LocalLifecycleController::with_recovery(
+                    reopened, local, stores, signer, recovery,
+                );
+                if scenario == 36 {
+                    assert!(matches!(result, Err(SharedAgentHostError::Unavailable)));
+                    assert_eq!(*intent.image.lock().unwrap(), intent_before);
+                    assert_eq!(*issuer.image.lock().unwrap(), issuer_before);
+                    assert!(intent.actor.lock().unwrap().is_none());
+                    return;
+                }
+                let controller = result.unwrap();
+                assert_eq!(
+                    controller.ordered_index_for_test().unwrap(),
+                    before + if restart == 0 { 3 } else { 0 }
+                );
+                let (owner, local, returned_stores, returned_signer) =
+                    controller.into_parts_for_test();
+                old_owner = owner;
+                stores = returned_stores;
+                signer = returned_signer;
+                assert_eq!(
+                    signer.calls,
+                    signatures + usize::from(restart == 0 && scenario != 35)
+                );
+                let recovered = DurableCleanManagementIssuer::open(
+                    issuer.clone(),
+                    descriptor.authority,
+                    descriptor.identity.space,
+                    descriptor.identity.agent,
+                )
+                .unwrap();
+                let (receipt, ack) = recovered
+                    .recover_finalized_application(
+                        authority,
+                        call.managed,
+                        &request,
+                        &call,
+                        &RawCredentialVerifier,
+                    )
+                    .unwrap()
+                    .unwrap();
+                let observation = local
+                    .observe_management_application(descriptor.identity.agent, &request, &receipt)
+                    .unwrap();
+                assert_eq!(ack.reopened_state, observation.reopened_state());
+                if let Some(previous) = previous_ack {
+                    assert_eq!(ack, previous);
+                }
+                previous_ack = Some(ack);
+                let slot = crate::agent::clean_management_intent::CleanManagementIntentSlot::open(
+                    intent.clone(),
+                )
+                .unwrap();
+                assert!(slot.retirement_complete().unwrap());
+                drop(local);
+            }
+            harness.owner = Some(old_owner);
+        }
+
+        #[inline(never)]
         fn check_local_install_application(
             harness: &mut NativeProjectionOwnerHarness,
             descriptor: AgentDescriptor,
             call: AuthorityCredentialCall,
             runtime: AdmittedRuntimePackage,
+            scenario: u8,
         ) {
             use crate::agent::clean_management_intent::{
                 CleanManagementIntent, CleanManagementIntentSlot,
@@ -12173,6 +12368,61 @@ mod tests {
                 slot.load_actor().unwrap().unwrap().exact_bytes(),
                 package.exact_bytes()
             );
+            if scenario >= 33 {
+                let receipt = owner
+                    .issue_management_intent_with_admission(
+                        &mut slot,
+                        install_call.managed,
+                        &mut issuer,
+                        &mut signer,
+                        true,
+                    )
+                    .unwrap();
+                if matches!(scenario, 34 | 35) {
+                    let result = local
+                        .manage(
+                            descriptor.identity.agent,
+                            request.clone(),
+                            Some(receipt.clone()),
+                            crate::agent::driver::SdkManagementArtifacts::Actor(&package),
+                        )
+                        .unwrap();
+                    assert!(matches!(
+                        result,
+                        RuntimeOutcome::Management(Ok(ManagementReply::Installed(_)))
+                    ));
+                }
+                if scenario == 35 {
+                    let observation = local
+                        .observe_management_application(
+                            descriptor.identity.agent,
+                            &request,
+                            &receipt,
+                        )
+                        .unwrap();
+                    issuer
+                        .observe_local_application(&observation, &mut signer)
+                        .unwrap();
+                }
+                if scenario == 36 {
+                    *intent_store.actor.lock().unwrap() = None;
+                }
+                drop(slot);
+                drop(issuer);
+                drop(local);
+                check_install_startup(
+                    harness,
+                    &root,
+                    descriptor,
+                    install_call,
+                    request,
+                    intent_store,
+                    issuer_store,
+                    signer,
+                    scenario,
+                );
+                return;
+            }
             let ack = owner
                 .install_local_from_management_intent(
                     &mut slot,

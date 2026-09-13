@@ -4147,6 +4147,51 @@ artifacts must fail closed. Controller/queue/HTTP/CLI wiring and real actor meth
 invocation/restart remain open. These changes stay inside C2; they do not close
 C1 recovery, ordinary Shared finality or C3 release gates.
 
+### Startup recovery for already-issued Local Install
+
+`LocalLifecycleController::with_recovery` now recognizes Install receipts already
+verified by lifecycle discovery. Before advancing required predecessors or
+applying work, it loads every issued Install's leased role-13 package, re-admits
+it, checks the exact request/package binding and derives the managed target from
+the independently opened Local descriptor. Missing Agent, package or conflicting
+Authority/runtime scope fails closed. The lifecycle factory contract now requires
+both the immutable Create-runtime and active actor-package storage capabilities.
+
+If an issued Install has no stored acknowledgement and the physical Local host
+reports no matching application record, recovery may apply that exact retained
+request/receipt/package. Other observation failures are not treated as missing
+work. If an acknowledgement already exists, its application must already be
+physically observable; startup does not recreate evidence behind an issuer ACK.
+All required packages and existing observations are checked before applying the
+pending installs, and every application is reopened before missing ACKs are signed.
+Existing protected finalization, positive result acknowledgement and durable
+retirement then complete before the controller is returned for route publication.
+
+Four physical startup regressions passed in 120.31s
+(`r16-install-startup-issued.log`): issued receipt without Local application,
+physical application without issuer acknowledgement, saved acknowledgement without
+finalization, and a missing-package refusal that preserves intent/issuer bytes.
+Each successful case reopens the system journal, Local image and discovered
+lifecycle stores, completes exactly one finalization and two result ACK entries,
+then restarts again with no new Ordered entries or signatures and the same
+verified application acknowledgement. The original genesis provider is retained;
+recovery cannot create a replacement bootstrap plan. The physical system and
+Local runtime use the existing native/bundled-PVM fixture; intent/issuer stores
+are memory-backed, so these are not whole-process filesystem crash tests.
+
+All 47 CLI hardened file-store tests also passed on the extended factory contract
+(1.98s, `r16-install-startup-files.log`). This is targeted evidence, not a final
+integrated release run. All 14 existing Local Create startup regressions passed
+as well (189.67s, `r16-install-startup-create-regressions.log`), including prepared
+and accepted authorization/finalization, pending receipt signature, missing or
+corrupt runtime refusal, reverse-Agent-order recovery, dependent clock and
+missing-finalization rejection, and retirement before publication. Formatting
+and `git diff --check` passed. Pending Install before receipt issuance still requires
+issuer eligibility and credential-ordered recovery; pristine Install retry and
+denial/expiry handling remain open. Controller/queue/HTTP/CLI Install submission,
+actual actor invocation/restart, ordinary Shared finality and C1/C3 gates remain
+unfinished. Keep this extension in C2 without promoting the branch.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its
