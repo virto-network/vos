@@ -2454,6 +2454,26 @@ stays in C2: protected retirement/handoff, then signed Install and real actor
 invocation/restart. C1 recovery and C3 final-source release gates remain open;
 no additional review batch or branch promotion is introduced here.
 
+The retirement phase now preflights the **combined** encoded acknowledgement
+suffix cost and remaining physical Raft slots before retiring either result.
+It counts two, one, or zero records using exact committed positive evidence,
+and retains an extra physical slot when work remains for the reopen leader
+no-op. Both inputs must be distinct, canonical Direct/Linear preflight envelopes;
+an unretired input must have its exact successful invocation in the authenticated
+suffix. Unlike Query recovery, this path does not speculatively re-execute a
+Linear invocation at a checkpoint boundary when evidence is missing.
+
+Final-source native lifecycle checks passed **10 tests, zero failures**, in
+16.80s: `.worktrees/ch08-c2-native/target/task-tmp/r16-management-retirement-capacity-final.log`.
+They cover two/one/zero remaining acknowledgements, duplicate invocation refusal,
+Query refusal, and rejection of a substituted but internally consistent preflight
+clock. This is not an exhausted-capacity or concurrent-writer proof: the precheck
+is not a reservation. The next required change is to hold proposal/GC exclusion
+through retirement and durable handoff, and restore that protection on reopen
+before publishing the route. Existing Query reservation semantics are unchanged.
+The authenticated-boundary Query reopen regression also passed (one test,
+1.92s): `.worktrees/ch08-c2-native/target/task-tmp/r16-management-retirement-projection.log`.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

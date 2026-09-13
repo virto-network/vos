@@ -2551,6 +2551,27 @@ where
         }
         let mut changed = false;
         let agent = crate::service::AgentId(self.pins.agent.0);
+        {
+            let host = self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let required = host
+                .management_retirement_admission_requirement(
+                    agent,
+                    [authorization_work, finalization_work],
+                )?
+                .ok_or(SharedAgentHostError::CapacityExhausted)?;
+            let status = host
+                .show(agent)?
+                .ok_or(SharedAgentHostError::AgentNotFound)?;
+            // Preserve a physical slot for the mandatory reopen leader no-op.
+            // The enclosing lifecycle still needs a proposal/GC reservation:
+            // this precheck alone cannot exclude concurrent journal writers.
+            if status.remaining_slots < required as u64 + u64::from(required != 0) {
+                return Err(SharedAgentHostError::CapacityExhausted);
+            }
+        }
         for envelope in [authorization_work, finalization_work] {
             let RuntimeWork::Invoke {
                 invocation,
@@ -8029,6 +8050,78 @@ mod tests {
         }
 
         #[inline(never)]
+        fn check_management_retirement_admission(
+            owner: &MemoryBootstrapOwner,
+            authorization: &RuntimeWork,
+            finalization: &RuntimeWork,
+        ) {
+            use crate::agent_sdk::{InvocationAuthorization, MethodMode, PublicPreflight};
+            let host = owner.host.lock().unwrap();
+            let agent = HostAgentId(owner.pins.agent.0);
+            assert_eq!(
+                host.management_retirement_admission_requirement(
+                    agent,
+                    [authorization, finalization],
+                )
+                .unwrap(),
+                Some(2)
+            );
+            assert!(
+                host.management_retirement_admission_requirement(
+                    agent,
+                    [authorization, authorization],
+                )
+                .is_err()
+            );
+            let mut substituted = finalization.clone();
+            let RuntimeWork::Invoke {
+                invocation,
+                authorization: preflight,
+                observed_slot,
+                ..
+            } = &mut substituted
+            else {
+                unreachable!()
+            };
+            invocation.mode = MethodMode::Query;
+            **preflight = InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(
+                invocation,
+                *observed_slot,
+            ));
+            assert!(
+                host.management_retirement_admission_requirement(
+                    agent,
+                    [authorization, &substituted],
+                )
+                .is_err()
+            );
+            let RuntimeWork::Invoke {
+                invocation,
+                authorization: preflight,
+                observed_slot,
+                ..
+            } = &mut substituted
+            else {
+                unreachable!()
+            };
+            invocation.mode = MethodMode::Linear;
+            *observed_slot += 1;
+            **preflight = InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(
+                invocation,
+                *observed_slot,
+            ));
+            // A valid fresh preflight is not evidence of this exact invocation
+            // having completed in the authenticated journal.
+            assert!(
+                host.management_retirement_admission_requirement(
+                    agent,
+                    [authorization, &substituted],
+                )
+                .is_err()
+            );
+        }
+
+        #[inline(never)]
         fn check_local_management_phases(
             mut harness: NativeProjectionOwnerHarness,
             descriptor: AgentDescriptor,
@@ -8297,6 +8390,7 @@ mod tests {
             assert_eq!(signer.calls, 2);
             let intent_image = slot.intent().unwrap().clone();
             let issuer_image = issuer_store.image.lock().unwrap().clone();
+            check_management_retirement_admission(owner, &envelope, &finalization_envelope);
             assert!(matches!(
                 owner.retire_management_intent_results(&slot, call.managed, &substituted, &issuer),
                 Err(SharedAgentHostError::ScopeMismatch)
@@ -8333,6 +8427,18 @@ mod tests {
                     RuntimeOutcome::Acknowledged(Ok(_))
                 ));
                 assert_eq!(owner.ordered_index_for_test().unwrap(), finalized + 1);
+                assert_eq!(
+                    owner
+                        .host
+                        .lock()
+                        .unwrap()
+                        .management_retirement_admission_requirement(
+                            HostAgentId(owner.pins.agent.0),
+                            [&envelope, &finalization_envelope],
+                        )
+                        .unwrap(),
+                    Some(1)
+                );
             }
             assert!(
                 owner
@@ -8346,6 +8452,18 @@ mod tests {
             );
             let retired = owner.ordered_index_for_test().unwrap();
             assert_eq!(retired, finalized + 2);
+            assert_eq!(
+                owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .management_retirement_admission_requirement(
+                        HostAgentId(owner.pins.agent.0),
+                        [&envelope, &finalization_envelope],
+                    )
+                    .unwrap(),
+                Some(0)
+            );
             assert!(
                 !owner
                     .retire_management_intent_results(

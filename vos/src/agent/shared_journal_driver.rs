@@ -1435,6 +1435,100 @@ where
             .then_some(required_entries))
     }
 
+    /// Exact remaining suffix cost of retiring two completed Linear management
+    /// invocations. This is a capacity check, not a proposal/GC reservation.
+    /// Unlike projection recovery, missing Linear evidence must never trigger
+    /// speculative execution at a checkpoint boundary.
+    pub(crate) fn management_retirement_admission_requirement(
+        &self,
+        envelopes: [&crate::agent_sdk::RuntimeWork; 2],
+    ) -> Result<Option<usize>, SharedJournalDriverError> {
+        use crate::agent_sdk::{
+            InvocationAuthorization, MethodMode, RuntimeExecutionContext, RuntimeOutcome,
+            RuntimeWork,
+        };
+        let heads = self.materialization.heads();
+        let mut index = heads.ordered_index;
+        let mut parent = heads.ordered_head;
+        let mut previous = None;
+        let mut entries = 0usize;
+        let mut bytes = 0usize;
+        for envelope in envelopes {
+            let RuntimeWork::Invoke {
+                context,
+                state,
+                invocation: work,
+                authorization,
+                observed_slot,
+            } = envelope
+            else {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            };
+            if *context != RuntimeExecutionContext::Direct
+                || *state != crate::agent_sdk::RuntimeState::default()
+                || work.mode != MethodMode::Linear
+                || !work.validate()
+                || **authorization
+                    != InvocationAuthorization::PublicPreflight(
+                        crate::agent_sdk::PublicPreflight::for_work(work, *observed_slot),
+                    )
+                || previous == Some(work.invocation)
+            {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            previous = Some(work.invocation);
+            if self.retained_positive_clean_acknowledgement(work, authorization)? {
+                continue;
+            }
+            let invoke = ReplayOperation::CleanInvoke {
+                context: *context,
+                work: (**work).clone(),
+                authorization: (**authorization).clone(),
+                observed_slot: *observed_slot,
+            };
+            let input =
+                recent_clean_ordered_operation(&self.store, &self.materialization, &invoke)?
+                    .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+            if !matches!(
+                self.executor.clean_ordered_result(input),
+                Some(RuntimeOutcome::Completed(Ok(_)))
+            ) {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            index = index
+                .checked_add(1)
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+            let entry = OrderedEntry {
+                genesis: heads.genesis,
+                index,
+                parent,
+                merge_frontier: heads.merge_frontier,
+                merge_seal: None,
+                input: ReplayInput {
+                    runtime: heads.runtime.clone(),
+                    operation: ReplayOperation::CleanAcknowledge {
+                        context: *context,
+                        expected_live: None,
+                        work: (**work).clone(),
+                        authorization: (**authorization).clone(),
+                    },
+                },
+            };
+            entry
+                .validate()
+                .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+            bytes = bytes
+                .checked_add(entry.encode().len())
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+            entries += 1;
+            parent = Some(entry.id());
+        }
+        Ok(self
+            .materialization
+            .has_suffix_headroom(entries, bytes)
+            .then_some(entries))
+    }
+
     /// Validate and encode the exact projection lifecycle delta independently
     /// of current suffix capacity. Checkpoint selection needs this count while
     /// the old authenticated suffix is deliberately full; ordinary admission
