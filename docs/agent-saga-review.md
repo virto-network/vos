@@ -2467,12 +2467,43 @@ Final-source native lifecycle checks passed **10 tests, zero failures**, in
 16.80s: `.worktrees/ch08-c2-native/target/task-tmp/r16-management-retirement-capacity-final.log`.
 They cover two/one/zero remaining acknowledgements, duplicate invocation refusal,
 Query refusal, and rejection of a substituted but internally consistent preflight
-clock. This is not an exhausted-capacity or concurrent-writer proof: the precheck
-is not a reservation. The next required change is to hold proposal/GC exclusion
-through retirement and durable handoff, and restore that protection on reopen
-before publishing the route. Existing Query reservation semantics are unchanged.
+clock. That checkpoint did not prove exhausted-capacity or concurrent-writer
+behavior: its precheck was not a reservation. The live reservation added below
+supersedes that precheck-only implementation. Existing Query reservation semantics
+remain unchanged.
 The authenticated-boundary Query reopen regression also passed (one test,
 1.92s): `.worktrees/ch08-c2-native/target/task-tmp/r16-management-retirement-projection.log`.
+
+### Live management-retirement reservation
+
+The retirement phase now reserves both exact acknowledgement keys under the
+live proposer's admission mutex. Before publishing the reservation it waits for
+the leader barrier, drains committed work, verifies the physical apply cursor,
+and checks the combined suffix and physical-slot budgets. Ordinary Ordered,
+Merge, Local and merge-import admission share the exclusion; projection and
+checkpoint reservations conflict with it. Only exact reserved Acknowledge work
+may pass, not a replacement Invoke or an unrelated acknowledgement.
+
+The reservation remains held after both positive acknowledgements. Completion
+rechecks committed evidence for both, calls the durable-handoff callback while
+admission is excluded, and releases only on callback success. A premature,
+failed or ambiguous completion leaves the reservation held. This does not yet
+implement the durable intent handoff: production Create still does not invoke
+retirement, and restoring this reservation on reopen before route publication
+remains required. There is no durable-record format change or new guest bundle.
+
+Final-source native lifecycle checks passed **10 tests, zero failures**, in
+14.30s: `.worktrees/ch08-c2-native/target/task-tmp/r16-management-retirement-reservation-final.log`.
+They exercise mutual exclusion with projection admission, idempotent exact
+reservation, reversed-key conflict, ordinary/unrelated acknowledgement refusal,
+premature callback refusal, retained exclusion after callback failure, partial
+retirement recovery, and release after a successful test callback. A test
+callback is not durable handoff evidence; these checks do not prove restart
+restoration or the exhausted-capacity boundary.
+The same source also passed all **six Shared-network unit tests** and the
+**pending-projection Invoke/Ack/record-clear recovery test**. Logs:
+`.worktrees/ch08-c2-native/target/task-tmp/r16-retirement-reservation-network.log`
+and `.worktrees/ch08-c2-native/target/task-tmp/r16-retirement-reservation-projection.log`.
 
 ### Durable client acknowledgement before completion
 

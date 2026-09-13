@@ -2464,7 +2464,8 @@ where
     /// Retire both runtime results only after the exact application has a
     /// durable issuer finalization marker. This phase preserves intent/issuer
     /// evidence; it does not yet authorize clearing or replacing the intent.
-    /// The enclosing lifecycle must protect journal capacity through retirement.
+    /// The reservation remains held after success until a durable handoff
+    /// commits through the network owner's completion boundary.
     pub(crate) fn retire_management_intent_results<B, J>(
         &mut self,
         slot: &super::clean_management_intent::CleanManagementIntentSlot<B>,
@@ -2551,27 +2552,8 @@ where
         }
         let mut changed = false;
         let agent = crate::service::AgentId(self.pins.agent.0);
-        {
-            let host = self
-                .host
-                .lock()
-                .map_err(|_| SharedAgentHostError::Unavailable)?;
-            let required = host
-                .management_retirement_admission_requirement(
-                    agent,
-                    [authorization_work, finalization_work],
-                )?
-                .ok_or(SharedAgentHostError::CapacityExhausted)?;
-            let status = host
-                .show(agent)?
-                .ok_or(SharedAgentHostError::AgentNotFound)?;
-            // Preserve a physical slot for the mandatory reopen leader no-op.
-            // The enclosing lifecycle still needs a proposal/GC reservation:
-            // this precheck alone cannot exclude concurrent journal writers.
-            if status.remaining_slots < required as u64 + u64::from(required != 0) {
-                return Err(SharedAgentHostError::CapacityExhausted);
-            }
-        }
+        self._network_host
+            .reserve_management_retirement(agent, [authorization_work, finalization_work])?;
         for envelope in [authorization_work, finalization_work] {
             let RuntimeWork::Invoke {
                 invocation,
@@ -2589,11 +2571,13 @@ where
             {
                 continue;
             }
-            let outcome = self.supervisor_acknowledge(
-                identity,
-                (**invocation).clone(),
-                (**authorization).clone(),
-            )?;
+            let outcome = self
+                ._network_host
+                .supervisor_acknowledge_management_retirement(
+                    identity,
+                    (**invocation).clone(),
+                    (**authorization).clone(),
+                )?;
             let super::sdk::RuntimeOutcome::Acknowledged(Ok(retired)) = outcome else {
                 return Err(SharedAgentHostError::Unavailable);
             };
@@ -8050,6 +8034,125 @@ mod tests {
         }
 
         #[inline(never)]
+        fn check_management_retirement_gate(
+            owner: &mut MemoryBootstrapOwner,
+            envelopes: [&RuntimeWork; 2],
+            completed: bool,
+        ) {
+            let agent = HostAgentId(owner.pins.agent.0);
+            let (query, query_auth) = fresh_projection_pair(owner, 0xe9);
+            if !completed {
+                owner
+                    ._network_host
+                    .reserve_projection_pair(agent, &query, &query_auth, false)
+                    .unwrap();
+                assert!(matches!(
+                    owner
+                        ._network_host
+                        .reserve_management_retirement(agent, envelopes),
+                    Err(SharedAgentHostError::Conflict)
+                ));
+                owner
+                    ._network_host
+                    .release_projection_pair(agent, &query, &query_auth)
+                    .unwrap();
+            }
+            owner
+                ._network_host
+                .reserve_management_retirement(agent, envelopes)
+                .unwrap();
+            owner
+                ._network_host
+                .reserve_management_retirement(agent, envelopes)
+                .unwrap();
+            assert!(matches!(
+                owner
+                    ._network_host
+                    .reserve_management_retirement(agent, [envelopes[1], envelopes[0]],),
+                Err(SharedAgentHostError::Conflict)
+            ));
+            assert!(matches!(
+                owner
+                    ._network_host
+                    .reserve_projection_pair(agent, &query, &query_auth, false,),
+                Err(SharedAgentHostError::Conflict)
+            ));
+            let RuntimeWork::Invoke {
+                invocation,
+                authorization,
+                observed_slot,
+                ..
+            } = envelopes[0]
+            else {
+                unreachable!()
+            };
+            let material = owner
+                .supervisor_invocation_material(owner.pins.agent, invocation.actor)
+                .unwrap();
+            let identity =
+                crate::agent::supervisor_adapters::physical_material_identity(&material).unwrap();
+            assert!(matches!(
+                owner
+                    ._network_host
+                    .supervisor_acknowledge_management_retirement(identity, query, query_auth,),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            let mut unrelated = (**invocation).clone();
+            unrelated.invocation = crate::agent_sdk::InvocationId([0xef; 32]);
+            let unrelated_authorization =
+                crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+                    crate::agent_sdk::PublicPreflight::for_work(&unrelated, *observed_slot),
+                );
+            assert!(matches!(
+                owner
+                    ._network_host
+                    .supervisor_acknowledge_management_retirement(
+                        identity,
+                        unrelated,
+                        unrelated_authorization,
+                    ),
+                Err(SharedAgentHostError::CapacityExhausted)
+            ));
+            assert!(matches!(
+                owner.supervisor_acknowledge(
+                    identity,
+                    (**invocation).clone(),
+                    (**authorization).clone(),
+                ),
+                Err(SharedAgentHostError::CapacityExhausted)
+            ));
+            let calls = Cell::new(0);
+            let result =
+                owner
+                    ._network_host
+                    .complete_management_retirement(agent, envelopes, || {
+                        calls.set(calls.get() + 1);
+                        Err(SharedAgentHostError::Unavailable)
+                    });
+            assert_eq!(calls.get(), usize::from(completed));
+            assert!(matches!(result, Err(SharedAgentHostError::Unavailable)) == completed);
+            if !completed {
+                assert!(matches!(result, Err(SharedAgentHostError::Conflict)));
+            }
+            // A failed durable handoff must not release even a fully retired pair.
+            assert!(matches!(
+                owner.supervisor_acknowledge(
+                    identity,
+                    (**invocation).clone(),
+                    (**authorization).clone(),
+                ),
+                Err(SharedAgentHostError::CapacityExhausted)
+            ));
+            if completed {
+                owner
+                    ._network_host
+                    .complete_management_retirement(agent, envelopes, || Ok(()))
+                    .unwrap();
+                assert_projection_gate_released(owner, 0xea);
+            }
+        }
+
+        #[inline(never)]
         fn check_management_retirement_admission(
             owner: &MemoryBootstrapOwner,
             authorization: &RuntimeWork,
@@ -8396,6 +8499,7 @@ mod tests {
                 Err(SharedAgentHostError::ScopeMismatch)
             ));
             assert_eq!(owner.ordered_index_for_test().unwrap(), finalized);
+            check_management_retirement_gate(owner, [&envelope, &finalization_envelope], false);
             if interrupted_retirement {
                 // Model interruption after the first positive acknowledgement.
                 // Recovery must consume only the remaining finalization result.
@@ -8418,7 +8522,8 @@ mod tests {
                 };
                 assert!(matches!(
                     owner
-                        .supervisor_acknowledge(
+                        ._network_host
+                        .supervisor_acknowledge_management_retirement(
                             identity,
                             (**invocation).clone(),
                             (**authorization).clone()
@@ -8483,6 +8588,8 @@ mod tests {
             );
             assert_eq!(*issuer_store.image.lock().unwrap(), issuer_image);
             assert_eq!(signer.calls, 2);
+            check_management_retirement_gate(owner, [&envelope, &finalization_envelope], true);
+            assert_eq!(owner.ordered_index_for_test().unwrap(), retired);
             harness.stop();
         }
 
