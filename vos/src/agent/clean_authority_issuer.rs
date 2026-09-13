@@ -2442,6 +2442,105 @@ mod tests {
     }
 
     #[test]
+    fn management_authorization_envelope_is_exact_durable_and_fail_closed() {
+        use super::super::clean_management_intent::{
+            CleanManagementIntent, CleanManagementIntentSlot, IntentSlotError,
+        };
+        use crate::agent_sdk::{
+            InvocationAuthorization, InvocationRoleClaims, InvocationWork, MethodMode,
+            PublicPreflight, RuntimeExecutionContext, RuntimeState, RuntimeWork,
+        };
+        use crate::service::wire::ServiceWire as _;
+        let signer = CountingSigner::new(0x3d);
+        let fixture = fixture(&signer);
+        let request = request(0x3e);
+        let (call, _) = approved_call(&fixture, 1, &request);
+        let intent = CleanManagementIntent::new(
+            call.authority,
+            call.managed,
+            request,
+            call.clone(),
+            &TestCredentialVerifier,
+        )
+        .unwrap();
+        let invocation = InvocationWork {
+            space: call.authority.space,
+            agent: call.authority.system_agent,
+            runtime_deployment: call.authority.system_runtime_deployment,
+            invocation: call.invocation,
+            actor: call.authority.binding.issuer.actor,
+            incarnation: Hash([0x3f; 32]),
+            deployment: call.authority.binding.issuer.deployment,
+            program: call.authority.binding.issuer.program,
+            mode: MethodMode::Linear,
+            origin: intent.authorization_origin(),
+            roles: InvocationRoleClaims::none(),
+            message: intent.authorization_message(),
+            installation_data: None,
+            availability: Vec::new(),
+            gas: 100,
+            recovery_only: false,
+        };
+        let envelope = |invocation: InvocationWork, slot| RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
+            state: RuntimeState::default(),
+            authorization: Box::new(InvocationAuthorization::PublicPreflight(
+                PublicPreflight::for_work(&invocation, slot),
+            )),
+            invocation: Box::new(invocation),
+            observed_slot: slot,
+        };
+        let work = envelope(invocation.clone(), 10);
+        let store = MemoryImageStore::default();
+        let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
+        assert_eq!(
+            slot.pledge_authorization_work(work.clone()),
+            Err(IntentSlotError::Invalid)
+        );
+        slot.pledge(intent.clone()).unwrap();
+        let before = store.image();
+        for mutation in 0..5 {
+            let mut wrong = invocation.clone();
+            match mutation {
+                0 => wrong.message.push(1),
+                1 => wrong.mode = MethodMode::Query,
+                2 => wrong.origin.principal = None,
+                3 => wrong.actor = ActorId([0xee; 32]),
+                _ => wrong.recovery_only = true,
+            }
+            assert_eq!(
+                slot.pledge_authorization_work(envelope(wrong, 10)),
+                Err(IntentSlotError::Invalid)
+            );
+            assert_eq!(store.image(), before);
+        }
+        store.fail_after_commit(1);
+        assert_eq!(
+            slot.pledge_authorization_work(work.clone()),
+            Err(IntentSlotError::Storage(MemoryStoreError))
+        );
+        assert_eq!(slot.authorization_work(), Err(IntentSlotError::Poisoned));
+        assert_eq!(
+            slot.pledge_authorization_work(work.clone()),
+            Err(IntentSlotError::Poisoned)
+        );
+        drop(slot);
+        let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
+        assert_eq!(slot.authorization_work().unwrap(), Some(&work));
+        let durable = store.image();
+        assert_eq!(slot.pledge(intent), Ok(false));
+        assert_eq!(slot.pledge_authorization_work(work), Ok(false));
+        assert_eq!(
+            slot.pledge_authorization_work(envelope(invocation, 11)),
+            Err(IntentSlotError::Conflict)
+        );
+        assert_eq!(store.image(), durable);
+        let mut previous = durable.unwrap();
+        previous[..4].copy_from_slice(b"CMI1");
+        assert!(CleanManagementIntent::decode(&previous).is_err());
+    }
+
+    #[test]
     fn persisted_intent_issues_only_its_exact_approval_across_signer_failure() {
         use super::super::clean_management_intent::{
             CleanManagementIntent, CleanManagementIntentSlot,

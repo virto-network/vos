@@ -1437,3 +1437,44 @@ original observation slot) before dispatch. Rebuilding that envelope from
 current material on retry would change its authorization commitment. Existing
 projection-query recovery is not a management authorization/finalization
 adapter; native lifecycle integration and ordinary-Agent finality remain open.
+
+### Native management authorization dispatch adapter
+
+The pending intent now uses **CMI2**, retaining the exact prepared Authority
+invocation and PublicPreflight as well as the request and credential call.
+Decoding binds the envelope to that call's target, invocation, principal,
+credential, message and Linear method mode, with no ambient role grants or
+runtime state. All nested frames are bounded. CMI1 is rejected rather than
+silently reconstructing missing invocation evidence. An identical input retry
+preserves its prepared envelope; a different envelope, including a changed
+observation slot, conflicts. An ambiguous envelope write poisons the live slot
+until a real reopen.
+
+`CleanSystemAgentBootstrapOwner::issue_management_intent` now connects those
+stores to the native owner's installed Authority route. It independently
+selects the pinned Authority target, verifies the signed input, loads the exact
+physical actor/artifact closure, checks the installed public Linear policy,
+persists the envelope before dispatch, and submits it through the authenticated
+terminal invocation path. Only an exact completed approval reaches the durable
+issuer. Recovery rechecks current physical identity/artifacts while reusing
+the original persisted preflight. A pending projection conflicts explicitly.
+
+The new tests cover invalid envelope substitutions, an ambiguous completed
+write, poisoned retry, recovery without another write, changed-slot refusal,
+and predecessor-format rejection. A native-owner test installs the existing
+projection-only fixture and confirms that a signed management call cannot
+bypass its missing `authorize` policy: no prepared envelope, invocation,
+issuer write or signature is produced. The initial test compile missed a
+local ServiceWire import; it was corrected before the passing runs.
+
+**39/39 issuer, native-boundary and supervisor-adapter tests pass**
+(`r16-native-intent-adapters-final.log`, 5.24s), using locked offline
+dependencies and disk-backed scratch space. Formatting and diff checks pass.
+
+This is an internal adapter, **not yet called by the running native lifecycle
+entry point**. Positive dispatch with the bundled Authority actor still needs
+an integration test. Result retirement, journal-capacity reservation across
+authorization/application/finalization, denial handling, host attachment and
+route publication remain to be connected before enabling it. The adapter
+deliberately leaves the authorization result retained and does not claim
+ordinary-Agent finality. No guest artifact was rebuilt in this checkpoint.

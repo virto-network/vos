@@ -2110,6 +2110,150 @@ where
         }
     }
 
+    /// Authorize the retained management input through the installed system
+    /// actor and issue only its exact durably applied approval. This leaves
+    /// the invocation result retained: the enclosing lifecycle coordinator
+    /// must finish application/finalization before retiring that result.
+    pub(crate) fn issue_management_intent<B, J, S>(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        managed: ManagedAgentTarget,
+        issuer: &mut DurableCleanManagementIssuer<J>,
+        signer: &mut S,
+    ) -> Result<AuthorityReceipt, SharedAgentHostError>
+    where
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
+        use crate::actors::codec::Decode as _;
+
+        if self.record.pending_projection.is_some() {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let target = self.authority_target();
+        slot.intent()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?
+            .verify(target, managed, &RawCredentialVerifier)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        self._network_host
+            .ensure_reattached(crate::service::AgentId(self.pins.agent.0))?;
+        let mut material =
+            self.supervisor_invocation_material(self.pins.agent, target.binding.issuer.actor)?;
+        if material.actor.entry.deployment != target.binding.issuer.deployment
+            || material.actor.entry.program != target.binding.issuer.program
+            || material.producer != target.binding.issuer.producer
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        material.root_provenance = false;
+        let identity = super::supervisor_adapters::physical_material_identity(&material)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if slot
+            .authorization_work()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .is_none()
+        {
+            let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+            let mut availability = vec![
+                material.program.clone(),
+                material.schema.clone(),
+                material.policies.clone(),
+            ];
+            availability.extend(material.installation_data.clone());
+            availability.sort_unstable_by(|left, right| left.reference.cmp(&right.reference));
+            let work = super::sdk::InvocationWork {
+                space: target.space,
+                agent: target.system_agent,
+                runtime_deployment: target.system_runtime_deployment,
+                invocation: intent.call().invocation,
+                actor: target.binding.issuer.actor,
+                incarnation: material.actor.incarnation,
+                deployment: target.binding.issuer.deployment,
+                program: target.binding.issuer.program,
+                mode: MethodMode::Linear,
+                origin: intent.authorization_origin(),
+                roles: InvocationRoleClaims::none(),
+                message: intent.authorization_message(),
+                installation_data: material.actor.entry.installation_data.clone(),
+                availability,
+                gas: self.invocation_gas,
+                recovery_only: false,
+            };
+            let authorization = InvocationAuthorization::PublicPreflight(
+                super::sdk::PublicPreflight::for_work(&work, material.observed_slot),
+            );
+            if !super::supervisor_adapters::physical_material_authorizes_work(
+                &material,
+                identity,
+                RuntimeExecutionContext::Direct,
+                &work,
+                &authorization,
+            ) {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            slot.pledge_authorization_work(RuntimeWork::Invoke {
+                context: RuntimeExecutionContext::Direct,
+                state: RuntimeState::default(),
+                invocation: Box::new(work),
+                authorization: Box::new(authorization),
+                observed_slot: material.observed_slot,
+            })
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        }
+        let Some(RuntimeWork::Invoke {
+            invocation: work,
+            authorization,
+            observed_slot,
+            ..
+        }) = slot
+            .authorization_work()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        if !super::supervisor_adapters::physical_material_authorizes_reserved_work(
+            &material,
+            identity,
+            RuntimeExecutionContext::Direct,
+            work,
+            authorization,
+            *observed_slot,
+        ) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let outcome =
+            self.supervisor_invoke_terminal(identity, (**work).clone(), (**authorization).clone())?;
+        let super::sdk::RuntimeOutcome::Completed(Ok(reply)) = outcome else {
+            return Err(SharedAgentHostError::Unavailable);
+        };
+        if reply.invocation != work.invocation
+            || reply.actor != work.actor
+            || reply.incarnation != work.incarnation
+            || reply.deployment != work.deployment
+            || reply.mode != work.mode
+            || reply.status != super::sdk::InvocationStatus::Done
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let Some(crate::actors::value::Value::Bytes(bytes)) =
+            crate::actors::value::Value::try_decode(&reply.reply)
+        else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        let approval =
+            ManagementApproval::decode(&bytes).map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        slot.issue_from_authenticated_approval(
+            target,
+            managed,
+            &approval,
+            &RawCredentialVerifier,
+            issuer,
+            signer,
+        )
+        .map_err(|_| SharedAgentHostError::Unavailable)
+    }
+
     pub(crate) fn audit_authority_projection(
         &mut self,
         head: super::sdk::authority::AuthorityProjectionHead,
@@ -6637,6 +6781,50 @@ mod tests {
         fn physical_current_abi_shared_bootstrap_restarts_after_every_phase_without_duplicate_slots()
          {
             exercise_restart_mode(RecordFailure::AfterEveryPhase, "after-every-phase");
+        }
+
+        #[test]
+        fn native_management_intent_requires_the_installed_authorize_policy() {
+            use crate::agent::clean_management_intent::{
+                CleanManagementIntent, CleanManagementIntentSlot,
+            };
+            let mut harness = NativeProjectionOwnerHarness::new("management-policy-boundary");
+            let owner = harness.owner.as_mut().unwrap();
+            let call = harness.fixture.plan.catalog_call.clone();
+            let intent = CleanManagementIntent::new(
+                owner.authority_target(),
+                call.managed,
+                harness.fixture.plan.catalog_request().clone(),
+                call.clone(),
+                &RawCredentialVerifier,
+            )
+            .unwrap();
+            let store = IssuerMemoryStore::default();
+            let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
+            slot.pledge(intent).unwrap();
+            let before = store.image.lock().unwrap().clone();
+            let issuer_store = IssuerMemoryStore::default();
+            let mut issuer = DurableCleanManagementIssuer::open(
+                issuer_store.clone(),
+                owner.pins.authority,
+                call.managed.space,
+                call.managed.agent,
+            )
+            .unwrap();
+            let mut signer = CountingSigner::new();
+            let before_index = owner.ordered_index_for_test().unwrap();
+            // This physically installed fixture has public projection methods,
+            // but no authorize method. A signed call must not bypass that policy.
+            assert!(matches!(
+                owner.issue_management_intent(&mut slot, call.managed, &mut issuer, &mut signer),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            assert_eq!(slot.authorization_work().unwrap(), None);
+            assert_eq!(*store.image.lock().unwrap(), before);
+            assert_eq!(*issuer_store.image.lock().unwrap(), None);
+            assert_eq!(signer.calls, 0);
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before_index);
+            harness.stop();
         }
 
         #[test]

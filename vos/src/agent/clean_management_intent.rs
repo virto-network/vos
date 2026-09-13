@@ -5,21 +5,26 @@ use super::clean_authority_issuer::{
     AuthorizedCleanManagementDecision, CleanManagementIssuerError, CleanManagementIssuerRejection,
     CleanManagementIssuerStore, CleanManagementReceiptSigner, DurableCleanManagementIssuer,
 };
-use crate::agent_sdk::ManagementRequest;
 use crate::agent_sdk::authority::{
     AuthorityActorTarget, AuthorityCredentialCall, AuthorityCredentialVerifier, ManagedAgentTarget,
 };
 use crate::agent_sdk::wire::CanonicalWire as _;
+use crate::agent_sdk::{
+    InvocationAuthorization, InvocationOrigin, InvocationRoleClaims, ManagementRequest, MethodMode,
+    RuntimeExecutionContext, RuntimeState, RuntimeWork,
+};
 use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 
 pub(crate) const MAX_INTENT_BYTES: usize = 64
     + crate::agent_sdk::wire::MAX_MANAGEMENT_REQUEST_WIRE_BYTES
-    + crate::agent_sdk::wire::MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES;
+    + crate::agent_sdk::wire::MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES
+    + crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CleanManagementIntent {
     request: ManagementRequest,
     call: AuthorityCredentialCall,
+    authorization_work: Option<RuntimeWork>,
 }
 
 impl CleanManagementIntent {
@@ -30,7 +35,11 @@ impl CleanManagementIntent {
         call: AuthorityCredentialCall,
         verifier: &V,
     ) -> Result<Self, DecodeError> {
-        let intent = Self { request, call };
+        let intent = Self {
+            request,
+            call,
+            authorization_work: None,
+        };
         intent.verify(authority, managed, verifier)?;
         Ok(intent)
     }
@@ -60,6 +69,30 @@ impl CleanManagementIntent {
         &self.call
     }
 
+    pub(crate) fn authorization_message(&self) -> Vec<u8> {
+        use crate::actors::codec::Encode as _;
+        let mut bytes = vec![crate::actors::value::TAG_DYNAMIC];
+        bytes.extend(
+            crate::actors::value::Msg::new("authorize")
+                .with(
+                    "call",
+                    crate::actors::value::Value::Bytes(self.call.encode().unwrap_or_default()),
+                )
+                .encode(),
+        );
+        bytes
+    }
+
+    pub(crate) fn authorization_origin(&self) -> InvocationOrigin {
+        InvocationOrigin {
+            principal: Some(self.call.principal),
+            transport_node: self.call.authenticated_node,
+            credential: Some(self.call.credential),
+            actor: None,
+            capability: None,
+        }
+    }
+
     fn validate(&self) -> Result<(), DecodeError> {
         if !self.request.is_valid()
             || self.call.encode().is_err()
@@ -86,16 +119,56 @@ impl CleanManagementIntent {
                 return Err(DecodeError::NonCanonical);
             }
         }
+        if let Some(work) = &self.authorization_work {
+            let RuntimeWork::Invoke {
+                context,
+                state,
+                invocation,
+                authorization,
+                observed_slot,
+            } = work
+            else {
+                return Err(DecodeError::NonCanonical);
+            };
+            let target = self.call.authority;
+            if *context != RuntimeExecutionContext::Direct
+                || *state != RuntimeState::default()
+                || !invocation.validate()
+                || invocation.space != target.space
+                || invocation.agent != target.system_agent
+                || invocation.runtime_deployment != target.system_runtime_deployment
+                || invocation.actor != target.binding.issuer.actor
+                || invocation.deployment != target.binding.issuer.deployment
+                || invocation.program != target.binding.issuer.program
+                || invocation.invocation != self.call.invocation
+                || invocation.mode != MethodMode::Linear
+                || invocation.origin != self.authorization_origin()
+                || invocation.roles != InvocationRoleClaims::none()
+                || invocation.message != self.authorization_message()
+                || invocation.recovery_only
+                || **authorization
+                    != InvocationAuthorization::PublicPreflight(
+                        crate::agent_sdk::PublicPreflight::for_work(invocation, *observed_slot),
+                    )
+                || work.encode().is_err()
+            {
+                return Err(DecodeError::NonCanonical);
+            }
+        }
         Ok(())
     }
 }
 
 impl ServiceWire for CleanManagementIntent {
-    const MAGIC: [u8; 4] = *b"CMI1";
+    const MAGIC: [u8; 4] = *b"CMI2";
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
         encoder.bytes(&self.request.encode().unwrap_or_default());
         encoder.bytes(&self.call.encode().unwrap_or_default());
+        encoder.bool(self.authorization_work.is_some());
+        if let Some(work) = &self.authorization_work {
+            encoder.bytes(&work.encode().unwrap_or_default());
+        }
     }
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let request_bytes = decoder.bytes_ref()?;
@@ -111,6 +184,15 @@ impl ServiceWire for CleanManagementIntent {
                 .map_err(|_| DecodeError::NonCanonical)?,
             call: AuthorityCredentialCall::decode(call_bytes)
                 .map_err(|_| DecodeError::NonCanonical)?,
+            authorization_work: if decoder.bool()? {
+                let bytes = decoder.bytes_ref()?;
+                if bytes.len() > crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES {
+                    return Err(DecodeError::LimitExceeded);
+                }
+                Some(RuntimeWork::decode(bytes).map_err(|_| DecodeError::NonCanonical)?)
+            } else {
+                None
+            },
         };
         intent.validate()?;
         Ok(intent)
@@ -197,6 +279,49 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
         self.intent.as_ref()
     }
 
+    pub(crate) fn authorization_work(
+        &self,
+    ) -> Result<Option<&RuntimeWork>, IntentSlotError<B::Error>> {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        Ok(self
+            .intent
+            .as_ref()
+            .and_then(|intent| intent.authorization_work.as_ref()))
+    }
+
+    /// Persist the exact physically prepared envelope before dispatch. A
+    /// retry must reuse it, including its original preflight observation.
+    pub(crate) fn pledge_authorization_work(
+        &mut self,
+        work: RuntimeWork,
+    ) -> Result<bool, IntentSlotError<B::Error>> {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        let mut intent = self.intent.clone().ok_or(IntentSlotError::Invalid)?;
+        if let Some(existing) = &intent.authorization_work {
+            return if *existing == work {
+                Ok(false)
+            } else {
+                Err(IntentSlotError::Conflict)
+            };
+        }
+        intent.authorization_work = Some(work);
+        intent.validate().map_err(|_| IntentSlotError::Invalid)?;
+        let bytes = intent.encode();
+        if bytes.len() > MAX_INTENT_BYTES {
+            return Err(IntentSlotError::Invalid);
+        }
+        if let Err(error) = self.store.commit(&bytes) {
+            self.poisoned = true;
+            return Err(IntentSlotError::Storage(error));
+        }
+        self.intent = Some(intent);
+        Ok(true)
+    }
+
     /// Commit before invoking authority policy or allocating any receipt.
     /// An ambiguous write poisons this instance; only a real reopen may retry.
     pub(crate) fn pledge(
@@ -208,7 +333,7 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
         }
         intent.validate().map_err(|_| IntentSlotError::Invalid)?;
         if let Some(existing) = &self.intent {
-            return if *existing == intent {
+            return if existing.request == intent.request && existing.call == intent.call {
                 Ok(false)
             } else {
                 Err(IntentSlotError::Conflict)

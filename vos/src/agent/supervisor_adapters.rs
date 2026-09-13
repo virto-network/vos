@@ -894,9 +894,10 @@ pub(crate) fn physical_material_authorizes_work(
     )
 }
 
-/// Re-check exact durable projection work at the preflight slot that was
-/// accepted before its pending record was committed. Only recovery calls this
-/// path; physical actor/artifact/route state remains current and exact.
+/// Re-check exact durably prepared work at the preflight slot accepted before
+/// its pending record was committed. Projection recovery and management
+/// coordination use this path; physical actor/artifact/route state remains
+/// current and exact. This does not itself reserve journal capacity.
 pub(crate) fn physical_material_authorizes_reserved_work(
     material: &super::invocation_preparation::PhysicalInvocationMaterial,
     expected: AgentRouteIdentity,
