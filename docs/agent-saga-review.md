@@ -156,8 +156,9 @@ Keep these as work within C2, not new review batches:
    coverage for the newly added continuation client passes (live evidence
    below). Native yielded work still belongs to item 3.
 2. Connect `DurableAuthorityOperationCoordinator` to durable native stores and
-   exact physical Authority dispatch. The existing dispatcher implementations
-   are test doubles; preparation and an API credential do not issue an actor
+   exact physical Authority dispatch. The CSF1 native store pair is implemented
+   and tested below, but startup/dispatch does not consume it yet. The existing
+   dispatcher implementations are test doubles; preparation and an API credential do not issue an actor
    receipt. Retain the signed AOC5, exact authorization context and issuance
    slot before policy dispatch, and recover the exact issued preimages before
    re-authorizing. Physical admission must also survive restart/checkpoint/GC
@@ -5044,6 +5045,49 @@ Workspace formatting and diff checks pass.
 The extra ignored test is the explicit live retirement campaign above. This
 closes native terminal Public-query acknowledgement coverage, not protected
 issuance, guest mutation/yielding, Shared finality or the release matrix.
+
+### Native protected-operation file stores
+
+`CleanAuthorityOperationFiles` supplies the existing
+`AuthorityOperationCoordinatorStore` and `AuthorityOperationIssuerStore`
+traits with hardened whole-image files in a dedicated private directory. CSF1
+roles 19/20 bind `authority-operation.coordinator` (2 MiB maximum) and
+`authority-operation.issuer` (4 MiB maximum), each with a fixed `.next` staging
+file. Both handles retain one shared exclusive writer lease, even when the
+other handle is dropped. Publication uses the existing synced, exact-
+predecessor replacement protocol. The pair is per Authority, not per invocation;
+the global issuance sequence must not be split across independently opened
+issuers. No existing bootstrap or management namespace is widened.
+
+Five focused tests pass in 0.19s
+(`r16-native-operation-files-semantic.log`): exact/repeated publication,
+independent reopen of both journal roles, initial and predecessor-bound stage
+recovery, ambiguous-stage preservation across reopen, both lease lifetimes,
+independent size ceilings, namespace and cross-role substitution refusal, and
+real coordinator/issuer opening. The latter uses a dispatcher that panics if
+called: startup of empty stores must not invoke policy, and CSF1-wrapped unsigned
+contents must be rejected by the actual semantic decoders without deleting
+evidence. These are storage/admission checks, not authenticated physical actor
+execution. The first focused run had a fixture-only `usize::MAX` bound overflow
+when directly inspecting a stored predecessor; changing it to the actual
+role ceiling fixes that check (`r16-native-operation-files.log` retains the
+failure; the four pre-semantic tests subsequently pass in
+`r16-native-operation-files-final.log`).
+
+The full vosx regression suite passes **203 tests, zero failed, five ignored**
+in 8.97s (`r16-native-operation-files-regression.log`). Formatting and diff
+checks pass. All logs are under the shared target's disk-backed `task-tmp`.
+
+The store pair is deliberately not installed into native startup yet. The next
+required change is a trusted physical operation dispatcher with durable exact
+RuntimeWork and pre-dispatch journal admission, startup recovery and safe
+exclusion/coexistence with pending management/projection work. Only then may
+startup reopen these stores and expose protected issuance. Retained coordinator
+context alone cannot reconstruct installed incarnation, availability and gas;
+do not regenerate those from a later live route or mark an uncommitted result
+`authenticated`/`durable`. The pending projection record remains read-only and
+must not carry `authorize_operation`. No protected method, live mutation,
+Private/Attested, Shared finality or release gate is claimed by this checkpoint.
 
 ### Durable client acknowledgement before completion
 

@@ -16,6 +16,12 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use fs2::FileExt as _;
+use vos::agent::authority_operation_coordinator::{
+    AuthorityOperationCoordinatorStore, MAX_AUTHORITY_OPERATION_COORDINATOR_IMAGE_BYTES,
+};
+use vos::agent::authority_operation_issuer::{
+    AuthorityOperationIssuerStore, MAX_AUTHORITY_OPERATION_ISSUER_IMAGE_BYTES,
+};
 use vos::agent::bootstrap::MAX_SYSTEM_AGENT_GENESIS_PROVISION_BYTES;
 use vos::agent::clean_authority_issuer::{
     CleanManagementActorStore, CleanManagementIssuerStore, CleanManagementRuntimeStore,
@@ -174,6 +180,8 @@ enum StoreRole {
     InvocationRequest = 16,
     InvocationResponse = 17,
     InvocationProgress = 18,
+    OperationCoordinator = 19,
+    OperationIssuer = 20,
 }
 
 impl StoreRole {
@@ -197,6 +205,8 @@ impl StoreRole {
             Self::InvocationRequest => "invocation.request",
             Self::InvocationResponse => "invocation.response",
             Self::InvocationProgress => "invocation.progress",
+            Self::OperationCoordinator => "authority-operation.coordinator",
+            Self::OperationIssuer => "authority-operation.issuer",
         }
     }
 
@@ -220,6 +230,8 @@ impl StoreRole {
             Self::InvocationRequest => "invocation.request.next",
             Self::InvocationResponse => "invocation.response.next",
             Self::InvocationProgress => "invocation.progress.next",
+            Self::OperationCoordinator => "authority-operation.coordinator.next",
+            Self::OperationIssuer => "authority-operation.issuer.next",
         }
     }
 
@@ -236,6 +248,8 @@ impl StoreRole {
             Self::InvocationRequest => super::local_invocation::MAX_REQUEST_BYTES,
             Self::InvocationResponse => super::local_invocation::MAX_RESPONSE_BYTES,
             Self::InvocationProgress => super::invocation_progress::MAX_PROGRESS_BYTES,
+            Self::OperationCoordinator => MAX_AUTHORITY_OPERATION_COORDINATOR_IMAGE_BYTES,
+            Self::OperationIssuer => MAX_AUTHORITY_OPERATION_ISSUER_IMAGE_BYTES,
             Self::LifecycleRuntime => MAX_PACKAGE_ENCODED_BYTES,
             Self::LifecycleActor => MAX_PACKAGE_ENCODED_BYTES,
             Self::LocalCreateDenial => vos::agent::local_lifecycle::LocalCreateDenial::MAX_BYTES,
@@ -254,6 +268,8 @@ impl StoreRole {
             16 => Some(Self::InvocationRequest),
             17 => Some(Self::InvocationResponse),
             18 => Some(Self::InvocationProgress),
+            19 => Some(Self::OperationCoordinator),
+            20 => Some(Self::OperationIssuer),
             1 => Some(Self::Pins),
             2 => Some(Self::Bootstrap),
             3 => Some(Self::ManagementIssuer),
@@ -380,6 +396,75 @@ impl CleanManagementLifecycleFiles {
 }
 
 pub(crate) struct CleanManagementIntentFile(ExactFileStore, ExactFileStore, ExactFileStore);
+
+/// One Authority's operation history under a shared exclusive writer lease.
+/// These are opaque durability adapters, not policy or signature verifiers.
+/// The coordinator must reopen both images against the trusted Authority and
+/// reconcile them before any new operation is admitted. Never open independent
+/// per-invocation issuers: issuance sequencing belongs to the whole Authority.
+pub(crate) struct CleanAuthorityOperationFiles {
+    coordinator: CleanAuthorityOperationCoordinatorFile,
+    issuer: CleanAuthorityOperationIssuerFile,
+}
+
+impl CleanAuthorityOperationFiles {
+    pub(crate) fn open_or_create(root: impl AsRef<Path>) -> Result<Self, CleanFileStoreError> {
+        const ENTRIES: &[&str] = &[
+            LOCK_FILE,
+            StoreRole::OperationCoordinator.file(),
+            StoreRole::OperationCoordinator.stage_file(),
+            StoreRole::OperationIssuer.file(),
+            StoreRole::OperationIssuer.stage_file(),
+        ];
+        let root = Arc::new(StoreRoot::open_with_entries(root.as_ref(), ENTRIES)?);
+        Ok(Self {
+            coordinator: CleanAuthorityOperationCoordinatorFile(ExactFileStore::new(
+                Arc::clone(&root),
+                StoreRole::OperationCoordinator,
+            )),
+            issuer: CleanAuthorityOperationIssuerFile(ExactFileStore::new(
+                root,
+                StoreRole::OperationIssuer,
+            )),
+        })
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CleanAuthorityOperationCoordinatorFile,
+        CleanAuthorityOperationIssuerFile,
+    ) {
+        (self.coordinator, self.issuer)
+    }
+}
+
+pub(crate) struct CleanAuthorityOperationCoordinatorFile(ExactFileStore);
+pub(crate) struct CleanAuthorityOperationIssuerFile(ExactFileStore);
+
+impl AuthorityOperationCoordinatorStore for CleanAuthorityOperationCoordinatorFile {
+    type Error = CleanFileStoreError;
+
+    fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.0.load(MAX_AUTHORITY_OPERATION_COORDINATOR_IMAGE_BYTES)
+    }
+
+    fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+        self.0.commit(image)
+    }
+}
+
+impl AuthorityOperationIssuerStore for CleanAuthorityOperationIssuerFile {
+    type Error = CleanFileStoreError;
+
+    fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.0.load(MAX_AUTHORITY_OPERATION_ISSUER_IMAGE_BYTES)
+    }
+
+    fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+        self.0.commit(image)
+    }
+}
 
 /// One immutable signed submission in its own leased private directory.
 /// Keep this lease until submission finishes; ambiguous outcomes retain the
@@ -2935,6 +3020,301 @@ pub(crate) mod tests {
             issuer.load().unwrap().as_deref(),
             Some(b"issuer".as_slice())
         );
+    }
+
+    #[test]
+    fn operation_files_reopen_exact_histories_under_one_lease() {
+        let fixture = Fixture::new("operation-reopen");
+        let (mut coordinator, mut issuer) =
+            CleanAuthorityOperationFiles::open_or_create(&fixture.root)
+                .unwrap()
+                .into_parts();
+        assert_eq!(coordinator.load().unwrap(), None);
+        assert_eq!(issuer.load().unwrap(), None);
+        // Opaque bytes deliberately test storage, not actor policy or issuance.
+        coordinator
+            .commit(b"retained authorization intent")
+            .unwrap();
+        issuer.commit(b"retained signing preimages").unwrap();
+        let original = fs::read(fixture.root.join(StoreRole::OperationIssuer.file())).unwrap();
+        issuer.commit(b"retained signing preimages").unwrap();
+        assert_eq!(
+            fs::read(fixture.root.join(StoreRole::OperationIssuer.file())).unwrap(),
+            original
+        );
+        let prior = coordinator
+            .0
+            .reconcile(MAX_AUTHORITY_OPERATION_COORDINATOR_IMAGE_BYTES)
+            .unwrap()
+            .unwrap();
+        stage(
+            &coordinator.0,
+            Some(prior.commitment()),
+            b"consumed issuance",
+        );
+        drop(coordinator);
+        assert!(matches!(
+            CleanAuthorityOperationFiles::open_or_create(&fixture.root),
+            Err(CleanFileStoreError::Busy)
+        ));
+        drop(issuer);
+        let (mut coordinator, mut issuer) =
+            CleanAuthorityOperationFiles::open_or_create(&fixture.root)
+                .unwrap()
+                .into_parts();
+        assert_eq!(
+            coordinator.load().unwrap().as_deref(),
+            Some(b"consumed issuance".as_slice())
+        );
+        assert_eq!(
+            issuer.load().unwrap().as_deref(),
+            Some(b"retained signing preimages".as_slice())
+        );
+        assert!(
+            !fixture
+                .root
+                .join(StoreRole::OperationCoordinator.stage_file())
+                .exists()
+        );
+        let prior = issuer
+            .0
+            .reconcile(MAX_AUTHORITY_OPERATION_ISSUER_IMAGE_BYTES)
+            .unwrap()
+            .unwrap();
+        stage(&issuer.0, Some(prior.commitment()), b"completed signatures");
+        drop(issuer);
+        assert!(matches!(
+            CleanAuthorityOperationFiles::open_or_create(&fixture.root),
+            Err(CleanFileStoreError::Busy)
+        ));
+        drop(coordinator);
+        let (mut coordinator, mut issuer) =
+            CleanAuthorityOperationFiles::open_or_create(&fixture.root)
+                .unwrap()
+                .into_parts();
+        assert_eq!(
+            coordinator.load().unwrap().as_deref(),
+            Some(b"consumed issuance".as_slice())
+        );
+        assert_eq!(
+            issuer.load().unwrap().as_deref(),
+            Some(b"completed signatures".as_slice())
+        );
+        assert!(
+            !fixture
+                .root
+                .join(StoreRole::OperationIssuer.stage_file())
+                .exists()
+        );
+    }
+
+    #[test]
+    fn operation_files_enforce_independent_role_bounds_and_namespaces() {
+        let fixture = Fixture::new("operation-bounds");
+        let (mut coordinator, mut issuer) =
+            CleanAuthorityOperationFiles::open_or_create(&fixture.root)
+                .unwrap()
+                .into_parts();
+        let coordinator_image = vec![19; MAX_AUTHORITY_OPERATION_COORDINATOR_IMAGE_BYTES];
+        let issuer_image = vec![20; MAX_AUTHORITY_OPERATION_ISSUER_IMAGE_BYTES];
+        coordinator.commit(&coordinator_image).unwrap();
+        issuer.commit(&issuer_image).unwrap();
+        assert!(matches!(
+            coordinator.commit(&vec![0; coordinator_image.len() + 1]),
+            Err(CleanFileStoreError::Oversized)
+        ));
+        assert!(matches!(
+            issuer.commit(&vec![0; issuer_image.len() + 1]),
+            Err(CleanFileStoreError::Oversized)
+        ));
+        assert_eq!(coordinator.load().unwrap(), Some(coordinator_image));
+        assert_eq!(issuer.load().unwrap(), Some(issuer_image));
+        drop((coordinator, issuer));
+        // Neither bootstrap nor management recovery may mistake these for
+        // one of its own journals, even though all use CSF1 envelopes.
+        assert!(CleanSystemAgentFileStores::open_or_create(&fixture.root).is_err());
+        assert!(CleanManagementLifecycleFiles::open_or_create(&fixture.root).is_err());
+        let fixture = Fixture::new("operation-wrong-namespace");
+        drop(fixture.stores());
+        write_private(&fixture.root.join(PINS_FILE), b"bootstrap evidence");
+        assert!(CleanAuthorityOperationFiles::open_or_create(&fixture.root).is_err());
+        assert_eq!(
+            fs::read(fixture.root.join(PINS_FILE)).unwrap(),
+            b"bootstrap evidence"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn operation_files_are_revalidated_by_the_real_coordinator_and_issuer() {
+        use vos::agent::authority_operation_coordinator::{
+            AuthorityOperationActorDispatch, AuthorityOperationActorDispatcher,
+            AuthorityOperationActorResult, AuthorityOperationCoordinatorError,
+            DurableAuthorityOperationCoordinator,
+        };
+        use vos::agent::authority_operation_issuer::{
+            AuthorityOperationIssuerError, DurableAuthorityOperationIssuer,
+        };
+        struct NoDispatch;
+        impl AuthorityOperationActorDispatcher for NoDispatch {
+            type Error = core::convert::Infallible;
+
+            fn dispatch(
+                &mut self,
+                _: &AuthorityOperationActorDispatch,
+            ) -> Result<AuthorityOperationActorResult, Self::Error> {
+                panic!("opening stored evidence must not dispatch an actor")
+            }
+        }
+        let fixture = Fixture::new("operation-real-open");
+        let (_, authority, _, _) = super::super::local_create::tests::fixture();
+        let (coordinator, issuer) = CleanAuthorityOperationFiles::open_or_create(&fixture.root)
+            .unwrap()
+            .into_parts();
+        let issuer = DurableAuthorityOperationIssuer::open(issuer, authority).unwrap();
+        let coordinator =
+            DurableAuthorityOperationCoordinator::open(coordinator, authority, NoDispatch, issuer)
+                .unwrap();
+        assert_eq!(coordinator.authority(), authority);
+        assert_eq!(coordinator.retained_operations(), 0);
+        assert!(!coordinator.has_pending_operation());
+        assert!(!coordinator.is_poisoned());
+        let (mut coordinator, _, issuer) = coordinator.into_parts();
+        // A valid CSF1 envelope is not a valid coordinator image or approval.
+        coordinator.commit(b"unsigned operation approval").unwrap();
+        assert!(matches!(
+            DurableAuthorityOperationCoordinator::open(coordinator, authority, NoDispatch, issuer),
+            Err(AuthorityOperationCoordinatorError::InvalidState)
+        ));
+        let (mut coordinator, mut issuer) =
+            CleanAuthorityOperationFiles::open_or_create(&fixture.root)
+                .unwrap()
+                .into_parts();
+        assert_eq!(
+            coordinator.load().unwrap().as_deref(),
+            Some(b"unsigned operation approval".as_slice())
+        );
+        issuer.commit(b"unsigned receipt").unwrap();
+        assert!(matches!(
+            DurableAuthorityOperationIssuer::open(issuer, authority),
+            Err(AuthorityOperationIssuerError::InvalidState)
+        ));
+        // Failed semantic admission must not delete either journal.
+        assert!(
+            fixture
+                .root
+                .join(StoreRole::OperationCoordinator.file())
+                .is_file()
+        );
+        assert!(
+            fixture
+                .root
+                .join(StoreRole::OperationIssuer.file())
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn operation_files_preserve_ambiguous_stages_in_both_roles() {
+        for role in [StoreRole::OperationCoordinator, StoreRole::OperationIssuer] {
+            let fixture = Fixture::new("operation-ambiguous-stage");
+            let (coordinator, issuer) = CleanAuthorityOperationFiles::open_or_create(&fixture.root)
+                .unwrap()
+                .into_parts();
+            let mut store = if role == StoreRole::OperationCoordinator {
+                drop(issuer);
+                coordinator.0
+            } else {
+                drop(coordinator);
+                issuer.0
+            };
+            store.commit(b"exact retained history").unwrap();
+            stage(&store, Some([99; 32]), b"unrelated history");
+            let canonical = fs::read(fixture.root.join(role.file())).unwrap();
+            let staged = fs::read(fixture.root.join(role.stage_file())).unwrap();
+            assert!(matches!(
+                store.load(role.maximum_bytes()),
+                Err(CleanFileStoreError::AmbiguousPublication)
+            ));
+            assert!(matches!(
+                store.commit(b"do not replace"),
+                Err(CleanFileStoreError::AmbiguousPublication)
+            ));
+            drop(store);
+            let (mut coordinator, mut issuer) =
+                CleanAuthorityOperationFiles::open_or_create(&fixture.root)
+                    .unwrap()
+                    .into_parts();
+            let loaded = if role == StoreRole::OperationCoordinator {
+                coordinator.load()
+            } else {
+                issuer.load()
+            };
+            assert!(matches!(
+                loaded,
+                Err(CleanFileStoreError::AmbiguousPublication)
+            ));
+            assert_eq!(fs::read(fixture.root.join(role.file())).unwrap(), canonical);
+            assert_eq!(
+                fs::read(fixture.root.join(role.stage_file())).unwrap(),
+                staged
+            );
+        }
+    }
+
+    #[test]
+    fn operation_files_recover_initial_stages_and_reject_cross_role_images() {
+        for role in [StoreRole::OperationCoordinator, StoreRole::OperationIssuer] {
+            let fixture = Fixture::new("operation-role-binding");
+            let (coordinator, issuer) = CleanAuthorityOperationFiles::open_or_create(&fixture.root)
+                .unwrap()
+                .into_parts();
+            let store = if role == StoreRole::OperationCoordinator {
+                drop(issuer);
+                coordinator.0
+            } else {
+                drop(coordinator);
+                issuer.0
+            };
+            stage(&store, None, b"initial pending evidence");
+            drop(store);
+            let (mut coordinator, mut issuer) =
+                CleanAuthorityOperationFiles::open_or_create(&fixture.root)
+                    .unwrap()
+                    .into_parts();
+            let loaded = if role == StoreRole::OperationCoordinator {
+                coordinator.load()
+            } else {
+                issuer.load()
+            };
+            assert_eq!(
+                loaded.unwrap().as_deref(),
+                Some(b"initial pending evidence".as_slice())
+            );
+            drop((coordinator, issuer));
+            let other = if role == StoreRole::OperationCoordinator {
+                StoreRole::OperationIssuer
+            } else {
+                StoreRole::OperationCoordinator
+            };
+            let encoded = fs::read(fixture.root.join(role.file())).unwrap();
+            fs::rename(
+                fixture.root.join(role.file()),
+                fixture.root.join(other.file()),
+            )
+            .unwrap();
+            let (mut coordinator, mut issuer) =
+                CleanAuthorityOperationFiles::open_or_create(&fixture.root)
+                    .unwrap()
+                    .into_parts();
+            let loaded = if other == StoreRole::OperationCoordinator {
+                coordinator.load()
+            } else {
+                issuer.load()
+            };
+            assert!(loaded.is_err());
+            assert_eq!(fs::read(fixture.root.join(other.file())).unwrap(), encoded);
+        }
     }
 
     #[test]
