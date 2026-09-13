@@ -8591,6 +8591,35 @@ mod tests {
             use crate::agent_sdk::{InvocationAuthorization, MethodMode, PublicPreflight};
             let host = owner.host.lock().unwrap();
             let agent = HostAgentId(owner.pins.agent.0);
+            for (set, expected) in [
+                (vec![], 0),
+                (vec![authorization], 1),
+                (vec![finalization], 1),
+                (vec![authorization, finalization], 2),
+                (vec![finalization, authorization], 2),
+            ] {
+                assert_eq!(
+                    host.management_retirement_set_admission_requirement(agent, &set)
+                        .unwrap(),
+                    Some(expected)
+                );
+            }
+            // Reject duplicate identities across pair boundaries as well as
+            // within one pair; never double-budget or silently deduplicate.
+            assert!(
+                host.management_retirement_set_admission_requirement(
+                    agent,
+                    &[authorization, finalization, authorization],
+                )
+                .is_err()
+            );
+            assert!(
+                host.management_retirement_set_admission_requirement(
+                    agent,
+                    &vec![authorization; crate::agent::replay::MAX_REPLAY_SUFFIX_ENTRIES + 1],
+                )
+                .is_err()
+            );
             assert_eq!(
                 host.management_retirement_admission_requirement(
                     agent,
@@ -8651,6 +8680,90 @@ mod tests {
                     [authorization, &substituted],
                 )
                 .is_err()
+            );
+        }
+
+        #[inline(never)]
+        fn check_multiple_management_retirement_admission(
+            owner: &mut MemoryBootstrapOwner,
+            original: [&RuntimeWork; 2],
+            intent: &crate::agent::clean_management_intent::CleanManagementIntent,
+        ) {
+            // Both original results have already been positively acknowledged.
+            // Execute four fresh signed calls through the bundled Authority so
+            // the joint check covers four distinct, unretired journal results.
+            // This tests suffix accounting, not fresh credential authorization.
+            let mut extra = Vec::new();
+            for index in 0..4 {
+                let mut call = intent.call().clone();
+                call.request_sequence =
+                    core::num::NonZeroU64::new(call.request_sequence.get() + index + 1).unwrap();
+                call.invocation = call.expected_invocation();
+                call.signature = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32])
+                    .sign(&call.signing_bytes())
+                    .to_bytes();
+                let next = crate::agent::clean_management_intent::CleanManagementIntent::new(
+                    call.authority,
+                    call.managed,
+                    intent.request().clone(),
+                    call,
+                    &RawCredentialVerifier,
+                )
+                .unwrap();
+                let mut envelope = original[0].clone();
+                let RuntimeWork::Invoke {
+                    invocation,
+                    authorization,
+                    observed_slot,
+                    ..
+                } = &mut envelope
+                else {
+                    unreachable!()
+                };
+                invocation.invocation = next.call().invocation;
+                invocation.message = next.authorization_message();
+                let material = owner
+                    .supervisor_invocation_material(owner.pins.agent, invocation.actor)
+                    .unwrap();
+                // These are new calls, not retries of persisted envelopes.
+                *observed_slot = material.observed_slot;
+                **authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+                    crate::agent_sdk::PublicPreflight::for_work(invocation, *observed_slot),
+                );
+                let identity =
+                    crate::agent::supervisor_adapters::physical_material_identity(&material)
+                        .unwrap();
+                let result = owner
+                    .supervisor_invoke_persisted_management(
+                        identity,
+                        (**invocation).clone(),
+                        (**authorization).clone(),
+                    )
+                    .unwrap();
+                assert!(
+                    matches!(result, RuntimeOutcome::Completed(Ok(_))),
+                    "{result:?}"
+                );
+                extra.push(envelope);
+            }
+            let host = owner.host.lock().unwrap();
+            let agent = HostAgentId(owner.pins.agent.0);
+            let set: Vec<_> = extra.iter().collect();
+            let before = host
+                .management_retirement_set_admission_requirement(agent, &set)
+                .unwrap();
+            assert_eq!(before, Some(4));
+            let mut mixed = original.to_vec();
+            mixed.extend(set);
+            assert_eq!(
+                host.management_retirement_set_admission_requirement(agent, &mixed)
+                    .unwrap(),
+                Some(4)
+            );
+            mixed.push(original[0]);
+            assert!(
+                host.management_retirement_set_admission_requirement(agent, &mixed)
+                    .is_err()
             );
         }
 
@@ -9051,6 +9164,11 @@ mod tests {
                 interrupted_retirement,
             );
             assert_eq!(owner.ordered_index_for_test().unwrap(), retired);
+            check_multiple_management_retirement_admission(
+                owner,
+                [&envelope, &finalization_envelope],
+                &intent_image,
+            );
             harness.stop();
         }
 

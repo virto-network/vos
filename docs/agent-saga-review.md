@@ -2705,6 +2705,47 @@ The next implementation step remains protected adoption of the verified pending
 lifecycle set before the first system route is published, including incomplete
 phases and without an unprotected gap between pending retirement pairs.
 
+### Joint retirement-set capacity
+
+The journal now accepts a bounded set of exact completed management envelopes
+for one combined retirement admission calculation. The existing two-envelope
+check delegates to it. Every remaining acknowledgement contributes its encoded
+Ordered-entry bytes and entry count to one prospective chain before the shared
+suffix headroom check. Independently checking pairs against the same starting
+headroom is not sufficient for startup recovery with multiple pending intents.
+
+Duplicate invocation identities are rejected across the entire set, including
+already-acknowledged members. Sets larger than the replay suffix entry bound
+are rejected before scanning. Exact retained positive acknowledgements consume
+no new entries; missing or unsuccessful Linear invocation evidence still fails
+closed, with no checkpoint-boundary re-execution fallback. This is a read-only
+capacity calculation, not a live reservation, authorization decision or durable
+retirement marker.
+
+The native fixture checks empty/single/pair sets, reverse order, non-adjacent
+duplicates and the size bound. Additional fresh signed calls exercise four
+distinct unretired results combined with two already-acknowledged results;
+the expected combined delta is four, not six. This is result-retirement
+accounting, not proof that four additional Agents were approved or created.
+The initial fixture that changed only old invocation IDs failed and was
+corrected to use fresh signed calls; its failure log is retained as
+`r16-retirement-set-final.log` in disk scratch. A second fixture run exposed
+`AuthoritySlotRegressed` (`r16-retirement-set-signed.log`): fresh calls must use
+the current physical admission slot, whereas retries keep their saved slot.
+The fixture now prepares fresh signed calls with fresh admission preflights;
+no persisted production request identity or clock was changed.
+
+The corrected final-source management tests pass: **3 passed, zero failed**
+in 32.28s (`r16-retirement-set-clock.log`). Formatting and diff checks pass.
+The final serial native bootstrap/lifecycle suite also passes: **11 passed,
+zero failed**, 68.29s (`r16-retirement-set-native.log`). These targeted checks
+do not replace final full-library, exhausted-capacity or real-daemon gates.
+
+Still required: seed a set-wide admission/GC exclusion before first route
+activation, protect incomplete and prepared-but-unaccepted phases too, and
+prove exhausted-capacity/restart behavior before enabling production handoff.
+The startup loader and production retirement/handoff wiring remain incomplete.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

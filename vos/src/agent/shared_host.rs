@@ -1569,6 +1569,19 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
+    pub(crate) fn management_retirement_set_admission_requirement(
+        &self,
+        agent: AgentId,
+        envelopes: &[&crate::agent_sdk::RuntimeWork],
+    ) -> Result<Option<usize>, SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .management_retirement_set_admission_requirement(envelopes)
+            .map_err(map_driver_error)
+    }
+
     pub(crate) fn projection_admission_records(
         &self,
         agent: AgentId,

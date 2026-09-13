@@ -1443,17 +1443,33 @@ where
         &self,
         envelopes: [&crate::agent_sdk::RuntimeWork; 2],
     ) -> Result<Option<usize>, SharedJournalDriverError> {
+        self.management_retirement_set_admission_requirement(&envelopes)
+    }
+
+    /// Budget all recovered completed invocations together, not independently
+    /// against the same remaining suffix. Callers must retain an admission/GC
+    /// exclusion over the entire set until durable retirement completes.
+    /// This does not authorize incomplete or prepared-but-unaccepted work.
+    pub(crate) fn management_retirement_set_admission_requirement(
+        &self,
+        envelopes: &[&crate::agent_sdk::RuntimeWork],
+    ) -> Result<Option<usize>, SharedJournalDriverError> {
         use crate::agent_sdk::{
             InvocationAuthorization, MethodMode, RuntimeExecutionContext, RuntimeOutcome,
             RuntimeWork,
         };
+        // Every member must have its own retained invocation or positive ack
+        // in this suffix. A larger set cannot be evidenced by that suffix.
+        if envelopes.len() > super::replay::MAX_REPLAY_SUFFIX_ENTRIES {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
         let heads = self.materialization.heads();
         let mut index = heads.ordered_index;
         let mut parent = heads.ordered_head;
-        let mut previous = None;
+        let mut seen = BTreeSet::new();
         let mut entries = 0usize;
         let mut bytes = 0usize;
-        for envelope in envelopes {
+        for &envelope in envelopes {
             let RuntimeWork::Invoke {
                 context,
                 state,
@@ -1472,11 +1488,10 @@ where
                     != InvocationAuthorization::PublicPreflight(
                         crate::agent_sdk::PublicPreflight::for_work(work, *observed_slot),
                     )
-                || previous == Some(work.invocation)
+                || !seen.insert(work.invocation)
             {
                 return Err(SharedJournalDriverError::CrossStoreMismatch);
             }
-            previous = Some(work.invocation);
             if self.retained_positive_clean_acknowledgement(work, authorization)? {
                 continue;
             }
