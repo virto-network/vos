@@ -21,6 +21,21 @@ pub(crate) fn run_create(
     http: Option<std::net::SocketAddr>,
     resume: bool,
 ) -> anyhow::Result<()> {
+    let (data, space, public, address) = resolve_local_space(query, http)?;
+    let operator = crate::identity::load_existing()?;
+    let ack = create_local(&data, address, &operator, space, public, resume)?;
+    print_acknowledgement(&ack)
+}
+
+pub(super) fn resolve_local_space(
+    query: &str,
+    http: Option<std::net::SocketAddr>,
+) -> anyhow::Result<(
+    std::path::PathBuf,
+    vos::agent::sdk::SpaceId,
+    [u8; 32],
+    std::net::SocketAddr,
+)> {
     let index = crate::spaces_index::load()?;
     let entry = crate::spaces_index::find(&index, query)?;
     let data = std::path::Path::new(&entry.data_dir);
@@ -30,7 +45,7 @@ pub(crate) fn run_create(
             .map_err(|_| anyhow::anyhow!("invalid Space ID"))?,
     );
     let endpoint = super::endpoint::read(data)?
-        .ok_or_else(|| anyhow::anyhow!("start the space before creating a Local Agent"))?;
+        .ok_or_else(|| anyhow::anyhow!("start the space before managing a Local Agent"))?;
     anyhow::ensure!(
         super::endpoint::is_alive(&endpoint),
         "space daemon is not running"
@@ -57,9 +72,7 @@ pub(crate) fn run_create(
             listeners[0]
         }
     };
-    let operator = crate::identity::load_existing()?;
-    let ack = create_local(data, address, &operator, space, public, resume)?;
-    print_acknowledgement(&ack)
+    Ok((data.to_path_buf(), space, public, address))
 }
 
 /// The credential lease spans every phase. Existing request bytes always take

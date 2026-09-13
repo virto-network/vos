@@ -45,6 +45,9 @@ pub mod verify;
 
 #[derive(Subcommand, Debug)]
 pub enum SpaceCommand {
+    /// Install a signed actor package into an operator-owned Local Agent.
+    #[cfg(target_os = "linux")]
+    InstallLocalActor(local_install::InstallLocalArgs),
     /// Submit or retry an already retained signed Local Install request.
     #[cfg(target_os = "linux")]
     SubmitLocalInstall {
@@ -140,6 +143,8 @@ pub enum SpaceCommand {
 
 pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
     match cmd {
+        #[cfg(target_os = "linux")]
+        SpaceCommand::InstallLocalActor(args) => local_install::run_install(args),
         #[cfg(target_os = "linux")]
         SpaceCommand::CreateLocalAgent {
             space,

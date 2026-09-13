@@ -27,10 +27,10 @@ physical tests from prepared authorization through retirement, including
 pristine client-retry admission. Native Install controller handoff, retry and
 restart now pass; the production-owner wrapper requires an exact active Local
 route after reconciliation. Install now has signed-frame, bounded native queue
-and HTTP server wiring, plus a retained-request CLI delivery command. Fresh
-Install discovery/preparation/credential allocation and actual actor method
-invocation remain unwired/unproven; these phase tests do
-not make actor installation available to users yet.
+and HTTP server wiring, plus retained-request and fresh managed CLI commands.
+Fresh Install discovery/preparation/credential allocation is wired; managed
+resume passes, but fresh live installation and actual actor method invocation
+remain unproven. Do not treat command availability as an end-to-end pass.
 The native Local-controller wiring at `ee047d48` passed fresh-data startup and
 restart using the rebuilt CLI (`target/native-local-smoke.DATNas`, details below).
 This is bootstrap/ingress coverage, not ordinary-Agent creation/installation.
@@ -4467,6 +4467,60 @@ Formatting and diff checks pass; all scratch remains disk-backed.
 The fresh managed command still needs orchestration and user-input wiring.
 This checkpoint does not expose fresh Install UX or close the live invocation
 and full C1/C2/C3 release gates.
+
+### Fresh managed Install command wiring
+
+The CLI now exposes:
+
+```sh
+vosx space install-local-actor SPACE AGENT_HEX actor.vos \
+  --name worker --constructor-data constructor.bin
+```
+
+`--http` overrides the configured loopback plaintext listener; `--resume`
+selects the current credential operation. `--name` defaults to the package
+manifest name. Constructor data is optional only when the schema permits its
+absence; it is exact encoded input, not JSON conversion. This command initially
+installs top-level actors. The package is bounded by the admitted-package limit,
+constructor input by 64 KiB, and durable request publication by the HTTP-sized
+request-store limit.
+
+It selects the indexed Space, live daemon node identity and bundled root
+Authority using the same resolver as Create. One shared Space/Credential lease
+spans nonce reservation, credential query, exact-head Agent/replica discovery,
+package-derived construction, signed LIQ1 publication, delivery and durable MAA2
+completion. The nonce becomes the signed installation ID; the request's registry
+correlation commitment is domain-separated over Space, Agent, nonce and package.
+This is not a separate registry mutation or external reservation proof.
+
+Retained LIQ1 takes precedence over reading package/name/constructor inputs and
+over new discovery/signing. It must still match the selected Space, Agent,
+operator, node and reserved installation ID. A completed marker with a missing
+request is rejected. Pending work blocks a new operation; failures preserve the
+reservation for the original command's resume. A retained verified MAA2 may
+finish a pending reservation without repeating the server mutation. The selected
+Space must still have a live daemon for the indexed managed command; the lower
+level retained delivery helper can resume saved completion without a connection.
+
+The managed-resume fixture uses the derived bundled Authority pins, rejects
+wrong Agent/node, ignores changed or missing package/constructor inputs after
+request retention, and completes/reopens the same reservation from saved MAA2.
+This is not fresh daemon execution. Invalid guest constructor semantics and
+post-approval failures still lack the complete denial/expiry/abort resolution
+needed for release readiness.
+
+The final full `vosx` binary suite passes: 191 passed, zero failed, two ignored,
+8.81s (`r16-install-command-final.log`, locked/offline with socket access and
+disk scratch). The actual clap parser accepts the new command/options and
+rejects missing required inputs. Earlier runs are
+`r16-install-command-precheck.log` and `r16-install-command-tests.log`.
+Formatting and diff checks pass. No fresh CLI executable or live campaign is
+claimed at this checkpoint.
+
+Next is rebuilding the CLI and running a fresh disposable-space
+install/invoke/restart campaign. Command parsing and isolated component tests
+cannot establish that campaign's result. C1 recovery and C3 release gates, plus
+remaining C2 failure/capacity cases, remain open; root branches are unpromoted.
 
 ### Durable client acknowledgement before completion
 

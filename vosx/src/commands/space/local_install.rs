@@ -5,6 +5,210 @@ use vos::agent::local_lifecycle::LocalInstallSubmission;
 use vos::agent::sdk::authority::ManagementApplicationAck;
 use vos::agent::sdk::wire::CanonicalWire as _;
 
+#[derive(clap::Args, Debug)]
+pub struct InstallLocalArgs {
+    pub space: String,
+    /// Full target Agent ID (hex), discovered again from the live Authority.
+    pub agent: String,
+    /// Signed VOS3 actor package; ignored once --resume finds a retained request.
+    pub package: std::path::PathBuf,
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Exact encoded constructor bytes, if required by the package schema.
+    #[arg(long)]
+    pub constructor_data: Option<std::path::PathBuf>,
+    #[arg(long)]
+    pub http: Option<std::net::SocketAddr>,
+    #[arg(long)]
+    pub resume: bool,
+}
+
+pub(crate) fn run_install(args: InstallLocalArgs) -> anyhow::Result<()> {
+    let (data, space, node_public, address) =
+        super::local_create::resolve_local_space(&args.space, args.http)?;
+    let agent = vos::agent::sdk::AgentId(
+        hex::decode(&args.agent)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid full Agent ID"))?,
+    );
+    let operator = crate::identity::load_existing()?;
+    let ack = install_local(&data, address, &operator, space, node_public, agent, &args)?;
+    print_acknowledgement(&ack)
+}
+
+fn read_bounded(path: &std::path::Path, maximum: usize) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= maximum,
+        "input exceeds the allowed size: {}",
+        path.display()
+    );
+    Ok(bytes)
+}
+
+fn install_local(
+    data: &std::path::Path,
+    address: std::net::SocketAddr,
+    operator: &libp2p::identity::Keypair,
+    space: vos::agent::sdk::SpaceId,
+    node_public: [u8; 32],
+    agent: vos::agent::sdk::AgentId,
+    args: &InstallLocalArgs,
+) -> anyhow::Result<ManagementApplicationAck> {
+    use super::clean_store::{
+        CleanCredentialReservation, CleanLocalInstallFile, CredentialReservationStatus,
+        ensure_private_directory,
+    };
+    use vos::agent::sdk::{AgentProfile, Hash, InstallationId, ProducerId};
+    anyhow::ensure!(
+        address.ip().is_loopback()
+            && address.port() != 0
+            && agent != vos::agent::sdk::AgentId::ZERO,
+        "invalid Local Install target/endpoint"
+    );
+    let identity = super::clean_identity::CleanOperatorIdentitySigner::new(operator)?;
+    let runtime = crate::bundled::root_signed_agent_runtime_package(operator)?;
+    let authority_package = crate::bundled::root_signed_actor_package(
+        crate::bundled::system_authority_package_template(),
+        "system-authority",
+        operator,
+    )?;
+    let (authority, _) = super::clean_startup::derive_system_authority_target(
+        space,
+        identity.raw_public_key(),
+        &runtime,
+        &authority_package,
+    )?;
+    let root = data.join("agent-client");
+    let _root = ensure_private_directory(&root)?;
+    let claims = root.join("credentials");
+    let _claims = ensure_private_directory(&claims)?;
+    let mut reservation =
+        CleanCredentialReservation::open_or_create(&claims, space, identity.credential())?;
+    let nonce = match reservation.current()? {
+        Some((nonce, _)) if args.resume => nonce,
+        Some((nonce, CredentialReservationStatus::Pending)) => anyhow::bail!(
+            "credential operation {} is pending; resume its original command",
+            hex::encode(nonce.0)
+        ),
+        _ if args.resume => anyhow::bail!("no Install operation to resume"),
+        _ => {
+            let mut nonce = [0; 32];
+            getrandom::getrandom(&mut nonce)
+                .map_err(|error| anyhow::anyhow!("Install nonce entropy: {error}"))?;
+            anyhow::ensure!(nonce != [0; 32], "zero Install nonce");
+            Hash(nonce)
+        }
+    };
+    let status = reservation.reserve(nonce)?;
+    let operations = root.join("operations");
+    let _operations = ensure_private_directory(&operations)?;
+    let operation = operations.join(format!(
+        "{}-{}",
+        hex::encode(identity.credential().0),
+        hex::encode(nonce.0)
+    ));
+    let _operation = ensure_private_directory(&operation)?;
+    let request_root = operation.join("request");
+    let mut store = CleanLocalInstallFile::open_or_create(&request_root)?;
+    let request = match store.load_request()? {
+        Some(bytes) => bytes,
+        None => {
+            anyhow::ensure!(
+                status == CredentialReservationStatus::Pending,
+                "completed Install is missing its retained request"
+            );
+            let package = vos::agent::package_admission::admit_actor_package(&read_bounded(
+                &args.package,
+                vos::agent::sdk::package::MAX_PACKAGE_ENCODED_BYTES,
+            )?)
+            .map_err(|error| anyhow::anyhow!("invalid actor package: {error:?}"))?;
+            let constructor = args
+                .constructor_data
+                .as_ref()
+                .map(|path| read_bounded(path, vos::agent::sdk::MAX_INSTALLATION_DATA_BYTES))
+                .transpose()?;
+            let name = args
+                .name
+                .clone()
+                .unwrap_or_else(|| package.manifest().name.clone());
+            let registry_reservation = Hash::digest(
+                b"vos/local-install/registry-reservation/v1",
+                &[
+                    space.as_bytes(),
+                    agent.as_bytes(),
+                    nonce.as_bytes(),
+                    package.package_ref().hash.as_bytes(),
+                ],
+            );
+            let install = build_install(
+                agent,
+                InstallationId(nonce.0),
+                registry_reservation,
+                name,
+                None,
+                constructor,
+                &package,
+            )?;
+            let (credential, sequence) = super::local_create::discover_credential(
+                &operation.join("query"),
+                address,
+                operator,
+                authority,
+            )?;
+            let descriptor = discover_agent(address, operator, authority, credential.head, agent)?;
+            anyhow::ensure!(
+                descriptor.identity.profile == AgentProfile::Local
+                    && descriptor.identity.transition_producer
+                        == ProducerId::of_public_key(&node_public),
+                "target is not a Local Agent of this node"
+            );
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            let expires = now
+                .checked_add(3600)
+                .ok_or_else(|| anyhow::anyhow!("validity overflow"))?;
+            let bytes = prepare(
+                operator,
+                authority,
+                &descriptor,
+                install,
+                package,
+                sequence,
+                now.saturating_sub(60),
+                expires,
+            )?
+            .encode();
+            store.publish_request(&bytes)?;
+            bytes
+        }
+    };
+    let (install, call, _) = LocalInstallSubmission::decode(&request)
+        .map_err(|error| anyhow::anyhow!("invalid retained Install: {error:?}"))?
+        .into_parts();
+    anyhow::ensure!(
+        install.installation_id.0 == nonce.0
+            && call.authority == authority
+            && call.managed.space == space
+            && call.managed.agent == agent
+            && call.managed.owner == identity.principal()
+            && call.principal == identity.principal()
+            && call.credential == identity.credential()
+            && call.managed.transition_producer == ProducerId::of_public_key(&node_public),
+        "retained Install differs from selected Space, Agent, operator or node"
+    );
+    drop(store);
+    let acknowledgement = submit_retained(&request_root, address)?;
+    let mut store = CleanLocalInstallFile::open_or_create(&request_root)?;
+    reservation.complete_install(&mut store)?;
+    Ok(acknowledgement)
+}
+
 /// Build the exact actor entry from admitted artifacts. IDs must already be
 /// reserved by the caller; this function does not allocate or publish them.
 pub(crate) fn build_install(
@@ -299,6 +503,10 @@ pub(crate) fn run_submit(
     address: std::net::SocketAddr,
 ) -> anyhow::Result<()> {
     let acknowledgement = submit_retained(root, address)?;
+    print_acknowledgement(&acknowledgement)
+}
+
+fn print_acknowledgement(acknowledgement: &ManagementApplicationAck) -> anyhow::Result<()> {
     if crate::output::is_json() {
         crate::output::print_json(&serde_json::json!({
             "agent": hex::encode(acknowledgement.managed.agent.0),
@@ -325,7 +533,35 @@ mod tests {
     use vos::agent::sdk::{Hash, ManagementReply};
 
     fn fixture() -> (Vec<u8>, ManagementApplicationAck, libp2p::identity::Keypair) {
-        let (operator, authority, descriptor, _) = super::super::local_create::tests::fixture();
+        fixture_with_target(false)
+    }
+
+    fn fixture_with_target(
+        native: bool,
+    ) -> (Vec<u8>, ManagementApplicationAck, libp2p::identity::Keypair) {
+        let (operator, mut authority, mut descriptor, runtime) =
+            super::super::local_create::tests::fixture();
+        if native {
+            let identity =
+                super::super::clean_identity::CleanOperatorIdentitySigner::new(&operator).unwrap();
+            let package = crate::bundled::root_signed_actor_package(
+                crate::bundled::system_authority_package_template(),
+                "system-authority",
+                &operator,
+            )
+            .unwrap();
+            authority = super::super::clean_startup::derive_system_authority_target(
+                descriptor.identity.space,
+                identity.raw_public_key(),
+                &runtime,
+                &package,
+            )
+            .unwrap()
+            .0;
+            descriptor.authority = authority.binding;
+            descriptor.identity.transition_producer =
+                vos::agent::sdk::ProducerId::of_public_key(&[0x77; 32]);
+        }
         let package = vos::agent::package_admission::admit_actor_package(include_bytes!(
             "../../../blobs/system_catalog.vos"
         ))
@@ -432,6 +668,168 @@ mod tests {
             .try_into()
             .unwrap();
         (request, ack, operator)
+    }
+
+    #[test]
+    fn fresh_install_command_parses_explicit_inputs_and_resume() {
+        use clap::Parser as _;
+        let parsed = crate::Cli::try_parse_from([
+            "vosx",
+            "space",
+            "install-local-actor",
+            "demo",
+            &hex::encode([0x11; 32]),
+            "actor.vos",
+            "--name",
+            "worker",
+            "--constructor-data",
+            "constructor.bin",
+            "--http",
+            "127.0.0.1:8080",
+            "--resume",
+        ])
+        .unwrap();
+        let Some(crate::Command::Space {
+            command: super::super::SpaceCommand::InstallLocalActor(args),
+        }) = parsed.command
+        else {
+            panic!("wrong command");
+        };
+        assert_eq!(args.space, "demo");
+        assert_eq!(args.package, std::path::PathBuf::from("actor.vos"));
+        assert_eq!(args.name.as_deref(), Some("worker"));
+        assert_eq!(
+            args.constructor_data,
+            Some(std::path::PathBuf::from("constructor.bin"))
+        );
+        assert_eq!(args.http, Some("127.0.0.1:8080".parse().unwrap()));
+        assert!(args.resume);
+        assert!(
+            crate::Cli::try_parse_from(["vosx", "space", "install-local-actor", "demo"]).is_err()
+        );
+    }
+
+    #[test]
+    fn managed_resume_uses_retained_bytes_and_finishes_reserved_delivery() {
+        use super::super::clean_store::{
+            CleanCredentialReservation, CleanLocalInstallFile, CredentialReservationStatus,
+            ensure_private_directory,
+        };
+        use std::os::unix::fs::DirBuilderExt as _;
+        let (request, ack, operator) = fixture_with_target(true);
+        let (install, call, _) = LocalInstallSubmission::decode(&request)
+            .unwrap()
+            .into_parts();
+        let nonce = Hash(install.installation_id.0);
+        let mut random = [0; 8];
+        getrandom::getrandom(&mut random).unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("vosx-managed-install-{}", hex::encode(random)));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let root = directory.join("agent-client");
+        let _root = ensure_private_directory(&root).unwrap();
+        let claims = root.join("credentials");
+        let _claims = ensure_private_directory(&claims).unwrap();
+        let mut reservation = CleanCredentialReservation::open_or_create(
+            &claims,
+            call.managed.space,
+            call.credential,
+        )
+        .unwrap();
+        reservation.reserve(nonce).unwrap();
+        drop(reservation);
+        let operations = root.join("operations");
+        let _operations = ensure_private_directory(&operations).unwrap();
+        let operation = operations.join(format!(
+            "{}-{}",
+            hex::encode(call.credential.0),
+            hex::encode(nonce.0)
+        ));
+        let _operation = ensure_private_directory(&operation).unwrap();
+        let mut delivery =
+            CleanLocalInstallFile::open_or_create(operation.join("request")).unwrap();
+        delivery.publish_request(&request).unwrap();
+        delivery
+            .publish_acknowledgement(&ack.encode().unwrap())
+            .unwrap();
+        drop(delivery);
+        let args = InstallLocalArgs {
+            space: "unused-index-name".into(),
+            agent: hex::encode(call.managed.agent.0),
+            package: directory.join("missing-package"),
+            name: Some("changed-and-ignored".into()),
+            constructor_data: Some(directory.join("missing-constructor")),
+            http: None,
+            resume: true,
+        };
+        let address = "127.0.0.1:1".parse().unwrap();
+        assert!(
+            install_local(
+                &directory,
+                address,
+                &operator,
+                call.managed.space,
+                [0x78; 32],
+                call.managed.agent,
+                &args
+            )
+            .is_err()
+        );
+        assert!(
+            install_local(
+                &directory,
+                address,
+                &operator,
+                call.managed.space,
+                [0x77; 32],
+                vos::agent::sdk::AgentId([0x78; 32]),
+                &args
+            )
+            .is_err()
+        );
+        assert_eq!(
+            install_local(
+                &directory,
+                address,
+                &operator,
+                call.managed.space,
+                [0x77; 32],
+                call.managed.agent,
+                &args
+            )
+            .unwrap(),
+            ack
+        );
+        assert_eq!(
+            install_local(
+                &directory,
+                address,
+                &operator,
+                call.managed.space,
+                [0x77; 32],
+                call.managed.agent,
+                &args
+            )
+            .unwrap(),
+            ack
+        );
+        let mut reservation = CleanCredentialReservation::open_or_create(
+            &claims,
+            call.managed.space,
+            call.credential,
+        )
+        .unwrap();
+        assert_eq!(
+            reservation.current().unwrap(),
+            Some((nonce, CredentialReservationStatus::Completed))
+        );
+        drop(reservation);
+        assert!(!args.package.exists());
+        drop((_operation, _operations, _claims, _root));
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
