@@ -1768,3 +1768,37 @@ references before expecting network and physical leases to disappear. Native
 startup still uses the move-owned constructor; it does not yet retain or expose
 the shared coordinator. The command interface, CLI file-store connection,
 publication, completion/reservations and Shared finality remain required.
+
+### Local lifecycle controller and native store factory
+
+`LocalLifecycleController` now owns the shared system and Local hosts, the
+receipt signer and a `LocalLifecycleStoreFactory`. It supplies route attachments
+using the same physical owners, and its Create method locks system then Local,
+checks scope/runtime and the signed intent before opening stores, then calls
+the tested durable Create/application/finalization coordinator. The controller
+retains the Local writer lease when an empty route worker is retired. It does
+not wait on a route worker while holding either owner lock.
+
+The `vosx` factory implements that interface with the existing lifecycle files.
+It accepts a configured private parent and Space, pins the opened parent
+directory, derives each child from the canonical hexadecimal Agent ID, rejects
+wrong-Space/zero-Agent calls and rechecks the parent identity before and after
+opening the child. The parent must already exist; startup directory creation and
+controller retention are not yet wired. Signed image bindings, not the parent
+path or integrity envelope, establish lifecycle authority.
+
+**4/4 native coordinator/controller tests pass** in 25.56s
+(`r16-local-lifecycle-controller.log`) and **29/29 CLI file-store tests pass** in
+0.10s (`r16-local-lifecycle-factory.log`). The controller test runs with both
+workers attached, refuses a forged call without opening stores, verifies issuer
+finalization, retires/reattaches the Local worker and repeats Create after expiry.
+The file factory test checks Space refusal before directory creation, derived
+paths, exclusive locking and independent image recovery. Commands were locked,
+offline and used disk-backed scratch. These remain separate controller and
+file-store tests, not an end-to-end daemon/ingress acceptance test.
+
+Next connect controller lifetime/shutdown to `VosNode`, construct it from native
+startup with this file factory, expose bounded signed lifecycle commands, and
+drive authenticated publication. Install/completion/capacity recovery, Shared
+genesis finality and final release gates remain open. No artifact repin or
+integration-branch move was performed.

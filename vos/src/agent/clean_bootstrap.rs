@@ -3514,7 +3514,7 @@ fn runtime_matches_pins(runtime: &AdmittedRuntimePackage, pins: &CleanSystemAgen
         && runtime.capabilities() == pins.descriptor.capabilities
 }
 
-struct RawCredentialVerifier;
+pub(crate) struct RawCredentialVerifier;
 
 impl AuthorityCredentialVerifier for RawCredentialVerifier {
     fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
@@ -7082,12 +7082,17 @@ mod tests {
 
         #[test]
         fn native_management_intent_executes_bundled_authority_and_recovers_receipt() {
-            native_local_management_lifecycle(false);
+            native_local_management_lifecycle(0);
         }
 
         #[test]
         fn native_local_creation_coordinator_finalizes_and_reopens_exactly() {
-            native_local_management_lifecycle(true);
+            native_local_management_lifecycle(1);
+        }
+
+        #[test]
+        fn native_local_lifecycle_controller_uses_scoped_stores_with_attached_workers() {
+            native_local_management_lifecycle(2);
         }
 
         #[test]
@@ -7145,7 +7150,7 @@ mod tests {
             harness.stop();
         }
 
-        fn native_local_management_lifecycle(coordinated: bool) {
+        fn native_local_management_lifecycle(coordinated: u8) {
             use crate::agent::clean_management_intent::{
                 CleanManagementIntent, CleanManagementIntentSlot,
             };
@@ -7269,7 +7274,92 @@ mod tests {
             call.authority = owner.authority_target();
             call.invocation = call.expected_invocation();
             call.signature = credential_key.sign(&call.signing_bytes()).to_bytes();
-            if coordinated {
+            if coordinated == 2 {
+                struct Stores {
+                    scope: (SpaceId, AgentId),
+                    intent: IssuerMemoryStore,
+                    issuer: IssuerMemoryStore,
+                    opens: Arc<AtomicUsize>,
+                }
+                impl crate::agent::local_lifecycle::LocalLifecycleStoreFactory for Stores {
+                    type Intent = IssuerMemoryStore;
+                    type Issuer = IssuerMemoryStore;
+                    type Error = ();
+                    fn open(
+                        &mut self,
+                        space: SpaceId,
+                        agent: AgentId,
+                    ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                        assert_eq!((space, agent), self.scope);
+                        self.opens.fetch_add(1, Ordering::SeqCst);
+                        Ok((self.intent.clone(), self.issuer.clone()))
+                    }
+                }
+                let root = harness._directory.0.join("controller-local");
+                let local = crate::agent::local_sdk_host::LocalAgentHost::create(
+                    &root,
+                    descriptor.identity.space,
+                    owner.pins.node,
+                    harness.fixture.trust.clone(),
+                )
+                .unwrap();
+                let issuer_store = IssuerMemoryStore::default();
+                let opens = Arc::new(AtomicUsize::new(0));
+                let stores = Stores {
+                    scope: (descriptor.identity.space, descriptor.identity.agent),
+                    intent: IssuerMemoryStore::default(),
+                    issuer: issuer_store.clone(),
+                    opens: opens.clone(),
+                };
+                let mut controller = crate::agent::local_lifecycle::LocalLifecycleController::new(
+                    harness.owner.take().unwrap(),
+                    local,
+                    stores,
+                    CountingSigner::new(),
+                )
+                .unwrap();
+                let system = controller.system_attachment(4).unwrap();
+                let routes = controller.local_attachment(4).unwrap();
+                let mut forged = call.clone();
+                forged.signature[0] ^= 1;
+                assert!(matches!(
+                    controller.create(descriptor.clone(), forged, runtime.clone()),
+                    Err(SharedAgentHostError::ScopeMismatch)
+                ));
+                assert_eq!(opens.load(Ordering::SeqCst), 0);
+                let result = controller
+                    .create(descriptor.clone(), call.clone(), runtime.clone())
+                    .unwrap();
+                assert_eq!(result.0, descriptor.identity.agent);
+                let issuer = DurableCleanManagementIssuer::open(
+                    issuer_store,
+                    descriptor.authority,
+                    descriptor.identity.space,
+                    descriptor.identity.agent,
+                )
+                .unwrap();
+                assert!(issuer.application_finalization_status(&result.1).unwrap());
+                drop(issuer);
+                routes.retire().unwrap();
+                let routes = controller.local_attachment(4).unwrap();
+                harness
+                    .fixture
+                    .logical_slot
+                    .as_ref()
+                    .unwrap()
+                    .store(LOGICAL_SLOT + 20, Ordering::Release);
+                assert_eq!(
+                    controller.create(descriptor, call, runtime).unwrap(),
+                    result
+                );
+                assert_eq!(opens.load(Ordering::SeqCst), 2);
+                routes.retire().unwrap();
+                system.retire().unwrap();
+                drop(controller);
+                harness.stop();
+                return;
+            }
+            if coordinated == 1 {
                 let shared_owner = Arc::new(Mutex::new(harness.owner.take().unwrap()));
                 let attachment =
                     crate::agent::supervisor_adapters::system_agent_supervisor_attachment_shared(

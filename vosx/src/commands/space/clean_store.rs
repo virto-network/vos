@@ -277,6 +277,56 @@ impl CleanManagementLifecycleFiles {
 
 pub(crate) struct CleanManagementIntentFile(ExactFileStore);
 
+/// A configured private directory for per-agent lifecycle images. Keeping the
+/// opened directory pins its physical identity across factory calls; image
+/// signatures/bindings remain the controller's responsibility.
+pub(crate) struct CleanManagementLifecycleStoreFactory {
+    parent: PathBuf,
+    directory: File,
+    space: vos::agent::sdk::SpaceId,
+}
+
+impl CleanManagementLifecycleStoreFactory {
+    pub(crate) fn new(
+        parent: impl AsRef<Path>,
+        space: vos::agent::sdk::SpaceId,
+    ) -> Result<Self, CleanFileStoreError> {
+        if space == vos::agent::sdk::SpaceId::ZERO {
+            return Err(CleanFileStoreError::InvalidPath);
+        }
+        let parent = parent.as_ref().to_path_buf();
+        let directory = open_private_directory(&parent, true)?;
+        Ok(Self {
+            parent,
+            directory,
+            space,
+        })
+    }
+}
+
+impl vos::agent::local_lifecycle::LocalLifecycleStoreFactory
+    for CleanManagementLifecycleStoreFactory
+{
+    type Intent = CleanManagementIntentFile;
+    type Issuer = CleanManagementIssuerFile;
+    type Error = CleanFileStoreError;
+
+    fn open(
+        &mut self,
+        space: vos::agent::sdk::SpaceId,
+        agent: vos::agent::sdk::AgentId,
+    ) -> Result<(Self::Intent, Self::Issuer), Self::Error> {
+        if space != self.space || agent == vos::agent::sdk::AgentId::ZERO {
+            return Err(CleanFileStoreError::InvalidPath);
+        }
+        validate_opened_directory(&self.directory, &self.parent, true)?;
+        let stores =
+            CleanManagementLifecycleFiles::open_or_create(self.parent.join(hex::encode(agent.0)))?;
+        validate_opened_directory(&self.directory, &self.parent, true)?;
+        Ok(stores.into_parts())
+    }
+}
+
 impl CleanManagementIssuerStore for CleanManagementIntentFile {
     type Error = CleanFileStoreError;
 
@@ -1201,6 +1251,45 @@ mod tests {
         let staged = decode_envelope(store.role, &encoded, payload.len()).expect("decode stage");
         store.write_stage(&encoded).expect("write stage");
         staged
+    }
+
+    #[test]
+    fn lifecycle_factory_derives_agent_paths_and_rejects_wrong_space() {
+        use vos::agent::local_lifecycle::LocalLifecycleStoreFactory as _;
+        use vos::agent::sdk::{AgentId, SpaceId};
+        let fixture = Fixture::new("lifecycle-factory");
+        let mut factory =
+            CleanManagementLifecycleStoreFactory::new(&fixture.parent, SpaceId([1; 32])).unwrap();
+        let agent = AgentId([2; 32]);
+        assert!(matches!(
+            factory.open(SpaceId([3; 32]), agent),
+            Err(CleanFileStoreError::InvalidPath)
+        ));
+        assert!(fs::read_dir(&fixture.parent).unwrap().next().is_none());
+        let (mut intent, mut issuer) = factory.open(SpaceId([1; 32]), agent).unwrap();
+        intent.commit(b"intent").unwrap();
+        issuer.commit(b"issuer").unwrap();
+        assert!(
+            fixture
+                .parent
+                .join(hex::encode(agent.0))
+                .join(INTENT_FILE)
+                .is_file()
+        );
+        assert!(matches!(
+            factory.open(SpaceId([1; 32]), agent),
+            Err(CleanFileStoreError::Busy)
+        ));
+        drop((intent, issuer));
+        let (mut intent, mut issuer) = factory.open(SpaceId([1; 32]), agent).unwrap();
+        assert_eq!(
+            intent.load().unwrap().as_deref(),
+            Some(b"intent".as_slice())
+        );
+        assert_eq!(
+            issuer.load().unwrap().as_deref(),
+            Some(b"issuer".as_slice())
+        );
     }
 
     #[test]
