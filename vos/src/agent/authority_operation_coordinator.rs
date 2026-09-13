@@ -66,6 +66,33 @@ pub struct AuthorityOperationActorDispatch {
     pub request: Vec<u8>,
 }
 
+impl AuthorityOperationActorDispatch {
+    /// Check the signed protocol domain before native physical preparation.
+    /// This authenticates the message, not its policy approval or execution.
+    pub(crate) fn has_valid_request(&self) -> bool {
+        if !self.target.is_valid() || !self.context.validate() {
+            return false;
+        }
+        let verifier = RawEd25519Verifier;
+        match self.method {
+            AuthorityOperationActorMethod::AuthorizeOperation => {
+                AuthorityOperationCall::decode(&self.request).is_ok_and(|call| {
+                    call.authority == self.target
+                        && call.matches_invocation_context(&self.context)
+                        && operation_call_has_valid_ingress_envelope(&call, &verifier)
+                })
+            }
+            AuthorityOperationActorMethod::AcknowledgeIssuance => {
+                AuthorityOperationIssuanceAck::decode(&self.request).is_ok_and(|ack| {
+                    ack.authority == self.target
+                        && ack.matches_invocation_context(&self.context)
+                        && ack.verify_with(self.target.binding, &verifier).is_ok()
+                })
+            }
+        }
+    }
+}
+
 /// Echoed dispatch identity and its exact, durably applied result bytes.
 ///
 /// The coordinator checks every echoed field. `authenticated` and `durable`
@@ -959,7 +986,7 @@ fn decode_issuer(decoder: &mut Decoder<'_>) -> Result<AuthorityIssuer, DecodeErr
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::{Arc, Mutex};
 
     use ed25519_dalek::{Signer as _, SigningKey};
@@ -1613,6 +1640,85 @@ mod tests {
                 observed_slot,
             }
         }
+    }
+
+    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+    pub(crate) fn unenrolled_native_dispatch(
+        authority: AuthorityActorTarget,
+        observed_slot: u64,
+    ) -> AuthorityOperationActorDispatch {
+        let fixture = Fixture {
+            authority,
+            credential_key: SigningKey::from_bytes(&[0x21; 32]),
+        };
+        let call = fixture.call(1);
+        AuthorityOperationActorDispatch {
+            target: authority,
+            method: AuthorityOperationActorMethod::AuthorizeOperation,
+            context: fixture.context(&call, observed_slot),
+            request: call.encode().unwrap(),
+        }
+    }
+
+    #[test]
+    fn native_dispatch_validates_signed_method_domain_and_context() {
+        let mut signer = CountingSigner::new(0x10);
+        let fixture = Fixture::new(&signer);
+        let call = fixture.call(1);
+        let context = fixture.context(&call, 20);
+        let request = AuthorityOperationActorDispatch {
+            target: fixture.authority,
+            method: AuthorityOperationActorMethod::AuthorizeOperation,
+            context,
+            request: call.encode().unwrap(),
+        };
+        assert!(request.has_valid_request());
+        let mut changed = request.clone();
+        changed.method = AuthorityOperationActorMethod::AcknowledgeIssuance;
+        assert!(!changed.has_valid_request());
+        let mut changed = request.clone();
+        changed.context.origin.principal = None;
+        assert!(!changed.has_valid_request());
+        let mut changed = request.clone();
+        changed.request.push(0);
+        assert!(!changed.has_valid_request());
+        let mut changed = request.clone();
+        changed.target.space = SpaceId([0x99; 32]);
+        assert!(!changed.has_valid_request());
+        let mut changed_call = call.clone();
+        if let AuthorityIngressAuthentication::ApiCredentialSignature { signature, .. } =
+            &mut changed_call.authentication
+        {
+            signature[0] ^= 1;
+        }
+        let mut changed = request;
+        changed.request = changed_call.encode().unwrap();
+        assert!(!changed.has_valid_request());
+
+        let mut coordinator = open(
+            MemoryImageStore::default(),
+            MemoryImageStore::default(),
+            FakeDispatcher::new(fixture.authority),
+            &fixture,
+        );
+        let issued = coordinator
+            .coordinate(&call, context, 20, &mut signer)
+            .unwrap();
+        let acknowledgement = AuthorityOperationActorDispatch {
+            target: fixture.authority,
+            method: AuthorityOperationActorMethod::AcknowledgeIssuance,
+            context: acknowledgement_context(&issued.issuance_ack),
+            request: issued.issuance_ack.encode().unwrap(),
+        };
+        assert!(acknowledgement.has_valid_request());
+        let mut changed = acknowledgement.clone();
+        changed.method = AuthorityOperationActorMethod::AuthorizeOperation;
+        assert!(!changed.has_valid_request());
+        let mut changed = acknowledgement;
+        let mut ack = issued.issuance_ack;
+        ack.signature[0] ^= 1;
+        changed.request = ack.encode().unwrap();
+        assert!(!changed.has_valid_request());
     }
 
     type TestCoordinator =

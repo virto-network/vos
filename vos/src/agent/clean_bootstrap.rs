@@ -5,6 +5,10 @@
 //! invoked through the authenticated Shared journal and Raft proposer.
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+#[path = "clean_operation_dispatch.rs"]
+pub(crate) mod operation_dispatch;
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
@@ -9664,8 +9668,7 @@ mod tests {
             assert_eq!(owner.ordered_index_for_test().unwrap(), before + 1);
         }
 
-        fn native_local_management_lifecycle(coordinated: u8) {
-            use crate::agent::clean_management_intent::CleanManagementIntent;
+        fn native_bundled_authority_fixture() -> PhysicalFixture {
             fn configuration(descriptor: &AgentDescriptor) -> Vec<u8> {
                 use system_authority::{
                     AuthorityBindingState, AuthorityBlobRow, AuthorityIssuerState,
@@ -9737,8 +9740,132 @@ mod tests {
             package.manifest.signing_mut().signature =
                 key.sign(&package.signing_bytes().unwrap()).to_bytes();
             let package = admit_actor_package(&package.encode().unwrap()).unwrap();
-            let fixture =
-                native_physical_fixture_with_authority_configuration(package, Some(configuration));
+            native_physical_fixture_with_authority_configuration(package, Some(configuration))
+        }
+
+        #[test]
+        fn native_operation_dispatch_executes_bundled_policy_with_exact_journal_binding() {
+            use crate::agent::authority_operation_coordinator::tests::unenrolled_native_dispatch;
+            use crate::agent::clean_bootstrap::operation_dispatch::matches_operation_envelope;
+            use crate::agent::clean_management_intent::ManagementJournalAnchor;
+            use crate::value::Value;
+            use std::io::Write as _;
+            let mut harness = NativeProjectionOwnerHarness::with_fixture(
+                "bundled-authority-operation",
+                native_bundled_authority_fixture(),
+            );
+            let saved_path = harness._directory.0.join("operation-dispatch.test");
+            let owner = harness.owner.as_mut().unwrap();
+            let target = owner.authority_target();
+            let slot = owner
+                .supervisor_invocation_material(owner.pins.agent, target.binding.issuer.actor)
+                .unwrap()
+                .observed_slot;
+            let request = unenrolled_native_dispatch(target, slot);
+            let envelope = owner
+                .prepare_authority_operation_dispatch(&request)
+                .unwrap();
+            assert!(matches_operation_envelope(&request, &envelope));
+            let agent = HostAgentId(owner.pins.agent.0);
+            // Persist the entire pre-dispatch input while native admission is
+            // held. This test-only file is not the eventual startup format.
+            owner
+                ._network_host
+                .capture_management_pending(agent, &envelope, |(anchor, work)| {
+                    let mut bytes = Vec::new();
+                    let mut encoder = vos_protocol::wire::Encoder(&mut bytes);
+                    encoder.bytes(&anchor.encode());
+                    encoder.bytes(&work.encode().unwrap());
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&saved_path)
+                        .unwrap();
+                    file.write_all(&bytes).unwrap();
+                    file.sync_all().unwrap();
+                    std::fs::File::open(saved_path.parent().unwrap())
+                        .unwrap()
+                        .sync_all()
+                        .unwrap();
+                    Ok(())
+                })
+                .unwrap();
+            let saved = std::fs::read(&saved_path).unwrap();
+            let mut decoder = vos_protocol::wire::Decoder::new(&saved);
+            let anchor =
+                ManagementJournalAnchor::decode(&decoder.bytes_bounded(1024).unwrap()).unwrap();
+            let persisted =
+                RuntimeWork::decode(&decoder.bytes_bounded(MAX_RUNTIME_WORK_WIRE_BYTES).unwrap())
+                    .unwrap();
+            assert!(decoder.exhausted());
+            assert_eq!(persisted, envelope);
+            let before = owner.ordered_index_for_test().unwrap();
+            let mut changed = request.clone();
+            changed.context.observed_slot += 1;
+            assert!(!matches_operation_envelope(&changed, &persisted));
+            assert!(
+                owner
+                    .execute_authority_operation_dispatch(&changed, &persisted, &anchor)
+                    .is_err()
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            let mut wrong_anchor = anchor.clone();
+            wrong_anchor.runtime = HostHash([0x99; 32]);
+            assert!(
+                owner
+                    .execute_authority_operation_dispatch(&request, &persisted, &wrong_anchor)
+                    .is_err()
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            let mut substituted = persisted.clone();
+            if let RuntimeWork::Invoke {
+                invocation,
+                authorization,
+                observed_slot,
+                ..
+            } = &mut substituted
+            {
+                invocation.gas -= 1;
+                **authorization = InvocationAuthorization::PublicPreflight(
+                    crate::agent_sdk::PublicPreflight::for_work(invocation, *observed_slot),
+                );
+            }
+            // Signed AOC5 and invocation context alone cannot bind the native
+            // gas/availability envelope. The exact admitted journal input must.
+            assert!(matches_operation_envelope(&request, &substituted));
+            assert!(
+                owner
+                    .execute_authority_operation_dispatch(&request, &substituted, &anchor)
+                    .is_err()
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            let result = owner
+                .execute_authority_operation_dispatch(&request, &persisted, &anchor)
+                .unwrap();
+            assert!(result.authenticated && result.durable);
+            assert_eq!(result.target, request.target);
+            assert_eq!(result.context, request.context);
+            assert_eq!(result.request, request.request);
+            // A signed but unenrolled credential is evaluated by the bundled
+            // guest and denied. Native code must not turn it into an approval.
+            assert_eq!(
+                Value::try_decode(&result.reply),
+                Some(Value::Bytes(Vec::new()))
+            );
+            let applied = owner.ordered_index_for_test().unwrap();
+            assert_eq!(applied, before + 1);
+            let repeated = owner
+                .execute_authority_operation_dispatch(&request, &persisted, &anchor)
+                .unwrap();
+            assert_eq!(repeated, result);
+            assert_eq!(owner.ordered_index_for_test().unwrap(), applied);
+            assert_eq!(std::fs::read(&saved_path).unwrap(), saved);
+            harness.stop();
+        }
+
+        fn native_local_management_lifecycle(coordinated: u8) {
+            use crate::agent::clean_management_intent::CleanManagementIntent;
+            let fixture = native_bundled_authority_fixture();
             let mut harness =
                 NativeProjectionOwnerHarness::with_fixture("bundled-authority-management", fixture);
             let owner = harness.owner.as_mut().unwrap();

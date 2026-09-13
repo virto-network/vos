@@ -156,9 +156,10 @@ Keep these as work within C2, not new review batches:
    coverage for the newly added continuation client passes (live evidence
    below). Native yielded work still belongs to item 3.
 2. Connect `DurableAuthorityOperationCoordinator` to durable native stores and
-   exact physical Authority dispatch. The CSF1 native store pair is implemented
-   and tested below, but startup/dispatch does not consume it yet. The existing
-   dispatcher implementations are test doubles; preparation and an API credential do not issue an actor
+   exact physical Authority dispatch. The CSF1 store pair and native owner
+   execution boundary are implemented and tested below. The coordinator
+   adapter and startup do not connect them yet; preparation and an API
+   credential do not issue an actor
    receipt. Retain the signed AOC5, exact authorization context and issuance
    slot before policy dispatch, and recover the exact issued preimages before
    re-authorizing. Physical admission must also survive restart/checkpoint/GC
@@ -5088,6 +5089,57 @@ do not regenerate those from a later live route or mark an uncommitted result
 `authenticated`/`durable`. The pending projection record remains read-only and
 must not carry `authorize_operation`. No protected method, live mutation,
 Private/Attested, Shared finality or release gate is claimed by this checkpoint.
+
+### Native protected-operation physical execution boundary
+
+The native owner now prepares an exact Authority operation envelope and executes
+only an already-retained envelope with its pre-dispatch journal anchor.
+`clean_operation_dispatch.rs` keeps this distinct from read-only projections.
+Both signed method domains are validated: AOC5 for `authorize_operation`, AOI1
+for `acknowledge_issuance`. Targets, context, signature, method argument name,
+Direct mode, empty runtime state, pinned incarnation/installation material and
+the exact Public preflight are checked. These self-authenticating Authority
+methods do not bypass policy for the requested downstream actor operation.
+
+Fresh preparation requires the selected observation clock. Execution preserves
+the saved work and uses the existing physical journal-anchored Linear admission
+path, including live installed-material checks. Only a durable completed native
+result with matching invocation/actor/incarnation/deployment/mode is reported
+as authenticated and durable to the operation coordinator. The result remains
+retained; this boundary does not sign receipts or release admission.
+
+The bundled-Authority physical test passes in **4.22s**
+(`r16-native-operation-physical-binding.log`). It persists the complete envelope
+and anchor in a synced test-only file under native admission, reads them back,
+and proves that changed context, substituted anchor and changed gas with a
+recomputed preflight cannot execute. A correctly signed but unenrolled credential
+is evaluated and denied by the actual bundled guest. The resulting empty approval
+is durable and an exact retry returns the same result with no second journal
+transition. This is native policy-denial execution, not successful protected
+issuance, AOI1 consumption or startup recovery. The earlier unextended test also
+passed in 4.77s (`r16-native-operation-physical-final.log`); its initial compile
+errors were confined to test fixture codec imports/API usage
+(`r16-native-operation-physical.log`).
+
+The signed-domain test passes in **0.07s** (`r16-native-operation-domain.log`),
+covering valid AOC5/AOI1, swapped method domains, changed target/context,
+trailing bytes and forged signatures. Its AOI1 is issued through the existing
+scripted coordinator fixture, not physical policy. Formatting and diff checks
+pass. All logs remain in the shared target's disk-backed `task-tmp`.
+
+At this checkpoint the broader coordinator regression
+(`r16-native-operation-dispatch.log`, started before the final test additions)
+and the existing native management issuance regression
+(`r16-native-operation-management-regression.log`) are still CPU-active. They
+are not counted as passing results. Preserve and poll those runs rather than
+restarting them because a tool observation yields no output.
+
+The next connection still requires a durable native dispatch record and its
+startup recovery: the coordinator's context omits incarnation, availability,
+gas and journal admission. Connect the validated native methods to the real
+coordinator only with those exact retained records and admission recovery,
+then verify approved issuance/AOI1 consumption and retirement. Do not expose
+HTTP authorization or treat the denial test as a working protected mutation.
 
 ### Durable client acknowledgement before completion
 
