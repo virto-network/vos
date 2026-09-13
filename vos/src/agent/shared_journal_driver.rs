@@ -1544,6 +1544,117 @@ where
             .then_some(entries))
     }
 
+    /// Joint suffix cost for anchored, terminal management invocations and
+    /// their acknowledgements. No runtime execution or policy preview occurs.
+    /// Anchors must have been durably captured before first dispatch; callers
+    /// must exclude competing admission and drain Raft before using the result.
+    pub(crate) fn management_pending_admission_requirement(
+        &self,
+        pending: &[(
+            &super::clean_management_intent::ManagementJournalAnchor,
+            &crate::agent_sdk::RuntimeWork,
+        )],
+    ) -> Result<Option<usize>, SharedJournalDriverError> {
+        use crate::agent_sdk::{RuntimeOutcome, RuntimeWork};
+        if pending.len() > super::replay::MAX_REPLAY_SUFFIX_ENTRIES {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let heads = self.materialization.heads();
+        let mut index = heads.ordered_index;
+        let mut parent = heads.ordered_head;
+        let mut bytes = 0usize;
+        let mut entries = 0usize;
+        let mut seen = BTreeSet::new();
+        for &(anchor, envelope) in pending {
+            if anchor.genesis != heads.genesis
+                || anchor.admission != heads.admission
+                || anchor.runtime != heads.runtime.commitment()
+            {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            let retained = self.management_invocation_after(anchor.ordered, envelope)?;
+            let RuntimeWork::Invoke {
+                context,
+                invocation: work,
+                authorization,
+                observed_slot,
+                ..
+            } = envelope
+            else {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            };
+            if !seen.insert(work.invocation) {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            let invoke = ReplayOperation::CleanInvoke {
+                context: *context,
+                work: (**work).clone(),
+                authorization: (**authorization).clone(),
+                observed_slot: *observed_slot,
+            };
+            // An anchor newer than a retained invocation cannot be used to
+            // budget it as unseen. Later lifecycle steps already fail the
+            // anchored walk; completed retirement uses its separate protocol.
+            if recent_clean_ordered_operation(&self.store, &self.materialization, &invoke)?
+                != retained
+            {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            if retained.is_none()
+                && self.retained_positive_clean_acknowledgement(work, authorization)?
+            {
+                return Err(SharedJournalDriverError::CrossStoreMismatch);
+            }
+            if let Some(input) = retained {
+                if !matches!(
+                    self.executor.clean_ordered_result(input),
+                    Some(RuntimeOutcome::Completed(Ok(_)))
+                ) {
+                    return Err(SharedJournalDriverError::CrossStoreMismatch);
+                }
+            }
+            let acknowledgement = ReplayOperation::CleanAcknowledge {
+                context: *context,
+                expected_live: None,
+                work: (**work).clone(),
+                authorization: (**authorization).clone(),
+            };
+            for operation in retained
+                .is_none()
+                .then_some(invoke)
+                .into_iter()
+                .chain(core::iter::once(acknowledgement))
+            {
+                index = index
+                    .checked_add(1)
+                    .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+                let entry = OrderedEntry {
+                    genesis: heads.genesis,
+                    index,
+                    parent,
+                    merge_frontier: heads.merge_frontier,
+                    merge_seal: None,
+                    input: ReplayInput {
+                        runtime: heads.runtime.clone(),
+                        operation,
+                    },
+                };
+                entry
+                    .validate()
+                    .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+                bytes = bytes
+                    .checked_add(entry.encode().len())
+                    .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+                entries += 1;
+                parent = Some(entry.id());
+            }
+        }
+        Ok(self
+            .materialization
+            .has_suffix_headroom(entries, bytes)
+            .then_some(entries))
+    }
+
     /// Validate and encode the exact projection lifecycle delta independently
     /// of current suffix capacity. Checkpoint selection needs this count while
     /// the old authenticated suffix is deliberately full; ordinary admission

@@ -8847,6 +8847,18 @@ mod tests {
                     .host
                     .lock()
                     .unwrap()
+                    .management_pending_admission_requirement(
+                        agent,
+                        &[(&management_anchor_for_test(&anchor), &prepared)],
+                    )
+                    .unwrap(),
+                Some(2)
+            );
+            assert_eq!(
+                owner
+                    .host
+                    .lock()
+                    .unwrap()
                     .management_invocation_after(agent, &anchor, &prepared)
                     .unwrap(),
                 None
@@ -8882,6 +8894,71 @@ mod tests {
                 Err(SharedAgentHostError::ScopeMismatch)
             ));
             let current = host.journal_position(agent).unwrap();
+            let saved_anchor = management_anchor_for_test(&anchor);
+            let late_anchor = management_anchor_for_test(&current);
+            assert_eq!(
+                host.management_pending_admission_requirement(agent, &[(&saved_anchor, &prepared)])
+                    .unwrap(),
+                Some(1)
+            );
+            assert_eq!(
+                host.management_pending_admission_requirement(agent, &[])
+                    .unwrap(),
+                Some(0)
+            );
+            assert!(
+                host.management_pending_admission_requirement(agent, &[(&late_anchor, &prepared)])
+                    .is_err()
+            );
+            assert!(
+                host.management_pending_admission_requirement(
+                    agent,
+                    &[(&saved_anchor, &prepared), (&saved_anchor, &prepared)]
+                )
+                .is_err()
+            );
+            assert!(
+                host.management_pending_admission_requirement(
+                    agent,
+                    &vec![
+                        (&saved_anchor, &prepared);
+                        crate::agent::replay::MAX_REPLAY_SUFFIX_ENTRIES + 1
+                    ]
+                )
+                .is_err()
+            );
+            // Budgeting does not approve or execute this synthetic unseen
+            // work. Its exact envelope length matches a terminal invocation.
+            let mut unseen = prepared.clone();
+            let RuntimeWork::Invoke {
+                invocation: unseen_work,
+                authorization: unseen_authorization,
+                observed_slot: unseen_slot,
+                ..
+            } = &mut unseen
+            else {
+                unreachable!()
+            };
+            unseen_work.invocation = crate::agent_sdk::InvocationId([0xbc; 32]);
+            **unseen_authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+                crate::agent_sdk::PublicPreflight::for_work(unseen_work, *unseen_slot),
+            );
+            assert_eq!(
+                host.management_pending_admission_requirement(
+                    agent,
+                    &[(&saved_anchor, &prepared), (&late_anchor, &unseen)]
+                )
+                .unwrap(),
+                Some(3)
+            );
+            assert_eq!(
+                host.management_pending_admission_requirement(
+                    agent,
+                    &[(&late_anchor, &unseen), (&saved_anchor, &prepared)]
+                )
+                .unwrap(),
+                Some(3)
+            );
             wrong = current.clone();
             wrong.ordered_index += 1;
             assert!(
@@ -9203,6 +9280,19 @@ mod tests {
                 owner._network_host.refresh().unwrap();
             }
             assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
+            let after = owner.host.lock().unwrap().journal_position(agent).unwrap();
+            assert!(
+                owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .management_pending_admission_requirement(
+                        agent,
+                        &[(&management_anchor_for_test(&after), &extra[0])],
+                    )
+                    .is_err(),
+                "retired work behind a late anchor is not an unseen invocation"
+            );
             assert_projection_gate_released(owner, 0xee);
             let host = Arc::clone(&owner.host);
             assert!(matches!(

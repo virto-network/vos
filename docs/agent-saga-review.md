@@ -2945,6 +2945,43 @@ verified store set before route activation; handle pending projections and
 exhausted capacity. Anchor persistence and dispatch checking do not close those
 remaining lifecycle/release gates.
 
+### Pending invocation and acknowledgement capacity
+
+The Shared journal now calculates one combined suffix budget for a bounded set
+of exact anchored terminal-management envelopes, without executing the runtime
+or previewing policy. An invocation not observed after its verified pre-dispatch
+anchor costs an Invoke plus an acknowledgement; an exact retained successful
+terminal invocation costs only its acknowledgement. Prospective Ordered entries
+are chained and their canonical encoded bytes counted together against the
+authenticated suffix budget. This does not cover Yielded/Resume lifecycles.
+
+The calculation rejects duplicate identities, invalid/pruned anchors, a retained
+input before a substituted later anchor, non-successful retained outcomes and
+retained positive acknowledgements being misclassified as unseen work. Retired
+intents use their separate durable-completion protocol. Absence remains scoped
+to the verified interval and does not establish an untrusted anchor's origin.
+
+Production anchored dispatch now checks this requirement under its existing
+proposal/leader barrier before preparing runtime work. It also requires a spare
+physical slot for the next leader's mandatory no-op. This is a capacity check,
+not a reservation lasting after dispatch returns: competing work can still
+consume headroom before later acknowledgement unless the incomplete-lifecycle
+reservation is implemented. Future finalization work that has not yet been
+prepared is not included in this set's cost.
+
+Native fixtures cover the two-entry fresh cost, one-entry retained cost, empty
+sets, duplicate/oversized sets, late anchors, acknowledged work and a mixed
+retained/unseen set costing three in either order. The synthetic unseen envelope
+used for the mixed-set check is not executed or claimed to be authorized.
+Exhausted-capacity and cross-process recovery remain release gates, as does the
+continuous reservation across capture, dispatch, finalization and retirement.
+
+Final-source verification: **11 native bootstrap/lifecycle tests passed**
+(124.04s, `r16-pending-management-budget.log`) and **7 network tests passed**
+(0.39s, `r16-pending-management-network.log`). Formatting and diff checks pass.
+Evidence remains in disk scratch; no rebuilt-CLI smoke or full release run is
+claimed from these targeted results.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

@@ -1400,17 +1400,25 @@ impl SharedRouteHandler {
                 else {
                     return Err(SharedAgentHostError::ScopeMismatch);
                 };
-                Some(host.management_invocation_after_anchor(
-                    self.agent,
-                    anchor,
-                    &crate::agent_sdk::RuntimeWork::Invoke {
-                        context: RuntimeExecutionContext::Direct,
-                        state: crate::agent_sdk::RuntimeState::default(),
-                        invocation: Box::new(work.clone()),
-                        authorization: Box::new(authorization.clone()),
-                        observed_slot: preflight.observed_slot,
-                    },
-                )?)
+                let envelope = crate::agent_sdk::RuntimeWork::Invoke {
+                    context: RuntimeExecutionContext::Direct,
+                    state: crate::agent_sdk::RuntimeState::default(),
+                    invocation: Box::new(work.clone()),
+                    authorization: Box::new(authorization.clone()),
+                    observed_slot: preflight.observed_slot,
+                };
+                let required = host
+                    .management_pending_admission_requirement(self.agent, &[(anchor, &envelope)])?
+                    .ok_or(SharedAgentHostError::CapacityExhausted)?;
+                if host
+                    .show(self.agent)?
+                    .ok_or(SharedAgentHostError::AgentNotFound)?
+                    .remaining_slots
+                    < required as u64 + 1
+                {
+                    return Err(SharedAgentHostError::CapacityExhausted);
+                }
+                Some(host.management_invocation_after_anchor(self.agent, anchor, &envelope)?)
             } else {
                 None
             };
