@@ -2363,6 +2363,18 @@ mod tests {
             RuntimeWork,
         };
         let template = descriptor(&admitted_runtime(), 9, AgentProfile::Local, space(), node());
+        let actor_package = admitted_actor();
+        let install_request = install_request(&template, &actor_package);
+        let ManagementRequest::Install(install) = &install_request else {
+            unreachable!()
+        };
+        let record = sdk::ActorDirectoryRecord {
+            entry: install.entry.clone(),
+            incarnation: Hash([0xc3; 32]),
+            installation_id: install.installation_id,
+            registry_reservation: install.registry_reservation,
+            install_request: install.lineage_commitment(),
+        };
         let create = ManagementRequest::Create(Box::new(template.clone()));
         let denied = ManagementRequest::RemoveLeaf {
             actor: ActorId::top_level(template.identity.agent, "absent"),
@@ -2372,8 +2384,13 @@ mod tests {
             after: None,
             limit: sdk::MAX_DIRECTORY_PAGE_ENTRIES as u16,
         };
-        let state = |tag| RuntimeState {
-            control: vec![tag],
+        let state = |tag: u8| RuntimeState {
+            control: vec![tag.min(0xa3)],
+            linear: if tag >= 0xa3 {
+                vec![tag - 0xa3]
+            } else {
+                Vec::new()
+            },
             ..Default::default()
         };
         let mut identity = Vec::new();
@@ -2392,7 +2409,7 @@ mod tests {
                 .unwrap()
         };
         let mut cases = Vec::new();
-        for tag in [0, 0xa1, 0xa2] {
+        for tag in [0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5] {
             let input = RuntimeWork::Manage {
                 context: RuntimeExecutionContext::Direct,
                 space: space(),
@@ -2428,9 +2445,12 @@ mod tests {
                 copies: vec![copy],
             });
         }
-        for tag in [0xa1, 0xa2] {
+        for tag in [0xa1, 0xa2, 0xa3, 0xa4, 0xa5] {
             for request in [&inspect, &denied] {
                 let inspection = request == &inspect;
+                if !inspection && tag >= 0xa3 {
+                    continue;
+                }
                 let input = RuntimeWork::Manage {
                     context: RuntimeExecutionContext::Direct,
                     space: space(),
@@ -2448,7 +2468,11 @@ mod tests {
                     state: state(if inspection { tag } else { 0xa2 }),
                     outcome: RuntimeOutcome::Management(if inspection {
                         Ok(ManagementReply::Actors(ActorDirectoryPage {
-                            entries: Vec::new(),
+                            entries: if tag >= 0xa3 {
+                                vec![record.clone()]
+                            } else {
+                                Vec::new()
+                            },
                             next: None,
                         }))
                     } else {
@@ -2463,6 +2487,133 @@ mod tests {
                     copies: Vec::new(),
                 });
             }
+        }
+        for tag in [0xa2, 0xa3, 0xa4, 0xa5] {
+            let input = RuntimeWork::Manage {
+                context: RuntimeExecutionContext::Direct,
+                space: space(),
+                agent: template.identity.agent,
+                runtime_deployment: template.identity.runtime_deployment,
+                state: state(tag),
+                request: Box::new(install_request.clone()),
+                authority: Some(Box::new(management_receipt(
+                    &template,
+                    &install_request,
+                    3,
+                    51,
+                    51,
+                ))),
+                observed_slot: 51,
+            }
+            .encode()
+            .unwrap();
+            let output = RuntimeTransition {
+                state: state(tag.max(0xa3)),
+                outcome: RuntimeOutcome::Management(Ok(ManagementReply::Installed(
+                    record.entry.clone(),
+                ))),
+            }
+            .encode()
+            .unwrap();
+            cases.push(ScriptedRuntimeCase {
+                input,
+                output,
+                copies: Vec::new(),
+            });
+        }
+        let invocation_template = invocation(&template, &record, &actor_package, 0xc4);
+        let completed = RuntimeOutcome::Completed(Ok(sdk::InvocationReply {
+            invocation: invocation_template.invocation,
+            actor: record.entry.actor,
+            incarnation: record.incarnation,
+            deployment: record.entry.deployment,
+            mode: MethodMode::Linear,
+            lane: Some(StateLane::Linear),
+            status: sdk::InvocationStatus::Done,
+            reply: vec![1],
+            gas_remaining: 100,
+            observation: sdk::InvocationObservation {
+                linear_revision: Some(1),
+                merge_frontier: None,
+                local_revision: None,
+            },
+        }));
+        let yielded = sdk::YieldedInvocation {
+            invocation: invocation_template.invocation,
+            actor: record.entry.actor,
+            incarnation: record.incarnation,
+            deployment: record.entry.deployment,
+            program: record.entry.program,
+            mode: MethodMode::Linear,
+            continuation: BlobRef::of_bytes(b"opaque-continuation"),
+            ready_sequence: 1,
+            installation_data: None,
+            required: invocation_template
+                .availability
+                .iter()
+                .map(|blob| blob.reference.clone())
+                .collect(),
+            reason: sdk::YieldReason::Cooperative,
+        };
+        for tag in [0xa3, 0xa4, 0xa5] {
+            let input = RuntimeWork::Invoke {
+                context: RuntimeExecutionContext::Direct,
+                state: state(tag),
+                invocation: Box::new(invocation_template.clone()),
+                authorization: Box::new(sdk::InvocationAuthorization::PublicPreflight(
+                    sdk::PublicPreflight::for_work(&invocation_template, 52),
+                )),
+                observed_slot: 52,
+            }
+            .encode()
+            .unwrap();
+            let output = RuntimeTransition {
+                state: state(tag.max(0xa4)),
+                outcome: if tag == 0xa5 {
+                    completed.clone()
+                } else {
+                    RuntimeOutcome::Yielded(yielded.clone())
+                },
+            }
+            .encode()
+            .unwrap();
+            cases.push(ScriptedRuntimeCase {
+                input,
+                output,
+                copies: Vec::new(),
+            });
+        }
+        for tag in [0xa4, 0xa5] {
+            let input = RuntimeWork::Resume {
+                context: RuntimeExecutionContext::Direct,
+                state: state(tag),
+                resume: Box::new(sdk::ResumeWork {
+                    invocation: yielded.invocation,
+                    actor: yielded.actor,
+                    incarnation: yielded.incarnation,
+                    deployment: yielded.deployment,
+                    program: yielded.program,
+                    mode: yielded.mode,
+                    continuation: yielded.continuation.clone(),
+                    ready_sequence: yielded.ready_sequence,
+                    installation_data: None,
+                    availability: invocation_template.availability.clone(),
+                    input: None,
+                }),
+            }
+            .encode()
+            .unwrap();
+            let output = RuntimeTransition {
+                state: state(0xa5),
+                outcome: completed.clone(),
+            }
+            .encode()
+            .unwrap();
+            cases.push(ScriptedRuntimeCase {
+                input,
+                output,
+                copies: Vec::new(),
+            });
         }
         let runtime =
             admitted_scripted_runtime_for_test("local-opaque-image-lifecycle", 0xc2, cases);
@@ -2521,7 +2672,7 @@ mod tests {
         );
         drop(host);
         slot.store(50, Ordering::SeqCst);
-        let mut host = LocalAgentHost::open(&root, space(), node(), trust).unwrap();
+        let mut host = LocalAgentHost::open(&root, space(), node(), trust.clone()).unwrap();
         assert_eq!(
             host.manage(
                 agent,
@@ -2533,10 +2684,97 @@ mod tests {
             outcome
         );
         assert_eq!(
-            host.create_agent(runtime, descriptor, receipt).unwrap(),
+            host.create_agent(runtime, descriptor.clone(), receipt)
+                .unwrap(),
             agent
         );
         assert_eq!(host.agents.get(&agent).unwrap().driver.image(), &before);
+        slot.store(51, Ordering::SeqCst);
+        let install_receipt = management_receipt(&descriptor, &install_request, 3, 51, 51);
+        host.manage(
+            agent,
+            install_request.clone(),
+            Some(install_receipt.clone()),
+            SdkManagementArtifacts::Actor(&actor_package),
+        )
+        .unwrap();
+        let material = host.agents[&agent]
+            .driver
+            .physical_invocation_material(record.entry.actor)
+            .unwrap();
+        assert_eq!(material.actor, record);
+        assert_eq!(material.program.bytes, actor_package.program_bytes());
+        assert_eq!(material.install_request, install.lineage_commitment());
+        assert_eq!(
+            host.agents[&agent].driver.image().runtime_state.linear,
+            vec![0]
+        );
+        slot.store(52, Ordering::SeqCst);
+        let work = invocation(&descriptor, &record, &actor_package, 0xc4);
+        let authorization = sdk::InvocationAuthorization::PublicPreflight(
+            sdk::PublicPreflight::for_work(&work, 52),
+        );
+        assert_eq!(
+            host.invoke(agent, work.clone(), authorization.clone())
+                .unwrap(),
+            RuntimeOutcome::Yielded(yielded.clone())
+        );
+        let pending = host.agents[&agent].driver.image().clone();
+        drop(host);
+        slot.store(60, Ordering::SeqCst);
+        let mut host = LocalAgentHost::open(&root, space(), node(), trust.clone()).unwrap();
+        assert_eq!(host.agents[&agent].driver.image(), &pending);
+        let mut missing_preimage = work.clone();
+        missing_preimage.availability.remove(0);
+        assert!(
+            host.resume_sdk_exact(
+                agent,
+                missing_preimage,
+                authorization.clone(),
+                yielded.clone()
+            )
+            .is_err()
+        );
+        assert_eq!(host.agents[&agent].driver.image(), &pending);
+        assert_eq!(
+            host.resume_sdk_exact(agent, work.clone(), authorization.clone(), yielded.clone())
+                .unwrap(),
+            completed
+        );
+        let terminal = host.agents[&agent].driver.image().clone();
+        assert_eq!(terminal.runtime_state.linear, vec![2]);
+        drop(host);
+        slot.store(70, Ordering::SeqCst);
+        let mut host = LocalAgentHost::open(&root, space(), node(), trust).unwrap();
+        assert_eq!(
+            host.agents[&agent]
+                .driver
+                .physical_invocation_material(record.entry.actor)
+                .unwrap()
+                .actor,
+            record
+        );
+        assert_eq!(
+            host.manage(
+                agent,
+                install_request.clone(),
+                Some(install_receipt),
+                SdkManagementArtifacts::Actor(&actor_package)
+            )
+            .unwrap(),
+            RuntimeOutcome::Management(Ok(ManagementReply::Installed(record.entry.clone())))
+        );
+        assert_eq!(
+            host.invoke(agent, work.clone(), authorization.clone())
+                .unwrap(),
+            completed
+        );
+        assert_eq!(
+            host.resume_sdk_exact(agent, work, authorization, yielded)
+                .unwrap(),
+            completed
+        );
+        assert_eq!(host.agents[&agent].driver.image(), &terminal);
     }
 
     #[test]

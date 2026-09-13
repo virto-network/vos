@@ -1211,3 +1211,27 @@ installation/invocation/continuation lifecycle test or the final release gates.
 The physical Shared custom-runtime management/snapshot/reopen regression also
 passes **1/1** (`r16-management-lane-shared-physical.log`, 1.27s), exercising
 the other production consumer of the common lane rule.
+
+### Opaque Local actor installation and continuation recovery
+
+The production Local opaque-runtime fixture now installs a real signed actor
+package and initializes its declared Linear lane. It resolves the actor through
+the public directory and verifies recovered program bytes, installation ID,
+reservation, incarnation and immutable install-plan lineage. It then yields an
+invocation, cold-reopens the file-backed host, refuses a resume with missing
+required preimages without changing the image, and completes the exact resume.
+A second reopen recovers the actor material and retries the expired install,
+original invocation and completed resume without changing the terminal image.
+
+**42/42 driver, Local host and management-history tests pass**
+(`r16-local-opaque-actor-resume.log`). The initial installation/invocation-only
+version also passed independently (`r16-local-opaque-actor-final.log`, 0.21s).
+Formatting and diff checks pass. This checkpoint changes tests, not production
+behavior or guest artifacts.
+
+This is a physical scripted-PVM **host ABI/persistence** regression: the actor
+package and immutable closure are genuinely admitted, but the custom runtime's
+responses are scripted, not proof that it executes the actor's program. It
+does not cover positive acknowledgement retirement or target-runtime migration
+execution. Those lifecycle edges and application-runtime execution evidence
+remain to be closed, alongside ordinary-Agent finality and final release gates.
