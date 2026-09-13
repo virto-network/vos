@@ -167,7 +167,14 @@ impl CleanAuthorityProjectionClient {
         &mut self,
         selector: AuthorityProjectionSelector,
     ) -> Result<(AuthorityProjectionQuery, T), AgentProductionOwnerError> {
+        let started = Instant::now();
+        tracing::debug!(?selector, "Authority inventory query started");
         self.transport.recover_pending()?;
+        tracing::debug!(
+            ?selector,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Authority inventory pending recovery complete"
+        );
         let query = self
             .authenticator
             .authenticate(self.transport.target(), selector)?;
@@ -178,6 +185,11 @@ impl CleanAuthorityProjectionClient {
             return Err(AgentProductionOwnerError::Authentication);
         }
         let bytes = self.transport.dispatch(query.clone())?;
+        tracing::debug!(
+            ?selector,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Authority inventory query dispatch complete"
+        );
         let response =
             T::decode(&bytes).map_err(|_| AgentProductionOwnerError::InvalidProjection)?;
         if response.encode().ok().as_deref() != Some(bytes.as_slice()) {
@@ -575,6 +587,8 @@ impl AgentProductionOwner {
         // evidence through the lifecycle. Errors invalidate prior delivery
         // deduplication instead of leaving a stale success available.
         let previous = self.completed_local_publication.take();
+        let started = Instant::now();
+        tracing::debug!(agent = ?descriptor.identity.agent, "Local Create lifecycle started");
         let had_local_attachment = !self.local.is_empty();
         let (lifecycle, capacity) = self
             .lifecycle
@@ -583,6 +597,7 @@ impl AgentProductionOwner {
         let result = lifecycle
             .create(descriptor, call, runtime)
             .map_err(AgentProductionOwnerError::Lifecycle)?;
+        tracing::debug!(agent = ?result.0, elapsed_ms = started.elapsed().as_millis() as u64, "Local Create lifecycle complete");
         if self.local.is_empty() {
             self.local = OwnedRouteSlot::Pending(lifecycle.local_attachment(*capacity)?);
         }
@@ -594,12 +609,14 @@ impl AgentProductionOwner {
             had_local_attachment,
         ) {
             self.completed_local_publication = previous;
+            tracing::debug!(agent = ?result.0, elapsed_ms = started.elapsed().as_millis() as u64, "Local Create exact publication reused");
             return Ok(result);
         }
         // The controller released both host locks before route reconciliation.
         // Errors leave durable application evidence for an exact retry.
         self.reconcile()?;
         self.completed_local_publication = self.accepted_head.map(|head| (acknowledgement, head));
+        tracing::debug!(agent = ?result.0, elapsed_ms = started.elapsed().as_millis() as u64, "Local Create publication complete");
         Ok(result)
     }
 
@@ -638,11 +655,18 @@ impl AgentProductionOwner {
     }
 
     fn reconcile_at(&mut self, now: Instant) -> Result<(), AgentProductionOwnerError> {
+        let started = Instant::now();
+        tracing::debug!("Authority inventory reconciliation started");
         // A new attempt can change or retire attachments even if it fails.
         // Only a subsequent successful lifecycle publication may remember a
         // response again; reopening always starts without this optimization.
         self.completed_local_publication = None;
         let inventory = self.source.load_inventory()?;
+        tracing::debug!(
+            agents = inventory.agents.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Authority inventory loaded; reconciling routes"
+        );
         accept_head(self.accepted_head, inventory.head)?;
         validate_root_provenance(&inventory, self.system_agent)?;
         let _authenticated_principal = inventory.principal;
@@ -700,6 +724,10 @@ impl AgentProductionOwner {
             .max(now)
             .checked_add(self.reconcile_interval)
             .ok_or(AgentProductionOwnerError::InvalidConfiguration)?;
+        tracing::debug!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Authority route reconciliation complete"
+        );
         Ok(())
     }
 

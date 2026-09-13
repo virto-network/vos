@@ -3883,6 +3883,58 @@ its stores or ports. No production failure was fixed by changing the signed
 request, and no release, arbitrary actor, or Shared-finality certification is
 claimed from this failed campaign.
 
+### Corrected live denial and successor publication deadline
+
+The first campaign's daemon (`native-denial-smoke.mmLNc8`) subsequently exited
+0 and removed its endpoint. A separate fresh directory,
+`target/native-denial-smoke.WkFgbh`, reused only the released loopback ports
+18083/2225, not the old lifecycle data. It became ready at
+`2026-09-13T12:18:35Z`, about 83 seconds after launch. The production binary
+still contains `50840aeb`; subsequent source changes before this run were only
+the opt-in test and documentation.
+
+The corrected real-daemon test performed authenticated sequence discovery and
+then received a verified signed denial after one HTTP 504 and an exact retry.
+It durably retained CND1, resumed the denied operation locally, confirmed CRS1
+Denied, and admitted a new credential reservation with fresh sequence discovery.
+The denied Agent was
+`ae90a229062b899655ac4f584646971528fa1114c73ca4eb6942f37e1c2847c3`.
+This closes real HTTP delivery and local client completion of the canonical
+denial path, but **the complete campaign failed** (752.21s, `client-test.log`).
+
+The valid successor, Agent
+`63625d0441fe106acdd58d0365da4ba01ff68bdfad85a2e8b26cf107bb151a1c`,
+created its Local image and published CMR2 by `12:29:34Z`. All four allowed
+submission waits nevertheless returned 504, so no verified client ACK or exact
+ACK-repeat result was obtained. A separately recorded, additional ordinary CLI
+`--resume` also returned 504 (`followup-resume.log`; its JSON output is empty).
+The bounded test was not changed to count that extra attempt as success. All
+original requests, certificate and lifecycle files remain intact. Do not infer
+successful route publication from the Local image or CMR2 alone.
+
+A five-second CPU sample found 84.81% of 237 samples in
+`blake2b_simd::avx2::compress1_loop` on the system-agent thread
+(`daemon.perf.data`, `daemon-profile.txt`). A second short sample showed hashing
+and interpreter work but could not reconstruct reliable callers
+(`daemon-callers.perf.data`). The hash implementation is already optimized by
+the dev/test package profile. These samples locate CPU cost, not its root cause;
+no verification, replay, or hashing checks were removed. Kernel ptrace policy
+prevented a function-only debugger attachment (`daemon-stacks.log`); no kernel
+settings were changed.
+
+Debug-level phase timing is now added for lifecycle completion, exact publication
+reuse, inventory pending recovery/dispatch, inventory loading, and route
+reconciliation. Next rebuild the CLI in this worktree's own target and resume
+the preserved operation with
+`RUST_LOG=info,vos::agent::production_owner=debug`, after confirming the current
+daemon has terminated. The original daemon received SIGINT after the diagnostic
+attempt; do not reuse its stores while it remains live. This timing change is
+diagnostic, not a claimed latency fix. Production responsiveness, fresh restart
+and successful ACK delivery remain open, alongside the existing install/invoke,
+Shared finality and full release gates. Keep this evidence within C2.
+All 5 production-owner regressions passed after the timing change (0.20s,
+shared scratch `r16-publication-timing.log`); this is not a new daemon run.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its
