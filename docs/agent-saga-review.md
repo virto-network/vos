@@ -159,8 +159,9 @@ Keep these as work within C2, not new review batches:
    exact physical Authority dispatch. The CSF1 store pair and native owner
    execution boundary are implemented and tested below. The native coordinator
    adapter now passes disk-backed fixture checks; the production immutable
-   journal backend also passes its CLI regression suite. Startup recovery and
-   daemon/controller wiring remain open. Preparation and an API
+   journal backend also passes its CLI regression suite. Exact operation
+   admission now passes native owner reopen before/after policy execution;
+   daemon/controller wiring and terminal recovery remain open. Preparation and an API
    credential do not issue an actor
    receipt. Retain the signed AOC5, exact authorization context and issuance
    slot before policy dispatch, and recover the exact issued preimages before
@@ -5294,6 +5295,51 @@ before normal routes and connect the coordinator/store pair to the daemon;
 then prove genuinely approved native issuance, successful AOI1 consumption,
 denial/success retirement and protected mutation/restart. The branch remains
 limited to isolated disposable testing, not master-ready deployment.
+
+### Exact operation admission at native owner startup
+
+`NativeAuthorityOperationStartupAdmission` loads the complete bounded NOD1
+discovery set while borrowing the journal lease. Missing/duplicate/zero IDs,
+wrong Authority/key, malformed records and issuance records without their exact
+authorization predecessor are rejected. Issuance references must match the
+saved call commitment and cannot predate its authorization slot. This is scope
+validation, not evidence that the native guest approved issuance.
+
+The production file backend exposes complete discovery plus admission loading
+as one borrowed operation. The native owner's new
+`open_or_bootstrap_with_operation_admission` entry point merges the saved
+anchor/envelope pairs into the existing management recovery barrier before
+route attachment. The physical host still authenticates anchors and checks
+admission compatibility; stored bytes alone cannot authorize execution. Pending
+projection coexistence remains fail-closed. Nonempty operation recovery against
+an incomplete/missing bootstrap is rejected before invoking a fresh-plan
+factory. Existing lifecycle-only callers retain their previous entry point.
+
+The new physical test closes the owner and reopens the actual journal-backed
+host before policy execution, then closes/reopens it again after the durable
+denial, advancing the clock each time. Exact native dispatch returns the same
+reply with only one transition total and unchanged NOD1 bytes. It passes in
+**6.90s** (`r16-native-operation-startup-final.log`). The initial compile used
+an unavailable Result helper; that compatibility error was corrected before
+the passing run. The combined native operation regression also passes:
+**three passed in 16.73s** (`r16-native-operation-startup-regression.log`),
+covering owner reopen, coordinator denial and physical dispatch/issuance
+binding. All **211 CLI tests pass, zero fail, five ignored**, in 10.38s
+(`r16-native-operation-startup-cli.log`), including complete leased discovery,
+duplicate/over-limit/wrong-target rejection and exact reopen. Logs remain under
+the shared disk-backed `target/task-tmp`.
+The existing native lifecycle startup retirement-before-route-publication
+regression also passes: **one passed in 14.01s**
+(`r16-native-operation-startup-lifecycle.log`). Formatting and diff checks pass.
+
+This is native owner recovery evidence, not a live daemon operation endpoint.
+Production startup/controller ownership of the journal and issuer/coordinator
+pair still needs wiring. All discovered operation records currently describe
+pending admission: terminal retirement classification, denial resolution and
+capacity reclamation remain required before treating completed operations as
+safe to release. No records may be deleted to bypass those gates. Genuinely
+approved issuance, successful AOI1 consumption and protected mutation/restart
+are still unproved. No guest artifacts changed; C1/C2/C3 review scope remains.
 
 ### Durable client acknowledgement before completion
 

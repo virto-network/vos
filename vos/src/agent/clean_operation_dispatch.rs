@@ -48,6 +48,73 @@ pub trait NativeAuthorityOperationJournalStore {
     fn retain(&mut self, invocation: InvocationId, record: &[u8]) -> Result<(), Self::Error>;
 }
 
+/// Exact pending admission loaded while the journal's writer lease is held.
+/// This is not approval or retirement evidence. Native attachment independently
+/// authenticates every saved anchor before exposing the recovered route.
+pub struct NativeAuthorityOperationStartupAdmission<'a> {
+    pub(super) authority: AuthorityActorTarget,
+    pub(super) pending: Vec<(ManagementJournalAnchor, RuntimeWork)>,
+    _lease: core::marker::PhantomData<&'a mut ()>,
+}
+
+impl<'a> NativeAuthorityOperationStartupAdmission<'a> {
+    /// Supply the complete bounded discovery set, including initial stages.
+    /// Missing or duplicate records are errors, never empty recovery state.
+    pub fn load<J: NativeAuthorityOperationJournalStore>(
+        journal: &'a mut J,
+        authority: AuthorityActorTarget,
+        invocations: &[InvocationId],
+    ) -> Result<Self, SharedAgentHostError> {
+        let maximum = 2 * crate::agent::authority_operation_coordinator::MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS;
+        if !authority.is_valid() || invocations.len() > maximum {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let mut records = std::collections::BTreeMap::new();
+        for &invocation in invocations {
+            if invocation == InvocationId::ZERO || records.contains_key(&invocation) {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            let bytes = journal
+                .load(invocation)
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .ok_or(SharedAgentHostError::Unavailable)?;
+            if !native_operation_record_matches(authority, invocation, &bytes) {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            let record = RetainedAuthorityOperationDispatch::decode(&bytes)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            records.insert(invocation, record);
+        }
+        for record in records.values() {
+            if record.request.method == AuthorityOperationActorMethod::AcknowledgeIssuance {
+                let ack = AuthorityOperationIssuanceAck::decode(&record.request.request)
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                let predecessor = records
+                    .get(&ack.authorization_invocation)
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                if predecessor.request.method != AuthorityOperationActorMethod::AuthorizeOperation {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                let call = AuthorityOperationCall::decode(&predecessor.request.request)
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                if ack.operation_call != call.commitment()
+                    || ack.issued_at < predecessor.request.context.observed_slot
+                {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+            }
+        }
+        Ok(Self {
+            authority,
+            pending: records
+                .into_values()
+                .map(|record| (record.anchor, record.envelope))
+                .collect(),
+            _lease: core::marker::PhantomData,
+        })
+    }
+}
+
 /// Trusted coordinator adapter: all successful replies come from physical
 /// execution/replay, never from cached unsigned approval bytes. Authorization
 /// must have been captured durably before constructing the coordinator.

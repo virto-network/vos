@@ -111,6 +111,55 @@ fn record(sequence: u64, native_gas: u64) -> (AuthorityActorTarget, InvocationId
 }
 
 #[test]
+fn operation_journal_startup_admission_preserves_complete_leased_records() {
+    use vos::agent::clean_bootstrap::NativeAuthorityOperationStartupAdmission;
+    let fixture = Fixture::new("operation-journal-admission");
+    let (authority, invocation, bytes) = record(1, 100);
+    let mut journal =
+        CleanNativeAuthorityOperationJournal::open_or_create(&fixture.root, authority).unwrap();
+    drop(journal.startup_admission().unwrap());
+    journal.retain(invocation, &bytes).unwrap();
+    let saved = fs::read(fixture.root.join(hex::encode(invocation.0))).unwrap();
+    let admission = journal.startup_admission().unwrap();
+    assert!(matches!(
+        CleanNativeAuthorityOperationJournal::open_existing(&fixture.root, authority),
+        Err(CleanFileStoreError::Busy)
+    ));
+    drop(admission);
+    assert!(
+        NativeAuthorityOperationStartupAdmission::load(
+            &mut journal,
+            authority,
+            &[invocation, invocation],
+        )
+        .is_err()
+    );
+    assert!(
+        NativeAuthorityOperationStartupAdmission::load(
+            &mut journal,
+            authority,
+            &vec![invocation; MAX_OPERATION_JOURNAL_RECORDS + 1],
+        )
+        .is_err()
+    );
+    let mut wrong = authority;
+    wrong.system_agent = AgentId([0x93; 32]);
+    assert!(
+        NativeAuthorityOperationStartupAdmission::load(&mut journal, wrong, &[invocation],)
+            .is_err()
+    );
+    assert_eq!(
+        fs::read(fixture.root.join(hex::encode(invocation.0))).unwrap(),
+        saved
+    );
+    drop(journal);
+    let mut journal =
+        CleanNativeAuthorityOperationJournal::open_existing(&fixture.root, authority).unwrap();
+    drop(journal.startup_admission().unwrap());
+    assert_eq!(journal.load(invocation).unwrap(), Some(bytes));
+}
+
+#[test]
 fn operation_journal_is_immutable_scoped_and_exclusively_leased() {
     let fixture = Fixture::new("operation-journal");
     let (authority, invocation, bytes) = record(1, 100);

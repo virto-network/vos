@@ -11,7 +11,7 @@ pub(crate) mod operation_dispatch;
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 pub use operation_dispatch::{
     MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES, NativeAuthorityOperationJournalStore,
-    native_operation_record_matches,
+    NativeAuthorityOperationStartupAdmission, native_operation_record_matches,
 };
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
@@ -1417,8 +1417,8 @@ where
     /// durable state is rejected without consulting `fresh_plan`.
     #[allow(clippy::too_many_arguments)]
     pub fn open_or_bootstrap_with_factory<S, F>(
-        mut pins_store: P,
-        mut record_store: R,
+        pins_store: P,
+        record_store: R,
         issuer_store: I,
         signer: &mut S,
         fresh_plan: F,
@@ -1437,6 +1437,52 @@ where
         S: CleanManagementReceiptSigner,
         F: FnOnce() -> Result<AuthorizedCleanSystemAgentBootstrap, CleanSystemAgentBootstrapError>,
     {
+        Self::open_or_bootstrap_with_operation_admission(
+            pins_store,
+            record_store,
+            issuer_store,
+            signer,
+            fresh_plan,
+            shared_host_root,
+            stable_lock_path,
+            expected_space,
+            expected_node,
+            trust,
+            merge,
+            finality,
+            genesis,
+            network,
+            lifecycle,
+            None,
+        )
+    }
+
+    /// Restore exact operation admission together with lifecycle recovery,
+    /// before checkpointing or publishing the system route. The operation
+    /// journal must remain leased throughout recovery and subsequent dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_or_bootstrap_with_operation_admission<S, F>(
+        mut pins_store: P,
+        mut record_store: R,
+        issuer_store: I,
+        signer: &mut S,
+        fresh_plan: F,
+        shared_host_root: impl AsRef<Path>,
+        stable_lock_path: impl AsRef<Path>,
+        expected_space: SpaceId,
+        expected_node: NodeId,
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+        finality: Arc<dyn AgentGenesisFinalityVerifier>,
+        genesis: Arc<dyn SystemAgentGenesisProvider>,
+        network: Arc<Network>,
+        lifecycle: Option<&super::local_lifecycle::LocalLifecycleStartupAdmission>,
+        operations: Option<&NativeAuthorityOperationStartupAdmission<'_>>,
+    ) -> Result<Self, CleanSystemAgentBootstrapError>
+    where
+        S: CleanManagementReceiptSigner,
+        F: FnOnce() -> Result<AuthorizedCleanSystemAgentBootstrap, CleanSystemAgentBootstrapError>,
+    {
         let shared_host_root = shared_host_root.as_ref();
         let stable_lock_path = stable_lock_path.as_ref();
         let loaded_pins = pins_store
@@ -1445,6 +1491,14 @@ where
         let loaded_record = record_store
             .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
             .map_err(|_| CleanSystemAgentBootstrapError::RecordStorage)?;
+        if operations.is_some_and(|admission| !admission.pending.is_empty())
+            && loaded_record.as_deref().is_none_or(|bytes| {
+                !CleanSystemAgentBootstrapRecord::decode(bytes)
+                    .is_ok_and(|record| record.phase == CleanSystemAgentBootstrapPhase::Complete)
+            })
+        {
+            return Err(rejected(CleanSystemAgentBootstrapRejection::InvalidRecord));
+        }
         let plan = match (loaded_pins.as_deref(), loaded_record.as_deref()) {
             (None, Some(_)) => {
                 return Err(rejected(CleanSystemAgentBootstrapRejection::MissingPins));
@@ -1497,6 +1551,7 @@ where
             genesis,
             network,
             lifecycle,
+            operations,
         )
     }
 
@@ -1533,6 +1588,7 @@ where
             genesis,
             network,
             None,
+            None,
         )
     }
 
@@ -1553,10 +1609,13 @@ where
         genesis: Arc<dyn SystemAgentGenesisProvider>,
         network: Arc<Network>,
         lifecycle: Option<&super::local_lifecycle::LocalLifecycleStartupAdmission>,
+        operations: Option<&NativeAuthorityOperationStartupAdmission<'_>>,
     ) -> Result<Self, CleanSystemAgentBootstrapError> {
         plan.validate()
             .map_err(CleanSystemAgentBootstrapError::Rejected)?;
-        if lifecycle.is_some_and(|admission| admission.authority != plan.authority_target()) {
+        if lifecycle.is_some_and(|admission| admission.authority != plan.authority_target())
+            || operations.is_some_and(|admission| admission.authority != plan.authority_target())
+        {
             return Err(rejected(CleanSystemAgentBootstrapRejection::WrongAuthority));
         }
         let current_slot = validate_plan_scope(
@@ -1795,18 +1854,30 @@ where
             }
         }
         let management = lifecycle.filter(|admission| !admission.is_empty());
-        if management.is_some() && record.pending_projection.is_some() {
+        let operations = operations.filter(|admission| !admission.pending.is_empty());
+        if (management.is_some() || operations.is_some()) && record.pending_projection.is_some() {
             return Err(CleanSystemAgentBootstrapError::Host(
                 SharedAgentHostError::Conflict,
             ));
         }
-        let network_host = if let Some(admission) = management {
+        let network_host = if management.is_some() || operations.is_some() {
+            let mut pending: Vec<_> = management
+                .into_iter()
+                .flat_map(|admission| admission.pending.iter().flatten().cloned())
+                .collect();
+            pending.extend(
+                operations
+                    .into_iter()
+                    .flat_map(|admission| admission.pending.iter().cloned()),
+            );
             SharedAgentNetworkHost::attach_recovering_management_set(
                 Arc::clone(&host),
                 network,
                 crate::service::AgentId(plan.pins.agent.0),
-                admission.pending.iter().flatten().cloned().collect(),
-                admission.retirements.clone(),
+                pending,
+                management
+                    .map(|admission| admission.retirements.clone())
+                    .unwrap_or_default(),
             )
         } else if let Some(pending) = &record.pending_projection {
             let (work, authorization) = pending
@@ -9850,6 +9921,108 @@ mod tests {
                 }
                 write_operation_test_image(&self.path(invocation), record)
             }
+        }
+
+        #[test]
+        fn native_operation_admission_reopens_before_and_after_policy_execution() {
+            use crate::agent::authority_operation_coordinator::{
+                AuthorityOperationActorDispatcher as _, tests::unenrolled_native_dispatch,
+            };
+            use crate::agent::clean_bootstrap::operation_dispatch::NativeAuthorityOperationDispatcher;
+            let mut harness = NativeProjectionOwnerHarness::with_fixture(
+                "native-operation-startup",
+                native_bundled_authority_fixture(),
+            );
+            let mut owner = harness.owner.take().unwrap();
+            let target = owner.authority_target();
+            let slot = owner
+                .supervisor_invocation_material(owner.pins.agent, target.binding.issuer.actor)
+                .unwrap()
+                .observed_slot;
+            let request = unenrolled_native_dispatch(target, slot);
+            let mut journal = OperationTestJournal(harness._directory.0.clone());
+            owner
+                .capture_authority_operation_dispatch(&request, |record| {
+                    journal
+                        .retain(request.context.invocation, &record.encode().unwrap())
+                        .map_err(|_| SharedAgentHostError::Unavailable)
+                })
+                .unwrap();
+            let original = journal.load(request.context.invocation).unwrap().unwrap();
+            let before = owner.ordered_index_for_test().unwrap();
+            assert!(
+                NativeAuthorityOperationStartupAdmission::load(
+                    &mut journal,
+                    target,
+                    &[request.context.invocation, request.context.invocation],
+                )
+                .is_err()
+            );
+            assert!(
+                NativeAuthorityOperationStartupAdmission::load(
+                    &mut journal,
+                    target,
+                    &[InvocationId([0xf1; 32])],
+                )
+                .is_err()
+            );
+            let mut first_reply = None;
+            for restart in 0..2 {
+                let pins = owner._pins_store.clone();
+                let record = owner.record_store.clone();
+                let issuer = owner.issuer.into_store();
+                drop(owner._network_host);
+                drop(owner.host);
+                harness
+                    .fixture
+                    .logical_slot
+                    .as_ref()
+                    .unwrap()
+                    .store(slot + 10 + restart, Ordering::Release);
+                let admission = NativeAuthorityOperationStartupAdmission::load(
+                    &mut journal,
+                    target,
+                    &[request.context.invocation],
+                )
+                .unwrap();
+                owner = CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+                    pins,
+                    record,
+                    issuer,
+                    &mut CountingSigner::new(),
+                    || panic!("operation recovery must not recreate bootstrap"),
+                    harness._directory.host(),
+                    harness._directory.lock(),
+                    harness.fixture.plan.pins.space,
+                    harness.fixture.plan.pins.node,
+                    harness.fixture.trust.clone(),
+                    harness.fixture.merge.clone(),
+                    harness.fixture.finality.clone(),
+                    harness.provider.clone(),
+                    harness.network.clone(),
+                    None,
+                    Some(&admission),
+                )
+                .unwrap();
+                drop(admission);
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before + restart);
+                let reply = NativeAuthorityOperationDispatcher::new(&mut owner, &mut journal)
+                    .dispatch(&request)
+                    .unwrap();
+                if let Some(first) = &first_reply {
+                    assert_eq!(&reply.reply, first);
+                } else {
+                    first_reply = Some(reply.reply.clone());
+                }
+                assert!(reply.authenticated && reply.durable);
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before + 1);
+                assert_eq!(
+                    journal.load(request.context.invocation).unwrap(),
+                    Some(original.clone())
+                );
+            }
+            harness.owner = Some(owner);
+            harness.stop();
         }
 
         #[test]

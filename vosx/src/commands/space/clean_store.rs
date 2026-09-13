@@ -469,6 +469,23 @@ pub(crate) struct CleanNativeAuthorityOperationJournal {
 
 #[cfg(target_os = "linux")]
 impl CleanNativeAuthorityOperationJournal {
+    /// Keep the complete discovery set and writer lease tied to startup.
+    pub(crate) fn startup_admission(
+        &mut self,
+    ) -> Result<
+        vos::agent::clean_bootstrap::NativeAuthorityOperationStartupAdmission<'_>,
+        CleanFileStoreError,
+    > {
+        let invocations = self.discover(MAX_OPERATION_JOURNAL_RECORDS)?;
+        let authority = self.authority;
+        vos::agent::clean_bootstrap::NativeAuthorityOperationStartupAdmission::load(
+            self,
+            authority,
+            &invocations,
+        )
+        .map_err(|_| CleanFileStoreError::Corrupt)
+    }
+
     pub(crate) fn open_or_create(
         path: impl AsRef<Path>,
         authority: vos::agent::sdk::authority::AuthorityActorTarget,
