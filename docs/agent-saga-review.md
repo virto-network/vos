@@ -18,7 +18,9 @@ Fresh-space first start and restart with bundled system actors and HTTP/SSH
 have passed. One recovered Local Create has returned a client-verified
 acknowledgement after native route reconciliation. Exact repeated delivery now
 passes after recovering a recorded HTTP timeout; first-response latency remains
-high. Install/invoke remains unproven, so this
+high. The fresh signed-denial / valid-successor / exact-retry campaign also
+passes at `8abbe363`, but requires two HTTP 504 retries for the valid Create.
+Install/invoke remains unproven, so this
 is not yet a usable ordinary-agent production path.
 The native Local-controller wiring at `ee047d48` passed fresh-data startup and
 restart using the rebuilt CLI (`target/native-local-smoke.DATNas`, details below).
@@ -49,12 +51,15 @@ Canonical unissued denials now positively acknowledge their single runtime
 result and persist signed retirement before releasing admission, including
 signer/write retries and startup recovery. Signed denial is now wired through
 the native queue and HTTP response; the managed Create CLI retains certificates
-before marking reservations denied. Full-daemon denial/retry testing,
+before marking reservations denied. A live signed denial and local denial resume
+passed; the subsequent valid Create timed out, then returned matching verified
+acknowledgements after restart with exact-head inventory reuse. A separate fresh
+combined denial/successor campaign now passes with two timeout retries (details
+below). Fresh latency remains high. Other blockers include
 expiry/abort resolution after approval or issuance,
-full capacity/crash-boundary verification, and
-coexistence with an unfinished projection remain blockers, not deployment-ready
-behavior. Do not delete
-those stores to bypass the recovery check.
+full capacity/crash-boundary verification, and coexistence with an unfinished
+projection. This is not deployment-ready behavior. Do not delete those stores
+to bypass the recovery check.
 
 The integrated library run at `37d6a5720e7e45e4a19850a16a531e6cb316e299`
 completed: **1,663 passed, zero failed, one filtered**, in 1,771.43 seconds.
@@ -3976,9 +3981,81 @@ physical protected-Authority projection regression also passed (1 test, 1.81s,
 `r16-inventory-head-reuse-physical.log`), as did formatting and `git diff --check`.
 The
 change does not alter guest artifacts, authentication, retirement or hard capacity
-limits, and does not yet prove acceptable live latency. Next rebuild and resume
-the preserved operation with phase logging to measure the effect; cold replay,
+limits. The following live check measures the effect; cold replay,
 first-time inventory cost and checkpoint policy remain separate open concerns.
+
+### Verified live retry with exact-head inventory reuse
+
+The worktree-local CLI rebuilt from `8abbe363` in 18.34s
+(`r16-inventory-head-reuse-cli-build.log`). It reopened the preserved
+`target/native-denial-smoke.WkFgbh` data with isolated XDG directories, disabled
+mDNS auto-dial and disk-backed temporary storage. No request, nonce or lifecycle store was
+replaced. `head-reuse-run.log` records start at `2026-09-13T13:04:06Z`, readiness
+at 13:09:59Z, a client-verified MAA2 at 13:10:32Z, and an identical exact-resume
+response at 13:10:33Z. Both retained request hashes matched before and after.
+SIGINT shutdown exited zero at 13:10:33Z and removed the endpoint.
+
+`head-reuse-daemon.log` shows first inventory loading took 156.420s and initial
+route reconciliation completed in 167.995s total. The resumed Create's lifecycle
+took 200ms. Publication performed a fresh authenticated Credential query in
+27.720s, reused pages at the unchanged complete head, physically reconciled
+routes and completed in 32.249s total. The immediate exact retry completed in
+196ms using the separately guarded completed-publication path. Neither CLI
+submission needed a timeout retry in this run.
+
+This proves retained-request delivery and matching retry after reopening the
+previously timed-out operation. It does not turn the earlier fresh campaign's
+failure into a pass: the successor had already persisted CMR2 before this run.
+Cold readiness still took about 354 seconds, and fresh mutations invalidate page
+reuse. Fresh workflow latency and the remaining native lifecycle/release gates
+are not closed by this result.
+
+Current-source SDK checks also passed: all 163 unit tests (0.16s; zero doc tests),
+`--no-default-features` check (0.82s), and all-targets no-default-features Clippy
+with `-D warnings` (5.33s). Logs in the shared disk-backed scratch directory are
+`r16-current-sdk-tests.log`, `r16-current-sdk-no-std.log` and
+`r16-current-sdk-clippy.log`. The complete current vosx binary suite also passed:
+182 tests, zero failures, two opt-in tests ignored, in 8.63s
+(`r16-head-reuse-vosx-tests.log`). The separate live campaign is not included in
+that count. These are leaf checks, not final-source integrated
+release certification. Keep this evidence within C2; root `saga/agents` and
+master remain unmodified.
+
+### Fresh denial, valid successor and exact retry: live pass
+
+The rebuilt `8abbe363` CLI then created a separate disposable space in
+`target/native-denial-head-reuse.XoaplU`, using fresh isolated XDG state and
+the default bundled artifacts. Generated HTTP/SSH listeners remained enabled;
+only their loopback ports changed to 18083/2225. mDNS auto-dial was disabled.
+All scratch and logs stayed on disk, not `/tmp`.
+
+The existing opt-in `real_daemon_denial_resume_then_valid_create` test passed
+without changing its retry bounds: **1 passed, zero failures**, 441.46s,
+183 unrelated tests filtered. It discovered the live credential sequence,
+submitted the deliberately skipped sequence, received and retained a verified
+signed denial on the first attempt, checked local denial resume and the durable
+Denied reservation, then created a valid successor with fresh discovery. The
+successor returned two HTTP 504 responses before exact-request resume obtained
+the verified MAA2. One additional exact resume returned the same acknowledgement.
+This is a fresh complete campaign pass, separate from the earlier preserved-data
+recovery check and its historical failed campaign.
+
+`run.log` records daemon start at `2026-09-13T13:16:38Z`, readiness at 13:18:14Z,
+successful campaign completion at 13:25:35Z and clean zero-exit shutdown with
+endpoint removal at 13:25:36Z. `client-test.log` contains the assertions and
+timeout/retry outcome. `daemon.log` measures valid Create lifecycle at 139.169s,
+changed-head full inventory at 136.478s, and lifecycle through publication at
+278.863s. Subsequent exact publication reuse took 214ms, 208ms and 198ms.
+The complete CLI regression suite ran during initial startup, so startup timing
+is not an isolated performance benchmark.
+
+This closes the bounded fresh denial/successor/repeated-ACK campaign, not the
+latency gate: first Create still exceeds the HTTP response deadline. Next work
+stays within C2: address lifecycle/publication latency without weakening replay
+or acknowledgement requirements, and implement/prove signed native actor
+installation plus real invocation/restart. Ordinary Shared finality, remaining
+C1 recovery/crash/capacity checks, and C3 final-source release gates remain open.
+No artifact repin, review-branch promotion or master-readiness claim is made.
 
 ### Durable client acknowledgement before completion
 
