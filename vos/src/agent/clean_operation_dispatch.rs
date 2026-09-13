@@ -303,6 +303,15 @@ pub(crate) struct RetainedAuthorityOperationDispatch {
     anchor: ManagementJournalAnchor,
 }
 
+/// Ephemeral proof produced only by replaying both successful native phases.
+/// Deliberately not deserializable: restart needs a durable terminal-proof
+/// protocol before this can authorize retirement after either result is gone.
+pub(crate) struct VerifiedNativeOperationCompletion {
+    target: AuthorityActorTarget,
+    authorization: RetainedAuthorityOperationDispatch,
+    acknowledgement: RetainedAuthorityOperationDispatch,
+}
+
 impl RetainedAuthorityOperationDispatch {
     fn new(
         request: AuthorityOperationActorDispatch,
@@ -464,6 +473,152 @@ where
     R: CleanSystemAgentBootstrapStore,
     I: CleanManagementIssuerStore,
 {
+    pub(crate) fn verify_native_operation_completion(
+        &mut self,
+        authorization: &RetainedAuthorityOperationDispatch,
+        acknowledgement: &RetainedAuthorityOperationDispatch,
+        issued: &crate::agent::authority_operation_issuer::IssuedAuthorityOperation,
+    ) -> Result<VerifiedNativeOperationCompletion, SharedAgentHostError> {
+        use crate::Decode as _;
+        if authorization.request.method != AuthorityOperationActorMethod::AuthorizeOperation
+            || acknowledgement.request.method != AuthorityOperationActorMethod::AcknowledgeIssuance
+            || authorization.request.target != self.authority_target()
+            || acknowledgement.request.target != self.authority_target()
+            || issued.receipt != issued.issuance_ack.receipt
+            || acknowledgement.request.request
+                != issued
+                    .issuance_ack
+                    .encode()
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let call = AuthorityOperationCall::decode(&authorization.request.request)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let result = self.execute_authority_operation_dispatch(
+            authorization.request(),
+            authorization.envelope(),
+            authorization.anchor(),
+        )?;
+        let Some(crate::value::Value::Bytes(bytes)) =
+            crate::value::Value::try_decode(&result.reply)
+        else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        let approval = AuthorityOperationApproval::decode(&bytes)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if !issued.issuance_ack.matches_pending(&call, &approval) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let result = self.execute_authority_operation_dispatch(
+            acknowledgement.request(),
+            acknowledgement.envelope(),
+            acknowledgement.anchor(),
+        )?;
+        if crate::value::Value::try_decode(&result.reply) != Some(crate::value::Value::Bool(true)) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Ok(VerifiedNativeOperationCompletion {
+            target: self.authority_target(),
+            authorization: authorization.clone(),
+            acknowledgement: acknowledgement.clone(),
+        })
+    }
+
+    /// Acknowledge both results but keep the reservation held. This phase must
+    /// not be wired into ingress until terminal evidence can be durably saved
+    /// and recovered. It deliberately never calls complete/release retirement.
+    pub(crate) fn acknowledge_native_operation_completion(
+        &mut self,
+        completion: &VerifiedNativeOperationCompletion,
+    ) -> Result<bool, SharedAgentHostError> {
+        if completion.target != self.authority_target() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let pair = [
+            completion.authorization.envelope(),
+            completion.acknowledgement.envelope(),
+        ];
+        let agent = crate::service::AgentId(self.pins.agent.0);
+        self._network_host.ensure_reattached(agent)?;
+        let mut material = self.supervisor_invocation_material(
+            self.pins.agent,
+            completion.target.binding.issuer.actor,
+        )?;
+        material.root_provenance = false;
+        let identity = crate::agent::supervisor_adapters::physical_material_identity(&material)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        for envelope in pair {
+            let RuntimeWork::Invoke {
+                invocation,
+                authorization,
+                observed_slot,
+                ..
+            } = envelope
+            else {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            };
+            if !crate::agent::supervisor_adapters::physical_material_authorizes_reserved_work(
+                &material,
+                identity,
+                RuntimeExecutionContext::Direct,
+                invocation,
+                authorization,
+                *observed_slot,
+            ) {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+        }
+        self._network_host
+            .handoff_management_pending_to_retirement(agent, &[pair])?;
+        let mut changed = false;
+        for envelope in pair {
+            let RuntimeWork::Invoke {
+                invocation,
+                authorization,
+                ..
+            } = envelope
+            else {
+                unreachable!()
+            };
+            if self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .retained_positive_clean_acknowledgement(agent, invocation, authorization)?
+            {
+                continue;
+            }
+            let outcome = self
+                ._network_host
+                .supervisor_acknowledge_management_retirement(
+                    identity,
+                    (**invocation).clone(),
+                    (**authorization).clone(),
+                )?;
+            let crate::agent::sdk::RuntimeOutcome::Acknowledged(Ok(ack)) = outcome else {
+                return Err(SharedAgentHostError::Unavailable);
+            };
+            if ack.invocation != invocation.invocation
+                || ack.actor != invocation.actor
+                || ack.incarnation != invocation.incarnation
+                || ack.deployment != invocation.deployment
+                || ack.mode != invocation.mode
+                || ack.work != invocation.commitment()
+                || ack.authorization != authorization.commitment()
+                || !self
+                    .host
+                    .lock()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                    .retained_positive_clean_acknowledgement(agent, invocation, authorization)?
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            changed = true;
+        }
+        Ok(changed)
+    }
+
     /// Reserve and durably retain the first exact operation invocation before
     /// it is given to the coordinator. The callback runs under admission and
     /// must sync the record without re-entering this owner. A callback error

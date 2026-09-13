@@ -10185,7 +10185,70 @@ mod tests {
             );
             assert_eq!(signer.calls, 2);
             assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
-            drop(operations);
+            let (_, _, mut journal) = operations.into_parts();
+            let authorization_bytes = journal.load(call.invocation).unwrap().unwrap();
+            let acknowledgement_bytes = journal
+                .load(issued.issuance_ack.acknowledgement_invocation)
+                .unwrap()
+                .unwrap();
+            let authorization = operation_dispatch::RetainedAuthorityOperationDispatch::decode(
+                &authorization_bytes,
+            )
+            .unwrap();
+            let acknowledgement = operation_dispatch::RetainedAuthorityOperationDispatch::decode(
+                &acknowledgement_bytes,
+            )
+            .unwrap();
+            assert!(
+                owner
+                    .verify_native_operation_completion(&acknowledgement, &authorization, &issued)
+                    .is_err()
+            );
+            let mut wrong = issued.clone();
+            wrong.issuance_ack.signature[0] ^= 1;
+            assert!(
+                owner
+                    .verify_native_operation_completion(&authorization, &acknowledgement, &wrong)
+                    .is_err()
+            );
+            let completion = owner
+                .verify_native_operation_completion(&authorization, &acknowledgement, &issued)
+                .unwrap();
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+            assert!(
+                owner
+                    .acknowledge_native_operation_completion(&completion)
+                    .unwrap()
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
+            assert!(
+                !owner
+                    .acknowledge_native_operation_completion(&completion)
+                    .unwrap()
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
+            assert_eq!(signer.calls, 2);
+            assert_eq!(
+                journal.load(call.invocation).unwrap(),
+                Some(authorization_bytes)
+            );
+            assert_eq!(
+                journal
+                    .load(issued.issuance_ack.acknowledgement_invocation)
+                    .unwrap(),
+                Some(acknowledgement_bytes)
+            );
+            let (query, query_auth) = fresh_projection_pair(&owner, 0xd7);
+            assert!(matches!(
+                owner._network_host.reserve_projection_pair(
+                    HostAgentId(owner.pins.agent.0),
+                    &query,
+                    &query_auth,
+                    false,
+                ),
+                Err(SharedAgentHostError::Conflict)
+            ));
+            drop(journal);
             drop(owner);
             stop_network(network);
         }
@@ -10770,6 +10833,30 @@ mod tests {
             assert_eq!(repeated, denied);
             assert_eq!(owner.ordered_index_for_test().unwrap(), applied + 1);
             assert_eq!(std::fs::read(&ack_path).unwrap(), saved_ack);
+            let signed_ack =
+                crate::agent::sdk::authority_operation::AuthorityOperationIssuanceAck::decode(
+                    &acknowledgement.request,
+                )
+                .unwrap();
+            let scripted_issued =
+                crate::agent::authority_operation_issuer::IssuedAuthorityOperation {
+                    receipt: signed_ack.receipt.clone(),
+                    issuance_ack: signed_ack,
+                };
+            assert!(
+                owner
+                    .verify_native_operation_completion(&retained, &ack_record, &scripted_issued)
+                    .is_err()
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), applied + 1);
+            owner
+                ._network_host
+                .ensure_management_pending_member(
+                    HostAgentId(owner.pins.agent.0),
+                    retained.anchor(),
+                    retained.envelope(),
+                )
+                .unwrap();
             harness.stop();
         }
 

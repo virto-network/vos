@@ -176,6 +176,8 @@ Keep these as work within C2, not new review batches:
    Real bundled-Authority approval, AOI1 consumption and exact issuance retry
    after owner reopen now pass for an installed executable query fixture.
    This does not prove protected application or terminal result retirement.
+   Native acknowledgement of the successful result pair now passes while
+   deliberately retaining admission; durable terminal proof/release is still open.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
    retirement and restart through native ingress; then expose the same
    preparation/authorization flow in the user-facing client. A Public query
@@ -5520,6 +5522,43 @@ Only test fixtures and coverage changed; no production code or guest artifacts
 were modified. The next required work remains terminal operation retirement,
 retained operation ingress/client wiring and a protected Local mutation with
 restart, followed by the existing broader C2 and C3 gates.
+
+### Native successful-result acknowledgement without release
+
+The native owner can now verify an exact successful operation completion by
+replaying its retained authorization and issuance dispatches. The signed AOI1
+must match the exact AOC5 and actual native AOP5, and native acknowledgement
+execution must return `true`. Receipt/issuance substitution and swapped phases
+are rejected. `VerifiedNativeOperationCompletion` is an opaque, ephemeral value
+with no decoder: unsigned disk bytes cannot manufacture this verification.
+
+Given that value, `acknowledge_native_operation_completion` validates both
+envelopes against current installed material, moves their exact pending pair
+to retirement admission, positively acknowledges each runtime result and
+independently observes the durable acknowledgements. Exact repetition adds no
+transition. This method never calls retirement completion/release and is not
+wired into the controller/ingress path. It must remain unwired until terminal
+evidence can be durably stored and recovered after either result is gone.
+
+The positive physical test passes in **20.17s**
+(`r16-native-operation-result-retirement.log`). After real approval, issuance
+and owner reopen, completion verification adds no transition; the two positive
+result acknowledgements add exactly two, and retry adds none. Signer counts
+and both NOD1 records remain unchanged. An unrelated projection reservation is
+still rejected, proving this step did not prematurely release admission.
+
+The combined native regression passes: **four passed, zero failed**, in
+**33.54s** (`r16-native-operation-result-retirement-regression.log`). The
+negative native case additionally refuses completion verification for signed
+but scripted issuance whose real guest result is denial, with no additional
+transition and the original pending admission still present. Formatting and
+diff checks pass.
+
+Next: durable, independently verifiable terminal evidence before destructive
+result retirement; restart classification and exact release; then application
+and ingress integration. This is not terminal recovery closure, protected
+mutation coverage or permission to delete retained stores. No guest artifacts
+changed. Evidence logs remain in shared disk-backed `target/task-tmp`.
 
 ### Durable client acknowledgement before completion
 
