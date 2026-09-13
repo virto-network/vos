@@ -2298,6 +2298,22 @@ impl IngressHandle {
             .submit(descriptor, call, runtime)
     }
 
+    /// Queue an authenticated Install frame. Acceptance is not application
+    /// success; disconnection does not cancel accepted durable work.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    pub fn install_clean_local_actor(
+        &self,
+        submission: crate::agent::local_lifecycle::LocalInstallSubmission,
+    ) -> Result<
+        mpsc::Receiver<crate::agent::local_lifecycle::LocalInstallResult>,
+        crate::agent::local_lifecycle::LocalLifecycleIngressError,
+    > {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(crate::agent::local_lifecycle::LocalLifecycleIngressError::Unavailable);
+        }
+        self.clean_local_lifecycle_queue.submit_install(submission)
+    }
+
     /// Return the currently exposed clean-generation supervisor. The slot is
     /// populated only after authenticated owner construction and is cleared
     /// before node shutdown begins.
@@ -8157,17 +8173,27 @@ impl VosNode {
     fn drive_clean_agent_owner(&mut self) -> bool {
         match self.clean_local_lifecycle_queue.pop() {
             Ok(Some(request)) if !self.shutdown.load(Ordering::Acquire) => {
-                let result = self.create_clean_local_agent(
-                    request.descriptor,
-                    request.call,
-                    request.runtime,
-                );
-                let _ = request.reply.try_send(result);
+                use crate::agent::local_lifecycle::PendingLocalLifecycle;
+                match request {
+                    PendingLocalLifecycle::Create(request) => {
+                        let result = self.create_clean_local_agent(
+                            request.descriptor,
+                            request.call,
+                            request.runtime,
+                        );
+                        let _ = request.reply.try_send(result);
+                    }
+                    PendingLocalLifecycle::Install { submission, reply } => {
+                        let (install, call, package) = submission.into_parts();
+                        let result = self.clean_agent_owner.as_mut()
+                            .ok_or(crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration)
+                            .and_then(|owner| owner.install_local_actor(install, call, package));
+                        let _ = reply.try_send(result);
+                    }
+                }
             }
             Ok(Some(request)) => {
-                let _ = request.reply.try_send(Err(
-                    crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration,
-                ));
+                request.reject();
             }
             Ok(None) => {}
             Err(_) => {

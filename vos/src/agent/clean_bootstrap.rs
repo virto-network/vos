@@ -9869,6 +9869,10 @@ mod tests {
                     Err(LocalLifecycleIngressError::Busy)
                 ));
                 let pending = queue.pop().unwrap().unwrap();
+                let crate::agent::local_lifecycle::PendingLocalLifecycle::Create(pending) = pending
+                else {
+                    panic!("wrong lifecycle operation");
+                };
                 assert_eq!(pending.descriptor, descriptor);
                 assert_eq!(pending.call, call);
                 pending
@@ -12389,6 +12393,87 @@ mod tests {
         }
 
         #[inline(never)]
+        fn check_install_submission(
+            install: &crate::agent::sdk::InstallActor,
+            call: &AuthorityCredentialCall,
+            package: &AdmittedActorPackage,
+        ) {
+            use crate::agent::local_lifecycle::{
+                LOCAL_LIFECYCLE_QUEUE_CAPACITY, LocalInstallSubmission, LocalLifecycleIngressError,
+                LocalLifecycleQueue, PendingLocalLifecycle,
+            };
+            let submission = || {
+                LocalInstallSubmission::new(install.clone(), call.clone(), package.clone()).unwrap()
+            };
+            let bytes = submission().encode();
+            assert_eq!(
+                LocalInstallSubmission::decode(&bytes).unwrap().encode(),
+                bytes
+            );
+            let (decoded, signed, admitted) =
+                LocalInstallSubmission::decode(&bytes).unwrap().into_parts();
+            assert_eq!(&decoded, install);
+            assert_eq!(&signed, call);
+            assert_eq!(admitted.exact_bytes(), package.exact_bytes());
+            for length in [0, 3, 4, bytes.len() - 1] {
+                assert!(LocalInstallSubmission::decode(&bytes[..length]).is_err());
+            }
+            let mut altered = bytes.clone();
+            altered.push(0);
+            assert!(LocalInstallSubmission::decode(&altered).is_err());
+            altered = bytes.clone();
+            altered[..4].copy_from_slice(b"LCQ1");
+            assert!(LocalInstallSubmission::decode(&altered).is_err());
+            altered = bytes.clone();
+            *altered.last_mut().unwrap() ^= 1;
+            assert!(LocalInstallSubmission::decode(&altered).is_err());
+            let mut invalid = call.clone();
+            invalid.signature[0] ^= 1;
+            assert!(
+                LocalInstallSubmission::new(install.clone(), invalid, package.clone()).is_err()
+            );
+            let mut wrong = install.clone();
+            wrong.package.len += 1;
+            assert!(LocalInstallSubmission::new(wrong, call.clone(), package.clone()).is_err());
+            let queue = LocalLifecycleQueue::default();
+            assert!(matches!(
+                queue.submit_install(submission()),
+                Err(LocalLifecycleIngressError::Unavailable)
+            ));
+            queue.open().unwrap();
+            assert_eq!(queue.open(), Err(LocalLifecycleIngressError::Busy));
+            let mut replies = Vec::new();
+            for _ in 0..LOCAL_LIFECYCLE_QUEUE_CAPACITY {
+                replies.push(queue.submit_install(submission()).unwrap());
+            }
+            assert!(matches!(
+                queue.submit_install(submission()),
+                Err(LocalLifecycleIngressError::Busy)
+            ));
+            let pending = queue.pop().unwrap().unwrap();
+            let PendingLocalLifecycle::Install { submission, reply } = pending else {
+                panic!("wrong operation");
+            };
+            assert_eq!(submission.encode(), bytes);
+            let error =
+                crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration;
+            reply.try_send(Err(error)).unwrap();
+            assert_eq!(replies.remove(0).recv().unwrap(), Err(error));
+            queue.close();
+            for reply in replies {
+                assert_eq!(reply.recv().unwrap(), Err(error));
+            }
+            assert!(queue.pop().unwrap().is_none());
+            queue.open().unwrap();
+            let reply = queue
+                .submit_install(LocalInstallSubmission::decode(&bytes).unwrap())
+                .unwrap();
+            drop(reply);
+            queue.pop().unwrap().unwrap().reject();
+            queue.close();
+        }
+
+        #[inline(never)]
         fn check_install_controller(
             harness: &mut NativeProjectionOwnerHarness,
             root: &Path,
@@ -12449,6 +12534,7 @@ mod tests {
             let ManagementRequest::Install(install) = &request else {
                 unreachable!()
             };
+            check_install_submission(install, &call, &package);
             let before = controller.ordered_index_for_test().unwrap();
             let original = intent.image.lock().unwrap().clone();
             let mut invalid = call.clone();

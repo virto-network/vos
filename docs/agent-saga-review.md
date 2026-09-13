@@ -26,7 +26,8 @@ The native Local Install application and startup-recovery phases now pass
 physical tests from prepared authorization through retirement, including
 pristine client-retry admission. Native Install controller handoff, retry and
 restart now pass; the production-owner wrapper requires an exact active Local
-route after reconciliation. Install ingress/CLI submission and
+route after reconciliation. Install now has signed-frame, bounded native queue
+and HTTP server wiring; CLI submission and
 actual actor method invocation remain unwired/unproven; these phase tests do
 not make actor installation available to users yet.
 The native Local-controller wiring at `ee047d48` passed fresh-data startup and
@@ -4285,6 +4286,50 @@ install/invoke/restart campaign, followed by unresolved denial/expiry/abort and
 crash/capacity cases. C1 recovery and C3 release gates remain open. These commits
 are implementation checkpoints within the three review groups, not new review
 batches; neither root `saga/agents` nor `master` has been promoted.
+
+### Signed Install ingress and shared lifecycle queue
+
+LIQ1 carries bounded canonical AMRQ Install, ACC3 credential call and the exact
+admitted VOS3 actor package. Construction checks the Local profile, signed
+request binding, package reference, deployment/program and producer. This is
+request authentication, not policy approval: the controller still independently
+loads and validates the Local descriptor, package requirements and Authority.
+
+Create and Install share one four-entry queue and serial node-owner execution.
+Closing the queue explicitly rejects pending operations; losing a client reply
+does not cancel an accepted operation. Install dispatch reaches the production
+wrapper and therefore requires exact active-route publication before success.
+
+`POST /__agents/local/install` accepts only binary LIQ1 with no query parameters
+or claimed authenticated transport node. Its exact path uses signed-body
+authentication; adjacent application paths retain bearer authentication.
+Success is HTTP 201 with canonical MAA2. Queue saturation/unavailability and
+controller failures return 503; a 120-second wait timeout returns 504. Those
+responses require identical signed retry and do not assert rollback. In
+particular, an Install policy failure is not represented as a completed denial:
+canonical Install denial/expiry/abort completion remains open.
+
+The expanded native controller regression passes (one test, 39.67s,
+`r16-install-ingress-controller.log`). In addition to physical recovery, it
+checks LIQ1 exact round-trip and parts, truncated/trailing/wrong-tag/corrupted
+package rejection, bad signature and package binding, closed/full queue,
+pending reply completion, shutdown rejection and disconnected-client handling.
+An initial compile caught the existing Create queue fixture's old struct
+assumption; it now matches the explicit Create enum variant.
+The existing Create queue regression passes (one test, 2.13s,
+`r16-install-ingress-create-queue.log`). All three HTTP server tests pass in
+0.26s with `pvm,private-agent-store,http-ingress`
+(`r16-install-ingress-http-enabled.log`), covering malformed lifecycle frames,
+exact endpoint routing versus adjacent bearer-protected paths, and status
+responsiveness under saturated workers. The earlier HTTP command omitted
+`http-ingress` and selected zero tests; `r16-install-ingress-http.log` is not
+passing HTTP evidence. Formatting and diff checks pass. Scratch remains on disk
+under the shared target, not `/tmp`.
+
+No CLI Install command, live install/invoke campaign, complete denial handling
+or release readiness is claimed by this server checkpoint. Next is durable
+client preparation/submission with exact MAA2 verification, then the live
+install/invoke/restart campaign. C1/C2/C3 remain the review groups.
 
 ### Durable client acknowledgement before completion
 

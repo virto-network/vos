@@ -24,6 +24,111 @@ pub struct LocalCreateSubmission {
     runtime: AdmittedRuntimePackage,
 }
 
+/// LIQ1 carries an exact signed Install and admitted actor package. Admission
+/// authenticates request bytes, not Authority approval or target availability.
+pub struct LocalInstallSubmission {
+    install: super::sdk::InstallActor,
+    call: AuthorityCredentialCall,
+    package: super::package_admission::AdmittedActorPackage,
+}
+
+impl LocalInstallSubmission {
+    pub const MAX_BYTES: usize = LocalCreateSubmission::MAX_BYTES;
+
+    pub(crate) fn has_transport_node_claim(&self) -> bool {
+        self.call.authenticated_node.is_some()
+    }
+
+    pub fn new(
+        install: super::sdk::InstallActor,
+        call: AuthorityCredentialCall,
+        package: super::package_admission::AdmittedActorPackage,
+    ) -> Result<Self, crate::service::wire::DecodeError> {
+        use crate::service::wire::DecodeError;
+        if call.managed.profile != AgentProfile::Local
+            || install.package != *package.package_ref()
+            || install.entry.deployment != package.deployment()
+            || install.entry.program != package.program()
+            || install.producer != package.producer()
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        install
+            .validate_for_profile(AgentProfile::Local)
+            .map_err(|_| DecodeError::NonCanonical)?;
+        super::clean_management_intent::CleanManagementIntent::new(
+            call.authority,
+            call.managed,
+            ManagementRequest::Install(Box::new(install.clone())),
+            call.clone(),
+            &super::clean_bootstrap::RawCredentialVerifier,
+        )
+        .map_err(|_| DecodeError::NonCanonical)?;
+        Ok(Self {
+            install,
+            call,
+            package,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        use super::sdk::wire::CanonicalWire as _;
+        let mut bytes = b"LIQ1".to_vec();
+        let mut encoder = crate::service::wire::Encoder(&mut bytes);
+        encoder.bytes(
+            &ManagementRequest::Install(Box::new(self.install.clone()))
+                .encode()
+                .expect("validated Install"),
+        );
+        encoder.bytes(&self.call.encode().expect("validated credential call"));
+        encoder.bytes(self.package.exact_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, crate::service::wire::DecodeError> {
+        use super::sdk::wire::CanonicalWire as _;
+        use crate::service::wire::{DecodeError, Decoder};
+        if bytes.len() > Self::MAX_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        if bytes.get(..4) != Some(b"LIQ1") {
+            return Err(DecodeError::InvalidTag);
+        }
+        let mut decoder = Decoder::new(&bytes[4..]);
+        let request = decoder.bytes_ref()?;
+        let call = decoder.bytes_ref()?;
+        let package = decoder.bytes_ref()?;
+        if !decoder.exhausted() {
+            return Err(DecodeError::TrailingBytes);
+        }
+        if request.len() > super::sdk::wire::MAX_MANAGEMENT_REQUEST_WIRE_BYTES
+            || call.len() > super::sdk::wire::MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES
+            || package.len() > super::sdk::package::MAX_PACKAGE_ENCODED_BYTES
+        {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let ManagementRequest::Install(install) =
+            ManagementRequest::decode(request).map_err(|_| DecodeError::NonCanonical)?
+        else {
+            return Err(DecodeError::NonCanonical);
+        };
+        let call = AuthorityCredentialCall::decode(call).map_err(|_| DecodeError::NonCanonical)?;
+        let package = super::package_admission::admit_actor_package(package)
+            .map_err(|_| DecodeError::NonCanonical)?;
+        Self::new(*install, call, package)
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        super::sdk::InstallActor,
+        AuthorityCredentialCall,
+        super::package_admission::AdmittedActorPackage,
+    ) {
+        (self.install, self.call, self.package)
+    }
+}
+
 /// A signed server-side retirement of one exact denied Create. This is not an
 /// application acknowledgement, policy approval, or evidence of a live route.
 /// Construct only by verifying against an independently retained submission.
@@ -178,12 +283,37 @@ pub(crate) struct PendingLocalCreate {
     pub reply: mpsc::SyncSender<LocalCreateResult>,
 }
 
+pub type LocalInstallResult =
+    Result<ManagementApplicationAck, super::production_owner::AgentProductionOwnerError>;
+
+pub(crate) enum PendingLocalLifecycle {
+    Create(PendingLocalCreate),
+    Install {
+        submission: LocalInstallSubmission,
+        reply: mpsc::SyncSender<LocalInstallResult>,
+    },
+}
+
+impl PendingLocalLifecycle {
+    pub(crate) fn reject(self) {
+        let error = super::production_owner::AgentProductionOwnerError::InvalidConfiguration;
+        match self {
+            Self::Create(request) => {
+                let _ = request.reply.try_send(Err(error));
+            }
+            Self::Install { reply, .. } => {
+                let _ = reply.try_send(Err(error));
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct LocalLifecycleQueue {
     channel: Mutex<
         Option<(
-            mpsc::SyncSender<PendingLocalCreate>,
-            mpsc::Receiver<PendingLocalCreate>,
+            mpsc::SyncSender<PendingLocalLifecycle>,
+            mpsc::Receiver<PendingLocalLifecycle>,
         )>,
     >,
 }
@@ -216,12 +346,12 @@ impl LocalLifecycleQueue {
             .ok_or(LocalLifecycleIngressError::Unavailable)?;
         let (reply, receiver) = mpsc::sync_channel(1);
         sender
-            .try_send(PendingLocalCreate {
+            .try_send(PendingLocalLifecycle::Create(PendingLocalCreate {
                 descriptor,
                 call,
                 runtime,
                 reply,
-            })
+            }))
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => LocalLifecycleIngressError::Busy,
                 mpsc::TrySendError::Disconnected(_) => LocalLifecycleIngressError::Unavailable,
@@ -229,7 +359,28 @@ impl LocalLifecycleQueue {
         Ok(receiver)
     }
 
-    pub(crate) fn pop(&self) -> Result<Option<PendingLocalCreate>, LocalLifecycleIngressError> {
+    pub(crate) fn submit_install(
+        &self,
+        submission: LocalInstallSubmission,
+    ) -> Result<mpsc::Receiver<LocalInstallResult>, LocalLifecycleIngressError> {
+        let channel = self
+            .channel
+            .lock()
+            .map_err(|_| LocalLifecycleIngressError::Unavailable)?;
+        let (sender, _) = channel
+            .as_ref()
+            .ok_or(LocalLifecycleIngressError::Unavailable)?;
+        let (reply, receiver) = mpsc::sync_channel(1);
+        sender
+            .try_send(PendingLocalLifecycle::Install { submission, reply })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => LocalLifecycleIngressError::Busy,
+                mpsc::TrySendError::Disconnected(_) => LocalLifecycleIngressError::Unavailable,
+            })?;
+        Ok(receiver)
+    }
+
+    pub(crate) fn pop(&self) -> Result<Option<PendingLocalLifecycle>, LocalLifecycleIngressError> {
         let channel = self
             .channel
             .lock()
@@ -248,9 +399,7 @@ impl LocalLifecycleQueue {
         if let Ok(mut channel) = self.channel.lock() {
             if let Some((_, receiver)) = channel.take() {
                 for pending in receiver.try_iter() {
-                    let _ = pending.reply.try_send(Err(
-                        super::production_owner::AgentProductionOwnerError::InvalidConfiguration,
-                    ));
+                    pending.reject();
                 }
             }
         }
