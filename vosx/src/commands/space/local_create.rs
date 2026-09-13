@@ -178,8 +178,39 @@ pub(crate) fn create_local(
         )?;
     // Verify/re-sync any prior response, but continue exercising the server's
     // exact retry path. A saved response is not a live publication check.
-    acknowledgement_store.load()?;
-    let ack = submit_retained(&request_root, address)?;
+    let saved_ack = acknowledgement_store.load()?;
+    let mut denial_store = super::clean_store::CleanLocalCreateDenialFile::open_or_create(
+        operation.join("denial"),
+        &bytes,
+    )?;
+    if denial_store.load()?.is_some() {
+        anyhow::ensure!(
+            saved_ack.is_none(),
+            "operation has conflicting completion evidence"
+        );
+        reservation.deny(&mut denial_store)?;
+        anyhow::bail!(
+            "Local Create was denied; signed denial retained. Start a new Create without --resume"
+        );
+    }
+    anyhow::ensure!(
+        status != CredentialReservationStatus::Denied,
+        "denied operation is missing its retained certificate"
+    );
+    let ack = match submit_retained_disposition(&request_root, address)? {
+        vos::agent::local_lifecycle::LocalCreateDisposition::Created(_, ack) => ack,
+        vos::agent::local_lifecycle::LocalCreateDisposition::Denied(denial) => {
+            anyhow::ensure!(
+                saved_ack.is_none(),
+                "operation has conflicting completion evidence"
+            );
+            denial_store.publish(denial.exact_bytes())?;
+            reservation.deny(&mut denial_store)?;
+            anyhow::bail!(
+                "Local Create was denied; signed denial retained. Start a new Create without --resume"
+            );
+        }
+    };
     let encoded = ack
         .encode()
         .map_err(|error| anyhow::anyhow!("encode acknowledgement: {error:?}"))?;
@@ -196,6 +227,17 @@ fn post_binary(
     bytes: &[u8],
     maximum: usize,
 ) -> anyhow::Result<Vec<u8>> {
+    post_binary_response(address, path, status, bytes, maximum, false).map(|(_, bytes)| bytes)
+}
+
+fn post_binary_response(
+    address: std::net::SocketAddr,
+    path: &'static str,
+    status: u16,
+    bytes: &[u8],
+    maximum: usize,
+    allow_denial: bool,
+) -> anyhow::Result<(u16, Vec<u8>)> {
     use std::io::Read as _;
     use std::time::Duration;
     anyhow::ensure!(
@@ -210,9 +252,20 @@ fn post_binary(
         .build()
         .post(&format!("http://{address}{path}"))
         .set("Content-Type", "application/octet-stream")
-        .send_bytes(bytes)?;
+        .send_bytes(bytes);
+    let response = match response {
+        Ok(response) => response,
+        Err(ureq::Error::Status(403, response)) if allow_denial => response,
+        Err(error) => return Err(error.into()),
+    };
+    let actual_status = response.status();
+    let maximum = if allow_denial && actual_status == 403 {
+        vos::agent::local_lifecycle::LocalCreateDenial::MAX_BYTES
+    } else {
+        maximum
+    };
     anyhow::ensure!(
-        response.status() == status,
+        actual_status == status || (allow_denial && actual_status == 403),
         "Agent control expected HTTP {status}, received {}",
         response.status()
     );
@@ -229,7 +282,7 @@ fn post_binary(
         reply.len() <= maximum,
         "Agent control reply exceeds the wire limit"
     );
-    Ok(reply)
+    Ok((actual_status, reply))
 }
 
 pub(super) struct CredentialVerifier;
@@ -412,7 +465,20 @@ pub(crate) fn submit_retained(
     root: &std::path::Path,
     address: std::net::SocketAddr,
 ) -> anyhow::Result<vos::agent::sdk::authority::ManagementApplicationAck> {
+    match submit_retained_disposition(root, address)? {
+        vos::agent::local_lifecycle::LocalCreateDisposition::Created(_, ack) => Ok(ack),
+        vos::agent::local_lifecycle::LocalCreateDisposition::Denied(_) => {
+            anyhow::bail!("verified Local Create denial; request retained")
+        }
+    }
+}
+
+fn submit_retained_disposition(
+    root: &std::path::Path,
+    address: std::net::SocketAddr,
+) -> anyhow::Result<vos::agent::local_lifecycle::LocalCreateDisposition> {
     use super::clean_store::CleanLocalCreateRequestFile;
+    use vos::agent::local_lifecycle::LocalCreateDisposition;
     use vos::agent::sdk::wire::MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES;
     anyhow::ensure!(
         address.ip().is_loopback() && address.port() != 0,
@@ -423,14 +489,23 @@ pub(crate) fn submit_retained(
         .load()?
         .ok_or_else(|| anyhow::anyhow!("no retained Local Create request"))?;
     let result = (|| -> anyhow::Result<_> {
-        let reply = post_binary(
+        let (status, reply) = post_binary_response(
             address,
             "/__agents/local",
             201,
             &bytes,
             MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES,
+            true,
         )?;
-        verify_acknowledgement(&bytes, &reply)
+        if status == 403 {
+            let denial = LocalCreateSubmission::decode(&bytes)
+                .and_then(|submission| submission.verify_denial(&reply))
+                .map_err(|error| anyhow::anyhow!("invalid signed denial: {error:?}"))?;
+            Ok(LocalCreateDisposition::Denied(denial))
+        } else {
+            let ack = verify_acknowledgement(&bytes, &reply)?;
+            Ok(LocalCreateDisposition::Created(ack.managed.agent, ack))
+        }
     })();
     // The store and its exclusive lease remain alive through verification.
     result.map_err(|error| {
@@ -678,6 +753,133 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_ne!(changed.into_parts().1.invocation, call.invocation);
+    }
+
+    /// A host-signed certificate fixture, not a claim of Authority execution.
+    /// Native vos tests separately prove the runtime/retirement preconditions.
+    pub(crate) fn denial_fixture() -> (Vec<u8>, Vec<u8>) {
+        use vos::actors::codec::Encode as _;
+        use vos::agent::sdk::wire::CanonicalWire as _;
+        use vos::agent::sdk::*;
+        let (operator, authority, descriptor, runtime) = fixture();
+        let submission = prepare(
+            &operator,
+            authority,
+            descriptor,
+            runtime,
+            NonZeroU64::new(2).unwrap(),
+            10,
+            100,
+        )
+        .unwrap();
+        let request = submission.encode();
+        let (descriptor, call, _) = submission.into_parts();
+        let mut message = vec![vos::actors::value::TAG_DYNAMIC];
+        message.extend(
+            vos::actors::value::Msg::new("authorize")
+                .with(
+                    "call",
+                    vos::actors::value::Value::Bytes(call.encode().unwrap()),
+                )
+                .encode(),
+        );
+        let invocation = InvocationWork {
+            space: authority.space,
+            agent: authority.system_agent,
+            runtime_deployment: authority.system_runtime_deployment,
+            invocation: call.invocation,
+            actor: authority.binding.issuer.actor,
+            incarnation: Hash([19; 32]),
+            deployment: authority.binding.issuer.deployment,
+            program: authority.binding.issuer.program,
+            mode: MethodMode::Linear,
+            origin: InvocationOrigin {
+                principal: Some(call.principal),
+                transport_node: None,
+                credential: Some(call.credential),
+                actor: None,
+                capability: None,
+            },
+            roles: InvocationRoleClaims::none(),
+            message,
+            installation_data: None,
+            availability: vec![],
+            gas: 1,
+            recovery_only: false,
+        };
+        let authorization =
+            InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&invocation, 10));
+        let work = RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
+            state: RuntimeState::default(),
+            invocation: Box::new(invocation),
+            authorization: Box::new(authorization),
+            observed_slot: 10,
+        };
+        fn wire(magic: &[u8]) -> Vec<u8> {
+            let mut bytes = magic.to_vec();
+            bytes.extend_from_slice(&vos::service::PLATFORM_ID.0);
+            bytes
+        }
+        fn field(output: &mut Vec<u8>, bytes: &[u8]) {
+            output.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            output.extend_from_slice(bytes);
+        }
+        let mut intent = wire(b"CMI4");
+        field(
+            &mut intent,
+            &ManagementRequest::Create(Box::new(descriptor))
+                .encode()
+                .unwrap(),
+        );
+        field(&mut intent, &call.encode().unwrap());
+        intent.push(1);
+        field(&mut intent, &work.encode().unwrap());
+        intent.push(0);
+        let mut anchor = wire(b"MJA1");
+        anchor.extend_from_slice(&[21; 96]);
+        anchor.extend_from_slice(&0u64.to_le_bytes());
+        anchor.push(0);
+        intent.push(1);
+        field(&mut intent, &anchor);
+        intent.push(0);
+        let mut message = b"vos/agent/management-denial-retired/v1".to_vec();
+        message.extend_from_slice(
+            Hash::digest(b"vos/agent/management-denial-intent/v1", &[&intent]).as_bytes(),
+        );
+        let signature = operator.sign(&message).unwrap();
+        intent[..4].copy_from_slice(b"CND1");
+        intent.extend_from_slice(&signature);
+        LocalCreateSubmission::decode(&request)
+            .unwrap()
+            .verify_denial(&intent)
+            .unwrap();
+        (request, intent)
+    }
+
+    #[test]
+    fn signed_denial_http_response_requires_exact_certificate() {
+        let (request, denial) = denial_fixture();
+        let response = |body: &[u8]| {
+            let mut bytes = format!("HTTP/1.1 403 Forbidden\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+            bytes.extend_from_slice(body);
+            bytes
+        };
+        assert!(
+            submit_fixture(&request, &response(&denial))
+                .unwrap_err()
+                .to_string()
+                .contains("verified Local Create denial")
+        );
+        let mut corrupt = denial;
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(
+            submit_fixture(&request, &response(&corrupt))
+                .unwrap_err()
+                .to_string()
+                .contains("invalid signed denial")
+        );
+        super::super::clean_store::tests::check_denial_retention(&request, &denial_fixture().1);
     }
 
     #[test]

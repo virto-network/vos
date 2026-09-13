@@ -55,6 +55,9 @@ const LOCAL_REQUEST_ENTRIES: [&str; 3] = [LOCK_FILE, LOCAL_REQUEST_FILE, LOCAL_R
 const LOCAL_ACK_FILE: &str = "local-create.acknowledgement";
 const LOCAL_ACK_STAGE_FILE: &str = "local-create.acknowledgement.next";
 const LOCAL_ACK_ENTRIES: [&str; 3] = [LOCK_FILE, LOCAL_ACK_FILE, LOCAL_ACK_STAGE_FILE];
+const LOCAL_DENIAL_FILE: &str = "local-create.denial";
+const LOCAL_DENIAL_STAGE_FILE: &str = "local-create.denial.next";
+const LOCAL_DENIAL_ENTRIES: [&str; 3] = [LOCK_FILE, LOCAL_DENIAL_FILE, LOCAL_DENIAL_STAGE_FILE];
 const CREDENTIAL_QUERY_FILE: &str = "credential.query";
 const RESERVATION_FILE: &str = "credential.reservation";
 const RESERVATION_STAGE_FILE: &str = "credential.reservation.next";
@@ -160,6 +163,7 @@ enum StoreRole {
     CredentialReservation = 9,
     LocalCreateAcknowledgement = 10,
     LifecycleRuntime = 11,
+    LocalCreateDenial = 12,
 }
 
 impl StoreRole {
@@ -176,6 +180,7 @@ impl StoreRole {
             Self::CredentialReservation => RESERVATION_FILE,
             Self::LocalCreateAcknowledgement => LOCAL_ACK_FILE,
             Self::LifecycleRuntime => LIFECYCLE_RUNTIME_FILE,
+            Self::LocalCreateDenial => LOCAL_DENIAL_FILE,
         }
     }
 
@@ -192,6 +197,7 @@ impl StoreRole {
             Self::CredentialReservation => RESERVATION_STAGE_FILE,
             Self::LocalCreateAcknowledgement => LOCAL_ACK_STAGE_FILE,
             Self::LifecycleRuntime => LIFECYCLE_RUNTIME_STAGE_FILE,
+            Self::LocalCreateDenial => LOCAL_DENIAL_STAGE_FILE,
         }
     }
 
@@ -205,6 +211,7 @@ impl StoreRole {
             Self::LifecycleIssuer => MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
             Self::LocalCreateRequest => 1024 * 1024,
             Self::LifecycleRuntime => MAX_PACKAGE_ENCODED_BYTES,
+            Self::LocalCreateDenial => vos::agent::local_lifecycle::LocalCreateDenial::MAX_BYTES,
             Self::CredentialReservation => 165,
             Self::LocalCreateAcknowledgement => {
                 vos::agent::sdk::wire::MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES
@@ -228,6 +235,7 @@ impl StoreRole {
             9 => Some(Self::CredentialReservation),
             10 => Some(Self::LocalCreateAcknowledgement),
             11 => Some(Self::LifecycleRuntime),
+            12 => Some(Self::LocalCreateDenial),
             _ => None,
         }
     }
@@ -350,6 +358,18 @@ pub(crate) struct CleanLocalCreateRequestFile(ExactFileStore);
 pub(crate) enum CredentialReservationStatus {
     Pending,
     Completed,
+    Denied,
+}
+
+impl CredentialReservationStatus {
+    fn from_tag(tag: u8) -> Self {
+        match tag {
+            0 => Self::Pending,
+            1 => Self::Completed,
+            2 => Self::Denied,
+            _ => unreachable!("validated reservation tag"),
+        }
+    }
 }
 
 /// One local operation at a time for a Space/Credential in this configured
@@ -416,7 +436,7 @@ impl CleanCredentialReservation {
                 || bytes[68..100] == [0; 32]
                 || !match bytes[100] {
                     0 => bytes[101..165] == [0; 64],
-                    1 => bytes[101..133] != [0; 32] && bytes[133..165] != [0; 32],
+                    1 | 2 => bytes[101..133] != [0; 32] && bytes[133..165] != [0; 32],
                     _ => false,
                 }
             {
@@ -438,11 +458,7 @@ impl CleanCredentialReservation {
                         .try_into()
                         .map_err(|_| CleanFileStoreError::Corrupt)?,
                 );
-                let status = if bytes[100] == 0 {
-                    CredentialReservationStatus::Pending
-                } else {
-                    CredentialReservationStatus::Completed
-                };
+                let status = CredentialReservationStatus::from_tag(bytes[100]);
                 Ok((nonce, status))
             })
             .transpose()
@@ -457,11 +473,7 @@ impl CleanCredentialReservation {
         }
         if let Some(current) = self.load()? {
             if current[68..100] == nonce.0 {
-                return Ok(if current[100] == 0 {
-                    CredentialReservationStatus::Pending
-                } else {
-                    CredentialReservationStatus::Completed
-                });
+                return Ok(CredentialReservationStatus::from_tag(current[100]));
             }
             if current[100] == 0 {
                 return Err(CleanFileStoreError::RequestConflict);
@@ -499,7 +511,40 @@ impl CleanCredentialReservation {
                 ack.commitment(),
             )),
         );
-        if current[100] == 1 && current != completed {
+        if current[100] != 0 && current != completed {
+            return Err(CleanFileStoreError::RequestConflict);
+        }
+        self.store.commit(&completed)
+    }
+
+    /// Re-verify and sync the immutable certificate under its lease before
+    /// committing a distinct denied marker. Raw HTTP errors never reach here.
+    pub(crate) fn deny(
+        &mut self,
+        denial: &mut CleanLocalCreateDenialFile,
+    ) -> Result<(), CleanFileStoreError> {
+        use vos::agent::sdk::Hash;
+        let bytes = denial.load()?.ok_or(CleanFileStoreError::RequestConflict)?;
+        let submission =
+            vos::agent::local_lifecycle::LocalCreateSubmission::decode(&denial.request)
+                .map_err(|_| CleanFileStoreError::Corrupt)?;
+        let (descriptor, call, _) = submission.into_parts();
+        if descriptor.identity.space != self.space || call.credential != self.credential {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        let current = self.load()?.ok_or(CleanFileStoreError::RequestConflict)?;
+        if current[68..100] != descriptor.creation_nonce.0 {
+            return Err(CleanFileStoreError::RequestConflict);
+        }
+        let mut completed = self.image(
+            descriptor.creation_nonce,
+            Some((
+                Hash::digest(b"vos/local-create/retained-request/v1", &[&denial.request]),
+                Hash::digest(b"vos/local-create/retained-denial/v1", &[&bytes]),
+            )),
+        );
+        completed[100] = 2;
+        if current[100] != 0 && current != completed {
             return Err(CleanFileStoreError::RequestConflict);
         }
         self.store.commit(&completed)
@@ -615,6 +660,55 @@ impl CleanLocalCreateAcknowledgementFile {
             return Err(CleanFileStoreError::Oversized);
         }
         super::local_create::verify_acknowledgement(&self.request, bytes)
+            .map(|_| ())
+            .map_err(|_| CleanFileStoreError::Corrupt)
+    }
+}
+
+/// Immutable independently verified CND1, retained separately from an MAA2.
+pub(crate) struct CleanLocalCreateDenialFile {
+    store: ExactFileStore,
+    request: Vec<u8>,
+}
+
+impl CleanLocalCreateDenialFile {
+    pub(crate) fn open_or_create(
+        root: impl AsRef<Path>,
+        request: &[u8],
+    ) -> Result<Self, CleanFileStoreError> {
+        CleanLocalCreateRequestFile::validate(request)?;
+        let root = Arc::new(StoreRoot::open_with_entries(
+            root.as_ref(),
+            &LOCAL_DENIAL_ENTRIES,
+        )?);
+        Ok(Self {
+            store: ExactFileStore::new(root, StoreRole::LocalCreateDenial),
+            request: request.to_vec(),
+        })
+    }
+
+    pub(crate) fn load(&mut self) -> Result<Option<Vec<u8>>, CleanFileStoreError> {
+        let bytes = self
+            .store
+            .load(StoreRole::LocalCreateDenial.maximum_bytes())?;
+        if let Some(bytes) = &bytes {
+            self.validate(bytes)?;
+            self.store.commit_with_replacement(bytes, false)?;
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn publish(&mut self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
+        self.validate(bytes)?;
+        self.store.commit_with_replacement(bytes, false)
+    }
+
+    fn validate(&self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
+        if bytes.len() > StoreRole::LocalCreateDenial.maximum_bytes() {
+            return Err(CleanFileStoreError::Oversized);
+        }
+        vos::agent::local_lifecycle::LocalCreateSubmission::decode(&self.request)
+            .and_then(|submission| submission.verify_denial(bytes))
             .map(|_| ())
             .map_err(|_| CleanFileStoreError::Corrupt)
     }
@@ -1063,6 +1157,7 @@ impl ExactFileStore {
             StoreRole::LocalCreateRequest
                 | StoreRole::CredentialQuery
                 | StoreRole::LocalCreateAcknowledgement
+                | StoreRole::LocalCreateDenial
         ) && canonical
             .iter()
             .chain(staged.iter())
@@ -1711,6 +1806,65 @@ fn unlink_at(directory: &File, _root: &Path, name: &str) -> Result<(), CleanFile
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    pub(crate) fn check_denial_retention(request: &[u8], certificate: &[u8]) {
+        let fixture = Fixture::new("denial-retention");
+        let submission =
+            vos::agent::local_lifecycle::LocalCreateSubmission::decode(request).unwrap();
+        let (descriptor, call, _) = submission.into_parts();
+        let mut reservation = CleanCredentialReservation::open_or_create(
+            &fixture.parent,
+            descriptor.identity.space,
+            call.credential,
+        )
+        .unwrap();
+        reservation.reserve(descriptor.creation_nonce).unwrap();
+        let mut denial =
+            CleanLocalCreateDenialFile::open_or_create(&fixture.root, request).unwrap();
+        assert!(reservation.deny(&mut denial).is_err());
+        assert_eq!(
+            reservation.current().unwrap().unwrap().1,
+            CredentialReservationStatus::Pending
+        );
+        assert!(matches!(
+            CleanLocalCreateDenialFile::open_or_create(&fixture.root, request),
+            Err(CleanFileStoreError::Busy)
+        ));
+        denial.publish(certificate).unwrap();
+        let mut corrupt = certificate.to_vec();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(denial.publish(&corrupt).is_err());
+        assert_eq!(denial.load().unwrap().as_deref(), Some(certificate));
+        // Simulate a process ending after certificate publication but before
+        // reservation completion, preserving the exact independently leased files.
+        drop(denial);
+        drop(reservation);
+        let mut denial =
+            CleanLocalCreateDenialFile::open_or_create(&fixture.root, request).unwrap();
+        let mut reservation = CleanCredentialReservation::open_or_create(
+            &fixture.parent,
+            descriptor.identity.space,
+            call.credential,
+        )
+        .unwrap();
+        reservation.deny(&mut denial).unwrap();
+        reservation.deny(&mut denial).unwrap();
+        assert_eq!(
+            reservation.current().unwrap().unwrap().1,
+            CredentialReservationStatus::Denied
+        );
+        assert_eq!(
+            reservation.reserve(descriptor.creation_nonce).unwrap(),
+            CredentialReservationStatus::Denied
+        );
+        assert_eq!(
+            reservation
+                .reserve(vos::agent::sdk::Hash([99; 32]))
+                .unwrap(),
+            CredentialReservationStatus::Pending
+        );
+        assert!(reservation.deny(&mut denial).is_err());
+        assert_eq!(denial.load().unwrap().as_deref(), Some(certificate));
+    }
     use std::io::{Seek as _, SeekFrom};
     #[cfg(unix)]
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};

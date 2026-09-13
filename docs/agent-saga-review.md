@@ -48,7 +48,8 @@ restored reservation; retirement-write retries release only the verified pair.
 Canonical unissued denials now positively acknowledge their single runtime
 result and persist signed retirement before releasing admission, including
 signer/write retries and startup recovery. Signed denial is now wired through
-the native queue and HTTP response; CLI persistence/credential retry bookkeeping,
+the native queue and HTTP response; the managed Create CLI retains certificates
+before marking reservations denied. Full-daemon denial/retry testing,
 expiry/abort resolution after approval or issuance,
 full capacity/crash-boundary verification, and
 coexistence with an unfinished projection remain blockers, not deployment-ready
@@ -3802,6 +3803,48 @@ before a distinct denied reservation marker, exact-response retry after ambiguou
 publication, and actual HTTP/CLI end-to-end tests. This checkpoint does not close
 client denial UX, expiry/abort, installation/invocation, Shared finality, or release
 gates. It belongs in C2 and does not promote the implementation branch.
+
+### Durable client denial and credential release
+
+The managed Create CLI now accepts a binary HTTP 403 only after exact-request
+CND1 verification. It preserves separate response limits: MAA2 retains its
+original bound, CND1 uses its own bound. Textual 403, malformed/substituted or
+oversized certificates, transport errors and unknown statuses remain failures
+with the exact request and pending credential reservation retained.
+
+CSF1 role 12 stores immutable `local-create.denial` under the operation's
+`denial/` directory with an exclusive lease, staged-publication recovery and no
+replacement predecessor. A distinct CRS1 tag 2 records Denied, committing to the
+retained request and a domain-separated certificate digest. The reservation API
+accepts an open denial-file store, re-verifies and synchronizes its certificate
+before committing that marker; raw response bytes or unsigned errors cannot
+complete it. Positive completion cannot replace denial or vice versa.
+
+If a certificate was published before a failed reservation write, `--resume`
+re-verifies it and completes denial locally without requiring another HTTP
+response. A denied marker with missing evidence fails closed on resume, and
+simultaneous acknowledgement/denial files are rejected. The CLI reports the
+verified denial and instructs the user to start a new Create without `--resume`;
+that new nonce goes through fresh authenticated sequence discovery rather than
+incrementing sequence for a denied request. Existing request/certificate files
+remain retained. The lower-level submit-only command still reports a verified
+denial as an error and leaves its exact request; it does not own a credential
+reservation.
+
+All 6 Local Create tests passed (3.12s,
+`r16-denial-client-flow-verified.log`). Coverage includes loopback HTTP delivery
+of host-signed valid/tampered certificates and physical leased denial-file
+publication, reopen before reservation completion, idempotent completion, new
+nonce admission, and refusal to complete a different reservation. An initial
+run failed the existing ACK oversize assertion because the shared response bound
+was widened; response-specific limits fixed it and the final six-test run includes
+the original assertion. The signed fixture models the host certificate, not an
+executed Authority denial; the prior native tests prove runtime prerequisites
+separately. All 45 clean file-store regressions also passed (1.07s,
+`r16-denial-client-stores.log`); formatting and `git diff --check` passed.
+Logs remain in shared disk scratch. A fresh real-daemon Create/deny/
+resume/new-Create campaign and physical crash injection are still required, as
+are the broader native lifecycle, Shared finality and release gates. Fold into C2.
 
 ### Durable client acknowledgement before completion
 
