@@ -261,6 +261,7 @@ pub struct LocalLifecycleRecovery<I: CleanManagementIssuerStore, J: CleanManagem
 /// independently observed from the Local image before acknowledgement signing.
 pub struct LocalLifecycleStartupAdmission {
     pub(crate) authority: super::sdk::authority::AuthorityActorTarget,
+    order: Vec<usize>,
     pub(crate) retirements: Vec<[super::sdk::RuntimeWork; 2]>,
     pub(crate) pending: Vec<
         Vec<(
@@ -296,16 +297,28 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
         let mut retirements = Vec::new();
         let mut pending = Vec::new();
         let mut credentials = Vec::new();
-        for entry in &self.entries {
-            if entry
+        for (index, entry) in self.entries.iter().enumerate() {
+            let retired = entry
                 .intent
                 .retirement_complete()
-                .map_err(|_| SharedAgentHostError::Unavailable)?
-            {
-                continue;
-            }
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
             if let Some(intent) = entry.intent.intent() {
-                credentials.push((intent.call().credential, entry.unissued_creation));
+                credentials.push(RecoveryOrderEntry {
+                    index,
+                    credential: intent.call().credential,
+                    sequence: intent.call().request_sequence.get(),
+                    needs_authorization: entry.unissued_creation,
+                    needs_finalization_preparation: !retired
+                        && entry
+                            .intent
+                            .finalization_work()
+                            .map_err(|_| SharedAgentHostError::Unavailable)?
+                            .is_none(),
+                    ready: retired || entry.issued.is_some() || entry.unissued_creation,
+                });
+            }
+            if retired {
+                continue;
             }
             let authorization = entry
                 .intent
@@ -347,9 +360,70 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
                 _ => return Err(SharedAgentHostError::Conflict),
             }
         }
-        ensure_independent_authorization_recovery(credentials)?;
+        let mut order = ordered_authorization_recovery(credentials)?;
+        let successors: BTreeMap<_, _> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.unissued_creation)
+            .map(|entry| {
+                let call = entry
+                    .intent
+                    .intent()
+                    .expect("validated unissued intent")
+                    .call();
+                (call.credential, call.request_sequence.get())
+            })
+            .collect();
+        // Only already-issued predecessors need early retirement. Independent
+        // unissued calls retain the existing all-authorizations-first pipeline.
+        order.retain(|index| {
+            let entry = &self.entries[*index];
+            let call = entry.intent.intent().expect("ordered intent").call();
+            entry.issued.is_some()
+                && !entry.intent.retirement_complete().unwrap_or(false)
+                && successors
+                    .get(&call.credential)
+                    .is_some_and(|sequence| call.request_sequence.get() < *sequence)
+        });
+        let saved_slot = |index: usize, finalization: bool| -> Result<u64, SharedAgentHostError> {
+            let slot = &self.entries[index].intent;
+            let work = if finalization {
+                slot.finalization_work()
+            } else {
+                slot.authorization_work()
+            }
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+            match work {
+                Some(super::sdk::RuntimeWork::Invoke { observed_slot, .. }) => Ok(*observed_slot),
+                _ => Err(SharedAgentHostError::ScopeMismatch),
+            }
+        };
+        let mut predecessors = order
+            .into_iter()
+            .map(|index| Ok((saved_slot(index, true)?, index)))
+            .collect::<Result<Vec<_>, SharedAgentHostError>>()?;
+        // Stable ties preserve the per-credential order validated above.
+        predecessors.sort_by_key(|(slot, _)| *slot);
+        let earliest_authorization = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.unissued_creation)
+            .map(|(index, _)| saved_slot(index, false))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .min();
+        if predecessors
+            .last()
+            .zip(earliest_authorization)
+            .is_some_and(|((slot, _), authorization)| *slot > authorization)
+        {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let order = predecessors.into_iter().map(|(_, index)| index).collect();
         Ok(LocalLifecycleStartupAdmission {
             authority: self.authority,
+            order,
             retirements,
             pending,
         })
@@ -363,46 +437,86 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
     }
 }
 
-/// Authority requires exact per-credential sequence and retirement of the
-/// previous application. Until recovery can hand off/retire subsets, reject a
-/// dependent set before attachment instead of recording a terminal denial.
-fn ensure_independent_authorization_recovery(
-    calls: impl IntoIterator<Item = (super::sdk::CredentialId, bool)>,
-) -> Result<(), SharedAgentHostError> {
-    let mut credentials = BTreeMap::new();
-    for (credential, needs_authorization) in calls {
-        let (count, pending) = credentials.entry(credential).or_insert((0usize, false));
-        *count += 1;
-        *pending |= needs_authorization;
-        if *count > 1 && *pending {
+struct RecoveryOrderEntry {
+    index: usize,
+    credential: super::sdk::CredentialId,
+    sequence: u64,
+    needs_authorization: bool,
+    needs_finalization_preparation: bool,
+    ready: bool,
+}
+
+/// Sort by signed credential sequence, never by the Agent directory name.
+/// Ambiguous sequence reuse and overtaking a known client-only predecessor
+/// reject before attachment. Authority replay remains the approval boundary.
+fn ordered_authorization_recovery(
+    mut calls: Vec<RecoveryOrderEntry>,
+) -> Result<Vec<usize>, SharedAgentHostError> {
+    calls.sort_unstable_by_key(|call| (call.credential, call.sequence));
+    let mut previous = None;
+    let mut waiting_for_client = false;
+    let mut needs_fresh_clock = false;
+    let mut order = Vec::with_capacity(calls.len());
+    for call in calls {
+        if call.sequence == 0 || previous == Some((call.credential, call.sequence)) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if previous.is_none_or(|(credential, _)| credential != call.credential) {
+            waiting_for_client = false;
+            needs_fresh_clock = false;
+        }
+        // A fresh predecessor finalization can advance the runtime clock past
+        // its successor's immutable authorization envelope. Until live capture
+        // prevents that overlap, reject this set before executing either call.
+        if (waiting_for_client || needs_fresh_clock) && call.needs_authorization {
             return Err(SharedAgentHostError::Conflict);
         }
+        waiting_for_client |= !call.ready;
+        needs_fresh_clock |= call.needs_finalization_preparation;
+        previous = Some((call.credential, call.sequence));
+        order.push(call.index);
     }
-    Ok(())
+    Ok(order)
 }
 
 #[test]
-fn unissued_recovery_rejects_credential_dependencies_before_dispatch() {
+fn unissued_recovery_orders_credentials_and_rejects_ambiguous_predecessors() {
     let a = super::sdk::CredentialId([1; 32]);
     let b = super::sdk::CredentialId([2; 32]);
-    for set in [
-        vec![],
-        vec![(a, true)],
-        vec![(a, true), (b, true)],
-        vec![(a, false), (a, false)],
-    ] {
-        assert!(ensure_independent_authorization_recovery(set).is_ok());
-    }
-    for set in [
-        vec![(a, true), (a, true)],
-        vec![(a, true), (a, false)],
-        vec![(a, false), (a, true)],
-    ] {
-        assert!(matches!(
-            ensure_independent_authorization_recovery(set),
-            Err(SharedAgentHostError::Conflict)
-        ));
-    }
+    let call = |index, credential, sequence, ready| RecoveryOrderEntry {
+        index,
+        credential,
+        sequence,
+        needs_authorization: ready,
+        needs_finalization_preparation: false,
+        ready,
+    };
+    assert_eq!(
+        ordered_authorization_recovery(vec![call(0, a, 2, true), call(1, a, 1, true)]).unwrap(),
+        vec![1, 0]
+    );
+    assert_eq!(
+        ordered_authorization_recovery(vec![call(0, b, 1, true), call(1, a, 1, true)]).unwrap(),
+        vec![1, 0]
+    );
+    assert!(matches!(
+        ordered_authorization_recovery(vec![call(0, a, 1, true), call(1, a, 1, true)]),
+        Err(SharedAgentHostError::ScopeMismatch)
+    ));
+    assert!(matches!(
+        ordered_authorization_recovery(vec![call(0, a, 2, true), call(1, a, 1, false)]),
+        Err(SharedAgentHostError::Conflict)
+    ));
+    assert_eq!(
+        ordered_authorization_recovery(vec![call(0, a, 1, true), call(1, a, 2, false)]).unwrap(),
+        vec![0, 1]
+    );
+    let mut predecessor = call(0, a, 1, true);
+    predecessor.needs_finalization_preparation = true;
+    assert!(matches!(
+        ordered_authorization_recovery(vec![predecessor, call(1, a, 2, true)]),
+        Err(SharedAgentHostError::Conflict)
+    ));
 }
 
 /// Load every discovered candidate through existing-only stores before ingress
@@ -765,6 +879,88 @@ where
                 runtimes.insert(index, load_create_runtime(&mut entry.intent)?);
             }
         }
+        // Verify physical images before advancing any required predecessor.
+        // Its saved finalization clock was checked against every unissued
+        // authorization by startup_admission; no envelope is rewritten.
+        if !admission.order.is_empty() {
+            for entry in &recovery.entries {
+                if let Some(receipt) = &entry.issued {
+                    if entry.observed.is_none()
+                        && matches!(
+                            local.show(entry.agent),
+                            Err(super::local_sdk_host::LocalAgentHostError::NotFound)
+                        )
+                    {
+                        continue;
+                    }
+                    local
+                        .observe_management_application(
+                            entry.agent,
+                            entry
+                                .intent
+                                .intent()
+                                .ok_or(SharedAgentHostError::ScopeMismatch)?
+                                .request(),
+                            receipt,
+                        )
+                        .map_err(|_| SharedAgentHostError::Unavailable)?;
+                }
+            }
+        }
+        for &index in &admission.order {
+            let entry = &mut recovery.entries[index];
+            let intent = entry
+                .intent
+                .intent()
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            let managed = intent.call().managed;
+            let receipt = entry
+                .issued
+                .as_ref()
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            let observation = local
+                .observe_management_application(entry.agent, intent.request(), receipt)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let acknowledgement = entry
+                .issuer
+                .observe_local_application(&observation, &mut signer)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            if entry
+                .observed
+                .as_ref()
+                .is_some_and(|saved| saved != &acknowledgement)
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            entry.observed = Some(acknowledgement.clone());
+            if entry.finalized.is_none() {
+                system.finalize_management_intent_with_admission(
+                    &mut entry.intent,
+                    managed,
+                    &acknowledgement,
+                    &mut entry.issuer,
+                    true,
+                )?;
+                entry.finalized = Some(acknowledgement.clone());
+                let authorization = entry
+                    .intent
+                    .authorization_work()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                let finalization = entry
+                    .intent
+                    .finalization_work()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                system.handoff_recovered_management(&[[authorization, finalization]])?;
+            }
+            system.finish_management_intent_retirement(
+                &mut entry.intent,
+                managed,
+                &acknowledgement,
+                &entry.issuer,
+            )?;
+        }
         // Runtime availability is checked before executing any unissued call.
         // The issuer eligibility check does not replace durable actor replay.
         for entry in &mut recovery.entries {
@@ -882,7 +1078,7 @@ where
                 ]);
             }
         }
-        if !admission.pending.is_empty() {
+        if !recovered_pairs.is_empty() {
             system.handoff_recovered_management(
                 &recovered_pairs
                     .iter()

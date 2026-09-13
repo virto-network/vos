@@ -34,9 +34,13 @@ recovers acknowledgements from durable Local images, completes finalization
 (including protected preparation of a missing envelope), and retires results
 before normal routes. First-time application still requires a valid unexpired
 receipt. A pristine intent without saved authorization remains available for
-client retry rather than automatic dispatch. Unsupported issuer histories,
-dependent unissued requests sharing a credential, or missing required runtime
-artifacts still stop startup, preserving their stores. Continuous live protection and
+client retry rather than automatic dispatch. A same-credential successor can
+now recover after its already-issued predecessor when that predecessor has a
+saved finalization whose clock does not overtake any unissued authorization.
+Startup physically checks and retires those predecessors before dispatching
+successors. Missing predecessor finalization, incompatible saved clocks,
+unsupported issuer histories, or missing required runtime artifacts still stop
+startup, preserving their stores. Continuous live protection and
 coexistence with an unfinished projection
 remain implementation blockers, not deployment-ready behavior. Do not delete
 those stores to bypass the recovery check.
@@ -3461,6 +3465,56 @@ test instead verifies that query admission and refresh remain protected. No
 production release behavior was weakened to satisfy the assertion. Formatting
 and diff checks pass; logs remain in shared disk scratch. No broad native/full
 library rerun, guest rebuild or CLI smoke is claimed for this prerequisite.
+
+### Clock-compatible dependent startup recovery
+
+Startup admission now validates signed credential sequence order independently
+of Agent directory order. It rejects duplicate sequences, a known pristine
+client-only predecessor, and a predecessor needing fresh finalization before
+an unissued successor. Already-issued predecessors with saved finalization can
+complete first using partial pending-to-retirement handoff. Their saved clocks
+must not exceed the earliest unissued authorization clock; ties preserve
+credential order. Physical Local images and required retained runtimes are
+checked before advancing that prefix. Remaining independent requests retain
+the existing all-authorizations-before-fresh-finalizations pipeline.
+
+The native two-agent fixture deliberately makes Agent ID order the reverse of
+signed request order. The compatible case starts with the predecessor's
+authorization accepted and finalization saved, and the successor's authorization
+saved but unaccepted. Recovery uses the real bundled Authority and Local runtime,
+adds exactly seven Ordered entries (one authorization, two finalizations and four
+positive ACKs), and leaves two physical Local images and durable retirement
+markers. Exact retries return verified identical ACKs; a second restart adds no
+Ordered entries. The stores in this fixture are memory-backed and do not claim
+new filesystem crash/lease coverage.
+
+Two negative native cases preserve issuer/intent images and journal position:
+both requests lack finalization, or the successor was captured before its
+predecessor's later finalization clock. These remain explicit startup blockers,
+not terminal denials or rewritten envelopes.
+
+The initial unrestricted sequential experiment failed on the second saved
+authorization with `Completed(Err(AuthoritySlotRegressed))`: fresh predecessor
+finalization advanced slot 22 to 23 while the successor retained slot 22.
+Evidence is `r16-sequential-recovery-diagnostic-outcome.log` in shared disk
+scratch. The final design preserves the runtime check and rejects that set
+before dispatch. Merely sorting requests or retiring the predecessor is not a
+general solution. Continuous live admission must prevent capturing overlapping
+successors until their prerequisites are complete; denial/expiry resolution
+and interrupted-set recovery beyond the supported prefix remain open.
+
+Verification on the final source: **14 native startup tests passed**, zero
+failed, in 175.30s (`r16-sequential-recovery-startup-final.log`); the pure ordering
+and rejection test also passed (`r16-sequential-recovery-order-final.log`).
+Formatting and diff checks pass. Logs are under
+`.worktrees/ch08-c2-native/target/task-tmp`, relative to the main checkout.
+The earlier 13-test run passed on the intermediate pipeline, not the final
+independent-request-preserving implementation; it is not substituted for the
+final run above.
+
+No source freeze, guest rebuild, CLI smoke, broad library rerun or release
+readiness is claimed here. Keep this checkpoint within C2, with C1/C2/C3 as the
+three eventual review batches; root `saga/agents` and `master` are not promoted.
 
 ### Durable client acknowledgement before completion
 

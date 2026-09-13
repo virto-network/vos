@@ -7694,6 +7694,21 @@ mod tests {
         }
 
         #[test]
+        fn native_local_lifecycle_startup_recovers_reverse_agent_order() {
+            native_local_management_lifecycle(20);
+        }
+
+        #[test]
+        fn native_local_lifecycle_startup_rejects_dependent_missing_finalization() {
+            native_local_management_lifecycle(21);
+        }
+
+        #[test]
+        fn native_local_lifecycle_startup_rejects_dependent_clock_regression() {
+            native_local_management_lifecycle(22);
+        }
+
+        #[test]
         fn native_node_rejects_lifecycle_start_after_shutdown_without_leaking_hosts() {
             native_local_management_lifecycle(3);
         }
@@ -7966,6 +7981,289 @@ mod tests {
             harness.stop();
         }
 
+        #[inline(never)]
+        fn check_dependent_lifecycle_recovery(
+            harness: &mut NativeProjectionOwnerHarness,
+            descriptor: AgentDescriptor,
+            runtime: AdmittedRuntimePackage,
+            scenario: u8,
+        ) {
+            let missing_predecessor_finalization = scenario == 21;
+            let regressing_clock = scenario == 22;
+            use crate::agent::local_lifecycle::{
+                LocalLifecycleController, LocalLifecycleStoreFactory,
+                discover_local_lifecycle_recovery,
+            };
+            struct Stores {
+                space: SpaceId,
+                agents: std::collections::BTreeMap<AgentId, (IssuerMemoryStore, IssuerMemoryStore)>,
+            }
+            impl LocalLifecycleStoreFactory for Stores {
+                type Intent = IssuerMemoryStore;
+                type Issuer = IssuerMemoryStore;
+                type Error = ();
+                fn discover(&mut self, space: SpaceId, maximum: usize) -> Result<Vec<AgentId>, ()> {
+                    if space != self.space || self.agents.len() > maximum {
+                        return Err(());
+                    }
+                    Ok(self.agents.keys().copied().collect())
+                }
+                fn open(
+                    &mut self,
+                    space: SpaceId,
+                    agent: AgentId,
+                ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                    self.open_existing(space, agent)
+                }
+                fn open_existing(
+                    &mut self,
+                    space: SpaceId,
+                    agent: AgentId,
+                ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                    if space != self.space {
+                        return Err(());
+                    }
+                    self.agents.get(&agent).cloned().ok_or(())
+                }
+            }
+            let mut second = descriptor.clone();
+            second.creation_nonce = Hash([0xdd; 32]);
+            second.identity.agent = AgentId::derive(
+                second.identity.space,
+                second.identity.owner,
+                second.creation_nonce.as_bytes(),
+            );
+            let mut descriptors = [descriptor, second];
+            descriptors.sort_by_key(|descriptor| std::cmp::Reverse(descriptor.identity.agent));
+            assert!(descriptors[0].identity.agent > descriptors[1].identity.agent);
+            let authority = harness.owner.as_ref().unwrap().authority_target();
+            let key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
+            let calls: Vec<_> = descriptors
+                .iter()
+                .enumerate()
+                .map(|(index, descriptor)| {
+                    descriptor.validate().unwrap();
+                    let request = ManagementRequest::Create(Box::new(descriptor.clone()));
+                    let (mut call, _) = credential_call_and_approval(descriptor, &request, &key);
+                    call.authority = authority;
+                    call.request_sequence = NonZeroU64::new(index as u64 + 1).unwrap();
+                    call.invocation = call.expected_invocation();
+                    call.signature = key.sign(&call.signing_bytes()).to_bytes();
+                    call
+                })
+                .collect();
+            let root = harness._directory.0.join("dependent-local");
+            let local = crate::agent::local_sdk_host::LocalAgentHost::create(
+                &root,
+                descriptors[0].identity.space,
+                harness.fixture.plan.pins.node,
+                harness.fixture.trust.clone(),
+            )
+            .unwrap();
+            let stores = Stores {
+                space: descriptors[0].identity.space,
+                agents: descriptors
+                    .iter()
+                    .map(|descriptor| {
+                        (
+                            descriptor.identity.agent,
+                            (IssuerMemoryStore::default(), IssuerMemoryStore::default()),
+                        )
+                    })
+                    .collect(),
+            };
+            let mut controller = LocalLifecycleController::new(
+                harness.owner.take().unwrap(),
+                local,
+                stores,
+                CountingSigner::new(),
+            )
+            .unwrap();
+            let initial = controller.ordered_index_for_test().unwrap();
+            for index in if regressing_clock { [1, 0] } else { [0, 1] } {
+                let descriptor = &descriptors[index];
+                let call = &calls[index];
+                if regressing_clock && index == 0 {
+                    // Capture the successor first, then let its predecessor's
+                    // saved finalization advance past that immutable clock.
+                    harness
+                        .fixture
+                        .logical_slot
+                        .as_ref()
+                        .unwrap()
+                        .store(LOGICAL_SLOT + 3, Ordering::Release);
+                }
+                // The predecessor has saved finalization at the same clock as
+                // its successor's unaccepted authorization. A missing first
+                // finalization instead must reject before startup dispatch.
+                controller.fail_finalization_once_for_test(
+                    if index == 0 && !missing_predecessor_finalization {
+                        0
+                    } else {
+                        5
+                    },
+                );
+                assert!(matches!(
+                    controller.create(descriptor.clone(), call.clone(), runtime.clone()),
+                    Err(SharedAgentHostError::Unavailable)
+                ));
+            }
+            assert_eq!(
+                controller.ordered_index_for_test().unwrap(),
+                initial + u64::from(!missing_predecessor_finalization)
+            );
+            harness
+                .fixture
+                .logical_slot
+                .as_ref()
+                .unwrap()
+                .store(LOGICAL_SLOT + 3, Ordering::Release);
+            if missing_predecessor_finalization || regressing_clock {
+                let (owner, local, mut stores, _) = controller.into_parts_for_test();
+                let before: Vec<_> = stores
+                    .agents
+                    .values()
+                    .map(|(intent, issuer)| {
+                        (
+                            intent.image.lock().unwrap().clone(),
+                            issuer.image.lock().unwrap().clone(),
+                        )
+                    })
+                    .collect();
+                let recovery =
+                    discover_local_lifecycle_recovery(&mut stores, authority, 2).unwrap();
+                assert!(matches!(
+                    recovery.startup_admission(),
+                    Err(SharedAgentHostError::Conflict)
+                ));
+                let after: Vec<_> = stores
+                    .agents
+                    .values()
+                    .map(|(intent, issuer)| {
+                        (
+                            intent.image.lock().unwrap().clone(),
+                            issuer.image.lock().unwrap().clone(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(before, after);
+                assert_eq!(
+                    owner.ordered_index_for_test().unwrap(),
+                    initial + u64::from(regressing_clock)
+                );
+                assert_eq!(local.list().unwrap().len(), usize::from(regressing_clock));
+                return;
+            }
+            #[inline(never)]
+            fn restart(
+                controller: TestLocalLifecycle<Stores>,
+                harness: &NativeProjectionOwnerHarness,
+                root: &Path,
+                attempt: usize,
+            ) -> TestLocalLifecycle<Stores> {
+                let (old_owner, old_local, mut stores, mut signer) =
+                    controller.into_parts_for_test();
+                let before = old_owner.ordered_index_for_test().unwrap();
+                let pins = old_owner._pins_store.clone();
+                let record = old_owner.record_store.clone();
+                let issuer = old_owner.issuer.into_store();
+                drop(old_owner._network_host);
+                drop(old_owner.host);
+                drop(old_local);
+                let recovery = discover_local_lifecycle_recovery(
+                    &mut stores,
+                    harness.fixture.plan.authority_target(),
+                    2,
+                )
+                .unwrap();
+                assert_eq!(recovery.entries.len(), 2);
+                assert!(recovery.entries[0].agent < recovery.entries[1].agent);
+                assert_eq!(
+                    recovery.entries[0]
+                        .intent
+                        .intent()
+                        .unwrap()
+                        .call()
+                        .request_sequence
+                        .get(),
+                    2
+                );
+                let admission = recovery.startup_admission().unwrap();
+                assert!(admission.retirements.is_empty());
+                assert_eq!(admission.pending.len(), if attempt == 0 { 2 } else { 0 });
+                let reopened = CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_factory(
+                    pins,
+                    record,
+                    issuer,
+                    &mut signer,
+                    || panic!("recovery cannot create a fresh bootstrap plan"),
+                    harness._directory.host(),
+                    harness._directory.lock(),
+                    harness.fixture.plan.pins.space,
+                    harness.fixture.plan.pins.node,
+                    harness.fixture.trust.clone(),
+                    harness.fixture.merge.clone(),
+                    harness.fixture.finality.clone(),
+                    harness.provider.clone(),
+                    harness.network.clone(),
+                    Some(&admission),
+                )
+                .unwrap();
+                assert_eq!(reopened.ordered_index_for_test().unwrap(), before);
+                let local = crate::agent::local_sdk_host::LocalAgentHost::open(
+                    root,
+                    stores.space,
+                    harness.fixture.plan.pins.node,
+                    harness.fixture.trust.clone(),
+                )
+                .unwrap();
+                let controller = LocalLifecycleController::with_recovery(
+                    reopened, local, stores, signer, recovery,
+                )
+                .unwrap();
+                // One remaining authorization, two finalizations, four ACKs.
+                assert_eq!(
+                    controller.ordered_index_for_test().unwrap(),
+                    before + if attempt == 0 { 7 } else { 0 }
+                );
+                controller
+            }
+            let mut acknowledgements = Vec::new();
+            for attempt in 0..2 {
+                controller = std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| restart(controller, harness, &root, attempt))
+                        .join()
+                        .unwrap()
+                });
+                let before = controller.ordered_index_for_test().unwrap();
+                for (index, (descriptor, call)) in descriptors.iter().zip(&calls).enumerate() {
+                    let result = controller
+                        .create(descriptor.clone(), call.clone(), runtime.clone())
+                        .unwrap();
+                    assert_eq!(result.0, descriptor.identity.agent);
+                    assert_eq!(result.1.credential_call, call.commitment());
+                    result.1.verify_with(&RawCredentialVerifier).unwrap();
+                    if attempt == 0 {
+                        acknowledgements.push(result);
+                    } else {
+                        assert_eq!(result, acknowledgements[index]);
+                    }
+                }
+                assert_eq!(controller.ordered_index_for_test().unwrap(), before);
+            }
+            let (_, local, stores, _) = controller.into_parts_for_test();
+            assert_eq!(local.list().unwrap().len(), 2);
+            for (intent, _) in stores.agents.into_values() {
+                assert!(
+                    crate::agent::clean_management_intent::CleanManagementIntentSlot::open(intent)
+                        .unwrap()
+                        .retirement_complete()
+                        .unwrap()
+                );
+            }
+        }
+
         fn native_local_management_lifecycle(coordinated: u8) {
             use crate::agent::clean_management_intent::CleanManagementIntent;
             fn configuration(descriptor: &AgentDescriptor) -> Vec<u8> {
@@ -8088,6 +8386,11 @@ mod tests {
             call.authority = owner.authority_target();
             call.invocation = call.expected_invocation();
             call.signature = credential_key.sign(&call.signing_bytes()).to_bytes();
+            if matches!(coordinated, 20 | 21 | 22) {
+                check_dependent_lifecycle_recovery(&mut harness, descriptor, runtime, coordinated);
+                harness.stop();
+                return;
+            }
             if coordinated == 5 {
                 check_local_create_submission(&descriptor, &call, &runtime);
                 harness.stop();
