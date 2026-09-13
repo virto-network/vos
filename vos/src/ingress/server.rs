@@ -602,14 +602,33 @@ fn handle_clean_preparation(
         Ok(value) => value,
         Err(_) => return text(400, "invalid canonical clean preparation"),
     };
-    // Preparation returns physical package/data material. Require live access;
-    // it does not authenticate claims in the intent or issue an actor receipt.
-    let access = match authenticate(request, handle) {
-        Ok(access) => access,
-        Err((status, message)) => return text(status.as_u16(), message),
+    // Clean inventory is visible to active enrolled credentials (Private
+    // preparation remains forbidden). Do not invent legacy capability grants
+    // from clean built-in roles. Actor execution still needs its own policy.
+    let Some(credential) = request
+        .headers()
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .and_then(decode_access_token)
+    else {
+        return text(401, "invalid access token");
     };
-    if !access.has_capability(crate::CapabilityId::named(crate::capability::AGENT_INVOKE)) {
-        return text(403, "agent.invoke capability is required");
+    let mut nonce = [0; 32];
+    if getrandom::getrandom(&mut nonce).is_err() || nonce == [0; 32] {
+        return text(503, "credential query nonce unavailable");
+    }
+    let access = match handle.authenticate_clean_api(&credential, crate::agent::sdk::Hash(nonce)) {
+        Ok(access) => access,
+        Err(IngressAuthenticationError::Invalid) => return text(401, "invalid access token"),
+        Err(IngressAuthenticationError::AuthorityUnavailable) => {
+            return text(503, "clean authority unavailable");
+        }
+    };
+    if access.status != crate::agent::sdk::authority::AuthorityCredentialStatus::Active
+        || access.kind != crate::agent::sdk::authority::AuthorityCredentialKind::Api
+    {
+        return text(403, "active API credential required for clean preparation");
     }
     let Some(supervisor) = handle.clean_agent_supervisor() else {
         return text(503, "clean agent supervisor unavailable");

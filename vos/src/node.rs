@@ -2231,6 +2231,42 @@ impl std::error::Error for IngressNodeAttestationError {}
     allow(dead_code)
 )]
 impl IngressHandle {
+    /// Resolve a proven API key against the currently attached clean Authority.
+    /// Unlike the legacy credential-id lookup, this signs an exact projection
+    /// query and never searches service_actor_routes or falls back to them.
+    #[cfg(all(
+        feature = "http-ingress",
+        feature = "network",
+        feature = "storage",
+        target_os = "linux"
+    ))]
+    pub(crate) fn authenticate_clean_api(
+        &self,
+        credential: &crate::ingress::ApiAccessCredential,
+        nonce: crate::agent::sdk::Hash,
+    ) -> Result<
+        crate::agent::sdk::authority::AuthorityCredentialProjection,
+        IngressAuthenticationError,
+    > {
+        let authority = self
+            .clean_agent_supervisor
+            .read()
+            .ok()
+            .and_then(|ingress| ingress.as_ref().map(|ingress| ingress.authority.clone()))
+            .ok_or(IngressAuthenticationError::AuthorityUnavailable)?;
+        let target = authority
+            .authority_target()
+            .map_err(|_| IngressAuthenticationError::AuthorityUnavailable)?;
+        let query = credential
+            .sign_projection_query(
+                target,
+                nonce,
+                crate::agent::sdk::authority::AuthorityProjectionSelector::Credential,
+            )
+            .map_err(|_| IngressAuthenticationError::Invalid)?;
+        self.query_clean_credential(query)
+    }
+
     /// Query only the API credential signing this exact clean projection. The
     /// live Authority checks enrollment/status; transport verification alone
     /// is not permission. No legacy bearer credential is consulted here.

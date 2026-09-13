@@ -4842,6 +4842,36 @@ ordinary client regression is not a substitute for this native result, and a
 Public Catalog query does not close protected non-Public invocation, continuation,
 attested delivery, or the remaining C1/C2/C3 gates.
 
+### Live preparation failure: legacy authentication lookup
+
+The page-bounded campaign is terminal: start 16:43:10Z, readiness 16:48:38Z,
+test failure and clean shutdown 16:48:40Z, endpoint removed. The live test
+failed at `/__agents/prepare` with HTTP 503 before invocation submission.
+Its dedicated invocation store contains only `lock`, no ASQ1/ASR1. Preserve
+the `invocation-page-bounded-*` logs; this is not an invocation pass.
+
+Source diagnosis found `handle_clean_preparation` reused `authenticate`, which
+calls `IngressHandle::authenticate_credential`. That function searches legacy
+`service_actor_routes` for a role authority; native clean startup publishes its
+Authority through `clean_agent_supervisor` instead. Readiness could therefore
+not make this authentication path available.
+
+Preparation now uses `authenticate_clean_api`: select the attached clean
+Authority target, sign a fresh Credential projection query using the proven
+API key, and require the exact echoed query through the existing bounded clean
+projection API. The handler requires Active status and API kind, with no cache
+or legacy fallback. Metadata access follows existing clean non-Private inventory
+visibility, not a fabricated mapping from clean built-in roles to legacy
+`agent.invoke` capabilities. Private physical preparation remains rejected;
+actor invocation still requires its installed policy/receipt. Earlier references
+to legacy capability gating for this new endpoint describe the failed version.
+
+All 47 ingress tests pass in 0.29s (`r16-preparation-clean-auth.log`), and the
+daemon rebuild passes in 18.76s (`r16-preparation-clean-auth-build.log`). A new
+live run is in progress with `invocation-clean-auth-*` logs, leaving both prior
+campaigns intact. The test result is still pending; inspect that existing run
+before starting another. Formatting and diff checks pass.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

@@ -45,7 +45,9 @@ public operator command returns only with the clean system bootstrap.
 ### Clean invocation transport (saga branch)
 
 `POST /__agents/prepare` accepts canonical `ATQ1` (binary content type) and
-requires a live bearer credential with `agent.invoke`. The request selects
+requires a live enrolled API bearer credential, resolved by a freshly signed
+query to the attached clean Authority. It uses clean non-Private inventory
+visibility, not legacy `agent.invoke` capability mapping. The request selects
 only Space/Agent/Actor and invocation intent. The live supervisor supplies the
 installed generation, runtime/package identity, method policy and availability;
 Private routes have no plaintext fallback. The binary `ATP1` response must be
