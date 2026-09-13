@@ -16,6 +16,82 @@ use vos::agent::sdk::{AgentDescriptor, InvocationId, ManagementRequest};
 
 use super::clean_identity::CleanOperatorIdentitySigner;
 
+/// Submit an already persisted request to a local daemon. No signing or
+/// sequence allocation occurs here; every error leaves the request retained.
+pub(crate) fn submit_retained(
+    root: &std::path::Path,
+    address: std::net::SocketAddr,
+) -> anyhow::Result<vos::agent::sdk::authority::ManagementApplicationAck> {
+    use super::clean_store::CleanLocalCreateRequestFile;
+    use std::io::Read as _;
+    use std::time::Duration;
+    use vos::agent::sdk::wire::MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES;
+    anyhow::ensure!(
+        address.ip().is_loopback() && address.port() != 0,
+        "plaintext Local Create submission requires a nonzero loopback address"
+    );
+    let mut store = CleanLocalCreateRequestFile::open_or_create(root)?;
+    let bytes = store
+        .load()?
+        .ok_or_else(|| anyhow::anyhow!("no retained Local Create request"))?;
+    let result = (|| -> anyhow::Result<_> {
+        let agent = ureq::AgentBuilder::new()
+            .try_proxy_from_env(false)
+            .redirects(0)
+            .timeout_connect(Duration::from_secs(5))
+            .timeout(Duration::from_secs(130))
+            .build();
+        let response = agent
+            .post(&format!("http://{address}/__agents/local"))
+            .set("Content-Type", "application/octet-stream")
+            .send_bytes(&bytes)
+            .map_err(|error| anyhow::anyhow!("Local Create HTTP submission failed: {error}"))?;
+        anyhow::ensure!(
+            response.status() == 201,
+            "Local Create expected HTTP 201, received {}",
+            response.status()
+        );
+        anyhow::ensure!(
+            response.header("Content-Type") == Some("application/octet-stream"),
+            "Local Create acknowledgement has unexpected content type"
+        );
+        let mut reply = Vec::new();
+        response
+            .into_reader()
+            .take((MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES + 1) as u64)
+            .read_to_end(&mut reply)?;
+        anyhow::ensure!(
+            reply.len() <= MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES,
+            "Local Create acknowledgement exceeds the wire limit"
+        );
+        verify_acknowledgement(&bytes, &reply)
+    })();
+    // The store and its exclusive lease remain alive through verification.
+    result.map_err(|error| {
+        anyhow::anyhow!(
+            "{error}; request retained: retry these exact bytes, outcome may be unknown"
+        )
+    })
+}
+
+pub(crate) fn run_submit(
+    root: &std::path::Path,
+    address: std::net::SocketAddr,
+) -> anyhow::Result<()> {
+    use vos::agent::sdk::wire::CanonicalWire as _;
+    let ack = submit_retained(root, address)?;
+    let agent = hex::encode(ack.managed.agent.0);
+    if crate::output::is_json() {
+        crate::output::print_json(&serde_json::json!({
+            "agent": agent,
+            "acknowledgement": hex::encode(ack.encode().map_err(|error| anyhow::anyhow!("encode acknowledgement: {error:?}"))?),
+        }));
+    } else {
+        println!("Local Agent {agent}: verified creation acknowledgement");
+    }
+    Ok(())
+}
+
 /// Verify a response against the retained request, never a key supplied only
 /// by the response. This verifies the issuer's application claim, not an
 /// independent replay proof or proof of HTTP route publication.
@@ -320,6 +396,26 @@ pub(crate) mod tests {
         sign(&mut ack);
         let bytes = ack.encode().unwrap();
         assert_eq!(verify_acknowledgement(&request, &bytes).unwrap(), ack);
+        let mut http = format!("HTTP/1.1 201 Created\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).into_bytes();
+        http.extend_from_slice(&bytes);
+        assert_eq!(submit_fixture(&request, &http).unwrap(), ack);
+        for response in [
+            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+            b"HTTP/1.1 503 Busy\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+            b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+            b"HTTP/1.1 201 Created\r\nContent-Type: application/octet-stream\r\nContent-Length: 4\r\nConnection: close\r\n\r\nMAA2".as_slice(),
+        ] {
+            assert!(submit_fixture(&request, response).unwrap_err().to_string().contains("request retained"));
+        }
+        let size = vos::agent::sdk::wire::MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES + 1;
+        let mut oversized = format!("HTTP/1.1 201 Created\r\nContent-Type: application/octet-stream\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n").into_bytes();
+        oversized.resize(oversized.len() + size, 0);
+        assert!(
+            submit_fixture(&request, &oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("wire limit")
+        );
         assert!(verify_acknowledgement(&request, &bytes[..bytes.len() - 1]).is_err());
         let mut trailing = bytes.clone();
         trailing.push(0);
@@ -358,6 +454,87 @@ pub(crate) mod tests {
         identity.runtime_program = ProgramId([13; 32]);
         sign(&mut forged);
         assert!(verify_acknowledgement(&request, &forged.encode().unwrap()).is_err());
+    }
+
+    fn submit_fixture(
+        request: &[u8],
+        response: &[u8],
+    ) -> anyhow::Result<vos::agent::sdk::authority::ManagementApplicationAck> {
+        use super::super::clean_store::{CleanFileStoreError, CleanLocalCreateRequestFile};
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::fs::DirBuilderExt as _;
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let mut nonce = [0; 8];
+        getrandom::getrandom(&mut nonce).unwrap();
+        let dir = Directory(
+            std::env::temp_dir().join(format!("vosx-local-submit-{}", hex::encode(nonce))),
+        );
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir.0)
+            .unwrap();
+        let root = dir.0.join("request");
+        CleanLocalCreateRequestFile::open_or_create(&root)
+            .unwrap()
+            .publish(request)
+            .unwrap();
+        let expected = request.to_vec();
+        let response = response.to_vec();
+        let leased_root = root.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "client never connected"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                assert!(header.len() < 8192);
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
+            }
+            assert!(header.starts_with(b"POST /__agents/local HTTP/1.1\r\n"));
+            let mut body = vec![0; expected.len()];
+            stream.read_exact(&mut body).unwrap();
+            assert_eq!(body, expected);
+            assert!(matches!(
+                CleanLocalCreateRequestFile::open_or_create(leased_root),
+                Err(CleanFileStoreError::Busy)
+            ));
+            let _ = stream.write_all(&response);
+        });
+        let result = submit_retained(&root, address);
+        server.join().unwrap();
+        assert_eq!(
+            CleanLocalCreateRequestFile::open_or_create(&root)
+                .unwrap()
+                .load()
+                .unwrap()
+                .unwrap(),
+            request
+        );
+        result
     }
 
     #[test]

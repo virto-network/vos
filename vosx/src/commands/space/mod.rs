@@ -1,8 +1,8 @@
 //! `vosx space *` — local space lifecycle and daemon control.
 //!
-//! Clean-generation Agent administration is deliberately absent. The CLI
-//! exposes only local lifecycle, verified backup/restore, and local extension
-//! capability inspection until system authority/catalog bootstrap is wired.
+//! Clean-generation administration currently includes submission/retry of an
+//! already retained signed Local Create request. Fresh request discovery and
+//! allocation, Install, and ordinary Shared-Agent provisioning remain unwired.
 
 use clap::Subcommand;
 use std::path::PathBuf;
@@ -43,6 +43,15 @@ pub mod verify;
 
 #[derive(Subcommand, Debug)]
 pub enum SpaceCommand {
+    /// Submit or retry an already retained signed Local Create request.
+    #[cfg(target_os = "linux")]
+    SubmitLocalCreate {
+        /// Private request-store directory; existing bytes are never replaced.
+        request_dir: PathBuf,
+        /// Local daemon HTTP socket (loopback only; no proxy or redirects).
+        #[arg(long)]
+        http: std::net::SocketAddr,
+    },
     /// Create a local space identity and data directory.
     New {
         name: String,
@@ -110,6 +119,10 @@ pub enum SpaceCommand {
 
 pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
     match cmd {
+        #[cfg(target_os = "linux")]
+        SpaceCommand::SubmitLocalCreate { request_dir, http } => {
+            local_create::run_submit(&request_dir, http)
+        }
         SpaceCommand::New {
             name,
             registry,

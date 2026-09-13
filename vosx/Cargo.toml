@@ -21,6 +21,7 @@ include = [
 ]
 
 [dependencies]
+ureq = { version = "2", default-features = false, features = ["tls"] }
 vos = { path = "../vos", version = "0.1.0", features = ["std", "http-client", "http-ingress", "ssh-ingress", "storage", "network", "private-agent-crypto"] }
 system-authority = { path = "../actors/system-authority", default-features = false }
 system-catalog = { path = "../actors/system-catalog", default-features = false }

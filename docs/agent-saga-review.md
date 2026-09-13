@@ -49,8 +49,9 @@ review endpoints for individual fixes:
 2. **C2 — native lifecycle:** finish ordinary-Agent provisioning through the
    native entry point. Startup now retains both the system owner and the Local
    lifecycle controller. Signed Local Create has a bounded ingress queue and
-   an HTTP submission endpoint; CLI submission and a successful native
-   Create/publication smoke remain open, as does Install ingress. Prove
+   an HTTP submission endpoint and retained-request CLI submission. Fresh CLI
+   preparation/discovery and a successful native Create/publication smoke remain
+   open, as does Install ingress. Prove
    authorization, durable issuance, physical application, acknowledgement and
    route publication as one restartable workflow. Replace the deliberately unavailable ordinary-Agent
    finality adapter with authenticated live system-Agent decision publication
@@ -2022,3 +2023,42 @@ journal replay, ordinary Shared genesis finality, or proof of live route
 publication. HTTP client/subcommand wiring and the native end-to-end smoke
 remain open. The existing `vos` HTTP-client dependency is `ureq` 2; it is not
 currently a direct `vosx` dependency or an exported general-purpose client.
+
+### Retained Local Create submission command
+
+The native CLI now exposes:
+
+```sh
+vosx space submit-local-create /absolute/private/request-store --http 127.0.0.1:8080
+```
+
+This command requires an already published request store; it does not discover
+descriptors, allocate a credential sequence or prepare a new request. The
+submission client loads/re-syncs the exact LCQ1 bytes and retains the exclusive
+store lease through response verification. It uses a fresh HTTP agent, disables
+environment proxies and redirects, bounds connection time to 5 seconds and the
+whole operation to 130 seconds, and bounds response bytes to the SDK MAA2 limit.
+Only HTTP 201 with the expected binary content type and a verified exact
+acknowledgement succeeds. Failures retain the request and warn that the outcome
+may be unknown. JSON output includes the Agent ID and canonical acknowledgement
+hex, not private key material.
+
+The explicit plaintext socket is loopback-only, suitable for a local daemon or
+a separately established local tunnel; this client does not provide direct
+remote HTTPS configuration. `vosx` now depends directly on the already locked
+`ureq` 2 package, without a version update. No fresh CLI build or real-daemon
+Create smoke is claimed at this checkpoint. Fresh preparation/discovery and
+safe sequence allocation still need command wiring before the complete Create
+UX can be exercised.
+
+Socket tests submit the actual bundled-runtime request to a simulated HTTP
+server, compare every request byte, verify the lease remains held, accept a
+correct signed acknowledgement, and reject redirects, 503, wrong content type,
+truncated MAA2 and oversized bodies while preserving the original stored bytes.
+These are client transport tests, not evidence of real native route publication.
+
+**All `vosx` binary tests pass: 167 passed, zero failed, one ignored**, in 3.29s
+(`r16-local-create-client-final.log`, locked/offline, serial tests with socket
+access and disk scratch). The ignored compiled-runtime candidate test requires
+fresh guest input/output paths and remains a release gate, not a passing test.
+Formatting and diff checks pass.
