@@ -2324,6 +2324,11 @@ where
         ) {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
+        #[cfg(test)]
+        if self.finalization_failure_once == Some(5) {
+            self.finalization_failure_once = None;
+            return Err(SharedAgentHostError::Unavailable);
+        }
         let outcome = self
             .supervisor_invoke_persisted_management(
                 identity,
@@ -2363,6 +2368,11 @@ where
         };
         let approval =
             ManagementApproval::decode(&bytes).map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        #[cfg(test)]
+        if self.finalization_failure_once == Some(6) {
+            self.finalization_failure_once = None;
+            return Err(SharedAgentHostError::Unavailable);
+        }
         slot.issue_from_authenticated_approval(
             target,
             managed,
@@ -4428,6 +4438,7 @@ mod tests {
         struct CountingSigner {
             key: SigningKey,
             calls: usize,
+            fail_receipt: bool,
         }
 
         impl CountingSigner {
@@ -4435,6 +4446,7 @@ mod tests {
                 Self {
                     key: SigningKey::from_bytes(&[RECEIPT_SEED; 32]),
                     calls: 0,
+                    fail_receipt: false,
                 }
             }
         }
@@ -4448,6 +4460,9 @@ mod tests {
 
             fn sign_authority_receipt(&mut self, message: &[u8]) -> Result<[u8; 64], Self::Error> {
                 self.calls += 1;
+                if core::mem::take(&mut self.fail_receipt) {
+                    return Err(MemoryError);
+                }
                 Ok(self.key.sign(message).to_bytes())
             }
 
@@ -7664,6 +7679,21 @@ mod tests {
         }
 
         #[test]
+        fn native_local_lifecycle_startup_recovers_prepared_authorization() {
+            native_local_management_lifecycle(17);
+        }
+
+        #[test]
+        fn native_local_lifecycle_startup_recovers_accepted_authorization() {
+            native_local_management_lifecycle(18);
+        }
+
+        #[test]
+        fn native_local_lifecycle_startup_recovers_pending_receipt_signature() {
+            native_local_management_lifecycle(19);
+        }
+
+        #[test]
         fn native_node_rejects_lifecycle_start_after_shutdown_without_leaking_hosts() {
             native_local_management_lifecycle(3);
         }
@@ -8117,7 +8147,7 @@ mod tests {
             }
             if matches!(
                 coordinated,
-                2 | 3 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16
+                2 | 3 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19
             ) {
                 struct LeasedStore {
                     inner: IssuerMemoryStore,
@@ -8228,6 +8258,8 @@ mod tests {
                     fail_after_commit,
                 };
                 let recovered = coordinated == 8;
+                let mut lifecycle_signer = CountingSigner::new();
+                lifecycle_signer.fail_receipt = coordinated == 19;
                 let mut controller = if recovered {
                     let recovery =
                         crate::agent::local_lifecycle::discover_local_lifecycle_recovery(
@@ -8241,7 +8273,7 @@ mod tests {
                         harness.owner.take().unwrap(),
                         local,
                         stores,
-                        CountingSigner::new(),
+                        lifecycle_signer,
                         recovery,
                     )
                     .unwrap()
@@ -8250,7 +8282,7 @@ mod tests {
                         harness.owner.take().unwrap(),
                         local,
                         stores,
-                        CountingSigner::new(),
+                        lifecycle_signer,
                     )
                     .unwrap()
                 };
@@ -8299,8 +8331,12 @@ mod tests {
                 assert_eq!(active.load(Ordering::SeqCst), 2);
                 let failed_loads = loads.load(Ordering::SeqCst);
                 let interrupted = coordinated >= 10;
-                if interrupted {
-                    controller.fail_finalization_once_for_test((coordinated - 10).min(4));
+                if interrupted && coordinated != 19 {
+                    controller.fail_finalization_once_for_test(match coordinated {
+                        17 => 5,
+                        18 => 6,
+                        _ => (coordinated - 10).min(4),
+                    });
                 }
                 let application_slot = harness
                     .fixture
@@ -8318,6 +8354,51 @@ mod tests {
                         descriptor.identity.agent,
                     )
                     .unwrap();
+                    let before_eligibility = issuer_store.image.lock().unwrap().clone();
+                    assert_eq!(
+                        issuer
+                            .can_resume_initial_creation(
+                                call.authority,
+                                call.managed,
+                                &ManagementRequest::Create(Box::new(descriptor.clone())),
+                                &call,
+                                &RawCredentialVerifier,
+                            )
+                            .unwrap(),
+                        coordinated >= 17
+                    );
+                    let mut forged = call.clone();
+                    forged.signature[0] ^= 1;
+                    assert!(
+                        issuer
+                            .can_resume_initial_creation(
+                                call.authority,
+                                call.managed,
+                                &ManagementRequest::Create(Box::new(descriptor.clone())),
+                                &forged,
+                                &RawCredentialVerifier,
+                            )
+                            .is_err()
+                    );
+                    if coordinated == 19 {
+                        let mut later = call.clone();
+                        later.request_sequence =
+                            core::num::NonZeroU64::new(call.request_sequence.get() + 1).unwrap();
+                        later.invocation = later.expected_invocation();
+                        later.signature = credential_key.sign(&later.signing_bytes()).to_bytes();
+                        assert!(
+                            issuer
+                                .can_resume_initial_creation(
+                                    later.authority,
+                                    later.managed,
+                                    &ManagementRequest::Create(Box::new(descriptor.clone())),
+                                    &later,
+                                    &RawCredentialVerifier,
+                                )
+                                .is_err()
+                        );
+                    }
+                    assert_eq!(*issuer_store.image.lock().unwrap(), before_eligibility);
                     let observed = issuer
                         .recover_observed_application(
                             call.authority,
@@ -8329,7 +8410,8 @@ mod tests {
                         .unwrap();
                     if coordinated >= 13 {
                         assert!(observed.is_none());
-                        assert_eq!(issuer.retained_decisions(), 1);
+                        assert_eq!(issuer.retained_decisions(), usize::from(coordinated < 17));
+                        assert_eq!(issuer.has_pending_decision(), coordinated == 19);
                         None
                     } else {
                         let (_, acknowledgement) = observed.unwrap();
@@ -8388,7 +8470,7 @@ mod tests {
                 assert_eq!(active.load(Ordering::SeqCst), 2);
                 routes.retire().unwrap();
                 system.retire().unwrap();
-                if coordinated >= 15 {
+                if matches!(coordinated, 15 | 16) {
                     *intent_store.runtime.lock().unwrap() =
                         (coordinated == 16).then(|| b"not-a-runtime-package".to_vec());
                 }
@@ -8402,7 +8484,7 @@ mod tests {
                         descriptor: &AgentDescriptor,
                         restart: usize,
                         interrupted: bool,
-                        unaccepted: bool,
+                        new_invocations: u64,
                         missing: bool,
                     ) -> Result<TestLocalLifecycle<F>, SharedAgentHostError> {
                         let (old_owner, old_local, mut stores, mut signer) =
@@ -8483,12 +8565,7 @@ mod tests {
                             )?;
                         assert_eq!(
                             controller.ordered_index_for_test().unwrap(),
-                            before
-                                + if restart == 0 {
-                                    2 + u64::from(unaccepted)
-                                } else {
-                                    0
-                                }
+                            before + if restart == 0 { 2 + new_invocations } else { 0 }
                         );
                         Ok(controller)
                     }
@@ -8505,14 +8582,18 @@ mod tests {
                                         &descriptor,
                                         attempt,
                                         interrupted,
-                                        coordinated == 10 || coordinated >= 12,
+                                        if coordinated == 17 {
+                                            2
+                                        } else {
+                                            u64::from(coordinated == 10 || coordinated >= 12)
+                                        },
                                         coordinated >= 12,
                                     )
                                 })
                                 .join()
                                 .unwrap()
                         });
-                        if coordinated >= 15 {
+                        if matches!(coordinated, 15 | 16) {
                             assert!(matches!(
                                 (coordinated, reopened),
                                 (15, Err(SharedAgentHostError::Unavailable))
@@ -8542,7 +8623,7 @@ mod tests {
                         if coordinated == 13 {
                             assert_eq!(recovered.1.applied_at, application_slot);
                         }
-                        if coordinated == 14 {
+                        if coordinated >= 14 {
                             assert_eq!(recovered.1.applied_at, recovery_slot);
                         }
                         assert_eq!(&recovered, result.get_or_insert(recovered.clone()));

@@ -256,9 +256,9 @@ pub struct LocalLifecycleRecovery<I: CleanManagementIssuerStore, J: CleanManagem
 }
 
 /// Startup admission derived only from verified, still-leased lifecycle stores.
-/// Covers completed work and issued receipts. Unacknowledged application must
-/// be independently recovered from the physical Local image before signing or
-/// finalization; this admission value alone does not prove application.
+/// Covers completed work, issued receipts, and saved initial-Create
+/// authorization. Issuer eligibility is not approval, and application must be
+/// independently observed from the Local image before acknowledgement signing.
 pub struct LocalLifecycleStartupAdmission {
     pub(crate) authority: super::sdk::authority::AuthorityActorTarget,
     pub(crate) retirements: Vec<[super::sdk::RuntimeWork; 2]>,
@@ -286,6 +286,7 @@ pub(crate) struct LocalLifecycleRecoveryEntry<
     pub(crate) finalized: Option<ManagementApplicationAck>,
     pub(crate) observed: Option<ManagementApplicationAck>,
     pub(crate) issued: Option<super::sdk::authority::AuthorityReceipt>,
+    pub(crate) unissued_creation: bool,
 }
 
 impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycleRecovery<I, J> {
@@ -294,6 +295,7 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
     ) -> Result<LocalLifecycleStartupAdmission, SharedAgentHostError> {
         let mut retirements = Vec::new();
         let mut pending = Vec::new();
+        let mut credentials = Vec::new();
         for entry in &self.entries {
             if entry
                 .intent
@@ -301,6 +303,9 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
                 .map_err(|_| SharedAgentHostError::Unavailable)?
             {
                 continue;
+            }
+            if let Some(intent) = entry.intent.intent() {
+                credentials.push((intent.call().credential, entry.unissued_creation));
             }
             let authorization = entry
                 .intent
@@ -318,7 +323,9 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
                 (Some(authorization), Some(finalization), Some(_)) => {
                     retirements.push([authorization.clone(), finalization.clone()]);
                 }
-                (Some(authorization), finalization, None) if entry.issued.is_some() => {
+                (Some(authorization), finalization, None)
+                    if entry.issued.is_some() || entry.unissued_creation =>
+                {
                     let authorization_anchor = entry
                         .intent
                         .authorization_anchor()
@@ -340,6 +347,7 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
                 _ => return Err(SharedAgentHostError::Conflict),
             }
         }
+        ensure_independent_authorization_recovery(credentials)?;
         Ok(LocalLifecycleStartupAdmission {
             authority: self.authority,
             retirements,
@@ -352,6 +360,48 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
     }
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+/// Authority requires exact per-credential sequence and retirement of the
+/// previous application. Until recovery can hand off/retire subsets, reject a
+/// dependent set before attachment instead of recording a terminal denial.
+fn ensure_independent_authorization_recovery(
+    calls: impl IntoIterator<Item = (super::sdk::CredentialId, bool)>,
+) -> Result<(), SharedAgentHostError> {
+    let mut credentials = BTreeMap::new();
+    for (credential, needs_authorization) in calls {
+        let (count, pending) = credentials.entry(credential).or_insert((0usize, false));
+        *count += 1;
+        *pending |= needs_authorization;
+        if *count > 1 && *pending {
+            return Err(SharedAgentHostError::Conflict);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn unissued_recovery_rejects_credential_dependencies_before_dispatch() {
+    let a = super::sdk::CredentialId([1; 32]);
+    let b = super::sdk::CredentialId([2; 32]);
+    for set in [
+        vec![],
+        vec![(a, true)],
+        vec![(a, true), (b, true)],
+        vec![(a, false), (a, false)],
+    ] {
+        assert!(ensure_independent_authorization_recovery(set).is_ok());
+    }
+    for set in [
+        vec![(a, true), (a, true)],
+        vec![(a, true), (a, false)],
+        vec![(a, false), (a, true)],
+    ] {
+        assert!(matches!(
+            ensure_independent_authorization_recovery(set),
+            Err(SharedAgentHostError::Conflict)
+        ));
     }
 }
 
@@ -521,6 +571,25 @@ pub fn discover_local_lifecycle_recovery<F: LocalLifecycleStoreFactory>(
         if observed.is_some() && issued.is_none() {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
+        let unissued_creation = if issued.is_none()
+            && intent
+                .authorization_work()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_some()
+        {
+            let request = intent.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+            issuer
+                .can_resume_initial_creation(
+                    authority,
+                    request.call().managed,
+                    request.request(),
+                    request.call(),
+                    &RawCredentialVerifier,
+                )
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+        } else {
+            false
+        };
         entries.push(LocalLifecycleRecoveryEntry {
             agent,
             intent,
@@ -528,9 +597,31 @@ pub fn discover_local_lifecycle_recovery<F: LocalLifecycleStoreFactory>(
             finalized,
             observed,
             issued,
+            unissued_creation,
         });
     }
     Ok(LocalLifecycleRecovery { authority, entries })
+}
+
+fn load_create_runtime<B: super::clean_authority_issuer::CleanManagementRuntimeStore>(
+    intent: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+) -> Result<AdmittedRuntimePackage, SharedAgentHostError> {
+    let bytes = intent
+        .load_runtime()
+        .map_err(|_| SharedAgentHostError::Unavailable)?
+        .ok_or(SharedAgentHostError::Unavailable)?;
+    let runtime = super::package_admission::admit_runtime_package(&bytes)
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+    let ManagementRequest::Create(descriptor) = intent
+        .intent()
+        .ok_or(SharedAgentHostError::ScopeMismatch)?
+        .request()
+    else {
+        return Err(SharedAgentHostError::ScopeMismatch);
+    };
+    super::driver::verify_clean_runtime_package_binding(descriptor, &runtime)
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+    Ok(runtime)
 }
 
 /// Type-erased, node-owned lifecycle access. It is deliberately not an ingress
@@ -661,6 +752,37 @@ where
         // Validate the entire set before retiring any member. Incomplete
         // phases require their own protected recovery protocol, not omission.
         let admission = recovery.startup_admission()?;
+        let mut runtimes = BTreeMap::new();
+        for (index, entry) in recovery.entries.iter_mut().enumerate() {
+            if entry.unissued_creation
+                || (entry.issued.is_some()
+                    && entry.observed.is_none()
+                    && matches!(
+                        local.show(entry.agent),
+                        Err(super::local_sdk_host::LocalAgentHostError::NotFound)
+                    ))
+            {
+                runtimes.insert(index, load_create_runtime(&mut entry.intent)?);
+            }
+        }
+        // Runtime availability is checked before executing any unissued call.
+        // The issuer eligibility check does not replace durable actor replay.
+        for entry in &mut recovery.entries {
+            if entry.unissued_creation {
+                let managed = entry
+                    .intent
+                    .intent()
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?
+                    .call()
+                    .managed;
+                entry.issued = Some(system.issue_management_intent(
+                    &mut entry.intent,
+                    managed,
+                    &mut entry.issuer,
+                    &mut signer,
+                )?);
+            }
+        }
         let mut observations = Vec::new();
         let mut creates = Vec::new();
         for (index, entry) in recovery.entries.iter_mut().enumerate() {
@@ -680,15 +802,9 @@ where
                     let ManagementRequest::Create(descriptor) = &request else {
                         return Err(SharedAgentHostError::ScopeMismatch);
                     };
-                    let bytes = entry
-                        .intent
-                        .load_runtime()
-                        .map_err(|_| SharedAgentHostError::Unavailable)?
-                        .ok_or(SharedAgentHostError::Unavailable)?;
-                    let runtime = super::package_admission::admit_runtime_package(&bytes)
-                        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-                    super::driver::verify_clean_runtime_package_binding(descriptor, &runtime)
-                        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                    let runtime = runtimes
+                        .remove(&index)
+                        .ok_or(SharedAgentHostError::ScopeMismatch)?;
                     creates.push((index, runtime, (**descriptor).clone(), receipt.clone()));
                     continue;
                 }

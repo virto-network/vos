@@ -27,13 +27,16 @@ AJC3 checkpoints and AGIM/AGI2 images are deliberately rejected, with no in-plac
 migration provided; do not point this clean-break build at valuable old data.
 Current host lifecycle images additionally require CMI4/CMR2 with pre-dispatch
 journal anchors; earlier CMI3/CMR1 images are rejected, not migrated.
-Startup now discovers lifecycle stores before system attachment, completes
+Startup now discovers lifecycle stores before system attachment, replays saved
+initial-Create authorization when receipt issuance is incomplete, completes
 Local Create from an exact issued receipt and retained runtime when necessary,
 recovers acknowledgements from durable Local images, completes finalization
 (including protected preparation of a missing envelope), and retires results
 before normal routes. First-time application still requires a valid unexpired
-receipt. Earlier phases without an issued receipt, or missing required runtime
-artifacts, still stop startup, preserving their stores. Continuous live protection and
+receipt. A pristine intent without saved authorization remains available for
+client retry rather than automatic dispatch. Unsupported issuer histories,
+dependent unissued requests sharing a credential, or missing required runtime
+artifacts still stop startup, preserving their stores. Continuous live protection and
 coexistence with an unfinished projection
 remain implementation blockers, not deployment-ready behavior. Do not delete
 those stores to bypass the recovery check.
@@ -3378,6 +3381,49 @@ attempt reused the post-expiry replay clock and was refused
 within the signed window, rather than slot 40. Receipt-expiry enforcement was
 not weakened. Logs remain in shared disk scratch. Formatting and diff checks
 pass; the full feature/release matrix remains pending.
+
+### Startup replays saved authorization and unfinished receipt issuance
+
+Initial Create recovery now accepts a saved anchored authorization envelope with
+an empty issuer or an exact first-decision issuance pledge. The new read-only
+issuer eligibility check binds the signed call, independent Authority/managed
+scope, request and any pending decision, and excludes existing receipt histories.
+Eligibility is not approval. Startup validates required runtime packages first,
+then invokes the existing anchored Authority replay path and issues only its
+actual accepted approval before physical Create, acknowledgement, finalization
+and retirement. It never signs a receipt merely from the pending issuer image.
+
+New native cases interrupt before authorization dispatch, after its accepted
+reply but before issuance, and during receipt signing after the durable pledge.
+They verify absent receipts, the exact pending/no-pending issuer state, read-only
+eligibility, forged-call rejection and a mismatched signed call against an
+existing pledge. First recovery adds two Invokes plus two Acks for an unaccepted
+authorization, or one Invoke plus two Acks when authorization was already
+accepted. Second restart adds no Ordered entries and exact retry preserves the
+signed acknowledgement. First physical application remains inside receipt expiry.
+
+The Authority permits only one outstanding application per credential and
+requires exact request sequence. Startup therefore rejects a recovery set that
+needs authorization while another unretired intent shares that credential,
+before attachment/dispatch. This prevents agent-ID iteration order from recording
+a terminal denial. The guard permits independent credentials and unchanged
+already-issued recovery sets; it is not completion of dependent-set recovery.
+Next, recovery needs partial pending-to-retirement handoff and per-credential
+phase sequencing before that guard can be removed. Pristine intents with no
+authorization envelope still await exact client retry. Continuous live admission,
+capacity/GC/projection cases, denial/expiry resolution, cross-process filesystem
+fault campaigns, install/invoke and release gates remain open.
+
+Verification: **23 native bootstrap/lifecycle tests passed** (412.76s,
+`r16-unissued-create-native-final.log`), **12 issuer tests passed** (4.74s,
+`r16-unissued-create-issuer.log`), and **12 filesystem tests passed** (0.11s,
+`r16-unissued-create-files.log`). After the final dependency guard was added,
+its focused order/independence test passed (`r16-unissued-create-dependencies.log`)
+and all **11 startup cases passed again** (142.19s,
+`r16-unissued-create-startup-final.log`). The broader native run preceded that
+last guard; it is not a final full-library or release-matrix run. Formatting and
+diff checks pass; logs remain in shared disk scratch. No guest artifacts or CLI
+deployment smoke were refreshed.
 
 ### Durable client acknowledgement before completion
 
