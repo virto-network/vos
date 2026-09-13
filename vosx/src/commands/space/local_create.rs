@@ -882,6 +882,134 @@ pub(crate) mod tests {
         super::super::clean_store::tests::check_denial_retention(&request, &denial_fixture().1);
     }
 
+    /// Opt-in real-daemon campaign. Use isolated XDG directories and a newly
+    /// started space named native-denial-smoke. Retain all files on failure.
+    #[test]
+    #[ignore = "requires a freshly started disposable native-denial-smoke daemon"]
+    fn real_daemon_denial_resume_then_valid_create() {
+        use super::super::clean_store::{
+            CleanCredentialReservation, CleanLocalCreateRequestFile, CredentialReservationStatus,
+            ensure_private_directory,
+        };
+        let index = crate::spaces_index::load().unwrap();
+        let entry = crate::spaces_index::find(&index, "native-denial-smoke").unwrap();
+        let data = std::path::Path::new(&entry.data_dir);
+        assert!(
+            !data.join("agent-client").exists(),
+            "fresh disposable client state required"
+        );
+        let space = SpaceId(hex::decode(&entry.id).unwrap().try_into().unwrap());
+        let endpoint = super::super::endpoint::read(data).unwrap().unwrap();
+        assert!(super::super::endpoint::is_alive(&endpoint));
+        let peer: libp2p::PeerId = endpoint.peer_id.parse().unwrap();
+        let public = vos::registry::ed25519_pubkey_from_peer_id(&peer.to_bytes()).unwrap();
+        let config = super::super::local_config::load(data).unwrap();
+        assert_eq!(config.ingress.http.len(), 1);
+        let address = config.ingress.http[0].listen.parse().unwrap();
+        let operator = crate::identity::load_existing().unwrap();
+        let identity = CleanOperatorIdentitySigner::new(&operator).unwrap();
+        let nonce = Hash([0xd3; 32]);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let provisional = prepare_fresh(
+            &operator,
+            space,
+            public,
+            nonce,
+            NonZeroU64::new(2).unwrap(),
+            now.saturating_sub(60),
+            now + 3600,
+        )
+        .unwrap();
+        let (_, provisional_call, _) = provisional.into_parts();
+        let root = data.join("agent-client");
+        ensure_private_directory(&root).unwrap();
+        let claims = root.join("credentials");
+        ensure_private_directory(&claims).unwrap();
+        let operations = root.join("operations");
+        ensure_private_directory(&operations).unwrap();
+        let operation = operations.join(format!(
+            "{}-{}",
+            hex::encode(identity.credential().0),
+            hex::encode(nonce.0)
+        ));
+        ensure_private_directory(&operation).unwrap();
+        {
+            let mut reservation =
+                CleanCredentialReservation::open_or_create(&claims, space, identity.credential())
+                    .unwrap();
+            reservation.reserve(nonce).unwrap();
+            // Production bootstrap itself consumes a credential sequence.
+            // Discover rather than copying the isolated Authority fixture's
+            // initial sequence assumption into a real daemon campaign.
+            let (_, sequence) = discover_credential(
+                &operation.join("query"),
+                address,
+                &operator,
+                provisional_call.authority,
+            )
+            .unwrap();
+            let wrong_sequence = NonZeroU64::new(sequence.get().checked_add(1).unwrap()).unwrap();
+            let request = prepare_fresh(
+                &operator,
+                space,
+                public,
+                nonce,
+                wrong_sequence,
+                now.saturating_sub(60),
+                now + 3600,
+            )
+            .unwrap()
+            .encode();
+            CleanLocalCreateRequestFile::open_or_create(operation.join("request"))
+                .unwrap()
+                .publish(&request)
+                .unwrap();
+        }
+        let mut denied = false;
+        for attempt in 0..3 {
+            let error = create_local(data, address, &operator, space, public, true).unwrap_err();
+            println!("denial attempt {attempt}: {error}");
+            if error.to_string().contains("signed denial retained") {
+                denied = true;
+                break;
+            }
+        }
+        assert!(denied, "denial did not reach durable client completion");
+        assert!(
+            create_local(data, address, &operator, space, public, true)
+                .unwrap_err()
+                .to_string()
+                .contains("signed denial retained")
+        );
+        assert_eq!(
+            CleanCredentialReservation::open_or_create(&claims, space, identity.credential())
+                .unwrap()
+                .current()
+                .unwrap(),
+            Some((nonce, CredentialReservationStatus::Denied))
+        );
+        let mut result = create_local(data, address, &operator, space, public, false);
+        for attempt in 0..3 {
+            if result.is_ok() {
+                break;
+            }
+            println!(
+                "valid Create retry {attempt}: {}",
+                result.as_ref().unwrap_err()
+            );
+            result = create_local(data, address, &operator, space, public, true);
+        }
+        let acknowledgement = result.unwrap();
+        assert_eq!(
+            create_local(data, address, &operator, space, public, true).unwrap(),
+            acknowledgement
+        );
+        println!("real daemon denial, local resume, valid successor and exact ACK retry passed");
+    }
+
     #[test]
     fn fresh_preparation_uses_startup_authority_and_only_the_node_public_key() {
         let operator = Keypair::ed25519_from_bytes([0x63; 32]).unwrap();

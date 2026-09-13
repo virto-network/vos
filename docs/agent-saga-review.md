@@ -3846,6 +3846,43 @@ Logs remain in shared disk scratch. A fresh real-daemon Create/deny/
 resume/new-Create campaign and physical crash injection are still required, as
 are the broader native lifecycle, Shared finality and release gates. Fold into C2.
 
+### Fresh daemon campaign and corrected sequence discovery
+
+The opt-in vosx test `real_daemon_denial_resume_then_valid_create` exercises the
+actual loopback daemon through the production client functions. It requires a
+fresh disposable space named `native-denial-smoke` and refuses existing client
+state. It prepares a deliberately skipped credential sequence, retries exact
+bytes after uncertain HTTP outcomes, checks retained denial/local resume, then
+requires valid successor creation and identical verified ACK delivery. It remains
+ignored in ordinary test runs; isolated XDG homes must select the disposable space.
+
+Initial run: current production source `50840aeb` was rebuilt in the implementation
+worktree's own target (46.47s, shared scratch `r16-denial-daemon-build.log`). New
+data is preserved at `target/native-denial-smoke.mmLNc8`, Space
+`b9e1120cb41249347b9070ec9065e81c92b4593d2c384af3ca612b0b2b6fdf3d`, HTTP
+18083 and SSH 2225. `space new` generated enabled ingress defaults and prepared
+bundles; only its local ports were changed. The daemon became ready in about
+81 seconds at `2026-09-13T12:07:12Z` (`daemon.log`).
+
+The first test run failed (310.85s, `client-test.log`) because its fixture assumed
+sequence 2 was invalid. Production bootstrap's signed catalog operation consumes
+sequence 1, so sequence 2 was valid. After two 504 waits, the exact request returned
+a verified MAA2 and durably retained client acknowledgement for Agent
+`3d28987950edee5f9dc50c502d7a023a22b512a00c573984ceae095d17d7bb48`.
+This is real Create/recovery evidence, **not a denial campaign pass**; the harness
+correctly failed its expected-denial assertion and did not run the remaining
+denial/successor checks. The original signed request was never rewritten.
+
+The harness now obtains the authenticated current sequence under its credential
+lease and deliberately skips that sequence rather than assuming an initial value.
+It compiles, and all 6 regular CLI tests passed with 1 opt-in test ignored (5.06s,
+shared scratch `r16-denial-daemon-harness-verified.log`). Corrected real-daemon
+execution on fresh data remains required. The original daemon was sent SIGINT
+after the test ended; confirm its process/session has terminated before reusing
+its stores or ports. No production failure was fixed by changing the signed
+request, and no release, arbitrary actor, or Shared-finality certification is
+claimed from this failed campaign.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its
