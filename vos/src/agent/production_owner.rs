@@ -20,8 +20,8 @@ use super::sdk::authority::{
 use super::sdk::wire::CanonicalWire;
 use super::sdk::{AgentDescriptor, AgentId, AgentProfile, NodeId, PrincipalId};
 use super::supervisor::{
-    AgentRouteIdentity, AgentRoutePublication, AgentSupervisorError, AgentSupervisorHandle,
-    AgentSupervisorLimits, AgentSupervisorOwner,
+    AgentRouteIdentity, AgentRouteKey, AgentRoutePublication, AgentSupervisorError,
+    AgentSupervisorHandle, AgentSupervisorLimits, AgentSupervisorOwner,
 };
 use super::supervisor_adapters::{
     AgentAuthorityRouteProjection, AgentRouteAdapterError, AgentRouteHostAttachment,
@@ -29,6 +29,22 @@ use super::supervisor_adapters::{
 };
 
 const MAX_INVENTORY_AGENTS: usize = 4096;
+
+fn installed_local_route_matches(
+    identity: Option<AgentRouteIdentity>,
+    key: AgentRouteKey,
+    runtime: super::sdk::DeploymentId,
+    deployment: super::sdk::DeploymentId,
+    program: super::sdk::ProgramId,
+) -> bool {
+    identity.is_some_and(|identity| {
+        identity.key() == key
+            && identity.runtime_deployment() == runtime
+            && identity.actor_deployment() == deployment
+            && identity.actor_program() == program
+            && identity.profile() == AgentProfile::Local
+    })
+}
 
 fn completed_local_publication_matches(
     previous: Option<(super::sdk::Hash, AuthorityProjectionHead)>,
@@ -645,6 +661,41 @@ impl AgentProductionOwner {
         self.completed_local_publication = self.accepted_head.map(|head| (acknowledgement, head));
         tracing::debug!(agent = ?result.0, elapsed_ms = started.elapsed().as_millis() as u64, "Local Create publication complete");
         Ok(result)
+    }
+
+    /// Native Install completion includes fresh Authority/physical route
+    /// reconciliation. A lifecycle ACK alone must not become ingress success.
+    pub(crate) fn install_local_actor(
+        &mut self,
+        install: super::sdk::InstallActor,
+        call: super::sdk::authority::AuthorityCredentialCall,
+        package: super::package_admission::AdmittedActorPackage,
+    ) -> Result<super::sdk::authority::ManagementApplicationAck, AgentProductionOwnerError> {
+        self.completed_local_publication = None;
+        let key = AgentRouteKey::new(call.managed.space, call.managed.agent, install.entry.actor)?;
+        let runtime = call.managed.runtime_deployment;
+        let deployment = install.entry.deployment;
+        let program = install.entry.program;
+        let (lifecycle, capacity) = self
+            .lifecycle
+            .as_mut()
+            .ok_or(AgentProductionOwnerError::InvalidConfiguration)?;
+        let acknowledgement = lifecycle
+            .install(install, call, package)
+            .map_err(AgentProductionOwnerError::Lifecycle)?;
+        if self.local.is_empty() {
+            self.local = OwnedRouteSlot::Pending(lifecycle.local_attachment(*capacity)?);
+        }
+        self.reconcile()?;
+        let supervisor = self
+            .supervisor
+            .as_ref()
+            .ok_or(AgentProductionOwnerError::InvalidConfiguration)?;
+        let identity = supervisor.handle().snapshot(key)?.identity();
+        if !installed_local_route_matches(Some(identity), key, runtime, deployment, program) {
+            return Err(AgentProductionOwnerError::InvalidProjection);
+        }
+        Ok(acknowledgement)
     }
 
     pub(crate) fn is_running(&self) -> bool {
@@ -1497,6 +1548,90 @@ mod tests {
         assert_eq!(calls.lock().unwrap().len(), before + 4);
         source.load_inventory().unwrap();
         assert_eq!(calls.lock().unwrap().len(), before + 5);
+    }
+
+    #[test]
+    fn install_delivery_requires_exact_active_local_identity() {
+        let key = AgentRouteKey::new(SpaceId([1; 32]), AgentId([2; 32]), ActorId([3; 32])).unwrap();
+        let runtime = DeploymentId([4; 32]);
+        let deployment = DeploymentId([5; 32]);
+        let program = ProgramId([6; 32]);
+        let identity = AgentRouteIdentity::new(
+            key,
+            Hash([7; 32]),
+            runtime,
+            deployment,
+            program,
+            AgentProfile::Local,
+        )
+        .unwrap();
+        assert!(installed_local_route_matches(
+            Some(identity),
+            key,
+            runtime,
+            deployment,
+            program
+        ));
+        assert!(!installed_local_route_matches(
+            None, key, runtime, deployment, program
+        ));
+        let other_key =
+            AgentRouteKey::new(SpaceId([1; 32]), AgentId([2; 32]), ActorId([8; 32])).unwrap();
+        for wrong in [
+            AgentRouteIdentity::new(
+                other_key,
+                Hash([7; 32]),
+                runtime,
+                deployment,
+                program,
+                AgentProfile::Local,
+            )
+            .unwrap(),
+            AgentRouteIdentity::new(
+                key,
+                Hash([7; 32]),
+                DeploymentId([8; 32]),
+                deployment,
+                program,
+                AgentProfile::Local,
+            )
+            .unwrap(),
+            AgentRouteIdentity::new(
+                key,
+                Hash([7; 32]),
+                runtime,
+                DeploymentId([8; 32]),
+                program,
+                AgentProfile::Local,
+            )
+            .unwrap(),
+            AgentRouteIdentity::new(
+                key,
+                Hash([7; 32]),
+                runtime,
+                deployment,
+                ProgramId([8; 32]),
+                AgentProfile::Local,
+            )
+            .unwrap(),
+            AgentRouteIdentity::new(
+                key,
+                Hash([7; 32]),
+                runtime,
+                deployment,
+                program,
+                AgentProfile::Shared,
+            )
+            .unwrap(),
+        ] {
+            assert!(!installed_local_route_matches(
+                Some(wrong),
+                key,
+                runtime,
+                deployment,
+                program
+            ));
+        }
     }
 
     #[test]

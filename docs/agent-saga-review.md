@@ -24,7 +24,9 @@ Install/invoke remains unproven, so this
 is not yet a usable ordinary-agent production path.
 The native Local Install application and startup-recovery phases now pass
 physical tests from prepared authorization through retirement, including
-pristine client-retry admission. Install controller/ingress/CLI submission and
+pristine client-retry admission. Native Install controller handoff, retry and
+restart now pass; the production-owner wrapper requires an exact active Local
+route after reconciliation. Install ingress/CLI submission and
 actual actor method invocation remain unwired/unproven; these phase tests do
 not make actor installation available to users yet.
 The native Local-controller wiring at `ee047d48` passed fresh-data startup and
@@ -4248,6 +4250,41 @@ repin, ordinary Shared finality or master readiness follows from this change.
 Remaining C2 work includes Install denial/expiry resolution, controller and
 queue/HTTP/CLI submission, actual actor invocation/restart, and mixed-operation
 capacity/crash campaigns. C1 recovery and C3 release gates remain open.
+
+### Native Install controller and publication guard
+
+The Local controller now validates the signed Install against the independently
+loaded Local descriptor and admitted package before opening lifecycle paths.
+It opens existing stores only and retains their exclusive handles across
+failures. A successor may hand off a retired slot only after verifying the
+predecessor's finalized acknowledgement and physical application. Active-call
+replacement and stale same-credential sequences are rejected. Exact finalized
+retry physically rechecks the saved application and retirement without dispatch.
+
+The production-owner wrapper reconciles Authority and physical routes, then
+requires a running supervisor snapshot matching the exact Space/Agent/Actor,
+runtime deployment, actor deployment/program and Local profile. Reconciliation
+alone is insufficient because a route may remain deferred. Publication failure
+preserves the durable lifecycle result for retry; no ingress success is claimed.
+
+The controller regression passed in 35.75s
+(`r16-install-controller-verified.log`): invalid signatures open no stores,
+interrupted finalization retains the existing lease, replacement fails, exact
+retry completes, stale calls fail, and two completed restarts add no Ordered
+work. The first fixture run overflowed its stack; separating the large setup
+and restart fixtures into normal-sized scoped threads fixed the test without
+increasing stack limits. Eight production-owner tests pass in 0.19s
+(`r16-install-controller-owner.log`), including missing/mismatched route identity
+rejection. This is not a live end-to-end test of the production wrapper.
+The final-code controller rerun also passes (one test, 41.05s,
+`r16-install-controller-final.log`); formatting and diff checks pass. All scratch
+and test logs remain on disk under the shared target, not the `/tmp` RAMFS.
+
+Next C2 work remains native queue/HTTP/CLI Install submission and a real actor
+install/invoke/restart campaign, followed by unresolved denial/expiry/abort and
+crash/capacity cases. C1 recovery and C3 release gates remain open. These commits
+are implementation checkpoints within the three review groups, not new review
+batches; neither root `saga/agents` nor `master` has been promoted.
 
 ### Durable client acknowledgement before completion
 

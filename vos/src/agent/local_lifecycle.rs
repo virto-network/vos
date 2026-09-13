@@ -850,6 +850,14 @@ pub(crate) trait NativeLocalLifecycle: Send {
         call: AuthorityCredentialCall,
         runtime: AdmittedRuntimePackage,
     ) -> Result<(AgentId, ManagementApplicationAck), SharedAgentHostError>;
+    fn install(
+        &mut self,
+        _install: super::sdk::InstallActor,
+        _call: AuthorityCredentialCall,
+        _package: super::package_admission::AdmittedActorPackage,
+    ) -> Result<ManagementApplicationAck, SharedAgentHostError> {
+        Err(SharedAgentHostError::Unavailable)
+    }
 }
 
 impl<P, R, I, F, S> NativeLocalLifecycle for LocalLifecycleController<P, R, I, F, S>
@@ -888,6 +896,15 @@ where
         runtime: AdmittedRuntimePackage,
     ) -> Result<(AgentId, ManagementApplicationAck), SharedAgentHostError> {
         LocalLifecycleController::create(self, descriptor, call, runtime)
+    }
+
+    fn install(
+        &mut self,
+        install: super::sdk::InstallActor,
+        call: AuthorityCredentialCall,
+        package: super::package_admission::AdmittedActorPackage,
+    ) -> Result<ManagementApplicationAck, SharedAgentHostError> {
+        LocalLifecycleController::install(self, install, call, package)
     }
 
     fn retained_denial(
@@ -1411,6 +1428,46 @@ where
             .into_inner()
             .unwrap();
         (system, local, stores, signer)
+    }
+
+    /// Install into an existing Local Agent, retaining the same exclusive
+    /// lifecycle handles on errors. The production owner must publish routes
+    /// before treating the returned acknowledgement as an ingress response.
+    pub fn install(
+        &mut self,
+        install: super::sdk::InstallActor,
+        call: AuthorityCredentialCall,
+        package: super::package_admission::AdmittedActorPackage,
+    ) -> Result<ManagementApplicationAck, SharedAgentHostError> {
+        let mut system = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let mut local = self
+            .local
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let request = ManagementRequest::Install(Box::new(install));
+        system.local_install_intent(&local, &request, &call, &package)?;
+        let (intent, issuer) = match self.retained_stores.entry(call.managed.agent) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let stores = self
+                    .stores
+                    .open_existing(call.managed.space, call.managed.agent)
+                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+                entry.insert(stores)
+            }
+        };
+        system.install_local_actor(
+            intent,
+            issuer,
+            request,
+            call,
+            &mut local,
+            &package,
+            &mut self.signer,
+        )
     }
 
     /// Complete Create/application/finalization, retaining evidence for later

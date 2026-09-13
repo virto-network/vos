@@ -3051,6 +3051,173 @@ where
             .map_err(|_| SharedAgentHostError::Unavailable)
     }
 
+    /// Validate before the native controller opens any lifecycle paths.
+    pub(crate) fn local_install_intent(
+        &self,
+        local: &super::local_sdk_host::LocalAgentHost,
+        request: &ManagementRequest,
+        call: &AuthorityCredentialCall,
+        package: &AdmittedActorPackage,
+    ) -> Result<super::clean_management_intent::CleanManagementIntent, SharedAgentHostError> {
+        if local.space() != self.pins.space || local.node() != self.pins.node {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let descriptor = local
+            .show(call.managed.agent)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if descriptor.authority != self.pins.authority {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let managed = ManagedAgentTarget {
+            space: descriptor.identity.space,
+            agent: descriptor.identity.agent,
+            owner: descriptor.identity.owner,
+            profile: descriptor.identity.profile,
+            runtime_deployment: descriptor.identity.runtime_deployment,
+            transition_producer: descriptor.identity.transition_producer,
+        };
+        validate_actor_install(descriptor, request, package)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        super::clean_management_intent::CleanManagementIntent::new(
+            self.authority_target(),
+            managed,
+            request.clone(),
+            call.clone(),
+            &RawCredentialVerifier,
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)
+    }
+
+    /// Complete a native Local Install while preserving the caller's store
+    /// leases. Route publication is still owned by the production supervisor.
+    pub(crate) fn install_local_actor<B, J, S>(
+        &mut self,
+        intent_store: B,
+        issuer_store: J,
+        request: ManagementRequest,
+        call: AuthorityCredentialCall,
+        local: &mut super::local_sdk_host::LocalAgentHost,
+        package: &AdmittedActorPackage,
+        signer: &mut S,
+    ) -> Result<ManagementApplicationAck, SharedAgentHostError>
+    where
+        B: super::clean_authority_issuer::CleanManagementActorStore,
+        J: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
+        let next = self.local_install_intent(local, &request, &call, package)?;
+        let target = self.authority_target();
+        let managed = call.managed;
+        let mut slot =
+            super::clean_management_intent::CleanManagementIntentSlot::open(intent_store)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let mut issuer = DurableCleanManagementIssuer::open(
+            issuer_store,
+            target.binding,
+            managed.space,
+            managed.agent,
+        )
+        .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let previous = slot
+            .intent()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?
+            .clone();
+        if previous.call() != next.call() || previous.request() != next.request() {
+            if !slot
+                .retirement_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                || (previous.call().credential == call.credential
+                    && previous.call().request_sequence >= call.request_sequence)
+                || !issuer
+                    .can_resume_install(target, managed, &request, &call, &RawCredentialVerifier)
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+            {
+                return Err(SharedAgentHostError::Conflict);
+            }
+            previous
+                .verify(target, managed, &RawCredentialVerifier)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            let (receipt, ack) = issuer
+                .recover_finalized_application(
+                    target,
+                    managed,
+                    previous.request(),
+                    previous.call(),
+                    &RawCredentialVerifier,
+                )
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            let observation = local
+                .observe_management_application(managed.agent, previous.request(), &receipt)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            if issuer
+                .observe_local_application(&observation, signer)
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                != ack
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            self.finish_live_management_intent(&mut slot, managed, &ack, &issuer)?;
+            slot.handoff_retired(&previous, next, &RawCredentialVerifier)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+        }
+        slot.retain_actor(package)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if let Some((receipt, ack)) = issuer
+            .recover_finalized_application(target, managed, &request, &call, &RawCredentialVerifier)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+        {
+            let Some(RuntimeWork::Invoke { observed_slot, .. }) = slot
+                .authorization_work()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            else {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            };
+            let Some(RuntimeWork::Invoke { invocation, .. }) = slot
+                .finalization_work()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            else {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            };
+            if ack.applied_at < *observed_slot
+                || invocation.message
+                    != super::clean_management_intent::CleanManagementIntent::finalization_message(
+                        &ack,
+                    )
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            let observation = local
+                .observe_management_application(managed.agent, &request, &receipt)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            if issuer
+                .observe_local_application(&observation, signer)
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                != ack
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            self.finish_live_management_intent(&mut slot, managed, &ack, &issuer)?;
+            return Ok(ack);
+        }
+        let ack = self.install_local_from_management_intent(
+            &mut slot,
+            local,
+            package,
+            &mut issuer,
+            signer,
+        )?;
+        self.finalize_management_intent_with_admission(
+            &mut slot,
+            managed,
+            &ack,
+            &mut issuer,
+            true,
+        )?;
+        self.finish_live_management_intent(&mut slot, managed, &ack, &issuer)?;
+        Ok(ack)
+    }
+
     /// Create and finalize one signed Local Agent lifecycle using independent
     /// durable intent and issuer stores. Reload those same stores after any
     /// error; a failed write may already have reached durable storage. Passing
@@ -8337,6 +8504,11 @@ mod tests {
         }
 
         #[test]
+        fn native_local_install_controller_handoff_retry_and_restart() {
+            native_local_management_lifecycle(41);
+        }
+
+        #[test]
         fn native_local_authorization_clock_advance_preserves_receipt_and_intent() {
             native_local_management_lifecycle(6);
         }
@@ -9614,7 +9786,7 @@ mod tests {
             call.authority = owner.authority_target();
             call.invocation = call.expected_invocation();
             call.signature = credential_key.sign(&call.signing_bytes()).to_bytes();
-            if (32..=40).contains(&coordinated) {
+            if (32..=41).contains(&coordinated) {
                 std::thread::scope(|scope| {
                     scope
                         .spawn(|| {
@@ -12104,7 +12276,7 @@ mod tests {
                 let admission = recovery.startup_admission().unwrap();
                 assert_eq!(
                     admission.pending.len(),
-                    usize::from(restart == 0 && scenario != 40)
+                    usize::from(restart == 0 && scenario != 40 && scenario != 42)
                 );
                 let reopened = CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_factory(
                     pins,
@@ -12161,7 +12333,7 @@ mod tests {
                 assert_eq!(
                     controller.ordered_index_for_test().unwrap(),
                     before
-                        + if restart == 0 {
+                        + if restart == 0 && scenario != 42 {
                             3 + u64::from(scenario == 37)
                         } else {
                             0
@@ -12175,7 +12347,7 @@ mod tests {
                 assert_eq!(
                     signer.calls,
                     signatures
-                        + if restart == 0 {
+                        + if restart == 0 && scenario != 42 {
                             usize::from(scenario != 35) + usize::from(scenario >= 37)
                         } else {
                             0
@@ -12214,6 +12386,140 @@ mod tests {
                 drop(local);
             }
             harness.owner = Some(old_owner);
+        }
+
+        #[inline(never)]
+        fn check_install_controller(
+            harness: &mut NativeProjectionOwnerHarness,
+            root: &Path,
+            local: crate::agent::local_sdk_host::LocalAgentHost,
+            descriptor: AgentDescriptor,
+            call: AuthorityCredentialCall,
+            request: ManagementRequest,
+            package: AdmittedActorPackage,
+            intent: IssuerMemoryStore,
+            issuer: IssuerMemoryStore,
+            signer: CountingSigner,
+        ) {
+            use crate::agent::local_lifecycle::{
+                LocalLifecycleController, LocalLifecycleStoreFactory, NativeLocalLifecycle,
+            };
+            struct Stores {
+                space: SpaceId,
+                agent: AgentId,
+                intent: IssuerMemoryStore,
+                issuer: IssuerMemoryStore,
+                opens: Arc<AtomicUsize>,
+            }
+            impl LocalLifecycleStoreFactory for Stores {
+                type Intent = IssuerMemoryStore;
+                type Issuer = IssuerMemoryStore;
+                type Error = ();
+                fn discover(&mut self, _: SpaceId, _: usize) -> Result<Vec<AgentId>, ()> {
+                    panic!("not startup")
+                }
+                fn open(
+                    &mut self,
+                    _: SpaceId,
+                    _: AgentId,
+                ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                    panic!("Install cannot create stores")
+                }
+                fn open_existing(
+                    &mut self,
+                    space: SpaceId,
+                    agent: AgentId,
+                ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                    assert_eq!((space, agent), (self.space, self.agent));
+                    self.opens.fetch_add(1, Ordering::SeqCst);
+                    Ok((self.intent.clone(), self.issuer.clone()))
+                }
+            }
+            let opens = Arc::new(AtomicUsize::new(0));
+            let stores = Stores {
+                space: descriptor.identity.space,
+                agent: descriptor.identity.agent,
+                intent: intent.clone(),
+                issuer: issuer.clone(),
+                opens: opens.clone(),
+            };
+            let mut controller =
+                LocalLifecycleController::new(harness.owner.take().unwrap(), local, stores, signer)
+                    .unwrap();
+            let ManagementRequest::Install(install) = &request else {
+                unreachable!()
+            };
+            let before = controller.ordered_index_for_test().unwrap();
+            let original = intent.image.lock().unwrap().clone();
+            let mut invalid = call.clone();
+            invalid.signature[0] ^= 1;
+            assert!(matches!(
+                controller.install((**install).clone(), invalid, package.clone()),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            assert_eq!(opens.load(Ordering::SeqCst), 0);
+            assert_eq!(*intent.image.lock().unwrap(), original);
+            assert_eq!(controller.ordered_index_for_test().unwrap(), before);
+            controller.fail_finalization_once_for_test(2);
+            assert!(matches!(
+                NativeLocalLifecycle::install(
+                    &mut controller,
+                    (**install).clone(),
+                    call.clone(),
+                    package.clone()
+                ),
+                Err(SharedAgentHostError::Unavailable)
+            ));
+            assert_eq!(opens.load(Ordering::SeqCst), 1);
+            let pending = intent.image.lock().unwrap().clone();
+            let applied = controller.ordered_index_for_test().unwrap();
+            let key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
+            let mut other = call.clone();
+            other.request_sequence = NonZeroU64::new(call.request_sequence.get() + 1).unwrap();
+            other.invocation = other.expected_invocation();
+            other.signature = key.sign(&other.signing_bytes()).to_bytes();
+            assert!(matches!(
+                controller.install((**install).clone(), other, package.clone()),
+                Err(SharedAgentHostError::Conflict)
+            ));
+            assert_eq!(*intent.image.lock().unwrap(), pending);
+            assert_eq!(controller.ordered_index_for_test().unwrap(), applied);
+            let ack = controller
+                .install((**install).clone(), call.clone(), package.clone())
+                .unwrap();
+            assert!(ack.verify_with(&RawCredentialVerifier).is_ok());
+            let completed = controller.ordered_index_for_test().unwrap();
+            assert_eq!(
+                controller
+                    .install((**install).clone(), call.clone(), package.clone())
+                    .unwrap(),
+                ack
+            );
+            assert_eq!(controller.ordered_index_for_test().unwrap(), completed);
+            let mut stale = call.clone();
+            stale.request_sequence = NonZeroU64::new(1).unwrap();
+            stale.invocation = stale.expected_invocation();
+            stale.signature = key.sign(&stale.signing_bytes()).to_bytes();
+            let retired = intent.image.lock().unwrap().clone();
+            assert!(matches!(
+                controller.install((**install).clone(), stale, package),
+                Err(SharedAgentHostError::Conflict)
+            ));
+            assert_eq!(*intent.image.lock().unwrap(), retired);
+            assert_eq!(opens.load(Ordering::SeqCst), 1);
+            let (owner, local, _, signer) = controller.into_parts_for_test();
+            harness.owner = Some(owner);
+            drop(local);
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        check_install_startup(
+                            harness, root, descriptor, call, request, intent, issuer, signer, 42,
+                        )
+                    })
+                    .join()
+                    .unwrap()
+            });
         }
 
         #[inline(never)]
@@ -12310,6 +12616,29 @@ mod tests {
             let mut slot = CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
             let previous = slot.intent().unwrap().clone();
             assert!(slot.retirement_complete().unwrap());
+            if scenario == 41 {
+                drop(slot);
+                std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            check_install_controller(
+                                harness,
+                                &root,
+                                local,
+                                descriptor,
+                                install_call,
+                                request,
+                                package,
+                                intent_store,
+                                issuer_store,
+                                signer,
+                            )
+                        })
+                        .join()
+                        .unwrap()
+                });
+                return;
+            }
             slot.handoff_retired(&previous, next, &RawCredentialVerifier)
                 .unwrap();
             let mut issuer = DurableCleanManagementIssuer::open(
