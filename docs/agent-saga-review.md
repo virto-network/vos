@@ -2746,6 +2746,53 @@ activation, protect incomplete and prepared-but-unaccepted phases too, and
 prove exhausted-capacity/restart behavior before enabling production handoff.
 The startup loader and production retirement/handoff wiring remain incomplete.
 
+### Live retirement sets survive partial completion and reattachment
+
+Network admission now retains a bounded set of exact retirement pairs rather
+than one pair. A set is jointly budgeted before reservation; its exact matching
+acknowledgements are the only admitted submissions while it is reserved. Query
+reservations and ordinary suffix-consuming submissions remain excluded.
+Re-reserving an existing member is idempotent and cannot replace the broader
+pending set. Empty, oversized and duplicate sets fail closed, as do sets that
+conflict with an existing grouping.
+
+The recovery attachment constructor seeds the entire supplied set before
+worker route activation and uses the joint capacity calculation both before
+and after leader promotion. The owning network host retains the set across
+generation retirement. Completing one pair requires its two retained positive
+acknowledgements and a successful completion callback under the proposal lock;
+only that pair is removed. Failed callbacks retain the whole remaining set.
+Reopened durable-marker release likewise removes only its matching pair and
+cannot clear a different pending operation.
+
+The bundled-Authority fixture exercises two pairs/four completed results,
+member re-reservation, conflicting regrouping, network-owner recreation,
+ordinary acknowledgement refusal, premature completion refusal, failed
+completion callbacks, and refresh both before and after partial completion.
+Query admission stays excluded until the final pair completes, and exactly
+four new Ordered acknowledgements are recorded. This test's successful
+callbacks simulate the network completion boundary; durable CMR1 publication
+is covered by the existing single-intent fixtures, not by a multi-intent
+filesystem restart in this test.
+
+Verification: the management subset passed **3/3** (54.40s,
+`r16-retirement-set-gate-native.log`); the broader native bootstrap/lifecycle
+run passed **11/11** (108.61s, `r16-retirement-set-gate-final.log`); and the
+projection checkpoint/reattachment failure test passed **1/1** (10.32s,
+`r16-retirement-set-gate-projection.log`). After the final constructor size
+guard, the network suite passed **7/7** (0.46s,
+`r16-retirement-set-gate-network-final.log`). Logs are in the shared disk
+scratch directory; formatting and diff checks pass.
+The final-source native bootstrap/lifecycle rerun also passed **11/11**
+(97.98s, `r16-retirement-set-gate-verified.log`).
+
+This remains an internal completed-pair recovery mechanism. Production startup
+still needs to adopt the independently verified store set before constructing
+the system owner, cover incomplete/prepared-but-unaccepted phases and coexist
+with a pending projection. No final-source exhausted-capacity proof or native
+daemon restart of multiple lifecycle stores is claimed. Production
+retirement/handoff remains disabled until those gates are implemented.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

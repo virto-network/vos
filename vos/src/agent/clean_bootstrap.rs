@@ -8688,6 +8688,7 @@ mod tests {
             owner: &mut MemoryBootstrapOwner,
             original: [&RuntimeWork; 2],
             intent: &crate::agent::clean_management_intent::CleanManagementIntent,
+            network: Arc<Network>,
         ) {
             // Both original results have already been positively acknowledged.
             // Execute four fresh signed calls through the bundled Authority so
@@ -8765,6 +8766,145 @@ mod tests {
                 host.management_retirement_set_admission_requirement(agent, &mixed)
                     .is_err()
             );
+            drop(host);
+            check_multiple_management_retirement_gate(owner, &extra, network);
+        }
+
+        #[inline(never)]
+        fn check_multiple_management_retirement_gate(
+            owner: &mut MemoryBootstrapOwner,
+            extra: &[RuntimeWork],
+            network: Arc<Network>,
+        ) {
+            let agent = HostAgentId(owner.pins.agent.0);
+            let pairs = [[&extra[0], &extra[1]], [&extra[2], &extra[3]]];
+            let before = owner.ordered_index_for_test().unwrap();
+            for invalid in [
+                vec![],
+                vec![pairs[0], pairs[0]],
+                vec![pairs[0]; crate::agent::replay::MAX_REPLAY_SUFFIX_ENTRIES / 2 + 1],
+            ] {
+                assert!(matches!(
+                    owner
+                        ._network_host
+                        .reserve_management_retirement_set(agent, &invalid),
+                    Err(SharedAgentHostError::ScopeMismatch)
+                ));
+            }
+            owner
+                ._network_host
+                .reserve_management_retirement_set(agent, &pairs)
+                .unwrap();
+            // Reserving a member is idempotent and must not replace the set.
+            owner
+                ._network_host
+                .reserve_management_retirement(agent, pairs[0])
+                .unwrap();
+            assert!(matches!(
+                owner._network_host.reserve_management_retirement_set(
+                    agent,
+                    &[[&extra[0], &extra[2]], [&extra[1], &extra[3]]],
+                ),
+                Err(SharedAgentHostError::Conflict)
+            ));
+            owner
+                ._network_host
+                .retire_attachment_for_test(agent)
+                .unwrap();
+            owner._network_host = crate::network::shared_agent::SharedAgentNetworkHost::attach_recovering_management_retirement_set(
+                Arc::clone(&owner.host), network, agent,
+                vec![[extra[0].clone(), extra[1].clone()], [extra[2].clone(), extra[3].clone()]],
+            ).unwrap();
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            let (query, query_auth) = fresh_projection_pair(owner, 0xed);
+            for (pair_index, pair) in pairs.into_iter().enumerate() {
+                assert!(matches!(
+                    owner
+                        ._network_host
+                        .reserve_projection_pair(agent, &query, &query_auth, false),
+                    Err(SharedAgentHostError::Conflict)
+                ));
+                assert!(matches!(
+                    owner
+                        ._network_host
+                        .complete_management_retirement(agent, pair, || {
+                            panic!("unacknowledged pair must not reach durable completion")
+                        }),
+                    Err(SharedAgentHostError::Conflict)
+                ));
+                for envelope in pair {
+                    let RuntimeWork::Invoke {
+                        invocation,
+                        authorization,
+                        ..
+                    } = envelope
+                    else {
+                        unreachable!()
+                    };
+                    let material = owner
+                        .supervisor_invocation_material(owner.pins.agent, invocation.actor)
+                        .unwrap();
+                    let identity =
+                        crate::agent::supervisor_adapters::physical_material_identity(&material)
+                            .unwrap();
+                    assert!(matches!(
+                        owner.supervisor_acknowledge(
+                            identity,
+                            (**invocation).clone(),
+                            (**authorization).clone()
+                        ),
+                        Err(SharedAgentHostError::CapacityExhausted)
+                    ));
+                    assert!(matches!(
+                        owner
+                            ._network_host
+                            .supervisor_acknowledge_management_retirement(
+                                identity,
+                                (**invocation).clone(),
+                                (**authorization).clone(),
+                            )
+                            .unwrap(),
+                        RuntimeOutcome::Acknowledged(Ok(_))
+                    ));
+                }
+                assert!(matches!(
+                    owner
+                        ._network_host
+                        .complete_management_retirement(agent, pair, || Err(
+                            SharedAgentHostError::Unavailable
+                        )),
+                    Err(SharedAgentHostError::Unavailable)
+                ));
+                assert!(owner._network_host.mark_stale_for_test(agent));
+                owner._network_host.refresh().unwrap();
+                assert!(matches!(
+                    owner
+                        ._network_host
+                        .reserve_projection_pair(agent, &query, &query_auth, false),
+                    Err(SharedAgentHostError::Conflict)
+                ));
+                // This callback tests the network boundary only. Production
+                // must commit its independently verified durable intent marker.
+                owner
+                    ._network_host
+                    .complete_management_retirement(agent, pair, || Ok(()))
+                    .unwrap();
+                if pair_index == 0 {
+                    // An old completion cannot clear a different pending pair.
+                    assert!(matches!(
+                        owner
+                            ._network_host
+                            .release_completed_management_retirement(agent, pair),
+                        Err(SharedAgentHostError::Conflict)
+                    ));
+                }
+                // Reattachment after the first completion must keep the
+                // remaining pair, not resurrect the completed one or open a gap.
+                assert!(owner._network_host.mark_stale_for_test(agent));
+                owner._network_host.refresh().unwrap();
+            }
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
+            assert_projection_gate_released(owner, 0xee);
         }
 
         #[inline(never)]
@@ -9168,6 +9308,7 @@ mod tests {
                 owner,
                 [&envelope, &finalization_envelope],
                 &intent_image,
+                Arc::clone(&harness.network),
             );
             harness.stop();
         }
