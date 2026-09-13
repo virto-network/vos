@@ -1407,6 +1407,25 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         &mut self,
         acknowledgement: &ManagementApplicationAck,
     ) -> Result<bool, CleanManagementIssuerError<B::Error>> {
+        if self.application_finalization_status(acknowledgement)? {
+            return Ok(false);
+        }
+        let mut completed = self.image.clone();
+        completed
+            .acknowledged
+            .as_mut()
+            .ok_or(CleanManagementIssuerError::InvalidState)?
+            .application_finalized = true;
+        self.commit_candidate::<Infallible>(completed)?;
+        Ok(true)
+    }
+
+    /// Validate the exact retained signed acknowledgement without advancing
+    /// its finalization barrier. A false result is not actor-application proof.
+    pub(crate) fn application_finalization_status(
+        &self,
+        acknowledgement: &ManagementApplicationAck,
+    ) -> Result<bool, CleanManagementIssuerError<B::Error>> {
         self.ensure_live()?;
         if self.image.pending.is_some() || self.image.pending_application_ack.is_some() {
             return Err(CleanManagementIssuerError::InvalidState);
@@ -1440,18 +1459,7 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
                 CleanManagementIssuerRejection::InvalidObservation,
             ));
         }
-        if record.application_finalized {
-            return Ok(false);
-        }
-
-        let mut completed = self.image.clone();
-        completed
-            .acknowledged
-            .as_mut()
-            .ok_or(CleanManagementIssuerError::InvalidState)?
-            .application_finalized = true;
-        self.commit_candidate::<Infallible>(completed)?;
-        Ok(true)
+        Ok(record.application_finalized)
     }
 
     /// Persist an Agent-owned proof boundary that the exact latest issued
@@ -2500,10 +2508,30 @@ mod tests {
             PublicPreflight, RuntimeExecutionContext, RuntimeState, RuntimeWork,
         };
         use crate::service::wire::ServiceWire as _;
-        let signer = CountingSigner::new(0x3d);
+        let mut signer = CountingSigner::new(0x3d);
         let fixture = fixture(&signer);
         let request = request(0x3e);
-        let (call, _) = approved_call(&fixture, 1, &request);
+        let (call, approval) = approved_call(&fixture, 1, &request);
+        let decision = AuthorizedCleanManagementDecision::from_approval(
+            call.authority,
+            call.managed,
+            &request,
+            &call,
+            &approval,
+            &TestCredentialVerifier,
+        )
+        .unwrap();
+        let mut issuer = open(MemoryImageStore::default(), &fixture);
+        let receipt = issuer.issue(&decision, &mut signer).unwrap();
+        let ack = issuer
+            .observe_durable_application(
+                &receipt,
+                &application(&request),
+                Hash([0x40; 32]),
+                fixture.context.valid_from,
+                &mut signer,
+            )
+            .unwrap();
         let intent = CleanManagementIntent::new(
             call.authority,
             call.managed,
@@ -2580,13 +2608,48 @@ mod tests {
         assert_eq!(slot.pledge(intent), Ok(false));
         assert_eq!(slot.pledge_authorization_work(work), Ok(false));
         assert_eq!(
-            slot.pledge_authorization_work(envelope(invocation, 11)),
+            slot.pledge_authorization_work(envelope(invocation.clone(), 11)),
             Err(IntentSlotError::Conflict)
         );
         assert_eq!(store.image(), durable);
-        let mut previous = durable.unwrap();
-        previous[..4].copy_from_slice(b"CMI1");
-        assert!(CleanManagementIntent::decode(&previous).is_err());
+        for magic in [b"CMI1", b"CMI2"] {
+            let mut previous = durable.clone().unwrap();
+            previous[..4].copy_from_slice(magic);
+            assert!(CleanManagementIntent::decode(&previous).is_err());
+        }
+        let mut finalization = invocation;
+        finalization.invocation = ack.acknowledgement_invocation;
+        finalization.origin = crate::agent_sdk::InvocationOrigin::anonymous();
+        finalization.message = CleanManagementIntent::finalization_message(&ack);
+        let final_slot = ack.applied_at + 1;
+        let final_work = envelope(finalization.clone(), final_slot);
+        let mut wrong = finalization.clone();
+        wrong.message.push(1);
+        assert_eq!(
+            slot.pledge_finalization_work(envelope(wrong, final_slot)),
+            Err(IntentSlotError::Invalid)
+        );
+        assert_eq!(store.image(), durable);
+        store.fail_after_commit(1);
+        assert_eq!(
+            slot.pledge_finalization_work(final_work.clone()),
+            Err(IntentSlotError::Storage(MemoryStoreError))
+        );
+        assert_eq!(slot.finalization_work(), Err(IntentSlotError::Poisoned));
+        assert_eq!(
+            slot.pledge_finalization_work(final_work.clone()),
+            Err(IntentSlotError::Poisoned)
+        );
+        drop(slot);
+        let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
+        assert_eq!(slot.finalization_work().unwrap(), Some(&final_work));
+        let durable = store.image();
+        assert_eq!(slot.pledge_finalization_work(final_work), Ok(false));
+        assert_eq!(
+            slot.pledge_finalization_work(envelope(finalization, final_slot + 1)),
+            Err(IntentSlotError::Conflict)
+        );
+        assert_eq!(store.image(), durable);
     }
 
     #[test]

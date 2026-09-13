@@ -18,13 +18,14 @@ use crate::service::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 pub(crate) const MAX_INTENT_BYTES: usize = 64
     + crate::agent_sdk::wire::MAX_MANAGEMENT_REQUEST_WIRE_BYTES
     + crate::agent_sdk::wire::MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES
-    + crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES;
+    + 2 * crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CleanManagementIntent {
     request: ManagementRequest,
     call: AuthorityCredentialCall,
     authorization_work: Option<RuntimeWork>,
+    finalization_work: Option<RuntimeWork>,
 }
 
 impl CleanManagementIntent {
@@ -39,6 +40,7 @@ impl CleanManagementIntent {
             request,
             call,
             authorization_work: None,
+            finalization_work: None,
         };
         intent.verify(authority, managed, verifier)?;
         Ok(intent)
@@ -93,6 +95,22 @@ impl CleanManagementIntent {
         }
     }
 
+    pub(crate) fn finalization_message(
+        ack: &crate::agent_sdk::authority::ManagementApplicationAck,
+    ) -> Vec<u8> {
+        use crate::actors::codec::Encode as _;
+        let mut bytes = vec![crate::actors::value::TAG_DYNAMIC];
+        bytes.extend(
+            crate::actors::value::Msg::new("finalize")
+                .with(
+                    "ack",
+                    crate::actors::value::Value::Bytes(ack.encode().unwrap_or_default()),
+                )
+                .encode(),
+        );
+        bytes
+    }
+
     fn validate(&self) -> Result<(), DecodeError> {
         if !self.request.is_valid()
             || self.call.encode().is_err()
@@ -119,7 +137,15 @@ impl CleanManagementIntent {
                 return Err(DecodeError::NonCanonical);
             }
         }
-        if let Some(work) = &self.authorization_work {
+        if self.finalization_work.is_some() && self.authorization_work.is_none() {
+            return Err(DecodeError::NonCanonical);
+        }
+        for (work, finalization) in self
+            .authorization_work
+            .iter()
+            .map(|work| (work, false))
+            .chain(self.finalization_work.iter().map(|work| (work, true)))
+        {
             let RuntimeWork::Invoke {
                 context,
                 state,
@@ -129,6 +155,45 @@ impl CleanManagementIntent {
             } = work
             else {
                 return Err(DecodeError::NonCanonical);
+            };
+            let (expected_invocation, expected_origin, expected_message) = if finalization {
+                use crate::actors::codec::Decode as _;
+                use crate::agent_sdk::authority::{ManagementApplicationAck, ManagementApproval};
+                let message = crate::actors::value::Msg::try_decode(
+                    invocation
+                        .message
+                        .get(1..)
+                        .ok_or(DecodeError::NonCanonical)?,
+                )
+                .ok_or(DecodeError::NonCanonical)?;
+                let Some(crate::actors::value::Value::Bytes(bytes)) = message.args.get("ack")
+                else {
+                    return Err(DecodeError::NonCanonical);
+                };
+                let ack = ManagementApplicationAck::decode(bytes)
+                    .map_err(|_| DecodeError::NonCanonical)?;
+                if ack.authority != self.call.authority
+                    || ack.managed != self.call.managed
+                    || ack.authorization_invocation != self.call.invocation
+                    || ack.acknowledgement_invocation
+                        != ManagementApproval::derive_acknowledgement_invocation(&self.call)
+                    || ack.credential_call != self.call.commitment()
+                    || ack.request != self.request.commitment()
+                    || ack.applied_at > *observed_slot
+                {
+                    return Err(DecodeError::NonCanonical);
+                }
+                (
+                    ack.acknowledgement_invocation,
+                    InvocationOrigin::anonymous(),
+                    Self::finalization_message(&ack),
+                )
+            } else {
+                (
+                    self.call.invocation,
+                    self.authorization_origin(),
+                    self.authorization_message(),
+                )
             };
             let target = self.call.authority;
             if *context != RuntimeExecutionContext::Direct
@@ -140,11 +205,11 @@ impl CleanManagementIntent {
                 || invocation.actor != target.binding.issuer.actor
                 || invocation.deployment != target.binding.issuer.deployment
                 || invocation.program != target.binding.issuer.program
-                || invocation.invocation != self.call.invocation
+                || invocation.invocation != expected_invocation
                 || invocation.mode != MethodMode::Linear
-                || invocation.origin != self.authorization_origin()
+                || invocation.origin != expected_origin
                 || invocation.roles != InvocationRoleClaims::none()
-                || invocation.message != self.authorization_message()
+                || invocation.message != expected_message
                 || invocation.recovery_only
                 || **authorization
                     != InvocationAuthorization::PublicPreflight(
@@ -160,13 +225,17 @@ impl CleanManagementIntent {
 }
 
 impl ServiceWire for CleanManagementIntent {
-    const MAGIC: [u8; 4] = *b"CMI2";
+    const MAGIC: [u8; 4] = *b"CMI3";
     fn encode_body(&self, output: &mut Vec<u8>) {
         let mut encoder = Encoder(output);
         encoder.bytes(&self.request.encode().unwrap_or_default());
         encoder.bytes(&self.call.encode().unwrap_or_default());
         encoder.bool(self.authorization_work.is_some());
         if let Some(work) = &self.authorization_work {
+            encoder.bytes(&work.encode().unwrap_or_default());
+        }
+        encoder.bool(self.finalization_work.is_some());
+        if let Some(work) = &self.finalization_work {
             encoder.bytes(&work.encode().unwrap_or_default());
         }
     }
@@ -185,6 +254,15 @@ impl ServiceWire for CleanManagementIntent {
             call: AuthorityCredentialCall::decode(call_bytes)
                 .map_err(|_| DecodeError::NonCanonical)?,
             authorization_work: if decoder.bool()? {
+                let bytes = decoder.bytes_ref()?;
+                if bytes.len() > crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES {
+                    return Err(DecodeError::LimitExceeded);
+                }
+                Some(RuntimeWork::decode(bytes).map_err(|_| DecodeError::NonCanonical)?)
+            } else {
+                None
+            },
+            finalization_work: if decoder.bool()? {
                 let bytes = decoder.bytes_ref()?;
                 if bytes.len() > crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES {
                     return Err(DecodeError::LimitExceeded);
@@ -297,18 +375,50 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
         &mut self,
         work: RuntimeWork,
     ) -> Result<bool, IntentSlotError<B::Error>> {
+        self.pledge_work(work, false)
+    }
+
+    pub(crate) fn finalization_work(
+        &self,
+    ) -> Result<Option<&RuntimeWork>, IntentSlotError<B::Error>> {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        Ok(self
+            .intent
+            .as_ref()
+            .and_then(|intent| intent.finalization_work.as_ref()))
+    }
+
+    pub(crate) fn pledge_finalization_work(
+        &mut self,
+        work: RuntimeWork,
+    ) -> Result<bool, IntentSlotError<B::Error>> {
+        self.pledge_work(work, true)
+    }
+
+    fn pledge_work(
+        &mut self,
+        work: RuntimeWork,
+        finalization: bool,
+    ) -> Result<bool, IntentSlotError<B::Error>> {
         if self.poisoned {
             return Err(IntentSlotError::Poisoned);
         }
         let mut intent = self.intent.clone().ok_or(IntentSlotError::Invalid)?;
-        if let Some(existing) = &intent.authorization_work {
+        let pending = if finalization {
+            &mut intent.finalization_work
+        } else {
+            &mut intent.authorization_work
+        };
+        if let Some(existing) = pending {
             return if *existing == work {
                 Ok(false)
             } else {
                 Err(IntentSlotError::Conflict)
             };
         }
-        intent.authorization_work = Some(work);
+        *pending = Some(work);
         intent.validate().map_err(|_| IntentSlotError::Invalid)?;
         let bytes = intent.encode();
         if bytes.len() > MAX_INTENT_BYTES {

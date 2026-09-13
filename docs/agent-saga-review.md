@@ -55,6 +55,10 @@ review endpoints for individual fixes:
    provision or permissive verifier is not sufficient. Prove ordinary-agent
    creation, actor installation, invocation and restart from the actual native
    entry point, not a manually prepared library host.
+   The owner now has tested Local Create/application and Authority-finalization
+   adapters, including fresh journal replay before the issuer's finalization
+   marker. These are not yet connected to that native entry point; they do not
+   close ordinary-Agent finality or route publication.
 3. **C3 — release:** after those implementation changes, freeze source, rebuild
    and independently reproduce artifacts, run the final feature, physical,
    inventory, docs/examples and release checks, and repeat the fresh-space
@@ -1552,3 +1556,42 @@ Next connect durable Authority finalization and receipt/result retirement,
 journal-capacity reservation, native host attachment and route publication.
 The CLI/ingress management entry point and independent ordinary-Agent finality
 are still incomplete. No artifact or store format changed in this checkpoint.
+
+### Native Authority finalization and exact recovery
+
+The owner now finalizes the exact signed application acknowledgement retained
+by the durable issuer. It checks the installed Authority identity and method
+policy, dispatches the bundled actor, and requires an exact successful terminal
+reply. Before marking the issuer finalized, a fresh replay executor materializes
+the durable Shared journal, reconciles its ledger/checkpoint and compares its
+heads, state and exact terminal result with the live host. This is independent
+of the live executor's result cache, not a whole-process cold reopen or an
+ordinary-Agent genesis-finality implementation. Missing/pruned results and
+histories needing an unavailable attested replay provider fail closed.
+
+Pending intents now use **CMI3**, rejecting CMI1/CMI2 without migration. They
+retain separate authorization and finalization envelopes. Finalization needs
+a current preflight slot for its first acceptance, even when the application
+receipt is an expired exact retry. An initial test using the application slot
+correctly failed with `AuthorityExpired`; the fix persists the current
+finalization envelope before dispatch and reuses it on retries, without weakening
+runtime clock checks. Prepared-but-not-accepted work still needs the lifecycle
+reservation/recovery design; this change does not solve that boundary.
+
+**13/13 issuer and native management tests pass** in 14.35s:
+`r16-native-management-finalization-recovery.log` under the shared disk-backed
+`target/task-tmp`. Coverage includes substituted signed-ack refusal before
+dispatch, canonical envelope reopen, ambiguous completed intent writes with
+poisoned-handle refusal, changed-slot retry conflict, and recovery with the
+issuer's pre-finalization image after the actor has committed. The latter
+advances the clock again and proves exact replay without another journal entry
+or signature. Already-finalized issuer reopen is also a no-op. As before, the
+system fixture uses the native Standard outer-runtime shortcut; the Authority
+actor and ordinary Local runtime execute their bundled PVM programs.
+
+Next: result/receipt retirement and safe intent completion, joint lifecycle
+capacity reservation, native management entry-point/host attachment and route
+publication, and independent ordinary-Agent finality. Then run final-source
+release gates and fresh-data startup before advancing integration branches.
+No artifact was rebuilt or repinned. This remains an internal C2 checkpoint,
+not a fourth review batch or a deployment-readiness claim.

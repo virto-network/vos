@@ -912,6 +912,8 @@ where
     materialization: ReplayMaterialization,
     ledger: AgentRaftApplicationLedgerV2,
     local_node: NodeId,
+    replay_trust: Arc<dyn AgentTrustProvider>,
+    replay_merge: Arc<dyn LocalMergeAuthenticator>,
 }
 
 impl<S, A> SharedJournalAgentDriver<S, A>
@@ -972,8 +974,12 @@ where
         artifacts.audit(ledger.generation())?;
         let committees = ledger.committee_history()?;
         let resolver = store.catalog_blob_resolver()?;
-        let mut executor =
-            StandardLocalReplayExecutor::new_shared(resolver, trust, merge, committees);
+        let mut executor = StandardLocalReplayExecutor::new_shared(
+            resolver,
+            trust.clone(),
+            merge.clone(),
+            committees,
+        );
         if let Some(provider) = provider {
             executor.replace_attested_transition_provider(provider);
         }
@@ -1028,7 +1034,48 @@ where
             materialization,
             ledger,
             local_node,
+            replay_trust: trust,
+            replay_merge: merge,
         })
+    }
+
+    /// Re-materialize the durable journal using a fresh verifier/result cache
+    /// before treating a retained Direct terminal result as lifecycle evidence.
+    /// Missing/pruned results and histories requiring an unavailable attested
+    /// replay provider fail closed; no new invocation is proposed here.
+    pub(crate) fn replay_durable_clean_terminal(
+        &mut self,
+        request: CleanInvocationReplayRequest,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedJournalDriverError> {
+        let operation = request.into_operation(0);
+        let resolver = self.store.catalog_blob_resolver()?;
+        let mut executor = StandardLocalReplayExecutor::new_shared(
+            resolver,
+            self.replay_trust.clone(),
+            self.replay_merge.clone(),
+            self.ledger.committee_history()?,
+        );
+        let recovered = materialize_current(&mut self.store, &mut executor, &NoPrunedOrderedBases)?;
+        let audit = self.ledger.journal_audit()?;
+        if let Some(snapshot) = &audit.snapshot {
+            validate_published_shared_checkpoint(&self.store, &recovered, &snapshot.claim)
+                .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+        }
+        reconcile_journal_ledger(&self.store, &recovered, self.ledger.journal_store(), &audit)?;
+        if recovered.heads() != self.materialization.heads()
+            || recovered.state() != self.materialization.state()
+        {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let input = recent_clean_ordered_operation(&self.store, &recovered, &operation)?
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        let outcome = executor
+            .clean_ordered_result(input)
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        if !matches!(outcome, crate::agent_sdk::RuntimeOutcome::Completed(_)) {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        Ok(outcome)
     }
 
     pub(crate) fn local_role(&self) -> Result<Option<ReplicaRole>, SharedJournalDriverError> {
