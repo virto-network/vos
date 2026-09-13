@@ -2085,6 +2085,41 @@ Next: credential-wide durable operation reservation and fresh Create command
 wiring, then real-daemon discovery/Create/publication and restart/retry. No
 master promotion, guest artifact rebuild or new native daemon smoke is claimed.
 
+### Durable credential-wide operation reservation
+
+`CleanCredentialReservation` now derives one control directory from the full
+Space and Credential IDs under a configured private parent and holds an
+exclusive writer lease. Its bounded CRS1 record (CSF1 role 9) retains an
+operation nonce and pending/completed disposition. A pending nonce survives
+restart and refuses replacement; `current()` exposes the validated retained
+nonce for resumption. The caller must use the same configured parent and retain
+this lease across discovery, preparation and sending. Other hosts or independently
+configured clients remain serialized by the live Authority's sequence policy.
+
+Completion requires a cryptographically verified MAA2 for the exact LCQ1 request,
+the reserved creation nonce, Space and Credential. The completed record binds
+the exact request hash and acknowledgement commitment. Repeating that completion
+is safe; a different operation can be reserved only after completion. An old
+acknowledgement cannot complete a newer pending nonce. No HTTP error, unsigned
+projection or cancellation can mark a reservation complete, and query/request
+files are not deleted by this control record.
+
+**All `vosx` binary tests pass: 173 passed, zero failed, one ignored**, in 3.99s
+(`r16-credential-reservation-final.log`, locked/offline, serial with socket
+access and disk scratch). Checks cover exclusive acquisition, zero-nonce
+rejection, unchanged pending state after conflicting reservations/bad completion,
+pending lookup after reopen, exact signed completion/reopen/retry, and refusal of
+stale completion after the next reservation. The positive completion assertions
+reuse the existing signed acknowledgement fixture. Formatting and diff checks
+pass; the ignored compiled-runtime candidate remains a release gate.
+
+Fresh Create CLI orchestration must now hold this reservation while choosing or
+resuming per-operation query/request stores and sending the retained request.
+That orchestration and real-daemon testing are still open; this is not yet an
+end-to-end usable fresh Create command. Explicit denial/abort recovery and
+retirement remain separate outstanding lifecycle requirements, not implicit
+permission to discard a pending reservation.
+
 The CLI subcommand is still absent. Next wiring must persist the complete
 submission durably before sending and resend those bytes on retry. Bootstrap
 uses management credential sequence 1; Authority requires the next consecutive

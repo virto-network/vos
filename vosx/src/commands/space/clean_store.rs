@@ -51,6 +51,9 @@ const LOCAL_REQUEST_FILE: &str = "local-create.request";
 const LOCAL_REQUEST_STAGE_FILE: &str = "local-create.request.next";
 const LOCAL_REQUEST_ENTRIES: [&str; 3] = [LOCK_FILE, LOCAL_REQUEST_FILE, LOCAL_REQUEST_STAGE_FILE];
 const CREDENTIAL_QUERY_FILE: &str = "credential.query";
+const RESERVATION_FILE: &str = "credential.reservation";
+const RESERVATION_STAGE_FILE: &str = "credential.reservation.next";
+const RESERVATION_ENTRIES: [&str; 3] = [LOCK_FILE, RESERVATION_FILE, RESERVATION_STAGE_FILE];
 const CREDENTIAL_QUERY_STAGE_FILE: &str = "credential.query.next";
 const CREDENTIAL_QUERY_ENTRIES: [&str; 3] = [
     LOCK_FILE,
@@ -147,6 +150,7 @@ enum StoreRole {
     LifecycleIssuer = 6,
     LocalCreateRequest = 7,
     CredentialQuery = 8,
+    CredentialReservation = 9,
 }
 
 impl StoreRole {
@@ -160,6 +164,7 @@ impl StoreRole {
             Self::LifecycleIssuer => LIFECYCLE_ISSUER_FILE,
             Self::LocalCreateRequest => LOCAL_REQUEST_FILE,
             Self::CredentialQuery => CREDENTIAL_QUERY_FILE,
+            Self::CredentialReservation => RESERVATION_FILE,
         }
     }
 
@@ -173,6 +178,7 @@ impl StoreRole {
             Self::LifecycleIssuer => LIFECYCLE_ISSUER_STAGE_FILE,
             Self::LocalCreateRequest => LOCAL_REQUEST_STAGE_FILE,
             Self::CredentialQuery => CREDENTIAL_QUERY_STAGE_FILE,
+            Self::CredentialReservation => RESERVATION_STAGE_FILE,
         }
     }
 
@@ -185,6 +191,7 @@ impl StoreRole {
             Self::ManagementIntent => MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES,
             Self::LifecycleIssuer => MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
             Self::LocalCreateRequest => 1024 * 1024,
+            Self::CredentialReservation => 165,
             Self::CredentialQuery => {
                 vos::agent::sdk::wire::MAX_AUTHORITY_PROJECTION_QUERY_WIRE_BYTES
             }
@@ -201,6 +208,7 @@ impl StoreRole {
             6 => Some(Self::LifecycleIssuer),
             7 => Some(Self::LocalCreateRequest),
             8 => Some(Self::CredentialQuery),
+            9 => Some(Self::CredentialReservation),
             _ => None,
         }
     }
@@ -305,6 +313,167 @@ pub(crate) struct CleanManagementIntentFile(ExactFileStore);
 /// same request for restart. This does not allocate a credential sequence.
 #[cfg(target_os = "linux")]
 pub(crate) struct CleanLocalCreateRequestFile(ExactFileStore);
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CredentialReservationStatus {
+    Pending,
+    Completed,
+}
+
+/// One local operation at a time for a Space/Credential in this configured
+/// private parent. Retain the lease across discovery, preparation and sending.
+/// Other machines are still serialized by Authority's exact sequence policy.
+#[cfg(target_os = "linux")]
+pub(crate) struct CleanCredentialReservation {
+    store: ExactFileStore,
+    space: vos::agent::sdk::SpaceId,
+    credential: vos::agent::sdk::CredentialId,
+}
+
+#[cfg(target_os = "linux")]
+impl CleanCredentialReservation {
+    pub(crate) fn open_or_create(
+        parent: &Path,
+        space: vos::agent::sdk::SpaceId,
+        credential: vos::agent::sdk::CredentialId,
+    ) -> Result<Self, CleanFileStoreError> {
+        if space == vos::agent::sdk::SpaceId::ZERO
+            || credential == vos::agent::sdk::CredentialId::ZERO
+        {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        let path = parent.join(format!(
+            "{}-{}",
+            hex::encode(space.0),
+            hex::encode(credential.0)
+        ));
+        let root = Arc::new(StoreRoot::open_with_entries(&path, &RESERVATION_ENTRIES)?);
+        Ok(Self {
+            store: ExactFileStore::new(root, StoreRole::CredentialReservation),
+            space,
+            credential,
+        })
+    }
+
+    fn image(
+        &self,
+        nonce: vos::agent::sdk::Hash,
+        completed: Option<(vos::agent::sdk::Hash, vos::agent::sdk::Hash)>,
+    ) -> Vec<u8> {
+        let mut bytes = b"CRS1".to_vec();
+        bytes.extend_from_slice(self.space.as_bytes());
+        bytes.extend_from_slice(self.credential.as_bytes());
+        bytes.extend_from_slice(nonce.as_bytes());
+        bytes.push(u8::from(completed.is_some()));
+        let (request, ack) =
+            completed.unwrap_or((vos::agent::sdk::Hash::ZERO, vos::agent::sdk::Hash::ZERO));
+        bytes.extend_from_slice(request.as_bytes());
+        bytes.extend_from_slice(ack.as_bytes());
+        bytes
+    }
+
+    fn load(&mut self) -> Result<Option<Vec<u8>>, CleanFileStoreError> {
+        let bytes = self
+            .store
+            .load(StoreRole::CredentialReservation.maximum_bytes())?;
+        if let Some(bytes) = &bytes {
+            if bytes.len() != 165
+                || &bytes[..4] != b"CRS1"
+                || bytes[4..36] != self.space.0
+                || bytes[36..68] != self.credential.0
+                || bytes[68..100] == [0; 32]
+                || !match bytes[100] {
+                    0 => bytes[101..165] == [0; 64],
+                    1 => bytes[101..133] != [0; 32] && bytes[133..165] != [0; 32],
+                    _ => false,
+                }
+            {
+                return Err(CleanFileStoreError::Corrupt);
+            }
+            self.store.commit(bytes)?;
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn current(
+        &mut self,
+    ) -> Result<Option<(vos::agent::sdk::Hash, CredentialReservationStatus)>, CleanFileStoreError>
+    {
+        self.load()?
+            .map(|bytes| {
+                let nonce = vos::agent::sdk::Hash(
+                    bytes[68..100]
+                        .try_into()
+                        .map_err(|_| CleanFileStoreError::Corrupt)?,
+                );
+                let status = if bytes[100] == 0 {
+                    CredentialReservationStatus::Pending
+                } else {
+                    CredentialReservationStatus::Completed
+                };
+                Ok((nonce, status))
+            })
+            .transpose()
+    }
+
+    pub(crate) fn reserve(
+        &mut self,
+        nonce: vos::agent::sdk::Hash,
+    ) -> Result<CredentialReservationStatus, CleanFileStoreError> {
+        if nonce == vos::agent::sdk::Hash::ZERO {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        if let Some(current) = self.load()? {
+            if current[68..100] == nonce.0 {
+                return Ok(if current[100] == 0 {
+                    CredentialReservationStatus::Pending
+                } else {
+                    CredentialReservationStatus::Completed
+                });
+            }
+            if current[100] == 0 {
+                return Err(CleanFileStoreError::RequestConflict);
+            }
+        }
+        self.store.commit(&self.image(nonce, None))?;
+        Ok(CredentialReservationStatus::Pending)
+    }
+
+    /// Only a cryptographically verified acknowledgement for the reserved
+    /// Create can complete this reservation. Never interpret an HTTP error,
+    /// cancellation or unsigned projection as completion.
+    pub(crate) fn complete(
+        &mut self,
+        request: &[u8],
+        acknowledgement: &[u8],
+    ) -> Result<(), CleanFileStoreError> {
+        use vos::agent::sdk::Hash;
+        let ack = super::local_create::verify_acknowledgement(request, acknowledgement)
+            .map_err(|_| CleanFileStoreError::Corrupt)?;
+        let submission = vos::agent::local_lifecycle::LocalCreateSubmission::decode(request)
+            .map_err(|_| CleanFileStoreError::Corrupt)?;
+        let (descriptor, call, _) = submission.into_parts();
+        if descriptor.identity.space != self.space || call.credential != self.credential {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        let current = self.load()?.ok_or(CleanFileStoreError::RequestConflict)?;
+        if current[68..100] != descriptor.creation_nonce.0 {
+            return Err(CleanFileStoreError::RequestConflict);
+        }
+        let completed = self.image(
+            descriptor.creation_nonce,
+            Some((
+                Hash::digest(b"vos/local-create/retained-request/v1", &[request]),
+                ack.commitment(),
+            )),
+        );
+        if current[100] == 1 && current != completed {
+            return Err(CleanFileStoreError::RequestConflict);
+        }
+        self.store.commit(&completed)
+    }
+}
 
 /// Immutable signed discovery query, scoped to an independently chosen target
 /// and credential. A valid initial stage is recoverable; no nonce replacement
@@ -1356,7 +1525,7 @@ fn unlink_at(directory: &File, _root: &Path, name: &str) -> Result<(), CleanFile
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::{Seek as _, SeekFrom};
     #[cfg(unix)]
@@ -1449,6 +1618,99 @@ mod tests {
         )
         .unwrap()
         .encode()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn credential_reservation_keeps_pending_operation_across_restart() {
+        use vos::agent::sdk::{CredentialId, Hash, SpaceId};
+        let fixture = Fixture::new("credential-reservation");
+        let space = SpaceId([1; 32]);
+        let credential = CredentialId([2; 32]);
+        let nonce = Hash([3; 32]);
+        let mut store =
+            CleanCredentialReservation::open_or_create(&fixture.parent, space, credential).unwrap();
+        assert!(matches!(
+            CleanCredentialReservation::open_or_create(&fixture.parent, space, credential),
+            Err(CleanFileStoreError::Busy)
+        ));
+        assert!(store.reserve(Hash::ZERO).is_err());
+        assert_eq!(store.current().unwrap(), None);
+        assert_eq!(
+            store.reserve(nonce).unwrap(),
+            CredentialReservationStatus::Pending
+        );
+        let root = store.store.root.path.clone();
+        let before = fs::read(root.join(RESERVATION_FILE)).unwrap();
+        assert!(matches!(
+            store.reserve(Hash([4; 32])),
+            Err(CleanFileStoreError::RequestConflict)
+        ));
+        assert!(store.complete(b"LCQ1", b"MAA2").is_err());
+        assert_eq!(fs::read(root.join(RESERVATION_FILE)).unwrap(), before);
+        drop(store);
+        let mut store =
+            CleanCredentialReservation::open_or_create(&fixture.parent, space, credential).unwrap();
+        assert_eq!(
+            store.current().unwrap(),
+            Some((nonce, CredentialReservationStatus::Pending))
+        );
+        assert_eq!(
+            store.reserve(nonce).unwrap(),
+            CredentialReservationStatus::Pending
+        );
+        assert!(matches!(
+            store.reserve(Hash([4; 32])),
+            Err(CleanFileStoreError::RequestConflict)
+        ));
+    }
+
+    /// Called by the signed acknowledgement fixture; keeps its large setup out
+    /// of the persistence test's stack frame.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn check_reservation_completion(request: &[u8], acknowledgement: &[u8]) {
+        use vos::agent::sdk::Hash;
+        let fixture = Fixture::new("reservation-completion");
+        let (descriptor, call, _) =
+            vos::agent::local_lifecycle::LocalCreateSubmission::decode(request)
+                .unwrap()
+                .into_parts();
+        let open = || {
+            CleanCredentialReservation::open_or_create(
+                &fixture.parent,
+                descriptor.identity.space,
+                call.credential,
+            )
+            .unwrap()
+        };
+        let mut store = open();
+        assert!(store.complete(request, acknowledgement).is_err());
+        store.reserve(descriptor.creation_nonce).unwrap();
+        let mut forged = acknowledgement.to_vec();
+        let last = forged.len() - 1;
+        forged[last] ^= 1;
+        assert!(store.complete(request, &forged).is_err());
+        store.complete(request, acknowledgement).unwrap();
+        store.complete(request, acknowledgement).unwrap();
+        drop(store);
+        let mut store = open();
+        assert_eq!(
+            store.reserve(descriptor.creation_nonce).unwrap(),
+            CredentialReservationStatus::Completed
+        );
+        let next = Hash([91; 32]);
+        assert_eq!(
+            store.reserve(next).unwrap(),
+            CredentialReservationStatus::Pending
+        );
+        assert!(matches!(
+            store.complete(request, acknowledgement),
+            Err(CleanFileStoreError::RequestConflict)
+        ));
+        assert_eq!(
+            store.reserve(next).unwrap(),
+            CredentialReservationStatus::Pending
+        );
     }
 
     #[cfg(target_os = "linux")]

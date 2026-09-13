@@ -767,6 +767,7 @@ pub(crate) mod tests {
         };
         sign(&mut ack);
         let bytes = ack.encode().unwrap();
+        super::super::clean_store::tests::check_reservation_completion(&request, &bytes);
         assert_eq!(verify_acknowledgement(&request, &bytes).unwrap(), ack);
         let mut http = format!("HTTP/1.1 201 Created\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).into_bytes();
         http.extend_from_slice(&bytes);
