@@ -56,6 +56,20 @@ pub trait CleanManagementIssuerStore {
     fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error>;
 }
 
+// Reload protocol state while retaining the caller's exclusive store lease.
+// A failed commit may already be durable, so retries must still call load.
+impl<B: CleanManagementIssuerStore + ?Sized> CleanManagementIssuerStore for &mut B {
+    type Error = B::Error;
+
+    fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        (**self).load()
+    }
+
+    fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+        (**self).commit(image)
+    }
+}
+
 /// Policy-selected context which is visible in the signed SDK receipt.
 ///
 /// This is data, not proof that policy ran. Possession of the separately

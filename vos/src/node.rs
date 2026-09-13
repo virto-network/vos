@@ -5689,6 +5689,8 @@ impl VosNode {
         R: crate::agent::clean_bootstrap::CleanSystemAgentBootstrapStore + Send + 'static,
         I: crate::agent::clean_authority_issuer::CleanManagementIssuerStore + Send + 'static,
         F: crate::agent::local_lifecycle::LocalLifecycleStoreFactory + Send + 'static,
+        F::Intent: Send + 'static,
+        F::Issuer: Send + 'static,
         S: crate::agent::clean_authority_issuer::CleanManagementReceiptSigner + Send + 'static,
     {
         if self.clean_agent_owner.is_some() || self.shutdown.load(Ordering::Acquire) {

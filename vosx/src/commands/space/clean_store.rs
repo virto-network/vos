@@ -2532,6 +2532,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn lifecycle_files_reload_staged_images_without_releasing_writer_lease() {
+        fn reload<B: CleanManagementIssuerStore>(mut store: B) -> Option<Vec<u8>> {
+            store.load().ok().flatten()
+        }
+        let fixture = Fixture::new("lifecycle-retained-lease");
+        let (mut intent, mut issuer) = CleanManagementLifecycleFiles::open_or_create(&fixture.root)
+            .unwrap()
+            .into_parts();
+        intent.commit(b"intent-before").unwrap();
+        issuer.commit(b"issuer-before").unwrap();
+        for (store, payload) in [
+            (&intent.0, b"intent-after".as_slice()),
+            (&issuer.0, b"issuer-after".as_slice()),
+        ] {
+            let predecessor = store
+                .reconcile(store.role.maximum_bytes())
+                .unwrap()
+                .unwrap();
+            stage(store, Some(predecessor.commitment()), payload);
+        }
+        assert_eq!(
+            reload(&mut intent).as_deref(),
+            Some(b"intent-after".as_slice())
+        );
+        assert_eq!(
+            reload(&mut issuer).as_deref(),
+            Some(b"issuer-after".as_slice())
+        );
+        assert!(!fixture.root.join(INTENT_STAGE_FILE).exists());
+        assert!(!fixture.root.join(LIFECYCLE_ISSUER_STAGE_FILE).exists());
+        assert!(matches!(
+            CleanManagementLifecycleFiles::open_or_create(&fixture.root),
+            Err(CleanFileStoreError::Busy)
+        ));
+        drop(intent);
+        assert!(matches!(
+            CleanManagementLifecycleFiles::open_or_create(&fixture.root),
+            Err(CleanFileStoreError::Busy)
+        ));
+        drop(issuer);
+        assert!(CleanManagementLifecycleFiles::open_or_create(&fixture.root).is_ok());
+    }
+
+    #[test]
     fn lifecycle_files_reject_bootstrap_names_and_cross_role_envelopes() {
         let fixture = Fixture::new("lifecycle-role");
         let (mut intent, mut issuer) = CleanManagementLifecycleFiles::open_or_create(&fixture.root)

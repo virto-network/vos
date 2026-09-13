@@ -6,6 +6,8 @@ but ordinary-agent finality, cross-runtime actor lifecycle, and full release gat
 remain open. This is not a master-ready branch.
 See the current closeout plan below; later checkpoint sections retain historical
 results, including failures that have since been fixed.
+Earlier clock-test pass counts had a fixture-dispatch gap; see "Retained
+lifecycle-store leases and corrected clock coverage" for the correction.
 
 ## Current closeout plan
 
@@ -3027,6 +3029,47 @@ protect capture/store-error/dispatch/application/finalization transitions;
 handle future unprepared finalization, pending projections, exhausted capacity,
 and process restart. This scoped change does not enable production retirement,
 ordinary Shared finality, actor install ingress, or master readiness.
+
+### Retained lifecycle-store leases and corrected clock coverage
+
+The native Local lifecycle controller now retains each intent/issuer store pair
+instead of reacquiring its filesystem paths for every Create retry. Protocol
+state is still reloaded and validated on every attempt using borrowed stores;
+a failed commit can already be durable and must not reuse poisoned cached state.
+Both handles remain owned through failure, retry, and route-worker retirement,
+and are released with the controller. Rejected request authentication still
+precedes creation of any new store directory.
+
+`LocalLifecycleController::with_recovery` adopts the verified discovery result's
+existing handles without reacquiring their leases. The recovery result now also
+retains its independently supplied Authority target; adoption rejects a target
+different from the system owner's pins. This is store ownership transfer, not
+proof of journal admission or an automatic startup recovery implementation.
+Production startup still needs the full pending set installed before routes,
+plus continuous management phase extension/error handling before retirement can
+be enabled.
+
+Native fixtures cover fresh and recovered handles, an intent commit that writes
+successfully then reports failure, retry with durable reload, unchanged factory
+open count, exclusive-handle retention through route retirement and release on
+shutdown. The lease counter fixture is not an OS-lock proof. A separate `vosx`
+filesystem test stages replacements for both lifecycle images, reloads through
+borrowed handles, verifies reconciliation, and verifies the actual writer lock
+remains busy until both handles are dropped.
+
+Coverage correction: the native fixture previously routed every mode >= 2 into
+the generic controller case. Consequently the tests named for authorization
+and finalization clock advance (modes 6/7) did not reach their intended branches.
+Earlier pass counts are historical execution results, not evidence for those
+two named scenarios. The dispatch now explicitly selects controller modes
+2/3/8, allowing both clock cases to execute their dedicated assertions.
+
+Verification: **12 native bootstrap/lifecycle tests passed**, including both
+corrected clock branches (241.53s, `r16-lifecycle-leases-native.log`), and **10
+`vosx` lifecycle-store tests passed** (0.09s, `r16-lifecycle-leases-files.log`).
+Formatting and diff checks pass. Logs are in the shared disk-backed
+`target/task-tmp` directory documented above. This is targeted source coverage,
+not a rebuilt-CLI deployment smoke, full-library run or release approval.
 
 ### Durable client acknowledgement before completion
 

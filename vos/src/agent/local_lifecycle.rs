@@ -1,5 +1,6 @@
 //! Native ownership boundary for signed Local Agent lifecycle operations.
 
+use std::collections::BTreeMap;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -249,6 +250,7 @@ pub trait LocalLifecycleStoreFactory {
 /// Pending entries are not approvals or proof of physical application. Keeping
 /// both stores alive preserves their exclusive leases through recovery setup.
 pub struct LocalLifecycleRecovery<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> {
+    authority: super::sdk::authority::AuthorityActorTarget,
     pub(crate) entries: Vec<LocalLifecycleRecoveryEntry<I, J>>,
 }
 
@@ -387,7 +389,7 @@ pub fn discover_local_lifecycle_recovery<F: LocalLifecycleStoreFactory>(
             finalized,
         });
     }
-    Ok(LocalLifecycleRecovery { entries })
+    Ok(LocalLifecycleRecovery { authority, entries })
 }
 
 /// Type-erased, node-owned lifecycle access. It is deliberately not an ingress
@@ -416,6 +418,8 @@ where
     R: CleanSystemAgentBootstrapStore + Send + 'static,
     I: CleanManagementIssuerStore + Send + 'static,
     F: LocalLifecycleStoreFactory + Send,
+    F::Intent: Send,
+    F::Issuer: Send,
     S: CleanManagementReceiptSigner + Send,
 {
     fn node(&self) -> Result<super::sdk::NodeId, SharedAgentHostError> {
@@ -457,10 +461,14 @@ where
     P: CleanSystemAgentBootstrapStore,
     R: CleanSystemAgentBootstrapStore,
     I: CleanManagementIssuerStore,
+    F: LocalLifecycleStoreFactory,
 {
     system: Arc<Mutex<CleanSystemAgentBootstrapOwner<P, R, I>>>,
     local: Arc<Mutex<LocalAgentHost>>,
     stores: F,
+    // Retain exclusive handles across retries, including ambiguous commits.
+    // Parsed protocol state is reopened from these handles for every call.
+    retained_stores: BTreeMap<AgentId, (F::Intent, F::Issuer)>,
     signer: S,
 }
 
@@ -485,8 +493,39 @@ where
             system: Arc::new(Mutex::new(system)),
             local: Arc::new(Mutex::new(local)),
             stores,
+            retained_stores: BTreeMap::new(),
             signer,
         })
+    }
+
+    /// Adopt stores previously verified against independently selected pins.
+    /// This transfers leases without opening their paths again. The caller
+    /// must separately seed system-network recovery before publishing routes;
+    /// adopting store handles does not establish journal admission protection.
+    pub fn with_recovery(
+        system: CleanSystemAgentBootstrapOwner<P, R, I>,
+        local: LocalAgentHost,
+        stores: F,
+        signer: S,
+        recovery: LocalLifecycleRecovery<F::Intent, F::Issuer>,
+    ) -> Result<Self, SharedAgentHostError> {
+        if recovery.authority != system.authority_target() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let mut controller = Self::new(system, local, stores, signer)?;
+        for entry in recovery.entries {
+            if controller
+                .retained_stores
+                .insert(
+                    entry.agent,
+                    (entry.intent.into_store(), entry.issuer.into_store()),
+                )
+                .is_some()
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+        }
+        Ok(controller)
     }
 
     pub fn system_attachment(
@@ -543,10 +582,17 @@ where
             &super::clean_bootstrap::RawCredentialVerifier,
         )
         .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-        let (intent, issuer) = self
-            .stores
-            .open(descriptor.identity.space, descriptor.identity.agent)
-            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let entry = self.retained_stores.entry(descriptor.identity.agent);
+        let (intent, issuer) = match entry {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let stores = self
+                    .stores
+                    .open(descriptor.identity.space, descriptor.identity.agent)
+                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+                entry.insert(stores)
+            }
+        };
         system.create_local_agent(
             intent,
             issuer,

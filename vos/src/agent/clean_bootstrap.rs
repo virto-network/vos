@@ -2734,8 +2734,9 @@ where
     }
 
     /// Create and finalize one signed Local Agent lifecycle using independent
-    /// durable intent and issuer stores. Reopen those same stores after any
-    /// error; a failed write may already have reached durable storage.
+    /// durable intent and issuer stores. Reload those same stores after any
+    /// error; a failed write may already have reached durable storage. Passing
+    /// borrowed stores retains the caller's exclusive leases across attempts.
     ///
     /// The caller owns the Local host exclusively until authenticated route
     /// publication. This does not publish routes, retire lifecycle evidence,
@@ -7425,6 +7426,11 @@ mod tests {
         }
 
         #[test]
+        fn native_local_lifecycle_controller_adopts_recovery_leases() {
+            native_local_management_lifecycle(8);
+        }
+
+        #[test]
         fn native_node_rejects_lifecycle_start_after_shutdown_without_leaking_hosts() {
             native_local_management_lifecycle(3);
         }
@@ -7876,16 +7882,45 @@ mod tests {
                 harness.stop();
                 return;
             }
-            if coordinated >= 2 {
+            if matches!(coordinated, 2 | 3 | 8) {
+                struct LeasedStore {
+                    inner: IssuerMemoryStore,
+                    active: Arc<AtomicUsize>,
+                    loads: Arc<AtomicUsize>,
+                    fail_after_commit: Arc<std::sync::atomic::AtomicBool>,
+                }
+                impl CleanManagementIssuerStore for LeasedStore {
+                    type Error = MemoryError;
+                    fn load(&mut self) -> Result<Option<Vec<u8>>, MemoryError> {
+                        self.loads.fetch_add(1, Ordering::SeqCst);
+                        self.inner.load()
+                    }
+                    fn commit(&mut self, image: &[u8]) -> Result<(), MemoryError> {
+                        self.inner.commit(image)?;
+                        if self.fail_after_commit.swap(false, Ordering::SeqCst) {
+                            Err(MemoryError)
+                        } else {
+                            Ok(())
+                        }
+                    }
+                }
+                impl Drop for LeasedStore {
+                    fn drop(&mut self) {
+                        self.active.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
                 struct Stores {
                     scope: (SpaceId, AgentId),
                     intent: IssuerMemoryStore,
                     issuer: IssuerMemoryStore,
                     opens: Arc<AtomicUsize>,
+                    active: Arc<AtomicUsize>,
+                    loads: Arc<AtomicUsize>,
+                    fail_after_commit: Arc<std::sync::atomic::AtomicBool>,
                 }
                 impl crate::agent::local_lifecycle::LocalLifecycleStoreFactory for Stores {
-                    type Intent = IssuerMemoryStore;
-                    type Issuer = IssuerMemoryStore;
+                    type Intent = LeasedStore;
+                    type Issuer = LeasedStore;
                     type Error = ();
                     fn discover(
                         &mut self,
@@ -7903,8 +7938,19 @@ mod tests {
                         agent: AgentId,
                     ) -> Result<(Self::Intent, Self::Issuer), ()> {
                         assert_eq!((space, agent), self.scope);
+                        assert_eq!(
+                            self.active.swap(2, Ordering::SeqCst),
+                            0,
+                            "attempted to reacquire retained leases"
+                        );
                         self.opens.fetch_add(1, Ordering::SeqCst);
-                        Ok((self.intent.clone(), self.issuer.clone()))
+                        let leased = |inner| LeasedStore {
+                            inner,
+                            active: self.active.clone(),
+                            loads: self.loads.clone(),
+                            fail_after_commit: self.fail_after_commit.clone(),
+                        };
+                        Ok((leased(self.intent.clone()), leased(self.issuer.clone())))
                     }
                     fn open_existing(
                         &mut self,
@@ -7924,19 +7970,45 @@ mod tests {
                 .unwrap();
                 let issuer_store = IssuerMemoryStore::default();
                 let opens = Arc::new(AtomicUsize::new(0));
-                let stores = Stores {
+                let active = Arc::new(AtomicUsize::new(0));
+                let loads = Arc::new(AtomicUsize::new(0));
+                let fail_after_commit = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                let mut stores = Stores {
                     scope: (descriptor.identity.space, descriptor.identity.agent),
                     intent: IssuerMemoryStore::default(),
                     issuer: issuer_store.clone(),
                     opens: opens.clone(),
+                    active: active.clone(),
+                    loads: loads.clone(),
+                    fail_after_commit,
                 };
-                let mut controller = crate::agent::local_lifecycle::LocalLifecycleController::new(
-                    harness.owner.take().unwrap(),
-                    local,
-                    stores,
-                    CountingSigner::new(),
-                )
-                .unwrap();
+                let recovered = coordinated == 8;
+                let mut controller = if recovered {
+                    let recovery =
+                        crate::agent::local_lifecycle::discover_local_lifecycle_recovery(
+                            &mut stores,
+                            owner.authority_target(),
+                            1,
+                        )
+                        .unwrap();
+                    assert_eq!(active.load(Ordering::SeqCst), 2);
+                    crate::agent::local_lifecycle::LocalLifecycleController::with_recovery(
+                        harness.owner.take().unwrap(),
+                        local,
+                        stores,
+                        CountingSigner::new(),
+                        recovery,
+                    )
+                    .unwrap()
+                } else {
+                    crate::agent::local_lifecycle::LocalLifecycleController::new(
+                        harness.owner.take().unwrap(),
+                        local,
+                        stores,
+                        CountingSigner::new(),
+                    )
+                    .unwrap()
+                };
                 if coordinated == 3 {
                     let authentications = Arc::new(AtomicUsize::new(0));
                     let mut node = crate::node::VosNode::new();
@@ -7973,11 +8045,19 @@ mod tests {
                     controller.create(descriptor.clone(), forged, runtime.clone()),
                     Err(SharedAgentHostError::ScopeMismatch)
                 ));
-                assert_eq!(opens.load(Ordering::SeqCst), 0);
+                assert_eq!(opens.load(Ordering::SeqCst), usize::from(recovered));
+                assert!(matches!(
+                    controller.create(descriptor.clone(), call.clone(), runtime.clone()),
+                    Err(SharedAgentHostError::Unavailable)
+                ));
+                assert_eq!(opens.load(Ordering::SeqCst), 1);
+                assert_eq!(active.load(Ordering::SeqCst), 2);
+                let failed_loads = loads.load(Ordering::SeqCst);
                 let result = controller
                     .create(descriptor.clone(), call.clone(), runtime.clone())
                     .unwrap();
                 assert_eq!(result.0, descriptor.identity.agent);
+                assert!(loads.load(Ordering::SeqCst) >= failed_loads + 2);
                 let issuer = DurableCleanManagementIssuer::open(
                     issuer_store,
                     descriptor.authority,
@@ -7999,10 +8079,12 @@ mod tests {
                     controller.create(descriptor, call, runtime).unwrap(),
                     result
                 );
-                assert_eq!(opens.load(Ordering::SeqCst), 2);
+                assert_eq!(opens.load(Ordering::SeqCst), 1);
+                assert_eq!(active.load(Ordering::SeqCst), 2);
                 routes.retire().unwrap();
                 system.retire().unwrap();
                 drop(controller);
+                assert_eq!(active.load(Ordering::SeqCst), 0);
                 harness.stop();
                 return;
             }

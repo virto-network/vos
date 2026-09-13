@@ -483,6 +483,12 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
         })
     }
 
+    /// Transfer ownership of the still-leased store, not trust in cached state.
+    /// The next protocol owner must reopen and validate its durable image.
+    pub(crate) fn into_store(self) -> B {
+        self.store
+    }
+
     pub(crate) fn intent(&self) -> Option<&CleanManagementIntent> {
         self.intent.as_ref()
     }
