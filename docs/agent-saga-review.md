@@ -2023,6 +2023,36 @@ reservation remain to be wired before fresh Create. The projection response is
 not an independent signed finality proof. No new native CLI build, artifact
 reproduction or master-readiness claim is made here.
 
+### Checked credential discovery client
+
+`local_create::query_credential` accepts already chosen canonical query bytes,
+verifies their API signature and Credential selector before network dispatch,
+then uses the same bounded loopback-only binary HTTP transport as Local Create
+submission. The caller is still responsible for durably retaining those bytes
+before dispatch; the helper does not generate a new nonce on retry.
+
+Response validation requires the exact echoed query and expected Principal,
+active status and API kind, and checks `management_request_high_water + 1`
+without overflow. Operation/admin high-water marks cannot influence the chosen
+management sequence. API kind is a client preparation restriction, not a new
+claim about ACC3's actor-side credential-kind rules. This result remains an
+unsigned discovery hint, not a credential-wide reservation or finality proof.
+The subsequent exact mutation must still be authorized by the live Authority.
+
+**All `vosx` binary tests pass: 169 passed, zero failed, one ignored**, in 3.60s
+(`r16-credential-query-client-final.log`, locked/offline, serial with socket
+access and disk scratch). New response tests cover exact query/owner binding,
+revocation, wrong kind, management-sequence exhaustion, truncation/trailing bytes
+and forged queries rejected before dispatch. Existing signed Create socket tests
+exercise the shared HTTP transport after its extraction. A successful credential
+query against a real daemon has not yet been tested. The ignored compiled-runtime
+candidate test remains a release gate. Formatting and diff checks pass.
+
+Next: durable exact-query retention and credential-wide reservation, wire fresh
+Create preparation and submission into the CLI, then prove live query/Create,
+route publication and restart/retry. Install/invoke, lifecycle retirement,
+ordinary Shared finality and full release gates remain within the original goal.
+
 The CLI subcommand is still absent. Next wiring must persist the complete
 submission durably before sending and resend those bytes on retry. Bootstrap
 uses management credential sequence 1; Authority requires the next consecutive

@@ -16,6 +16,123 @@ use vos::agent::sdk::{AgentDescriptor, InvocationId, ManagementRequest};
 
 use super::clean_identity::CleanOperatorIdentitySigner;
 
+fn post_binary(
+    address: std::net::SocketAddr,
+    path: &'static str,
+    status: u16,
+    bytes: &[u8],
+    maximum: usize,
+) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read as _;
+    use std::time::Duration;
+    anyhow::ensure!(
+        address.ip().is_loopback() && address.port() != 0,
+        "plaintext Agent control requires a nonzero loopback address"
+    );
+    let response = ureq::AgentBuilder::new()
+        .try_proxy_from_env(false)
+        .redirects(0)
+        .timeout_connect(Duration::from_secs(5))
+        .timeout(Duration::from_secs(130))
+        .build()
+        .post(&format!("http://{address}{path}"))
+        .set("Content-Type", "application/octet-stream")
+        .send_bytes(bytes)?;
+    anyhow::ensure!(
+        response.status() == status,
+        "Agent control expected HTTP {status}, received {}",
+        response.status()
+    );
+    anyhow::ensure!(
+        response.header("Content-Type") == Some("application/octet-stream"),
+        "Agent control reply has unexpected content type"
+    );
+    let mut reply = Vec::new();
+    response
+        .into_reader()
+        .take((maximum + 1) as u64)
+        .read_to_end(&mut reply)?;
+    anyhow::ensure!(
+        reply.len() <= maximum,
+        "Agent control reply exceeds the wire limit"
+    );
+    Ok(reply)
+}
+
+struct CredentialVerifier;
+impl vos::agent::sdk::authority::AuthorityCredentialVerifier for CredentialVerifier {
+    fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+        libp2p::identity::ed25519::PublicKey::try_from_bytes(public_key)
+            .is_ok_and(|key| key.verify(message, signature))
+    }
+}
+
+/// Query bytes must be retained by the caller before dispatch and reused after
+/// ambiguity. This local response is a discovery hint, not signed finality or
+/// a reservation: Authority still authorizes the subsequent exact mutation.
+pub(crate) fn query_credential(
+    address: std::net::SocketAddr,
+    query_bytes: &[u8],
+    expected_principal: vos::agent::sdk::PrincipalId,
+) -> anyhow::Result<(
+    vos::agent::sdk::authority::AuthorityCredentialProjection,
+    NonZeroU64,
+)> {
+    use vos::agent::sdk::authority::{AuthorityProjectionQuery, AuthorityProjectionSelector};
+    use vos::agent::sdk::wire::{
+        CanonicalWire as _, MAX_AUTHORITY_CREDENTIAL_PROJECTION_WIRE_BYTES,
+    };
+    let query = AuthorityProjectionQuery::decode(query_bytes)
+        .map_err(|error| anyhow::anyhow!("invalid retained credential query: {error:?}"))?;
+    query
+        .verify_api_with(&CredentialVerifier)
+        .map_err(|error| anyhow::anyhow!("invalid credential query signature: {error:?}"))?;
+    anyhow::ensure!(
+        query.selector == AuthorityProjectionSelector::Credential,
+        "credential discovery requires the Credential selector"
+    );
+    let bytes = post_binary(
+        address,
+        "/__agents/credential",
+        200,
+        query_bytes,
+        MAX_AUTHORITY_CREDENTIAL_PROJECTION_WIRE_BYTES,
+    )
+    .map_err(|error| anyhow::anyhow!("{error}; retry the identical retained credential query"))?;
+    validate_credential_response(&query, expected_principal, &bytes)
+}
+
+fn validate_credential_response(
+    query: &vos::agent::sdk::authority::AuthorityProjectionQuery,
+    expected_principal: vos::agent::sdk::PrincipalId,
+    bytes: &[u8],
+) -> anyhow::Result<(
+    vos::agent::sdk::authority::AuthorityCredentialProjection,
+    NonZeroU64,
+)> {
+    use vos::agent::sdk::authority::{
+        AuthorityCredentialKind, AuthorityCredentialProjection, AuthorityCredentialStatus,
+    };
+    use vos::agent::sdk::wire::CanonicalWire as _;
+    let projection = AuthorityCredentialProjection::decode(bytes)
+        .map_err(|error| anyhow::anyhow!("invalid credential response: {error:?}"))?;
+    anyhow::ensure!(
+        projection.query == *query && projection.principal == expected_principal,
+        "credential response does not match the exact query and owner"
+    );
+    anyhow::ensure!(
+        projection.status == AuthorityCredentialStatus::Active
+            && projection.kind == AuthorityCredentialKind::Api,
+        "Local Create requires an active API credential"
+    );
+    let sequence = projection
+        .management_request_high_water
+        .checked_add(1)
+        .and_then(NonZeroU64::new)
+        .ok_or_else(|| anyhow::anyhow!("management credential sequence exhausted"))?;
+    Ok((projection, sequence))
+}
+
 /// Prepare against the same bundled root system identity used by startup.
 /// The node's public key is sufficient; never load its private transport key.
 /// The caller must discover/check live state and allocate sequence/nonce before
@@ -87,8 +204,6 @@ pub(crate) fn submit_retained(
     address: std::net::SocketAddr,
 ) -> anyhow::Result<vos::agent::sdk::authority::ManagementApplicationAck> {
     use super::clean_store::CleanLocalCreateRequestFile;
-    use std::io::Read as _;
-    use std::time::Duration;
     use vos::agent::sdk::wire::MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES;
     anyhow::ensure!(
         address.ip().is_loopback() && address.port() != 0,
@@ -99,35 +214,13 @@ pub(crate) fn submit_retained(
         .load()?
         .ok_or_else(|| anyhow::anyhow!("no retained Local Create request"))?;
     let result = (|| -> anyhow::Result<_> {
-        let agent = ureq::AgentBuilder::new()
-            .try_proxy_from_env(false)
-            .redirects(0)
-            .timeout_connect(Duration::from_secs(5))
-            .timeout(Duration::from_secs(130))
-            .build();
-        let response = agent
-            .post(&format!("http://{address}/__agents/local"))
-            .set("Content-Type", "application/octet-stream")
-            .send_bytes(&bytes)
-            .map_err(|error| anyhow::anyhow!("Local Create HTTP submission failed: {error}"))?;
-        anyhow::ensure!(
-            response.status() == 201,
-            "Local Create expected HTTP 201, received {}",
-            response.status()
-        );
-        anyhow::ensure!(
-            response.header("Content-Type") == Some("application/octet-stream"),
-            "Local Create acknowledgement has unexpected content type"
-        );
-        let mut reply = Vec::new();
-        response
-            .into_reader()
-            .take((MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES + 1) as u64)
-            .read_to_end(&mut reply)?;
-        anyhow::ensure!(
-            reply.len() <= MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES,
-            "Local Create acknowledgement exceeds the wire limit"
-        );
+        let reply = post_binary(
+            address,
+            "/__agents/local",
+            201,
+            &bytes,
+            MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES,
+        )?;
         verify_acknowledgement(&bytes, &reply)
     })();
     // The store and its exclusive lease remain alive through verification.
@@ -471,6 +564,83 @@ pub(crate) mod tests {
                 30
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn credential_discovery_binds_query_owner_status_and_management_sequence() {
+        use vos::agent::production_owner::AuthorityProjectionQueryAuthenticator as _;
+        use vos::agent::sdk::authority::{
+            AuthorityBuiltinRole, AuthorityCredentialKind, AuthorityCredentialProjection,
+            AuthorityCredentialStatus, AuthorityProjectionHead, AuthorityProjectionSelector,
+        };
+        use vos::agent::sdk::{PrincipalId, wire::CanonicalWire as _};
+        let (operator, authority, descriptor, _) = fixture();
+        let owner = descriptor.identity.owner;
+        let mut signer = super::super::authority_projection_authenticator::OperatorAuthorityProjectionAuthenticator::new(operator).unwrap();
+        let query = signer
+            .authenticate(authority, AuthorityProjectionSelector::Credential)
+            .unwrap();
+        let one = NonZeroU64::new(1).unwrap();
+        let projection = AuthorityCredentialProjection {
+            query: query.clone(),
+            head: AuthorityProjectionHead {
+                state_revision: one,
+                epoch: one,
+                authorization_sequence: one,
+                administration_generation: one,
+                state_commitment: Hash([21; 32]),
+            },
+            principal: owner,
+            status: AuthorityCredentialStatus::Active,
+            kind: AuthorityCredentialKind::Api,
+            builtin_role: AuthorityBuiltinRole::Admin,
+            management_request_high_water: 1,
+            operation_request_high_water: 99,
+            admin_request_high_water: 999,
+            space_roles: vec![],
+            actor_roles: vec![],
+            capabilities: vec![],
+        };
+        let bytes = projection.encode().unwrap();
+        let (decoded, next) = validate_credential_response(&query, owner, &bytes).unwrap();
+        assert_eq!(decoded, projection);
+        assert_eq!(next.get(), 2);
+        assert!(validate_credential_response(&query, PrincipalId([22; 32]), &bytes).is_err());
+        assert!(validate_credential_response(&query, owner, &bytes[..bytes.len() - 1]).is_err());
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(validate_credential_response(&query, owner, &trailing).is_err());
+        for variant in 0..4 {
+            let mut changed = projection.clone();
+            match variant {
+                0 => changed.status = AuthorityCredentialStatus::Revoked,
+                1 => changed.kind = AuthorityCredentialKind::Ssh,
+                2 => changed.query.nonce = Hash([23; 32]),
+                _ => changed.management_request_high_water = u64::MAX,
+            }
+            assert!(
+                validate_credential_response(&query, owner, &changed.encode().unwrap()).is_err()
+            );
+        }
+        let mut forged = query.clone();
+        let vos::agent::sdk::authority::AuthorityIngressAuthentication::ApiCredentialSignature {
+            signature,
+            ..
+        } = &mut forged.authentication
+        else {
+            unreachable!()
+        };
+        signature[0] ^= 1;
+        assert!(
+            query_credential(
+                "127.0.0.1:1".parse().unwrap(),
+                &forged.encode().unwrap(),
+                owner
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("signature")
         );
     }
 
