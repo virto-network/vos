@@ -189,6 +189,27 @@ pub(super) fn clean_ordered_operation_after<S: AgentJournalStore>(
     anchor: super::journal::OrderedBase,
     operation: &ReplayOperation,
 ) -> Result<Option<ReplayInputId>, JournalStoreError> {
+    clean_ordered_operation_after_with_denial_ack(store, materialization, anchor, operation, false)
+}
+
+/// Denial completion may replay one exact Invoke followed by its exact ACK.
+/// The caller separately verifies the canonical denial and positive ACK result.
+pub(super) fn clean_denial_operation_after<S: AgentJournalStore>(
+    store: &S,
+    materialization: &ReplayMaterialization,
+    anchor: super::journal::OrderedBase,
+    operation: &ReplayOperation,
+) -> Result<Option<ReplayInputId>, JournalStoreError> {
+    clean_ordered_operation_after_with_denial_ack(store, materialization, anchor, operation, true)
+}
+
+fn clean_ordered_operation_after_with_denial_ack<S: AgentJournalStore>(
+    store: &S,
+    materialization: &ReplayMaterialization,
+    anchor: super::journal::OrderedBase,
+    operation: &ReplayOperation,
+    allow_denial_ack: bool,
+) -> Result<Option<ReplayInputId>, JournalStoreError> {
     anchor.validate().map_err(|_| JournalStoreError::Corrupt)?;
     let heads = materialization.heads();
     let boundary = materialization.replay_boundary();
@@ -203,6 +224,7 @@ pub(super) fn clean_ordered_operation_after<S: AgentJournalStore>(
     let mut cursor = heads.ordered_head;
     let mut index = heads.ordered_index;
     let mut found = None;
+    let mut acknowledgement = false;
     for _ in 0..distance {
         let id = cursor.ok_or(JournalStoreError::Corrupt)?;
         let entry = store
@@ -216,6 +238,19 @@ pub(super) fn clean_ordered_operation_after<S: AgentJournalStore>(
             return Err(JournalStoreError::Corrupt);
         }
         if clean_operation_invocation(&entry.input.operation) == Some(requested) {
+            if allow_denial_ack
+                && matches!((&entry.input.operation, operation),
+                (ReplayOperation::CleanAcknowledge { context: a, expected_live: None, work: aw, authorization: aa },
+                 ReplayOperation::CleanInvoke { context: b, work: bw, authorization: ba, .. }) if a == b && aw == bw && aa == ba)
+            {
+                if found.is_some() || acknowledgement {
+                    return Err(JournalStoreError::Conflict);
+                }
+                acknowledgement = true;
+                cursor = entry.parent;
+                index -= 1;
+                continue;
+            }
             // A different lifecycle step or substituted observation must not
             // be mistaken for absence, and duplicate publication is ambiguous.
             if entry.input.operation != *operation || found.is_some() {
@@ -227,6 +262,9 @@ pub(super) fn clean_ordered_operation_after<S: AgentJournalStore>(
         index -= 1;
     }
     if cursor != anchor.head || (anchor.index == boundary.index && anchor != boundary) {
+        return Err(JournalStoreError::Conflict);
+    }
+    if acknowledgement && found.is_none() {
         return Err(JournalStoreError::Conflict);
     }
     Ok(found)

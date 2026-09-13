@@ -1384,6 +1384,18 @@ pub(crate) struct VerifiedManagementDenial {
 }
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+impl VerifiedManagementDenial {
+    pub(crate) fn envelope(
+        &self,
+    ) -> (
+        &super::clean_management_intent::ManagementJournalAnchor,
+        &RuntimeWork,
+    ) {
+        (&self.anchor, &self.work)
+    }
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 impl<P, R, I> CleanSystemAgentBootstrapOwner<P, R, I>
 where
     P: CleanSystemAgentBootstrapStore,
@@ -3035,8 +3047,23 @@ where
                 }
             }
         })?;
+        if slot
+            .denial_complete()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            self.finish_denied_management_intent(&mut slot, &issuer, local, signer)?;
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
         slot.retain_runtime(runtime.exact_bytes())
             .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if slot
+            .authorization_work()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .is_some()
+            && self.finish_denied_management_intent(&mut slot, &issuer, local, signer)?
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
         let retained = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
         if let Some((receipt, acknowledgement)) = issuer
             .recover_finalized_application(
@@ -3084,7 +3111,7 @@ where
             self.finish_live_management_intent(&mut slot, managed, &acknowledgement, &issuer)?;
             return Ok((agent, acknowledgement));
         }
-        let (agent, acknowledgement) = self.create_local_from_management_intent_with_admission(
+        let created = self.create_local_from_management_intent_with_admission(
             &mut slot,
             managed,
             local,
@@ -3092,7 +3119,25 @@ where
             &mut issuer,
             signer,
             true,
-        )?;
+        );
+        let (agent, acknowledgement) = match created {
+            Ok(created) => created,
+            Err(error) => {
+                #[cfg(test)]
+                if self.finalization_failure_once == Some(8) {
+                    self.finalization_failure_once = None;
+                    return Err(error);
+                }
+                if error == SharedAgentHostError::ScopeMismatch
+                    && issuer.sequence_high_water() == 0
+                    && !issuer.has_pending_decision()
+                    && slot.authorization_work().ok().flatten().is_some()
+                {
+                    self.finish_denied_management_intent(&mut slot, &issuer, local, signer)?;
+                }
+                return Err(error);
+            }
+        };
         self.finalize_management_intent_with_admission(
             &mut slot,
             managed,
@@ -3191,11 +3236,12 @@ where
             .host
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
-        let Some(input) = host.management_invocation_after_anchor(agent, anchor, envelope)? else {
+        let Some(input) =
+            host.management_denial_invocation_after_anchor(agent, anchor, envelope)?
+        else {
             return Ok(None);
         };
-        let outcome =
-            host.replay_durable_clean_terminal(agent, (**work).clone(), (**authorization).clone())?;
+        let outcome = host.replay_durable_management_denial(agent, anchor, envelope)?;
         let super::sdk::RuntimeOutcome::Completed(Ok(reply)) = outcome else {
             return Ok(None);
         };
@@ -3219,6 +3265,137 @@ where
             work: envelope.clone(),
             input,
         }))
+    }
+
+    pub(crate) fn finish_denied_management_intent<
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    >(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        issuer: &DurableCleanManagementIssuer<J>,
+        local: &super::local_sdk_host::LocalAgentHost,
+        signer: &mut S,
+    ) -> Result<bool, SharedAgentHostError> {
+        let completed = slot
+            .denial_complete()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if !completed
+            && (issuer.sequence_high_water() != 0
+                || issuer.has_pending_decision()
+                || issuer.retained_decisions() != 0)
+        {
+            return Ok(false);
+        }
+        let intent = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
+        let target = self.authority_target();
+        let managed = intent.call().managed;
+        intent
+            .verify(target, managed, &RawCredentialVerifier)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if completed {
+            if local.space() != self.pins.space
+                || local.node() != self.pins.node
+                || !matches!(
+                    local.show(managed.agent),
+                    Err(super::local_sdk_host::LocalAgentHostError::NotFound)
+                )
+                || issuer.sequence_high_water() != 0
+                || issuer.has_pending_decision()
+                || issuer.retained_decisions() != 0
+                || !issuer
+                    .can_resume_initial_creation(
+                        target,
+                        managed,
+                        intent.request(),
+                        intent.call(),
+                        &RawCredentialVerifier,
+                    )
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+        } else {
+            let Some(proof) = self.verify_management_denial(slot, issuer, local)? else {
+                return Ok(false);
+            };
+            let RuntimeWork::Invoke {
+                invocation,
+                authorization,
+                ..
+            } = &proof.work
+            else {
+                unreachable!()
+            };
+            let agent = crate::service::AgentId(self.pins.agent.0);
+            if !self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .retained_positive_clean_acknowledgement(agent, invocation, authorization)?
+            {
+                let mut material = self
+                    .supervisor_invocation_material(self.pins.agent, target.binding.issuer.actor)?;
+                material.root_provenance = false;
+                let identity = super::supervisor_adapters::physical_material_identity(&material)
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                let outcome = self
+                    ._network_host
+                    .supervisor_acknowledge_management_denial(identity, &proof)?;
+                if !matches!(outcome, super::sdk::RuntimeOutcome::Acknowledged(Ok(_))) {
+                    return Err(SharedAgentHostError::Unavailable);
+                }
+            }
+            if !self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .retained_positive_clean_acknowledgement(agent, invocation, authorization)?
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+        }
+        let anchor = slot
+            .authorization_anchor()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .ok_or(SharedAgentHostError::ScopeMismatch)?
+            .clone();
+        let work = slot
+            .authorization_work()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .ok_or(SharedAgentHostError::ScopeMismatch)?
+            .clone();
+        let signature = if completed {
+            None
+        } else {
+            if signer.public_key() != target.binding.public_key {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            Some(
+                signer
+                    .sign_management_denial_retirement(
+                        &slot
+                            .denial_signing_bytes()
+                            .map_err(|_| SharedAgentHostError::Unavailable)?,
+                    )
+                    .map_err(|_| SharedAgentHostError::Unavailable)?,
+            )
+        };
+        self._network_host.finish_management_denial_record(
+            crate::service::AgentId(self.pins.agent.0),
+            &anchor,
+            &work,
+            completed,
+            || {
+                if let Some(signature) = signature {
+                    slot.commit_denial(signature)
+                        .map_err(|_| SharedAgentHostError::Unavailable)?;
+                }
+                Ok(())
+            },
+        )?;
+        Ok(true)
     }
 
     fn finish_live_management_intent<
@@ -4659,7 +4836,7 @@ mod tests {
 
             fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
                 *self.image.lock().unwrap() = Some(image.to_vec());
-                if image.starts_with(b"CMR2")
+                if (image.starts_with(b"CMR2") || image.starts_with(b"CND1"))
                     && self
                         .fail_retirement_after_commit
                         .as_ref()
@@ -4683,6 +4860,7 @@ mod tests {
             key: SigningKey,
             calls: usize,
             fail_receipt: bool,
+            fail_denial: bool,
         }
 
         impl CountingSigner {
@@ -4691,12 +4869,24 @@ mod tests {
                     key: SigningKey::from_bytes(&[RECEIPT_SEED; 32]),
                     calls: 0,
                     fail_receipt: false,
+                    fail_denial: false,
                 }
             }
         }
 
         impl CleanManagementReceiptSigner for CountingSigner {
             type Error = MemoryError;
+
+            fn sign_management_denial_retirement(
+                &mut self,
+                message: &[u8],
+            ) -> Result<[u8; 64], Self::Error> {
+                self.calls += 1;
+                if core::mem::take(&mut self.fail_denial) {
+                    return Err(MemoryError);
+                }
+                Ok(self.key.sign(message).to_bytes())
+            }
 
             fn public_key(&self) -> [u8; 32] {
                 self.key.verifying_key().to_bytes()
@@ -7978,6 +8168,26 @@ mod tests {
         }
 
         #[test]
+        fn native_local_lifecycle_denial_retires_and_unblocks_valid_creation() {
+            native_local_management_lifecycle(28);
+        }
+
+        #[test]
+        fn native_local_lifecycle_denial_retries_signing_after_positive_ack() {
+            native_local_management_lifecycle(29);
+        }
+
+        #[test]
+        fn native_local_lifecycle_denial_releases_after_ambiguous_record_commit() {
+            native_local_management_lifecycle(30);
+        }
+
+        #[test]
+        fn native_local_lifecycle_denial_startup_recovers_after_positive_ack() {
+            native_local_management_lifecycle(31);
+        }
+
+        #[test]
         fn native_node_rejects_lifecycle_start_after_shutdown_without_leaking_hosts() {
             native_local_management_lifecycle(3);
         }
@@ -8695,8 +8905,9 @@ mod tests {
             descriptor: AgentDescriptor,
             mut call: AuthorityCredentialCall,
             runtime: AdmittedRuntimePackage,
-            denied: bool,
+            scenario: u8,
         ) {
+            let denied = scenario != 27;
             if denied {
                 // A genuine signed request with an unavailable next sequence:
                 // policy returns canonical empty bytes, not a runtime failure.
@@ -8714,12 +8925,17 @@ mod tests {
                 harness.fixture.trust.clone(),
             )
             .unwrap();
-            let intent_store = IssuerMemoryStore::default();
+            let mut intent_store = IssuerMemoryStore::default();
             let issuer_store = IssuerMemoryStore::default();
             let mut signer = CountingSigner::new();
+            if scenario == 30 {
+                intent_store.fail_retirement_after_commit =
+                    Some(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+            }
+            signer.fail_denial = matches!(scenario, 29 | 31);
             let before = owner.ordered_index_for_test().unwrap();
-            if !denied {
-                owner.fail_finalization_once_for_test(6);
+            if scenario < 28 {
+                owner.fail_finalization_once_for_test(if denied { 8 } else { 6 });
             }
             assert_eq!(
                 owner.create_local_agent(
@@ -8728,15 +8944,243 @@ mod tests {
                     descriptor.clone(),
                     call.clone(),
                     &mut local,
-                    runtime,
+                    runtime.clone(),
                     &mut signer
                 ),
-                Err(if denied {
+                Err(if denied && scenario < 29 {
                     SharedAgentHostError::ScopeMismatch
                 } else {
                     SharedAgentHostError::Unavailable
                 })
             );
+            if scenario >= 28 {
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+                assert_eq!(signer.calls, 1);
+                assert!(local.list().unwrap().is_empty());
+                assert!(issuer_store.image.lock().unwrap().is_none());
+                if scenario == 31 {
+                    #[inline(never)]
+                    fn restart_denial(
+                        old: MemoryBootstrapOwner,
+                        local: crate::agent::local_sdk_host::LocalAgentHost,
+                        mut signer: CountingSigner,
+                        harness: &NativeProjectionOwnerHarness,
+                        descriptor: &AgentDescriptor,
+                        intent: IssuerMemoryStore,
+                        issuer: IssuerMemoryStore,
+                    ) -> (
+                        MemoryBootstrapOwner,
+                        crate::agent::local_sdk_host::LocalAgentHost,
+                        CountingSigner,
+                    ) {
+                        struct Stores {
+                            scope: (SpaceId, AgentId),
+                            intent: IssuerMemoryStore,
+                            issuer: IssuerMemoryStore,
+                        }
+                        impl crate::agent::local_lifecycle::LocalLifecycleStoreFactory for Stores {
+                            type Intent = IssuerMemoryStore;
+                            type Issuer = IssuerMemoryStore;
+                            type Error = ();
+                            fn discover(
+                                &mut self,
+                                space: SpaceId,
+                                maximum: usize,
+                            ) -> Result<Vec<AgentId>, ()> {
+                                if space != self.scope.0 || maximum < 1 {
+                                    return Err(());
+                                }
+                                Ok(vec![self.scope.1])
+                            }
+                            fn open(
+                                &mut self,
+                                space: SpaceId,
+                                agent: AgentId,
+                            ) -> Result<(Self::Intent, Self::Issuer), ()>
+                            {
+                                if (space, agent) != self.scope {
+                                    return Err(());
+                                }
+                                Ok((self.intent.clone(), self.issuer.clone()))
+                            }
+                            fn open_existing(
+                                &mut self,
+                                space: SpaceId,
+                                agent: AgentId,
+                            ) -> Result<(Self::Intent, Self::Issuer), ()>
+                            {
+                                self.open(space, agent)
+                            }
+                        }
+                        let before = old.ordered_index_for_test().unwrap();
+                        let pins = old._pins_store.clone();
+                        let record = old.record_store.clone();
+                        let bootstrap_issuer = old.issuer.into_store();
+                        drop(old._network_host);
+                        drop(old.host);
+                        drop(local);
+                        let mut stores = Stores {
+                            scope: (descriptor.identity.space, descriptor.identity.agent),
+                            intent,
+                            issuer,
+                        };
+                        let pending = usize::from(
+                            !stores
+                                .intent
+                                .image
+                                .lock()
+                                .unwrap()
+                                .as_ref()
+                                .unwrap()
+                                .starts_with(b"CND1"),
+                        );
+                        let recovery =
+                            crate::agent::local_lifecycle::discover_local_lifecycle_recovery(
+                                &mut stores,
+                                harness.fixture.plan.authority_target(),
+                                1,
+                            )
+                            .unwrap();
+                        let admission = recovery.startup_admission().unwrap();
+                        assert_eq!(admission.pending.len(), pending);
+                        let owner = CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_factory(
+                            pins,
+                            record,
+                            bootstrap_issuer,
+                            &mut signer,
+                            || panic!("denial recovery cannot bootstrap"),
+                            harness._directory.host(),
+                            harness._directory.lock(),
+                            harness.fixture.plan.pins.space,
+                            harness.fixture.plan.pins.node,
+                            harness.fixture.trust.clone(),
+                            harness.fixture.merge.clone(),
+                            harness.fixture.finality.clone(),
+                            harness.provider.clone(),
+                            harness.network.clone(),
+                            Some(&admission),
+                        )
+                        .unwrap();
+                        let local = crate::agent::local_sdk_host::LocalAgentHost::open(
+                            &harness._directory.0.join("denial-local"),
+                            descriptor.identity.space,
+                            harness.fixture.plan.pins.node,
+                            harness.fixture.trust.clone(),
+                        )
+                        .unwrap();
+                        let controller =
+                            crate::agent::local_lifecycle::LocalLifecycleController::with_recovery(
+                                owner, local, stores, signer, recovery,
+                            )
+                            .unwrap();
+                        assert_eq!(controller.ordered_index_for_test().unwrap(), before);
+                        let (owner, local, _, signer) = controller.into_parts_for_test();
+                        (owner, local, signer)
+                    }
+                    for _ in 0..2 {
+                        (owner, local, signer) = std::thread::scope(|scope| {
+                            scope
+                                .spawn(|| {
+                                    restart_denial(
+                                        owner,
+                                        local,
+                                        signer,
+                                        harness,
+                                        &descriptor,
+                                        intent_store.clone(),
+                                        issuer_store.clone(),
+                                    )
+                                })
+                                .join()
+                                .unwrap()
+                        });
+                    }
+                }
+                if scenario >= 29 {
+                    assert_eq!(
+                        owner.create_local_agent(
+                            intent_store.clone(),
+                            issuer_store.clone(),
+                            descriptor.clone(),
+                            call.clone(),
+                            &mut local,
+                            runtime.clone(),
+                            &mut signer
+                        ),
+                        Err(SharedAgentHostError::ScopeMismatch)
+                    );
+                    assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+                }
+                let signatures = if matches!(scenario, 29 | 31) { 2 } else { 1 };
+                assert_eq!(signer.calls, signatures);
+                let image = intent_store.image.lock().unwrap().clone().unwrap();
+                assert!(image.starts_with(b"CND1"));
+                assert!(
+                    crate::agent::clean_management_intent::CleanManagementIntentSlot::open(
+                        intent_store.clone()
+                    )
+                    .unwrap()
+                    .denial_complete()
+                    .unwrap()
+                );
+                assert_eq!(
+                    owner.create_local_agent(
+                        intent_store.clone(),
+                        issuer_store.clone(),
+                        descriptor.clone(),
+                        call.clone(),
+                        &mut local,
+                        runtime.clone(),
+                        &mut signer
+                    ),
+                    Err(SharedAgentHostError::ScopeMismatch)
+                );
+                assert_eq!(signer.calls, signatures);
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+                let mut corrupt = image.clone();
+                *corrupt.last_mut().unwrap() ^= 1;
+                let corrupt_store = IssuerMemoryStore::default();
+                *corrupt_store.image.lock().unwrap() = Some(corrupt);
+                assert!(
+                    crate::agent::clean_management_intent::CleanManagementIntentSlot::open(
+                        corrupt_store
+                    )
+                    .is_err()
+                );
+                let mut next = descriptor.clone();
+                next.creation_nonce = Hash([0xb9; 32]);
+                next.identity.agent = AgentId::derive(
+                    next.identity.space,
+                    next.identity.owner,
+                    next.creation_nonce.as_bytes(),
+                );
+                let key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
+                let (mut next_call, _) = credential_call_and_approval(
+                    &next,
+                    &ManagementRequest::Create(Box::new(next.clone())),
+                    &key,
+                );
+                next_call.authority = owner.authority_target();
+                next_call.invocation = next_call.expected_invocation();
+                next_call.signature = key.sign(&next_call.signing_bytes()).to_bytes();
+                let result = owner
+                    .create_local_agent(
+                        IssuerMemoryStore::default(),
+                        IssuerMemoryStore::default(),
+                        next.clone(),
+                        next_call,
+                        &mut local,
+                        runtime,
+                        &mut signer,
+                    )
+                    .unwrap();
+                assert_eq!(result.0, next.identity.agent);
+                result.1.verify_with(&RawCredentialVerifier).unwrap();
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before + 6);
+                assert_eq!(local.list().unwrap().len(), 1);
+                assert_eq!(*intent_store.image.lock().unwrap(), Some(image));
+                return;
+            }
             assert_eq!(owner.ordered_index_for_test().unwrap(), before + 1);
             assert_eq!(signer.calls, 0);
             assert!(local.list().unwrap().is_empty());
@@ -8927,7 +9371,7 @@ mod tests {
             call.authority = owner.authority_target();
             call.invocation = call.expected_invocation();
             call.signature = credential_key.sign(&call.signing_bytes()).to_bytes();
-            if matches!(coordinated, 26 | 27) {
+            if matches!(coordinated, 26 | 27 | 28 | 29 | 30 | 31) {
                 std::thread::scope(|scope| {
                     scope
                         .spawn(|| {
@@ -8936,7 +9380,7 @@ mod tests {
                                 descriptor,
                                 call,
                                 runtime,
-                                coordinated == 26,
+                                coordinated,
                             )
                         })
                         .join()
@@ -8946,7 +9390,21 @@ mod tests {
                 return;
             }
             if matches!(coordinated, 20 | 21 | 22 | 23 | 24 | 25) {
-                check_dependent_lifecycle_recovery(&mut harness, descriptor, runtime, coordinated);
+                // Keep native setup frames off the default-sized lifecycle
+                // execution stack, just as for the denial fixture above.
+                std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            check_dependent_lifecycle_recovery(
+                                &mut harness,
+                                descriptor,
+                                runtime,
+                                coordinated,
+                            )
+                        })
+                        .join()
+                        .unwrap()
+                });
                 harness.stop();
                 return;
             }
@@ -11718,6 +12176,28 @@ mod tests {
             assert_eq!(*issuer_store.image.lock().unwrap(), issuer_image);
             assert_eq!(signer.calls, 2);
             check_management_retirement_gate(owner, [&envelope, &finalization_envelope], true);
+            {
+                let host = owner.host.lock().unwrap();
+                let agent = HostAgentId(owner.pins.agent.0);
+                assert!(
+                    host.management_denial_invocation_after_anchor(
+                        agent,
+                        &authorization_anchor,
+                        &envelope
+                    )
+                    .unwrap()
+                    .is_some()
+                );
+                // The denial walker can identify the old Invoke, but an
+                // approved result must never acquire denial-only admission.
+                assert!(
+                    host.management_pending_admission_requirement(
+                        agent,
+                        &[(&authorization_anchor, &envelope)]
+                    )
+                    .is_err()
+                );
+            }
             drop(slot);
             check_durable_management_retirement(
                 owner,

@@ -298,6 +298,13 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
         let mut pending = Vec::new();
         let mut credentials = Vec::new();
         for (index, entry) in self.entries.iter().enumerate() {
+            if entry
+                .intent
+                .denial_complete()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            {
+                continue;
+            }
             let retired = entry
                 .intent
                 .retirement_complete()
@@ -685,7 +692,18 @@ pub fn discover_local_lifecycle_recovery<F: LocalLifecycleStoreFactory>(
         if observed.is_some() && issued.is_none() {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        let unissued_creation = if issued.is_none()
+        let denied = intent
+            .denial_complete()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if denied
+            && (issuer.sequence_high_water() != 0
+                || issuer.has_pending_decision()
+                || issuer.retained_decisions() != 0)
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let unissued_creation = if !denied
+            && issued.is_none()
             && intent
                 .authorization_work()
                 .map_err(|_| SharedAgentHostError::Unavailable)?
@@ -866,6 +884,22 @@ where
         // Validate the entire set before retiring any member. Incomplete
         // phases require their own protected recovery protocol, not omission.
         let admission = recovery.startup_admission()?;
+        for entry in &mut recovery.entries {
+            if (entry.unissued_creation
+                || entry
+                    .intent
+                    .denial_complete()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?)
+                && system.finish_denied_management_intent(
+                    &mut entry.intent,
+                    &entry.issuer,
+                    &local,
+                    &mut signer,
+                )?
+            {
+                entry.unissued_creation = false;
+            }
+        }
         let mut runtimes = BTreeMap::new();
         for (index, entry) in recovery.entries.iter_mut().enumerate() {
             if entry.unissued_creation

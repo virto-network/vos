@@ -958,6 +958,7 @@ impl ProposalAdmission {
 enum ReservedSubmission {
     Projection(ProjectionPairKey),
     ManagementRetirement(ProjectionPairKey),
+    ManagementDenial(ProjectionPairKey),
 }
 
 #[derive(Clone, Copy)]
@@ -972,6 +973,7 @@ enum SupervisorAdmission<'a> {
     Ordinary,
     ReservedProjection,
     ReservedManagementRetirement,
+    ReservedManagementDenial,
     PersistedManagement(&'a crate::agent::clean_management_intent::ManagementJournalAnchor),
 }
 
@@ -1621,13 +1623,19 @@ impl SharedRouteHandler {
             (None, Some(expected), Some(ReservedSubmission::ManagementRetirement(actual)))
                 if expected.iter().any(|pair| pair.contains(&actual))
                     && matches!(&request, crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Acknowledge { .. }) => {}
+            (None, _, Some(ReservedSubmission::ManagementDenial(actual)))
+                if proposal.management_pending.as_ref().is_some_and(|pending| pending.iter().any(|(key, _)| *key == actual))
+                    && matches!(&request, crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Acknowledge { .. }) => {}
             _ => return Err(SharedAgentHostError::CapacityExhausted),
         }
         if proposal.management_pending.is_some()
             && !pending_invoke
             && !matches!(
                 reservation,
-                Some(ReservedSubmission::ManagementRetirement(_))
+                Some(
+                    ReservedSubmission::ManagementRetirement(_)
+                        | ReservedSubmission::ManagementDenial(_)
+                )
             )
         {
             return Err(SharedAgentHostError::CapacityExhausted);
@@ -2821,6 +2829,95 @@ impl SharedAgentNetworkHost {
             self.management_pending.remove(&agent);
         }
         result
+    }
+
+    /// Publish signed denial retirement before releasing its exact pending
+    /// member. A failed store callback retains both admission and refresh state.
+    /// Completed signed records may release after pruning without replaying.
+    pub(crate) fn finish_management_denial_record<F>(
+        &mut self,
+        agent: crate::service::AgentId,
+        anchor: &crate::agent::clean_management_intent::ManagementJournalAnchor,
+        envelope: &crate::agent_sdk::RuntimeWork,
+        completed: bool,
+        complete: F,
+    ) -> Result<(), SharedAgentHostError>
+    where
+        F: FnOnce() -> Result<(), SharedAgentHostError>,
+    {
+        let key = (management_envelope_key(agent, envelope)?, anchor.clone());
+        let Some(pending) = self.management_pending.get(&agent) else {
+            return if completed {
+                Ok(())
+            } else {
+                Err(SharedAgentHostError::Conflict)
+            };
+        };
+        let keys = pending_management_keys(agent, pending)?;
+        if !keys.contains(&key) {
+            return if completed {
+                Ok(())
+            } else {
+                Err(SharedAgentHostError::Conflict)
+            };
+        }
+        let remaining: Vec<_> = pending
+            .iter()
+            .zip(&keys)
+            .filter(|(_, old)| **old != key)
+            .map(|(entry, _)| entry.clone())
+            .collect();
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        let live = attached
+            .lifecycle
+            .read()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if !*live || attached.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        let mut proposal = attached
+            .coordinator
+            .proposal
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if proposal.management_pending.as_ref() != Some(&keys) {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        if !completed {
+            let crate::agent_sdk::RuntimeWork::Invoke {
+                invocation,
+                authorization,
+                ..
+            } = envelope
+            else {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            };
+            let host = self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            if !host.retained_positive_clean_acknowledgement(agent, invocation, authorization)? {
+                return Err(SharedAgentHostError::Conflict);
+            }
+            // Keep host and proposal locks across the independent store write.
+            complete()?;
+        } else {
+            complete()?;
+        }
+        proposal.management_pending = if remaining.is_empty() {
+            None
+        } else {
+            Some(pending_management_keys(agent, &remaining)?)
+        };
+        if remaining.is_empty() {
+            self.management_pending.remove(&agent);
+        } else {
+            self.management_pending.insert(agent, remaining);
+        }
+        Ok(())
     }
 
     /// A saved live intent may resume only under its exact restored reservation.
@@ -4162,6 +4259,36 @@ impl SharedAgentNetworkHost {
         )
     }
 
+    pub(crate) fn supervisor_acknowledge_management_denial(
+        &self,
+        expected: crate::agent::supervisor::AgentRouteIdentity,
+        proof: &crate::agent::clean_bootstrap::VerifiedManagementDenial,
+    ) -> Result<RuntimeOutcome, SharedAgentHostError> {
+        let (anchor, envelope) = proof.envelope();
+        let crate::agent_sdk::RuntimeWork::Invoke {
+            invocation,
+            authorization,
+            ..
+        } = envelope
+        else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        self.ensure_management_pending_member(
+            crate::service::AgentId(invocation.agent.0),
+            anchor,
+            envelope,
+        )?;
+        self.supervisor_invocation_operation(
+            expected,
+            crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Acknowledge {
+                work: (**invocation).clone(),
+                authorization: (**authorization).clone(),
+            },
+            false,
+            SupervisorAdmission::ReservedManagementDenial,
+        )
+    }
+
     pub(crate) fn supervisor_acknowledge_reserved(
         &self,
         expected: crate::agent::supervisor::AgentRouteIdentity,
@@ -4187,9 +4314,15 @@ impl SharedAgentNetworkHost {
         admission: SupervisorAdmission<'_>,
     ) -> Result<RuntimeOutcome, SharedAgentHostError> {
         let work = request.work();
-        if matches!(admission, SupervisorAdmission::ReservedManagementRetirement)
-            && (work.mode != MethodMode::Linear
-                || !matches!(&request, crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Acknowledge { .. }))
+        if matches!(
+            admission,
+            SupervisorAdmission::ReservedManagementRetirement
+                | SupervisorAdmission::ReservedManagementDenial
+        ) && (work.mode != MethodMode::Linear
+            || !matches!(
+                &request,
+                crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Acknowledge { .. }
+            ))
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
@@ -4270,6 +4403,20 @@ impl SharedAgentNetworkHost {
                 None
             };
         match scope {
+            InvocationScope::Ordered
+                if matches!(admission, SupervisorAdmission::ReservedManagementDenial) =>
+            {
+                let key = ProjectionPairKey::new(request.work(), request.authorization());
+                attached
+                    .coordinator
+                    .submit_clean_ordered_operation_with_admission(
+                        request,
+                        false,
+                        Some(ReservedSubmission::ManagementDenial(key)),
+                        InvocationClock::Current,
+                    )
+                    .map(|submission| submission.outcome)
+            }
             InvocationScope::Ordered
                 if matches!(admission, SupervisorAdmission::ReservedManagementRetirement) =>
             {

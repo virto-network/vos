@@ -1512,6 +1512,43 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
+    pub(crate) fn management_denial_invocation_after_anchor(
+        &self,
+        agent: AgentId,
+        anchor: &super::clean_management_intent::ManagementJournalAnchor,
+        envelope: &crate::agent_sdk::RuntimeWork,
+    ) -> Result<Option<super::journal::ReplayInputId>, SharedAgentHostError> {
+        let current = self.journal_position(agent)?;
+        if current.genesis != anchor.genesis
+            || current.admission != anchor.admission
+            || current.runtime.commitment() != anchor.runtime
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .management_denial_invocation_after(anchor.ordered, envelope)
+            .map_err(map_driver_error)
+    }
+
+    pub(crate) fn replay_durable_management_denial(
+        &mut self,
+        agent: AgentId,
+        anchor: &super::clean_management_intent::ManagementJournalAnchor,
+        envelope: &crate::agent_sdk::RuntimeWork,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedAgentHostError> {
+        self.management_denial_invocation_after_anchor(agent, anchor, envelope)?
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+        self.agents
+            .get_mut(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .replay_durable_management_denial(anchor.ordered, envelope)
+            .map_err(map_driver_error)
+    }
+
     #[cfg(test)]
     pub(crate) fn snapshot_state_for_test(
         &self,

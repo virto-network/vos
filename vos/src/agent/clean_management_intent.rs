@@ -385,6 +385,47 @@ pub(crate) enum IntentSlotError<E> {
 /// finalization envelope remain available for exact application retry.
 struct RetiredManagementIntent(CleanManagementIntent);
 
+/// Signed only after canonical denial replay and a positive runtime ACK.
+/// Signature covers the entire previously pledged intent, including its anchor.
+struct DeniedManagementIntent(CleanManagementIntent, [u8; 64]);
+
+fn denial_retirement_signing_bytes(intent: &CleanManagementIntent) -> Vec<u8> {
+    let mut bytes = b"vos/agent/management-denial-retired/v1".to_vec();
+    bytes.extend_from_slice(
+        crate::agent_sdk::Hash::digest(
+            b"vos/agent/management-denial-intent/v1",
+            &[&intent.encode()],
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+impl ServiceWire for DeniedManagementIntent {
+    const MAGIC: [u8; 4] = *b"CND1";
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        self.0.encode_body(output);
+        output.extend_from_slice(&self.1);
+    }
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let intent = CleanManagementIntent::decode_body(decoder)?;
+        let mut signature = [0; 64];
+        signature[..32].copy_from_slice(&decoder.fixed()?);
+        signature[32..].copy_from_slice(&decoder.fixed()?);
+        if intent.authorization_work.is_none()
+            || intent.finalization_work.is_some()
+            || !super::authority::verify_raw_ed25519(
+                &intent.call.authority.binding.public_key,
+                &denial_retirement_signing_bytes(&intent),
+                &signature,
+            )
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(Self(intent, signature))
+    }
+}
+
 impl ServiceWire for RetiredManagementIntent {
     const MAGIC: [u8; 4] = *b"CMR2";
 
@@ -407,6 +448,7 @@ pub(crate) struct CleanManagementIntentSlot<B> {
     store: B,
     intent: Option<CleanManagementIntent>,
     retired: bool,
+    denied: bool,
     poisoned: bool,
 }
 
@@ -433,7 +475,7 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
         let invalid = || {
             CleanManagementIssuerError::Rejected(CleanManagementIssuerRejection::InvalidObservation)
         };
-        if self.poisoned {
+        if self.poisoned || self.denied {
             return Err(invalid());
         }
         let intent = self.intent.as_ref().ok_or_else(invalid)?;
@@ -460,25 +502,30 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
                 if bytes.len() > MAX_INTENT_BYTES {
                     return Err(IntentSlotError::Invalid);
                 }
-                if bytes.starts_with(&RetiredManagementIntent::MAGIC) {
+                if bytes.starts_with(&DeniedManagementIntent::MAGIC) {
+                    DeniedManagementIntent::decode(&bytes)
+                        .map(|denied| (denied.0, false, true))
+                        .map_err(|_| IntentSlotError::Invalid)
+                } else if bytes.starts_with(&RetiredManagementIntent::MAGIC) {
                     RetiredManagementIntent::decode(&bytes)
-                        .map(|retired| (retired.0, true))
+                        .map(|retired| (retired.0, true, false))
                         .map_err(|_| IntentSlotError::Invalid)
                 } else {
                     CleanManagementIntent::decode(&bytes)
-                        .map(|intent| (intent, false))
+                        .map(|intent| (intent, false, false))
                         .map_err(|_| IntentSlotError::Invalid)
                 }
             })
             .transpose()?;
-        let (intent, retired) = match retained {
-            Some((intent, retired)) => (Some(intent), retired),
-            None => (None, false),
+        let (intent, retired, denied) = match retained {
+            Some((intent, retired, denied)) => (Some(intent), retired, denied),
+            None => (None, false, false),
         };
         Ok(Self {
             store,
             intent,
             retired,
+            denied,
             poisoned: false,
         })
     }
@@ -524,6 +571,55 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
         self.intent.as_ref()
     }
 
+    pub(crate) fn denial_complete(&self) -> Result<bool, IntentSlotError<B::Error>> {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        Ok(self.denied)
+    }
+
+    pub(crate) fn denial_signing_bytes(&self) -> Result<Vec<u8>, IntentSlotError<B::Error>> {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        let intent = self.intent.as_ref().ok_or(IntentSlotError::Invalid)?;
+        if self.retired || intent.authorization_work.is_none() || intent.finalization_work.is_some()
+        {
+            return Err(IntentSlotError::Conflict);
+        }
+        Ok(denial_retirement_signing_bytes(intent))
+    }
+
+    /// Caller has verified denial and positive retirement before signing.
+    pub(crate) fn commit_denial(
+        &mut self,
+        signature: [u8; 64],
+    ) -> Result<(), IntentSlotError<B::Error>> {
+        let message = self.denial_signing_bytes()?;
+        let intent = self.intent.as_ref().ok_or(IntentSlotError::Invalid)?;
+        if !super::authority::verify_raw_ed25519(
+            &intent.call.authority.binding.public_key,
+            &message,
+            &signature,
+        ) {
+            return Err(IntentSlotError::Invalid);
+        }
+        if self.denied {
+            return Ok(());
+        }
+        let bytes = DeniedManagementIntent(intent.clone(), signature).encode();
+        if bytes.len() > MAX_INTENT_BYTES {
+            return Err(IntentSlotError::Invalid);
+        }
+        self.poisoned = true;
+        self.store
+            .commit(&bytes)
+            .map_err(IntentSlotError::Storage)?;
+        self.denied = true;
+        self.poisoned = false;
+        Ok(())
+    }
+
     pub(crate) fn retirement_complete(&self) -> Result<bool, IntentSlotError<B::Error>> {
         if self.poisoned {
             return Err(IntentSlotError::Poisoned);
@@ -537,6 +633,9 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
         &mut self,
         acknowledgement: &crate::agent_sdk::authority::ManagementApplicationAck,
     ) -> Result<bool, IntentSlotError<B::Error>> {
+        if self.denied {
+            return Err(IntentSlotError::Conflict);
+        }
         if self.poisoned {
             return Err(IntentSlotError::Poisoned);
         }
@@ -636,6 +735,9 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
         anchor: ManagementJournalAnchor,
         finalization: bool,
     ) -> Result<bool, IntentSlotError<B::Error>> {
+        if self.denied {
+            return Err(IntentSlotError::Conflict);
+        }
         if self.poisoned {
             return Err(IntentSlotError::Poisoned);
         }

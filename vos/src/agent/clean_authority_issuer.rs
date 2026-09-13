@@ -446,6 +446,13 @@ pub trait CleanManagementReceiptSigner {
     fn sign_authority_receipt(&mut self, message: &[u8]) -> Result<[u8; 64], Self::Error>;
 
     fn sign_management_application_ack(&mut self, message: &[u8]) -> Result<[u8; 64], Self::Error>;
+
+    /// Distinct domain: a proven denial whose authorization result was retired,
+    /// never approval or evidence of an applied management operation.
+    fn sign_management_denial_retirement(
+        &mut self,
+        message: &[u8],
+    ) -> Result<[u8; 64], Self::Error>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2319,6 +2326,17 @@ mod tests {
 
     impl CleanManagementReceiptSigner for CountingSigner {
         type Error = TestSignerError;
+
+        fn sign_management_denial_retirement(
+            &mut self,
+            message: &[u8],
+        ) -> Result<[u8; 64], Self::Error> {
+            self.calls += 1;
+            if core::mem::take(&mut self.fail_next) {
+                return Err(TestSignerError);
+            }
+            Ok(self.key.sign(message).to_bytes())
+        }
 
         fn public_key(&self) -> [u8; 32] {
             self.key.verifying_key().to_bytes()

@@ -96,6 +96,17 @@ impl<'key> CleanOperatorIdentitySigner<'key> {
 impl CleanManagementReceiptSigner for CleanOperatorIdentitySigner<'_> {
     type Error = CleanIdentitySignerError;
 
+    fn sign_management_denial_retirement(
+        &mut self,
+        message: &[u8],
+    ) -> Result<[u8; 64], Self::Error> {
+        self.keypair
+            .sign(message)
+            .map_err(|_| CleanIdentitySignerError::SigningFailed)?
+            .try_into()
+            .map_err(|_| CleanIdentitySignerError::InvalidSignatureLength)
+    }
+
     fn public_key(&self) -> [u8; 32] {
         self.public_key
     }
@@ -136,6 +147,13 @@ impl OwnedCleanOperatorIdentitySigner {
 
 impl CleanManagementReceiptSigner for OwnedCleanOperatorIdentitySigner {
     type Error = CleanIdentitySignerError;
+
+    fn sign_management_denial_retirement(
+        &mut self,
+        message: &[u8],
+    ) -> Result<[u8; 64], Self::Error> {
+        CleanOperatorIdentitySigner::new(&self.keypair)?.sign_management_denial_retirement(message)
+    }
 
     fn public_key(&self) -> [u8; 32] {
         self.public_key

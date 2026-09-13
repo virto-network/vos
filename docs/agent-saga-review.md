@@ -25,8 +25,9 @@ restart using the rebuilt CLI (`target/native-local-smoke.DATNas`, details below
 This is bootstrap/ingress coverage, not ordinary-Agent creation/installation.
 AJC3 checkpoints and AGIM/AGI2 images are deliberately rejected, with no in-place
 migration provided; do not point this clean-break build at valuable old data.
-Current host lifecycle images additionally require CMI4/CMR2 with pre-dispatch
+Current host lifecycle images additionally use CMI4/CMR2 with pre-dispatch
 journal anchors; earlier CMI3/CMR1 images are rejected, not migrated.
+Canonical denial completion now uses a signed CND1 host record.
 Startup now discovers lifecycle stores before system attachment, replays saved
 initial-Create authorization when receipt issuance is incomplete, completes
 Local Create from an exact issued receipt and retained runtime when necessary,
@@ -44,7 +45,11 @@ startup, preserving their stores. Fresh live Local Create now reserves capture,
 extends admission through finalization and positively acknowledges both runtime
 results before returning success. Saved live requests require their exact
 restored reservation; retirement-write retries release only the verified pair.
-Denial/expiry resolution, full capacity/crash-boundary verification, and
+Canonical unissued denials now positively acknowledge their single runtime
+result and persist signed retirement before releasing admission, including
+signer/write retries and startup recovery. Client-visible signed denial and
+credential retry bookkeeping, expiry/abort resolution after approval or issuance,
+full capacity/crash-boundary verification, and
 coexistence with an unfinished projection remain blockers, not deployment-ready
 behavior. Do not delete
 those stores to bypass the recovery check.
@@ -3659,6 +3664,71 @@ an empty issuer, local error or discarded CMI4 file is not that proof. Client
 credential retry bookkeeping and expiry/abort handling still need their own
 verified completion semantics. No release readiness or branch promotion is
 claimed by this C2 checkpoint.
+
+### Signed server-side denial retirement
+
+The preceding evidence-only checkpoint is now extended into live Create and
+startup recovery. Only independently replayed canonical empty-byte denials of
+the exact signed, anchored authorization qualify. The issuer must remain empty
+and the Local Agent absent. An approval, malformed response, trap, or transport
+failure cannot become a denial disposition.
+
+A dedicated reserved route positively acknowledges the single authorization
+result. The host then signs a domain-separated commitment to the full retained
+intent and durably publishes CND1 in the existing intent store before releasing
+only that pending member. This is neither a management approval nor an application
+ACK, and does not manufacture a two-result retirement pair. Store errors preserve
+admission even when publication may already have succeeded. A completed CND1
+verifies against the independently pinned Authority key without retaining the
+runtime result; it cannot be overwritten by a different request or reissued.
+
+Recovery after the runtime ACK uses a separate bounded anchored walker accepting
+exactly the original Invoke and its following exact ACK. Ordinary pending-Invoke
+lookup stays strict. Admission grants zero additional journal slots only for an
+exact positively acknowledged canonical denial; acknowledged approvals remain
+rejected. Fresh replay still reconciles journal heads and state before signing.
+Completed denials do not consume credential sequence and are omitted from startup
+credential predecessor ordering. A subsequent valid request for a different Agent
+at the original credential sequence succeeds in the native regression.
+
+Targeted evidence in `.worktrees/ch08-c2-native/target/task-tmp`:
+
+- `r16-denial-retirement-final.log`: 19 denial tests passed (67.15s), including
+  automatic retirement, signer failure after ACK, ambiguous CND1 publication,
+  restart after ACK, a second restart after signed completion, tampered-signature
+  rejection, and subsequent valid creation without duplicate journal work.
+- `r16-denial-retirement-approved-guard.log`: native management regression passed
+  (1 test, 127.62s), including rejection of an acknowledged approval as pending
+  denial recovery.
+- `r16-denial-retirement-network.log`: 7 adjacent network tests passed (0.71s).
+- `r16-denial-retirement-live-verified.log`: 3 live overlap/restart, prepared
+  authorization retry, and committed-retirement retry tests passed (73.92s).
+- `r16-denial-retirement-files.log`: 12 vosx lifecycle file tests passed (0.18s),
+  compiling the production identity signer implementation.
+- `r16-denial-retirement-startup.log`: 14 startup tests passed (175.77s) after
+  initial CND1 integration but before the final post-ACK walker/retry changes;
+  this is intermediate-source evidence, not a final-source startup-suite claim.
+
+Initial compilation exposed the decoder's 32-byte fixed-field limit; the
+64-byte signature now uses two such reads. An intermediate fault run passed 17
+tests and failed two post-ACK retries (`r16-denial-retirement-faults.log`): strict
+ordinary invocation lookup correctly rejected an invocation hidden behind its
+ACK. The dedicated denial walker and fresh anchored replay fixed those failures;
+the final 19-test result above includes both cases.
+The initial live regression overflowed the combined setup/runtime stack
+(`r16-denial-retirement-live.log`). Moving dependent lifecycle fixture execution
+onto its own default-sized thread fixed all three live checks; stack limits were
+not increased. Formatting and `git diff --check` also passed.
+
+These native fixtures use real bundled Authority/runtime execution and Local
+filesystem images with memory-backed intent/issuer fault stores. They do not
+certify cross-process host-store crashes, checkpoint/GC pruning, or full capacity
+boundaries. No guest or SDK artifact ABI changed; final artifact/source freeze
+still remains. Client transport currently returns `ScopeMismatch`, not a signed
+denial response, so client credential retry bookkeeping remains open. Expiry or
+abort after approval/issuance and runtime failures retain their protected evidence.
+No full-library rerun, rebuilt-CLI smoke, release certification, or branch
+promotion is claimed. Fold this checkpoint into C2, not a separate review batch.
 
 ### Durable client acknowledgement before completion
 

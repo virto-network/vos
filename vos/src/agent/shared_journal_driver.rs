@@ -1047,6 +1047,40 @@ where
         &mut self,
         request: CleanInvocationReplayRequest,
     ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedJournalDriverError> {
+        self.replay_durable_clean_terminal_with_input(request, None)
+    }
+
+    pub(crate) fn replay_durable_management_denial(
+        &mut self,
+        anchor: OrderedBase,
+        envelope: &crate::agent_sdk::RuntimeWork,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedJournalDriverError> {
+        let input = self
+            .management_denial_invocation_after(anchor, envelope)?
+            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        let crate::agent_sdk::RuntimeWork::Invoke {
+            invocation,
+            authorization,
+            ..
+        } = envelope
+        else {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        };
+        self.replay_durable_clean_terminal_with_input(
+            CleanInvocationReplayRequest::Invoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                work: (**invocation).clone(),
+                authorization: (**authorization).clone(),
+            },
+            Some(input),
+        )
+    }
+
+    fn replay_durable_clean_terminal_with_input(
+        &mut self,
+        request: CleanInvocationReplayRequest,
+        anchored_input: Option<ReplayInputId>,
+    ) -> Result<crate::agent_sdk::RuntimeOutcome, SharedJournalDriverError> {
         let operation = request.into_operation(0);
         let resolver = self.store.catalog_blob_resolver()?;
         let mut executor = StandardLocalReplayExecutor::new_shared(
@@ -1067,8 +1101,12 @@ where
         {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
-        let input = recent_clean_ordered_operation(&self.store, &recovered, &operation)?
-            .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        let input = if let Some(input) = anchored_input {
+            input
+        } else {
+            recent_clean_ordered_operation(&self.store, &recovered, &operation)?
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?
+        };
         let outcome = executor
             .clean_ordered_result(input)
             .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
@@ -1673,7 +1711,6 @@ where
             {
                 return Err(SharedJournalDriverError::CrossStoreMismatch);
             }
-            let retained = self.management_invocation_after(anchor.ordered, envelope)?;
             let RuntimeWork::Invoke {
                 context,
                 invocation: work,
@@ -1687,6 +1724,33 @@ where
             if !seen.insert(work.invocation) {
                 return Err(SharedJournalDriverError::CrossStoreMismatch);
             }
+            if self.retained_positive_clean_acknowledgement(work, authorization)? {
+                let input = self
+                    .management_denial_invocation_after(anchor.ordered, envelope)?
+                    .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+                let Some(RuntimeOutcome::Completed(Ok(reply))) =
+                    self.executor.clean_ordered_result(input)
+                else {
+                    return Err(SharedJournalDriverError::CrossStoreMismatch);
+                };
+                if reply.invocation != work.invocation
+                    || reply.actor != work.actor
+                    || reply.incarnation != work.incarnation
+                    || reply.deployment != work.deployment
+                    || reply.mode != work.mode
+                    || reply.status != crate::agent_sdk::InvocationStatus::Done
+                    || reply.reply
+                        != crate::actors::codec::Encode::encode(
+                            &crate::actors::value::Value::Bytes(Vec::new()),
+                        )
+                {
+                    return Err(SharedJournalDriverError::CrossStoreMismatch);
+                }
+                // Only a proven denial can remain pending after its positive
+                // ACK. No more Ordered slots are needed to sign/persist it.
+                continue;
+            }
+            let retained = self.management_invocation_after(anchor.ordered, envelope)?;
             let invoke = ReplayOperation::CleanInvoke {
                 context: *context,
                 work: (**work).clone(),
@@ -2063,6 +2127,23 @@ where
         anchor: OrderedBase,
         envelope: &crate::agent_sdk::RuntimeWork,
     ) -> Result<Option<ReplayInputId>, SharedJournalDriverError> {
+        self.management_invocation_after_with_denial_ack(anchor, envelope, false)
+    }
+
+    pub(crate) fn management_denial_invocation_after(
+        &self,
+        anchor: OrderedBase,
+        envelope: &crate::agent_sdk::RuntimeWork,
+    ) -> Result<Option<ReplayInputId>, SharedJournalDriverError> {
+        self.management_invocation_after_with_denial_ack(anchor, envelope, true)
+    }
+
+    fn management_invocation_after_with_denial_ack(
+        &self,
+        anchor: OrderedBase,
+        envelope: &crate::agent_sdk::RuntimeWork,
+        denial: bool,
+    ) -> Result<Option<ReplayInputId>, SharedJournalDriverError> {
         use crate::agent_sdk::{
             InvocationAuthorization, MethodMode, RuntimeExecutionContext, RuntimeState, RuntimeWork,
         };
@@ -2090,6 +2171,21 @@ where
                 )
         {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        let operation = ReplayOperation::CleanInvoke {
+            context: *context,
+            work: (**invocation).clone(),
+            authorization: (**authorization).clone(),
+            observed_slot: *observed_slot,
+        };
+        if denial {
+            return super::local_journal_driver::clean_denial_operation_after(
+                &self.store,
+                &self.materialization,
+                anchor,
+                &operation,
+            )
+            .map_err(Into::into);
         }
         super::local_journal_driver::clean_ordered_operation_after(
             &self.store,
