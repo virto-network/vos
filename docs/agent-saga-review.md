@@ -22,6 +22,11 @@ high. The fresh signed-denial / valid-successor / exact-retry campaign also
 passes at `8abbe363`, but requires two HTTP 504 retries for the valid Create.
 Install/invoke remains unproven, so this
 is not yet a usable ordinary-agent production path.
+The native Local Install application and startup-recovery phases now pass
+physical tests from prepared authorization through retirement, including
+pristine client-retry admission. Install controller/ingress/CLI submission and
+actual actor method invocation remain unwired/unproven; these phase tests do
+not make actor installation available to users yet.
 The native Local-controller wiring at `ee047d48` passed fresh-data startup and
 restart using the rebuilt CLI (`target/native-local-smoke.DATNas`, details below).
 This is bootstrap/ingress coverage, not ordinary-Agent creation/installation.
@@ -4191,6 +4196,58 @@ issuer eligibility and credential-ordered recovery; pristine Install retry and
 denial/expiry handling remain open. Controller/queue/HTTP/CLI Install submission,
 actual actor invocation/restart, ordinary Shared finality and C1/C3 gates remain
 unfinished. Keep this extension in C2 without promoting the branch.
+
+### Pre-issuance Install recovery and pristine retry admission
+
+The issuer now exposes a read-only Install replay-eligibility check. It verifies
+the signed request against the selected Authority/Agent scope and requires a
+fully application-finalized predecessor, matching decision/acknowledgement high
+waters, no retained unacknowledged decision and no pending application ACK.
+A pending receipt must be the next sequence and reconstruct the exact retained
+Install decision from the signed call; a different signed call cannot adopt it.
+Eligibility is not policy approval: the anchored Authority invocation still has
+to execute or replay and yield its authenticated approval before issuance.
+
+Startup's former Create-only unissued flag now represents unissued authorization
+for Create or Install. Install uses the existing per-credential ordering and
+saved-clock constraints. Required actor packages and the independently opened
+Local descriptor are checked before replay. After receipt issuance, the issued
+Install application/finalization/retirement recovery added above completes the
+workflow. Create denial handling remains Create-specific; Install denials are
+not reclassified as completed Create denials.
+
+A pristine Install without any dispatch envelope may leave startup available
+for exact client retry when its predecessor issuer is fully finalized. It does
+not dispatch during startup or reconstruct an absent actor package. An empty
+issuer can represent pristine Create, not a pristine Install whose predecessor
+evidence has disappeared. Credential ordering still prevents automatic work
+from overtaking a known operation waiting for its client.
+
+The first three new restart regressions passed (114.50s,
+`r16-install-startup-unissued.log`): prepared authorization, accepted authorization
+without issuance, and interrupted receipt signature. They exercise the bundled
+Authority/runtime and preserve the original signed call and captured work.
+All nine final-source Install regressions passed in 258.63s
+(`r16-install-unissued-all-verified.log`), including pristine retry and predecessor
+finalization-barrier checks. Pristine retry leaves intent/issuer bytes and the
+absent package unchanged across two restarts, with no new Ordered entries or
+signatures. Prepared authorization recovery adds its one missing invocation;
+already accepted authorization is replayed without a duplicate invocation.
+The existing application/finalization/retirement checks still pass, including
+missing-artifact refusal and exact repeated recovery.
+
+All 14 existing Create startup regressions passed on the same source (182.87s,
+`r16-install-unissued-create-regressions.log`), as did all 12 issuer tests (4.43s,
+`r16-install-unissued-issuer-regressions.log`). Formatting and diff checks passed.
+These targeted runs do not replace final-source feature, full-library, artifact
+reproduction or whole-daemon release checks.
+
+These are native physical journal/Local-image tests with memory-backed lifecycle
+stores, not a whole-daemon power-loss campaign. No ingress endpoint, artifact
+repin, ordinary Shared finality or master readiness follows from this change.
+Remaining C2 work includes Install denial/expiry resolution, controller and
+queue/HTTP/CLI submission, actual actor invocation/restart, and mixed-operation
+capacity/crash campaigns. C1 recovery and C3 release gates remain open.
 
 ### Durable client acknowledgement before completion
 

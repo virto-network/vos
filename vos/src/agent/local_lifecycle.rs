@@ -296,7 +296,7 @@ pub struct LocalLifecycleRecovery<I: CleanManagementIssuerStore, J: CleanManagem
 }
 
 /// Startup admission derived only from verified, still-leased lifecycle stores.
-/// Covers completed work, issued receipts, and saved initial-Create
+/// Covers completed work, issued receipts, and saved Create/Install
 /// authorization. Issuer eligibility is not approval, and application must be
 /// independently observed from the Local image before acknowledgement signing.
 pub struct LocalLifecycleStartupAdmission {
@@ -327,7 +327,7 @@ pub(crate) struct LocalLifecycleRecoveryEntry<
     pub(crate) finalized: Option<ManagementApplicationAck>,
     pub(crate) observed: Option<ManagementApplicationAck>,
     pub(crate) issued: Option<super::sdk::authority::AuthorityReceipt>,
-    pub(crate) unissued_creation: bool,
+    pub(crate) unissued_authorization: bool,
 }
 
 impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycleRecovery<I, J> {
@@ -354,14 +354,14 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
                     index,
                     credential: intent.call().credential,
                     sequence: intent.call().request_sequence.get(),
-                    needs_authorization: entry.unissued_creation,
+                    needs_authorization: entry.unissued_authorization,
                     needs_finalization_preparation: !retired
                         && entry
                             .intent
                             .finalization_work()
                             .map_err(|_| SharedAgentHostError::Unavailable)?
                             .is_none(),
-                    ready: retired || entry.issued.is_some() || entry.unissued_creation,
+                    ready: retired || entry.issued.is_some() || entry.unissued_authorization,
                 });
             }
             if retired {
@@ -377,14 +377,33 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
             match (authorization, finalization, &entry.finalized) {
                 (None, None, None)
-                    if entry.issuer.sequence_high_water() == 0
-                        && !entry.issuer.has_pending_decision()
-                        && entry.issuer.retained_decisions() == 0 => {}
+                    if !entry.issuer.has_pending_decision()
+                        && entry.issuer.retained_decisions() == 0
+                        && ((entry.issuer.sequence_high_water() == 0
+                            && entry.intent.intent().is_none_or(|intent| {
+                                matches!(intent.request(), ManagementRequest::Create(_))
+                            }))
+                            || {
+                                let intent = entry
+                                    .intent
+                                    .intent()
+                                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                                entry
+                                    .issuer
+                                    .can_resume_install(
+                                        self.authority,
+                                        intent.call().managed,
+                                        intent.request(),
+                                        intent.call(),
+                                        &super::clean_bootstrap::RawCredentialVerifier,
+                                    )
+                                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+                            }) => {}
                 (Some(authorization), Some(finalization), Some(_)) => {
                     retirements.push([authorization.clone(), finalization.clone()]);
                 }
                 (Some(authorization), finalization, None)
-                    if entry.issued.is_some() || entry.unissued_creation =>
+                    if entry.issued.is_some() || entry.unissued_authorization =>
                 {
                     let authorization_anchor = entry
                         .intent
@@ -411,7 +430,7 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
         let successors: BTreeMap<_, _> = self
             .entries
             .iter()
-            .filter(|entry| entry.unissued_creation)
+            .filter(|entry| entry.unissued_authorization)
             .map(|entry| {
                 let call = entry
                     .intent
@@ -455,7 +474,7 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| entry.unissued_creation)
+            .filter(|(_, entry)| entry.unissued_authorization)
             .map(|(index, _)| saved_slot(index, false))
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
@@ -742,7 +761,7 @@ pub fn discover_local_lifecycle_recovery<F: LocalLifecycleStoreFactory>(
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        let unissued_creation = if !denied
+        let unissued_authorization = if !denied
             && issued.is_none()
             && intent
                 .authorization_work()
@@ -750,15 +769,24 @@ pub fn discover_local_lifecycle_recovery<F: LocalLifecycleStoreFactory>(
                 .is_some()
         {
             let request = intent.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
-            issuer
-                .can_resume_initial_creation(
+            let eligible = if matches!(request.request(), ManagementRequest::Install(_)) {
+                issuer.can_resume_install(
                     authority,
                     request.call().managed,
                     request.request(),
                     request.call(),
                     &RawCredentialVerifier,
                 )
-                .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+            } else {
+                issuer.can_resume_initial_creation(
+                    authority,
+                    request.call().managed,
+                    request.request(),
+                    request.call(),
+                    &RawCredentialVerifier,
+                )
+            };
+            eligible.map_err(|_| SharedAgentHostError::ScopeMismatch)?
         } else {
             false
         };
@@ -769,7 +797,7 @@ pub fn discover_local_lifecycle_recovery<F: LocalLifecycleStoreFactory>(
             finalized,
             observed,
             issued,
-            unissued_creation,
+            unissued_authorization,
         });
     }
     Ok(LocalLifecycleRecovery { authority, entries })
@@ -965,7 +993,11 @@ where
         // phases require their own protected recovery protocol, not omission.
         let admission = recovery.startup_admission()?;
         for entry in &mut recovery.entries {
-            if (entry.unissued_creation
+            if ((entry.unissued_authorization
+                && matches!(
+                    entry.intent.intent().map(|intent| intent.request()),
+                    Some(ManagementRequest::Create(_))
+                ))
                 || entry
                     .intent
                     .denial_complete()
@@ -977,13 +1009,13 @@ where
                     &mut signer,
                 )?
             {
-                entry.unissued_creation = false;
+                entry.unissued_authorization = false;
             }
         }
         let mut runtimes = BTreeMap::new();
         let mut actors = BTreeMap::new();
         for (index, entry) in recovery.entries.iter_mut().enumerate() {
-            if entry.issued.is_some()
+            if (entry.issued.is_some() || entry.unissued_authorization)
                 && matches!(
                     entry.intent.intent().map(|intent| intent.request()),
                     Some(ManagementRequest::Install(_))
@@ -1027,7 +1059,11 @@ where
                 .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
                 actors.insert(index, package);
             }
-            if entry.unissued_creation
+            if (entry.unissued_authorization
+                && matches!(
+                    entry.intent.intent().map(|intent| intent.request()),
+                    Some(ManagementRequest::Create(_))
+                ))
                 || (entry.issued.is_some()
                     && entry.observed.is_none()
                     && matches!(
@@ -1126,7 +1162,7 @@ where
         // Runtime availability is checked before executing any unissued call.
         // The issuer eligibility check does not replace durable actor replay.
         for entry in &mut recovery.entries {
-            if entry.unissued_creation {
+            if entry.unissued_authorization {
                 let managed = entry
                     .intent
                     .intent()

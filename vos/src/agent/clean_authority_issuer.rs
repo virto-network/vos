@@ -1654,6 +1654,86 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         Ok(true)
     }
 
+    /// Eligibility to replay an Install authorization after a fully finalized
+    /// predecessor. This does not prove policy execution or issue a receipt.
+    pub(crate) fn can_resume_install<V: AuthorityCredentialVerifier>(
+        &self,
+        authority: AuthorityActorTarget,
+        managed: ManagedAgentTarget,
+        request: &ManagementRequest,
+        call: &AuthorityCredentialCall,
+        verifier: &V,
+    ) -> Result<bool, CleanManagementIssuerError<B::Error>> {
+        self.ensure_live()?;
+        let invalid = || {
+            CleanManagementIssuerError::Rejected(CleanManagementIssuerRejection::InvalidObservation)
+        };
+        if call.authority != authority
+            || call.managed != managed
+            || authority.binding != self.image.binding
+            || managed.space != self.image.space
+            || managed.agent != self.image.agent
+            || !call.plan.matches_request(request)
+            || call.verify_with(verifier).is_err()
+        {
+            return Err(invalid());
+        }
+        if !matches!(request, ManagementRequest::Install(_))
+            || !self.image.retained.is_empty()
+            || self.image.pending_application_ack.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(previous) = &self.image.acknowledged else {
+            return Ok(false);
+        };
+        if !previous.application_finalized
+            || previous.application_ack.is_none()
+            || previous.sequence != self.image.decision_sequence_high_water
+            || previous.sequence != self.image.acknowledged_through
+        {
+            return Ok(false);
+        }
+        let prior = decode_authorized_decision(&previous.decision)
+            .map_err(|_| CleanManagementIssuerError::InvalidState)?;
+        if prior
+            .application
+            .is_none_or(|application| application.credential_call == call.commitment())
+        {
+            return Ok(false);
+        }
+        let Some(pending) = &self.image.pending else {
+            return Ok(true);
+        };
+        let decision = decode_authorized_decision(&pending.decision)
+            .map_err(|_| CleanManagementIssuerError::InvalidState)?;
+        if previous.sequence.checked_add(1) != Some(pending.sequence)
+            || decision
+                .application
+                .is_none_or(|application| application.credential_call != call.commitment())
+        {
+            return Err(invalid());
+        }
+        let approval = ManagementApproval::from_call(
+            call,
+            decision.authorization_id,
+            decision.evidence.clone(),
+            decision.lane_roots,
+            decision.epoch,
+            decision.valid_from,
+            decision.expires_at,
+        )
+        .map_err(|_| invalid())?;
+        let expected = AuthorizedCleanManagementDecision::from_approval(
+            authority, managed, request, call, &approval, verifier,
+        )
+        .map_err(|_| invalid())?;
+        if expected != decision {
+            return Err(invalid());
+        }
+        Ok(true)
+    }
+
     fn recover_recorded_application<V: AuthorityCredentialVerifier>(
         &self,
         authority: AuthorityActorTarget,

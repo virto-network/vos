@@ -8317,6 +8317,26 @@ mod tests {
         }
 
         #[test]
+        fn native_local_install_startup_recovers_prepared_authorization() {
+            native_local_management_lifecycle(37);
+        }
+
+        #[test]
+        fn native_local_install_startup_recovers_accepted_authorization() {
+            native_local_management_lifecycle(38);
+        }
+
+        #[test]
+        fn native_local_install_startup_recovers_pending_receipt_signature() {
+            native_local_management_lifecycle(39);
+        }
+
+        #[test]
+        fn native_local_install_startup_pristine_waits_for_client() {
+            native_local_management_lifecycle(40);
+        }
+
+        #[test]
         fn native_local_authorization_clock_advance_preserves_receipt_and_intent() {
             native_local_management_lifecycle(6);
         }
@@ -9594,7 +9614,7 @@ mod tests {
             call.authority = owner.authority_target();
             call.invocation = call.expected_invocation();
             call.signature = credential_key.sign(&call.signing_bytes()).to_bytes();
-            if (32..=36).contains(&coordinated) {
+            if (32..=40).contains(&coordinated) {
                 std::thread::scope(|scope| {
                     scope
                         .spawn(|| {
@@ -12082,7 +12102,10 @@ mod tests {
                 let recovery =
                     discover_local_lifecycle_recovery(&mut stores, authority, 1).unwrap();
                 let admission = recovery.startup_admission().unwrap();
-                assert_eq!(admission.pending.len(), usize::from(restart == 0));
+                assert_eq!(
+                    admission.pending.len(),
+                    usize::from(restart == 0 && scenario != 40)
+                );
                 let reopened = CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_factory(
                     pins,
                     record,
@@ -12120,9 +12143,29 @@ mod tests {
                     return;
                 }
                 let controller = result.unwrap();
+                if scenario == 40 {
+                    assert_eq!(controller.ordered_index_for_test().unwrap(), before);
+                    let (owner, local, returned_stores, returned_signer) =
+                        controller.into_parts_for_test();
+                    old_owner = owner;
+                    stores = returned_stores;
+                    signer = returned_signer;
+                    assert_eq!(signer.calls, signatures);
+                    assert_eq!(*intent.image.lock().unwrap(), intent_before);
+                    assert_eq!(*issuer.image.lock().unwrap(), issuer_before);
+                    assert!(intent.actor.lock().unwrap().is_none());
+                    assert_eq!(local.show(descriptor.identity.agent).unwrap(), &descriptor);
+                    drop(local);
+                    continue;
+                }
                 assert_eq!(
                     controller.ordered_index_for_test().unwrap(),
-                    before + if restart == 0 { 3 } else { 0 }
+                    before
+                        + if restart == 0 {
+                            3 + u64::from(scenario == 37)
+                        } else {
+                            0
+                        }
                 );
                 let (owner, local, returned_stores, returned_signer) =
                     controller.into_parts_for_test();
@@ -12131,7 +12174,12 @@ mod tests {
                 signer = returned_signer;
                 assert_eq!(
                     signer.calls,
-                    signatures + usize::from(restart == 0 && scenario != 35)
+                    signatures
+                        + if restart == 0 {
+                            usize::from(scenario != 35) + usize::from(scenario >= 37)
+                        } else {
+                            0
+                        }
                 );
                 let recovered = DurableCleanManagementIssuer::open(
                     issuer.clone(),
@@ -12369,15 +12417,127 @@ mod tests {
                 package.exact_bytes()
             );
             if scenario >= 33 {
-                let receipt = owner
-                    .issue_management_intent_with_admission(
-                        &mut slot,
-                        install_call.managed,
-                        &mut issuer,
-                        &mut signer,
-                        true,
+                if scenario == 40 {
+                    // Pristine intent: no dispatch envelope and no artifact
+                    // publication yet. Startup must leave it for client retry.
+                    *intent_store.actor.lock().unwrap() = None;
+                    drop(slot);
+                    drop(issuer);
+                    drop(local);
+                    check_install_startup(
+                        harness,
+                        &root,
+                        descriptor,
+                        install_call,
+                        request,
+                        intent_store,
+                        issuer_store,
+                        signer,
+                        scenario,
+                    );
+                    return;
+                }
+                assert!(
+                    issuer
+                        .can_resume_install(
+                            install_call.authority,
+                            install_call.managed,
+                            &request,
+                            &install_call,
+                            &RawCredentialVerifier
+                        )
+                        .unwrap()
+                );
+                let fresh = DurableCleanManagementIssuer::open(
+                    IssuerMemoryStore::default(),
+                    descriptor.authority,
+                    descriptor.identity.space,
+                    descriptor.identity.agent,
+                )
+                .unwrap();
+                assert!(
+                    !fresh
+                        .can_resume_install(
+                            install_call.authority,
+                            install_call.managed,
+                            &request,
+                            &install_call,
+                            &RawCredentialVerifier
+                        )
+                        .unwrap()
+                );
+                if scenario == 37 {
+                    owner.finalization_failure_once = Some(5);
+                }
+                if scenario == 38 {
+                    owner.finalization_failure_once = Some(6);
+                }
+                if scenario == 39 {
+                    signer.fail_receipt = true;
+                }
+                let issuance = owner.issue_management_intent_with_admission(
+                    &mut slot,
+                    install_call.managed,
+                    &mut issuer,
+                    &mut signer,
+                    true,
+                );
+                if scenario >= 37 {
+                    assert!(matches!(issuance, Err(SharedAgentHostError::Unavailable)));
+                    let recovered = DurableCleanManagementIssuer::open(
+                        issuer_store.clone(),
+                        descriptor.authority,
+                        descriptor.identity.space,
+                        descriptor.identity.agent,
                     )
                     .unwrap();
+                    assert!(
+                        recovered
+                            .can_resume_install(
+                                install_call.authority,
+                                install_call.managed,
+                                &request,
+                                &install_call,
+                                &RawCredentialVerifier
+                            )
+                            .unwrap()
+                    );
+                    if scenario == 39 {
+                        let mut different = install_call.clone();
+                        different.request_sequence =
+                            NonZeroU64::new(different.request_sequence.get() + 1).unwrap();
+                        different.invocation = different.expected_invocation();
+                        different.signature = key.sign(&different.signing_bytes()).to_bytes();
+                        assert!(
+                            recovered
+                                .can_resume_install(
+                                    different.authority,
+                                    different.managed,
+                                    &request,
+                                    &different,
+                                    &RawCredentialVerifier
+                                )
+                                .is_err()
+                        );
+                    }
+                    drop(recovered);
+                    drop(slot);
+                    drop(issuer);
+                    drop(local);
+                    check_install_startup(
+                        harness,
+                        &root,
+                        descriptor,
+                        install_call,
+                        request,
+                        intent_store,
+                        issuer_store,
+                        signer,
+                        scenario,
+                    );
+                    return;
+                }
+                let receipt = issuance.unwrap();
                 if matches!(scenario, 34 | 35) {
                     let result = local
                         .manage(
@@ -12435,6 +12595,22 @@ mod tests {
             assert!(ack.verify_with(&RawCredentialVerifier).is_ok());
             assert_eq!(signer.calls, signatures + 2);
             assert!(!issuer.application_finalization_status(&ack).unwrap());
+            let mut next_call = install_call.clone();
+            next_call.request_sequence =
+                NonZeroU64::new(next_call.request_sequence.get() + 1).unwrap();
+            next_call.invocation = next_call.expected_invocation();
+            next_call.signature = key.sign(&next_call.signing_bytes()).to_bytes();
+            assert!(
+                !issuer
+                    .can_resume_install(
+                        next_call.authority,
+                        next_call.managed,
+                        &request,
+                        &next_call,
+                        &RawCredentialVerifier
+                    )
+                    .unwrap()
+            );
             let receipt = owner
                 .issue_management_intent(&mut slot, install_call.managed, &mut issuer, &mut signer)
                 .unwrap();
@@ -12514,6 +12690,40 @@ mod tests {
                 .finish_live_management_intent(&mut slot, install_call.managed, &ack, &issuer)
                 .unwrap();
             assert!(slot.retirement_complete().unwrap());
+            assert!(
+                issuer
+                    .can_resume_install(
+                        next_call.authority,
+                        next_call.managed,
+                        &request,
+                        &next_call,
+                        &RawCredentialVerifier
+                    )
+                    .unwrap()
+            );
+            assert!(
+                !issuer
+                    .can_resume_install(
+                        install_call.authority,
+                        install_call.managed,
+                        &request,
+                        &install_call,
+                        &RawCredentialVerifier
+                    )
+                    .unwrap()
+            );
+            next_call.signature[0] ^= 1;
+            assert!(
+                issuer
+                    .can_resume_install(
+                        next_call.authority,
+                        next_call.managed,
+                        &request,
+                        &next_call,
+                        &RawCredentialVerifier
+                    )
+                    .is_err()
+            );
         }
 
         #[inline(never)]
