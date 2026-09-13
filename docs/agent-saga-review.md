@@ -1942,3 +1942,28 @@ exact signed submission from the native CLI, prove HTTP Create/publication plus
 restart/retry, then wire Install and prove invocation. Durable retirement,
 capacity/recovery boundaries, ordinary Shared-Agent finality and final release
 gates remain open. This checkpoint belongs inside C2, not a fourth review batch.
+
+### Native operator Local Create preparation
+
+`vosx` now has an internal `local_create::prepare` boundary that constructs ACC3
+from an explicit operator key, Authority target, Local descriptor, admitted
+runtime, nonzero credential sequence and validity window. It derives the exact
+invocation identity, signs the complete call, omits transport-node claims, and
+passes the result through the host LCQ1 verifier. This founding-operator helper
+requires the operator to own the new Agent; it is not a general delegated
+credential/owner API. It reads no keys or clock and creates no nonce or files.
+
+**8/8 Local Create preparation and identity tests pass** in 0.20s
+(`r16-local-create-preparation-final.log`, locked/offline `vosx` binary tests,
+disk scratch). With the actual bundled runtime, repeated exact inputs produce
+identical HTTP-sized signed frames; changed sequences change invocation identity.
+Wrong owner, Authority space, validity ordering and runtime package are rejected.
+Formatting and diff checks pass.
+
+The CLI subcommand is still absent. Next wiring must persist the complete
+submission durably before sending and resend those bytes on retry. Bootstrap
+uses management credential sequence 1; Authority requires the next consecutive
+sequence and refuses another pending application. Do not silently choose a fresh
+sequence, nonce or window after an ambiguous response. Descriptor/Authority
+discovery, safe sequence allocation, request-file publication and bounded HTTP
+submission/ack verification remain necessary before the native Create smoke.

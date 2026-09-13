@@ -32,6 +32,8 @@ pub mod forget;
 pub mod info;
 pub mod list;
 pub mod local_config;
+#[cfg(target_os = "linux")]
+pub(crate) mod local_create;
 pub mod new;
 pub mod op_sign;
 pub mod reconcile;
