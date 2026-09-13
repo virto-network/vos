@@ -237,6 +237,10 @@ async fn handle_request(
             if request.uri().path() == "/__agents/invoke" {
                 return handle_clean_invocation(&request, &handle);
             }
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            if request.uri().path() == "/__agents/prepare" {
+                return handle_clean_preparation(&request, &handle);
+            }
             let access = match authenticate(&request, &handle) {
                 Ok(access) => access,
                 Err((status, message)) => return simple_bytes(status, message),
@@ -564,6 +568,61 @@ fn handle_clean_invocation(
     }
 }
 
+#[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+fn handle_clean_preparation(
+    request: &super::types::Request,
+    handle: &IngressHandle,
+) -> super::types::Response {
+    use super::types::{text, with_content_type};
+    use crate::agent::sdk::wire::CanonicalWire as _;
+    use crate::agent::supervisor_adapters::{
+        AgentTargetedPreparationRequest, prepare_targeted_invocation,
+    };
+    if request.body().len() > MAX_BODY_BYTES {
+        return text(413, "request body too large");
+    }
+    if request.method() != http::Method::POST {
+        return text(405, "clean preparation is POST-only");
+    }
+    if request.uri().query().is_some() {
+        return text(400, "clean preparation does not accept query parameters");
+    }
+    if request
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        != Some("application/octet-stream")
+    {
+        return text(
+            415,
+            "clean preparation requires application/octet-stream ATQ1",
+        );
+    }
+    let preparation = match AgentTargetedPreparationRequest::decode(request.body()) {
+        Ok(value) => value,
+        Err(_) => return text(400, "invalid canonical clean preparation"),
+    };
+    // Preparation returns physical package/data material. Require live access;
+    // it does not authenticate claims in the intent or issue an actor receipt.
+    let access = match authenticate(request, handle) {
+        Ok(access) => access,
+        Err((status, message)) => return text(status.as_u16(), message),
+    };
+    if !access.has_capability(crate::CapabilityId::named(crate::capability::AGENT_INVOKE)) {
+        return text(403, "agent.invoke capability is required");
+    }
+    let Some(supervisor) = handle.clean_agent_supervisor() else {
+        return text(503, "clean agent supervisor unavailable");
+    };
+    match prepare_targeted_invocation(&supervisor, &preparation) {
+        Ok(response) => match response.encode() {
+            Ok(bytes) => with_content_type(200, "application/octet-stream", bytes),
+            Err(_) => text(503, "clean preparation response unavailable"),
+        },
+        Err(_) => text(503, "clean preparation unavailable"),
+    }
+}
+
 fn authenticate<B>(
     request: &Request<B>,
     handle: &IngressHandle,
@@ -683,6 +742,12 @@ mod tests {
                 handle_clean_invocation(&request, &handle).status().as_u16(),
                 expected
             );
+            assert_eq!(
+                handle_clean_preparation(&request, &handle)
+                    .status()
+                    .as_u16(),
+                expected
+            );
             let (mut parts, mut body) = request.into_parts();
             parts.uri = path
                 .replace("/__agents/local", "/__agents/local/install")
@@ -772,6 +837,37 @@ mod tests {
                     .encode()
                     .unwrap();
             let direct = AgentInvocationRequest::decode(&body).unwrap();
+            let work = direct.work();
+            let target =
+                crate::agent::supervisor::AgentRouteKey::new(work.space, work.agent, work.actor)
+                    .unwrap();
+            let intent = crate::agent::supervisor_adapters::AgentInvocationIntent::new(
+                work.invocation,
+                work.mode,
+                work.origin,
+                work.roles,
+                work.message.clone(),
+                work.gas,
+                work.recovery_only,
+            )
+            .unwrap();
+            let preparation =
+                crate::agent::supervisor_adapters::AgentTargetedPreparationRequest::new(
+                    target, intent,
+                )
+                .unwrap();
+            let preparation_request = http::Request::builder()
+                .method("POST")
+                .uri("/__agents/prepare")
+                .header(http::header::CONTENT_TYPE, "application/octet-stream")
+                .body(preparation.encode().unwrap())
+                .unwrap();
+            assert_eq!(
+                handle_clean_preparation(&preparation_request, &handle)
+                    .status()
+                    .as_u16(),
+                401
+            );
             let attested = AgentInvocationRequest::new(
                 RuntimeExecutionContext::Attested {
                     proof_system: Hash([9; 32]),
@@ -871,6 +967,13 @@ mod tests {
             assert!(inventory.starts_with("HTTP/1.1 405"), "{inventory}");
             let invoke = request(port, "/__agents/invoke");
             assert!(invoke.starts_with("HTTP/1.1 405"), "{invoke}");
+            let prepare = request(port, "/__agents/prepare");
+            assert!(prepare.starts_with("HTTP/1.1 405"), "{prepare}");
+            let adjacent_prepare = request(port, "/__agents/prepare/");
+            assert!(
+                adjacent_prepare.starts_with("HTTP/1.1 401"),
+                "{adjacent_prepare}"
+            );
             let adjacent_invoke = request(port, "/__agents/invoke/");
             assert!(
                 adjacent_invoke.starts_with("HTTP/1.1 401"),

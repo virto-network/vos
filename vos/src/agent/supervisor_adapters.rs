@@ -216,6 +216,144 @@ impl PreparedAgentInvocation {
     }
 }
 
+/// Remote preparation selects only a route and untrusted invocation intent.
+/// The live host supplies incarnation, packages, installation data and policy.
+/// Preparation itself is neither caller authentication nor authorization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTargetedPreparationRequest {
+    target: AgentRouteKey,
+    intent: AgentInvocationIntent,
+}
+
+impl AgentTargetedPreparationRequest {
+    pub fn new(target: AgentRouteKey, intent: AgentInvocationIntent) -> Result<Self, WireError> {
+        let value = Self { target, intent };
+        value
+            .validate_wire()
+            .then_some(value)
+            .ok_or(WireError::InvalidValue)
+    }
+
+    pub const fn target(&self) -> AgentRouteKey {
+        self.target
+    }
+
+    pub const fn intent(&self) -> &AgentInvocationIntent {
+        &self.intent
+    }
+
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(
+            b"vos/agent/targeted-preparation/v1",
+            &[&self.encode().expect("validated preparation")],
+        )
+    }
+}
+
+impl CanonicalWire for AgentTargetedPreparationRequest {
+    const MAGIC: [u8; 4] = *b"ATQ1";
+    const MAX_ENCODED_BYTES: usize = AgentPreparationRequest::MAX_ENCODED_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.intent.validate()
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encoder.fixed(self.target.space().as_bytes());
+        encoder.fixed(self.target.agent().as_bytes());
+        encoder.fixed(self.target.actor().as_bytes());
+        encode_intent(encoder, &self.intent);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let target = AgentRouteKey::new(
+            SpaceId(decoder.fixed()?),
+            AgentId(decoder.fixed()?),
+            ActorId(decoder.fixed()?),
+        )
+        .map_err(|_| DecodeError::NonCanonical)?;
+        Self::new(target, decode_intent(decoder)?).map_err(|_| DecodeError::NonCanonical)
+    }
+}
+
+/// Response-bound physical preparation, not a signed Authority approval.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTargetedPreparationResponse {
+    request: Hash,
+    prepared: PreparedAgentInvocation,
+}
+
+impl AgentTargetedPreparationResponse {
+    /// Check the exact remote intent before using any returned physical work.
+    /// This does not independently authenticate the responding host or policy.
+    pub fn for_request(
+        &self,
+        request: &AgentTargetedPreparationRequest,
+    ) -> Option<&PreparedAgentInvocation> {
+        let work = self.prepared.work();
+        let intent = request.intent();
+        (self.request == request.commitment()
+            && work.space == request.target.space()
+            && work.agent == request.target.agent()
+            && work.actor == request.target.actor()
+            && work.invocation == intent.invocation
+            && work.mode == intent.mode
+            && work.origin == intent.origin
+            && work.roles == intent.roles
+            && work.message == intent.message
+            && work.gas == intent.gas
+            && work.recovery_only == intent.recovery_only)
+            .then_some(&self.prepared)
+    }
+}
+
+impl CanonicalWire for AgentTargetedPreparationResponse {
+    const MAGIC: [u8; 4] = *b"ATP1";
+    const MAX_ENCODED_BYTES: usize = 36 + 32 + 4 + AgentPreparationResponse::MAX_ENCODED_BYTES;
+
+    fn validate_wire(&self) -> bool {
+        self.request != Hash::ZERO && prepared_invocation_valid(&self.prepared)
+    }
+
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encoder.fixed(self.request.as_bytes());
+        encoder.bytes(
+            &AgentPreparationResponse {
+                prepared: self.prepared.clone(),
+            }
+            .encode()
+            .expect("validated preparation"),
+        );
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let request = Hash(decoder.fixed()?);
+        let bytes = decoder.bytes_bounded(AgentPreparationResponse::MAX_ENCODED_BYTES)?;
+        let prepared = AgentPreparationResponse::decode(&bytes)
+            .map_err(|_| DecodeError::NonCanonical)?
+            .prepared;
+        let value = Self { request, prepared };
+        value
+            .validate_wire()
+            .then_some(value)
+            .ok_or(DecodeError::NonCanonical)
+    }
+}
+
+/// Resolve a client-selected target at the current live generation. Neither
+/// cached identity nor caller-supplied availability enters this preparation.
+pub fn prepare_targeted_invocation(
+    supervisor: &super::supervisor::AgentSupervisorHandle,
+    request: &AgentTargetedPreparationRequest,
+) -> Result<AgentTargetedPreparationResponse, AgentSupervisorError> {
+    let snapshot = supervisor.snapshot(request.target)?;
+    let prepared = prepare_invocation(supervisor, snapshot, request.intent.clone())?;
+    Ok(AgentTargetedPreparationResponse {
+        request: request.commitment(),
+        prepared,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AgentPreparationRequest {
     expected: AgentRouteIdentity,
@@ -4793,6 +4931,42 @@ mod tests {
         let snapshot = publication.snapshots()[0];
 
         let prepared = prepare_invocation(&owner.handle(), snapshot, intent.clone()).unwrap();
+        let targeted =
+            AgentTargetedPreparationRequest::new(snapshot.key(), intent.clone()).unwrap();
+        let encoded_target = targeted.encode().unwrap();
+        assert_eq!(
+            AgentTargetedPreparationRequest::decode(&encoded_target).unwrap(),
+            targeted
+        );
+        let mut trailing = encoded_target.clone();
+        trailing.push(0);
+        assert!(AgentTargetedPreparationRequest::decode(&trailing).is_err());
+        assert!(AgentPreparationRequest::decode(&encoded_target).is_err());
+        let remote = prepare_targeted_invocation(&owner.handle(), &targeted).unwrap();
+        let encoded_remote = remote.encode().unwrap();
+        let remote = AgentTargetedPreparationResponse::decode(&encoded_remote).unwrap();
+        assert_eq!(remote.for_request(&targeted), Some(&prepared));
+        let mut trailing = encoded_remote;
+        trailing.push(0);
+        assert!(AgentTargetedPreparationResponse::decode(&trailing).is_err());
+        let mut changed = targeted.clone();
+        changed.intent.gas += 1;
+        assert!(remote.for_request(&changed).is_none());
+        let mut forged = remote.clone();
+        forged.request = changed.commitment();
+        assert!(
+            forged.for_request(&changed).is_none(),
+            "echo alone cannot bind substituted work"
+        );
+        changed = targeted.clone();
+        changed.target = AgentRouteKey::new(
+            SpaceId([0x88; 32]),
+            changed.target.agent(),
+            changed.target.actor(),
+        )
+        .unwrap();
+        assert!(remote.for_request(&changed).is_none());
+        assert!(prepare_targeted_invocation(&owner.handle(), &changed).is_err());
         assert_eq!(prepared.profile(), AgentProfile::Local);
         assert_eq!(
             prepared.runtime_program(),

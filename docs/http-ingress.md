@@ -44,6 +44,16 @@ public operator command returns only with the clean system bootstrap.
 
 ### Clean invocation transport (saga branch)
 
+`POST /__agents/prepare` accepts canonical `ATQ1` (binary content type) and
+requires a live bearer credential with `agent.invoke`. The request selects
+only Space/Agent/Actor and invocation intent. The live supervisor supplies the
+installed generation, runtime/package identity, method policy and availability;
+Private routes have no plaintext fallback. The binary `ATP1` response must be
+decoded and checked with `AgentTargetedPreparationResponse::for_request` before
+using its work. This binds the response to the exact target and intent, but is
+not an independent host attestation, identity authentication for the intent,
+or an Authority receipt. Preparing does not execute the requested method.
+
 `POST /__agents/invoke` accepts an exact canonical `ASQ1` body with
 `Content-Type: application/octet-stream`, bounded by the HTTP request limit.
 Query parameters are rejected. The Space/Agent/Actor and installed generation
@@ -61,8 +71,8 @@ dispatcher cannot provide verified attested delivery yet.
 A 200 binary response is canonical `ASR1`, bound to the exact request. Inspect
 its runtime outcome: HTTP 200 does not itself mean actor success. On transport
 failure or 503, retain the original bytes; do not assume execution did not
-occur or generate a new invocation identity. This endpoint does not yet supply
-client preparation, receipt issuance, continuation/acknowledgement transport,
+occur or generate a new invocation identity. The transport does not yet supply
+a retained client workflow, receipt issuance, continuation/acknowledgement transport,
 or the friendly JSON route below. A full live invocation/restart campaign is
 still required before ordinary-agent testing is considered ready.
 

@@ -4734,6 +4734,38 @@ fresh installed actor invocation/exact retry/restart campaign. The typed
 endpoint is one implementation step toward that workflow, not a replacement
 for it or for any C1/C2/C3 release gate.
 
+### Targeted physical preparation transport
+
+Clients can now encode `AgentTargetedPreparationRequest` (ATQ1), containing
+only the full route key and invocation intent. `prepare_targeted_invocation`
+selects a current supervisor snapshot and uses the existing physical
+preparation worker; caller-supplied incarnation, packages, availability and
+policy are absent. ATP1 wraps the validated physical preparation with an exact
+request commitment. `for_request` checks that commitment plus every intent and
+target field, so echoing a different commitment cannot mask substituted work.
+This response binding is not an independent host attestation or authorization.
+
+`POST /__agents/prepare` requires binary ATQ1, bounded framing, no query
+parameters, and a live bearer credential with `agent.invoke`. Preparation
+returns package/installation material, so anonymous discovery is not exposed.
+Intent identity/role claims remain untrusted until proper authorization;
+preparation neither signs a receipt nor executes the requested method. Private
+routes retain their existing no-plaintext-preparation rejection.
+
+Checks pass: 28 supervisor-adapter tests in 0.03s
+(`r16-targeted-preparation-supervisor.log`), including physical preparation,
+canonical ATQ1/ATP1 round trips, trailing/cross-format rejection, response/intent
+substitution and missing target refusal; four HTTP tests in 0.26s
+(`r16-targeted-preparation-http.log`), including valid-frame authentication,
+framing limits and exact versus adjacent paths. Formatting/diff checks pass.
+These are host/transport checks, not a native HTTP method invocation pass.
+
+Next required work remains the retained client preparation/invocation workflow,
+protected non-Public receipt issuance and continuation/acknowledgement delivery,
+then live installed-actor invocation/exact retry/restart. The full C1/C2/C3
+scope remains open; neither this endpoint nor a Public-only smoke substitutes
+for authenticated ordinary-agent use or release verification.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its
