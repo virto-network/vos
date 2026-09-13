@@ -240,7 +240,30 @@ pub(super) fn post_binary(
     bytes: &[u8],
     maximum: usize,
 ) -> anyhow::Result<Vec<u8>> {
-    post_binary_response(address, path, status, bytes, maximum, false).map(|(_, bytes)| bytes)
+    post_binary_response(address, path, status, bytes, maximum, false, None).map(|(_, bytes)| bytes)
+}
+
+pub(super) fn post_binary_authenticated(
+    address: std::net::SocketAddr,
+    path: &'static str,
+    bytes: &[u8],
+    maximum: usize,
+    access_token: &str,
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        vos::ingress::decode_access_token(access_token).is_some(),
+        "invalid VOS access token"
+    );
+    post_binary_response(
+        address,
+        path,
+        200,
+        bytes,
+        maximum,
+        false,
+        Some(access_token),
+    )
+    .map(|(_, bytes)| bytes)
 }
 
 fn post_binary_response(
@@ -250,6 +273,7 @@ fn post_binary_response(
     bytes: &[u8],
     maximum: usize,
     allow_denial: bool,
+    access_token: Option<&str>,
 ) -> anyhow::Result<(u16, Vec<u8>)> {
     use std::io::Read as _;
     use std::time::Duration;
@@ -257,15 +281,19 @@ fn post_binary_response(
         address.ip().is_loopback() && address.port() != 0,
         "plaintext Agent control requires a nonzero loopback address"
     );
-    let response = ureq::AgentBuilder::new()
+    let request = ureq::AgentBuilder::new()
         .try_proxy_from_env(false)
         .redirects(0)
         .timeout_connect(Duration::from_secs(5))
         .timeout(Duration::from_secs(130))
         .build()
         .post(&format!("http://{address}{path}"))
-        .set("Content-Type", "application/octet-stream")
-        .send_bytes(bytes);
+        .set("Content-Type", "application/octet-stream");
+    let request = match access_token {
+        Some(token) => request.set("Authorization", &format!("Bearer {token}")),
+        None => request,
+    };
+    let response = request.send_bytes(bytes);
     let response = match response {
         Ok(response) => response,
         Err(ureq::Error::Status(403, response)) if allow_denial => response,
@@ -509,6 +537,7 @@ fn submit_retained_disposition(
             &bytes,
             MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES,
             true,
+            None,
         )?;
         if status == 403 {
             let denial = LocalCreateSubmission::decode(&bytes)

@@ -58,7 +58,9 @@ or an Authority receipt. Preparing does not execute the requested method.
 `Content-Type: application/octet-stream`, bounded by the HTTP request limit.
 Query parameters are rejected. The Space/Agent/Actor and installed generation
 come from the envelope and must match the active clean supervisor route; there
-is no legacy name or dynamic-message fallback.
+is no legacy name-route fallback. The canonical work may carry the existing
+tagged `Msg` actor payload; ASQ1 supplies the clean identity and authorization
+boundary around it.
 
 Authorization is in the envelope, not a bearer-header rewrite. Authority
 receipts remain signature/policy-verified by the selected runtime. Unsigned

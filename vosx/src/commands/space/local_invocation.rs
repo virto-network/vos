@@ -6,9 +6,69 @@ use vos::agent::sdk::{
     InvocationAuthorization, InvocationOrigin, InvocationRoleClaims, RuntimeExecutionContext,
 };
 use vos::agent::supervisor_adapters::{AgentInvocationRequest, AgentInvocationResponse};
+use vos::agent::supervisor_adapters::{
+    AgentTargetedPreparationRequest, AgentTargetedPreparationResponse, PreparedAgentInvocation,
+};
 
 pub(crate) const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_RESPONSE_BYTES: usize = AgentInvocationResponse::MAX_ENCODED_BYTES;
+
+/// Query physical preparation for an already selected, stable client intent.
+/// The caller retains that intent; this function generates no IDs or authority.
+pub(crate) fn prepare(
+    address: std::net::SocketAddr,
+    access_token: &str,
+    request: &AgentTargetedPreparationRequest,
+) -> anyhow::Result<PreparedAgentInvocation> {
+    let bytes = request
+        .encode()
+        .map_err(|error| anyhow::anyhow!("invalid preparation: {error:?}"))?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_REQUEST_BYTES,
+        "preparation exceeds HTTP request limit"
+    );
+    let reply = super::local_create::post_binary_authenticated(
+        address,
+        "/__agents/prepare",
+        &bytes,
+        AgentTargetedPreparationResponse::MAX_ENCODED_BYTES,
+        access_token,
+    )?;
+    let response = AgentTargetedPreparationResponse::decode(&reply)
+        .map_err(|error| anyhow::anyhow!("invalid ATP1: {error:?}"))?;
+    response
+        .for_request(request)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("physical preparation differs from the requested intent"))
+}
+
+/// Combine host-prepared work with an explicitly supplied authorization.
+/// Non-Public methods never receive a synthesized public preflight. The
+/// runtime remains responsible for receipt signature and policy verification.
+pub(crate) fn assemble(
+    prepared: &PreparedAgentInvocation,
+    receipt: Option<vos::agent::sdk::authority::AuthorityReceipt>,
+) -> anyhow::Result<Vec<u8>> {
+    let authorization = match receipt {
+        Some(receipt) => InvocationAuthorization::AuthorityReceipt(receipt),
+        None => InvocationAuthorization::PublicPreflight(prepared.public_preflight().ok_or_else(
+            || anyhow::anyhow!("installed method requires protected Authority receipt issuance"),
+        )?),
+    };
+    let request = AgentInvocationRequest::new(
+        RuntimeExecutionContext::Direct,
+        prepared.work().clone(),
+        authorization,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!("authorization differs from prepared invocation: {error:?}")
+    })?;
+    let bytes = request
+        .encode()
+        .map_err(|error| anyhow::anyhow!("encode invocation: {error:?}"))?;
+    validate_request(&bytes)?;
+    Ok(bytes)
+}
 
 pub(crate) fn validate_request(bytes: &[u8]) -> anyhow::Result<AgentInvocationRequest> {
     anyhow::ensure!(
@@ -127,6 +187,124 @@ mod tests {
     use std::os::unix::fs::DirBuilderExt as _;
     use vos::agent::sdk::*;
 
+    #[test]
+    #[ignore = "requires explicitly selected disposable native invocation campaign"]
+    fn real_daemon_preparation_invocation_and_exact_retry() {
+        use vos::agent::sdk::authority::{AgentAuthorityBinding, AuthorityIssuer};
+        use vos::agent::sdk::catalog::{CatalogActorTarget, CatalogPage, CatalogPageRequest};
+        use vos::agent::supervisor::AgentRouteKey;
+        use vos::agent::supervisor_adapters::AgentInvocationIntent;
+        use vos::{Decode as _, Encode as _};
+        let config_path = std::path::PathBuf::from(
+            std::env::var_os("VOSX_INVOKE_SMOKE_CONFIG")
+                .expect("explicit disposable configuration"),
+        );
+        let (data, space, _, address) =
+            super::super::local_create::resolve_local_space("native-denial-smoke", None).unwrap();
+        assert!(data.to_string_lossy().contains("native-denial-head-reuse."));
+        assert_eq!(config_path.parent(), data.parent());
+        let config = system_catalog::SystemCatalogConfiguration::decode(
+            &std::fs::read(config_path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config.space, space.0);
+        let target = CatalogActorTarget {
+            space,
+            system_agent: AgentId(config.system_agent),
+            system_runtime_deployment: DeploymentId(config.system_runtime_deployment),
+            actor: ActorId(config.actor),
+            deployment: DeploymentId(config.deployment),
+            program: ProgramId(config.program),
+            authority: AgentAuthorityBinding {
+                policy: Hash(config.authority.policy),
+                public_key: config.authority.public_key,
+                initial_epoch: config.authority.initial_epoch,
+                issuer: AuthorityIssuer {
+                    principal: PrincipalId(config.authority.issuer.principal),
+                    actor: ActorId(config.authority.issuer.actor),
+                    deployment: DeploymentId(config.authority.issuer.deployment),
+                    program: ProgramId(config.authority.issuer.program),
+                    producer: ProducerId(config.authority.issuer.producer),
+                },
+            },
+        };
+        let query = CatalogPageRequest {
+            catalog: target,
+            namespace: "invoke-smoke".into(),
+            after: None,
+            limit: u16::try_from(vos::agent::sdk::catalog::MAX_CATALOG_PAGE_ENTRIES).unwrap(),
+        };
+        let root = data.join("agent-client/invocation-smoke");
+        let mut store = CleanInvocationFile::open_or_create(&root).unwrap();
+        if store.load_request().unwrap().is_none() {
+            let operator = crate::identity::load_existing()
+                .unwrap()
+                .try_into_ed25519()
+                .unwrap();
+            let secret = operator.secret();
+            let token =
+                vos::ingress::encode_access_token(secret.as_ref().try_into().unwrap()).unwrap();
+            let mut nonce = [0; 32];
+            getrandom::getrandom(&mut nonce).unwrap();
+            let mut message = vec![vos::value::TAG_DYNAMIC];
+            message.extend_from_slice(
+                &vos::value::Msg::new("page")
+                    .with("request", query.encode().unwrap())
+                    .encode(),
+            );
+            let request = AgentTargetedPreparationRequest::new(
+                AgentRouteKey::new(space, AgentId(config.system_agent), ActorId(config.actor))
+                    .unwrap(),
+                AgentInvocationIntent::new(
+                    InvocationId(nonce),
+                    MethodMode::Query,
+                    InvocationOrigin::anonymous(),
+                    InvocationRoleClaims::none(),
+                    message,
+                    vos::agent::execution::MAX_EXECUTION_GAS,
+                    false,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let prepared = prepare(address, &token, &request).unwrap();
+            assert_eq!(prepared.selected_method().name, "page");
+            let bytes = assemble(&prepared, None).unwrap();
+            store.publish_request(&bytes).unwrap();
+        }
+        let request = store.load_request().unwrap().unwrap();
+        drop(store);
+        let response = submit(&root, None, address).unwrap();
+        // Force a real exact HTTP retry even when a prior campaign saved ASR1.
+        let repeated = super::super::local_create::post_binary(
+            address,
+            "/__agents/invoke",
+            200,
+            &request,
+            MAX_RESPONSE_BYTES,
+        )
+        .unwrap();
+        assert_eq!(verify_response(&request, &repeated).unwrap(), response);
+        let AgentInvocationResponse::Direct {
+            outcome: RuntimeOutcome::Completed(Ok(reply)),
+            ..
+        } = response
+        else {
+            panic!("actor did not complete successfully");
+        };
+        assert_eq!(reply.status, InvocationStatus::Done);
+        let vos::value::Value::Bytes(bytes) = vos::value::Value::try_decode(&reply.reply).unwrap()
+        else {
+            panic!("expected Catalog bytes");
+        };
+        let page = CatalogPage::decode(&bytes).unwrap();
+        assert_eq!(page.catalog, query.catalog);
+        assert_eq!(page.namespace, query.namespace);
+        assert!(page.next.is_none());
+        assert!(page.entries.is_empty());
+        eprintln!("native Catalog query, retained delivery and exact HTTP retry passed");
+    }
+
     fn fixture(seed: u8) -> (Vec<u8>, Vec<u8>) {
         let work = InvocationWork {
             space: SpaceId([1; 32]),
@@ -156,6 +334,74 @@ mod tests {
             outcome: RuntimeOutcome::Completed(Err(InvocationError::NotFound)),
         };
         (request.encode().unwrap(), response.encode().unwrap())
+    }
+
+    #[test]
+    fn preparation_http_authenticates_exact_body_and_rejects_invalid_delivery() {
+        use std::io::{Read as _, Write as _};
+        use vos::agent::supervisor::AgentRouteKey;
+        use vos::agent::supervisor_adapters::AgentInvocationIntent;
+        let (bytes, _) = fixture(23);
+        let call = validate_request(&bytes).unwrap();
+        let work = call.work();
+        let request = AgentTargetedPreparationRequest::new(
+            AgentRouteKey::new(work.space, work.agent, work.actor).unwrap(),
+            AgentInvocationIntent::new(
+                work.invocation,
+                work.mode,
+                work.origin,
+                work.roles,
+                work.message.clone(),
+                work.gas,
+                false,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let token = vos::ingress::encode_access_token(&[0x51; 32]).unwrap();
+        assert!(prepare("192.0.2.1:8080".parse().unwrap(), &token, &request).is_err());
+        assert!(prepare("127.0.0.1:1".parse().unwrap(), "invalid", &request).is_err());
+        for (status, content_type) in [
+            (401, "application/octet-stream"),
+            (302, "application/octet-stream"),
+            (200, "application/json"),
+            (200, "application/octet-stream"),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let expected = request.encode().unwrap();
+            let secret_header = format!("authorization: Bearer {token}");
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut header = Vec::new();
+                loop {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    header.push(byte[0]);
+                    if header.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                    assert!(header.len() < 8192);
+                }
+                let header = String::from_utf8(header).unwrap();
+                assert!(header.starts_with("POST /__agents/prepare HTTP/1.1\r\n"));
+                // Boolean assertion deliberately avoids printing secret headers.
+                assert!(
+                    header
+                        .lines()
+                        .any(|line| line.eq_ignore_ascii_case(&secret_header))
+                );
+                let mut body = vec![0; expected.len()];
+                stream.read_exact(&mut body).unwrap();
+                assert_eq!(body, expected);
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: 4\r\nConnection: close\r\n\r\nATP1").unwrap();
+            });
+            assert!(prepare(address, &token, &request).is_err());
+            server.join().unwrap();
+        }
     }
 
     fn directory() -> std::path::PathBuf {

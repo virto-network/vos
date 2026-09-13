@@ -4798,6 +4798,50 @@ Fresh preparation/authorization, continuation/acknowledgement transport and
 native installed-actor invocation/restart are still required. This closes the
 retained submission seam, not that full workflow or any remaining release gate.
 
+### Preparation client and guarded live invocation campaign
+
+The local preparation client now sends exact ATQ1 over bounded, proxy-free,
+non-redirecting loopback HTTP with a validated VOS bearer credential. It decodes
+ATP1 and requires exact target/intent binding before exposing prepared work.
+Assembly accepts an explicit Authority receipt or, only for an installed Public
+method, the prepared public preflight. It never synthesizes authorization for a
+non-Public method. Receipt issuance remains a separate protected workflow;
+runtime signature/policy verification is not replaced by this client check.
+
+The guarded ignored test `real_daemon_preparation_invocation_and_exact_retry`
+uses the existing disposable second Catalog installation, queries an empty
+namespace, retains ASQ1/ASR1 through the real client, and forces a second HTTP
+request even if client delivery was already cached. It requires an explicitly
+selected constructor configuration and checks its disposable data-directory
+boundary. Operator credential material is used only in memory, not logged.
+
+Correction to the earlier routing analysis: clean preparation itself selects
+the method from `TAG_DYNAMIC` plus `Msg` (`invocation_method_name`). That payload
+format is supported; the ordinary ingress gap is clean route selection and
+authorization, not tagged message encoding. ASQ1 is the clean envelope around
+that payload. No change of guest payload ABI is needed for this check.
+
+The CLI rebuild passed in 35.13s (`r16-invocation-preparation-build.log`). Ordinary
+vosx regression passes: 195 tests, zero failed, four ignored, 9.94s
+(`r16-invocation-preparation-http-client-final.log`). Preparation socket tests
+check exact credential/body forwarding, refusal of remote addresses/invalid
+tokens, and rejection of 401, redirects, wrong content type and malformed ATP1.
+Initial harness compilation exposed incorrect test API names and was corrected;
+the initial log is not a passing test result.
+
+The first live campaign started at 2026-09-13T16:36:44Z, reached readiness at
+16:41:27Z, and failed immediately before HTTP: its Catalog query requested
+eight entries while the protocol maximum is four. The daemon shut down cleanly
+at 16:41:27Z and removed its endpoint. No ASQ1 was submitted or retained by this
+failed fixture. The fixture now uses `MAX_CATALOG_PAGE_ENTRIES` directly.
+Logs are preserved under
+`target/native-denial-head-reuse.XoaplU/invocation-{run,daemon,client-test}.log`.
+A corrected campaign is running with separate `invocation-page-bounded-*` logs;
+inspect its existing live process before starting another campaign. The
+ordinary client regression is not a substitute for this native result, and a
+Public Catalog query does not close protected non-Public invocation, continuation,
+attested delivery, or the remaining C1/C2/C3 gates.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its
