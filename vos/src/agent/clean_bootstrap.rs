@@ -8739,14 +8739,35 @@ mod tests {
             // This tests suffix accounting, not fresh credential authorization.
             let agent = HostAgentId(owner.pins.agent.0);
             let first_anchor = owner.host.lock().unwrap().journal_position(agent).unwrap();
-            let mut extra = Vec::new();
-            for index in 0..4 {
-                extra.push(execute_extra_management_call(
-                    owner,
-                    original[0],
-                    intent,
-                    index,
-                ));
+            let extra: Vec<_> = (0..4)
+                .map(|index| prepare_extra_management_call(owner, original[0], intent, index))
+                .collect();
+            owner
+                ._network_host
+                .retire_attachment_for_test(agent)
+                .unwrap();
+            owner._network_host = crate::network::shared_agent::SharedAgentNetworkHost::attach_recovering_management_pending(
+                Arc::clone(&owner.host), Arc::clone(&network), agent,
+                extra.iter().map(|work| (management_anchor_for_test(&first_anchor), work.clone())).collect(),
+            ).unwrap();
+            for (index, envelope) in extra.iter().enumerate() {
+                // Full identity coverage alone cannot retire unaccepted work.
+                assert!(
+                    owner
+                        ._network_host
+                        .handoff_management_pending_to_retirement(
+                            agent,
+                            &[[&extra[0], &extra[1]], [&extra[2], &extra[3]]]
+                        )
+                        .is_err()
+                );
+                execute_prepared_management_call(owner, envelope.clone(), &first_anchor);
+                assert_eq!(
+                    owner.ordered_index_for_test().unwrap(),
+                    first_anchor.ordered_index + index as u64 + 1
+                );
+                assert!(owner._network_host.mark_stale_for_test(agent));
+                owner._network_host.refresh().unwrap();
             }
             let host = owner.host.lock().unwrap();
             let agent = HostAgentId(owner.pins.agent.0);
@@ -8774,7 +8795,12 @@ mod tests {
                     .is_err()
             );
             drop(host);
-            check_multiple_management_retirement_gate(owner, &extra, network);
+            check_multiple_management_retirement_gate(
+                owner,
+                &extra,
+                &management_anchor_for_test(&first_anchor),
+                network,
+            );
             // A later acknowledgement is not evidence of non-acceptance.
             assert!(
                 owner
@@ -8791,6 +8817,23 @@ mod tests {
 
         #[inline(never)]
         fn execute_extra_management_call(
+            owner: &MemoryBootstrapOwner,
+            original: &RuntimeWork,
+            intent: &crate::agent::clean_management_intent::CleanManagementIntent,
+            index: u64,
+        ) -> RuntimeWork {
+            let envelope = prepare_extra_management_call(owner, original, intent, index);
+            let anchor = owner
+                .host
+                .lock()
+                .unwrap()
+                .journal_position(HostAgentId(owner.pins.agent.0))
+                .unwrap();
+            execute_prepared_management_call(owner, envelope, &anchor)
+        }
+
+        #[inline(never)]
+        fn prepare_extra_management_call(
             owner: &MemoryBootstrapOwner,
             original: &RuntimeWork,
             intent: &crate::agent::clean_management_intent::CleanManagementIntent,
@@ -8831,10 +8874,30 @@ mod tests {
             **authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
                 crate::agent_sdk::PublicPreflight::for_work(invocation, *observed_slot),
             );
+            envelope
+        }
+
+        #[inline(never)]
+        fn execute_prepared_management_call(
+            owner: &MemoryBootstrapOwner,
+            envelope: RuntimeWork,
+            anchor: &crate::agent::shared_host::SharedAgentJournalPosition,
+        ) -> RuntimeWork {
+            let RuntimeWork::Invoke {
+                invocation,
+                authorization,
+                observed_slot,
+                ..
+            } = &envelope
+            else {
+                unreachable!()
+            };
+            let material = owner
+                .supervisor_invocation_material(owner.pins.agent, invocation.actor)
+                .unwrap();
             let identity =
                 crate::agent::supervisor_adapters::physical_material_identity(&material).unwrap();
             let agent = HostAgentId(owner.pins.agent.0);
-            let anchor = owner.host.lock().unwrap().journal_position(agent).unwrap();
             let prepared = RuntimeWork::Invoke {
                 context: RuntimeExecutionContext::Direct,
                 state: crate::agent_sdk::RuntimeState::default(),
@@ -9140,6 +9203,7 @@ mod tests {
         fn check_multiple_management_retirement_gate(
             owner: &mut MemoryBootstrapOwner,
             extra: &[RuntimeWork],
+            anchor: &crate::agent::clean_management_intent::ManagementJournalAnchor,
             network: Arc<Network>,
         ) {
             let agent = HostAgentId(owner.pins.agent.0);
@@ -9159,7 +9223,128 @@ mod tests {
             }
             owner
                 ._network_host
-                .reserve_management_retirement_set(agent, &pairs)
+                .retire_attachment_for_test(agent)
+                .unwrap();
+            owner._network_host = crate::network::shared_agent::SharedAgentNetworkHost::attach_recovering_management_pending(
+                Arc::clone(&owner.host), Arc::clone(&network), agent,
+                extra.iter().map(|work| (anchor.clone(), work.clone())).collect(),
+            ).unwrap();
+            let (query, query_auth) = fresh_projection_pair(owner, 0xec);
+            for _ in 0..2 {
+                assert!(matches!(
+                    owner
+                        ._network_host
+                        .reserve_projection_pair(agent, &query, &query_auth, false),
+                    Err(SharedAgentHostError::Conflict)
+                ));
+                assert!(matches!(
+                    owner
+                        ._network_host
+                        .reserve_management_retirement_set(agent, &pairs),
+                    Err(SharedAgentHostError::Conflict)
+                ));
+                assert!(matches!(
+                    owner
+                        ._network_host
+                        .handoff_management_pending_to_retirement(agent, &pairs[..1]),
+                    Err(SharedAgentHostError::Conflict)
+                ));
+                assert!(matches!(
+                    owner._network_host.record_management_anchor(
+                        agent,
+                        &extra[0],
+                        |_| -> Result<(), SharedAgentHostError> {
+                            panic!("pending exclusion must reject anchor publication")
+                        }
+                    ),
+                    Err(SharedAgentHostError::Conflict)
+                ));
+                let RuntimeWork::Invoke {
+                    invocation,
+                    authorization,
+                    ..
+                } = &extra[0]
+                else {
+                    unreachable!()
+                };
+                let material = owner
+                    .supervisor_invocation_material(owner.pins.agent, invocation.actor)
+                    .unwrap();
+                let identity =
+                    crate::agent::supervisor_adapters::physical_material_identity(&material)
+                        .unwrap();
+                assert!(matches!(
+                    owner.supervisor_acknowledge(
+                        identity,
+                        (**invocation).clone(),
+                        (**authorization).clone()
+                    ),
+                    Err(SharedAgentHostError::CapacityExhausted)
+                ));
+                assert!(matches!(
+                    owner
+                        ._network_host
+                        .supervisor_acknowledge_management_retirement(
+                            identity,
+                            (**invocation).clone(),
+                            (**authorization).clone()
+                        ),
+                    Err(SharedAgentHostError::CapacityExhausted)
+                ));
+                let mut wrong = anchor.clone();
+                wrong.runtime = crate::service::Hash([0xdc; 32]);
+                assert!(matches!(
+                    owner.supervisor_invoke(
+                        identity,
+                        (**invocation).clone(),
+                        (**authorization).clone()
+                    ),
+                    Err(SharedAgentHostError::CapacityExhausted)
+                ));
+                let mut unknown = (**invocation).clone();
+                unknown.invocation = crate::agent_sdk::InvocationId([0xee; 32]);
+                let RuntimeWork::Invoke { observed_slot, .. } = &extra[0] else {
+                    unreachable!()
+                };
+                let unknown_auth = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+                    crate::agent_sdk::PublicPreflight::for_work(&unknown, *observed_slot),
+                );
+                assert!(matches!(
+                    owner.supervisor_invoke_persisted_management(
+                        identity,
+                        unknown,
+                        unknown_auth,
+                        anchor
+                    ),
+                    Err(SharedAgentHostError::CapacityExhausted)
+                ));
+                assert!(matches!(
+                    owner.supervisor_invoke_persisted_management(
+                        identity,
+                        (**invocation).clone(),
+                        (**authorization).clone(),
+                        &wrong
+                    ),
+                    Err(SharedAgentHostError::CapacityExhausted)
+                ));
+                assert!(matches!(
+                    owner
+                        .supervisor_invoke_persisted_management(
+                            identity,
+                            (**invocation).clone(),
+                            (**authorization).clone(),
+                            anchor
+                        )
+                        .unwrap(),
+                    RuntimeOutcome::Completed(Ok(_))
+                ));
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+                assert!(owner._network_host.mark_stale_for_test(agent));
+                owner._network_host.refresh().unwrap();
+            }
+            owner
+                ._network_host
+                .handoff_management_pending_to_retirement(agent, &pairs)
                 .unwrap();
             assert!(matches!(
                 owner._network_host.record_management_anchor(

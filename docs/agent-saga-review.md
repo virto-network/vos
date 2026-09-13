@@ -2982,6 +2982,52 @@ Final-source verification: **11 native bootstrap/lifecycle tests passed**
 Evidence remains in disk scratch; no rebuilt-CLI smoke or full release run is
 claimed from these targeted results.
 
+### Pending management admission and atomic retirement handoff
+
+The internal network recovery constructor now accepts a bounded, independently
+verified set of prepared management envelopes and their saved journal anchors.
+Before worker/route publication it validates the entire set's journal evidence
+and combined Invoke/acknowledgement budget, including the leader-promotion no-op.
+It rechecks capacity after promotion and never checkpoints away these anchors
+to make recovery fit. Missing agents, malformed/duplicate envelopes, and
+coexisting projection/retirement recovery are rejected.
+
+While this set is pending, only an exact saved envelope with its exact anchor
+can invoke. Ordinary traffic, projection reservations, acknowledgements and new
+anchor publication remain excluded. Refresh reinstates the same full set before
+publishing the replacement route. An explicit handoff requires every pending
+identity, successful retained terminal results, a committed leader/application
+barrier, and the joint acknowledgement budget. It replaces pending admission
+with retirement admission under one proposal lock; failed or partial handoffs
+leave the original protection intact. The lifecycle owner must independently
+verify authorization/finalization pairing; network identity coverage alone is
+not that proof.
+
+Native physical fixtures now prepare four signed Authority calls before any is
+submitted, attach with that pending set, reject premature handoff, execute each
+call once, and refresh between submissions. Retained retries leave Ordered
+unchanged. Checks reject wrong anchors, unknown work, ordinary dispatch, both
+acknowledgement paths, new anchor publication and partial retirement handoff.
+The full handoff feeds the existing two-pair retirement test, including failed
+completion callbacks and refresh while another pair remains protected. These
+are in-process physical-journal/network tests, not filesystem startup adoption
+or independently verified lifecycle pairing.
+
+Final-source verification: **11 native bootstrap/lifecycle tests passed**
+(140.34s, `r16-pending-gate-final.log`) and **7 network tests passed**
+(0.36s, `r16-pending-gate-network.log`). An earlier retained-only version passed
+23 tests selected by `native_` (144.47s, `r16-pending-gate.log`); that broader
+selection is not a final-source full-library run. Formatting and diff checks
+pass. Logs remain under `.worktrees/ch08-c2-native/target/task-tmp` relative to
+the main checkout. No guest artifacts changed and no new CLI smoke is claimed.
+
+This constructor is **not wired into production startup yet**. Still required:
+adopt all verified lifecycle-store leases before route activation; continuously
+protect capture/store-error/dispatch/application/finalization transitions;
+handle future unprepared finalization, pending projections, exhausted capacity,
+and process restart. This scoped change does not enable production retirement,
+ordinary Shared finality, actor install ingress, or master readiness.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its
