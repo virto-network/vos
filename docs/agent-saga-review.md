@@ -2549,6 +2549,43 @@ exhausted-capacity recovery, then wire native lifecycle completion/handoff and
 signed Install/invoke. These store-reopen tests are not daemon-restart or
 post-GC physical evidence, and do not complete C1/C2/C3 release gates.
 
+### Retirement protection across network reattachment
+
+The network owner now retains exact pending retirement envelopes independently
+of its volatile route/worker generation. Refresh restores their admission gate
+before activating a replacement route. A new recovery constructor also accepts
+one independently verified pending retirement before attaching the system Agent.
+Both paths drain recovered commits, enforce the one-voter leader barrier, check
+capacity before and after promotion, and initialize the reserved keys before
+route registration or merge pumping. They refuse missing Linear evidence or
+insufficient capacity rather than checkpointing away the pending results.
+
+Durable completion removes both the live reservation and its retained recovery
+envelopes. A stale completion cannot remove a different pending retirement,
+including while no route is attached. Projection and retirement recovery cannot
+be selected together for the same attachment.
+
+Final-source native checks passed **10 tests, zero failures**, in 17.82s:
+`.worktrees/ch08-c2-native/target/task-tmp/r16-retirement-reattachment-final.log`.
+They retire/recreate a real network owner with both acknowledgements pending,
+replace a stale route after the first acknowledgement, verify a different
+handler is installed with projection admission still excluded, and prove the
+completed reservation does not reappear on another refresh. No replacement
+Ordered work is introduced. The Shared runtime host is retained during these
+tests; they are not a full filesystem-host or daemon restart.
+The same source passed the projection checkpoint-failure/reattachment regression
+(one test, 9.47s) and all six Shared-network unit tests (0.23s):
+`.worktrees/ch08-c2-native/target/task-tmp/r16-retirement-reattachment-projection.log`
+and `.worktrees/ch08-c2-native/target/task-tmp/r16-retirement-reattachment-network.log`.
+
+Startup integration remains open: `clean_startup.rs` currently constructs the
+system owner before opening `CleanManagementLifecycleStoreFactory`, whose trait
+only opens a selected Agent's stores. It cannot yet discover/verify pending
+retirements before the first system route is attached. Move that discovery
+boundary ahead of owner attachment, handle the bounded pending set without an
+unprotected publication gap, and prove full restart/GC/exhausted-capacity recovery
+before enabling production retirement/handoff or native Install.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

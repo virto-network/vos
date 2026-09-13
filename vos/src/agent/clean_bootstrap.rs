@@ -8088,6 +8088,49 @@ mod tests {
         }
 
         #[inline(never)]
+        fn check_management_retirement_reattachment(
+            owner: &mut MemoryBootstrapOwner,
+            envelopes: [&RuntimeWork; 2],
+            recreate: bool,
+            network: Arc<Network>,
+        ) {
+            let agent = HostAgentId(owner.pins.agent.0);
+            let before = owner.ordered_index_for_test().unwrap();
+            let (old, _) = owner
+                .network_host_for_test()
+                .attachment_for_test(agent)
+                .unwrap();
+            if recreate {
+                owner
+                    ._network_host
+                    .retire_attachment_for_test(agent)
+                    .unwrap();
+                // Supply the exact envelopes retained in the durable intent,
+                // not a freshly prepared invocation or current-clock preflight.
+                owner._network_host = crate::network::shared_agent::SharedAgentNetworkHost::attach_recovering_management_retirement(
+                    Arc::clone(&owner.host), network, agent,
+                    [envelopes[0].clone(), envelopes[1].clone()],
+                ).unwrap();
+            } else {
+                assert!(owner._network_host.mark_stale_for_test(agent));
+                owner._network_host.refresh().unwrap();
+            }
+            let (new, _) = owner
+                .network_host_for_test()
+                .attachment_for_test(agent)
+                .unwrap();
+            assert!(!Arc::ptr_eq(&old, &new));
+            let (query, authorization) = fresh_projection_pair(owner, 0xeb);
+            assert!(matches!(
+                owner
+                    ._network_host
+                    .reserve_projection_pair(agent, &query, &authorization, false),
+                Err(SharedAgentHostError::Conflict)
+            ));
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+        }
+
+        #[inline(never)]
         fn check_management_retirement_gate(
             owner: &mut MemoryBootstrapOwner,
             envelopes: [&RuntimeWork; 2],
@@ -8288,6 +8331,12 @@ mod tests {
             assert_eq!(owner.ordered_index_for_test().unwrap(), before);
             assert_eq!(store.image.lock().unwrap().as_ref(), Some(&retired));
             assert_projection_gate_released(owner, 0xea);
+            let agent = HostAgentId(owner.pins.agent.0);
+            assert!(owner._network_host.mark_stale_for_test(agent));
+            owner._network_host.refresh().unwrap();
+            // Completion must remove the retained recovery envelope as well
+            // as the current route's gate; it must not reappear on refresh.
+            assert_projection_gate_released(owner, 0xec);
             let expected = slot.intent().unwrap().clone();
             let mut next_call = expected.call().clone();
             next_call.request_sequence =
@@ -8713,6 +8762,14 @@ mod tests {
             ));
             assert_eq!(owner.ordered_index_for_test().unwrap(), finalized);
             check_management_retirement_gate(owner, [&envelope, &finalization_envelope], false);
+            if !interrupted_retirement {
+                check_management_retirement_reattachment(
+                    owner,
+                    [&envelope, &finalization_envelope],
+                    true,
+                    Arc::clone(&harness.network),
+                );
+            }
             if interrupted_retirement {
                 // Model interruption after the first positive acknowledgement.
                 // Recovery must consume only the remaining finalization result.
@@ -8745,6 +8802,12 @@ mod tests {
                     RuntimeOutcome::Acknowledged(Ok(_))
                 ));
                 assert_eq!(owner.ordered_index_for_test().unwrap(), finalized + 1);
+                check_management_retirement_reattachment(
+                    owner,
+                    [&envelope, &finalization_envelope],
+                    false,
+                    Arc::clone(&harness.network),
+                );
                 assert_eq!(
                     owner
                         .host

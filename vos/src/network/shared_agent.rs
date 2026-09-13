@@ -1896,6 +1896,10 @@ pub struct SharedAgentNetworkHost {
     // recovered physical suffix before publishing a route. Keep that
     // identity across refresh/checkpoint reattachment, not just bootstrap.
     system_agents: BTreeSet<crate::service::AgentId>,
+    // Exact pending envelopes outlive a volatile route/worker generation.
+    // Startup callers must seed these from independently verified durable
+    // lifecycle stores before any system route is activated.
+    management_retirements: BTreeMap<crate::service::AgentId, [crate::agent_sdk::RuntimeWork; 2]>,
     #[cfg(test)]
     force_checkpoint_once: bool,
     #[cfg(test)]
@@ -1951,7 +1955,7 @@ impl SharedAgentNetworkHost {
         host: Arc<Mutex<SharedAgentHost>>,
         network: Arc<Network>,
     ) -> Result<Self, SharedAgentHostError> {
-        Self::attach_internal(host, network, None, None)
+        Self::attach_internal(host, network, None, None, None)
     }
 
     /// Attach the one-voter clean system Agent. With no durable pending
@@ -1977,7 +1981,7 @@ impl SharedAgentNetworkHost {
             let mut locked = host.lock().map_err(|_| SharedAgentHostError::Unavailable)?;
             Self::install_detached_checkpoint(&mut locked, agent, expected_committee, signer)?;
         }
-        Self::attach_internal(host, network, None, Some(agent))
+        Self::attach_internal(host, network, None, Some(agent), None)
     }
 
     /// Reopen a system host with the exact durable pending projection pair
@@ -2006,7 +2010,21 @@ impl SharedAgentNetworkHost {
                 signer,
             }),
             Some(agent),
+            None,
         )
+    }
+
+    /// Restore an independently verified pending retirement before publishing
+    /// the system route. Unlike Query recovery, do not checkpoint away missing
+    /// Linear invocation/acknowledgement evidence to make this attachment fit.
+    pub(crate) fn attach_recovering_management_retirement(
+        host: Arc<Mutex<SharedAgentHost>>,
+        network: Arc<Network>,
+        agent: crate::service::AgentId,
+        envelopes: [crate::agent_sdk::RuntimeWork; 2],
+    ) -> Result<Self, SharedAgentHostError> {
+        management_retirement_keys(agent, [&envelopes[0], &envelopes[1]])?;
+        Self::attach_internal(host, network, None, Some(agent), Some((agent, envelopes)))
     }
 
     fn attach_internal<'a>(
@@ -2014,6 +2032,7 @@ impl SharedAgentNetworkHost {
         network: Arc<Network>,
         recovering: Option<RecoveringProjectionAdmission<'a>>,
         promotion_barrier: Option<crate::service::AgentId>,
+        retirement: Option<(crate::service::AgentId, [crate::agent_sdk::RuntimeWork; 2])>,
     ) -> Result<Self, SharedAgentHostError> {
         let statuses = host
             .lock()
@@ -2024,6 +2043,7 @@ impl SharedAgentNetworkHost {
             network,
             generations: BTreeMap::new(),
             system_agents: promotion_barrier.into_iter().collect(),
+            management_retirements: retirement.into_iter().collect(),
             #[cfg(test)]
             force_checkpoint_once: false,
             #[cfg(test)]
@@ -2043,6 +2063,13 @@ impl SharedAgentNetworkHost {
         if recovering
             .as_ref()
             .is_some_and(|pending| !attachment.generations.contains_key(&pending.agent))
+        {
+            return Err(SharedAgentHostError::AgentNotFound);
+        }
+        if attachment
+            .management_retirements
+            .keys()
+            .any(|agent| !attachment.generations.contains_key(agent))
         {
             return Err(SharedAgentHostError::AgentNotFound);
         }
@@ -2142,7 +2169,7 @@ impl SharedAgentNetworkHost {
     }
 
     pub(crate) fn reserve_management_retirement(
-        &self,
+        &mut self,
         agent: crate::service::AgentId,
         envelopes: [&crate::agent_sdk::RuntimeWork; 2],
     ) -> Result<(), SharedAgentHostError> {
@@ -2159,11 +2186,14 @@ impl SharedAgentNetworkHost {
         }
         attached
             .coordinator
-            .reserve_management_retirement(envelopes)
+            .reserve_management_retirement(envelopes)?;
+        self.management_retirements
+            .insert(agent, [envelopes[0].clone(), envelopes[1].clone()]);
+        Ok(())
     }
 
     pub(crate) fn complete_management_retirement<F>(
-        &self,
+        &mut self,
         agent: crate::service::AgentId,
         envelopes: [&crate::agent_sdk::RuntimeWork; 2],
         complete: F,
@@ -2184,23 +2214,33 @@ impl SharedAgentNetworkHost {
         }
         attached
             .coordinator
-            .complete_management_retirement(envelopes, complete)
+            .complete_management_retirement(envelopes, complete)?;
+        self.management_retirements.remove(&agent);
+        Ok(())
     }
 
     /// Only the lifecycle owner may release from a verified durable intent
     /// retirement marker, including after an ambiguous successful commit.
     pub(crate) fn release_completed_management_retirement(
-        &self,
+        &mut self,
         agent: crate::service::AgentId,
         envelopes: [&crate::agent_sdk::RuntimeWork; 2],
     ) -> Result<(), SharedAgentHostError> {
-        management_retirement_keys(agent, envelopes)?;
+        let keys = management_retirement_keys(agent, envelopes)?;
+        if let Some(pending) = self.management_retirements.get(&agent)
+            && management_retirement_keys(agent, [&pending[0], &pending[1]])? != keys
+        {
+            return Err(SharedAgentHostError::Conflict);
+        }
         let Some(attached) = self.generations.get(&agent) else {
+            self.management_retirements.remove(&agent);
             return Ok(());
         };
         attached
             .coordinator
-            .release_completed_management_retirement(envelopes)
+            .release_completed_management_retirement(envelopes)?;
+        self.management_retirements.remove(&agent);
+        Ok(())
     }
 
     pub(crate) fn reserve_recovering_projection_pair(
@@ -2451,7 +2491,12 @@ impl SharedAgentNetworkHost {
         allow_checkpoint: bool,
     ) -> Result<(), SharedAgentHostError> {
         let agent = status.generation.agent();
-        let promotion_barrier = promotion_barrier || self.system_agents.contains(&agent);
+        let retirement = self.management_retirements.get(&agent).cloned();
+        if retirement.is_some() && recovering.is_some() {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let promotion_barrier =
+            promotion_barrier || self.system_agents.contains(&agent) || retirement.is_some();
         if self.generations.contains_key(&agent) {
             return Err(SharedAgentHostError::Conflict);
         }
@@ -2470,6 +2515,23 @@ impl SharedAgentNetworkHost {
             host.supervisor_attachment_status(agent)?
                 .ok_or(SharedAgentHostError::AgentNotFound)?
         };
+        if let Some(envelopes) = &retirement {
+            let host = self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let required = host
+                .management_retirement_admission_requirement(agent, [&envelopes[0], &envelopes[1]])?
+                .ok_or(SharedAgentHostError::CapacityExhausted)?;
+            let remaining = host
+                .show(agent)?
+                .ok_or(SharedAgentHostError::AgentNotFound)?
+                .remaining_slots;
+            // The new one-voter worker must append its current-term no-op.
+            if remaining < required as u64 + 1 {
+                return Err(SharedAgentHostError::CapacityExhausted);
+            }
+        }
         if let Some(recovering) = recovering {
             let (required, remaining) = {
                 let host = self
@@ -2683,6 +2745,28 @@ impl SharedAgentNetworkHost {
                     recovering.work,
                     recovering.authorization,
                 )),
+                ..ProposalAdmission::default()
+            }
+        } else if let Some(envelopes) = &retirement {
+            let host = self
+                .host
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let required = host
+                .management_retirement_admission_requirement(agent, [&envelopes[0], &envelopes[1]])?
+                .ok_or(SharedAgentHostError::CapacityExhausted)?;
+            let remaining = host
+                .show(agent)?
+                .ok_or(SharedAgentHostError::AgentNotFound)?
+                .remaining_slots;
+            if remaining < required as u64 {
+                return Err(SharedAgentHostError::CapacityExhausted);
+            }
+            ProposalAdmission {
+                management_retirement: Some(management_retirement_keys(
+                    agent,
+                    [&envelopes[0], &envelopes[1]],
+                )?),
                 ..ProposalAdmission::default()
             }
         } else {
@@ -3525,6 +3609,14 @@ impl SharedAgentNetworkHost {
             attached.stale.store(true, Ordering::Release);
             true
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retire_attachment_for_test(
+        &mut self,
+        agent: crate::service::AgentId,
+    ) -> Result<(), SharedAgentHostError> {
+        self.retire(agent)
     }
 
     fn retire(&mut self, agent: crate::service::AgentId) -> Result<(), SharedAgentHostError> {
