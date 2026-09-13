@@ -1802,3 +1802,35 @@ startup with this file factory, expose bounded signed lifecycle commands, and
 drive authenticated publication. Install/completion/capacity recovery, Shared
 genesis finality and final release gates remain open. No artifact repin or
 integration-branch move was performed.
+
+### Node-owned lifecycle lifetime and creation API
+
+`VosNode::start_clean_local_agent_production` now consumes the controller into
+the production owner through a crate-private, Send-only lifecycle interface.
+It rejects duplicate/shutdown admission before starting attachments. Production
+construction checks the configured node, attaches both physical owners before
+the initial authenticated reconciliation, and exposes the supervisor only after
+that reconciliation succeeds. Existing system-only startup still delegates to
+the same construction logic without a lifecycle controller.
+
+`VosNode::create_clean_local_agent` now calls the retained controller, attaches
+the Local worker again if empty-route reconciliation retired it, and performs
+authenticated reconciliation after creation/finalization. A publication failure
+is not an application rollback: the exact signed request and durable stores are
+retained for retry. No host mutex is held while waiting on reconciliation.
+Production shutdown joins pending and published workers before dropping the
+retained lifecycle controller and its physical/network owners.
+
+**33/33 controller, production-owner and supervisor-adapter tests pass** in
+10.63s (`r16-node-local-lifecycle-final.log`, locked/offline
+`pvm,private-agent-store`, disk scratch). The new native node test rejects
+post-shutdown startup before authentication/store access, exposes no supervisor,
+and verifies that the Local root can reopen after the consumed controller is
+dropped. Positive lifecycle execution remains the attached-controller test;
+successful node startup/Create with live authenticated inventory has not yet
+been demonstrated by this suite.
+
+The CLI still calls system-only startup. Next construct the Local host/factory
+and controller there, exercise positive node startup/Create/publication with
+complete system-actor state, and expose the bounded ingress command. Remaining
+Install, completion/reservations, Shared finality and release gates are unchanged.

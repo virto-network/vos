@@ -25,6 +25,63 @@ pub trait LocalLifecycleStoreFactory {
     ) -> Result<(Self::Intent, Self::Issuer), Self::Error>;
 }
 
+/// Type-erased, node-owned lifecycle access. It is deliberately not an ingress
+/// trait: only the production owner may coordinate creation and publication.
+pub(crate) trait NativeLocalLifecycle: Send {
+    fn node(&self) -> Result<super::sdk::NodeId, SharedAgentHostError>;
+    fn system_attachment(
+        &self,
+        capacity: usize,
+    ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError>;
+    fn local_attachment(
+        &self,
+        capacity: usize,
+    ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError>;
+    fn create(
+        &mut self,
+        descriptor: AgentDescriptor,
+        call: AuthorityCredentialCall,
+        runtime: AdmittedRuntimePackage,
+    ) -> Result<(AgentId, ManagementApplicationAck), SharedAgentHostError>;
+}
+
+impl<P, R, I, F, S> NativeLocalLifecycle for LocalLifecycleController<P, R, I, F, S>
+where
+    P: CleanSystemAgentBootstrapStore + Send + 'static,
+    R: CleanSystemAgentBootstrapStore + Send + 'static,
+    I: CleanManagementIssuerStore + Send + 'static,
+    F: LocalLifecycleStoreFactory + Send,
+    S: CleanManagementReceiptSigner + Send,
+{
+    fn node(&self) -> Result<super::sdk::NodeId, SharedAgentHostError> {
+        Ok(self
+            .local
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .node())
+    }
+    fn system_attachment(
+        &self,
+        capacity: usize,
+    ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
+        LocalLifecycleController::system_attachment(self, capacity)
+    }
+    fn local_attachment(
+        &self,
+        capacity: usize,
+    ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
+        LocalLifecycleController::local_attachment(self, capacity)
+    }
+    fn create(
+        &mut self,
+        descriptor: AgentDescriptor,
+        call: AuthorityCredentialCall,
+        runtime: AdmittedRuntimePackage,
+    ) -> Result<(AgentId, ManagementApplicationAck), SharedAgentHostError> {
+        LocalLifecycleController::create(self, descriptor, call, runtime)
+    }
+}
+
 /// Retains one system owner and one physical Local host across route-worker
 /// retirement. Lifecycle calls lock system then Local; route workers lock only
 /// their own host. Never call route-worker methods while either guard is held.

@@ -7096,6 +7096,11 @@ mod tests {
         }
 
         #[test]
+        fn native_node_rejects_lifecycle_start_after_shutdown_without_leaking_hosts() {
+            native_local_management_lifecycle(3);
+        }
+
+        #[test]
         fn native_shared_system_owner_survives_route_retirement_and_fails_closed_on_poison() {
             let mut harness = NativeProjectionOwnerHarness::new("shared-system-owner");
             let owner = Arc::new(Mutex::new(harness.owner.take().unwrap()));
@@ -7274,7 +7279,7 @@ mod tests {
             call.authority = owner.authority_target();
             call.invocation = call.expected_invocation();
             call.signature = credential_key.sign(&call.signing_bytes()).to_bytes();
-            if coordinated == 2 {
+            if coordinated >= 2 {
                 struct Stores {
                     scope: (SpaceId, AgentId),
                     intent: IssuerMemoryStore,
@@ -7318,6 +7323,34 @@ mod tests {
                     CountingSigner::new(),
                 )
                 .unwrap();
+                if coordinated == 3 {
+                    let authentications = Arc::new(AtomicUsize::new(0));
+                    let mut node = crate::node::VosNode::new();
+                    node.shutdown();
+                    assert_eq!(node.start_clean_local_agent_production(
+                        harness.fixture.plan.pins.node,
+                        controller,
+                        Box::new(NeverProjectionAuthenticator(authentications.clone())),
+                        crate::agent::supervisor::AgentSupervisorLimits::default(),
+                        4,
+                        std::time::Duration::from_secs(60),
+                    ), Err(crate::agent::production_owner::AgentProductionOwnerError::DuplicateHost));
+                    assert_eq!(authentications.load(Ordering::SeqCst), 0);
+                    assert_eq!(opens.load(Ordering::SeqCst), 0);
+                    assert!(node.clean_agent_supervisor().is_none());
+                    node.collect_checked().unwrap();
+                    let local = crate::agent::local_sdk_host::LocalAgentHost::open(
+                        &root,
+                        descriptor.identity.space,
+                        harness.fixture.plan.pins.node,
+                        harness.fixture.trust.clone(),
+                    )
+                    .unwrap();
+                    assert!(local.list().unwrap().is_empty());
+                    drop(local);
+                    harness.stop();
+                    return;
+                }
                 let system = controller.system_attachment(4).unwrap();
                 let routes = controller.local_attachment(4).unwrap();
                 let mut forged = call.clone();

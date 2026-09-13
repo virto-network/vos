@@ -47,6 +47,7 @@ pub enum AgentProductionOwnerError {
     DuplicateHost,
     Adapter(AgentRouteAdapterError),
     Supervisor(AgentSupervisorError),
+    Lifecycle(super::shared_host::SharedAgentHostError),
 }
 
 impl fmt::Display for AgentProductionOwnerError {
@@ -379,6 +380,7 @@ pub(crate) struct AgentProductionOwner {
     accepted_head: Option<AuthorityProjectionHead>,
     reconcile_interval: Duration,
     reconcile_after: Instant,
+    lifecycle: Option<(Box<dyn super::local_lifecycle::NativeLocalLifecycle>, usize)>,
 }
 
 impl fmt::Debug for AgentProductionOwner {
@@ -400,6 +402,50 @@ impl AgentProductionOwner {
         system_attachment: AgentRouteHostAttachment,
         authenticator: Box<dyn AuthorityProjectionQueryAuthenticator>,
         reconcile_interval: Duration,
+    ) -> Result<Self, AgentProductionOwnerError> {
+        Self::start_with_lifecycle(
+            node,
+            limits,
+            system_attachment,
+            authenticator,
+            reconcile_interval,
+            None,
+        )
+    }
+
+    pub(crate) fn start_local(
+        node: NodeId,
+        limits: AgentSupervisorLimits,
+        lifecycle: Box<dyn super::local_lifecycle::NativeLocalLifecycle>,
+        queue_capacity: usize,
+        authenticator: Box<dyn AuthorityProjectionQueryAuthenticator>,
+        reconcile_interval: Duration,
+    ) -> Result<Self, AgentProductionOwnerError> {
+        if lifecycle
+            .node()
+            .map_err(AgentProductionOwnerError::Lifecycle)?
+            != node
+        {
+            return Err(AgentProductionOwnerError::InvalidConfiguration);
+        }
+        let system = lifecycle.system_attachment(queue_capacity)?;
+        Self::start_with_lifecycle(
+            node,
+            limits,
+            system,
+            authenticator,
+            reconcile_interval,
+            Some((lifecycle, queue_capacity)),
+        )
+    }
+
+    fn start_with_lifecycle(
+        node: NodeId,
+        limits: AgentSupervisorLimits,
+        system_attachment: AgentRouteHostAttachment,
+        authenticator: Box<dyn AuthorityProjectionQueryAuthenticator>,
+        reconcile_interval: Duration,
+        lifecycle: Option<(Box<dyn super::local_lifecycle::NativeLocalLifecycle>, usize)>,
     ) -> Result<Self, AgentProductionOwnerError> {
         if node == NodeId::ZERO || reconcile_interval.is_zero() {
             system_attachment.retire()?;
@@ -438,7 +484,11 @@ impl AgentProductionOwner {
             accepted_head: None,
             reconcile_interval,
             reconcile_after: Instant::now(),
+            lifecycle,
         };
+        if let Some((lifecycle, capacity)) = &owner.lifecycle {
+            owner.local = OwnedRouteSlot::Pending(lifecycle.local_attachment(*capacity)?);
+        }
         if let Err(error) = owner.reconcile() {
             let _ = owner.shutdown_and_join();
             return Err(error);
@@ -454,6 +504,32 @@ impl AgentProductionOwner {
             .as_ref()
             .expect("production owner retains supervisor until consumed")
             .handle()
+    }
+
+    pub(crate) fn create_local_agent(
+        &mut self,
+        descriptor: super::sdk::AgentDescriptor,
+        call: super::sdk::authority::AuthorityCredentialCall,
+        runtime: super::package_admission::AdmittedRuntimePackage,
+    ) -> Result<(AgentId, super::sdk::authority::ManagementApplicationAck), AgentProductionOwnerError>
+    {
+        if !self.is_running() {
+            return Err(AgentProductionOwnerError::InvalidConfiguration);
+        }
+        let (lifecycle, capacity) = self
+            .lifecycle
+            .as_mut()
+            .ok_or(AgentProductionOwnerError::InvalidConfiguration)?;
+        let result = lifecycle
+            .create(descriptor, call, runtime)
+            .map_err(AgentProductionOwnerError::Lifecycle)?;
+        if self.local.is_empty() {
+            self.local = OwnedRouteSlot::Pending(lifecycle.local_attachment(*capacity)?);
+        }
+        // The controller released both host locks before route reconciliation.
+        // Errors leave durable application evidence for an exact retry.
+        self.reconcile()?;
+        Ok(result)
     }
 
     pub(crate) fn is_running(&self) -> bool {
@@ -1176,6 +1252,7 @@ mod tests {
             accepted_head: None,
             reconcile_interval: interval,
             reconcile_after: admitted,
+            lifecycle: None,
         };
         let before = Instant::now();
         assert_eq!(owner.drive_if_due(admitted), Ok(true));

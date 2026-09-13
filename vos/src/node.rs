@@ -5593,6 +5593,70 @@ impl VosNode {
         self.attach_clean_agent_owner(owner)
     }
 
+    /// Retain Local lifecycle coordination inside the production owner. Initial
+    /// authenticated reconciliation includes the physical Local host before
+    /// any supervisor handle is exposed to ingress.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_clean_local_agent_production<P, R, I, F, S>(
+        &mut self,
+        node: crate::agent::sdk::NodeId,
+        lifecycle: crate::agent::local_lifecycle::LocalLifecycleController<P, R, I, F, S>,
+        authenticator: Box<
+            dyn crate::agent::production_owner::AuthorityProjectionQueryAuthenticator,
+        >,
+        limits: crate::agent::supervisor::AgentSupervisorLimits,
+        queue_capacity: usize,
+        reconcile_interval: Duration,
+    ) -> Result<(), crate::agent::production_owner::AgentProductionOwnerError>
+    where
+        P: crate::agent::clean_bootstrap::CleanSystemAgentBootstrapStore + Send + 'static,
+        R: crate::agent::clean_bootstrap::CleanSystemAgentBootstrapStore + Send + 'static,
+        I: crate::agent::clean_authority_issuer::CleanManagementIssuerStore + Send + 'static,
+        F: crate::agent::local_lifecycle::LocalLifecycleStoreFactory + Send + 'static,
+        S: crate::agent::clean_authority_issuer::CleanManagementReceiptSigner + Send + 'static,
+    {
+        if self.clean_agent_owner.is_some() || self.shutdown.load(Ordering::Acquire) {
+            return Err(crate::agent::production_owner::AgentProductionOwnerError::DuplicateHost);
+        }
+        let owner = crate::agent::production_owner::AgentProductionOwner::start_local(
+            node,
+            limits,
+            Box::new(lifecycle),
+            queue_capacity,
+            authenticator,
+            reconcile_interval,
+        )?;
+        self.attach_clean_agent_owner(owner)
+    }
+
+    /// Signed Local Create through the retained lifecycle controller, followed
+    /// by authenticated route reconciliation. A failure after application is
+    /// retryable only with the same signed request; it is not a rollback.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    pub fn create_clean_local_agent(
+        &mut self,
+        descriptor: crate::agent::sdk::AgentDescriptor,
+        call: crate::agent::sdk::authority::AuthorityCredentialCall,
+        runtime: crate::agent::package_admission::AdmittedRuntimePackage,
+    ) -> Result<
+        (
+            crate::agent::sdk::AgentId,
+            crate::agent::sdk::authority::ManagementApplicationAck,
+        ),
+        crate::agent::production_owner::AgentProductionOwnerError,
+    > {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(
+                crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration,
+            );
+        }
+        self.clean_agent_owner
+            .as_mut()
+            .ok_or(crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration)?
+            .create_local_agent(descriptor, call, runtime)
+    }
+
     /// Complete the node-owned half of clean production construction after
     /// the owner has performed its initial authenticated reconciliation.
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
