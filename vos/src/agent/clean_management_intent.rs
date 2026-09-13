@@ -1,7 +1,10 @@
 //! Durable exact input for native management coordination, before policy runs.
 //! A signed credential call is not policy approval or genesis finality.
 
-use super::clean_authority_issuer::CleanManagementIssuerStore;
+use super::clean_authority_issuer::{
+    AuthorizedCleanManagementDecision, CleanManagementIssuerError, CleanManagementIssuerRejection,
+    CleanManagementIssuerStore, CleanManagementReceiptSigner, DurableCleanManagementIssuer,
+};
 use crate::agent_sdk::ManagementRequest;
 use crate::agent_sdk::authority::{
     AuthorityActorTarget, AuthorityCredentialCall, AuthorityCredentialVerifier, ManagedAgentTarget,
@@ -131,6 +134,47 @@ pub(crate) struct CleanManagementIntentSlot<B> {
 }
 
 impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
+    /// The native coordinator may call this only for the exact result of the
+    /// configured authority actor's authenticated, durably applied invocation.
+    /// A decoded approval or a policy preview is not that evidence.
+    pub(crate) fn issue_from_authenticated_approval<
+        I: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+        V: AuthorityCredentialVerifier,
+    >(
+        &self,
+        authority: AuthorityActorTarget,
+        managed: ManagedAgentTarget,
+        approval: &crate::agent_sdk::authority::ManagementApproval,
+        verifier: &V,
+        issuer: &mut DurableCleanManagementIssuer<I>,
+        signer: &mut S,
+    ) -> Result<
+        crate::agent_sdk::authority::AuthorityReceipt,
+        CleanManagementIssuerError<I::Error, S::Error>,
+    > {
+        let invalid = || {
+            CleanManagementIssuerError::Rejected(CleanManagementIssuerRejection::InvalidObservation)
+        };
+        if self.poisoned {
+            return Err(invalid());
+        }
+        let intent = self.intent.as_ref().ok_or_else(invalid)?;
+        intent
+            .verify(authority, managed, verifier)
+            .map_err(|_| invalid())?;
+        let decision = AuthorizedCleanManagementDecision::from_approval(
+            authority,
+            managed,
+            intent.request(),
+            intent.call(),
+            approval,
+            verifier,
+        )
+        .map_err(|_| invalid())?;
+        issuer.issue(&decision, signer)
+    }
+
     pub(crate) fn open(mut store: B) -> Result<Self, IntentSlotError<B::Error>> {
         let intent = store
             .load()

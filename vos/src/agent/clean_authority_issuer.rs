@@ -2442,6 +2442,141 @@ mod tests {
     }
 
     #[test]
+    fn persisted_intent_issues_only_its_exact_approval_across_signer_failure() {
+        use super::super::clean_management_intent::{
+            CleanManagementIntent, CleanManagementIntentSlot,
+        };
+        let intent_store = MemoryImageStore::default();
+        let issuer_store = MemoryImageStore::default();
+        let mut signer = CountingSigner::new(0x3b);
+        let fixture = fixture(&signer);
+        let request = request(0x3c);
+        let (call, approval) = approved_call(&fixture, 1, &request);
+        let intent = CleanManagementIntent::new(
+            call.authority,
+            call.managed,
+            request.clone(),
+            call.clone(),
+            &TestCredentialVerifier,
+        )
+        .unwrap();
+        let mut slot = CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
+        let mut issuer = open(issuer_store.clone(), &fixture);
+        assert!(
+            slot.issue_from_authenticated_approval(
+                call.authority,
+                call.managed,
+                &approval,
+                &TestCredentialVerifier,
+                &mut issuer,
+                &mut signer
+            )
+            .is_err()
+        );
+        assert_eq!(signer.calls, 0);
+        // A failed write can have persisted the intent. The live slot must not
+        // issue until it is reopened, even when the approval is otherwise exact.
+        let ambiguous_store = MemoryImageStore::default();
+        ambiguous_store.fail_after_commit(1);
+        let mut ambiguous_slot = CleanManagementIntentSlot::open(ambiguous_store).unwrap();
+        assert!(ambiguous_slot.pledge(intent.clone()).is_err());
+        let before_poisoned_issue = issuer_store.image();
+        assert!(matches!(
+            ambiguous_slot.issue_from_authenticated_approval(
+                call.authority,
+                call.managed,
+                &approval,
+                &TestCredentialVerifier,
+                &mut issuer,
+                &mut signer
+            ),
+            Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::InvalidObservation
+            ))
+        ));
+        assert_eq!(signer.calls, 0);
+        assert_eq!(issuer_store.image(), before_poisoned_issue);
+        slot.pledge(intent).unwrap();
+        let before = issuer_store.image();
+        let (_, wrong_approval) = approved_call(&fixture, 2, &request);
+        assert!(
+            slot.issue_from_authenticated_approval(
+                call.authority,
+                call.managed,
+                &wrong_approval,
+                &TestCredentialVerifier,
+                &mut issuer,
+                &mut signer
+            )
+            .is_err()
+        );
+        let mut wrong_managed = call.managed;
+        wrong_managed.agent = AgentId([0xed; 32]);
+        assert!(
+            slot.issue_from_authenticated_approval(
+                call.authority,
+                wrong_managed,
+                &approval,
+                &TestCredentialVerifier,
+                &mut issuer,
+                &mut signer
+            )
+            .is_err()
+        );
+        assert_eq!(signer.calls, 0);
+        assert_eq!(issuer_store.image(), before);
+
+        signer.fail_next = true;
+        assert!(matches!(
+            slot.issue_from_authenticated_approval(
+                call.authority,
+                call.managed,
+                &approval,
+                &TestCredentialVerifier,
+                &mut issuer,
+                &mut signer
+            ),
+            Err(CleanManagementIssuerError::Signer(TestSignerError))
+        ));
+        assert_eq!(signer.calls, 1);
+        drop(slot);
+        drop(issuer);
+        let slot = CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
+        let mut issuer = open(issuer_store.clone(), &fixture);
+        let receipt = slot
+            .issue_from_authenticated_approval(
+                call.authority,
+                call.managed,
+                &approval,
+                &TestCredentialVerifier,
+                &mut issuer,
+                &mut signer,
+            )
+            .unwrap();
+        assert_eq!(receipt.selector.request, request.commitment());
+        assert_eq!(signer.calls, 2);
+        drop(slot);
+        drop(issuer);
+        let slot = CleanManagementIntentSlot::open(intent_store).unwrap();
+        let mut issuer = open(issuer_store, &fixture);
+        let mut unavailable = CountingSigner::new(0xef);
+        unavailable.fail_next = true;
+        assert_eq!(
+            slot.issue_from_authenticated_approval(
+                call.authority,
+                call.managed,
+                &approval,
+                &TestCredentialVerifier,
+                &mut issuer,
+                &mut unavailable
+            )
+            .unwrap(),
+            receipt
+        );
+        assert_eq!(unavailable.calls, 0);
+    }
+
+    #[test]
     fn application_ack_is_pledged_after_reopen_and_is_exact_across_restart() {
         let store = MemoryImageStore::default();
         let mut signer = CountingSigner::new(0x28);

@@ -37,9 +37,12 @@ review endpoints for individual fixes:
    substituted-evidence reopen checks now pass, as do portable evidence
    preservation and the post-snapshot one-ack-lag projection checks described
    below. Production Local opaque-runtime management Create/reopen now uses
-   public metadata and durable history. Finish its actor installation,
-   invocation/recovery and lane-transition checks and tests. Neither a private-
-   state decoder nor a volatile cache is a runtime-independent proof.
+   public metadata and durable history. Scripted physical-PVM actor installation,
+   invocation/resume/reopen and lane-transition checks now pass. Complete the
+   remaining positive-ack retirement and target-runtime migration checks; the
+   scripted host-ABI tests do not prove arbitrary guest execution semantics.
+   Neither a private-state decoder nor a volatile cache is a runtime-independent
+   proof.
 2. **C2 — native lifecycle:** connect ordinary-Agent provisioning to the native
    owner, not just its existing invocation route workers. Startup currently
    attaches the system Agent only; the route worker exposes no Create/Install
@@ -1368,3 +1371,31 @@ completed workflow or publish routes. Next connect its persisted input to the
 authenticated authority dispatcher and existing durable issuer/application
 observation/finalization stages, including completion and restart handling.
 No guest artifact or existing store format is changed by this checkpoint.
+
+### Persisted intent to durable issuance
+
+The intent slot now feeds its stored request and signed credential call into
+the existing issuer, after rechecking independently selected routes and the
+credential signature. Missing or poisoned intent, mismatched approval and
+wrong managed routes are rejected before signing or changing the issuer image.
+The caller must supply the configured authority actor's authenticated, durably
+applied result; this crate-private adapter does not authenticate actor execution
+merely because an approval decodes or matches the call.
+
+The regression reopens both independent stores after signer failure, recovers
+the exact receipt, then reopens again and retrieves that receipt without an
+available signer. It also checks that an ambiguous intent write cannot issue
+through the poisoned live slot. This remains component-level evidence, not a
+native authority-dispatch or provisioning test.
+
+**9/9 issuer and intent tests pass** (`r16-intent-issuance-final.log`, 3.59s),
+using locked offline dependencies and disk-backed scratch space. Formatting
+and diff checks pass. Existing compiler warnings remain; this is not a full
+library or release-gate rerun.
+
+The next integration milestone remains one real native ordinary-Agent Create:
+durably retain its input, invoke the installed Authority actor, issue and apply
+the receipt, reopen the physical result, finalize its acknowledgement through
+that actor, and publish its route with independently verified finality. Only
+after that path works should Install/invoke/restart acceptance and final release
+gates be claimed. No new review batch, guest artifact or store format is added.
