@@ -1,7 +1,7 @@
 //! Explicit identity adapters for clean space genesis.
 //!
 //! These adapters do not discover, load, generate, clone, or serialize private
-//! key material. The caller owns both identities: an operator/root Ed25519
+//! key material. The caller supplies both identities: an operator/root Ed25519
 //! keypair used for clean management receipts and a node-transport Ed25519
 //! keypair whose exact libp2p [`PeerId`] identifies the replica. Keeping those
 //! inputs explicit also prevents a compact legacy node prefix from becoming
@@ -114,6 +114,39 @@ impl CleanManagementReceiptSigner for CleanOperatorIdentitySigner<'_> {
             .map_err(|_| CleanIdentitySignerError::SigningFailed)?
             .try_into()
             .map_err(|_| CleanIdentitySignerError::InvalidSignatureLength)
+    }
+}
+
+/// Explicitly owned signer retained for native lifecycle operations. It never
+/// reloads an identity from disk or serializes secret material.
+pub(crate) struct OwnedCleanOperatorIdentitySigner {
+    keypair: Keypair,
+    public_key: [u8; 32],
+}
+
+impl OwnedCleanOperatorIdentitySigner {
+    pub(crate) fn new(keypair: Keypair) -> Result<Self, CleanIdentitySignerError> {
+        let public_key = CleanOperatorIdentitySigner::new(&keypair)?.raw_public_key();
+        Ok(Self {
+            keypair,
+            public_key,
+        })
+    }
+}
+
+impl CleanManagementReceiptSigner for OwnedCleanOperatorIdentitySigner {
+    type Error = CleanIdentitySignerError;
+
+    fn public_key(&self) -> [u8; 32] {
+        self.public_key
+    }
+
+    fn sign_authority_receipt(&mut self, message: &[u8]) -> Result<[u8; 64], Self::Error> {
+        CleanOperatorIdentitySigner::new(&self.keypair)?.sign_authority_receipt(message)
+    }
+
+    fn sign_management_application_ack(&mut self, message: &[u8]) -> Result<[u8; 64], Self::Error> {
+        CleanOperatorIdentitySigner::new(&self.keypair)?.sign_management_application_ack(message)
     }
 }
 
@@ -250,6 +283,26 @@ mod tests {
                 .map(|key| key.verify_strict(message, &Signature::from_bytes(signature)))
                 .is_ok_and(|result| result.is_ok())
         }
+    }
+
+    #[test]
+    fn owned_lifecycle_signer_preserves_explicit_operator_identity() {
+        let keypair = operator_keypair();
+        let mut borrowed = CleanOperatorIdentitySigner::new(&keypair).unwrap();
+        let mut owned = OwnedCleanOperatorIdentitySigner::new(keypair.clone()).unwrap();
+        assert_eq!(owned.public_key(), borrowed.public_key());
+        assert_eq!(
+            owned.sign_authority_receipt(b"receipt").unwrap(),
+            borrowed.sign_authority_receipt(b"receipt").unwrap()
+        );
+        assert_eq!(
+            owned
+                .sign_management_application_ack(b"application")
+                .unwrap(),
+            borrowed
+                .sign_management_application_ack(b"application")
+                .unwrap()
+        );
     }
 
     #[test]

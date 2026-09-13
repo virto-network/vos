@@ -287,6 +287,31 @@ pub(crate) struct CleanManagementLifecycleStoreFactory {
 }
 
 impl CleanManagementLifecycleStoreFactory {
+    pub(crate) fn open_or_create(
+        parent: impl AsRef<Path>,
+        space: vos::agent::sdk::SpaceId,
+    ) -> Result<Self, CleanFileStoreError> {
+        if space == vos::agent::sdk::SpaceId::ZERO {
+            return Err(CleanFileStoreError::InvalidPath);
+        }
+        let path = parent.as_ref();
+        validate_new_path(path)?;
+        let ancestor =
+            open_private_directory(path.parent().ok_or(CleanFileStoreError::InvalidPath)?, true)?;
+        let (directory, created) = open_or_create_child_directory(&ancestor, path)?;
+        if created {
+            set_private_directory_permissions(&directory)?;
+            directory.sync_all()?;
+            ancestor.sync_all()?;
+        }
+        validate_opened_directory(&directory, path, false)?;
+        Ok(Self {
+            parent: path.to_path_buf(),
+            directory,
+            space,
+        })
+    }
+
     pub(crate) fn new(
         parent: impl AsRef<Path>,
         space: vos::agent::sdk::SpaceId,
@@ -1251,6 +1276,23 @@ mod tests {
         let staged = decode_envelope(store.role, &encoded, payload.len()).expect("decode stage");
         store.write_stage(&encoded).expect("write stage");
         staged
+    }
+
+    #[test]
+    fn lifecycle_factory_creates_and_reopens_its_private_parent() {
+        let fixture = Fixture::new("lifecycle-parent");
+        let space = vos::agent::sdk::SpaceId([1; 32]);
+        let factory =
+            CleanManagementLifecycleStoreFactory::open_or_create(&fixture.root, space).unwrap();
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&fixture.root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        drop(factory);
+        let factory =
+            CleanManagementLifecycleStoreFactory::open_or_create(&fixture.root, space).unwrap();
+        validate_opened_directory(&factory.directory, &fixture.root, false).unwrap();
     }
 
     #[test]

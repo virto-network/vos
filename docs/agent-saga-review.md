@@ -14,10 +14,11 @@ Implementation is in `.worktrees/ch08-runtime-directory` on
 Use only an isolated, disposable environment for bootstrap/ingress testing.
 Fresh-space first start and restart with bundled system actors and HTTP/SSH
 have passed; ordinary-agent creation is not yet a usable production path.
-Those ingress checks predate the new AJC4 checkpoint and AGI3 Local image
-formats. A newly built CLI needs a fresh disposable data directory and another
-smoke run; AJC3 checkpoints and AGIM/AGI2 images are deliberately rejected, with no
-in-place migration provided.
+The current native Local-controller wiring also passed fresh-data startup and
+restart using the rebuilt CLI (`target/native-local-smoke.DATNas`, details below).
+This is bootstrap/ingress coverage, not ordinary-Agent creation/installation.
+AJC3 checkpoints and AGIM/AGI2 images are deliberately rejected, with no in-place
+migration provided; do not point this clean-break build at valuable old data.
 
 The integrated library run at `37d6a5720e7e45e4a19850a16a531e6cb316e299`
 completed: **1,663 passed, zero failed, one filtered**, in 1,771.43 seconds.
@@ -1830,7 +1831,42 @@ dropped. Positive lifecycle execution remains the attached-controller test;
 successful node startup/Create with live authenticated inventory has not yet
 been demonstrated by this suite.
 
-The CLI still calls system-only startup. Next construct the Local host/factory
-and controller there, exercise positive node startup/Create/publication with
-complete system-actor state, and expose the bounded ingress command. Remaining
+At this checkpoint the CLI still called system-only startup; the native wiring
+checkpoint below supersedes that limitation. Positive node Create/publication
+with complete system-actor state and a bounded ingress command remain required. Remaining
 Install, completion/reservations, Shared finality and release gates are unchanged.
+
+### Native startup retains Local lifecycle coordination
+
+`vosx space up` now creates or exactly reopens the dedicated `local-agent-host`
+root, opens `local-agent-lifecycle` with the hardened store factory, and passes
+the controller to node-owned Local production startup. Existing paths are opened,
+not recreated or silently repaired; symlink/partial-root rejection stays with
+the physical host. This provisions an empty Local host, not arbitrary Agents.
+The system actors still complete their existing bootstrap before production
+publication.
+
+An explicitly owned Ed25519 operator signer is retained for future lifecycle
+calls. It uses the existing signer validation and signing implementation, without
+loading or serializing secret keys. The lifecycle factory can now create its
+private parent with directory-relative filesystem operations and sync both new
+directory and parent. **36/36 signer and file-store tests pass** in 0.32s
+(`r16-native-local-startup.log`). The current-worktree CLI build passes
+(`r16-native-local-cli-build.log`, 39.97s), preserving the older shared-cache
+`target/debug/vosx`. No guest program/package was rebuilt or repinned.
+
+A fresh disposable smoke space is under `target/native-local-smoke.DATNas`,
+using HTTP 18081 and SSH 2223. First start reported ready at
+2026-09-13 02:15:47 UTC (about 77 seconds), with HTTP 401 and an SSH host-key
+handshake. This exercises current-source native startup and the Local controller
+with the real bundled system runtime/actors; it does not exercise ordinary-Agent
+Create or Install through ingress.
+
+Restart also passed, reporting ready at 2026-09-13 02:17:47 UTC (about 118
+seconds). The complete smoke script exited successfully: both starts returned
+HTTP 401 and completed SSH handshakes, the canonical SSH host-key lines matched,
+and both dedicated Local directories were present. Both daemon processes stopped
+after their checks. This establishes current-source positive native startup and
+restart with the retained controller, but not ordinary-Agent Create/publication
+or management ingress. The compiled CLI remains an unpromoted test candidate;
+the final reproducible-artifact and release gates are still open.

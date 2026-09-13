@@ -48,14 +48,17 @@ use vos::service::{
 use super::authority_projection_authenticator::OperatorAuthorityProjectionAuthenticator;
 use super::clean_genesis_archive::CleanSystemAgentGenesisArchive;
 use super::clean_identity::{
-    CleanOperatorIdentitySigner, node_id_from_authenticated_peer, sign_node_encryption_enrollment,
+    CleanOperatorIdentitySigner, OwnedCleanOperatorIdentitySigner, node_id_from_authenticated_peer,
+    sign_node_encryption_enrollment,
 };
-use super::clean_store::CleanSystemAgentFileStores;
+use super::clean_store::{CleanManagementLifecycleStoreFactory, CleanSystemAgentFileStores};
 
 const SYSTEM_AUTHORITY_NAME: &str = "system-authority";
 const SYSTEM_CATALOG_NAME: &str = "system-catalog";
 const SYSTEM_AGENT_CONTROL_DIRECTORY: &str = "system-agent";
 const SHARED_AGENT_HOST_DIRECTORY: &str = "agent-host";
+const LOCAL_AGENT_HOST_DIRECTORY: &str = "local-agent-host";
+const LOCAL_LIFECYCLE_DIRECTORY: &str = "local-agent-lifecycle";
 const PROJECTION_ROUTE_QUEUE_CAPACITY: usize = 64;
 const PROJECTION_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -368,9 +371,37 @@ pub(crate) fn start_clean_system_agent(
         genesis,
         network,
     )?;
-    node.start_clean_agent_production(
-        clean_node,
+    let local_root = data_dir.join(LOCAL_AGENT_HOST_DIRECTORY);
+    let local = match std::fs::symlink_metadata(&local_root) {
+        Ok(_) => vos::agent::local_sdk_host::LocalAgentHost::open(
+            &local_root,
+            space,
+            clean_node,
+            Arc::clone(&trust),
+        )?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            vos::agent::local_sdk_host::LocalAgentHost::create(
+                &local_root,
+                space,
+                clean_node,
+                Arc::clone(&trust),
+            )?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let lifecycle_stores = CleanManagementLifecycleStoreFactory::open_or_create(
+        data_dir.join(LOCAL_LIFECYCLE_DIRECTORY),
+        space,
+    )?;
+    let lifecycle = vos::agent::local_lifecycle::LocalLifecycleController::new(
         owner,
+        local,
+        lifecycle_stores,
+        OwnedCleanOperatorIdentitySigner::new(operator.clone())?,
+    )?;
+    node.start_clean_local_agent_production(
+        clean_node,
+        lifecycle,
         Box::new(OperatorAuthorityProjectionAuthenticator::new(
             operator.clone(),
         )?),
