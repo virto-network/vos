@@ -5,6 +5,115 @@ use vos::agent::local_lifecycle::LocalInstallSubmission;
 use vos::agent::sdk::authority::ManagementApplicationAck;
 use vos::agent::sdk::wire::CanonicalWire as _;
 
+/// Discovery must agree with the head used for credential sequence selection.
+/// These response-bound local pages are not a management receipt or finality.
+pub(crate) fn discover_agent(
+    address: std::net::SocketAddr,
+    operator: &libp2p::identity::Keypair,
+    authority: vos::agent::sdk::authority::AuthorityActorTarget,
+    head: vos::agent::sdk::authority::AuthorityProjectionHead,
+    agent: vos::agent::sdk::AgentId,
+) -> anyhow::Result<vos::agent::sdk::AgentDescriptor> {
+    discover_agent_with(operator, authority, head, agent, |query| {
+        let bytes = query
+            .encode()
+            .map_err(|error| anyhow::anyhow!("encode inventory query: {error:?}"))?;
+        super::local_create::post_binary(
+            address,
+            "/__agents/inventory",
+            200,
+            &bytes,
+            vos::agent::sdk::MAX_INVOCATION_REPLY_BYTES,
+        )
+    })
+}
+
+fn discover_agent_with(
+    operator: &libp2p::identity::Keypair,
+    authority: vos::agent::sdk::authority::AuthorityActorTarget,
+    head: vos::agent::sdk::authority::AuthorityProjectionHead,
+    agent: vos::agent::sdk::AgentId,
+    mut query: impl FnMut(
+        &vos::agent::sdk::authority::AuthorityProjectionQuery,
+    ) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<vos::agent::sdk::AgentDescriptor> {
+    use vos::agent::production_owner::AuthorityProjectionQueryAuthenticator as _;
+    use vos::agent::sdk::authority::{
+        AuthorityAgentProjectionPage, AuthorityAgentReplicaProjectionPage,
+        AuthorityProjectionSelector, MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES,
+        MAX_AUTHORITY_REPLICA_PAGE_ENTRIES,
+    };
+    anyhow::ensure!(
+        head.is_valid() && agent != vos::agent::sdk::AgentId::ZERO,
+        "invalid inventory target/head"
+    );
+    let mut signer =
+        super::authority_projection_authenticator::OperatorAuthorityProjectionAuthenticator::new(
+            operator.clone(),
+        )?;
+    let mut after = None;
+    let mut count = 0usize;
+    let row = loop {
+        let request = signer.authenticate(
+            authority,
+            AuthorityProjectionSelector::Agents {
+                after,
+                limit: MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES as u16,
+            },
+        )?;
+        let page = AuthorityAgentProjectionPage::decode(&query(&request)?)
+            .map_err(|error| anyhow::anyhow!("invalid Agent inventory: {error:?}"))?;
+        anyhow::ensure!(
+            page.query == request && page.head == head,
+            "Agent inventory differs from exact query or credential head"
+        );
+        count = count
+            .checked_add(page.entries.len())
+            .ok_or_else(|| anyhow::anyhow!("inventory overflow"))?;
+        anyhow::ensure!(count <= 4096, "Agent inventory exceeds discovery bound");
+        if let Some(row) = page
+            .entries
+            .into_iter()
+            .find(|row| row.identity.agent == agent)
+        {
+            break row;
+        }
+        after = Some(
+            page.next
+                .ok_or_else(|| anyhow::anyhow!("Agent absent from Authority inventory"))?,
+        );
+    };
+    let mut after = None;
+    let mut replicas = Vec::new();
+    loop {
+        let request = signer.authenticate(
+            authority,
+            AuthorityProjectionSelector::AgentReplicas {
+                agent,
+                after,
+                limit: MAX_AUTHORITY_REPLICA_PAGE_ENTRIES as u16,
+            },
+        )?;
+        let page = AuthorityAgentReplicaProjectionPage::decode(&query(&request)?)
+            .map_err(|error| anyhow::anyhow!("invalid replica inventory: {error:?}"))?;
+        anyhow::ensure!(
+            page.query == request && page.matches_agent_at_head(&row, head),
+            "replica inventory differs from exact query, Agent or credential head"
+        );
+        replicas.extend(page.entries);
+        anyhow::ensure!(
+            replicas.len() <= usize::from(row.replica_count),
+            "replica inventory overflow"
+        );
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    row.reconstruct_descriptor(replicas)
+        .map_err(|error| anyhow::anyhow!("incomplete or inconsistent Agent descriptor: {error:?}"))
+}
+
 /// Prepare exact bytes using an already allocated credential sequence and
 /// independently selected descriptor/Authority. No clock or nonce is generated.
 pub(crate) fn prepare(
@@ -243,6 +352,93 @@ mod tests {
             .try_into()
             .unwrap();
         (request, ack, operator)
+    }
+
+    #[test]
+    fn descriptor_discovery_requires_exact_query_head_and_complete_roster() {
+        use vos::agent::sdk::authority::{
+            AuthorityAgentProjection, AuthorityAgentProjectionPage,
+            AuthorityAgentReplicaProjectionPage, AuthorityProjectionHead,
+            AuthorityProjectionSelector,
+        };
+        let (operator, authority, descriptor, _) = super::super::local_create::tests::fixture();
+        let head = AuthorityProjectionHead {
+            state_revision: NonZeroU64::new(1).unwrap(),
+            epoch: NonZeroU64::new(1).unwrap(),
+            authorization_sequence: NonZeroU64::new(1).unwrap(),
+            administration_generation: NonZeroU64::new(1).unwrap(),
+            state_commitment: Hash([0x31; 32]),
+        };
+        let row = AuthorityAgentProjection {
+            identity: descriptor.identity.clone(),
+            creation_nonce: descriptor.creation_nonce,
+            authority: descriptor.authority,
+            private_recovery: descriptor.private_recovery,
+            runtime_package: descriptor.runtime_package.clone(),
+            runtime_contract: descriptor.runtime_contract,
+            capabilities: descriptor.capabilities,
+            replica_count: descriptor.replicas.len() as u16,
+            replica_generation: vos::agent::sdk::replica_set_generation(
+                &descriptor.identity,
+                descriptor.creation_nonce,
+                &descriptor.replicas,
+            ),
+        };
+        for mode in 0..6 {
+            let result = discover_agent_with(
+                &operator,
+                authority,
+                head,
+                descriptor.identity.agent,
+                |query| {
+                    let mut returned_head = head;
+                    if mode == 1 {
+                        returned_head.state_commitment = Hash([0x32; 32]);
+                    }
+                    match query.selector {
+                        AuthorityProjectionSelector::Agents { .. } => {
+                            let mut echoed = query.clone();
+                            if mode == 2 {
+                                echoed.nonce = Hash([0x33; 32]);
+                            }
+                            AuthorityAgentProjectionPage {
+                                query: echoed,
+                                head: returned_head,
+                                entries: if mode == 3 { vec![] } else { vec![row.clone()] },
+                                next: None,
+                            }
+                            .encode()
+                            .map_err(|error| anyhow::anyhow!("fixture: {error:?}"))
+                        }
+                        AuthorityProjectionSelector::AgentReplicas { .. } => {
+                            if mode == 4 {
+                                returned_head.state_commitment = Hash([0x34; 32]);
+                            }
+                            AuthorityAgentReplicaProjectionPage {
+                                query: query.clone(),
+                                head: returned_head,
+                                replica_count: row.replica_count,
+                                replica_generation: row.replica_generation,
+                                entries: if mode == 5 {
+                                    vec![]
+                                } else {
+                                    descriptor.replicas.clone()
+                                },
+                                next: None,
+                            }
+                            .encode()
+                            .map_err(|error| anyhow::anyhow!("fixture: {error:?}"))
+                        }
+                        _ => panic!("unexpected selector"),
+                    }
+                },
+            );
+            if mode == 0 {
+                assert_eq!(result.unwrap(), descriptor);
+            } else {
+                assert!(result.is_err(), "mode {mode}");
+            }
+        }
     }
 
     #[test]

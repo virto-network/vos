@@ -4409,6 +4409,38 @@ response-bound pages at one exact Authority head; do not invent a descriptor
 from a caller-provided Agent ID or substitute a stale inventory on query errors.
 The full goal and C1/C2/C3 release blockers remain unchanged.
 
+### Response-bound Agent discovery for fresh Install
+
+`POST /__agents/inventory` now exposes only the existing bounded Agents and
+AgentReplicas selectors, with canonical signed API queries, no URL query
+parameters and binary content type. The live Authority still checks permission;
+the node decodes the exact expected page type and verifies its echoed query
+before returning bytes. Adjacent paths retain normal bearer authentication.
+This is a discovery endpoint, not mutation approval or signed finality.
+
+The Install client discovery helper signs each read query, requires every page
+to match the independently supplied credential-discovery head, scans at most
+4096 Agent entries, collects the target's bounded replica roster and reconstructs
+the descriptor only after checking its count and generation. Missing targets,
+changed heads, query substitutions and incomplete rosters fail rather than
+returning a partially reconstructed or cached descriptor. Queries are read-only;
+the managed command must retain its credential lease and retry discovery before
+signing if the Authority head changes.
+
+All three HTTP server tests pass in 0.26s (`r16-install-inventory-http.log`,
+`pvm,private-agent-store,http-ingress`), including exact inventory endpoint versus
+adjacent-path authentication. The full `vosx` binary suite passes: 188 passed,
+zero failed, two ignored (`r16-install-discovery-client.log`). The new client
+fixture verifies a complete descriptor and rejects Agent-head changes, echoed
+query substitution, missing Agent, replica-head changes and missing roster.
+These are endpoint-routing and client-validation tests, not a live multi-page
+Authority discovery campaign. Formatting and diff checks pass.
+
+Fresh managed Install command wiring remains next: reserve the installation ID,
+discover credential and descriptor at one head, prepare and persist the actor
+request, submit it and complete the shared reservation from saved MAA2. The
+live install/invoke/restart campaign and full C1/C2/C3 release gates remain open.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

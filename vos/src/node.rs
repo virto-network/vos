@@ -2273,6 +2273,56 @@ impl IngressHandle {
         Ok(projection)
     }
 
+    /// Read one response-bound Agent/replica inventory page through the live
+    /// Authority. Pages are discovery, not management approval or finality.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    pub fn query_clean_agent_inventory(
+        &self,
+        query: crate::agent::sdk::authority::AuthorityProjectionQuery,
+    ) -> Result<Vec<u8>, IngressAuthenticationError> {
+        use crate::agent::sdk::authority::{
+            AuthorityAgentProjectionPage, AuthorityAgentReplicaProjectionPage,
+            AuthorityProjectionSelector,
+        };
+        use crate::agent::sdk::wire::CanonicalWire as _;
+        if !matches!(
+            query.selector,
+            AuthorityProjectionSelector::Agents { .. }
+                | AuthorityProjectionSelector::AgentReplicas { .. }
+        ) || query
+            .verify_api_with(&crate::agent::clean_bootstrap::RawCredentialVerifier)
+            .is_err()
+        {
+            return Err(IngressAuthenticationError::Invalid);
+        }
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(IngressAuthenticationError::AuthorityUnavailable);
+        }
+        let authority = self
+            .clean_agent_supervisor
+            .read()
+            .ok()
+            .and_then(|ingress| ingress.as_ref().map(|ingress| ingress.authority.clone()))
+            .ok_or(IngressAuthenticationError::AuthorityUnavailable)?;
+        let bytes = authority
+            .authority_projection_bounded(query.clone())
+            .map_err(|_| IngressAuthenticationError::AuthorityUnavailable)?;
+        let bound = match query.selector {
+            AuthorityProjectionSelector::Agents { .. } => {
+                AuthorityAgentProjectionPage::decode(&bytes).is_ok_and(|page| page.query == query)
+            }
+            AuthorityProjectionSelector::AgentReplicas { .. } => {
+                AuthorityAgentReplicaProjectionPage::decode(&bytes)
+                    .is_ok_and(|page| page.query == query)
+            }
+            _ => false,
+        };
+        if !bound {
+            return Err(IngressAuthenticationError::AuthorityUnavailable);
+        }
+        Ok(bytes)
+    }
+
     /// Queue one bounded Local Create for the node owner. Queue acceptance is
     /// not authorization or application success: await the returned result.
     /// Disconnecting does not cancel an accepted durable lifecycle operation.

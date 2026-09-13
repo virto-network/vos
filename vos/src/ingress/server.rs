@@ -222,6 +222,10 @@ async fn handle_request(
                 return handle_clean_credential(&request, &handle);
             }
             #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            if request.uri().path() == "/__agents/inventory" {
+                return handle_clean_inventory(&request, &handle);
+            }
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
             if request.uri().path() == "/__agents/local" {
                 return handle_local_create(&request, &handle);
             }
@@ -279,6 +283,45 @@ fn handle_clean_credential(
             Err(_) => text(503, "invalid Authority projection"),
         },
         Err(IngressAuthenticationError::Invalid) => text(403, "invalid API credential query"),
+        Err(IngressAuthenticationError::AuthorityUnavailable) => text(
+            503,
+            "clean Authority unavailable; retry the identical signed query",
+        ),
+    }
+}
+
+#[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+fn handle_clean_inventory(
+    request: &super::types::Request,
+    handle: &IngressHandle,
+) -> super::types::Response {
+    use super::types::{text, with_content_type};
+    use crate::agent::sdk::authority::AuthorityProjectionQuery;
+    use crate::agent::sdk::wire::CanonicalWire as _;
+    if request.body().len() > crate::agent::sdk::wire::MAX_AUTHORITY_PROJECTION_QUERY_WIRE_BYTES {
+        return text(413, "inventory query too large");
+    }
+    if request.method() != http::Method::POST {
+        return text(405, "inventory query is POST-only");
+    }
+    if request.uri().query().is_some() {
+        return text(400, "inventory query does not accept query parameters");
+    }
+    if request
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        != Some("application/octet-stream")
+    {
+        return text(415, "inventory query requires application/octet-stream");
+    }
+    let query = match AuthorityProjectionQuery::decode(request.body()) {
+        Ok(query) => query,
+        Err(_) => return text(400, "invalid clean inventory query"),
+    };
+    match handle.query_clean_agent_inventory(query) {
+        Ok(bytes) => with_content_type(200, "application/octet-stream", bytes),
+        Err(IngressAuthenticationError::Invalid) => text(403, "invalid API inventory query"),
         Err(IngressAuthenticationError::AuthorityUnavailable) => text(
             503,
             "clean Authority unavailable; retry the identical signed query",
@@ -606,6 +649,13 @@ mod tests {
             assert!(
                 adjacent_query.starts_with("HTTP/1.1 401"),
                 "{adjacent_query}"
+            );
+            let inventory = request(port, "/__agents/inventory");
+            assert!(inventory.starts_with("HTTP/1.1 405"), "{inventory}");
+            let adjacent_inventory = request(port, "/__agents/inventory/");
+            assert!(
+                adjacent_inventory.starts_with("HTTP/1.1 401"),
+                "{adjacent_inventory}"
             );
             // The exact lifecycle endpoint uses signed-body authentication;
             // adjacent application paths retain the existing bearer gate.
