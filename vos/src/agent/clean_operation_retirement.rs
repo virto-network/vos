@@ -12,6 +12,16 @@ pub trait NativeAuthorityOperationRetirementStore {
     fn retain(&mut self, certificate: &[u8]) -> Result<(), Self::Error>;
 }
 
+impl NativeAuthorityOperationRetirementStore for () {
+    type Error = SharedAgentHostError;
+    fn load(&mut self) -> Result<Vec<Vec<u8>>, Self::Error> {
+        Ok(Vec::new())
+    }
+    fn retain(&mut self, _: &[u8]) -> Result<(), Self::Error> {
+        Err(SharedAgentHostError::Unavailable)
+    }
+}
+
 /// Check both signatures and canonical framing. Native recovery must still
 /// bind the returned completion to its two exact source dispatch records.
 pub fn native_operation_retirement_completion(

@@ -9921,6 +9921,19 @@ mod tests {
         struct OperationTestJournal(PathBuf);
 
         struct OperationTestCompletions(PathBuf);
+        struct OperationTestRetirements(PathBuf);
+        impl NativeAuthorityOperationRetirementStore for OperationTestRetirements {
+            type Error = SharedAgentHostError;
+            fn load(&mut self) -> Result<Vec<Vec<u8>>, Self::Error> {
+                std::fs::read(&self.0)
+                    .map(|bytes| vec![bytes])
+                    .map_err(|_| SharedAgentHostError::Unavailable)
+            }
+            fn retain(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+                write_operation_test_image(&self.0, bytes)
+                    .map_err(|_| SharedAgentHostError::Unavailable)
+            }
+        }
         impl NativeAuthorityOperationCompletionStore for OperationTestCompletions {
             type Error = SharedAgentHostError;
             fn load(&mut self) -> Result<Vec<Vec<u8>>, Self::Error> {
@@ -10055,6 +10068,136 @@ mod tests {
                     self.calls += 1;
                     Ok(self.key.sign(bytes).to_bytes())
                 }
+            }
+            // Keep automatic-write campaign locals off the bootstrap replay
+            // stack: the native Standard test adapter has a deep restore.
+            fn check_automatic_completion(
+                owner: &mut CleanSystemAgentBootstrapOwner<
+                    BootstrapMemoryStore,
+                    BootstrapMemoryStore,
+                    IssuerMemoryStore,
+                >,
+                operations: NativeAuthorityOperationController<
+                    OperationTestImageFile,
+                    OperationTestImageFile,
+                    OperationTestJournal,
+                >,
+                call: &AuthorityOperationCall,
+                context: InvocationContext,
+                slot: u64,
+                signer: &mut Signer,
+                before: u64,
+                issued: crate::agent::authority_operation_issuer::IssuedAuthorityOperation,
+                directory: &TestDirectory,
+            ) {
+                struct FailOnceCompletion(PathBuf, bool);
+                impl NativeAuthorityOperationRetirementStore for FailOnceCompletion {
+                    type Error = std::io::Error;
+                    fn load(&mut self) -> Result<Vec<Vec<u8>>, Self::Error> {
+                        NativeAuthorityOperationCompletionStore::load(self)
+                    }
+                    fn retain(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+                        NativeAuthorityOperationCompletionStore::retain(self, bytes)
+                    }
+                }
+                impl NativeAuthorityOperationCompletionStore for FailOnceCompletion {
+                    type Error = std::io::Error;
+                    fn load(&mut self) -> Result<Vec<Vec<u8>>, Self::Error> {
+                        match std::fs::read(&self.0) {
+                            Ok(bytes) => Ok(vec![bytes]),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                Ok(vec![])
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    fn retain(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+                        write_operation_test_image(&self.0, bytes)?;
+                        if core::mem::take(&mut self.1) {
+                            return Err(std::io::Error::other(
+                                "completion published before injected failure",
+                            ));
+                        }
+                        Ok(())
+                    }
+                }
+                let path = directory.0.join("automatic-completion");
+                let mut operations =
+                    operations.with_completions(FailOnceCompletion(path.clone(), true));
+                assert!(
+                    operations
+                        .coordinate_and_acknowledge(owner, &call, context, slot, signer)
+                        .is_err()
+                );
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+                assert_eq!(signer.calls, 2);
+                assert_eq!(signer.completion_calls, 1);
+                let certificate = std::fs::read(&path).unwrap();
+                for _ in 0..2 {
+                    assert_eq!(
+                        operations
+                            .coordinate_and_acknowledge(owner, &call, context, slot, signer)
+                            .unwrap(),
+                        issued
+                    );
+                    assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
+                    assert_eq!(signer.calls, 2);
+                    assert_eq!(signer.completion_calls, 1);
+                    assert_eq!(std::fs::read(&path).unwrap(), certificate);
+                }
+                let (query, query_auth) = fresh_projection_pair(&owner, 0xd9);
+                assert!(matches!(
+                    owner._network_host.reserve_projection_pair(
+                        HostAgentId(owner.pins.agent.0),
+                        &query,
+                        &query_auth,
+                        false,
+                    ),
+                    Err(SharedAgentHostError::Conflict)
+                ));
+                let retirement_path = directory.0.join("automatic-retirement");
+                let mut operations =
+                    operations.with_retirements(FailOnceCompletion(retirement_path.clone(), true));
+                assert!(
+                    operations
+                        .coordinate_and_retire(owner, &call, context, slot, signer)
+                        .is_err()
+                );
+                assert_eq!(signer.retirement_calls, 1);
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
+                assert!(matches!(
+                    owner._network_host.reserve_projection_pair(
+                        HostAgentId(owner.pins.agent.0),
+                        &query,
+                        &query_auth,
+                        false,
+                    ),
+                    Err(SharedAgentHostError::Conflict)
+                ));
+                let retirement = std::fs::read(&retirement_path).unwrap();
+                for _ in 0..2 {
+                    assert_eq!(
+                        operations
+                            .coordinate_and_retire(owner, &call, context, slot, signer)
+                            .unwrap(),
+                        issued
+                    );
+                    assert_eq!(signer.retirement_calls, 1);
+                    assert_eq!(signer.completion_calls, 1);
+                    assert_eq!(signer.calls, 2);
+                    assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
+                    assert_eq!(std::fs::read(&retirement_path).unwrap(), retirement);
+                }
+                owner
+                    ._network_host
+                    .reserve_projection_pair(
+                        HostAgentId(owner.pins.agent.0),
+                        &query,
+                        &query_auth,
+                        false,
+                    )
+                    .unwrap();
+                drop(operations);
             }
             let fixture = native_bundled_authority_fixture_with_query_catalog(true);
             let directory = TestDirectory::new("native-approved-operation");
@@ -10256,69 +10399,17 @@ mod tests {
             assert_eq!(signer.calls, 2);
             assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
             if automatic {
-                struct FailOnceCompletion(PathBuf, bool);
-                impl NativeAuthorityOperationCompletionStore for FailOnceCompletion {
-                    type Error = std::io::Error;
-                    fn load(&mut self) -> Result<Vec<Vec<u8>>, Self::Error> {
-                        match std::fs::read(&self.0) {
-                            Ok(bytes) => Ok(vec![bytes]),
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                                Ok(vec![])
-                            }
-                            Err(error) => Err(error),
-                        }
-                    }
-                    fn retain(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
-                        write_operation_test_image(&self.0, bytes)?;
-                        if core::mem::take(&mut self.1) {
-                            return Err(std::io::Error::other(
-                                "completion published before injected failure",
-                            ));
-                        }
-                        Ok(())
-                    }
-                }
-                let path = directory.0.join("automatic-completion");
-                let mut operations =
-                    operations.with_completions(FailOnceCompletion(path.clone(), true));
-                assert!(
-                    operations
-                        .coordinate_and_acknowledge(&mut owner, &call, context, slot, &mut signer)
-                        .is_err()
+                check_automatic_completion(
+                    &mut owner,
+                    operations,
+                    &call,
+                    context,
+                    slot,
+                    &mut signer,
+                    before,
+                    issued,
+                    &directory,
                 );
-                assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
-                assert_eq!(signer.calls, 2);
-                assert_eq!(signer.completion_calls, 1);
-                let certificate = std::fs::read(&path).unwrap();
-                for _ in 0..2 {
-                    assert_eq!(
-                        operations
-                            .coordinate_and_acknowledge(
-                                &mut owner,
-                                &call,
-                                context,
-                                slot,
-                                &mut signer
-                            )
-                            .unwrap(),
-                        issued
-                    );
-                    assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
-                    assert_eq!(signer.calls, 2);
-                    assert_eq!(signer.completion_calls, 1);
-                    assert_eq!(std::fs::read(&path).unwrap(), certificate);
-                }
-                let (query, query_auth) = fresh_projection_pair(&owner, 0xd9);
-                assert!(matches!(
-                    owner._network_host.reserve_projection_pair(
-                        HostAgentId(owner.pins.agent.0),
-                        &query,
-                        &query_auth,
-                        false,
-                    ),
-                    Err(SharedAgentHostError::Conflict)
-                ));
-                drop(operations);
                 drop(owner);
                 stop_network(network);
                 return;
@@ -10690,7 +10781,8 @@ mod tests {
             let issuer = owner.issuer.into_store();
             drop(owner._network_host);
             drop(owner.host);
-            let (_, _, mut journal, _completion_store) = operations.into_parts_with_completions();
+            let (operation_coordinator, operation_issuer, mut journal, completion_store) =
+                operations.into_parts_with_completions();
             for (completions, terminals, ids) in [
                 (vec![], vec![retired_bytes.clone()], invocations.to_vec()),
                 (
@@ -10720,14 +10812,15 @@ mod tests {
                     .is_err()
                 );
             }
-            let admission = NativeAuthorityOperationStartupAdmission::load_with_retirements(
-                &mut journal,
+            let mut operations = NativeAuthorityOperationController::new(
                 authority,
-                &invocations,
-                &[certificate.clone()],
-                &[retired_bytes.clone()],
+                operation_coordinator,
+                operation_issuer,
+                journal,
             )
-            .unwrap();
+            .with_completions(completion_store)
+            .with_retirements(OperationTestRetirements(retirement_path.clone()));
+            let admission = operations.startup_admission(&invocations).unwrap();
             assert!(admission.is_empty());
             assert!(admission.has_history);
             assert!(matches!(
@@ -10783,6 +10876,13 @@ mod tests {
                 .unwrap();
             owner.release_native_operation_retirement(&retired).unwrap();
             assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
+            assert_eq!(
+                operations
+                    .coordinate_and_retire(&mut owner, &call, context, slot, &mut signer)
+                    .unwrap(),
+                issued
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
             assert_eq!(signer.calls, 2);
             assert_eq!(signer.completion_calls, 2);
             let (query, query_auth) = fresh_projection_pair(&owner, 0xda);
@@ -10795,7 +10895,7 @@ mod tests {
                     false,
                 )
                 .unwrap();
-            drop(journal);
+            drop(operations);
             drop(owner);
             stop_network(network);
         }
@@ -10913,6 +11013,18 @@ mod tests {
             use crate::agent::clean_bootstrap::operation_dispatch::NativeAuthorityOperationDispatcher;
             use crate::agent_sdk::authority_operation::AuthorityOperationCall;
             struct NoSigning([u8; 32]);
+            impl NativeAuthorityOperationRetirementSigner for NoSigning {
+                type Error = core::convert::Infallible;
+                fn public_key(&self) -> [u8; 32] {
+                    self.0
+                }
+                fn sign_native_operation_retirement(
+                    &mut self,
+                    _: &[u8],
+                ) -> Result<[u8; 64], Self::Error> {
+                    panic!("native denial must not sign terminal retirement")
+                }
+            }
             impl NativeAuthorityOperationCompletionSigner for NoSigning {
                 type Error = core::convert::Infallible;
                 fn public_key(&self) -> [u8; 32] {

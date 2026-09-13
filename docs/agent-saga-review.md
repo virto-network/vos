@@ -184,8 +184,9 @@ Keep these as work within C2, not new review batches:
    operation dispatch now captures completion and acknowledges the result pair;
    signed terminal retirement and durable release now have a native owner
    boundary. Signed terminal startup classification now passes through the
-   native owner. A hardened retirement index is implemented; production
-   controller/daemon adoption remains open.
+   native owner. The production controller/daemon now own the hardened
+   retirement index and use terminal retry/release; denial retirement and
+   operation ingress/client wiring remain open.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
    retirement and restart through native ingress; then expose the same
    preparation/authorization flow in the user-facing client. A Public query
@@ -5859,6 +5860,63 @@ must still match each certificate against its exact NOD1 pair and NOC1 index.
 The backend is not yet adopted by the production controller/daemon. That wiring,
 owned terminal signing, and exact retry after terminal publication remain the
 immediate C2 integration work. No guest artifact or HTTP endpoint changed.
+
+### Production terminal retirement and exact retry
+
+Verification: final native operation regression **6 passed, zero failures** in
+**104.97s** (`r16-terminal-operation-controller-native-final.log`), with the
+normal test stack limit; CLI regression **219 passed, zero failures, five
+ignored** in **34.11s** (`r16-terminal-operation-controller-cli-final.log`).
+The normal daemon binary rebuilt in **11.59s**
+(`r16-terminal-operation-controller-build-final.log`). These logs are in shared
+disk-backed `.worktrees/ch08-c2-native/target/task-tmp`.
+
+Two initial native runs aborted with a stack overflow. Removing redundant
+nested coordination did not resolve it; a debugger backtrace located the
+overflow in Standard-runtime replay during bootstrap reopen, before the new
+terminal entry point. The expanded automatic-write fixture campaign was
+extracted into a separate helper to keep its locals off that replay stack.
+The final run passed without increasing the stack limit. Diagnostic evidence:
+`r16-terminal-operation-controller-stack.log` in the same directory. This is
+targeted recovery evidence, not a completed full-library release run.
+
+Daemon startup now opens `authority-operation-retirements` and transfers its
+exclusive store handle into the operation controller alongside coordinator,
+issuer, NOD1 journal and NOC1 completion stores. Validation and startup admission
+load the terminal index and fully cross-check its records before attachment.
+Controller decomposition returns every adopted handle rather than silently
+dropping the retirement lease. The owned operator signer implements terminal
+signing, and Local lifecycle adoption verifies all three signer capabilities
+against the configured Authority key.
+
+Production native dispatch now calls `coordinate_and_retire`. It recovers or
+issues exact evidence once, completes and acknowledges the pair through a
+shared completion helper, and publishes signed terminal retirement under
+exclusion before release. A retained NRT1 takes the terminal retry path instead:
+verify exact source records, synchronize the saved certificate, then idempotently
+release without re-acknowledging or re-signing. Publication followed by an error
+preserves exclusion until exact retry establishes durability. Denials remain
+unavailable and reserved; their terminal recovery still needs implementation.
+
+Native fixtures cover terminal publication failure, exact same-owner retry,
+retired owner/controller reopen, and unchanged execution/signature counts.
+The production path does not apply the authorized actor operation and still has
+no operation HTTP endpoint. Protected application, denial/expiry resolution,
+mixed pending work, capacity/GC, and C3 release gates remain open.
+
+The rebuilt daemon also passed the existing disposable-state ingress campaign
+in `target/native-denial-head-reuse.XoaplU`. Start: **2026-09-13 20:42:32 UTC**;
+ready: **20:47:37 UTC** (about **5m05s**); the ignored live retirement/exact HTTP
+acknowledgement retry test passed **1 test in 1.18s**, with two forced exact
+acknowledgement retries. Campaign exited zero at **20:47:42 UTC**, followed by
+clean shutdown at **20:48:12 UTC** and removal of the endpoint marker. Evidence:
+`terminal-controller-startup-{run,daemon,client-test}.log` under that disposable
+root. The saved invocation request/response/progress hashes remain unchanged.
+The new completion and retirement directories are mode 0700 with mode-0600
+lock files. Their indexes are empty in this live campaign: it proves normal
+daemon adoption/startup and existing Public-query ingress compatibility, not
+live protected operation authorization. Positive operation retirement/reopen
+evidence comes from the native tests above. Startup latency remains high.
 
 ### Durable client acknowledgement before completion
 

@@ -1173,9 +1173,9 @@ where
     }
 
     /// Adopt recovered operation stores and a signer matching the native owner.
-    pub fn with_operations<C, B, J, K, O>(
+    pub fn with_operations<C, B, J, K, T, O>(
         mut self,
-        mut operations: super::clean_bootstrap::NativeAuthorityOperationController<C, B, J, K>,
+        mut operations: super::clean_bootstrap::NativeAuthorityOperationController<C, B, J, K, T>,
         signer: O,
     ) -> Result<Self, SharedAgentHostError>
     where
@@ -1185,8 +1185,10 @@ where
         B: super::authority_operation_issuer::AuthorityOperationIssuerStore + Send + 'static,
         J: super::clean_bootstrap::NativeAuthorityOperationJournalStore + Send + 'static,
         K: super::clean_bootstrap::NativeAuthorityOperationCompletionStore + Send + 'static,
+        T: super::clean_bootstrap::NativeAuthorityOperationRetirementStore + Send + 'static,
         O: super::authority_operation_issuer::AuthorityOperationEvidenceSigner
             + super::clean_bootstrap::NativeAuthorityOperationCompletionSigner
+            + super::clean_bootstrap::NativeAuthorityOperationRetirementSigner
             + Send
             + 'static,
     {
@@ -1201,6 +1203,8 @@ where
                 &signer,
             ) != target.binding.public_key
             || super::clean_bootstrap::NativeAuthorityOperationCompletionSigner::public_key(&signer)
+                != target.binding.public_key
+            || super::clean_bootstrap::NativeAuthorityOperationRetirementSigner::public_key(&signer)
                 != target.binding.public_key
         {
             return Err(SharedAgentHostError::ScopeMismatch);

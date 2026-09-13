@@ -37,12 +37,13 @@ impl NativeAuthorityOperationCompletionStore for () {
 /// Construction does not assert recovery or release admission: the caller must
 /// restore startup admission before dispatch and keep the controller alive for
 /// the lifetime of the corresponding system owner.
-pub struct NativeAuthorityOperationController<C, B, J, K = ()> {
+pub struct NativeAuthorityOperationController<C, B, J, K = (), T = ()> {
     authority: AuthorityActorTarget,
     coordinator: C,
     issuer: B,
     journal: J,
     completions: K,
+    retirements: T,
 }
 
 #[derive(Debug)]
@@ -67,6 +68,7 @@ where
             issuer,
             journal,
             completions: (),
+            retirements: (),
         }
     }
 
@@ -80,6 +82,7 @@ where
             issuer: self.issuer,
             journal: self.journal,
             completions,
+            retirements: (),
         }
     }
 
@@ -95,6 +98,38 @@ where
     J: NativeAuthorityOperationJournalStore,
     K: NativeAuthorityOperationCompletionStore,
 {
+    pub fn with_retirements<T: NativeAuthorityOperationRetirementStore>(
+        self,
+        retirements: T,
+    ) -> NativeAuthorityOperationController<C, B, J, K, T> {
+        NativeAuthorityOperationController {
+            authority: self.authority,
+            coordinator: self.coordinator,
+            issuer: self.issuer,
+            journal: self.journal,
+            completions: self.completions,
+            retirements,
+        }
+    }
+
+    pub fn into_parts_with_completions(self) -> (C, B, J, K) {
+        (
+            self.coordinator,
+            self.issuer,
+            self.journal,
+            self.completions,
+        )
+    }
+}
+
+impl<C, B, J, K, T> NativeAuthorityOperationController<C, B, J, K, T>
+where
+    C: AuthorityOperationCoordinatorStore,
+    B: AuthorityOperationIssuerStore,
+    J: NativeAuthorityOperationJournalStore,
+    K: NativeAuthorityOperationCompletionStore,
+    T: NativeAuthorityOperationRetirementStore,
+{
     pub fn startup_admission(
         &mut self,
         invocations: &[InvocationId],
@@ -105,11 +140,16 @@ where
             .completions
             .load()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
-        NativeAuthorityOperationStartupAdmission::load_with_completions(
+        let retirements = self
+            .retirements
+            .load()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        NativeAuthorityOperationStartupAdmission::load_with_retirements(
             &mut self.journal,
             self.authority,
             invocations,
             &certificates,
+            &retirements,
         )
     }
 
@@ -184,11 +224,15 @@ where
             ))?;
             invocations.extend_from_slice(&ids);
         }
-        NativeAuthorityOperationStartupAdmission::load_with_completions(
+        let retirements = self.retirements.load().map_err(|_| {
+            NativeAuthorityOperationControllerError::Completion(SharedAgentHostError::Unavailable)
+        })?;
+        NativeAuthorityOperationStartupAdmission::load_with_retirements(
             &mut self.journal,
             self.authority,
             &invocations,
             &certificates,
+            &retirements,
         )
         .map_err(NativeAuthorityOperationControllerError::Completion)?;
         Ok(())
@@ -267,8 +311,25 @@ where
         let issued = self
             .coordinate(owner, call, context, issued_at, signer)
             .map_err(|_| SharedAgentHostError::Unavailable)?;
+        self.acknowledge_issued(owner, call.invocation, &issued, signer)?;
+        Ok(issued)
+    }
+
+    fn acknowledge_issued<P, R, I, S>(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        authorization: InvocationId,
+        issued: &IssuedAuthorityOperation,
+        signer: &mut S,
+    ) -> Result<operation_dispatch::RetainedNativeOperationCompletion, SharedAgentHostError>
+    where
+        P: CleanSystemAgentBootstrapStore,
+        R: CleanSystemAgentBootstrapStore,
+        I: CleanManagementIssuerStore,
+        S: NativeAuthorityOperationCompletionSigner,
+    {
         let ids = [
-            call.invocation,
+            authorization,
             issued.issuance_ack.acknowledgement_invocation,
         ];
         let mut records = Vec::new();
@@ -324,15 +385,102 @@ where
             })?
         };
         owner.acknowledge_native_operation_completion(&retained)?;
+        Ok(retained)
+    }
+
+    /// Production policy-result completion. Terminal retries recover the exact
+    /// issuance and release from synchronized signed retirement without trying
+    /// to re-acknowledge results whose admission has already been released.
+    pub fn coordinate_and_retire<P, R, I, S>(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        call: &AuthorityOperationCall,
+        context: InvocationContext,
+        issued_at: u64,
+        signer: &mut S,
+    ) -> Result<IssuedAuthorityOperation, SharedAgentHostError>
+    where
+        P: CleanSystemAgentBootstrapStore,
+        R: CleanSystemAgentBootstrapStore,
+        I: CleanManagementIssuerStore,
+        S: AuthorityOperationEvidenceSigner
+            + NativeAuthorityOperationCompletionSigner
+            + NativeAuthorityOperationRetirementSigner,
+    {
+        if NativeAuthorityOperationRetirementSigner::public_key(signer)
+            != self.authority.binding.public_key
+            || NativeAuthorityOperationCompletionSigner::public_key(signer)
+                != self.authority.binding.public_key
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self.validate()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let issued = self
+            .coordinate(owner, call, context, issued_at, signer)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let ids = [
+            call.invocation,
+            issued.issuance_ack.acknowledgement_invocation,
+        ];
+        let mut load = |id| {
+            let bytes = self
+                .journal
+                .load(id)
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .ok_or(SharedAgentHostError::Unavailable)?;
+            operation_dispatch::RetainedAuthorityOperationDispatch::decode(&bytes)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)
+        };
+        let authorization = load(ids[0])?;
+        let acknowledgement = load(ids[1])?;
+        for certificate in self
+            .retirements
+            .load()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            let completion = native_operation_retirement_completion(
+                &self.authority.binding.public_key,
+                &certificate,
+            )
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            let terminal_ids = native_operation_completion_invocations(
+                &self.authority.binding.public_key,
+                &completion,
+            )
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            if terminal_ids == ids {
+                let retired = owner.restore_native_operation_retirement(
+                    &authorization,
+                    &acknowledgement,
+                    &certificate,
+                )?;
+                self.retirements
+                    .retain(&certificate)
+                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+                owner.release_native_operation_retirement(&retired)?;
+                return Ok(issued);
+            }
+            if terminal_ids.iter().any(|id| ids.contains(id)) {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+        }
+        let retained = self.acknowledge_issued(owner, call.invocation, &issued, signer)?;
+        owner.finish_native_operation_retirement(&retained, signer, |bytes| {
+            self.retirements
+                .retain(bytes)
+                .map_err(|_| SharedAgentHostError::Unavailable)
+        })?;
         Ok(issued)
     }
 
-    pub fn into_parts_with_completions(self) -> (C, B, J, K) {
+    pub fn into_all_parts(self) -> (C, B, J, K, T) {
         (
             self.coordinator,
             self.issuer,
             self.journal,
             self.completions,
+            self.retirements,
         )
     }
 }
@@ -353,8 +501,9 @@ impl crate::agent::authority_operation_coordinator::AuthorityOperationActorDispa
     }
 }
 
-impl<P, R, I, C, B, J, K, S> crate::agent::local_lifecycle::NativeAuthorityOperationAccess<P, R, I>
-    for (NativeAuthorityOperationController<C, B, J, K>, S)
+impl<P, R, I, C, B, J, K, T, S>
+    crate::agent::local_lifecycle::NativeAuthorityOperationAccess<P, R, I>
+    for (NativeAuthorityOperationController<C, B, J, K, T>, S)
 where
     P: CleanSystemAgentBootstrapStore,
     R: CleanSystemAgentBootstrapStore,
@@ -363,7 +512,11 @@ where
     B: AuthorityOperationIssuerStore + Send,
     J: NativeAuthorityOperationJournalStore + Send,
     K: NativeAuthorityOperationCompletionStore + Send,
-    S: AuthorityOperationEvidenceSigner + NativeAuthorityOperationCompletionSigner + Send,
+    T: NativeAuthorityOperationRetirementStore + Send,
+    S: AuthorityOperationEvidenceSigner
+        + NativeAuthorityOperationCompletionSigner
+        + NativeAuthorityOperationRetirementSigner
+        + Send,
 {
     fn coordinate(
         &mut self,
@@ -375,7 +528,7 @@ where
         // No terminal denial certificate exists here yet. Preserve errors as
         // unavailable rather than releasing admission or declaring success.
         self.0
-            .coordinate_and_acknowledge(owner, call, context, issued_at, &mut self.1)
+            .coordinate_and_retire(owner, call, context, issued_at, &mut self.1)
     }
 }
 
