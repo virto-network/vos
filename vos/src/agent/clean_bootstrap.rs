@@ -7827,6 +7827,16 @@ mod tests {
                     type Intent = IssuerMemoryStore;
                     type Issuer = IssuerMemoryStore;
                     type Error = ();
+                    fn discover(
+                        &mut self,
+                        space: SpaceId,
+                        maximum: usize,
+                    ) -> Result<Vec<AgentId>, ()> {
+                        if space != self.scope.0 || maximum == 0 {
+                            return Err(());
+                        }
+                        Ok(vec![self.scope.1])
+                    }
                     fn open(
                         &mut self,
                         space: SpaceId,
@@ -7835,6 +7845,13 @@ mod tests {
                         assert_eq!((space, agent), self.scope);
                         self.opens.fetch_add(1, Ordering::SeqCst);
                         Ok((self.intent.clone(), self.issuer.clone()))
+                    }
+                    fn open_existing(
+                        &mut self,
+                        space: SpaceId,
+                        agent: AgentId,
+                    ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                        self.open(space, agent)
                     }
                 }
                 let root = harness._directory.0.join("controller-local");

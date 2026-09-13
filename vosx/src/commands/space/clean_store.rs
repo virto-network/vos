@@ -295,11 +295,23 @@ pub(crate) struct CleanManagementLifecycleFiles {
 
 impl CleanManagementLifecycleFiles {
     pub(crate) fn open_or_create(root: impl AsRef<Path>) -> Result<Self, CleanFileStoreError> {
-        let root = Arc::new(StoreRoot::open_with_entries(
+        Ok(Self::from_root(StoreRoot::open_with_entries(
             root.as_ref(),
             &LIFECYCLE_ENTRIES,
-        )?);
-        Ok(Self {
+        )?))
+    }
+
+    fn open_existing(root: &Path) -> Result<Self, CleanFileStoreError> {
+        Ok(Self::from_root(StoreRoot::open_with_entries_mode(
+            root,
+            &LIFECYCLE_ENTRIES,
+            false,
+        )?))
+    }
+
+    fn from_root(root: StoreRoot) -> Self {
+        let root = Arc::new(root);
+        Self {
             intent: CleanManagementIntentFile(ExactFileStore::new(
                 Arc::clone(&root),
                 StoreRole::ManagementIntent,
@@ -308,7 +320,7 @@ impl CleanManagementLifecycleFiles {
                 root,
                 StoreRole::LifecycleIssuer,
             )),
-        })
+        }
     }
 
     pub(crate) fn into_parts(self) -> (CleanManagementIntentFile, CleanManagementIssuerFile) {
@@ -705,6 +717,77 @@ impl vos::agent::local_lifecycle::LocalLifecycleStoreFactory
     type Issuer = CleanManagementIssuerFile;
     type Error = CleanFileStoreError;
 
+    fn discover(
+        &mut self,
+        space: vos::agent::sdk::SpaceId,
+        maximum: usize,
+    ) -> Result<Vec<vos::agent::sdk::AgentId>, Self::Error> {
+        if space != self.space {
+            return Err(CleanFileStoreError::InvalidPath);
+        }
+        validate_opened_directory(&self.directory, &self.parent, true)?;
+        // Scan the pinned directory, not a pathname that can be replaced
+        // between validation and read_dir. This backend already relies on
+        // Linux descriptor-relative physical storage boundaries.
+        #[cfg(target_os = "linux")]
+        let scan = PathBuf::from(format!("/proc/self/fd/{}", self.directory.as_raw_fd()));
+        #[cfg(not(target_os = "linux"))]
+        let scan: PathBuf = return Err(CleanFileStoreError::Io(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "descriptor-pinned lifecycle discovery requires Linux",
+        )));
+        let mut agents = Vec::new();
+        for entry in fs::read_dir(scan)? {
+            let entry = entry?;
+            if agents.len() == maximum {
+                return Err(CleanFileStoreError::Oversized);
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| CleanFileStoreError::UnexpectedResidue)?;
+            if name.len() != 64
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(CleanFileStoreError::UnexpectedResidue);
+            }
+            let mut bytes = [0; 32];
+            hex::decode_to_slice(&name, &mut bytes)
+                .map_err(|_| CleanFileStoreError::UnexpectedResidue)?;
+            let agent = vos::agent::sdk::AgentId(bytes);
+            if agent == vos::agent::sdk::AgentId::ZERO {
+                return Err(CleanFileStoreError::UnexpectedResidue);
+            }
+            let path = self.parent.join(&name);
+            let directory = open_child_directory(&self.directory, &path)?;
+            validate_opened_directory(&directory, &path, false)?;
+            agents.push(agent);
+        }
+        validate_opened_directory(&self.directory, &self.parent, true)?;
+        agents.sort_unstable();
+        if agents.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(CleanFileStoreError::Alias);
+        }
+        Ok(agents)
+    }
+
+    fn open_existing(
+        &mut self,
+        space: vos::agent::sdk::SpaceId,
+        agent: vos::agent::sdk::AgentId,
+    ) -> Result<(Self::Intent, Self::Issuer), Self::Error> {
+        if space != self.space || agent == vos::agent::sdk::AgentId::ZERO {
+            return Err(CleanFileStoreError::InvalidPath);
+        }
+        validate_opened_directory(&self.directory, &self.parent, true)?;
+        let stores =
+            CleanManagementLifecycleFiles::open_existing(&self.parent.join(hex::encode(agent.0)))?;
+        validate_opened_directory(&self.directory, &self.parent, true)?;
+        Ok(stores.into_parts())
+    }
+
     fn open(
         &mut self,
         space: vos::agent::sdk::SpaceId,
@@ -798,10 +881,22 @@ impl StoreRoot {
         path: &Path,
         allowed_entries: &'static [&'static str],
     ) -> Result<Self, CleanFileStoreError> {
+        Self::open_with_entries_mode(path, allowed_entries, true)
+    }
+
+    fn open_with_entries_mode(
+        path: &Path,
+        allowed_entries: &'static [&'static str],
+        create: bool,
+    ) -> Result<Self, CleanFileStoreError> {
         validate_new_path(path)?;
         let parent_path = path.parent().ok_or(CleanFileStoreError::InvalidPath)?;
         let parent = open_private_directory(parent_path, true)?;
-        let (directory, created) = open_or_create_child_directory(&parent, path)?;
+        let (directory, created) = if create {
+            open_or_create_child_directory(&parent, path)?
+        } else {
+            (open_child_directory(&parent, path)?, false)
+        };
         if created {
             set_private_directory_permissions(&directory)?;
         }
@@ -2213,6 +2308,124 @@ pub(crate) mod tests {
             fs::read(other.root.join(LOCAL_REQUEST_FILE)).unwrap(),
             wrong
         );
+    }
+
+    #[test]
+    fn lifecycle_discovery_is_sorted_bounded_and_does_not_open_images() {
+        use vos::agent::local_lifecycle::LocalLifecycleStoreFactory as _;
+        use vos::agent::sdk::{AgentId, SpaceId};
+        let fixture = Fixture::new("lifecycle-discovery");
+        let space = SpaceId([1; 32]);
+        let mut factory =
+            CleanManagementLifecycleStoreFactory::open_or_create(&fixture.root, space).unwrap();
+        assert!(factory.discover(space, 0).unwrap().is_empty());
+        assert!(matches!(
+            factory.discover(SpaceId([9; 32]), 4),
+            Err(CleanFileStoreError::InvalidPath)
+        ));
+        let high = AgentId([3; 32]);
+        let low = AgentId([2; 32]);
+        // Leases remain held: discovery must not open, reconcile, or write
+        // either image, even though a later recovery open must acquire them.
+        let (mut high_intent, _high_issuer) = factory.open(space, high).unwrap();
+        high_intent.commit(b"unverified candidate bytes").unwrap();
+        let (_low_intent, _low_issuer) = factory.open(space, low).unwrap();
+        let path = fixture.root.join(hex::encode(high.0)).join(INTENT_FILE);
+        let before = fs::read(&path).unwrap();
+        assert_eq!(factory.discover(space, 2).unwrap(), vec![low, high]);
+        assert_eq!(factory.discover(space, 2).unwrap(), vec![low, high]);
+        assert!(matches!(
+            factory.discover(space, 1),
+            Err(CleanFileStoreError::Oversized)
+        ));
+        assert!(matches!(
+            factory.discover(space, 0),
+            Err(CleanFileStoreError::Oversized)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn lifecycle_discovery_rejects_residue_and_non_directories() {
+        use vos::agent::local_lifecycle::LocalLifecycleStoreFactory as _;
+        use vos::agent::sdk::SpaceId;
+        for name in ["unrecognized".to_owned(), "AB".repeat(32), "00".repeat(32)] {
+            let fixture = Fixture::new("lifecycle-discovery-residue");
+            let space = SpaceId([1; 32]);
+            let mut factory =
+                CleanManagementLifecycleStoreFactory::open_or_create(&fixture.root, space).unwrap();
+            fs::create_dir(fixture.root.join(name)).unwrap();
+            assert!(matches!(
+                factory.discover(space, 4),
+                Err(CleanFileStoreError::UnexpectedResidue)
+            ));
+        }
+        let fixture = Fixture::new("lifecycle-discovery-file");
+        let space = SpaceId([1; 32]);
+        let mut factory =
+            CleanManagementLifecycleStoreFactory::open_or_create(&fixture.root, space).unwrap();
+        fs::write(fixture.root.join("ab".repeat(32)), b"not a directory").unwrap();
+        assert!(factory.discover(space, 4).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_discovery_rejects_symlinks_and_parent_replacement() {
+        use vos::agent::local_lifecycle::LocalLifecycleStoreFactory as _;
+        use vos::agent::sdk::SpaceId;
+        let fixture = Fixture::new("lifecycle-discovery-symlink");
+        let space = SpaceId([1; 32]);
+        let mut factory =
+            CleanManagementLifecycleStoreFactory::open_or_create(&fixture.root, space).unwrap();
+        let alias = fixture.root.join("ab".repeat(32));
+        std::os::unix::fs::symlink(&fixture.parent, &alias).unwrap();
+        assert!(factory.discover(space, 4).is_err());
+        fs::rename(&fixture.root, fixture.parent.join("retained-parent")).unwrap();
+        let _replacement =
+            CleanManagementLifecycleStoreFactory::open_or_create(&fixture.root, space).unwrap();
+        assert!(matches!(
+            factory.discover(space, 4),
+            Err(CleanFileStoreError::Alias)
+        ));
+        assert!(
+            fs::symlink_metadata(fixture.parent.join("retained-parent").join("ab".repeat(32)))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn lifecycle_recovery_open_never_recreates_a_missing_candidate() {
+        use vos::agent::local_lifecycle::LocalLifecycleStoreFactory as _;
+        use vos::agent::sdk::{AgentId, SpaceId};
+        let fixture = Fixture::new("lifecycle-existing-only");
+        let space = SpaceId([1; 32]);
+        let agent = AgentId([2; 32]);
+        let mut factory =
+            CleanManagementLifecycleStoreFactory::open_or_create(&fixture.root, space).unwrap();
+        assert!(factory.open_existing(space, agent).is_err());
+        assert!(fs::read_dir(&fixture.root).unwrap().next().is_none());
+        let (mut intent, issuer) = factory.open(space, agent).unwrap();
+        intent.commit(b"retained intent").unwrap();
+        assert!(matches!(
+            factory.open_existing(space, agent),
+            Err(CleanFileStoreError::Busy)
+        ));
+        drop((intent, issuer));
+        let (mut intent, issuer) = factory.open_existing(space, agent).unwrap();
+        assert_eq!(
+            intent.load().unwrap().as_deref(),
+            Some(b"retained intent".as_slice())
+        );
+        drop((intent, issuer));
+        assert_eq!(factory.discover(space, 1).unwrap(), vec![agent]);
+        let path = fixture.root.join(hex::encode(agent.0));
+        let retained = fixture.parent.join("retained-candidate");
+        fs::rename(&path, &retained).unwrap();
+        assert!(factory.open_existing(space, agent).is_err());
+        assert!(!path.exists());
+        assert!(retained.join(INTENT_FILE).is_file());
     }
 
     #[test]

@@ -2579,12 +2579,47 @@ The same source passed the projection checkpoint-failure/reattachment regression
 and `.worktrees/ch08-c2-native/target/task-tmp/r16-retirement-reattachment-network.log`.
 
 Startup integration remains open: `clean_startup.rs` currently constructs the
-system owner before opening `CleanManagementLifecycleStoreFactory`, whose trait
-only opens a selected Agent's stores. It cannot yet discover/verify pending
+system owner before opening `CleanManagementLifecycleStoreFactory`. At that
+checkpoint its trait only opened a selected Agent's stores; the discovery
+boundary added below is not yet invoked by startup. It cannot yet verify pending
 retirements before the first system route is attached. Move that discovery
 boundary ahead of owner attachment, handle the bounded pending set without an
 unprotected publication gap, and prove full restart/GC/exhausted-capacity recovery
 before enabling production retirement/handoff or native Install.
+
+### Bounded lifecycle-store discovery
+
+`LocalLifecycleStoreFactory` now requires explicit `discover` and `open_existing`
+operations. Discovery returns sorted unique Agent candidates, fails rather than
+truncating at the caller's bound, and does not read/reconcile images or acquire
+their writer leases. The filesystem implementation scans the pinned directory
+descriptor, revalidates the configured parent, and accepts only canonical nonzero
+lowercase Agent names backed by exact private child directories. Unexpected
+residue, files, symlinks and replaced parents fail closed. Callers must run this
+before lifecycle writers start; candidate names are not authenticated requests,
+issuer evidence or a transactional snapshot of concurrent directory changes.
+
+Recovery-only opening retains the existing exclusive lease and staged-image
+checks but never creates a missing Agent directory. If a candidate disappears
+after discovery, recovery fails instead of silently treating it as fresh state.
+The descriptor-pinned scan currently uses Linux `/proc/self/fd`; other platforms
+explicitly return Unsupported and require a supported equivalent before this
+startup path can be enabled there.
+
+Final-source results: **nine lifecycle-storage tests passed** (0.01s), **all
+42 clean-store tests passed** (0.45s with loopback socket access), and the native
+scoped-store controller regression passed (6.74s). Evidence:
+`.worktrees/ch08-c2-native/target/task-tmp/r16-lifecycle-discovery-final.log`,
+`r16-lifecycle-discovery-clean-store-final.log`, and
+`r16-lifecycle-discovery-controller.log` in the same directory. The initial
+broader sandbox run passed 41 tests and could not bind the existing HTTP-retry
+fixture's socket; the socket-enabled rerun passed all 42.
+
+This boundary is not yet wired into `clean_startup.rs`. Next, load every bounded
+candidate through `open_existing`, verify its intent and issuer against the
+independently selected system Authority and Agent scope, then feed the pending
+set into attachment before route publication. Keep incomplete and finalized
+but unretired intents protected; do not mistake directory discovery for recovery.
 
 ### Durable client acknowledgement before completion
 

@@ -224,6 +224,20 @@ pub trait LocalLifecycleStoreFactory {
     type Issuer: CleanManagementIssuerStore;
     type Error;
 
+    /// Discover existing per-Agent store candidates before routes or lifecycle
+    /// writers start. Return a sorted, unique, bounded list; never truncate.
+    /// Names are not authority or evidence of pending work. The caller must
+    /// open and independently verify every candidate's intent/issuer images.
+    fn discover(&mut self, space: SpaceId, maximum: usize) -> Result<Vec<AgentId>, Self::Error>;
+
+    /// Open a discovered store without recreating a missing Agent directory.
+    /// Normal exclusive leasing and staged-image reconciliation still apply.
+    fn open_existing(
+        &mut self,
+        space: SpaceId,
+        agent: AgentId,
+    ) -> Result<(Self::Intent, Self::Issuer), Self::Error>;
+
     fn open(
         &mut self,
         space: SpaceId,
