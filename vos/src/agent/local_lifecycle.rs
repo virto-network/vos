@@ -162,8 +162,14 @@ impl std::fmt::Display for LocalLifecycleIngressError {
 
 impl std::error::Error for LocalLifecycleIngressError {}
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalCreateDisposition {
+    Created(AgentId, ManagementApplicationAck),
+    Denied(LocalCreateDenial),
+}
+
 pub type LocalCreateResult =
-    Result<(AgentId, ManagementApplicationAck), super::production_owner::AgentProductionOwnerError>;
+    Result<LocalCreateDisposition, super::production_owner::AgentProductionOwnerError>;
 
 pub(crate) struct PendingLocalCreate {
     pub descriptor: AgentDescriptor,
@@ -792,6 +798,14 @@ fn load_create_runtime<B: super::clean_authority_issuer::CleanManagementRuntimeS
 /// Type-erased, node-owned lifecycle access. It is deliberately not an ingress
 /// trait: only the production owner may coordinate creation and publication.
 pub(crate) trait NativeLocalLifecycle: Send {
+    /// Only a retained, signed completion may turn a failed Create into a
+    /// terminal denial. Other implementations conservatively retain the error.
+    fn retained_denial(
+        &mut self,
+        _submission: &LocalCreateSubmission,
+    ) -> Result<Option<LocalCreateDenial>, SharedAgentHostError> {
+        Ok(None)
+    }
     fn node(&self) -> Result<super::sdk::NodeId, SharedAgentHostError>;
     fn system_attachment(
         &self,
@@ -845,6 +859,38 @@ where
         runtime: AdmittedRuntimePackage,
     ) -> Result<(AgentId, ManagementApplicationAck), SharedAgentHostError> {
         LocalLifecycleController::create(self, descriptor, call, runtime)
+    }
+
+    fn retained_denial(
+        &mut self,
+        submission: &LocalCreateSubmission,
+    ) -> Result<Option<LocalCreateDenial>, SharedAgentHostError> {
+        let system = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if submission.call.authority != system.authority_target() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let Some((intent, _)) = self
+            .retained_stores
+            .get_mut(&submission.descriptor.identity.agent)
+        else {
+            return Ok(None);
+        };
+        let Some(bytes) = intent
+            .load()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        else {
+            return Ok(None);
+        };
+        if !bytes.starts_with(b"CND1") {
+            return Ok(None);
+        }
+        submission
+            .verify_denial(&bytes)
+            .map(Some)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)
     }
 }
 

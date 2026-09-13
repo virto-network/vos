@@ -528,6 +528,39 @@ impl AgentProductionOwner {
             .handle()
     }
 
+    pub(crate) fn create_local_disposition(
+        &mut self,
+        descriptor: super::sdk::AgentDescriptor,
+        call: super::sdk::authority::AuthorityCredentialCall,
+        runtime: super::package_admission::AdmittedRuntimePackage,
+    ) -> super::local_lifecycle::LocalCreateResult {
+        use super::local_lifecycle::{LocalCreateDisposition, LocalCreateSubmission};
+        let submission =
+            LocalCreateSubmission::new(descriptor.clone(), call.clone(), runtime.clone())
+                .map_err(|_| AgentProductionOwnerError::Authentication)?;
+        match self.create_local_agent(descriptor, call, runtime) {
+            Ok((agent, ack)) => Ok(LocalCreateDisposition::Created(agent, ack)),
+            Err(
+                error @ AgentProductionOwnerError::Lifecycle(
+                    super::shared_host::SharedAgentHostError::ScopeMismatch,
+                ),
+            ) => {
+                let (lifecycle, _) = self
+                    .lifecycle
+                    .as_mut()
+                    .ok_or(AgentProductionOwnerError::InvalidConfiguration)?;
+                match lifecycle
+                    .retained_denial(&submission)
+                    .map_err(AgentProductionOwnerError::Lifecycle)?
+                {
+                    Some(denial) => Ok(LocalCreateDisposition::Denied(denial)),
+                    None => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn create_local_agent(
         &mut self,
         descriptor: super::sdk::AgentDescriptor,

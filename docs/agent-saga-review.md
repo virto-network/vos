@@ -47,8 +47,9 @@ results before returning success. Saved live requests require their exact
 restored reservation; retirement-write retries release only the verified pair.
 Canonical unissued denials now positively acknowledge their single runtime
 result and persist signed retirement before releasing admission, including
-signer/write retries and startup recovery. Client-visible signed denial and
-credential retry bookkeeping, expiry/abort resolution after approval or issuance,
+signer/write retries and startup recovery. Signed denial is now wired through
+the native queue and HTTP response; CLI persistence/credential retry bookkeeping,
+expiry/abort resolution after approval or issuance,
 full capacity/crash-boundary verification, and
 coexistence with an unfinished projection remain blockers, not deployment-ready
 behavior. Do not delete
@@ -3762,6 +3763,45 @@ the reservation denied, and let a new operation discover the current credential
 sequence. Preserve exact retry after every ambiguous HTTP or store outcome;
 neither a generic HTTP error nor `ScopeMismatch` can release the credential lease.
 Keep these changes in the existing C2 review batch.
+
+### Typed native denial delivery
+
+The native queue now carries `LocalCreateDisposition::{Created, Denied}` rather
+than assuming every completed operation created an Agent. The production owner
+still runs the existing authenticated Create path first. Only its scope-rejection
+result may trigger certificate lookup; the concrete controller reads the already
+leased retained intent, checks its Authority against the live system pins, and
+verifies CND1 against the exact submitted request. Missing stores or an ordinary
+pending intent yield no certificate. Other lifecycle implementations default to
+no denial evidence. Generic failures, signer/storage errors, and timeouts remain
+errors; no journal work or successful route publication is manufactured for denial.
+
+The HTTP endpoint preserves 201 plus MAA2 for successful creation and now sends
+403 plus `application/octet-stream` CND1 for a verified denial. A generic scope
+rejection remains a textual 403, incomplete work remains 503, and unknown timeout
+remains 504. Clients must verify the binary certificate; HTTP status is not proof.
+The existing CLI still treats these 403 responses as errors and retains its
+reservation until the following client-persistence change is implemented.
+
+Native fixtures additionally reopen the completed request through a concrete
+lifecycle controller, recover the exact certificate from its retained stores,
+reject absent/unrelated entries, and confirm no extra Ordered records. The first
+compile attempt exposed the node method's old tuple reply type; it now forwards
+the typed disposition consistently with the queue and HTTP consumer.
+
+Verification: all 5 native denial tests passed (90.33s,
+`r16-denial-disposition-verified.log`); all 12 vosx lifecycle file tests passed
+(0.17s, `r16-denial-disposition-files.log`), also compiling the HTTP-enabled
+production path. Logs are in shared disk scratch under
+`.worktrees/ch08-c2-native/target/task-tmp`. Formatting and `git diff --check`
+passed. No socket-level signed-denial response or CLI completion test is claimed
+by these controller/file results.
+
+Next: bounded client receipt of binary 403, immutable leased denial-file retention
+before a distinct denied reservation marker, exact-response retry after ambiguous
+publication, and actual HTTP/CLI end-to-end tests. This checkpoint does not close
+client denial UX, expiry/abort, installation/invocation, Shared finality, or release
+gates. It belongs in C2 and does not promote the implementation branch.
 
 ### Durable client acknowledgement before completion
 

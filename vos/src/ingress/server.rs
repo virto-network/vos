@@ -331,10 +331,20 @@ fn handle_local_create(
         }
     };
     match reply.recv_timeout(Duration::from_secs(120)) {
-        Ok(Ok((_, acknowledgement))) => match acknowledgement.encode() {
+        Ok(Ok(crate::agent::local_lifecycle::LocalCreateDisposition::Created(
+            _,
+            acknowledgement,
+        ))) => match acknowledgement.encode() {
             Ok(bytes) => with_content_type(201, "application/octet-stream", bytes),
             Err(_) => text(500, "invalid lifecycle acknowledgement"),
         },
+        Ok(Ok(crate::agent::local_lifecycle::LocalCreateDisposition::Denied(denial))) => {
+            with_content_type(
+                403,
+                "application/octet-stream",
+                denial.exact_bytes().to_vec(),
+            )
+        }
         Ok(Err(crate::agent::production_owner::AgentProductionOwnerError::Lifecycle(
             crate::agent::shared_host::SharedAgentHostError::ScopeMismatch,
         ))) => text(403, "Local Create scope or authorization rejected"),

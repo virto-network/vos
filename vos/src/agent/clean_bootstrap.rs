@@ -9211,6 +9211,83 @@ mod tests {
                 assert_eq!(owner.ordered_index_for_test().unwrap(), before + 6);
                 assert_eq!(local.list().unwrap().len(), 1);
                 assert_eq!(*intent_store.image.lock().unwrap(), Some(image));
+                std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            use crate::agent::local_lifecycle::{
+                                LocalLifecycleController, LocalLifecycleStoreFactory,
+                                NativeLocalLifecycle,
+                            };
+                            struct Stores(SpaceId, AgentId, IssuerMemoryStore, IssuerMemoryStore);
+                            impl LocalLifecycleStoreFactory for Stores {
+                                type Intent = IssuerMemoryStore;
+                                type Issuer = IssuerMemoryStore;
+                                type Error = ();
+                                fn discover(
+                                    &mut self,
+                                    space: SpaceId,
+                                    maximum: usize,
+                                ) -> Result<Vec<AgentId>, ()> {
+                                    if space != self.0 || maximum == 0 {
+                                        return Err(());
+                                    }
+                                    Ok(vec![self.1])
+                                }
+                                fn open_existing(
+                                    &mut self,
+                                    space: SpaceId,
+                                    agent: AgentId,
+                                ) -> Result<(Self::Intent, Self::Issuer), ()>
+                                {
+                                    if (space, agent) != (self.0, self.1) {
+                                        return Err(());
+                                    }
+                                    Ok((self.2.clone(), self.3.clone()))
+                                }
+                                fn open(
+                                    &mut self,
+                                    space: SpaceId,
+                                    agent: AgentId,
+                                ) -> Result<(Self::Intent, Self::Issuer), ()>
+                                {
+                                    self.open_existing(space, agent)
+                                }
+                            }
+                            let stores = Stores(
+                                descriptor.identity.space,
+                                descriptor.identity.agent,
+                                intent_store,
+                                issuer_store,
+                            );
+                            let mut controller =
+                                LocalLifecycleController::new(owner, local, stores, signer)
+                                    .unwrap();
+                            assert!(controller.retained_denial(&submission).unwrap().is_none());
+                            let (descriptor, call, runtime) =
+                                crate::agent::local_lifecycle::LocalCreateSubmission::decode(
+                                    &submission.encode(),
+                                )
+                                .unwrap()
+                                .into_parts();
+                            assert_eq!(
+                                controller.create(descriptor, call, runtime),
+                                Err(SharedAgentHostError::ScopeMismatch)
+                            );
+                            assert_eq!(
+                                controller.retained_denial(&submission).unwrap(),
+                                Some(verified_denial)
+                            );
+                            assert!(
+                                controller
+                                    .retained_denial(&next_submission)
+                                    .unwrap()
+                                    .is_none()
+                            );
+                            assert_eq!(controller.ordered_index_for_test().unwrap(), before + 6);
+                        })
+                        .join()
+                        .unwrap();
+                });
                 return;
             }
             assert_eq!(owner.ordered_index_for_test().unwrap(), before + 1);

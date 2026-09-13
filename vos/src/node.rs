@@ -5724,13 +5724,7 @@ impl VosNode {
         descriptor: crate::agent::sdk::AgentDescriptor,
         call: crate::agent::sdk::authority::AuthorityCredentialCall,
         runtime: crate::agent::package_admission::AdmittedRuntimePackage,
-    ) -> Result<
-        (
-            crate::agent::sdk::AgentId,
-            crate::agent::sdk::authority::ManagementApplicationAck,
-        ),
-        crate::agent::production_owner::AgentProductionOwnerError,
-    > {
+    ) -> crate::agent::local_lifecycle::LocalCreateResult {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(
                 crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration,
@@ -5739,7 +5733,7 @@ impl VosNode {
         self.clean_agent_owner
             .as_mut()
             .ok_or(crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration)?
-            .create_local_agent(descriptor, call, runtime)
+            .create_local_disposition(descriptor, call, runtime)
     }
 
     /// Complete the node-owned half of clean production construction after
