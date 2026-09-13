@@ -2446,8 +2446,9 @@ The resumed phase adds only the second acknowledgement, and another repeat adds
 none. This is a retained-journal interruption check, not a daemon-restart smoke.
 
 This phase is deliberately **not wired into the production lifecycle yet**.
-It does not clear or replace the retained intent. Joint journal-capacity/GC
-protection and durable intent handoff must be implemented before enabling it;
+Production does not clear or replace the retained intent. The completion/handoff
+storage boundary is now implemented below, but joint journal-capacity/GC
+protection across restart must be finished before enabling it;
 the bounded retained acknowledgement suffix alone is not a permanent retirement
 marker. Install remains unavailable through the native lifecycle. Next work
 stays in C2: protected retirement/handoff, then signed Install and real actor
@@ -2504,6 +2505,49 @@ The same source also passed all **six Shared-network unit tests** and the
 **pending-projection Invoke/Ack/record-clear recovery test**. Logs:
 `.worktrees/ch08-c2-native/target/task-tmp/r16-retirement-reservation-network.log`
 and `.worktrees/ch08-c2-native/target/task-tmp/r16-retirement-reservation-projection.log`.
+
+### Durable retirement marker and intent handoff
+
+The lifecycle owner can now commit a host-owned **CMR1** retirement marker while
+the reservation proves both positive journal acknowledgements, then release
+admission. CMR1 retains the exact CMI3 body: signed request, authorization work,
+and finalization work containing the signed application acknowledgement. It has
+the same encoded length and storage bound; no guest ABI, bundle or CSF1 role
+changes. Old active CMI3 records remain readable. The CMR1 decoder rejects
+missing authorization/finalization envelopes; this marker is trusted private
+host persistence, not an independently signed finality proof.
+
+After an ambiguous successful marker write, reopening the store recognizes
+completion and can release the matching volatile reservation without relying
+on the bounded journal acknowledgement suffix. The lifecycle owner still
+reverifies the exact signed intent and finalized issuer acknowledgement before
+using that marker. A marker write error poisons the current slot instance.
+
+An explicit `handoff_retired` operation atomically replaces only the exact
+completed intent with a fresh signed request for the same Space/Agent. Ordinary
+`pledge` still refuses replacement. Handoff grants no policy approval: later
+dispatch must verify independently selected routes and run Authority policy.
+Retries after an ambiguous replacement recognize the already-persisted next
+request without resetting its envelopes. Active/unretired intents cannot be
+replaced through this boundary.
+
+Final-source native checks passed **10 tests, zero failures**, in 16.78s:
+`.worktrees/ch08-c2-native/target/task-tmp/r16-management-retirement-handoff.log`.
+The full lifecycle fixture covers successful completion and handoff, before-
+and after-publication failures for both writes, poisoned-instance refusal,
+exact reopened retry, unchanged acknowledgement/issuer evidence through
+retirement, and no extra Ordered slots for marker/handoff recovery. The next
+request in this test is persisted only; it is not dispatched or approved.
+The intent-filter run also passed **three tests** (including two overlapping
+native checks), covering rejection of a premature CMR1 marker and existing
+ambiguous-pledge recovery:
+`.worktrees/ch08-c2-native/target/task-tmp/r16-management-intent-handoff-codec.log`.
+
+Production integration remains disabled. Next: restore pending retirement
+protection before any startup/reattachment route publication, verify GC and
+exhausted-capacity recovery, then wire native lifecycle completion/handoff and
+signed Install/invoke. These store-reopen tests are not daemon-restart or
+post-GC physical evidence, and do not complete C1/C2/C3 release gates.
 
 ### Durable client acknowledgement before completion
 

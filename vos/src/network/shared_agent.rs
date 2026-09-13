@@ -1071,6 +1071,27 @@ impl SharedRouteHandler {
         Ok(())
     }
 
+    /// Caller has reopened and verified the durable host completion marker.
+    /// No journal lookup is needed: its bounded suffix may already be pruned.
+    fn release_completed_management_retirement(
+        &self,
+        envelopes: [&crate::agent_sdk::RuntimeWork; 2],
+    ) -> Result<(), SharedAgentHostError> {
+        let keys = management_retirement_keys(self.agent, envelopes)?;
+        let mut proposal = self
+            .proposal
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        match proposal.management_retirement {
+            None => Ok(()),
+            Some(expected) if expected == keys => {
+                proposal.management_retirement = None;
+                Ok(())
+            }
+            Some(_) => Err(SharedAgentHostError::Conflict),
+        }
+    }
+
     fn release_projection_pair(
         &self,
         work: &InvocationWork,
@@ -2164,6 +2185,22 @@ impl SharedAgentNetworkHost {
         attached
             .coordinator
             .complete_management_retirement(envelopes, complete)
+    }
+
+    /// Only the lifecycle owner may release from a verified durable intent
+    /// retirement marker, including after an ambiguous successful commit.
+    pub(crate) fn release_completed_management_retirement(
+        &self,
+        agent: crate::service::AgentId,
+        envelopes: [&crate::agent_sdk::RuntimeWork; 2],
+    ) -> Result<(), SharedAgentHostError> {
+        management_retirement_keys(agent, envelopes)?;
+        let Some(attached) = self.generations.get(&agent) else {
+            return Ok(());
+        };
+        attached
+            .coordinator
+            .release_completed_management_retirement(envelopes)
     }
 
     pub(crate) fn reserve_recovering_projection_pair(

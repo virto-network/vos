@@ -283,11 +283,33 @@ pub(crate) enum IntentSlotError<E> {
     Poisoned,
 }
 
+/// Host-owned completion marker, written only while the live retirement gate
+/// proves both positive journal acknowledgements. The full signed intent and
+/// finalization envelope remain available for exact application retry.
+struct RetiredManagementIntent(CleanManagementIntent);
+
+impl ServiceWire for RetiredManagementIntent {
+    const MAGIC: [u8; 4] = *b"CMR1";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        self.0.encode_body(output);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let intent = CleanManagementIntent::decode_body(decoder)?;
+        if intent.authorization_work.is_none() || intent.finalization_work.is_none() {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(Self(intent))
+    }
+}
+
 /// Dedicated single-writer intent store. It must not share its physical image
 /// with the issuer even though both use the same atomic whole-image contract.
 pub(crate) struct CleanManagementIntentSlot<B> {
     store: B,
     intent: Option<CleanManagementIntent>,
+    retired: bool,
     poisoned: bool,
 }
 
@@ -334,25 +356,78 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
     }
 
     pub(crate) fn open(mut store: B) -> Result<Self, IntentSlotError<B::Error>> {
-        let intent = store
+        let retained = store
             .load()
             .map_err(IntentSlotError::Storage)?
             .map(|bytes| {
                 if bytes.len() > MAX_INTENT_BYTES {
                     return Err(IntentSlotError::Invalid);
                 }
-                CleanManagementIntent::decode(&bytes).map_err(|_| IntentSlotError::Invalid)
+                if bytes.starts_with(&RetiredManagementIntent::MAGIC) {
+                    RetiredManagementIntent::decode(&bytes)
+                        .map(|retired| (retired.0, true))
+                        .map_err(|_| IntentSlotError::Invalid)
+                } else {
+                    CleanManagementIntent::decode(&bytes)
+                        .map(|intent| (intent, false))
+                        .map_err(|_| IntentSlotError::Invalid)
+                }
             })
             .transpose()?;
+        let (intent, retired) = match retained {
+            Some((intent, retired)) => (Some(intent), retired),
+            None => (None, false),
+        };
         Ok(Self {
             store,
             intent,
+            retired,
             poisoned: false,
         })
     }
 
     pub(crate) fn intent(&self) -> Option<&CleanManagementIntent> {
         self.intent.as_ref()
+    }
+
+    pub(crate) fn retirement_complete(&self) -> Result<bool, IntentSlotError<B::Error>> {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        Ok(self.retired)
+    }
+
+    /// Only call inside the network retirement completion callback: an
+    /// application acknowledgement alone is not runtime-result retirement.
+    pub(crate) fn commit_retirement(
+        &mut self,
+        acknowledgement: &crate::agent_sdk::authority::ManagementApplicationAck,
+    ) -> Result<bool, IntentSlotError<B::Error>> {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        let intent = self.intent.as_ref().ok_or(IntentSlotError::Invalid)?;
+        let Some(RuntimeWork::Invoke { invocation, .. }) = &intent.finalization_work else {
+            return Err(IntentSlotError::Invalid);
+        };
+        if intent.authorization_work.is_none()
+            || invocation.message != CleanManagementIntent::finalization_message(acknowledgement)
+        {
+            return Err(IntentSlotError::Conflict);
+        }
+        if self.retired {
+            return Ok(false);
+        }
+        let bytes = RetiredManagementIntent(intent.clone()).encode();
+        if bytes.len() > MAX_INTENT_BYTES {
+            return Err(IntentSlotError::Invalid);
+        }
+        if let Err(error) = self.store.commit(&bytes) {
+            self.poisoned = true;
+            return Err(IntentSlotError::Storage(error));
+        }
+        self.retired = true;
+        Ok(true)
     }
 
     pub(crate) fn authorization_work(
@@ -427,6 +502,50 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
             return Err(IntentSlotError::Storage(error));
         }
         self.intent = Some(intent);
+        Ok(true)
+    }
+
+    /// Atomically replace one durably retired intent with the next signed
+    /// request in the same Agent's store. This grants no policy approval:
+    /// dispatch must still verify independently selected Authority/Agent routes.
+    pub(crate) fn handoff_retired<V: AuthorityCredentialVerifier>(
+        &mut self,
+        expected: &CleanManagementIntent,
+        next: CleanManagementIntent,
+        verifier: &V,
+    ) -> Result<bool, IntentSlotError<B::Error>> {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        next.verify(next.call.authority, next.call.managed, verifier)
+            .map_err(|_| IntentSlotError::Invalid)?;
+        if next.authorization_work.is_some()
+            || next.finalization_work.is_some()
+            || next.call.managed.space != expected.call.managed.space
+            || next.call.managed.agent != expected.call.managed.agent
+            || next.call == expected.call
+        {
+            return Err(IntentSlotError::Invalid);
+        }
+        let current = self.intent.as_ref().ok_or(IntentSlotError::Conflict)?;
+        // Recover an ambiguous successful replacement without resetting any
+        // envelopes the new request may already have durably prepared.
+        if current.call == next.call && current.request == next.request {
+            return Ok(false);
+        }
+        if !self.retired || current != expected {
+            return Err(IntentSlotError::Conflict);
+        }
+        let bytes = next.encode();
+        if bytes.len() > MAX_INTENT_BYTES {
+            return Err(IntentSlotError::Invalid);
+        }
+        if let Err(error) = self.store.commit(&bytes) {
+            self.poisoned = true;
+            return Err(IntentSlotError::Storage(error));
+        }
+        self.intent = Some(next);
+        self.retired = false;
         Ok(true)
     }
 

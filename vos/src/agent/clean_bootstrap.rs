@@ -2519,6 +2519,12 @@ where
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
+        if slot
+            .retirement_complete()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            return Ok(false);
+        }
         self._network_host
             .ensure_reattached(crate::service::AgentId(self.pins.agent.0))?;
         let mut material =
@@ -2599,6 +2605,54 @@ where
             changed = true;
         }
         Ok(changed)
+    }
+
+    /// Finish retirement under live admission exclusion and publish its durable
+    /// host marker before releasing the reservation. Production startup must
+    /// still restore pending reservations before exposing ingress.
+    pub(crate) fn finish_management_intent_retirement<B, J>(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        managed: ManagedAgentTarget,
+        acknowledgement: &ManagementApplicationAck,
+        issuer: &DurableCleanManagementIssuer<J>,
+    ) -> Result<bool, SharedAgentHostError>
+    where
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+    {
+        // Always reverify the signed intent and finalized issuer acknowledgement,
+        // even when recovering the durable marker rather than journal results.
+        self.retire_management_intent_results(slot, managed, acknowledgement, issuer)?;
+        let authorization = slot
+            .authorization_work()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .ok_or(SharedAgentHostError::ScopeMismatch)?
+            .clone();
+        let finalization = slot
+            .finalization_work()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .ok_or(SharedAgentHostError::ScopeMismatch)?
+            .clone();
+        let agent = crate::service::AgentId(self.pins.agent.0);
+        if slot
+            .retirement_complete()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            self._network_host
+                .release_completed_management_retirement(agent, [&authorization, &finalization])?;
+            return Ok(false);
+        }
+        self._network_host.complete_management_retirement(
+            agent,
+            [&authorization, &finalization],
+            || {
+                slot.commit_retirement(acknowledgement)
+                    .map(|_| ())
+                    .map_err(|_| SharedAgentHostError::Unavailable)
+            },
+        )?;
+        Ok(true)
     }
 
     /// Execute the Local Create/application portion of a retained lifecycle
@@ -8143,13 +8197,172 @@ mod tests {
                 ),
                 Err(SharedAgentHostError::CapacityExhausted)
             ));
-            if completed {
-                owner
-                    ._network_host
-                    .complete_management_retirement(agent, envelopes, || Ok(()))
-                    .unwrap();
-                assert_projection_gate_released(owner, 0xea);
+        }
+
+        #[inline(never)]
+        fn check_durable_management_retirement(
+            owner: &mut MemoryBootstrapOwner,
+            store: IssuerMemoryStore,
+            managed: ManagedAgentTarget,
+            acknowledgement: &ManagementApplicationAck,
+            issuer: &DurableCleanManagementIssuer<IssuerMemoryStore>,
+            failures: bool,
+        ) {
+            use crate::agent::clean_management_intent::{
+                CleanManagementIntentSlot, IntentSlotError,
+            };
+            struct FailingStore {
+                inner: IssuerMemoryStore,
+                after: bool,
+                magic: &'static [u8; 4],
             }
+            impl CleanManagementIssuerStore for FailingStore {
+                type Error = MemoryError;
+                fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+                    self.inner.load()
+                }
+                fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+                    assert!(image.starts_with(self.magic));
+                    if self.after {
+                        self.inner.commit(image)?;
+                    }
+                    Err(MemoryError)
+                }
+            }
+            let before = owner.ordered_index_for_test().unwrap();
+            let original = store.image.lock().unwrap().clone();
+            if failures {
+                for after in [false, true] {
+                    let mut slot = CleanManagementIntentSlot::open(FailingStore {
+                        inner: store.clone(),
+                        after,
+                        magic: b"CMR1",
+                    })
+                    .unwrap();
+                    assert!(matches!(
+                        owner.finish_management_intent_retirement(
+                            &mut slot,
+                            managed,
+                            acknowledgement,
+                            issuer,
+                        ),
+                        Err(SharedAgentHostError::Unavailable)
+                    ));
+                    assert_eq!(slot.retirement_complete(), Err(IntentSlotError::Poisoned));
+                    assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+                    if !after {
+                        assert_eq!(*store.image.lock().unwrap(), original);
+                    }
+                }
+            }
+            let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
+            assert_eq!(slot.retirement_complete().unwrap(), failures);
+            assert_eq!(
+                owner
+                    .finish_management_intent_retirement(
+                        &mut slot,
+                        managed,
+                        acknowledgement,
+                        issuer,
+                    )
+                    .unwrap(),
+                !failures
+            );
+            assert!(slot.retirement_complete().unwrap());
+            let retired = store.image.lock().unwrap().clone().unwrap();
+            assert!(retired.starts_with(b"CMR1"));
+            assert_eq!(retired.len(), original.as_ref().unwrap().len());
+            assert_eq!(&retired[4..], &original.as_ref().unwrap()[4..]);
+            drop(slot);
+            let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
+            assert!(
+                !owner
+                    .finish_management_intent_retirement(
+                        &mut slot,
+                        managed,
+                        acknowledgement,
+                        issuer,
+                    )
+                    .unwrap()
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            assert_eq!(store.image.lock().unwrap().as_ref(), Some(&retired));
+            assert_projection_gate_released(owner, 0xea);
+            let expected = slot.intent().unwrap().clone();
+            let mut next_call = expected.call().clone();
+            next_call.request_sequence =
+                core::num::NonZeroU64::new(next_call.request_sequence.get() + 1).unwrap();
+            next_call.invocation = next_call.expected_invocation();
+            next_call.signature = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32])
+                .sign(&next_call.signing_bytes())
+                .to_bytes();
+            let next = crate::agent::clean_management_intent::CleanManagementIntent::new(
+                next_call.authority,
+                next_call.managed,
+                expected.request().clone(),
+                next_call,
+                &RawCredentialVerifier,
+            )
+            .unwrap();
+            assert!(matches!(
+                slot.pledge(next.clone()),
+                Err(IntentSlotError::Conflict)
+            ));
+            let active_store = IssuerMemoryStore {
+                image: Arc::new(Mutex::new(original.clone())),
+                ..Default::default()
+            };
+            let mut active = CleanManagementIntentSlot::open(active_store.clone()).unwrap();
+            assert!(matches!(
+                active.handoff_retired(&expected, next.clone(), &RawCredentialVerifier),
+                Err(IntentSlotError::Conflict)
+            ));
+            assert_eq!(*active_store.image.lock().unwrap(), original);
+            drop(slot);
+            if failures {
+                for after in [false, true] {
+                    let mut slot = CleanManagementIntentSlot::open(FailingStore {
+                        inner: store.clone(),
+                        after,
+                        magic: b"CMI3",
+                    })
+                    .unwrap();
+                    assert!(matches!(
+                        slot.handoff_retired(&expected, next.clone(), &RawCredentialVerifier),
+                        Err(IntentSlotError::Storage(_))
+                    ));
+                    assert_eq!(slot.retirement_complete(), Err(IntentSlotError::Poisoned));
+                    if !after {
+                        assert_eq!(store.image.lock().unwrap().as_ref(), Some(&retired));
+                    }
+                }
+            }
+            let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
+            assert_eq!(
+                slot.handoff_retired(&expected, next.clone(), &RawCredentialVerifier)
+                    .unwrap(),
+                !failures
+            );
+            assert!(!slot.retirement_complete().unwrap());
+            assert_eq!(slot.intent(), Some(&next));
+            drop(slot);
+            let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
+            assert!(
+                !slot
+                    .handoff_retired(&expected, next.clone(), &RawCredentialVerifier)
+                    .unwrap()
+            );
+            assert_eq!(slot.intent(), Some(&next));
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            assert!(
+                store
+                    .image
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .starts_with(b"CMI3")
+            );
         }
 
         #[inline(never)]
@@ -8433,7 +8646,7 @@ mod tests {
             assert!(finalized > applied);
             let finalization_envelope = slot.finalization_work().unwrap().unwrap().clone();
             drop(slot);
-            let mut slot = CleanManagementIntentSlot::open(store).unwrap();
+            let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
             assert_eq!(
                 slot.finalization_work().unwrap(),
                 Some(&finalization_envelope)
@@ -8589,6 +8802,15 @@ mod tests {
             assert_eq!(*issuer_store.image.lock().unwrap(), issuer_image);
             assert_eq!(signer.calls, 2);
             check_management_retirement_gate(owner, [&envelope, &finalization_envelope], true);
+            drop(slot);
+            check_durable_management_retirement(
+                owner,
+                store,
+                call.managed,
+                &acknowledgement,
+                &issuer,
+                interrupted_retirement,
+            );
             assert_eq!(owner.ordered_index_for_test().unwrap(), retired);
             harness.stop();
         }

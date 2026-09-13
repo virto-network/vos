@@ -2475,6 +2475,12 @@ mod tests {
         .unwrap();
         assert_eq!(intent.request(), &request);
         assert_eq!(intent.call(), &call);
+        // A retirement tag cannot make an unexecuted intent complete.
+        let mut premature = intent.encode();
+        premature[..4].copy_from_slice(b"CMR1");
+        let mut premature_store = MemoryImageStore::default();
+        premature_store.commit(&premature).unwrap();
+        assert!(CleanManagementIntentSlot::open(premature_store).is_err());
         assert_eq!(
             CleanManagementIntent::decode(&intent.encode()).unwrap(),
             intent
