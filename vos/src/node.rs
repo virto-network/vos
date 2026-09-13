@@ -5838,6 +5838,27 @@ impl VosNode {
             .create_local_disposition(descriptor, call, runtime)
     }
 
+    /// Native policy authorization only; returned issuance is not application
+    /// or retirement. Callers must retain exact context/slot inputs for retry.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    pub fn authorize_clean_agent_operation(
+        &mut self,
+        call: &crate::agent::sdk::authority_operation::AuthorityOperationCall,
+        context: crate::agent::sdk::InvocationContext,
+        issued_at: u64,
+    ) -> Result<
+        crate::agent::authority_operation_issuer::IssuedAuthorityOperation,
+        crate::agent::shared_host::SharedAgentHostError,
+    > {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(crate::agent::shared_host::SharedAgentHostError::Unavailable);
+        }
+        self.clean_agent_owner
+            .as_mut()
+            .ok_or(crate::agent::shared_host::SharedAgentHostError::Unavailable)?
+            .authorize_operation(call, context, issued_at)
+    }
+
     /// Complete the node-owned half of clean production construction after
     /// the owner has performed its initial authenticated reconciliation.
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]

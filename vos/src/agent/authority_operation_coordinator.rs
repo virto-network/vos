@@ -458,6 +458,46 @@ where
         (self.store, self.dispatcher, self.issuer)
     }
 
+    /// Physical records required by already-pledged/completed coordinator state.
+    /// An issued but unconsumed AOI1 may legitimately await first capture.
+    pub(crate) fn required_native_dispatches(
+        &self,
+    ) -> Result<
+        Vec<AuthorityOperationActorDispatch>,
+        AuthorityOperationCoordinatorError<C::Error, I::Error>,
+    > {
+        let mut requests = Vec::new();
+        for record in &self.image.records {
+            let call = AuthorityOperationCall::decode(&record.call)
+                .map_err(|_| AuthorityOperationCoordinatorError::InvalidState)?;
+            let context = InvocationContext::decode(&record.authorization_context)
+                .map_err(|_| AuthorityOperationCoordinatorError::InvalidState)?;
+            requests.push(AuthorityOperationActorDispatch {
+                target: self.authority,
+                method: AuthorityOperationActorMethod::AuthorizeOperation,
+                context,
+                request: record.call.clone(),
+            });
+            if record.consumed_issuance_ack.is_some() {
+                let ack = self
+                    .issuer
+                    .recover_retained(call.invocation)
+                    .map_err(|_| AuthorityOperationCoordinatorError::InvalidState)?
+                    .and_then(|retained| retained.issuance_ack)
+                    .ok_or(AuthorityOperationCoordinatorError::InvalidState)?;
+                requests.push(AuthorityOperationActorDispatch {
+                    target: self.authority,
+                    method: AuthorityOperationActorMethod::AcknowledgeIssuance,
+                    context: acknowledgement_context(&ack),
+                    request: ack
+                        .encode()
+                        .map_err(|_| AuthorityOperationCoordinatorError::InvalidState)?,
+                });
+            }
+        }
+        Ok(requests)
+    }
+
     /// Execute one exact credential-authenticated operation through policy,
     /// durable evidence issuance, and durable AOI1 consumption.
     ///

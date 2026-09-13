@@ -164,7 +164,8 @@ Keep these as work within C2, not new review batches:
    the coordinator now captures native input automatically before a new pledge.
    A native-only controller now retains all three store handles across calls
    and reopens parsed state on each attempt, including after open failures.
-   daemon/controller wiring and terminal recovery remain open. Preparation and an API
+   Daemon startup now adopts those stores and native node dispatch reaches the
+   controller; operation ingress/client wiring and terminal recovery remain open. Preparation and an API
    credential do not issue an actor
    receipt. Retain the signed AOC5, exact authorization context and issuance
    slot before policy dispatch, and recover the exact issued preimages before
@@ -5418,6 +5419,64 @@ The controller still needs adoption by daemon startup and lifecycle/operation
 dispatch, with complete discovery and terminal retirement classification. This
 does not close protected issuance, mutation, denial retirement, capacity or
 release gates. No guest artifacts changed; review scope remains C1/C2/C3.
+
+### Daemon adoption and native operation dispatch
+
+Startup now opens dedicated `authority-operation` image and
+`authority-operation-journal` namespaces, discovers every NOD1 candidate and
+cross-checks coordinator/issuer images before loading admission. Every pledged
+authorization and consumed issuance acknowledgement must have an exact retained
+native dispatch record; a missing/substituted record stops startup. Signed but
+unconsumed issuance may legitimately await first native acknowledgement capture.
+The owner restores operation admission together with lifecycle recovery before
+attachment; the lifecycle controller then adopts all three handles and an
+explicitly owned signer pinned to the same Authority.
+
+`VosNode::authorize_clean_agent_operation` dispatches through the retained
+production/lifecycle owner, holding the system-owner lock while coordinating.
+Shutdown/unavailable-owner checks fail closed. This is a native node API, not
+an HTTP/CLI operation endpoint, and issuance is not actor application or result
+retirement. The type-erased lifecycle boundary currently reports operation
+errors as unavailable: it must not turn a denial into terminal completion or
+release admission without the still-missing durable retirement evidence.
+
+The three physical native operation tests pass in **33.95s**
+(`r16-native-operation-daemon-native-final.log`). Coverage now includes an error
+after a durable coordinator pledge, missing required NOD1 refusal without
+execution, exact recovery after restoring the deliberately displaced test file,
+and native denial replay through the actual type-erased lifecycle access.
+The latter cannot open lifecycle stores or sign, and does not add a transition.
+The earlier pass before the lifecycle-access assertion was **15.52s** in
+`r16-native-operation-daemon-native.log`.
+All **212 CLI tests pass, zero fail, five ignored**, in **10.12s**
+(`r16-native-operation-daemon-cli-final.log`). The current daemon build passes
+(`r16-native-operation-daemon-build.log`, 43.49s). These logs remain under the
+shared disk-backed `target/task-tmp`; no guest artifacts changed.
+
+The owned-signer check also passes with exact deterministic operation-issuance
+signatures and the same configured public key
+(`r16-native-operation-daemon-signer-final.log`, one passed). Its initial test
+compile had ambiguous management/operation trait calls; those fixture calls
+were qualified explicitly. The daemon binary used for the disposable smoke
+predates only this test assertion and a documentation-only source edit.
+
+Remaining C2 work includes retained operation ingress/client preparation,
+genuinely approved native issuance and protected mutation, success/denial
+retirement, restart/terminal classification and the existing capacity/finality
+gates. Directory creation or a native API alone is not a completed user workflow.
+
+The rebuilt daemon also passes the existing disposable-space smoke:
+`operation-controller-startup` started **2026-09-13 19:02:42Z**, became ready at
+**19:07:04Z**, passed native invocation retirement/two forced exact HTTP
+acknowledgement retries (**one passed in 1.14s**), and shut down cleanly at
+**19:07:06Z**, with no endpoint marker left. Evidence is under
+`target/native-denial-head-reuse.XoaplU/operation-controller-startup-{run,daemon,client-test}.log`
+in this implementation worktree. The new image/journal directories are private
+and contain only their lock files: this proves empty-operation-store startup
+compatibility, not live pending-operation recovery. The saved request, response
+and progress hashes remain exactly those from the earlier retirement campaign.
+Startup still takes roughly 4m22s; this does not close the latency gate or make
+the branch master-ready.
 
 ### Durable client acknowledgement before completion
 

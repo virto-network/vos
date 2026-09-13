@@ -51,7 +51,10 @@ use super::clean_identity::{
     CleanOperatorIdentitySigner, OwnedCleanOperatorIdentitySigner, node_id_from_authenticated_peer,
     sign_node_encryption_enrollment,
 };
-use super::clean_store::{CleanManagementLifecycleStoreFactory, CleanSystemAgentFileStores};
+use super::clean_store::{
+    CleanAuthorityOperationFiles, CleanManagementLifecycleStoreFactory,
+    CleanNativeAuthorityOperationJournal, CleanSystemAgentFileStores,
+};
 
 const SYSTEM_AUTHORITY_NAME: &str = "system-authority";
 const SYSTEM_CATALOG_NAME: &str = "system-catalog";
@@ -59,6 +62,8 @@ const SYSTEM_AGENT_CONTROL_DIRECTORY: &str = "system-agent";
 const SHARED_AGENT_HOST_DIRECTORY: &str = "agent-host";
 const LOCAL_AGENT_HOST_DIRECTORY: &str = "local-agent-host";
 const LOCAL_LIFECYCLE_DIRECTORY: &str = "local-agent-lifecycle";
+const OPERATION_IMAGES_DIRECTORY: &str = "authority-operation";
+const OPERATION_JOURNAL_DIRECTORY: &str = "authority-operation-journal";
 const PROJECTION_ROUTE_QUEUE_CAPACITY: usize = 64;
 const LOCAL_LIFECYCLE_RECOVERY_LIMIT: usize = 1_024;
 const PROJECTION_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
@@ -394,7 +399,28 @@ pub(crate) fn start_clean_system_agent(
     .map_err(|error| anyhow::anyhow!("verify Local lifecycle stores before startup: {error:?}"))?;
     let lifecycle_admission = lifecycle_recovery.startup_admission()
         .map_err(|error| anyhow::anyhow!("Local lifecycle requires incomplete-phase recovery before startup; preserved all stores: {error:?}"))?;
-    let owner = CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_factory(
+    let operation_journal = CleanNativeAuthorityOperationJournal::open_or_create(
+        data_dir.join(OPERATION_JOURNAL_DIRECTORY),
+        authority_target,
+    )?;
+    let operation_ids = operation_journal.discover(
+        2 * vos::agent::authority_operation_coordinator::MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS,
+    )?;
+    let (operation_coordinator, operation_issuer) =
+        CleanAuthorityOperationFiles::open_or_create(data_dir.join(OPERATION_IMAGES_DIRECTORY))?
+            .into_parts();
+    let mut operations = vos::agent::clean_bootstrap::NativeAuthorityOperationController::new(
+        authority_target,
+        operation_coordinator,
+        operation_issuer,
+        operation_journal,
+    );
+    let operation_admission = operations
+        .startup_admission(&operation_ids)
+        .map_err(|error| {
+            anyhow::anyhow!("verify operation recovery before startup; preserved stores: {error:?}")
+        })?;
+    let owner = CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
         pins_store,
         record_store,
         issuer_store,
@@ -410,7 +436,9 @@ pub(crate) fn start_clean_system_agent(
         genesis,
         network,
         Some(&lifecycle_admission),
+        Some(&operation_admission),
     )?;
+    drop(operation_admission);
     let local_root = data_dir.join(LOCAL_AGENT_HOST_DIRECTORY);
     let local = match std::fs::symlink_metadata(&local_root) {
         Ok(_) => vos::agent::local_sdk_host::LocalAgentHost::open(
@@ -435,6 +463,10 @@ pub(crate) fn start_clean_system_agent(
         lifecycle_stores,
         OwnedCleanOperatorIdentitySigner::new(operator.clone())?,
         lifecycle_recovery,
+    )?
+    .with_operations(
+        operations,
+        OwnedCleanOperatorIdentitySigner::new(operator.clone())?,
     )?;
     node.start_clean_local_agent_production(
         clean_node,

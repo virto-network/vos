@@ -704,6 +704,25 @@ impl AgentProductionOwner {
             .is_some_and(|supervisor| supervisor.handle().is_running())
     }
 
+    pub(crate) fn authorize_operation(
+        &mut self,
+        call: &super::sdk::authority_operation::AuthorityOperationCall,
+        context: super::sdk::InvocationContext,
+        issued_at: u64,
+    ) -> Result<
+        super::authority_operation_issuer::IssuedAuthorityOperation,
+        super::shared_host::SharedAgentHostError,
+    > {
+        if !self.is_running() {
+            return Err(super::shared_host::SharedAgentHostError::Unavailable);
+        }
+        self.lifecycle
+            .as_mut()
+            .ok_or(super::shared_host::SharedAgentHostError::Unavailable)?
+            .0
+            .authorize_operation(call, context, issued_at)
+    }
+
     pub(crate) fn install_local_host(
         &mut self,
         attachment: AgentRouteHostAttachment,

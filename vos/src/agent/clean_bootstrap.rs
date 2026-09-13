@@ -10045,7 +10045,7 @@ mod tests {
             use crate::agent::clean_bootstrap::operation_dispatch::NativeAuthorityOperationDispatcher;
             use crate::agent_sdk::authority_operation::AuthorityOperationCall;
             struct NoSigning([u8; 32]);
-            struct FailOnceCoordinator(OperationTestImageFile, bool);
+            struct FailOnceCoordinator(OperationTestImageFile, bool, bool);
             impl AuthorityOperationCoordinatorStore for FailOnceCoordinator {
                 type Error = std::io::Error;
                 fn load(&mut self) -> std::io::Result<Option<Vec<u8>>> {
@@ -10055,7 +10055,11 @@ mod tests {
                     self.0.read()
                 }
                 fn commit(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-                    AuthorityOperationCoordinatorStore::commit(&mut self.0, bytes)
+                    AuthorityOperationCoordinatorStore::commit(&mut self.0, bytes)?;
+                    if core::mem::take(&mut self.2) {
+                        return Err(std::io::Error::other("injected error after durable pledge"));
+                    }
+                    Ok(())
                 }
             }
             impl AuthorityOperationEvidenceSigner for NoSigning {
@@ -10099,6 +10103,7 @@ mod tests {
                 FailOnceCoordinator(
                     OperationTestImageFile(root.join("operation-coordinator")),
                     true,
+                    true,
                 ),
                 OperationTestImageFile(root.join("operation-issuer")),
                 journal,
@@ -10119,6 +10124,27 @@ mod tests {
             assert!(!journal_path.exists());
             assert!(!root.join("operation-coordinator").exists());
             assert!(!root.join("operation-issuer").exists());
+            assert!(matches!(
+                controller.coordinate(
+                    owner,
+                    &call,
+                    request.context,
+                    slot,
+                    &mut NoSigning(target.binding.public_key)
+                ),
+                Err(NativeAuthorityOperationControllerError::Coordinate(
+                    AuthorityOperationCoordinatorError::Storage(_)
+                ))
+            ));
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            assert!(journal_path.exists());
+            controller.validate().unwrap();
+            let held_journal = root.join("temporarily-unavailable-operation-record");
+            std::fs::rename(&journal_path, &held_journal).unwrap();
+            assert!(controller.validate().is_err());
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            std::fs::rename(&held_journal, &journal_path).unwrap();
+            controller.validate().unwrap();
             let mut original = None;
             for retry in 0..2 {
                 if retry == 1 {
@@ -10160,8 +10186,69 @@ mod tests {
             assert_eq!(owner.ordered_index_for_test().unwrap(), before + 1);
             assert_eq!(
                 journal.load(request.context.invocation).unwrap(),
-                Some(corrupt)
+                Some(corrupt.clone())
             );
+            // Restore only the deliberately injected test corruption, then
+            // exercise the type-erased access retained by the lifecycle owner.
+            corrupt[0] ^= 1;
+            write_operation_test_image(&journal_path, &corrupt).unwrap();
+            struct NoLifecycleStores;
+            impl crate::agent::local_lifecycle::LocalLifecycleStoreFactory for NoLifecycleStores {
+                type Intent = IssuerMemoryStore;
+                type Issuer = IssuerMemoryStore;
+                type Error = ();
+                fn discover(&mut self, _: SpaceId, _: usize) -> Result<Vec<AgentId>, ()> {
+                    panic!("operation must not discover lifecycle stores")
+                }
+                fn open_existing(
+                    &mut self,
+                    _: SpaceId,
+                    _: AgentId,
+                ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                    panic!("operation must not reopen lifecycle stores")
+                }
+                fn open(
+                    &mut self,
+                    _: SpaceId,
+                    _: AgentId,
+                ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                    panic!("operation must not create lifecycle stores")
+                }
+            }
+            let local = crate::agent::local_sdk_host::LocalAgentHost::create(
+                root.join("operation-local-host"),
+                target.space,
+                harness.fixture.plan.pins.node,
+                harness.fixture.trust.clone(),
+            )
+            .unwrap();
+            let operations = NativeAuthorityOperationController::new(
+                target,
+                OperationTestImageFile(root.join("operation-coordinator")),
+                OperationTestImageFile(root.join("operation-issuer")),
+                journal,
+            );
+            let mut lifecycle = crate::agent::local_lifecycle::LocalLifecycleController::new(
+                harness.owner.take().unwrap(),
+                local,
+                NoLifecycleStores,
+                CountingSigner::new(),
+            )
+            .unwrap()
+            .with_operations(operations, NoSigning(target.binding.public_key))
+            .unwrap();
+            assert!(matches!(
+                crate::agent::local_lifecycle::NativeLocalLifecycle::authorize_operation(
+                    &mut lifecycle,
+                    &call,
+                    request.context,
+                    slot,
+                ),
+                Err(SharedAgentHostError::Unavailable)
+            ));
+            assert_eq!(lifecycle.ordered_index_for_test().unwrap(), before + 1);
+            assert_eq!(std::fs::read(&journal_path).unwrap(), corrupt);
+            drop(lifecycle);
             harness.stop();
         }
 

@@ -51,11 +51,68 @@ where
         &mut self,
         invocations: &[InvocationId],
     ) -> Result<NativeAuthorityOperationStartupAdmission<'_>, SharedAgentHostError> {
+        self.validate()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
         NativeAuthorityOperationStartupAdmission::load(
             &mut self.journal,
             self.authority,
             invocations,
         )
+    }
+
+    pub fn authority(&self) -> AuthorityActorTarget {
+        self.authority
+    }
+
+    /// Read and cross-check both images without executing any operation.
+    pub fn validate(
+        &mut self,
+    ) -> Result<
+        (),
+        NativeAuthorityOperationControllerError<C::Error, B::Error, core::convert::Infallible>,
+    > {
+        let issuer =
+            DurableAuthorityOperationIssuer::open(BorrowedIssuer(&mut self.issuer), self.authority)
+                .map_err(NativeAuthorityOperationControllerError::OpenIssuer)?;
+        let coordinator = DurableAuthorityOperationCoordinator::open(
+            BorrowedCoordinator(&mut self.coordinator),
+            self.authority,
+            ValidationOnly,
+            issuer,
+        )
+        .map_err(NativeAuthorityOperationControllerError::OpenCoordinator)?;
+        let requests = coordinator
+            .required_native_dispatches()
+            .map_err(NativeAuthorityOperationControllerError::OpenCoordinator)?;
+        for request in requests {
+            let saved = self
+                .journal
+                .load(request.context.invocation)
+                .map_err(|_| {
+                    NativeAuthorityOperationControllerError::Coordinate(
+                        AuthorityOperationCoordinatorError::Dispatch(
+                            SharedAgentHostError::Unavailable,
+                        ),
+                    )
+                })?
+                .ok_or(NativeAuthorityOperationControllerError::Coordinate(
+                    AuthorityOperationCoordinatorError::InvalidState,
+                ))?;
+            let record = operation_dispatch::RetainedAuthorityOperationDispatch::decode(&saved)
+                .map_err(|_| {
+                    NativeAuthorityOperationControllerError::Coordinate(
+                        AuthorityOperationCoordinatorError::InvalidState,
+                    )
+                })?;
+            if record.request() != &request
+                || record.encode().ok().as_deref() != Some(saved.as_slice())
+            {
+                return Err(NativeAuthorityOperationControllerError::Coordinate(
+                    AuthorityOperationCoordinatorError::InvalidState,
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Only the native owner can supply policy results. Neither retained
@@ -106,6 +163,48 @@ where
 
     pub fn into_parts(self) -> (C, B, J) {
         (self.coordinator, self.issuer, self.journal)
+    }
+}
+
+struct ValidationOnly;
+impl crate::agent::authority_operation_coordinator::AuthorityOperationActorDispatcher
+    for ValidationOnly
+{
+    type Error = SharedAgentHostError;
+    fn dispatch(
+        &mut self,
+        _: &crate::agent::authority_operation_coordinator::AuthorityOperationActorDispatch,
+    ) -> Result<
+        crate::agent::authority_operation_coordinator::AuthorityOperationActorResult,
+        Self::Error,
+    > {
+        Err(SharedAgentHostError::Unavailable)
+    }
+}
+
+impl<P, R, I, C, B, J, S> crate::agent::local_lifecycle::NativeAuthorityOperationAccess<P, R, I>
+    for (NativeAuthorityOperationController<C, B, J>, S)
+where
+    P: CleanSystemAgentBootstrapStore,
+    R: CleanSystemAgentBootstrapStore,
+    I: CleanManagementIssuerStore,
+    C: AuthorityOperationCoordinatorStore + Send,
+    B: AuthorityOperationIssuerStore + Send,
+    J: NativeAuthorityOperationJournalStore + Send,
+    S: AuthorityOperationEvidenceSigner + Send,
+{
+    fn coordinate(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        call: &AuthorityOperationCall,
+        context: InvocationContext,
+        issued_at: u64,
+    ) -> Result<IssuedAuthorityOperation, SharedAgentHostError> {
+        // No terminal denial certificate exists here yet. Preserve errors as
+        // unavailable rather than releasing admission or declaring success.
+        self.0
+            .coordinate(owner, call, context, issued_at, &mut self.1)
+            .map_err(|_| SharedAgentHostError::Unavailable)
     }
 }
 

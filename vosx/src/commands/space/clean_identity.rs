@@ -168,6 +168,25 @@ impl CleanManagementReceiptSigner for OwnedCleanOperatorIdentitySigner {
     }
 }
 
+impl vos::agent::authority_operation_issuer::AuthorityOperationEvidenceSigner
+    for OwnedCleanOperatorIdentitySigner
+{
+    type Error = CleanIdentitySignerError;
+    fn public_key(&self) -> [u8; 32] {
+        self.public_key
+    }
+    fn sign_authority_receipt(&mut self, message: &[u8]) -> Result<[u8; 64], Self::Error> {
+        CleanManagementReceiptSigner::sign_authority_receipt(self, message)
+    }
+    fn sign_issuance_ack(&mut self, message: &[u8]) -> Result<[u8; 64], Self::Error> {
+        self.keypair
+            .sign(message)
+            .map_err(|_| CleanIdentitySignerError::SigningFailed)?
+            .try_into()
+            .map_err(|_| CleanIdentitySignerError::InvalidSignatureLength)
+    }
+}
+
 /// Derive the clean Node identity from every byte of an already-authenticated
 /// libp2p PeerId. Compact routing hints are deliberately not accepted here.
 pub(crate) fn node_id_from_authenticated_peer(peer_id: &PeerId) -> NodeId {
@@ -308,9 +327,24 @@ mod tests {
         let keypair = operator_keypair();
         let mut borrowed = CleanOperatorIdentitySigner::new(&keypair).unwrap();
         let mut owned = OwnedCleanOperatorIdentitySigner::new(keypair.clone()).unwrap();
-        assert_eq!(owned.public_key(), borrowed.public_key());
         assert_eq!(
-            owned.sign_authority_receipt(b"receipt").unwrap(),
+            CleanManagementReceiptSigner::public_key(&owned),
+            borrowed.public_key()
+        );
+        use vos::agent::authority_operation_issuer::AuthorityOperationEvidenceSigner as OperationSigner;
+        assert_eq!(OperationSigner::public_key(&owned), borrowed.public_key());
+        let operation_ack =
+            OperationSigner::sign_issuance_ack(&mut owned, b"operation-issuance").unwrap();
+        assert_eq!(
+            operation_ack.as_slice(),
+            keypair.sign(b"operation-issuance").unwrap()
+        );
+        assert_eq!(
+            OperationSigner::sign_issuance_ack(&mut owned, b"operation-issuance").unwrap(),
+            operation_ack
+        );
+        assert_eq!(
+            CleanManagementReceiptSigner::sign_authority_receipt(&mut owned, b"receipt").unwrap(),
             borrowed.sign_authority_receipt(b"receipt").unwrap()
         );
         assert_eq!(

@@ -976,6 +976,15 @@ fn load_create_runtime<B: super::clean_authority_issuer::CleanManagementRuntimeS
 /// Type-erased, node-owned lifecycle access. It is deliberately not an ingress
 /// trait: only the production owner may coordinate creation and publication.
 pub(crate) trait NativeLocalLifecycle: Send {
+    fn authorize_operation(
+        &mut self,
+        _call: &super::sdk::authority_operation::AuthorityOperationCall,
+        _context: super::sdk::InvocationContext,
+        _issued_at: u64,
+    ) -> Result<super::authority_operation_issuer::IssuedAuthorityOperation, SharedAgentHostError>
+    {
+        Err(SharedAgentHostError::Unavailable)
+    }
     /// Only a retained, signed completion may turn a failed Create into a
     /// terminal denial. Other implementations conservatively retain the error.
     fn retained_denial(
@@ -1019,6 +1028,15 @@ where
     F::Issuer: Send,
     S: CleanManagementReceiptSigner + Send,
 {
+    fn authorize_operation(
+        &mut self,
+        call: &super::sdk::authority_operation::AuthorityOperationCall,
+        context: super::sdk::InvocationContext,
+        issued_at: u64,
+    ) -> Result<super::authority_operation_issuer::IssuedAuthorityOperation, SharedAgentHostError>
+    {
+        LocalLifecycleController::authorize_operation(self, call, context, issued_at)
+    }
     fn node(&self) -> Result<super::sdk::NodeId, SharedAgentHostError> {
         Ok(self
             .local
@@ -1089,11 +1107,27 @@ where
     }
 }
 
+/// Type-erased operation storage/signing retained with the native owner.
+pub(crate) trait NativeAuthorityOperationAccess<P, R, I>: Send
+where
+    P: CleanSystemAgentBootstrapStore,
+    R: CleanSystemAgentBootstrapStore,
+    I: CleanManagementIssuerStore,
+{
+    fn coordinate(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        call: &super::sdk::authority_operation::AuthorityOperationCall,
+        context: super::sdk::InvocationContext,
+        issued_at: u64,
+    ) -> Result<super::authority_operation_issuer::IssuedAuthorityOperation, SharedAgentHostError>;
+}
+
 /// Retains one system owner and one physical Local host across route-worker
 /// retirement. Lifecycle calls lock system then Local; route workers lock only
 /// their own host. Never call route-worker methods while either guard is held.
 /// Native shutdown must stop lifecycle callers and retire/join route workers
-/// before dropping this controller's final owner references.
+/// before dropping this controller's final owner references and operation leases.
 pub struct LocalLifecycleController<P, R, I, F, S>
 where
     P: CleanSystemAgentBootstrapStore,
@@ -1108,6 +1142,7 @@ where
     // Parsed protocol state is reopened from these handles for every call.
     retained_stores: BTreeMap<AgentId, (F::Intent, F::Issuer)>,
     signer: S,
+    operations: Option<Box<dyn NativeAuthorityOperationAccess<P, R, I>>>,
 }
 
 impl<P, R, I, F, S> LocalLifecycleController<P, R, I, F, S>
@@ -1133,7 +1168,58 @@ where
             stores,
             retained_stores: BTreeMap::new(),
             signer,
+            operations: None,
         })
+    }
+
+    /// Adopt recovered operation stores and a signer matching the native owner.
+    pub fn with_operations<C, B, J, O>(
+        mut self,
+        mut operations: super::clean_bootstrap::NativeAuthorityOperationController<C, B, J>,
+        signer: O,
+    ) -> Result<Self, SharedAgentHostError>
+    where
+        C: super::authority_operation_coordinator::AuthorityOperationCoordinatorStore
+            + Send
+            + 'static,
+        B: super::authority_operation_issuer::AuthorityOperationIssuerStore + Send + 'static,
+        J: super::clean_bootstrap::NativeAuthorityOperationJournalStore + Send + 'static,
+        O: super::authority_operation_issuer::AuthorityOperationEvidenceSigner + Send + 'static,
+    {
+        let target = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .authority_target();
+        if self.operations.is_some()
+            || operations.authority() != target
+            || signer.public_key() != target.binding.public_key
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        operations
+            .validate()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        self.operations = Some(Box::new((operations, signer)));
+        Ok(self)
+    }
+
+    pub fn authorize_operation(
+        &mut self,
+        call: &super::sdk::authority_operation::AuthorityOperationCall,
+        context: super::sdk::InvocationContext,
+        issued_at: u64,
+    ) -> Result<super::authority_operation_issuer::IssuedAuthorityOperation, SharedAgentHostError>
+    {
+        let operations = self
+            .operations
+            .as_mut()
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        let mut system = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        operations.coordinate(&mut system, call, context, issued_at)
     }
 
     /// Adopt stores previously verified against independently selected pins.
@@ -1564,7 +1650,12 @@ where
             stores,
             retained_stores,
             signer,
+            operations,
         } = self;
+        assert!(
+            operations.is_none(),
+            "test extraction must preserve operation leases"
+        );
         drop(retained_stores);
         let system = Arc::try_unwrap(system)
             .ok()
