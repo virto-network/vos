@@ -449,6 +449,14 @@ pub(crate) fn start_clean_system_agent(
     Ok(())
 }
 
+#[cfg(test)]
+pub(super) fn install_request_fixture(
+    agent: AgentId,
+    package: &AdmittedActorPackage,
+) -> ManagementRequest {
+    install_request(agent, package, vec![1], b"client-wire-test").unwrap()
+}
+
 fn install_request(
     agent: AgentId,
     package: &AdmittedActorPackage,

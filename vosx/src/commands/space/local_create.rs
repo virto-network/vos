@@ -220,7 +220,7 @@ pub(crate) fn create_local(
     Ok(ack)
 }
 
-fn post_binary(
+pub(super) fn post_binary(
     address: std::net::SocketAddr,
     path: &'static str,
     status: u16,
@@ -546,6 +546,18 @@ pub(crate) fn verify_acknowledgement(
     request: &[u8],
     response: &[u8],
 ) -> anyhow::Result<vos::agent::sdk::authority::ManagementApplicationAck> {
+    let submission = LocalCreateSubmission::decode(request)
+        .map_err(|error| anyhow::anyhow!("invalid retained Local Create: {error:?}"))?;
+    let (_, call, _) = submission.into_parts();
+    verify_call_acknowledgement(&call, response)
+}
+
+/// The caller must first authenticate the retained Create/Install submission;
+/// a response cannot select its own trusted Authority or pending call.
+pub(super) fn verify_call_acknowledgement(
+    call: &AuthorityCredentialCall,
+    response: &[u8],
+) -> anyhow::Result<vos::agent::sdk::authority::ManagementApplicationAck> {
     use vos::agent::sdk::authority::{
         AuthorityVerifier, ManagementApplicationAck, ManagementApproval,
     };
@@ -559,15 +571,12 @@ pub(crate) fn verify_acknowledgement(
         }
     }
 
-    let submission = LocalCreateSubmission::decode(request)
-        .map_err(|error| anyhow::anyhow!("invalid retained Local Create: {error:?}"))?;
-    let (_, call, _) = submission.into_parts();
     anyhow::ensure!(
         call.authenticated_node.is_none(),
         "retained request is not HTTP-compatible"
     );
     let ack = ManagementApplicationAck::decode(response)
-        .map_err(|error| anyhow::anyhow!("invalid Local Create acknowledgement: {error:?}"))?;
+        .map_err(|error| anyhow::anyhow!("invalid lifecycle acknowledgement: {error:?}"))?;
     anyhow::ensure!(
         ack.authority == call.authority,
         "acknowledgement Authority differs from retained request"
@@ -576,7 +585,7 @@ pub(crate) fn verify_acknowledgement(
         .map_err(|error| anyhow::anyhow!("invalid acknowledgement signature: {error:?}"))?;
     let selector = &ack.receipt.selector;
     let approval = ManagementApproval::from_call(
-        &call,
+        call,
         ack.authorization_sequence,
         selector.evidence.clone(),
         selector.lane_roots,
@@ -588,8 +597,8 @@ pub(crate) fn verify_acknowledgement(
         anyhow::anyhow!("acknowledgement approval differs from retained request: {error:?}")
     })?;
     anyhow::ensure!(
-        ack.matches_pending(&call, &approval),
-        "acknowledgement does not match the exact retained Local Create"
+        ack.matches_pending(call, &approval),
+        "acknowledgement does not match the exact retained lifecycle request"
     );
     Ok(ack)
 }

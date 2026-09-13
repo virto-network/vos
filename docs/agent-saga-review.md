@@ -27,8 +27,9 @@ physical tests from prepared authorization through retirement, including
 pristine client-retry admission. Native Install controller handoff, retry and
 restart now pass; the production-owner wrapper requires an exact active Local
 route after reconciliation. Install now has signed-frame, bounded native queue
-and HTTP server wiring; CLI submission and
-actual actor method invocation remain unwired/unproven; these phase tests do
+and HTTP server wiring, plus a retained-request CLI delivery command. Fresh
+Install discovery/preparation/credential allocation and actual actor method
+invocation remain unwired/unproven; these phase tests do
 not make actor installation available to users yet.
 The native Local-controller wiring at `ee047d48` passed fresh-data startup and
 restart using the rebuilt CLI (`target/native-local-smoke.DATNas`, details below).
@@ -4330,6 +4331,55 @@ No CLI Install command, live install/invoke campaign, complete denial handling
 or release readiness is claimed by this server checkpoint. Next is durable
 client preparation/submission with exact MAA2 verification, then the live
 install/invoke/restart campaign. C1/C2/C3 remain the review groups.
+
+### Retained Install client delivery
+
+`vosx space submit-local-install /absolute/private/request-store --http 127.0.0.1:8080`
+now submits an already retained LIQ1. It does not discover an Agent, allocate a
+credential sequence, build an actor installation or sign a fresh request. The
+new pure preparation helper accepts an explicitly selected descriptor/Authority,
+Install/package and already allocated sequence/validity window; wiring those
+inputs into the managed CLI remains the next step, not completed UX.
+
+CSF1 roles 14/15 retain immutable `local-install.request` and
+`local-install.acknowledgement` under one exclusive private-directory lease.
+Request load revalidates signed LIQ1 and re-establishes durability; publication
+cannot replace different bytes. MAA2 load/publication verifies the exact retained
+call, both signatures, selected Authority, reconstructed approval and exact
+Installed actor entry. An orphaned acknowledgement cannot authorize recreation
+of its missing request. A different otherwise valid MAA2 cannot replace retained
+completion. This authenticates the issuer's application claim, not independent
+runtime replay or proof that a formerly published route is still live.
+
+Submission retains that lease through HTTP delivery and verification, persists
+MAA2 before returning success, and resumes a saved verified acknowledgement
+without network access. The existing bounded loopback-only transport disables
+proxies/redirects and accepts only HTTP 201 binary MAA2. Errors retain the exact
+request and report an unknown/incomplete outcome; Install has no client-side
+denial completion. Create and Install now share only the exact-call MAA2 verifier
+and transport helper; their signed frames and persistent roles remain distinct.
+
+The first new storage fixture was rejected with `InsecureParent`; its private
+parent layout was corrected without relaxing store validation. The signed
+Install fixture is synthetic client evidence, not a runtime execution. Its
+constructor data is intentionally not used to invoke the PVM. The empty failed
+fixture directory was removed; all scratch/logs use disk-backed target paths.
+The final full `vosx` binary suite passes: 186 passed, zero failed, two ignored,
+6.78s (`r16-install-client-final.log`, locked/offline with socket access).
+The new tests include deterministic preparation, both signature checks,
+re-signed actor-entry substitution, immutable request/response conflicts,
+exclusive lease/reopen, orphan rejection, local completed resume and six real
+socket response cases (201, 503, 403, redirect, wrong content type, truncated
+MAA2), comparing every transmitted request byte. Earlier full and targeted logs
+are `r16-install-client-all.log`, `r16-install-client-verified.log` and
+`r16-install-client-create-regressions.log`; the ignored live-daemon campaign
+and compiled-runtime candidate remain unexecuted release evidence at this head.
+Formatting and diff checks pass.
+
+Remaining C2 work is fresh managed Install command wiring with shared durable
+credential reservation, followed by real install/invoke/restart testing and
+the still-open denial/expiry/abort/crash/capacity cases. No master promotion or
+ordinary-agent usability claim is made here.
 
 ### Durable client acknowledgement before completion
 

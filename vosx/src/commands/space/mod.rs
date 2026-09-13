@@ -34,6 +34,8 @@ pub mod list;
 pub mod local_config;
 #[cfg(target_os = "linux")]
 pub(crate) mod local_create;
+#[cfg(target_os = "linux")]
+pub(crate) mod local_install;
 pub mod new;
 pub mod op_sign;
 pub mod reconcile;
@@ -43,6 +45,14 @@ pub mod verify;
 
 #[derive(Subcommand, Debug)]
 pub enum SpaceCommand {
+    /// Submit or retry an already retained signed Local Install request.
+    #[cfg(target_os = "linux")]
+    SubmitLocalInstall {
+        request_dir: PathBuf,
+        /// Local plaintext daemon socket; no proxies or redirects.
+        #[arg(long)]
+        http: std::net::SocketAddr,
+    },
     /// Create an operator-owned Local Agent with the bundled runtime.
     #[cfg(target_os = "linux")]
     CreateLocalAgent {
@@ -136,6 +146,10 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             http,
             resume,
         } => local_create::run_create(&space, http, resume),
+        #[cfg(target_os = "linux")]
+        SpaceCommand::SubmitLocalInstall { request_dir, http } => {
+            local_install::run_submit(&request_dir, http)
+        }
         #[cfg(target_os = "linux")]
         SpaceCommand::SubmitLocalCreate { request_dir, http } => {
             local_create::run_submit(&request_dir, http)

@@ -169,6 +169,8 @@ enum StoreRole {
     LifecycleRuntime = 11,
     LocalCreateDenial = 12,
     LifecycleActor = 13,
+    LocalInstallRequest = 14,
+    LocalInstallAcknowledgement = 15,
 }
 
 impl StoreRole {
@@ -187,6 +189,8 @@ impl StoreRole {
             Self::LifecycleRuntime => LIFECYCLE_RUNTIME_FILE,
             Self::LocalCreateDenial => LOCAL_DENIAL_FILE,
             Self::LifecycleActor => LIFECYCLE_ACTOR_FILE,
+            Self::LocalInstallRequest => "local-install.request",
+            Self::LocalInstallAcknowledgement => "local-install.acknowledgement",
         }
     }
 
@@ -205,6 +209,8 @@ impl StoreRole {
             Self::LifecycleRuntime => LIFECYCLE_RUNTIME_STAGE_FILE,
             Self::LocalCreateDenial => LOCAL_DENIAL_STAGE_FILE,
             Self::LifecycleActor => LIFECYCLE_ACTOR_STAGE_FILE,
+            Self::LocalInstallRequest => "local-install.request.next",
+            Self::LocalInstallAcknowledgement => "local-install.acknowledgement.next",
         }
     }
 
@@ -217,11 +223,12 @@ impl StoreRole {
             Self::ManagementIntent => MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES,
             Self::LifecycleIssuer => MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
             Self::LocalCreateRequest => 1024 * 1024,
+            Self::LocalInstallRequest => 1024 * 1024,
             Self::LifecycleRuntime => MAX_PACKAGE_ENCODED_BYTES,
             Self::LifecycleActor => MAX_PACKAGE_ENCODED_BYTES,
             Self::LocalCreateDenial => vos::agent::local_lifecycle::LocalCreateDenial::MAX_BYTES,
             Self::CredentialReservation => 165,
-            Self::LocalCreateAcknowledgement => {
+            Self::LocalCreateAcknowledgement | Self::LocalInstallAcknowledgement => {
                 vos::agent::sdk::wire::MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES
             }
             Self::CredentialQuery => {
@@ -245,6 +252,8 @@ impl StoreRole {
             11 => Some(Self::LifecycleRuntime),
             12 => Some(Self::LocalCreateDenial),
             13 => Some(Self::LifecycleActor),
+            14 => Some(Self::LocalInstallRequest),
+            15 => Some(Self::LocalInstallAcknowledgement),
             _ => None,
         }
     }
@@ -631,6 +640,88 @@ impl CleanCredentialQueryFile {
 pub(crate) struct CleanLocalCreateAcknowledgementFile {
     store: ExactFileStore,
     request: Vec<u8>,
+}
+
+/// Immutable Install request and verified delivery evidence under one lease.
+pub(crate) struct CleanLocalInstallFile {
+    request: ExactFileStore,
+    acknowledgement: ExactFileStore,
+}
+
+impl CleanLocalInstallFile {
+    pub(crate) fn open_or_create(root: impl AsRef<Path>) -> Result<Self, CleanFileStoreError> {
+        let root = Arc::new(StoreRoot::open_with_entries(
+            root.as_ref(),
+            &[
+                LOCK_FILE,
+                "local-install.request",
+                "local-install.request.next",
+                "local-install.acknowledgement",
+                "local-install.acknowledgement.next",
+            ],
+        )?);
+        Ok(Self {
+            request: ExactFileStore::new(root.clone(), StoreRole::LocalInstallRequest),
+            acknowledgement: ExactFileStore::new(root, StoreRole::LocalInstallAcknowledgement),
+        })
+    }
+
+    fn validate_request(bytes: &[u8]) -> Result<(), CleanFileStoreError> {
+        if bytes.len() > StoreRole::LocalInstallRequest.maximum_bytes() {
+            return Err(CleanFileStoreError::Oversized);
+        }
+        let submission = vos::agent::local_lifecycle::LocalInstallSubmission::decode(bytes)
+            .map_err(|_| CleanFileStoreError::Corrupt)?;
+        if submission.into_parts().1.authenticated_node.is_some() {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn publish_request(&mut self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
+        Self::validate_request(bytes)?;
+        // An orphaned or contradictory completion is not permission to
+        // regenerate its missing request from newly supplied bytes.
+        self.load_acknowledgement()?;
+        self.request.commit_with_replacement(bytes, false)
+    }
+
+    pub(crate) fn load_request(&mut self) -> Result<Option<Vec<u8>>, CleanFileStoreError> {
+        let bytes = self
+            .request
+            .load(StoreRole::LocalInstallRequest.maximum_bytes())?;
+        if let Some(bytes) = &bytes {
+            Self::validate_request(bytes)?;
+            self.request.commit_with_replacement(bytes, false)?;
+        }
+        Ok(bytes)
+    }
+
+    fn validate_acknowledgement(&mut self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
+        let request = self.load_request()?.ok_or(CleanFileStoreError::Corrupt)?;
+        super::local_install::verify_acknowledgement(&request, bytes)
+            .map(|_| ())
+            .map_err(|_| CleanFileStoreError::Corrupt)
+    }
+
+    pub(crate) fn publish_acknowledgement(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), CleanFileStoreError> {
+        self.validate_acknowledgement(bytes)?;
+        self.acknowledgement.commit_with_replacement(bytes, false)
+    }
+
+    pub(crate) fn load_acknowledgement(&mut self) -> Result<Option<Vec<u8>>, CleanFileStoreError> {
+        let bytes = self
+            .acknowledgement
+            .load(StoreRole::LocalInstallAcknowledgement.maximum_bytes())?;
+        if let Some(bytes) = &bytes {
+            self.validate_acknowledgement(bytes)?;
+            self.acknowledgement.commit_with_replacement(bytes, false)?;
+        }
+        Ok(bytes)
+    }
 }
 
 impl CleanLocalCreateAcknowledgementFile {
