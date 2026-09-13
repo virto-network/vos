@@ -2864,6 +2864,11 @@ where
         super::driver::verify_clean_runtime_package_binding(descriptor, &runtime)
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
         let receipt = self.issue_management_intent(slot, managed, issuer, signer)?;
+        #[cfg(test)]
+        if self.finalization_failure_once == Some(4) {
+            self.finalization_failure_once = None;
+            return Err(SharedAgentHostError::Unavailable);
+        }
         let agent = local
             .create_agent(runtime, (**descriptor).clone(), receipt.clone())
             .map_err(|_| SharedAgentHostError::Unavailable)?;
@@ -2903,7 +2908,7 @@ where
         signer: &mut S,
     ) -> Result<(AgentId, ManagementApplicationAck), SharedAgentHostError>
     where
-        B: CleanManagementIssuerStore,
+        B: super::clean_authority_issuer::CleanManagementRuntimeStore,
         J: CleanManagementIssuerStore,
         S: CleanManagementReceiptSigner,
     {
@@ -2948,6 +2953,8 @@ where
                 }
             }
         })?;
+        slot.retain_runtime(runtime.exact_bytes())
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
         let retained = slot.intent().ok_or(SharedAgentHostError::ScopeMismatch)?;
         if let Some((receipt, acknowledgement)) = issuer
             .recover_finalized_application(
@@ -4379,7 +4386,22 @@ mod tests {
         #[derive(Clone, Default)]
         struct IssuerMemoryStore {
             image: Arc<Mutex<Option<Vec<u8>>>>,
+            runtime: Arc<Mutex<Option<Vec<u8>>>>,
             advance_clock_after_commits: Option<(Arc<AtomicU64>, usize)>,
+        }
+
+        impl crate::agent::clean_authority_issuer::CleanManagementRuntimeStore for IssuerMemoryStore {
+            fn load_runtime(&mut self) -> Result<Option<Vec<u8>>, MemoryError> {
+                Ok(self.runtime.lock().unwrap().clone())
+            }
+            fn commit_runtime(&mut self, bytes: &[u8]) -> Result<(), MemoryError> {
+                let mut runtime = self.runtime.lock().unwrap();
+                if runtime.as_ref().is_some_and(|saved| saved != bytes) {
+                    return Err(MemoryError);
+                }
+                *runtime = Some(bytes.to_vec());
+                Ok(())
+            }
         }
 
         impl CleanManagementIssuerStore for IssuerMemoryStore {
@@ -7627,6 +7649,21 @@ mod tests {
         }
 
         #[test]
+        fn native_local_lifecycle_startup_creates_from_retained_runtime() {
+            native_local_management_lifecycle(14);
+        }
+
+        #[test]
+        fn native_local_lifecycle_startup_rejects_missing_runtime_before_create() {
+            native_local_management_lifecycle(15);
+        }
+
+        #[test]
+        fn native_local_lifecycle_startup_rejects_corrupt_runtime_before_create() {
+            native_local_management_lifecycle(16);
+        }
+
+        #[test]
         fn native_node_rejects_lifecycle_start_after_shutdown_without_leaking_hosts() {
             native_local_management_lifecycle(3);
         }
@@ -8078,7 +8115,10 @@ mod tests {
                 harness.stop();
                 return;
             }
-            if matches!(coordinated, 2 | 3 | 8 | 9 | 10 | 11 | 12 | 13) {
+            if matches!(
+                coordinated,
+                2 | 3 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16
+            ) {
                 struct LeasedStore {
                     inner: IssuerMemoryStore,
                     active: Arc<AtomicUsize>,
@@ -8103,6 +8143,14 @@ mod tests {
                 impl Drop for LeasedStore {
                     fn drop(&mut self) {
                         self.active.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+                impl crate::agent::clean_authority_issuer::CleanManagementRuntimeStore for LeasedStore {
+                    fn load_runtime(&mut self) -> Result<Option<Vec<u8>>, MemoryError> {
+                        crate::agent::clean_authority_issuer::CleanManagementRuntimeStore::load_runtime(&mut self.inner)
+                    }
+                    fn commit_runtime(&mut self, bytes: &[u8]) -> Result<(), MemoryError> {
+                        crate::agent::clean_authority_issuer::CleanManagementRuntimeStore::commit_runtime(&mut self.inner, bytes)
                     }
                 }
                 struct Stores {
@@ -8252,7 +8300,7 @@ mod tests {
                 let failed_loads = loads.load(Ordering::SeqCst);
                 let interrupted = coordinated >= 10;
                 if interrupted {
-                    controller.fail_finalization_once_for_test(coordinated - 10);
+                    controller.fail_finalization_once_for_test((coordinated - 10).min(4));
                 }
                 let application_slot = harness
                     .fixture
@@ -8279,7 +8327,7 @@ mod tests {
                             &RawCredentialVerifier,
                         )
                         .unwrap();
-                    if coordinated == 13 {
+                    if coordinated >= 13 {
                         assert!(observed.is_none());
                         assert_eq!(issuer.retained_decisions(), 1);
                         None
@@ -8300,7 +8348,7 @@ mod tests {
                 }
                 assert!(loads.load(Ordering::SeqCst) >= failed_loads + 2);
                 let issuer = DurableCleanManagementIssuer::open(
-                    issuer_store,
+                    issuer_store.clone(),
                     descriptor.authority,
                     descriptor.identity.space,
                     descriptor.identity.agent,
@@ -8315,12 +8363,19 @@ mod tests {
                 drop(issuer);
                 routes.retire().unwrap();
                 let routes = controller.local_attachment(4).unwrap();
+                // Unlike replay of an already-applied Create, first physical
+                // application must still be within the issued receipt window.
+                let recovery_slot = if coordinated >= 14 {
+                    LOGICAL_SLOT + 3
+                } else {
+                    LOGICAL_SLOT + 20
+                };
                 harness
                     .fixture
                     .logical_slot
                     .as_ref()
                     .unwrap()
-                    .store(LOGICAL_SLOT + 20, Ordering::Release);
+                    .store(recovery_slot, Ordering::Release);
                 if !interrupted {
                     assert_eq!(
                         controller
@@ -8333,6 +8388,11 @@ mod tests {
                 assert_eq!(active.load(Ordering::SeqCst), 2);
                 routes.retire().unwrap();
                 system.retire().unwrap();
+                if coordinated >= 15 {
+                    *intent_store.runtime.lock().unwrap() =
+                        (coordinated == 16).then(|| b"not-a-runtime-package".to_vec());
+                }
+                let issuer_before_restart = issuer_store.image.lock().unwrap().clone();
                 if coordinated >= 9 {
                     #[inline(never)]
                     fn restart<F: crate::agent::local_lifecycle::LocalLifecycleStoreFactory>(
@@ -8344,7 +8404,7 @@ mod tests {
                         interrupted: bool,
                         unaccepted: bool,
                         missing: bool,
-                    ) -> TestLocalLifecycle<F> {
+                    ) -> Result<TestLocalLifecycle<F>, SharedAgentHostError> {
                         let (old_owner, old_local, mut stores, mut signer) =
                             controller.into_parts_for_test();
                         let before = old_owner.ordered_index_for_test().unwrap();
@@ -8420,8 +8480,7 @@ mod tests {
                         let controller =
                             crate::agent::local_lifecycle::LocalLifecycleController::with_recovery(
                                 reopened, local, stores, signer, recovery,
-                            )
-                            .unwrap();
+                            )?;
                         assert_eq!(
                             controller.ordered_index_for_test().unwrap(),
                             before
@@ -8431,12 +8490,12 @@ mod tests {
                                     0
                                 }
                         );
-                        controller
+                        Ok(controller)
                     }
                     for attempt in 0..2 {
                         // Startup has its own normal-sized thread stack, not
                         // the large multiphase setup fixture's live frames.
-                        controller = std::thread::scope(|scope| {
+                        let reopened = std::thread::scope(|scope| {
                             scope
                                 .spawn(|| {
                                     restart(
@@ -8453,6 +8512,27 @@ mod tests {
                                 .join()
                                 .unwrap()
                         });
+                        if coordinated >= 15 {
+                            assert!(matches!(
+                                (coordinated, reopened),
+                                (15, Err(SharedAgentHostError::Unavailable))
+                                    | (16, Err(SharedAgentHostError::ScopeMismatch))
+                            ));
+                            assert_eq!(active.load(Ordering::SeqCst), 0);
+                            assert_eq!(*issuer_store.image.lock().unwrap(), issuer_before_restart);
+                            let local = crate::agent::local_sdk_host::LocalAgentHost::open(
+                                &root,
+                                descriptor.identity.space,
+                                harness.fixture.plan.pins.node,
+                                harness.fixture.trust.clone(),
+                            )
+                            .unwrap();
+                            assert!(local.list().unwrap().is_empty());
+                            drop(local);
+                            harness.stop();
+                            return;
+                        }
+                        controller = reopened.unwrap();
                         let recovered = controller
                             .create(descriptor.clone(), call.clone(), runtime.clone())
                             .unwrap();
@@ -8461,6 +8541,9 @@ mod tests {
                         assert!(recovered.1.verify_with(&RawCredentialVerifier).is_ok());
                         if coordinated == 13 {
                             assert_eq!(recovered.1.applied_at, application_slot);
+                        }
+                        if coordinated == 14 {
+                            assert_eq!(recovered.1.applied_at, recovery_slot);
                         }
                         assert_eq!(&recovered, result.get_or_insert(recovered.clone()));
                         assert_eq!(active.load(Ordering::SeqCst), 2);
@@ -8480,7 +8563,7 @@ mod tests {
                     else {
                         panic!("startup did not persist finalization")
                     };
-                    assert_eq!(*observed_slot, LOGICAL_SLOT + 20);
+                    assert_eq!(*observed_slot, recovery_slot);
                 }
                 harness.stop();
                 return;

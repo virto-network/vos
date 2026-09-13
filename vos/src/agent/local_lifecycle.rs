@@ -218,10 +218,11 @@ impl LocalLifecycleQueue {
     }
 }
 
-/// Open the same two independent durable images on every retry. Implementors
-/// derive paths from the configured Space and Agent, never caller path strings.
+/// Open the independent intent/issuer images and retained Create runtime under
+/// the same exclusive lifecycle lease on every retry. Implementors derive paths
+/// from the configured Space and Agent, never caller path strings.
 pub trait LocalLifecycleStoreFactory {
-    type Intent: CleanManagementIssuerStore;
+    type Intent: super::clean_authority_issuer::CleanManagementRuntimeStore;
     type Issuer: CleanManagementIssuerStore;
     type Error;
 
@@ -646,7 +647,7 @@ where
     /// lifecycle/route access.
     pub fn with_recovery(
         mut system: CleanSystemAgentBootstrapOwner<P, R, I>,
-        local: LocalAgentHost,
+        mut local: LocalAgentHost,
         stores: F,
         mut signer: S,
         mut recovery: LocalLifecycleRecovery<F::Intent, F::Issuer>,
@@ -661,18 +662,55 @@ where
         // phases require their own protected recovery protocol, not omission.
         let admission = recovery.startup_admission()?;
         let mut observations = Vec::new();
-        for (index, entry) in recovery.entries.iter().enumerate() {
+        let mut creates = Vec::new();
+        for (index, entry) in recovery.entries.iter_mut().enumerate() {
             if let Some(receipt) = &entry.issued {
                 let request = entry
                     .intent
                     .intent()
-                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?
+                    .request()
+                    .clone();
+                if entry.observed.is_none()
+                    && matches!(
+                        local.show(entry.agent),
+                        Err(super::local_sdk_host::LocalAgentHostError::NotFound)
+                    )
+                {
+                    let ManagementRequest::Create(descriptor) = &request else {
+                        return Err(SharedAgentHostError::ScopeMismatch);
+                    };
+                    let bytes = entry
+                        .intent
+                        .load_runtime()
+                        .map_err(|_| SharedAgentHostError::Unavailable)?
+                        .ok_or(SharedAgentHostError::Unavailable)?;
+                    let runtime = super::package_admission::admit_runtime_package(&bytes)
+                        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                    super::driver::verify_clean_runtime_package_binding(descriptor, &runtime)
+                        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                    creates.push((index, runtime, (**descriptor).clone(), receipt.clone()));
+                    continue;
+                }
                 // A finalized issuer cannot replace the actual Local image.
                 let observation = local
-                    .observe_management_application(entry.agent, request.request(), receipt)
+                    .observe_management_application(entry.agent, &request, receipt)
                     .map_err(|_| SharedAgentHostError::Unavailable)?;
                 observations.push((index, observation));
             }
+        }
+        for (index, runtime, descriptor, receipt) in creates {
+            let request = ManagementRequest::Create(Box::new(descriptor.clone()));
+            let agent = local
+                .create_agent(runtime, descriptor, receipt.clone())
+                .map_err(|error| {
+                    crate::log::warn!("Local lifecycle recovery Create failed: {error:?}");
+                    SharedAgentHostError::Unavailable
+                })?;
+            let observation = local
+                .observe_management_application(agent, &request, &receipt)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            observations.push((index, observation));
         }
         // Check all physical images before signing a missing acknowledgement
         // for any member. An issued receipt alone is not application proof.

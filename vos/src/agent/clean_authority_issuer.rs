@@ -70,6 +70,23 @@ impl<B: CleanManagementIssuerStore + ?Sized> CleanManagementIssuerStore for &mut
     }
 }
 
+/// The exact Create runtime is stored independently of the intent image but
+/// under the same exclusive lease. Publication is immutable and durable before
+/// policy/issuance; a retry must reload after any ambiguous write.
+pub trait CleanManagementRuntimeStore: CleanManagementIssuerStore {
+    fn load_runtime(&mut self) -> Result<Option<Vec<u8>>, Self::Error>;
+    fn commit_runtime(&mut self, package: &[u8]) -> Result<(), Self::Error>;
+}
+
+impl<B: CleanManagementRuntimeStore + ?Sized> CleanManagementRuntimeStore for &mut B {
+    fn load_runtime(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        (**self).load_runtime()
+    }
+    fn commit_runtime(&mut self, package: &[u8]) -> Result<(), Self::Error> {
+        (**self).commit_runtime(package)
+    }
+}
+
 /// Policy-selected context which is visible in the signed SDK receipt.
 ///
 /// This is data, not proof that policy ran. Possession of the separately

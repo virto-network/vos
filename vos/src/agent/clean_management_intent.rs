@@ -489,6 +489,37 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
         self.store
     }
 
+    pub(crate) fn load_runtime(&mut self) -> Result<Option<Vec<u8>>, IntentSlotError<B::Error>>
+    where
+        B: super::clean_authority_issuer::CleanManagementRuntimeStore,
+    {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        self.store.load_runtime().map_err(IntentSlotError::Storage)
+    }
+
+    pub(crate) fn retain_runtime(&mut self, package: &[u8]) -> Result<(), IntentSlotError<B::Error>>
+    where
+        B: super::clean_authority_issuer::CleanManagementRuntimeStore,
+    {
+        if self.intent.is_none() {
+            return Err(IntentSlotError::Invalid);
+        }
+        match self.load_runtime()? {
+            Some(bytes) if bytes == package => Ok(()),
+            Some(_) => Err(IntentSlotError::Conflict),
+            None => {
+                self.poisoned = true;
+                self.store
+                    .commit_runtime(package)
+                    .map_err(IntentSlotError::Storage)?;
+                self.poisoned = false;
+                Ok(())
+            }
+        }
+    }
+
     pub(crate) fn intent(&self) -> Option<&CleanManagementIntent> {
         self.intent.as_ref()
     }

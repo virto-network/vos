@@ -27,12 +27,13 @@ AJC3 checkpoints and AGIM/AGI2 images are deliberately rejected, with no in-plac
 migration provided; do not point this clean-break build at valuable old data.
 Current host lifecycle images additionally require CMI4/CMR2 with pre-dispatch
 journal anchors; earlier CMI3/CMR1 images are rejected, not migrated.
-Startup now discovers lifecycle stores before system attachment, recovers
-acknowledgements from exact issued receipts and durable Local images, completes
-finalization (including protected preparation of a missing envelope), and retires
-results before normal routes. Earlier phases without an issued receipt or
-recoverable physical Local application still stop startup, preserving their
-stores. Continuous live protection and
+Startup now discovers lifecycle stores before system attachment, completes
+Local Create from an exact issued receipt and retained runtime when necessary,
+recovers acknowledgements from durable Local images, completes finalization
+(including protected preparation of a missing envelope), and retires results
+before normal routes. First-time application still requires a valid unexpired
+receipt. Earlier phases without an issued receipt, or missing required runtime
+artifacts, still stop startup, preserving their stores. Continuous live protection and
 coexistence with an unfinished projection
 remain implementation blockers, not deployment-ready behavior. Do not delete
 those stores to bypass the recovery check.
@@ -3332,6 +3333,51 @@ Create. The assertion now captures the actual pre-Create clock; the final five
 startup tests above include that correction. Production code did not change
 between those runs. This is not a claim of a single all-green full native rerun.
 Logs remain in shared disk scratch; formatting and diff checks pass.
+
+### Retained Create runtime and recovery before Local image creation
+
+Authenticated Create now retains its exact admitted runtime package after
+pledging the intent but before authorization/issuance. The runtime has an
+independent immutable whole-image store under the intent/issuer writer lease;
+storage failures poison the live intent slot and retries reload without dropping
+the lease. In vosx this is `management.runtime`/`management.runtime.next`, CSF1
+role 11, bounded by `MAX_PACKAGE_ENCODED_BYTES`. Existing private-file validation,
+role separation, predecessor-bound staged publication and directory syncing are
+reused. CMI4/CMR2 remain unchanged. Older completed intents need no runtime sidecar
+for physical re-observation, but an older missing-image intent without this
+artifact cannot be reconstructed from a substitute/default runtime.
+
+Startup with an issued receipt and no Local image loads and re-admits the saved
+package, checks its complete descriptor binding, then applies Create. It checks
+all existing images and needed package bindings before creating missing images;
+all resulting physical applications are observed before signing any missing
+acknowledgement. Protected finalization and retirement follow as before. An
+already-recorded application acknowledgement cannot authorize recreating a
+missing image. Expired first application still fails; this does not bypass
+receipt expiry or implement reauthorization/cancellation.
+
+The new positive native case interrupts after receipt issuance but before
+physical Create, recovers using only retained stores, and verifies current-slot
+application/finalization followed by a zero-Ordered-work second restart and exact
+retry. Missing/corrupt runtime cases require no created agent, unchanged issuer
+state, and released leases after rejection. The filesystem tests cover staged
+runtime publication, borrowed reload, immutable retry, writer exclusion and
+cross-role rejection; raw file payload tests are not package-admission proof.
+
+Pending authorization/issuance, continuous protection throughout live creation,
+cross-process filesystem fault campaigns, projection/capacity/GC cases and
+expired-operation resolution remain open, along with native install/invoke and
+the release gates. No bundle rebuild or fresh deployment smoke is claimed.
+
+Verification: **20 native bootstrap/lifecycle tests passed** (347.78s,
+`r16-retained-runtime-native-final.log`), and **12 filesystem lifecycle tests
+passed** (0.09s, `r16-retained-runtime-files.log`). The focused positive recovery
+also passed (13.83s, `r16-retained-runtime-startup-final.log`). Its initial fixture
+attempt reused the post-expiry replay clock and was refused
+(`r16-retained-runtime-startup.log`); first application is now tested at slot 23,
+within the signed window, rather than slot 40. Receipt-expiry enforcement was
+not weakened. Logs remain in shared disk scratch. Formatting and diff checks
+pass; the full feature/release matrix remains pending.
 
 ### Durable client acknowledgement before completion
 

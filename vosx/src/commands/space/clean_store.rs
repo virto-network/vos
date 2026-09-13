@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use fs2::FileExt as _;
 use vos::agent::bootstrap::MAX_SYSTEM_AGENT_GENESIS_PROVISION_BYTES;
 use vos::agent::clean_authority_issuer::{
-    CleanManagementIssuerStore, MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES,
-    MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
+    CleanManagementIssuerStore, CleanManagementRuntimeStore,
+    MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES, MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
 };
 use vos::agent::clean_bootstrap::{
     CleanSystemAgentBootstrapStore, MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES,
@@ -47,6 +47,8 @@ const INTENT_FILE: &str = "management.intent";
 const INTENT_STAGE_FILE: &str = "management.intent.next";
 const LIFECYCLE_ISSUER_FILE: &str = "management.issuer";
 const LIFECYCLE_ISSUER_STAGE_FILE: &str = "management.issuer.next";
+const LIFECYCLE_RUNTIME_FILE: &str = "management.runtime";
+const LIFECYCLE_RUNTIME_STAGE_FILE: &str = "management.runtime.next";
 const LOCAL_REQUEST_FILE: &str = "local-create.request";
 const LOCAL_REQUEST_STAGE_FILE: &str = "local-create.request.next";
 const LOCAL_REQUEST_ENTRIES: [&str; 3] = [LOCK_FILE, LOCAL_REQUEST_FILE, LOCAL_REQUEST_STAGE_FILE];
@@ -63,12 +65,14 @@ const CREDENTIAL_QUERY_ENTRIES: [&str; 3] = [
     CREDENTIAL_QUERY_FILE,
     CREDENTIAL_QUERY_STAGE_FILE,
 ];
-const LIFECYCLE_ENTRIES: [&str; 5] = [
+const LIFECYCLE_ENTRIES: [&str; 7] = [
     LOCK_FILE,
     INTENT_FILE,
     INTENT_STAGE_FILE,
     LIFECYCLE_ISSUER_FILE,
     LIFECYCLE_ISSUER_STAGE_FILE,
+    LIFECYCLE_RUNTIME_FILE,
+    LIFECYCLE_RUNTIME_STAGE_FILE,
 ];
 
 pub(crate) const MAX_CLEAN_SYSTEM_AGENT_GENESIS_ARCHIVE_BYTES: usize =
@@ -155,6 +159,7 @@ enum StoreRole {
     CredentialQuery = 8,
     CredentialReservation = 9,
     LocalCreateAcknowledgement = 10,
+    LifecycleRuntime = 11,
 }
 
 impl StoreRole {
@@ -170,6 +175,7 @@ impl StoreRole {
             Self::CredentialQuery => CREDENTIAL_QUERY_FILE,
             Self::CredentialReservation => RESERVATION_FILE,
             Self::LocalCreateAcknowledgement => LOCAL_ACK_FILE,
+            Self::LifecycleRuntime => LIFECYCLE_RUNTIME_FILE,
         }
     }
 
@@ -185,6 +191,7 @@ impl StoreRole {
             Self::CredentialQuery => CREDENTIAL_QUERY_STAGE_FILE,
             Self::CredentialReservation => RESERVATION_STAGE_FILE,
             Self::LocalCreateAcknowledgement => LOCAL_ACK_STAGE_FILE,
+            Self::LifecycleRuntime => LIFECYCLE_RUNTIME_STAGE_FILE,
         }
     }
 
@@ -197,6 +204,7 @@ impl StoreRole {
             Self::ManagementIntent => MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES,
             Self::LifecycleIssuer => MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
             Self::LocalCreateRequest => 1024 * 1024,
+            Self::LifecycleRuntime => MAX_PACKAGE_ENCODED_BYTES,
             Self::CredentialReservation => 165,
             Self::LocalCreateAcknowledgement => {
                 vos::agent::sdk::wire::MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES
@@ -219,6 +227,7 @@ impl StoreRole {
             8 => Some(Self::CredentialQuery),
             9 => Some(Self::CredentialReservation),
             10 => Some(Self::LocalCreateAcknowledgement),
+            11 => Some(Self::LifecycleRuntime),
             _ => None,
         }
     }
@@ -312,10 +321,10 @@ impl CleanManagementLifecycleFiles {
     fn from_root(root: StoreRoot) -> Self {
         let root = Arc::new(root);
         Self {
-            intent: CleanManagementIntentFile(ExactFileStore::new(
-                Arc::clone(&root),
-                StoreRole::ManagementIntent,
-            )),
+            intent: CleanManagementIntentFile(
+                ExactFileStore::new(Arc::clone(&root), StoreRole::ManagementIntent),
+                ExactFileStore::new(Arc::clone(&root), StoreRole::LifecycleRuntime),
+            ),
             issuer: CleanManagementIssuerFile(ExactFileStore::new(
                 root,
                 StoreRole::LifecycleIssuer,
@@ -328,7 +337,7 @@ impl CleanManagementLifecycleFiles {
     }
 }
 
-pub(crate) struct CleanManagementIntentFile(ExactFileStore);
+pub(crate) struct CleanManagementIntentFile(ExactFileStore, ExactFileStore);
 
 /// One immutable signed submission in its own leased private directory.
 /// Keep this lease until submission finishes; ambiguous outcomes retain the
@@ -813,6 +822,19 @@ impl CleanManagementIssuerStore for CleanManagementIntentFile {
 
     fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
         self.0.commit(image)
+    }
+}
+
+impl CleanManagementRuntimeStore for CleanManagementIntentFile {
+    fn load_runtime(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.1.load(MAX_PACKAGE_ENCODED_BYTES)
+    }
+    fn commit_runtime(&mut self, package: &[u8]) -> Result<(), Self::Error> {
+        match self.load_runtime()? {
+            Some(bytes) if bytes == package => Ok(()),
+            Some(_) => Err(CleanFileStoreError::RequestConflict),
+            None => self.1.commit(package),
+        }
     }
 }
 
@@ -2573,6 +2595,64 @@ pub(crate) mod tests {
         ));
         drop(issuer);
         assert!(CleanManagementLifecycleFiles::open_or_create(&fixture.root).is_ok());
+    }
+
+    #[test]
+    fn lifecycle_runtime_recovers_staged_publication_and_is_immutable_under_lease() {
+        let fixture = Fixture::new("lifecycle-runtime");
+        let (mut intent, mut issuer) = CleanManagementLifecycleFiles::open_or_create(&fixture.root)
+            .unwrap()
+            .into_parts();
+        intent.commit(b"intent").unwrap();
+        issuer.commit(b"issuer").unwrap();
+        assert_eq!(intent.load_runtime().unwrap(), None);
+        stage(&intent.1, None, b"exact-runtime");
+        assert_eq!(
+            CleanManagementRuntimeStore::load_runtime(&mut &mut intent).unwrap(),
+            Some(b"exact-runtime".to_vec())
+        );
+        assert!(!fixture.root.join(LIFECYCLE_RUNTIME_STAGE_FILE).exists());
+        intent.commit_runtime(b"exact-runtime").unwrap();
+        assert!(matches!(
+            intent.commit_runtime(b"different-runtime"),
+            Err(CleanFileStoreError::RequestConflict)
+        ));
+        assert_eq!(intent.load().unwrap(), Some(b"intent".to_vec()));
+        assert_eq!(issuer.load().unwrap(), Some(b"issuer".to_vec()));
+        assert!(matches!(
+            CleanManagementLifecycleFiles::open_existing(&fixture.root),
+            Err(CleanFileStoreError::Busy)
+        ));
+        drop(issuer);
+        assert!(matches!(
+            CleanManagementLifecycleFiles::open_existing(&fixture.root),
+            Err(CleanFileStoreError::Busy)
+        ));
+        drop(intent);
+        let (mut intent, _) = CleanManagementLifecycleFiles::open_existing(&fixture.root)
+            .unwrap()
+            .into_parts();
+        assert_eq!(
+            intent.load_runtime().unwrap(),
+            Some(b"exact-runtime".to_vec())
+        );
+        assert_eq!(intent.1.role.maximum_bytes(), MAX_PACKAGE_ENCODED_BYTES);
+    }
+
+    #[test]
+    fn lifecycle_runtime_rejects_an_issuer_envelope() {
+        let fixture = Fixture::new("lifecycle-runtime-role");
+        let (mut intent, mut issuer) = CleanManagementLifecycleFiles::open_or_create(&fixture.root)
+            .unwrap()
+            .into_parts();
+        issuer.commit(b"issuer").unwrap();
+        let bytes = fs::read(fixture.root.join(LIFECYCLE_ISSUER_FILE)).unwrap();
+        write_private(&fixture.root.join(LIFECYCLE_RUNTIME_FILE), &bytes);
+        assert!(matches!(
+            intent.load_runtime(),
+            Err(CleanFileStoreError::WrongStoreRole)
+        ));
+        assert_eq!(issuer.load().unwrap(), Some(b"issuer".to_vec()));
     }
 
     #[test]
