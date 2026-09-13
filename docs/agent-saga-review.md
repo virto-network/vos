@@ -13,7 +13,11 @@ Implementation is in `.worktrees/ch08-runtime-directory` on
 `wip/ch08-runtime-directory`, not yet in the root `saga/agents` checkout.
 Use only an isolated, disposable environment for bootstrap/ingress testing.
 Fresh-space first start and restart with bundled system actors and HTTP/SSH
-have passed; ordinary-agent creation is not yet a usable production path.
+have passed. One recovered Local Create has returned a client-verified
+acknowledgement after native route reconciliation. Exact repeated delivery now
+passes after recovering a recorded HTTP timeout; first-response latency remains
+high. Install/invoke remains unproven, so this
+is not yet a usable ordinary-agent production path.
 The native Local-controller wiring at `ee047d48` passed fresh-data startup and
 restart using the rebuilt CLI (`target/native-local-smoke.DATNas`, details below).
 This is bootstrap/ingress coverage, not ordinary-Agent creation/installation.
@@ -51,8 +55,10 @@ review endpoints for individual fixes:
    lifecycle controller. Signed Local Create has a bounded ingress queue and
    an HTTP submission endpoint and retained-request CLI submission. Fresh CLI
    preparation/discovery is now wired. Management dispatch clock drift is fixed
-   in targeted tests; the latest live Create produced a Local image but timed
-   out before acknowledgement/publication was verified. Install ingress also
+   in targeted tests. One live resume returned a verified acknowledgement after
+   route reconciliation. The latest live test recovered a timeout and then
+   returned two identical verified responses; initial latency remains high.
+   Install ingress also
    remains open. Prove
    authorization, durable issuance, physical application, acknowledgement and
    route publication as one restartable workflow. Replace the deliberately unavailable ordinary-Agent
@@ -64,7 +70,7 @@ review endpoints for individual fixes:
    The owner now has tested Local Create/application and Authority-finalization
    adapters, including fresh journal replay before the issuer's finalization
    marker. These are now wired into native startup and the node Create API;
-   they do not yet prove end-to-end ingress creation/publication or close
+   initial Create/retry completion remains unreliable, and they do not close
    ordinary Shared-Agent finality.
    Implement the Local native entry point first without pretending it replaces
    the Shared finality gate: image-backed `LocalAgentHost::open` does not use
@@ -2398,6 +2404,52 @@ failure and allows one more exact `--resume` while keeping the same daemon up,
 then compares the next verified response byte-for-byte. It neither increases
 the HTTP deadline nor substitutes a new request. This exercises bounded
 recovery after a wait timeout; any initial timeout remains a latency failure.
+
+That live script subsequently **passed with exit 0** on `d95b7afa`. Startup
+became ready at `2026-09-13T05:01:13.745562Z`. The first submission timed out;
+an exact retry on the same running daemon returned a verified response at
+`05:04:08.307527Z`, and the next identical retry returned at
+`05:04:08.811548Z` (about 0.50 seconds later). Both JSON files are 3,138 bytes
+with SHA-256 `b45514dc37f30798a2fae95769fc75388ab7f2431805fd80a5fde8c2e0736cc0`:
+`published-resume-recovered-result.json` and `published-resume-retry-result.json`
+under `target/native-clock-smoke.GLMaE7`. The request hash remains
+`173da629f2e649e485927ca92a2d02b9ab5aa629197645ff6bfbe124aef8862f`.
+The daemon shut down and removed its endpoint. This proves verified Local
+Create recovery and repeat delivery after restart, not a within-deadline
+initial response or actor Install/invoke. No fresh nonce, permissive verifier,
+cached client response, or fabricated acknowledgement was used.
+The recovered response also compares byte-for-byte equal to the earlier
+`fast-resume-result.json`, proving the acknowledgement itself stayed unchanged
+across the intervening daemon restart.
+
+### Durable client acknowledgement before completion
+
+The fresh Create CLI now persists the full verified MAA2 before marking its
+credential reservation completed. CSF1 role 10 stores an immutable
+`local-create.acknowledgement` in an exclusively leased private directory under
+the operation's `acknowledgement/` child. Both load and publication verify the
+canonical acknowledgement against the complete retained signed request;
+loads also re-establish durability before proceeding. Different responses and
+replacement-predecessor frames are refused. This retains the actual completion
+evidence, not only its hash, as a prerequisite for safe lifecycle retirement.
+
+The CLI still submits exact retries to the server: a local acknowledgement is
+not presented as fresh route/publication evidence, and this change cannot make
+the running HTTP smoke pass through a local cache. The running
+`published-resume` script uses the preceding `d95b7afa` binary, without this
+storage addition.
+
+All **174 CLI tests pass**, zero fail, one existing compiled-runtime release
+test remains ignored (`r16-client-ack-storage-final.log`, 2.85 seconds, under
+`.worktrees/ch08-c2-native/target/task-tmp`). New coverage includes valid reopen,
+signature and request substitution refusal, immutable bytes, interrupted initial
+stage recovery, and preservation of rejected replacement evidence. The first
+run exposed an accidentally identical “different request” fixture and a sandbox
+socket denial; the fixture was corrected and the final suite ran with local
+socket access. No guest artifact or existing store role changed.
+The final native CLI build including acknowledgement storage also passes
+(`r16-client-ack-cli-build.log`, 3.47 seconds); the live smoke above predates
+only this client-side storage addition.
 
 ### Durable immutable Local Create request storage
 

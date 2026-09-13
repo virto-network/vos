@@ -50,6 +50,9 @@ const LIFECYCLE_ISSUER_STAGE_FILE: &str = "management.issuer.next";
 const LOCAL_REQUEST_FILE: &str = "local-create.request";
 const LOCAL_REQUEST_STAGE_FILE: &str = "local-create.request.next";
 const LOCAL_REQUEST_ENTRIES: [&str; 3] = [LOCK_FILE, LOCAL_REQUEST_FILE, LOCAL_REQUEST_STAGE_FILE];
+const LOCAL_ACK_FILE: &str = "local-create.acknowledgement";
+const LOCAL_ACK_STAGE_FILE: &str = "local-create.acknowledgement.next";
+const LOCAL_ACK_ENTRIES: [&str; 3] = [LOCK_FILE, LOCAL_ACK_FILE, LOCAL_ACK_STAGE_FILE];
 const CREDENTIAL_QUERY_FILE: &str = "credential.query";
 const RESERVATION_FILE: &str = "credential.reservation";
 const RESERVATION_STAGE_FILE: &str = "credential.reservation.next";
@@ -151,6 +154,7 @@ enum StoreRole {
     LocalCreateRequest = 7,
     CredentialQuery = 8,
     CredentialReservation = 9,
+    LocalCreateAcknowledgement = 10,
 }
 
 impl StoreRole {
@@ -165,6 +169,7 @@ impl StoreRole {
             Self::LocalCreateRequest => LOCAL_REQUEST_FILE,
             Self::CredentialQuery => CREDENTIAL_QUERY_FILE,
             Self::CredentialReservation => RESERVATION_FILE,
+            Self::LocalCreateAcknowledgement => LOCAL_ACK_FILE,
         }
     }
 
@@ -179,6 +184,7 @@ impl StoreRole {
             Self::LocalCreateRequest => LOCAL_REQUEST_STAGE_FILE,
             Self::CredentialQuery => CREDENTIAL_QUERY_STAGE_FILE,
             Self::CredentialReservation => RESERVATION_STAGE_FILE,
+            Self::LocalCreateAcknowledgement => LOCAL_ACK_STAGE_FILE,
         }
     }
 
@@ -192,6 +198,9 @@ impl StoreRole {
             Self::LifecycleIssuer => MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
             Self::LocalCreateRequest => 1024 * 1024,
             Self::CredentialReservation => 165,
+            Self::LocalCreateAcknowledgement => {
+                vos::agent::sdk::wire::MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES
+            }
             Self::CredentialQuery => {
                 vos::agent::sdk::wire::MAX_AUTHORITY_PROJECTION_QUERY_WIRE_BYTES
             }
@@ -209,6 +218,7 @@ impl StoreRole {
             7 => Some(Self::LocalCreateRequest),
             8 => Some(Self::CredentialQuery),
             9 => Some(Self::CredentialReservation),
+            10 => Some(Self::LocalCreateAcknowledgement),
             _ => None,
         }
     }
@@ -540,6 +550,55 @@ impl CleanCredentialQueryFile {
 }
 
 #[cfg(target_os = "linux")]
+/// Immutable client delivery evidence, bound to the complete retained request.
+/// This is not a substitute for server publication or runtime finality.
+pub(crate) struct CleanLocalCreateAcknowledgementFile {
+    store: ExactFileStore,
+    request: Vec<u8>,
+}
+
+impl CleanLocalCreateAcknowledgementFile {
+    pub(crate) fn open_or_create(
+        root: impl AsRef<Path>,
+        request: &[u8],
+    ) -> Result<Self, CleanFileStoreError> {
+        CleanLocalCreateRequestFile::validate(request)?;
+        let root = Arc::new(StoreRoot::open_with_entries(
+            root.as_ref(),
+            &LOCAL_ACK_ENTRIES,
+        )?);
+        Ok(Self {
+            store: ExactFileStore::new(root, StoreRole::LocalCreateAcknowledgement),
+            request: request.to_vec(),
+        })
+    }
+
+    pub(crate) fn load(&mut self) -> Result<Option<Vec<u8>>, CleanFileStoreError> {
+        let bytes = self
+            .store
+            .load(StoreRole::LocalCreateAcknowledgement.maximum_bytes())?;
+        if let Some(bytes) = &bytes {
+            self.validate(bytes)?;
+            self.store.commit_with_replacement(bytes, false)?;
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn publish(&mut self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
+        self.validate(bytes)?;
+        self.store.commit_with_replacement(bytes, false)
+    }
+
+    fn validate(&self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
+        if bytes.len() > StoreRole::LocalCreateAcknowledgement.maximum_bytes() {
+            return Err(CleanFileStoreError::Oversized);
+        }
+        super::local_create::verify_acknowledgement(&self.request, bytes)
+            .map(|_| ())
+            .map_err(|_| CleanFileStoreError::Corrupt)
+    }
+}
+
 impl CleanLocalCreateRequestFile {
     pub(crate) fn open_or_create(root: impl AsRef<Path>) -> Result<Self, CleanFileStoreError> {
         let root = Arc::new(StoreRoot::open_with_entries(
@@ -884,7 +943,9 @@ impl ExactFileStore {
         let staged = self.read_optional(self.role.stage_file(), maximum_bytes)?;
         if matches!(
             self.role,
-            StoreRole::LocalCreateRequest | StoreRole::CredentialQuery
+            StoreRole::LocalCreateRequest
+                | StoreRole::CredentialQuery
+                | StoreRole::LocalCreateAcknowledgement
         ) && canonical
             .iter()
             .chain(staged.iter())
@@ -1792,6 +1853,65 @@ pub(crate) mod tests {
             store.reserve(next).unwrap(),
             CredentialReservationStatus::Pending
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[inline(never)]
+    pub(crate) fn check_acknowledgement_storage(request: &[u8], acknowledgement: &[u8]) {
+        let fixture = Fixture::new("local-create-acknowledgement");
+        let open =
+            || CleanLocalCreateAcknowledgementFile::open_or_create(&fixture.root, request).unwrap();
+        let mut store = open();
+        assert_eq!(store.load().unwrap(), None);
+        let mut forged = acknowledgement.to_vec();
+        let last = forged.len() - 1;
+        forged[last] ^= 1;
+        assert!(store.publish(&forged).is_err());
+        assert!(!fixture.root.join(LOCAL_ACK_FILE).exists());
+        store.publish(acknowledgement).unwrap();
+        let original = fs::read(fixture.root.join(LOCAL_ACK_FILE)).unwrap();
+        store.publish(acknowledgement).unwrap();
+        assert!(store.publish(&forged).is_err());
+        assert_eq!(
+            fs::read(fixture.root.join(LOCAL_ACK_FILE)).unwrap(),
+            original
+        );
+        drop(store);
+        let mut store = open();
+        assert_eq!(store.load().unwrap().as_deref(), Some(acknowledgement));
+        drop(store);
+        let different = local_request(u64::MAX);
+        assert_ne!(different, request);
+        let mut wrong_scope =
+            CleanLocalCreateAcknowledgementFile::open_or_create(&fixture.root, &different).unwrap();
+        assert!(wrong_scope.load().is_err());
+        assert_eq!(
+            fs::read(fixture.root.join(LOCAL_ACK_FILE)).unwrap(),
+            original
+        );
+        drop(wrong_scope);
+
+        let staged_fixture = Fixture::new("local-create-acknowledgement-stage");
+        let mut staged =
+            CleanLocalCreateAcknowledgementFile::open_or_create(&staged_fixture.root, request)
+                .unwrap();
+        stage(&staged.store, None, acknowledgement);
+        drop(staged);
+        staged = CleanLocalCreateAcknowledgementFile::open_or_create(&staged_fixture.root, request)
+            .unwrap();
+        assert_eq!(staged.load().unwrap().as_deref(), Some(acknowledgement));
+        assert!(!staged_fixture.root.join(LOCAL_ACK_STAGE_FILE).exists());
+        let before = fs::read(staged_fixture.root.join(LOCAL_ACK_FILE)).unwrap();
+        stage(&staged.store, Some([0x31; 32]), acknowledgement);
+        assert!(matches!(
+            staged.load(),
+            Err(CleanFileStoreError::RequestConflict)
+        ));
+        assert_eq!(
+            fs::read(staged_fixture.root.join(LOCAL_ACK_FILE)).unwrap(),
+            before
+        );
+        assert!(staged_fixture.root.join(LOCAL_ACK_STAGE_FILE).exists());
     }
 
     #[cfg(target_os = "linux")]

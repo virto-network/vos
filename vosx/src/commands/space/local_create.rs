@@ -171,10 +171,20 @@ pub(crate) fn create_local(
         "retained Create differs from the selected Space, operator or node"
     );
     drop(store);
+    let mut acknowledgement_store =
+        super::clean_store::CleanLocalCreateAcknowledgementFile::open_or_create(
+            operation.join("acknowledgement"),
+            &bytes,
+        )?;
+    // Verify/re-sync any prior response, but continue exercising the server's
+    // exact retry path. A saved response is not a live publication check.
+    acknowledgement_store.load()?;
     let ack = submit_retained(&request_root, address)?;
     let encoded = ack
         .encode()
         .map_err(|error| anyhow::anyhow!("encode acknowledgement: {error:?}"))?;
+    // Completion must never outlive the verified response bytes it names.
+    acknowledgement_store.publish(&encoded)?;
     reservation.complete(&bytes, &encoded)?;
     Ok(ack)
 }
@@ -937,6 +947,7 @@ pub(crate) mod tests {
         sign(&mut ack);
         let bytes = ack.encode().unwrap();
         super::super::clean_store::tests::check_reservation_completion(&request, &bytes);
+        super::super::clean_store::tests::check_acknowledgement_storage(&request, &bytes);
         assert_eq!(verify_acknowledgement(&request, &bytes).unwrap(), ack);
         let mut http = format!("HTTP/1.1 201 Created\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).into_bytes();
         http.extend_from_slice(&bytes);
