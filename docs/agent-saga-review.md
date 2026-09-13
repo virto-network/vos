@@ -162,6 +162,8 @@ Keep these as work within C2, not new review batches:
    journal backend also passes its CLI regression suite. Exact operation
    admission now passes native owner reopen before/after policy execution;
    the coordinator now captures native input automatically before a new pledge.
+   A native-only controller now retains all three store handles across calls
+   and reopens parsed state on each attempt, including after open failures.
    daemon/controller wiring and terminal recovery remain open. Preparation and an API
    credential do not issue an actor
    receipt. Retain the signed AOC5, exact authorization context and issuance
@@ -5375,6 +5377,47 @@ changed. This is targeted evidence, not a new full regression/release run.
 Daemon/controller store ownership, live operation ingress, terminal retirement
 classification and genuinely approved protected mutation remain open. This
 checkpoint does not change deployment readiness or the C1/C2/C3 review batches.
+
+### Long-lived native operation controller ownership
+
+`NativeAuthorityOperationController` owns the coordinator, issuer and NOD1
+journal handles. Each call borrows those handles and reopens both parsed images
+before constructing the native-only dispatcher. Failed opens and ambiguous
+operation errors therefore leave the backing handles owned by the controller;
+later attempts cannot accidentally reuse a poisoned parsed issuer. No caller
+can supply an unsigned approval or a replacement dispatcher through this API.
+Controller, request and native owner must select the same valid Authority.
+Structured errors preserve the distinction between issuer/coordinator opening
+and coordination failures, including native policy denial.
+
+Construction merely adopts stores; it is not a readiness assertion. Startup
+admission remains explicitly loaded from the complete discovery set, borrowing
+the controller's journal. Exact contexts and issuance slots are still required
+on calls and retries; they must not be regenerated from a later host clock.
+`into_parts` transfers handles without reopening their paths. This follows the
+existing lifecycle controller's long-lived-handle/per-call-parsing pattern.
+
+The three native operation tests pass in **14.91s**
+(`r16-native-operation-controller.log`). The coordinator fixture now uses one
+controller across an injected coordinator-open failure and two native denial
+attempts. The failed open creates no coordinator/issuer/NOD1 file, executes no
+transition and never signs; recovery on the same controller then automatically
+retains native input, and retry after clock advance preserves its bytes without
+a second transition. These are native physical tests with synced test image
+backends, not a live daemon endpoint.
+
+All **212 CLI tests pass, zero fail, five ignored**, in 10.63s
+(`r16-native-operation-controller-cli.log`). The new CSF1-backed ownership test
+rejects missing recovery input while retaining both directory leases, recovers
+the exact record on the same controller, and verifies that transferring/dropping
+one image handle cannot release the other image's shared lease or the separate
+journal lease. Formatting/diff checks pass. Logs remain in disk-backed
+`target/task-tmp`.
+
+The controller still needs adoption by daemon startup and lifecycle/operation
+dispatch, with complete discovery and terminal retirement classification. This
+does not close protected issuance, mutation, denial retirement, capacity or
+release gates. No guest artifacts changed; review scope remains C1/C2/C3.
 
 ### Durable client acknowledgement before completion
 

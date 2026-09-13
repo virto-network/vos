@@ -111,6 +111,51 @@ fn record(sequence: u64, native_gas: u64) -> (AuthorityActorTarget, InvocationId
 }
 
 #[test]
+fn operation_controller_keeps_all_store_leases_after_recovery_error() {
+    use vos::agent::clean_bootstrap::NativeAuthorityOperationController;
+    let fixture = Fixture::new("operation-controller-leases");
+    let images = fixture.parent.join("operation-images");
+    let (authority, invocation, bytes) = record(1, 100);
+    let mut journal =
+        CleanNativeAuthorityOperationJournal::open_or_create(&fixture.root, authority).unwrap();
+    journal.retain(invocation, &bytes).unwrap();
+    let (coordinator, issuer) = CleanAuthorityOperationFiles::open_or_create(&images)
+        .unwrap()
+        .into_parts();
+    let mut controller =
+        NativeAuthorityOperationController::new(authority, coordinator, issuer, journal);
+    assert!(
+        controller
+            .startup_admission(&[InvocationId([0x94; 32])])
+            .is_err()
+    );
+    assert!(matches!(
+        CleanAuthorityOperationFiles::open_or_create(&images),
+        Err(CleanFileStoreError::Busy)
+    ));
+    assert!(matches!(
+        CleanNativeAuthorityOperationJournal::open_existing(&fixture.root, authority),
+        Err(CleanFileStoreError::Busy)
+    ));
+    drop(controller.startup_admission(&[invocation]).unwrap());
+    let (coordinator, issuer, mut journal) = controller.into_parts();
+    assert_eq!(journal.load(invocation).unwrap(), Some(bytes));
+    drop(coordinator);
+    assert!(matches!(
+        CleanAuthorityOperationFiles::open_or_create(&images),
+        Err(CleanFileStoreError::Busy)
+    ));
+    drop(issuer);
+    drop(CleanAuthorityOperationFiles::open_or_create(&images).unwrap());
+    assert!(matches!(
+        CleanNativeAuthorityOperationJournal::open_existing(&fixture.root, authority),
+        Err(CleanFileStoreError::Busy)
+    ));
+    drop(journal);
+    drop(CleanNativeAuthorityOperationJournal::open_existing(&fixture.root, authority).unwrap());
+}
+
+#[test]
 fn operation_journal_startup_admission_preserves_complete_leased_records() {
     use vos::agent::clean_bootstrap::NativeAuthorityOperationStartupAdmission;
     let fixture = Fixture::new("operation-journal-admission");

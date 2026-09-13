@@ -9,6 +9,15 @@
 pub(crate) mod operation_dispatch;
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+#[path = "clean_operation_controller.rs"]
+mod operation_controller;
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+pub use operation_controller::{
+    NativeAuthorityOperationController, NativeAuthorityOperationControllerError,
+};
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 pub use operation_dispatch::{
     MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES, NativeAuthorityOperationJournalStore,
     NativeAuthorityOperationStartupAdmission, native_operation_record_matches,
@@ -10029,15 +10038,26 @@ mod tests {
         fn native_operation_coordinator_requires_retained_policy_before_signing() {
             use crate::agent::authority_operation_coordinator::{
                 AuthorityOperationActorDispatcher as _, AuthorityOperationCoordinatorError,
-                AuthorityOperationCoordinatorRejection, DurableAuthorityOperationCoordinator,
+                AuthorityOperationCoordinatorRejection, AuthorityOperationCoordinatorStore,
                 tests::unenrolled_native_dispatch,
             };
-            use crate::agent::authority_operation_issuer::{
-                AuthorityOperationEvidenceSigner, DurableAuthorityOperationIssuer,
-            };
+            use crate::agent::authority_operation_issuer::AuthorityOperationEvidenceSigner;
             use crate::agent::clean_bootstrap::operation_dispatch::NativeAuthorityOperationDispatcher;
             use crate::agent_sdk::authority_operation::AuthorityOperationCall;
             struct NoSigning([u8; 32]);
+            struct FailOnceCoordinator(OperationTestImageFile, bool);
+            impl AuthorityOperationCoordinatorStore for FailOnceCoordinator {
+                type Error = std::io::Error;
+                fn load(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+                    if core::mem::take(&mut self.1) {
+                        return Err(std::io::Error::other("injected coordinator open failure"));
+                    }
+                    self.0.read()
+                }
+                fn commit(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+                    AuthorityOperationCoordinatorStore::commit(&mut self.0, bytes)
+                }
+            }
             impl AuthorityOperationEvidenceSigner for NoSigning {
                 type Error = core::convert::Infallible;
                 fn public_key(&self) -> [u8; 32] {
@@ -10073,39 +10093,53 @@ mod tests {
             );
             assert_eq!(owner.ordered_index_for_test().unwrap(), before);
             assert!(journal.load(request.context.invocation).unwrap().is_none());
+            let journal_path = journal.path(request.context.invocation);
+            let mut controller = NativeAuthorityOperationController::new(
+                target,
+                FailOnceCoordinator(
+                    OperationTestImageFile(root.join("operation-coordinator")),
+                    true,
+                ),
+                OperationTestImageFile(root.join("operation-issuer")),
+                journal,
+            );
+            assert!(matches!(
+                controller.coordinate(
+                    owner,
+                    &call,
+                    request.context,
+                    slot,
+                    &mut NoSigning(target.binding.public_key)
+                ),
+                Err(NativeAuthorityOperationControllerError::OpenCoordinator(
+                    AuthorityOperationCoordinatorError::Storage(_)
+                ))
+            ));
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            assert!(!journal_path.exists());
+            assert!(!root.join("operation-coordinator").exists());
+            assert!(!root.join("operation-issuer").exists());
             let mut original = None;
             for retry in 0..2 {
                 if retry == 1 {
                     clock.store(slot + 10, Ordering::Release);
                 }
-                let issuer = DurableAuthorityOperationIssuer::open(
-                    OperationTestImageFile(root.join("operation-issuer")),
-                    target,
-                )
-                .unwrap();
-                let mut coordinator = DurableAuthorityOperationCoordinator::open(
-                    OperationTestImageFile(root.join("operation-coordinator")),
-                    target,
-                    NativeAuthorityOperationDispatcher::new(owner, &mut journal),
-                    issuer,
-                )
-                .unwrap();
                 assert!(matches!(
-                    coordinator.coordinate(
+                    controller.coordinate(
+                        owner,
                         &call,
                         request.context,
                         slot,
                         &mut NoSigning(target.binding.public_key)
                     ),
-                    Err(AuthorityOperationCoordinatorError::Rejected(
-                        AuthorityOperationCoordinatorRejection::AuthorizationDenied
+                    Err(NativeAuthorityOperationControllerError::Coordinate(
+                        AuthorityOperationCoordinatorError::Rejected(
+                            AuthorityOperationCoordinatorRejection::AuthorizationDenied
+                        )
                     ))
                 ));
-                assert!(!coordinator.is_poisoned());
-                assert!(!coordinator.has_pending_operation());
-                drop(coordinator);
                 assert_eq!(owner.ordered_index_for_test().unwrap(), before + 1);
-                let saved = journal.load(request.context.invocation).unwrap().unwrap();
+                let saved = std::fs::read(&journal_path).unwrap();
                 if let Some(original) = &original {
                     assert_eq!(&saved, original);
                 } else {
@@ -10113,6 +10147,7 @@ mod tests {
                 }
                 assert!(!root.join("operation-issuer").exists());
             }
+            let (_, _, mut journal) = controller.into_parts();
             let mut corrupt = original.unwrap();
             corrupt[0] ^= 1;
             write_operation_test_image(&journal.path(request.context.invocation), &corrupt)
