@@ -2621,6 +2621,51 @@ independently selected system Authority and Agent scope, then feed the pending
 set into attachment before route publication. Keep incomplete and finalized
 but unretired intents protected; do not mistake directory discovery for recovery.
 
+### Verified lifecycle recovery candidates
+
+`discover_local_lifecycle_recovery` now opens every bounded candidate through
+existing-only stores and retains both store handles (and their backend leases)
+in an opaque recovery container. It independently checks the candidate list's
+bound, strict ordering, uniqueness and nonzero identities, then verifies each
+signed intent against the caller's configured Authority, discovered Space/Agent,
+and Local profile. Issuer images are opened against that same independent scope.
+
+Incomplete intents remain pending rather than being skipped. Finalized entries
+must reproduce the exact signed issuer acknowledgement and match both retained
+envelopes, including the authorization clock. A completed CMR1 marker cannot be
+accepted without that finalized issuer evidence. Missing intents alongside
+nonempty issuers, missing issuers alongside finalization work, and finalized
+records hiding an outstanding issuance fail closed. A new handoff intent may
+legitimately coexist with the previous completed issuer record; it remains
+pending and is not treated as approved. Empty directory candidates remain
+distinct from authenticated work.
+
+This loader performs no policy invocation, signing, retirement or route
+publication. It verifies request/storage scope, not physical Local application
+or independent Shared finality. `clean_startup.rs` does not yet call it or pass
+the returned pending set into protected attachment.
+
+The lifecycle fixtures exercise finalized-unretired, completed and next-pending
+states, wrong Authority/Agent scope, duplicate/oversized/zero candidate lists,
+missing intent/issuer evidence and empty stores. They also assert that scanning
+does not change either stored image or use a create-capable factory open.
+
+Verification includes an intermediate serial run with **10 passed** (59.00s,
+`r16-lifecycle-recovery-scan-serial.log`). Final-source serial execution recorded
+**nine passed and one failure** at bootstrap attachment (`Host(Unavailable)`,
+before the failing fixture reached the new scan assertions), in 40.67s:
+`r16-lifecycle-recovery-scan-final-source.log`. The exact failed test then passed
+in isolation on the same source (**one passed**, 14.75s):
+`r16-lifecycle-recovery-isolated.log`. An earlier parallel run also recorded an
+attachment `Unavailable`. All logs are under
+`.worktrees/ch08-c2-native/target/task-tmp/`. No deadline was increased and no
+failure was filtered out. This intermittent attachment failure remains a release
+investigation item; these results do not establish a green final-source suite.
+
+Next: integrate the verified pending set before first route activation, including
+incomplete lifecycle phases rather than only finalized retirement pairs, and
+resolve the attachment failure before claiming restart/release readiness.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

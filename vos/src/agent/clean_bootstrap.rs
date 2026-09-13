@@ -8260,12 +8260,132 @@ mod tests {
         }
 
         #[inline(never)]
+        fn check_lifecycle_recovery_scan(
+            authority: AuthorityActorTarget,
+            intent: IssuerMemoryStore,
+            issuer: IssuerMemoryStore,
+            retired: bool,
+            finalized: bool,
+        ) {
+            use crate::agent::local_lifecycle::{
+                LocalLifecycleStoreFactory, discover_local_lifecycle_recovery,
+            };
+            struct Stores {
+                agents: Vec<AgentId>,
+                intent: IssuerMemoryStore,
+                issuer: IssuerMemoryStore,
+                opens: usize,
+            }
+            impl LocalLifecycleStoreFactory for Stores {
+                type Intent = IssuerMemoryStore;
+                type Issuer = IssuerMemoryStore;
+                type Error = ();
+                fn discover(&mut self, _: SpaceId, _: usize) -> Result<Vec<AgentId>, ()> {
+                    Ok(self.agents.clone())
+                }
+                fn open(
+                    &mut self,
+                    _: SpaceId,
+                    _: AgentId,
+                ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                    panic!("recovery must never create stores")
+                }
+                fn open_existing(
+                    &mut self,
+                    _: SpaceId,
+                    _: AgentId,
+                ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                    self.opens += 1;
+                    Ok((self.intent.clone(), self.issuer.clone()))
+                }
+            }
+            let expected = crate::agent::clean_management_intent::CleanManagementIntentSlot::open(
+                intent.clone(),
+            )
+            .unwrap();
+            let agent = expected.intent().unwrap().call().managed.agent;
+            let intent_before = intent.image.lock().unwrap().clone();
+            let issuer_before = issuer.image.lock().unwrap().clone();
+            let mut stores = Stores {
+                agents: vec![agent],
+                intent: intent.clone(),
+                issuer: issuer.clone(),
+                opens: 0,
+            };
+            let recovery = discover_local_lifecycle_recovery(&mut stores, authority, 1).unwrap();
+            assert_eq!(recovery.len(), 1);
+            assert!(!recovery.is_empty());
+            let entry = &recovery.entries[0];
+            assert_eq!(entry.agent, agent);
+            assert_eq!(entry.intent.intent(), expected.intent());
+            assert_eq!(entry.intent.retirement_complete().unwrap(), retired);
+            assert_eq!(entry.finalized.is_some(), finalized);
+            assert!(entry.issuer.sequence_high_water() > 0);
+            drop(recovery);
+            assert_eq!(stores.opens, 1);
+            stores.agents = vec![agent, agent];
+            assert!(matches!(
+                discover_local_lifecycle_recovery(&mut stores, authority, 2),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            assert!(matches!(
+                discover_local_lifecycle_recovery(&mut stores, authority, 1),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            assert_eq!(stores.opens, 1);
+            stores.agents = vec![AgentId::ZERO];
+            assert!(matches!(
+                discover_local_lifecycle_recovery(&mut stores, authority, 1),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            assert_eq!(stores.opens, 1);
+            stores.agents = vec![AgentId([0xee; 32])];
+            assert!(matches!(
+                discover_local_lifecycle_recovery(&mut stores, authority, 1),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            stores.agents = vec![agent];
+            let mut wrong = authority;
+            wrong.system_agent = AgentId([0xee; 32]);
+            assert!(matches!(
+                discover_local_lifecycle_recovery(&mut stores, wrong, 1),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            if finalized {
+                stores.issuer = IssuerMemoryStore::default();
+                assert!(matches!(
+                    discover_local_lifecycle_recovery(&mut stores, authority, 1),
+                    Err(SharedAgentHostError::ScopeMismatch)
+                ));
+                stores.issuer = issuer.clone();
+            }
+            stores.intent = IssuerMemoryStore::default();
+            assert!(matches!(
+                discover_local_lifecycle_recovery(&mut stores, authority, 1),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            stores.issuer = IssuerMemoryStore::default();
+            let empty = discover_local_lifecycle_recovery(&mut stores, authority, 1).unwrap();
+            assert!(empty.entries[0].intent.intent().is_none());
+            assert!(empty.entries[0].finalized.is_none());
+            stores.agents.clear();
+            assert!(
+                discover_local_lifecycle_recovery(&mut stores, authority, 0)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(*intent.image.lock().unwrap(), intent_before);
+            assert_eq!(*issuer.image.lock().unwrap(), issuer_before);
+        }
+
+        #[inline(never)]
         fn check_durable_management_retirement(
             owner: &mut MemoryBootstrapOwner,
             store: IssuerMemoryStore,
             managed: ManagedAgentTarget,
             acknowledgement: &ManagementApplicationAck,
             issuer: &DurableCleanManagementIssuer<IssuerMemoryStore>,
+            issuer_store: IssuerMemoryStore,
             failures: bool,
         ) {
             use crate::agent::clean_management_intent::{
@@ -8348,6 +8468,13 @@ mod tests {
             assert_eq!(owner.ordered_index_for_test().unwrap(), before);
             assert_eq!(store.image.lock().unwrap().as_ref(), Some(&retired));
             assert_projection_gate_released(owner, 0xea);
+            check_lifecycle_recovery_scan(
+                owner.authority_target(),
+                store.clone(),
+                issuer_store.clone(),
+                true,
+                true,
+            );
             let agent = HostAgentId(owner.pins.agent.0);
             assert!(owner._network_host.mark_stale_for_test(agent));
             owner._network_host.refresh().unwrap();
@@ -8428,6 +8555,13 @@ mod tests {
                     .as_ref()
                     .unwrap()
                     .starts_with(b"CMI3")
+            );
+            check_lifecycle_recovery_scan(
+                owner.authority_target(),
+                store,
+                issuer_store,
+                false,
+                false,
             );
         }
 
@@ -8772,6 +8906,13 @@ mod tests {
             assert_eq!(signer.calls, 2);
             let intent_image = slot.intent().unwrap().clone();
             let issuer_image = issuer_store.image.lock().unwrap().clone();
+            check_lifecycle_recovery_scan(
+                owner.authority_target(),
+                store.clone(),
+                issuer_store.clone(),
+                false,
+                true,
+            );
             check_management_retirement_admission(owner, &envelope, &finalization_envelope);
             assert!(matches!(
                 owner.retire_management_intent_results(&slot, call.managed, &substituted, &issuer),
@@ -8889,6 +9030,7 @@ mod tests {
                 call.managed,
                 &acknowledgement,
                 &issuer,
+                issuer_store,
                 interrupted_retirement,
             );
             assert_eq!(owner.ordered_index_for_test().unwrap(), retired);

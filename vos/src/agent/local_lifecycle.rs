@@ -245,6 +245,151 @@ pub trait LocalLifecycleStoreFactory {
     ) -> Result<(Self::Intent, Self::Issuer), Self::Error>;
 }
 
+/// Verified request/storage scope retained before startup publishes routes.
+/// Pending entries are not approvals or proof of physical application. Keeping
+/// both stores alive preserves their exclusive leases through recovery setup.
+pub struct LocalLifecycleRecovery<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> {
+    pub(crate) entries: Vec<LocalLifecycleRecoveryEntry<I, J>>,
+}
+
+pub(crate) struct LocalLifecycleRecoveryEntry<
+    I: CleanManagementIssuerStore,
+    J: CleanManagementIssuerStore,
+> {
+    pub(crate) agent: AgentId,
+    pub(crate) intent: super::clean_management_intent::CleanManagementIntentSlot<I>,
+    pub(crate) issuer: super::clean_authority_issuer::DurableCleanManagementIssuer<J>,
+    pub(crate) finalized: Option<ManagementApplicationAck>,
+}
+
+impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycleRecovery<I, J> {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Load every discovered candidate through existing-only stores before ingress
+/// starts. The Authority target must come from independently selected bootstrap
+/// pins, not from a candidate's own signed request. This function never invokes
+/// policy, signs receipts, retires results, or publishes a route.
+pub fn discover_local_lifecycle_recovery<F: LocalLifecycleStoreFactory>(
+    factory: &mut F,
+    authority: super::sdk::authority::AuthorityActorTarget,
+    maximum: usize,
+) -> Result<LocalLifecycleRecovery<F::Intent, F::Issuer>, SharedAgentHostError> {
+    use super::clean_authority_issuer::DurableCleanManagementIssuer;
+    use super::clean_bootstrap::RawCredentialVerifier;
+    use super::clean_management_intent::{CleanManagementIntent, CleanManagementIntentSlot};
+    if !authority.is_valid() {
+        return Err(SharedAgentHostError::ScopeMismatch);
+    }
+    let candidates = factory
+        .discover(authority.space, maximum)
+        .map_err(|_| SharedAgentHostError::Unavailable)?;
+    if candidates.len() > maximum
+        || candidates.iter().any(|agent| *agent == AgentId::ZERO)
+        || candidates.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(SharedAgentHostError::ScopeMismatch);
+    }
+    let mut entries = Vec::with_capacity(candidates.len());
+    for agent in candidates {
+        let (intent_store, issuer_store) = factory
+            .open_existing(authority.space, agent)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let intent = CleanManagementIntentSlot::open(intent_store)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if let Some(request) = intent.intent() {
+            let managed = request.call().managed;
+            if managed.space != authority.space
+                || managed.agent != agent
+                || managed.profile != AgentProfile::Local
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            request
+                .verify(authority, managed, &RawCredentialVerifier)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        }
+        let issuer = DurableCleanManagementIssuer::open(
+            issuer_store,
+            authority.binding,
+            authority.space,
+            agent,
+        )
+        .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let finalized = if let Some(request) = intent.intent() {
+            let recovered = issuer
+                .recover_finalized_application(
+                    authority,
+                    request.call().managed,
+                    request.request(),
+                    request.call(),
+                    &RawCredentialVerifier,
+                )
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            let final_work = intent
+                .finalization_work()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            if final_work.is_some() && issuer.sequence_high_water() == 0 {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            if let Some((_, acknowledgement)) = recovered {
+                // A different outstanding issuance cannot be hidden behind
+                // the previous finalized acknowledgement during startup.
+                if issuer.has_pending_decision()
+                    || issuer.retained_decisions() != 0
+                    || issuer.sequence_high_water() != issuer.acknowledged_through()
+                {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                let Some(super::sdk::RuntimeWork::Invoke { invocation, .. }) = final_work else {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                };
+                let Some(super::sdk::RuntimeWork::Invoke { observed_slot, .. }) = intent
+                    .authorization_work()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                else {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                };
+                if acknowledgement.applied_at < *observed_slot
+                    || invocation.message
+                        != CleanManagementIntent::finalization_message(&acknowledgement)
+                {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                Some(acknowledgement)
+            } else {
+                if intent
+                    .retirement_complete()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                None
+            }
+        } else {
+            if issuer.sequence_high_water() != 0
+                || issuer.has_pending_decision()
+                || issuer.retained_decisions() != 0
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            None
+        };
+        entries.push(LocalLifecycleRecoveryEntry {
+            agent,
+            intent,
+            issuer,
+            finalized,
+        });
+    }
+    Ok(LocalLifecycleRecovery { entries })
+}
+
 /// Type-erased, node-owned lifecycle access. It is deliberately not an ingress
 /// trait: only the production owner may coordinate creation and publication.
 pub(crate) trait NativeLocalLifecycle: Send {
