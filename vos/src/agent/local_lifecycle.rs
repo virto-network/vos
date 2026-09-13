@@ -1173,9 +1173,16 @@ where
     }
 
     /// Adopt recovered operation stores and a signer matching the native owner.
-    pub fn with_operations<C, B, J, K, T, O>(
+    pub fn with_operations<C, B, J, K, T, D, O>(
         mut self,
-        mut operations: super::clean_bootstrap::NativeAuthorityOperationController<C, B, J, K, T>,
+        mut operations: super::clean_bootstrap::NativeAuthorityOperationController<
+            C,
+            B,
+            J,
+            K,
+            T,
+            D,
+        >,
         signer: O,
     ) -> Result<Self, SharedAgentHostError>
     where
@@ -1186,6 +1193,7 @@ where
         J: super::clean_bootstrap::NativeAuthorityOperationJournalStore + Send + 'static,
         K: super::clean_bootstrap::NativeAuthorityOperationCompletionStore + Send + 'static,
         T: super::clean_bootstrap::NativeAuthorityOperationRetirementStore + Send + 'static,
+        D: super::clean_bootstrap::NativeAuthorityOperationDenialStore + Send + 'static,
         O: super::authority_operation_issuer::AuthorityOperationEvidenceSigner
             + super::clean_bootstrap::NativeAuthorityOperationCompletionSigner
             + super::clean_bootstrap::NativeAuthorityOperationRetirementSigner

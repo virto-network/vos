@@ -53,8 +53,9 @@ use super::clean_identity::{
 };
 use super::clean_store::{
     CleanAuthorityOperationFiles, CleanManagementLifecycleStoreFactory,
-    CleanNativeAuthorityOperationCompletions, CleanNativeAuthorityOperationJournal,
-    CleanNativeAuthorityOperationRetirements, CleanSystemAgentFileStores,
+    CleanNativeAuthorityOperationCompletions, CleanNativeAuthorityOperationDenials,
+    CleanNativeAuthorityOperationJournal, CleanNativeAuthorityOperationRetirements,
+    CleanSystemAgentFileStores,
 };
 
 const SYSTEM_AUTHORITY_NAME: &str = "system-authority";
@@ -67,6 +68,7 @@ const OPERATION_IMAGES_DIRECTORY: &str = "authority-operation";
 const OPERATION_JOURNAL_DIRECTORY: &str = "authority-operation-journal";
 const OPERATION_COMPLETIONS_DIRECTORY: &str = "authority-operation-completions";
 const OPERATION_RETIREMENTS_DIRECTORY: &str = "authority-operation-retirements";
+const OPERATION_DENIALS_DIRECTORY: &str = "authority-operation-denials";
 const PROJECTION_ROUTE_QUEUE_CAPACITY: usize = 64;
 const LOCAL_LIFECYCLE_RECOVERY_LIMIT: usize = 1_024;
 const PROJECTION_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
@@ -425,6 +427,10 @@ pub(crate) fn start_clean_system_agent(
     .with_completions(operation_completions)
     .with_retirements(CleanNativeAuthorityOperationRetirements::open_or_create(
         data_dir.join(OPERATION_RETIREMENTS_DIRECTORY),
+        authority_target,
+    )?)
+    .with_denials(CleanNativeAuthorityOperationDenials::open_or_create(
+        data_dir.join(OPERATION_DENIALS_DIRECTORY),
         authority_target,
     )?);
     let operation_admission = operations

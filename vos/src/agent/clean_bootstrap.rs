@@ -9924,6 +9924,19 @@ mod tests {
 
         struct OperationTestCompletions(PathBuf);
         struct OperationTestRetirements(PathBuf);
+        struct OperationTestDenials(PathBuf);
+        impl NativeAuthorityOperationDenialStore for OperationTestDenials {
+            type Error = SharedAgentHostError;
+            fn load(&mut self) -> Result<Vec<Vec<u8>>, Self::Error> {
+                std::fs::read(&self.0)
+                    .map(|bytes| vec![bytes])
+                    .map_err(|_| SharedAgentHostError::Unavailable)
+            }
+            fn retain(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+                write_operation_test_image(&self.0, bytes)
+                    .map_err(|_| SharedAgentHostError::Unavailable)
+            }
+        }
         impl NativeAuthorityOperationRetirementStore for OperationTestRetirements {
             type Error = SharedAgentHostError;
             fn load(&mut self) -> Result<Vec<Vec<u8>>, Self::Error> {
@@ -11306,16 +11319,17 @@ mod tests {
             let bootstrap_issuer = old_owner.issuer.into_store();
             drop(old_owner._network_host);
             drop(old_owner.host);
-            let admission = NativeAuthorityOperationStartupAdmission::load_with_denials(
-                &mut journal,
-                &mut issuer_store,
+            let mut operations = NativeAuthorityOperationController::new(
                 target,
-                &[request.context.invocation],
-                &[],
-                &[],
-                &[saved.clone()],
+                OperationTestImageFile(root.join("denial-operation-coordinator")),
+                issuer_store,
+                journal,
             )
-            .unwrap();
+            .with_denials(OperationTestDenials(path.clone()));
+            assert!(operations.startup_admission(&[]).is_err());
+            let admission = operations
+                .startup_admission(&[request.context.invocation])
+                .unwrap();
             assert!(admission.is_empty());
             assert!(admission.has_history);
             let mut owner =
@@ -11339,6 +11353,7 @@ mod tests {
                 )
                 .unwrap();
             drop(admission);
+            let (_, issuer_store, journal, _, _, _) = operations.into_parts_with_denials();
             let mut issuer = DurableAuthorityOperationIssuer::open(issuer_store, target).unwrap();
             let retired = owner
                 .restore_native_operation_denial(&record, &mut issuer, &saved)

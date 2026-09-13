@@ -15,6 +15,16 @@ pub trait NativeAuthorityOperationDenialStore {
     fn retain(&mut self, certificate: &[u8]) -> Result<(), Self::Error>;
 }
 
+impl NativeAuthorityOperationDenialStore for () {
+    type Error = SharedAgentHostError;
+    fn load(&mut self) -> Result<Vec<Vec<u8>>, Self::Error> {
+        Ok(Vec::new())
+    }
+    fn retain(&mut self, _: &[u8]) -> Result<(), Self::Error> {
+        Err(SharedAgentHostError::Unavailable)
+    }
+}
+
 /// Signature/framing validation only; native recovery also requires the exact
 /// source record and independently verified absence of retained issuance.
 pub fn native_operation_denial_invocation(

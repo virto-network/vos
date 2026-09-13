@@ -188,8 +188,9 @@ Keep these as work within C2, not new review batches:
    retirement index and use terminal retry/release. Native unissued-denial
    verification/acknowledgement and signed terminal denial release have native
    owner boundaries. Issuer-gated denial startup classification is implemented;
-   a hardened denial index is implemented. Production denial controller/daemon
-   adoption and operation ingress/client wiring remain open.
+   the production controller/daemon now retain the hardened denial index and
+   validate it during startup. Automatic terminal denial handling and operation
+   ingress/client wiring remain open.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
    retirement and restart through native ingress; then expose the same
    preparation/authorization flow in the user-facing client. A Public query
@@ -6056,6 +6057,37 @@ conflicting/malformed stage preservation, and the count limit. Their signed
 source hashes are synthetic storage fixtures, not native denial proof. The
 backend is not yet adopted by the production controller/daemon; that integration
 and automatic terminal denial handling remain next within C2.
+
+### Production operation denial-store recovery adoption
+
+Verification: **8 targeted native tests passed, zero failures**, in **117.92s**;
+**222 CLI tests passed, zero failures, five ignored**, in **46.82s**. Evidence
+is in `.worktrees/ch08-c2-native/target/task-tmp/`:
+`r16-denial-adoption-native-final.log` and
+`r16-denial-adoption-cli-final.log`. Formatting and whitespace checks pass.
+The initial CLI run had seven loopback permission failures; the permitted rerun
+passed. The initial native compile found a moved journal handle in fixture
+cleanup, corrected before the passing run. The full library/release matrix was
+not rerun.
+
+The production controller now owns the denial-index lease alongside its five
+existing stores. Daemon startup opens `authority-operation-denials` and uses
+issuer-gated denial admission before attaching the native owner. Validation
+checks signed denial IDs against canonical native dispatches and freshly read
+issuer history; missing discovery, contradictory issuance, duplicate evidence
+and cross-kind substitution remain errors. A controller without a denial store
+has an empty, fail-closed default that cannot acknowledge retention.
+
+Both native terminal-denial fixture variants now reopen through this controller,
+including rejection of an omitted source discovery set. The controller retains
+all store handles during attachment, and its six-part decomposition explicitly
+returns the denial handle rather than silently dropping it.
+
+This checkpoint only integrates recovery. Production dispatch still does not
+automatically sign/retire a new policy denial or return a retained denial on exact
+retry. That distinction, the valid-successor campaign, operation HTTP/client
+wiring and protected mutation remain open. No guest artifact or master branch
+change is included; no new live-daemon campaign is claimed.
 
 ### Durable client acknowledgement before completion
 

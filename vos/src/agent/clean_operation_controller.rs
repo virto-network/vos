@@ -37,13 +37,14 @@ impl NativeAuthorityOperationCompletionStore for () {
 /// Construction does not assert recovery or release admission: the caller must
 /// restore startup admission before dispatch and keep the controller alive for
 /// the lifetime of the corresponding system owner.
-pub struct NativeAuthorityOperationController<C, B, J, K = (), T = ()> {
+pub struct NativeAuthorityOperationController<C, B, J, K = (), T = (), D = ()> {
     authority: AuthorityActorTarget,
     coordinator: C,
     issuer: B,
     journal: J,
     completions: K,
     retirements: T,
+    denials: D,
 }
 
 #[derive(Debug)]
@@ -69,6 +70,7 @@ where
             journal,
             completions: (),
             retirements: (),
+            denials: (),
         }
     }
 
@@ -83,6 +85,7 @@ where
             journal: self.journal,
             completions,
             retirements: (),
+            denials: (),
         }
     }
 
@@ -109,6 +112,7 @@ where
             journal: self.journal,
             completions: self.completions,
             retirements,
+            denials: (),
         }
     }
 
@@ -122,13 +126,41 @@ where
     }
 }
 
-impl<C, B, J, K, T> NativeAuthorityOperationController<C, B, J, K, T>
+impl<C, B, J, K, T> NativeAuthorityOperationController<C, B, J, K, T> {
+    pub fn with_denials<D: NativeAuthorityOperationDenialStore>(
+        self,
+        denials: D,
+    ) -> NativeAuthorityOperationController<C, B, J, K, T, D> {
+        NativeAuthorityOperationController {
+            authority: self.authority,
+            coordinator: self.coordinator,
+            issuer: self.issuer,
+            journal: self.journal,
+            completions: self.completions,
+            retirements: self.retirements,
+            denials,
+        }
+    }
+
+    pub fn into_all_parts(self) -> (C, B, J, K, T) {
+        (
+            self.coordinator,
+            self.issuer,
+            self.journal,
+            self.completions,
+            self.retirements,
+        )
+    }
+}
+
+impl<C, B, J, K, T, D> NativeAuthorityOperationController<C, B, J, K, T, D>
 where
     C: AuthorityOperationCoordinatorStore,
     B: AuthorityOperationIssuerStore,
     J: NativeAuthorityOperationJournalStore,
     K: NativeAuthorityOperationCompletionStore,
     T: NativeAuthorityOperationRetirementStore,
+    D: NativeAuthorityOperationDenialStore,
 {
     pub fn startup_admission(
         &mut self,
@@ -144,12 +176,18 @@ where
             .retirements
             .load()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
-        NativeAuthorityOperationStartupAdmission::load_with_retirements(
+        let denials = self
+            .denials
+            .load()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        NativeAuthorityOperationStartupAdmission::load_with_denials(
             &mut self.journal,
+            &mut self.issuer,
             self.authority,
             invocations,
             &certificates,
             &retirements,
+            &denials,
         )
     }
 
@@ -177,6 +215,7 @@ where
         let requests = coordinator
             .required_native_dispatches()
             .map_err(NativeAuthorityOperationControllerError::OpenCoordinator)?;
+        drop(coordinator);
         for request in requests {
             let saved = self
                 .journal
@@ -227,12 +266,32 @@ where
         let retirements = self.retirements.load().map_err(|_| {
             NativeAuthorityOperationControllerError::Completion(SharedAgentHostError::Unavailable)
         })?;
-        NativeAuthorityOperationStartupAdmission::load_with_retirements(
+        let denials = self.denials.load().map_err(|_| {
+            NativeAuthorityOperationControllerError::Completion(SharedAgentHostError::Unavailable)
+        })?;
+        if denials.len() > MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS {
+            return Err(NativeAuthorityOperationControllerError::Completion(
+                SharedAgentHostError::Unavailable,
+            ));
+        }
+        for certificate in &denials {
+            let id =
+                native_operation_denial_invocation(&self.authority.binding.public_key, certificate)
+                    .ok_or(NativeAuthorityOperationControllerError::Completion(
+                        SharedAgentHostError::Unavailable,
+                    ))?;
+            if !invocations.contains(&id) {
+                invocations.push(id);
+            }
+        }
+        NativeAuthorityOperationStartupAdmission::load_with_denials(
             &mut self.journal,
+            &mut self.issuer,
             self.authority,
             &invocations,
             &certificates,
             &retirements,
+            &denials,
         )
         .map_err(NativeAuthorityOperationControllerError::Completion)?;
         Ok(())
@@ -474,13 +533,14 @@ where
         Ok(issued)
     }
 
-    pub fn into_all_parts(self) -> (C, B, J, K, T) {
+    pub fn into_parts_with_denials(self) -> (C, B, J, K, T, D) {
         (
             self.coordinator,
             self.issuer,
             self.journal,
             self.completions,
             self.retirements,
+            self.denials,
         )
     }
 }
@@ -501,9 +561,9 @@ impl crate::agent::authority_operation_coordinator::AuthorityOperationActorDispa
     }
 }
 
-impl<P, R, I, C, B, J, K, T, S>
+impl<P, R, I, C, B, J, K, T, D, S>
     crate::agent::local_lifecycle::NativeAuthorityOperationAccess<P, R, I>
-    for (NativeAuthorityOperationController<C, B, J, K, T>, S)
+    for (NativeAuthorityOperationController<C, B, J, K, T, D>, S)
 where
     P: CleanSystemAgentBootstrapStore,
     R: CleanSystemAgentBootstrapStore,
@@ -513,6 +573,7 @@ where
     J: NativeAuthorityOperationJournalStore + Send,
     K: NativeAuthorityOperationCompletionStore + Send,
     T: NativeAuthorityOperationRetirementStore + Send,
+    D: NativeAuthorityOperationDenialStore + Send,
     S: AuthorityOperationEvidenceSigner
         + NativeAuthorityOperationCompletionSigner
         + NativeAuthorityOperationRetirementSigner
