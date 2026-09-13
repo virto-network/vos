@@ -158,8 +158,9 @@ Keep these as work within C2, not new review batches:
 2. Connect `DurableAuthorityOperationCoordinator` to durable native stores and
    exact physical Authority dispatch. The CSF1 store pair and native owner
    execution boundary are implemented and tested below. The native coordinator
-   adapter now passes disk-backed fixture checks; production journal-store and
-   startup wiring remain open. Preparation and an API
+   adapter now passes disk-backed fixture checks; the production immutable
+   journal backend also passes its CLI regression suite. Startup recovery and
+   daemon/controller wiring remain open. Preparation and an API
    credential do not issue an actor
    receipt. Retain the signed AOC5, exact authorization context and issuance
    slot before policy dispatch, and recover the exact issued preimages before
@@ -5260,6 +5261,39 @@ and same-owner recovery evidence. Production journal storage, startup
 restoration of exact pending admission, genuinely approved native issuance,
 successful AOI1 consumption, denial/success retirement and protected mutation
 remain open. Do not report protected issuance as available to users yet.
+
+### Production native operation journal storage
+
+`CleanNativeAuthorityOperationJournal` implements the NOD1 store boundary in
+`vosx`, under one exclusive directory lease pinned to the configured Authority.
+CSF1 role 21 uses nonzero lowercase invocation-derived names and immutable
+initial-publication stages. Existing fixed-name store namespaces remain closed
+to these names. Opening validates every discovered record, including staged
+records, before returning a usable handle; key/Authority substitution is
+rejected before stage publication. Exact retries re-establish file/directory
+durability. Missing existing stores, replacement histories, unknown names,
+symlink/hardlink aliases and replaced directories/locks fail closed.
+
+The backend enforces the NOD1 byte bound and at most 512 distinct records
+(two per coordinator capacity slot), without eviction. This is a safety bound,
+not completed retention/compaction support. Record framing and pinned-target
+validation do not establish native admission, policy approval or finality.
+
+All **210 CLI tests pass, zero fail, five ignored**, in 9.43s, including seven
+new journal tests. Evidence: `r16-native-operation-journal-regression.log` in
+the shared disk-backed `target/task-tmp`. Tests cover staged recovery, immutable
+retry/conflict, wrong key/Authority/role, exclusive leases, byte/count limits
+and filesystem substitution while preserving rejected evidence. The initial
+restricted precheck hit an existing socket permission failure; an intermediate
+fixture compile failure was corrected. The final full run had socket access.
+Formatting and diff checks pass. No guest artifacts changed.
+
+This closes the backend gap identified in the preceding checkpoint, not native
+startup recovery or endpoint integration. Next, restore retained NOD1 admission
+before normal routes and connect the coordinator/store pair to the daemon;
+then prove genuinely approved native issuance, successful AOI1 consumption,
+denial/success retirement and protected mutation/restart. The branch remains
+limited to isolated disposable testing, not master-ready deployment.
 
 ### Durable client acknowledgement before completion
 

@@ -24,6 +24,19 @@ const MAX_DISPATCH_ANCHOR_BYTES: usize = 1024;
 pub const MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES: usize =
     RetainedAuthorityOperationDispatch::MAX_ENCODED_BYTES;
 
+/// Check immutable file-key and Authority binding, not native journal finality.
+pub fn native_operation_record_matches(
+    authority: AuthorityActorTarget,
+    invocation: InvocationId,
+    bytes: &[u8],
+) -> bool {
+    RetainedAuthorityOperationDispatch::decode(bytes).is_ok_and(|record| {
+        record.request.target == authority
+            && record.request.context.invocation == invocation
+            && record.encode().ok().as_deref() == Some(bytes)
+    })
+}
+
 /// Immutable per-invocation native dispatch records under one writer lease.
 /// Successful retention means the exact bytes survive restart. Repeated exact
 /// retention is allowed; replacing different bytes or discarding predecessors

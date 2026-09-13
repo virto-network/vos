@@ -11,6 +11,7 @@ pub(crate) mod operation_dispatch;
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 pub use operation_dispatch::{
     MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES, NativeAuthorityOperationJournalStore,
+    native_operation_record_matches,
 };
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]

@@ -1,8 +1,8 @@
 //! Hardened whole-image stores for clean system-Agent bootstrap state.
 //!
 //! The directory is a dedicated, single-writer namespace. Each logical image
-//! has a fixed file name and a fixed staging name; callers cannot supply either
-//! name. Files contain a role-bound integrity envelope, while the persistence
+//! has fixed names or names derived from a validated invocation ID; callers
+//! cannot supply paths. Files contain a role-bound integrity envelope, while the persistence
 //! traits continue to return the caller's exact image bytes. The envelope also
 //! binds a staged replacement to the exact canonical predecessor, allowing
 //! restart to finish only an unambiguous publication.
@@ -30,6 +30,11 @@ use vos::agent::clean_authority_issuer::{
 use vos::agent::clean_bootstrap::{
     CleanSystemAgentBootstrapStore, MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES,
     MAX_CLEAN_SYSTEM_AGENT_PINS_BYTES,
+};
+#[cfg(target_os = "linux")]
+use vos::agent::clean_bootstrap::{
+    MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES, NativeAuthorityOperationJournalStore,
+    native_operation_record_matches,
 };
 use vos::agent::sdk::package::MAX_PACKAGE_ENCODED_BYTES;
 
@@ -182,6 +187,7 @@ enum StoreRole {
     InvocationProgress = 18,
     OperationCoordinator = 19,
     OperationIssuer = 20,
+    OperationDispatch = 21,
 }
 
 impl StoreRole {
@@ -207,6 +213,7 @@ impl StoreRole {
             Self::InvocationProgress => "invocation.progress",
             Self::OperationCoordinator => "authority-operation.coordinator",
             Self::OperationIssuer => "authority-operation.issuer",
+            Self::OperationDispatch => "authority-operation.dispatch",
         }
     }
 
@@ -232,6 +239,7 @@ impl StoreRole {
             Self::InvocationProgress => "invocation.progress.next",
             Self::OperationCoordinator => "authority-operation.coordinator.next",
             Self::OperationIssuer => "authority-operation.issuer.next",
+            Self::OperationDispatch => "authority-operation.dispatch.next",
         }
     }
 
@@ -250,6 +258,16 @@ impl StoreRole {
             Self::InvocationProgress => super::invocation_progress::MAX_PROGRESS_BYTES,
             Self::OperationCoordinator => MAX_AUTHORITY_OPERATION_COORDINATOR_IMAGE_BYTES,
             Self::OperationIssuer => MAX_AUTHORITY_OPERATION_ISSUER_IMAGE_BYTES,
+            Self::OperationDispatch => {
+                #[cfg(target_os = "linux")]
+                {
+                    MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    0
+                }
+            }
             Self::LifecycleRuntime => MAX_PACKAGE_ENCODED_BYTES,
             Self::LifecycleActor => MAX_PACKAGE_ENCODED_BYTES,
             Self::LocalCreateDenial => vos::agent::local_lifecycle::LocalCreateDenial::MAX_BYTES,
@@ -270,6 +288,7 @@ impl StoreRole {
             18 => Some(Self::InvocationProgress),
             19 => Some(Self::OperationCoordinator),
             20 => Some(Self::OperationIssuer),
+            21 => Some(Self::OperationDispatch),
             1 => Some(Self::Pins),
             2 => Some(Self::Bootstrap),
             3 => Some(Self::ManagementIssuer),
@@ -436,6 +455,142 @@ impl CleanAuthorityOperationFiles {
         CleanAuthorityOperationIssuerFile,
     ) {
         (self.coordinator, self.issuer)
+    }
+}
+
+/// Keyed immutable NOD1 records under one Authority-wide exclusive lease.
+/// The caller independently pins the Authority; CSF1 integrity does not prove
+/// that a journal anchor was admitted or that policy approved an operation.
+#[cfg(target_os = "linux")]
+pub(crate) struct CleanNativeAuthorityOperationJournal {
+    root: Arc<StoreRoot>,
+    authority: vos::agent::sdk::authority::AuthorityActorTarget,
+}
+
+#[cfg(target_os = "linux")]
+impl CleanNativeAuthorityOperationJournal {
+    pub(crate) fn open_or_create(
+        path: impl AsRef<Path>,
+        authority: vos::agent::sdk::authority::AuthorityActorTarget,
+    ) -> Result<Self, CleanFileStoreError> {
+        Self::open(path.as_ref(), authority, true)
+    }
+
+    pub(crate) fn open_existing(
+        path: impl AsRef<Path>,
+        authority: vos::agent::sdk::authority::AuthorityActorTarget,
+    ) -> Result<Self, CleanFileStoreError> {
+        Self::open(path.as_ref(), authority, false)
+    }
+
+    fn open(
+        path: &Path,
+        authority: vos::agent::sdk::authority::AuthorityActorTarget,
+        create: bool,
+    ) -> Result<Self, CleanFileStoreError> {
+        if !authority.is_valid() {
+            return Err(CleanFileStoreError::InvalidPath);
+        }
+        let mut journal = Self {
+            root: Arc::new(StoreRoot::open_namespace(path, &[LOCK_FILE], create, true)?),
+            authority,
+        };
+        for invocation in journal.discover(MAX_OPERATION_JOURNAL_RECORDS)? {
+            journal
+                .load(invocation)?
+                .ok_or(CleanFileStoreError::Corrupt)?;
+        }
+        Ok(journal)
+    }
+
+    /// Include first-publication staging records so startup cannot miss an
+    /// ambiguous commit. Decode/reconcile each discovered ID before admission.
+    pub(crate) fn discover(
+        &self,
+        maximum: usize,
+    ) -> Result<Vec<vos::agent::sdk::InvocationId>, CleanFileStoreError> {
+        self.root.audit_entries()?;
+        let scan = PathBuf::from(format!("/proc/self/fd/{}", self.root.directory.as_raw_fd()));
+        let mut records = std::collections::BTreeSet::new();
+        for entry in fs::read_dir(scan)? {
+            let name = entry?
+                .file_name()
+                .into_string()
+                .map_err(|_| CleanFileStoreError::UnexpectedResidue)?;
+            if name == LOCK_FILE {
+                continue;
+            }
+            let invocation =
+                operation_record_name(&name).ok_or(CleanFileStoreError::UnexpectedResidue)?;
+            records.insert(invocation);
+            if records.len() > maximum.min(MAX_OPERATION_JOURNAL_RECORDS) {
+                return Err(CleanFileStoreError::Oversized);
+            }
+        }
+        self.root.audit_entries()?;
+        Ok(records.into_iter().collect())
+    }
+
+    fn validate(
+        &self,
+        invocation: vos::agent::sdk::InvocationId,
+        bytes: &[u8],
+    ) -> Result<(), CleanFileStoreError> {
+        if bytes.len() > MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES {
+            return Err(CleanFileStoreError::Oversized);
+        }
+        if !native_operation_record_matches(self.authority, invocation, bytes) {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl NativeAuthorityOperationJournalStore for CleanNativeAuthorityOperationJournal {
+    type Error = CleanFileStoreError;
+
+    fn load(
+        &mut self,
+        invocation: vos::agent::sdk::InvocationId,
+    ) -> Result<Option<Vec<u8>>, Self::Error> {
+        let file = ExactFileStore::operation_record(Arc::clone(&self.root), invocation)?;
+        let _guard = self.root.guard()?;
+        self.root.audit_entries()?;
+        // Validate both names before reconciliation may publish a stage.
+        for name in [file.file(), file.stage_file()] {
+            if let Some(image) =
+                file.read_optional(name, MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES)?
+            {
+                self.validate(invocation, &image.payload)?;
+            }
+        }
+        let image = file.reconcile(MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES)?;
+        if let Some(image) = &image {
+            self.validate(invocation, &image.payload)?;
+            file.sync_named(file.file())?;
+            self.root.sync()?;
+        }
+        Ok(image.map(|image| image.payload))
+    }
+
+    fn retain(
+        &mut self,
+        invocation: vos::agent::sdk::InvocationId,
+        record: &[u8],
+    ) -> Result<(), Self::Error> {
+        self.validate(invocation, record)?;
+        let existing = self.load(invocation)?;
+        if existing.as_deref().is_some_and(|bytes| bytes != record) {
+            return Err(CleanFileStoreError::RequestConflict);
+        }
+        if existing.is_none()
+            && self.discover(MAX_OPERATION_JOURNAL_RECORDS)?.len() == MAX_OPERATION_JOURNAL_RECORDS
+        {
+            return Err(CleanFileStoreError::Oversized);
+        }
+        ExactFileStore::operation_record(Arc::clone(&self.root), invocation)?
+            .commit_with_replacement(record, false)
     }
 }
 
@@ -1342,6 +1497,7 @@ impl CleanManagementIssuerStore for CleanManagementIssuerFile {
 
 struct StoreRoot {
     allowed_entries: &'static [&'static str],
+    operation_records: bool,
     parent_path: PathBuf,
     parent: File,
     path: PathBuf,
@@ -1367,6 +1523,15 @@ impl StoreRoot {
         allowed_entries: &'static [&'static str],
         create: bool,
     ) -> Result<Self, CleanFileStoreError> {
+        Self::open_namespace(path, allowed_entries, create, false)
+    }
+
+    fn open_namespace(
+        path: &Path,
+        allowed_entries: &'static [&'static str],
+        create: bool,
+        operation_records: bool,
+    ) -> Result<Self, CleanFileStoreError> {
         validate_new_path(path)?;
         let parent_path = path.parent().ok_or(CleanFileStoreError::InvalidPath)?;
         let parent = open_private_directory(parent_path, true)?;
@@ -1387,7 +1552,7 @@ impl StoreRoot {
             directory.sync_all()?;
             parent.sync_all()?;
         }
-        audit_named_entries(path, allowed_entries)?;
+        audit_named_entries(path, allowed_entries, operation_records)?;
         let lock = open_lock(&directory, path)?;
         match lock.try_lock_exclusive() {
             Ok(()) => {}
@@ -1398,6 +1563,7 @@ impl StoreRoot {
         }
         let root = Self {
             allowed_entries,
+            operation_records,
             parent_path: parent_path.to_path_buf(),
             parent,
             path: path.to_path_buf(),
@@ -1449,7 +1615,7 @@ impl StoreRoot {
 
     fn audit_entries(&self) -> Result<(), CleanFileStoreError> {
         self.validate_path()?;
-        audit_named_entries(&self.path, self.allowed_entries)?;
+        audit_named_entries(&self.path, self.allowed_entries, self.operation_records)?;
         self.validate_path()
     }
 
@@ -1463,11 +1629,44 @@ impl StoreRoot {
 struct ExactFileStore {
     root: Arc<StoreRoot>,
     role: StoreRole,
+    names: Option<(String, String)>,
 }
 
 impl ExactFileStore {
     fn new(root: Arc<StoreRoot>, role: StoreRole) -> Self {
-        Self { root, role }
+        Self {
+            root,
+            role,
+            names: None,
+        }
+    }
+
+    fn operation_record(
+        root: Arc<StoreRoot>,
+        invocation: vos::agent::sdk::InvocationId,
+    ) -> Result<Self, CleanFileStoreError> {
+        if !root.operation_records || invocation == vos::agent::sdk::InvocationId::ZERO {
+            return Err(CleanFileStoreError::InvalidPath);
+        }
+        let name = hex::encode(invocation.0);
+        let stage = format!("{name}.next");
+        Ok(Self {
+            root,
+            role: StoreRole::OperationDispatch,
+            names: Some((name, stage)),
+        })
+    }
+
+    fn file(&self) -> &str {
+        self.names
+            .as_ref()
+            .map_or_else(|| self.role.file(), |names| names.0.as_str())
+    }
+
+    fn stage_file(&self) -> &str {
+        self.names
+            .as_ref()
+            .map_or_else(|| self.role.stage_file(), |names| names.1.as_str())
     }
 
     fn load(&mut self, maximum_bytes: usize) -> Result<Option<Vec<u8>>, CleanFileStoreError> {
@@ -1495,7 +1694,7 @@ impl ExactFileStore {
             .as_ref()
             .is_some_and(|current| current.payload == image)
         {
-            self.sync_named(self.role.file())?;
+            self.sync_named(self.file())?;
             return self.root.sync();
         }
         if !replace && current.is_some() {
@@ -1512,14 +1711,15 @@ impl ExactFileStore {
 
     fn reconcile(&self, maximum_bytes: usize) -> Result<Option<StoredImage>, CleanFileStoreError> {
         self.root.audit_entries()?;
-        let canonical = self.read_optional(self.role.file(), maximum_bytes)?;
-        let staged = self.read_optional(self.role.stage_file(), maximum_bytes)?;
+        let canonical = self.read_optional(self.file(), maximum_bytes)?;
+        let staged = self.read_optional(self.stage_file(), maximum_bytes)?;
         if matches!(
             self.role,
             StoreRole::LocalCreateRequest
                 | StoreRole::CredentialQuery
                 | StoreRole::LocalCreateAcknowledgement
                 | StoreRole::LocalCreateDenial
+                | StoreRole::OperationDispatch
         ) && canonical
             .iter()
             .chain(staged.iter())
@@ -1604,7 +1804,7 @@ impl ExactFileStore {
     }
 
     fn write_stage(&self, encoded: &[u8]) -> Result<(), CleanFileStoreError> {
-        let name = self.role.stage_file();
+        let name = self.stage_file();
         let mut file = match create_new_at(&self.root.directory, &self.root.path, name) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -1650,32 +1850,32 @@ impl ExactFileStore {
         staged: &StoredImage,
     ) -> Result<(), CleanFileStoreError> {
         let observed_stage = self
-            .read_optional(self.role.stage_file(), self.role.maximum_bytes())?
+            .read_optional(self.stage_file(), self.role.maximum_bytes())?
             .ok_or(CleanFileStoreError::AmbiguousPublication)?;
         if &observed_stage != staged {
             return Err(CleanFileStoreError::AmbiguousPublication);
         }
-        let observed_canonical = self.read_optional(self.role.file(), self.role.maximum_bytes())?;
+        let observed_canonical = self.read_optional(self.file(), self.role.maximum_bytes())?;
         if observed_canonical.as_ref() != expected
             || staged.predecessor != expected.map(StoredImage::commitment)
         {
             return Err(CleanFileStoreError::AmbiguousPublication);
         }
-        self.sync_named(self.role.stage_file())?;
+        self.sync_named(self.stage_file())?;
         rename_at(
             &self.root.directory,
             &self.root.path,
-            self.role.stage_file(),
-            self.role.file(),
+            self.stage_file(),
+            self.file(),
         )?;
         self.root.sync()?;
         let published = self
-            .read_optional(self.role.file(), self.role.maximum_bytes())?
+            .read_optional(self.file(), self.role.maximum_bytes())?
             .ok_or(CleanFileStoreError::Corrupt)?;
         if &published != staged {
             return Err(CleanFileStoreError::Corrupt);
         }
-        match named_metadata(&self.root.path, self.role.stage_file()) {
+        match named_metadata(&self.root.path, self.stage_file()) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Ok(_) => return Err(CleanFileStoreError::Corrupt),
             Err(error) => return Err(error.into()),
@@ -1684,11 +1884,7 @@ impl ExactFileStore {
     }
 
     fn unlink_stage(&self) -> Result<(), CleanFileStoreError> {
-        unlink_at(
-            &self.root.directory,
-            &self.root.path,
-            self.role.stage_file(),
-        )?;
+        unlink_at(&self.root.directory, &self.root.path, self.stage_file())?;
         self.root.sync()
     }
 
@@ -1999,7 +2195,29 @@ fn validate_private_regular_metadata(metadata: &fs::Metadata) -> Result<(), Clea
     Ok(())
 }
 
-fn audit_named_entries(root: &Path, allowed_entries: &[&str]) -> Result<(), CleanFileStoreError> {
+const MAX_OPERATION_JOURNAL_RECORDS: usize =
+    2 * vos::agent::authority_operation_coordinator::MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS;
+
+fn operation_record_name(name: &str) -> Option<vos::agent::sdk::InvocationId> {
+    let name = name.strip_suffix(".next").unwrap_or(name);
+    if name.len() != 64
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let mut bytes = [0; 32];
+    hex::decode_to_slice(name, &mut bytes).ok()?;
+    (bytes != [0; 32]).then_some(vos::agent::sdk::InvocationId(bytes))
+}
+
+fn audit_named_entries(
+    root: &Path,
+    allowed_entries: &[&str],
+    operation_records: bool,
+) -> Result<(), CleanFileStoreError> {
+    let mut records = 0;
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let name = entry
@@ -2007,7 +2225,13 @@ fn audit_named_entries(root: &Path, allowed_entries: &[&str]) -> Result<(), Clea
             .into_string()
             .map_err(|_| CleanFileStoreError::UnexpectedResidue)?;
         if !allowed_entries.contains(&name.as_str()) {
-            return Err(CleanFileStoreError::UnexpectedResidue);
+            if !operation_records || operation_record_name(&name).is_none() {
+                return Err(CleanFileStoreError::UnexpectedResidue);
+            }
+            records += 1;
+            if records > 2 * MAX_OPERATION_JOURNAL_RECORDS {
+                return Err(CleanFileStoreError::Oversized);
+            }
         }
         validate_private_regular_metadata(&fs::symlink_metadata(entry.path())?)?;
     }
@@ -2165,6 +2389,10 @@ fn unlink_at(directory: &File, _root: &Path, name: &str) -> Result<(), CleanFile
     Ok(())
 }
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "clean_operation_journal_tests.rs"]
+mod operation_journal_tests;
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2231,13 +2459,13 @@ pub(crate) mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 
-    struct Fixture {
-        parent: PathBuf,
-        root: PathBuf,
+    pub(super) struct Fixture {
+        pub(super) parent: PathBuf,
+        pub(super) root: PathBuf,
     }
 
     impl Fixture {
-        fn new(label: &str) -> Self {
+        pub(super) fn new(label: &str) -> Self {
             let mut nonce = [0_u8; 8];
             getrandom::getrandom(&mut nonce).expect("test entropy");
             let parent = std::env::temp_dir().join(format!(
@@ -2277,7 +2505,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn write_private(path: &Path, bytes: &[u8]) {
+    pub(super) fn write_private(path: &Path, bytes: &[u8]) {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -2296,7 +2524,11 @@ pub(crate) mod tests {
             .expect("sync private test directory");
     }
 
-    fn stage(store: &ExactFileStore, predecessor: Option<[u8; 32]>, payload: &[u8]) -> StoredImage {
+    pub(super) fn stage(
+        store: &ExactFileStore,
+        predecessor: Option<[u8; 32]>,
+        payload: &[u8],
+    ) -> StoredImage {
         let encoded = encode_envelope(store.role, predecessor, payload).expect("encode stage");
         let staged = decode_envelope(store.role, &encoded, payload.len()).expect("decode stage");
         store.write_stage(&encoded).expect("write stage");
