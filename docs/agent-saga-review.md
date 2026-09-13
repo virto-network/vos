@@ -1519,3 +1519,36 @@ bootstrap, an all-PVM outer-runtime restart, physical application of the newly
 authorized Create, finalization, route publication or native ingress wiring.
 Those remain required, alongside the existing journal-capacity and lifecycle
 completion work. No guest artifact was rebuilt or repinned here.
+
+### Native Local Create and application acknowledgement
+
+`CleanSystemAgentBootstrapOwner::create_local_from_management_intent` now
+connects authorization/issuance to physical Local creation and durable
+application acknowledgement. It rejects non-Create/non-Local input, checks
+the host's Space/node and the sole replica, and verifies the admitted runtime
+package against the requested descriptor before dispatch. After creation it
+uses `observe_management_application`, which reloads the image and re-admits
+its runtime/catalog, before asking the issuer to sign application evidence.
+It does not finalize the Authority effect or publish a route; the enclosing
+lifecycle coordinator must retain exclusive ownership through those phases.
+
+The bundled-Authority regression now uses the actual bundled runtime PVM for
+the ordinary Local Agent. It tests runtime-package mismatch refusal, successful
+Create through the owner adapter, cold Local-host reopen, exact Created
+observation and signed application acknowledgement, then reopens the intent,
+issuer and Local host and retries at slot 40 after expiry at slot 30. The image
+commitment, receipt and acknowledgement remain exact, with only two signatures
+total (receipt and application ack) and no extra Authority journal entry.
+The system fixture still uses its native Standard outer-runtime shortcut and
+seeded bootstrap predecessor; this does not prove an all-PVM system restart.
+
+**26/26 issuer, native creation and Local-host tests pass**
+(`r16-native-local-create-coordinator-final.log`, 22.10s), using locked offline
+dependencies and disk-backed scratch space. Formatting and diff checks pass.
+An initial test compile used `program` instead of the runtime manifest's
+`outer_program` field; it was corrected before the passing runs.
+
+Next connect durable Authority finalization and receipt/result retirement,
+journal-capacity reservation, native host attachment and route publication.
+The CLI/ingress management entry point and independent ordinary-Agent finality
+are still incomplete. No artifact or store format changed in this checkpoint.

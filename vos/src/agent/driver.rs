@@ -139,7 +139,7 @@ fn validate_clean_standard_descriptor(
     }
 }
 
-fn verify_clean_runtime_package_binding(
+pub(crate) fn verify_clean_runtime_package_binding(
     descriptor: &crate::agent_sdk::AgentDescriptor,
     package: &super::package_admission::AdmittedRuntimePackage,
 ) -> Result<(), AgentDriverError> {

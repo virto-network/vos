@@ -2254,6 +2254,57 @@ where
         .map_err(|_| SharedAgentHostError::Unavailable)
     }
 
+    /// Execute the Local Create/application portion of a retained lifecycle
+    /// intent. No route is published and no Authority effect is finalized here.
+    /// The caller must retain exclusive lifecycle ownership through those phases.
+    pub(crate) fn create_local_from_management_intent<B, J, S>(
+        &mut self,
+        slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
+        managed: ManagedAgentTarget,
+        local: &mut super::local_sdk_host::LocalAgentHost,
+        runtime: AdmittedRuntimePackage,
+        issuer: &mut DurableCleanManagementIssuer<J>,
+        signer: &mut S,
+    ) -> Result<(AgentId, ManagementApplicationAck), SharedAgentHostError>
+    where
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
+        let request = slot
+            .intent()
+            .ok_or(SharedAgentHostError::ScopeMismatch)?
+            .request()
+            .clone();
+        let ManagementRequest::Create(descriptor) = &request else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        if descriptor.identity.profile != AgentProfile::Local
+            || local.space() != self.pins.space
+            || local.node() != self.pins.node
+            || descriptor.identity.space != local.space()
+            || descriptor.replicas.len() != 1
+            || descriptor.replicas[0].node != local.node()
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        super::driver::verify_clean_runtime_package_binding(descriptor, &runtime)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let receipt = self.issue_management_intent(slot, managed, issuer, signer)?;
+        let agent = local
+            .create_agent(runtime, (**descriptor).clone(), receipt.clone())
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        // This observation reloads the image and re-admits its runtime and
+        // catalog. An in-memory Created reply is not application evidence.
+        let observation = local
+            .observe_management_application(agent, &request, &receipt)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let acknowledgement = issuer
+            .observe_local_application(&observation, signer)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        Ok((agent, acknowledgement))
+    }
+
     pub(crate) fn audit_authority_projection(
         &mut self,
         head: super::sdk::authority::AuthorityProjectionHead,
@@ -6881,6 +6932,31 @@ mod tests {
                 NativeProjectionOwnerHarness::with_fixture("bundled-authority-management", fixture);
             let owner = harness.owner.as_mut().unwrap();
             let mut descriptor = owner.pins.descriptor.clone();
+            // The ordinary Local host executes the real bundled runtime PVM,
+            // not the outer system fixture's native Standard test shortcut.
+            let mut runtime = PackageEnvelope::decode(shape_only_runtime().exact_bytes()).unwrap();
+            let program = include_bytes!("../../../vosx/blobs/agent_runtime.pvm").to_vec();
+            let program_ref = BlobRef::of_bytes(&program);
+            let crate::agent_sdk::package::PackageManifest::AgentRuntime(manifest) =
+                &mut runtime.manifest
+            else {
+                unreachable!()
+            };
+            manifest.outer_program = program_ref.clone();
+            runtime.artifacts = vec![PackageArtifact {
+                identity: program_ref,
+                bytes: program,
+            }];
+            runtime.manifest.signing_mut().signature = SigningKey::from_bytes(&[0x63; 32])
+                .sign(&runtime.signing_bytes().unwrap())
+                .to_bytes();
+            let runtime = admit_runtime_package(&runtime.encode().unwrap()).unwrap();
+            descriptor.identity.runtime_deployment = runtime.deployment();
+            descriptor.identity.runtime_program = runtime.program();
+            descriptor.identity.runtime_producer = runtime.producer();
+            descriptor.runtime_package = runtime.package_ref().clone();
+            descriptor.runtime_contract = runtime.manifest().contract;
+            descriptor.capabilities = runtime.capabilities();
             descriptor.creation_nonce = Hash([0xdc; 32]);
             descriptor.identity.agent = AgentId::derive(
                 descriptor.identity.space,
@@ -6929,6 +7005,63 @@ mod tests {
             let applied = owner.ordered_index_for_test().unwrap();
             assert!(applied > before);
             let envelope = slot.authorization_work().unwrap().unwrap().clone();
+            let local_root = harness._directory.0.join("ordinary-local");
+            let mut local = crate::agent::local_sdk_host::LocalAgentHost::create(
+                &local_root,
+                descriptor.identity.space,
+                owner.pins.node,
+                harness.fixture.trust.clone(),
+            )
+            .unwrap();
+            assert!(matches!(
+                owner.create_local_from_management_intent(
+                    &mut slot,
+                    call.managed,
+                    &mut local,
+                    shape_only_runtime(),
+                    &mut issuer,
+                    &mut signer,
+                ),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            assert!(local.list().unwrap().is_empty());
+            assert_eq!(signer.calls, 1);
+            assert_eq!(owner.ordered_index_for_test().unwrap(), applied);
+            let (agent, initial_acknowledgement) = owner
+                .create_local_from_management_intent(
+                    &mut slot,
+                    call.managed,
+                    &mut local,
+                    runtime.clone(),
+                    &mut issuer,
+                    &mut signer,
+                )
+                .unwrap();
+            assert_eq!(agent, descriptor.identity.agent);
+            drop(local);
+            let local = crate::agent::local_sdk_host::LocalAgentHost::open(
+                &local_root,
+                descriptor.identity.space,
+                owner.pins.node,
+                harness.fixture.trust.clone(),
+            )
+            .unwrap();
+            let observation = local
+                .observe_management_application(agent, &request, &receipt)
+                .unwrap();
+            assert_eq!(
+                observation.result(),
+                &Ok(ManagementReply::Created(descriptor.identity.clone()))
+            );
+            let acknowledgement = issuer
+                .observe_local_application(&observation, &mut signer)
+                .unwrap();
+            assert_eq!(acknowledgement, initial_acknowledgement);
+            assert_eq!(acknowledgement.reopened_state, observation.reopened_state());
+            assert_eq!(acknowledgement.applied_at, observation.applied_at());
+            assert!(acknowledgement.verify_with(&RawCredentialVerifier).is_ok());
+            assert_eq!(signer.calls, 2);
+            drop(local);
             drop(slot);
             drop(issuer);
             harness
@@ -6952,8 +7085,40 @@ mod tests {
                 receipt
             );
             assert_eq!(slot.authorization_work().unwrap(), Some(&envelope));
-            assert_eq!(signer.calls, 1);
+            assert_eq!(signer.calls, 2);
             assert_eq!(owner.ordered_index_for_test().unwrap(), applied);
+            let mut local = crate::agent::local_sdk_host::LocalAgentHost::open(
+                &local_root,
+                descriptor.identity.space,
+                owner.pins.node,
+                harness.fixture.trust.clone(),
+            )
+            .unwrap();
+            assert_eq!(
+                owner
+                    .create_local_from_management_intent(
+                        &mut slot,
+                        call.managed,
+                        &mut local,
+                        runtime,
+                        &mut issuer,
+                        &mut signer,
+                    )
+                    .unwrap(),
+                (agent, acknowledgement.clone())
+            );
+            let recovered = local
+                .observe_management_application(agent, &request, &receipt)
+                .unwrap();
+            assert_eq!(recovered.reopened_state(), observation.reopened_state());
+            assert_eq!(
+                issuer
+                    .observe_local_application(&recovered, &mut signer)
+                    .unwrap(),
+                acknowledgement
+            );
+            assert_eq!(signer.calls, 2);
+            drop(local);
             harness.stop();
         }
 
