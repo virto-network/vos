@@ -19,8 +19,9 @@ pub use operation_controller::{
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 pub use operation_dispatch::{
-    MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES, NativeAuthorityOperationCompletionSigner,
-    NativeAuthorityOperationJournalStore, NativeAuthorityOperationStartupAdmission,
+    MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES, MAX_NATIVE_OPERATION_COMPLETION_BYTES,
+    NativeAuthorityOperationCompletionSigner, NativeAuthorityOperationJournalStore,
+    NativeAuthorityOperationStartupAdmission, native_operation_completion_invocations,
     native_operation_record_matches,
 };
 

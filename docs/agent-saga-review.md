@@ -179,7 +179,8 @@ Keep these as work within C2, not new review batches:
    Native acknowledgement of the successful result pair now passes while
    deliberately retaining admission. Signed completion continuation and owner
    reopen after either one or both acknowledgements now pass; production
-   continuation storage and final durable release remain open.
+   continuation storage now has a hardened, bounded file backend. Controller/
+   daemon adoption of that backend and final durable release remain open.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
    retirement and restart through native ingress; then expose the same
    preparation/authorization flow in the user-facing client. A Public query
@@ -5637,6 +5638,38 @@ required before enabling this phase in ingress. No guest artifacts changed.
 The combined native regression passes: **five passed, zero failed**, in
 **56.37s** (`r16-native-operation-partial-retirement-regression.log`). Formatting
 and diff checks pass. This is targeted coverage, not a new full release run.
+
+### Bounded native operation completion storage
+
+Verification: the final CLI suite passed **216 tests, zero failures, five
+ignored**, in **14.14s**, including four completion-index tests. Evidence:
+`.worktrees/ch08-c2-native/target/task-tmp/r16-native-operation-completion-store-cli-final.log`
+(relative to the main checkout). The initial three focused tests passed in
+5.26s; the earlier CLI run passed 215 tests before adding malformed-stage
+coverage. Formatting and whitespace checks pass. These are host storage/CLI
+checks, not a fresh live deployment or full-library release run.
+
+The native operation completion index now has a dedicated, exclusively leased
+CSF1 role (22) and an NCI1 image pinned to the configured Authority scope.
+It retains at most 256 signed NOC1 certificates, with bounded canonical framing,
+signature validation, sorted authorization IDs and no overlapping invocation
+IDs. Exact retries preserve bytes and synchronize storage; capacity exhaustion
+fails without eviction. Recovery validates both canonical and staged images
+before publication, permitting only exact retention or one-record append to an
+existing image. Removal, replacement and malformed stages preserve evidence and
+fail closed. Missing existing stores are not silently recreated.
+
+This backend is not yet owned by the production operation controller or daemon.
+Signature/index validation is not native execution proof: startup must still
+bind each certificate to both exact NOD1 records. NOC1 permits continuation of
+acknowledgement, not release of admission. Final signed retirement after both
+positive acknowledgements, its restart handling, and denial retirement remain
+required. No guest artifact or user-facing operation endpoint changed here.
+
+The next scoped C2 step is controller/daemon ownership of the completion-store
+lease and recovery admission from its fully validated certificates, followed by
+durable terminal retirement before release. Do not treat this storage checkpoint
+as completion of protected invocation or the release gates.
 
 ### Durable client acknowledgement before completion
 

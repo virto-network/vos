@@ -1,6 +1,27 @@
 //! Signed continuation evidence, not an application receipt or finality proof.
 use super::*;
 
+pub const MAX_NATIVE_OPERATION_COMPLETION_BYTES: usize = 512;
+
+/// Verify canonical framing and the selected signer's key. Full scope and
+/// journal binding still require both source NOD1 records during recovery.
+pub fn native_operation_completion_invocations(
+    public_key: &[u8; 32],
+    bytes: &[u8],
+) -> Option<[InvocationId; 2]> {
+    let certificate = CompletionCertificate::decode(bytes).ok()?;
+    if certificate.encode().ok().as_deref() != Some(bytes)
+        || !crate::agent::authority::verify_raw_ed25519(
+            public_key,
+            &certificate.signing_bytes(),
+            &certificate.signature,
+        )
+    {
+        return None;
+    }
+    Some([certificate.authorization, certificate.acknowledgement])
+}
+
 /// A configured Authority signer; exact repeated messages must be idempotent.
 pub trait NativeAuthorityOperationCompletionSigner {
     type Error;
@@ -40,7 +61,7 @@ impl CompletionCertificate {
 
 impl CanonicalWire for CompletionCertificate {
     const MAGIC: [u8; 4] = *b"NOC1";
-    const MAX_ENCODED_BYTES: usize = 512;
+    const MAX_ENCODED_BYTES: usize = MAX_NATIVE_OPERATION_COMPLETION_BYTES;
     fn validate_wire(&self) -> bool {
         self.authorization != InvocationId::ZERO
             && self.acknowledgement != InvocationId::ZERO

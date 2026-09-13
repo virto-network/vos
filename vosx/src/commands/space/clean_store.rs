@@ -188,6 +188,7 @@ enum StoreRole {
     OperationCoordinator = 19,
     OperationIssuer = 20,
     OperationDispatch = 21,
+    OperationCompletions = 22,
 }
 
 impl StoreRole {
@@ -214,6 +215,7 @@ impl StoreRole {
             Self::OperationCoordinator => "authority-operation.coordinator",
             Self::OperationIssuer => "authority-operation.issuer",
             Self::OperationDispatch => "authority-operation.dispatch",
+            Self::OperationCompletions => "authority-operation.completions",
         }
     }
 
@@ -240,6 +242,7 @@ impl StoreRole {
             Self::OperationCoordinator => "authority-operation.coordinator.next",
             Self::OperationIssuer => "authority-operation.issuer.next",
             Self::OperationDispatch => "authority-operation.dispatch.next",
+            Self::OperationCompletions => "authority-operation.completions.next",
         }
     }
 
@@ -258,6 +261,7 @@ impl StoreRole {
             Self::InvocationProgress => super::invocation_progress::MAX_PROGRESS_BYTES,
             Self::OperationCoordinator => MAX_AUTHORITY_OPERATION_COORDINATOR_IMAGE_BYTES,
             Self::OperationIssuer => MAX_AUTHORITY_OPERATION_ISSUER_IMAGE_BYTES,
+            Self::OperationCompletions => 40 + 256 * (4 + 512),
             Self::OperationDispatch => {
                 #[cfg(target_os = "linux")]
                 {
@@ -289,6 +293,7 @@ impl StoreRole {
             19 => Some(Self::OperationCoordinator),
             20 => Some(Self::OperationIssuer),
             21 => Some(Self::OperationDispatch),
+            22 => Some(Self::OperationCompletions),
             1 => Some(Self::Pins),
             2 => Some(Self::Bootstrap),
             3 => Some(Self::ManagementIssuer),
@@ -2409,6 +2414,12 @@ fn unlink_at(directory: &File, _root: &Path, name: &str) -> Result<(), CleanFile
 #[cfg(all(test, target_os = "linux"))]
 #[path = "clean_operation_journal_tests.rs"]
 mod operation_journal_tests;
+
+#[cfg(target_os = "linux")]
+#[path = "clean_operation_completions.rs"]
+mod operation_completions;
+#[cfg(target_os = "linux")]
+pub(crate) use operation_completions::CleanNativeAuthorityOperationCompletions;
 
 #[cfg(test)]
 pub(crate) mod tests {
