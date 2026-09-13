@@ -1663,6 +1663,20 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
+    pub(crate) fn management_initial_admission_requirement(
+        &self,
+        agent: AgentId,
+        anchor: &super::clean_management_intent::ManagementJournalAnchor,
+        envelope: &crate::agent_sdk::RuntimeWork,
+    ) -> Result<Option<usize>, SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .management_initial_admission_requirement(anchor, envelope)
+            .map_err(map_driver_error)
+    }
+
     pub(crate) fn projection_admission_records(
         &self,
         agent: AgentId,

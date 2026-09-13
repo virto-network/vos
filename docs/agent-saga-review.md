@@ -40,9 +40,13 @@ saved finalization whose clock does not overtake any unissued authorization.
 Startup physically checks and retires those predecessors before dispatching
 successors. Missing predecessor finalization, incompatible saved clocks,
 unsupported issuer histories, or missing required runtime artifacts still stop
-startup, preserving their stores. Continuous live protection and
-coexistence with an unfinished projection
-remain implementation blockers, not deployment-ready behavior. Do not delete
+startup, preserving their stores. Fresh live Local Create now reserves capture,
+extends admission through finalization and positively acknowledges both runtime
+results before returning success. Saved live requests require their exact
+restored reservation; retirement-write retries release only the verified pair.
+Denial/expiry resolution, full capacity/crash-boundary verification, and
+coexistence with an unfinished projection remain blockers, not deployment-ready
+behavior. Do not delete
 those stores to bypass the recovery check.
 
 The integrated library run at `37d6a5720e7e45e4a19850a16a531e6cb316e299`
@@ -3552,6 +3556,71 @@ capacity before dispatch. Switching only capture would strand callers at their
 unprotected finalization step. Continuous live protection, complete dependent
 recovery and the previously listed C1/C2/C3 release gates remain open. This is
 another internal C2 checkpoint, not a new review batch or deployment claim.
+
+### Protected live Local Create through retirement
+
+The native controller's public `create_local_agent` path now captures initial
+authorization under persistent pending admission, uses protected finalization
+extension, hands off the pair to retirement, positively acknowledges both
+runtime results, and commits CMR2 before reporting success. Physical Local
+application and independently reopened issuer evidence remain required. A saved
+authorization can resume on this path only if its exact envelope/anchor is in
+both the root refresh image and live coordinator reservation; possession of a
+saved intent alone cannot dispatch it without protection.
+
+Initial capture now budgets both remaining authorization/ACK records and two
+future finalization/ACK records. The future byte allowance derives from the
+actual authorization Ordered encodings plus the full SDK invocation-message
+limit and possible parent-hash growth for each record. Finalization copies the
+same work, replaces fixed-width identities, uses anonymous origin and a bounded
+message, so this overestimates its size without manufacturing an acknowledgement
+as application evidence. Physical generation headroom still requires one spare
+slot. Protected extension later checks the exact final envelope. Boundary and
+filesystem crash campaigns remain release gates; a passing normal-sized native
+fixture is not proof of those campaigns.
+
+Retirement handoff now accepts an exact already-retiring pair idempotently,
+without duplicating it or changing other pending members. If retirement-store
+publication persists CMR2 and then fails, a same-process retry revalidates the
+durable marker and releases that exact reservation. Returning an ACK without
+this release would strand the next request, so that case has a native regression.
+
+The new live two-agent test interrupts authorization preparation, rejects the
+successor before it captures an authorization, restarts and completes the first
+request, then creates and retires the successor normally. Both signed ACKs are
+verified and exact repeated delivery adds no Ordered entries. Historical
+overlapping-store tests now construct their residues through low-level fixture
+primitives: the public live path deliberately can no longer create those stores.
+The pre-retirement startup test now interrupts the actual live handoff, rather
+than relying on successful Create leaving retirement until restart.
+
+Verification so far: 21 native Local regressions passed (266.05s,
+`r16-live-admission-native.log`) before the final exact-membership and
+post-commit-release adjustments. On the adjusted production source, both live
+overlap/restart and committed-retirement retry tests passed (60.80s,
+`r16-live-admission-live-verified.log`), 12 vosx lifecycle file tests passed
+(0.13s, `r16-live-admission-files.log`), and 7 adjacent network tests passed
+(0.43s, `r16-live-admission-network.log`). The native admission/extension/retirement
+regression also passed (141.72s, `r16-live-admission-capacity.log`), including
+current-phase cost of two records versus initial full-lifecycle cost of four.
+The final same-process prepared-authorization retry also passed (1 test,
+24.42s, `r16-live-admission-prepared-retry.log`): the successor remains blocked
+until the exact saved request finishes, then both requests retire with exactly
+eight total Ordered entries and no additional entries on repeated delivery.
+These are targeted results, not a final full-library rerun. Logs remain under
+`.worktrees/ch08-c2-native/target/task-tmp`, relative to the main checkout.
+
+Two intermediate live-test runs overflowed the combined setup/runtime stack
+(`r16-live-admission-retirement-retry.log` and
+`r16-live-admission-live-final.log`). Moving the retirement retry sequence to its
+own normal-sized execution thread fixed the fixture; stack limits were not
+increased. The passing final live checks above include that correction.
+
+Next: resolve denied/expired requests without abandoning admission or durable
+evidence, complete physical fault/capacity gates, and continue native actor
+installation/invocation and ordinary Shared finality. No rebuilt-CLI smoke,
+source freeze, guest rebuild, release certification or branch promotion is
+claimed by this C2 checkpoint.
 
 ### Durable client acknowledgement before completion
 

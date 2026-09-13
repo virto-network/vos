@@ -1573,6 +1573,85 @@ where
         )],
         retiring: &[&crate::agent_sdk::RuntimeWork],
     ) -> Result<Option<usize>, SharedJournalDriverError> {
+        self.management_recovery_admission_with_headroom(pending, retiring, 0, 0)
+    }
+
+    /// Reserve a complete fresh two-invocation lifecycle before authorization.
+    /// Finalization copies the authorization work, replacing only fixed-size
+    /// identities, the origin with anonymous, and the bounded message. Budget
+    /// the full message limit in addition to the original message, so no
+    /// placeholder acknowledgement is treated as application evidence.
+    pub(crate) fn management_initial_admission_requirement(
+        &self,
+        anchor: &super::clean_management_intent::ManagementJournalAnchor,
+        envelope: &crate::agent_sdk::RuntimeWork,
+    ) -> Result<Option<usize>, SharedJournalDriverError> {
+        let crate::agent_sdk::RuntimeWork::Invoke {
+            context,
+            invocation,
+            authorization,
+            observed_slot,
+            ..
+        } = envelope
+        else {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        };
+        let heads = self.materialization.heads();
+        let mut future_bytes = 0usize;
+        for operation in [
+            ReplayOperation::CleanInvoke {
+                context: *context,
+                work: (**invocation).clone(),
+                authorization: (**authorization).clone(),
+                observed_slot: *observed_slot,
+            },
+            ReplayOperation::CleanAcknowledge {
+                context: *context,
+                expected_live: None,
+                work: (**invocation).clone(),
+                authorization: (**authorization).clone(),
+            },
+        ] {
+            let entry = OrderedEntry {
+                genesis: heads.genesis,
+                index: heads
+                    .ordered_index
+                    .checked_add(1)
+                    .ok_or(SharedJournalDriverError::CrossStoreMismatch)?,
+                parent: heads.ordered_head,
+                merge_frontier: heads.merge_frontier,
+                merge_seal: None,
+                input: ReplayInput {
+                    runtime: heads.runtime.clone(),
+                    operation,
+                },
+            };
+            // A currently absent parent may become a 32-byte hash. All other
+            // framing uses the same fixed-width encoding as actual admission.
+            future_bytes = future_bytes
+                .checked_add(entry.encode().len())
+                .and_then(|bytes| bytes.checked_add(crate::agent_sdk::MAX_INVOCATION_MESSAGE_BYTES))
+                .and_then(|bytes| bytes.checked_add(32))
+                .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+        }
+        self.management_recovery_admission_with_headroom(
+            &[(anchor, envelope)],
+            &[],
+            2,
+            future_bytes,
+        )
+    }
+
+    fn management_recovery_admission_with_headroom(
+        &self,
+        pending: &[(
+            &super::clean_management_intent::ManagementJournalAnchor,
+            &crate::agent_sdk::RuntimeWork,
+        )],
+        retiring: &[&crate::agent_sdk::RuntimeWork],
+        future_entries: usize,
+        future_bytes: usize,
+    ) -> Result<Option<usize>, SharedJournalDriverError> {
         use crate::agent_sdk::{RuntimeOutcome, RuntimeWork};
         if pending
             .len()
@@ -1683,9 +1762,11 @@ where
             self.management_retirement_delta(retiring, index, parent)?;
         let entries = entries
             .checked_add(retirement_entries)
+            .and_then(|entries| entries.checked_add(future_entries))
             .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
         let bytes = bytes
             .checked_add(retirement_bytes)
+            .and_then(|bytes| bytes.checked_add(future_bytes))
             .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
         Ok(self
             .materialization

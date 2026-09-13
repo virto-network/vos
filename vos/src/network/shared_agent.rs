@@ -1282,13 +1282,16 @@ impl SharedRouteHandler {
             combined.push(candidate.clone());
         }
         let keys = pending_management_keys(self.agent, &combined)?;
-        let required = host
-            .management_recovery_admission_requirement(
+        let required = if predecessor.is_none() {
+            host.management_initial_admission_requirement(self.agent, &candidate.0, &candidate.1)?
+        } else {
+            host.management_recovery_admission_requirement(
                 self.agent,
                 &pending_management_refs(&combined),
                 &retiring.iter().flatten().collect::<Vec<_>>(),
             )?
-            .ok_or(SharedAgentHostError::CapacityExhausted)?;
+        }
+        .ok_or(SharedAgentHostError::CapacityExhausted)?;
         if status.remaining_slots < required as u64 + 1 {
             return Err(SharedAgentHostError::CapacityExhausted);
         }
@@ -2780,7 +2783,7 @@ impl SharedAgentNetworkHost {
     /// Reserve the initial immutable envelope and its journal anchor before
     /// publishing the intent. Retain admission after an ambiguous store error;
     /// an exact retry receives the original clock and anchor. This reserves the
-    /// current phase, not capacity for an as-yet-unprepared finalization.
+    /// authorization/ACK plus a conservative bounded finalization/ACK delta.
     pub(crate) fn capture_management_pending<F, T>(
         &mut self,
         agent: crate::service::AgentId,
@@ -2818,6 +2821,45 @@ impl SharedAgentNetworkHost {
             self.management_pending.remove(&agent);
         }
         result
+    }
+
+    /// A saved live intent may resume only under its exact restored reservation.
+    /// Possession of an old envelope is not permission to dispatch unprotected.
+    pub(crate) fn ensure_management_pending_member(
+        &self,
+        agent: crate::service::AgentId,
+        anchor: &crate::agent::clean_management_intent::ManagementJournalAnchor,
+        envelope: &crate::agent_sdk::RuntimeWork,
+    ) -> Result<(), SharedAgentHostError> {
+        let key = management_envelope_key(agent, envelope)?;
+        let pending = self
+            .management_pending
+            .get(&agent)
+            .ok_or(SharedAgentHostError::Conflict)?;
+        let keys = pending_management_keys(agent, pending)?;
+        if !keys.contains(&(key, anchor.clone())) {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        let live = attached
+            .lifecycle
+            .read()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if !*live || attached.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        let proposal = attached
+            .coordinator
+            .proposal
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if proposal.management_pending.as_ref() != Some(&keys) {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        Ok(())
     }
 
     pub(crate) fn reserve_management_retirement_set(
@@ -2858,6 +2900,18 @@ impl SharedAgentNetworkHost {
         pairs: &[[&crate::agent_sdk::RuntimeWork; 2]],
     ) -> Result<(), SharedAgentHostError> {
         let moved = management_retirement_set_keys(agent, pairs)?;
+        // A failed retirement-store publication may already have completed
+        // handoff. Revalidate the exact existing pair without duplicating it.
+        if self
+            .management_retirements
+            .get(&agent)
+            .is_some_and(|existing| {
+                management_retirement_set_keys(agent, &retirement_pair_refs(existing))
+                    .is_ok_and(|keys| moved.iter().all(|pair| keys.contains(pair)))
+            })
+        {
+            return self.reserve_management_retirement_set(agent, pairs);
+        }
         let pending = self
             .management_pending
             .get(&agent)
