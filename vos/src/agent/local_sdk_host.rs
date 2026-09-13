@@ -2439,6 +2439,18 @@ mod tests {
 
     #[test]
     fn physical_opaque_runtime_create_management_and_expired_retry_reopen() {
+        opaque_runtime_lifecycle_with_upgrade(0);
+    }
+
+    #[test]
+    fn physical_runtime_upgrade_rejects_unreadable_or_changed_target_directory() {
+        for mutation in 1..=7 {
+            opaque_runtime_lifecycle_with_upgrade(mutation);
+        }
+    }
+
+    fn opaque_runtime_lifecycle_with_upgrade(upgrade_mutation: u8) {
+        use super::super::driver::AgentImageStore as _;
         use super::super::package_admission::{
             ScriptedRuntimeCase, ScriptedRuntimeCopy, admitted_scripted_runtime_for_test,
         };
@@ -2700,6 +2712,100 @@ mod tests {
                 copies: Vec::new(),
             });
         }
+        let mut target_reply = RuntimeTransition {
+            state: state(0xa5),
+            outcome: RuntimeOutcome::Management(Ok(ManagementReply::Actors(ActorDirectoryPage {
+                entries: vec![record.clone()],
+                next: None,
+            }))),
+        };
+        match upgrade_mutation {
+            0 => {}
+            1 => target_reply.state.control.push(9),
+            2 => target_reply.state.linear.push(9),
+            3 => target_reply.state.merge.push(9),
+            4 => target_reply.state.local.push(9),
+            5 => {
+                target_reply.outcome =
+                    RuntimeOutcome::Management(Ok(ManagementReply::Actors(ActorDirectoryPage {
+                        entries: Vec::new(),
+                        next: None,
+                    })));
+            }
+            6 => {
+                let mut substituted = record.clone();
+                substituted.incarnation = Hash([0xd2; 32]);
+                target_reply.outcome =
+                    RuntimeOutcome::Management(Ok(ManagementReply::Actors(ActorDirectoryPage {
+                        entries: vec![substituted],
+                        next: None,
+                    })));
+            }
+            _ => {
+                target_reply.outcome =
+                    RuntimeOutcome::Management(Err(sdk::ManagementError::UnsupportedRuntime));
+            }
+        }
+        let target = admitted_scripted_runtime_for_test(
+            "local-opaque-migration-target",
+            0xd1,
+            vec![ScriptedRuntimeCase {
+                input: RuntimeWork::Manage {
+                    context: RuntimeExecutionContext::Direct,
+                    space: space(),
+                    agent: template.identity.agent,
+                    runtime_deployment: template.identity.runtime_deployment,
+                    state: state(0xa5),
+                    request: Box::new(inspect.clone()),
+                    authority: None,
+                    observed_slot: 71,
+                }
+                .encode()
+                .unwrap(),
+                output: target_reply.encode().unwrap(),
+                copies: Vec::new(),
+            }],
+        );
+        let target_descriptor = descriptor(&target, 9, AgentProfile::Local, space(), node());
+        let mut upgrade_request =
+            ManagementRequest::UpgradeRuntime(Box::new(sdk::RuntimeUpgrade {
+                from_deployment: template.identity.runtime_deployment,
+                to_deployment: target.deployment(),
+                to_program: target.program(),
+                producer: target.producer(),
+                package: target.package_ref().clone(),
+                contract: target.manifest().contract,
+                capabilities: target.capabilities(),
+            }));
+        cases.push(ScriptedRuntimeCase {
+            input: RuntimeWork::Manage {
+                context: RuntimeExecutionContext::Direct,
+                space: space(),
+                agent: template.identity.agent,
+                runtime_deployment: template.identity.runtime_deployment,
+                state: state(0xa5),
+                request: Box::new(upgrade_request.clone()),
+                authority: Some(Box::new(management_receipt(
+                    &template,
+                    &upgrade_request,
+                    4,
+                    71,
+                    71,
+                ))),
+                observed_slot: 71,
+            }
+            .encode()
+            .unwrap(),
+            output: RuntimeTransition {
+                state: state(0xa5),
+                outcome: RuntimeOutcome::Management(Ok(ManagementReply::RuntimeUpgraded(
+                    target_descriptor.identity.clone(),
+                ))),
+            }
+            .encode()
+            .unwrap(),
+            copies: Vec::new(),
+        });
         let runtime =
             admitted_scripted_runtime_for_test("local-opaque-image-lifecycle", 0xc2, cases);
         let descriptor = descriptor(&runtime, 9, AgentProfile::Local, space(), node());
@@ -2846,7 +2952,7 @@ mod tests {
         assert_eq!(terminal.runtime_state.linear, vec![2]);
         drop(host);
         slot.store(70, Ordering::SeqCst);
-        let mut host = LocalAgentHost::open(&root, space(), node(), trust).unwrap();
+        let mut host = LocalAgentHost::open(&root, space(), node(), trust.clone()).unwrap();
         assert_eq!(
             host.agents[&agent]
                 .driver
@@ -2884,6 +2990,66 @@ mod tests {
         assert_ne!(
             late_observation.reopened_state(),
             application.reopened_state()
+        );
+        let ManagementRequest::UpgradeRuntime(upgrade) = &mut upgrade_request else {
+            unreachable!()
+        };
+        upgrade.from_deployment = descriptor.identity.runtime_deployment;
+        let upgrade_receipt = management_receipt(&descriptor, &upgrade_request, 4, 71, 71);
+        slot.store(71, Ordering::SeqCst);
+        let result = host.manage(
+            agent,
+            upgrade_request,
+            Some(upgrade_receipt),
+            SdkManagementArtifacts::Runtime(&target),
+        );
+        if upgrade_mutation == 0 {
+            assert_eq!(
+                result.unwrap(),
+                RuntimeOutcome::Management(Ok(ManagementReply::RuntimeUpgraded(
+                    target_descriptor.identity.clone()
+                )))
+            );
+            assert_eq!(
+                host.agents[&agent].driver.image().revision,
+                terminal.revision + 1
+            );
+            assert_eq!(
+                host.agents[&agent].driver.image().runtime_program.0,
+                target.program().0
+            );
+        } else {
+            assert!(result.is_err(), "target mutation {upgrade_mutation}");
+            assert_eq!(host.agents[&agent].driver.image(), &terminal);
+            let store = FileAgentStore::new(image_path(&root.join(encode_agent_id(agent))));
+            assert_eq!(store.load().unwrap(), Some(terminal.clone()));
+            assert_eq!(
+                store
+                    .load_program(crate::service::ProgramId(target.program().0))
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                store
+                    .load_package(&crate::service::BlobRef {
+                        hash: crate::service::Hash(target.package_ref().hash.0),
+                        len: target.package_ref().len,
+                    })
+                    .unwrap(),
+                None
+            );
+        }
+        let expected_image = host.agents[&agent].driver.image().clone();
+        drop(host);
+        let host = LocalAgentHost::open(&root, space(), node(), trust).unwrap();
+        assert_eq!(host.agents[&agent].driver.image(), &expected_image);
+        assert_eq!(
+            host.agents[&agent]
+                .driver
+                .physical_invocation_material(record.entry.actor)
+                .unwrap()
+                .actor,
+            record
         );
     }
 

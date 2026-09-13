@@ -3730,6 +3730,36 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 config: next_config,
                 runtime_state: next_state,
             };
+            if let Some((_, package)) = runtime_upgrade {
+                // The old runtime's successful reply is not evidence that the
+                // admitted target can interpret the migrated state. Execute the
+                // target's public, state-preserving directory query before the
+                // atomic cutover and require the exact existing installations.
+                let migration = (|| {
+                    let before = Self::inspect_sdk_actor_directory_image(
+                        &self.runtime_pvm,
+                        self.management_gas,
+                        &self.image,
+                        &current,
+                        observed_slot,
+                    )?;
+                    let after = Self::inspect_sdk_actor_directory_image(
+                        package.program_bytes(),
+                        self.management_gas,
+                        &next,
+                        &next_descriptor,
+                        observed_slot,
+                    )?;
+                    if before != after {
+                        return Err(AgentDriverError::InvalidRuntime);
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = migration {
+                    staged.rollback(&mut self.store);
+                    return Err(error);
+                }
+            }
             // A failed commit may have become durable before returning an I/O
             // error; staged artifacts are therefore intentionally retained.
             self.store.commit(Some(self.image.revision), &next)?;

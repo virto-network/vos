@@ -39,8 +39,9 @@ review endpoints for individual fixes:
    below. Production Local opaque-runtime management Create/reopen now uses
    public metadata and durable history. Scripted physical-PVM actor installation,
    invocation/resume/reopen and lane-transition checks now pass. Complete the
-   remaining positive-ack retirement and target-runtime migration checks; the
-   scripted host-ABI tests do not prove arbitrary guest execution semantics.
+   remaining positive-ack retirement and migrated invocation/retry checks.
+   Target-runtime directory compatibility is now checked before Local cutover;
+   the scripted host-ABI tests do not prove arbitrary guest execution semantics.
    Neither a private-state decoder nor a volatile cache is a runtime-independent
    proof.
 2. **C2 — native lifecycle:** connect ordinary-Agent provisioning to the native
@@ -1399,3 +1400,40 @@ the receipt, reopen the physical result, finalize its acknowledgement through
 that actor, and publish its route with independently verified finality. Only
 after that path works should Install/invoke/restart acceptance and final release
 gates be claimed. No new review batch, guest artifact or store format is added.
+
+### Local target-runtime compatibility before cutover
+
+`AgentDriver::manage_sdk` now physically executes the admitted target runtime's
+bounded public directory query against the proposed migrated image before an
+UpgradeRuntime commit. The query must preserve all four state lanes and return
+exactly the existing actor installation records, including incarnation and
+installation lineage. The old runtime's successful upgrade reply alone no
+longer causes publication of a target that cannot interpret that image.
+Probe errors roll back only newly staged artifacts; the prior image, runtime
+selection, descriptor and receipt history remain unchanged. Ambiguous errors
+from the subsequent atomic image commit still retain staged artifacts for
+recovery, as before.
+
+The existing physical opaque-runtime lifecycle fixture now upgrades through
+the actual Local host after actor installation, invocation, yield/resume and
+restart. A compatible target commits one revision and resolves the same actor
+from its signed catalog after cold reopen. Seven incompatible targets mutate
+one of the four lanes, omit the actor, substitute its incarnation, or reject
+inspection. Every refusal checks the unchanged live and on-disk image, removal
+of the newly staged target package/program, and successful reopen of the old
+runtime and actor material.
+
+**43/43 driver, Local-host and management-history tests pass**
+(`r16-runtime-migration-regression-final.log`, 12.04s), with locked offline
+dependencies and disk-backed scratch space. Formatting and diff checks pass.
+An intermediate test-only compile failed on two incorrectly qualified legacy
+types; both were corrected before this final run. This evidence covers target
+directory compatibility, not execution of migrated actor code or exact receipt
+retry through the new runtime. No guest artifact or store format changes.
+
+The native authority-dispatch trace also confirms that its restartable path
+must persist the exact prepared invocation and PublicPreflight (including the
+original observation slot) before dispatch. Rebuilding that envelope from
+current material on retry would change its authorization commitment. Existing
+projection-query recovery is not a management authorization/finalization
+adapter; native lifecycle integration and ordinary-Agent finality remain open.
