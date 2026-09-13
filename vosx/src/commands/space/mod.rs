@@ -36,6 +36,8 @@ pub mod local_config;
 pub(crate) mod local_create;
 #[cfg(target_os = "linux")]
 pub(crate) mod local_install;
+#[cfg(target_os = "linux")]
+pub(crate) mod local_invocation;
 pub mod new;
 pub mod op_sign;
 pub mod reconcile;
@@ -45,6 +47,16 @@ pub mod verify;
 
 #[derive(Subcommand, Debug)]
 pub enum SpaceCommand {
+    /// Deliver or retry exact canonical ASQ1; retains the first bound response.
+    #[cfg(target_os = "linux")]
+    SubmitAgentInvocation {
+        request_dir: PathBuf,
+        /// Initial ASQ1 input, ignored after an invocation has been retained.
+        #[arg(long)]
+        request: Option<PathBuf>,
+        #[arg(long)]
+        http: std::net::SocketAddr,
+    },
     /// Install a signed actor package into an operator-owned Local Agent.
     #[cfg(target_os = "linux")]
     InstallLocalActor(local_install::InstallLocalArgs),
@@ -143,6 +155,12 @@ pub enum SpaceCommand {
 
 pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
     match cmd {
+        #[cfg(target_os = "linux")]
+        SpaceCommand::SubmitAgentInvocation {
+            request_dir,
+            request,
+            http,
+        } => local_invocation::run(&request_dir, request.as_deref(), http),
         #[cfg(target_os = "linux")]
         SpaceCommand::InstallLocalActor(args) => local_install::run_install(args),
         #[cfg(target_os = "linux")]

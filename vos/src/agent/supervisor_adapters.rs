@@ -1655,7 +1655,9 @@ impl AgentInvocationResponse {
         }
     }
 
-    fn matches_request(&self, request: &AgentInvocationRequest) -> bool {
+    /// Verify exact transport binding, including identity-bearing outcomes.
+    /// This is not an independent signature/finality proof for a Direct reply.
+    pub fn matches_request(&self, request: &AgentInvocationRequest) -> bool {
         if self.request_commitment() != request.commitment()
             || !outcome_matches_work(self.outcome(), &request.work)
         {

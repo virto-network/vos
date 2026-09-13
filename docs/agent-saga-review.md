@@ -4766,6 +4766,38 @@ then live installed-actor invocation/exact retry/restart. The full C1/C2/C3
 scope remains open; neither this endpoint nor a Public-only smoke substitutes
 for authenticated ordinary-agent use or release verification.
 
+### Retained clean invocation delivery client
+
+`vosx space submit-agent-invocation REQUEST_DIR --request call.asq1 --http
+127.0.0.1:PORT` now imports a bounded canonical Direct invocation and publishes
+it before HTTP submission. Retries omit `--request`; even when supplied, input
+is ignored after retention. No signing, identity allocation or preparation
+occurs in this command. Non-loopback/zero-port endpoints, attested delivery,
+transport-node claims and identity-bearing unsigned public requests are refused.
+
+CSF1 roles 16/17 hold immutable `invocation.request`/`invocation.response` under
+one exclusive lease, using existing private-directory and durable replacement
+rules. The lease spans network delivery and response persistence. A response
+is canonical ASR1 and must match the exact request and outcome identity before
+publication. Reopen revalidates/resyncs both records; an orphan response cannot
+authorize reconstructing its missing request. Existing saved delivery is
+returned without contacting the daemon. Output preserves the full response:
+retained delivery may be an actor error or yield, not terminal actor success.
+Direct response binding is not independent daemon authentication or finality.
+
+Full vosx regression passes: 194 tests, zero failed, three ignored, 7.92s
+(`r16-invocation-client-final.log`). New coverage includes actual CLI parsing,
+initial input publication, retry after that input is removed, exclusive lease,
+conflicting requests/replies, mismatched/truncated response refusal, orphan
+refusal and offline reopen. Six socket cases verify identical request bytes
+and a held store lease across 503, 302, wrong content type, substituted reply,
+truncated reply, and successful bound delivery. The earlier run passed 193
+tests (`r16-invocation-client.log`) before parser/input-path additions.
+
+Fresh preparation/authorization, continuation/acknowledgement transport and
+native installed-actor invocation/restart are still required. This closes the
+retained submission seam, not that full workflow or any remaining release gate.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

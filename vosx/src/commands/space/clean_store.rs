@@ -171,6 +171,8 @@ enum StoreRole {
     LifecycleActor = 13,
     LocalInstallRequest = 14,
     LocalInstallAcknowledgement = 15,
+    InvocationRequest = 16,
+    InvocationResponse = 17,
 }
 
 impl StoreRole {
@@ -191,6 +193,8 @@ impl StoreRole {
             Self::LifecycleActor => LIFECYCLE_ACTOR_FILE,
             Self::LocalInstallRequest => "local-install.request",
             Self::LocalInstallAcknowledgement => "local-install.acknowledgement",
+            Self::InvocationRequest => "invocation.request",
+            Self::InvocationResponse => "invocation.response",
         }
     }
 
@@ -211,6 +215,8 @@ impl StoreRole {
             Self::LifecycleActor => LIFECYCLE_ACTOR_STAGE_FILE,
             Self::LocalInstallRequest => "local-install.request.next",
             Self::LocalInstallAcknowledgement => "local-install.acknowledgement.next",
+            Self::InvocationRequest => "invocation.request.next",
+            Self::InvocationResponse => "invocation.response.next",
         }
     }
 
@@ -224,6 +230,8 @@ impl StoreRole {
             Self::LifecycleIssuer => MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
             Self::LocalCreateRequest => 1024 * 1024,
             Self::LocalInstallRequest => 1024 * 1024,
+            Self::InvocationRequest => super::local_invocation::MAX_REQUEST_BYTES,
+            Self::InvocationResponse => super::local_invocation::MAX_RESPONSE_BYTES,
             Self::LifecycleRuntime => MAX_PACKAGE_ENCODED_BYTES,
             Self::LifecycleActor => MAX_PACKAGE_ENCODED_BYTES,
             Self::LocalCreateDenial => vos::agent::local_lifecycle::LocalCreateDenial::MAX_BYTES,
@@ -239,6 +247,8 @@ impl StoreRole {
 
     fn from_byte(byte: u8) -> Option<Self> {
         match byte {
+            16 => Some(Self::InvocationRequest),
+            17 => Some(Self::InvocationResponse),
             1 => Some(Self::Pins),
             2 => Some(Self::Bootstrap),
             3 => Some(Self::ManagementIssuer),
@@ -682,6 +692,74 @@ impl CleanCredentialQueryFile {
 pub(crate) struct CleanLocalCreateAcknowledgementFile {
     store: ExactFileStore,
     request: Vec<u8>,
+}
+
+/// Exact invocation and its first request-bound delivery under one lease.
+/// A retained response may be an error or yield, not terminal actor success.
+pub(crate) struct CleanInvocationFile {
+    request: ExactFileStore,
+    response: ExactFileStore,
+}
+
+impl CleanInvocationFile {
+    pub(crate) fn open_or_create(root: impl AsRef<Path>) -> Result<Self, CleanFileStoreError> {
+        let root = Arc::new(StoreRoot::open_with_entries(
+            root.as_ref(),
+            &[
+                LOCK_FILE,
+                "invocation.request",
+                "invocation.request.next",
+                "invocation.response",
+                "invocation.response.next",
+            ],
+        )?);
+        Ok(Self {
+            request: ExactFileStore::new(root.clone(), StoreRole::InvocationRequest),
+            response: ExactFileStore::new(root, StoreRole::InvocationResponse),
+        })
+    }
+
+    pub(crate) fn load_request(&mut self) -> Result<Option<Vec<u8>>, CleanFileStoreError> {
+        let bytes = self
+            .request
+            .load(StoreRole::InvocationRequest.maximum_bytes())?;
+        if let Some(bytes) = &bytes {
+            super::local_invocation::validate_request(bytes)
+                .map_err(|_| CleanFileStoreError::Corrupt)?;
+            self.request.commit_with_replacement(bytes, false)?;
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn publish_request(&mut self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
+        super::local_invocation::validate_request(bytes)
+            .map_err(|_| CleanFileStoreError::Corrupt)?;
+        self.load_response()?; // Never repair an orphan response from new input.
+        self.request.commit_with_replacement(bytes, false)
+    }
+
+    fn validate_response(&mut self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
+        let request = self.load_request()?.ok_or(CleanFileStoreError::Corrupt)?;
+        super::local_invocation::verify_response(&request, bytes)
+            .map(|_| ())
+            .map_err(|_| CleanFileStoreError::Corrupt)
+    }
+
+    pub(crate) fn load_response(&mut self) -> Result<Option<Vec<u8>>, CleanFileStoreError> {
+        let bytes = self
+            .response
+            .load(StoreRole::InvocationResponse.maximum_bytes())?;
+        if let Some(bytes) = &bytes {
+            self.validate_response(bytes)?;
+            self.response.commit_with_replacement(bytes, false)?;
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn publish_response(&mut self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
+        self.validate_response(bytes)?;
+        self.response.commit_with_replacement(bytes, false)
+    }
 }
 
 /// Immutable Install request and verified delivery evidence under one lease.

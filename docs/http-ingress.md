@@ -72,9 +72,27 @@ A 200 binary response is canonical `ASR1`, bound to the exact request. Inspect
 its runtime outcome: HTTP 200 does not itself mean actor success. On transport
 failure or 503, retain the original bytes; do not assume execution did not
 occur or generate a new invocation identity. The transport does not yet supply
-a retained client workflow, receipt issuance, continuation/acknowledgement transport,
+fresh client preparation/receipt issuance or continuation/acknowledgement transport,
 or the friendly JSON route below. A full live invocation/restart campaign is
 still required before ordinary-agent testing is considered ready.
+
+An already prepared Direct ASQ1 can be durably delivered with:
+
+```sh
+vosx space submit-agent-invocation /private/delivery-dir \
+  --request call.asq1 --http 127.0.0.1:8080
+vosx space submit-agent-invocation /private/delivery-dir --http 127.0.0.1:8080
+```
+
+Use a dedicated delivery directory beneath a mode-0700 parent. The command
+publishes the immutable request before sending and holds its exclusive lease
+through response persistence. Once retained, `--request` is ignored even if
+its input file is missing. A saved, request-bound response is returned offline
+on retry. Output is JSON containing the canonical response as hex and a
+`delivery_retained` marker, not an actor-success assertion: errors and yielded
+outcomes are also responses. Direct reply binding trusts the selected local
+daemon; it is not a signed finality proof. The command does not generate
+authorization or drive a yielded continuation.
 
 ### Existing name-based routes
 
