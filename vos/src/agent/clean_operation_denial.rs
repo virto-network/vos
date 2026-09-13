@@ -5,6 +5,27 @@ use crate::agent::authority_operation_issuer::{
 };
 use crate::agent::sdk::{InvocationStatus, RuntimeOutcome};
 
+pub const MAX_NATIVE_OPERATION_DENIAL_BYTES: usize = 512;
+
+/// Signature/framing validation only; native recovery also requires the exact
+/// source record and independently verified absence of retained issuance.
+pub fn native_operation_denial_invocation(
+    public_key: &[u8; 32],
+    bytes: &[u8],
+) -> Option<InvocationId> {
+    let certificate = DenialCertificate::decode(bytes).ok()?;
+    if certificate.encode().ok().as_deref() != Some(bytes)
+        || !crate::agent::authority::verify_raw_ed25519(
+            public_key,
+            &certificate.signing_bytes(),
+            &certificate.signature,
+        )
+    {
+        return None;
+    }
+    Some(certificate.invocation)
+}
+
 pub(crate) struct VerifiedNativeOperationDenial<'a> {
     proof: VerifiedManagementDenial,
     target: AuthorityActorTarget,
@@ -52,7 +73,7 @@ impl DenialCertificate {
 
 impl CanonicalWire for DenialCertificate {
     const MAGIC: [u8; 4] = *b"NDR1";
-    const MAX_ENCODED_BYTES: usize = 512;
+    const MAX_ENCODED_BYTES: usize = MAX_NATIVE_OPERATION_DENIAL_BYTES;
     fn validate_wire(&self) -> bool {
         self.invocation != InvocationId::ZERO
             && self.record != Hash::ZERO
@@ -81,7 +102,7 @@ impl CanonicalWire for DenialCertificate {
     }
 }
 
-fn restore_denial<'a>(
+pub(super) fn restore_denial<'a>(
     target: AuthorityActorTarget,
     record: &RetainedAuthorityOperationDispatch,
     bytes: &[u8],

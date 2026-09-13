@@ -187,8 +187,9 @@ Keep these as work within C2, not new review batches:
    native owner. The production controller/daemon now own the hardened
    retirement index and use terminal retry/release. Native unissued-denial
    verification/acknowledgement and signed terminal denial release have native
-   owner boundaries; production denial storage/recovery and operation
-   ingress/client wiring remain open.
+   owner boundaries. Issuer-gated denial startup classification is implemented;
+   production denial storage/controller adoption and operation ingress/client
+   wiring remain open.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
    retirement and restart through native ingress; then expose the same
    preparation/authorization flow in the user-facing client. A Public query
@@ -5989,6 +5990,39 @@ substituted certificate rejection, unchanged issuer/source evidence, and no
 additional native execution transitions. After durable release the previously
 excluded projection reservation succeeds. This is same-owner recovery evidence;
 NDR1 startup classification and a live valid-successor campaign remain open.
+
+### Issuer-gated native denial restart classification
+
+Verification: **8 native operation tests passed, zero failures**, in **116.78s**
+(`r16-native-operation-denial-reopen.log`); **219 CLI tests passed, zero failures,
+five ignored**, in **35.42s** (`r16-native-operation-denial-reopen-cli.log`).
+Logs are in shared disk-backed `.worktrees/ch08-c2-native/target/task-tmp`.
+Formatting and whitespace checks pass. No fresh live-daemon or full-library
+release campaign was run for this native recovery checkpoint.
+
+Native operation startup admission now accepts signed NDR1 evidence while
+borrowing both the native journal and issuer stores through attachment. It
+reopens and validates issuer state, verifies each signed denial against the
+exact source record, and requires absence of retained issuance for that
+invocation. Duplicate/missing denial sources, malformed signatures, issuance
+acknowledgement records contradicting denial, and completion/denial overlap all
+fail closed. A denied-only history has no active reservations but still requires
+completed existing bootstrap state.
+
+The denial fixtures close and reopen the owner after terminal publication,
+restore the signed denial without another execution/signature, repeat release,
+and successfully reserve unrelated projection work. Negative cases reject
+missing source discovery, duplicate certificates, corrupted signatures and
+native-record substitution. The approved fixture deliberately constructs a
+correctly signed but contradictory denial storage record: issuer history
+prevents it from being admitted, regardless of its signature. That synthetic
+record is test-only and is not native policy-denial evidence.
+
+The new public signature/framing helper supports the forthcoming durable denial
+index; it is not sufficient without native-source and issuer-history checks.
+Production daemon/controller discovery of denial storage, automatic terminal
+denial handling, and live valid-successor testing remain open. No guest bundle,
+HTTP endpoint or master integration changed in this checkpoint.
 
 ### Durable client acknowledgement before completion
 

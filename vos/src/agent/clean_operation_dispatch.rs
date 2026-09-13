@@ -7,7 +7,10 @@ use super::*;
 mod completion;
 #[path = "clean_operation_denial.rs"]
 mod denial;
-pub use denial::NativeAuthorityOperationDenialSigner;
+pub use denial::{
+    MAX_NATIVE_OPERATION_DENIAL_BYTES, NativeAuthorityOperationDenialSigner,
+    native_operation_denial_invocation,
+};
 #[path = "clean_operation_retirement.rs"]
 mod retirement;
 use crate::agent::authority_operation_coordinator::{
@@ -110,11 +113,73 @@ impl<'a> NativeAuthorityOperationStartupAdmission<'a> {
         certificates: &[Vec<u8>],
         terminal_certificates: &[Vec<u8>],
     ) -> Result<Self, SharedAgentHostError> {
+        Self::load_evidence(
+            journal,
+            authority,
+            invocations,
+            certificates,
+            terminal_certificates,
+            &[],
+            |_| Err(SharedAgentHostError::Unavailable),
+        )
+    }
+
+    /// Retain both journal and issuer leases throughout attachment. Signed
+    /// denials exclude only unissued invocations with exact native sources.
+    pub fn load_with_denials<J, B>(
+        journal: &'a mut J,
+        issuer: &'a mut B,
+        authority: AuthorityActorTarget,
+        invocations: &[InvocationId],
+        certificates: &[Vec<u8>],
+        terminal_certificates: &[Vec<u8>],
+        denials: &[Vec<u8>],
+    ) -> Result<Self, SharedAgentHostError>
+    where
+        J: NativeAuthorityOperationJournalStore,
+        B: crate::agent::authority_operation_issuer::AuthorityOperationIssuerStore,
+    {
+        let issuer =
+            crate::agent::authority_operation_issuer::DurableAuthorityOperationIssuer::open(
+                super::operation_controller::BorrowedIssuer(issuer),
+                authority,
+            )
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        Self::load_evidence(
+            journal,
+            authority,
+            invocations,
+            certificates,
+            terminal_certificates,
+            denials,
+            |invocation| {
+                issuer
+                    .recover_retained(invocation)
+                    .map(|retained| retained.is_none())
+                    .map_err(|_| SharedAgentHostError::Unavailable)
+            },
+        )
+    }
+
+    fn load_evidence<J, F>(
+        journal: &'a mut J,
+        authority: AuthorityActorTarget,
+        invocations: &[InvocationId],
+        certificates: &[Vec<u8>],
+        terminal_certificates: &[Vec<u8>],
+        denials: &[Vec<u8>],
+        mut unissued: F,
+    ) -> Result<Self, SharedAgentHostError>
+    where
+        J: NativeAuthorityOperationJournalStore,
+        F: FnMut(InvocationId) -> Result<bool, SharedAgentHostError>,
+    {
         let maximum = 2 * crate::agent::authority_operation_coordinator::MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS;
         if !authority.is_valid()
             || invocations.len() > maximum
             || certificates.len() > maximum / 2
             || terminal_certificates.len() > maximum / 2
+            || denials.len() > maximum / 2
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
@@ -134,10 +199,29 @@ impl<'a> NativeAuthorityOperationStartupAdmission<'a> {
                 .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
             records.insert(invocation, record);
         }
+        let mut denied = std::collections::BTreeSet::new();
+        for certificate in denials {
+            let invocation =
+                native_operation_denial_invocation(&authority.binding.public_key, certificate)
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            if !denied.insert(invocation) || !unissued(invocation)? {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            denial::restore_denial(
+                authority,
+                records
+                    .get(&invocation)
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?,
+                certificate,
+            )?;
+        }
         for record in records.values() {
             if record.request.method == AuthorityOperationActorMethod::AcknowledgeIssuance {
                 let ack = AuthorityOperationIssuanceAck::decode(&record.request.request)
                     .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                if denied.contains(&ack.authorization_invocation) {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
                 let predecessor = records
                     .get(&ack.authorization_invocation)
                     .ok_or(SharedAgentHostError::ScopeMismatch)?;
@@ -180,7 +264,11 @@ impl<'a> NativeAuthorityOperationStartupAdmission<'a> {
         let mut retirements = Vec::new();
         for certificate in certificates {
             let [authorization, acknowledgement] = completion::completion_invocations(certificate)?;
-            if !retiring.insert(authorization) || !retiring.insert(acknowledgement) {
+            if denied.contains(&authorization)
+                || denied.contains(&acknowledgement)
+                || !retiring.insert(authorization)
+                || !retiring.insert(acknowledgement)
+            {
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
             let authorization = records
@@ -202,7 +290,10 @@ impl<'a> NativeAuthorityOperationStartupAdmission<'a> {
             has_history: !records.is_empty(),
             pending: records
                 .into_values()
-                .filter(|record| !retiring.contains(&record.request.context.invocation))
+                .filter(|record| {
+                    !retiring.contains(&record.request.context.invocation)
+                        && !denied.contains(&record.request.context.invocation)
+                })
                 .map(|record| (record.anchor, record.envelope))
                 .collect(),
             retirements,

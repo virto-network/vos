@@ -545,7 +545,7 @@ impl<C: AuthorityOperationCoordinatorStore> AuthorityOperationCoordinatorStore
     }
 }
 
-struct BorrowedIssuer<'a, B>(&'a mut B);
+pub(super) struct BorrowedIssuer<'a, B>(pub(super) &'a mut B);
 impl<B: AuthorityOperationIssuerStore> AuthorityOperationIssuerStore for BorrowedIssuer<'_, B> {
     type Error = B::Error;
     fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {

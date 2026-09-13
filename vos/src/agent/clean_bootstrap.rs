@@ -21,10 +21,11 @@ pub use operation_controller::{
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 pub use operation_dispatch::{
     MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES, MAX_NATIVE_OPERATION_COMPLETION_BYTES,
-    MAX_NATIVE_OPERATION_RETIREMENT_BYTES, NativeAuthorityOperationCompletionSigner,
-    NativeAuthorityOperationDenialSigner, NativeAuthorityOperationJournalStore,
-    NativeAuthorityOperationRetirementSigner, NativeAuthorityOperationRetirementStore,
-    NativeAuthorityOperationStartupAdmission, native_operation_completion_invocations,
+    MAX_NATIVE_OPERATION_DENIAL_BYTES, MAX_NATIVE_OPERATION_RETIREMENT_BYTES,
+    NativeAuthorityOperationCompletionSigner, NativeAuthorityOperationDenialSigner,
+    NativeAuthorityOperationJournalStore, NativeAuthorityOperationRetirementSigner,
+    NativeAuthorityOperationRetirementStore, NativeAuthorityOperationStartupAdmission,
+    native_operation_completion_invocations, native_operation_denial_invocation,
     native_operation_record_matches, native_operation_retirement_completion,
 };
 
@@ -10439,7 +10440,48 @@ mod tests {
                     .verify_native_operation_denial(&authorization, &mut retained_issuer)
                     .is_err()
             );
-            let operation_issuer = retained_issuer.into_store();
+            let mut operation_issuer = retained_issuer.into_store();
+            // Deliberately contradictory signed storage fixture, not native
+            // denial evidence: retained issuance must override no such claim.
+            let fields = [
+                call.invocation.0,
+                Hash::digest(
+                    b"vos/agent/native-operation-dispatch/v1",
+                    &[&authorization_bytes],
+                )
+                .0,
+                call.commitment().0,
+                [0xef; 32],
+            ]
+            .concat();
+            let abi = crate::agent::sdk::RUNTIME_ABI_ID.as_bytes();
+            let mut message = b"vos/agent/native-operation-denial-retirement/v1".to_vec();
+            message.extend_from_slice(abi);
+            message.extend_from_slice(&fields);
+            let mut contradictory = b"NDR1".to_vec();
+            contradictory.extend_from_slice(abi);
+            contradictory.extend_from_slice(&fields);
+            contradictory.extend_from_slice(&64u32.to_le_bytes());
+            contradictory.extend_from_slice(&signer.key.sign(&message).to_bytes());
+            assert_eq!(
+                native_operation_denial_invocation(&authority.binding.public_key, &contradictory),
+                Some(call.invocation)
+            );
+            assert!(
+                NativeAuthorityOperationStartupAdmission::load_with_denials(
+                    &mut journal,
+                    &mut operation_issuer,
+                    authority,
+                    &[
+                        call.invocation,
+                        issued.issuance_ack.acknowledgement_invocation
+                    ],
+                    &[],
+                    &[],
+                    &[contradictory],
+                )
+                .is_err()
+            );
             assert!(
                 owner
                     .verify_native_operation_completion(&acknowledgement, &authorization, &issued)
@@ -11231,6 +11273,82 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(), saved);
             assert!(!issuer_path.exists());
             assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+            let mut issuer_store = issuer.into_store();
+            for (ids, denials) in [
+                (vec![], vec![saved.clone()]),
+                (
+                    vec![request.context.invocation],
+                    vec![saved.clone(), saved.clone()],
+                ),
+                (vec![request.context.invocation], vec![corrupt.clone()]),
+                (
+                    vec![request.context.invocation],
+                    vec![record.encode().unwrap()],
+                ),
+            ] {
+                assert!(
+                    NativeAuthorityOperationStartupAdmission::load_with_denials(
+                        &mut journal,
+                        &mut issuer_store,
+                        target,
+                        &ids,
+                        &[],
+                        &[],
+                        &denials,
+                    )
+                    .is_err()
+                );
+            }
+            let old_owner = harness.owner.take().unwrap();
+            let pins = old_owner._pins_store.clone();
+            let bootstrap_record = old_owner.record_store.clone();
+            let bootstrap_issuer = old_owner.issuer.into_store();
+            drop(old_owner._network_host);
+            drop(old_owner.host);
+            let admission = NativeAuthorityOperationStartupAdmission::load_with_denials(
+                &mut journal,
+                &mut issuer_store,
+                target,
+                &[request.context.invocation],
+                &[],
+                &[],
+                &[saved.clone()],
+            )
+            .unwrap();
+            assert!(admission.is_empty());
+            assert!(admission.has_history);
+            let mut owner =
+                CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+                    pins,
+                    bootstrap_record,
+                    bootstrap_issuer,
+                    &mut CountingSigner::new(),
+                    || panic!("denial retirement must reopen existing bootstrap"),
+                    harness._directory.host(),
+                    harness._directory.lock(),
+                    harness.fixture.plan.pins.space,
+                    harness.fixture.plan.pins.node,
+                    harness.fixture.trust.clone(),
+                    harness.fixture.merge.clone(),
+                    harness.fixture.finality.clone(),
+                    harness.provider.clone(),
+                    harness.network.clone(),
+                    None,
+                    Some(&admission),
+                )
+                .unwrap();
+            drop(admission);
+            let mut issuer = DurableAuthorityOperationIssuer::open(issuer_store, target).unwrap();
+            let retired = owner
+                .restore_native_operation_denial(&record, &mut issuer, &saved)
+                .unwrap();
+            owner.release_native_operation_denial(&retired).unwrap();
+            owner.release_native_operation_denial(&retired).unwrap();
+            drop(retired);
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+            assert_eq!(signer.1, if recover_published { 1 } else { 2 });
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+            let (query, query_auth) = fresh_projection_pair(&owner, 0xdc);
             owner
                 ._network_host
                 .reserve_projection_pair(
@@ -11243,6 +11361,7 @@ mod tests {
             drop(issuer);
             drop(wrong_issuer);
             drop(journal);
+            harness.owner = Some(owner);
             harness.stop();
         }
 
