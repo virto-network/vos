@@ -2356,6 +2356,49 @@ unproven at this checkpoint. Initial Create latency, journal capacity/retirement
 Install/invoke, ordinary Shared finality, and the full C1/C2/C3 release gates
 remain open.
 
+### First verified live Create acknowledgement and repeated-publication work
+
+The `fast-resume` daemon reached readiness at `2026-09-13T04:43:32.969598Z`,
+about 108 seconds after startup. Its first retained-request submission returned
+a **client-verified MAA2** for Local Agent
+`c73db0519443e8c5744763a8073ec17781aeda5017cfb8a131ec15e9efb6c866` at
+approximately `04:45:27Z`, about 114 seconds later. This exercised durable
+application recovery and production route reconciliation before HTTP 201.
+The 3,138-byte JSON response is `fast-resume-result.json` under the smoke root.
+However, the immediate second retry returned HTTP 504 and the script exited 1;
+`fast-resume-retry-result.json` is empty. Both outcomes matter: one verified live
+acknowledgement is now proven, but repeat completion within the HTTP deadline
+is not. The daemon stopped and removed its endpoint. The request SHA-256 stayed
+`173da629f2e649e485927ca92a2d02b9ab5aa629197645ff6bfbe124aef8862f`.
+
+The production owner now remembers at most one successfully published Local
+application response in memory. Every retry still passes through signed-call
+validation and durable physical application recovery. Only an identical full
+acknowledgement commitment, unchanged accepted head, and existing Local
+attachment may reuse that previous completion without another inventory pass.
+The record is cleared before each lifecycle attempt and every reconciliation
+attempt, including failures; a successful exact delivery may restore it.
+Reopening starts empty and must reconcile again. This is bounded response
+delivery deduplication, not an authorization proof, durable publication marker,
+or promise that a previously created Agent is currently healthy.
+
+All five production-owner tests pass in 0.09 seconds
+(`r16-published-create-owner.log` under the shared disk test target). They cover
+matching response/head/attachment, missing and substituted matches, and clearing
+the record on successful and failed reconciliation. A new native script,
+`target/native-clock-smoke.GLMaE7/published-resume-smoke.sh`, preserves all earlier
+logs and will compare two exact retained-request responses with the rebuilt CLI.
+Full C1/C2/C3 completion and native latency remain open.
+
+Follow-up validation: all ten native lifecycle tests pass in 55.47 seconds
+(`r16-published-create-native.log`), and the CLI builds in 19.85 seconds
+(`r16-published-create-cli-build.log`). The new live script is running against
+that rebuilt source. If its first submission returns 504, it records that
+failure and allows one more exact `--resume` while keeping the same daemon up,
+then compares the next verified response byte-for-byte. It neither increases
+the HTTP deadline nor substitutes a new request. This exercises bounded
+recovery after a wait timeout; any initial timeout remains a latency failure.
+
 ### Durable immutable Local Create request storage
 
 `CleanLocalCreateRequestFile` stores one signed HTTP-compatible LCQ1 submission

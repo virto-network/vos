@@ -30,6 +30,17 @@ use super::supervisor_adapters::{
 
 const MAX_INVENTORY_AGENTS: usize = 4096;
 
+fn completed_local_publication_matches(
+    previous: Option<(super::sdk::Hash, AuthorityProjectionHead)>,
+    acknowledgement: super::sdk::Hash,
+    accepted_head: Option<AuthorityProjectionHead>,
+    had_local_attachment: bool,
+) -> bool {
+    had_local_attachment
+        && previous
+            .is_some_and(|(prior, head)| prior == acknowledgement && Some(head) == accepted_head)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentProductionOwnerError {
     InvalidConfiguration,
@@ -378,6 +389,9 @@ pub(crate) struct AgentProductionOwner {
     shared: OwnedRouteSlot,
     source: Box<dyn AuthorityInventorySource>,
     accepted_head: Option<AuthorityProjectionHead>,
+    // Bounded, process-local delivery deduplication only. Never used to
+    // authorize management, recover an application, or restore publication.
+    completed_local_publication: Option<(super::sdk::Hash, AuthorityProjectionHead)>,
     reconcile_interval: Duration,
     reconcile_after: Instant,
     lifecycle: Option<(Box<dyn super::local_lifecycle::NativeLocalLifecycle>, usize)>,
@@ -492,6 +506,7 @@ impl AgentProductionOwner {
             shared: OwnedRouteSlot::Empty,
             source: Box::new(source),
             accepted_head: None,
+            completed_local_publication: None,
             reconcile_interval,
             reconcile_after: Instant::now(),
             lifecycle,
@@ -523,6 +538,11 @@ impl AgentProductionOwner {
         if !self.is_running() {
             return Err(AgentProductionOwnerError::InvalidConfiguration);
         }
+        // Every attempt still authenticates and reopens physical application
+        // evidence through the lifecycle. Errors invalidate prior delivery
+        // deduplication instead of leaving a stale success available.
+        let previous = self.completed_local_publication.take();
+        let had_local_attachment = !self.local.is_empty();
         let (lifecycle, capacity) = self
             .lifecycle
             .as_mut()
@@ -533,9 +553,20 @@ impl AgentProductionOwner {
         if self.local.is_empty() {
             self.local = OwnedRouteSlot::Pending(lifecycle.local_attachment(*capacity)?);
         }
+        let acknowledgement = result.1.commitment();
+        if completed_local_publication_matches(
+            previous,
+            acknowledgement,
+            self.accepted_head,
+            had_local_attachment,
+        ) {
+            self.completed_local_publication = previous;
+            return Ok(result);
+        }
         // The controller released both host locks before route reconciliation.
         // Errors leave durable application evidence for an exact retry.
         self.reconcile()?;
+        self.completed_local_publication = self.accepted_head.map(|head| (acknowledgement, head));
         Ok(result)
     }
 
@@ -574,6 +605,10 @@ impl AgentProductionOwner {
     }
 
     fn reconcile_at(&mut self, now: Instant) -> Result<(), AgentProductionOwnerError> {
+        // A new attempt can change or retire attachments even if it fails.
+        // Only a subsequent successful lifecycle publication may remember a
+        // response again; reopening always starts without this optimization.
+        self.completed_local_publication = None;
         let inventory = self.source.load_inventory()?;
         accept_head(self.accepted_head, inventory.head)?;
         validate_root_provenance(&inventory, self.system_agent)?;
@@ -1249,6 +1284,48 @@ mod tests {
     }
 
     #[test]
+    fn completed_local_delivery_requires_exact_response_head_and_attachment() {
+        let acknowledgement = super::super::sdk::Hash([0x31; 32]);
+        let prior = Some((acknowledgement, head(1)));
+        assert!(completed_local_publication_matches(
+            prior,
+            acknowledgement,
+            Some(head(1)),
+            true
+        ));
+        assert!(!completed_local_publication_matches(
+            None,
+            acknowledgement,
+            Some(head(1)),
+            true
+        ));
+        assert!(!completed_local_publication_matches(
+            prior,
+            acknowledgement,
+            None,
+            true
+        ));
+        assert!(!completed_local_publication_matches(
+            prior,
+            acknowledgement,
+            Some(head(2)),
+            true
+        ));
+        assert!(!completed_local_publication_matches(
+            prior,
+            super::super::sdk::Hash([0x32; 32]),
+            Some(head(1)),
+            true
+        ));
+        assert!(!completed_local_publication_matches(
+            prior,
+            acknowledgement,
+            Some(head(1)),
+            false
+        ));
+    }
+
+    #[test]
     fn lifecycle_reconciliation_defers_the_next_periodic_run() {
         check_reconciliation_deadline(true);
     }
@@ -1281,8 +1358,10 @@ mod tests {
             reconcile_interval: interval,
             reconcile_after: admitted,
             lifecycle: None,
+            completed_local_publication: None,
         };
         let before = Instant::now();
+        owner.completed_local_publication = Some((super::super::sdk::Hash([0x31; 32]), head(1)));
         if lifecycle {
             assert_eq!(owner.reconcile(), Ok(()));
         } else {
@@ -1292,6 +1371,11 @@ mod tests {
         assert_eq!(calls.lock().unwrap().len(), 4);
         assert_eq!(owner.drive_if_due(before), Ok(false));
         assert_eq!(calls.lock().unwrap().len(), 4);
+        assert!(owner.completed_local_publication.is_none());
+        owner.completed_local_publication = Some((super::super::sdk::Hash([0x31; 32]), head(1)));
+        owner.source = Box::new(client(Vec::new(), Vec::new(), head(1), calls));
+        assert!(owner.reconcile().is_err());
+        assert!(owner.completed_local_publication.is_none());
         owner.shutdown_and_join().unwrap();
     }
 
