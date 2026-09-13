@@ -7,6 +7,14 @@ use crate::agent::sdk::{InvocationStatus, RuntimeOutcome};
 
 pub const MAX_NATIVE_OPERATION_DENIAL_BYTES: usize = 512;
 
+/// Exclusively leased terminal-denial index. Successful retention synchronizes
+/// exact bytes; failed/conflicting writes preserve prior evidence.
+pub trait NativeAuthorityOperationDenialStore {
+    type Error;
+    fn load(&mut self) -> Result<Vec<Vec<u8>>, Self::Error>;
+    fn retain(&mut self, certificate: &[u8]) -> Result<(), Self::Error>;
+}
+
 /// Signature/framing validation only; native recovery also requires the exact
 /// source record and independently verified absence of retained issuance.
 pub fn native_operation_denial_invocation(

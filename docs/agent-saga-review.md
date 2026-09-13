@@ -188,8 +188,8 @@ Keep these as work within C2, not new review batches:
    retirement index and use terminal retry/release. Native unissued-denial
    verification/acknowledgement and signed terminal denial release have native
    owner boundaries. Issuer-gated denial startup classification is implemented;
-   production denial storage/controller adoption and operation ingress/client
-   wiring remain open.
+   a hardened denial index is implemented. Production denial controller/daemon
+   adoption and operation ingress/client wiring remain open.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
    retirement and restart through native ingress; then expose the same
    preparation/authorization flow in the user-facing client. A Public query
@@ -6023,6 +6023,39 @@ index; it is not sufficient without native-source and issuer-history checks.
 Production daemon/controller discovery of denial storage, automatic terminal
 denial handling, and live valid-successor testing remain open. No guest bundle,
 HTTP endpoint or master integration changed in this checkpoint.
+
+### Hardened native operation denial index
+
+Verification: **222 CLI tests passed, zero failures, five ignored**, in
+**37.14s**, including three new denial-index tests and the existing completion/
+retirement regressions. Evidence:
+`.worktrees/ch08-c2-native/target/task-tmp/r16-native-operation-denial-store-cli.log`.
+Formatting and whitespace checks pass. No native execution behavior changed;
+no full-library or fresh live deployment campaign was run for this storage
+checkpoint.
+
+`CleanNativeAuthorityOperationDenials` now implements the leased denial store
+boundary. It uses a separate CSF1 role (24), `authority-operation.denials` and
+its `.next` stage, NDI1 framing, and a denial-specific Authority scope digest.
+It shares the hardened certificate-index engine with completion and successful
+retirement through an explicit certificate-kind enum. Existing NCI1/NRI1 bytes
+and namespaces are unchanged. Denials carry one invocation ID rather than a
+pair, with uniqueness and canonical ordering checked before publication.
+
+The index bounds retention to 256 NDR1 records of at most 512 bytes each.
+Signature/framing checks reject completion/retirement substitution; native
+source binding and issuer-history checks still belong to startup recovery.
+Exact retries synchronize unchanged bytes. Recovery permits only retention or
+one-record append to an existing image; deletion, replacement, duplicate IDs,
+invalid ordering/signatures and trailing bytes preserve evidence and fail
+closed. Capacity exhaustion does not evict records.
+
+Storage fixtures cover exact retry, exclusive ownership, wrong Authority scope,
+missing-existing behavior, cross-kind rejection, staged append recovery,
+conflicting/malformed stage preservation, and the count limit. Their signed
+source hashes are synthetic storage fixtures, not native denial proof. The
+backend is not yet adopted by the production controller/daemon; that integration
+and automatic terminal denial handling remain next within C2.
 
 ### Durable client acknowledgement before completion
 

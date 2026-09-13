@@ -190,6 +190,7 @@ enum StoreRole {
     OperationDispatch = 21,
     OperationCompletions = 22,
     OperationRetirements = 23,
+    OperationDenials = 24,
 }
 
 impl StoreRole {
@@ -218,6 +219,7 @@ impl StoreRole {
             Self::OperationDispatch => "authority-operation.dispatch",
             Self::OperationCompletions => "authority-operation.completions",
             Self::OperationRetirements => "authority-operation.retirements",
+            Self::OperationDenials => "authority-operation.denials",
         }
     }
 
@@ -246,6 +248,7 @@ impl StoreRole {
             Self::OperationDispatch => "authority-operation.dispatch.next",
             Self::OperationCompletions => "authority-operation.completions.next",
             Self::OperationRetirements => "authority-operation.retirements.next",
+            Self::OperationDenials => "authority-operation.denials.next",
         }
     }
 
@@ -266,6 +269,7 @@ impl StoreRole {
             Self::OperationIssuer => MAX_AUTHORITY_OPERATION_ISSUER_IMAGE_BYTES,
             Self::OperationCompletions => 40 + 256 * (4 + 512),
             Self::OperationRetirements => 40 + 256 * (4 + 1024),
+            Self::OperationDenials => 40 + 256 * (4 + 512),
             Self::OperationDispatch => {
                 #[cfg(target_os = "linux")]
                 {
@@ -299,6 +303,7 @@ impl StoreRole {
             21 => Some(Self::OperationDispatch),
             22 => Some(Self::OperationCompletions),
             23 => Some(Self::OperationRetirements),
+            24 => Some(Self::OperationDenials),
             1 => Some(Self::Pins),
             2 => Some(Self::Bootstrap),
             3 => Some(Self::ManagementIssuer),
@@ -2425,6 +2430,8 @@ mod operation_journal_tests;
 mod operation_completions;
 #[cfg(target_os = "linux")]
 pub(crate) use operation_completions::CleanNativeAuthorityOperationCompletions;
+#[cfg(target_os = "linux")]
+pub(crate) use operation_completions::CleanNativeAuthorityOperationDenials;
 #[cfg(target_os = "linux")]
 pub(crate) use operation_completions::CleanNativeAuthorityOperationRetirements;
 

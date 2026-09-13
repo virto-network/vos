@@ -1,8 +1,12 @@
-//! Bounded, append-only signed completion index inside a hardened CSF1 image.
+//! Bounded, append-only signed operation evidence in role-separated CSF1 images.
 use super::*;
+#[cfg(test)]
+#[path = "clean_operation_denial_store_tests.rs"]
+mod denial_tests;
 use vos::agent::clean_bootstrap::{
-    MAX_NATIVE_OPERATION_COMPLETION_BYTES, MAX_NATIVE_OPERATION_RETIREMENT_BYTES,
-    native_operation_completion_invocations, native_operation_retirement_completion,
+    MAX_NATIVE_OPERATION_COMPLETION_BYTES, MAX_NATIVE_OPERATION_DENIAL_BYTES,
+    MAX_NATIVE_OPERATION_RETIREMENT_BYTES, native_operation_completion_invocations,
+    native_operation_denial_invocation, native_operation_retirement_completion,
 };
 use vos::agent::sdk::{Hash, InvocationId, authority::AuthorityActorTarget};
 
@@ -11,10 +15,64 @@ const MAX_RECORDS: usize =
 #[cfg(test)]
 const MAX_IMAGE: usize = 40 + MAX_RECORDS * (4 + MAX_NATIVE_OPERATION_COMPLETION_BYTES);
 
+#[derive(Clone, Copy)]
+enum CertificateKind {
+    Completion,
+    Retirement,
+    Denial,
+}
+
 pub(crate) struct CleanNativeAuthorityOperationCompletions {
     file: ExactFileStore,
     authority: AuthorityActorTarget,
-    terminal: bool,
+    kind: CertificateKind,
+}
+
+pub(crate) struct CleanNativeAuthorityOperationDenials(CleanNativeAuthorityOperationCompletions);
+
+impl CleanNativeAuthorityOperationDenials {
+    pub(crate) fn open_or_create(
+        path: impl AsRef<Path>,
+        authority: AuthorityActorTarget,
+    ) -> Result<Self, CleanFileStoreError> {
+        CleanNativeAuthorityOperationCompletions::open_kind(
+            path.as_ref(),
+            authority,
+            true,
+            CertificateKind::Denial,
+        )
+        .map(Self)
+    }
+    pub(crate) fn open_existing(
+        path: impl AsRef<Path>,
+        authority: AuthorityActorTarget,
+    ) -> Result<Self, CleanFileStoreError> {
+        CleanNativeAuthorityOperationCompletions::open_kind(
+            path.as_ref(),
+            authority,
+            false,
+            CertificateKind::Denial,
+        )
+        .map(Self)
+    }
+    pub(crate) fn load(&self) -> Result<Vec<Vec<u8>>, CleanFileStoreError> {
+        self.0.load()
+    }
+    pub(crate) fn retain(&mut self, certificate: &[u8]) -> Result<(), CleanFileStoreError> {
+        self.0.retain(certificate)
+    }
+}
+
+impl vos::agent::clean_bootstrap::NativeAuthorityOperationDenialStore
+    for CleanNativeAuthorityOperationDenials
+{
+    type Error = CleanFileStoreError;
+    fn load(&mut self) -> Result<Vec<Vec<u8>>, Self::Error> {
+        CleanNativeAuthorityOperationDenials::load(self)
+    }
+    fn retain(&mut self, certificate: &[u8]) -> Result<(), Self::Error> {
+        CleanNativeAuthorityOperationDenials::retain(self, certificate)
+    }
 }
 
 pub(crate) struct CleanNativeAuthorityOperationRetirements(
@@ -26,15 +84,25 @@ impl CleanNativeAuthorityOperationRetirements {
         path: impl AsRef<Path>,
         authority: AuthorityActorTarget,
     ) -> Result<Self, CleanFileStoreError> {
-        CleanNativeAuthorityOperationCompletions::open_kind(path.as_ref(), authority, true, true)
-            .map(Self)
+        CleanNativeAuthorityOperationCompletions::open_kind(
+            path.as_ref(),
+            authority,
+            true,
+            CertificateKind::Retirement,
+        )
+        .map(Self)
     }
     pub(crate) fn open_existing(
         path: impl AsRef<Path>,
         authority: AuthorityActorTarget,
     ) -> Result<Self, CleanFileStoreError> {
-        CleanNativeAuthorityOperationCompletions::open_kind(path.as_ref(), authority, false, true)
-            .map(Self)
+        CleanNativeAuthorityOperationCompletions::open_kind(
+            path.as_ref(),
+            authority,
+            false,
+            CertificateKind::Retirement,
+        )
+        .map(Self)
     }
     pub(crate) fn load(&self) -> Result<Vec<Vec<u8>>, CleanFileStoreError> {
         self.0.load()
@@ -77,7 +145,7 @@ mod tests {
 
     // Signature/framing fixture only: these hashes do not claim native
     // execution. Startup must independently match the actual NOD1 pair.
-    fn certificate(key: &libp2p::identity::Keypair, number: u16, hash: u8) -> Vec<u8> {
+    pub(super) fn certificate(key: &libp2p::identity::Keypair, number: u16, hash: u8) -> Vec<u8> {
         let mut authorization = [0x41; 32];
         authorization[30..].copy_from_slice(&number.to_be_bytes());
         let mut acknowledgement = [0x42; 32];
@@ -97,7 +165,7 @@ mod tests {
     }
 
     // Signed storage fixture only, not proof of positive native Ack.
-    fn terminal(key: &libp2p::identity::Keypair, number: u16, hash: u8) -> Vec<u8> {
+    pub(super) fn terminal(key: &libp2p::identity::Keypair, number: u16, hash: u8) -> Vec<u8> {
         let completion = certificate(key, number, hash);
         terminal_from_completion(key, &completion)
     }
@@ -433,22 +501,22 @@ impl CleanNativeAuthorityOperationCompletions {
         authority: AuthorityActorTarget,
         create: bool,
     ) -> Result<Self, CleanFileStoreError> {
-        Self::open_kind(path, authority, create, false)
+        Self::open_kind(path, authority, create, CertificateKind::Completion)
     }
 
     fn open_kind(
         path: &Path,
         authority: AuthorityActorTarget,
         create: bool,
-        terminal: bool,
+        kind: CertificateKind,
     ) -> Result<Self, CleanFileStoreError> {
         if !authority.is_valid() {
             return Err(CleanFileStoreError::InvalidPath);
         }
-        let role = if terminal {
-            StoreRole::OperationRetirements
-        } else {
-            StoreRole::OperationCompletions
+        let role = match kind {
+            CertificateKind::Retirement => StoreRole::OperationRetirements,
+            CertificateKind::Completion => StoreRole::OperationCompletions,
+            CertificateKind::Denial => StoreRole::OperationDenials,
         };
         const COMPLETION_ENTRIES: &[&str] = &[
             LOCK_FILE,
@@ -460,16 +528,21 @@ impl CleanNativeAuthorityOperationCompletions {
             StoreRole::OperationRetirements.file(),
             StoreRole::OperationRetirements.stage_file(),
         ];
-        let entries = if terminal {
-            RETIREMENT_ENTRIES
-        } else {
-            COMPLETION_ENTRIES
+        const DENIAL_ENTRIES: &[&str] = &[
+            LOCK_FILE,
+            StoreRole::OperationDenials.file(),
+            StoreRole::OperationDenials.stage_file(),
+        ];
+        let entries = match kind {
+            CertificateKind::Retirement => RETIREMENT_ENTRIES,
+            CertificateKind::Completion => COMPLETION_ENTRIES,
+            CertificateKind::Denial => DENIAL_ENTRIES,
         };
         let root = Arc::new(StoreRoot::open_with_entries_mode(path, entries, create)?);
         let store = Self {
             file: ExactFileStore::new(root, role),
             authority,
-            terminal,
+            kind,
         };
         store.load()?;
         Ok(store)
@@ -477,10 +550,14 @@ impl CleanNativeAuthorityOperationCompletions {
 
     fn scope(&self) -> Hash {
         Hash::digest(
-            if self.terminal {
-                b"vos/agent/native-operation-retirement-index/v1"
-            } else {
-                b"vos/agent/native-operation-completion-index/v1"
+            match self.kind {
+                CertificateKind::Retirement => {
+                    b"vos/agent/native-operation-retirement-index/v1".as_slice()
+                }
+                CertificateKind::Completion => {
+                    b"vos/agent/native-operation-completion-index/v1".as_slice()
+                }
+                CertificateKind::Denial => b"vos/agent/native-operation-denial-index/v1".as_slice(),
             },
             &[
                 &self.authority.space.0,
@@ -491,9 +568,14 @@ impl CleanNativeAuthorityOperationCompletions {
         )
     }
 
-    fn ids(&self, bytes: &[u8]) -> Result<[InvocationId; 2], CleanFileStoreError> {
+    fn ids(&self, bytes: &[u8]) -> Result<Vec<InvocationId>, CleanFileStoreError> {
+        if matches!(self.kind, CertificateKind::Denial) {
+            return native_operation_denial_invocation(&self.authority.binding.public_key, bytes)
+                .map(|id| vec![id])
+                .ok_or(CleanFileStoreError::Corrupt);
+        }
         let completion;
-        let bytes = if self.terminal {
+        let bytes = if matches!(self.kind, CertificateKind::Retirement) {
             completion =
                 native_operation_retirement_completion(&self.authority.binding.public_key, bytes)
                     .ok_or(CleanFileStoreError::Corrupt)?;
@@ -502,21 +584,26 @@ impl CleanNativeAuthorityOperationCompletions {
             bytes
         };
         native_operation_completion_invocations(&self.authority.binding.public_key, bytes)
+            .map(|ids| ids.to_vec())
             .ok_or(CleanFileStoreError::Corrupt)
     }
 
     fn maximum_record(&self) -> usize {
-        if self.terminal {
-            MAX_NATIVE_OPERATION_RETIREMENT_BYTES
-        } else {
-            MAX_NATIVE_OPERATION_COMPLETION_BYTES
+        match self.kind {
+            CertificateKind::Retirement => MAX_NATIVE_OPERATION_RETIREMENT_BYTES,
+            CertificateKind::Completion => MAX_NATIVE_OPERATION_COMPLETION_BYTES,
+            CertificateKind::Denial => MAX_NATIVE_OPERATION_DENIAL_BYTES,
         }
     }
     fn maximum_image(&self) -> usize {
         40 + MAX_RECORDS * (4 + self.maximum_record())
     }
     fn magic(&self) -> &[u8; 4] {
-        if self.terminal { b"NRI1" } else { b"NCI1" }
+        match self.kind {
+            CertificateKind::Retirement => b"NRI1",
+            CertificateKind::Completion => b"NCI1",
+            CertificateKind::Denial => b"NDI1",
+        }
     }
 
     fn encode(&self, records: &[Vec<u8>]) -> Result<Vec<u8>, CleanFileStoreError> {
@@ -564,10 +651,10 @@ impl CleanNativeAuthorityOperationCompletions {
                 .get(cursor..cursor + size)
                 .ok_or(CleanFileStoreError::Corrupt)?;
             cursor += size;
-            let [authorization, acknowledgement] = self.ids(record)?;
+            let ids = self.ids(record)?;
+            let authorization = ids[0];
             if previous.is_some_and(|last| last >= authorization)
-                || !seen.insert(authorization)
-                || !seen.insert(acknowledgement)
+                || ids.into_iter().any(|id| !seen.insert(id))
             {
                 return Err(CleanFileStoreError::Corrupt);
             }
