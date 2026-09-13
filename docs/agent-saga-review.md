@@ -46,12 +46,13 @@ review endpoints for individual fixes:
    the scripted host-ABI tests do not prove arbitrary guest execution semantics.
    Neither a private-state decoder nor a volatile cache is a runtime-independent
    proof.
-2. **C2 — native lifecycle:** connect ordinary-Agent provisioning to the native
-   owner, not just its existing invocation route workers. Startup currently
-   attaches the system Agent only; the route worker exposes no Create/Install
-   management command. Drive authenticated authorization, durable issuance,
-   physical application, acknowledgement and route publication as one
-   restartable workflow. Replace the deliberately unavailable ordinary-Agent
+2. **C2 — native lifecycle:** finish ordinary-Agent provisioning through the
+   native entry point. Startup now retains both the system owner and the Local
+   lifecycle controller. Signed Local Create has a bounded ingress queue and
+   an HTTP submission endpoint; CLI submission and a successful native
+   Create/publication smoke remain open, as does Install ingress. Prove
+   authorization, durable issuance, physical application, acknowledgement and
+   route publication as one restartable workflow. Replace the deliberately unavailable ordinary-Agent
    finality adapter with authenticated live system-Agent decision publication
    and independent replay verification, including reopen. A self-consistent
    provision or permissive verifier is not sufficient. Prove ordinary-agent
@@ -59,8 +60,9 @@ review endpoints for individual fixes:
    entry point, not a manually prepared library host.
    The owner now has tested Local Create/application and Authority-finalization
    adapters, including fresh journal replay before the issuer's finalization
-   marker. These are not yet connected to that native entry point; they do not
-   close ordinary-Agent finality or route publication.
+   marker. These are now wired into native startup and the node Create API;
+   they do not yet prove end-to-end ingress creation/publication or close
+   ordinary Shared-Agent finality.
    Implement the Local native entry point first without pretending it replaces
    the Shared finality gate: image-backed `LocalAgentHost::open` does not use
    `AgentGenesisFinalityVerifier`. The journal-backed ordinary-Agent path does.
@@ -1900,3 +1902,43 @@ smoke has been claimed for the queue checkpoint.
 **34/34 queue/controller/node-boundary, production-owner and supervisor-adapter
 tests pass** in 11.94s (`r16-local-lifecycle-queue-final.log`, locked/offline
 `pvm,private-agent-store`, disk scratch). Formatting and diff checks pass.
+
+### Signed Local Create HTTP submission
+
+The exact `POST /__agents/local` path now accepts `application/octet-stream`
+LCQ1: magic followed by three u32-length-prefixed canonical values (AMRQ Create,
+ACC3 credential call, exact VOS3 runtime package). The public
+`LocalCreateSubmission` codec checks bounds, canonical decoding, the credential
+signature, request/target binding and admitted runtime identity. This is request
+validation, not authorization: the configured live Authority still approves the
+operation before receipt issuance. HTTP rejects transport-node claims and uses
+the signed body instead of the older bearer-authentication route. ACC3 does not
+enforce an API credential-kind restriction. All other application paths retain
+their existing bearer gate.
+
+The endpoint keeps the 1 MiB body cap and bounded blocking worker pool. It
+waits outside the node router for at most 120 seconds and returns a canonical
+MAA2 acknowledgement with HTTP 201 only after node lifecycle success. Queue
+pressure/unavailability returns 503; an unknown timeout/disconnect outcome
+returns 504. A failure after application is not rollback: retain and retry the
+identical signed submission. Request decoding neither installs an arbitrary
+actor nor auto-creates an ordinary Agent during startup.
+
+Coverage includes actual bundled-runtime signed-frame round trips, forged
+signatures, runtime substitution, truncation/trailing bytes, HTTP method/query/
+content-type/body rejection, and socket dispatch of the reserved endpoint while
+adjacent paths remain bearer-protected. The first combined fixture run overflowed
+the debug test stack; extracting the codec assertions into a separate helper
+resolved it without raising the stack limit.
+
+**48/48 focused lifecycle and ingress tests pass** in 12.36s with explicit
+`pvm,private-agent-store,http-ingress`, locked/offline and disk-backed scratch
+(`r16-local-create-http-final.log`). Formatting and diff checks pass. This is
+not a final-source full-library or release-gate run.
+
+No rebuilt CLI or successful HTTP Create/publication smoke is claimed here.
+The existing CLI smoke still refers to `ee047d48`. Next: construct and retain an
+exact signed submission from the native CLI, prove HTTP Create/publication plus
+restart/retry, then wire Install and prove invocation. Durable retirement,
+capacity/recovery boundaries, ordinary Shared-Agent finality and final release
+gates remain open. This checkpoint belongs inside C2, not a fourth review batch.

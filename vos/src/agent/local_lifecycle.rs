@@ -14,6 +14,105 @@ use super::supervisor_adapters::{AgentRouteAdapterError, AgentRouteHostAttachmen
 
 pub const LOCAL_LIFECYCLE_QUEUE_CAPACITY: usize = 4;
 
+/// Canonical signed Create submission: LCQ1 followed by length-prefixed AMRQ,
+/// ACC3 and an exact admitted VOS3 runtime package. This is untrusted request
+/// data, not an Authority approval or a genesis-finality proof.
+pub struct LocalCreateSubmission {
+    descriptor: AgentDescriptor,
+    call: AuthorityCredentialCall,
+    runtime: AdmittedRuntimePackage,
+}
+
+impl LocalCreateSubmission {
+    pub const MAX_BYTES: usize = 16
+        + super::sdk::wire::MAX_MANAGEMENT_REQUEST_WIRE_BYTES
+        + super::sdk::wire::MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES
+        + super::sdk::package::MAX_PACKAGE_ENCODED_BYTES;
+
+    pub fn new(
+        descriptor: AgentDescriptor,
+        call: AuthorityCredentialCall,
+        runtime: AdmittedRuntimePackage,
+    ) -> Result<Self, crate::service::wire::DecodeError> {
+        use crate::service::wire::DecodeError;
+        if descriptor.identity.profile != AgentProfile::Local {
+            return Err(DecodeError::NonCanonical);
+        }
+        super::driver::verify_clean_runtime_package_binding(&descriptor, &runtime)
+            .map_err(|_| DecodeError::NonCanonical)?;
+        super::clean_management_intent::CleanManagementIntent::new(
+            call.authority,
+            call.managed,
+            ManagementRequest::Create(Box::new(descriptor.clone())),
+            call.clone(),
+            &super::clean_bootstrap::RawCredentialVerifier,
+        )
+        .map_err(|_| DecodeError::NonCanonical)?;
+        Ok(Self {
+            descriptor,
+            call,
+            runtime,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        use super::sdk::wire::CanonicalWire as _;
+        let mut bytes = b"LCQ1".to_vec();
+        let mut encoder = crate::service::wire::Encoder(&mut bytes);
+        encoder.bytes(
+            &ManagementRequest::Create(Box::new(self.descriptor.clone()))
+                .encode()
+                .expect("validated Create"),
+        );
+        encoder.bytes(&self.call.encode().expect("validated credential call"));
+        encoder.bytes(self.runtime.exact_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, crate::service::wire::DecodeError> {
+        use super::sdk::wire::CanonicalWire as _;
+        use crate::service::wire::{DecodeError, Decoder};
+        if bytes.len() > Self::MAX_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        if bytes.get(..4) != Some(b"LCQ1") {
+            return Err(DecodeError::InvalidTag);
+        }
+        let mut decoder = Decoder::new(&bytes[4..]);
+        let request = decoder.bytes_ref()?;
+        let call = decoder.bytes_ref()?;
+        let package = decoder.bytes_ref()?;
+        if !decoder.exhausted() {
+            return Err(DecodeError::TrailingBytes);
+        }
+        if request.len() > super::sdk::wire::MAX_MANAGEMENT_REQUEST_WIRE_BYTES
+            || call.len() > super::sdk::wire::MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES
+            || package.len() > super::sdk::package::MAX_PACKAGE_ENCODED_BYTES
+        {
+            return Err(DecodeError::LimitExceeded);
+        }
+        let ManagementRequest::Create(descriptor) =
+            ManagementRequest::decode(request).map_err(|_| DecodeError::NonCanonical)?
+        else {
+            return Err(DecodeError::NonCanonical);
+        };
+        let call = AuthorityCredentialCall::decode(call).map_err(|_| DecodeError::NonCanonical)?;
+        let runtime = super::package_admission::admit_runtime_package(package)
+            .map_err(|_| DecodeError::NonCanonical)?;
+        Self::new(*descriptor, call, runtime)
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        AgentDescriptor,
+        AuthorityCredentialCall,
+        AdmittedRuntimePackage,
+    ) {
+        (self.descriptor, self.call, self.runtime)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalLifecycleIngressError {
     Unavailable,

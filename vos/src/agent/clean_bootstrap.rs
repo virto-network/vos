@@ -7106,6 +7106,50 @@ mod tests {
         }
 
         #[test]
+        fn native_local_create_submission_is_canonical_signed_and_runtime_bound() {
+            native_local_management_lifecycle(5);
+        }
+
+        #[inline(never)]
+        fn check_local_create_submission(
+            descriptor: &AgentDescriptor,
+            call: &AuthorityCredentialCall,
+            runtime: &AdmittedRuntimePackage,
+        ) {
+            use crate::agent::local_lifecycle::LocalCreateSubmission;
+            let submission =
+                LocalCreateSubmission::new(descriptor.clone(), call.clone(), runtime.clone())
+                    .unwrap();
+            let bytes = submission.encode();
+            assert!(
+                bytes.len() <= 1024 * 1024,
+                "bundled runtime submission fits HTTP body cap"
+            );
+            let decoded = LocalCreateSubmission::decode(&bytes).unwrap();
+            assert_eq!(decoded.encode(), bytes);
+            let (restored_descriptor, restored_call, restored_runtime) = decoded.into_parts();
+            assert_eq!(&restored_descriptor, descriptor);
+            assert_eq!(&restored_call, call);
+            assert_eq!(restored_runtime.exact_bytes(), runtime.exact_bytes());
+            assert!(LocalCreateSubmission::decode(&bytes[..bytes.len() - 1]).is_err());
+            let mut altered = bytes.clone();
+            altered.push(0);
+            assert!(LocalCreateSubmission::decode(&altered).is_err());
+            altered = bytes;
+            altered[0] ^= 1;
+            assert!(LocalCreateSubmission::decode(&altered).is_err());
+            let mut forged = call.clone();
+            forged.signature[0] ^= 1;
+            assert!(
+                LocalCreateSubmission::new(descriptor.clone(), forged, runtime.clone()).is_err()
+            );
+            assert!(
+                LocalCreateSubmission::new(descriptor.clone(), call.clone(), shape_only_runtime())
+                    .is_err()
+            );
+        }
+
+        #[test]
         fn native_shared_system_owner_survives_route_retirement_and_fails_closed_on_poison() {
             let mut harness = NativeProjectionOwnerHarness::new("shared-system-owner");
             let owner = Arc::new(Mutex::new(harness.owner.take().unwrap()));
@@ -7284,6 +7328,11 @@ mod tests {
             call.authority = owner.authority_target();
             call.invocation = call.expected_invocation();
             call.signature = credential_key.sign(&call.signing_bytes()).to_bytes();
+            if coordinated == 5 {
+                check_local_create_submission(&descriptor, &call, &runtime);
+                harness.stop();
+                return;
+            }
             if coordinated == 4 {
                 use crate::agent::local_lifecycle::{
                     LOCAL_LIFECYCLE_QUEUE_CAPACITY, LocalLifecycleIngressError, LocalLifecycleQueue,

@@ -217,6 +217,10 @@ async fn handle_request(
         let work_inner = inner.clone();
         match tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            if request.uri().path() == "/__agents/local" {
+                return handle_local_create(&request, &handle);
+            }
             let access = match authenticate(&request, &handle) {
                 Ok(access) => access,
                 Err((status, message)) => return simple_bytes(status, message),
@@ -233,6 +237,73 @@ async fn handle_request(
     inner.metrics.record_response(response.status().as_u16());
     let (parts, body) = response.into_parts();
     Ok(Response::from_parts(parts, Full::new(Bytes::from(body))))
+}
+
+/// Signed-body authentication: LCQ1 verifies ACC3 locally and the node's live
+/// Authority actor independently authorizes the exact request before issuance.
+#[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+fn handle_local_create(
+    request: &super::types::Request,
+    handle: &IngressHandle,
+) -> super::types::Response {
+    use super::types::{text, with_content_type};
+    if request.body().len() > MAX_BODY_BYTES {
+        return text(413, "request body too large");
+    }
+    use crate::agent::local_lifecycle::{LocalCreateSubmission, LocalLifecycleIngressError};
+    use crate::agent::sdk::wire::CanonicalWire as _;
+    if request.method() != http::Method::POST {
+        return text(405, "Local Create is POST-only");
+    }
+    if request.uri().query().is_some() {
+        return text(400, "Local Create does not accept query parameters");
+    }
+    if request
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        != Some("application/octet-stream")
+    {
+        return text(415, "Local Create requires application/octet-stream LCQ1");
+    }
+    let submission = match LocalCreateSubmission::decode(request.body()) {
+        Ok(value) => value,
+        Err(_) => return text(400, "invalid signed Local Create submission"),
+    };
+    let (descriptor, call, runtime) = submission.into_parts();
+    // HTTP cannot attest a transport/node binding. The signed credential call
+    // still requires independent authorization by the Authority actor.
+    if call.authenticated_node.is_some() {
+        return text(
+            403,
+            "HTTP Local Create does not accept transport-node claims",
+        );
+    }
+    let reply = match handle.create_clean_local_agent(descriptor, call, runtime) {
+        Ok(reply) => reply,
+        Err(LocalLifecycleIngressError::Invalid) => return text(400, "invalid Local Create"),
+        Err(LocalLifecycleIngressError::Busy) => return text(503, "Local lifecycle queue is full"),
+        Err(LocalLifecycleIngressError::Unavailable) => {
+            return text(503, "Local lifecycle unavailable");
+        }
+    };
+    match reply.recv_timeout(Duration::from_secs(120)) {
+        Ok(Ok((_, acknowledgement))) => match acknowledgement.encode() {
+            Ok(bytes) => with_content_type(201, "application/octet-stream", bytes),
+            Err(_) => text(500, "invalid lifecycle acknowledgement"),
+        },
+        Ok(Err(crate::agent::production_owner::AgentProductionOwnerError::Lifecycle(
+            crate::agent::shared_host::SharedAgentHostError::ScopeMismatch,
+        ))) => text(403, "Local Create scope or authorization rejected"),
+        Ok(Err(_)) => text(
+            503,
+            "Local Create incomplete; retry the identical signed submission",
+        ),
+        Err(_) => text(
+            504,
+            "Local Create outcome unknown; retry the identical signed submission",
+        ),
+    }
 }
 
 fn authenticate<B>(
@@ -298,6 +369,60 @@ fn load_tls(config: &HttpTlsConfig) -> Result<TlsAcceptor, HttpIngressError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    #[test]
+    fn local_create_rejects_noncanonical_http_and_unsigned_frames() {
+        let node = crate::node::VosNode::new();
+        let handle = node.ingress_handle();
+        for (method, path, content_type, body, expected) in [
+            (
+                "GET",
+                "/__agents/local",
+                "application/octet-stream",
+                Vec::new(),
+                405,
+            ),
+            (
+                "POST",
+                "/__agents/local?alias=1",
+                "application/octet-stream",
+                Vec::new(),
+                400,
+            ),
+            (
+                "POST",
+                "/__agents/local",
+                "application/json",
+                Vec::new(),
+                415,
+            ),
+            (
+                "POST",
+                "/__agents/local",
+                "application/octet-stream",
+                b"LCQ1".to_vec(),
+                400,
+            ),
+            (
+                "POST",
+                "/__agents/local",
+                "application/octet-stream",
+                vec![0; MAX_BODY_BYTES + 1],
+                413,
+            ),
+        ] {
+            let request = http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header(http::header::CONTENT_TYPE, content_type)
+                .body(body)
+                .unwrap();
+            assert_eq!(
+                handle_local_create(&request, &handle).status().as_u16(),
+                expected
+            );
+        }
+    }
     use std::io::{Read, Write};
 
     use super::*;
@@ -337,6 +462,23 @@ mod tests {
 
         let protected = request(port, "/openapi.json");
         assert!(protected.starts_with("HTTP/1.1 401"), "{protected}");
+
+        #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+        {
+            // The exact lifecycle endpoint uses signed-body authentication;
+            // adjacent application paths retain the existing bearer gate.
+            let wrong_method = request(port, "/__agents/local");
+            assert!(wrong_method.starts_with("HTTP/1.1 405"), "{wrong_method}");
+            let adjacent = request(port, "/__agents/local/");
+            assert!(adjacent.starts_with("HTTP/1.1 401"), "{adjacent}");
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .write_all(b"POST /__agents/local HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/octet-stream\r\nContent-Length: 4\r\nConnection: close\r\n\r\nLCQ1")
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        }
 
         let results = node.collect();
         assert!(results.is_empty());
