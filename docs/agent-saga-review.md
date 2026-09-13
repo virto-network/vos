@@ -1961,6 +1961,35 @@ identical HTTP-sized signed frames; changed sequences change invocation identity
 Wrong owner, Authority space, validity ordering and runtime package are rejected.
 Formatting and diff checks pass.
 
+### Shared native identity derivation for fresh Local Create
+
+Native startup and `local_create::prepare_fresh` now share
+`derive_system_authority_target`. The extraction preserves the existing
+creation-nonce, Agent-ID and policy-binding domains and inputs. It requires the
+admitted runtime and Authority package to be signed by the configured root and
+checks their runtime compatibility. This is expected immutable identity
+derivation, not evidence that a remote daemon currently uses those pins.
+
+Fresh preparation constructs an operator-owned single-node Local descriptor
+using the bundled runtime and only the node's public Ed25519 key. Its replica
+principal is the enrolled owner, its Node ID uses the full authenticated-peer
+derivation, and its transition producer binds that public key. Root/node key
+reuse is rejected. Nonce, sequence and validity remain explicit inputs; the
+helper does not load transport secrets, read live stores or allocate a sequence.
+
+The SDK credential projection already exposes `management_request_high_water`,
+but a clean HTTP query path and credential-wide local reservation are still
+needed for fresh command wiring. The legacy bearer gate must not be treated as
+a clean Authority projection. Follow that with the real native Create/restart
+smoke; the previous startup smoke predates this source refactor.
+
+**All `vosx` binary tests pass: 168 passed, zero failed, one ignored**, in 3.54s
+(`r16-local-create-fresh-identity-final.log`, locked/offline, serial with socket
+access and disk scratch). New checks cover deterministic fresh preparation,
+the original identity hash formulas, owner/node/producer binding, wrong-root
+packages, zero Space and root/node reuse. The ignored compiled-runtime candidate
+test remains a release gate. Formatting and diff checks pass.
+
 The CLI subcommand is still absent. Next wiring must persist the complete
 submission durably before sending and resend those bytes on retry. Bootstrap
 uses management credential sequence 1; Authority requires the next consecutive

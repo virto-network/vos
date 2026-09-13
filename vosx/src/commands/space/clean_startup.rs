@@ -62,6 +62,57 @@ const LOCAL_LIFECYCLE_DIRECTORY: &str = "local-agent-lifecycle";
 const PROJECTION_ROUTE_QUEUE_CAPACITY: usize = 64;
 const PROJECTION_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Shared immutable bootstrap derivation for startup and fresh CLI requests.
+/// This derives an expected target, not proof of the daemon's live state.
+pub(crate) fn derive_system_authority_target(
+    space: SpaceId,
+    operator_public: [u8; 32],
+    runtime: &vos::agent::package_admission::AdmittedRuntimePackage,
+    authority_package: &AdmittedActorPackage,
+) -> anyhow::Result<(AuthorityActorTarget, Hash)> {
+    let principal = PrincipalId::of_public_key(&operator_public);
+    let producer = ProducerId::of_public_key(&operator_public);
+    anyhow::ensure!(
+        runtime.producer() == producer && authority_package.producer() == producer,
+        "system packages must be signed by the configured root"
+    );
+    authority_package.require_runtime(AgentProfile::Shared, runtime)?;
+    let nonce = Hash::digest(
+        b"vos/system-agent/creation-nonce/v1",
+        &[space.as_bytes(), &operator_public],
+    );
+    let agent = AgentId::derive(space, principal, nonce.as_bytes());
+    let target = AuthorityActorTarget {
+        space,
+        system_agent: agent,
+        system_runtime_deployment: runtime.deployment(),
+        binding: AgentAuthorityBinding {
+            policy: Hash::digest(
+                b"vos/system-authority/policy-binding/v1",
+                &[
+                    space.as_bytes(),
+                    agent.as_bytes(),
+                    authority_package.package_ref().hash.as_bytes(),
+                ],
+            ),
+            issuer: AuthorityIssuer {
+                principal,
+                actor: ActorId::top_level(agent, SYSTEM_AUTHORITY_NAME),
+                deployment: authority_package.deployment(),
+                program: authority_package.program(),
+                producer: authority_package.producer(),
+            },
+            public_key: operator_public,
+            initial_epoch: 1,
+        },
+    };
+    anyhow::ensure!(
+        target.is_valid(),
+        "derived system-authority target is invalid"
+    );
+    Ok((target, nonce))
+}
+
 /// Start or exactly reopen the native system Agent after the node network has
 /// been attached. Every fresh identity is derived from the immutable Space
 /// root and authenticated node key; no compatibility runtime is selectable.
@@ -89,11 +140,6 @@ pub(crate) fn start_clean_system_agent(
     let peer = daemon.public().to_peer_id();
     let peer_bytes = peer.to_bytes();
     let clean_node = node_id_from_authenticated_peer(&peer);
-    let creation_nonce = Hash::digest(
-        b"vos/system-agent/creation-nonce/v1",
-        &[space.as_bytes(), &operator_public],
-    );
-    let system_agent = AgentId::derive(space, operator_principal, creation_nonce.as_bytes());
 
     let runtime = crate::bundled::root_signed_agent_runtime_package(operator)?;
     let authority_package = crate::bundled::root_signed_actor_package(
@@ -109,31 +155,11 @@ pub(crate) fn start_clean_system_agent(
     authority_package.require_runtime(AgentProfile::Shared, &runtime)?;
     catalog_package.require_runtime(AgentProfile::Shared, &runtime)?;
 
-    let authority_actor = ActorId::top_level(system_agent, SYSTEM_AUTHORITY_NAME);
+    let (authority_target, creation_nonce) =
+        derive_system_authority_target(space, operator_public, &runtime, &authority_package)?;
+    let system_agent = authority_target.system_agent;
+    let authority = authority_target.binding;
     let catalog_actor = ActorId::top_level(system_agent, SYSTEM_CATALOG_NAME);
-    let policy = Hash::digest(
-        b"vos/system-authority/policy-binding/v1",
-        &[
-            space.as_bytes(),
-            system_agent.as_bytes(),
-            authority_package.package_ref().hash.as_bytes(),
-        ],
-    );
-    let authority = AgentAuthorityBinding {
-        policy,
-        issuer: AuthorityIssuer {
-            principal: operator_principal,
-            actor: authority_actor,
-            deployment: authority_package.deployment(),
-            program: authority_package.program(),
-            producer: authority_package.producer(),
-        },
-        public_key: operator_public,
-        initial_epoch: 1,
-    };
-    if !authority.is_valid() {
-        anyhow::bail!("derived system-authority binding is invalid");
-    }
 
     let node_encryption_public = derive_node_encryption_public(daemon, space)?;
     let enrollment =

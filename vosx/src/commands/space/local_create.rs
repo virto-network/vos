@@ -16,6 +16,70 @@ use vos::agent::sdk::{AgentDescriptor, InvocationId, ManagementRequest};
 
 use super::clean_identity::CleanOperatorIdentitySigner;
 
+/// Prepare against the same bundled root system identity used by startup.
+/// The node's public key is sufficient; never load its private transport key.
+/// The caller must discover/check live state and allocate sequence/nonce before
+/// this call, then publish the resulting bytes before sending.
+pub(crate) fn prepare_fresh(
+    operator: &Keypair,
+    space: vos::agent::sdk::SpaceId,
+    node_public: [u8; 32],
+    nonce: vos::agent::sdk::Hash,
+    sequence: NonZeroU64,
+    valid_from: u64,
+    expires_at: u64,
+) -> anyhow::Result<LocalCreateSubmission> {
+    use vos::agent::sdk::{
+        AgentId, AgentIdentity, AgentProfile, AgentReplica, ProducerId, ReplicaRole,
+    };
+    let signer = CleanOperatorIdentitySigner::new(operator)?;
+    anyhow::ensure!(
+        node_public != signer.raw_public_key(),
+        "root and node identities must be distinct"
+    );
+    let node_key = libp2p::identity::ed25519::PublicKey::try_from_bytes(&node_public)
+        .map_err(|_| anyhow::anyhow!("invalid node public key"))?;
+    let node_peer = libp2p::identity::PublicKey::from(node_key).to_peer_id();
+    let runtime = crate::bundled::root_signed_agent_runtime_package(operator)?;
+    let authority_package = crate::bundled::root_signed_actor_package(
+        crate::bundled::system_authority_package_template(),
+        "system-authority",
+        operator,
+    )?;
+    let (authority, _) = super::clean_startup::derive_system_authority_target(
+        space,
+        signer.raw_public_key(),
+        &runtime,
+        &authority_package,
+    )?;
+    let descriptor = AgentDescriptor {
+        identity: AgentIdentity {
+            space,
+            agent: AgentId::derive(space, signer.principal(), nonce.as_bytes()),
+            owner: signer.principal(),
+            profile: AgentProfile::Local,
+            runtime_deployment: runtime.deployment(),
+            runtime_program: runtime.program(),
+            runtime_producer: runtime.producer(),
+            transition_producer: ProducerId::of_public_key(&node_public),
+        },
+        creation_nonce: nonce,
+        authority: authority.binding,
+        private_recovery: None,
+        runtime_package: runtime.package_ref().clone(),
+        runtime_contract: runtime.manifest().contract,
+        capabilities: runtime.capabilities(),
+        replicas: vec![AgentReplica {
+            node: super::clean_identity::node_id_from_authenticated_peer(&node_peer),
+            principal: signer.principal(),
+            role: ReplicaRole::Voter,
+        }],
+    };
+    prepare(
+        operator, authority, descriptor, runtime, sequence, valid_from, expires_at,
+    )
+}
+
 /// Submit an already persisted request to a local daemon. No signing or
 /// sequence allocation occurs here; every error leaves the request retained.
 pub(crate) fn submit_retained(
@@ -306,6 +370,108 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_ne!(changed.into_parts().1.invocation, call.invocation);
+    }
+
+    #[test]
+    fn fresh_preparation_uses_startup_authority_and_only_the_node_public_key() {
+        let operator = Keypair::ed25519_from_bytes([0x63; 32]).unwrap();
+        let node = Keypair::ed25519_from_bytes([0x64; 32]).unwrap();
+        let public = node.public().try_into_ed25519().unwrap().to_bytes();
+        let space = SpaceId([1; 32]);
+        let sequence = NonZeroU64::new(2).unwrap();
+        let first =
+            prepare_fresh(&operator, space, public, Hash([2; 32]), sequence, 10, 30).unwrap();
+        let encoded = first.encode();
+        assert_eq!(
+            prepare_fresh(&operator, space, public, Hash([2; 32]), sequence, 10, 30)
+                .unwrap()
+                .encode(),
+            encoded
+        );
+        let (descriptor, call, runtime) = first.into_parts();
+        let authority_package = crate::bundled::root_signed_actor_package(
+            crate::bundled::system_authority_package_template(),
+            "system-authority",
+            &operator,
+        )
+        .unwrap();
+        let root_public = CleanOperatorIdentitySigner::new(&operator)
+            .unwrap()
+            .raw_public_key();
+        let (expected, nonce) = super::super::clean_startup::derive_system_authority_target(
+            space,
+            root_public,
+            &runtime,
+            &authority_package,
+        )
+        .unwrap();
+        assert_eq!(call.authority, expected);
+        assert_eq!(
+            nonce,
+            Hash::digest(
+                b"vos/system-agent/creation-nonce/v1",
+                &[space.as_bytes(), &root_public]
+            )
+        );
+        assert_eq!(
+            expected.system_agent,
+            AgentId::derive(space, descriptor.identity.owner, nonce.as_bytes())
+        );
+        assert_eq!(
+            expected.binding.policy,
+            Hash::digest(
+                b"vos/system-authority/policy-binding/v1",
+                &[
+                    space.as_bytes(),
+                    expected.system_agent.as_bytes(),
+                    authority_package.package_ref().hash.as_bytes(),
+                ]
+            )
+        );
+        assert_eq!(
+            descriptor.replicas[0].node,
+            super::super::clean_identity::node_id_from_authenticated_peer(
+                &node.public().to_peer_id()
+            )
+        );
+        assert_eq!(descriptor.replicas[0].principal, descriptor.identity.owner);
+        assert_eq!(
+            descriptor.identity.transition_producer,
+            ProducerId::of_public_key(&public)
+        );
+        assert!(
+            prepare_fresh(
+                &operator,
+                space,
+                root_public,
+                Hash([2; 32]),
+                sequence,
+                10,
+                30
+            )
+            .is_err()
+        );
+        assert!(
+            super::super::clean_startup::derive_system_authority_target(
+                space,
+                public,
+                &runtime,
+                &authority_package
+            )
+            .is_err()
+        );
+        assert!(
+            prepare_fresh(
+                &operator,
+                SpaceId::ZERO,
+                public,
+                Hash([2; 32]),
+                sequence,
+                10,
+                30
+            )
+            .is_err()
+        );
     }
 
     #[test]
