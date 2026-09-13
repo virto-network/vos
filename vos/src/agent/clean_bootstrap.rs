@@ -2028,6 +2028,7 @@ where
         expected: super::supervisor::AgentRouteIdentity,
         work: super::sdk::InvocationWork,
         authorization: super::sdk::InvocationAuthorization,
+        anchor: &super::clean_management_intent::ManagementJournalAnchor,
     ) -> Result<super::sdk::RuntimeOutcome, SharedAgentHostError> {
         let target = self.authority_target();
         if work.space != target.space
@@ -2039,8 +2040,12 @@ where
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        self._network_host
-            .supervisor_invoke_persisted_management(expected, work, authorization)
+        self._network_host.supervisor_invoke_persisted_management(
+            expected,
+            work,
+            authorization,
+            anchor,
+        )
     }
 
     fn supervisor_invoke_terminal_reserved(
@@ -2254,6 +2259,9 @@ where
                 identity,
                 (**work).clone(),
                 (**authorization).clone(),
+                slot.authorization_anchor()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?,
             )
             .map_err(|error| {
                 crate::log::warn!("management authorization dispatch failed: {error:?}");
@@ -2443,6 +2451,9 @@ where
             identity,
             (**work).clone(),
             (**authorization).clone(),
+            slot.finalization_anchor()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .ok_or(SharedAgentHostError::ScopeMismatch)?,
         )?;
         let super::sdk::RuntimeOutcome::Completed(Ok(reply)) = &outcome else {
             return Err(SharedAgentHostError::Unavailable);
@@ -7488,6 +7499,7 @@ mod tests {
                     identity,
                     (**invocation).clone(),
                     (**authorization).clone(),
+                    slot.authorization_anchor().unwrap().unwrap(),
                 )
                 .unwrap();
             assert!(matches!(outcome, RuntimeOutcome::Completed(Ok(_))));
@@ -7496,6 +7508,7 @@ mod tests {
                 identity,
                 invocation,
                 clock.load(Ordering::Acquire),
+                slot.authorization_anchor().unwrap().unwrap(),
             );
             drop(slot);
             let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
@@ -7526,6 +7539,7 @@ mod tests {
             identity: crate::agent::supervisor::AgentRouteIdentity,
             work: &InvocationWork,
             observed_slot: u64,
+            anchor: &crate::agent::clean_management_intent::ManagementJournalAnchor,
         ) {
             let before = owner.ordered_index_for_test().unwrap();
             let authorization = InvocationAuthorization::PublicPreflight(
@@ -7533,7 +7547,12 @@ mod tests {
             );
             assert!(
                 owner
-                    .supervisor_invoke_persisted_management(identity, work.clone(), authorization)
+                    .supervisor_invoke_persisted_management(
+                        identity,
+                        work.clone(),
+                        authorization,
+                        anchor
+                    )
                     .is_err()
             );
             let mut query = work.clone();
@@ -7542,7 +7561,12 @@ mod tests {
                 crate::agent_sdk::PublicPreflight::for_work(&query, observed_slot),
             );
             assert!(matches!(
-                owner.supervisor_invoke_persisted_management(identity, query, authorization),
+                owner.supervisor_invoke_persisted_management(
+                    identity,
+                    query,
+                    authorization,
+                    anchor
+                ),
                 Err(SharedAgentHostError::ScopeMismatch)
             ));
             let mut other_actor = work.clone();
@@ -7551,7 +7575,12 @@ mod tests {
                 crate::agent_sdk::PublicPreflight::for_work(&other_actor, observed_slot),
             );
             assert!(matches!(
-                owner.supervisor_invoke_persisted_management(identity, other_actor, authorization),
+                owner.supervisor_invoke_persisted_management(
+                    identity,
+                    other_actor,
+                    authorization,
+                    anchor
+                ),
                 Err(SharedAgentHostError::ScopeMismatch)
             ));
             assert_eq!(owner.ordered_index_for_test().unwrap(), before);
@@ -8827,6 +8856,7 @@ mod tests {
                     identity,
                     (**invocation).clone(),
                     (**authorization).clone(),
+                    &management_anchor_for_test(&anchor),
                 )
                 .unwrap();
             assert!(
@@ -8899,7 +8929,61 @@ mod tests {
                 host.management_invocation_after(agent, &current, &altered)
                     .is_err()
             );
+            drop(host);
+            let RuntimeWork::Invoke {
+                invocation,
+                authorization,
+                ..
+            } = &prepared
+            else {
+                unreachable!()
+            };
+            for mutation in 0..4 {
+                let mut substituted = management_anchor_for_test(&anchor);
+                match mutation {
+                    0 => {
+                        substituted.genesis =
+                            crate::agent::journal::AgentJournalGenesisId([0xcc; 32])
+                    }
+                    1 => substituted.runtime = crate::service::Hash([0xcc; 32]),
+                    2 => {
+                        substituted.ordered.head =
+                            Some(crate::agent::journal::OrderedEntryId([0xcc; 32]))
+                    }
+                    _ => substituted = management_anchor_for_test(&current),
+                }
+                assert!(
+                    owner
+                        .supervisor_invoke_persisted_management(
+                            identity,
+                            (**invocation).clone(),
+                            (**authorization).clone(),
+                            &substituted,
+                        )
+                        .is_err(),
+                    "dispatch accepted substituted anchor {mutation}"
+                );
+                assert_eq!(
+                    owner.ordered_index_for_test().unwrap(),
+                    current.ordered_index
+                );
+            }
             envelope
+        }
+
+        #[inline(never)]
+        fn management_anchor_for_test(
+            position: &crate::agent::shared_host::SharedAgentJournalPosition,
+        ) -> crate::agent::clean_management_intent::ManagementJournalAnchor {
+            crate::agent::clean_management_intent::ManagementJournalAnchor {
+                genesis: position.genesis,
+                admission: position.admission,
+                runtime: position.runtime.commitment(),
+                ordered: crate::agent::journal::OrderedBase {
+                    index: position.ordered_index,
+                    head: position.ordered_head,
+                },
+            }
         }
 
         #[inline(never)]
@@ -8930,6 +9014,7 @@ mod tests {
                         identity,
                         (**invocation).clone(),
                         (**authorization).clone(),
+                        &management_anchor_for_test(anchor),
                     )
                     .unwrap(),
                 RuntimeOutcome::Completed(Ok(_))
@@ -8965,6 +9050,7 @@ mod tests {
                 identity,
                 (**invocation).clone(),
                 (**authorization).clone(),
+                &management_anchor_for_test(anchor),
             );
             assert!(
                 result.is_err(),

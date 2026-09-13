@@ -1491,6 +1491,27 @@ impl SharedAgentHost {
             .map_err(map_driver_error)
     }
 
+    pub(crate) fn management_invocation_after_anchor(
+        &self,
+        agent: AgentId,
+        anchor: &super::clean_management_intent::ManagementJournalAnchor,
+        envelope: &crate::agent_sdk::RuntimeWork,
+    ) -> Result<Option<super::journal::ReplayInputId>, SharedAgentHostError> {
+        let current = self.journal_position(agent)?;
+        if current.genesis != anchor.genesis
+            || current.admission != anchor.admission
+            || current.runtime.commitment() != anchor.runtime
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .management_invocation_after(anchor.ordered, envelope)
+            .map_err(map_driver_error)
+    }
+
     #[cfg(test)]
     pub(crate) fn snapshot_state_for_test(
         &self,

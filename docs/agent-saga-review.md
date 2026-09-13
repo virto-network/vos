@@ -2908,6 +2908,43 @@ adopt and protect incomplete work before publishing routes, and reconcile it
 with pending projections. No real-daemon incomplete recovery or release-ready
 claim follows from persisting the anchors alone.
 
+### Persisted anchors are checked inside management dispatch
+
+The production authorization/finalization dispatch interface now requires the
+anchor from its retained intent slot; there is no unanchored overload of that
+internal management entry point. Under the proposal lock, dispatch obtains a
+worker-serialized leader barrier, refuses an uncommitted tail, drains committed
+work and checks that the host application cursor exactly equals the barrier.
+It then authenticates the saved anchor's genesis/admission/runtime commitment
+and walks the exact applied journal interval before preparing the invocation.
+The same proposal exclusion remains held through Raft proposal and result wait.
+
+Preparation must agree with the interval evidence: a retained response must
+have the exact replay input ID found after the anchor, and an absent interval
+must not be satisfied by a cached result predating a substituted late anchor.
+Pruned, substituted or unreachable anchors fail closed without publishing a
+replacement invocation. Both fresh dispatch and retained-result retry preserve
+the saved preflight clock.
+
+Native fixtures now pass the original saved anchors through retry and physical
+checkpoint tests. Additional dispatch-level cases substitute genesis, runtime,
+head and a later real journal position; every refusal leaves the Ordered index
+unchanged. These are tests of the invocation admission boundary, not proof of
+complete startup recovery or of an anchor's provenance in an untrusted store.
+
+Final-source verification: **11 native bootstrap/lifecycle tests passed**
+(114.06s, `r16-anchored-dispatch-final.log`) and **7 network tests passed**
+(0.58s, `r16-anchored-dispatch-network.log`). An intermediate native run also
+passed 11/11 (101.87s, `r16-anchored-dispatch.log`). Formatting and diff checks
+pass. Logs remain in disk scratch; no rebuilt-CLI smoke or full release gate
+is claimed by these targeted results.
+
+Still required: retain incomplete-work protection across the gap between the
+anchor-store callback and dispatch, and across process restart; adopt the entire
+verified store set before route activation; handle pending projections and
+exhausted capacity. Anchor persistence and dispatch checking do not close those
+remaining lifecycle/release gates.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

@@ -910,18 +910,18 @@ enum ReservedSubmission {
 }
 
 #[derive(Clone, Copy)]
-enum InvocationClock {
+enum InvocationClock<'a> {
     Current,
     Bootstrap,
-    PersistedManagement,
+    PersistedManagement(&'a crate::agent::clean_management_intent::ManagementJournalAnchor),
 }
 
 #[derive(Clone, Copy)]
-enum SupervisorAdmission {
+enum SupervisorAdmission<'a> {
     Ordinary,
     ReservedProjection,
     ReservedManagementRetirement,
-    PersistedManagement,
+    PersistedManagement(&'a crate::agent::clean_management_intent::ManagementJournalAnchor),
 }
 
 struct RecoveringProjectionAdmission<'a> {
@@ -1343,7 +1343,7 @@ impl SharedRouteHandler {
         request: crate::agent::shared_journal_driver::CleanInvocationReplayRequest,
         terminal_only: bool,
         reservation: Option<ReservedSubmission>,
-        clock: InvocationClock,
+        clock: InvocationClock<'_>,
     ) -> Result<CleanOrderedSubmission, SharedAgentHostError> {
         let proposal = self
             .proposal
@@ -1364,15 +1364,59 @@ impl SharedRouteHandler {
         if !self.has_local_proposer(worker) {
             return Err(SharedAgentHostError::Unavailable);
         }
+        let anchor_barrier = if matches!(clock, InvocationClock::PersistedManagement(_)) {
+            let barrier = futures_executor::block_on(worker.snapshot())
+                .ok_or(SharedAgentHostError::Unavailable)?;
+            if barrier.role != vos_raft::Role::Leader
+                || barrier.commit_index != barrier.last_log_index
+            {
+                return Err(SharedAgentHostError::Unavailable);
+            }
+            Some(barrier.commit_index)
+        } else {
+            None
+        };
         let input = {
             let mut host = self
                 .host
                 .lock()
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
             drain_committed(&mut host, self.agent, &self.ordered_replies)?;
+            let anchored_input = if let InvocationClock::PersistedManagement(anchor) = clock {
+                if host
+                    .show(self.agent)?
+                    .ok_or(SharedAgentHostError::AgentNotFound)?
+                    .applied_slots
+                    != anchor_barrier.unwrap()
+                {
+                    return Err(SharedAgentHostError::CorruptResidue);
+                }
+                let crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Invoke {
+                    context: RuntimeExecutionContext::Direct,
+                    work,
+                    authorization:
+                        authorization @ InvocationAuthorization::PublicPreflight(preflight),
+                } = &request
+                else {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                };
+                Some(host.management_invocation_after_anchor(
+                    self.agent,
+                    anchor,
+                    &crate::agent_sdk::RuntimeWork::Invoke {
+                        context: RuntimeExecutionContext::Direct,
+                        state: crate::agent_sdk::RuntimeState::default(),
+                        invocation: Box::new(work.clone()),
+                        authorization: Box::new(authorization.clone()),
+                        observed_slot: preflight.observed_slot,
+                    },
+                )?)
+            } else {
+                None
+            };
             let prepared = if matches!(clock, InvocationClock::Bootstrap) {
                 host.prepare_bootstrap_invocation(self.agent, request)?
-            } else if matches!(clock, InvocationClock::PersistedManagement) {
+            } else if matches!(clock, InvocationClock::PersistedManagement(_)) {
                 host.prepare_persisted_management_invocation(self.agent, request)?
             } else if matches!(reservation, Some(ReservedSubmission::Projection(_))) {
                 host.prepare_reserved_projection_operation(self.agent, request, terminal_only)?
@@ -1382,6 +1426,14 @@ impl SharedRouteHandler {
                 host.prepare_clean_ordered_operation(self.agent, request)?
             };
             let input = prepared.input();
+            if let Some(observed) = anchored_input {
+                // Preparation must agree with the authenticated interval. A
+                // result predating a substituted late anchor is not a retry
+                // proved by that anchor, even if another cache can find it.
+                if observed != prepared.retained().map(|_| input) {
+                    return Err(SharedAgentHostError::CorruptResidue);
+                }
+            }
             if let Some(outcome) = prepared.retained().cloned() {
                 return Ok(CleanOrderedSubmission {
                     input,
@@ -3429,6 +3481,7 @@ impl SharedAgentNetworkHost {
         expected: crate::agent::supervisor::AgentRouteIdentity,
         work: InvocationWork,
         authorization: InvocationAuthorization,
+        anchor: &crate::agent::clean_management_intent::ManagementJournalAnchor,
     ) -> Result<RuntimeOutcome, SharedAgentHostError> {
         if work.mode != crate::agent_sdk::MethodMode::Linear
             || !matches!(&authorization, InvocationAuthorization::PublicPreflight(preflight) if preflight.matches_work(&work))
@@ -3443,7 +3496,7 @@ impl SharedAgentNetworkHost {
                 authorization,
             },
             true,
-            SupervisorAdmission::PersistedManagement,
+            SupervisorAdmission::PersistedManagement(anchor),
         )
     }
 
@@ -3541,7 +3594,7 @@ impl SharedAgentNetworkHost {
         expected: crate::agent::supervisor::AgentRouteIdentity,
         request: crate::agent::shared_journal_driver::CleanInvocationReplayRequest,
         terminal_only: bool,
-        admission: SupervisorAdmission,
+        admission: SupervisorAdmission<'_>,
     ) -> Result<RuntimeOutcome, SharedAgentHostError> {
         let work = request.work();
         if matches!(admission, SupervisorAdmission::ReservedManagementRetirement)
@@ -3642,15 +3695,18 @@ impl SharedAgentNetworkHost {
                     .map(|submission| submission.outcome)
             }
             InvocationScope::Ordered
-                if matches!(admission, SupervisorAdmission::PersistedManagement) =>
+                if matches!(admission, SupervisorAdmission::PersistedManagement(_)) =>
             {
+                let SupervisorAdmission::PersistedManagement(anchor) = admission else {
+                    unreachable!()
+                };
                 attached
                     .coordinator
                     .submit_clean_ordered_operation_with_admission(
                         request,
                         true,
                         None,
-                        InvocationClock::PersistedManagement,
+                        InvocationClock::PersistedManagement(anchor),
                     )
                     .map(|submission| submission.outcome)
             }
