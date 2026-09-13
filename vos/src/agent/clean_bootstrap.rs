@@ -7583,6 +7583,23 @@ mod tests {
         }
 
         #[test]
+        fn native_system_attachment_repeated_promotions_preserve_journal() {
+            let mut harness = NativeProjectionOwnerHarness::new("repeated-system-promotion");
+            let owner = harness.owner.as_mut().unwrap();
+            let agent = HostAgentId(owner.pins.agent.0);
+            let before = owner.ordered_index_for_test().unwrap();
+            for attempt in 0..16 {
+                assert!(owner._network_host.mark_stale_for_test(agent));
+                owner
+                    ._network_host
+                    .refresh()
+                    .unwrap_or_else(|error| panic!("promotion {attempt}: {error:?}"));
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            }
+            harness.stop();
+        }
+
+        #[test]
         fn native_shared_system_owner_survives_route_retirement_and_fails_closed_on_poison() {
             let mut harness = NativeProjectionOwnerHarness::new("shared-system-owner");
             let owner = Arc::new(Mutex::new(harness.owner.take().unwrap()));

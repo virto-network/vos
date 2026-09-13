@@ -2666,6 +2666,45 @@ Next: integrate the verified pending set before first route activation, includin
 incomplete lifecycle phases rather than only finalized retirement pairs, and
 resolve the attachment failure before claiming restart/release readiness.
 
+### Serialized attachment check at the promotion deadline
+
+Investigation reproduced an attachment failure with the atomic worker role still
+`Candidate` at the 1.8-second polling deadline. It did not capture the serialized
+worker state from that failure, so the full intermittent failure cause remains
+unproven. Subsequent diagnostic runs found no storage commit errors; repeated
+reattachment also passed, including one observed 478 ms metadata commit. Those
+observations alone do not establish a storage-latency cause.
+
+Attachment now consults one worker-serialized snapshot even when atomic role
+polling reaches its deadline. This lets an in-flight promotion finish before
+the attachment decision. The snapshot must still report `Leader` with the
+entire log committed, and the host must drain to that exact committed cursor
+before proceeding. A non-leader, incomplete commit, stopped worker or cursor
+mismatch still fails closed. The polling interval and 1.8-second hint deadline
+are unchanged; the blocking snapshot query is not a hard wall-clock timeout.
+Temporary diagnostic logging was removed.
+
+A deterministic regression test failed with the old deadline behavior and now
+passes, including the refusal cases. A new native stress test retires and
+reattaches the system worker 16 times and checks that the Ordered journal index
+does not change. Evidence logs use the `r16-promotion-barrier-` prefix under
+`.worktrees/ch08-c2-native/target/task-tmp/` (disk scratch, not `/tmp`).
+
+Final-source targeted checks: **7 network tests passed** (0.57s,
+`r16-promotion-barrier-green.log`), and the serial `native_` filter reported
+**23 passed, zero failed** (68.89s, `r16-promotion-barrier-native.log`), including
+all 11 native bootstrap/lifecycle tests and the 16-reattachment stress test.
+One unrelated extension test self-skipped because `echo-extension` was not
+built, despite the harness counting it as passed; no extension coverage is
+claimed from that test. Formatting and diff checks pass. These targeted results
+do not replace a final full-library run or a rebuilt-CLI real-daemon smoke.
+
+This change does not wire startup recovery, enable retirement/handoff in the
+production controller, or establish native Install/invoke or Shared finality.
+The next implementation step remains protected adoption of the verified pending
+lifecycle set before the first system route is published, including incomplete
+phases and without an unprotected gap between pending retirement pairs.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

@@ -61,6 +61,29 @@ const MAX_MERGE_SYNC_SCAN_EVENTS: usize = MAX_REPLAY_SUFFIX_ENTRIES + MAX_MERGE_
 const MAX_MERGE_SYNC_EVENTS: usize = MAX_IMPORT_EVENTS;
 const MAX_MERGE_SYNC_BYTES: usize = MAX_IMPORT_BYTES;
 const ORDERED_REPLY_WAIT: Duration = Duration::from_millis(1_800);
+
+fn system_promotion_barrier(
+    role: impl Fn() -> vos_raft::Role,
+    snapshot: impl FnOnce() -> Option<(vos_raft::Role, u64, u64)>,
+    hint_wait: Duration,
+) -> Result<u64, SharedAgentHostError> {
+    let deadline = Instant::now() + hint_wait;
+    while role() != vos_raft::Role::Leader {
+        if Instant::now() >= deadline {
+            // The atomic role is only a hint: promotion may still be inside
+            // a durable worker event. Consult serialized state once before
+            // refusing attachment, queued behind that event. This is not a
+            // hard timeout for the blocking snapshot query.
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (role, committed, last) = snapshot().ok_or(SharedAgentHostError::Unavailable)?;
+    if role != vos_raft::Role::Leader || committed != last {
+        return Err(SharedAgentHostError::Unavailable);
+    }
+    Ok(committed)
+}
 const MERGE_SYNC_BUDGET: Duration = Duration::from_millis(1_500);
 const MERGE_PUMP_REPLY_WAIT: Duration = Duration::from_millis(350);
 const MERGE_PUMP_INTERVAL: Duration = Duration::from_millis(250);
@@ -2634,24 +2657,18 @@ impl SharedAgentNetworkHost {
             let recovery_worker = handle
                 .as_ref()
                 .ok_or(SharedAgentHostError::TransportNotAttached)?;
-            let deadline = Instant::now() + ORDERED_REPLY_WAIT;
-            while recovery_worker.role() != vos_raft::Role::Leader {
-                if Instant::now() >= deadline {
-                    return Err(SharedAgentHostError::Unavailable);
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
             // Serialize behind leader promotion: role publication can precede
             // its mandatory current-term no-op commit advance by one worker
             // step. The snapshot barrier proves the no-op and every recovered
             // tail row are committed before we derive admission capacity.
-            let barrier = futures_executor::block_on(recovery_worker.snapshot())
-                .ok_or(SharedAgentHostError::Unavailable)?;
-            if barrier.role != vos_raft::Role::Leader
-                || barrier.commit_index != barrier.last_log_index
-            {
-                return Err(SharedAgentHostError::Unavailable);
-            }
+            let committed = system_promotion_barrier(
+                || recovery_worker.role(),
+                || {
+                    futures_executor::block_on(recovery_worker.snapshot())
+                        .map(|state| (state.role, state.commit_index, state.last_log_index))
+                },
+                ORDERED_REPLY_WAIT,
+            )?;
             let mut host = self
                 .host
                 .lock()
@@ -2661,7 +2678,7 @@ impl SharedAgentNetworkHost {
                 .show(agent)?
                 .ok_or(SharedAgentHostError::AgentNotFound)?
                 .applied_slots
-                != barrier.commit_index
+                != committed
             {
                 return Err(SharedAgentHostError::CorruptResidue);
             }
@@ -3761,6 +3778,38 @@ mod tests {
         }
         transaction.commit().unwrap();
         database
+    }
+
+    #[test]
+    fn promotion_deadline_consults_serialized_state_and_requires_full_commit() {
+        let snapshot = |role, committed| (role, committed, 1);
+        // The atomic hint can still expose Candidate while an in-flight
+        // worker event finishes promotion. Only the serialized reply is final.
+        let result = system_promotion_barrier(
+            || vos_raft::Role::Candidate,
+            || Some(snapshot(vos_raft::Role::Leader, 1)),
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(result, 1);
+        for (role, committed) in [
+            (vos_raft::Role::Candidate, 1),
+            (vos_raft::Role::Follower, 1),
+            (vos_raft::Role::Leader, 0),
+        ] {
+            assert!(matches!(
+                system_promotion_barrier(
+                    || vos_raft::Role::Candidate,
+                    || Some(snapshot(role, committed)),
+                    Duration::ZERO,
+                ),
+                Err(SharedAgentHostError::Unavailable)
+            ));
+        }
+        assert!(matches!(
+            system_promotion_barrier(|| vos_raft::Role::Leader, || None, Duration::ZERO),
+            Err(SharedAgentHostError::Unavailable)
+        ));
     }
 
     #[test]
