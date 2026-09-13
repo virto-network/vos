@@ -33,8 +33,9 @@ resume passes, but fresh live installation and actual actor method invocation
 remain unproven. Do not treat command availability as an end-to-end pass.
 The first fresh Install campaign on saved disposable state failed all four
 HTTP waits (604.30s total test time), then shut down cleanly after route
-reconciliation finished. No client MAA2 was retained; exact resume/recovery and
-invocation remain required. See the live Install result below.
+reconciliation finished. No client MAA2 was retained in that failed campaign.
+Subsequent exact resume after restart now passes and retains verified MAA2;
+first-response latency and invocation remain open. See the live results below.
 The native Local-controller wiring at `ee047d48` passed fresh-data startup and
 restart using the rebuilt CLI (`target/native-local-smoke.DATNas`, details below).
 This is bootstrap/ingress coverage, not ordinary-Agent creation/installation.
@@ -4589,6 +4590,60 @@ This identifies a hashing-dominated performance problem, not a proven complete
 root cause. Next work must verify exact resume/reopen and address the latency
 and clean invocation bridge; simply increasing the test retry count does not
 make this UX or the full C1/C2/C3 release gates pass.
+
+### Recovery profile and Standard scalar permission fast path
+
+An explicit resume campaign started at 2026-09-13T15:45:03Z using the same
+stopped disposable state and unchanged retained Install. The harness uses
+`VOSX_INSTALL_SMOKE_RESUME=1` and separate `install-resume-*` logs, preserving
+the fresh failure. The previous daemon binary reached readiness at 15:54:08Z;
+the exact-resume client test is running as of this checkpoint. Inspect its
+existing process/logs before starting another campaign. Reopen/readiness alone
+is not client MAA2 or an invocation pass.
+
+A separate five-second branch-stack profile during cold recovery (no raw stack
+memory capture) identified Standard interpreter execution and per-byte memory
+permission checks as a startup hotspot. This is a different execution phase
+from the earlier hashing-dominated profile. Evidence is
+`r16-install-resume-lbr.perf.data` and `.perf.txt` (255 core samples and one atom
+sample, no lost samples); inclusive call percentages are not additive.
+
+`standard_memory_exception` now checks scalar accesses wholly within one page
+with one range-permission check. The original ordered byte walk remains for
+page crossings and u32 wrapping, preserving first-fault and low-zone panic
+precedence. It changes no gas, guest artifact, permission or memory contents.
+A differential test compares the original algorithm against the fast path for
+widths 1/2/4/8, reads/writes, all combinations of NONE/RO/RW on adjacent pages,
+flat/sparse memories, bounds, low-zone boundaries and high-address wrapping.
+
+Full PVM tests pass: 259 library tests (one ignored), 20 vector tests and four
+SPI tests (`r16-standard-permission-all.log`; the vector runner also logs its
+one-test subprocess). The no-default-features library check passes in 0.79s
+(`r16-standard-permission-nostd.log`). The earlier targeted library result is
+`r16-standard-permission-fast-path.log`. Formatting/diff checks pass.
+
+The live resume daemon predates this optimization. No real-world speedup or
+resolution of the hashing hotspot is claimed until a rebuilt daemon is measured.
+Exact delivery recovery, clean invocation and all remaining release gates still
+must be verified; the goal is not complete.
+
+### Live Install exact recovery passed
+
+The old-binary resume campaign is now terminal: readiness at 15:54:08Z, test
+completion and clean daemon shutdown at 15:55:28Z, endpoint removed. The live
+test passed once in 67.47s (`install-resume-client-test.log`), recovering the
+original signed Install from the failed campaign, verifying/persisting its MAA2,
+completing the shared credential reservation and matching a repeated retained
+resume. The request's CSF1 SHA-256 remains exactly
+`6a828eccec0a481672d25e2186f0d59819308d2a1e9820a04c345bb851d14c3b`.
+Its `local-install.acknowledgement` now exists. Both live process handles are
+closed; neither campaign has a running daemon.
+
+This proves native restart recovery and client-verified Install delivery, not
+fresh delivery within the original retry window, actor method execution, or a
+post-delivery invocation/restart campaign. The previous four-timeout failure
+remains release evidence. The newly committed permission optimization was not
+in this daemon and still requires rebuilt-binary performance measurement.
 
 ### Durable client acknowledgement before completion
 

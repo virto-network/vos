@@ -591,6 +591,23 @@ impl Interpreter {
         write: bool,
     ) -> Option<ExitReason> {
         debug_assert!(matches!(width, 1 | 2 | 4 | 8));
+        if addr < crate::PVM_ZONE_SIZE {
+            return Some(ExitReason::Panic);
+        }
+        let last = addr.wrapping_add(width as u32 - 1);
+        if addr / crate::PVM_PAGE_SIZE == last / crate::PVM_PAGE_SIZE {
+            // Permissions are page-granular. Ordinary scalar accesses stay
+            // on one page, so one range check proves all their bytes. Keep
+            // the ordered byte walk below for page crossings and u32 wrap:
+            // the first fault (including the low-zone panic) must not change.
+            let accessible = if write {
+                self.mem.is_writable(addr, width)
+            } else {
+                self.mem.is_readable(addr, width)
+            };
+            return (!accessible)
+                .then_some(ExitReason::PageFault(addr & !(crate::PVM_PAGE_SIZE - 1)));
+        }
         for offset in 0..width {
             let byte_addr = addr.wrapping_add(offset as u32);
             if byte_addr < crate::PVM_ZONE_SIZE {
@@ -3549,6 +3566,72 @@ fn predecode_instructions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standard_scalar_permission_fast_path_matches_ordered_byte_walk() {
+        fn reference(vm: &Interpreter, addr: u32, width: usize, write: bool) -> Option<ExitReason> {
+            for offset in 0..width {
+                let byte = addr.wrapping_add(offset as u32);
+                if byte < crate::PVM_ZONE_SIZE {
+                    return Some(ExitReason::Panic);
+                }
+                let accessible = if write {
+                    vm.mem.is_writable(byte, 1)
+                } else {
+                    vm.mem.is_readable(byte, 1)
+                };
+                if !accessible {
+                    return Some(ExitReason::PageFault(byte & !(crate::PVM_PAGE_SIZE - 1)));
+                }
+            }
+            None
+        }
+        let page = crate::PVM_PAGE_SIZE;
+        let zone = crate::PVM_ZONE_SIZE;
+        let span = zone + 3 * page;
+        for memory in [
+            Memory::flat(vec![0; span as usize]),
+            Memory::sparse(1u64 << 32),
+        ] {
+            let mut vm = Interpreter::with_memory(
+                vec![],
+                vec![],
+                vec![],
+                [0; 13],
+                memory,
+                100,
+                crate::gas_cost::DEFAULT_MEM_CYCLES,
+            );
+            let pages = vm.mem.page_perms().len();
+            for a in [PERM_NONE, PERM_RO, PERM_RW] {
+                for b in [PERM_NONE, PERM_RO, PERM_RW] {
+                    for c in [PERM_NONE, PERM_RO, PERM_RW] {
+                        let mut perms = vec![PERM_NONE; pages];
+                        perms[(zone / page) as usize..(zone / page) as usize + 3]
+                            .copy_from_slice(&[a, b, c]);
+                        if pages > (span / page) as usize {
+                            perms[pages - 2..].copy_from_slice(&[a, b]);
+                        }
+                        vm.set_page_perms(perms);
+                        for boundary in [0, zone, zone + page, zone + 2 * page, span, u32::MAX] {
+                            for delta in -8i32..=8 {
+                                let addr = boundary.wrapping_add_signed(delta);
+                                for width in [1, 2, 4, 8] {
+                                    for write in [false, true] {
+                                        assert_eq!(
+                                            vm.standard_memory_exception(addr, width, write),
+                                            reference(&vm, addr, width, write),
+                                            "addr={addr:#x} width={width} write={write} perms={a},{b},{c}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// Helper to create a VM with simple bitmask (every byte is instruction start).
     fn simple_vm(code: Vec<u8>, gas: Gas) -> Interpreter {
