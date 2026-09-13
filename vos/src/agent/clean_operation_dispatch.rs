@@ -117,7 +117,7 @@ impl<'a> NativeAuthorityOperationStartupAdmission<'a> {
 
 /// Trusted coordinator adapter: all successful replies come from physical
 /// execution/replay, never from cached unsigned approval bytes. Authorization
-/// must have been captured durably before constructing the coordinator.
+/// is captured durably by the coordinator's pre-pledge retention hook.
 pub(crate) struct NativeAuthorityOperationDispatcher<'a, P, R, I, J>
 where
     P: CleanSystemAgentBootstrapStore,
@@ -174,6 +174,42 @@ where
     J: NativeAuthorityOperationJournalStore,
 {
     type Error = SharedAgentHostError;
+
+    fn retain_authorization(
+        &mut self,
+        request: &AuthorityOperationActorDispatch,
+    ) -> Result<(), Self::Error> {
+        if request.method != AuthorityOperationActorMethod::AuthorizeOperation
+            || request.target != self.owner.authority_target()
+            || !request.has_valid_request()
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if let Some(retained) = self.retained(request.context.invocation)? {
+            return if retained.request == *request {
+                Ok(())
+            } else {
+                Err(SharedAgentHostError::ScopeMismatch)
+            };
+        }
+        let journal = &mut self.journal;
+        let captured = self
+            .owner
+            .capture_authority_operation_dispatch(request, |record| {
+                journal
+                    .retain(
+                        request.context.invocation,
+                        &record
+                            .encode()
+                            .map_err(|_| SharedAgentHostError::ScopeMismatch)?,
+                    )
+                    .map_err(|_| SharedAgentHostError::Unavailable)
+            })?;
+        if self.retained(request.context.invocation)?.as_ref() != Some(&captured) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Ok(())
+    }
 
     fn dispatch(
         &mut self,

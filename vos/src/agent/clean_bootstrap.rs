@@ -10072,14 +10072,8 @@ mod tests {
                     .is_err()
             );
             assert_eq!(owner.ordered_index_for_test().unwrap(), before);
-            let retained = owner
-                .capture_authority_operation_dispatch(&request, |record| {
-                    journal
-                        .retain(request.context.invocation, &record.encode().unwrap())
-                        .map_err(|_| SharedAgentHostError::Unavailable)
-                })
-                .unwrap();
-            let original = journal.load(request.context.invocation).unwrap().unwrap();
+            assert!(journal.load(request.context.invocation).unwrap().is_none());
+            let mut original = None;
             for retry in 0..2 {
                 if retry == 1 {
                     clock.store(slot + 10, Ordering::Release);
@@ -10099,7 +10093,7 @@ mod tests {
                 assert!(matches!(
                     coordinator.coordinate(
                         &call,
-                        retained.request().context,
+                        request.context,
                         slot,
                         &mut NoSigning(target.binding.public_key)
                     ),
@@ -10111,13 +10105,15 @@ mod tests {
                 assert!(!coordinator.has_pending_operation());
                 drop(coordinator);
                 assert_eq!(owner.ordered_index_for_test().unwrap(), before + 1);
-                assert_eq!(
-                    journal.load(request.context.invocation).unwrap(),
-                    Some(original.clone())
-                );
+                let saved = journal.load(request.context.invocation).unwrap().unwrap();
+                if let Some(original) = &original {
+                    assert_eq!(&saved, original);
+                } else {
+                    original = Some(saved);
+                }
                 assert!(!root.join("operation-issuer").exists());
             }
-            let mut corrupt = original;
+            let mut corrupt = original.unwrap();
             corrupt[0] ^= 1;
             write_operation_test_image(&journal.path(request.context.invocation), &corrupt)
                 .unwrap();

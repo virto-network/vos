@@ -161,6 +161,7 @@ Keep these as work within C2, not new review batches:
    adapter now passes disk-backed fixture checks; the production immutable
    journal backend also passes its CLI regression suite. Exact operation
    admission now passes native owner reopen before/after policy execution;
+   the coordinator now captures native input automatically before a new pledge.
    daemon/controller wiring and terminal recovery remain open. Preparation and an API
    credential do not issue an actor
    receipt. Retain the signed AOC5, exact authorization context and issuance
@@ -5340,6 +5341,40 @@ capacity reclamation remain required before treating completed operations as
 safe to release. No records may be deleted to bypass those gates. Genuinely
 approved issuance, successful AOI1 consumption and protected mutation/restart
 are still unproved. No guest artifacts changed; C1/C2/C3 review scope remains.
+
+### Coordinator-owned pre-pledge native retention
+
+The coordinator now calls the trusted dispatcher's `retain_authorization`
+hook only after validating a new operation's signature, route, context, slots,
+pending/capacity/collision constraints and signer, but before committing its
+pledge. The native adapter loads an exact existing NOD1 or captures and durably
+retains a new one under physical admission, then reads it back exactly. This
+hook neither executes policy nor signs evidence. Existing coordinator pledges
+skip preparation entirely: missing NOD1 still fails closed at native dispatch,
+and cannot be reconstructed against a later physical head. Adapters without a
+separate physical journal retain their previous behavior through a no-op hook.
+
+This closes an ordering prerequisite for daemon/controller wiring: a caller no
+longer has to reproduce capture-before-pledge ordering outside the coordinator.
+The native coordinator test now begins with no NOD1 and no manual capture;
+automatic retention precedes the bundled Authority's denial, with no signer
+calls. Exact retry after clock advance preserves the original NOD1 and causes
+no second transition.
+
+Verification: the new retention-order/failure test passes in **0.06s**
+(`r16-native-operation-retention-order.log`), including invalid-signer refusal
+before preparation, failed retention with no coordinator/issuer writes or
+execution, and an ambiguous successful pledge commit followed by recovery that
+never calls preparation again. The three native operation tests pass in
+**14.69s** (`r16-native-operation-automatic-retention.log`). The existing
+completed retry/restart test passes in **0.08s** with no additional dispatch or
+signing (`r16-native-operation-retention-retry.log`). Formatting/diff checks
+pass; logs are in shared disk-backed `target/task-tmp`. No guest artifacts
+changed. This is targeted evidence, not a new full regression/release run.
+
+Daemon/controller store ownership, live operation ingress, terminal retirement
+classification and genuinely approved protected mutation remain open. This
+checkpoint does not change deployment readiness or the C1/C2/C3 review batches.
 
 ### Durable client acknowledgement before completion
 

@@ -122,6 +122,18 @@ pub struct AuthorityOperationActorResult {
 pub trait AuthorityOperationActorDispatcher {
     type Error;
 
+    /// Retain physical input after all new-operation checks, before pledging
+    /// its context. This must not execute policy or sign evidence. Adapters
+    /// without a separate physical journal need no additional preparation.
+    /// Existing pledges skip this hook: missing recovery input is not permission
+    /// to reconstruct it against a newer physical head.
+    fn retain_authorization(
+        &mut self,
+        _request: &AuthorityOperationActorDispatch,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     fn dispatch(
         &mut self,
         request: &AuthorityOperationActorDispatch,
@@ -559,6 +571,14 @@ where
                     AuthorityOperationCoordinatorRejection::WrongSigner,
                 ));
             }
+            self.dispatcher
+                .retain_authorization(&AuthorityOperationActorDispatch {
+                    target: self.authority,
+                    method: AuthorityOperationActorMethod::AuthorizeOperation,
+                    context: authorization_context,
+                    request: call_bytes.clone(),
+                })
+                .map_err(AuthorityOperationCoordinatorError::Dispatch)?;
             let mut pledged = self.image.clone();
             pledged.authorization_slot_high_water = Some(authorization_context.observed_slot);
             pledged.issuance_slot_high_water = Some(issued_at);
@@ -1203,6 +1223,8 @@ pub(crate) mod tests {
 
     #[derive(Debug, Default)]
     struct FakeActorState {
+        retention_calls: usize,
+        fail_retention: bool,
         authorization_sequence: u64,
         pending: Vec<PendingActorOperation>,
         retired: Vec<RetiredActorOperation>,
@@ -1402,6 +1424,24 @@ pub(crate) mod tests {
 
     impl AuthorityOperationActorDispatcher for FakeDispatcher {
         type Error = FakeDispatchError;
+
+        fn retain_authorization(
+            &mut self,
+            request: &AuthorityOperationActorDispatch,
+        ) -> Result<(), Self::Error> {
+            assert_eq!(
+                request.method,
+                AuthorityOperationActorMethod::AuthorizeOperation
+            );
+            assert!(request.has_valid_request());
+            let mut state = self.state.lock().unwrap();
+            state.retention_calls += 1;
+            if state.fail_retention {
+                Err(FakeDispatchError)
+            } else {
+                Ok(())
+            }
+        }
 
         fn dispatch(
             &mut self,
@@ -1790,6 +1830,68 @@ pub(crate) mod tests {
         let mut value = [prefix; 32];
         value[24..].copy_from_slice(&number.to_le_bytes());
         value
+    }
+
+    #[test]
+    fn physical_retention_precedes_pledge_but_never_recreates_existing_input() {
+        let coordinator_store = MemoryImageStore::default();
+        let issuer_store = MemoryImageStore::default();
+        let mut signer = CountingSigner::new(0x19);
+        let fixture = Fixture::new(&signer);
+        let dispatcher = FakeDispatcher::new(fixture.authority);
+        let call = fixture.call(1);
+        let context = fixture.context(&call, 20);
+        let mut coordinator = open(
+            coordinator_store.clone(),
+            issuer_store.clone(),
+            dispatcher.clone(),
+            &fixture,
+        );
+        let mut wrong_signer = CountingSigner::new(0x20);
+        assert!(
+            coordinator
+                .coordinate(&call, context, 20, &mut wrong_signer)
+                .is_err()
+        );
+        assert_eq!(dispatcher.state.lock().unwrap().retention_calls, 0);
+        dispatcher.state.lock().unwrap().fail_retention = true;
+        assert!(matches!(
+            coordinator.coordinate(&call, context, 20, &mut signer),
+            Err(AuthorityOperationCoordinatorError::Dispatch(
+                FakeDispatchError
+            ))
+        ));
+        assert_eq!(coordinator_store.commits(), 0);
+        assert_eq!(issuer_store.commits(), 0);
+        assert_eq!(dispatcher.counts(), (0, 0));
+        assert_eq!((signer.receipt_calls, signer.acknowledgement_calls), (0, 0));
+        assert!(!coordinator.has_pending_operation());
+        assert!(!coordinator.is_poisoned());
+        dispatcher.state.lock().unwrap().fail_retention = false;
+        coordinator_store.fail_after_commit(1);
+        assert!(matches!(
+            coordinator.coordinate(&call, context, 20, &mut signer),
+            Err(AuthorityOperationCoordinatorError::Storage(
+                MemoryStoreError
+            ))
+        ));
+        assert_eq!(dispatcher.state.lock().unwrap().retention_calls, 2);
+        assert_eq!(dispatcher.counts(), (0, 0));
+        drop(coordinator);
+        // Once the pledge is durable, even a failing retention hook is never
+        // consulted. The dispatcher must use its already-retained exact work.
+        dispatcher.state.lock().unwrap().fail_retention = true;
+        let mut reopened = open(
+            coordinator_store,
+            issuer_store,
+            dispatcher.clone(),
+            &fixture,
+        );
+        reopened
+            .coordinate(&call, context, 20, &mut signer)
+            .unwrap();
+        assert_eq!(dispatcher.state.lock().unwrap().retention_calls, 2);
+        assert_eq!(dispatcher.counts(), (1, 1));
     }
 
     #[test]
