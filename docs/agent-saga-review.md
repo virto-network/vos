@@ -1314,3 +1314,28 @@ routes. Retrying after a later image must recover the already-pledged
 acknowledgement rather than silently sign a different state commitment. The
 Local observation component does not itself complete native provisioning or
 ordinary-Agent finality.
+
+### Recover original application acknowledgements before observing newer state
+
+The durable clean issuer now exposes a crate-private recovery operation for an
+exact issued receipt. It returns no acknowledgement only when that receipt is
+known but has no application pledge. Unknown/substituted receipts are refused.
+A pending pledge is signed using its stored image commitment and application
+slot; an already signed MAA2 is recovered without consulting the signer. Both
+paths reuse the existing exact result/decision validation and crash-safe commit
+machinery, rather than rebuilding evidence from today's Agent state.
+
+The Local observation entry point attempts this recovery before pledging a new
+observation. Thus a retry after subsequent invocation state cannot silently
+replace the already-pledged image commitment. A changed application result is
+still rejected, and authority-actor finalization remains mandatory before the
+next management decision can be issued. No wire format or artifact changes.
+
+The issuer regressions now exercise recovery before any pledge, rejection of an
+unissued receipt, recovery after a failed signer, exact result substitution,
+restart with an unavailable signer, and an ambiguous completed storage commit
+without resigning. This supports the forthcoming native lifecycle coordinator;
+it does not connect native Create/Install or provide ordinary-Agent finality by
+itself.
+**19/19 clean-issuer and Local-host tests pass**
+(`r16-local-ack-recovery-final.log`, 14.54s); formatting and diff checks pass.

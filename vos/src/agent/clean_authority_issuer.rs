@@ -1320,6 +1320,53 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         Ok(acknowledgement)
     }
 
+    /// Recover a previously pledged or signed application acknowledgement
+    /// using its original durable state/slot, never a caller's newer image.
+    /// None means this exact issued receipt has no application pledge yet.
+    pub(crate) fn recover_application_ack<S: CleanManagementReceiptSigner>(
+        &mut self,
+        receipt: &AuthorityReceipt,
+        application: &ManagementReply,
+        signer: &mut S,
+    ) -> Result<Option<ManagementApplicationAck>, CleanManagementIssuerError<B::Error, S::Error>>
+    {
+        self.ensure_live()?;
+        let receipt_bytes = receipt.encode().map_err(|_| {
+            CleanManagementIssuerError::Rejected(CleanManagementIssuerRejection::InvalidObservation)
+        })?;
+        let record = self
+            .image
+            .acknowledged
+            .iter()
+            .chain(self.image.retained.iter())
+            .find(|record| {
+                record.sequence == receipt.selector.decision_sequence
+                    && record.receipt == receipt_bytes
+            })
+            .ok_or(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::InvalidObservation,
+            ))?;
+        let original = if let Some(bytes) = &record.application_ack {
+            let acknowledgement = ManagementApplicationAck::decode(bytes)
+                .map_err(|_| CleanManagementIssuerError::InvalidState)?;
+            Some((acknowledgement.reopened_state, acknowledgement.applied_at))
+        } else if let Some(pending) = self.image.pending_application_ack {
+            if pending.sequence != record.sequence {
+                return Err(CleanManagementIssuerError::Rejected(
+                    CleanManagementIssuerRejection::DivergentApplicationAck,
+                ));
+            }
+            Some((pending.reopened_state, pending.applied_at))
+        } else {
+            None
+        };
+        original
+            .map(|(state, slot)| {
+                self.observe_durable_application(receipt, application, state, slot, signer)
+            })
+            .transpose()
+    }
+
     /// Local callers cannot substitute an in-memory result for the physical
     /// host's exact durable observation. Denials are never signed as applied.
     pub(crate) fn observe_local_application<S: CleanManagementReceiptSigner>(
@@ -1330,6 +1377,11 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         let application = observation.result().as_ref().map_err(|_| {
             CleanManagementIssuerError::Rejected(CleanManagementIssuerRejection::InvalidObservation)
         })?;
+        if let Some(acknowledgement) =
+            self.recover_application_ack(observation.receipt(), application, signer)?
+        {
+            return Ok(acknowledgement);
+        }
         self.observe_durable_application(
             observation.receipt(),
             application,
@@ -2334,6 +2386,21 @@ mod tests {
         .unwrap();
         let mut issuer = open(store.clone(), &fixture);
         let receipt = issuer.issue(&approved_decision, &mut signer).unwrap();
+        assert_eq!(
+            issuer
+                .recover_application_ack(&receipt, &application, &mut signer)
+                .unwrap(),
+            None
+        );
+        let mut unissued = receipt.clone();
+        unissued.signature[0] ^= 1;
+        let calls_before_recovery = signer.calls;
+        assert!(
+            issuer
+                .recover_application_ack(&unissued, &application, &mut signer)
+                .is_err()
+        );
+        assert_eq!(signer.calls, calls_before_recovery);
 
         let second_request = request(0x2f);
         let (second_call, second_approval) = approved_call(&fixture, 2, &second_request);
@@ -2409,6 +2476,14 @@ mod tests {
         let image_after_pledge = issuer.image.clone();
         let calls = signer.calls;
         assert!(matches!(
+            issuer.recover_application_ack(&receipt, &wrong_application, &mut signer),
+            Err(CleanManagementIssuerError::Rejected(
+                CleanManagementIssuerRejection::DivergentApplicationAck
+            ))
+        ));
+        assert_eq!(issuer.image, image_after_pledge);
+        assert_eq!(signer.calls, calls);
+        assert!(matches!(
             issuer.observe_durable_application(
                 &receipt,
                 &wrong_application,
@@ -2437,14 +2512,11 @@ mod tests {
         assert_eq!(signer.calls, calls);
 
         let acknowledgement = issuer
-            .observe_durable_application(
-                &receipt,
-                &application,
-                reopened_state,
-                applied_at,
-                &mut signer,
-            )
+            .recover_application_ack(&receipt, &application, &mut signer)
+            .unwrap()
             .unwrap();
+        assert_eq!(acknowledgement.reopened_state, reopened_state);
+        assert_eq!(acknowledgement.applied_at, applied_at);
         assert!(acknowledgement.matches_pending(&call, &approval));
         assert_eq!(
             acknowledgement.acknowledgement_invocation,
@@ -2482,13 +2554,8 @@ mod tests {
         assert_eq!(issuer.image, completed_image);
         assert_eq!(unavailable_signer.calls, 0);
         let exact_retry = issuer
-            .observe_durable_application(
-                &receipt,
-                &application,
-                reopened_state,
-                applied_at,
-                &mut unavailable_signer,
-            )
+            .recover_application_ack(&receipt, &application, &mut unavailable_signer)
+            .unwrap()
             .unwrap();
         assert_eq!(exact_retry, acknowledgement);
         assert_eq!(unavailable_signer.calls, 0);
@@ -2589,13 +2656,8 @@ mod tests {
         let mut unavailable_signer = CountingSigner::new(0x38);
         unavailable_signer.fail_next = true;
         let acknowledgement = issuer
-            .observe_durable_application(
-                &receipt,
-                &application,
-                reopened_state,
-                applied_at,
-                &mut unavailable_signer,
-            )
+            .recover_application_ack(&receipt, &application, &mut unavailable_signer)
+            .unwrap()
             .unwrap();
         assert!(acknowledgement.matches_pending(&call, &approval));
         assert_eq!(acknowledgement.verify_with(&TestCredentialVerifier), Ok(()));
