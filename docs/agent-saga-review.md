@@ -185,7 +185,8 @@ Keep these as work within C2, not new review batches:
    signed terminal retirement and durable release now have a native owner
    boundary. Signed terminal startup classification now passes through the
    native owner. The production controller/daemon now own the hardened
-   retirement index and use terminal retry/release; denial retirement and
+   retirement index and use terminal retry/release. Native unissued-denial
+   verification/acknowledgement is implemented; signed denial retirement and
    operation ingress/client wiring remain open.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
    retirement and restart through native ingress; then expose the same
@@ -5917,6 +5918,40 @@ lock files. Their indexes are empty in this live campaign: it proves normal
 daemon adoption/startup and existing Public-query ingress compatibility, not
 live protected operation authorization. Positive operation retirement/reopen
 evidence comes from the native tests above. Startup latency remains high.
+
+### Native unissued operation denial proof and acknowledgement
+
+Verification: **7 native operation tests passed, zero failures**, in **111.97s**
+(`r16-native-operation-denial-proof-final.log`); **219 CLI tests passed, zero
+failures, five ignored**, in **37.35s** (`r16-native-operation-denial-proof-cli.log`).
+Logs are in shared disk-backed `.worktrees/ch08-c2-native/target/task-tmp`.
+The initial compile required explicit SDK outcome/status imports, fixed before
+the passing runs. Formatting and whitespace checks pass. No fresh live campaign
+or full-library release run was performed for this native-owner checkpoint.
+
+The operation denial boundary now inspects exact retained native policy
+execution without dispatching new work. It validates the signed authorization
+record and physical reservation, requires a matching non-poisoned issuer with
+no retained issuance for that invocation, and independently replays the durable
+input after its saved anchor. Only canonical empty approval bytes from a
+matching completed reply produce a denial proof; absent execution, another
+reply, or execution/storage errors cannot be substituted for denial.
+
+The proof borrows the issuer mutably for its lifetime, preventing issuance or
+replacement while it is used. The native owner acknowledges only that exact
+reserved input, checks the complete acknowledgement identity/commitments, and
+independently observes positive durable acknowledgement. Exact retries do not
+add another transition. The reservation is deliberately retained: signed
+terminal denial evidence and production controller/startup integration still
+need implementation before release is safe.
+
+The new native fixture checks no proof before policy execution, wrong issuer
+scope rejection, genuine bundled-Authority denial, one positive acknowledgement,
+exact acknowledgement retry, proof reconstruction after acknowledgement, no
+issuer record/write, unchanged native source bytes, and continuing exclusion of
+unrelated projection work. The approved-operation fixture additionally rejects
+denial classification when issuance is retained. This does not yet prove denial
+retirement or a usable successor operation after denial.
 
 ### Durable client acknowledgement before completion
 

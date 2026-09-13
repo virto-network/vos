@@ -10428,6 +10428,18 @@ mod tests {
                 &acknowledgement_bytes,
             )
             .unwrap();
+            let mut retained_issuer =
+                crate::agent::authority_operation_issuer::DurableAuthorityOperationIssuer::open(
+                    operation_issuer,
+                    authority,
+                )
+                .unwrap();
+            assert!(
+                owner
+                    .verify_native_operation_denial(&authorization, &mut retained_issuer)
+                    .is_err()
+            );
+            let operation_issuer = retained_issuer.into_store();
             assert!(
                 owner
                     .verify_native_operation_completion(&acknowledgement, &authorization, &issued)
@@ -10999,6 +11011,107 @@ mod tests {
                 );
             }
             harness.owner = Some(owner);
+            harness.stop();
+        }
+
+        #[test]
+        fn native_operation_denial_requires_durable_policy_and_retains_admission_after_ack() {
+            use crate::agent::authority_operation_coordinator::tests::unenrolled_native_dispatch;
+            use crate::agent::authority_operation_issuer::DurableAuthorityOperationIssuer;
+            let mut harness = NativeProjectionOwnerHarness::with_fixture(
+                "native-operation-denial",
+                native_bundled_authority_fixture(),
+            );
+            let root = harness._directory.0.clone();
+            let owner = harness.owner.as_mut().unwrap();
+            let target = owner.authority_target();
+            let slot = owner
+                .supervisor_invocation_material(owner.pins.agent, target.binding.issuer.actor)
+                .unwrap()
+                .observed_slot;
+            let request = unenrolled_native_dispatch(target, slot);
+            let mut journal = OperationTestJournal(root.clone());
+            let record = owner
+                .capture_authority_operation_dispatch(&request, |record| {
+                    journal
+                        .retain(request.context.invocation, &record.encode().unwrap())
+                        .map_err(|_| SharedAgentHostError::Unavailable)
+                })
+                .unwrap();
+            let before = owner.ordered_index_for_test().unwrap();
+            let issuer_path = root.join("denial-operation-issuer");
+            let mut issuer = DurableAuthorityOperationIssuer::open(
+                OperationTestImageFile(issuer_path.clone()),
+                target,
+            )
+            .unwrap();
+            assert!(
+                owner
+                    .verify_native_operation_denial(&record, &mut issuer)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            let mut wrong_target = target;
+            wrong_target.system_agent.0[0] ^= 1;
+            let mut wrong_issuer = DurableAuthorityOperationIssuer::open(
+                OperationTestImageFile(root.join("wrong-denial-issuer")),
+                wrong_target,
+            )
+            .unwrap();
+            assert!(
+                owner
+                    .verify_native_operation_denial(&record, &mut wrong_issuer)
+                    .is_err()
+            );
+            owner
+                .execute_authority_operation_dispatch(
+                    record.request(),
+                    record.envelope(),
+                    record.anchor(),
+                )
+                .unwrap();
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 1);
+            let denial = owner
+                .verify_native_operation_denial(&record, &mut issuer)
+                .unwrap()
+                .unwrap();
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 1);
+            assert!(owner.acknowledge_native_operation_denial(&denial).unwrap());
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+            assert!(!owner.acknowledge_native_operation_denial(&denial).unwrap());
+            drop(denial);
+            let denial = owner
+                .verify_native_operation_denial(&record, &mut issuer)
+                .unwrap()
+                .unwrap();
+            assert!(!owner.acknowledge_native_operation_denial(&denial).unwrap());
+            drop(denial);
+            assert!(
+                issuer
+                    .recover_retained(request.context.invocation)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!issuer_path.exists());
+            assert_eq!(
+                journal.load(request.context.invocation).unwrap(),
+                Some(record.encode().unwrap())
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+            let (query, query_auth) = fresh_projection_pair(owner, 0xdb);
+            assert!(matches!(
+                owner._network_host.reserve_projection_pair(
+                    HostAgentId(owner.pins.agent.0),
+                    &query,
+                    &query_auth,
+                    false,
+                ),
+                Err(SharedAgentHostError::Conflict)
+            ));
+            drop(issuer);
+            drop(wrong_issuer);
+            drop(journal);
             harness.stop();
         }
 
