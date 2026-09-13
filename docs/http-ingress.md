@@ -76,7 +76,7 @@ A 200 binary response is canonical `ASR1`, bound to the exact request. Inspect
 its runtime outcome: HTTP 200 does not itself mean actor success. On transport
 failure or 503, retain the original bytes; do not assume execution did not
 occur or generate a new invocation identity. The transport does not yet supply
-fresh client preparation/receipt issuance or a retained continuation driver,
+fresh client preparation/receipt issuance,
 or the friendly JSON route below. A full live invocation/restart campaign is
 still required before ordinary-agent testing is considered ready.
 
@@ -113,8 +113,26 @@ reconstructs continuation work from its durable FIFO. Acknowledgement retires
 delivery for the original invocation, not a new actor call. All three preserve
 the same anonymous-Public/receipt boundary, exact live route checks, bounded
 framing and request-bound responses. An HTTP error does not prove non-execution
-or non-retirement. A retained continuation/acknowledgement client and native
-yield/resume/retirement campaign are still required.
+or non-retirement. A native yield/resume/retirement campaign is still required.
+
+After retaining initial delivery, continue it with:
+
+```sh
+vosx space continue-agent-invocation /private/delivery-dir --http 127.0.0.1:8080
+```
+
+The command derives each resume from the saved yielded selector and original
+work/authorization. It saves the exact step before sending, persists only a
+matching reply, and finally acknowledges terminal delivery. Repeating the
+command resumes an interrupted pending step; a saved successful acknowledgement
+returns offline. `delivery_retired: true` confirms delivery retirement, not
+actor success. A negative acknowledgement is retained and reported as failure.
+
+The same exclusive store lease protects the entire workflow. `invocation.progress`
+is a CSF1-protected, canonical CIP1 JSON history with hex-encoded protocol frames,
+bounded to 64 exchanges and 64 MiB. Only appending a pending request or filling
+its response is allowed; predecessors cannot be rewritten. At capacity the
+command preserves history and stops without silently discarding evidence.
 
 ### Existing name-based routes
 

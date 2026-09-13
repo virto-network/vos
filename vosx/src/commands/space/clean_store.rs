@@ -173,6 +173,7 @@ enum StoreRole {
     LocalInstallAcknowledgement = 15,
     InvocationRequest = 16,
     InvocationResponse = 17,
+    InvocationProgress = 18,
 }
 
 impl StoreRole {
@@ -195,6 +196,7 @@ impl StoreRole {
             Self::LocalInstallAcknowledgement => "local-install.acknowledgement",
             Self::InvocationRequest => "invocation.request",
             Self::InvocationResponse => "invocation.response",
+            Self::InvocationProgress => "invocation.progress",
         }
     }
 
@@ -217,6 +219,7 @@ impl StoreRole {
             Self::LocalInstallAcknowledgement => "local-install.acknowledgement.next",
             Self::InvocationRequest => "invocation.request.next",
             Self::InvocationResponse => "invocation.response.next",
+            Self::InvocationProgress => "invocation.progress.next",
         }
     }
 
@@ -232,6 +235,7 @@ impl StoreRole {
             Self::LocalInstallRequest => 1024 * 1024,
             Self::InvocationRequest => super::local_invocation::MAX_REQUEST_BYTES,
             Self::InvocationResponse => super::local_invocation::MAX_RESPONSE_BYTES,
+            Self::InvocationProgress => super::invocation_progress::MAX_PROGRESS_BYTES,
             Self::LifecycleRuntime => MAX_PACKAGE_ENCODED_BYTES,
             Self::LifecycleActor => MAX_PACKAGE_ENCODED_BYTES,
             Self::LocalCreateDenial => vos::agent::local_lifecycle::LocalCreateDenial::MAX_BYTES,
@@ -249,6 +253,7 @@ impl StoreRole {
         match byte {
             16 => Some(Self::InvocationRequest),
             17 => Some(Self::InvocationResponse),
+            18 => Some(Self::InvocationProgress),
             1 => Some(Self::Pins),
             2 => Some(Self::Bootstrap),
             3 => Some(Self::ManagementIssuer),
@@ -699,6 +704,7 @@ pub(crate) struct CleanLocalCreateAcknowledgementFile {
 pub(crate) struct CleanInvocationFile {
     request: ExactFileStore,
     response: ExactFileStore,
+    progress: ExactFileStore,
 }
 
 impl CleanInvocationFile {
@@ -711,11 +717,14 @@ impl CleanInvocationFile {
                 "invocation.request.next",
                 "invocation.response",
                 "invocation.response.next",
+                "invocation.progress",
+                "invocation.progress.next",
             ],
         )?);
         Ok(Self {
             request: ExactFileStore::new(root.clone(), StoreRole::InvocationRequest),
-            response: ExactFileStore::new(root, StoreRole::InvocationResponse),
+            response: ExactFileStore::new(root.clone(), StoreRole::InvocationResponse),
+            progress: ExactFileStore::new(root, StoreRole::InvocationProgress),
         })
     }
 
@@ -735,6 +744,7 @@ impl CleanInvocationFile {
         super::local_invocation::validate_request(bytes)
             .map_err(|_| CleanFileStoreError::Corrupt)?;
         self.load_response()?; // Never repair an orphan response from new input.
+        self.load_progress()?;
         self.request.commit_with_replacement(bytes, false)
     }
 
@@ -757,8 +767,45 @@ impl CleanInvocationFile {
     }
 
     pub(crate) fn publish_response(&mut self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
+        self.load_progress()?; // Nor reconstruct a missing predecessor of progress.
         self.validate_response(bytes)?;
         self.response.commit_with_replacement(bytes, false)
+    }
+
+    fn decode_progress(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<super::invocation_progress::Progress, CleanFileStoreError> {
+        let request = self.load_request()?.ok_or(CleanFileStoreError::Corrupt)?;
+        let response = self.load_response()?.ok_or(CleanFileStoreError::Corrupt)?;
+        super::invocation_progress::Progress::decode(bytes, &request, &response)
+            .map_err(|_| CleanFileStoreError::Corrupt)
+    }
+
+    pub(crate) fn load_progress(&mut self) -> Result<Option<Vec<u8>>, CleanFileStoreError> {
+        let bytes = self
+            .progress
+            .load(StoreRole::InvocationProgress.maximum_bytes())?;
+        if let Some(bytes) = &bytes {
+            self.decode_progress(bytes)?;
+            self.progress.commit_with_replacement(bytes, false)?;
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn publish_progress(&mut self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
+        let next = self.decode_progress(bytes)?;
+        let previous = match self.load_progress()? {
+            Some(bytes) => self.decode_progress(&bytes)?,
+            None => super::invocation_progress::Progress::new(
+                &self.load_request()?.ok_or(CleanFileStoreError::Corrupt)?,
+            )
+            .map_err(|_| CleanFileStoreError::Corrupt)?,
+        };
+        if !next.succeeds(&previous) {
+            return Err(CleanFileStoreError::RequestConflict);
+        }
+        self.progress.commit_with_replacement(bytes, true)
     }
 }
 

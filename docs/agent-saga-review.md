@@ -4940,6 +4940,46 @@ This is transport wiring, not a native yielded-work/retirement pass. Durable
 client continuation/acknowledgement, protected non-Public issuance/mutation,
 ordinary Shared finality and all remaining release gates remain required.
 
+### Durable continuation and retirement client
+
+`vosx space continue-agent-invocation REQUEST_DIR --http 127.0.0.1:PORT` now
+advances the saved Direct invocation through successive yields and terminal
+delivery acknowledgement. It uses the original work and authorization plus
+each exact saved yielded selector; no IDs, caller claims, availability or
+continuation state are regenerated from current inputs.
+
+CSF1 role 18 stores `invocation.progress`/`.next` in the same exclusively leased
+directory as the initial ASQ1/ASR1. Its bounded canonical CIP1 JSON history
+contains hex protocol frames, the original invocation commitment and at most
+64 exchanges/64 MiB. Publication permits only appending a pending request or
+filling that request's exact response. Every predecessor is revalidated against
+the original request and each typed response commitment. Missing base delivery,
+rewritten history, orphan progress, or response-before-request publication is
+rejected. Ambiguity retains the exact pending request for reopen/retry. At the
+history ceiling nothing is evicted to manufacture room.
+
+The lease spans request publication, HTTP delivery and response persistence.
+Resume replies must advance the yielded selector or terminate; terminal delivery
+is acknowledged using original work/authorization. Saved successful retirement
+returns offline; a negative acknowledgement remains retained and reports
+failure. The success marker is delivery retirement, never actor success.
+
+Initial regression passes: 197 vosx tests, zero failed, four ignored in 7.70s
+(`r16-invocation-progress-tests.log`). New fixture tests cover two yields,
+terminal acknowledgement, 503 then identical retry, the physical held lease,
+pending request presence before network response, reopen, malformed/substituted
+responses, canonical JSON, bounded step count, predecessor rollback and orphan
+refusal. This is protocol/store coverage; its scripted terminal outcome does
+not prove native guest mutation, yielding or retirement. The final regression
+passes: 198 tests, zero failed, four ignored in 7.70s
+(`r16-invocation-progress-final.log`), including actual CLI parsing and refusal
+to publish a response without its preceding durable pending request.
+Formatting and diff checks pass.
+
+The native yielded-work/retirement campaign, protected non-Public issuance and
+mutation, ordinary Shared finality, capacity/crash closure and final release
+matrix remain required. The Public query/restart pass does not replace them.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

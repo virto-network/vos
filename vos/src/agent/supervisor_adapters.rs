@@ -1860,7 +1860,8 @@ impl AgentResumeResponse {
         }
     }
 
-    fn matches_request(&self, request: &AgentResumeRequest) -> bool {
+    /// Check exact Direct response binding; this is not a finality proof.
+    pub fn matches_request(&self, request: &AgentResumeRequest) -> bool {
         if self.request_commitment() != request.commitment()
             || !outcome_matches_work(self.outcome(), request.work())
             || !match self.outcome() {
@@ -2004,7 +2005,8 @@ impl AgentAcknowledgementResponse {
         &self.outcome
     }
 
-    fn matches_request(&self, request: &AgentAcknowledgementRequest) -> bool {
+    /// Check exact Direct retirement response binding, including result scope.
+    pub fn matches_request(&self, request: &AgentAcknowledgementRequest) -> bool {
         if self.request != request.commitment()
             || !matches!(request.execution(), RuntimeExecutionContext::Direct)
         {

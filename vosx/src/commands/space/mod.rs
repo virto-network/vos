@@ -30,6 +30,8 @@ pub mod down;
 pub mod endpoint;
 pub mod forget;
 pub mod info;
+#[cfg(target_os = "linux")]
+pub(crate) mod invocation_progress;
 pub mod list;
 pub mod local_config;
 #[cfg(target_os = "linux")]
@@ -47,6 +49,13 @@ pub mod verify;
 
 #[derive(Subcommand, Debug)]
 pub enum SpaceCommand {
+    /// Resume retained yielded work and retire its terminal delivery exactly.
+    #[cfg(target_os = "linux")]
+    ContinueAgentInvocation {
+        request_dir: PathBuf,
+        #[arg(long)]
+        http: std::net::SocketAddr,
+    },
     /// Deliver or retry exact canonical ASQ1; retains the first bound response.
     #[cfg(target_os = "linux")]
     SubmitAgentInvocation {
@@ -155,6 +164,10 @@ pub enum SpaceCommand {
 
 pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
     match cmd {
+        #[cfg(target_os = "linux")]
+        SpaceCommand::ContinueAgentInvocation { request_dir, http } => {
+            invocation_progress::run(&request_dir, http)
+        }
         #[cfg(target_os = "linux")]
         SpaceCommand::SubmitAgentInvocation {
             request_dir,
