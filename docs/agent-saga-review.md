@@ -1999,3 +1999,26 @@ disk scratch). The new cases cover immutable/exclusive publication and reopen,
 initial-stage recovery, staged replacement refusal, incomplete-stage retention
 and cross-role rejection. Existing bootstrap/lifecycle store regressions remain
 green. Formatting and diff checks pass.
+
+### Local Create response verification
+
+`local_create::verify_acknowledgement` now verifies a canonical MAA2 response
+against the exact retained LCQ1 request. It checks the Authority target against
+the request before trusting the response key, verifies both the original
+receipt signature and the post-application signature, reconstructs the approval
+preimage from the call and signed receipt fields, and uses the SDK's exact
+pending-call matcher. That matcher includes the complete created Agent identity.
+Receipt validity is checked at its signed application slot, not the client's
+current time, so a retained successful reply remains verifiable on later retry.
+
+**36/36 preparation, acknowledgement and file-store tests pass** in 1.30s
+(`r16-local-create-ack-final.log`, locked/offline `vosx` binary tests, disk scratch).
+Negative cases cover truncation/trailing bytes, a different signed request,
+either corrupted signature, and re-signed substitutions of approval commitment,
+Authority target or created runtime identity. Formatting and diff checks pass.
+
+This authenticates the issuer's exact application claim; it is not independent
+journal replay, ordinary Shared genesis finality, or proof of live route
+publication. HTTP client/subcommand wiring and the native end-to-end smoke
+remain open. The existing `vos` HTTP-client dependency is `ureq` 2; it is not
+currently a direct `vosx` dependency or an exported general-purpose client.

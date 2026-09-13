@@ -16,6 +16,61 @@ use vos::agent::sdk::{AgentDescriptor, InvocationId, ManagementRequest};
 
 use super::clean_identity::CleanOperatorIdentitySigner;
 
+/// Verify a response against the retained request, never a key supplied only
+/// by the response. This verifies the issuer's application claim, not an
+/// independent replay proof or proof of HTTP route publication.
+pub(crate) fn verify_acknowledgement(
+    request: &[u8],
+    response: &[u8],
+) -> anyhow::Result<vos::agent::sdk::authority::ManagementApplicationAck> {
+    use vos::agent::sdk::authority::{
+        AuthorityVerifier, ManagementApplicationAck, ManagementApproval,
+    };
+    use vos::agent::sdk::wire::CanonicalWire as _;
+
+    struct Verifier;
+    impl AuthorityVerifier for Verifier {
+        fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+            libp2p::identity::ed25519::PublicKey::try_from_bytes(public_key)
+                .is_ok_and(|key| key.verify(message, signature))
+        }
+    }
+
+    let submission = LocalCreateSubmission::decode(request)
+        .map_err(|error| anyhow::anyhow!("invalid retained Local Create: {error:?}"))?;
+    let (_, call, _) = submission.into_parts();
+    anyhow::ensure!(
+        call.authenticated_node.is_none(),
+        "retained request is not HTTP-compatible"
+    );
+    let ack = ManagementApplicationAck::decode(response)
+        .map_err(|error| anyhow::anyhow!("invalid Local Create acknowledgement: {error:?}"))?;
+    anyhow::ensure!(
+        ack.authority == call.authority,
+        "acknowledgement Authority differs from retained request"
+    );
+    ack.verify_with(&Verifier)
+        .map_err(|error| anyhow::anyhow!("invalid acknowledgement signature: {error:?}"))?;
+    let selector = &ack.receipt.selector;
+    let approval = ManagementApproval::from_call(
+        &call,
+        ack.authorization_sequence,
+        selector.evidence.clone(),
+        selector.lane_roots,
+        selector.epoch,
+        selector.valid_from,
+        selector.expires_at,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!("acknowledgement approval differs from retained request: {error:?}")
+    })?;
+    anyhow::ensure!(
+        ack.matches_pending(&call, &approval),
+        "acknowledgement does not match the exact retained Local Create"
+    );
+    Ok(ack)
+}
+
 pub(crate) fn prepare(
     operator: &Keypair,
     authority: AuthorityActorTarget,
@@ -175,6 +230,134 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_ne!(changed.into_parts().1.invocation, call.invocation);
+    }
+
+    #[test]
+    fn acknowledgement_requires_both_signatures_and_exact_request_and_reply() {
+        use vos::agent::sdk::authority::{
+            AuthorityEvidence, AuthorityLaneRoots, AuthorityReceipt, AuthorityReceiptSelector,
+            ManagementApplicationAck, ManagementApproval,
+        };
+        use vos::agent::sdk::{ManagementReply, wire::CanonicalWire as _};
+        let (operator, authority, descriptor, runtime) = fixture();
+        let request = prepare(
+            &operator,
+            authority,
+            descriptor.clone(),
+            runtime.clone(),
+            NonZeroU64::new(2).unwrap(),
+            10,
+            30,
+        )
+        .unwrap()
+        .encode();
+        let (_, call, _) = LocalCreateSubmission::decode(&request)
+            .unwrap()
+            .into_parts();
+        let approval = ManagementApproval::from_call(
+            &call,
+            NonZeroU64::new(3).unwrap(),
+            AuthorityEvidence {
+                package: None,
+                proof: None,
+                commitment: Hash([10; 32]),
+            },
+            AuthorityLaneRoots::default(),
+            1,
+            10,
+            30,
+        )
+        .unwrap();
+        let mut receipt = AuthorityReceipt {
+            selector: AuthorityReceiptSelector {
+                policy: authority.binding.policy,
+                issuer: authority.binding.issuer,
+                space: call.managed.space,
+                agent: call.managed.agent,
+                operation: call.plan.authority_operation(),
+                runtime_deployment: call.managed.runtime_deployment,
+                actor: None,
+                actor_deployment: None,
+                evidence: approval.evidence.clone(),
+                lane_roots: approval.lane_roots,
+                epoch: 1,
+                decision_sequence: 1,
+                acknowledged_through: 0,
+                valid_from: 10,
+                expires_at: 30,
+                request: approval.plan_commitment,
+            },
+            public_key: authority.binding.public_key,
+            signature: [0; 64],
+        };
+        receipt.signature = operator
+            .sign(&receipt.signing_bytes())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let mut ack = ManagementApplicationAck {
+            authorization_invocation: call.invocation,
+            acknowledgement_invocation: approval.acknowledgement_invocation,
+            authority,
+            managed: call.managed,
+            credential_call: call.commitment(),
+            approval: approval.commitment(),
+            authorization_sequence: approval.authorization_sequence,
+            request: approval.plan_commitment,
+            receipt,
+            application: ManagementReply::Created(descriptor.identity.clone()),
+            reopened_state: Hash([11; 32]),
+            applied_at: 20,
+            signature: [0; 64],
+        };
+        let sign = |ack: &mut ManagementApplicationAck| {
+            ack.signature = operator
+                .sign(&ack.signing_bytes())
+                .unwrap()
+                .try_into()
+                .unwrap();
+        };
+        sign(&mut ack);
+        let bytes = ack.encode().unwrap();
+        assert_eq!(verify_acknowledgement(&request, &bytes).unwrap(), ack);
+        assert!(verify_acknowledgement(&request, &bytes[..bytes.len() - 1]).is_err());
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(verify_acknowledgement(&request, &trailing).is_err());
+        let other_request = prepare(
+            &operator,
+            authority,
+            descriptor,
+            runtime,
+            NonZeroU64::new(3).unwrap(),
+            10,
+            30,
+        )
+        .unwrap()
+        .encode();
+        assert!(verify_acknowledgement(&other_request, &bytes).is_err());
+        let mut forged = ack.clone();
+        forged.signature[0] ^= 1;
+        assert!(verify_acknowledgement(&request, &forged.encode().unwrap()).is_err());
+        forged = ack.clone();
+        forged.receipt.signature[0] ^= 1;
+        sign(&mut forged);
+        assert!(verify_acknowledgement(&request, &forged.encode().unwrap()).is_err());
+        forged = ack.clone();
+        forged.approval = Hash([12; 32]);
+        sign(&mut forged);
+        assert!(verify_acknowledgement(&request, &forged.encode().unwrap()).is_err());
+        forged = ack.clone();
+        forged.authority.system_agent = AgentId([14; 32]);
+        sign(&mut forged);
+        assert!(verify_acknowledgement(&request, &forged.encode().unwrap()).is_err());
+        forged = ack;
+        let ManagementReply::Created(identity) = &mut forged.application else {
+            unreachable!()
+        };
+        identity.runtime_program = ProgramId([13; 32]);
+        sign(&mut forged);
+        assert!(verify_acknowledgement(&request, &forged.encode().unwrap()).is_err());
     }
 
     #[test]
