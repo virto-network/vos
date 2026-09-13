@@ -7,6 +7,7 @@ use super::*;
 mod completion;
 #[path = "clean_operation_denial.rs"]
 mod denial;
+pub use denial::NativeAuthorityOperationDenialSigner;
 #[path = "clean_operation_retirement.rs"]
 mod retirement;
 use crate::agent::authority_operation_coordinator::{

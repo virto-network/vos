@@ -93,7 +93,9 @@ impl CanonicalWire for CompletionCertificate {
     }
 }
 
-fn commitment(record: &RetainedAuthorityOperationDispatch) -> Result<Hash, SharedAgentHostError> {
+pub(super) fn commitment(
+    record: &RetainedAuthorityOperationDispatch,
+) -> Result<Hash, SharedAgentHostError> {
     let bytes = record
         .encode()
         .map_err(|_| SharedAgentHostError::ScopeMismatch)?;

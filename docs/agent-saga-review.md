@@ -186,8 +186,9 @@ Keep these as work within C2, not new review batches:
    boundary. Signed terminal startup classification now passes through the
    native owner. The production controller/daemon now own the hardened
    retirement index and use terminal retry/release. Native unissued-denial
-   verification/acknowledgement is implemented; signed denial retirement and
-   operation ingress/client wiring remain open.
+   verification/acknowledgement and signed terminal denial release have native
+   owner boundaries; production denial storage/recovery and operation
+   ingress/client wiring remain open.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
    retirement and restart through native ingress; then expose the same
    preparation/authorization flow in the user-facing client. A Public query
@@ -5952,6 +5953,42 @@ issuer record/write, unchanged native source bytes, and continuing exclusion of
 unrelated projection work. The approved-operation fixture additionally rejects
 denial classification when issuance is retained. This does not yet prove denial
 retirement or a usable successor operation after denial.
+
+### Signed native operation denial retirement boundary
+
+Verification: **8 native operation tests passed, zero failures**, in **120.28s**
+(`r16-native-operation-denial-retirement.log`); **219 CLI tests passed, zero
+failures, five ignored**, in **36.27s**
+(`r16-native-operation-denial-retirement-cli.log`). Logs are in shared disk-backed
+`.worktrees/ch08-c2-native/target/task-tmp`. Formatting and whitespace checks
+pass. No full-library or fresh live deployment campaign was run for this
+native-owner checkpoint.
+
+NDR1 is now a bounded host-only terminal denial certificate, separately domain
+signed over the invocation, exact NOD1 source-record commitment, signed call
+commitment and durable replay input. Native verification retains the source
+record and borrows the issuer until the proof/terminal token is dropped, keeping
+the unissued invariant intact. Restoration validates canonical framing,
+signature and source/call linkage, and rejects a mismatched, poisoned or
+already-issued issuer. It does not reinterpret execution/storage errors as
+policy denial.
+
+The owner signs and persists NDR1 through the existing pending-denial completion
+callback, under proposal/host exclusion and only after independently confirmed
+positive acknowledgement. A failed write retains admission even if it already
+published the certificate. Exact signed retry can finish that callback; an
+already-published certificate can instead be verified and synchronized before
+idempotent release without another signature. A denial store lease remains a
+caller requirement, and production store/controller/startup integration is not
+yet implemented.
+
+The two native denial fixtures cover premature retirement rejection without
+signing, publication followed by error with exclusion preserved, byte-identical
+signed retry, restored-certificate release without re-signing, malformed and
+substituted certificate rejection, unchanged issuer/source evidence, and no
+additional native execution transitions. After durable release the previously
+excluded projection reservation succeeds. This is same-owner recovery evidence;
+NDR1 startup classification and a live valid-successor campaign remain open.
 
 ### Durable client acknowledgement before completion
 

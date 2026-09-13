@@ -22,10 +22,10 @@ pub use operation_controller::{
 pub use operation_dispatch::{
     MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES, MAX_NATIVE_OPERATION_COMPLETION_BYTES,
     MAX_NATIVE_OPERATION_RETIREMENT_BYTES, NativeAuthorityOperationCompletionSigner,
-    NativeAuthorityOperationJournalStore, NativeAuthorityOperationRetirementSigner,
-    NativeAuthorityOperationRetirementStore, NativeAuthorityOperationStartupAdmission,
-    native_operation_completion_invocations, native_operation_record_matches,
-    native_operation_retirement_completion,
+    NativeAuthorityOperationDenialSigner, NativeAuthorityOperationJournalStore,
+    NativeAuthorityOperationRetirementSigner, NativeAuthorityOperationRetirementStore,
+    NativeAuthorityOperationStartupAdmission, native_operation_completion_invocations,
+    native_operation_record_matches, native_operation_retirement_completion,
 };
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
@@ -11016,6 +11016,15 @@ mod tests {
 
         #[test]
         fn native_operation_denial_requires_durable_policy_and_retains_admission_after_ack() {
+            check_native_operation_denial_retirement(false);
+        }
+
+        #[test]
+        fn native_operation_denial_retirement_recovers_published_certificate() {
+            check_native_operation_denial_retirement(true);
+        }
+
+        fn check_native_operation_denial_retirement(recover_published: bool) {
             use crate::agent::authority_operation_coordinator::tests::unenrolled_native_dispatch;
             use crate::agent::authority_operation_issuer::DurableAuthorityOperationIssuer;
             let mut harness = NativeProjectionOwnerHarness::with_fixture(
@@ -11025,6 +11034,21 @@ mod tests {
             let root = harness._directory.0.clone();
             let owner = harness.owner.as_mut().unwrap();
             let target = owner.authority_target();
+            struct DenialSigner(SigningKey, usize);
+            impl NativeAuthorityOperationDenialSigner for DenialSigner {
+                type Error = core::convert::Infallible;
+                fn public_key(&self) -> [u8; 32] {
+                    self.0.verifying_key().to_bytes()
+                }
+                fn sign_native_operation_denial(
+                    &mut self,
+                    bytes: &[u8],
+                ) -> Result<[u8; 64], Self::Error> {
+                    self.1 += 1;
+                    Ok(self.0.sign(bytes).to_bytes())
+                }
+            }
+            let mut signer = DenialSigner(SigningKey::from_bytes(&[RECEIPT_SEED; 32]), 0);
             let slot = owner
                 .supervisor_invocation_material(owner.pins.agent, target.binding.issuer.actor)
                 .unwrap()
@@ -11077,6 +11101,14 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(owner.ordered_index_for_test().unwrap(), before + 1);
+            assert!(
+                owner
+                    .finish_native_operation_denial(&denial, &mut signer, |_| {
+                        panic!("denial cannot publish terminal evidence before positive Ack")
+                    })
+                    .is_err()
+            );
+            assert_eq!(signer.1, 0);
             assert!(owner.acknowledge_native_operation_denial(&denial).unwrap());
             assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
             assert!(!owner.acknowledge_native_operation_denial(&denial).unwrap());
@@ -11109,6 +11141,105 @@ mod tests {
                 ),
                 Err(SharedAgentHostError::Conflict)
             ));
+            let denial = owner
+                .verify_native_operation_denial(&record, &mut issuer)
+                .unwrap()
+                .unwrap();
+            let path = root.join("operation-denial-retirement");
+            assert!(
+                owner
+                    .finish_native_operation_denial(&denial, &mut signer, |bytes| {
+                        write_operation_test_image(&path, bytes).unwrap();
+                        Err(SharedAgentHostError::Unavailable)
+                    })
+                    .is_err()
+            );
+            assert_eq!(signer.1, 1);
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+            assert!(matches!(
+                owner._network_host.reserve_projection_pair(
+                    HostAgentId(owner.pins.agent.0),
+                    &query,
+                    &query_auth,
+                    false,
+                ),
+                Err(SharedAgentHostError::Conflict)
+            ));
+            let saved = std::fs::read(&path).unwrap();
+            if recover_published {
+                drop(denial);
+                std::fs::File::open(&path).unwrap().sync_all().unwrap();
+                std::fs::File::open(path.parent().unwrap())
+                    .unwrap()
+                    .sync_all()
+                    .unwrap();
+                let retired = owner
+                    .restore_native_operation_denial(&record, &mut issuer, &saved)
+                    .unwrap();
+                owner.release_native_operation_denial(&retired).unwrap();
+                owner.release_native_operation_denial(&retired).unwrap();
+                drop(retired);
+            } else {
+                let retired = owner
+                    .finish_native_operation_denial(&denial, &mut signer, |bytes| {
+                        assert_eq!(bytes, saved);
+                        write_operation_test_image(&path, bytes).unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+                owner.release_native_operation_denial(&retired).unwrap();
+                owner.release_native_operation_denial(&retired).unwrap();
+                drop(retired);
+                drop(denial);
+            }
+            assert_eq!(signer.1, if recover_published { 1 } else { 2 });
+            let mut corrupt = saved.clone();
+            *corrupt.last_mut().unwrap() ^= 1;
+            assert!(
+                owner
+                    .restore_native_operation_denial(&record, &mut issuer, &corrupt)
+                    .is_err()
+            );
+            for end in [0, 3, saved.len() - 1] {
+                assert!(
+                    owner
+                        .restore_native_operation_denial(&record, &mut issuer, &saved[..end])
+                        .is_err()
+                );
+            }
+            let mut trailing = saved.clone();
+            trailing.push(0);
+            assert!(
+                owner
+                    .restore_native_operation_denial(&record, &mut issuer, &trailing)
+                    .is_err()
+            );
+            assert!(
+                owner
+                    .restore_native_operation_denial(
+                        &record,
+                        &mut issuer,
+                        &record.encode().unwrap()
+                    )
+                    .is_err()
+            );
+            assert!(
+                owner
+                    .restore_native_operation_denial(&record, &mut wrong_issuer, &saved)
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+            assert!(!issuer_path.exists());
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+            owner
+                ._network_host
+                .reserve_projection_pair(
+                    HostAgentId(owner.pins.agent.0),
+                    &query,
+                    &query_auth,
+                    false,
+                )
+                .unwrap();
             drop(issuer);
             drop(wrong_issuer);
             drop(journal);
