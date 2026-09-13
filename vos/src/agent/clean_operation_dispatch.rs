@@ -4,7 +4,8 @@
 
 use super::*;
 use crate::agent::authority_operation_coordinator::{
-    AuthorityOperationActorDispatch, AuthorityOperationActorMethod, AuthorityOperationActorResult,
+    AuthorityOperationActorDispatch, AuthorityOperationActorDispatcher,
+    AuthorityOperationActorMethod, AuthorityOperationActorResult,
 };
 use crate::agent::clean_management_intent::ManagementJournalAnchor;
 use crate::agent::sdk::authority_operation::{
@@ -19,6 +20,162 @@ const MAX_DISPATCH_REQUEST_BYTES: usize =
         MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES
     };
 const MAX_DISPATCH_ANCHOR_BYTES: usize = 1024;
+
+pub const MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES: usize =
+    RetainedAuthorityOperationDispatch::MAX_ENCODED_BYTES;
+
+/// Immutable per-invocation native dispatch records under one writer lease.
+/// Successful retention means the exact bytes survive restart. Repeated exact
+/// retention is allowed; replacing different bytes or discarding predecessors
+/// is not. Readers must enforce the record byte ceiling before allocating.
+pub trait NativeAuthorityOperationJournalStore {
+    type Error;
+
+    fn load(&mut self, invocation: InvocationId) -> Result<Option<Vec<u8>>, Self::Error>;
+    fn retain(&mut self, invocation: InvocationId, record: &[u8]) -> Result<(), Self::Error>;
+}
+
+/// Trusted coordinator adapter: all successful replies come from physical
+/// execution/replay, never from cached unsigned approval bytes. Authorization
+/// must have been captured durably before constructing the coordinator.
+pub(crate) struct NativeAuthorityOperationDispatcher<'a, P, R, I, J>
+where
+    P: CleanSystemAgentBootstrapStore,
+    R: CleanSystemAgentBootstrapStore,
+    I: CleanManagementIssuerStore,
+    J: NativeAuthorityOperationJournalStore,
+{
+    owner: &'a mut CleanSystemAgentBootstrapOwner<P, R, I>,
+    journal: &'a mut J,
+}
+
+impl<'a, P, R, I, J> NativeAuthorityOperationDispatcher<'a, P, R, I, J>
+where
+    P: CleanSystemAgentBootstrapStore,
+    R: CleanSystemAgentBootstrapStore,
+    I: CleanManagementIssuerStore,
+    J: NativeAuthorityOperationJournalStore,
+{
+    pub(crate) fn new(
+        owner: &'a mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        journal: &'a mut J,
+    ) -> Self {
+        Self { owner, journal }
+    }
+
+    fn retained(
+        &mut self,
+        invocation: InvocationId,
+    ) -> Result<Option<RetainedAuthorityOperationDispatch>, SharedAgentHostError> {
+        self.journal
+            .load(invocation)
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .map(|bytes| {
+                let record = RetainedAuthorityOperationDispatch::decode(&bytes)
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                if record.request.context.invocation != invocation
+                    || record.request.target != self.owner.authority_target()
+                    || record.encode().ok().as_deref() != Some(bytes.as_slice())
+                {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+}
+
+impl<P, R, I, J> AuthorityOperationActorDispatcher
+    for NativeAuthorityOperationDispatcher<'_, P, R, I, J>
+where
+    P: CleanSystemAgentBootstrapStore,
+    R: CleanSystemAgentBootstrapStore,
+    I: CleanManagementIssuerStore,
+    J: NativeAuthorityOperationJournalStore,
+{
+    type Error = SharedAgentHostError;
+
+    fn dispatch(
+        &mut self,
+        request: &AuthorityOperationActorDispatch,
+    ) -> Result<AuthorityOperationActorResult, Self::Error> {
+        use crate::Decode as _;
+        if request.target != self.owner.authority_target() || !request.has_valid_request() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let mut retained = self.retained(request.context.invocation)?;
+        if retained
+            .as_ref()
+            .is_some_and(|record| record.request != *request)
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        match request.method {
+            AuthorityOperationActorMethod::AuthorizeOperation => {
+                // Absence is not permission to reconstruct work from a later
+                // route/clock after the coordinator has pledged its context.
+                if retained.is_none() {
+                    return Err(SharedAgentHostError::Unavailable);
+                }
+            }
+            AuthorityOperationActorMethod::AcknowledgeIssuance => {
+                let ack = AuthorityOperationIssuanceAck::decode(&request.request)
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                let predecessor = self
+                    .retained(ack.authorization_invocation)?
+                    .ok_or(SharedAgentHostError::Unavailable)?;
+                if predecessor.request.method != AuthorityOperationActorMethod::AuthorizeOperation {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                // Re-observe the exact retained native approval, including on
+                // an AOI1 retry. A signed AOI1 cannot supply its own policy.
+                let approval_reply = self.owner.execute_authority_operation_dispatch(
+                    predecessor.request(),
+                    predecessor.envelope(),
+                    predecessor.anchor(),
+                )?;
+                let Some(crate::value::Value::Bytes(bytes)) =
+                    crate::value::Value::try_decode(&approval_reply.reply)
+                else {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                };
+                let approval = AuthorityOperationApproval::decode(&bytes)
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                let call = AuthorityOperationCall::decode(&predecessor.request.request)
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                if !ack.matches_pending(&call, &approval) {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                if retained.is_none() {
+                    let journal = &mut self.journal;
+                    let captured = self.owner.extend_authority_operation_dispatch(
+                        &predecessor,
+                        &approval,
+                        request,
+                        |record| {
+                            let bytes = record
+                                .encode()
+                                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                            journal
+                                .retain(request.context.invocation, &bytes)
+                                .map_err(|_| SharedAgentHostError::Unavailable)
+                        },
+                    )?;
+                    retained = self.retained(request.context.invocation)?;
+                    if retained.as_ref() != Some(&captured) {
+                        return Err(SharedAgentHostError::Unavailable);
+                    }
+                }
+            }
+        }
+        let retained = retained.ok_or(SharedAgentHostError::Unavailable)?;
+        self.owner.execute_authority_operation_dispatch(
+            request,
+            retained.envelope(),
+            retained.anchor(),
+        )
+    }
+}
 
 /// Immutable native input retained before operation policy or AOI1 execution.
 /// A valid record is not its own trust anchor: reopening/execution must still

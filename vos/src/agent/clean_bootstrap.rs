@@ -9,6 +9,11 @@
 pub(crate) mod operation_dispatch;
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+pub use operation_dispatch::{
+    MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES, NativeAuthorityOperationJournalStore,
+};
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
@@ -9743,6 +9748,218 @@ mod tests {
             native_physical_fixture_with_authority_configuration(package, Some(configuration))
         }
 
+        // Test-only durable backends. Production uses hardened CSF1 stores;
+        // these exercise coordinator/native integration under a private fixture.
+        fn write_operation_test_image(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+            use std::io::Write as _;
+            let staged = path.with_extension("next");
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staged)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&staged, path)?;
+            std::fs::File::open(path.parent().unwrap())?.sync_all()
+        }
+
+        struct OperationTestImageFile(PathBuf);
+
+        impl OperationTestImageFile {
+            fn read(&self) -> std::io::Result<Option<Vec<u8>>> {
+                match std::fs::read(&self.0) {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error),
+                }
+            }
+        }
+
+        impl crate::agent::authority_operation_coordinator::AuthorityOperationCoordinatorStore
+            for OperationTestImageFile
+        {
+            type Error = std::io::Error;
+            fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+                self.read()
+            }
+            fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+                write_operation_test_image(&self.0, image)
+            }
+        }
+
+        impl crate::agent::authority_operation_issuer::AuthorityOperationIssuerStore
+            for OperationTestImageFile
+        {
+            type Error = std::io::Error;
+            fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+                self.read()
+            }
+            fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+                write_operation_test_image(&self.0, image)
+            }
+        }
+
+        struct OperationTestJournal(PathBuf);
+
+        impl OperationTestJournal {
+            fn path(&self, invocation: InvocationId) -> PathBuf {
+                self.0.join(
+                    invocation
+                        .0
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>(),
+                )
+            }
+        }
+
+        impl NativeAuthorityOperationJournalStore for OperationTestJournal {
+            type Error = std::io::Error;
+            fn load(&mut self, invocation: InvocationId) -> Result<Option<Vec<u8>>, Self::Error> {
+                let path = self.path(invocation);
+                match std::fs::metadata(&path) {
+                    Ok(metadata)
+                        if metadata.len()
+                            > MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES as u64 =>
+                    {
+                        return Err(std::io::ErrorKind::InvalidData.into());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(error) => return Err(error),
+                    _ => {}
+                }
+                std::fs::read(path).map(Some)
+            }
+            fn retain(
+                &mut self,
+                invocation: InvocationId,
+                record: &[u8],
+            ) -> Result<(), Self::Error> {
+                if record.len() > MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES {
+                    return Err(std::io::ErrorKind::InvalidData.into());
+                }
+                if let Some(existing) = self.load(invocation)? {
+                    return if existing == record {
+                        std::fs::File::open(self.path(invocation))?.sync_all()?;
+                        std::fs::File::open(&self.0)?.sync_all()?;
+                        Ok(())
+                    } else {
+                        Err(std::io::ErrorKind::AlreadyExists.into())
+                    };
+                }
+                write_operation_test_image(&self.path(invocation), record)
+            }
+        }
+
+        #[test]
+        fn native_operation_coordinator_requires_retained_policy_before_signing() {
+            use crate::agent::authority_operation_coordinator::{
+                AuthorityOperationActorDispatcher as _, AuthorityOperationCoordinatorError,
+                AuthorityOperationCoordinatorRejection, DurableAuthorityOperationCoordinator,
+                tests::unenrolled_native_dispatch,
+            };
+            use crate::agent::authority_operation_issuer::{
+                AuthorityOperationEvidenceSigner, DurableAuthorityOperationIssuer,
+            };
+            use crate::agent::clean_bootstrap::operation_dispatch::NativeAuthorityOperationDispatcher;
+            use crate::agent_sdk::authority_operation::AuthorityOperationCall;
+            struct NoSigning([u8; 32]);
+            impl AuthorityOperationEvidenceSigner for NoSigning {
+                type Error = core::convert::Infallible;
+                fn public_key(&self) -> [u8; 32] {
+                    self.0
+                }
+                fn sign_authority_receipt(&mut self, _: &[u8]) -> Result<[u8; 64], Self::Error> {
+                    panic!("native policy denial must not sign a receipt")
+                }
+                fn sign_issuance_ack(&mut self, _: &[u8]) -> Result<[u8; 64], Self::Error> {
+                    panic!("native policy denial must not sign AOI1")
+                }
+            }
+            let mut harness = NativeProjectionOwnerHarness::with_fixture(
+                "native-operation-coordinator",
+                native_bundled_authority_fixture(),
+            );
+            let root = harness._directory.0.clone();
+            let clock = harness.fixture.logical_slot.as_ref().unwrap().clone();
+            let owner = harness.owner.as_mut().unwrap();
+            let target = owner.authority_target();
+            let slot = owner
+                .supervisor_invocation_material(owner.pins.agent, target.binding.issuer.actor)
+                .unwrap()
+                .observed_slot;
+            let request = unenrolled_native_dispatch(target, slot);
+            let call = AuthorityOperationCall::decode(&request.request).unwrap();
+            let mut journal = OperationTestJournal(root.clone());
+            let before = owner.ordered_index_for_test().unwrap();
+            assert!(
+                NativeAuthorityOperationDispatcher::new(owner, &mut journal)
+                    .dispatch(&request)
+                    .is_err()
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            let retained = owner
+                .capture_authority_operation_dispatch(&request, |record| {
+                    journal
+                        .retain(request.context.invocation, &record.encode().unwrap())
+                        .map_err(|_| SharedAgentHostError::Unavailable)
+                })
+                .unwrap();
+            let original = journal.load(request.context.invocation).unwrap().unwrap();
+            for retry in 0..2 {
+                if retry == 1 {
+                    clock.store(slot + 10, Ordering::Release);
+                }
+                let issuer = DurableAuthorityOperationIssuer::open(
+                    OperationTestImageFile(root.join("operation-issuer")),
+                    target,
+                )
+                .unwrap();
+                let mut coordinator = DurableAuthorityOperationCoordinator::open(
+                    OperationTestImageFile(root.join("operation-coordinator")),
+                    target,
+                    NativeAuthorityOperationDispatcher::new(owner, &mut journal),
+                    issuer,
+                )
+                .unwrap();
+                assert!(matches!(
+                    coordinator.coordinate(
+                        &call,
+                        retained.request().context,
+                        slot,
+                        &mut NoSigning(target.binding.public_key)
+                    ),
+                    Err(AuthorityOperationCoordinatorError::Rejected(
+                        AuthorityOperationCoordinatorRejection::AuthorizationDenied
+                    ))
+                ));
+                assert!(!coordinator.is_poisoned());
+                assert!(!coordinator.has_pending_operation());
+                drop(coordinator);
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before + 1);
+                assert_eq!(
+                    journal.load(request.context.invocation).unwrap(),
+                    Some(original.clone())
+                );
+                assert!(!root.join("operation-issuer").exists());
+            }
+            let mut corrupt = original;
+            corrupt[0] ^= 1;
+            write_operation_test_image(&journal.path(request.context.invocation), &corrupt)
+                .unwrap();
+            assert!(
+                NativeAuthorityOperationDispatcher::new(owner, &mut journal)
+                    .dispatch(&request)
+                    .is_err()
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 1);
+            assert_eq!(
+                journal.load(request.context.invocation).unwrap(),
+                Some(corrupt)
+            );
+            harness.stop();
+        }
+
         #[test]
         fn native_operation_dispatch_executes_bundled_policy_with_exact_journal_binding() {
             use crate::agent::authority_operation_coordinator::tests::unenrolled_native_dispatch;
@@ -9890,6 +10107,20 @@ mod tests {
             // guest denial above. It exercises signed phase admission, while
             // the guest must still reject consumption without its own approval.
             let (approval, acknowledgement) = crate::agent::authority_operation_coordinator::tests::scripted_issuance_for_native_rejection(&request, RECEIPT_SEED);
+            let mut journal = OperationTestJournal(saved_path.parent().unwrap().to_path_buf());
+            journal.retain(request.context.invocation, &saved).unwrap();
+            {
+                use crate::agent::authority_operation_coordinator::AuthorityOperationActorDispatcher as _;
+                let mut dispatcher = crate::agent::clean_bootstrap::operation_dispatch::NativeAuthorityOperationDispatcher::new(owner, &mut journal);
+                assert!(dispatcher.dispatch(&acknowledgement).is_err());
+            }
+            assert!(
+                journal
+                    .load(acknowledgement.context.invocation)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), applied);
             clock.store(slot + 10, Ordering::Release);
             let mut unknown_anchor = retained.anchor().clone();
             unknown_anchor.runtime = HostHash([0x98; 32]);

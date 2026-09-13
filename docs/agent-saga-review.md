@@ -157,8 +157,9 @@ Keep these as work within C2, not new review batches:
    below). Native yielded work still belongs to item 3.
 2. Connect `DurableAuthorityOperationCoordinator` to durable native stores and
    exact physical Authority dispatch. The CSF1 store pair and native owner
-   execution boundary are implemented and tested below. The coordinator
-   adapter and startup do not connect them yet; preparation and an API
+   execution boundary are implemented and tested below. The native coordinator
+   adapter now passes disk-backed fixture checks; production journal-store and
+   startup wiring remain open. Preparation and an API
    credential do not issue an actor
    receipt. Retain the signed AOC5, exact authorization context and issuance
    slot before policy dispatch, and recover the exact issued preimages before
@@ -5216,6 +5217,49 @@ scripted signer/policy path. Formatting and diff checks pass; all test processes
 are terminal. The next implementation remains the durable dispatch-store and
 coordinator connection plus native startup admission recovery, followed by a
 genuinely approved operation, successful consumption and positive retirement.
+
+### Native dispatcher connected to the operation coordinator
+
+`NativeAuthorityOperationDispatcher` now implements the coordinator's trusted
+`AuthorityOperationActorDispatcher` boundary. Authorization requires an existing
+canonical NOD1 matching the exact invocation, request, context and pinned
+Authority; missing state never triggers fresh preparation. Every successful
+reply comes from the native owner's authenticated journal execution/replay.
+No unsigned approval-response cache substitutes for the guest.
+
+AOI1 dispatch always reloads its exact authorization predecessor and re-observes
+the native retained approval, including on retries. Its signed issuance must
+match both AOC5 and that AOP5. Only then can a missing AOI1 record extend
+admission, persist, and be read back exactly before physical execution. An
+issuer-signed acknowledgement without native policy approval is rejected before
+creating the acknowledgement record. Completed operation receipt recovery in
+the portable coordinator still takes precedence over new dispatch.
+
+The public `NativeAuthorityOperationJournalStore` boundary supplies immutable,
+bounded per-invocation NOD1 load/retain under a writer lease. Backend success
+must mean durable publication, exact retries must remain idempotent, and
+different records cannot replace one another. The `vosx` hardened production
+implementation and native startup wiring are still required; the new physical
+tests use synced, disk-backed test-only image/journal backends in private
+fixtures, not production CSF1 storage or a live CLI endpoint.
+
+Both physical tests pass: **two passed in 10.02s**
+(`r16-native-operation-coordinator-final.log`; preceding pass 8.99s in
+`r16-native-operation-coordinator.log`). The real coordinator calls the bundled
+Authority through the native dispatcher, returns `AuthorizationDenied`, and
+never reaches either signer method. Reopening the actual coordinator/issuer
+file backends and advancing the host clock returns the same denial with no
+second native transition or issuer image. Missing/corrupt NOD1 is rejected and
+preserved. The signed-but-scripted AOI1 negative case is additionally rejected
+by the dispatcher before acknowledgement record creation because the actual
+retained guest result is a denial. Lower-level phase/clock/substitution checks
+remain passing. Formatting and diff checks pass; all processes are terminal.
+
+This connects the coordinator to native execution but is still negative-path
+and same-owner recovery evidence. Production journal storage, startup
+restoration of exact pending admission, genuinely approved native issuance,
+successful AOI1 consumption, denial/success retirement and protected mutation
+remain open. Do not report protected issuance as available to users yet.
 
 ### Durable client acknowledgement before completion
 
