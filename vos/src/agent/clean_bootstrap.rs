@@ -21,9 +21,10 @@ pub use operation_controller::{
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 pub use operation_dispatch::{
     MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES, MAX_NATIVE_OPERATION_COMPLETION_BYTES,
-    NativeAuthorityOperationCompletionSigner, NativeAuthorityOperationJournalStore,
-    NativeAuthorityOperationRetirementSigner, NativeAuthorityOperationStartupAdmission,
-    native_operation_completion_invocations, native_operation_record_matches,
+    MAX_NATIVE_OPERATION_RETIREMENT_BYTES, NativeAuthorityOperationCompletionSigner,
+    NativeAuthorityOperationJournalStore, NativeAuthorityOperationRetirementSigner,
+    NativeAuthorityOperationStartupAdmission, native_operation_completion_invocations,
+    native_operation_record_matches, native_operation_retirement_completion,
 };
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
@@ -1503,7 +1504,7 @@ where
         let loaded_record = record_store
             .load(MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES)
             .map_err(|_| CleanSystemAgentBootstrapError::RecordStorage)?;
-        if operations.is_some_and(|admission| !admission.is_empty())
+        if operations.is_some_and(|admission| admission.has_history)
             && loaded_record.as_deref().is_none_or(|bytes| {
                 !CleanSystemAgentBootstrapRecord::decode(bytes)
                     .is_ok_and(|record| record.phase == CleanSystemAgentBootstrapPhase::Complete)
@@ -1664,7 +1665,8 @@ where
             .map(CleanSystemAgentBootstrapRecord::decode)
             .transpose()
             .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidRecord))?;
-        if lifecycle.is_some_and(|admission| !admission.is_empty())
+        if (lifecycle.is_some_and(|admission| !admission.is_empty())
+            || operations.is_some_and(|admission| admission.has_history))
             && existing_record
                 .as_ref()
                 .is_none_or(|record| record.phase != CleanSystemAgentBootstrapPhase::Complete)
@@ -10544,7 +10546,7 @@ mod tests {
                     fixture.trust.clone(),
                     fixture.merge.clone(),
                     fixture.finality.clone(),
-                    provider,
+                    provider.clone(),
                     network.clone(),
                     None,
                     Some(&admission),
@@ -10682,6 +10684,107 @@ mod tests {
             );
             assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
             assert_eq!(std::fs::read(&retirement_path).unwrap(), retired_bytes);
+            let pins = owner._pins_store.clone();
+            let record = owner.record_store.clone();
+            let issuer = owner.issuer.into_store();
+            drop(owner._network_host);
+            drop(owner.host);
+            let (_, _, mut journal, _completion_store) = operations.into_parts_with_completions();
+            for (completions, terminals, ids) in [
+                (vec![], vec![retired_bytes.clone()], invocations.to_vec()),
+                (
+                    vec![certificate.clone()],
+                    vec![retired_bytes.clone(), retired_bytes.clone()],
+                    invocations.to_vec(),
+                ),
+                (
+                    vec![certificate.clone()],
+                    vec![retired_bytes.clone()],
+                    invocations[..1].to_vec(),
+                ),
+                (
+                    vec![certificate.clone()],
+                    vec![certificate.clone()],
+                    invocations.to_vec(),
+                ),
+            ] {
+                assert!(
+                    NativeAuthorityOperationStartupAdmission::load_with_retirements(
+                        &mut journal,
+                        authority,
+                        &ids,
+                        &completions,
+                        &terminals,
+                    )
+                    .is_err()
+                );
+            }
+            let admission = NativeAuthorityOperationStartupAdmission::load_with_retirements(
+                &mut journal,
+                authority,
+                &invocations,
+                &[certificate.clone()],
+                &[retired_bytes.clone()],
+            )
+            .unwrap();
+            assert!(admission.is_empty());
+            assert!(admission.has_history);
+            assert!(matches!(
+                CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+                    pins.clone(),
+                    BootstrapMemoryStore::default(),
+                    issuer.clone(),
+                    &mut CountingSigner::new(),
+                    || panic!("retired history must not recreate missing bootstrap"),
+                    directory.host(),
+                    directory.lock(),
+                    fixture.plan.pins.space,
+                    fixture.plan.pins.node,
+                    fixture.trust.clone(),
+                    fixture.merge.clone(),
+                    fixture.finality.clone(),
+                    provider.clone(),
+                    network.clone(),
+                    None,
+                    Some(&admission),
+                ),
+                Err(CleanSystemAgentBootstrapError::Rejected(
+                    CleanSystemAgentBootstrapRejection::InvalidRecord
+                ))
+            ));
+            let mut owner =
+                CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+                    pins,
+                    record,
+                    issuer,
+                    &mut CountingSigner::new(),
+                    || panic!("terminal retirement must reopen existing bootstrap"),
+                    directory.host(),
+                    directory.lock(),
+                    fixture.plan.pins.space,
+                    fixture.plan.pins.node,
+                    fixture.trust.clone(),
+                    fixture.merge.clone(),
+                    fixture.finality.clone(),
+                    provider,
+                    network.clone(),
+                    None,
+                    Some(&admission),
+                )
+                .unwrap();
+            drop(admission);
+            let retired = owner
+                .restore_native_operation_retirement(
+                    &authorization,
+                    &acknowledgement,
+                    &retired_bytes,
+                )
+                .unwrap();
+            owner.release_native_operation_retirement(&retired).unwrap();
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
+            assert_eq!(signer.calls, 2);
+            assert_eq!(signer.completion_calls, 2);
+            let (query, query_auth) = fresh_projection_pair(&owner, 0xda);
             owner
                 ._network_host
                 .reserve_projection_pair(
@@ -10691,7 +10794,7 @@ mod tests {
                     false,
                 )
                 .unwrap();
-            drop(operations);
+            drop(journal);
             drop(owner);
             stop_network(network);
         }

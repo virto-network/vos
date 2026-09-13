@@ -183,7 +183,8 @@ Keep these as work within C2, not new review batches:
    production controller throughout daemon recovery and dispatch. Production
    operation dispatch now captures completion and acknowledges the result pair;
    signed terminal retirement and durable release now have a native owner
-   boundary; production retirement storage and startup classification remain open.
+   boundary. Signed terminal startup classification now passes through the
+   native owner; production retirement-store/controller adoption remains open.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
    retirement and restart through native ingress; then expose the same
    preparation/authorization flow in the user-facing client. A Public query
@@ -5788,6 +5789,42 @@ trailing bytes, and substitution of NOC1 for NRT1 fail verification. Successful
 release permits the previously excluded projection reservation without adding
 native execution transitions. Restart classification using NRT1 is not yet
 covered and must not be inferred from same-owner certificate restoration.
+
+### Native startup classification of retired operation pairs
+
+Verification: native operation regression **6 passed, zero failures** in
+**106.17s** (`r16-terminal-operation-reopen-native.log`); CLI regression **216
+passed, zero failures, five ignored** in **16.54s**
+(`r16-terminal-operation-reopen-cli.log`). The final test adding explicit
+missing-bootstrap rejection passed **1 test, zero failures** in **27.63s**
+(`r16-terminal-operation-reopen-final.log`). Logs are in the shared disk-backed
+`.worktrees/ch08-c2-native/target/task-tmp` directory. Formatting and whitespace
+checks pass. These are targeted host/native checks, not final release evidence.
+
+Startup admission now accepts bounded NRT1 terminal evidence alongside the
+complete NOD1 discovery set and NOC1 completion index. It verifies canonical
+framing, both signatures, exact embedded completion membership, and linkage to
+both source dispatch records before excluding a retired pair from pending or
+retiring admission. Missing completion/source records, duplicate terminal
+records, and substitution of a completion for a terminal certificate fail
+closed. The terminal signature/framing helper is public for the upcoming file
+backend, but does not replace native source-record verification.
+
+An admission set containing only retired pairs has no active reservations but
+still has history. Both bootstrap entry paths require completed existing
+bootstrap state for that history, so retired evidence cannot turn a missing
+bootstrap record into permission to initialize a new system. The native fixture
+closes and reopens the owner after signed terminal publication, restores the
+retired pair without execution or signing, retries release, and successfully
+reserves unrelated projection work. The missing-bootstrap check rejects before
+calling the fresh factory.
+
+The production operation controller and daemon still do not own/discover a
+terminal retirement store. They therefore continue to restore NOC1 pairs as
+retiring, not released. The next C2 step is hardened retirement storage plus
+controller/daemon adoption and exact terminal retry, using this classification
+before attachment. Mixed unfinished-operation/projection coverage and the
+remaining application/release gates are not closed by this single-pair test.
 
 ### Durable client acknowledgement before completion
 

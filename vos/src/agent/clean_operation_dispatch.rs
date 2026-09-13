@@ -21,7 +21,10 @@ pub use completion::{
     MAX_NATIVE_OPERATION_COMPLETION_BYTES, NativeAuthorityOperationCompletionSigner,
     native_operation_completion_invocations,
 };
-pub use retirement::NativeAuthorityOperationRetirementSigner;
+pub use retirement::{
+    MAX_NATIVE_OPERATION_RETIREMENT_BYTES, NativeAuthorityOperationRetirementSigner,
+    native_operation_retirement_completion,
+};
 
 const MAX_DISPATCH_REQUEST_BYTES: usize =
     if MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES > MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES {
@@ -58,13 +61,14 @@ pub trait NativeAuthorityOperationJournalStore {
     fn retain(&mut self, invocation: InvocationId, record: &[u8]) -> Result<(), Self::Error>;
 }
 
-/// Exact pending admission loaded while the journal's writer lease is held.
-/// This is not approval or retirement evidence. Native attachment independently
-/// authenticates every saved anchor before exposing the recovered route.
+/// Exact admission loaded while the journal and certificate leases are held.
+/// Signed terminal records may exclude retired pairs; every remaining native
+/// anchor is independently authenticated before exposing the recovered route.
 pub struct NativeAuthorityOperationStartupAdmission<'a> {
     pub(super) authority: AuthorityActorTarget,
     pub(super) pending: Vec<(ManagementJournalAnchor, RuntimeWork)>,
     pub(super) retirements: Vec<[RuntimeWork; 2]>,
+    pub(super) has_history: bool,
     _lease: core::marker::PhantomData<&'a mut ()>,
 }
 
@@ -91,8 +95,23 @@ impl<'a> NativeAuthorityOperationStartupAdmission<'a> {
         invocations: &[InvocationId],
         certificates: &[Vec<u8>],
     ) -> Result<Self, SharedAgentHostError> {
+        Self::load_with_retirements(journal, authority, invocations, certificates, &[])
+    }
+
+    /// Terminal certificates remove only their exact verified pairs from
+    /// admission. All three backing stores must remain exclusively leased.
+    pub fn load_with_retirements<J: NativeAuthorityOperationJournalStore>(
+        journal: &'a mut J,
+        authority: AuthorityActorTarget,
+        invocations: &[InvocationId],
+        certificates: &[Vec<u8>],
+        terminal_certificates: &[Vec<u8>],
+    ) -> Result<Self, SharedAgentHostError> {
         let maximum = 2 * crate::agent::authority_operation_coordinator::MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS;
-        if !authority.is_valid() || invocations.len() > maximum || certificates.len() > maximum / 2
+        if !authority.is_valid()
+            || invocations.len() > maximum
+            || certificates.len() > maximum / 2
+            || terminal_certificates.len() > maximum / 2
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
@@ -131,6 +150,29 @@ impl<'a> NativeAuthorityOperationStartupAdmission<'a> {
                 }
             }
         }
+        let mut retired = std::collections::BTreeSet::new();
+        for certificate in terminal_certificates {
+            let completion =
+                native_operation_retirement_completion(&authority.binding.public_key, certificate)
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            if !certificates.contains(&completion) {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            let [authorization, acknowledgement] = completion::completion_invocations(&completion)?;
+            if !retired.insert(authorization) || !retired.insert(acknowledgement) {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            retirement::restore_retirement(
+                authority,
+                records
+                    .get(&authorization)
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?,
+                records
+                    .get(&acknowledgement)
+                    .ok_or(SharedAgentHostError::ScopeMismatch)?,
+                certificate,
+            )?;
+        }
         let mut retiring = std::collections::BTreeSet::new();
         let mut retirements = Vec::new();
         for certificate in certificates {
@@ -145,13 +187,16 @@ impl<'a> NativeAuthorityOperationStartupAdmission<'a> {
                 .get(&acknowledgement)
                 .ok_or(SharedAgentHostError::ScopeMismatch)?;
             completion::restore_completion(authority, authorization, acknowledgement, certificate)?;
-            retirements.push([
-                authorization.envelope.clone(),
-                acknowledgement.envelope.clone(),
-            ]);
+            if !retired.contains(&authorization.request.context.invocation) {
+                retirements.push([
+                    authorization.envelope.clone(),
+                    acknowledgement.envelope.clone(),
+                ]);
+            }
         }
         Ok(Self {
             authority,
+            has_history: !records.is_empty(),
             pending: records
                 .into_values()
                 .filter(|record| !retiring.contains(&record.request.context.invocation))

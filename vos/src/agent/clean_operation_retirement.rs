@@ -2,6 +2,28 @@
 //! evidence that the authorized actor operation itself has been applied.
 use super::*;
 
+pub const MAX_NATIVE_OPERATION_RETIREMENT_BYTES: usize = 1024;
+
+/// Check both signatures and canonical framing. Native recovery must still
+/// bind the returned completion to its two exact source dispatch records.
+pub fn native_operation_retirement_completion(
+    public_key: &[u8; 32],
+    bytes: &[u8],
+) -> Option<Vec<u8>> {
+    let certificate = RetirementCertificate::decode(bytes).ok()?;
+    if certificate.encode().ok().as_deref() != Some(bytes)
+        || !crate::agent::authority::verify_raw_ed25519(
+            public_key,
+            &certificate.signing_bytes(),
+            &certificate.signature,
+        )
+        || native_operation_completion_invocations(public_key, &certificate.completion).is_none()
+    {
+        return None;
+    }
+    Some(certificate.completion)
+}
+
 pub trait NativeAuthorityOperationRetirementSigner {
     type Error;
     fn public_key(&self) -> [u8; 32];
@@ -35,7 +57,7 @@ impl RetirementCertificate {
 
 impl CanonicalWire for RetirementCertificate {
     const MAGIC: [u8; 4] = *b"NRT1";
-    const MAX_ENCODED_BYTES: usize = 1024;
+    const MAX_ENCODED_BYTES: usize = MAX_NATIVE_OPERATION_RETIREMENT_BYTES;
     fn validate_wire(&self) -> bool {
         !self.completion.is_empty()
             && self.completion.len() <= MAX_NATIVE_OPERATION_COMPLETION_BYTES
@@ -58,7 +80,7 @@ impl CanonicalWire for RetirementCertificate {
     }
 }
 
-fn restore_retirement(
+pub(super) fn restore_retirement(
     target: AuthorityActorTarget,
     authorization: &RetainedAuthorityOperationDispatch,
     acknowledgement: &RetainedAuthorityOperationDispatch,
