@@ -27,12 +27,13 @@ AJC3 checkpoints and AGIM/AGI2 images are deliberately rejected, with no in-plac
 migration provided; do not point this clean-break build at valuable old data.
 Current host lifecycle images additionally require CMI4/CMR2 with pre-dispatch
 journal anchors; earlier CMI3/CMR1 images are rejected, not migrated.
-Startup now discovers lifecycle stores before system attachment and retires
-verified finalized work before normal routes. Interrupted work with a prepared
-envelope but no finalized issuer acknowledgement currently stops startup,
-preserving its stores. Automatic incomplete-phase recovery and coexistence with
-an unfinished projection remain implementation blockers, not deployment-ready
-behavior. Do not delete those stores to bypass the recovery check.
+Startup now discovers lifecycle stores before system attachment, recovers saved
+finalization calls from durable application acknowledgements, and retires their
+results before normal routes. Earlier phases without a saved finalization call
+or durable application acknowledgement still stop startup, preserving their
+stores. Continuous live protection and coexistence with an unfinished projection
+remain implementation blockers, not deployment-ready behavior. Do not delete
+those stores to bypass the recovery check.
 
 The integrated library run at `37d6a5720e7e45e4a19850a16a531e6cb316e299`
 completed: **1,663 passed, zero failed, one filtered**, in 1,771.43 seconds.
@@ -3164,6 +3165,56 @@ Verification: **13 native tests passed** (250.47s,
 recovery run also passed (104.74s, `r16-mixed-management-gate.log`), before the
 last duplicate/retirement-only dispatch assertions were added. Formatting and
 diff checks pass; logs remain in the shared disk-backed scratch directory.
+
+### Saved-finalization recovery in production startup
+
+The issuer can now independently recover an exact durable signed application
+acknowledgement without claiming that the Authority finalization call completed.
+It validates the signed credential call, request, managed target, reconstructed
+decision, receipt and acknowledgement against the issuer image. This read-only
+operation neither signs nor advances the finalization barrier. Existing finalized
+recovery retains its stricter completed-barrier requirement.
+
+Lifecycle discovery validates saved finalization work against that exact
+acknowledgement and rejects hidden outstanding issuer work. Startup admission
+classifies both saved anchored envelopes as pending when the issuer has not yet
+recorded finalization. The system owner seeds the combined pending/retirement
+set before attaching routes and does not checkpoint away its evidence.
+
+The recovering controller rechecks every recorded application against the
+physical Local image first, then replays only already-saved finalization calls
+using their original preflight clocks and journal anchors. After every pending
+finalization has a durable issuer marker, it atomically hands those pairs into
+the existing retirement set and publishes CMR2 markers under admission exclusion.
+Already-retired entries continue to use their durable marker rather than a
+possibly pruned journal suffix.
+
+Two native interruption cases now exercise the production startup APIs: failure
+after finalization-envelope persistence but before dispatch, and failure after
+successful durable invocation/replay but before issuer finalization persistence.
+The clock advances before restart. The first case adds one Invoke and two Acks;
+the second adds only two Acks. A second restart adds no Ordered entries, and
+exact Create retry returns the same acknowledgement after both restarts. These
+are injected between-action failures with physical host journals and Local
+images plus lease-tracked in-memory lifecycle stores, not cross-process file
+write fault injection or an end-to-end CLI deployment smoke.
+
+Earlier authorization/application phases, creation of a not-yet-saved finalization
+envelope, continuous live admission protection, pending projection coexistence,
+exhausted/pruned evidence recovery, install/invoke and release gates remain open.
+Saved-finalization recovery requires its authenticated anchors and retained
+authorization evidence; it does not paper over evidence lost before startup.
+
+Verification: **15 native tests passed** (288.16s,
+`r16-saved-finalization-native-final.log`), **12 issuer tests passed** (4.04s,
+`r16-saved-finalization-issuer.log`), and **10 filesystem tests passed** (0.09s,
+`r16-saved-finalization-files.log`). The three focused startup cases also passed
+(44.89s, `r16-saved-finalization-startup-isolated.log`). Formatting and diff checks
+pass; evidence remains in shared disk scratch. An initial fixture run overflowed
+its stack during bootstrap replay beneath the large multiphase caller, located
+with a debugger (`r16-saved-finalization-stack.log`). Fixture bootstrap now runs
+on its own default-sized thread stack; stack limits were not increased. No guest
+artifact rebuild, full-library run or fresh CLI deployment smoke is claimed.
 
 ### Durable client acknowledgement before completion
 

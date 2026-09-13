@@ -1345,6 +1345,8 @@ where
     // Authority inventory row or by whatever happens to be installed now.
     authority_install: super::sdk::InstallActor,
     invocation_gas: u64,
+    #[cfg(test)]
+    finalization_failure_once: Option<bool>,
 }
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
@@ -1434,7 +1436,7 @@ where
                 plan
             }
             (None, None) => {
-                if lifecycle.is_some_and(|admission| !admission.retirements.is_empty()) {
+                if lifecycle.is_some_and(|admission| !admission.is_empty()) {
                     return Err(rejected(CleanSystemAgentBootstrapRejection::InvalidRecord));
                 }
                 if host_root_exists(shared_host_root)? {
@@ -1557,7 +1559,7 @@ where
             .map(CleanSystemAgentBootstrapRecord::decode)
             .transpose()
             .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidRecord))?;
-        if lifecycle.is_some_and(|admission| !admission.retirements.is_empty())
+        if lifecycle.is_some_and(|admission| !admission.is_empty())
             && existing_record
                 .as_ref()
                 .is_none_or(|record| record.phase != CleanSystemAgentBootstrapPhase::Complete)
@@ -1758,17 +1760,18 @@ where
                 record = cleared;
             }
         }
-        let retirements = lifecycle.filter(|admission| !admission.retirements.is_empty());
-        if retirements.is_some() && record.pending_projection.is_some() {
+        let management = lifecycle.filter(|admission| !admission.is_empty());
+        if management.is_some() && record.pending_projection.is_some() {
             return Err(CleanSystemAgentBootstrapError::Host(
                 SharedAgentHostError::Conflict,
             ));
         }
-        let network_host = if let Some(admission) = retirements {
-            SharedAgentNetworkHost::attach_recovering_management_retirement_set(
+        let network_host = if let Some(admission) = management {
+            SharedAgentNetworkHost::attach_recovering_management_set(
                 Arc::clone(&host),
                 network,
                 crate::service::AgentId(plan.pins.agent.0),
+                admission.pending.iter().flatten().cloned().collect(),
                 admission.retirements.clone(),
             )
         } else if let Some(pending) = &record.pending_projection {
@@ -1975,6 +1978,8 @@ where
             root_lineage,
             authority_install: install_request(plan.authority_request())?.clone(),
             invocation_gas: plan.invocation_gas,
+            #[cfg(test)]
+            finalization_failure_once: None,
         };
         // Reconstruct volatile admission from the durable exact pending work
         // before returning an owner that could authenticate a fresh query.
@@ -2512,6 +2517,11 @@ where
         ) {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
+        #[cfg(test)]
+        if self.finalization_failure_once == Some(false) {
+            self.finalization_failure_once = None;
+            return Err(SharedAgentHostError::Unavailable);
+        }
         let outcome = self.supervisor_invoke_persisted_management(
             identity,
             (**work).clone(),
@@ -2546,9 +2556,29 @@ where
         if replayed != outcome {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
+        #[cfg(test)]
+        if self.finalization_failure_once == Some(true) {
+            self.finalization_failure_once = None;
+            return Err(SharedAgentHostError::Unavailable);
+        }
         issuer
             .observe_durable_actor_finalization(acknowledgement)
             .map_err(|_| SharedAgentHostError::Unavailable)
+    }
+
+    pub(crate) fn handoff_recovered_management(
+        &mut self,
+        pairs: &[[&RuntimeWork; 2]],
+    ) -> Result<(), SharedAgentHostError> {
+        self._network_host.handoff_management_pending_to_retirement(
+            crate::service::AgentId(self.pins.agent.0),
+            pairs,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_finalization_once_for_test(&mut self, after_accept: bool) {
+        self.finalization_failure_once = Some(after_accept);
     }
 
     /// Retire both runtime results only after the exact application has a
@@ -7158,16 +7188,25 @@ mod tests {
                 let mut signer = CountingSigner::new();
                 let record = BootstrapMemoryStore::default();
                 let provider = Arc::new(MemoryProvider::new(fixture.provision.clone()));
-                let owner = seed_complete_native_projection_owner(
-                    &fixture,
-                    &directory,
-                    BootstrapMemoryStore::default(),
-                    record.clone(),
-                    IssuerMemoryStore::default(),
-                    &mut signer,
-                    provider.clone(),
-                    Arc::clone(&network),
-                );
+                // Keep native bootstrap/replay on a normal thread stack,
+                // independently of the large multiphase fixture caller.
+                let owner = std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            seed_complete_native_projection_owner(
+                                &fixture,
+                                &directory,
+                                BootstrapMemoryStore::default(),
+                                record.clone(),
+                                IssuerMemoryStore::default(),
+                                &mut signer,
+                                provider.clone(),
+                                Arc::clone(&network),
+                            )
+                        })
+                        .join()
+                        .unwrap()
+                });
                 Self {
                     owner: Some(owner),
                     fixture,
@@ -7510,6 +7549,16 @@ mod tests {
         #[test]
         fn native_local_lifecycle_startup_retires_before_route_publication() {
             native_local_management_lifecycle(9);
+        }
+
+        #[test]
+        fn native_local_lifecycle_startup_recovers_prepared_finalization() {
+            native_local_management_lifecycle(10);
+        }
+
+        #[test]
+        fn native_local_lifecycle_startup_recovers_accepted_finalization() {
+            native_local_management_lifecycle(11);
         }
 
         #[test]
@@ -7964,7 +8013,7 @@ mod tests {
                 harness.stop();
                 return;
             }
-            if matches!(coordinated, 2 | 3 | 8 | 9) {
+            if matches!(coordinated, 2 | 3 | 8 | 9 | 10 | 11) {
                 struct LeasedStore {
                     inner: IssuerMemoryStore,
                     active: Arc<AtomicUsize>,
@@ -8135,9 +8184,39 @@ mod tests {
                 assert_eq!(opens.load(Ordering::SeqCst), 1);
                 assert_eq!(active.load(Ordering::SeqCst), 2);
                 let failed_loads = loads.load(Ordering::SeqCst);
-                let result = controller
-                    .create(descriptor.clone(), call.clone(), runtime.clone())
+                let interrupted = coordinated >= 10;
+                if interrupted {
+                    controller.fail_finalization_once_for_test(coordinated == 11);
+                }
+                let created = controller.create(descriptor.clone(), call.clone(), runtime.clone());
+                let result = if interrupted {
+                    assert!(matches!(created, Err(SharedAgentHostError::Unavailable)));
+                    let issuer = DurableCleanManagementIssuer::open(
+                        issuer_store.clone(),
+                        descriptor.authority,
+                        descriptor.identity.space,
+                        descriptor.identity.agent,
+                    )
                     .unwrap();
+                    let (_, acknowledgement) = issuer
+                        .recover_observed_application(
+                            call.authority,
+                            call.managed,
+                            &ManagementRequest::Create(Box::new(descriptor.clone())),
+                            &call,
+                            &RawCredentialVerifier,
+                        )
+                        .unwrap()
+                        .unwrap();
+                    assert!(
+                        !issuer
+                            .application_finalization_status(&acknowledgement)
+                            .unwrap()
+                    );
+                    (descriptor.identity.agent, acknowledgement)
+                } else {
+                    created.unwrap()
+                };
                 assert_eq!(result.0, descriptor.identity.agent);
                 assert!(loads.load(Ordering::SeqCst) >= failed_loads + 2);
                 let issuer = DurableCleanManagementIssuer::open(
@@ -8147,7 +8226,10 @@ mod tests {
                     descriptor.identity.agent,
                 )
                 .unwrap();
-                assert!(issuer.application_finalization_status(&result.1).unwrap());
+                assert_eq!(
+                    issuer.application_finalization_status(&result.1).unwrap(),
+                    !interrupted
+                );
                 drop(issuer);
                 routes.retire().unwrap();
                 let routes = controller.local_attachment(4).unwrap();
@@ -8157,17 +8239,19 @@ mod tests {
                     .as_ref()
                     .unwrap()
                     .store(LOGICAL_SLOT + 20, Ordering::Release);
-                assert_eq!(
-                    controller
-                        .create(descriptor.clone(), call.clone(), runtime.clone())
-                        .unwrap(),
-                    result
-                );
+                if !interrupted {
+                    assert_eq!(
+                        controller
+                            .create(descriptor.clone(), call.clone(), runtime.clone())
+                            .unwrap(),
+                        result
+                    );
+                }
                 assert_eq!(opens.load(Ordering::SeqCst), 1);
                 assert_eq!(active.load(Ordering::SeqCst), 2);
                 routes.retire().unwrap();
                 system.retire().unwrap();
-                if coordinated == 9 {
+                if coordinated >= 9 {
                     #[inline(never)]
                     fn restart<F: crate::agent::local_lifecycle::LocalLifecycleStoreFactory>(
                         controller: TestLocalLifecycle<F>,
@@ -8175,6 +8259,8 @@ mod tests {
                         root: &Path,
                         descriptor: &AgentDescriptor,
                         restart: usize,
+                        interrupted: bool,
+                        unaccepted: bool,
                     ) -> TestLocalLifecycle<F> {
                         let (old_owner, old_local, mut stores, mut signer) =
                             controller.into_parts_for_test();
@@ -8193,7 +8279,14 @@ mod tests {
                             )
                             .unwrap();
                         let admission = recovery.startup_admission().unwrap();
-                        assert_eq!(admission.retirements.len(), usize::from(restart == 0));
+                        assert_eq!(
+                            admission.retirements.len(),
+                            usize::from(restart == 0 && !interrupted)
+                        );
+                        assert_eq!(
+                            admission.pending.len(),
+                            usize::from(restart == 0 && interrupted)
+                        );
                         let mut reopened =
                             CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_factory(
                                 pins,
@@ -8240,7 +8333,12 @@ mod tests {
                             .unwrap();
                         assert_eq!(
                             controller.ordered_index_for_test().unwrap(),
-                            before + if restart == 0 { 2 } else { 0 }
+                            before
+                                + if restart == 0 {
+                                    2 + u64::from(unaccepted)
+                                } else {
+                                    0
+                                }
                         );
                         controller
                     }
@@ -8250,7 +8348,15 @@ mod tests {
                         controller = std::thread::scope(|scope| {
                             scope
                                 .spawn(|| {
-                                    restart(controller, &harness, &root, &descriptor, attempt)
+                                    restart(
+                                        controller,
+                                        &harness,
+                                        &root,
+                                        &descriptor,
+                                        attempt,
+                                        interrupted,
+                                        coordinated == 10,
+                                    )
                                 })
                                 .join()
                                 .unwrap()

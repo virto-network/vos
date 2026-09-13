@@ -1456,6 +1456,38 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         Option<(AuthorityReceipt, ManagementApplicationAck)>,
         CleanManagementIssuerError<B::Error>,
     > {
+        self.recover_recorded_application(authority, managed, request, call, verifier, true)
+    }
+
+    /// Recover the exact durable application acknowledgement without claiming
+    /// that its Authority finalization call completed. This does not sign or
+    /// advance state; the caller must reverify physical application before use.
+    pub(crate) fn recover_observed_application<V: AuthorityCredentialVerifier>(
+        &self,
+        authority: AuthorityActorTarget,
+        managed: ManagedAgentTarget,
+        request: &ManagementRequest,
+        call: &AuthorityCredentialCall,
+        verifier: &V,
+    ) -> Result<
+        Option<(AuthorityReceipt, ManagementApplicationAck)>,
+        CleanManagementIssuerError<B::Error>,
+    > {
+        self.recover_recorded_application(authority, managed, request, call, verifier, false)
+    }
+
+    fn recover_recorded_application<V: AuthorityCredentialVerifier>(
+        &self,
+        authority: AuthorityActorTarget,
+        managed: ManagedAgentTarget,
+        request: &ManagementRequest,
+        call: &AuthorityCredentialCall,
+        verifier: &V,
+        require_finalized: bool,
+    ) -> Result<
+        Option<(AuthorityReceipt, ManagementApplicationAck)>,
+        CleanManagementIssuerError<B::Error>,
+    > {
         self.ensure_live()?;
         let invalid = || {
             CleanManagementIssuerError::Rejected(CleanManagementIssuerRejection::InvalidObservation)
@@ -1473,7 +1505,9 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         let Some(record) = &self.image.acknowledged else {
             return Ok(None);
         };
-        if !record.application_finalized {
+        if (require_finalized && !record.application_finalized)
+            || (!require_finalized && record.application_ack.is_none())
+        {
             return Ok(None);
         }
         let decision = decode_authorized_decision(&record.decision)
@@ -1505,7 +1539,8 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
             record.application_ack.as_deref().ok_or_else(invalid)?,
         )
         .map_err(|_| invalid())?;
-        if !self.application_finalization_status(&acknowledgement)? {
+        let finalized = self.application_finalization_status(&acknowledgement)?;
+        if require_finalized && !finalized {
             return Err(invalid());
         }
         Ok(Some((acknowledgement.receipt.clone(), acknowledgement)))
@@ -3192,9 +3227,20 @@ mod tests {
                 &TestCredentialVerifier,
             )
         };
+        let observe = |issuer: &DurableCleanManagementIssuer<MemoryImageStore>| {
+            issuer.recover_observed_application(
+                call.authority,
+                call.managed,
+                &request,
+                &call,
+                &TestCredentialVerifier,
+            )
+        };
         assert_eq!(recover(&issuer).unwrap(), None);
+        assert_eq!(observe(&issuer).unwrap(), None);
         let receipt = issuer.issue(&decision, &mut signer).unwrap();
         assert_eq!(recover(&issuer).unwrap(), None);
+        assert_eq!(observe(&issuer).unwrap(), None);
         let ack = issuer
             .observe_durable_application(
                 &receipt,
@@ -3205,6 +3251,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(recover(&issuer).unwrap(), None);
+        let before_finalization = store.image();
+        let before_calls = signer.calls;
+        assert_eq!(
+            observe(&issuer).unwrap(),
+            Some((receipt.clone(), ack.clone()))
+        );
+        assert!(!issuer.application_finalization_status(&ack).unwrap());
+        let mut forged_unfinalized = call.clone();
+        forged_unfinalized.signature[0] ^= 1;
+        assert!(
+            issuer
+                .recover_observed_application(
+                    call.authority,
+                    call.managed,
+                    &request,
+                    &forged_unfinalized,
+                    &TestCredentialVerifier
+                )
+                .is_err()
+        );
+        assert_eq!(store.image(), before_finalization);
+        assert_eq!(signer.calls, before_calls);
         issuer.observe_durable_actor_finalization(&ack).unwrap();
         drop(issuer);
         let mut issuer = open(store.clone(), &fixture);
@@ -3255,6 +3323,7 @@ mod tests {
         assert_eq!(signer.calls, calls);
         issuer.poisoned = true;
         assert!(recover(&issuer).is_err());
+        assert!(observe(&issuer).is_err());
     }
 
     #[test]
