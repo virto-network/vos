@@ -240,6 +240,93 @@ where
             .map_err(NativeAuthorityOperationControllerError::Coordinate)
     }
 
+    /// Finish the native policy-result pair only after durably retaining its
+    /// signed continuation. This does not release admission or apply the actor
+    /// operation. Exact retries reuse retained certificates without re-signing.
+    pub fn coordinate_and_acknowledge<P, R, I, S>(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        call: &AuthorityOperationCall,
+        context: InvocationContext,
+        issued_at: u64,
+        signer: &mut S,
+    ) -> Result<IssuedAuthorityOperation, SharedAgentHostError>
+    where
+        P: CleanSystemAgentBootstrapStore,
+        R: CleanSystemAgentBootstrapStore,
+        I: CleanManagementIssuerStore,
+        S: AuthorityOperationEvidenceSigner + NativeAuthorityOperationCompletionSigner,
+    {
+        if NativeAuthorityOperationCompletionSigner::public_key(signer)
+            != self.authority.binding.public_key
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self.validate()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let issued = self
+            .coordinate(owner, call, context, issued_at, signer)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let ids = [
+            call.invocation,
+            issued.issuance_ack.acknowledgement_invocation,
+        ];
+        let mut records = Vec::new();
+        for id in ids {
+            let bytes = self
+                .journal
+                .load(id)
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .ok_or(SharedAgentHostError::Unavailable)?;
+            records.push(
+                operation_dispatch::RetainedAuthorityOperationDispatch::decode(&bytes)
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?,
+            );
+        }
+        let certificates = self
+            .completions
+            .load()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let mut saved = None;
+        for certificate in certificates {
+            let certificate_ids = native_operation_completion_invocations(
+                &self.authority.binding.public_key,
+                &certificate,
+            )
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            if certificate_ids == ids {
+                if saved.replace(certificate).is_some() {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+            } else if certificate_ids.iter().any(|id| ids.contains(id)) {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+        }
+        let retained = if let Some(certificate) = saved {
+            let retained = owner.restore_native_operation_completion(
+                &records[0],
+                &records[1],
+                &certificate,
+            )?;
+            // A preceding write may have published before reporting failure.
+            // Repeat exact retention to establish synchronization before Ack.
+            self.completions
+                .retain(&certificate)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            retained
+        } else {
+            let verified =
+                owner.verify_native_operation_completion(&records[0], &records[1], &issued)?;
+            owner.retain_native_operation_completion(&verified, signer, |certificate| {
+                self.completions
+                    .retain(certificate)
+                    .map_err(|_| SharedAgentHostError::Unavailable)
+            })?
+        };
+        owner.acknowledge_native_operation_completion(&retained)?;
+        Ok(issued)
+    }
+
     pub fn into_parts_with_completions(self) -> (C, B, J, K) {
         (
             self.coordinator,
@@ -276,7 +363,7 @@ where
     B: AuthorityOperationIssuerStore + Send,
     J: NativeAuthorityOperationJournalStore + Send,
     K: NativeAuthorityOperationCompletionStore + Send,
-    S: AuthorityOperationEvidenceSigner + Send,
+    S: AuthorityOperationEvidenceSigner + NativeAuthorityOperationCompletionSigner + Send,
 {
     fn coordinate(
         &mut self,
@@ -288,8 +375,7 @@ where
         // No terminal denial certificate exists here yet. Preserve errors as
         // unavailable rather than releasing admission or declaring success.
         self.0
-            .coordinate(owner, call, context, issued_at, &mut self.1)
-            .map_err(|_| SharedAgentHostError::Unavailable)
+            .coordinate_and_acknowledge(owner, call, context, issued_at, &mut self.1)
     }
 }
 

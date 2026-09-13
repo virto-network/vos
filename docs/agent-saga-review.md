@@ -180,8 +180,9 @@ Keep these as work within C2, not new review batches:
    deliberately retaining admission. Signed completion continuation and owner
    reopen after either one or both acknowledgements now pass; production
    continuation storage now has a hardened, bounded file backend, owned by the
-   production controller throughout daemon recovery and dispatch. Automatic
-   completion capture/acknowledgement and final durable release remain open.
+   production controller throughout daemon recovery and dispatch. Production
+   operation dispatch now captures completion and acknowledges the result pair;
+   final durable retirement/release remains open.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
    retirement and restart through native ingress; then expose the same
    preparation/authorization flow in the user-facing client. A Public query
@@ -5706,6 +5707,46 @@ Automatic completion capture and acknowledgement in production dispatch are
 still unwired. Final durable retirement/release and denial retirement remain
 required; simply loading a valid NOC1 is not permission to release admission.
 No operation HTTP endpoint, guest artifact, or master integration changed.
+
+### Production operation completion and acknowledgement
+
+Verification: final native operation regression **6 passed, zero failures** in
+**85.09s** (`r16-automatic-completion-native-final.log`); CLI regression **216
+passed, zero failures, five ignored** in **16.89s**
+(`r16-automatic-completion-cli.log`). Both logs are in the shared disk-backed
+`.worktrees/ch08-c2-native/target/task-tmp` directory. The first native run also
+passed all six in 85.15s before strengthening the reopened-controller retry
+assertions. Formatting and whitespace checks pass. No full-library or fresh
+live-daemon release campaign was run for this host-only checkpoint.
+
+The native fixture covers a completion file published before an injected write
+error: zero acknowledgements occur on that failure, and exact retry adds just
+the two acknowledgement transitions without another receipt or completion
+signature. Another exact retry changes neither bytes nor execution history.
+The existing full/partial acknowledgement restart fixtures now call the same
+production controller entry point after reopening. Unrelated projection work
+remains excluded, demonstrating that acknowledgement alone does not release
+the reservation.
+
+Native Local lifecycle operation dispatch now uses the controller's
+`coordinate_and_acknowledge` path. It validates retained state, recovers or
+issues the exact operation evidence, reads both native dispatch records, and
+verifies the actual native policy results before signing new completion.
+Completion retention must succeed before either result acknowledgement. A
+saved certificate is fully restored against its source records and retained
+again to establish durability, without another completion signature. The
+configured owned operator signer now implements completion signing, and Local
+lifecycle adoption checks both operation and completion signer keys.
+
+An ambiguous completion write that publishes before reporting failure returns
+unavailable without acknowledging either result. Exact retry uses that saved
+certificate; successful result acknowledgement remains independently verified
+by the native owner. Denials still return unavailable and retain their native
+reservation, without signing completion. Admission is deliberately not released:
+NOC1 is continuation evidence, not the required terminal retirement record.
+This change does not apply the requested actor operation or add operation HTTP
+ingress. Final durable release, denial retirement, and protected application
+remain the next C2 work.
 
 ### Durable client acknowledgement before completion
 

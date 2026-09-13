@@ -187,6 +187,25 @@ impl vos::agent::authority_operation_issuer::AuthorityOperationEvidenceSigner
     }
 }
 
+impl vos::agent::clean_bootstrap::NativeAuthorityOperationCompletionSigner
+    for OwnedCleanOperatorIdentitySigner
+{
+    type Error = CleanIdentitySignerError;
+    fn public_key(&self) -> [u8; 32] {
+        self.public_key
+    }
+    fn sign_native_operation_completion(
+        &mut self,
+        message: &[u8],
+    ) -> Result<[u8; 64], Self::Error> {
+        self.keypair
+            .sign(message)
+            .map_err(|_| CleanIdentitySignerError::SigningFailed)?
+            .try_into()
+            .map_err(|_| CleanIdentitySignerError::InvalidSignatureLength)
+    }
+}
+
 /// Derive the clean Node identity from every byte of an already-authenticated
 /// libp2p PeerId. Compact routing hints are deliberately not accepted here.
 pub(crate) fn node_id_from_authenticated_peer(peer_id: &PeerId) -> NodeId {
@@ -333,6 +352,20 @@ mod tests {
         );
         use vos::agent::authority_operation_issuer::AuthorityOperationEvidenceSigner as OperationSigner;
         assert_eq!(OperationSigner::public_key(&owned), borrowed.public_key());
+        use vos::agent::clean_bootstrap::NativeAuthorityOperationCompletionSigner as CompletionSigner;
+        assert_eq!(CompletionSigner::public_key(&owned), borrowed.public_key());
+        let completion =
+            CompletionSigner::sign_native_operation_completion(&mut owned, b"operation-completion")
+                .unwrap();
+        assert_eq!(
+            completion.as_slice(),
+            keypair.sign(b"operation-completion").unwrap()
+        );
+        assert_eq!(
+            CompletionSigner::sign_native_operation_completion(&mut owned, b"operation-completion")
+                .unwrap(),
+            completion
+        );
         let operation_ack =
             OperationSigner::sign_issuance_ack(&mut owned, b"operation-issuance").unwrap();
         assert_eq!(

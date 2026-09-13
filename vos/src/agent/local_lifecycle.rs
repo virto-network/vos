@@ -1185,7 +1185,10 @@ where
         B: super::authority_operation_issuer::AuthorityOperationIssuerStore + Send + 'static,
         J: super::clean_bootstrap::NativeAuthorityOperationJournalStore + Send + 'static,
         K: super::clean_bootstrap::NativeAuthorityOperationCompletionStore + Send + 'static,
-        O: super::authority_operation_issuer::AuthorityOperationEvidenceSigner + Send + 'static,
+        O: super::authority_operation_issuer::AuthorityOperationEvidenceSigner
+            + super::clean_bootstrap::NativeAuthorityOperationCompletionSigner
+            + Send
+            + 'static,
     {
         let target = self
             .system
@@ -1194,7 +1197,11 @@ where
             .authority_target();
         if self.operations.is_some()
             || operations.authority() != target
-            || signer.public_key() != target.binding.public_key
+            || super::authority_operation_issuer::AuthorityOperationEvidenceSigner::public_key(
+                &signer,
+            ) != target.binding.public_key
+            || super::clean_bootstrap::NativeAuthorityOperationCompletionSigner::public_key(&signer)
+                != target.binding.public_key
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }

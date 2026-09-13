@@ -9983,15 +9983,20 @@ mod tests {
 
         #[test]
         fn native_operation_approved_issuance_reopens_without_new_signatures() {
-            check_native_operation_approved_retirement(false);
+            check_native_operation_approved_retirement(false, false);
         }
 
         #[test]
         fn native_operation_partial_result_retirement_reopens_exactly() {
-            check_native_operation_approved_retirement(true);
+            check_native_operation_approved_retirement(true, false);
         }
 
-        fn check_native_operation_approved_retirement(partial_retirement: bool) {
+        #[test]
+        fn native_operation_controller_completion_write_retry_precedes_acknowledgement() {
+            check_native_operation_approved_retirement(false, true);
+        }
+
+        fn check_native_operation_approved_retirement(partial_retirement: bool, automatic: bool) {
             use crate::Encode as _;
             use crate::agent::authority_operation_issuer::AuthorityOperationEvidenceSigner;
             use crate::agent::sdk::authority::AuthorityIngressAuthentication;
@@ -10232,6 +10237,74 @@ mod tests {
             );
             assert_eq!(signer.calls, 2);
             assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+            if automatic {
+                struct FailOnceCompletion(PathBuf, bool);
+                impl NativeAuthorityOperationCompletionStore for FailOnceCompletion {
+                    type Error = std::io::Error;
+                    fn load(&mut self) -> Result<Vec<Vec<u8>>, Self::Error> {
+                        match std::fs::read(&self.0) {
+                            Ok(bytes) => Ok(vec![bytes]),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                Ok(vec![])
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    fn retain(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+                        write_operation_test_image(&self.0, bytes)?;
+                        if core::mem::take(&mut self.1) {
+                            return Err(std::io::Error::other(
+                                "completion published before injected failure",
+                            ));
+                        }
+                        Ok(())
+                    }
+                }
+                let path = directory.0.join("automatic-completion");
+                let mut operations =
+                    operations.with_completions(FailOnceCompletion(path.clone(), true));
+                assert!(
+                    operations
+                        .coordinate_and_acknowledge(&mut owner, &call, context, slot, &mut signer)
+                        .is_err()
+                );
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+                assert_eq!(signer.calls, 2);
+                assert_eq!(signer.completion_calls, 1);
+                let certificate = std::fs::read(&path).unwrap();
+                for _ in 0..2 {
+                    assert_eq!(
+                        operations
+                            .coordinate_and_acknowledge(
+                                &mut owner,
+                                &call,
+                                context,
+                                slot,
+                                &mut signer
+                            )
+                            .unwrap(),
+                        issued
+                    );
+                    assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
+                    assert_eq!(signer.calls, 2);
+                    assert_eq!(signer.completion_calls, 1);
+                    assert_eq!(std::fs::read(&path).unwrap(), certificate);
+                }
+                let (query, query_auth) = fresh_projection_pair(&owner, 0xd9);
+                assert!(matches!(
+                    owner._network_host.reserve_projection_pair(
+                        HostAgentId(owner.pins.agent.0),
+                        &query,
+                        &query_auth,
+                        false,
+                    ),
+                    Err(SharedAgentHostError::Conflict)
+                ));
+                drop(operations);
+                drop(owner);
+                stop_network(network);
+                return;
+            }
             let (operation_coordinator, operation_issuer, mut journal) = operations.into_parts();
             let authorization_bytes = journal.load(call.invocation).unwrap().unwrap();
             let acknowledgement_bytes = journal
@@ -10454,11 +10527,16 @@ mod tests {
                     &std::fs::read(&completion_path).unwrap(),
                 )
                 .unwrap();
+            let before_retry = owner.ordered_index_for_test().unwrap();
             assert_eq!(
-                owner
-                    .acknowledge_native_operation_completion(&restored)
+                operations
+                    .coordinate_and_acknowledge(&mut owner, &call, context, slot, &mut signer)
                     .unwrap(),
-                partial_retirement
+                issued
+            );
+            assert_eq!(
+                owner.ordered_index_for_test().unwrap(),
+                before_retry + u64::from(partial_retirement)
             );
             assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
             assert!(
@@ -10598,6 +10676,18 @@ mod tests {
             use crate::agent::clean_bootstrap::operation_dispatch::NativeAuthorityOperationDispatcher;
             use crate::agent_sdk::authority_operation::AuthorityOperationCall;
             struct NoSigning([u8; 32]);
+            impl NativeAuthorityOperationCompletionSigner for NoSigning {
+                type Error = core::convert::Infallible;
+                fn public_key(&self) -> [u8; 32] {
+                    self.0
+                }
+                fn sign_native_operation_completion(
+                    &mut self,
+                    _: &[u8],
+                ) -> Result<[u8; 64], Self::Error> {
+                    panic!("native policy denial must not sign completion")
+                }
+            }
             struct FailOnceCoordinator(OperationTestImageFile, bool, bool);
             impl AuthorityOperationCoordinatorStore for FailOnceCoordinator {
                 type Error = std::io::Error;
