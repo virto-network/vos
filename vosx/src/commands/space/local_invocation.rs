@@ -305,6 +305,76 @@ mod tests {
         eprintln!("native Catalog query, retained delivery and exact HTTP retry passed");
     }
 
+    #[test]
+    #[ignore = "requires explicitly selected disposable native retirement campaign"]
+    fn real_daemon_invocation_retirement_and_exact_retry() {
+        use vos::agent::supervisor_adapters::{
+            AgentAcknowledgementRequest, AgentAcknowledgementResponse,
+        };
+        let config_path = std::path::PathBuf::from(
+            std::env::var_os("VOSX_INVOKE_SMOKE_CONFIG")
+                .expect("explicit disposable configuration"),
+        );
+        let (data, _, _, address) =
+            super::super::local_create::resolve_local_space("native-denial-smoke", None).unwrap();
+        assert!(data.to_string_lossy().contains("native-denial-head-reuse."));
+        assert_eq!(config_path.parent(), data.parent());
+        let root = data.join("agent-client/invocation-smoke");
+        let mut store = CleanInvocationFile::open_or_create(&root).unwrap();
+        let request = store.load_request().unwrap().expect("retained live ASQ1");
+        let response = store.load_response().unwrap().expect("retained live ASR1");
+        assert!(matches!(
+            verify_response(&request, &response).unwrap(),
+            AgentInvocationResponse::Direct {
+                outcome: RuntimeOutcome::Completed(Ok(_)),
+                ..
+            }
+        ));
+        drop(store);
+        super::super::invocation_progress::continue_retained(&root, address).unwrap();
+
+        // Always contact the physical daemon, including after restart when
+        // continue_retained can return its already-durable positive reply.
+        let call = validate_request(&request).unwrap();
+        let acknowledgement = AgentAcknowledgementRequest::new(
+            RuntimeExecutionContext::Direct,
+            None,
+            call.work().clone(),
+            call.authorization().clone(),
+        )
+        .unwrap();
+        let encoded = acknowledgement.encode().unwrap();
+        let mut previous = None;
+        for _ in 0..2 {
+            let reply = super::super::local_create::post_binary(
+                address,
+                "/__agents/acknowledge",
+                200,
+                &encoded,
+                MAX_RESPONSE_BYTES,
+            )
+            .unwrap();
+            let decoded = AgentAcknowledgementResponse::decode(&reply).unwrap();
+            assert!(decoded.matches_request(&acknowledgement));
+            assert!(matches!(
+                decoded.outcome(),
+                RuntimeOutcome::Acknowledged(Ok(_))
+            ));
+            if let Some(previous) = previous.replace(reply.clone()) {
+                assert_eq!(reply, previous);
+            }
+        }
+        let mut store = CleanInvocationFile::open_or_create(&root).unwrap();
+        assert_eq!(store.load_request().unwrap().as_ref(), Some(&request));
+        assert_eq!(store.load_response().unwrap().as_ref(), Some(&response));
+        let progress = store.load_progress().unwrap().expect("durable retirement");
+        drop(store);
+        super::super::invocation_progress::continue_retained(&root, address).unwrap();
+        let mut store = CleanInvocationFile::open_or_create(&root).unwrap();
+        assert_eq!(store.load_progress().unwrap(), Some(progress));
+        eprintln!("native invocation retirement and two exact HTTP acknowledgement retries passed");
+    }
+
     fn fixture(seed: u8) -> (Vec<u8>, Vec<u8>) {
         let work = InvocationWork {
             space: SpaceId([1; 32]),

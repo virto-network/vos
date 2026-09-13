@@ -23,8 +23,9 @@ passes at `8abbe363`, but requires two HTTP 504 retries for the valid Create.
 Install delivery has passed exact recovery after restart. A Public Catalog
 query on the installed Local actor now passes through clean HTTP preparation,
 invocation, retained delivery and an exact HTTP retry. Exact HTTP invocation
-after restart also passes; protected/non-Public and mutating actor workflows
-remain open.
+after restart also passes. Native positive retirement and exact acknowledgement
+retries now pass before and after restart; protected/non-Public and mutating
+actor workflows remain open.
 This is not yet a usable ordinary-agent production path.
 The native Local Install application and startup-recovery phases now pass
 physical tests from prepared authorization through retirement, including
@@ -42,7 +43,8 @@ reconciliation finished. No client MAA2 was retained in that failed campaign.
 Subsequent exact resume after restart now passes and retains verified MAA2.
 A second fresh actor Install on the same Agent passes in 394.01s after two
 HTTP 504 responses, followed by exact retained retry and clean shutdown;
-first-response latency and invocation remain open. See the live results below.
+first-response latency and protected/mutating invocation remain open. See the
+live results below.
 The native Local-controller wiring at `ee047d48` passed fresh-data startup and
 restart using the rebuilt CLI (`target/native-local-smoke.DATNas`, details below).
 This is bootstrap/ingress coverage, not ordinary-Agent creation/installation.
@@ -117,7 +119,8 @@ review endpoints for individual fixes:
    route reconciliation. The latest live test recovered a timeout and then
    returned two identical verified responses; initial latency remains high.
    Install ingress and retained CLI delivery are now wired, with live exact
-   recovery passing; fresh completion latency and invocation remain open. Prove
+   recovery passing; fresh completion latency and protected/mutating invocation
+   remain open. Prove
    authorization, durable issuance, physical application, acknowledgement and
    route publication as one restartable workflow. Replace the deliberately unavailable ordinary-Agent
    finality adapter with authenticated live system-Agent decision publication
@@ -144,6 +147,31 @@ failures. It does not close either implementation gap or certify master
 readiness. Avoid another full build/artifact repin before those changes are
 ready, and keep temporary build data on disk under `target`, not RAM-backed
 `/tmp`.
+
+### Immediate C2 execution order
+
+Keep these as work within C2, not new review batches:
+
+1. **Done for the terminal Public query:** native invocation retirement/restart
+   coverage for the newly added continuation client passes (live evidence
+   below). Native yielded work still belongs to item 3.
+2. Connect `DurableAuthorityOperationCoordinator` to durable native stores and
+   exact physical Authority dispatch. The existing dispatcher implementations
+   are test doubles; preparation and an API credential do not issue an actor
+   receipt. Retain the signed AOC5, exact authorization context and issuance
+   slot before policy dispatch, and recover the exact issued preimages before
+   re-authorizing. Physical admission must also survive restart/checkpoint/GC
+   and coexist safely with pending management/projection work. Do not route a
+   mutating operation through the read-only `pending_projection` record or
+   replace actor policy with host-side signing.
+3. Prove a protected Local mutation, yield/resume where applicable, positive
+   retirement and restart through native ingress; then expose the same
+   preparation/authorization flow in the user-facing client. A Public query
+   alone does not close this item.
+4. Close the already-required Shared finality, Private/Attested, terminal
+   resolution and physical recovery/capacity gates above before C3. These are
+   implementation blockers, not merely a final test run. Do not promote the
+   branch or report the full saga complete while they remain open.
 
 The nested system actor libraries also pass on `ae66a058`: Authority **58/58**
 and Catalog **10/10**, with no ignored or filtered tests. Evidence beside the
@@ -4979,6 +5007,43 @@ Formatting and diff checks pass.
 The native yielded-work/retirement campaign, protected non-Public issuance and
 mutation, ordinary Shared finality, capacity/crash closure and final release
 matrix remain required. The Public query/restart pass does not replace them.
+
+### Native Public invocation retirement
+
+The ignored, explicitly disposable
+`real_daemon_invocation_retirement_and_exact_retry` test continues the retained
+live Catalog query through positive acknowledgement, then forces two real
+`/__agents/acknowledge` HTTP requests even when client progress is already
+complete. Both canonical AAR3 replies must match the original work and
+authorization, report `Acknowledged(Ok(_))`, and be byte-identical. The original
+ASQ1/ASR1 are checked unchanged; reopening completed continuation must preserve
+the exact progress image. This test never manufactures a new invocation or
+counts offline client completion as native acknowledgement evidence.
+
+The rebuilt CLI passed the first live campaign on the existing disposable
+`target/native-denial-head-reuse.XoaplU` state: startup at 17:22:51Z, readiness
+17:25:34Z, **one passed in 1.84s**, clean shutdown 17:25:37Z (2026-09-13).
+Evidence is `invocation-retirement-{run,daemon,client-test}.log` beneath that
+directory. The original request/response hashes remain those of the preceding
+Public query campaign. The new CSF1 progress image SHA-256 is
+`02bd4992091a3294dd23d5e6989fdd04db4391a1772703c45d62a12ed7bd93a5`.
+
+The same-state restart also passes: startup 17:26:14Z, readiness 17:29:46Z,
+**one passed in 1.18s**, clean shutdown 17:29:50Z. Evidence is
+`invocation-retirement-restart-{run,daemon,client-test}.log`. The test forces
+two actual HTTP acknowledgements against the reopened native route; it does
+not merely read client progress. All three client image hashes remain exact.
+The disposable query is now retired: preserve its evidence and use a separate
+invocation/store for any fresh execution campaign. Both daemons are stopped
+and their endpoint marker is absent. Startup latency remains high; these are
+correctness results, not a startup-performance improvement.
+
+The vosx regression suite passes **198 tests, zero failed, five ignored**, in
+9.15s (`r16-native-retirement-regression.log` in the shared target's task-tmp).
+Workspace formatting and diff checks pass.
+The extra ignored test is the explicit live retirement campaign above. This
+closes native terminal Public-query acknowledgement coverage, not protected
+issuance, guest mutation/yielding, Shared finality or the release matrix.
 
 ### Durable client acknowledgement before completion
 

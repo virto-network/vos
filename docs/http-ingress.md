@@ -113,7 +113,10 @@ reconstructs continuation work from its durable FIFO. Acknowledgement retires
 delivery for the original invocation, not a new actor call. All three preserve
 the same anonymous-Public/receipt boundary, exact live route checks, bounded
 framing and request-bound responses. An HTTP error does not prove non-execution
-or non-retirement. A native yield/resume/retirement campaign is still required.
+or non-retirement. Native terminal Public-query retirement and exact HTTP
+acknowledgement retries pass before and after restart on disposable Local
+state. Native guest yield/resume and protected mutation remain unverified;
+this is not a full ordinary-agent readiness pass.
 
 After retaining initial delivery, continue it with:
 
