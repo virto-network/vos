@@ -31,6 +31,10 @@ and HTTP server wiring, plus retained-request and fresh managed CLI commands.
 Fresh Install discovery/preparation/credential allocation is wired; managed
 resume passes, but fresh live installation and actual actor method invocation
 remain unproven. Do not treat command availability as an end-to-end pass.
+The first fresh Install campaign on saved disposable state failed all four
+HTTP waits (604.30s total test time), then shut down cleanly after route
+reconciliation finished. No client MAA2 was retained; exact resume/recovery and
+invocation remain required. See the live Install result below.
 The native Local-controller wiring at `ee047d48` passed fresh-data startup and
 restart using the rebuilt CLI (`target/native-local-smoke.DATNas`, details below).
 This is bootstrap/ingress coverage, not ordinary-Agent creation/installation.
@@ -4521,6 +4525,70 @@ Next is rebuilding the CLI and running a fresh disposable-space
 install/invoke/restart campaign. Command parsing and isolated component tests
 cannot establish that campaign's result. C1 recovery and C3 release gates, plus
 remaining C2 failure/capacity cases, remain open; root branches are unpromoted.
+
+### Live Install campaign (initial progress record)
+
+The CLI was rebuilt from `f37625e3` (locked/offline, 52.00s,
+`r16-install-live-build.log`). A guarded ignored test now supplies a valid typed
+Catalog constructor, runs fresh managed Install against a previously verified
+Local Agent, retries only the retained operation and verifies identical retained
+resume. It requires explicit disposable-space environment variables and is not
+enabled in ordinary test runs. The ordinary full suite with the harness compiled
+passes: 191 passed, zero failed, three ignored, 11.44s
+(`r16-install-live-harness-tests.log`).
+
+The live campaign started at 2026-09-13T15:25:20Z on the existing disposable
+`target/native-denial-head-reuse.XoaplU` space, using the rebuilt shared-target
+CLI and `install-live-run.sh`. This is a fresh actor installation on saved test
+state, not a fresh-space campaign. Logs are `install-run.log`,
+`install-daemon.log` and, once ready, `install-client-test.log`. The harness owns
+daemon shutdown and endpoint cleanup. At 15:28:47Z startup had reached Authority
+inventory reconciliation; no Install result was available. Check the running
+process/logs before attempting another run; do not interpret this entry as a pass.
+
+Source inspection also identifies an invocation gate: ordinary HTTP routing
+still calls `IngressHandle::resolve_actor` over `service_actor_routes`, then
+uses registry `meta_for_instance` and a one-schema-actor assumption in
+`ingress/routing.rs`. The typed clean supervisor route published by Install is
+not by itself proof this bridge can invoke an ordinary clean Agent actor. A
+live Install pass therefore cannot close install/invoke/restart or C2 release
+readiness without verifying/updating that path.
+
+### Live Install result: delivery timeout gate failed
+
+The campaign above is terminal, not still running. The daemon became ready at
+15:31:08Z after 348 seconds of saved-state reopen. Fresh client discovery
+succeeded and published LIQ1; the server retained the actor package at
+15:33:48Z and updated its protected intent. All four HTTP waits returned 504.
+The ignored live test failed after 604.30s at 15:41:12Z
+(`install-client-test.log`); this is not superseded by the passing ordinary
+suite. No client `local-install.acknowledgement` exists.
+
+Post-lifecycle reconciliation began at 15:39:05Z. Its changed-head inventory
+took 193.298s, with complete route reconciliation at 15:42:23.962Z (198.957s).
+The harness's shutdown request waited for this work; daemon exit and endpoint
+removal completed at 15:42:24Z (`install-run.log`, `install-daemon.log`). The
+live process handle is closed. No daemon was restarted or operation regenerated.
+Successful reconciliation after clients timed out is not client-verified MAA2
+or proof of actor method execution.
+
+The exact request is retained under operation suffix
+`6f9522e4a40e22033ea6197b93ffdc4861fc0cb310aedca6ceeacec7ed7a5813`.
+Its complete CSF1 file SHA-256 remained
+`6a828eccec0a481672d25e2186f0d59819308d2a1e9820a04c345bb851d14c3b`
+before/after retries and clean shutdown. Server and client evidence, valid
+constructor bytes and the campaign script remain in the same disposable tree.
+A subsequent run must explicitly resume, not use the fresh script unchanged
+(its constructor-file absence guard correctly prevents that).
+
+A five-second CPU profile while the accepted operation was running recorded
+253 samples, no lost samples, and 81.70% self samples in
+`blake2b_simd::avx2::compress1_loop`; the daemon was at 100% CPU, not idle.
+Disk-backed `r16-install-live.perf.data` and `.perf.txt` retain that evidence.
+This identifies a hashing-dominated performance problem, not a proven complete
+root cause. Next work must verify exact resume/reopen and address the latency
+and clean invocation bridge; simply increasing the test retry count does not
+make this UX or the full C1/C2/C3 release gates pass.
 
 ### Durable client acknowledgement before completion
 

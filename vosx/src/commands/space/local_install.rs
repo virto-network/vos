@@ -671,6 +671,130 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the disposable native-denial-smoke daemon and explicit Install smoke environment"]
+    fn real_daemon_managed_install_and_exact_resume() {
+        use super::super::clean_store::{CleanCredentialReservation, CleanLocalCreateRequestFile};
+        let ctor = std::path::PathBuf::from(
+            std::env::var("VOSX_INSTALL_SMOKE_CONSTRUCTOR")
+                .expect("explicit disposable constructor path"),
+        );
+        let agent = vos::agent::sdk::AgentId(
+            hex::decode(std::env::var("VOSX_INSTALL_SMOKE_AGENT").unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        let (data, space, node_public, address) =
+            super::super::local_create::resolve_local_space("native-denial-smoke", None).unwrap();
+        assert!(
+            data.to_string_lossy().contains("native-denial-head-reuse."),
+            "disposable campaign only"
+        );
+        assert_eq!(ctor.parent(), data.parent());
+        let operator = crate::identity::load_existing().unwrap();
+        let package_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("blobs/system_catalog.vos");
+        let package = vos::agent::package_admission::admit_actor_package(
+            &std::fs::read(&package_path).unwrap(),
+        )
+        .unwrap();
+        let name = "install-smoke-catalog";
+        let resume = std::env::var_os("VOSX_INSTALL_SMOKE_RESUME").is_some();
+        if !resume {
+            assert!(
+                !ctor.exists(),
+                "fresh Install constructor artifact required"
+            );
+            let identity =
+                super::super::clean_identity::CleanOperatorIdentitySigner::new(&operator).unwrap();
+            let mut reservation = CleanCredentialReservation::open_or_create(
+                &data.join("agent-client/credentials"),
+                space,
+                identity.credential(),
+            )
+            .unwrap();
+            let (nonce, status) = reservation.current().unwrap().unwrap();
+            assert_eq!(
+                status,
+                super::super::clean_store::CredentialReservationStatus::Completed
+            );
+            let root = data
+                .join("agent-client/operations")
+                .join(format!(
+                    "{}-{}",
+                    hex::encode(identity.credential().0),
+                    hex::encode(nonce.0)
+                ))
+                .join("request");
+            let request = CleanLocalCreateRequestFile::open_or_create(&root)
+                .unwrap()
+                .load()
+                .unwrap()
+                .unwrap();
+            let (descriptor, _, _) =
+                vos::agent::local_lifecycle::LocalCreateSubmission::decode(&request)
+                    .unwrap()
+                    .into_parts();
+            assert_eq!(descriptor.identity.agent, agent);
+            let binding = descriptor.authority;
+            let configuration = system_catalog::SystemCatalogConfiguration {
+                space: space.0,
+                system_agent: agent.0,
+                system_runtime_deployment: descriptor.identity.runtime_deployment.0,
+                actor: vos::agent::sdk::ActorId::top_level(agent, name).0,
+                deployment: package.deployment().0,
+                program: package.program().0,
+                authority: system_catalog::CatalogAuthorityState {
+                    policy: binding.policy.0,
+                    issuer: system_catalog::CatalogIssuerState {
+                        principal: binding.issuer.principal.0,
+                        actor: binding.issuer.actor.0,
+                        deployment: binding.issuer.deployment.0,
+                        program: binding.issuer.program.0,
+                        producer: binding.issuer.producer.0,
+                    },
+                    public_key: binding.public_key,
+                    initial_epoch: binding.initial_epoch,
+                },
+            };
+            assert!(configuration.is_valid());
+            std::fs::write(&ctor, configuration.encode()).unwrap();
+        }
+        let mut args = InstallLocalArgs {
+            space: "native-denial-smoke".into(),
+            agent: hex::encode(agent.0),
+            package: package_path,
+            name: Some(name.into()),
+            constructor_data: Some(ctor),
+            http: Some(address),
+            resume,
+        };
+        let mut completed = None;
+        for attempt in 0..4 {
+            match install_local(&data, address, &operator, space, node_public, agent, &args) {
+                Ok(ack) => {
+                    completed = Some(ack);
+                    break;
+                }
+                Err(error) => eprintln!("Install attempt {attempt}: {error}"),
+            }
+            args.resume = true;
+        }
+        let acknowledgement =
+            completed.expect("native Install must complete within bounded identical retries");
+        args.resume = true;
+        assert_eq!(
+            install_local(&data, address, &operator, space, node_public, agent, &args).unwrap(),
+            acknowledgement
+        );
+        assert!(matches!(
+            acknowledgement.application,
+            ManagementReply::Installed(_)
+        ));
+        eprintln!("native Install and exact retained resume passed");
+    }
+
+    #[test]
     fn fresh_install_command_parses_explicit_inputs_and_resume() {
         use clap::Parser as _;
         let parsed = crate::Cli::try_parse_from([
