@@ -1478,3 +1478,44 @@ authorization/application/finalization, denial handling, host attachment and
 route publication remain to be connected before enabling it. The adapter
 deliberately leaves the authorization result retained and does not claim
 ordinary-Agent finality. No guest artifact was rebuilt in this checkpoint.
+
+### Bundled Authority Create authorization and issuer-size fix
+
+The positive native-owner dispatch test now executes the bundled Authority
+PVM, retaining its executable/schema/policy bytes and re-signing only the
+package for the fixture's issuer identity. It submits a signed ordinary Local
+Agent Create call through `issue_management_intent`, obtains the real actor's
+approval and a durable signed receipt, then reopens the separate intent and
+issuer stores and retries after expiry. The exact original envelope and
+receipt are recovered without another signature or ordered journal entry.
+
+This test exposed a production issuer defect: its 1,024-byte internal decision
+limit rejected a valid approved Create carrying both the complete creation
+authority binding and the authenticated application context. The limit is now
+1,536 bytes; a codec matrix exercises all optional evidence and lane-root
+fields with and without the Create binding, round-trips those frames, and
+rejects oversized input. The complete issuer image remains bounded at 512 KiB.
+The field encoding and CIS2 magic are unchanged. A dev-only `system-authority`
+dependency supplies the exact constructor configuration codec; the lockfile
+change adds only that dependency edge.
+
+Initial integration attempts also caught two fixture errors: the enrollment
+signature must name the founding owner, and the ordinary replica roster must
+name the enrolled node owner rather than copying the system bootstrap's
+separate transport-principal pin. These were corrected without bypassing
+Authority validation. Temporary diagnostics were removed.
+
+**41/41 issuer, native dispatch and supervisor-adapter tests pass**
+(`r16-bundled-authority-dispatch-regression-final.log`, 8.43s), including the
+expired retry at slot 40 for a receipt expiring at slot 30. The final run uses
+locked offline dependencies and disk-backed scratch space. Formatting and
+diff checks pass.
+
+Scope of evidence: the Authority actor itself executes as PVM, while this
+native-owner fixture uses the existing test-only native Standard outer runtime
+and seeds a completed bootstrap predecessor. The intent/issuer stores are
+reopened, not the whole owner/transport. This does not prove fresh production
+bootstrap, an all-PVM outer-runtime restart, physical application of the newly
+authorized Create, finalization, route publication or native ingress wiring.
+Those remain required, alongside the existing journal-capacity and lifecycle
+completion work. No guest artifact was rebuilt or repinned here.

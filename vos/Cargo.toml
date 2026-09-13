@@ -196,6 +196,8 @@ futures-channel = { version = "0.3", default-features = false, features = ["allo
 # tests load the pre-built actor ELF separately and only need the
 # Ref surface from the rlib.
 space-registry = { path = "../actors/space-registry", default-features = false }
+# Exact configuration codec for the bundled Authority PVM integration test.
+system-authority = { path = "../actors/system-authority", default-features = false }
 # Per-bank stateful clerk agent — host tests use ClerkLedgerRef to
 # drive bootstrap / create_account / account against the wire ABI.
 clerk-ledger = { path = "../actors/clerk-ledger", default-features = false }

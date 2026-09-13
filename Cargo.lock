@@ -7688,6 +7688,7 @@ dependencies = [
  "space-registry",
  "ssh-key",
  "subtle",
+ "system-authority",
  "tokio",
  "tokio-rustls",
  "toml 0.8.23",

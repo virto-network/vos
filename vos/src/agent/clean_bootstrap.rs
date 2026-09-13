@@ -6048,6 +6048,13 @@ mod tests {
         fn native_projection_physical_fixture_with_authority(
             authority_package: AdmittedActorPackage,
         ) -> PhysicalFixture {
+            native_physical_fixture_with_authority_configuration(authority_package, None)
+        }
+
+        fn native_physical_fixture_with_authority_configuration(
+            authority_package: AdmittedActorPackage,
+            configuration: Option<fn(&AgentDescriptor) -> Vec<u8>>,
+        ) -> PhysicalFixture {
             let receipt_key = SigningKey::from_bytes(&[RECEIPT_SEED; 32]);
             let credential_key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
             let runtime = shape_only_runtime();
@@ -6060,7 +6067,12 @@ mod tests {
                 admitted_standard_actor_for_test("root-catalog", StateLane::Linear, 0xa5);
             let authority = authority_binding(agent, &authority_package, &receipt_key);
             let descriptor = descriptor(&runtime, space, agent, owner, nonce, &member, authority);
-            let authority_request = install_request(agent, &authority_package, 0xa6, None);
+            let authority_request = install_request(
+                agent,
+                &authority_package,
+                0xa6,
+                configuration.map(|encode| encode(&descriptor)),
+            );
             let catalog_request = install_request(agent, &catalog_package, 0xa8, None);
             let (catalog_call, _) =
                 credential_call_and_approval(&descriptor, &catalog_request, &credential_key);
@@ -6098,7 +6110,11 @@ mod tests {
                 catalog_package.exact_bytes().to_vec(),
                 catalog_request,
                 catalog_call,
-                10_000_000,
+                if configuration.is_some() {
+                    crate::agent::execution::MAX_EXECUTION_GAS
+                } else {
+                    10_000_000
+                },
                 &mut receipt_signer,
                 &mut root_certifier,
                 Arc::clone(&trust),
@@ -6781,6 +6797,164 @@ mod tests {
         fn physical_current_abi_shared_bootstrap_restarts_after_every_phase_without_duplicate_slots()
          {
             exercise_restart_mode(RecordFailure::AfterEveryPhase, "after-every-phase");
+        }
+
+        #[test]
+        fn native_management_intent_executes_bundled_authority_and_recovers_receipt() {
+            use crate::agent::clean_management_intent::{
+                CleanManagementIntent, CleanManagementIntentSlot,
+            };
+            fn configuration(descriptor: &AgentDescriptor) -> Vec<u8> {
+                use system_authority::{
+                    AuthorityBindingState, AuthorityBlobRow, AuthorityIssuerState,
+                    ROOT_BOOTSTRAP_AUTHORIZATION_HIGH_WATER, SystemAuthorityConfiguration,
+                };
+                let (key, _, public, _) = node_material();
+                let principal = PrincipalId::of_public_key(&public);
+                let mut enrollment = crate::agent_sdk::private::NodeEncryptionEnrollment::from_keys(
+                    descriptor.identity.space,
+                    descriptor.identity.owner,
+                    public,
+                    [0x41; 32],
+                    [1; 64],
+                );
+                enrollment.transport_signature = key.sign(&enrollment.signing_bytes()).to_bytes();
+                let authority = descriptor.authority;
+                let config = SystemAuthorityConfiguration {
+                    space: descriptor.identity.space.0,
+                    system_agent: descriptor.identity.agent.0,
+                    system_runtime_deployment: descriptor.identity.runtime_deployment.0,
+                    system_runtime_program: descriptor.identity.runtime_program.0,
+                    system_runtime_producer: descriptor.identity.runtime_producer.0,
+                    system_transition_producer: descriptor.identity.transition_producer.0,
+                    system_runtime_package: AuthorityBlobRow {
+                        hash: descriptor.runtime_package.hash.0,
+                        len: descriptor.runtime_package.len,
+                    },
+                    binding: AuthorityBindingState {
+                        policy: authority.policy.0,
+                        issuer: AuthorityIssuerState {
+                            principal: authority.issuer.principal.0,
+                            actor: authority.issuer.actor.0,
+                            deployment: authority.issuer.deployment.0,
+                            program: authority.issuer.program.0,
+                            producer: authority.issuer.producer.0,
+                        },
+                        public_key: authority.public_key,
+                        initial_epoch: authority.initial_epoch,
+                    },
+                    bootstrap_authorization_high_water: ROOT_BOOTSTRAP_AUTHORIZATION_HIGH_WATER,
+                    bootstrap_system_agent_creation_nonce: descriptor.creation_nonce.0,
+                    bootstrap_principal: descriptor.identity.owner.0,
+                    bootstrap_replica_principal: principal.0,
+                    bootstrap_credential_public_key: SigningKey::from_bytes(&[CREDENTIAL_SEED; 32])
+                        .verifying_key()
+                        .to_bytes(),
+                    bootstrap_credential_kind: 0,
+                    bootstrap_node: enrollment.node.0,
+                    bootstrap_node_transport_public_key: enrollment.transport_public_key,
+                    bootstrap_node_transport_peer_id: enrollment.transport_peer_id,
+                    bootstrap_node_encryption_public_key: enrollment.encryption_public_key,
+                    bootstrap_node_transport_signature: enrollment.transport_signature,
+                };
+                assert!(config.is_valid());
+                config.encode()
+            }
+            // Re-sign the bundled artifact with this fixture's pinned issuer;
+            // the executable PVM, schema and policies are unchanged.
+            let mut package =
+                PackageEnvelope::decode(include_bytes!("../../../vosx/blobs/system_authority.vos"))
+                    .unwrap();
+            let key = SigningKey::from_bytes(&[RECEIPT_SEED; 32]);
+            let public = key.verifying_key().to_bytes();
+            *package.manifest.signing_mut() = PackageSigning {
+                producer: ProducerId::of_public_key(&public),
+                public_key: public,
+                signature: [0; 64],
+            };
+            package.manifest.signing_mut().signature =
+                key.sign(&package.signing_bytes().unwrap()).to_bytes();
+            let package = admit_actor_package(&package.encode().unwrap()).unwrap();
+            let fixture =
+                native_physical_fixture_with_authority_configuration(package, Some(configuration));
+            let mut harness =
+                NativeProjectionOwnerHarness::with_fixture("bundled-authority-management", fixture);
+            let owner = harness.owner.as_mut().unwrap();
+            let mut descriptor = owner.pins.descriptor.clone();
+            descriptor.creation_nonce = Hash([0xdc; 32]);
+            descriptor.identity.agent = AgentId::derive(
+                descriptor.identity.space,
+                descriptor.identity.owner,
+                descriptor.creation_nonce.as_bytes(),
+            );
+            descriptor.identity.profile = AgentProfile::Local;
+            // Ordinary replica rosters name the enrolled node owner. The
+            // bootstrap system roster separately pins its transport principal.
+            descriptor.replicas[0].principal = descriptor.identity.owner;
+            descriptor.validate().unwrap();
+            let request = ManagementRequest::Create(Box::new(descriptor.clone()));
+            let credential_key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
+            let (mut call, _) =
+                credential_call_and_approval(&descriptor, &request, &credential_key);
+            call.authority = owner.authority_target();
+            call.invocation = call.expected_invocation();
+            call.signature = credential_key.sign(&call.signing_bytes()).to_bytes();
+            let intent = CleanManagementIntent::new(
+                owner.authority_target(),
+                call.managed,
+                request.clone(),
+                call.clone(),
+                &RawCredentialVerifier,
+            )
+            .unwrap();
+            let store = IssuerMemoryStore::default();
+            let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
+            slot.pledge(intent).unwrap();
+            let issuer_store = IssuerMemoryStore::default();
+            let mut issuer = DurableCleanManagementIssuer::open(
+                issuer_store.clone(),
+                descriptor.authority,
+                descriptor.identity.space,
+                descriptor.identity.agent,
+            )
+            .unwrap();
+            let mut signer = CountingSigner::new();
+            let before = owner.ordered_index_for_test().unwrap();
+            let receipt = owner
+                .issue_management_intent(&mut slot, call.managed, &mut issuer, &mut signer)
+                .unwrap();
+            assert_eq!(receipt.selector.request, request.commitment());
+            assert_eq!(receipt.selector.agent, descriptor.identity.agent);
+            assert_eq!(signer.calls, 1);
+            let applied = owner.ordered_index_for_test().unwrap();
+            assert!(applied > before);
+            let envelope = slot.authorization_work().unwrap().unwrap().clone();
+            drop(slot);
+            drop(issuer);
+            harness
+                .fixture
+                .logical_slot
+                .as_ref()
+                .unwrap()
+                .store(LOGICAL_SLOT + 20, Ordering::Release);
+            let mut slot = CleanManagementIntentSlot::open(store).unwrap();
+            let mut issuer = DurableCleanManagementIssuer::open(
+                issuer_store,
+                descriptor.authority,
+                descriptor.identity.space,
+                descriptor.identity.agent,
+            )
+            .unwrap();
+            assert_eq!(
+                owner
+                    .issue_management_intent(&mut slot, call.managed, &mut issuer, &mut signer)
+                    .unwrap(),
+                receipt
+            );
+            assert_eq!(slot.authorization_work().unwrap(), Some(&envelope));
+            assert_eq!(signer.calls, 1);
+            assert_eq!(owner.ordered_index_for_test().unwrap(), applied);
+            harness.stop();
         }
 
         #[test]

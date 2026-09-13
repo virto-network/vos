@@ -29,7 +29,10 @@ pub const MAX_CLEAN_MANAGEMENT_ISSUER_DECISIONS: usize =
     super::standard::MAX_AUTHORITY_DISPOSITIONS;
 /// Maximum complete canonical issuer image accepted from durable storage.
 pub const MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES: usize = 512 * 1024;
-pub(crate) const MAX_AUTHORIZED_DECISION_BYTES: usize = 1_024;
+// Create retains its authority binding in addition to the full authenticated
+// application context. That valid combination exceeds the old 1 KiB bound.
+// Keep a bounded frame large enough for every fixed-width optional field.
+pub(crate) const MAX_AUTHORIZED_DECISION_BYTES: usize = 1_536;
 const CLEAN_MANAGEMENT_ISSUER_MAGIC: [u8; 4] = *b"CIS2";
 
 /// Minimal durable whole-image boundary owned by the clean Agent issuer.
@@ -2439,6 +2442,52 @@ mod tests {
         .unwrap();
         assert_eq!(slot.pledge(later), Err(IntentSlotError::Conflict));
         assert_eq!(store.image().unwrap(), durable);
+    }
+
+    #[test]
+    fn authorized_decision_frame_bounds_include_create_and_application() {
+        let signer = CountingSigner::new(0x4d);
+        let fixture = fixture(&signer);
+        let request = request(0x4e);
+        let (call, approval) = approved_call(&fixture, 1, &request);
+        let mut decision = AuthorizedCleanManagementDecision::from_approval(
+            call.authority,
+            call.managed,
+            &request,
+            &call,
+            &approval,
+            &TestCredentialVerifier,
+        )
+        .unwrap();
+        // Codec-size matrix only: these modified shapes are not policy proof.
+        // The native bundled-Authority test exercises a real Create approval.
+        decision.evidence.package = Some(BlobRef {
+            hash: Hash([0x4f; 32]),
+            len: 1,
+        });
+        decision.evidence.proof = decision.evidence.package.clone();
+        decision.lane_roots = AuthorityLaneRoots {
+            control: Some(Hash([1; 32])),
+            linear: Some(Hash([2; 32])),
+            merge: Some(Hash([3; 32])),
+            local: Some(Hash([4; 32])),
+        };
+        for create in [false, true] {
+            if create {
+                decision.operation = AuthorityOperationKind::CreateAgent;
+                decision.actor = None;
+                decision.actor_deployment = None;
+                decision.creation_authority = Some(call.authority.binding);
+            }
+            assert!(decision.is_valid());
+            let encoded = encode_authorized_decision(&decision);
+            assert!(encoded.len() <= MAX_AUTHORIZED_DECISION_BYTES);
+            assert_eq!(decode_authorized_decision(&encoded).unwrap(), decision);
+            if create {
+                assert!(encoded.len() > 1_024);
+            }
+        }
+        assert!(decode_authorized_decision(&vec![0; MAX_AUTHORIZED_DECISION_BYTES + 1]).is_err());
     }
 
     #[test]
