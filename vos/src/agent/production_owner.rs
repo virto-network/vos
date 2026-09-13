@@ -150,6 +150,7 @@ trait AuthorityInventorySource: Send {
 struct CleanAuthorityProjectionClient {
     transport: Box<dyn AuthorityProjectionTransport>,
     authenticator: Box<dyn AuthorityProjectionQueryAuthenticator>,
+    inventory: Option<(AuthorityCredentialProjection, AgentAuthorityInventory)>,
 }
 
 impl CleanAuthorityProjectionClient {
@@ -160,6 +161,7 @@ impl CleanAuthorityProjectionClient {
         Self {
             transport,
             authenticator,
+            inventory: None,
         }
     }
 
@@ -283,6 +285,9 @@ impl CleanAuthorityProjectionClient {
 
 impl AuthorityInventorySource for CleanAuthorityProjectionClient {
     fn load_inventory(&mut self) -> Result<AgentAuthorityInventory, AgentProductionOwnerError> {
+        // Any failed refresh invalidates reuse, including authentication and
+        // partial pagination errors. No cached value is a fallback on failure.
+        let previous = self.inventory.take();
         let (credential_query, credential): (_, AuthorityCredentialProjection) =
             self.query(AuthorityProjectionSelector::Credential)?;
         if credential.query != credential_query || credential.validate_shape().is_err() {
@@ -295,6 +300,26 @@ impl AuthorityInventorySource for CleanAuthorityProjectionClient {
             return Err(AgentProductionOwnerError::WrongCredentialKind);
         }
         let head = credential.head;
+        if let Some((mut prior_credential, inventory)) = previous {
+            if prior_credential.query.authority == credential_query.authority
+                && prior_credential.query.credential == credential_query.credential
+                && inventory.head == head
+            {
+                // The head commits to the COMPLETE Authority state, advancing
+                // on every mutation. Visibility is a function of that state
+                // and these claims, not the query nonce. Require fresh active
+                // credential authentication above and exact claims below.
+                prior_credential.query = credential_query.clone();
+                if prior_credential != credential {
+                    return Err(AgentProductionOwnerError::InconsistentHead);
+                }
+                self.inventory = Some((credential, inventory.clone()));
+                tracing::debug!(
+                    "Authority inventory pages reused at freshly authenticated unchanged head"
+                );
+                return Ok(inventory);
+            }
+        }
         let limit = u16::try_from(MAX_AUTHORITY_PROJECTION_PAGE_ENTRIES)
             .map_err(|_| AgentProductionOwnerError::InventoryLimit)?;
         let maximum_pages = MAX_INVENTORY_AGENTS
@@ -343,11 +368,13 @@ impl AuthorityInventorySource for CleanAuthorityProjectionClient {
                     .map_err(|_| AgentProductionOwnerError::InvalidProjection)?,
             );
         }
-        Ok(AgentAuthorityInventory {
+        let inventory = AgentAuthorityInventory {
             head,
             principal: credential.principal,
             agents,
-        })
+        };
+        self.inventory = Some((credential, inventory.clone()));
+        Ok(inventory)
     }
 }
 
@@ -1342,6 +1369,134 @@ mod tests {
     #[test]
     fn reconciliation_overrun_waits_a_full_interval_before_running_again() {
         check_reconciliation_deadline(false);
+    }
+
+    #[test]
+    fn inventory_reuse_requires_fresh_credential_and_exact_complete_head() {
+        let node = NodeId([0x31; 32]);
+        let descriptor = descriptor(1, AgentProfile::Shared, node);
+        let actor = actor(&descriptor, true);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut source = client(vec![descriptor], vec![actor], head(1), calls.clone());
+        let original = source.load_inventory().unwrap();
+        assert_eq!(calls.lock().unwrap().len(), 4);
+        assert_eq!(source.load_inventory().unwrap(), original);
+        assert_eq!(calls.lock().unwrap().len(), 5);
+        assert_eq!(
+            calls.lock().unwrap().last(),
+            Some(&AuthorityProjectionSelector::Credential)
+        );
+
+        // Neither another Authority target nor another credential may reuse
+        // a prior principal's pages, even at an otherwise equal head.
+        source
+            .inventory
+            .as_mut()
+            .unwrap()
+            .0
+            .query
+            .authority
+            .system_agent = AgentId([0x91; 32]);
+        assert_eq!(source.load_inventory().unwrap(), original);
+        assert_eq!(calls.lock().unwrap().len(), 9);
+        source.inventory.as_mut().unwrap().0.query.credential =
+            super::super::sdk::CredentialId([0x92; 32]);
+        assert_eq!(source.load_inventory().unwrap(), original);
+        assert_eq!(calls.lock().unwrap().len(), 13);
+        source.inventory.as_mut().unwrap().1.head = head(2);
+        assert_eq!(source.load_inventory().unwrap(), original);
+        assert_eq!(calls.lock().unwrap().len(), 17);
+
+        // Equal head with contradictory claims is invalid, not a cache hit
+        // and not an excuse to return previously authorized pages.
+        source.inventory.as_mut().unwrap().0.principal = PrincipalId([0x93; 32]);
+        assert_eq!(
+            source.load_inventory(),
+            Err(AgentProductionOwnerError::InconsistentHead)
+        );
+        assert!(source.inventory.is_none());
+        assert_eq!(source.load_inventory().unwrap(), original);
+        assert_eq!(calls.lock().unwrap().len(), 22);
+    }
+
+    #[test]
+    fn inventory_reuse_never_masks_revocation_kind_or_transport_failure() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        struct ControlledTransport {
+            inner: ProjectionTransport,
+            mode: Arc<AtomicU8>,
+        }
+        impl AuthorityProjectionTransport for ControlledTransport {
+            fn target(&self) -> AuthorityActorTarget {
+                self.inner.target()
+            }
+            fn dispatch(
+                &mut self,
+                query: AuthorityProjectionQuery,
+            ) -> Result<Vec<u8>, AgentProductionOwnerError> {
+                let mode = self.mode.load(Ordering::Relaxed);
+                if mode == 3 {
+                    return Err(AgentProductionOwnerError::ProjectionTransport);
+                }
+                if mode == 4 {
+                    self.inner.head = head(2);
+                    self.inner.actor_head = head(2);
+                }
+                let is_credential = query.selector == AuthorityProjectionSelector::Credential;
+                let bytes = self.inner.dispatch(query)?;
+                if !is_credential {
+                    return Ok(bytes);
+                }
+                let mut projection = AuthorityCredentialProjection::decode(&bytes).unwrap();
+                match mode {
+                    1 => projection.status = AuthorityCredentialStatus::Revoked,
+                    2 => projection.kind = AuthorityCredentialKind::Ssh,
+                    _ => {}
+                }
+                projection
+                    .encode()
+                    .map_err(|_| AgentProductionOwnerError::InvalidProjection)
+            }
+        }
+        let node = NodeId([0x31; 32]);
+        let descriptor = descriptor(1, AgentProfile::Shared, node);
+        let actor = actor(&descriptor, true);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mode = Arc::new(AtomicU8::new(0));
+        let mut source = CleanAuthorityProjectionClient::new(
+            Box::new(ControlledTransport {
+                inner: ProjectionTransport {
+                    target: target(),
+                    head: head(1),
+                    actor_head: head(1),
+                    descriptors: vec![descriptor],
+                    actors: vec![actor],
+                    calls: calls.clone(),
+                },
+                mode: mode.clone(),
+            }),
+            Box::new(TestAuthenticator { ordinal: 0 }),
+        );
+        source.load_inventory().unwrap();
+        for (value, error) in [
+            (1, AgentProductionOwnerError::RevokedCredential),
+            (2, AgentProductionOwnerError::WrongCredentialKind),
+            (3, AgentProductionOwnerError::ProjectionTransport),
+        ] {
+            mode.store(value, Ordering::Relaxed);
+            assert_eq!(source.load_inventory(), Err(error));
+            assert!(source.inventory.is_none());
+            mode.store(0, Ordering::Relaxed);
+            let before = calls.lock().unwrap().len();
+            source.load_inventory().unwrap();
+            assert_eq!(calls.lock().unwrap().len(), before + 4);
+        }
+        mode.store(4, Ordering::Relaxed);
+        let before = calls.lock().unwrap().len();
+        assert_eq!(source.load_inventory().unwrap().head, head(2));
+        assert_eq!(calls.lock().unwrap().len(), before + 4);
+        source.load_inventory().unwrap();
+        assert_eq!(calls.lock().unwrap().len(), before + 5);
     }
 
     #[test]

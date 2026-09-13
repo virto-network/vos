@@ -3935,6 +3935,51 @@ Shared finality and full release gates. Keep this evidence within C2.
 All 5 production-owner regressions passed after the timing change (0.20s,
 shared scratch `r16-publication-timing.log`); this is not a new daemon run.
 
+### Timed inventory bottleneck and exact-head page reuse
+
+The prior daemon exited 0 and removed its endpoint. The instrumented CLI rebuilt
+in 17.59s (`r16-publication-timing-cli-build.log`) and reopened the same
+`target/native-denial-smoke.WkFgbh` stores without changing either signed request.
+`timing-daemon.log` locates the delay: initial reopening took about 356 seconds
+before inventory began; the first complete two-Agent inventory took 203.215s,
+while route reconciliation added only about 2.8s. Credential, Agent listing,
+Local replica and Local actor queries took 36.531s, 38.120s, 38.186s and 59.542s
+respectively. Every pending-recovery phase reported zero milliseconds. Readiness
+was reached at `2026-09-13T12:50:59Z`, then full periodic inventory restarted five
+seconds later. Subsequent complete reconciliations took 105.881s, 126.801s and
+148.456s. The daemon was stopped gracefully and its endpoint was removed.
+
+`CleanAuthorityProjectionClient` now retains at most one complete bounded
+inventory together with its credential projection. Every refresh still performs
+a fresh authenticated Credential query and validates shape, active status and
+credential kind. Pages are reused only for an exact match of Authority target,
+credential, complete Authority head and every credential claim (ignoring only
+the replaced fresh query itself). `AuthorityProjectionHead` commits to the full
+validated state and advances on every mutation; current inventory visibility is
+derived solely from that state and credential claims. Equal head with conflicting
+claims fails closed. Changed scope/head forces complete pagination, and any failed
+refresh discards the cached inventory. Only a fully loaded, bounded, same-head
+inventory enters the cache; it never supplies a fallback for a failed query.
+
+Physical route authorization/reconciliation still runs on each refresh, and
+completed-response delivery caching is not relaxed. Restart starts with no page
+cache and still performs full reopening and inventory. This is not acceptance of
+a volatile cache as independent Authority evidence: fresh live head/credential
+evidence is required for every reuse, with existing host audits unchanged.
+
+All 7 production-owner regressions passed (0.15s,
+`r16-inventory-head-reuse.log`). New tests require a fresh Credential query for
+every reuse (the one-Agent fixture goes from four queries to one), force full
+refetch after scope/head changes, reject conflicting claims, and prove that
+revocation, wrong kind and transport failure cannot return cached pages. The
+physical protected-Authority projection regression also passed (1 test, 1.81s,
+`r16-inventory-head-reuse-physical.log`), as did formatting and `git diff --check`.
+The
+change does not alter guest artifacts, authentication, retirement or hard capacity
+limits, and does not yet prove acceptable live latency. Next rebuild and resume
+the preserved operation with phase logging to measure the effect; cold replay,
+first-time inventory cost and checkpoint policy remain separate open concerns.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its
