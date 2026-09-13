@@ -50,8 +50,8 @@ review endpoints for individual fixes:
    native entry point. Startup now retains both the system owner and the Local
    lifecycle controller. Signed Local Create has a bounded ingress queue and
    an HTTP submission endpoint and retained-request CLI submission. Fresh CLI
-   preparation/discovery and a successful native Create/publication smoke remain
-   open, as does Install ingress. Prove
+   preparation/discovery is now wired, but the live Create/publication smoke
+   fails in management authorization; Install ingress also remains open. Prove
    authorization, durable issuance, physical application, acknowledgement and
    route publication as one restartable workflow. Replace the deliberately unavailable ordinary-Agent
    finality adapter with authenticated live system-Agent decision publication
@@ -2119,6 +2119,67 @@ That orchestration and real-daemon testing are still open; this is not yet an
 end-to-end usable fresh Create command. Explicit denial/abort recovery and
 retirement remain separate outstanding lifecycle requirements, not implicit
 permission to discard a pending reservation.
+
+### Fresh Local Create CLI and failed live integration smoke
+
+The CLI now exposes `vosx space create-local-agent SPACE [--http LOOPBACK:PORT]`
+and `--resume`. It loads an existing operator identity (never generates a
+replacement), resolves the indexed Space and daemon public peer identity, and
+selects a unique configured plaintext loopback listener unless overridden.
+Under `<space-data>/agent-client`, it holds the credential reservation through
+query discovery, signed preparation, durable request publication, submission
+and verified completion. A pending operation requires explicit `--resume`;
+resume loads its retained nonce and request instead of re-signing with a new
+sequence/window. A fresh request uses a one-hour validity window with 60 seconds
+of start-time tolerance. An expired unaccepted request is not silently refreshed.
+
+The private-directory creation helper was extracted from the existing lifecycle
+factory without changing its validation/sync behavior. The command checks the
+retained Space/operator/Authority/nonce/transition-producer scope before sending.
+It does not install an arbitrary Actor automatically or expose Shared creation.
+
+**Final-source `vosx` binary tests: 174 passed, zero failed, one ignored**, in
+5.21s (`r16-create-local-command-final.log`, locked/offline, serial with socket
+access, disk scratch). New guards reject a fresh command over pending work and
+a resume using a different retained target without replacing its request.
+The ignored compiled-runtime candidate remains a release gate. Formatting and
+diff checks pass. Native CLI builds passed (32.47s initial, 13.38s diagnostic);
+the shared r14 CLI build was not overwritten.
+
+**The real integration smoke failed; ordinary creation is not usable yet.**
+The existing disposable `target/native-local-smoke.DATNas` Space was started
+with the rebuilt CLI on HTTP 18081/SSH 2223. It became ready at
+`2026-09-13T03:31:52.008871Z`, after roughly 160 seconds. Live signed credential
+discovery completed and a signed Create request was durably published. The
+status endpoint stayed responsive, but Create returned HTTP 503 without a Local
+Agent image or verified acknowledgement. Logs are `create-daemon.log`,
+`create-client.log` and `create-result.json` under that smoke directory.
+
+Diagnostic logging was added for management authorization/issuance and the
+HTTP lifecycle failure category, without dumping request bodies or key material.
+The same Space was restarted and only `--resume` was run. Startup became ready
+at `03:44:35.273351Z`, after roughly 307 seconds; at `03:44:40.794677Z` the owner
+reported `management authorization did not return a completed invocation`,
+followed by `Local Create did not complete: Lifecycle(Unavailable)` and HTTP
+503. This identifies the failed stage, not the exact runtime error variant.
+See `create-resume-daemon.log` and `create-resume-client.log`. Both scripts ended
+with exit 1 and both daemons were stopped; their endpoint files are absent.
+
+The retained request envelope SHA-256 before and after restart/retry is
+`daf809373a7734d8b92bafcd5e901f677512b78b5068cb17cac8c1b9fd3edc0f`.
+Operation nonce: `a32443984fc1548ad3899af014b755f9ec7c25f8ca2918396bfe52589e2cd7b4`.
+Pending reservation/query/request and management intent remain intact for
+diagnosis; no new nonce, repaired state or permissive authorization was used.
+
+Next: capture the precise runtime rejection and add a regression with a clock
+advance between durable authorization-envelope pledge and dispatch. One concrete
+suspect is that management uses `prepare_terminal_clean_ordered_operation`
+(which samples a fresh observation slot), while the existing reserved projection
+path retains the accepted preflight slot. This is a source-based hypothesis,
+not a proven root cause. Fix the admission/recovery boundary without refreshing
+already accepted identities, then rerun native Create/restart/publication.
+Journal-capacity reservation, Install/invoke, retirement, Shared finality and
+full release gates remain open. This failed smoke does not justify promotion.
 
 The CLI subcommand is still absent. Next wiring must persist the complete
 submission durably before sending and resend those bytes on retry. Bootstrap

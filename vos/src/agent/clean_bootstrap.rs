@@ -2222,9 +2222,14 @@ where
         ) {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        let outcome =
-            self.supervisor_invoke_terminal(identity, (**work).clone(), (**authorization).clone())?;
+        let outcome = self
+            .supervisor_invoke_terminal(identity, (**work).clone(), (**authorization).clone())
+            .map_err(|error| {
+                crate::log::warn!("management authorization dispatch failed: {error:?}");
+                error
+            })?;
         let super::sdk::RuntimeOutcome::Completed(Ok(reply)) = outcome else {
+            crate::log::warn!("management authorization did not return a completed invocation");
             return Err(SharedAgentHostError::Unavailable);
         };
         if reply.invocation != work.invocation
@@ -2251,7 +2256,24 @@ where
             issuer,
             signer,
         )
-        .map_err(|_| SharedAgentHostError::Unavailable)
+        .map_err(|error| {
+            use super::clean_authority_issuer::CleanManagementIssuerError;
+            match error {
+                CleanManagementIssuerError::Rejected(reason) => {
+                    crate::log::warn!("management receipt issuance rejected: {reason:?}")
+                }
+                CleanManagementIssuerError::Storage(_) => {
+                    crate::log::warn!("management receipt storage failed")
+                }
+                CleanManagementIssuerError::Signer(_) => {
+                    crate::log::warn!("management receipt signer failed")
+                }
+                CleanManagementIssuerError::InvalidState => {
+                    crate::log::warn!("management receipt issuer state invalid")
+                }
+            }
+            SharedAgentHostError::Unavailable
+        })
     }
 
     /// Finalize only the exact durable application acknowledgement. The work

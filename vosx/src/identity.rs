@@ -24,6 +24,16 @@ use crate::paths;
 
 const MAX_IDENTITY_KEY_BYTES: u64 = 4 * 1024;
 
+/// Administrative retries must never create an ambient replacement identity.
+pub fn load_existing() -> anyhow::Result<Keypair> {
+    let path = paths::client_identity_path();
+    let bytes = crate::secure_file::read_owner_only_optional(&path, MAX_IDENTITY_KEY_BYTES)?
+        .ok_or_else(|| {
+            anyhow::anyhow!("operator identity is missing; refusing to create a replacement")
+        })?;
+    decode_canonical_ed25519(&path, &bytes)
+}
+
 /// Load the operator's persistent client keypair, creating it
 /// on first use. Idempotent — every `vosx` command can call
 /// this freely.

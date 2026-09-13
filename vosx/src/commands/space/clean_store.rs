@@ -599,16 +599,7 @@ impl CleanManagementLifecycleStoreFactory {
             return Err(CleanFileStoreError::InvalidPath);
         }
         let path = parent.as_ref();
-        validate_new_path(path)?;
-        let ancestor =
-            open_private_directory(path.parent().ok_or(CleanFileStoreError::InvalidPath)?, true)?;
-        let (directory, created) = open_or_create_child_directory(&ancestor, path)?;
-        if created {
-            set_private_directory_permissions(&directory)?;
-            directory.sync_all()?;
-            ancestor.sync_all()?;
-        }
-        validate_opened_directory(&directory, path, false)?;
+        let directory = ensure_private_directory(path)?;
         Ok(Self {
             parent: path.to_path_buf(),
             directory,
@@ -631,6 +622,21 @@ impl CleanManagementLifecycleStoreFactory {
             space,
         })
     }
+}
+
+/// Create one private directory under an existing validated private parent.
+pub(crate) fn ensure_private_directory(path: &Path) -> Result<File, CleanFileStoreError> {
+    validate_new_path(path)?;
+    let ancestor =
+        open_private_directory(path.parent().ok_or(CleanFileStoreError::InvalidPath)?, true)?;
+    let (directory, created) = open_or_create_child_directory(&ancestor, path)?;
+    if created {
+        set_private_directory_permissions(&directory)?;
+        directory.sync_all()?;
+        ancestor.sync_all()?;
+    }
+    validate_opened_directory(&directory, path, false)?;
+    Ok(directory)
 }
 
 impl vos::agent::local_lifecycle::LocalLifecycleStoreFactory
@@ -1663,6 +1669,81 @@ pub(crate) mod tests {
             store.reserve(Hash([4; 32])),
             Err(CleanFileStoreError::RequestConflict)
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fresh_create_requires_resume_and_rejects_a_different_retained_target() {
+        let fixture = Fixture::new("fresh-create-pending");
+        let (operator, _, descriptor, _) = super::super::local_create::tests::fixture();
+        let identity =
+            super::super::clean_identity::CleanOperatorIdentitySigner::new(&operator).unwrap();
+        let root = fixture.parent.join("agent-client");
+        let _root = ensure_private_directory(&root).unwrap();
+        let claims = root.join("credentials");
+        let _claims = ensure_private_directory(&claims).unwrap();
+        let mut reservation = CleanCredentialReservation::open_or_create(
+            &claims,
+            descriptor.identity.space,
+            identity.credential(),
+        )
+        .unwrap();
+        reservation.reserve(descriptor.creation_nonce).unwrap();
+        drop(reservation);
+        let node = libp2p::identity::Keypair::ed25519_from_bytes([0x64; 32]).unwrap();
+        let public = node.public().try_into_ed25519().unwrap().to_bytes();
+        let create = |resume| {
+            super::super::local_create::create_local(
+                &fixture.parent,
+                "127.0.0.1:1".parse().unwrap(),
+                &operator,
+                descriptor.identity.space,
+                public,
+                resume,
+            )
+        };
+        assert!(create(false).unwrap_err().to_string().contains("--resume"));
+        let operations = root.join("operations");
+        let _operations = ensure_private_directory(&operations).unwrap();
+        let operation = operations.join(format!(
+            "{}-{}",
+            hex::encode(identity.credential().0),
+            hex::encode(descriptor.creation_nonce.0)
+        ));
+        let _operation = ensure_private_directory(&operation).unwrap();
+        let request_root = operation.join("request");
+        let bytes = local_request(2);
+        CleanLocalCreateRequestFile::open_or_create(&request_root)
+            .unwrap()
+            .publish(&bytes)
+            .unwrap();
+        assert!(
+            create(true)
+                .unwrap_err()
+                .to_string()
+                .contains("retained Create differs")
+        );
+        assert_eq!(
+            CleanLocalCreateRequestFile::open_or_create(&request_root)
+                .unwrap()
+                .load()
+                .unwrap(),
+            Some(bytes)
+        );
+        assert_eq!(
+            CleanCredentialReservation::open_or_create(
+                &claims,
+                descriptor.identity.space,
+                identity.credential()
+            )
+            .unwrap()
+            .current()
+            .unwrap(),
+            Some((
+                descriptor.creation_nonce,
+                CredentialReservationStatus::Pending
+            ))
+        );
     }
 
     /// Called by the signed acknowledgement fixture; keeps its large setup out

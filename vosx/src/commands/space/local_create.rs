@@ -16,6 +16,169 @@ use vos::agent::sdk::{AgentDescriptor, InvocationId, ManagementRequest};
 
 use super::clean_identity::CleanOperatorIdentitySigner;
 
+pub(crate) fn run_create(
+    query: &str,
+    http: Option<std::net::SocketAddr>,
+    resume: bool,
+) -> anyhow::Result<()> {
+    let index = crate::spaces_index::load()?;
+    let entry = crate::spaces_index::find(&index, query)?;
+    let data = std::path::Path::new(&entry.data_dir);
+    let space = vos::agent::sdk::SpaceId(
+        hex::decode(&entry.id)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid Space ID"))?,
+    );
+    let endpoint = super::endpoint::read(data)?
+        .ok_or_else(|| anyhow::anyhow!("start the space before creating a Local Agent"))?;
+    anyhow::ensure!(
+        super::endpoint::is_alive(&endpoint),
+        "space daemon is not running"
+    );
+    let peer: libp2p::PeerId = endpoint.peer_id.parse()?;
+    let public = vos::registry::ed25519_pubkey_from_peer_id(&peer.to_bytes())
+        .ok_or_else(|| anyhow::anyhow!("daemon must advertise a full Ed25519 peer identity"))?;
+    let address = match http {
+        Some(address) => address,
+        None => {
+            let config = super::local_config::load(data)?;
+            let listeners = config
+                .ingress
+                .http
+                .iter()
+                .filter(|listener| listener.tls_cert.is_none() && listener.tls_key.is_none())
+                .filter_map(|listener| listener.listen.parse::<std::net::SocketAddr>().ok())
+                .filter(|address| address.ip().is_loopback() && address.port() != 0)
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                listeners.len() == 1,
+                "specify --http with one local plaintext daemon endpoint"
+            );
+            listeners[0]
+        }
+    };
+    let operator = crate::identity::load_existing()?;
+    let ack = create_local(data, address, &operator, space, public, resume)?;
+    print_acknowledgement(&ack)
+}
+
+/// The credential lease spans every phase. Existing request bytes always take
+/// precedence over discovery and preparation when explicitly resuming.
+pub(crate) fn create_local(
+    data: &std::path::Path,
+    address: std::net::SocketAddr,
+    operator: &Keypair,
+    space: vos::agent::sdk::SpaceId,
+    node_public: [u8; 32],
+    resume: bool,
+) -> anyhow::Result<vos::agent::sdk::authority::ManagementApplicationAck> {
+    use super::clean_store::{
+        CleanCredentialReservation, CleanLocalCreateRequestFile, CredentialReservationStatus,
+        ensure_private_directory,
+    };
+    use vos::agent::sdk::{Hash, wire::CanonicalWire as _};
+    anyhow::ensure!(
+        address.ip().is_loopback() && address.port() != 0,
+        "Local Create requires a nonzero loopback endpoint"
+    );
+    let identity = CleanOperatorIdentitySigner::new(operator)?;
+    let runtime = crate::bundled::root_signed_agent_runtime_package(operator)?;
+    let authority_package = crate::bundled::root_signed_actor_package(
+        crate::bundled::system_authority_package_template(),
+        "system-authority",
+        operator,
+    )?;
+    let (authority, _) = super::clean_startup::derive_system_authority_target(
+        space,
+        identity.raw_public_key(),
+        &runtime,
+        &authority_package,
+    )?;
+    let root = data.join("agent-client");
+    let _root = ensure_private_directory(&root)?;
+    let claims = root.join("credentials");
+    let _claims = ensure_private_directory(&claims)?;
+    let mut reservation =
+        CleanCredentialReservation::open_or_create(&claims, space, identity.credential())?;
+    let current = reservation.current()?;
+    let nonce = match current {
+        Some((nonce, _)) if resume => nonce,
+        Some((nonce, CredentialReservationStatus::Pending)) => anyhow::bail!(
+            "Local Create {} is pending; use --resume",
+            hex::encode(nonce.0)
+        ),
+        _ if resume => anyhow::bail!("no Local Create operation to resume"),
+        _ => {
+            let mut bytes = [0; 32];
+            getrandom::getrandom(&mut bytes)
+                .map_err(|error| anyhow::anyhow!("operation nonce entropy: {error}"))?;
+            anyhow::ensure!(bytes != [0; 32], "operation nonce entropy was zero");
+            Hash(bytes)
+        }
+    };
+    let status = reservation.reserve(nonce)?;
+    let operations = root.join("operations");
+    let _operations = ensure_private_directory(&operations)?;
+    let operation = operations.join(format!(
+        "{}-{}",
+        hex::encode(identity.credential().0),
+        hex::encode(nonce.0)
+    ));
+    let _operation = ensure_private_directory(&operation)?;
+    let request_root = operation.join("request");
+    let mut store = CleanLocalCreateRequestFile::open_or_create(&request_root)?;
+    let bytes = match store.load()? {
+        Some(bytes) => bytes,
+        None => {
+            anyhow::ensure!(
+                status == CredentialReservationStatus::Pending,
+                "completed operation is missing its retained request"
+            );
+            let (_, sequence) =
+                discover_credential(&operation.join("query"), address, operator, authority)?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            let expires = now
+                .checked_add(3600)
+                .ok_or_else(|| anyhow::anyhow!("validity window overflow"))?;
+            let bytes = prepare_fresh(
+                operator,
+                space,
+                node_public,
+                nonce,
+                sequence,
+                now.saturating_sub(60),
+                expires,
+            )?
+            .encode();
+            store.publish(&bytes)?;
+            bytes
+        }
+    };
+    let (descriptor, call, _) = LocalCreateSubmission::decode(&bytes)
+        .map_err(|error| anyhow::anyhow!("invalid retained Create: {error:?}"))?
+        .into_parts();
+    anyhow::ensure!(
+        descriptor.creation_nonce == nonce
+            && descriptor.identity.space == space
+            && descriptor.identity.owner == identity.principal()
+            && call.principal == identity.principal()
+            && call.credential == identity.credential()
+            && call.authority == authority
+            && descriptor.identity.transition_producer
+                == vos::agent::sdk::ProducerId::of_public_key(&node_public),
+        "retained Create differs from the selected Space, operator or node"
+    );
+    drop(store);
+    let ack = submit_retained(&request_root, address)?;
+    let encoded = ack
+        .encode()
+        .map_err(|error| anyhow::anyhow!("encode acknowledgement: {error:?}"))?;
+    reservation.complete(&bytes, &encoded)?;
+    Ok(ack)
+}
+
 fn post_binary(
     address: std::net::SocketAddr,
     path: &'static str,
@@ -271,8 +434,14 @@ pub(crate) fn run_submit(
     root: &std::path::Path,
     address: std::net::SocketAddr,
 ) -> anyhow::Result<()> {
-    use vos::agent::sdk::wire::CanonicalWire as _;
     let ack = submit_retained(root, address)?;
+    print_acknowledgement(&ack)
+}
+
+fn print_acknowledgement(
+    ack: &vos::agent::sdk::authority::ManagementApplicationAck,
+) -> anyhow::Result<()> {
+    use vos::agent::sdk::wire::CanonicalWire as _;
     let agent = hex::encode(ack.managed.agent.0);
     if crate::output::is_json() {
         crate::output::print_json(&serde_json::json!({

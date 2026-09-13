@@ -1,8 +1,8 @@
 //! `vosx space *` — local space lifecycle and daemon control.
 //!
-//! Clean-generation administration currently includes submission/retry of an
-//! already retained signed Local Create request. Fresh request discovery and
-//! allocation, Install, and ordinary Shared-Agent provisioning remain unwired.
+//! Clean-generation administration includes fresh Local Create and exact
+//! retained-request retries. Install and ordinary Shared-Agent provisioning
+//! remain unwired.
 
 use clap::Subcommand;
 use std::path::PathBuf;
@@ -43,6 +43,17 @@ pub mod verify;
 
 #[derive(Subcommand, Debug)]
 pub enum SpaceCommand {
+    /// Create an operator-owned Local Agent with the bundled runtime.
+    #[cfg(target_os = "linux")]
+    CreateLocalAgent {
+        space: String,
+        /// Override the configured local plaintext HTTP endpoint.
+        #[arg(long)]
+        http: Option<std::net::SocketAddr>,
+        /// Resume the latest retained operation without changing signed bytes.
+        #[arg(long)]
+        resume: bool,
+    },
     /// Submit or retry an already retained signed Local Create request.
     #[cfg(target_os = "linux")]
     SubmitLocalCreate {
@@ -119,6 +130,12 @@ pub enum SpaceCommand {
 
 pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
     match cmd {
+        #[cfg(target_os = "linux")]
+        SpaceCommand::CreateLocalAgent {
+            space,
+            http,
+            resume,
+        } => local_create::run_create(&space, http, resume),
         #[cfg(target_os = "linux")]
         SpaceCommand::SubmitLocalCreate { request_dir, http } => {
             local_create::run_submit(&request_dir, http)

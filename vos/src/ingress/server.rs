@@ -338,10 +338,13 @@ fn handle_local_create(
         Ok(Err(crate::agent::production_owner::AgentProductionOwnerError::Lifecycle(
             crate::agent::shared_host::SharedAgentHostError::ScopeMismatch,
         ))) => text(403, "Local Create scope or authorization rejected"),
-        Ok(Err(_)) => text(
-            503,
-            "Local Create incomplete; retry the identical signed submission",
-        ),
+        Ok(Err(error)) => {
+            crate::log::warn!("Local Create did not complete: {error:?}");
+            text(
+                503,
+                "Local Create incomplete; retry the identical signed submission",
+            )
+        }
         Err(_) => text(
             504,
             "Local Create outcome unknown; retry the identical signed submission",
