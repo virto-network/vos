@@ -1686,3 +1686,31 @@ cross-role swaps and incompatible directory namespaces. These tests use opaque
 payload bytes; they do not yet exercise a native lifecycle command with CMI3/CIS2.
 The stores are implemented but not wired to startup or management ingress. No
 guest artifact was rebuilt, and the three review batches are unchanged.
+
+### Public Local creation coordinator
+
+`CleanSystemAgentBootstrapOwner::create_local_agent` now composes the existing
+Create lifecycle behind a public native-call boundary. It accepts independent
+intent/issuer stores, the signed credential call and descriptor, an admitted
+runtime, an exclusively owned Local host and receipt signer. Before pledging
+anything it checks host/replica/runtime scope and the signed call. It opens both
+stores with the expected binding, pledges CMI3, executes authorization and
+issuance, creates/reopens the physical Local image, signs the durable application
+acknowledgement and finalizes through independently replayed Authority execution.
+Errors preserve pending evidence; callers reopen the same stores to recover.
+
+**14/14 issuer and native management tests pass** in 25.23s
+(`r16-local-coordinator-final.log`, locked/offline `pvm,private-agent-store`,
+disk scratch). The new complete-coordinator case rejects a forged call before
+intent/issuer writes, journal changes or signing, then creates and finalizes a
+valid Local Agent. Reopening the Local host and both stores after expiry returns
+the exact result with no additional Authority entry and still two signatures.
+It shares the existing actual bundled Authority/Local-runtime PVM fixture; the
+system outer runtime remains the test-only native shortcut. Stores in this test
+are in-memory durable-image fixtures, not the CLI file-store implementation.
+
+This gives native callers an implemented coordinator instead of exposing private
+intent/approval internals. It does not yet add a route-worker management command,
+connect the CLI file stores, publish routes, retire evidence or implement joint
+capacity reservation. Those steps, Install on a running Local host, Shared
+genesis finality and final release gates remain required.

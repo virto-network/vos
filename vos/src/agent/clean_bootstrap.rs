@@ -2407,6 +2407,8 @@ where
     }
 
     /// Execute the Local Create/application portion of a retained lifecycle
+    ///
+    /// The public coordinator below is the boundary for native callers.
     /// intent. No route is published and no Authority effect is finalized here.
     /// The caller must retain exclusive lifecycle ownership through those phases.
     pub(crate) fn create_local_from_management_intent<B, J, S>(
@@ -2454,6 +2456,82 @@ where
         let acknowledgement = issuer
             .observe_local_application(&observation, signer)
             .map_err(|_| SharedAgentHostError::Unavailable)?;
+        Ok((agent, acknowledgement))
+    }
+
+    /// Create and finalize one signed Local Agent lifecycle using independent
+    /// durable intent and issuer stores. Reopen those same stores after any
+    /// error; a failed write may already have reached durable storage.
+    ///
+    /// The caller owns the Local host exclusively until authenticated route
+    /// publication. This does not publish routes, retire lifecycle evidence,
+    /// or provide journal-backed ordinary-Agent genesis finality.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_local_agent<B, J, S>(
+        &mut self,
+        intent_store: B,
+        issuer_store: J,
+        descriptor: super::sdk::AgentDescriptor,
+        call: AuthorityCredentialCall,
+        local: &mut super::local_sdk_host::LocalAgentHost,
+        runtime: AdmittedRuntimePackage,
+        signer: &mut S,
+    ) -> Result<(AgentId, ManagementApplicationAck), SharedAgentHostError>
+    where
+        B: CleanManagementIssuerStore,
+        J: CleanManagementIssuerStore,
+        S: CleanManagementReceiptSigner,
+    {
+        let target = self.authority_target();
+        let managed = call.managed;
+        if descriptor.identity.profile != AgentProfile::Local
+            || descriptor.identity.space != self.pins.space
+            || local.space() != self.pins.space
+            || local.node() != self.pins.node
+            || descriptor.replicas.len() != 1
+            || descriptor.replicas[0].node != self.pins.node
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        super::driver::verify_clean_runtime_package_binding(&descriptor, &runtime)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let intent = super::clean_management_intent::CleanManagementIntent::new(
+            target,
+            managed,
+            ManagementRequest::Create(Box::new(descriptor.clone())),
+            call,
+            &RawCredentialVerifier,
+        )
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let mut slot =
+            super::clean_management_intent::CleanManagementIntentSlot::open(intent_store)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let mut issuer = DurableCleanManagementIssuer::open(
+            issuer_store,
+            descriptor.authority,
+            descriptor.identity.space,
+            descriptor.identity.agent,
+        )
+        .map_err(|_| SharedAgentHostError::Unavailable)?;
+        slot.pledge(intent).map_err(|error| {
+            use super::clean_management_intent::IntentSlotError;
+            match error {
+                IntentSlotError::Conflict => SharedAgentHostError::Conflict,
+                IntentSlotError::Invalid => SharedAgentHostError::ScopeMismatch,
+                IntentSlotError::Storage(_) | IntentSlotError::Poisoned => {
+                    SharedAgentHostError::Unavailable
+                }
+            }
+        })?;
+        let (agent, acknowledgement) = self.create_local_from_management_intent(
+            &mut slot,
+            managed,
+            local,
+            runtime,
+            &mut issuer,
+            signer,
+        )?;
+        self.finalize_management_intent(&mut slot, managed, &acknowledgement, &mut issuer)?;
         Ok((agent, acknowledgement))
     }
 
@@ -7004,6 +7082,15 @@ mod tests {
 
         #[test]
         fn native_management_intent_executes_bundled_authority_and_recovers_receipt() {
+            native_local_management_lifecycle(false);
+        }
+
+        #[test]
+        fn native_local_creation_coordinator_finalizes_and_reopens_exactly() {
+            native_local_management_lifecycle(true);
+        }
+
+        fn native_local_management_lifecycle(coordinated: bool) {
             use crate::agent::clean_management_intent::{
                 CleanManagementIntent, CleanManagementIntentSlot,
             };
@@ -7127,6 +7214,95 @@ mod tests {
             call.authority = owner.authority_target();
             call.invocation = call.expected_invocation();
             call.signature = credential_key.sign(&call.signing_bytes()).to_bytes();
+            if coordinated {
+                let store = IssuerMemoryStore::default();
+                let issuer_store = IssuerMemoryStore::default();
+                let root = harness._directory.0.join("coordinated-local");
+                let mut local = crate::agent::local_sdk_host::LocalAgentHost::create(
+                    &root,
+                    descriptor.identity.space,
+                    owner.pins.node,
+                    harness.fixture.trust.clone(),
+                )
+                .unwrap();
+                let mut signer = CountingSigner::new();
+                let before = owner.ordered_index_for_test().unwrap();
+                let mut forged = call.clone();
+                forged.signature[0] ^= 1;
+                assert!(matches!(
+                    owner.create_local_agent(
+                        store.clone(),
+                        issuer_store.clone(),
+                        descriptor.clone(),
+                        forged,
+                        &mut local,
+                        runtime.clone(),
+                        &mut signer,
+                    ),
+                    Err(SharedAgentHostError::ScopeMismatch)
+                ));
+                assert!(store.image.lock().unwrap().is_none());
+                assert!(issuer_store.image.lock().unwrap().is_none());
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+                assert_eq!(signer.calls, 0);
+                let result = owner
+                    .create_local_agent(
+                        store.clone(),
+                        issuer_store.clone(),
+                        descriptor.clone(),
+                        call.clone(),
+                        &mut local,
+                        runtime.clone(),
+                        &mut signer,
+                    )
+                    .unwrap();
+                assert_eq!(result.0, descriptor.identity.agent);
+                let issuer = DurableCleanManagementIssuer::open(
+                    issuer_store.clone(),
+                    descriptor.authority,
+                    descriptor.identity.space,
+                    descriptor.identity.agent,
+                )
+                .unwrap();
+                assert!(issuer.application_finalization_status(&result.1).unwrap());
+                drop(issuer);
+                assert_eq!(signer.calls, 2);
+                let finalized = owner.ordered_index_for_test().unwrap();
+                assert!(finalized > before);
+                drop(local);
+                harness
+                    .fixture
+                    .logical_slot
+                    .as_ref()
+                    .unwrap()
+                    .store(LOGICAL_SLOT + 20, Ordering::Release);
+                let mut local = crate::agent::local_sdk_host::LocalAgentHost::open(
+                    &root,
+                    descriptor.identity.space,
+                    owner.pins.node,
+                    harness.fixture.trust.clone(),
+                )
+                .unwrap();
+                assert_eq!(
+                    owner
+                        .create_local_agent(
+                            store,
+                            issuer_store,
+                            descriptor,
+                            call,
+                            &mut local,
+                            runtime,
+                            &mut signer,
+                        )
+                        .unwrap(),
+                    result
+                );
+                assert_eq!(signer.calls, 2);
+                assert_eq!(owner.ordered_index_for_test().unwrap(), finalized);
+                drop(local);
+                harness.stop();
+                return;
+            }
             let intent = CleanManagementIntent::new(
                 owner.authority_target(),
                 call.managed,
