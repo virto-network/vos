@@ -11507,51 +11507,20 @@ fn validate_clean_management_lanes<SourceError, ExecutorError>(
     let ReplayOperation::CleanManage { request, .. } = &input.operation else {
         return Err(ReplayError::InvalidPosition);
     };
-    let allowed = if disposition == ReplayDisposition::Applied {
-        match request {
-            crate::agent_sdk::ManagementRequest::Install(install) => {
-                install.requirements.lanes.bits()
-            }
-            crate::agent_sdk::ManagementRequest::UpgradeActor(upgrade) => {
-                upgrade.requirements.lanes.bits()
-            }
-            crate::agent_sdk::ManagementRequest::UpgradeRuntime(upgrade) => {
-                upgrade.capabilities.lanes.bits()
-            }
-            // Removing an actor may clear state in any lane the retired actor
-            // owned. The exact guest request/result still determines whether
-            // the removal succeeded.
-            crate::agent_sdk::ManagementRequest::RemoveLeaf { .. } => {
-                crate::agent_sdk::LaneSet::ALL.bits()
-            }
-            crate::agent_sdk::ManagementRequest::Create(_)
-            | crate::agent_sdk::ManagementRequest::Suspend { .. }
-            | crate::agent_sdk::ManagementRequest::Resume { .. }
-            | crate::agent_sdk::ManagementRequest::ChangeReplicas { .. } => {
-                crate::agent_sdk::LaneSet::NONE.bits()
-            }
-            crate::agent_sdk::ManagementRequest::InspectActors { .. }
+    if matches!(
+        request,
+        crate::agent_sdk::ManagementRequest::InspectActors { .. }
             | crate::agent_sdk::ManagementRequest::InspectResources
-            | crate::agent_sdk::ManagementRequest::PrivateControl { .. } => {
-                return Err(ReplayError::InvalidManagementTransition);
-            }
-        }
-    } else {
-        // A rejected mutation may durably consume authority in Control but
-        // cannot initialize, migrate, or clear actor-owned lane state.
-        crate::agent_sdk::LaneSet::NONE.bits()
-    };
-    let linear = crate::agent_sdk::LaneSet::of(crate::agent_sdk::StateLane::Linear).bits();
-    let merge = crate::agent_sdk::LaneSet::of(crate::agent_sdk::StateLane::Merge).bits();
-    let local = crate::agent_sdk::LaneSet::of(crate::agent_sdk::StateLane::Local).bits();
-    let canonical_create_initialization = disposition == ReplayDisposition::Applied
-        && matches!(request, crate::agent_sdk::ManagementRequest::Create(_))
-        && super::wire::clean_create_initializes_only_empty_lanes(before, after);
-    if !canonical_create_initialization
-        && ((after.linear != before.linear && allowed & linear == 0)
-            || (after.merge != before.merge && allowed & merge == 0)
-            || (after.local != before.local && allowed & local == 0))
-    {
+            | crate::agent_sdk::ManagementRequest::PrivateControl { .. }
+    ) {
+        return Err(ReplayError::InvalidManagementTransition);
+    }
+    if !super::wire::clean_management_lane_changes_allowed(
+        request,
+        before,
+        after,
+        disposition == ReplayDisposition::Applied,
+    ) {
         return Err(ReplayError::CrossLaneMutation);
     }
     Ok(None)

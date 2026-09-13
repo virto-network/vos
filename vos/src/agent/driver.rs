@@ -3636,11 +3636,15 @@ impl<S: AgentImageStore> AgentDriver<S> {
                 crate::agent_sdk::RuntimeOutcome::Management(_)
             )
             || !sdk_management_reply_matches(&current, &request, &returned.outcome)
-            || (read_only && returned.state != legacy_state_as_sdk(&self.image.runtime_state))
-            || (!read_only
-                && (returned.state.linear != self.image.runtime_state.linear
-                    || returned.state.merge != self.image.runtime_state.merge
-                    || returned.state.local != self.image.runtime_state.local))
+            || !super::wire::clean_management_lane_changes_allowed(
+                &request,
+                &self.image.runtime_state,
+                &sdk_state_as_legacy(&returned.state),
+                matches!(
+                    returned.outcome,
+                    crate::agent_sdk::RuntimeOutcome::Management(Ok(_))
+                ),
+            )
         {
             staged.rollback(&mut self.store);
             return Err(AgentDriverError::InvalidRuntime);

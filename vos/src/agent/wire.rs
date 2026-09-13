@@ -709,6 +709,52 @@ pub(crate) fn clean_create_initializes_only_empty_lanes(
     after.linear == empty.linear && after.merge == empty.merge && after.local == empty.local
 }
 
+/// Common public management lane boundary for image and journal hosts.
+/// Request authentication and exact reply validation must happen separately.
+pub(crate) fn clean_management_lane_changes_allowed(
+    request: &crate::agent_sdk::ManagementRequest,
+    before: &RuntimeState,
+    after: &RuntimeState,
+    success: bool,
+) -> bool {
+    use crate::agent_sdk::{LaneSet, ManagementRequest, StateLane};
+    if matches!(
+        request,
+        ManagementRequest::InspectActors { .. } | ManagementRequest::InspectResources
+    ) {
+        return before == after;
+    }
+    if matches!(request, ManagementRequest::PrivateControl { .. }) {
+        return false;
+    }
+    let allowed = if success {
+        match request {
+            ManagementRequest::Install(install) => install.requirements.lanes,
+            ManagementRequest::UpgradeActor(upgrade) => upgrade.requirements.lanes,
+            ManagementRequest::UpgradeRuntime(upgrade) => upgrade.capabilities.lanes,
+            // The admitted runtime resolves the retired actor's ownership;
+            // removal may clear any lane. This is not authorization by itself.
+            ManagementRequest::RemoveLeaf { .. } => LaneSet::ALL,
+            _ => LaneSet::NONE,
+        }
+    } else {
+        LaneSet::NONE
+    };
+    if success
+        && matches!(request, ManagementRequest::Create(_))
+        && clean_create_initializes_only_empty_lanes(before, after)
+    {
+        return true;
+    }
+    [
+        (StateLane::Linear, &before.linear, &after.linear),
+        (StateLane::Merge, &before.merge, &after.merge),
+        (StateLane::Local, &before.local, &after.local),
+    ]
+    .into_iter()
+    .all(|(lane, prior, next)| prior == next || allowed.bits() & LaneSet::of(lane).bits() != 0)
+}
+
 /// Decode all opaque standard-runtime components. Lane maps are sparse and
 /// independently keyed: matching active generations hydrate actor state,
 /// missing matching entries mean fresh empty state, and nonmatching entries
@@ -5252,6 +5298,93 @@ pub(crate) mod tests {
                 scheduling: false,
                 proof_systems: crate::agent_sdk::ProofSystemSet::EMPTY,
             },
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_management_lane_boundary_covers_initialization_migration_and_denials() {
+        use crate::agent_sdk::{
+            LaneSet, ManagementRequest, RuntimeUpgrade, StateLane, UpgradeActor,
+        };
+        let descriptor = clean_test_descriptor(crate::agent_sdk::AgentProfile::Shared);
+        let before = RuntimeState {
+            control: vec![0xa1],
+            linear: vec![1],
+            merge: vec![2],
+            local: vec![3],
+        };
+        for bits in 0..8 {
+            let lanes = LaneSet::from_bits(bits).unwrap();
+            let install = clean_install_request(&descriptor, "lane-probe", None, 0x71, lanes);
+            let upgrade = UpgradeActor {
+                actor: install.entry.actor,
+                from_deployment: crate::agent_sdk::DeploymentId([0x70; 32]),
+                to_deployment: install.entry.deployment,
+                to_program: install.entry.program,
+                producer: install.producer,
+                package: install.package.clone(),
+                agent_schema: install.agent_schema.clone(),
+                method_policy: install.method_policy.clone(),
+                constructor_abi: install.constructor_abi,
+                state_layout: install.state_layout,
+                contract: install.contract,
+                requirements: install.requirements,
+            };
+            let mut capabilities = descriptor.capabilities;
+            capabilities.lanes = lanes;
+            let runtime_upgrade = RuntimeUpgrade {
+                from_deployment: descriptor.identity.runtime_deployment,
+                to_deployment: crate::agent_sdk::DeploymentId([0x72; 32]),
+                to_program: descriptor.identity.runtime_program,
+                producer: descriptor.identity.runtime_producer,
+                package: descriptor.runtime_package.clone(),
+                contract: descriptor.runtime_contract,
+                capabilities,
+            };
+            for request in [
+                ManagementRequest::Install(Box::new(install)),
+                ManagementRequest::UpgradeActor(Box::new(upgrade)),
+                ManagementRequest::UpgradeRuntime(Box::new(runtime_upgrade)),
+            ] {
+                for lane in [StateLane::Linear, StateLane::Merge, StateLane::Local] {
+                    let mut after = before.clone();
+                    match lane {
+                        StateLane::Linear => after.linear.push(9),
+                        StateLane::Merge => after.merge.push(9),
+                        StateLane::Local => after.local.push(9),
+                    }
+                    assert_eq!(
+                        clean_management_lane_changes_allowed(&request, &before, &after, true),
+                        bits & LaneSet::of(lane).bits() != 0
+                    );
+                    assert!(!clean_management_lane_changes_allowed(
+                        &request, &before, &after, false
+                    ));
+                }
+                let mut control_only = before.clone();
+                control_only.control.push(9);
+                assert!(clean_management_lane_changes_allowed(
+                    &request,
+                    &before,
+                    &control_only,
+                    false
+                ));
+            }
+        }
+        let inspect = ManagementRequest::InspectResources;
+        let mut control_only = before.clone();
+        control_only.control.push(9);
+        for success in [false, true] {
+            assert!(clean_management_lane_changes_allowed(
+                &inspect, &before, &before, success
+            ));
+            assert!(!clean_management_lane_changes_allowed(
+                &inspect,
+                &before,
+                &control_only,
+                success
+            ));
         }
     }
 

@@ -1187,3 +1187,27 @@ continuation/acknowledgement recovery through this same host, and reconcile
 management lane-transition rules with the public ABI for initialization and
 migration. Ordinary-Agent finality and the final release gates remain open;
 the branch is not yet master-ready.
+
+### Local and journal management lane parity
+
+The image-backed Local path previously rejected every non-Control management
+change, including legitimate actor initialization and migration which journal
+replay already permitted. Both paths now use one public lane-boundary helper:
+successful installation/actor upgrade may change declared requirement lanes,
+runtime upgrade may change declared capability lanes, and successful removal
+may clear retired actor state. Signed request admission, runtime validation,
+typed replies and exact-history checks remain separate mandatory gates; a lane
+mask alone is not authorization. Denials may consume authority in Control but
+cannot change actor lanes, and inspection preserves all four lanes exactly.
+
+The new regression checks all eight lane masks against each actor lane for
+installation, actor upgrade and runtime upgrade, plus denied transitions and
+read-only Control mutation. **160/160 driver, Local host, replay and wire tests
+pass** (`r16-management-lane-parity.log`, 33.02s), including opaque Local
+Create/reopen, checkpoint/replay and the existing exact retry tests. Formatting
+and diff checks pass. This removes a concrete Local initialization/migration
+restriction; it does not replace the still-required signed custom actor
+installation/invocation/continuation lifecycle test or the final release gates.
+The physical Shared custom-runtime management/snapshot/reopen regression also
+passes **1/1** (`r16-management-lane-shared-physical.log`, 1.27s), exercising
+the other production consumer of the common lane rule.
