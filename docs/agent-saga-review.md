@@ -2793,6 +2793,39 @@ with a pending projection. No final-source exhausted-capacity proof or native
 daemon restart of multiple lifecycle stores is claimed. Production
 retirement/handoff remains disabled until those gates are implemented.
 
+### Linear management cannot use the projection boundary fallback
+
+Tracing incomplete recovery found that persisted Linear management preparation
+also reached `retained_terminal_projection_boundary`. That fallback is meant
+for read-only Query projections, but it previously accepted an exact matching
+Linear invocation at the certified checkpoint boundary and executed the runtime
+to reconstruct a terminal result. A physical bundled-Authority regression
+reproduced this: the old source returned `Ok(Completed(Ok(...)))` for Linear work
+after checkpointing its invocation (`r16-linear-boundary-red.log`, one expected
+failure, 48.08s). This proves the unsupported fallback was reachable; it does
+not prove the bundled runtime duplicated an external effect.
+
+An exact non-Query boundary now returns a cross-store error before runtime
+execution, instead of reporting a retained result or falling through to new
+publication. Exact Linear results still present in the authenticated suffix
+remain replayable without an additional Ordered slot. The fixture checks both
+sides of that boundary and verifies that checkpoint/refusal do not append a
+replacement invocation. The existing read-only Query boundary protocol remains
+supported and has a separate physical checkpoint/reopen regression.
+
+Final-source verification: **11 native bootstrap/lifecycle tests passed**
+(100.67s, `r16-linear-boundary-green.log`), including the previously failing
+Linear-boundary regression. The physical Query boundary/reopen test also
+passed (**1/1**, 1.34s, `r16-linear-boundary-query.log`). Formatting and diff
+checks pass. All evidence is under the shared disk scratch directory, not
+`/tmp`; no rebuilt-CLI smoke or full release run is claimed.
+
+This is not a complete incomplete-intent recovery protocol. Startup still needs
+authenticated evidence distinguishing never-accepted work from pruned work,
+protection before any checkpoint can discard needed evidence, and integration
+of pending projections with the lifecycle recovery set. Rejecting this unsafe
+fallback does not establish restart readiness for those cases.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

@@ -8696,56 +8696,12 @@ mod tests {
             // This tests suffix accounting, not fresh credential authorization.
             let mut extra = Vec::new();
             for index in 0..4 {
-                let mut call = intent.call().clone();
-                call.request_sequence =
-                    core::num::NonZeroU64::new(call.request_sequence.get() + index + 1).unwrap();
-                call.invocation = call.expected_invocation();
-                call.signature = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32])
-                    .sign(&call.signing_bytes())
-                    .to_bytes();
-                let next = crate::agent::clean_management_intent::CleanManagementIntent::new(
-                    call.authority,
-                    call.managed,
-                    intent.request().clone(),
-                    call,
-                    &RawCredentialVerifier,
-                )
-                .unwrap();
-                let mut envelope = original[0].clone();
-                let RuntimeWork::Invoke {
-                    invocation,
-                    authorization,
-                    observed_slot,
-                    ..
-                } = &mut envelope
-                else {
-                    unreachable!()
-                };
-                invocation.invocation = next.call().invocation;
-                invocation.message = next.authorization_message();
-                let material = owner
-                    .supervisor_invocation_material(owner.pins.agent, invocation.actor)
-                    .unwrap();
-                // These are new calls, not retries of persisted envelopes.
-                *observed_slot = material.observed_slot;
-                **authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
-                    crate::agent_sdk::PublicPreflight::for_work(invocation, *observed_slot),
-                );
-                let identity =
-                    crate::agent::supervisor_adapters::physical_material_identity(&material)
-                        .unwrap();
-                let result = owner
-                    .supervisor_invoke_persisted_management(
-                        identity,
-                        (**invocation).clone(),
-                        (**authorization).clone(),
-                    )
-                    .unwrap();
-                assert!(
-                    matches!(result, RuntimeOutcome::Completed(Ok(_))),
-                    "{result:?}"
-                );
-                extra.push(envelope);
+                extra.push(execute_extra_management_call(
+                    owner,
+                    original[0],
+                    intent,
+                    index,
+                ));
             }
             let host = owner.host.lock().unwrap();
             let agent = HostAgentId(owner.pins.agent.0);
@@ -8768,6 +8724,128 @@ mod tests {
             );
             drop(host);
             check_multiple_management_retirement_gate(owner, &extra, network);
+            let boundary = execute_extra_management_call(owner, original[0], intent, 4);
+            check_linear_checkpoint_boundary_refuses_projection_fallback(owner, &boundary);
+        }
+
+        #[inline(never)]
+        fn execute_extra_management_call(
+            owner: &MemoryBootstrapOwner,
+            original: &RuntimeWork,
+            intent: &crate::agent::clean_management_intent::CleanManagementIntent,
+            index: u64,
+        ) -> RuntimeWork {
+            let mut call = intent.call().clone();
+            call.request_sequence =
+                core::num::NonZeroU64::new(call.request_sequence.get() + index + 1).unwrap();
+            call.invocation = call.expected_invocation();
+            call.signature = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32])
+                .sign(&call.signing_bytes())
+                .to_bytes();
+            let next = crate::agent::clean_management_intent::CleanManagementIntent::new(
+                call.authority,
+                call.managed,
+                intent.request().clone(),
+                call,
+                &RawCredentialVerifier,
+            )
+            .unwrap();
+            let mut envelope = original.clone();
+            let RuntimeWork::Invoke {
+                invocation,
+                authorization,
+                observed_slot,
+                ..
+            } = &mut envelope
+            else {
+                unreachable!()
+            };
+            invocation.invocation = next.call().invocation;
+            invocation.message = next.authorization_message();
+            let material = owner
+                .supervisor_invocation_material(owner.pins.agent, invocation.actor)
+                .unwrap();
+            // Fresh calls use current admission; persisted retries retain it.
+            *observed_slot = material.observed_slot;
+            **authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+                crate::agent_sdk::PublicPreflight::for_work(invocation, *observed_slot),
+            );
+            let identity =
+                crate::agent::supervisor_adapters::physical_material_identity(&material).unwrap();
+            let result = owner
+                .supervisor_invoke_persisted_management(
+                    identity,
+                    (**invocation).clone(),
+                    (**authorization).clone(),
+                )
+                .unwrap();
+            assert!(
+                matches!(result, RuntimeOutcome::Completed(Ok(_))),
+                "{result:?}"
+            );
+            envelope
+        }
+
+        #[inline(never)]
+        fn check_linear_checkpoint_boundary_refuses_projection_fallback(
+            owner: &mut MemoryBootstrapOwner,
+            envelope: &RuntimeWork,
+        ) {
+            let RuntimeWork::Invoke {
+                invocation,
+                authorization,
+                ..
+            } = envelope
+            else {
+                unreachable!()
+            };
+            let agent = HostAgentId(owner.pins.agent.0);
+            let before = owner.ordered_index_for_test().unwrap();
+            let (query, query_auth) = fresh_projection_pair(owner, 0xef);
+            let material = owner
+                .supervisor_invocation_material(owner.pins.agent, invocation.actor)
+                .unwrap();
+            let identity =
+                crate::agent::supervisor_adapters::physical_material_identity(&material).unwrap();
+            assert!(matches!(
+                owner
+                    .supervisor_invoke_persisted_management(
+                        identity,
+                        (**invocation).clone(),
+                        (**authorization).clone(),
+                    )
+                    .unwrap(),
+                RuntimeOutcome::Completed(Ok(_))
+            ));
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            owner._network_host.force_checkpoint_once_for_test();
+            assert!(
+                owner
+                    ._network_host
+                    .certified_checkpoint_for_projection_pair(
+                        agent,
+                        &query,
+                        &query_auth,
+                        &owner.pins.replicas,
+                        owner.snapshot_signer.as_ref(),
+                    )
+                    .unwrap()
+            );
+            let material = owner
+                .supervisor_invocation_material(owner.pins.agent, invocation.actor)
+                .unwrap();
+            let identity =
+                crate::agent::supervisor_adapters::physical_material_identity(&material).unwrap();
+            let result = owner.supervisor_invoke_persisted_management(
+                identity,
+                (**invocation).clone(),
+                (**authorization).clone(),
+            );
+            assert!(
+                result.is_err(),
+                "Linear checkpoint boundary used projection fallback: {result:?}"
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
         }
 
         #[inline(never)]

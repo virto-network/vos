@@ -1719,6 +1719,13 @@ where
         if prior_context != context || prior_work != work || prior_authorization != authorization {
             return Ok(None);
         }
+        // This fallback is exclusively the read-only projection protocol.
+        // Persisted management dispatch also reaches this preparation path;
+        // an exact Linear boundary is not authenticated retained-result
+        // evidence and must not fall through to speculative execution.
+        if work.mode != crate::agent_sdk::MethodMode::Query {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
         let outcome = self
             .executor
             .clean_invocation_terminal_outcome(
