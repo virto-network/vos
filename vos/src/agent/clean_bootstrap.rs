@@ -2872,6 +2872,11 @@ where
         let observation = local
             .observe_management_application(agent, &request, &receipt)
             .map_err(|_| SharedAgentHostError::Unavailable)?;
+        #[cfg(test)]
+        if self.finalization_failure_once == Some(3) {
+            self.finalization_failure_once = None;
+            return Err(SharedAgentHostError::Unavailable);
+        }
         let acknowledgement = issuer
             .observe_local_application(&observation, signer)
             .map_err(|_| SharedAgentHostError::Unavailable)?;
@@ -7617,6 +7622,11 @@ mod tests {
         }
 
         #[test]
+        fn native_local_lifecycle_startup_observes_unacknowledged_local_image() {
+            native_local_management_lifecycle(13);
+        }
+
+        #[test]
         fn native_node_rejects_lifecycle_start_after_shutdown_without_leaking_hosts() {
             native_local_management_lifecycle(3);
         }
@@ -8068,7 +8078,7 @@ mod tests {
                 harness.stop();
                 return;
             }
-            if matches!(coordinated, 2 | 3 | 8 | 9 | 10 | 11 | 12) {
+            if matches!(coordinated, 2 | 3 | 8 | 9 | 10 | 11 | 12 | 13) {
                 struct LeasedStore {
                     inner: IssuerMemoryStore,
                     active: Arc<AtomicUsize>,
@@ -8244,8 +8254,14 @@ mod tests {
                 if interrupted {
                     controller.fail_finalization_once_for_test(coordinated - 10);
                 }
+                let application_slot = harness
+                    .fixture
+                    .logical_slot
+                    .as_ref()
+                    .unwrap()
+                    .load(Ordering::Acquire);
                 let created = controller.create(descriptor.clone(), call.clone(), runtime.clone());
-                let result = if interrupted {
+                let mut result = if interrupted {
                     assert!(matches!(created, Err(SharedAgentHostError::Unavailable)));
                     let issuer = DurableCleanManagementIssuer::open(
                         issuer_store.clone(),
@@ -8254,7 +8270,7 @@ mod tests {
                         descriptor.identity.agent,
                     )
                     .unwrap();
-                    let (_, acknowledgement) = issuer
+                    let observed = issuer
                         .recover_observed_application(
                             call.authority,
                             call.managed,
@@ -8262,18 +8278,26 @@ mod tests {
                             &call,
                             &RawCredentialVerifier,
                         )
-                        .unwrap()
                         .unwrap();
-                    assert!(
-                        !issuer
-                            .application_finalization_status(&acknowledgement)
-                            .unwrap()
-                    );
-                    (descriptor.identity.agent, acknowledgement)
+                    if coordinated == 13 {
+                        assert!(observed.is_none());
+                        assert_eq!(issuer.retained_decisions(), 1);
+                        None
+                    } else {
+                        let (_, acknowledgement) = observed.unwrap();
+                        assert!(
+                            !issuer
+                                .application_finalization_status(&acknowledgement)
+                                .unwrap()
+                        );
+                        Some((descriptor.identity.agent, acknowledgement))
+                    }
                 } else {
-                    created.unwrap()
+                    Some(created.unwrap())
                 };
-                assert_eq!(result.0, descriptor.identity.agent);
+                if let Some(result) = &result {
+                    assert_eq!(result.0, descriptor.identity.agent);
+                }
                 assert!(loads.load(Ordering::SeqCst) >= failed_loads + 2);
                 let issuer = DurableCleanManagementIssuer::open(
                     issuer_store,
@@ -8282,10 +8306,12 @@ mod tests {
                     descriptor.identity.agent,
                 )
                 .unwrap();
-                assert_eq!(
-                    issuer.application_finalization_status(&result.1).unwrap(),
-                    !interrupted
-                );
+                if let Some(result) = &result {
+                    assert_eq!(
+                        issuer.application_finalization_status(&result.1).unwrap(),
+                        !interrupted
+                    );
+                }
                 drop(issuer);
                 routes.retire().unwrap();
                 let routes = controller.local_attachment(4).unwrap();
@@ -8300,7 +8326,7 @@ mod tests {
                         controller
                             .create(descriptor.clone(), call.clone(), runtime.clone())
                             .unwrap(),
-                        result
+                        result.clone().unwrap()
                     );
                 }
                 assert_eq!(opens.load(Ordering::SeqCst), 1);
@@ -8420,25 +8446,29 @@ mod tests {
                                         &descriptor,
                                         attempt,
                                         interrupted,
-                                        coordinated == 10 || coordinated == 12,
-                                        coordinated == 12,
+                                        coordinated == 10 || coordinated >= 12,
+                                        coordinated >= 12,
                                     )
                                 })
                                 .join()
                                 .unwrap()
                         });
-                        assert_eq!(
-                            controller
-                                .create(descriptor.clone(), call.clone(), runtime.clone())
-                                .unwrap(),
-                            result
-                        );
+                        let recovered = controller
+                            .create(descriptor.clone(), call.clone(), runtime.clone())
+                            .unwrap();
+                        assert_eq!(recovered.0, descriptor.identity.agent);
+                        assert_eq!(recovered.1.credential_call, call.commitment());
+                        assert!(recovered.1.verify_with(&RawCredentialVerifier).is_ok());
+                        if coordinated == 13 {
+                            assert_eq!(recovered.1.applied_at, application_slot);
+                        }
+                        assert_eq!(&recovered, result.get_or_insert(recovered.clone()));
                         assert_eq!(active.load(Ordering::SeqCst), 2);
                     }
                 }
                 drop(controller);
                 assert_eq!(active.load(Ordering::SeqCst), 0);
-                if coordinated == 12 {
+                if coordinated >= 12 {
                     let slot =
                         crate::agent::clean_management_intent::CleanManagementIntentSlot::open(
                             intent_store,

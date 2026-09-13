@@ -28,10 +28,11 @@ migration provided; do not point this clean-break build at valuable old data.
 Current host lifecycle images additionally require CMI4/CMR2 with pre-dispatch
 journal anchors; earlier CMI3/CMR1 images are rejected, not migrated.
 Startup now discovers lifecycle stores before system attachment, recovers
-finalization from durable application acknowledgements (including protected
-preparation of a missing finalization envelope), and retires results before
-normal routes. Earlier phases without a durable application acknowledgement
-still stop startup, preserving their stores. Continuous live protection and
+acknowledgements from exact issued receipts and durable Local images, completes
+finalization (including protected preparation of a missing envelope), and retires
+results before normal routes. Earlier phases without an issued receipt or
+recoverable physical Local application still stop startup, preserving their
+stores. Continuous live protection and
 coexistence with an unfinished projection
 remain implementation blockers, not deployment-ready behavior. Do not delete
 those stores to bypass the recovery check.
@@ -3287,6 +3288,50 @@ coverage. The filesystem lifecycle filter passed **10 tests** (0.04s,
 4 cases (69.57s, `r16-missing-finalization-startup.log`); final clock/CMR2 assertions
 are covered by the later native run. Evidence is in shared disk scratch.
 Formatting and diff checks pass.
+
+### Startup observes an unacknowledged durable Local application
+
+Issuer recovery now exposes a read-only lookup for the exact latest issued
+application receipt. It binds the signed call, independent Authority target,
+managed agent, request, and reconstructed authorized decision. Pending issuance
+is not a receipt; forged calls and poisoned issuers reject. It does not sign,
+observe application, or advance a watermark.
+
+Lifecycle discovery can admit the saved authorization envelope for that receipt
+even before an application acknowledgement exists. Before any missing
+acknowledgement is signed, startup re-observes **all** recovered applications by
+reopening their physical Local images and runtime/catalog artifacts. It then
+recovers or signs the acknowledgement against the original durable application
+state/slot and uses protected finalization/retirement before normal routes.
+This handles an already-durable Create, not creation with an unavailable runtime
+or missing Local image. A receipt without physical application still fails shut.
+
+The new native test interrupts after physical Create observation but before
+acknowledgement publication. It verifies the outstanding receipt and absent
+acknowledgement, then restarts with an advanced clock. Recovery adds one
+finalization Invoke and two Acks; the acknowledgement keeps the original
+application slot and the finalization envelope uses the restart slot. A second
+restart adds no Ordered work and exact retries return the same signed result.
+Fixtures use physical Local images/host journals and lease-tracked in-memory
+lifecycle stores, not a cross-process filesystem fault campaign.
+
+Remaining C2 recovery work includes pending authorization/issuance, obtaining
+the exact runtime and finishing Create when no durable Local image exists,
+ambiguous filesystem writes across process restart, continuous live protection,
+and unfinished-projection/capacity/GC cases. Native install/invoke and the other
+release gates remain open; bundles and deployment smoke were not refreshed.
+
+Verification: **5 startup tests passed** on the corrected final fixture (82.17s,
+`r16-unacknowledged-local-startup-final.log`), **12 issuer tests passed** (4.36s,
+`r16-unacknowledged-local-issuer.log`), and **10 filesystem tests passed** (0.11s,
+`r16-unacknowledged-local-files.log`). The broader native run passed its 16
+existing tests but failed the new test's initial hard-coded application-slot
+assertion (357.94s, `r16-unacknowledged-local-native-final.log`). Diagnostic output
+showed 22 versus 20: bootstrap had advanced the fixture clock twice before
+Create. The assertion now captures the actual pre-Create clock; the final five
+startup tests above include that correction. Production code did not change
+between those runs. This is not a claim of a single all-green full native rerun.
+Logs remain in shared disk scratch; formatting and diff checks pass.
 
 ### Durable client acknowledgement before completion
 

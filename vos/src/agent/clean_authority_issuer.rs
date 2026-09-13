@@ -1476,6 +1476,77 @@ impl<B: CleanManagementIssuerStore> DurableCleanManagementIssuer<B> {
         self.recover_recorded_application(authority, managed, request, call, verifier, false)
     }
 
+    /// Read the exact latest issued application receipt without signing,
+    /// observing application, or advancing either durable acknowledgement.
+    /// Pending issuance is not a receipt and cannot enter this recovery phase.
+    pub(crate) fn recover_issued_application<V: AuthorityCredentialVerifier>(
+        &self,
+        authority: AuthorityActorTarget,
+        managed: ManagedAgentTarget,
+        request: &ManagementRequest,
+        call: &AuthorityCredentialCall,
+        verifier: &V,
+    ) -> Result<Option<AuthorityReceipt>, CleanManagementIssuerError<B::Error>> {
+        self.ensure_live()?;
+        let invalid = || {
+            CleanManagementIssuerError::Rejected(CleanManagementIssuerRejection::InvalidObservation)
+        };
+        if call.authority != authority
+            || call.managed != managed
+            || authority.binding != self.image.binding
+            || managed.space != self.image.space
+            || managed.agent != self.image.agent
+            || !call.plan.matches_request(request)
+            || call.verify_with(verifier).is_err()
+        {
+            return Err(invalid());
+        }
+        if self.image.pending.is_some() || self.image.retained.len() > 1 {
+            return Ok(None);
+        }
+        let Some(record) = self
+            .image
+            .retained
+            .last()
+            .or(self.image.acknowledged.as_ref())
+        else {
+            return Ok(None);
+        };
+        if record.sequence != self.image.decision_sequence_high_water {
+            return Err(invalid());
+        }
+        let decision = decode_authorized_decision(&record.decision)
+            .map_err(|_| CleanManagementIssuerError::InvalidState)?;
+        let Some(application) = decision.application else {
+            return Ok(None);
+        };
+        if application.credential_call != call.commitment() {
+            return Ok(None);
+        }
+        let approval = ManagementApproval::from_call(
+            call,
+            decision.authorization_id,
+            decision.evidence.clone(),
+            decision.lane_roots,
+            decision.epoch,
+            decision.valid_from,
+            decision.expires_at,
+        )
+        .map_err(|_| invalid())?;
+        let expected = AuthorizedCleanManagementDecision::from_approval(
+            authority, managed, request, call, &approval, verifier,
+        )
+        .map_err(|_| invalid())?;
+        if expected != decision {
+            return Err(invalid());
+        }
+        // The loaded/committed issuer image validates the selector, receipt
+        // signature and canonical bytes against this exact decision.
+        AuthorityReceipt::decode(&record.receipt)
+            .map(Some)
+            .map_err(|_| CleanManagementIssuerError::InvalidState)
+    }
+
     fn recover_recorded_application<V: AuthorityCredentialVerifier>(
         &self,
         authority: AuthorityActorTarget,
@@ -3236,9 +3307,28 @@ mod tests {
                 &TestCredentialVerifier,
             )
         };
+        let issued = |issuer: &DurableCleanManagementIssuer<MemoryImageStore>| {
+            issuer.recover_issued_application(
+                call.authority,
+                call.managed,
+                &request,
+                &call,
+                &TestCredentialVerifier,
+            )
+        };
         assert_eq!(recover(&issuer).unwrap(), None);
         assert_eq!(observe(&issuer).unwrap(), None);
+        assert_eq!(issued(&issuer).unwrap(), None);
+        signer.fail_next = true;
+        assert!(issuer.issue(&decision, &mut signer).is_err());
+        assert!(issuer.has_pending_decision());
+        assert_eq!(issued(&issuer).unwrap(), None);
         let receipt = issuer.issue(&decision, &mut signer).unwrap();
+        let before_receipt_recovery = store.image();
+        let before_receipt_calls = signer.calls;
+        assert_eq!(issued(&issuer).unwrap(), Some(receipt.clone()));
+        assert_eq!(store.image(), before_receipt_recovery);
+        assert_eq!(signer.calls, before_receipt_calls);
         assert_eq!(recover(&issuer).unwrap(), None);
         assert_eq!(observe(&issuer).unwrap(), None);
         let ack = issuer
@@ -3258,8 +3348,20 @@ mod tests {
             Some((receipt.clone(), ack.clone()))
         );
         assert!(!issuer.application_finalization_status(&ack).unwrap());
+        assert_eq!(issued(&issuer).unwrap(), Some(receipt.clone()));
         let mut forged_unfinalized = call.clone();
         forged_unfinalized.signature[0] ^= 1;
+        assert!(
+            issuer
+                .recover_issued_application(
+                    call.authority,
+                    call.managed,
+                    &request,
+                    &forged_unfinalized,
+                    &TestCredentialVerifier
+                )
+                .is_err()
+        );
         assert!(
             issuer
                 .recover_observed_application(
@@ -3324,6 +3426,7 @@ mod tests {
         issuer.poisoned = true;
         assert!(recover(&issuer).is_err());
         assert!(observe(&issuer).is_err());
+        assert!(issued(&issuer).is_err());
     }
 
     #[test]

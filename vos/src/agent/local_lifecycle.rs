@@ -255,8 +255,9 @@ pub struct LocalLifecycleRecovery<I: CleanManagementIssuerStore, J: CleanManagem
 }
 
 /// Startup admission derived only from verified, still-leased lifecycle stores.
-/// Covers completed work and observed application acknowledgements, including
-/// those whose finalization envelope still needs protected publication.
+/// Covers completed work and issued receipts. Unacknowledged application must
+/// be independently recovered from the physical Local image before signing or
+/// finalization; this admission value alone does not prove application.
 pub struct LocalLifecycleStartupAdmission {
     pub(crate) authority: super::sdk::authority::AuthorityActorTarget,
     pub(crate) retirements: Vec<[super::sdk::RuntimeWork; 2]>,
@@ -283,6 +284,7 @@ pub(crate) struct LocalLifecycleRecoveryEntry<
     pub(crate) issuer: super::clean_authority_issuer::DurableCleanManagementIssuer<J>,
     pub(crate) finalized: Option<ManagementApplicationAck>,
     pub(crate) observed: Option<ManagementApplicationAck>,
+    pub(crate) issued: Option<super::sdk::authority::AuthorityReceipt>,
 }
 
 impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycleRecovery<I, J> {
@@ -315,7 +317,7 @@ impl<I: CleanManagementIssuerStore, J: CleanManagementIssuerStore> LocalLifecycl
                 (Some(authorization), Some(finalization), Some(_)) => {
                     retirements.push([authorization.clone(), finalization.clone()]);
                 }
-                (Some(authorization), finalization, None) if entry.observed.is_some() => {
+                (Some(authorization), finalization, None) if entry.issued.is_some() => {
                     let authorization_anchor = entry
                         .intent
                         .authorization_anchor()
@@ -502,12 +504,29 @@ pub fn discover_local_lifecycle_recovery<F: LocalLifecycleStoreFactory>(
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
         }
+        let issued = if let Some(request) = intent.intent() {
+            issuer
+                .recover_issued_application(
+                    authority,
+                    request.call().managed,
+                    request.request(),
+                    request.call(),
+                    &RawCredentialVerifier,
+                )
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+        } else {
+            None
+        };
+        if observed.is_some() && issued.is_none() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
         entries.push(LocalLifecycleRecoveryEntry {
             agent,
             intent,
             issuer,
             finalized,
             observed,
+            issued,
         });
     }
     Ok(LocalLifecycleRecovery { authority, entries })
@@ -641,39 +660,36 @@ where
         // Validate the entire set before retiring any member. Incomplete
         // phases require their own protected recovery protocol, not omission.
         let admission = recovery.startup_admission()?;
-        for entry in &mut recovery.entries {
-            if let Some(acknowledgement) = &entry.observed {
+        let mut observations = Vec::new();
+        for (index, entry) in recovery.entries.iter().enumerate() {
+            if let Some(receipt) = &entry.issued {
                 let request = entry
                     .intent
                     .intent()
                     .ok_or(SharedAgentHostError::ScopeMismatch)?;
-                let (receipt, recovered) = entry
-                    .issuer
-                    .recover_observed_application(
-                        recovery.authority,
-                        request.call().managed,
-                        request.request(),
-                        request.call(),
-                        &super::clean_bootstrap::RawCredentialVerifier,
-                    )
-                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?
-                    .ok_or(SharedAgentHostError::ScopeMismatch)?;
-                if &recovered != acknowledgement {
-                    return Err(SharedAgentHostError::ScopeMismatch);
-                }
                 // A finalized issuer cannot replace the actual Local image.
                 let observation = local
-                    .observe_management_application(entry.agent, request.request(), &receipt)
+                    .observe_management_application(entry.agent, request.request(), receipt)
                     .map_err(|_| SharedAgentHostError::Unavailable)?;
-                if entry
-                    .issuer
-                    .observe_local_application(&observation, &mut signer)
-                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?
-                    != *acknowledgement
-                {
-                    return Err(SharedAgentHostError::ScopeMismatch);
-                }
+                observations.push((index, observation));
             }
+        }
+        // Check all physical images before signing a missing acknowledgement
+        // for any member. An issued receipt alone is not application proof.
+        for (index, observation) in observations {
+            let entry = &mut recovery.entries[index];
+            let acknowledgement = entry
+                .issuer
+                .observe_local_application(&observation, &mut signer)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            if entry
+                .observed
+                .as_ref()
+                .is_some_and(|saved| saved != &acknowledgement)
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            entry.observed = Some(acknowledgement);
         }
         let mut recovered_pairs = Vec::new();
         for entry in &mut recovery.entries {
