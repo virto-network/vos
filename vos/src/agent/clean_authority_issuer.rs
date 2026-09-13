@@ -87,6 +87,24 @@ impl<B: CleanManagementRuntimeStore + ?Sized> CleanManagementRuntimeStore for &m
     }
 }
 
+/// One bounded active actor package under the intent's exclusive lease.
+/// Unlike the immutable Create runtime, a later retired-intent handoff may
+/// replace this image. The intent coordinator, not the storage envelope,
+/// authenticates the package and forbids replacement after dispatch preparation.
+pub trait CleanManagementActorStore: CleanManagementIssuerStore {
+    fn load_actor(&mut self) -> Result<Option<Vec<u8>>, Self::Error>;
+    fn commit_actor(&mut self, package: &[u8]) -> Result<(), Self::Error>;
+}
+
+impl<B: CleanManagementActorStore + ?Sized> CleanManagementActorStore for &mut B {
+    fn load_actor(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        (**self).load_actor()
+    }
+    fn commit_actor(&mut self, package: &[u8]) -> Result<(), Self::Error> {
+        (**self).commit_actor(package)
+    }
+}
+
 /// Policy-selected context which is visible in the signed SDK receipt.
 ///
 /// This is data, not proof that policy ran. Possession of the separately

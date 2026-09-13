@@ -2982,12 +2982,11 @@ where
     }
 
     /// Apply a retained signed Install to an independently opened Local Agent.
-    /// The caller retains the exact actor package before policy dispatch and
-    /// owns protected finalization, result retirement and route publication.
+    /// Retains and re-admits the exact actor package before policy dispatch.
+    /// The caller owns protected finalization, retirement and route publication.
     /// Live pending admission is captured before authorization dispatch and
-    /// remains held after this phase. This phase
-    /// returns only a physically reopened application acknowledgement, not a
-    /// completed native lifecycle response.
+    /// remains held after this phase, which returns only a physically reopened
+    /// application acknowledgement, not a completed native lifecycle response.
     pub(crate) fn install_local_from_management_intent<B, J, S>(
         &mut self,
         slot: &mut super::clean_management_intent::CleanManagementIntentSlot<B>,
@@ -2997,7 +2996,7 @@ where
         signer: &mut S,
     ) -> Result<ManagementApplicationAck, SharedAgentHostError>
     where
-        B: CleanManagementIssuerStore,
+        B: super::clean_authority_issuer::CleanManagementActorStore,
         J: CleanManagementIssuerStore,
         S: CleanManagementReceiptSigner,
     {
@@ -3028,6 +3027,12 @@ where
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
         validate_actor_install(descriptor, &request, package)
             .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        slot.retain_actor(package)
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let retained_package = slot
+            .load_actor()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .ok_or(SharedAgentHostError::Unavailable)?;
         let receipt =
             self.issue_management_intent_with_admission(slot, managed, issuer, signer, true)?;
         local
@@ -3035,7 +3040,7 @@ where
                 managed.agent,
                 request.clone(),
                 Some(receipt.clone()),
-                super::driver::SdkManagementArtifacts::Actor(package),
+                super::driver::SdkManagementArtifacts::Actor(&retained_package),
             )
             .map_err(|_| SharedAgentHostError::Unavailable)?;
         let observation = local
@@ -4874,6 +4879,8 @@ mod tests {
         struct IssuerMemoryStore {
             image: Arc<Mutex<Option<Vec<u8>>>>,
             runtime: Arc<Mutex<Option<Vec<u8>>>>,
+            actor: Arc<Mutex<Option<Vec<u8>>>>,
+            actor_failure: Arc<AtomicUsize>,
             advance_clock_after_commits: Option<(Arc<AtomicU64>, usize)>,
             fail_retirement_after_commit: Option<Arc<std::sync::atomic::AtomicBool>>,
         }
@@ -4888,6 +4895,23 @@ mod tests {
                     return Err(MemoryError);
                 }
                 *runtime = Some(bytes.to_vec());
+                Ok(())
+            }
+        }
+
+        impl crate::agent::clean_authority_issuer::CleanManagementActorStore for IssuerMemoryStore {
+            fn load_actor(&mut self) -> Result<Option<Vec<u8>>, MemoryError> {
+                Ok(self.actor.lock().unwrap().clone())
+            }
+            fn commit_actor(&mut self, bytes: &[u8]) -> Result<(), MemoryError> {
+                let failure = self.actor_failure.swap(0, Ordering::SeqCst);
+                if failure == 1 {
+                    return Err(MemoryError);
+                }
+                *self.actor.lock().unwrap() = Some(bytes.to_vec());
+                if failure == 2 {
+                    return Err(MemoryError);
+                }
                 Ok(())
             }
         }
@@ -12100,6 +12124,55 @@ mod tests {
             ));
             assert_eq!(owner.ordered_index_for_test().unwrap(), before);
             assert_eq!(signer.calls, signatures);
+            // The sidecar left by a retired predecessor is replaceable only
+            // while this exact successor has no prepared authorization.
+            *intent_store.actor.lock().unwrap() = Some(b"malformed-package".to_vec());
+            assert!(matches!(
+                owner.install_local_from_management_intent(
+                    &mut slot,
+                    &mut local,
+                    &package,
+                    &mut issuer,
+                    &mut signer,
+                ),
+                Err(SharedAgentHostError::Unavailable)
+            ));
+            assert_eq!(
+                intent_store.actor.lock().unwrap().as_deref(),
+                Some(b"malformed-package".as_slice())
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            assert_eq!(signer.calls, signatures);
+            *intent_store.actor.lock().unwrap() = Some(wrong_package.exact_bytes().to_vec());
+            assert!(matches!(
+                slot.load_actor(),
+                Err(crate::agent::clean_management_intent::IntentSlotError::Conflict)
+            ));
+            for failure in [1, 2] {
+                intent_store.actor_failure.store(failure, Ordering::SeqCst);
+                assert!(matches!(
+                    owner.install_local_from_management_intent(
+                        &mut slot,
+                        &mut local,
+                        &package,
+                        &mut issuer,
+                        &mut signer,
+                    ),
+                    Err(SharedAgentHostError::Unavailable)
+                ));
+                assert!(matches!(
+                    slot.load_actor(),
+                    Err(crate::agent::clean_management_intent::IntentSlotError::Poisoned)
+                ));
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+                assert_eq!(signer.calls, signatures);
+                drop(slot);
+                slot = CleanManagementIntentSlot::open(intent_store.clone()).unwrap();
+            }
+            assert_eq!(
+                slot.load_actor().unwrap().unwrap().exact_bytes(),
+                package.exact_bytes()
+            );
             let ack = owner
                 .install_local_from_management_intent(
                     &mut slot,
@@ -12127,6 +12200,23 @@ mod tests {
             );
             assert_eq!(ack.reopened_state, observation.reopened_state());
             let applied = owner.ordered_index_for_test().unwrap();
+            let saved_actor = intent_store.actor.lock().unwrap().take().unwrap();
+            assert!(matches!(
+                owner.install_local_from_management_intent(
+                    &mut slot,
+                    &mut local,
+                    &package,
+                    &mut issuer,
+                    &mut signer,
+                ),
+                Err(SharedAgentHostError::Unavailable)
+            ));
+            assert!(intent_store.actor.lock().unwrap().is_none());
+            assert_eq!(owner.ordered_index_for_test().unwrap(), applied);
+            assert_eq!(signer.calls, signatures + 2);
+            // Undo this fixture's injected loss to continue the independent
+            // reopen/retry check; production never reconstructs these bytes.
+            *intent_store.actor.lock().unwrap() = Some(saved_actor);
             drop(local);
             drop(slot);
             drop(issuer);

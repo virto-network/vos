@@ -4104,6 +4104,49 @@ pending Install/application/finalization from those leased stores. Do not repurp
 the immutable Create-runtime role or expose this phase directly as client success.
 All work stays in C2, with C1 recovery and C3 final-source release gates unchanged.
 
+### Durable active Install artifact under the lifecycle lease
+
+`CleanManagementActorStore` now supplies a separate bounded active actor-package
+image. The Linux lifecycle files use CSF1 role 13 (`management.actor` and
+`management.actor.next`) under the existing intent/issuer lease, with the existing
+package-size bound, role integrity and predecessor-bound staged publication.
+Create's role-11 runtime remains immutable and separate. A later Install may
+replace the previous operation's valid package only before its authorization
+or finalization envelope exists; retired/denied current intents cannot replace it.
+
+The intent slot checks the exact Install package reference, re-admits the saved
+VOS3 package, and poisons itself after any failed publication. Reopen is mandatory
+after an ambiguous write. Malformed saved package bytes are preserved and rejected,
+not silently repaired. Once dispatch is prepared, a missing or different artifact
+cannot be reconstructed from the retry's supplied package. The native Install
+phase now requires this storage capability, durably retains and reloads the package
+before authorization, and applies the re-admitted stored bytes.
+
+All 47 hardened filesystem tests passed (2.14s, `r16-install-artifact-files.log`),
+including staged initial publication/replacement, lease retention, cross-role
+refusal, divergent-stage preservation and unchanged Create-runtime bytes. The
+first restricted run failed only its existing loopback HTTP fixture; the rerun
+with socket permission passed. File-store fixtures test physical persistence,
+not actor-package authentication; the intent layer supplies the latter.
+
+The final-source physical Install regression passed (1 test, 23.95s,
+`r16-install-artifact-recovery-verified.log`). It additionally checks a mismatched
+valid predecessor package, preservation of malformed persisted bytes, failures
+before and after artifact commit, poisoned-slot refusal, explicit slot reopen,
+and exact recovery without policy/signature activity before durable publication.
+Injected artifact loss after application refuses ACK recovery without rewriting
+the missing sidecar. The fixture restores its injected loss only to continue the
+separate Local-image/store reopen and protected-retirement assertions. This is
+not an automatic artifact-repair path or a whole-daemon crash campaign. Formatting
+and diff checks passed; no guest artifact or ABI was changed or repinned.
+
+Automatic startup lifecycle discovery still needs to recognize pending Install
+intents and use this leased artifact role for application/finalization recovery.
+Pristine pre-dispatch Install must remain retryable, while missing prepared-work
+artifacts must fail closed. Controller/queue/HTTP/CLI wiring and real actor method
+invocation/restart remain open. These changes stay inside C2; they do not close
+C1 recovery, ordinary Shared finality or C3 release gates.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

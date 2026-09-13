@@ -592,6 +592,77 @@ impl<B: CleanManagementIssuerStore> CleanManagementIntentSlot<B> {
         self.intent.as_ref()
     }
 
+    /// Re-admit the exact actor package named by the current Install intent.
+    /// A file envelope or an old operation's sidecar is not package authority.
+    pub(crate) fn load_actor(
+        &mut self,
+    ) -> Result<Option<super::package_admission::AdmittedActorPackage>, IntentSlotError<B::Error>>
+    where
+        B: super::clean_authority_issuer::CleanManagementActorStore,
+    {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        let Some(ManagementRequest::Install(install)) =
+            self.intent.as_ref().map(|intent| intent.request())
+        else {
+            return Err(IntentSlotError::Invalid);
+        };
+        let Some(bytes) = self.store.load_actor().map_err(IntentSlotError::Storage)? else {
+            return Ok(None);
+        };
+        let package = super::package_admission::admit_actor_package(&bytes)
+            .map_err(|_| IntentSlotError::Invalid)?;
+        if package.package_ref() != &install.package {
+            return Err(IntentSlotError::Conflict);
+        }
+        Ok(Some(package))
+    }
+
+    /// Publish before authorization preparation. Once a work envelope exists,
+    /// never reconstruct missing artifact evidence from a retry's request.
+    pub(crate) fn retain_actor(
+        &mut self,
+        package: &super::package_admission::AdmittedActorPackage,
+    ) -> Result<(), IntentSlotError<B::Error>>
+    where
+        B: super::clean_authority_issuer::CleanManagementActorStore,
+    {
+        if self.poisoned {
+            return Err(IntentSlotError::Poisoned);
+        }
+        let intent = self.intent.as_ref().ok_or(IntentSlotError::Invalid)?;
+        let ManagementRequest::Install(install) = intent.request() else {
+            return Err(IntentSlotError::Invalid);
+        };
+        if package.package_ref() != &install.package {
+            return Err(IntentSlotError::Conflict);
+        }
+        let previous = self.store.load_actor().map_err(IntentSlotError::Storage)?;
+        if previous.as_deref() == Some(package.exact_bytes()) {
+            return Ok(());
+        }
+        if self.retired
+            || self.denied
+            || intent.authorization_work.is_some()
+            || intent.finalization_work.is_some()
+        {
+            return Err(IntentSlotError::Conflict);
+        }
+        if let Some(bytes) = previous {
+            // A predecessor may differ, but malformed persisted evidence is
+            // never silently repaired by an otherwise valid new submission.
+            super::package_admission::admit_actor_package(&bytes)
+                .map_err(|_| IntentSlotError::Invalid)?;
+        }
+        self.poisoned = true;
+        self.store
+            .commit_actor(package.exact_bytes())
+            .map_err(IntentSlotError::Storage)?;
+        self.poisoned = false;
+        Ok(())
+    }
+
     pub(crate) fn denial_complete(&self) -> Result<bool, IntentSlotError<B::Error>> {
         if self.poisoned {
             return Err(IntentSlotError::Poisoned);

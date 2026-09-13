@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use fs2::FileExt as _;
 use vos::agent::bootstrap::MAX_SYSTEM_AGENT_GENESIS_PROVISION_BYTES;
 use vos::agent::clean_authority_issuer::{
-    CleanManagementIssuerStore, CleanManagementRuntimeStore,
+    CleanManagementActorStore, CleanManagementIssuerStore, CleanManagementRuntimeStore,
     MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES, MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
 };
 use vos::agent::clean_bootstrap::{
@@ -49,6 +49,8 @@ const LIFECYCLE_ISSUER_FILE: &str = "management.issuer";
 const LIFECYCLE_ISSUER_STAGE_FILE: &str = "management.issuer.next";
 const LIFECYCLE_RUNTIME_FILE: &str = "management.runtime";
 const LIFECYCLE_RUNTIME_STAGE_FILE: &str = "management.runtime.next";
+const LIFECYCLE_ACTOR_FILE: &str = "management.actor";
+const LIFECYCLE_ACTOR_STAGE_FILE: &str = "management.actor.next";
 const LOCAL_REQUEST_FILE: &str = "local-create.request";
 const LOCAL_REQUEST_STAGE_FILE: &str = "local-create.request.next";
 const LOCAL_REQUEST_ENTRIES: [&str; 3] = [LOCK_FILE, LOCAL_REQUEST_FILE, LOCAL_REQUEST_STAGE_FILE];
@@ -68,7 +70,7 @@ const CREDENTIAL_QUERY_ENTRIES: [&str; 3] = [
     CREDENTIAL_QUERY_FILE,
     CREDENTIAL_QUERY_STAGE_FILE,
 ];
-const LIFECYCLE_ENTRIES: [&str; 7] = [
+const LIFECYCLE_ENTRIES: [&str; 9] = [
     LOCK_FILE,
     INTENT_FILE,
     INTENT_STAGE_FILE,
@@ -76,6 +78,8 @@ const LIFECYCLE_ENTRIES: [&str; 7] = [
     LIFECYCLE_ISSUER_STAGE_FILE,
     LIFECYCLE_RUNTIME_FILE,
     LIFECYCLE_RUNTIME_STAGE_FILE,
+    LIFECYCLE_ACTOR_FILE,
+    LIFECYCLE_ACTOR_STAGE_FILE,
 ];
 
 pub(crate) const MAX_CLEAN_SYSTEM_AGENT_GENESIS_ARCHIVE_BYTES: usize =
@@ -164,6 +168,7 @@ enum StoreRole {
     LocalCreateAcknowledgement = 10,
     LifecycleRuntime = 11,
     LocalCreateDenial = 12,
+    LifecycleActor = 13,
 }
 
 impl StoreRole {
@@ -181,6 +186,7 @@ impl StoreRole {
             Self::LocalCreateAcknowledgement => LOCAL_ACK_FILE,
             Self::LifecycleRuntime => LIFECYCLE_RUNTIME_FILE,
             Self::LocalCreateDenial => LOCAL_DENIAL_FILE,
+            Self::LifecycleActor => LIFECYCLE_ACTOR_FILE,
         }
     }
 
@@ -198,6 +204,7 @@ impl StoreRole {
             Self::LocalCreateAcknowledgement => LOCAL_ACK_STAGE_FILE,
             Self::LifecycleRuntime => LIFECYCLE_RUNTIME_STAGE_FILE,
             Self::LocalCreateDenial => LOCAL_DENIAL_STAGE_FILE,
+            Self::LifecycleActor => LIFECYCLE_ACTOR_STAGE_FILE,
         }
     }
 
@@ -211,6 +218,7 @@ impl StoreRole {
             Self::LifecycleIssuer => MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
             Self::LocalCreateRequest => 1024 * 1024,
             Self::LifecycleRuntime => MAX_PACKAGE_ENCODED_BYTES,
+            Self::LifecycleActor => MAX_PACKAGE_ENCODED_BYTES,
             Self::LocalCreateDenial => vos::agent::local_lifecycle::LocalCreateDenial::MAX_BYTES,
             Self::CredentialReservation => 165,
             Self::LocalCreateAcknowledgement => {
@@ -236,6 +244,7 @@ impl StoreRole {
             10 => Some(Self::LocalCreateAcknowledgement),
             11 => Some(Self::LifecycleRuntime),
             12 => Some(Self::LocalCreateDenial),
+            13 => Some(Self::LifecycleActor),
             _ => None,
         }
     }
@@ -332,6 +341,7 @@ impl CleanManagementLifecycleFiles {
             intent: CleanManagementIntentFile(
                 ExactFileStore::new(Arc::clone(&root), StoreRole::ManagementIntent),
                 ExactFileStore::new(Arc::clone(&root), StoreRole::LifecycleRuntime),
+                ExactFileStore::new(Arc::clone(&root), StoreRole::LifecycleActor),
             ),
             issuer: CleanManagementIssuerFile(ExactFileStore::new(
                 root,
@@ -345,7 +355,7 @@ impl CleanManagementLifecycleFiles {
     }
 }
 
-pub(crate) struct CleanManagementIntentFile(ExactFileStore, ExactFileStore);
+pub(crate) struct CleanManagementIntentFile(ExactFileStore, ExactFileStore, ExactFileStore);
 
 /// One immutable signed submission in its own leased private directory.
 /// Keep this lease until submission finishes; ambiguous outcomes retain the
@@ -929,6 +939,15 @@ impl CleanManagementRuntimeStore for CleanManagementIntentFile {
             Some(_) => Err(CleanFileStoreError::RequestConflict),
             None => self.1.commit(package),
         }
+    }
+}
+
+impl CleanManagementActorStore for CleanManagementIntentFile {
+    fn load_actor(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.2.load(MAX_PACKAGE_ENCODED_BYTES)
+    }
+    fn commit_actor(&mut self, package: &[u8]) -> Result<(), Self::Error> {
+        self.2.commit(package)
     }
 }
 
@@ -2806,6 +2825,72 @@ pub(crate) mod tests {
             intent.load_runtime(),
             Err(CleanFileStoreError::WrongStoreRole)
         ));
+        assert_eq!(issuer.load().unwrap(), Some(b"issuer".to_vec()));
+    }
+
+    #[test]
+    fn lifecycle_actor_recovers_bounded_replacement_without_changing_create_runtime() {
+        let fixture = Fixture::new("lifecycle-actor");
+        let (mut intent, issuer) = CleanManagementLifecycleFiles::open_or_create(&fixture.root)
+            .unwrap()
+            .into_parts();
+        intent.commit(b"signed-intent").unwrap();
+        intent.commit_runtime(b"immutable-create-runtime").unwrap();
+        assert_eq!(intent.load_actor().unwrap(), None);
+        stage(&intent.2, None, b"first-actor");
+        assert_eq!(
+            CleanManagementActorStore::load_actor(&mut &mut intent).unwrap(),
+            Some(b"first-actor".to_vec())
+        );
+        let previous = intent
+            .2
+            .reconcile(MAX_PACKAGE_ENCODED_BYTES)
+            .unwrap()
+            .unwrap();
+        stage(&intent.2, Some(previous.commitment()), b"next-actor");
+        assert_eq!(intent.load_actor().unwrap(), Some(b"next-actor".to_vec()));
+        assert!(!fixture.root.join(LIFECYCLE_ACTOR_STAGE_FILE).exists());
+        CleanManagementActorStore::commit_actor(&mut &mut intent, b"next-actor").unwrap();
+        assert_eq!(intent.load().unwrap(), Some(b"signed-intent".to_vec()));
+        assert_eq!(
+            intent.load_runtime().unwrap(),
+            Some(b"immutable-create-runtime".to_vec())
+        );
+        assert_eq!(intent.2.role.maximum_bytes(), MAX_PACKAGE_ENCODED_BYTES);
+        drop(issuer);
+        assert!(matches!(
+            CleanManagementLifecycleFiles::open_existing(&fixture.root),
+            Err(CleanFileStoreError::Busy)
+        ));
+        drop(intent);
+        let (mut intent, _) = CleanManagementLifecycleFiles::open_existing(&fixture.root)
+            .unwrap()
+            .into_parts();
+        assert_eq!(intent.load_actor().unwrap(), Some(b"next-actor".to_vec()));
+        assert_eq!(
+            intent.load_runtime().unwrap(),
+            Some(b"immutable-create-runtime".to_vec())
+        );
+    }
+
+    #[test]
+    fn lifecycle_actor_rejects_cross_role_and_divergent_staged_images() {
+        let fixture = Fixture::new("lifecycle-actor-role");
+        let (mut intent, mut issuer) = CleanManagementLifecycleFiles::open_or_create(&fixture.root)
+            .unwrap()
+            .into_parts();
+        issuer.commit(b"issuer").unwrap();
+        let wrong = fs::read(fixture.root.join(LIFECYCLE_ISSUER_FILE)).unwrap();
+        write_private(&fixture.root.join(LIFECYCLE_ACTOR_FILE), &wrong);
+        assert!(matches!(
+            intent.load_actor(),
+            Err(CleanFileStoreError::WrongStoreRole)
+        ));
+        fs::remove_file(fixture.root.join(LIFECYCLE_ACTOR_FILE)).unwrap();
+        intent.commit_actor(b"actor").unwrap();
+        stage(&intent.2, Some([0x91; 32]), b"substituted");
+        assert!(intent.load_actor().is_err());
+        assert!(fixture.root.join(LIFECYCLE_ACTOR_STAGE_FILE).exists());
         assert_eq!(issuer.load().unwrap(), Some(b"issuer".to_vec()));
     }
 
