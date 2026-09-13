@@ -2280,6 +2280,48 @@ The lifecycle request SHA-256 is
 no new request or nonce was substituted after the timeout. Debug-build completion
 latency and shutdown latency need assessment alongside the resume result.
 
+### Lifecycle reconciliation scheduling
+
+The first clock-fix smoke subsequently stopped with exit 1 and removed its
+endpoint. Its retained-request resume script started the same Space at
+`2026-09-13T04:22:10Z`; no new request/nonce was generated. That running binary
+contains `470adcfb`, not the scheduling change below.
+
+Source inspection found a second concrete latency problem: Create calls
+`AgentProductionOwner::reconcile` directly, but only startup and periodic driving
+previously advanced `reconcile_after`. A slow Create could therefore finish route
+publication and immediately repeat the full inventory query in the same router
+tick. The node also did not recheck shutdown between completing a queued lifecycle
+request and beginning that periodic pass.
+
+Every successful reconciliation now sets the next deadline after completion,
+including lifecycle-triggered publication. The router finishes/replies to an
+accepted lifecycle request, then checks shutdown before starting periodic work.
+No in-flight application is canceled, and no projection or authorization check
+is omitted. The new deadline regression failed on the old implementation
+(`r16-lifecycle-reconcile-deadline-red.log`) and passes with the fix. Seven tests
+matching `reconciliation` pass in 4.22 seconds, including the new shutdown guard
+(`r16-lifecycle-reconcile-deadline.log`); all four production-owner tests pass in
+0.12 seconds (`r16-lifecycle-reconcile-owner.log`). Logs are under
+`.worktrees/ch08-c2-native/target/task-tmp`, relative to the main checkout.
+This scheduling fix is not yet covered by a rebuilt native smoke and does not
+prove that the original Create can finish within the HTTP deadline.
+
+Final-source follow-up: all ten native bootstrap/lifecycle tests pass in 51.35
+seconds (`r16-lifecycle-reconcile-native.log`), and the existing busy-outbox raw
+shutdown test passes (`r16-lifecycle-reconcile-shutdown.log`). The live resume
+daemon running the earlier `470adcfb` binary reached readiness at
+`04:29:11.097691Z`, about 421 seconds after restart. Its retained Create again
+returned HTTP 504 (`create-resume-client.log`), leaving
+`create-resume-result.json` empty. The request SHA-256 is still
+`173da629f2e649e485927ca92a2d02b9ab5aa629197645ff6bfbe124aef8862f`.
+No native acknowledgement/publication success is claimed. The resume script
+requested shutdown and is waiting on that same daemon; do not start an
+overlapping process. Next: establish which work an already-applied Create retry
+repeats, then verify bounded completion with the updated native binary. Do not
+replace durable authorization or remove physical/Authority verification to make
+the HTTP test pass.
+
 ### Durable immutable Local Create request storage
 
 `CleanLocalCreateRequestFile` stores one signed HTTP-compatible LCQ1 submission

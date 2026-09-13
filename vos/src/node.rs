@@ -8179,6 +8179,12 @@ impl VosNode {
                 return false;
             }
         }
+        // Shutdown may arrive while an accepted lifecycle request is running.
+        // Finish and reply to that request above, but do not start another
+        // potentially expensive inventory pass before leaving the router loop.
+        if self.shutdown.load(Ordering::Acquire) {
+            return false;
+        }
         let result = self
             .clean_agent_owner
             .as_mut()
@@ -16063,6 +16069,16 @@ mod tests {
             node.collect_checked(),
             Err(crate::agent::host::AgentHostError::WorkerPanicked)
         ));
+    }
+
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    #[test]
+    fn lifecycle_tick_observes_shutdown_before_periodic_reconciliation() {
+        let mut node = VosNode::new();
+        assert!(node.drive_clean_agent_owner());
+        node.shutdown_handle().store(true, Ordering::Release);
+        assert!(!node.drive_clean_agent_owner());
+        assert!(node.clean_agent_owner_error.is_none());
     }
 
     #[test]

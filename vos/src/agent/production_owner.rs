@@ -503,9 +503,6 @@ impl AgentProductionOwner {
             let _ = owner.shutdown_and_join();
             return Err(error);
         }
-        owner.reconcile_after = Instant::now()
-            .checked_add(reconcile_interval)
-            .ok_or(AgentProductionOwnerError::InvalidConfiguration)?;
         Ok(owner)
     }
 
@@ -566,20 +563,17 @@ impl AgentProductionOwner {
         if now < self.reconcile_after {
             return Ok(false);
         }
-        self.reconcile()?;
-        // Physical inventory queries may take longer than the interval. Start
-        // the next interval after completion, not at this run's admission, so
-        // an overrun cannot keep the node in back-to-back reconciliation.
-        self.reconcile_after = Instant::now()
-            .max(now)
-            .checked_add(self.reconcile_interval)
-            .ok_or(AgentProductionOwnerError::InvalidConfiguration)?;
+        self.reconcile_at(now)?;
         Ok(true)
     }
 
     /// Reconciliation is crate-private: only the node owner may mutate route
     /// publication after construction.
     pub(crate) fn reconcile(&mut self) -> Result<(), AgentProductionOwnerError> {
+        self.reconcile_at(Instant::now())
+    }
+
+    fn reconcile_at(&mut self, now: Instant) -> Result<(), AgentProductionOwnerError> {
         let inventory = self.source.load_inventory()?;
         accept_head(self.accepted_head, inventory.head)?;
         validate_root_provenance(&inventory, self.system_agent)?;
@@ -631,6 +625,13 @@ impl AgentProductionOwner {
         reconcile_slot(supervisor, &mut self.local, inventory.head, local)?;
         reconcile_slot(supervisor, &mut self.shared, inventory.head, shared)?;
         self.accepted_head = Some(inventory.head);
+        // Every successful reconciliation, including a lifecycle-triggered
+        // publication, starts a full quiet interval after completion. Physical
+        // inventory work may itself take longer than the configured interval.
+        self.reconcile_after = Instant::now()
+            .max(now)
+            .checked_add(self.reconcile_interval)
+            .ok_or(AgentProductionOwnerError::InvalidConfiguration)?;
         Ok(())
     }
 
@@ -1244,6 +1245,15 @@ mod tests {
 
     #[test]
     fn reconciliation_overrun_waits_a_full_interval_before_running_again() {
+        check_reconciliation_deadline(false);
+    }
+
+    #[test]
+    fn lifecycle_reconciliation_defers_the_next_periodic_run() {
+        check_reconciliation_deadline(true);
+    }
+
+    fn check_reconciliation_deadline(lifecycle: bool) {
         let node = NodeId([0x31; 32]);
         let descriptor = descriptor(1, AgentProfile::Shared, node);
         let actor = actor(&descriptor, true);
@@ -1273,7 +1283,11 @@ mod tests {
             lifecycle: None,
         };
         let before = Instant::now();
-        assert_eq!(owner.drive_if_due(admitted), Ok(true));
+        if lifecycle {
+            assert_eq!(owner.reconcile(), Ok(()));
+        } else {
+            assert_eq!(owner.drive_if_due(admitted), Ok(true));
+        }
         assert!(owner.reconcile_after >= before + interval);
         assert_eq!(calls.lock().unwrap().len(), 4);
         assert_eq!(owner.drive_if_due(before), Ok(false));
