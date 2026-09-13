@@ -179,8 +179,9 @@ Keep these as work within C2, not new review batches:
    Native acknowledgement of the successful result pair now passes while
    deliberately retaining admission. Signed completion continuation and owner
    reopen after either one or both acknowledgements now pass; production
-   continuation storage now has a hardened, bounded file backend. Controller/
-   daemon adoption of that backend and final durable release remain open.
+   continuation storage now has a hardened, bounded file backend, owned by the
+   production controller throughout daemon recovery and dispatch. Automatic
+   completion capture/acknowledgement and final durable release remain open.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
    retirement and restart through native ingress; then expose the same
    preparation/authorization flow in the user-facing client. A Public query
@@ -5670,6 +5671,41 @@ The next scoped C2 step is controller/daemon ownership of the completion-store
 lease and recovery admission from its fully validated certificates, followed by
 durable terminal retirement before release. Do not treat this storage checkpoint
 as completion of protected invocation or the release gates.
+
+### Controller-owned completion recovery
+
+Verification: **5 native operation tests passed, zero failures**, in **68.19s**
+(`r16-completion-controller-native-final.log`); **216 CLI tests passed, zero
+failures, five ignored**, in **14.83s**
+(`r16-completion-controller-cli-final.log`). Logs are in the shared disk-backed
+`.worktrees/ch08-c2-native/target/task-tmp` directory. Initial builds caught an
+incorrect host-error import at the storage boundary and a moved-store cleanup
+in the test fixture; both were corrected before these passing runs. Formatting
+and whitespace checks pass. No fresh live daemon or full-library release
+campaign was run for this checkpoint.
+
+Following the storage checkpoint, the native operation controller now owns a
+fourth store handle through `NativeAuthorityOperationCompletionStore`. Daemon
+startup opens `authority-operation-completions`, transfers its lease to that
+controller, and restores retirement admission from its saved certificates before
+system-owner attachment. Local lifecycle adoption retains the complete
+controller and therefore all four leases. Decomposition of a completion-bearing
+controller returns all four stores; the original three-store constructor has no
+completion durability and its empty backend refuses retention.
+
+Validation checks bounded certificates against the configured signer and both
+exact native dispatch records, not merely the completion index's framing. The
+startup discovery list must include both records. Validation failures preserve
+the stores and no policy execution, signing, or admission release occurs there.
+The positive native fixtures now reopen through controller-owned completion
+storage after one or both acknowledgements, reject a deliberately corrupted
+certificate without changing it, and reject incomplete discovery before
+recovering the exact retirement pair.
+
+Automatic completion capture and acknowledgement in production dispatch are
+still unwired. Final durable retirement/release and denial retirement remain
+required; simply loading a valid NOC1 is not permission to release admission.
+No operation HTTP endpoint, guest artifact, or master integration changed.
 
 ### Durable client acknowledgement before completion
 

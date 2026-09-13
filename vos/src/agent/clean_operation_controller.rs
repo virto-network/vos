@@ -4,7 +4,7 @@
 use super::*;
 use crate::agent::authority_operation_coordinator::{
     AuthorityOperationCoordinatorError, AuthorityOperationCoordinatorStore,
-    DurableAuthorityOperationCoordinator,
+    DurableAuthorityOperationCoordinator, MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS,
 };
 use crate::agent::authority_operation_issuer::{
     AuthorityOperationEvidenceSigner, AuthorityOperationIssuerError, AuthorityOperationIssuerStore,
@@ -13,20 +13,42 @@ use crate::agent::authority_operation_issuer::{
 use crate::agent::sdk::InvocationContext;
 use crate::agent::sdk::authority_operation::AuthorityOperationCall;
 
-/// Retains all three exclusive store handles across calls and failures.
+/// A leased, bounded completion index. Implementations must synchronize exact
+/// retries and preserve existing certificates on failed or conflicting writes.
+pub trait NativeAuthorityOperationCompletionStore {
+    type Error;
+    fn load(&mut self) -> Result<Vec<Vec<u8>>, Self::Error>;
+    fn retain(&mut self, certificate: &[u8]) -> Result<(), Self::Error>;
+}
+
+// Legacy/test construction has no completion persistence. It must never
+// manufacture a successful durability acknowledgement.
+impl NativeAuthorityOperationCompletionStore for () {
+    type Error = SharedAgentHostError;
+    fn load(&mut self) -> Result<Vec<Vec<u8>>, SharedAgentHostError> {
+        Ok(Vec::new())
+    }
+    fn retain(&mut self, _: &[u8]) -> Result<(), SharedAgentHostError> {
+        Err(SharedAgentHostError::Unavailable)
+    }
+}
+
+/// Retains all exclusive store handles across calls and failures.
 /// Construction does not assert recovery or release admission: the caller must
 /// restore startup admission before dispatch and keep the controller alive for
 /// the lifetime of the corresponding system owner.
-pub struct NativeAuthorityOperationController<C, B, J> {
+pub struct NativeAuthorityOperationController<C, B, J, K = ()> {
     authority: AuthorityActorTarget,
     coordinator: C,
     issuer: B,
     journal: J,
+    completions: K,
 }
 
 #[derive(Debug)]
 pub enum NativeAuthorityOperationControllerError<C, B, S> {
     WrongAuthority,
+    Completion(SharedAgentHostError),
     OpenIssuer(AuthorityOperationIssuerError<B>),
     OpenCoordinator(AuthorityOperationCoordinatorError<C, B>),
     Coordinate(AuthorityOperationCoordinatorError<C, B, SharedAgentHostError, S>),
@@ -44,19 +66,50 @@ where
             coordinator,
             issuer,
             journal,
+            completions: (),
         }
     }
 
+    pub fn with_completions<K: NativeAuthorityOperationCompletionStore>(
+        self,
+        completions: K,
+    ) -> NativeAuthorityOperationController<C, B, J, K> {
+        NativeAuthorityOperationController {
+            authority: self.authority,
+            coordinator: self.coordinator,
+            issuer: self.issuer,
+            journal: self.journal,
+            completions,
+        }
+    }
+
+    pub fn into_parts(self) -> (C, B, J) {
+        (self.coordinator, self.issuer, self.journal)
+    }
+}
+
+impl<C, B, J, K> NativeAuthorityOperationController<C, B, J, K>
+where
+    C: AuthorityOperationCoordinatorStore,
+    B: AuthorityOperationIssuerStore,
+    J: NativeAuthorityOperationJournalStore,
+    K: NativeAuthorityOperationCompletionStore,
+{
     pub fn startup_admission(
         &mut self,
         invocations: &[InvocationId],
     ) -> Result<NativeAuthorityOperationStartupAdmission<'_>, SharedAgentHostError> {
         self.validate()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
-        NativeAuthorityOperationStartupAdmission::load(
+        let certificates = self
+            .completions
+            .load()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        NativeAuthorityOperationStartupAdmission::load_with_completions(
             &mut self.journal,
             self.authority,
             invocations,
+            &certificates,
         )
     }
 
@@ -112,6 +165,32 @@ where
                 ));
             }
         }
+        let certificates = self.completions.load().map_err(|_| {
+            NativeAuthorityOperationControllerError::Completion(SharedAgentHostError::Unavailable)
+        })?;
+        if certificates.len() > MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS {
+            return Err(NativeAuthorityOperationControllerError::Completion(
+                SharedAgentHostError::Unavailable,
+            ));
+        }
+        let mut invocations = Vec::new();
+        for certificate in &certificates {
+            let ids = native_operation_completion_invocations(
+                &self.authority.binding.public_key,
+                certificate,
+            )
+            .ok_or(NativeAuthorityOperationControllerError::Completion(
+                SharedAgentHostError::Unavailable,
+            ))?;
+            invocations.extend_from_slice(&ids);
+        }
+        NativeAuthorityOperationStartupAdmission::load_with_completions(
+            &mut self.journal,
+            self.authority,
+            &invocations,
+            &certificates,
+        )
+        .map_err(NativeAuthorityOperationControllerError::Completion)?;
         Ok(())
     }
 
@@ -161,8 +240,13 @@ where
             .map_err(NativeAuthorityOperationControllerError::Coordinate)
     }
 
-    pub fn into_parts(self) -> (C, B, J) {
-        (self.coordinator, self.issuer, self.journal)
+    pub fn into_parts_with_completions(self) -> (C, B, J, K) {
+        (
+            self.coordinator,
+            self.issuer,
+            self.journal,
+            self.completions,
+        )
     }
 }
 
@@ -182,8 +266,8 @@ impl crate::agent::authority_operation_coordinator::AuthorityOperationActorDispa
     }
 }
 
-impl<P, R, I, C, B, J, S> crate::agent::local_lifecycle::NativeAuthorityOperationAccess<P, R, I>
-    for (NativeAuthorityOperationController<C, B, J>, S)
+impl<P, R, I, C, B, J, K, S> crate::agent::local_lifecycle::NativeAuthorityOperationAccess<P, R, I>
+    for (NativeAuthorityOperationController<C, B, J, K>, S)
 where
     P: CleanSystemAgentBootstrapStore,
     R: CleanSystemAgentBootstrapStore,
@@ -191,6 +275,7 @@ where
     C: AuthorityOperationCoordinatorStore + Send,
     B: AuthorityOperationIssuerStore + Send,
     J: NativeAuthorityOperationJournalStore + Send,
+    K: NativeAuthorityOperationCompletionStore + Send,
     S: AuthorityOperationEvidenceSigner + Send,
 {
     fn coordinate(

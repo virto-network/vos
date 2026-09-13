@@ -14,6 +14,20 @@ pub(crate) struct CleanNativeAuthorityOperationCompletions {
     authority: AuthorityActorTarget,
 }
 
+impl vos::agent::clean_bootstrap::NativeAuthorityOperationCompletionStore
+    for CleanNativeAuthorityOperationCompletions
+{
+    type Error = CleanFileStoreError;
+
+    fn load(&mut self) -> Result<Vec<Vec<u8>>, Self::Error> {
+        CleanNativeAuthorityOperationCompletions::load(self)
+    }
+
+    fn retain(&mut self, certificate: &[u8]) -> Result<(), Self::Error> {
+        CleanNativeAuthorityOperationCompletions::retain(self, certificate)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::{Fixture, stage};

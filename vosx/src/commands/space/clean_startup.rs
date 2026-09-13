@@ -53,7 +53,8 @@ use super::clean_identity::{
 };
 use super::clean_store::{
     CleanAuthorityOperationFiles, CleanManagementLifecycleStoreFactory,
-    CleanNativeAuthorityOperationJournal, CleanSystemAgentFileStores,
+    CleanNativeAuthorityOperationCompletions, CleanNativeAuthorityOperationJournal,
+    CleanSystemAgentFileStores,
 };
 
 const SYSTEM_AUTHORITY_NAME: &str = "system-authority";
@@ -64,6 +65,7 @@ const LOCAL_AGENT_HOST_DIRECTORY: &str = "local-agent-host";
 const LOCAL_LIFECYCLE_DIRECTORY: &str = "local-agent-lifecycle";
 const OPERATION_IMAGES_DIRECTORY: &str = "authority-operation";
 const OPERATION_JOURNAL_DIRECTORY: &str = "authority-operation-journal";
+const OPERATION_COMPLETIONS_DIRECTORY: &str = "authority-operation-completions";
 const PROJECTION_ROUTE_QUEUE_CAPACITY: usize = 64;
 const LOCAL_LIFECYCLE_RECOVERY_LIMIT: usize = 1_024;
 const PROJECTION_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
@@ -409,12 +411,17 @@ pub(crate) fn start_clean_system_agent(
     let (operation_coordinator, operation_issuer) =
         CleanAuthorityOperationFiles::open_or_create(data_dir.join(OPERATION_IMAGES_DIRECTORY))?
             .into_parts();
+    let operation_completions = CleanNativeAuthorityOperationCompletions::open_or_create(
+        data_dir.join(OPERATION_COMPLETIONS_DIRECTORY),
+        authority_target,
+    )?;
     let mut operations = vos::agent::clean_bootstrap::NativeAuthorityOperationController::new(
         authority_target,
         operation_coordinator,
         operation_issuer,
         operation_journal,
-    );
+    )
+    .with_completions(operation_completions);
     let operation_admission = operations
         .startup_admission(&operation_ids)
         .map_err(|error| {

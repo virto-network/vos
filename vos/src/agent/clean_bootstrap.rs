@@ -14,7 +14,8 @@ mod operation_controller;
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 pub use operation_controller::{
-    NativeAuthorityOperationController, NativeAuthorityOperationControllerError,
+    NativeAuthorityOperationCompletionStore, NativeAuthorityOperationController,
+    NativeAuthorityOperationControllerError,
 };
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
@@ -9916,6 +9917,20 @@ mod tests {
 
         struct OperationTestJournal(PathBuf);
 
+        struct OperationTestCompletions(PathBuf);
+        impl NativeAuthorityOperationCompletionStore for OperationTestCompletions {
+            type Error = SharedAgentHostError;
+            fn load(&mut self) -> Result<Vec<Vec<u8>>, Self::Error> {
+                std::fs::read(&self.0)
+                    .map(|bytes| vec![bytes])
+                    .map_err(|_| SharedAgentHostError::Unavailable)
+            }
+            fn retain(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+                write_operation_test_image(&self.0, bytes)
+                    .map_err(|_| SharedAgentHostError::Unavailable)
+            }
+        }
+
         impl OperationTestJournal {
             fn path(&self, invocation: InvocationId) -> PathBuf {
                 self.0.join(
@@ -10217,7 +10232,7 @@ mod tests {
             );
             assert_eq!(signer.calls, 2);
             assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
-            let (_, _, mut journal) = operations.into_parts();
+            let (operation_coordinator, operation_issuer, mut journal) = operations.into_parts();
             let authorization_bytes = journal.load(call.invocation).unwrap().unwrap();
             let acknowledgement_bytes = journal
                 .load(issued.issuance_ack.acknowledgement_invocation)
@@ -10390,13 +10405,25 @@ mod tests {
                 )
                 .is_err()
             );
-            let admission = NativeAuthorityOperationStartupAdmission::load_with_completions(
-                &mut journal,
+            let mut operations = NativeAuthorityOperationController::new(
                 authority,
-                &invocations,
-                &[std::fs::read(&completion_path).unwrap()],
+                operation_coordinator,
+                operation_issuer,
+                journal,
             )
-            .unwrap();
+            .with_completions(OperationTestCompletions(completion_path.clone()));
+            operations.validate().unwrap();
+            let saved = std::fs::read(&completion_path).unwrap();
+            let mut corrupt = saved.clone();
+            *corrupt.last_mut().unwrap() ^= 1;
+            write_operation_test_image(&completion_path, &corrupt).unwrap();
+            assert!(operations.validate().is_err());
+            assert!(operations.startup_admission(&invocations).is_err());
+            assert_eq!(std::fs::read(&completion_path).unwrap(), corrupt);
+            // Repair only the deliberately corrupted test fixture.
+            write_operation_test_image(&completion_path, &saved).unwrap();
+            assert!(operations.startup_admission(&invocations[..1]).is_err());
+            let admission = operations.startup_admission(&invocations).unwrap();
             assert!(admission.pending.is_empty());
             assert_eq!(admission.retirements.len(), 1);
             let mut owner =
@@ -10453,7 +10480,7 @@ mod tests {
                 ),
                 Err(SharedAgentHostError::Conflict)
             ));
-            drop(journal);
+            drop(operations);
             drop(owner);
             stop_network(network);
         }
