@@ -9115,6 +9115,27 @@ mod tests {
                 assert_eq!(signer.calls, signatures);
                 let image = intent_store.image.lock().unwrap().clone().unwrap();
                 assert!(image.starts_with(b"CND1"));
+                let submission = crate::agent::local_lifecycle::LocalCreateSubmission::new(
+                    descriptor.clone(),
+                    call.clone(),
+                    runtime.clone(),
+                )
+                .unwrap();
+                let verified_denial = submission.verify_denial(&image).unwrap();
+                assert_eq!(verified_denial.exact_bytes(), image);
+                assert!(submission.verify_denial(&image[..image.len() - 1]).is_err());
+                let mut trailing = image.clone();
+                trailing.push(0);
+                assert!(submission.verify_denial(&trailing).is_err());
+                assert!(
+                    submission
+                        .verify_denial(&vec![
+                            0;
+                            crate::agent::local_lifecycle::LocalCreateDenial::MAX_BYTES
+                                + 1
+                        ])
+                        .is_err()
+                );
                 assert!(
                     crate::agent::clean_management_intent::CleanManagementIntentSlot::open(
                         intent_store.clone()
@@ -9139,6 +9160,10 @@ mod tests {
                 assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
                 let mut corrupt = image.clone();
                 *corrupt.last_mut().unwrap() ^= 1;
+                assert!(submission.verify_denial(&corrupt).is_err());
+                let mut wrong_domain = image.clone();
+                wrong_domain[..4].copy_from_slice(b"CMR2");
+                assert!(submission.verify_denial(&wrong_domain).is_err());
                 let corrupt_store = IssuerMemoryStore::default();
                 *corrupt_store.image.lock().unwrap() = Some(corrupt);
                 assert!(
@@ -9163,6 +9188,13 @@ mod tests {
                 next_call.authority = owner.authority_target();
                 next_call.invocation = next_call.expected_invocation();
                 next_call.signature = key.sign(&next_call.signing_bytes()).to_bytes();
+                let next_submission = crate::agent::local_lifecycle::LocalCreateSubmission::new(
+                    next.clone(),
+                    next_call.clone(),
+                    runtime.clone(),
+                )
+                .unwrap();
+                assert!(next_submission.verify_denial(&image).is_err());
                 let result = owner
                     .create_local_agent(
                         IssuerMemoryStore::default(),

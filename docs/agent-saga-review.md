@@ -3730,6 +3730,39 @@ abort after approval/issuance and runtime failures retain their protected eviden
 No full-library rerun, rebuilt-CLI smoke, release certification, or branch
 promotion is claimed. Fold this checkpoint into C2, not a separate review batch.
 
+### Exact-request client denial verification
+
+`LocalCreateSubmission::verify_denial` now verifies a bounded CND1 response
+against the independently retained full Create and credential call, including
+its Authority binding. Signature validation against a key supplied only by the
+response is insufficient: both embedded inputs must exactly equal the retained
+submission, whose credential signature and shape are checked again. The returned
+`LocalCreateDenial` has private bytes and no unchecked constructor, and exposes
+the exact verified certificate for durable retention. It is not an application
+ACK, approval, route check, or credential-sequence advancement.
+
+Native denial fixtures now exercise this client-facing verifier against actual
+server certificates, including after recovery. They also reject truncation,
+trailing bytes, oversized input, altered signatures, a positive-retirement tag,
+and substitution for a different valid signed Create. Verification requires no
+server journal/store access. Callers must still establish their retained request's
+Space/operator/Authority from independent local pins, as the current Create CLI
+already does for acknowledgement handling.
+
+All 5 native denial tests passed (68.83s), including startup after a positive
+runtime ACK and reopening signed completion. Evidence:
+`.worktrees/ch08-c2-native/target/task-tmp/r16-denial-client-verification.log`.
+Formatting and `git diff --check` passed. This is targeted verification, not a
+full-library or CLI end-to-end release run.
+
+This is verification infrastructure, not completed CLI denial handling. Next wire
+the typed disposition through the lifecycle controller/queue and HTTP response,
+persist the verified certificate in a distinct leased client store before marking
+the reservation denied, and let a new operation discover the current credential
+sequence. Preserve exact retry after every ambiguous HTTP or store outcome;
+neither a generic HTTP error nor `ScopeMismatch` can release the credential lease.
+Keep these changes in the existing C2 review batch.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

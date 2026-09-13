@@ -24,7 +24,40 @@ pub struct LocalCreateSubmission {
     runtime: AdmittedRuntimePackage,
 }
 
+/// A signed server-side retirement of one exact denied Create. This is not an
+/// application acknowledgement, policy approval, or evidence of a live route.
+/// Construct only by verifying against an independently retained submission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalCreateDenial {
+    bytes: Vec<u8>,
+}
+
+impl LocalCreateDenial {
+    pub const MAX_BYTES: usize = super::clean_management_intent::MAX_INTENT_BYTES;
+
+    pub fn exact_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 impl LocalCreateSubmission {
+    /// The caller must establish this submission's Space, operator and Authority
+    /// from its own retained request/pins before treating denial as completion.
+    /// No runtime replay or access to the server's stores is needed here.
+    pub fn verify_denial(
+        &self,
+        bytes: &[u8],
+    ) -> Result<LocalCreateDenial, crate::service::wire::DecodeError> {
+        super::clean_management_intent::verify_denial_record(
+            bytes,
+            &ManagementRequest::Create(Box::new(self.descriptor.clone())),
+            &self.call,
+        )?;
+        Ok(LocalCreateDenial {
+            bytes: bytes.to_vec(),
+        })
+    }
+
     pub const MAX_BYTES: usize = 16
         + super::sdk::wire::MAX_MANAGEMENT_REQUEST_WIRE_BYTES
         + super::sdk::wire::MAX_AUTHORITY_CREDENTIAL_CALL_WIRE_BYTES

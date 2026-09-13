@@ -389,6 +389,27 @@ struct RetiredManagementIntent(CleanManagementIntent);
 /// Signature covers the entire previously pledged intent, including its anchor.
 struct DeniedManagementIntent(CleanManagementIntent, [u8; 64]);
 
+/// Verify a host retirement certificate against independently retained input,
+/// never against the certificate's self-asserted Authority or request alone.
+pub(crate) fn verify_denial_record(
+    bytes: &[u8],
+    request: &ManagementRequest,
+    call: &AuthorityCredentialCall,
+) -> Result<(), DecodeError> {
+    if bytes.len() > MAX_INTENT_BYTES {
+        return Err(DecodeError::LimitExceeded);
+    }
+    let denied = DeniedManagementIntent::decode(bytes)?;
+    if denied.0.request() != request || denied.0.call() != call {
+        return Err(DecodeError::NonCanonical);
+    }
+    denied.0.verify(
+        call.authority,
+        call.managed,
+        &super::clean_bootstrap::RawCredentialVerifier,
+    )
+}
+
 fn denial_retirement_signing_bytes(intent: &CleanManagementIntent) -> Vec<u8> {
     let mut bytes = b"vos/agent/management-denial-retired/v1".to_vec();
     bytes.extend_from_slice(
