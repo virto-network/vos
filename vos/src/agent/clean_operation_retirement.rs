@@ -4,6 +4,14 @@ use super::*;
 
 pub const MAX_NATIVE_OPERATION_RETIREMENT_BYTES: usize = 1024;
 
+/// Exclusively leased, bounded terminal evidence. Successful retention must
+/// synchronize exact bytes; failures must preserve existing evidence.
+pub trait NativeAuthorityOperationRetirementStore {
+    type Error;
+    fn load(&mut self) -> Result<Vec<Vec<u8>>, Self::Error>;
+    fn retain(&mut self, certificate: &[u8]) -> Result<(), Self::Error>;
+}
+
 /// Check both signatures and canonical framing. Native recovery must still
 /// bind the returned completion to its two exact source dispatch records.
 pub fn native_operation_retirement_completion(

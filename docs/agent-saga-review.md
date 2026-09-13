@@ -184,7 +184,8 @@ Keep these as work within C2, not new review batches:
    operation dispatch now captures completion and acknowledges the result pair;
    signed terminal retirement and durable release now have a native owner
    boundary. Signed terminal startup classification now passes through the
-   native owner; production retirement-store/controller adoption remains open.
+   native owner. A hardened retirement index is implemented; production
+   controller/daemon adoption remains open.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
    retirement and restart through native ingress; then expose the same
    preparation/authorization flow in the user-facing client. A Public query
@@ -5825,6 +5826,39 @@ retiring, not released. The next C2 step is hardened retirement storage plus
 controller/daemon adoption and exact terminal retry, using this classification
 before attachment. Mixed unfinished-operation/projection coverage and the
 remaining application/release gates are not closed by this single-pair test.
+
+### Hardened terminal operation retirement index
+
+Verification: **219 CLI tests passed, zero failures, five ignored**, in
+**33.78s**, including three new retirement-index tests and the unchanged
+completion-index regressions. Evidence:
+`.worktrees/ch08-c2-native/target/task-tmp/r16-terminal-operation-store-cli-final.log`.
+The first compile caught a static-lifetime requirement in the shared namespace
+entry list, corrected before the passing run. Formatting and whitespace checks
+pass. No native execution behavior changed and no fresh live daemon or
+full-library release run was performed for this storage checkpoint.
+
+`CleanNativeAuthorityOperationRetirements` implements the leased retirement
+store boundary using the completion index's shared hardened storage logic.
+Its namespace is separate: CSF1 role 23, `authority-operation.retirements` and
+its `.next` stage, with NRI1 framing and a retirement-specific Authority scope
+digest. The existing completion namespace and NCI1 wire image are unchanged.
+The index retains at most 256 NRT1 certificates, each bounded to 1,024 bytes.
+It validates both terminal and embedded completion signatures, rejects reused
+invocation IDs, and permits only exact retry or one-record append to an existing
+image. No record is evicted to make room.
+
+Recovery verifies both images before publishing an append. Removal,
+replacement, duplicates, malformed framing, and completion-only substitution
+preserve source/staged evidence and fail closed. The storage fixtures cover
+exclusive leases, wrong Authority scope, missing-existing behavior, exact byte
+retention, nested-signature rejection, stage recovery, and capacity exhaustion.
+They use synthetic signed source hashes, not native execution evidence; startup
+must still match each certificate against its exact NOD1 pair and NOC1 index.
+
+The backend is not yet adopted by the production controller/daemon. That wiring,
+owned terminal signing, and exact retry after terminal publication remain the
+immediate C2 integration work. No guest artifact or HTTP endpoint changed.
 
 ### Durable client acknowledgement before completion
 

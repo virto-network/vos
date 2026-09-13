@@ -189,6 +189,7 @@ enum StoreRole {
     OperationIssuer = 20,
     OperationDispatch = 21,
     OperationCompletions = 22,
+    OperationRetirements = 23,
 }
 
 impl StoreRole {
@@ -216,6 +217,7 @@ impl StoreRole {
             Self::OperationIssuer => "authority-operation.issuer",
             Self::OperationDispatch => "authority-operation.dispatch",
             Self::OperationCompletions => "authority-operation.completions",
+            Self::OperationRetirements => "authority-operation.retirements",
         }
     }
 
@@ -243,6 +245,7 @@ impl StoreRole {
             Self::OperationIssuer => "authority-operation.issuer.next",
             Self::OperationDispatch => "authority-operation.dispatch.next",
             Self::OperationCompletions => "authority-operation.completions.next",
+            Self::OperationRetirements => "authority-operation.retirements.next",
         }
     }
 
@@ -262,6 +265,7 @@ impl StoreRole {
             Self::OperationCoordinator => MAX_AUTHORITY_OPERATION_COORDINATOR_IMAGE_BYTES,
             Self::OperationIssuer => MAX_AUTHORITY_OPERATION_ISSUER_IMAGE_BYTES,
             Self::OperationCompletions => 40 + 256 * (4 + 512),
+            Self::OperationRetirements => 40 + 256 * (4 + 1024),
             Self::OperationDispatch => {
                 #[cfg(target_os = "linux")]
                 {
@@ -294,6 +298,7 @@ impl StoreRole {
             20 => Some(Self::OperationIssuer),
             21 => Some(Self::OperationDispatch),
             22 => Some(Self::OperationCompletions),
+            23 => Some(Self::OperationRetirements),
             1 => Some(Self::Pins),
             2 => Some(Self::Bootstrap),
             3 => Some(Self::ManagementIssuer),
@@ -2420,6 +2425,8 @@ mod operation_journal_tests;
 mod operation_completions;
 #[cfg(target_os = "linux")]
 pub(crate) use operation_completions::CleanNativeAuthorityOperationCompletions;
+#[cfg(target_os = "linux")]
+pub(crate) use operation_completions::CleanNativeAuthorityOperationRetirements;
 
 #[cfg(test)]
 pub(crate) mod tests {

@@ -23,7 +23,7 @@ pub use completion::{
 };
 pub use retirement::{
     MAX_NATIVE_OPERATION_RETIREMENT_BYTES, NativeAuthorityOperationRetirementSigner,
-    native_operation_retirement_completion,
+    NativeAuthorityOperationRetirementStore, native_operation_retirement_completion,
 };
 
 const MAX_DISPATCH_REQUEST_BYTES: usize =

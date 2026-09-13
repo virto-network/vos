@@ -23,8 +23,9 @@ pub use operation_dispatch::{
     MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES, MAX_NATIVE_OPERATION_COMPLETION_BYTES,
     MAX_NATIVE_OPERATION_RETIREMENT_BYTES, NativeAuthorityOperationCompletionSigner,
     NativeAuthorityOperationJournalStore, NativeAuthorityOperationRetirementSigner,
-    NativeAuthorityOperationStartupAdmission, native_operation_completion_invocations,
-    native_operation_record_matches, native_operation_retirement_completion,
+    NativeAuthorityOperationRetirementStore, NativeAuthorityOperationStartupAdmission,
+    native_operation_completion_invocations, native_operation_record_matches,
+    native_operation_retirement_completion,
 };
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
