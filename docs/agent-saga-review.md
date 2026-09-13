@@ -3622,6 +3622,44 @@ installation/invocation and ordinary Shared finality. No rebuilt-CLI smoke,
 source freeze, guest rebuild, release certification or branch promotion is
 claimed by this C2 checkpoint.
 
+### Independently replayed unissued-denial evidence
+
+`verify_management_denial` now distinguishes an executed canonical Authority
+denial from an approval awaiting issuance. It authenticates the retained signed
+Create against independent bootstrap pins, requires an empty matching issuer
+with no pending issuance, no finalization/retirement marker and no Local
+application, and requires the exact live envelope/anchor reservation. It walks
+the anchored journal to the retained invocation and uses a fresh replay executor
+to recover its terminal result, reconciling replay state/heads with the physical
+journal and ledger. Reply identity and Done status must match the exact work.
+Only the byte-for-byte canonical encoding of an empty byte value qualifies;
+transport/runtime failures, malformed responses and nonempty approvals do not.
+
+The resulting evidence binds the credential-call commitment, immutable envelope,
+anchor and journal input ID. Its fields cannot be constructed outside the pinned
+owner module. It is deliberately ephemeral: it is not a durable denial marker
+and does not authorize releasing admission or signing an application ACK.
+
+Native regressions send a genuine signed out-of-sequence request through the
+bundled Authority and compare it with a valid authorization interrupted before
+receipt issuance. The denial alone yields evidence, including after attachment
+refresh. Both cases retain one Ordered invocation, zero receipt/ACK signatures,
+unchanged issuer/intent images and no Local Agent; the reservation remains held.
+A substituted issuer scope is rejected. All 15 tests selected by `denial` passed
+(11.15s, `r16-denial-evidence-verified.log`), including both native controls and
+adjacent existing denial tests. The initial compile attempt failed on an absent
+decode-trait import; exact canonical-byte comparison replaced decoding and is
+what the verified run exercised. Logs remain in shared disk scratch.
+
+This evidence helper is not yet invoked by automatic denial cleanup. Next, add
+a durable denial disposition and single-authorization positive-ACK retirement,
+including recovery when the host marker or ACK publication fails. The completed
+disposition must remain independently verifiable after runtime result pruning;
+an empty issuer, local error or discarded CMI4 file is not that proof. Client
+credential retry bookkeeping and expiry/abort handling still need their own
+verified completion semantics. No release readiness or branch promotion is
+claimed by this C2 checkpoint.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its
