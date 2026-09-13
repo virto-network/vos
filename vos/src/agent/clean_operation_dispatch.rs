@@ -8,8 +8,8 @@ use crate::agent::authority_operation_coordinator::{
 };
 use crate::agent::clean_management_intent::ManagementJournalAnchor;
 use crate::agent::sdk::authority_operation::{
-    AuthorityOperationCall, AuthorityOperationIssuanceAck, MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES,
-    MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES,
+    AuthorityOperationApproval, AuthorityOperationCall, AuthorityOperationIssuanceAck,
+    MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES, MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES,
 };
 
 const MAX_DISPATCH_REQUEST_BYTES: usize =
@@ -224,8 +224,55 @@ where
         )
     }
 
-    /// Prepare only fresh work. Recovery must use the saved whole envelope,
-    /// never current installation data or a regenerated authorization clock.
+    /// Extend only the exact retained authorization with its signed issuance
+    /// acknowledgement. The journal admission layer independently requires the
+    /// predecessor to be present; a matching signature cannot invent admission.
+    pub(crate) fn extend_authority_operation_dispatch<F>(
+        &mut self,
+        predecessor: &RetainedAuthorityOperationDispatch,
+        approval: &AuthorityOperationApproval,
+        request: &AuthorityOperationActorDispatch,
+        persist: F,
+    ) -> Result<RetainedAuthorityOperationDispatch, SharedAgentHostError>
+    where
+        F: FnOnce(&RetainedAuthorityOperationDispatch) -> Result<(), SharedAgentHostError>,
+    {
+        if !predecessor.validate_wire()
+            || predecessor.request.method != AuthorityOperationActorMethod::AuthorizeOperation
+            || predecessor.request.target != self.authority_target()
+            || request.method != AuthorityOperationActorMethod::AcknowledgeIssuance
+            || !request.has_valid_request()
+            || request.context.observed_slot < predecessor.request.context.observed_slot
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let call = AuthorityOperationCall::decode(&predecessor.request.request)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let acknowledgement = AuthorityOperationIssuanceAck::decode(&request.request)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if !acknowledgement.matches_pending(&call, approval) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let proposed = self.prepare_authority_operation_dispatch(request)?;
+        self._network_host.extend_management_pending(
+            crate::service::AgentId(self.pins.agent.0),
+            &(predecessor.anchor.clone(), predecessor.envelope.clone()),
+            &proposed,
+            |(anchor, envelope)| {
+                let retained = RetainedAuthorityOperationDispatch::new(
+                    request.clone(),
+                    envelope.clone(),
+                    anchor.clone(),
+                )?;
+                persist(&retained)?;
+                Ok(retained)
+            },
+        )
+    }
+
+    /// Prepare fresh installed material. Authorization uses the current clock;
+    /// AOI1 uses its already-signed issuance clock, never a later host clock.
+    /// Recovery must use the saved whole envelope instead of this method.
     pub(crate) fn prepare_authority_operation_dispatch(
         &self,
         request: &AuthorityOperationActorDispatch,
@@ -242,7 +289,9 @@ where
         if material.actor.entry.deployment != request.target.binding.issuer.deployment
             || material.actor.entry.program != request.target.binding.issuer.program
             || material.producer != request.target.binding.issuer.producer
-            || material.observed_slot != request.context.observed_slot
+            || request.context.observed_slot > material.observed_slot
+            || (request.method == AuthorityOperationActorMethod::AuthorizeOperation
+                && material.observed_slot != request.context.observed_slot)
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
@@ -274,14 +323,15 @@ where
             recovery_only: false,
         };
         let authorization = InvocationAuthorization::PublicPreflight(
-            super::super::sdk::PublicPreflight::for_work(&work, material.observed_slot),
+            super::super::sdk::PublicPreflight::for_work(&work, request.context.observed_slot),
         );
-        if !super::super::supervisor_adapters::physical_material_authorizes_work(
+        if !super::super::supervisor_adapters::physical_material_authorizes_reserved_work(
             &material,
             identity,
             RuntimeExecutionContext::Direct,
             &work,
             &authorization,
+            request.context.observed_slot,
         ) {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
@@ -290,7 +340,7 @@ where
             state: RuntimeState::default(),
             invocation: Box::new(work),
             authorization: Box::new(authorization),
-            observed_slot: material.observed_slot,
+            observed_slot: request.context.observed_slot,
         };
         matches_operation_envelope(request, &envelope)
             .then_some(envelope)

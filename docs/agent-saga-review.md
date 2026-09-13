@@ -5129,10 +5129,10 @@ pass. All logs remain in the shared target's disk-backed `task-tmp`.
 
 The existing native management issuance regression passes: **one passed in
 124.90s** (`r16-native-operation-management-regression.log`). The broader
-coordinator regression (`r16-native-operation-dispatch.log`, started before the
-final test additions) remains running at this checkpoint and is not counted as
-passing. Preserve and poll that run rather than restarting it because a tool
-observation yields no output.
+coordinator regression also completed: **19 passed, zero failed, in 1,254.24s**
+(`r16-native-operation-dispatch.log`). That run started before the final native
+test additions and clock-extension changes; it is not a final-source release
+matrix. Both processes are terminal, not waiting or abandoned.
 
 The next connection still requires a durable native dispatch record and its
 startup recovery: the coordinator's context omits incarnation, availability,
@@ -5178,6 +5178,44 @@ unrelated initial invocation. Then connect the native record store, coordinator
 and issuer and prove approved issuance, actor consumption and positive
 retirement. This checkpoint does not expose protected HTTP issuance, complete
 startup recovery or establish a working protected mutation.
+
+### Native issuance-acknowledgement phase admission
+
+`extend_authority_operation_dispatch` now admits AOI1 only after validating its
+exact retained AOC5 predecessor, matching AOP5, both issuance signatures and
+the signed observation slot. The native journal independently requires that
+exact predecessor envelope and anchor to be present in the pending admission
+set. A structurally valid NOD1 record cannot manufacture that admission.
+The new AOI1 record is persisted under the same admission boundary; ambiguous
+publication retains the exact pair for retry. This does not consume the actor's
+pending approval or retire either native result by itself.
+
+Fresh AOC5 preparation still requires the current observed clock. AOI1
+preparation instead preserves its signed `issued_at`, which may precede the
+current host clock but may not precede its authorization or lie in the future.
+Current physical actor/installation material is still checked. Regenerating
+AOI1 context from a later host clock would violate its signed protocol binding;
+the native preparation path now supports that delayed phase without rewriting
+the signed time or weakening initial authorization admission.
+
+The extended physical test passes **one test in 5.18s**
+(`r16-native-operation-extension-final.log`; the preceding pass was 5.25s in
+`r16-native-operation-extension.log`). It advances the host clock after the
+original authorization, rejects fresh-AOI1 capture, substituted predecessor
+anchors and mismatched approval, then syncs an AOI1 NOD1 record and injects a
+post-publication error. Exact extension retry preserves the record and signed
+clock, with no policy execution during capture. The bundled guest rejects its
+consumption and exact replay adds no second journal transition.
+
+This is intentionally a negative security test: a test-only scripted
+coordinator produces authority-signed issuance for the real guest-denied,
+unenrolled request. The guest's `false` reply proves host signatures alone
+cannot substitute for its own policy approval. It is not evidence for approved
+native issuance or successful AOI1 consumption. Production code has no such
+scripted signer/policy path. Formatting and diff checks pass; all test processes
+are terminal. The next implementation remains the durable dispatch-store and
+coordinator connection plus native startup admission recovery, followed by a
+genuinely approved operation, successful consumption and positive retirement.
 
 ### Durable client acknowledgement before completion
 

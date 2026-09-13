@@ -9755,6 +9755,8 @@ mod tests {
                 native_bundled_authority_fixture(),
             );
             let saved_path = harness._directory.0.join("operation-dispatch.test");
+            let ack_path = harness._directory.0.join("operation-issuance.test");
+            let clock = harness.fixture.logical_slot.as_ref().unwrap().clone();
             let owner = harness.owner.as_mut().unwrap();
             let target = owner.authority_target();
             let slot = owner
@@ -9884,6 +9886,109 @@ mod tests {
             assert_eq!(repeated, result);
             assert_eq!(owner.ordered_index_for_test().unwrap(), applied);
             assert_eq!(std::fs::read(&saved_path).unwrap(), saved);
+            // Scripted issuance is intentionally inconsistent with the real
+            // guest denial above. It exercises signed phase admission, while
+            // the guest must still reject consumption without its own approval.
+            let (approval, acknowledgement) = crate::agent::authority_operation_coordinator::tests::scripted_issuance_for_native_rejection(&request, RECEIPT_SEED);
+            clock.store(slot + 10, Ordering::Release);
+            let mut unknown_anchor = retained.anchor().clone();
+            unknown_anchor.runtime = HostHash([0x98; 32]);
+            let mut unknown_record = Vec::new();
+            unknown_record.extend_from_slice(&RetainedAuthorityOperationDispatch::MAGIC);
+            unknown_record.extend_from_slice(crate::agent_sdk::RUNTIME_ABI_ID.as_bytes());
+            let mut encoder = vos_protocol::wire::Encoder(&mut unknown_record);
+            encoder.u8(request.method as u8);
+            encoder.bytes(&request.request);
+            encoder.bytes(&retained.envelope().encode().unwrap());
+            encoder.bytes(&unknown_anchor.encode());
+            let unknown = RetainedAuthorityOperationDispatch::decode(&unknown_record).unwrap();
+            assert!(
+                owner
+                    .extend_authority_operation_dispatch(
+                        &unknown,
+                        &approval,
+                        &acknowledgement,
+                        |_| { panic!("an unadmitted predecessor cannot extend native admission") }
+                    )
+                    .is_err()
+            );
+            assert!(
+                owner
+                    .capture_authority_operation_dispatch(&acknowledgement, |_| {
+                        panic!("AOI1 cannot be captured as a fresh authorization")
+                    })
+                    .is_err()
+            );
+            let mut wrong_approval = approval.clone();
+            wrong_approval.authorization_sequence = core::num::NonZeroU64::new(99).unwrap();
+            assert!(
+                owner
+                    .extend_authority_operation_dispatch(
+                        &retained,
+                        &wrong_approval,
+                        &acknowledgement,
+                        |_| { panic!("mismatched issuance must not reach persistence") }
+                    )
+                    .is_err()
+            );
+            let extended = owner.extend_authority_operation_dispatch(
+                &retained,
+                &approval,
+                &acknowledgement,
+                |record| {
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&ack_path)
+                        .unwrap();
+                    file.write_all(&record.encode().unwrap()).unwrap();
+                    file.sync_all().unwrap();
+                    std::fs::File::open(ack_path.parent().unwrap())
+                        .unwrap()
+                        .sync_all()
+                        .unwrap();
+                    Err(SharedAgentHostError::Unavailable)
+                },
+            );
+            assert!(matches!(extended, Err(SharedAgentHostError::Unavailable)));
+            assert_eq!(owner.ordered_index_for_test().unwrap(), applied);
+            let saved_ack = std::fs::read(&ack_path).unwrap();
+            let ack_record = RetainedAuthorityOperationDispatch::decode(&saved_ack).unwrap();
+            assert_eq!(ack_record.request(), &acknowledgement);
+            assert_eq!(ack_record.request().context.observed_slot, slot);
+            assert_eq!(ack_record.encode().unwrap(), saved_ack);
+            let retry = owner
+                .extend_authority_operation_dispatch(
+                    &retained,
+                    &approval,
+                    &acknowledgement,
+                    |record| {
+                        assert_eq!(record.encode().unwrap(), saved_ack);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            assert_eq!(retry, ack_record);
+            let denied = owner
+                .execute_authority_operation_dispatch(
+                    ack_record.request(),
+                    ack_record.envelope(),
+                    ack_record.anchor(),
+                )
+                .unwrap();
+            assert!(denied.authenticated && denied.durable);
+            assert_eq!(Value::try_decode(&denied.reply), Some(Value::Bool(false)));
+            assert_eq!(owner.ordered_index_for_test().unwrap(), applied + 1);
+            let repeated = owner
+                .execute_authority_operation_dispatch(
+                    ack_record.request(),
+                    ack_record.envelope(),
+                    ack_record.anchor(),
+                )
+                .unwrap();
+            assert_eq!(repeated, denied);
+            assert_eq!(owner.ordered_index_for_test().unwrap(), applied + 1);
+            assert_eq!(std::fs::read(&ack_path).unwrap(), saved_ack);
             harness.stop();
         }
 

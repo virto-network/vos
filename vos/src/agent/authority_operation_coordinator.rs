@@ -1660,6 +1660,51 @@ pub(crate) mod tests {
         }
     }
 
+    /// Deliberately use scripted policy to manufacture issuance for a native
+    /// denial test. This must never be treated as native approval evidence.
+    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+    pub(crate) fn scripted_issuance_for_native_rejection(
+        request: &AuthorityOperationActorDispatch,
+        signer_seed: u8,
+    ) -> (AuthorityOperationApproval, AuthorityOperationActorDispatch) {
+        let mut signer = CountingSigner::new(signer_seed);
+        assert_eq!(signer.public_key(), request.target.binding.public_key);
+        let fixture = Fixture {
+            authority: request.target,
+            credential_key: SigningKey::from_bytes(&[0x21; 32]),
+        };
+        let call = AuthorityOperationCall::decode(&request.request).unwrap();
+        let mut coordinator = open(
+            MemoryImageStore::default(),
+            MemoryImageStore::default(),
+            FakeDispatcher::new(request.target),
+            &fixture,
+        );
+        let issued = coordinator
+            .coordinate(
+                &call,
+                request.context,
+                request.context.observed_slot,
+                &mut signer,
+            )
+            .unwrap();
+        let approval = coordinator
+            .issuer
+            .recover_retained(call.invocation)
+            .unwrap()
+            .unwrap()
+            .approval;
+        (
+            approval,
+            AuthorityOperationActorDispatch {
+                target: request.target,
+                method: AuthorityOperationActorMethod::AcknowledgeIssuance,
+                context: acknowledgement_context(&issued.issuance_ack),
+                request: issued.issuance_ack.encode().unwrap(),
+            },
+        )
+    }
+
     #[test]
     fn native_dispatch_validates_signed_method_domain_and_context() {
         let mut signer = CountingSigner::new(0x10);
