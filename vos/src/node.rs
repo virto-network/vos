@@ -1344,6 +1344,8 @@ pub struct VosNode {
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
     clean_agent_ingress_supervisor:
         Arc<RwLock<Option<crate::agent::supervisor::AgentSupervisorHandle>>>,
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    clean_local_lifecycle_queue: Arc<crate::agent::local_lifecycle::LocalLifecycleQueue>,
 }
 
 /// Shared content-addressed proof-blob store. Cheap to clone; both
@@ -2191,6 +2193,8 @@ pub struct IngressHandle {
     ingress_node_attester: Option<IngressNodeAttester>,
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
     clean_agent_supervisor: Arc<RwLock<Option<crate::agent::supervisor::AgentSupervisorHandle>>>,
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    clean_local_lifecycle_queue: Arc<crate::agent::local_lifecycle::LocalLifecycleQueue>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2227,6 +2231,31 @@ impl std::error::Error for IngressNodeAttestationError {}
     allow(dead_code)
 )]
 impl IngressHandle {
+    /// Queue one bounded Local Create for the node owner. Queue acceptance is
+    /// not authorization or application success: await the returned result.
+    /// Disconnecting does not cancel an accepted durable lifecycle operation.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    pub fn create_clean_local_agent(
+        &self,
+        descriptor: crate::agent::sdk::AgentDescriptor,
+        call: crate::agent::sdk::authority::AuthorityCredentialCall,
+        runtime: crate::agent::package_admission::AdmittedRuntimePackage,
+    ) -> Result<
+        mpsc::Receiver<crate::agent::local_lifecycle::LocalCreateResult>,
+        crate::agent::local_lifecycle::LocalLifecycleIngressError,
+    > {
+        use crate::agent::local_lifecycle::LocalLifecycleIngressError;
+        use crate::agent::sdk::wire::CanonicalWire as _;
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(LocalLifecycleIngressError::Unavailable);
+        }
+        if descriptor.validate().is_err() || call.encode().is_err() {
+            return Err(LocalLifecycleIngressError::Invalid);
+        }
+        self.clean_local_lifecycle_queue
+            .submit(descriptor, call, runtime)
+    }
+
     /// Return the currently exposed clean-generation supervisor. The slot is
     /// populated only after authenticated owner construction and is cleared
     /// before node shutdown begins.
@@ -5496,6 +5525,10 @@ impl VosNode {
             clean_agent_owner_error: None,
             #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
             clean_agent_ingress_supervisor: Arc::new(RwLock::new(None)),
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            clean_local_lifecycle_queue: Arc::new(
+                crate::agent::local_lifecycle::LocalLifecycleQueue::default(),
+            ),
         }
     }
 
@@ -5627,7 +5660,15 @@ impl VosNode {
             authenticator,
             reconcile_interval,
         )?;
-        self.attach_clean_agent_owner(owner)
+        self.attach_clean_agent_owner(owner)?;
+        if self.clean_local_lifecycle_queue.open().is_err() || self.shutdown.load(Ordering::Acquire)
+        {
+            self.signal_node_shutdown();
+            return Err(
+                crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration,
+            );
+        }
+        Ok(())
     }
 
     /// Signed Local Create through the retained lifecycle controller, followed
@@ -8056,6 +8097,7 @@ impl VosNode {
         self.shutdown.store(true, Ordering::Relaxed);
         #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
         {
+            self.clean_local_lifecycle_queue.close();
             if let Ok(mut exposed) = self.clean_agent_ingress_supervisor.write() {
                 *exposed = None;
             }
@@ -8075,6 +8117,26 @@ impl VosNode {
 
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
     fn drive_clean_agent_owner(&mut self) -> bool {
+        match self.clean_local_lifecycle_queue.pop() {
+            Ok(Some(request)) if !self.shutdown.load(Ordering::Acquire) => {
+                let result = self.create_clean_local_agent(
+                    request.descriptor,
+                    request.call,
+                    request.runtime,
+                );
+                let _ = request.reply.try_send(result);
+            }
+            Ok(Some(request)) => {
+                let _ = request.reply.try_send(Err(
+                    crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration,
+                ));
+            }
+            Ok(None) => {}
+            Err(_) => {
+                self.signal_node_shutdown();
+                return false;
+            }
+        }
         let result = self
             .clean_agent_owner
             .as_mut()
@@ -8241,6 +8303,8 @@ impl VosNode {
             ingress_node_attester: self.ingress_node_attester.clone(),
             #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
             clean_agent_supervisor: self.clean_agent_ingress_supervisor.clone(),
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            clean_local_lifecycle_queue: self.clean_local_lifecycle_queue.clone(),
         }
     }
 

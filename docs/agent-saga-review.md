@@ -14,7 +14,7 @@ Implementation is in `.worktrees/ch08-runtime-directory` on
 Use only an isolated, disposable environment for bootstrap/ingress testing.
 Fresh-space first start and restart with bundled system actors and HTTP/SSH
 have passed; ordinary-agent creation is not yet a usable production path.
-The current native Local-controller wiring also passed fresh-data startup and
+The native Local-controller wiring at `ee047d48` passed fresh-data startup and
 restart using the rebuilt CLI (`target/native-local-smoke.DATNas`, details below).
 This is bootstrap/ingress coverage, not ordinary-Agent creation/installation.
 AJC3 checkpoints and AGIM/AGI2 images are deliberately rejected, with no in-place
@@ -1870,3 +1870,33 @@ after their checks. This establishes current-source positive native startup and
 restart with the retained controller, but not ordinary-Agent Create/publication
 or management ingress. The compiled CLI remains an unpromoted test candidate;
 the final reproducible-artifact and release gates are still open.
+
+### Bounded ingress-to-node Local lifecycle queue
+
+`IngressHandle::create_clean_local_agent` now accepts structurally bounded
+descriptor/call data and an admitted runtime, then returns a separate result
+receiver. The queue opens only after Local production startup succeeds, holds
+at most four pending requests (plus one executing), and is closed during node
+shutdown. The router loop processes at most one lifecycle request per pass
+through the existing node Create API; it does not hold the queue lock during
+authorization, physical application or authenticated reconciliation.
+
+Queue acceptance is neither authorization nor success. The controller still
+verifies the signed call before opening stores. Disconnect does not cancel an
+accepted durable lifecycle operation, and a post-application failure still needs
+the same signed retry. Shutdown refuses queued requests and prevents later
+submission; a request already executing may have committed and must not be
+reported as rolled back. Ingress handlers must await the result outside the node
+router thread. HTTP/SSH request decoding and CLI command submission are not yet
+connected to this API.
+
+The queue regression uses the existing native lifecycle fixture to check closed
+admission, capacity refusal, exact queued descriptor/call delivery, slot reuse
+after dequeue, response routing, shutdown replies and refusal after close. It is
+a transport-boundary test, not an ordinary-Agent creation test through HTTP/SSH.
+The CLI smoke at `ee047d48` predates this queue change; no new CLI build or daemon
+smoke has been claimed for the queue checkpoint.
+
+**34/34 queue/controller/node-boundary, production-owner and supervisor-adapter
+tests pass** in 11.94s (`r16-local-lifecycle-queue-final.log`, locked/offline
+`pvm,private-agent-store`, disk scratch). Formatting and diff checks pass.

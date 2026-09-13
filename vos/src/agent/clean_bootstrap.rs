@@ -7101,6 +7101,11 @@ mod tests {
         }
 
         #[test]
+        fn native_local_lifecycle_queue_is_bounded_and_closes_pending_replies() {
+            native_local_management_lifecycle(4);
+        }
+
+        #[test]
         fn native_shared_system_owner_survives_route_retirement_and_fails_closed_on_poison() {
             let mut harness = NativeProjectionOwnerHarness::new("shared-system-owner");
             let owner = Arc::new(Mutex::new(harness.owner.take().unwrap()));
@@ -7279,6 +7284,58 @@ mod tests {
             call.authority = owner.authority_target();
             call.invocation = call.expected_invocation();
             call.signature = credential_key.sign(&call.signing_bytes()).to_bytes();
+            if coordinated == 4 {
+                use crate::agent::local_lifecycle::{
+                    LOCAL_LIFECYCLE_QUEUE_CAPACITY, LocalLifecycleIngressError, LocalLifecycleQueue,
+                };
+                let queue = LocalLifecycleQueue::default();
+                assert!(matches!(
+                    queue.submit(descriptor.clone(), call.clone(), runtime.clone()),
+                    Err(LocalLifecycleIngressError::Unavailable)
+                ));
+                queue.open().unwrap();
+                let mut replies = Vec::new();
+                for _ in 0..LOCAL_LIFECYCLE_QUEUE_CAPACITY {
+                    replies.push(
+                        queue
+                            .submit(descriptor.clone(), call.clone(), runtime.clone())
+                            .unwrap(),
+                    );
+                }
+                assert!(matches!(
+                    queue.submit(descriptor.clone(), call.clone(), runtime.clone()),
+                    Err(LocalLifecycleIngressError::Busy)
+                ));
+                let pending = queue.pop().unwrap().unwrap();
+                assert_eq!(pending.descriptor, descriptor);
+                assert_eq!(pending.call, call);
+                pending
+                    .reply
+                    .try_send(Err(
+                        crate::agent::production_owner::AgentProductionOwnerError::Authentication,
+                    ))
+                    .unwrap();
+                assert_eq!(
+                    replies.remove(0).recv().unwrap(),
+                    Err(crate::agent::production_owner::AgentProductionOwnerError::Authentication)
+                );
+                replies.push(
+                    queue
+                        .submit(descriptor.clone(), call.clone(), runtime.clone())
+                        .unwrap(),
+                );
+                queue.close();
+                for reply in replies {
+                    assert_eq!(reply.recv().unwrap(), Err(crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration));
+                }
+                assert!(queue.pop().unwrap().is_none());
+                assert!(matches!(
+                    queue.submit(descriptor, call, runtime),
+                    Err(LocalLifecycleIngressError::Unavailable)
+                ));
+                harness.stop();
+                return;
+            }
             if coordinated >= 2 {
                 struct Stores {
                     scope: (SpaceId, AgentId),
