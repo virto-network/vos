@@ -50,6 +50,13 @@ const LIFECYCLE_ISSUER_STAGE_FILE: &str = "management.issuer.next";
 const LOCAL_REQUEST_FILE: &str = "local-create.request";
 const LOCAL_REQUEST_STAGE_FILE: &str = "local-create.request.next";
 const LOCAL_REQUEST_ENTRIES: [&str; 3] = [LOCK_FILE, LOCAL_REQUEST_FILE, LOCAL_REQUEST_STAGE_FILE];
+const CREDENTIAL_QUERY_FILE: &str = "credential.query";
+const CREDENTIAL_QUERY_STAGE_FILE: &str = "credential.query.next";
+const CREDENTIAL_QUERY_ENTRIES: [&str; 3] = [
+    LOCK_FILE,
+    CREDENTIAL_QUERY_FILE,
+    CREDENTIAL_QUERY_STAGE_FILE,
+];
 const LIFECYCLE_ENTRIES: [&str; 5] = [
     LOCK_FILE,
     INTENT_FILE,
@@ -139,6 +146,7 @@ enum StoreRole {
     ManagementIntent = 5,
     LifecycleIssuer = 6,
     LocalCreateRequest = 7,
+    CredentialQuery = 8,
 }
 
 impl StoreRole {
@@ -151,6 +159,7 @@ impl StoreRole {
             Self::ManagementIntent => INTENT_FILE,
             Self::LifecycleIssuer => LIFECYCLE_ISSUER_FILE,
             Self::LocalCreateRequest => LOCAL_REQUEST_FILE,
+            Self::CredentialQuery => CREDENTIAL_QUERY_FILE,
         }
     }
 
@@ -163,6 +172,7 @@ impl StoreRole {
             Self::ManagementIntent => INTENT_STAGE_FILE,
             Self::LifecycleIssuer => LIFECYCLE_ISSUER_STAGE_FILE,
             Self::LocalCreateRequest => LOCAL_REQUEST_STAGE_FILE,
+            Self::CredentialQuery => CREDENTIAL_QUERY_STAGE_FILE,
         }
     }
 
@@ -175,6 +185,9 @@ impl StoreRole {
             Self::ManagementIntent => MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES,
             Self::LifecycleIssuer => MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
             Self::LocalCreateRequest => 1024 * 1024,
+            Self::CredentialQuery => {
+                vos::agent::sdk::wire::MAX_AUTHORITY_PROJECTION_QUERY_WIRE_BYTES
+            }
         }
     }
 
@@ -187,6 +200,7 @@ impl StoreRole {
             5 => Some(Self::ManagementIntent),
             6 => Some(Self::LifecycleIssuer),
             7 => Some(Self::LocalCreateRequest),
+            8 => Some(Self::CredentialQuery),
             _ => None,
         }
     }
@@ -291,6 +305,70 @@ pub(crate) struct CleanManagementIntentFile(ExactFileStore);
 /// same request for restart. This does not allocate a credential sequence.
 #[cfg(target_os = "linux")]
 pub(crate) struct CleanLocalCreateRequestFile(ExactFileStore);
+
+/// Immutable signed discovery query, scoped to an independently chosen target
+/// and credential. A valid initial stage is recoverable; no nonce replacement
+/// is allowed after publication or ambiguous completion.
+#[cfg(target_os = "linux")]
+pub(crate) struct CleanCredentialQueryFile {
+    store: ExactFileStore,
+    authority: vos::agent::sdk::authority::AuthorityActorTarget,
+    credential: vos::agent::sdk::CredentialId,
+}
+
+#[cfg(target_os = "linux")]
+impl CleanCredentialQueryFile {
+    pub(crate) fn open_or_create(
+        root: impl AsRef<Path>,
+        authority: vos::agent::sdk::authority::AuthorityActorTarget,
+        credential: vos::agent::sdk::CredentialId,
+    ) -> Result<Self, CleanFileStoreError> {
+        if !authority.is_valid() || credential == vos::agent::sdk::CredentialId::ZERO {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        let root = Arc::new(StoreRoot::open_with_entries(
+            root.as_ref(),
+            &CREDENTIAL_QUERY_ENTRIES,
+        )?);
+        Ok(Self {
+            store: ExactFileStore::new(root, StoreRole::CredentialQuery),
+            authority,
+            credential,
+        })
+    }
+
+    pub(crate) fn load(&mut self) -> Result<Option<Vec<u8>>, CleanFileStoreError> {
+        let bytes = self
+            .store
+            .load(StoreRole::CredentialQuery.maximum_bytes())?;
+        if let Some(bytes) = &bytes {
+            self.validate(bytes)?;
+            self.store.commit_with_replacement(bytes, false)?;
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn publish(&mut self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
+        self.validate(bytes)?;
+        self.store.commit_with_replacement(bytes, false)
+    }
+
+    fn validate(&self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
+        use vos::agent::sdk::authority::{AuthorityProjectionQuery, AuthorityProjectionSelector};
+        use vos::agent::sdk::wire::CanonicalWire as _;
+        let query =
+            AuthorityProjectionQuery::decode(bytes).map_err(|_| CleanFileStoreError::Corrupt)?;
+        if query.authority != self.authority
+            || query.credential != self.credential
+            || query.selector != AuthorityProjectionSelector::Credential
+        {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        query
+            .verify_api_with(&super::local_create::CredentialVerifier)
+            .map_err(|_| CleanFileStoreError::Corrupt)
+    }
+}
 
 #[cfg(target_os = "linux")]
 impl CleanLocalCreateRequestFile {
@@ -629,11 +707,13 @@ impl ExactFileStore {
         self.root.audit_entries()?;
         let canonical = self.read_optional(self.role.file(), maximum_bytes)?;
         let staged = self.read_optional(self.role.stage_file(), maximum_bytes)?;
-        if self.role == StoreRole::LocalCreateRequest
-            && canonical
-                .iter()
-                .chain(staged.iter())
-                .any(|image| image.predecessor.is_some())
+        if matches!(
+            self.role,
+            StoreRole::LocalCreateRequest | StoreRole::CredentialQuery
+        ) && canonical
+            .iter()
+            .chain(staged.iter())
+            .any(|image| image.predecessor.is_some())
         {
             return Err(CleanFileStoreError::RequestConflict);
         }
@@ -1369,6 +1449,219 @@ mod tests {
         )
         .unwrap()
         .encode()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn credential_queries() -> (
+        vos::agent::sdk::authority::AuthorityActorTarget,
+        vos::agent::sdk::CredentialId,
+        Vec<u8>,
+        Vec<u8>,
+    ) {
+        use vos::agent::production_owner::AuthorityProjectionQueryAuthenticator as _;
+        use vos::agent::sdk::{authority::AuthorityProjectionSelector, wire::CanonicalWire as _};
+        let (operator, authority, _, _) = super::super::local_create::tests::fixture();
+        let mut signer = super::super::authority_projection_authenticator::OperatorAuthorityProjectionAuthenticator::new(operator).unwrap();
+        let first = signer
+            .authenticate(authority, AuthorityProjectionSelector::Credential)
+            .unwrap();
+        let second = signer
+            .authenticate(authority, AuthorityProjectionSelector::Credential)
+            .unwrap();
+        (
+            authority,
+            first.credential,
+            first.encode().unwrap(),
+            second.encode().unwrap(),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn credential_query_retains_exact_nonce_and_scope_under_one_lease() {
+        use vos::agent::sdk::{
+            authority::{AuthorityIngressAuthentication, AuthorityProjectionQuery},
+            wire::CanonicalWire as _,
+        };
+        let fixture = Fixture::new("credential-query");
+        let (authority, credential, first, second) = credential_queries();
+        let mut store =
+            CleanCredentialQueryFile::open_or_create(&fixture.root, authority, credential).unwrap();
+        assert!(matches!(
+            CleanCredentialQueryFile::open_or_create(&fixture.root, authority, credential),
+            Err(CleanFileStoreError::Busy)
+        ));
+        let mut forged = AuthorityProjectionQuery::decode(&first).unwrap();
+        let AuthorityIngressAuthentication::ApiCredentialSignature { signature, .. } =
+            &mut forged.authentication
+        else {
+            unreachable!()
+        };
+        signature[0] ^= 1;
+        assert!(store.publish(&forged.encode().unwrap()).is_err());
+        assert!(store.load().unwrap().is_none());
+        store.publish(&first).unwrap();
+        store.publish(&first).unwrap();
+        assert!(matches!(
+            store.publish(&second),
+            Err(CleanFileStoreError::RequestConflict)
+        ));
+        drop(store);
+        let mut wrong = CleanCredentialQueryFile::open_or_create(
+            &fixture.root,
+            authority,
+            vos::agent::sdk::CredentialId([99; 32]),
+        )
+        .unwrap();
+        assert!(wrong.load().is_err());
+        drop(wrong);
+        let mut store =
+            CleanCredentialQueryFile::open_or_create(&fixture.root, authority, credential).unwrap();
+        assert_eq!(store.load().unwrap(), Some(first));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn credential_query_recovers_initial_stage_without_accepting_replacement() {
+        let fixture = Fixture::new("credential-query-stage");
+        let (authority, credential, first, second) = credential_queries();
+        let store =
+            CleanCredentialQueryFile::open_or_create(&fixture.root, authority, credential).unwrap();
+        let initial = stage(&store.store, None, &first);
+        drop(store);
+        let mut store =
+            CleanCredentialQueryFile::open_or_create(&fixture.root, authority, credential).unwrap();
+        assert_eq!(store.load().unwrap(), Some(first));
+        let canonical = fs::read(fixture.root.join(CREDENTIAL_QUERY_FILE)).unwrap();
+        stage(&store.store, Some(initial.commitment()), &second);
+        drop(store);
+        let mut store =
+            CleanCredentialQueryFile::open_or_create(&fixture.root, authority, credential).unwrap();
+        assert!(matches!(
+            store.load(),
+            Err(CleanFileStoreError::RequestConflict)
+        ));
+        assert_eq!(
+            fs::read(fixture.root.join(CREDENTIAL_QUERY_FILE)).unwrap(),
+            canonical
+        );
+        assert!(fixture.root.join(CREDENTIAL_QUERY_STAGE_FILE).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn credential_discovery_reuses_published_query_across_http_retries() {
+        use vos::agent::sdk::authority::*;
+        use vos::agent::sdk::{Hash, wire::CanonicalWire as _};
+        let fixture = Fixture::new("credential-discovery-http");
+        let (operator, authority, descriptor, _) = super::super::local_create::tests::fixture();
+        let principal = descriptor.identity.owner;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let root = fixture.root.clone();
+        let server = std::thread::spawn(move || {
+            let mut original = None;
+            for _ in 0..2 {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "discovery never connected"
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    assert!(header.len() < 8192);
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    header.push(byte[0]);
+                }
+                let header = String::from_utf8(header).unwrap();
+                assert!(header.starts_with("POST /__agents/credential HTTP/1.1\r\n"));
+                let len: usize = header
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                    .unwrap()
+                    .1
+                    .trim()
+                    .parse()
+                    .unwrap();
+                assert!(len <= StoreRole::CredentialQuery.maximum_bytes());
+                let mut bytes = vec![0; len];
+                stream.read_exact(&mut bytes).unwrap();
+                if let Some(original) = &original {
+                    assert_eq!(original, &bytes);
+                } else {
+                    original = Some(bytes.clone());
+                }
+                let query = AuthorityProjectionQuery::decode(&bytes).unwrap();
+                assert!(root.join(CREDENTIAL_QUERY_FILE).exists());
+                assert!(matches!(
+                    CleanCredentialQueryFile::open_or_create(&root, authority, query.credential),
+                    Err(CleanFileStoreError::Busy)
+                ));
+                let one = std::num::NonZeroU64::new(1).unwrap();
+                let reply = AuthorityCredentialProjection {
+                    query,
+                    head: AuthorityProjectionHead {
+                        state_revision: one,
+                        epoch: one,
+                        authorization_sequence: one,
+                        administration_generation: one,
+                        state_commitment: Hash([42; 32]),
+                    },
+                    principal,
+                    status: AuthorityCredentialStatus::Active,
+                    kind: AuthorityCredentialKind::Api,
+                    builtin_role: AuthorityBuiltinRole::Admin,
+                    management_request_high_water: 1,
+                    operation_request_high_water: 0,
+                    admin_request_high_water: 0,
+                    space_roles: vec![],
+                    actor_roles: vec![],
+                    capabilities: vec![],
+                }
+                .encode()
+                .unwrap();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", reply.len()).unwrap();
+                stream.write_all(&reply).unwrap();
+            }
+            original.unwrap()
+        });
+        for _ in 0..2 {
+            let (_, sequence) = super::super::local_create::discover_credential(
+                &fixture.root,
+                address,
+                &operator,
+                authority,
+            )
+            .unwrap();
+            assert_eq!(sequence.get(), 2);
+        }
+        let bytes = server.join().unwrap();
+        let query = AuthorityProjectionQuery::decode(&bytes).unwrap();
+        assert_eq!(
+            CleanCredentialQueryFile::open_or_create(&fixture.root, authority, query.credential)
+                .unwrap()
+                .load()
+                .unwrap(),
+            Some(bytes)
+        );
     }
 
     #[cfg(target_os = "linux")]

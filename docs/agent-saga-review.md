@@ -2053,6 +2053,38 @@ Create preparation and submission into the CLI, then prove live query/Create,
 route publication and restart/retry. Install/invoke, lifecycle retirement,
 ordinary Shared finality and full release gates remain within the original goal.
 
+### Durable credential discovery queries
+
+`CleanCredentialQueryFile` now retains one canonical signed Credential query in
+its own private, exclusively leased store, using CSF1 role 8. Expected Authority
+and Credential IDs are supplied independently at open and checked again against
+the signed query on load/publication. Invalid signatures, other selectors and
+scope mismatches are refused. Existing role numbers and store directory
+allowlists are unchanged. Initial-stage recovery and file/directory syncing
+reuse the hardened store machinery; replacement nonces and staged replacements
+are refused without deleting evidence.
+
+`discover_credential` loads the original query when present; only an empty store
+causes it to sign a new query, which is durably published before HTTP dispatch.
+The lease remains held while receiving and validating the response. This is a
+per-query lease, not yet the credential-wide reservation needed to prevent two
+separate local operation directories from selecting the same next sequence.
+
+**All `vosx` binary tests pass: 172 passed, zero failed, one ignored**, in 4.88s
+(`r16-credential-query-store-final.log`, locked/offline, serial with socket
+access and disk scratch). New store tests cover exact nonce retention, exclusive
+leases, forged queries, wrong-credential reopen, initial-stage recovery and
+staged-replacement refusal. A positive simulated HTTP server observes two
+identical query bodies, verifies the query was published and the lease remains
+held at receipt, and returns a response accepted as next management sequence 2.
+This tests the real client/store boundary but not the real Authority daemon.
+Formatting and diff checks pass; the ignored compiled-runtime candidate still
+requires its release inputs.
+
+Next: credential-wide durable operation reservation and fresh Create command
+wiring, then real-daemon discovery/Create/publication and restart/retry. No
+master promotion, guest artifact rebuild or new native daemon smoke is claimed.
+
 The CLI subcommand is still absent. Next wiring must persist the complete
 submission durably before sending and resend those bytes on retry. Bootstrap
 uses management credential sequence 1; Authority requires the next consecutive

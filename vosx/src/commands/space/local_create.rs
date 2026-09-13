@@ -59,7 +59,7 @@ fn post_binary(
     Ok(reply)
 }
 
-struct CredentialVerifier;
+pub(super) struct CredentialVerifier;
 impl vos::agent::sdk::authority::AuthorityCredentialVerifier for CredentialVerifier {
     fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
         libp2p::identity::ed25519::PublicKey::try_from_bytes(public_key)
@@ -100,6 +100,42 @@ pub(crate) fn query_credential(
     )
     .map_err(|error| anyhow::anyhow!("{error}; retry the identical retained credential query"))?;
     validate_credential_response(&query, expected_principal, &bytes)
+}
+
+/// Persist a first query before sending, or resume the exact retained query.
+/// The caller must also hold its credential-wide mutation reservation; this
+/// per-query lease does not serialize other directories or other clients.
+pub(crate) fn discover_credential(
+    root: &std::path::Path,
+    address: std::net::SocketAddr,
+    operator: &Keypair,
+    authority: AuthorityActorTarget,
+) -> anyhow::Result<(
+    vos::agent::sdk::authority::AuthorityCredentialProjection,
+    NonZeroU64,
+)> {
+    use vos::agent::production_owner::AuthorityProjectionQueryAuthenticator as _;
+    use vos::agent::sdk::authority::AuthorityProjectionSelector;
+    use vos::agent::sdk::wire::CanonicalWire as _;
+    let identity = CleanOperatorIdentitySigner::new(operator)?;
+    let mut store = super::clean_store::CleanCredentialQueryFile::open_or_create(
+        root,
+        authority,
+        identity.credential(),
+    )?;
+    let bytes = match store.load()? {
+        Some(bytes) => bytes,
+        None => {
+            let mut signer = super::authority_projection_authenticator::OperatorAuthorityProjectionAuthenticator::new(operator.clone())?;
+            let query = signer.authenticate(authority, AuthorityProjectionSelector::Credential)?;
+            let bytes = query
+                .encode()
+                .map_err(|error| anyhow::anyhow!("encode credential query: {error:?}"))?;
+            store.publish(&bytes)?;
+            bytes
+        }
+    };
+    query_credential(address, &bytes, identity.principal())
 }
 
 fn validate_credential_response(
