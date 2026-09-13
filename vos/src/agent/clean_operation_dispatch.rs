@@ -5,6 +5,8 @@
 use super::*;
 #[path = "clean_operation_completion.rs"]
 mod completion;
+#[path = "clean_operation_retirement.rs"]
+mod retirement;
 use crate::agent::authority_operation_coordinator::{
     AuthorityOperationActorDispatch, AuthorityOperationActorDispatcher,
     AuthorityOperationActorMethod, AuthorityOperationActorResult,
@@ -19,6 +21,7 @@ pub use completion::{
     MAX_NATIVE_OPERATION_COMPLETION_BYTES, NativeAuthorityOperationCompletionSigner,
     native_operation_completion_invocations,
 };
+pub use retirement::NativeAuthorityOperationRetirementSigner;
 
 const MAX_DISPATCH_REQUEST_BYTES: usize =
     if MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES > MAX_AUTHORITY_OPERATION_ISSUANCE_ACK_WIRE_BYTES {

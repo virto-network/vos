@@ -182,7 +182,8 @@ Keep these as work within C2, not new review batches:
    continuation storage now has a hardened, bounded file backend, owned by the
    production controller throughout daemon recovery and dispatch. Production
    operation dispatch now captures completion and acknowledges the result pair;
-   final durable retirement/release remains open.
+   signed terminal retirement and durable release now have a native owner
+   boundary; production retirement storage and startup classification remain open.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
    retirement and restart through native ingress; then expose the same
    preparation/authorization flow in the user-facing client. A Public query
@@ -5747,6 +5748,46 @@ NOC1 is continuation evidence, not the required terminal retirement record.
 This change does not apply the requested actor operation or add operation HTTP
 ingress. Final durable release, denial retirement, and protected application
 remain the next C2 work.
+
+### Signed terminal operation retirement boundary
+
+Verification: the native operation regression passed **6 tests, zero failures**
+in **93.56s** (`r16-terminal-operation-retirement-native.log`); CLI regression
+passed **216 tests, zero failures, five ignored** in **17.30s**
+(`r16-terminal-operation-retirement-cli.log`). The final strengthened partial
+acknowledgement test passed **1 test, zero failures** in **25.91s**
+(`r16-terminal-operation-retirement-partial-final.log`), explicitly verifying no
+retirement signature or publication after only one acknowledgement. Formatting
+and whitespace checks pass. Logs are in the shared disk-backed
+`.worktrees/ch08-c2-native/target/task-tmp` directory. These are targeted native
+and CLI checks, not a full-library or fresh live deployment release campaign.
+
+NRT1 is a bounded host-only terminal certificate containing the exact NOC1
+continuation and a separately domain-separated Authority signature. Restoration
+verifies canonical framing, the terminal signature, and the embedded completion
+against both exact NOD1 source records. A completion certificate alone cannot be
+used as retirement evidence. This certifies retirement of the policy-result
+pair, not application of the authorized actor operation.
+
+The native owner signs and persists NRT1 inside the existing network retirement
+completion callback. That callback runs under proposal exclusion only after
+the native host independently confirms both positive acknowledgements. Failure
+before or during durable publication preserves exclusion. Recovery from an
+ambiguous successful publication verifies and synchronizes the exact saved
+certificate before idempotent release, without another signature. These are
+owner-level APIs; production controller retirement storage, owned retirement
+signer wiring, and startup classification of retired pairs are still required.
+Production dispatch continues to retain admission after NOC1 acknowledgement
+until that integration exists. No guest bundle or user-facing ingress changed.
+
+The native fixtures test rejection without signing before acknowledgement,
+rejection after only one positive acknowledgement, publication followed by a
+reported failure with exclusion preserved, exact signed retry, and restoration
+of published retirement followed by idempotent release. Corruption, truncation,
+trailing bytes, and substitution of NOC1 for NRT1 fail verification. Successful
+release permits the previously excluded projection reservation without adding
+native execution transitions. Restart classification using NRT1 is not yet
+covered and must not be inferred from same-owner certificate restoration.
 
 ### Durable client acknowledgement before completion
 

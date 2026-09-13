@@ -22,8 +22,8 @@ pub use operation_controller::{
 pub use operation_dispatch::{
     MAX_NATIVE_AUTHORITY_OPERATION_DISPATCH_BYTES, MAX_NATIVE_OPERATION_COMPLETION_BYTES,
     NativeAuthorityOperationCompletionSigner, NativeAuthorityOperationJournalStore,
-    NativeAuthorityOperationStartupAdmission, native_operation_completion_invocations,
-    native_operation_record_matches,
+    NativeAuthorityOperationRetirementSigner, NativeAuthorityOperationStartupAdmission,
+    native_operation_completion_invocations, native_operation_record_matches,
 };
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
@@ -10008,6 +10008,20 @@ mod tests {
                 key: SigningKey,
                 calls: usize,
                 completion_calls: usize,
+                retirement_calls: usize,
+            }
+            impl NativeAuthorityOperationRetirementSigner for Signer {
+                type Error = core::convert::Infallible;
+                fn public_key(&self) -> [u8; 32] {
+                    self.key.verifying_key().to_bytes()
+                }
+                fn sign_native_operation_retirement(
+                    &mut self,
+                    message: &[u8],
+                ) -> Result<[u8; 64], Self::Error> {
+                    self.retirement_calls += 1;
+                    Ok(self.key.sign(message).to_bytes())
+                }
             }
             impl NativeAuthorityOperationCompletionSigner for Signer {
                 type Error = core::convert::Infallible;
@@ -10181,6 +10195,7 @@ mod tests {
                 key: SigningKey::from_bytes(&[RECEIPT_SEED; 32]),
                 calls: 0,
                 completion_calls: 0,
+                retirement_calls: 0,
             };
             let before = owner.ordered_index_for_test().unwrap();
             let issued = operations
@@ -10360,6 +10375,14 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(signer.completion_calls, 2);
+            assert!(
+                owner
+                    .finish_native_operation_retirement(&completion, &mut signer, |_| {
+                        panic!("retirement cannot publish before acknowledgement")
+                    })
+                    .is_err()
+            );
+            assert_eq!(signer.retirement_calls, 0);
             for end in [0, 3, certificate.len() - 1] {
                 assert!(
                     owner
@@ -10413,6 +10436,14 @@ mod tests {
                 ));
                 assert_eq!(observed, 1);
                 assert_eq!(owner.ordered_index_for_test().unwrap(), before + 3);
+                assert!(
+                    owner
+                        .finish_native_operation_retirement(&completion, &mut signer, |_| {
+                            panic!("one positive acknowledgement cannot publish retirement")
+                        })
+                        .is_err()
+                );
+                assert_eq!(signer.retirement_calls, 0);
             } else {
                 assert!(
                     owner
@@ -10558,6 +10589,108 @@ mod tests {
                 ),
                 Err(SharedAgentHostError::Conflict)
             ));
+            let retirement_path = directory.0.join("operation-retirement");
+            assert!(
+                owner
+                    .finish_native_operation_retirement(&restored, &mut signer, |bytes| {
+                        write_operation_test_image(&retirement_path, bytes).unwrap();
+                        Err(SharedAgentHostError::Unavailable)
+                    })
+                    .is_err()
+            );
+            assert_eq!(signer.retirement_calls, 1);
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
+            assert!(matches!(
+                owner._network_host.reserve_projection_pair(
+                    HostAgentId(owner.pins.agent.0),
+                    &query,
+                    &query_auth,
+                    false,
+                ),
+                Err(SharedAgentHostError::Conflict)
+            ));
+            let retired_bytes = std::fs::read(&retirement_path).unwrap();
+            assert!(
+                owner
+                    .restore_native_operation_retirement(
+                        &authorization,
+                        &acknowledgement,
+                        &certificate
+                    )
+                    .is_err()
+            );
+            let mut corrupt = retired_bytes.clone();
+            *corrupt.last_mut().unwrap() ^= 1;
+            assert!(
+                owner
+                    .restore_native_operation_retirement(&authorization, &acknowledgement, &corrupt)
+                    .is_err()
+            );
+            for end in [0, 3, retired_bytes.len() - 1] {
+                assert!(
+                    owner
+                        .restore_native_operation_retirement(
+                            &authorization,
+                            &acknowledgement,
+                            &retired_bytes[..end]
+                        )
+                        .is_err()
+                );
+            }
+            let mut trailing = retired_bytes.clone();
+            trailing.push(0);
+            assert!(
+                owner
+                    .restore_native_operation_retirement(
+                        &authorization,
+                        &acknowledgement,
+                        &trailing
+                    )
+                    .is_err()
+            );
+            let retired = if partial_retirement {
+                // Recover an ambiguous successful publication without signing.
+                std::fs::File::open(&retirement_path)
+                    .unwrap()
+                    .sync_all()
+                    .unwrap();
+                std::fs::File::open(retirement_path.parent().unwrap())
+                    .unwrap()
+                    .sync_all()
+                    .unwrap();
+                owner
+                    .restore_native_operation_retirement(
+                        &authorization,
+                        &acknowledgement,
+                        &retired_bytes,
+                    )
+                    .unwrap()
+            } else {
+                owner
+                    .finish_native_operation_retirement(&restored, &mut signer, |bytes| {
+                        assert_eq!(bytes, retired_bytes);
+                        write_operation_test_image(&retirement_path, bytes).unwrap();
+                        Ok(())
+                    })
+                    .unwrap()
+            };
+            owner.release_native_operation_retirement(&retired).unwrap();
+            owner.release_native_operation_retirement(&retired).unwrap();
+            assert_eq!(
+                signer.retirement_calls,
+                if partial_retirement { 1 } else { 2 }
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
+            assert_eq!(std::fs::read(&retirement_path).unwrap(), retired_bytes);
+            owner
+                ._network_host
+                .reserve_projection_pair(
+                    HostAgentId(owner.pins.agent.0),
+                    &query,
+                    &query_auth,
+                    false,
+                )
+                .unwrap();
             drop(operations);
             drop(owner);
             stop_network(network);

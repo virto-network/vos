@@ -30,8 +30,10 @@ pub trait NativeAuthorityOperationCompletionSigner {
     -> Result<[u8; 64], Self::Error>;
 }
 
+#[derive(Clone)]
 pub(crate) struct RetainedNativeOperationCompletion {
     pub(super) completion: VerifiedNativeOperationCompletion,
+    pub(super) certificate: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -210,6 +212,7 @@ pub(super) fn restore_completion(
         return Err(SharedAgentHostError::ScopeMismatch);
     }
     Ok(RetainedNativeOperationCompletion {
+        certificate: bytes.to_vec(),
         completion: VerifiedNativeOperationCompletion {
             target,
             authorization: authorization.clone(),
