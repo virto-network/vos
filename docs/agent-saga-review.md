@@ -39,7 +39,8 @@ review endpoints for individual fixes:
    below. Production Local opaque-runtime management Create/reopen now uses
    public metadata and durable history. Scripted physical-PVM actor installation,
    invocation/resume/reopen and lane-transition checks now pass. Complete the
-   remaining positive-ack retirement and migrated invocation/retry checks.
+   remaining positive-ack retirement checks. Migrated invocation/reopen and
+   expired upgrade retries now pass at the scripted physical host-ABI boundary.
    Target-runtime directory compatibility is now checked before Local cutover;
    the scripted host-ABI tests do not prove arbitrary guest execution semantics.
    Neither a private-state decoder nor a volatile cache is a runtime-independent
@@ -1595,3 +1596,28 @@ publication, and independent ordinary-Agent finality. Then run final-source
 release gates and fresh-data startup before advancing integration branches.
 No artifact was rebuilt or repinned. This remains an internal C2 checkpoint,
 not a fourth review batch or a deployment-readiness claim.
+
+### Local migrated execution and expired upgrade recovery
+
+The opaque-runtime Local regression now reopens after runtime cutover, invokes
+the installed actor through the target PVM, observes its new Linear state and
+one image revision, and reopens again at slot 100. Replaying the upgrade receipt
+(expired at slot 71) returns the exact historical identity without reverting
+the post-upgrade state, descriptor or image revision. Replaying the migrated
+invocation also leaves the image byte-identical. The seven invalid target
+directory/lane variants continue to reject cutover without changing disk state.
+
+**13/13 Local-host tests pass** in 10.39s, using locked offline dependencies and
+disk-backed scratch space (`r16-migrated-runtime-retry-final.log`). The initial
+extension correctly trapped on upgrade retry because the scripted target had
+no management-retry handler; adding that fixture handler resolved it without a
+production-code change. These PVM scripts exercise host ABI, persistence and
+retry validation, not general actor bytecode semantics inside an arbitrary
+runtime. Positive acknowledgement retirement for opaque Local runtimes remains
+open, as do the native lifecycle/finality/publication and release gates above.
+
+Do not clear native lifecycle intents or retire their finalization evidence
+merely because the issuer marker exists: independent ordinary-Agent finality
+and publication still need durable evidence. That completion ordering must be
+resolved in C2. This test-only checkpoint remains part of C1; no new review batch,
+artifact repin or integration-branch move is introduced.

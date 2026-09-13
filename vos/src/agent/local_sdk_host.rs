@@ -2746,26 +2746,140 @@ mod tests {
                     RuntimeOutcome::Management(Err(sdk::ManagementError::UnsupportedRuntime));
             }
         }
-        let target = admitted_scripted_runtime_for_test(
-            "local-opaque-migration-target",
-            0xd1,
-            vec![ScriptedRuntimeCase {
-                input: RuntimeWork::Manage {
+        let mut target_cases = vec![ScriptedRuntimeCase {
+            input: RuntimeWork::Manage {
+                context: RuntimeExecutionContext::Direct,
+                space: space(),
+                agent: template.identity.agent,
+                runtime_deployment: template.identity.runtime_deployment,
+                state: state(0xa5),
+                request: Box::new(inspect.clone()),
+                authority: None,
+                observed_slot: 71,
+            }
+            .encode()
+            .unwrap(),
+            output: target_reply.encode().unwrap(),
+            copies: Vec::new(),
+        }];
+        let mut migrated_invocation = invocation_template.clone();
+        migrated_invocation.invocation = InvocationId([0xc5; 32]);
+        let RuntimeOutcome::Completed(Ok(mut migrated_reply)) = completed.clone() else {
+            unreachable!()
+        };
+        migrated_reply.invocation = migrated_invocation.invocation;
+        migrated_reply.reply = vec![2];
+        migrated_reply.observation.linear_revision = Some(2);
+        let migrated_outcome = RuntimeOutcome::Completed(Ok(migrated_reply));
+        for tag in [0xa5, 0xa6] {
+            target_cases.push(ScriptedRuntimeCase {
+                input: RuntimeWork::Invoke {
                     context: RuntimeExecutionContext::Direct,
-                    space: space(),
-                    agent: template.identity.agent,
-                    runtime_deployment: template.identity.runtime_deployment,
-                    state: state(0xa5),
-                    request: Box::new(inspect.clone()),
-                    authority: None,
-                    observed_slot: 71,
+                    state: state(tag),
+                    invocation: Box::new(migrated_invocation.clone()),
+                    authorization: Box::new(sdk::InvocationAuthorization::PublicPreflight(
+                        sdk::PublicPreflight::for_work(&migrated_invocation, 72),
+                    )),
+                    observed_slot: 72,
                 }
                 .encode()
                 .unwrap(),
-                output: target_reply.encode().unwrap(),
+                output: RuntimeTransition {
+                    state: state(0xa6),
+                    outcome: migrated_outcome.clone(),
+                }
+                .encode()
+                .unwrap(),
                 copies: Vec::new(),
-            }],
-        );
+            });
+        }
+        target_cases.push(ScriptedRuntimeCase {
+            input: RuntimeWork::Manage {
+                context: RuntimeExecutionContext::Direct,
+                space: space(),
+                agent: template.identity.agent,
+                runtime_deployment: template.identity.runtime_deployment,
+                state: state(0xa6),
+                request: Box::new(inspect.clone()),
+                authority: None,
+                observed_slot: 72,
+            }
+            .encode()
+            .unwrap(),
+            output: RuntimeTransition {
+                state: state(0xa6),
+                outcome: RuntimeOutcome::Management(Ok(ManagementReply::Actors(
+                    ActorDirectoryPage {
+                        entries: vec![record.clone()],
+                        next: None,
+                    },
+                ))),
+            }
+            .encode()
+            .unwrap(),
+            copies: Vec::new(),
+        });
+        // The new runtime owns retries after cutover. Copy the target identity
+        // fields from the request so the scripted package need not contain its
+        // own content-derived identity.
+        let retry_request = ManagementRequest::UpgradeRuntime(Box::new(sdk::RuntimeUpgrade {
+            from_deployment: template.identity.runtime_deployment,
+            to_deployment: sdk::DeploymentId([0xd7; 32]),
+            to_program: sdk::ProgramId([0xd8; 32]),
+            producer: sdk::ProducerId([0xd9; 32]),
+            package: template.runtime_package.clone(),
+            contract: template.runtime_contract,
+            capabilities: template.capabilities,
+        }));
+        let mut retry_identity = template.identity.clone();
+        retry_identity.runtime_deployment = sdk::DeploymentId([0xd7; 32]);
+        retry_identity.runtime_program = sdk::ProgramId([0xd8; 32]);
+        retry_identity.runtime_producer = sdk::ProducerId([0xd9; 32]);
+        let identity_fields = [vec![0xd7; 32], vec![0xd8; 32], vec![0xd9; 32]].concat();
+        let input = RuntimeWork::Manage {
+            context: RuntimeExecutionContext::Direct,
+            space: space(),
+            agent: template.identity.agent,
+            runtime_deployment: template.identity.runtime_deployment,
+            state: state(0xa6),
+            request: Box::new(retry_request.clone()),
+            authority: Some(Box::new(management_receipt(
+                &template,
+                &retry_request,
+                4,
+                71,
+                71,
+            ))),
+            observed_slot: 100,
+        }
+        .encode()
+        .unwrap();
+        let output = RuntimeTransition {
+            state: state(0xa6),
+            outcome: RuntimeOutcome::Management(Ok(ManagementReply::RuntimeUpgraded(
+                retry_identity,
+            ))),
+        }
+        .encode()
+        .unwrap();
+        let copy = ScriptedRuntimeCopy {
+            input_offset: input
+                .windows(identity_fields.len())
+                .position(|bytes| bytes == identity_fields)
+                .unwrap(),
+            output_offset: output
+                .windows(identity_fields.len())
+                .position(|bytes| bytes == identity_fields)
+                .unwrap(),
+            len: identity_fields.len(),
+        };
+        target_cases.push(ScriptedRuntimeCase {
+            input,
+            output,
+            copies: vec![copy],
+        });
+        let target =
+            admitted_scripted_runtime_for_test("local-opaque-migration-target", 0xd1, target_cases);
         let target_descriptor = descriptor(&target, 9, AgentProfile::Local, space(), node());
         let mut upgrade_request =
             ManagementRequest::UpgradeRuntime(Box::new(sdk::RuntimeUpgrade {
@@ -2999,8 +3113,8 @@ mod tests {
         slot.store(71, Ordering::SeqCst);
         let result = host.manage(
             agent,
-            upgrade_request,
-            Some(upgrade_receipt),
+            upgrade_request.clone(),
+            Some(upgrade_receipt.clone()),
             SdkManagementArtifacts::Runtime(&target),
         );
         if upgrade_mutation == 0 {
@@ -3041,7 +3155,7 @@ mod tests {
         }
         let expected_image = host.agents[&agent].driver.image().clone();
         drop(host);
-        let host = LocalAgentHost::open(&root, space(), node(), trust).unwrap();
+        let mut host = LocalAgentHost::open(&root, space(), node(), trust.clone()).unwrap();
         assert_eq!(host.agents[&agent].driver.image(), &expected_image);
         assert_eq!(
             host.agents[&agent]
@@ -3051,6 +3165,46 @@ mod tests {
                 .actor,
             record
         );
+        if upgrade_mutation == 0 {
+            slot.store(72, Ordering::SeqCst);
+            let work = invocation(&target_descriptor, &record, &actor_package, 0xc5);
+            let authorization = sdk::InvocationAuthorization::PublicPreflight(
+                sdk::PublicPreflight::for_work(&work, 72),
+            );
+            assert_eq!(
+                host.invoke(agent, work.clone(), authorization.clone())
+                    .unwrap(),
+                migrated_outcome
+            );
+            let invoked = host.agents[&agent].driver.image().clone();
+            assert_eq!(invoked.runtime_state.linear, vec![3]);
+            assert_eq!(invoked.revision, expected_image.revision + 1);
+            drop(host);
+            slot.store(100, Ordering::SeqCst);
+            let mut host = LocalAgentHost::open(&root, space(), node(), trust).unwrap();
+            assert_eq!(
+                host.manage(
+                    agent,
+                    upgrade_request,
+                    Some(upgrade_receipt),
+                    SdkManagementArtifacts::Runtime(&target),
+                )
+                .unwrap(),
+                RuntimeOutcome::Management(Ok(ManagementReply::RuntimeUpgraded(
+                    target_descriptor.identity
+                )))
+            );
+            assert_eq!(
+                host.agents[&agent].driver.image(),
+                &invoked,
+                "expired upgrade retry must not roll back post-migration execution"
+            );
+            assert_eq!(
+                host.invoke(agent, work, authorization).unwrap(),
+                migrated_outcome
+            );
+            assert_eq!(host.agents[&agent].driver.image(), &invoked);
+        }
     }
 
     #[test]
