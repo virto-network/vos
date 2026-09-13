@@ -2229,7 +2229,13 @@ where
                 error
             })?;
         let super::sdk::RuntimeOutcome::Completed(Ok(reply)) = outcome else {
-            crate::log::warn!("management authorization did not return a completed invocation");
+            if let super::sdk::RuntimeOutcome::Completed(Err(error)) = outcome {
+                crate::log::warn!(
+                    "management authorization runtime rejected invocation: {error:?}"
+                );
+            } else {
+                crate::log::warn!("management authorization did not return a completed invocation");
+            }
             return Err(SharedAgentHostError::Unavailable);
         };
         if reply.invocation != work.invocation
@@ -3930,6 +3936,7 @@ mod tests {
         #[derive(Clone, Default)]
         struct IssuerMemoryStore {
             image: Arc<Mutex<Option<Vec<u8>>>>,
+            advance_clock_after_commits: Option<(Arc<AtomicU64>, usize)>,
         }
 
         impl CleanManagementIssuerStore for IssuerMemoryStore {
@@ -3941,6 +3948,14 @@ mod tests {
 
             fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
                 *self.image.lock().unwrap() = Some(image.to_vec());
+                if let Some((clock, remaining)) = &mut self.advance_clock_after_commits {
+                    if *remaining > 0 {
+                        *remaining -= 1;
+                        if *remaining == 0 {
+                            clock.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                }
                 Ok(())
             }
         }
@@ -7132,6 +7147,81 @@ mod tests {
             native_local_management_lifecycle(5);
         }
 
+        #[test]
+        fn native_local_authorization_clock_advance_preserves_rejected_intent() {
+            native_local_management_lifecycle(6);
+        }
+
+        #[inline(never)]
+        fn check_management_clock_advance(
+            owner: &mut MemoryBootstrapOwner,
+            intent: crate::agent::clean_management_intent::CleanManagementIntent,
+            descriptor: &AgentDescriptor,
+            clock: Arc<AtomicU64>,
+        ) {
+            use crate::agent::clean_management_intent::CleanManagementIntentSlot;
+            let managed = intent.call().managed;
+            let store = IssuerMemoryStore {
+                // First commit pledges the intent; second saves its preflight.
+                advance_clock_after_commits: Some((clock, 2)),
+                ..Default::default()
+            };
+            let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
+            slot.pledge(intent).unwrap();
+            let issuer_store = IssuerMemoryStore::default();
+            let mut issuer = DurableCleanManagementIssuer::open(
+                issuer_store.clone(),
+                descriptor.authority,
+                descriptor.identity.space,
+                descriptor.identity.agent,
+            )
+            .unwrap();
+            let mut signer = CountingSigner::new();
+            assert!(matches!(
+                owner.issue_management_intent(&mut slot, managed, &mut issuer, &mut signer),
+                Err(SharedAgentHostError::Unavailable)
+            ));
+            let envelope = slot.authorization_work().unwrap().unwrap().clone();
+            let image = store.image.lock().unwrap().clone();
+            let RuntimeWork::Invoke {
+                invocation,
+                authorization,
+                ..
+            } = &envelope
+            else {
+                panic!("expected persisted authorization work");
+            };
+            let mut material = owner
+                .supervisor_invocation_material(owner.pins.agent, invocation.actor)
+                .unwrap();
+            material.root_provenance = false;
+            let identity =
+                crate::agent::supervisor_adapters::physical_material_identity(&material).unwrap();
+            let outcome = owner
+                .supervisor_invoke_terminal(
+                    identity,
+                    (**invocation).clone(),
+                    (**authorization).clone(),
+                )
+                .unwrap();
+            assert_eq!(
+                outcome,
+                RuntimeOutcome::Completed(
+                    Err(crate::agent_sdk::InvocationError::AuthorityExpired,)
+                )
+            );
+            drop(slot);
+            let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
+            assert!(matches!(
+                owner.issue_management_intent(&mut slot, managed, &mut issuer, &mut signer),
+                Err(SharedAgentHostError::Unavailable)
+            ));
+            assert_eq!(slot.authorization_work().unwrap(), Some(&envelope));
+            assert_eq!(*store.image.lock().unwrap(), image);
+            assert_eq!(signer.calls, 0);
+            assert!(issuer_store.image.lock().unwrap().is_none());
+        }
+
         #[inline(never)]
         fn check_local_create_submission(
             descriptor: &AgentDescriptor,
@@ -7227,9 +7317,7 @@ mod tests {
         }
 
         fn native_local_management_lifecycle(coordinated: u8) {
-            use crate::agent::clean_management_intent::{
-                CleanManagementIntent, CleanManagementIntentSlot,
-            };
+            use crate::agent::clean_management_intent::CleanManagementIntent;
             fn configuration(descriptor: &AgentDescriptor) -> Vec<u8> {
                 use system_authority::{
                     AuthorityBindingState, AuthorityBlobRow, AuthorityIssuerState,
@@ -7628,6 +7716,30 @@ mod tests {
                 &RawCredentialVerifier,
             )
             .unwrap();
+            if coordinated == 6 {
+                check_management_clock_advance(
+                    owner,
+                    intent,
+                    &descriptor,
+                    harness.fixture.logical_slot.as_ref().unwrap().clone(),
+                );
+                harness.stop();
+                return;
+            }
+            check_local_management_phases(harness, descriptor, call, request, runtime, intent);
+        }
+
+        #[inline(never)]
+        fn check_local_management_phases(
+            mut harness: NativeProjectionOwnerHarness,
+            descriptor: AgentDescriptor,
+            call: AuthorityCredentialCall,
+            request: ManagementRequest,
+            runtime: AdmittedRuntimePackage,
+            intent: crate::agent::clean_management_intent::CleanManagementIntent,
+        ) {
+            use crate::agent::clean_management_intent::CleanManagementIntentSlot;
+            let owner = harness.owner.as_mut().unwrap();
             let store = IssuerMemoryStore::default();
             let mut slot = CleanManagementIntentSlot::open(store.clone()).unwrap();
             slot.pledge(intent).unwrap();
@@ -7819,6 +7931,7 @@ mod tests {
             // A fresh issuer must recover via exact replay, not dispatch new work.
             let interrupted_store = IssuerMemoryStore {
                 image: Arc::new(Mutex::new(interrupted_image)),
+                ..Default::default()
             };
             let mut interrupted = DurableCleanManagementIssuer::open(
                 interrupted_store,

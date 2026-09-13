@@ -2181,13 +2181,51 @@ already accepted identities, then rerun native Create/restart/publication.
 Journal-capacity reservation, Install/invoke, retirement, Shared finality and
 full release gates remain open. This failed smoke does not justify promotion.
 
-The CLI subcommand is still absent. Next wiring must persist the complete
+Historical pre-CLI checkpoint (superseded by the fresh CLI wiring above):
+the CLI subcommand was still absent. The required wiring had to persist the complete
 submission durably before sending and resend those bytes on retry. Bootstrap
 uses management credential sequence 1; Authority requires the next consecutive
 sequence and refuses another pending application. Do not silently choose a fresh
 sequence, nonce or window after an ambiguous response. Descriptor/Authority
 discovery, safe sequence allocation, request-file publication and bounded HTTP
-submission/ack verification remain necessary before the native Create smoke.
+submission/ack verification were prerequisites for the native Create smoke.
+
+### Management authorization clock-advance reproduction
+
+The physical native fixture now deterministically advances the trusted clock by
+one slot immediately after the authorization envelope's durable commit. The
+management call returns `Unavailable`; exact dispatch returns
+`RuntimeOutcome::Completed(Err(AuthorityExpired))`. Reopening the intent and
+retrying preserves the original envelope and store bytes, signs no receipt,
+and leaves the issuer store untouched. This is a **passing diagnostic test for
+an unresolved bug**, not a successful Create regression.
+
+The underlying mismatch is confirmed: management persists a PublicPreflight at
+the material's observation slot, while normal terminal journal admission samples
+the clock again. Standard runtime requires equal slots for unseen preflight work.
+The live smoke's exact error still needs confirmation with the improved logging;
+the deterministic reproduction does not establish that it was the only live
+failure. Production logging now reports only the bounded invocation-error enum,
+never request bodies, credentials, or reply contents.
+
+The large fixture's phased lifecycle assertions were extracted into a separate
+non-inlined helper to stay within the default test-thread stack; neither runtime
+semantics nor a global stack-size setting was changed. The initial diagnostic
+attempts hit the fixture stack limit before reaching the assertion.
+
+Final-source targeted validation: all **9 native bootstrap/lifecycle tests pass**
+with `pvm,private-agent-store`, serial execution, and the default stack size.
+Evidence: `.worktrees/ch08-c2-native/target/task-tmp/r16-management-clock-final.log`
+(relative to the main checkout). `cargo fmt --all -- --check` and
+`git diff --check` also pass. No guest source or bundled artifact changed.
+
+Next implementation remains the admission/recovery boundary: persist and replay
+the exact admitted authorization with management capacity protected, distinguish
+prepared-but-unaccepted work from accepted work, and never refresh an already
+accepted identity. Do not reuse the query-only reserved projection API for Linear
+management work without its corresponding admission protocol. Then rerun live
+Create, route publication, restart, and exact retry. All other C1/C2/C3 release
+requirements above remain open; no branch promotion is justified yet.
 
 ### Durable immutable Local Create request storage
 
