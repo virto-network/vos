@@ -1822,6 +1822,59 @@ where
         )
     }
 
+    /// Read-only evidence for an exact management invocation after a retained
+    /// pre-dispatch anchor. Absence is interval-scoped and is not authorization
+    /// to dispatch; callers must independently verify and persist that anchor.
+    /// This observes applied journal history, not an unapplied Raft tail. The
+    /// coordinator must hold admission exclusion and drain a leader barrier
+    /// before interpreting it as recovery evidence.
+    pub(crate) fn management_invocation_after(
+        &self,
+        anchor: OrderedBase,
+        envelope: &crate::agent_sdk::RuntimeWork,
+    ) -> Result<Option<ReplayInputId>, SharedJournalDriverError> {
+        use crate::agent_sdk::{
+            InvocationAuthorization, MethodMode, RuntimeExecutionContext, RuntimeState, RuntimeWork,
+        };
+        let RuntimeWork::Invoke {
+            context,
+            state,
+            invocation,
+            authorization,
+            observed_slot,
+        } = envelope
+        else {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        };
+        let binding = self.materialization.runtime();
+        if *context != RuntimeExecutionContext::Direct
+            || *state != RuntimeState::default()
+            || invocation.mode != MethodMode::Linear
+            || !invocation.validate()
+            || invocation.space.0 != binding.space.0
+            || invocation.agent.0 != binding.agent.0
+            || invocation.runtime_deployment.0 != binding.deployment.0
+            || **authorization
+                != InvocationAuthorization::PublicPreflight(
+                    crate::agent_sdk::PublicPreflight::for_work(invocation, *observed_slot),
+                )
+        {
+            return Err(SharedJournalDriverError::CrossStoreMismatch);
+        }
+        super::local_journal_driver::clean_ordered_operation_after(
+            &self.store,
+            &self.materialization,
+            anchor,
+            &ReplayOperation::CleanInvoke {
+                context: *context,
+                work: (**invocation).clone(),
+                authorization: (**authorization).clone(),
+                observed_slot: *observed_slot,
+            },
+        )
+        .map_err(Into::into)
+    }
+
     pub(crate) fn ledger(&self) -> &AgentRaftApplicationLedgerV2 {
         &self.ledger
     }

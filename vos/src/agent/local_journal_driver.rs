@@ -179,6 +179,59 @@ pub(super) fn recent_clean_ordered_operation<S: AgentJournalStore>(
     )
 }
 
+/// Inspect only the authenticated interval after a caller's pre-dispatch
+/// anchor. `None` means not observed in that interval, NOT never accepted in
+/// earlier history. A pruned, substituted or unreachable anchor is an error.
+/// Finish authenticating the anchor even after finding a matching operation.
+pub(super) fn clean_ordered_operation_after<S: AgentJournalStore>(
+    store: &S,
+    materialization: &ReplayMaterialization,
+    anchor: super::journal::OrderedBase,
+    operation: &ReplayOperation,
+) -> Result<Option<ReplayInputId>, JournalStoreError> {
+    anchor.validate().map_err(|_| JournalStoreError::Corrupt)?;
+    let heads = materialization.heads();
+    let boundary = materialization.replay_boundary();
+    if anchor.index < boundary.index || anchor.index > heads.ordered_index {
+        return Err(JournalStoreError::Conflict);
+    }
+    let distance = heads.ordered_index - anchor.index;
+    if distance > super::replay::MAX_REPLAY_SUFFIX_ENTRIES as u64 {
+        return Err(JournalStoreError::Backpressure);
+    }
+    let requested = clean_operation_invocation(operation).ok_or(JournalStoreError::Corrupt)?;
+    let mut cursor = heads.ordered_head;
+    let mut index = heads.ordered_index;
+    let mut found = None;
+    for _ in 0..distance {
+        let id = cursor.ok_or(JournalStoreError::Corrupt)?;
+        let entry = store
+            .get::<OrderedEntry>(id)?
+            .ok_or(JournalStoreError::MissingObject)?;
+        if entry.id() != id
+            || entry.genesis != heads.genesis
+            || entry.index != index
+            || entry.input.runtime != heads.runtime
+        {
+            return Err(JournalStoreError::Corrupt);
+        }
+        if clean_operation_invocation(&entry.input.operation) == Some(requested) {
+            // A different lifecycle step or substituted observation must not
+            // be mistaken for absence, and duplicate publication is ambiguous.
+            if entry.input.operation != *operation || found.is_some() {
+                return Err(JournalStoreError::Conflict);
+            }
+            found = Some(entry.input.id());
+        }
+        cursor = entry.parent;
+        index -= 1;
+    }
+    if cursor != anchor.head || (anchor.index == boundary.index && anchor != boundary) {
+        return Err(JournalStoreError::Conflict);
+    }
+    Ok(found)
+}
+
 fn recent_clean_ordered_operation_bounded<S: AgentJournalStore>(
     store: &S,
     materialization: &ReplayMaterialization,

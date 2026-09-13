@@ -8694,6 +8694,8 @@ mod tests {
             // Execute four fresh signed calls through the bundled Authority so
             // the joint check covers four distinct, unretired journal results.
             // This tests suffix accounting, not fresh credential authorization.
+            let agent = HostAgentId(owner.pins.agent.0);
+            let first_anchor = owner.host.lock().unwrap().journal_position(agent).unwrap();
             let mut extra = Vec::new();
             for index in 0..4 {
                 extra.push(execute_extra_management_call(
@@ -8705,6 +8707,12 @@ mod tests {
             }
             let host = owner.host.lock().unwrap();
             let agent = HostAgentId(owner.pins.agent.0);
+            // Unrelated later calls cannot hide an accepted earlier call.
+            assert!(
+                host.management_invocation_after(agent, &first_anchor, &extra[0])
+                    .unwrap()
+                    .is_some()
+            );
             let set: Vec<_> = extra.iter().collect();
             let before = host
                 .management_retirement_set_admission_requirement(agent, &set)
@@ -8724,8 +8732,18 @@ mod tests {
             );
             drop(host);
             check_multiple_management_retirement_gate(owner, &extra, network);
+            // A later acknowledgement is not evidence of non-acceptance.
+            assert!(
+                owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .management_invocation_after(agent, &first_anchor, &extra[0])
+                    .is_err()
+            );
+            let anchor = owner.host.lock().unwrap().journal_position(agent).unwrap();
             let boundary = execute_extra_management_call(owner, original[0], intent, 4);
-            check_linear_checkpoint_boundary_refuses_projection_fallback(owner, &boundary);
+            check_linear_checkpoint_boundary_refuses_projection_fallback(owner, &boundary, &anchor);
         }
 
         #[inline(never)]
@@ -8772,6 +8790,24 @@ mod tests {
             );
             let identity =
                 crate::agent::supervisor_adapters::physical_material_identity(&material).unwrap();
+            let agent = HostAgentId(owner.pins.agent.0);
+            let anchor = owner.host.lock().unwrap().journal_position(agent).unwrap();
+            let prepared = RuntimeWork::Invoke {
+                context: RuntimeExecutionContext::Direct,
+                state: crate::agent_sdk::RuntimeState::default(),
+                invocation: invocation.clone(),
+                authorization: authorization.clone(),
+                observed_slot: *observed_slot,
+            };
+            assert_eq!(
+                owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .management_invocation_after(agent, &anchor, &prepared)
+                    .unwrap(),
+                None
+            );
             let result = owner
                 .supervisor_invoke_persisted_management(
                     identity,
@@ -8783,6 +8819,72 @@ mod tests {
                 matches!(result, RuntimeOutcome::Completed(Ok(_))),
                 "{result:?}"
             );
+            let host = owner.host.lock().unwrap();
+            assert!(
+                host.management_invocation_after(agent, &anchor, &prepared)
+                    .unwrap()
+                    .is_some()
+            );
+            let mut wrong = anchor.clone();
+            wrong.ordered_head = Some(crate::agent::journal::OrderedEntryId([0xdd; 32]));
+            assert!(
+                host.management_invocation_after(agent, &wrong, &prepared)
+                    .is_err()
+            );
+            wrong = anchor.clone();
+            wrong.genesis = crate::agent::journal::AgentJournalGenesisId([0xdd; 32]);
+            assert!(matches!(
+                host.management_invocation_after(agent, &wrong, &prepared),
+                Err(SharedAgentHostError::ScopeMismatch)
+            ));
+            let current = host.journal_position(agent).unwrap();
+            wrong = current.clone();
+            wrong.ordered_index += 1;
+            assert!(
+                host.management_invocation_after(agent, &wrong, &prepared)
+                    .is_err()
+            );
+            // A late anchor cannot prove that this call never existed before it.
+            assert_eq!(
+                host.management_invocation_after(agent, &current, &prepared)
+                    .unwrap(),
+                None
+            );
+            let mut altered = prepared.clone();
+            let RuntimeWork::Invoke {
+                invocation,
+                authorization,
+                observed_slot,
+                ..
+            } = &mut altered
+            else {
+                unreachable!()
+            };
+            *observed_slot += 1;
+            **authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+                crate::agent_sdk::PublicPreflight::for_work(invocation, *observed_slot),
+            );
+            assert!(
+                host.management_invocation_after(agent, &anchor, &altered)
+                    .is_err()
+            );
+            let RuntimeWork::Invoke {
+                invocation,
+                authorization,
+                observed_slot,
+                ..
+            } = &mut altered
+            else {
+                unreachable!()
+            };
+            invocation.agent = crate::agent_sdk::AgentId([0xdc; 32]);
+            **authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+                crate::agent_sdk::PublicPreflight::for_work(invocation, *observed_slot),
+            );
+            assert!(
+                host.management_invocation_after(agent, &current, &altered)
+                    .is_err()
+            );
             envelope
         }
 
@@ -8790,6 +8892,7 @@ mod tests {
         fn check_linear_checkpoint_boundary_refuses_projection_fallback(
             owner: &mut MemoryBootstrapOwner,
             envelope: &RuntimeWork,
+            anchor: &crate::agent::shared_host::SharedAgentJournalPosition,
         ) {
             let RuntimeWork::Invoke {
                 invocation,
@@ -8830,6 +8933,14 @@ mod tests {
                         owner.snapshot_signer.as_ref(),
                     )
                     .unwrap()
+            );
+            assert!(
+                owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .management_invocation_after(agent, anchor, envelope)
+                    .is_err()
             );
             let material = owner
                 .supervisor_invocation_material(owner.pins.agent, invocation.actor)

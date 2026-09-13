@@ -2826,6 +2826,44 @@ protection before any checkpoint can discard needed evidence, and integration
 of pending projections with the lifecycle recovery set. Rejecting this unsafe
 fallback does not establish restart readiness for those cases.
 
+### Anchored management journal lookup
+
+The Shared host now exposes an internal read-only lookup for one exact Linear
+management envelope after a supplied journal position. It independently matches
+the anchor's genesis, genesis admission and runtime binding, and the envelope's
+Space/Agent/runtime scope. The journal walk verifies every content-addressed
+entry's index, parent chain, genesis and runtime back to the exact anchor before
+returning a matching input ID. It does not stop early after finding the request.
+The walk is bounded by the replay suffix limit and rejects anchors before the
+authenticated replay boundary, future or substituted anchors, mismatched
+preflight clocks, duplicate publication and later lifecycle steps for the same
+invocation.
+
+`None` means only **not observed in the applied Ordered interval after the
+anchor**. It does not mean never accepted before the anchor, nor does it cover
+unapplied Raft entries. The recovery coordinator must first exclude competing
+admissions, drain a leader barrier, and verify that the anchor was durably
+recorded before the first dispatch. This lookup does not invoke the runtime,
+sign, retire evidence, publish routes or authorize a retry.
+
+Native bundled-Authority fixtures check absence before dispatch, exact presence
+after dispatch and after unrelated later calls, refusal of altered head/genesis,
+future anchors, substituted clocks and foreign Agent scope. A late anchor gives
+interval absence even though the call existed earlier, documenting that limit.
+Acknowledgement and checkpointing make the old evidence lookup fail closed,
+rather than changing missing evidence into permission to execute.
+
+Verification: the intermediate management subset passed **3/3** (62.02s,
+`r16-management-anchor.log`). The final-source serial native bootstrap/lifecycle
+suite passed **11/11** (97.82s, `r16-management-anchor-final.log`). Formatting
+and diff checks pass; logs remain in shared disk scratch. No full release or
+real-daemon incomplete-recovery test is claimed.
+
+The pre-dispatch position is not yet persisted in the intent image; no intent
+wire format changed at this checkpoint. Durable anchor capture under admission
+exclusion and startup adoption remain required before incomplete lifecycle
+recovery can use this primitive.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its
