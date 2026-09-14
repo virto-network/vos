@@ -6535,6 +6535,7 @@ mod application_ledger_v2 {
         }
 
         fn audit_recovery_capacity(&self) -> Result<(u64, u64, bool), AgentRaftApplicationErrorV2> {
+            let started = std::time::Instant::now();
             let key = generation_storage_key(self.generation);
             let transaction = self.database.begin_read()?;
             ensure_v2_config_in_read(
@@ -6734,6 +6735,11 @@ mod application_ledger_v2 {
                 }
                 verify_reservation_physical_row_in_read(&transaction, &raft, &reservation)?;
             }
+            tracing::debug!(
+                elapsed_us = started.elapsed().as_micros() as u64,
+                rows = retained,
+                "Shared recovery audit complete"
+            );
             Ok((
                 meta.applied_index,
                 (MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES as u64)
@@ -7931,6 +7937,72 @@ mod application_ledger_v2 {
             verify_physical_bytes(1, 7, malformed_commitment, disposition, &malformed_stored)
                 .is_err()
         );
+    }
+
+    /// Diagnostic only: provide a disk-backed COPY of a stopped space's Raft
+    /// database. Opening redb may update its metadata even without a write txn.
+    #[test]
+    #[ignore = "requires VOS_AGENT_RAFT_BENCH_COPIED_DB; reports timing, not a release gate"]
+    fn fixed_history_physical_decode_probe() {
+        let path = std::env::var_os("VOS_AGENT_RAFT_BENCH_COPIED_DB")
+            .expect("provide a copied, stopped Raft database");
+        let database = Database::open(path).unwrap();
+        let transaction = database.begin_read().unwrap();
+        let audit = transaction.open_table(APPLY_AUDIT_TABLE_V2).unwrap();
+        let log = transaction.open_table(crate::raft::RAFT_LOG).unwrap();
+        let mut rows = Vec::new();
+        let mut bytes = 0usize;
+        for row in audit.iter().unwrap() {
+            let (_, value) = row.unwrap();
+            let record = AgentRaftApplyAuditRecordV2::decode(value.value()).unwrap();
+            assert_eq!(record.encode(), value.value());
+            let physical = log.get(record.index).unwrap().unwrap().value().to_vec();
+            bytes = bytes.checked_add(physical.len()).unwrap();
+            assert!(rows.len() < MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES);
+            assert!(bytes <= 256 * 1024 * 1024);
+            rows.push((record, physical));
+        }
+        assert!(!rows.is_empty());
+        // Alternate order to reduce warm-cache/order bias. Neither path
+        // changes history; the additional decode models the former consumer.
+        for round in 0..4 {
+            for duplicate in if round % 2 == 0 {
+                [true, false]
+            } else {
+                [false, true]
+            } {
+                let started = std::time::Instant::now();
+                let mut commands = 0usize;
+                for (record, stored) in &rows {
+                    let verified = verify_physical_bytes(
+                        record.index,
+                        record.term,
+                        record.raw_payload_commitment,
+                        record.disposition,
+                        stored,
+                    )
+                    .unwrap();
+                    if let Some(command) = verified.command {
+                        commands += 1;
+                        let vos_raft::EntryKind::Data { payload } = verified.kind else {
+                            panic!("validated command without data entry");
+                        };
+                        let consumed = if duplicate {
+                            AgentRaftCommand::decode(&payload).unwrap()
+                        } else {
+                            command
+                        };
+                        assert_eq!(consumed.encode(), payload);
+                        std::hint::black_box(consumed);
+                    }
+                }
+                eprintln!(
+                    "physical-decode round={round} duplicate={duplicate} rows={} commands={commands} bytes={bytes} elapsed_us={}",
+                    rows.len(),
+                    started.elapsed().as_micros()
+                );
+            }
+        }
     }
 
     pub(super) fn generation_storage_key(

@@ -7216,6 +7216,75 @@ is not materially better than the preceding run and is not a speedup claim.
 Next performance validation should compare equivalent retained histories, not
 infer improvement from consecutive boots that each append more journal work.
 
+### Fixed-history decoding probe and recovery-audit attribution (C2)
+
+`fixed_history_physical_decode_probe` is an opt-in diagnostic, not a timing
+assertion or release gate. It consumes `VOS_AGENT_RAFT_BENCH_COPIED_DB`, which
+must name a **copy** of a stopped space's Raft database: redb open can update
+metadata. It reads one fixed set of retained physical rows and alternates the
+current canonical-command reuse path with the former consumer's extra decode.
+Both paths retain the same physical-byte and canonical-encoding checks. Output
+contains counts and elapsed times, not command bodies or credentials.
+
+Evidence is `target/task-tmp/fixed-history-probe.NVoTam`: `raft.redb`,
+`probe.log`, `build.log` and `tests.log`. The source was the stopped corrected-
+genesis `genesis-one` fixture; an external file-user check found no opener.
+After the probe, source and copy still had identical SHA-256
+`fd90548eaadb787e197c0f0cf45f541532b22ea1b0f0f93afbc5ea42aea97f58`.
+The probe processed **52 rows / 49 commands / 20,894,428 bytes** without
+appending history. Excluding the first warm-up round, median physical-row pass
+time was **531,526 us** with duplicate decoding and **296,368 us** with reuse
+(about **44% lower for this path only**). This does not measure full recovery,
+PVM execution, I/O, or end-to-end startup/Create/Install latency. The modeled
+duplicate path runs in the current binary, not a separate historical build.
+
+The complete Shared-Raft suite passed **31 tests**, with this diagnostic
+ignored by default (6.16s); the explicit probe passed separately (3.71s).
+Normal CLI build passed. A debug-only recovery-audit timer now reports retained
+row count and elapsed microseconds so live query cost can be attributed to
+actual full audits rather than inferred from microbenchmark improvements.
+
+Two additional native runs completed on the same disposable space, each with
+normal HTTP readiness and clean shutdown:
+
+- `recovery-audit-profile.log`: **20:39:01Z–20:41:07Z**. Queries took
+  13.069 / 13.277 / 13.866 / 14.135s. Each performed five full recovery audits,
+  totaling 1.540 / 1.687 / 1.882 / 1.959s respectively. Audits are therefore
+  not the main remaining query cost.
+- `execution-profile.log`: **20:42:17Z–20:44:56Z**, ready at **20:44:55Z**.
+  Additional debug timings cover ordered retry lookup and physical runtime
+  load/run (not output decoding). Before the first inventory query, 48 runtime
+  calls consumed **79.193s** and 14 full audits consumed **5.898s**. Fresh
+  query timings below are disjoint measured call intervals; the unaccounted
+  remainder includes other host work and output processing.
+
+| Query | Total | Full audits (5) | Retry lookups (3) | Runtime calls (10) |
+| --- | ---: | ---: | ---: | ---: |
+| Credential | 14.833s | 2.053s | 0.823s | 7.643s |
+| Agents | 15.199s | 2.172s | 0.798s | 7.716s |
+| Replicas | 15.601s | 2.272s | 0.852s | 7.778s |
+| Actors | 15.950s | 2.374s | 0.887s | 7.815s |
+
+The two largest identical Invoke executions per query take approximately 2.5s
+each (preflight plus committed execution); ACK takes approximately 1.9s.
+These calls carry roughly 780KB inputs. Short management inspection calls are
+about 0.1s each. This directs the next latency work to the guest/runtime path,
+not more audit-only micro-optimizations. Source inspection also finds repeated
+availability validation in invocation decoding, outer wire validation and
+runtime admission. Its contribution is not yet separately measured; any
+deduplication must retain byte integrity, shape and authorization rejection,
+and requires the normal guest rebuild/reproducibility gates if guest code
+changes. Do not omit preflight or committed execution checks speculatively.
+
+The runtime timer was added to the existing debug execution event; the retry
+timer logs only index and elapsed time. No work bytes, signatures or secrets
+are logged. `summarize.awk` in the probe directory reproduces the per-query
+totals; the earlier audit-only log has no lookup/runtime timings. The final
+normal binary build (`execution-build.log`), formatting and whitespace checks
+passed. The final instrumentation was exercised by the second live run.
+These are diagnostic results, **not production latency passes**. No guest
+artifact changed, and every live/test process from this checkpoint is stopped.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

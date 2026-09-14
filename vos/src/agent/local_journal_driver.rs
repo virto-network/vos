@@ -171,12 +171,19 @@ pub(super) fn recent_clean_ordered_operation<S: AgentJournalStore>(
     materialization: &ReplayMaterialization,
     operation: &ReplayOperation,
 ) -> Result<Option<ReplayInputId>, JournalStoreError> {
-    recent_clean_ordered_operation_bounded(
+    let started = std::time::Instant::now();
+    let result = recent_clean_ordered_operation_bounded(
         store,
         materialization,
         operation,
         MAX_PENDING_CLEAN_INVOCATION_RESULTS,
-    )
+    );
+    tracing::debug!(
+        elapsed_us = started.elapsed().as_micros() as u64,
+        ordered_index = materialization.heads().ordered_index,
+        "Clean ordered retry lookup complete"
+    );
+    result
 }
 
 /// Inspect only the authenticated interval after a caller's pre-dispatch
@@ -3099,10 +3106,13 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         gas: Gas,
         input: &[u8],
     ) -> Result<T, LocalReplayExecutorError> {
+        let started = std::time::Instant::now();
         let invocation = RefineContext::load(runtime_pvm, input, gas)
             .map_err(|_| LocalReplayExecutorError::RuntimeOutput)?
             .run();
         tracing::debug!(
+            elapsed_us = started.elapsed().as_micros() as u64,
+            input_bytes = input.len(),
             gas_limit = gas,
             gas_used = invocation.gas_used,
             "physical Agent runtime execution"
