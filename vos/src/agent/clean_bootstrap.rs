@@ -10128,7 +10128,49 @@ mod tests {
             };
             successor.invocation = successor.expected_invocation();
             successor.signature = key.sign(&successor.signing_bytes()).to_bytes();
+            owner
+                .retain_authority_admin(&successor, &mut journal)
+                .unwrap();
             let mut controller = NativeAuthorityAdminController::new(target, journal, terminals);
+            let mut ids = vec![call.invocation, successor.invocation];
+            ids.sort_unstable();
+            let pins = owner._pins_store.clone();
+            let record = owner.record_store.clone();
+            let issuer = owner.issuer.into_store();
+            drop(owner._network_host);
+            drop(owner.host);
+            let admission = controller
+                .startup_admission(
+                    NativeAuthorityOperationStartupAdmission::load(&mut operations, target, &[])
+                        .unwrap(),
+                    &ids,
+                )
+                .unwrap();
+            owner = CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+                pins,
+                record,
+                issuer,
+                &mut CountingSigner::new(),
+                || panic!("admin controller recovery must not recreate bootstrap"),
+                harness._directory.host(),
+                harness._directory.lock(),
+                harness.fixture.plan.pins.space,
+                harness.fixture.plan.pins.node,
+                harness.fixture.trust.clone(),
+                harness.fixture.merge.clone(),
+                harness.fixture.finality.clone(),
+                harness.provider.clone(),
+                harness.network.clone(),
+                None,
+                Some(&admission),
+            )
+            .unwrap();
+            drop(admission);
+            assert!(owner.management_admission_held().unwrap());
+            controller
+                .recover(&mut owner, &ids, &mut terminal_signer)
+                .unwrap();
+            assert!(!owner.management_admission_held().unwrap());
             let successor_result = controller
                 .coordinate_and_retire(&mut owner, &successor, &mut terminal_signer)
                 .unwrap();
@@ -10150,7 +10192,48 @@ mod tests {
             assert_eq!(owner.ordered_index_for_test().unwrap(), committed);
             assert_eq!(terminal_signer.0, signatures);
             assert!(!owner.management_admission_held().unwrap());
-            harness.owner = Some(owner);
+            struct NoLifecycleStores;
+            impl crate::agent::local_lifecycle::LocalLifecycleStoreFactory for NoLifecycleStores {
+                type Intent = IssuerMemoryStore;
+                type Issuer = IssuerMemoryStore;
+                type Error = ();
+                fn discover(&mut self, _: SpaceId, _: usize) -> Result<Vec<AgentId>, ()> {
+                    panic!("admin must not discover lifecycle stores")
+                }
+                fn open_existing(
+                    &mut self,
+                    _: SpaceId,
+                    _: AgentId,
+                ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                    panic!("admin must not reopen lifecycle stores")
+                }
+                fn open(
+                    &mut self,
+                    _: SpaceId,
+                    _: AgentId,
+                ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                    panic!("admin must not create lifecycle stores")
+                }
+            }
+            let local = crate::agent::local_sdk_host::LocalAgentHost::create(
+                harness._directory.0.join("admin-local-host"),
+                target.space,
+                harness.fixture.plan.pins.node,
+                harness.fixture.trust.clone(),
+            )
+            .unwrap();
+            let mut lifecycle = crate::agent::local_lifecycle::LocalLifecycleController::new(
+                owner,
+                local,
+                NoLifecycleStores,
+                CountingSigner::new(),
+            )
+            .unwrap()
+            .with_admins(controller, terminal_signer)
+            .unwrap();
+            assert_eq!(lifecycle.administer(&successor).unwrap(), successor_result);
+            assert_eq!(lifecycle.ordered_index_for_test().unwrap(), committed);
+            drop(lifecycle);
             harness.stop();
         }
 

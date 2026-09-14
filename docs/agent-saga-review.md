@@ -247,9 +247,10 @@ Keep these as work within C2, not new review batches:
    publication failures and owner restart before/after execution. Native
    success/denial terminal retirement and a valid successor now pass across
    result/retirement publication failures and restart. Hardened admin stores
-   and the lease-owning controller are implemented and tested, but daemon
-   startup ownership, host-clock preparation and host/client delivery remain
-   unwired. Keep
+   and the lease-owning controller are implemented and tested. Daemon startup
+   now discovers/replays admin evidence before routes and retains those leases
+   in the lifecycle owner. Host-clock preparation and host/client delivery
+   remain unwired. Keep
    its credential sequence and generation CAS distinct from operation
    authorization; do not relax anonymous HTTP invocation or
    put this mutation in the read-only projection journal.
@@ -7489,6 +7490,41 @@ These types are not wired into daemon startup or ingress yet. Next connect
 their lifetime/discovery to daemon recovery, then implement host-clock preparation
 and client delivery before the protected Local mutation campaign. No SDK ABI,
 bundled artifact or timeout changed; this remains C2, not a new review batch.
+
+### Daemon admin recovery ownership and fresh startup (C2)
+
+Daemon startup now opens `authority-admin-dispatch`, `authority-admin-results`
+and `authority-admin-retirements`, combines their full discovery set with
+operation recovery admission, and resumes only retained signed calls before
+publishing ordinary routes. `LocalLifecycleController::with_admins` checks the
+Authority and signer binding and owns the controller for its lifetime. Typed
+native `administer` dispatch is available; no HTTP/SSH admin endpoint or client
+preparation is enabled yet.
+
+Native tests now reopen with a pending successor, recover it through the owning
+controller, adopt the controller into the lifecycle owner, and verify exact
+retired retry without further commits. All 3 pass (61.37s;
+`target/task-tmp/native-admin-startup-native.log`). CLI tests pass 243 / 9 ignored
+(73.36s; `native-admin-startup-cli.log`), as do the owned-signer regression
+(`native-admin-startup-signer.log`), normal build, formatting and diff checks.
+Logs are under shared `target/task-tmp`.
+
+Live evidence: `target/task-tmp/admin-startup-smoke.nHw46n/run.sh` and
+`timing.log`, using isolated operator/node/config/data, HTTP 18088 and SSH 2230
+on loopback with mDNS autodial disabled. Fresh Space
+`e82c2863a174c3ba25f6aa08bb1f3e2d6f936389028c66a644ae5e98158a685a`
+uses the current f24a8ea3 runtime pin. First startup reached HTTP 200 after
+61s, then shut down cleanly; restart reached HTTP 200 after 66s and shut down
+cleanly. Each admin namespace was present and independently locked during
+restart (`flock -n -E 75`); all three locks were released after final shutdown.
+This live check has empty admin history; populated-history recovery is covered
+by the separate native fixtures, not by an unimplemented live admin command.
+Concurrent test/build activity means these timings are not a controlled
+performance comparison. The production latency gate remains open.
+
+Next: host-clock preparation plus authenticated admin delivery/client wiring,
+then the deployment-scoped protected Local mutation/retirement/restart campaign.
+No runtime artifact, SDK ABI, ingress permission check or timeout changed.
 
 ### Durable client acknowledgement before completion
 

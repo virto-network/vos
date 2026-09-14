@@ -241,6 +241,23 @@ impl vos::agent::clean_bootstrap::NativeAuthorityOperationDenialSigner
     }
 }
 
+/// Sign phase-separated native admin evidence with the pinned Authority key.
+impl vos::agent::clean_bootstrap::NativeAuthorityAdminTerminalSigner
+    for OwnedCleanOperatorIdentitySigner
+{
+    type Error = CleanIdentitySignerError;
+    fn public_key(&self) -> [u8; 32] {
+        self.public_key
+    }
+    fn sign_admin_terminal(&mut self, message: &[u8]) -> Result<[u8; 64], Self::Error> {
+        self.keypair
+            .sign(message)
+            .map_err(|_| CleanIdentitySignerError::SigningFailed)?
+            .try_into()
+            .map_err(|_| CleanIdentitySignerError::InvalidSignatureLength)
+    }
+}
+
 /// Derive the clean Node identity from every byte of an already-authenticated
 /// libp2p PeerId. Compact routing hints are deliberately not accepted here.
 pub(crate) fn node_id_from_authenticated_peer(peer_id: &PeerId) -> NodeId {
@@ -387,6 +404,14 @@ mod tests {
         );
         use vos::agent::authority_operation_issuer::AuthorityOperationEvidenceSigner as OperationSigner;
         assert_eq!(OperationSigner::public_key(&owned), borrowed.public_key());
+        use vos::agent::clean_bootstrap::NativeAuthorityAdminTerminalSigner as AdminSigner;
+        assert_eq!(AdminSigner::public_key(&owned), borrowed.public_key());
+        let admin = AdminSigner::sign_admin_terminal(&mut owned, b"admin-terminal").unwrap();
+        assert_eq!(admin.as_slice(), keypair.sign(b"admin-terminal").unwrap());
+        assert_eq!(
+            AdminSigner::sign_admin_terminal(&mut owned, b"admin-terminal").unwrap(),
+            admin
+        );
         use vos::agent::clean_bootstrap::NativeAuthorityOperationCompletionSigner as CompletionSigner;
         use vos::agent::clean_bootstrap::NativeAuthorityOperationDenialSigner as DenialSigner;
         use vos::agent::clean_bootstrap::NativeAuthorityOperationRetirementSigner as RetirementSigner;

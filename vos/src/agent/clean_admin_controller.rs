@@ -14,6 +14,48 @@ pub struct NativeAuthorityAdminController<J, T> {
 impl<J: NativeAuthorityAdminJournalStore, T: NativeAuthorityAdminTerminalStore>
     NativeAuthorityAdminController<J, T>
 {
+    pub fn authority(&self) -> AuthorityActorTarget {
+        self.authority
+    }
+
+    /// Resume only previously retained signed calls before ordinary routes
+    /// are published. Missing/corrupt discovery members are never skipped.
+    pub fn recover<P, R, I, S>(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        invocations: &[InvocationId],
+        signer: &mut S,
+    ) -> Result<(), SharedAgentHostError>
+    where
+        P: CleanSystemAgentBootstrapStore,
+        R: CleanSystemAgentBootstrapStore,
+        I: CleanManagementIssuerStore,
+        S: NativeAuthorityAdminTerminalSigner,
+    {
+        let maximum = 2 * crate::agent::authority_operation_coordinator::MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS;
+        if owner.authority_target() != self.authority
+            || signer.public_key() != self.authority.binding.public_key
+            || invocations.len() > maximum
+            || invocations.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        for id in invocations {
+            let bytes = self
+                .journal
+                .load(*id)
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .ok_or(SharedAgentHostError::Unavailable)?;
+            let record = admin_dispatch::RetainedAuthorityAdminDispatch::decode(&bytes)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            if record.call.invocation != *id {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            self.coordinate_and_retire(owner, &record.call, signer)?;
+        }
+        Ok(())
+    }
+
     pub fn new(authority: AuthorityActorTarget, journal: J, terminals: T) -> Self {
         Self {
             authority,

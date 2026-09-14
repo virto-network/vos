@@ -1218,6 +1218,42 @@ where
     }
 }
 
+/// Type-erased admin storage/signing retained with the native owner.
+trait NativeAuthorityAdminAccess<P, R, I>: Send
+where
+    P: CleanSystemAgentBootstrapStore,
+    R: CleanSystemAgentBootstrapStore,
+    I: CleanManagementIssuerStore,
+{
+    fn coordinate(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        call: &super::sdk::authority::AuthorityAdminCall,
+    ) -> Result<Option<super::sdk::authority::AuthorityAdminResult>, SharedAgentHostError>;
+}
+
+impl<P, R, I, J, T, S> NativeAuthorityAdminAccess<P, R, I>
+    for (
+        super::clean_bootstrap::NativeAuthorityAdminController<J, T>,
+        S,
+    )
+where
+    P: CleanSystemAgentBootstrapStore,
+    R: CleanSystemAgentBootstrapStore,
+    I: CleanManagementIssuerStore,
+    J: super::clean_bootstrap::NativeAuthorityAdminJournalStore + Send,
+    T: super::clean_bootstrap::NativeAuthorityAdminTerminalStore + Send,
+    S: super::clean_bootstrap::NativeAuthorityAdminTerminalSigner + Send,
+{
+    fn coordinate(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        call: &super::sdk::authority::AuthorityAdminCall,
+    ) -> Result<Option<super::sdk::authority::AuthorityAdminResult>, SharedAgentHostError> {
+        self.0.coordinate_and_retire(owner, call, &mut self.1)
+    }
+}
+
 /// Type-erased operation storage/signing retained with the native owner.
 pub(crate) trait NativeAuthorityOperationAccess<P, R, I>: Send
 where
@@ -1264,6 +1300,7 @@ where
     retained_stores: BTreeMap<AgentId, (F::Intent, F::Issuer)>,
     signer: S,
     operations: Option<Box<dyn NativeAuthorityOperationAccess<P, R, I>>>,
+    admins: Option<Box<dyn NativeAuthorityAdminAccess<P, R, I>>>,
 }
 
 impl<P, R, I, F, S> LocalLifecycleController<P, R, I, F, S>
@@ -1290,7 +1327,49 @@ where
             retained_stores: BTreeMap::new(),
             signer,
             operations: None,
+            admins: None,
         })
+    }
+
+    /// Adopt the recovered admin stores for the full production-owner lifetime.
+    pub fn with_admins<J, T, A>(
+        mut self,
+        admins: super::clean_bootstrap::NativeAuthorityAdminController<J, T>,
+        signer: A,
+    ) -> Result<Self, SharedAgentHostError>
+    where
+        J: super::clean_bootstrap::NativeAuthorityAdminJournalStore + Send + 'static,
+        T: super::clean_bootstrap::NativeAuthorityAdminTerminalStore + Send + 'static,
+        A: super::clean_bootstrap::NativeAuthorityAdminTerminalSigner + Send + 'static,
+    {
+        let target = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .authority_target();
+        if self.admins.is_some()
+            || admins.authority() != target
+            || signer.public_key() != target.binding.public_key
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self.admins = Some(Box::new((admins, signer)));
+        Ok(self)
+    }
+
+    pub fn administer(
+        &mut self,
+        call: &super::sdk::authority::AuthorityAdminCall,
+    ) -> Result<Option<super::sdk::authority::AuthorityAdminResult>, SharedAgentHostError> {
+        let admins = self
+            .admins
+            .as_mut()
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        let mut system = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        admins.coordinate(&mut system, call)
     }
 
     /// Adopt recovered operation stores and a signer matching the native owner.
@@ -1815,7 +1894,12 @@ where
             retained_stores,
             signer,
             operations,
+            admins,
         } = self;
+        assert!(
+            admins.is_none(),
+            "test extraction must preserve admin leases"
+        );
         assert!(
             operations.is_none(),
             "test extraction must preserve operation leases"

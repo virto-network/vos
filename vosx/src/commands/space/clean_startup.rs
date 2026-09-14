@@ -69,6 +69,9 @@ const OPERATION_JOURNAL_DIRECTORY: &str = "authority-operation-journal";
 const OPERATION_COMPLETIONS_DIRECTORY: &str = "authority-operation-completions";
 const OPERATION_RETIREMENTS_DIRECTORY: &str = "authority-operation-retirements";
 const OPERATION_DENIALS_DIRECTORY: &str = "authority-operation-denials";
+const ADMIN_DISPATCH_DIRECTORY: &str = "authority-admin-dispatch";
+const ADMIN_RESULTS_DIRECTORY: &str = "authority-admin-results";
+const ADMIN_RETIREMENTS_DIRECTORY: &str = "authority-admin-retirements";
 const PROJECTION_ROUTE_QUEUE_CAPACITY: usize = 64;
 const LOCAL_LIFECYCLE_RECOVERY_LIMIT: usize = 1_024;
 const PROJECTION_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
@@ -433,12 +436,30 @@ pub(crate) fn start_clean_system_agent(
         data_dir.join(OPERATION_DENIALS_DIRECTORY),
         authority_target,
     )?);
+    let admin_stores = super::clean_store::admin_store::CleanNativeAuthorityAdminStores::open(
+        &data_dir.join(ADMIN_DISPATCH_DIRECTORY),
+        &data_dir.join(ADMIN_RESULTS_DIRECTORY),
+        &data_dir.join(ADMIN_RETIREMENTS_DIRECTORY),
+        authority_target,
+        true,
+    )?;
+    let admin_ids = admin_stores.journal.discover()?;
+    let mut admins = vos::agent::clean_bootstrap::NativeAuthorityAdminController::new(
+        authority_target,
+        admin_stores.journal,
+        admin_stores.terminals,
+    );
     let operation_admission = operations
         .startup_admission(&operation_ids)
         .map_err(|error| {
             anyhow::anyhow!("verify operation recovery before startup; preserved stores: {error:?}")
         })?;
-    let owner = CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+    let operation_admission = admins
+        .startup_admission(operation_admission, &admin_ids)
+        .map_err(|error| {
+            anyhow::anyhow!("verify admin recovery before startup; preserved stores: {error:?}")
+        })?;
+    let mut owner = CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
         pins_store,
         record_store,
         issuer_store,
@@ -457,6 +478,14 @@ pub(crate) fn start_clean_system_agent(
         Some(&operation_admission),
     )?;
     drop(operation_admission);
+    let mut admin_signer = OwnedCleanOperatorIdentitySigner::new(operator.clone())?;
+    admins
+        .recover(&mut owner, &admin_ids, &mut admin_signer)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "complete retained admin recovery before routes; preserved stores: {error:?}"
+            )
+        })?;
     let local_root = data_dir.join(LOCAL_AGENT_HOST_DIRECTORY);
     let local = match std::fs::symlink_metadata(&local_root) {
         Ok(_) => vos::agent::local_sdk_host::LocalAgentHost::open(
@@ -485,7 +514,8 @@ pub(crate) fn start_clean_system_agent(
     .with_operations(
         operations,
         OwnedCleanOperatorIdentitySigner::new(operator.clone())?,
-    )?;
+    )?
+    .with_admins(admins, admin_signer)?;
     node.start_clean_local_agent_production(
         clean_node,
         lifecycle,
