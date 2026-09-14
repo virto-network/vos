@@ -10034,6 +10034,24 @@ mod tests {
         }
 
         fn check_native_operation_approved_retirement(partial_retirement: bool, automatic: bool) {
+            // This fixture keeps several complete Standard/PVM restore frames
+            // on one debug-build stack. Bound its test-only stack explicitly;
+            // production workers and their limits are unchanged.
+            std::thread::Builder::new()
+                .name("native-operation-recovery-test".into())
+                .stack_size(8 * 1024 * 1024)
+                .spawn(move || {
+                    check_native_operation_approved_retirement_inner(partial_retirement, automatic)
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+        }
+
+        fn check_native_operation_approved_retirement_inner(
+            partial_retirement: bool,
+            automatic: bool,
+        ) {
             use crate::Encode as _;
             use crate::agent::authority_operation_issuer::AuthorityOperationEvidenceSigner;
             use crate::agent::sdk::authority::AuthorityIngressAuthentication;
@@ -10431,6 +10449,65 @@ mod tests {
                 signature[0] ^= 1;
             }
             assert!(operations.prepare_call(&mut owner, &substituted).is_err());
+            // A lost preparation response may be followed by process restart
+            // before any coordinator or issuer record exists. Restore only the
+            // journal-backed admission, never mint a replacement context.
+            #[inline(never)]
+            fn reopen_prepared(
+                owner: CleanSystemAgentBootstrapOwner<
+                    BootstrapMemoryStore,
+                    BootstrapMemoryStore,
+                    IssuerMemoryStore,
+                >,
+                fixture: &PhysicalFixture,
+                directory: &TestDirectory,
+                provider: Arc<MemoryProvider>,
+                network: Arc<Network>,
+                admission: &NativeAuthorityOperationStartupAdmission<'_>,
+            ) -> CleanSystemAgentBootstrapOwner<
+                BootstrapMemoryStore,
+                BootstrapMemoryStore,
+                IssuerMemoryStore,
+            > {
+                let pins = owner._pins_store.clone();
+                let record = owner.record_store.clone();
+                let issuer = owner.issuer.into_store();
+                drop(owner._network_host);
+                drop(owner.host);
+                CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+                    pins,
+                    record,
+                    issuer,
+                    &mut CountingSigner::new(),
+                    || panic!("prepared operation must reopen, not bootstrap"),
+                    directory.host(),
+                    directory.lock(),
+                    fixture.plan.pins.space,
+                    fixture.plan.pins.node,
+                    fixture.trust.clone(),
+                    fixture.merge.clone(),
+                    fixture.finality.clone(),
+                    provider.clone(),
+                    network.clone(),
+                    None,
+                    Some(admission),
+                )
+                .unwrap()
+            }
+            let admission = operations.startup_admission(&[call.invocation]).unwrap();
+            owner = reopen_prepared(
+                owner,
+                &fixture,
+                &directory,
+                provider.clone(),
+                network.clone(),
+                &admission,
+            );
+            drop(admission);
+            assert!(owner.management_admission_held().unwrap());
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            assert_eq!(operations.prepare_call(&mut owner, &call).unwrap(), context);
+            assert_eq!(signer.calls, 0);
             let (coordinator, issuer, journal) = operations.into_parts();
             let mut operations =
                 NativeAuthorityOperationController::new(authority, coordinator, issuer, journal.1);

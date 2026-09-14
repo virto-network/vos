@@ -45,8 +45,9 @@ authorization with HTTP 503. Background inventory runs between preparation and
 authorization, followed by a ProjectionTransport owner/shutdown failure. See the
 fresh campaign below; this is not a live invocation pass.
 Periodic reconciliation now defers while native management admission is held;
-physical and scheduler regressions pass. Prepared-only startup recovery and an
-exact live retry remain unverified; forced startup reconciliation is unchanged.
+physical and scheduler regressions pass. Prepared-only physical reopen now passes,
+but the saved live restart fails at forced startup reconciliation before ingress;
+the client cannot yet reach its exact retry. See the recovery check below.
 The native Local Install application and startup-recovery phases now pass
 physical tests from prepared authorization through retirement, including
 pristine client-retry admission. Native Install controller handoff, retry and
@@ -6662,6 +6663,45 @@ ordinary readiness, rebase the saved AOQ1, or clear admission. Reproduce and han
 that recovery boundary, then run the exact saved live retry. The periodic fix is
 not proof of restart recovery or end-to-end invocation. Latency, expiry/abort,
 non-Public mutation, ordinary Shared finality and C3 release gates remain open.
+
+### Prepared-only physical reopen versus production startup (C2)
+
+The preserved IgQS0r Space was restarted using the normal **0754b9ad** binary,
+without editing the request, reservation or native journal. `recovery-run.sh`
+started at **2026-09-14 17:49:56Z**. Initial inventory reconciliation began at
+**17:53:53.533Z**, then failed with `ProjectionTransport`; the log's final write
+was at **17:54:03Z**. No readiness was reported, the script exited **1**, the daemon
+exited, and `.endpoint` is absent. The exact invocation test was never reached.
+Evidence is `recovery-daemon.log` and `recovery-run.sh` in the same disk-backed
+`target/task-tmp/native-denial-head-reuse.IgQS0r` directory; earlier logs remain.
+
+A native regression now reopens the owner immediately after durable preparation,
+before any operation coordinator or issuer image exists. It reloads admission
+from the exact journal, forbids fresh bootstrap, asserts the same ordered index,
+held admission, original context and zero early signatures, then completes policy,
+issuance and the existing later recovery/retirement checks. All **nine native
+operation tests pass**, zero failures, in **134.57 seconds**
+(`r16-prepared-recovery-native.log`). This isolates the live failure to production
+startup coordination rather than an inability to restore the prepared journal.
+
+The enlarged multi-reopen debug fixture initially overflowed the default test
+stack, including after restore setup was split into a non-inlined helper. Its
+three callers now use a bounded **8 MiB test-only thread stack**. Production
+thread limits are unchanged. The two initial failures remain in
+`r16-prepared-only-reopen.log` and `r16-prepared-only-reopen-final.log`; only the
+subsequent full native run is a pass. Formatting and whitespace checks pass.
+No production code or guest artifacts changed in this checkpoint.
+
+Required next step: permit exact-request recovery before normal readiness, while
+retaining admission and requiring verified inventory before ordinary routes are
+published. `space up` currently constructs/reconciles the production owner before
+registering HTTP ingress, so a client cannot resolve this prepared state. Do not
+derive a fresh issuance input from journal-only state: the coordinator retains
+native authorization before committing its record, and that intermediate NOD1
+does not preserve a direct AOQ1 caller's separately chosen issuance time. Recovery
+must preserve the actual request rather than guess or silently rebase it.
+Periodic deferral remains verified; live invocation, startup recovery, expiry/
+abort and all previously listed production/release gates remain open.
 
 ### Durable client acknowledgement before completion
 
