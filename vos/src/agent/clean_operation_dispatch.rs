@@ -921,10 +921,18 @@ where
         if material.actor.entry.deployment != request.target.binding.issuer.deployment
             || material.actor.entry.program != request.target.binding.issuer.program
             || material.producer != request.target.binding.issuer.producer
-            || request.context.observed_slot > material.observed_slot
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if request.context.observed_slot > material.observed_slot
             || (request.method == AuthorityOperationActorMethod::AuthorizeOperation
                 && material.observed_slot != request.context.observed_slot)
         {
+            tracing::warn!(
+                requested_slot = request.context.observed_slot,
+                physical_slot = material.observed_slot,
+                "native operation preparation rejected observation clock"
+            );
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         let identity = super::super::supervisor_adapters::physical_material_identity(&material)

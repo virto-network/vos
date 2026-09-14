@@ -1,5 +1,8 @@
 //! Credential-reserved Local invocation authorization. Physical application is
 //! a separate gate; an issued receipt does not complete this reservation.
+#[cfg(test)]
+#[path = "local_operation_live_tests.rs"]
+mod live_tests;
 use super::clean_store::{
     CleanCredentialReservation, CleanOperationClientFile, CleanPreparationClientFile,
     CredentialReservationStatus, ensure_private_directory,

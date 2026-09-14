@@ -482,10 +482,13 @@ fn handle_operation_authorization(
             Ok(bytes) => with_content_type(200, "application/octet-stream", bytes),
             Err(_) => text(500, "invalid operation response binding"),
         },
-        Ok(Err(_)) => text(
-            503,
-            "operation authorization incomplete; retry identical AOQ1",
-        ),
+        Ok(Err(error)) => {
+            tracing::warn!(?error, "native operation authorization incomplete");
+            text(
+                503,
+                "operation authorization incomplete; retry identical AOQ1",
+            )
+        }
         Err(_) => text(
             504,
             "operation authorization outcome unknown; retry identical AOQ1",

@@ -33,6 +33,9 @@ are still unproven. Issuance leaves its credential reservation pending.
 `invoke-local` now wires retained application, continuation and positive
 retirement/credential completion; its current evidence is protocol/loopback tests,
 not live native protected mutation or ordinary Shared finality.
+The first live managed receipt-bearing query attempt now fails at native
+authorization with HTTP 503 (80.36s); exact client state is retained. See the
+campaign section below. Do not deploy this as a working ordinary-Agent path.
 The native Local Install application and startup-recovery phases now pass
 physical tests from prepared authorization through retirement, including
 pristine client-retry admission. Native Install controller handoff, retry and
@@ -6437,6 +6440,51 @@ and failed-ACK histories do not count as retired. These are shaped signed protoc
 records and HTTP responses, not native guest execution. Live fresh protected
 authorization/application, mutation/restart, Shared finality, latency and full
 release gates remain required. No bundled artifacts or timeouts changed.
+
+### First native managed receipt-bearing invocation campaign
+
+On the existing disposable `target/native-denial-head-reuse.XoaplU` space, the
+normal binary at `831f6d57` started at **2026-09-14 16:33:21Z**, became ready at
+**16:39:49Z** (about **6m28s**), and shut down cleanly at **16:41:10Z**, with its
+endpoint removed. Startup inventory dispatch took **194.351s** and complete
+reconciliation **197.298s**. Two short CPU profiles were taken during startup,
+so this is diagnostic timing, not an uninstrumented release latency result.
+
+The new opt-in `real_daemon_managed_receipt_invocation_and_exact_retry` attempted
+a receipt-bearing `page` query on the already-installed Local Catalog actor.
+It **failed after 80.36s at `/__agents/authorize` with HTTP 503**. ATQ1, ATP1 and
+signed AOQ1 were retained for exact retry; no AOR1, application envelope or native
+operation journal/coordinator/issuer image was published. The credential remains
+pending. This is a concrete native authorization blocker, not a completed
+invocation or mutation result. The Catalog method is Public; even a future pass
+of this campaign will not by itself prove non-Public policy or mutation.
+
+Evidence remains in `managed-receipt-first-daemon.log` and
+`managed-receipt-first-client-test.log` under that disposable root. The operation
+nonce is `fb1fa8b78381d4729409d93eb21d797f019da38018c7e816ee2d65d45b0a3eed`.
+Never replace its signed request/timestamps or clear its reservation to retry.
+The exact native failure stage was not logged by the tested binary. The strict
+AuthorizeOperation observation-equals-physical-clock check is a candidate,
+not a confirmed diagnosis. Added diagnostics now report controller error class
+and rejected requested/physical clock slots, without relaxing those checks or
+logging request bodies/credentials. Next: diagnose the exact retained retry and
+fix the demonstrated native handoff, preserving recovery binding.
+
+Five-second profiles, kept under shared disk-backed `target/task-tmp`, show
+different phase costs: `r16-managed-startup.perf` sampled **72.75%** of core cycles
+in the PVM interpreter; `r16-managed-inventory.perf` sampled **54.23%** in BLAKE2
+and **19.79%** in the interpreter. Both crates already have opt-level 3 dev/test
+overrides. These short samples do not identify the full caller/root cause.
+An argument-free debugger attach was denied by the OS; permissions were not
+changed. No `/tmp` scratch, timeout increase, validation bypass or latency waiver
+was introduced.
+
+Normal regression verification after adding the campaign/diagnostics:
+**237 CLI tests passed**, zero failures, **six ignored**, in **50.51s**
+(`r16-managed-live-cli.log`). The opt-in live test separately failed as described
+above; the ordinary suite is not evidence that this live blocker is resolved.
+The normal diagnostic binary builds in **15.02s**
+(`r16-managed-live-diagnostic-build.log`); formatting and whitespace checks pass.
 
 ### Durable client acknowledgement before completion
 
