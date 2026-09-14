@@ -5872,12 +5872,7 @@ mod application_ledger_v2 {
                     continue;
                 }
                 let physical = verify_audited_physical_row_in_read(&transaction, &raft, &record)?;
-                let vos_raft::EntryKind::Data { payload } = physical else {
-                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
-                };
-                let AgentRaftCommand::PrepareCommitteeChange(change) =
-                    AgentRaftCommand::decode(&payload)
-                        .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?
+                let Some(AgentRaftCommand::PrepareCommitteeChange(change)) = physical.command
                 else {
                     return Err(AgentRaftApplicationErrorV2::CorruptLedger);
                 };
@@ -6798,11 +6793,9 @@ mod application_ledger_v2 {
                     return Err(AgentRaftApplicationErrorV2::BacklogLimit);
                 }
                 let physical = verify_audited_physical_row_in_read(&transaction, &raft, &record)?;
-                let vos_raft::EntryKind::Data { payload } = physical else {
-                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
-                };
-                let command = AgentRaftCommand::decode(&payload)
-                    .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                let command = physical
+                    .command
+                    .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
                 let AgentRaftCommand::Ordered {
                     route,
                     entry: physical_entry,
@@ -7006,6 +6999,7 @@ mod application_ledger_v2 {
             item.validate()?;
             let physical = decode_agent_raft_entry_kind(&item.physical)
                 .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            let physical = validate_physical_kind(physical, item.record.disposition)?;
             replay_committee_disposition(&mut state, authority, &item.record, physical)?;
         }
         if state.pending.is_some() {
@@ -7018,17 +7012,17 @@ mod application_ledger_v2 {
         state: &mut CommitteeApplicationStateV2,
         authority: CommitteeChangeAuthorityBinding,
         record: &AgentRaftApplyAuditRecordV2,
-        physical: vos_raft::EntryKind<AgentNodeId>,
+        physical: ValidatedPhysicalEntry,
     ) -> Result<(), AgentRaftApplicationErrorV2> {
-        match (record.disposition, physical) {
+        let ValidatedPhysicalEntry { kind, command } = physical;
+        match (record.disposition, kind) {
             (AgentRaftApplyDispositionV2::LeaderNoop, vos_raft::EntryKind::Data { payload })
                 if payload.is_empty() && state.pending.is_none() => {}
             (
                 AgentRaftApplyDispositionV2::Command(disposition),
                 vos_raft::EntryKind::Data { payload },
             ) if state.pending.is_none() => {
-                let command = AgentRaftCommand::decode(&payload)
-                    .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                let command = command.ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
                 if command.encode() != payload
                     || command.route().generation() != state.generation
                     || command.route().committee() != state.active.id()
@@ -7045,15 +7039,12 @@ mod application_ledger_v2 {
                     next,
                     authority: authority_commitment,
                 },
-                vos_raft::EntryKind::Data { payload },
+                vos_raft::EntryKind::Data { .. },
             ) => {
                 if state.pending.is_some() {
                     return Err(AgentRaftApplicationErrorV2::CorruptLedger);
                 }
-                let AgentRaftCommand::PrepareCommitteeChange(change) =
-                    AgentRaftCommand::decode(&payload)
-                        .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?
-                else {
+                let Some(AgentRaftCommand::PrepareCommitteeChange(change)) = command else {
                     return Err(AgentRaftApplicationErrorV2::CorruptLedger);
                 };
                 if change.generation() != state.generation
@@ -7764,11 +7755,19 @@ mod application_ledger_v2 {
         Ok(())
     }
 
+    /// Carries the canonical command decoded while checking physical shape.
+    /// Consumers still check their own route, disposition and authority.
+    /// This is per-read evidence, never a cache across storage observations.
+    struct ValidatedPhysicalEntry {
+        kind: vos_raft::EntryKind<AgentNodeId>,
+        command: Option<AgentRaftCommand>,
+    }
+
     fn verify_audited_physical_row_in_read(
         transaction: &redb::ReadTransaction,
         raft: &crate::raft::RaftMeta,
         record: &AgentRaftApplyAuditRecordV2,
-    ) -> Result<vos_raft::EntryKind<AgentNodeId>, AgentRaftApplicationErrorV2> {
+    ) -> Result<ValidatedPhysicalEntry, AgentRaftApplicationErrorV2> {
         if raft.commit_index < record.index {
             return Err(AgentRaftApplicationErrorV2::CorruptLedger);
         }
@@ -7791,7 +7790,7 @@ mod application_ledger_v2 {
         expected_commitment: Hash,
         disposition: AgentRaftApplyDispositionV2,
         stored: &[u8],
-    ) -> Result<vos_raft::EntryKind<AgentNodeId>, AgentRaftApplicationErrorV2> {
+    ) -> Result<ValidatedPhysicalEntry, AgentRaftApplicationErrorV2> {
         let (term, raw) = stored
             .split_at_checked(8)
             .ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
@@ -7811,36 +7810,53 @@ mod application_ledger_v2 {
         {
             return Err(AgentRaftApplicationErrorV2::CorruptLedger);
         }
+        validate_physical_kind(kind, disposition)
+    }
+
+    fn validate_physical_kind(
+        kind: vos_raft::EntryKind<AgentNodeId>,
+        disposition: AgentRaftApplyDispositionV2,
+    ) -> Result<ValidatedPhysicalEntry, AgentRaftApplicationErrorV2> {
+        let command = match &kind {
+            vos_raft::EntryKind::Data { payload } if !payload.is_empty() => {
+                if payload.len() > MAX_AGENT_RAFT_COMMAND_BYTES {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                }
+                let command = AgentRaftCommand::decode(payload)
+                    .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+                if command.encode() != *payload {
+                    return Err(AgentRaftApplicationErrorV2::CorruptLedger);
+                }
+                Some(command)
+            }
+            _ => None,
+        };
         let compatible = match (&kind, disposition) {
             (vos_raft::EntryKind::Data { payload }, AgentRaftApplyDispositionV2::LeaderNoop) => {
                 payload.is_empty()
             }
-            (vos_raft::EntryKind::Data { payload }, AgentRaftApplyDispositionV2::Command(_)) => {
-                !payload.is_empty()
-                    && payload.len() <= MAX_AGENT_RAFT_COMMAND_BYTES
-                    && AgentRaftCommand::decode(&payload).is_ok_and(|command| {
-                        command.encode() == *payload
-                            && !matches!(command, AgentRaftCommand::PrepareCommitteeChange(_))
-                    })
+            (vos_raft::EntryKind::Data { .. }, AgentRaftApplyDispositionV2::Command(_)) => {
+                command.as_ref().is_some_and(|command| {
+                    !matches!(command, AgentRaftCommand::PrepareCommitteeChange(_))
+                })
             }
             (
-                vos_raft::EntryKind::Data { payload },
+                vos_raft::EntryKind::Data { .. },
                 AgentRaftApplyDispositionV2::CommitteeChangePrepared {
                     transition,
                     previous,
                     next,
                     authority,
                 },
-            ) => AgentRaftCommand::decode(payload).is_ok_and(|command| {
-                command.encode() == *payload
-                    && matches!(
-                        command,
-                        AgentRaftCommand::PrepareCommitteeChange(change)
-                            if change.transition() == transition
-                                && change.previous().id() == previous
-                                && change.next().id() == next
-                                && change.authority_commitment() == authority
-                    )
+            ) => command.as_ref().is_some_and(|command| {
+                matches!(
+                    command,
+                    AgentRaftCommand::PrepareCommitteeChange(change)
+                        if change.transition() == transition
+                            && change.previous().id() == previous
+                            && change.next().id() == next
+                            && change.authority_commitment() == authority
+                )
             }),
             (
                 vos_raft::EntryKind::ConfigChange { joint_old, members },
@@ -7861,7 +7877,60 @@ mod application_ledger_v2 {
         if !compatible {
             return Err(AgentRaftApplicationErrorV2::CorruptLedger);
         }
-        Ok(kind)
+        Ok(ValidatedPhysicalEntry { kind, command })
+    }
+
+    #[test]
+    fn physical_command_reuse_preserves_fresh_byte_and_shape_validation() {
+        let route = AgentRouteKey::new(
+            SpaceId([1; 32]),
+            AgentId([2; 32]),
+            AgentJournalGenesisId([3; 32]),
+            AgentGenesisAdmissionId::from_bytes([4; 32]),
+            AgentReplicaCommitteeId::from_bytes([5; 32]),
+        )
+        .unwrap();
+        let batch = ArtifactBatchId::from_bytes([6; 32]);
+        let command = AgentRaftCommand::ArtifactAbort { route, batch };
+        let disposition =
+            AgentRaftApplyDispositionV2::Command(AgentRaftAuditDisposition::ArtifactBatchAborted {
+                batch,
+            });
+        let raw = encode_agent_raft_entry_kind(&vos_raft::EntryKind::Data {
+            payload: command.encode(),
+        })
+        .unwrap();
+        let commitment = Hash::digest(AGENT_RAFT_PHYSICAL_SLOT_COMMITMENT_DOMAIN, &[&raw]);
+        let mut stored = 7u64.to_le_bytes().to_vec();
+        stored.extend_from_slice(&raw);
+        let verified = verify_physical_bytes(1, 7, commitment, disposition, &stored).unwrap();
+        assert_eq!(verified.command.unwrap().encode(), command.encode());
+        assert!(verify_physical_bytes(1, 8, commitment, disposition, &stored).is_err());
+        assert!(
+            verify_physical_bytes(
+                1,
+                7,
+                commitment,
+                AgentRaftApplyDispositionV2::LeaderNoop,
+                &stored
+            )
+            .is_err()
+        );
+        *stored.last_mut().unwrap() ^= 1;
+        assert!(verify_physical_bytes(1, 7, commitment, disposition, &stored).is_err());
+        // A newly committed hash must not make malformed command bytes valid.
+        let malformed = encode_agent_raft_entry_kind(&vos_raft::EntryKind::Data {
+            payload: vec![0xff],
+        })
+        .unwrap();
+        let malformed_commitment =
+            Hash::digest(AGENT_RAFT_PHYSICAL_SLOT_COMMITMENT_DOMAIN, &[&malformed]);
+        let mut malformed_stored = 7u64.to_le_bytes().to_vec();
+        malformed_stored.extend_from_slice(&malformed);
+        assert!(
+            verify_physical_bytes(1, 7, malformed_commitment, disposition, &malformed_stored)
+                .is_err()
+        );
     }
 
     pub(super) fn generation_storage_key(

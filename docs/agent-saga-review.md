@@ -7184,6 +7184,38 @@ gate. The larger restart and dispatch times keep history-dependent physical
 validation and Invoke/ACK execution as the next profiling targets. Do not
 replace the full recovery audit with unauthenticated cached metadata.
 
+### Reuse canonical command decoding within one physical read (C2)
+
+V2 physical-row verification previously decoded and canonically checked the
+command, discarded it, and returned only raw entry-kind bytes. Recovery then
+decoded the same command again to replay committee disposition. Full journal
+projection and committee-history projection also decoded it again.
+
+The private `ValidatedPhysicalEntry` now carries that canonical command forward
+with its entry kind. Consumers retain their route, disposition, authority and
+entry-ID checks. Every storage observation still verifies the physical term,
+raw-payload commitment and canonical outer framing, and every nonempty command
+still undergoes bounded canonical decoding. Snapshot committee replay uses the
+same shape validator after validating its evidence item. This is **not** a
+cross-read cache: changed storage bytes cannot reuse earlier validation.
+
+The new regression checks exact command preservation, wrong physical term,
+wrong record kind, changed bytes after a successful read, and malformed command
+bytes even when their new physical hash matches. All **31 Shared-Raft tests
+passed** (6.17s), including V2 recovery, reservations, committee rotation and
+snapshot cases (`r16-physical-decode-all-tests.log`). An initial unused-pattern
+warning introduced during refactoring was removed before that final suite.
+This host-only optimization remains in C2; no guest artifact or wire change.
+It does not by itself establish acceptable startup or Create/Install latency.
+
+All **9 native operation regressions passed** (115.90s;
+`r16-physical-decode-native.log`), and the normal CLI build passed
+(`r16-physical-decode-build.log`), along with formatting and whitespace checks.
+No live latency campaign was run for this checkpoint. The native test duration
+is not materially better than the preceding run and is not a speedup claim.
+Next performance validation should compare equivalent retained histories, not
+infer improvement from consecutive boots that each append more journal work.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its
