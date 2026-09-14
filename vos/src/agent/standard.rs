@@ -2522,6 +2522,16 @@ impl StandardAgentRuntime {
         use crate::agent_sdk::InvocationError;
 
         self.verify_clean_invocation_authorization(work, authorization, observed_slot)?;
+        // Acknowledgement deletes the delivered reply, not the consumed
+        // invocation identity. Treating that absent reply as unseen work would
+        // execute the same mutation again. Keep exact ACK retries available,
+        // but never admit Invoke through a retained retirement fact.
+        if self
+            .recover_clean_acknowledgement(work, authorization)?
+            .is_some()
+        {
+            return Err(InvocationError::DivergentInvocation);
+        }
         let scope = clean_method_mode(work.mode).invocation_scope();
         let key = (scope, InvocationId(work.invocation.0));
         let Some(result) = self.invocation_results.get(&key) else {

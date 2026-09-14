@@ -264,8 +264,10 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
             vos::value::Value::try_decode(&reply.reply).unwrap(),
             vos::value::Value::U64(7)
         );
-        // Exercise actual duplicate delivery, not just the client response cache.
-        // The separate post-restart Query checks that mutation happened once.
+        // The managed path already acknowledged (and deleted) the reply.
+        // Late Invoke must reject the consumed identity, not execute it again.
+        // ACK retries below remain positive; a fresh post-restart Query checks
+        // that the mutation happened once.
         for _ in 0..2 {
             let repeated = super::super::local_create::post_binary(
                 address,
@@ -275,7 +277,13 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
                 super::super::local_invocation::MAX_RESPONSE_BYTES,
             )
             .unwrap();
-            assert_eq!(repeated, response);
+            assert!(matches!(
+                super::super::local_invocation::verify_response(&request, &repeated).unwrap(),
+                AgentInvocationResponse::Direct {
+                    outcome: RuntimeOutcome::Completed(Err(InvocationError::DivergentInvocation)),
+                    ..
+                }
+            ));
         }
     } else {
         let vos::value::Value::Bytes(bytes) = vos::value::Value::try_decode(&reply.reply).unwrap()

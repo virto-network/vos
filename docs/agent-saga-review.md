@@ -36,11 +36,16 @@ A fresh successor invocation now also passes on its first managed attempt, with
 the next credential operation sequence, positive retirement and exact retries.
 It took 176.52s; the full live test took 178.76s. Historical clock/scheduler/startup
 failures are preserved below. Protected mutation and latency gates remain open.
-The next Counter installation exhausted four exact HTTP attempts with 504s;
-no client completion was verified. Its mutation/restart fixtures compile but
-remain unexecuted. Preserve the retained install for exact recovery, not a fresh
-request. A short reconciliation CPU sample was dominated by BLAKE2 hashing;
-it does not yet identify the responsible caller or establish a complete cause.
+The next Counter installation exhausted four exact HTTP attempts with 504s,
+then exact resume after restart returned a verified acknowledgement in about
+14 seconds. The subsequent live mutation exposed a **duplicate-execution bug**:
+the first increment returned seven and retired, but exact late Invoke returned
+fourteen. Restart-read verification was not run. A source guard now rejects
+Invoke against a retained acknowledgement; it requires rebuilt/repinned runtime
+artifacts and fresh live verification before it can be considered deployed.
+Do not deploy the old bundled runtime as fixed. The failing disposable state is
+preserved, not reset. A short reconciliation CPU sample was dominated by BLAKE2
+hashing; the complete caller/root cause remains unproven.
 Native host-clock preparation retains AOC5 before HTTP and exact returned AOQ1
 before authorization. Periodic reconciliation defers while admission is held;
 startup now exposes only exact retained authorization recovery until inventory
@@ -6850,6 +6855,64 @@ run mutation/duplicate/restart verification. Protected permission setup should
 reuse existing Authority administration calls and authorization machinery;
 Counter's Public mutation does not close it. No new review batch, timeout
 increase, production artifact repin or master integration is included here.
+
+### Counter recovery and post-retirement duplicate-execution fix (C2)
+
+Exact Counter install resume passed on the preserved IgQS0r space using the
+unchanged normal binary: start **2026-09-14 18:56:40Z**, ready **18:57:57Z**,
+verified install completion **18:58:11Z**, clean shutdown **18:58:12Z**, exit **0**.
+Evidence: `counter-resume-{run.sh,daemon.log}`, `counter-resume.{json,log}` in the
+same disk-backed campaign directory. No retained request or reservation was
+replaced. Startup/inventory CPU samples (`r16-counter-resume*.perf.data`) again
+showed both PVM interpretation and BLAKE2 hashing, but even deeper unwinding did
+not produce reliable high-level callers; no latency fix is claimed.
+
+The subsequent mutation campaign began at **18:58:59Z**, ready **19:01:11Z**.
+Fresh invocation
+`9dee2d6be9bcafe8b870cde9b66cebfcfa2a2b7012f256114fe56746b7e0abec`
+completed its managed application/retirement in **192.06s**, returning seven.
+The first real HTTP replay after retirement returned fourteen rather than the
+retained response. The live test correctly failed in **192.52s**, and the
+script did not start its read-after-restart phase. The daemon subsequently
+exited and removed `.endpoint`; script exit **101**. Evidence is
+`counter-mutation-{run.sh,daemon.log,test.log}`. This is a production-blocking
+correctness failure, not just slow delivery. Preserve this now-double-mutated
+actor as failure evidence; a passing exactly-once campaign needs fresh state.
+
+Cause found in `StandardAgentRuntime::recover_clean_execution`: acknowledgement
+removes the delivered reply but retains a durable retirement fact. Recovery
+looked only for the reply, classified its absence as unseen work, and allowed
+the same live receipt to execute again. The source fix checks the exact durable
+acknowledgement before unseen-work admission. Late Invoke now returns the
+existing non-mutating `DivergentInvocation` rejection for the consumed key;
+exact Acknowledge retries remain positive. This changes no wire encoding or
+stored-state layout, and does not resurrect a deleted reply or discard facts.
+
+The live fixture's old demand for byte-identical Invoke replies *after* managed
+retirement was also incorrect: after explicit result deletion, the host must
+reject late Invoke. It now requires that rejection while retaining positive ACK
+retry checks and a separate fresh Query after restart. Existing pre-retirement
+exact-result retry coverage remains in the runtime test.
+
+Regression coverage extends the full runtime Invoke/Acknowledge/reopen test and
+the acknowledgement-capacity test: reject retired work with still-live receipts,
+preserve all retirement facts across restore, keep unacknowledged replies
+retryable, and leave state byte-identical on rejection. The initial pre-fix
+regression (`r16-retired-reinvoke-red.log`) failed because an expired late Invoke
+reached fresh authorization/expiry handling instead of the consumed-key check;
+the stronger still-live assertions accompany the fix. Native test success is
+not a bundled-PVM verification. Rebuild/repin the standard runtime and dependent
+system packages, then use fresh disposable state for mutation/restart coverage.
+This remains C2, with production artifact verification in the existing C3 gate.
+
+Validation so far: acknowledgement/capacity tests **2 passed, 0.61s**
+(`r16-retired-reinvoke-green.log`); full Invoke/Acknowledge/reopen regression
+**1 passed, 0.05s** (`r16-retired-reinvoke-done.log`); CLI **239 passed**, zero
+failures, **9 ignored**, **49.15s** (`r16-retired-reinvoke-cli.log`). Formatting
+and whitespace checks pass. The native operation authorization/retirement and
+physical reopen suite also passed: **9 passed, 120.50s**
+(`r16-retired-reinvoke-native.log`). None of these results closes the fresh bundled-PVM
+mutation/restart gate or the separate protected-permission gate.
 
 ### Durable client acknowledgement before completion
 

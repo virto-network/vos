@@ -9333,6 +9333,27 @@ pub(crate) mod tests {
         .unwrap();
         let after_restart =
             legacy_state_to_clean(encode_standard_runtime_state(&restarted.snapshot()));
+        for state in [&acknowledged.state, &after_restart] {
+            let late_invoke = apply_standard_runtime_work(RuntimeWork::Invoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                state: state.clone(),
+                invocation: Box::new(work.clone()),
+                authorization: Box::new(
+                    crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(authority.clone()),
+                ),
+                observed_slot: 99,
+            })
+            .unwrap();
+            assert_eq!(
+                late_invoke.state, *state,
+                "retired work cannot mutate again"
+            );
+            assert_eq!(
+                late_invoke.outcome,
+                RuntimeOutcome::Completed(Err(InvocationError::DivergentInvocation)),
+                "retirement consumes the invocation key before and after restart"
+            );
+        }
         let replayed = apply_standard_runtime_work(RuntimeWork::Acknowledge {
             context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             state: after_restart.clone(),
@@ -9478,6 +9499,11 @@ pub(crate) mod tests {
             let acknowledgement = runtime
                 .acknowledge_clean_invocation(&work, &authorization)
                 .unwrap();
+            assert_eq!(
+                runtime.recover_clean_execution(&work, &authorization, 1),
+                Err(InvocationError::DivergentInvocation),
+                "even a still-live receipt cannot execute retired work again"
+            );
             retained.push((work, authorization, acknowledgement));
         }
 
@@ -9535,6 +9561,11 @@ pub(crate) mod tests {
         );
 
         for (work, authorization, acknowledgement) in &retained {
+            assert_eq!(
+                reopened.recover_clean_execution(work, authorization, 1),
+                Err(InvocationError::DivergentInvocation),
+                "restart must preserve the consumed invocation identity"
+            );
             assert_eq!(
                 reopened
                     .recover_clean_acknowledgement(work, authorization)
