@@ -180,6 +180,105 @@ mod tests {
     }
 
     #[test]
+    fn operation_authorization_http_retries_exact_bytes_and_retains_verified_decision() {
+        use std::io::{Read as _, Write as _};
+        let fixture = Fixture::new("operation-http");
+        let request = submission(1);
+        let bytes = request.encode().unwrap();
+        let response = denial(&request);
+        let input = fixture.parent.join("initial.aoq1");
+        super::super::tests::write_private(&input, &bytes);
+        let mut last_address = None;
+        for (status, content_type, body, succeeds) in [
+            (503, "application/octet-stream", Vec::new(), false),
+            (504, "application/octet-stream", Vec::new(), false),
+            (302, "application/octet-stream", response.clone(), false),
+            (200, "application/json", response.clone(), false),
+            (
+                200,
+                "application/octet-stream",
+                denial(&submission(2)),
+                false,
+            ),
+            (
+                200,
+                "application/octet-stream",
+                response[..response.len() - 1].to_vec(),
+                false,
+            ),
+            (200, "application/octet-stream", response.clone(), true),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            last_address = Some(address);
+            let expected = bytes.clone();
+            let root = fixture.root.clone();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut received = Vec::new();
+                loop {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    received.push(byte[0]);
+                    if received.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                    assert!(received.len() < 8192);
+                }
+                assert!(received.starts_with(b"POST /__agents/authorize HTTP/1.1\r\n"));
+                let mut body_received = vec![0; expected.len()];
+                stream.read_exact(&mut body_received).unwrap();
+                assert_eq!(body_received, expected);
+                assert!(matches!(
+                    CleanOperationClientFile::open_or_create(root),
+                    Err(CleanFileStoreError::Busy)
+                ));
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                stream.write_all(&body).unwrap();
+            });
+            let result = crate::commands::space::operation_authorization::submit(
+                &fixture.root,
+                Some(&input),
+                address,
+            );
+            server.join().unwrap();
+            assert_eq!(result.is_ok(), succeeds, "{result:?}");
+            let mut store = CleanOperationClientFile::open_or_create(&fixture.root).unwrap();
+            assert_eq!(store.load_request().unwrap(), Some(bytes.clone()));
+            assert_eq!(
+                store.load_response().unwrap(),
+                succeeds.then(|| response.clone())
+            );
+            drop(store);
+            if input.exists() {
+                fs::rename(&input, fixture.parent.join("held-input")).unwrap();
+            }
+        }
+        // No listener remains, and initial input no longer exists. Exact local
+        // completion must still succeed without repreparation or HTTP traffic.
+        assert_eq!(
+            crate::commands::space::operation_authorization::submit(
+                &fixture.root,
+                Some(&input),
+                last_address.unwrap()
+            )
+            .unwrap(),
+            response
+        );
+        assert!(
+            crate::commands::space::operation_authorization::submit(
+                &fixture.root,
+                None,
+                "192.0.2.1:80".parse().unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn operation_response_denial_requires_exact_call_and_signature() {
         let request = submission(1);
         let response = denial(&request);

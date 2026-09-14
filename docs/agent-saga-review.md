@@ -192,8 +192,8 @@ Keep these as work within C2, not new review batches:
    validate it during startup. Automatic terminal denial handling now has a typed
    native decision path. Canonical AOQ1 retry inputs now enter the existing
    bounded lifecycle queue. Request-bound AOR1 responses and immutable client
-   request/response storage are implemented; operation HTTP/client commands and the live
-   denial/valid-successor campaign remain open.
+   request/response storage are implemented. HTTP and retained-submission CLI delivery
+   are wired; fresh preparation and the live denial/valid-successor campaign remain open.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
    retirement and restart through native ingress; then expose the same
    preparation/authorization flow in the user-facing client. A Public query
@@ -6148,10 +6148,10 @@ Verification: **2 focused frame/queue tests passed**, zero failures, in **0.04s*
 Formatting and whitespace checks pass. Initial compilation required correcting
 the nested decoder's borrowed bytes and explicit wire-error conversion.
 
-The broader 23-test coordinator run is **pending**, not a pass:
-`r16-operation-submission-coordinator-final.log`. At this checkpoint its existing
-process is still exercising the full-capacity retention fixture; preserve that
-run rather than restarting it. Historical coordinator coverage took 1,254.24s.
+The broader coordinator run subsequently completed: **23 passed, zero failures**
+in **1,593.99s**, including the full-capacity retention fixture. Evidence:
+`r16-operation-submission-coordinator-final.log`. This run predates the response
+and HTTP checkpoints and is not a current-source full-library release pass.
 No native PVM execution or live HTTP campaign is claimed for this queue slice.
 
 `AuthorityOperationSubmission` adds canonical AOQ1 framing for the exact signed
@@ -6182,8 +6182,8 @@ the focused issued-response verifier passed **1 test** in **0.27s**. Logs under
 and `r16-operation-response-verifier-final.log`. Formatting and whitespace checks
 pass. The first CLI fixture compile used a private decoder and the wrong ABI
 length accessor; the fixture was corrected before these passing checks.
-The earlier 23-test coordinator process remains live/pending and predates this
-response checkpoint; it is not current-source release evidence. No full release
+The earlier 23-test coordinator process subsequently passed in 1,593.99s and
+predates this response checkpoint; it is not current-source release evidence. No full release
 matrix, live HTTP or artifact rebuild is claimed here.
 
 AOR1 carries either the signed AOI1 (including its receipt), or NDR1 plus its
@@ -6214,6 +6214,42 @@ signed denial/source/context binding, framing/truncation, exact file retry,
 exclusive ownership, staged recovery and orphan rejection. CLI denial storage
 fixtures use a synthetic journal anchor/input commitment, not native policy
 execution evidence; native owner tests separately exercise actual denials.
+
+### HTTP operation authorization and retained-submission CLI
+
+Verification: **228 CLI tests passed**, zero failures, five ignored, in **62.21s**;
+**4 ingress-server tests passed**, zero failures, in **0.27s**. Evidence under
+`.worktrees/ch08-c2-native/target/task-tmp/`: `r16-operation-http-cli.log` and
+`r16-operation-http-server-final.log`. The server tests include exact path versus
+adjacent-path isolation and malformed frame rejection. The CLI campaign uses a
+loopback mock server with correctly signed fixture responses; it is not a live
+native authorization/application campaign.
+
+The normal `vosx` binary also built successfully in about 65 seconds
+(`r16-operation-http-build.log`), and its
+`space submit-agent-authorization --help` output confirms the retained-input
+command is available. Formatting and whitespace checks pass. All test/build
+processes from this and the preceding coordinator campaign are terminal.
+
+`POST /__agents/authorize` accepts signed canonical AOQ1 on the existing bounded
+lifecycle queue. Exact path routing, POST/content-type/body checks and rejection
+of caller-asserted transport nodes apply before enqueue. Both completed signed
+policy decisions return HTTP 200 with AOR1; the verified payload distinguishes
+issuance from denial. Queue/controller failures return 503, and the existing
+120-second wait returns 504 without cancelling accepted work. No timeout was
+increased and this does not resolve the production latency gate.
+
+`vosx space submit-agent-authorization REQUEST_DIR --request INPUT --http ADDRESS`
+persists the initial exact request before delivery, ignores new input once a
+request exists, verifies the bound signed response and synchronizes it before
+reporting completion. Retry can omit `--request`; a saved decision is verified
+locally without another HTTP request. Delivery uses loopback only, no environment
+proxy or redirects, bounded binary responses and the existing transport client.
+Output distinguishes `issued` / `denied` and explicitly reports `applied: false`.
+
+This is retained-input delivery, not a fresh preparation/signing command or
+proof of protected actor application. The latter, its live restart/resume
+campaign, the existing latency blocker and remaining C2/C3 gates remain open.
 
 ### Durable client acknowledgement before completion
 

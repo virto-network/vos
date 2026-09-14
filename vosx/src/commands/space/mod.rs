@@ -42,6 +42,8 @@ pub(crate) mod local_install;
 pub(crate) mod local_invocation;
 pub mod new;
 pub mod op_sign;
+#[cfg(target_os = "linux")]
+mod operation_authorization;
 pub mod reconcile;
 mod space_lock;
 pub mod up;
@@ -49,6 +51,17 @@ pub mod verify;
 
 #[derive(Subcommand, Debug)]
 pub enum SpaceCommand {
+    /// Submit or retry exact AOQ1 authorization; retain the verified decision.
+    #[cfg(target_os = "linux")]
+    SubmitAgentAuthorization {
+        request_dir: PathBuf,
+        /// Initial signed AOQ1; ignored after a request has been retained.
+        #[arg(long)]
+        request: Option<PathBuf>,
+        /// Loopback HTTP only; no proxies or redirects.
+        #[arg(long)]
+        http: std::net::SocketAddr,
+    },
     /// Resume retained yielded work and retire its terminal delivery exactly.
     #[cfg(target_os = "linux")]
     ContinueAgentInvocation {
@@ -164,6 +177,12 @@ pub enum SpaceCommand {
 
 pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
     match cmd {
+        #[cfg(target_os = "linux")]
+        SpaceCommand::SubmitAgentAuthorization {
+            request_dir,
+            request,
+            http,
+        } => operation_authorization::run(&request_dir, request.as_deref(), http),
         #[cfg(target_os = "linux")]
         SpaceCommand::ContinueAgentInvocation { request_dir, http } => {
             invocation_progress::run(&request_dir, http)

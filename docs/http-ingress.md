@@ -42,6 +42,38 @@ public operator command returns only with the clean system bootstrap.
 
 ## Routes
 
+### Operation authorization
+
+`POST /__agents/authorize` accepts `application/octet-stream` containing canonical
+`AOQ1`: the signed operation call, exact authorization context and issuance slot.
+It authenticates the embedded call and rejects transport-node claims over HTTP.
+The existing bounded lifecycle queue processes the request; acceptance alone is
+not durable completion.
+
+HTTP 200 contains a request-bound signed `AOR1` decision, either issued evidence
+or a terminal denial. Clients must verify the payload against their retained
+request, not interpret HTTP 200 as approval or actor execution. HTTP 503/504
+does not prove non-execution; retry the identical request. The server's existing
+120-second wait does not cancel accepted work.
+
+For an already prepared and signed AOQ1 file:
+
+```sh
+vosx space submit-agent-authorization /private/authorization-dir \
+  --request authorization.aoq1 --http 127.0.0.1:8080
+vosx space submit-agent-authorization /private/authorization-dir \
+  --http 127.0.0.1:8080
+```
+
+The CLI retains the first request before HTTP delivery and the verified response
+before reporting a decision. Later input is ignored; a saved decision is verified
+locally without sending another request. Output includes `decision: issued` or
+`decision: denied`, canonical response bytes, and `applied: false`. Delivery is
+loopback-only, with no proxies or redirects. This command does not yet prepare or
+sign a fresh operation, apply it to an actor, or prove application retirement.
+
+### Invocation and application routes
+
 ### Clean invocation transport (saga branch)
 
 `POST /__agents/prepare` accepts canonical `ATQ1` (binary content type) and

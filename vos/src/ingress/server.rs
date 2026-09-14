@@ -234,6 +234,10 @@ async fn handle_request(
                 return handle_local_install(&request, &handle);
             }
             #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            if request.uri().path() == "/__agents/authorize" {
+                return handle_operation_authorization(&request, &handle);
+            }
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
             if matches!(
                 request.uri().path(),
                 "/__agents/invoke" | "/__agents/resume" | "/__agents/acknowledge"
@@ -416,6 +420,75 @@ fn handle_local_create(
         Err(_) => text(
             504,
             "Local Create outcome unknown; retry the identical signed submission",
+        ),
+    }
+}
+
+#[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+fn handle_operation_authorization(
+    request: &super::types::Request,
+    handle: &IngressHandle,
+) -> super::types::Response {
+    use super::types::{text, with_content_type};
+    use crate::agent::local_lifecycle::{AuthorityOperationSubmission, LocalLifecycleIngressError};
+    use crate::agent::sdk::wire::CanonicalWire as _;
+    if request.body().len() > MAX_BODY_BYTES.min(AuthorityOperationSubmission::MAX_ENCODED_BYTES) {
+        return text(413, "operation request body too large");
+    }
+    if request.method() != http::Method::POST {
+        return text(405, "operation authorization is POST-only");
+    }
+    if request.uri().query().is_some() {
+        return text(
+            400,
+            "operation authorization does not accept query parameters",
+        );
+    }
+    if request
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        != Some("application/octet-stream")
+    {
+        return text(
+            415,
+            "operation authorization requires application/octet-stream AOQ1",
+        );
+    }
+    let submission = match AuthorityOperationSubmission::decode(request.body()) {
+        Ok(value) => value,
+        Err(_) => return text(400, "invalid signed operation submission"),
+    };
+    if submission.call().authenticated_node().is_some() {
+        return text(
+            403,
+            "HTTP operation authorization does not accept transport-node claims",
+        );
+    }
+    let reply = match handle.submit_clean_agent_operation(submission.clone()) {
+        Ok(reply) => reply,
+        Err(LocalLifecycleIngressError::Invalid) => {
+            return text(400, "invalid operation submission");
+        }
+        Err(LocalLifecycleIngressError::Busy) => return text(503, "Local lifecycle queue is full"),
+        Err(LocalLifecycleIngressError::Unavailable) => {
+            return text(503, "operation authorization unavailable");
+        }
+    };
+    match reply.recv_timeout(Duration::from_secs(120)) {
+        Ok(Ok(decision)) => match submission.encode_response(&decision) {
+            // Both verified policy outcomes are completed decisions; callers
+            // distinguish issuance/denial from the authenticated AOR1 payload.
+            Ok(bytes) => with_content_type(200, "application/octet-stream", bytes),
+            Err(_) => text(500, "invalid operation response binding"),
+        },
+        Ok(Err(_)) => text(
+            503,
+            "operation authorization incomplete; retry identical AOQ1",
+        ),
+        Err(_) => text(
+            504,
+            "operation authorization outcome unknown; retry identical AOQ1",
         ),
     }
 }
@@ -800,6 +873,12 @@ mod tests {
                 expected
             );
             assert_eq!(
+                handle_operation_authorization(&request, &handle)
+                    .status()
+                    .as_u16(),
+                expected
+            );
+            assert_eq!(
                 handle_clean_preparation(&request, &handle)
                     .status()
                     .as_u16(),
@@ -1107,7 +1186,11 @@ mod tests {
             assert!(inventory.starts_with("HTTP/1.1 405"), "{inventory}");
             let invoke = request(port, "/__agents/invoke");
             assert!(invoke.starts_with("HTTP/1.1 405"), "{invoke}");
-            for path in ["/__agents/resume", "/__agents/acknowledge"] {
+            for path in [
+                "/__agents/resume",
+                "/__agents/acknowledge",
+                "/__agents/authorize",
+            ] {
                 let wrong_method = request(port, path);
                 assert!(wrong_method.starts_with("HTTP/1.1 405"), "{wrong_method}");
                 let adjacent = request(port, &format!("{path}/"));
