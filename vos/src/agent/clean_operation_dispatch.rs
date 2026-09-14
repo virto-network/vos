@@ -10,6 +10,7 @@ mod denial;
 pub use denial::{
     MAX_NATIVE_OPERATION_DENIAL_BYTES, NativeAuthorityOperationDenialSigner,
     NativeAuthorityOperationDenialStore, native_operation_denial_invocation,
+    native_operation_denial_matches_request,
 };
 #[path = "clean_operation_retirement.rs"]
 mod retirement;

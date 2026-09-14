@@ -44,6 +44,23 @@ pub fn native_operation_denial_invocation(
     Some(certificate.invocation)
 }
 
+/// Client-side terminal denial verification against an independently retained
+/// call. This does not substitute for native source/issuer recovery checks.
+pub fn native_operation_denial_matches_request(
+    call: &AuthorityOperationCall,
+    context: &crate::agent::sdk::InvocationContext,
+    dispatch: &[u8],
+    certificate: &[u8],
+) -> bool {
+    let Ok(record) = RetainedAuthorityOperationDispatch::decode(dispatch) else {
+        return false;
+    };
+    record.encode().ok().as_deref() == Some(dispatch)
+        && record.request.context == *context
+        && call.encode().ok().as_deref() == Some(record.request.request.as_slice())
+        && restore_denial(call.authority, &record, certificate).is_ok()
+}
+
 pub(crate) struct VerifiedNativeOperationDenial<'a> {
     proof: VerifiedManagementDenial,
     target: AuthorityActorTarget,

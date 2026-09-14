@@ -953,7 +953,7 @@ fn acknowledgement_context(ack: &AuthorityOperationIssuanceAck) -> InvocationCon
     }
 }
 
-struct RawEd25519Verifier;
+pub(crate) struct RawEd25519Verifier;
 
 fn operation_call_has_valid_ingress_envelope(
     call: &AuthorityOperationCall,
@@ -1605,6 +1605,83 @@ pub(crate) mod tests {
     struct Fixture {
         authority: AuthorityActorTarget,
         credential_key: SigningKey,
+    }
+
+    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+    #[test]
+    fn operation_response_verifies_both_signatures_and_exact_request() {
+        use crate::agent::clean_bootstrap::NativeAuthorityOperationDecision;
+        use crate::agent::local_lifecycle::AuthorityOperationSubmission;
+        let mut signer = CountingSigner::new(0x31);
+        let fixture = Fixture::new(&signer);
+        let call = fixture.call(1);
+        let context = fixture.context(&call, 20);
+        let mut coordinator = open(
+            MemoryImageStore::default(),
+            MemoryImageStore::default(),
+            FakeDispatcher::new(fixture.authority),
+            &fixture,
+        );
+        let issued = coordinator
+            .coordinate(&call, context.clone(), 20, &mut signer)
+            .unwrap();
+        let submission =
+            AuthorityOperationSubmission::new(call.clone(), context.clone(), 20).unwrap();
+        let bytes = submission
+            .encode_response(&NativeAuthorityOperationDecision::Issued(issued.clone()))
+            .unwrap();
+        let NativeAuthorityOperationDecision::Issued(decoded) =
+            submission.decode_response(&bytes).unwrap()
+        else {
+            panic!("changed response kind")
+        };
+        assert_eq!(decoded, issued);
+        assert!(
+            AuthorityOperationSubmission::new(call.clone(), context, 21)
+                .unwrap()
+                .decode_response(&bytes)
+                .is_err()
+        );
+        let other = fixture.call(2);
+        assert!(
+            AuthorityOperationSubmission::new(other.clone(), fixture.context(&other, 20), 20)
+                .unwrap()
+                .decode_response(&bytes)
+                .is_err()
+        );
+        for end in 0..bytes.len() {
+            assert!(submission.decode_response(&bytes[..end]).is_err());
+        }
+        let mut corrupt = bytes.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(submission.decode_response(&corrupt).is_err());
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(submission.decode_response(&trailing).is_err());
+        let mut changed = issued.clone();
+        changed.receipt.signature[0] ^= 1;
+        changed.issuance_ack.receipt = changed.receipt.clone();
+        changed.issuance_ack.signature = signer
+            .key
+            .sign(&changed.issuance_ack.signing_bytes())
+            .to_bytes();
+        assert!(
+            submission
+                .encode_response(&NativeAuthorityOperationDecision::Issued(changed))
+                .is_err()
+        );
+        let mut changed = issued;
+        changed.issuance_ack.operation_call = Hash::ZERO;
+        assert!(
+            submission
+                .encode_response(&NativeAuthorityOperationDecision::Issued(changed))
+                .is_err()
+        );
+        assert!(
+            submission
+                .decode_response(b"AOR1\x01\x00\x00\x00\x00")
+                .is_err()
+        );
     }
 
     #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]

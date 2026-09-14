@@ -4,8 +4,36 @@ use vos::Encode as _;
 use vos::agent::sdk::{authority::*, authority_operation::*, wire::CanonicalWire as _, *};
 
 // Signed protocol fixture with a synthetic, structurally valid journal anchor.
+pub(super) fn submission(
+    sequence: u64,
+) -> vos::agent::local_lifecycle::AuthorityOperationSubmission {
+    let (authority, invocation, bytes) = record(sequence, 100);
+    let offset = 4 + RUNTIME_ABI_ID.as_bytes().len() + 1;
+    let length = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+    let call = AuthorityOperationCall::decode(&bytes[offset + 4..offset + 4 + length]).unwrap();
+    let context = InvocationContext {
+        invocation,
+        actor: authority.binding.issuer.actor,
+        mode: MethodMode::Linear,
+        origin: InvocationOrigin {
+            principal: Some(call.principal),
+            credential: Some(call.credential),
+            transport_node: None,
+            actor: None,
+            capability: None,
+        },
+        roles: InvocationRoleClaims::none(),
+        observed_slot: 20,
+    };
+    vos::agent::local_lifecycle::AuthorityOperationSubmission::new(call, context, 20).unwrap()
+}
+
+// Signed protocol fixture with a synthetic, structurally valid journal anchor.
 // This tests file binding, not native execution or admission of that anchor.
-fn record(sequence: u64, native_gas: u64) -> (AuthorityActorTarget, InvocationId, Vec<u8>) {
+pub(super) fn record(
+    sequence: u64,
+    native_gas: u64,
+) -> (AuthorityActorTarget, InvocationId, Vec<u8>) {
     let (operator, authority, descriptor, _) = super::super::local_create::tests::fixture();
     let public = operator.public().try_into_ed25519().unwrap().to_bytes();
     let origin = InvocationOrigin {

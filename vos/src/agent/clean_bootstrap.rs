@@ -26,8 +26,8 @@ pub use operation_dispatch::{
     NativeAuthorityOperationDenialStore, NativeAuthorityOperationJournalStore,
     NativeAuthorityOperationRetirementSigner, NativeAuthorityOperationRetirementStore,
     NativeAuthorityOperationStartupAdmission, native_operation_completion_invocations,
-    native_operation_denial_invocation, native_operation_record_matches,
-    native_operation_retirement_completion,
+    native_operation_denial_invocation, native_operation_denial_matches_request,
+    native_operation_record_matches, native_operation_retirement_completion,
 };
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
@@ -11524,13 +11524,22 @@ mod tests {
             }
             let saved = std::fs::read(&denial_path).unwrap();
             for _ in 0..2 {
-                let NativeAuthorityOperationDecision::Denied(bytes) = controller
+                let NativeAuthorityOperationDecision::Denied {
+                    certificate: bytes,
+                    dispatch,
+                } = controller
                     .coordinate_and_decide(owner, &call, request.context.clone(), slot, &mut signer)
                     .unwrap()
                 else {
                     panic!("expected signed denial")
                 };
                 assert_eq!(bytes, saved);
+                assert!(native_operation_denial_matches_request(
+                    &call,
+                    &request.context,
+                    &dispatch,
+                    &bytes
+                ));
             }
             let mut wrong_context = request.context.clone();
             wrong_context.observed_slot += 1;

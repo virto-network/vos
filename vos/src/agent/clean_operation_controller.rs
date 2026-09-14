@@ -61,8 +61,11 @@ pub enum NativeAuthorityOperationControllerError<C, B, S> {
 #[derive(Debug)]
 pub enum NativeAuthorityOperationDecision {
     Issued(IssuedAuthorityOperation),
-    /// Exact synchronized NDR1 certificate, not an unsigned rejection reason.
-    Denied(Vec<u8>),
+    /// Exact synchronized NDR1 and its committed NOD1 source.
+    Denied {
+        certificate: Vec<u8>,
+        dispatch: Vec<u8>,
+    },
 }
 
 impl<C, B, J> NativeAuthorityOperationController<C, B, J>
@@ -446,7 +449,12 @@ where
                 .retain(&certificate)
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
             owner.release_native_operation_denial(&retained)?;
-            return Ok(NativeAuthorityOperationDecision::Denied(certificate));
+            return Ok(NativeAuthorityOperationDecision::Denied {
+                certificate,
+                dispatch: record
+                    .encode()
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?,
+            });
         }
         // A failed certificate write follows durable removal of the unissued
         // coordinator pledge. Recover the native result without re-pledging an
@@ -481,7 +489,10 @@ where
                         Ok(())
                     })?;
                     return certificate
-                        .map(NativeAuthorityOperationDecision::Denied)
+                        .map(|certificate| NativeAuthorityOperationDecision::Denied {
+                            certificate,
+                            dispatch: record.encode().expect("verified native denial source"),
+                        })
                         .ok_or(SharedAgentHostError::Unavailable);
                 }
             }
@@ -506,7 +517,8 @@ where
                     certificate = Some(bytes.to_vec());
                     Ok(())
                 })?;
-                certificate.map(NativeAuthorityOperationDecision::Denied)
+                certificate.map(|certificate| NativeAuthorityOperationDecision::Denied { certificate,
+                    dispatch: record.encode().expect("verified native denial source") })
                     .ok_or(SharedAgentHostError::Unavailable)
             }
             Err(_) => Err(SharedAgentHostError::Unavailable),

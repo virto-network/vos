@@ -1,0 +1,297 @@
+//! One exclusively leased, immutable operation request and bound signed response.
+use super::*;
+use vos::agent::local_lifecycle::AuthorityOperationSubmission;
+use vos::agent::sdk::wire::CanonicalWire as _;
+
+pub(crate) struct CleanOperationClientFile {
+    request: ExactFileStore,
+    response: ExactFileStore,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::operation_journal_tests::submission;
+    use super::super::tests::Fixture;
+    use super::*;
+    use vos::agent::clean_bootstrap::NativeAuthorityOperationDecision;
+
+    // Synthetic source/input commitments test signature binding and storage,
+    // not native execution. Native denial proof is tested in the library.
+    fn denial(request: &AuthorityOperationSubmission) -> Vec<u8> {
+        let (key, _, _, _) = crate::commands::space::local_create::tests::fixture();
+        let (_, _, dispatch) = super::super::operation_journal_tests::record(
+            request.call().request_sequence.get(),
+            100,
+        );
+        let fields = [
+            request.call().invocation.0,
+            vos::agent::sdk::Hash::digest(b"vos/agent/native-operation-dispatch/v1", &[&dispatch])
+                .0,
+            request.call().commitment().0,
+            [0x66; 32],
+        ]
+        .concat();
+        let abi = vos::agent::sdk::RUNTIME_ABI_ID.as_bytes();
+        let mut signed = b"vos/agent/native-operation-denial-retirement/v1".to_vec();
+        signed.extend_from_slice(abi);
+        signed.extend_from_slice(&fields);
+        let mut bytes = b"NDR1".to_vec();
+        bytes.extend_from_slice(abi);
+        bytes.extend_from_slice(&fields);
+        bytes.extend_from_slice(&64u32.to_le_bytes());
+        bytes.extend_from_slice(&key.sign(&signed).unwrap());
+        request
+            .encode_response(&NativeAuthorityOperationDecision::Denied {
+                certificate: bytes,
+                dispatch,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn operation_client_retains_exact_bound_response_and_exclusive_lease() {
+        let fixture = Fixture::new("operation-client");
+        let request = submission(1);
+        let bytes = request.encode().unwrap();
+        let response = denial(&request);
+        let mut store = CleanOperationClientFile::open_or_create(&fixture.root).unwrap();
+        assert!(store.publish_response(&response).is_err());
+        assert!(store.load_request().unwrap().is_none());
+        store.publish_request(&bytes).unwrap();
+        assert!(matches!(
+            CleanOperationClientFile::open_or_create(&fixture.root),
+            Err(CleanFileStoreError::Busy)
+        ));
+        assert!(
+            store
+                .publish_request(&submission(2).encode().unwrap())
+                .is_err()
+        );
+        assert!(store.publish_response(&denial(&submission(2))).is_err());
+        let mut corrupt = response.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(store.publish_response(&corrupt).is_err());
+        store.publish_response(&response).unwrap();
+        let saved = fs::read(fixture.root.join("operation.response")).unwrap();
+        store.publish_request(&bytes).unwrap();
+        store.publish_response(&response).unwrap();
+        assert_eq!(
+            fs::read(fixture.root.join("operation.response")).unwrap(),
+            saved
+        );
+        drop(store);
+        let mut reopened = CleanOperationClientFile::open_or_create(&fixture.root).unwrap();
+        assert_eq!(reopened.load_request().unwrap(), Some(bytes));
+        assert_eq!(reopened.load_response().unwrap(), Some(response));
+    }
+
+    #[test]
+    fn operation_client_recovers_stages_but_never_repairs_orphan_response() {
+        let fixture = Fixture::new("operation-client-stage");
+        let request = submission(1);
+        let bytes = request.encode().unwrap();
+        let response = denial(&request);
+        let mut store = CleanOperationClientFile::open_or_create(&fixture.root).unwrap();
+        store.publish_request(&bytes).unwrap();
+        store.publish_response(&response).unwrap();
+        drop(store);
+        for name in ["operation.request", "operation.response"] {
+            fs::rename(
+                fixture.root.join(name),
+                fixture.root.join(format!("{name}.next")),
+            )
+            .unwrap();
+        }
+        let mut store = CleanOperationClientFile::open_or_create(&fixture.root).unwrap();
+        assert_eq!(store.load_response().unwrap(), Some(response));
+        assert_eq!(store.load_request().unwrap(), Some(bytes.clone()));
+        drop(store);
+        let saved = fs::read(fixture.root.join("operation.response")).unwrap();
+        fs::rename(
+            fixture.root.join("operation.request"),
+            fixture.parent.join("held-request"),
+        )
+        .unwrap();
+        let mut store = CleanOperationClientFile::open_or_create(&fixture.root).unwrap();
+        assert!(store.load_response().is_err());
+        assert!(store.publish_request(&bytes).is_err());
+        assert!(!fixture.root.join("operation.request").exists());
+        assert_eq!(
+            fs::read(fixture.root.join("operation.response")).unwrap(),
+            saved
+        );
+    }
+
+    #[test]
+    fn operation_client_preserves_invalid_or_replacing_stages() {
+        use super::super::tests::stage;
+        let request = submission(1);
+        let response = denial(&request);
+        for case in 0..3 {
+            let fixture = Fixture::new("operation-client-conflict");
+            let mut store = CleanOperationClientFile::open_or_create(&fixture.root).unwrap();
+            store.publish_request(&request.encode().unwrap()).unwrap();
+            store.publish_response(&response).unwrap();
+            let current = store
+                .response
+                .read_optional(
+                    store.response.file(),
+                    AuthorityOperationSubmission::MAX_RESPONSE_BYTES,
+                )
+                .unwrap()
+                .unwrap();
+            let mut candidate = response.clone();
+            let predecessor = match case {
+                0 => {
+                    candidate.push(0);
+                    None
+                }
+                1 => {
+                    candidate = denial(&submission(2));
+                    None
+                }
+                _ => Some(current.commitment()),
+            };
+            stage(&store.response, predecessor, &candidate);
+            let canonical = fs::read(fixture.root.join("operation.response")).unwrap();
+            let staged = fs::read(fixture.root.join("operation.response.next")).unwrap();
+            assert!(store.load_response().is_err());
+            assert!(store.publish_response(&response).is_err());
+            assert_eq!(
+                fs::read(fixture.root.join("operation.response")).unwrap(),
+                canonical
+            );
+            assert_eq!(
+                fs::read(fixture.root.join("operation.response.next")).unwrap(),
+                staged
+            );
+        }
+        let fixture = Fixture::new("operation-client-invalid-request");
+        let mut store = CleanOperationClientFile::open_or_create(&fixture.root).unwrap();
+        stage(&store.request, None, b"invalid AOQ1");
+        let staged = fs::read(fixture.root.join("operation.request.next")).unwrap();
+        assert!(store.load_request().is_err());
+        assert!(store.publish_request(&request.encode().unwrap()).is_err());
+        assert!(!fixture.root.join("operation.request").exists());
+        assert_eq!(
+            fs::read(fixture.root.join("operation.request.next")).unwrap(),
+            staged
+        );
+    }
+
+    #[test]
+    fn operation_response_denial_requires_exact_call_and_signature() {
+        let request = submission(1);
+        let response = denial(&request);
+        assert!(matches!(
+            request.decode_response(&response),
+            Ok(NativeAuthorityOperationDecision::Denied { .. })
+        ));
+        assert!(submission(2).decode_response(&response).is_err());
+        let mut context = request.context().clone();
+        context.observed_slot += 1;
+        let changed_context = AuthorityOperationSubmission::new(
+            request.call().clone(),
+            context,
+            request.issued_at() + 1,
+        )
+        .unwrap();
+        assert!(changed_context.decode_response(&response).is_err());
+        for end in 0..response.len() {
+            assert!(request.decode_response(&response[..end]).is_err());
+        }
+        let mut trailing = response.clone();
+        trailing.push(0);
+        assert!(request.decode_response(&trailing).is_err());
+        let mut corrupt = response.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(request.decode_response(&corrupt).is_err());
+        let mut wrong_kind = response;
+        wrong_kind[4] = 0;
+        assert!(request.decode_response(&wrong_kind).is_err());
+    }
+}
+
+impl CleanOperationClientFile {
+    fn candidates(file: &ExactFileStore) -> Result<Vec<Vec<u8>>, CleanFileStoreError> {
+        let _guard = file.root.guard()?;
+        file.root.audit_entries()?;
+        [file.file(), file.stage_file()]
+            .into_iter()
+            .map(|name| {
+                file.read_optional(name, file.role.maximum_bytes())
+                    .map(|image| image.map(|image| image.payload))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|images| images.into_iter().flatten().collect())
+    }
+
+    pub(crate) fn open_or_create(root: impl AsRef<Path>) -> Result<Self, CleanFileStoreError> {
+        let root = Arc::new(StoreRoot::open_with_entries(
+            root.as_ref(),
+            &[
+                LOCK_FILE,
+                "operation.request",
+                "operation.request.next",
+                "operation.response",
+                "operation.response.next",
+            ],
+        )?);
+        Ok(Self {
+            request: ExactFileStore::new(root.clone(), StoreRole::OperationRequest),
+            response: ExactFileStore::new(root, StoreRole::OperationResponse),
+        })
+    }
+
+    pub(crate) fn load_request(&mut self) -> Result<Option<Vec<u8>>, CleanFileStoreError> {
+        for bytes in Self::candidates(&self.request)? {
+            AuthorityOperationSubmission::decode(&bytes)
+                .map_err(|_| CleanFileStoreError::Corrupt)?;
+        }
+        let bytes = self
+            .request
+            .load(AuthorityOperationSubmission::MAX_ENCODED_BYTES)?;
+        if let Some(bytes) = &bytes {
+            AuthorityOperationSubmission::decode(bytes)
+                .map_err(|_| CleanFileStoreError::Corrupt)?;
+            self.request.commit_with_replacement(bytes, false)?;
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn publish_request(&mut self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
+        AuthorityOperationSubmission::decode(bytes).map_err(|_| CleanFileStoreError::Corrupt)?;
+        self.load_response()?; // Never repair an orphan response from fresh input.
+        self.load_request()?;
+        self.request.commit_with_replacement(bytes, false)
+    }
+
+    fn verify_response(&mut self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
+        let request = self.load_request()?.ok_or(CleanFileStoreError::Corrupt)?;
+        AuthorityOperationSubmission::decode(&request)
+            .map_err(|_| CleanFileStoreError::Corrupt)?
+            .decode_response(bytes)
+            .map_err(|_| CleanFileStoreError::Corrupt)?;
+        Ok(())
+    }
+
+    pub(crate) fn load_response(&mut self) -> Result<Option<Vec<u8>>, CleanFileStoreError> {
+        for bytes in Self::candidates(&self.response)? {
+            self.verify_response(&bytes)?;
+        }
+        let bytes = self
+            .response
+            .load(AuthorityOperationSubmission::MAX_RESPONSE_BYTES)?;
+        if let Some(bytes) = &bytes {
+            self.verify_response(bytes)?;
+            self.response.commit_with_replacement(bytes, false)?;
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn publish_response(&mut self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
+        self.load_response()?;
+        self.verify_response(bytes)?;
+        self.response.commit_with_replacement(bytes, false)
+    }
+}

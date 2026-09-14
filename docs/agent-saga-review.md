@@ -191,7 +191,8 @@ Keep these as work within C2, not new review batches:
    the production controller/daemon now retain the hardened denial index and
    validate it during startup. Automatic terminal denial handling now has a typed
    native decision path. Canonical AOQ1 retry inputs now enter the existing
-   bounded lifecycle queue; operation HTTP/client wiring and the live
+   bounded lifecycle queue. Request-bound AOR1 responses and immutable client
+   request/response storage are implemented; operation HTTP/client commands and the live
    denial/valid-successor campaign remain open.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
    retirement and restart through native ingress; then expose the same
@@ -6170,6 +6171,49 @@ This is the native request/queue boundary, not an HTTP endpoint or a completed
 client. Durable client retention, bound response verification, HTTP handling,
 fresh preparation and protected application still belong to the remaining C2
 work. No guest artifacts or performance behavior are claimed changed.
+
+### Request-bound operation responses and immutable client retention
+
+Verification: **226 CLI tests passed**, zero failures, five ignored, in
+**63.52s**; **9 native operation tests passed**, zero failures, in **208.99s**;
+the focused issued-response verifier passed **1 test** in **0.27s**. Logs under
+`.worktrees/ch08-c2-native/target/task-tmp/`:
+`r16-operation-response-client-final.log`, `r16-operation-response-native-final.log`,
+and `r16-operation-response-verifier-final.log`. Formatting and whitespace checks
+pass. The first CLI fixture compile used a private decoder and the wrong ABI
+length accessor; the fixture was corrected before these passing checks.
+The earlier 23-test coordinator process remains live/pending and predates this
+response checkpoint; it is not current-source release evidence. No full release
+matrix, live HTTP or artifact rebuild is claimed here.
+
+AOR1 carries either the signed AOI1 (including its receipt), or NDR1 plus its
+committed NOD1 source. Response verification always uses the independently
+retained AOQ1, never an authority key selected by the response. Issued evidence
+must match the exact call, acknowledgement identity and retained issuance slot;
+the verifier reconstructs the expected approval selector and checks both
+authority signatures. Historical verification is not present-day receipt
+liveness: application must still independently check expiry.
+
+Denial verification checks the entire original dispatch against NDR1, including
+the expected call and authorization context. A valid signature/InvocationId alone
+is insufficient. The native decision now returns the original source alongside
+the exact retained denial certificate; this adds no new signature or guest wire
+format. Client verification does not replace native issuer-absence/replay checks.
+
+`CleanOperationClientFile` retains immutable AOQ1/AOR1 under an exclusive private
+directory, using distinct CSF1 roles 25/26 and `operation.request` /
+`operation.response` files. Exact retries synchronize unchanged evidence. A
+response requires its existing independently retained request, including during
+staged recovery; new input cannot repair an orphan response. Both canonical and
+staged payloads are validated before recovery publication, and either role rejects
+replacement lineage. Malformed or substituting stages preserve both files. This backend is not
+yet a CLI delivery command or HTTP endpoint.
+
+Tests cover signed issued-response substitution and invalid receipt signatures,
+signed denial/source/context binding, framing/truncation, exact file retry,
+exclusive ownership, staged recovery and orphan rejection. CLI denial storage
+fixtures use a synthetic journal anchor/input commitment, not native policy
+execution evidence; native owner tests separately exercise actual denials.
 
 ### Durable client acknowledgement before completion
 

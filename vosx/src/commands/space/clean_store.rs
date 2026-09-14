@@ -191,6 +191,8 @@ enum StoreRole {
     OperationCompletions = 22,
     OperationRetirements = 23,
     OperationDenials = 24,
+    OperationRequest = 25,
+    OperationResponse = 26,
 }
 
 impl StoreRole {
@@ -220,6 +222,8 @@ impl StoreRole {
             Self::OperationCompletions => "authority-operation.completions",
             Self::OperationRetirements => "authority-operation.retirements",
             Self::OperationDenials => "authority-operation.denials",
+            Self::OperationRequest => "operation.request",
+            Self::OperationResponse => "operation.response",
         }
     }
 
@@ -249,6 +253,8 @@ impl StoreRole {
             Self::OperationCompletions => "authority-operation.completions.next",
             Self::OperationRetirements => "authority-operation.retirements.next",
             Self::OperationDenials => "authority-operation.denials.next",
+            Self::OperationRequest => "operation.request.next",
+            Self::OperationResponse => "operation.response.next",
         }
     }
 
@@ -270,6 +276,20 @@ impl StoreRole {
             Self::OperationCompletions => 40 + 256 * (4 + 512),
             Self::OperationRetirements => 40 + 256 * (4 + 1024),
             Self::OperationDenials => 40 + 256 * (4 + 512),
+            Self::OperationRequest => {
+                32 + vos::agent::sdk::authority_operation::MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES
+                    + vos::agent::sdk::wire::MAX_INVOCATION_CONTEXT_WIRE_BYTES
+            }
+            Self::OperationResponse => {
+                #[cfg(target_os = "linux")]
+                {
+                    vos::agent::local_lifecycle::AuthorityOperationSubmission::MAX_RESPONSE_BYTES
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    0
+                }
+            }
             Self::OperationDispatch => {
                 #[cfg(target_os = "linux")]
                 {
@@ -304,6 +324,8 @@ impl StoreRole {
             22 => Some(Self::OperationCompletions),
             23 => Some(Self::OperationRetirements),
             24 => Some(Self::OperationDenials),
+            25 => Some(Self::OperationRequest),
+            26 => Some(Self::OperationResponse),
             1 => Some(Self::Pins),
             2 => Some(Self::Bootstrap),
             3 => Some(Self::ManagementIssuer),
@@ -973,6 +995,12 @@ pub(crate) struct CleanLocalCreateAcknowledgementFile {
 
 /// Exact invocation and its first request-bound delivery under one lease.
 /// A retained response may be an error or yield, not terminal actor success.
+#[cfg(target_os = "linux")]
+#[path = "clean_operation_client.rs"]
+mod operation_client;
+#[cfg(target_os = "linux")]
+pub(crate) use operation_client::CleanOperationClientFile;
+
 pub(crate) struct CleanInvocationFile {
     request: ExactFileStore,
     response: ExactFileStore,
@@ -1752,6 +1780,8 @@ impl ExactFileStore {
                 | StoreRole::LocalCreateAcknowledgement
                 | StoreRole::LocalCreateDenial
                 | StoreRole::OperationDispatch
+                | StoreRole::OperationRequest
+                | StoreRole::OperationResponse
         ) && canonical
             .iter()
             .chain(staged.iter())
