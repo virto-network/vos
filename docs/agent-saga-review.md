@@ -27,6 +27,8 @@ after restart also passes. Native positive retirement and exact acknowledgement
 retries now pass before and after restart; protected/non-Public and mutating
 actor workflows remain open.
 This is not yet a usable ordinary-agent production path.
+Operation signing and retained targeted preparation helpers now pass CLI tests;
+fresh-command orchestration and live protected application are still open.
 The native Local Install application and startup-recovery phases now pass
 physical tests from prepared authorization through retirement, including
 pristine client-retry admission. Native Install controller handoff, retry and
@@ -6285,6 +6287,34 @@ must own the credential reservation, retain initial intent and physical
 preparation, load any existing AOQ1 before fresh discovery/signing, and publish the
 exact new AOQ1 before HTTP delivery. Protected application and restart remain
 subsequent C2 work; no release or latency gate is waived.
+
+### Durable targeted physical preparation
+
+Verification: **231 CLI tests passed**, zero failures, five opt-in tests ignored,
+in **53.26s** (`.worktrees/ch08-c2-native/target/task-tmp/r16-preparation-retained-cli.log`).
+Formatting and whitespace checks pass. Earlier runs exposed fixture-only issues
+(private parent admission and canonical schema/availability construction), fixed
+before this pass. No current native or live-daemon campaign is claimed here.
+
+The fresh-command foundation now has a separately leased immutable ATQ1/ATP1
+pair (CSF1 roles 27/28), reusing the existing operation-client storage engine.
+It retains the exact targeted intent before authenticated HTTP delivery, verifies
+the response against that intent, and syncs the first bound preparation before
+returning it. Retries use the saved intent even when supplied a different new
+intent, and a saved response can be returned without contacting the daemon.
+Both canonical and staged images are checked before recovery promotion; orphan
+responses cannot be repaired with new input, and replacement lineage is rejected.
+Tests cover authenticated exact-body retries after errors, redirects, wrong
+content type, malformed and wrong-request ATP1; successful retention and offline
+reuse; exclusive leasing, staged recovery, corrupt-stage preservation and orphan
+rejection. The shaped response uses admitted Catalog artifacts and tests wire
+binding, not native execution or usable Catalog installation configuration.
+
+This is historical physical work, not Authority approval, host attestation or a
+guarantee that its observed head remains live. The fresh command still needs
+credential-wide reservation and orchestration through discovery, retained
+preparation, signing, authorization and protected application. No timeout,
+latency gate, bundled artifact or review-batch boundary changed.
 
 ### Durable client acknowledgement before completion
 

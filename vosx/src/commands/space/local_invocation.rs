@@ -20,6 +20,27 @@ pub(crate) fn prepare(
     access_token: &str,
     request: &AgentTargetedPreparationRequest,
 ) -> anyhow::Result<PreparedAgentInvocation> {
+    let reply = prepare_response(address, access_token, request)?;
+    decode_preparation(request, &reply)
+}
+
+fn decode_preparation(
+    request: &AgentTargetedPreparationRequest,
+    reply: &[u8],
+) -> anyhow::Result<PreparedAgentInvocation> {
+    let response = AgentTargetedPreparationResponse::decode(reply)
+        .map_err(|error| anyhow::anyhow!("invalid ATP1: {error:?}"))?;
+    response
+        .for_request(request)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("physical preparation differs from the requested intent"))
+}
+
+fn validate_preparation(request: &AgentTargetedPreparationRequest) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        request.intent().origin().transport_node.is_none(),
+        "HTTP cannot assert a transport node"
+    );
     let bytes = request
         .encode()
         .map_err(|error| anyhow::anyhow!("invalid preparation: {error:?}"))?;
@@ -27,6 +48,15 @@ pub(crate) fn prepare(
         bytes.len() <= MAX_REQUEST_BYTES,
         "preparation exceeds HTTP request limit"
     );
+    Ok(bytes)
+}
+
+fn prepare_response(
+    address: std::net::SocketAddr,
+    access_token: &str,
+    request: &AgentTargetedPreparationRequest,
+) -> anyhow::Result<Vec<u8>> {
+    let bytes = validate_preparation(request)?;
     let reply = super::local_create::post_binary_authenticated(
         address,
         "/__agents/prepare",
@@ -34,12 +64,43 @@ pub(crate) fn prepare(
         AgentTargetedPreparationResponse::MAX_ENCODED_BYTES,
         access_token,
     )?;
-    let response = AgentTargetedPreparationResponse::decode(&reply)
-        .map_err(|error| anyhow::anyhow!("invalid ATP1: {error:?}"))?;
-    response
-        .for_request(request)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("physical preparation differs from the requested intent"))
+    decode_preparation(request, &reply)?;
+    Ok(reply)
+}
+
+/// Retain the exact intent before HTTP and the first bound preparation before
+/// returning. Cached work is historical, not proof of live head or approval.
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_retained(
+    root: &std::path::Path,
+    address: std::net::SocketAddr,
+    access_token: &str,
+    initial: Option<&AgentTargetedPreparationRequest>,
+) -> anyhow::Result<PreparedAgentInvocation> {
+    anyhow::ensure!(
+        address.ip().is_loopback() && address.port() != 0,
+        "preparation delivery requires nonzero loopback HTTP"
+    );
+    let mut store = super::clean_store::CleanPreparationClientFile::open_or_create(root)?;
+    let bytes = match store.load_request()? {
+        Some(bytes) => bytes,
+        None => {
+            let request =
+                initial.ok_or_else(|| anyhow::anyhow!("no retained preparation intent"))?;
+            let bytes = validate_preparation(request)?;
+            store.publish_request(&bytes)?;
+            bytes
+        }
+    };
+    let request = AgentTargetedPreparationRequest::decode(&bytes)
+        .map_err(|error| anyhow::anyhow!("invalid retained preparation: {error:?}"))?;
+    validate_preparation(&request)?;
+    if let Some(reply) = store.load_response()? {
+        return decode_preparation(&request, &reply);
+    }
+    let reply = prepare_response(address, access_token, &request)?;
+    store.publish_response(&reply)?;
+    decode_preparation(&request, &reply)
 }
 
 /// Combine host-prepared work with an explicitly supplied authorization.
@@ -407,36 +468,187 @@ mod tests {
     }
 
     #[test]
-    fn preparation_http_authenticates_exact_body_and_rejects_invalid_delivery() {
-        use std::io::{Read as _, Write as _};
+    fn retained_preparation_recovers_and_rejects_substitution_or_orphans() {
+        use super::super::clean_store::CleanPreparationClientFile;
+        let (request, reply) = preparation_fixture(31);
+        let (other, other_reply) = preparation_fixture(32);
+        let parent = directory();
+        let root = parent.join("preparation");
+        let mut store = CleanPreparationClientFile::open_or_create(&root).unwrap();
+        assert!(store.publish_response(&reply).is_err());
+        store.publish_request(&request.encode().unwrap()).unwrap();
+        assert!(CleanPreparationClientFile::open_or_create(&root).is_err());
+        assert!(store.publish_request(&other.encode().unwrap()).is_err());
+        assert!(store.publish_response(&other_reply).is_err());
+        let mut corrupt = reply.clone();
+        corrupt.push(0);
+        assert!(store.publish_response(&corrupt).is_err());
+        store.publish_response(&reply).unwrap();
+        drop(store);
+        for name in ["preparation.request", "preparation.response"] {
+            std::fs::rename(root.join(name), root.join(format!("{name}.next"))).unwrap();
+        }
+        // No server or token is needed to return already retained work. A
+        // different fresh intent is ignored, not silently substituted.
+        let prepared =
+            prepare_retained(&root, "127.0.0.1:1".parse().unwrap(), "", Some(&other)).unwrap();
+        assert_eq!(prepared.work().invocation, request.intent().invocation());
+        let mut store = CleanPreparationClientFile::open_or_create(&root).unwrap();
+        assert_eq!(store.load_response().unwrap(), Some(reply.clone()));
+        assert_eq!(
+            store.load_request().unwrap(),
+            Some(request.encode().unwrap())
+        );
+        drop(store);
+        let saved = std::fs::read(root.join("preparation.response")).unwrap();
+        // Corrupt staged bytes must remain untouched, not be promoted/removed.
+        std::fs::copy(
+            root.join("preparation.response"),
+            root.join("preparation.response.next"),
+        )
+        .unwrap();
+        let staged = root.join("preparation.response.next");
+        let mut bad = std::fs::read(&staged).unwrap();
+        *bad.last_mut().unwrap() ^= 1;
+        std::fs::write(&staged, &bad).unwrap();
+        let mut store = CleanPreparationClientFile::open_or_create(&root).unwrap();
+        assert!(store.load_response().is_err());
+        assert_eq!(std::fs::read(&staged).unwrap(), bad);
+        assert_eq!(
+            std::fs::read(root.join("preparation.response")).unwrap(),
+            saved
+        );
+        drop(store);
+        std::fs::remove_file(staged).unwrap();
+        // An orphan response cannot be repaired from new user input.
+        std::fs::remove_file(root.join("preparation.request")).unwrap();
+        let mut store = CleanPreparationClientFile::open_or_create(&root).unwrap();
+        assert!(store.publish_request(&request.encode().unwrap()).is_err());
+        assert!(!root.join("preparation.request").exists());
+        assert_eq!(
+            std::fs::read(root.join("preparation.response")).unwrap(),
+            saved
+        );
+        drop(store);
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    // Canonical shaped host response using admitted Catalog artifacts. This
+    // tests wire binding/storage only, not native preparation or execution.
+    fn preparation_fixture(seed: u8) -> (AgentTargetedPreparationRequest, Vec<u8>) {
+        use vos::Encode as _;
         use vos::agent::supervisor::AgentRouteKey;
         use vos::agent::supervisor_adapters::AgentInvocationIntent;
-        let (bytes, _) = fixture(23);
-        let call = validate_request(&bytes).unwrap();
-        let work = call.work();
+        fn bytes(out: &mut Vec<u8>, value: &[u8]) {
+            out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            out.extend_from_slice(value);
+        }
+        fn reference(out: &mut Vec<u8>, value: &BlobRef) {
+            out.extend_from_slice(value.hash.as_bytes());
+            out.extend_from_slice(&value.len.to_le_bytes());
+        }
+        let (operator, _, descriptor, _) = super::super::local_create::tests::fixture();
+        let actor = crate::bundled::root_signed_actor_package(
+            crate::bundled::system_catalog_package_template(),
+            "system-catalog",
+            &operator,
+        )
+        .unwrap();
+        let mut message = vec![vos::value::TAG_DYNAMIC];
+        message.extend_from_slice(&vos::value::Msg::new("page").encode());
         let request = AgentTargetedPreparationRequest::new(
-            AgentRouteKey::new(work.space, work.agent, work.actor).unwrap(),
+            AgentRouteKey::new(SpaceId([1; 32]), AgentId([2; 32]), ActorId([4; 32])).unwrap(),
             AgentInvocationIntent::new(
-                work.invocation,
-                work.mode,
-                work.origin,
-                work.roles,
-                work.message.clone(),
-                work.gas,
+                InvocationId([seed; 32]),
+                MethodMode::Query,
+                InvocationOrigin::anonymous(),
+                InvocationRoleClaims::none(),
+                message.clone(),
+                100,
                 false,
             )
             .unwrap(),
         )
         .unwrap();
+        let mut inner = b"APR1".to_vec();
+        inner.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+        inner.extend_from_slice(&[9; 32]); // Nonzero internal preparation commitment.
+        inner.push(AgentProfile::Local as u8);
+        inner.extend_from_slice(descriptor.identity.runtime_program.as_bytes());
+        reference(&mut inner, &descriptor.runtime_package);
+        inner.extend_from_slice(&17u64.to_le_bytes());
+        for field in [
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            [seed; 32],
+            [4; 32],
+            [5; 32],
+            [6; 32],
+            ProgramId::of_pvm(actor.program_bytes()).0,
+        ] {
+            inner.extend_from_slice(&field);
+        }
+        inner.push(MethodMode::Query as u8);
+        inner.extend_from_slice(&[0; 7]); // Anonymous origin and no role claims.
+        bytes(&mut inner, &message);
+        let schema = vos::agent::sdk::schema::decode(actor.state_lane_schema_bytes()).unwrap();
+        let mut blobs = vec![
+            actor.program_bytes(),
+            actor.state_lane_schema_bytes(),
+            actor.method_policy_bytes(),
+        ];
+        // Presence/preimage binding only; this fixture does not execute the
+        // Catalog or claim this shaped installation data is usable configuration.
+        if schema.requires_installation_data() {
+            inner.push(1);
+            reference(&mut inner, &BlobRef::of_bytes(b"shaped installation data"));
+            blobs.push(b"shaped installation data");
+        } else {
+            inner.push(0);
+        }
+        inner.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
+        blobs.sort_by_key(|blob| BlobRef::of_bytes(blob));
+        for blob in blobs {
+            reference(&mut inner, &BlobRef::of_bytes(blob));
+            bytes(&mut inner, blob);
+        }
+        inner.extend_from_slice(&100u64.to_le_bytes());
+        inner.push(0);
+        bytes(&mut inner, actor.method_policy_bytes());
+        bytes(&mut inner, b"page");
+        let mut response = b"ATP1".to_vec();
+        response.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+        response.extend_from_slice(request.commitment().as_bytes());
+        bytes(&mut response, &inner);
+        decode_preparation(&request, &response).unwrap();
+        (request, response)
+    }
+
+    #[test]
+    fn preparation_http_authenticates_exact_body_and_rejects_invalid_delivery() {
+        use std::io::{Read as _, Write as _};
+        let (request, reply) = preparation_fixture(23);
+        let (_, wrong) = preparation_fixture(24);
         let token = vos::ingress::encode_access_token(&[0x51; 32]).unwrap();
+        let parent = directory();
+        let root = parent.join("preparation");
+        // Prove storage admission before starting a mock listener.
+        drop(super::super::clean_store::CleanPreparationClientFile::open_or_create(&root).unwrap());
         assert!(prepare("192.0.2.1:8080".parse().unwrap(), &token, &request).is_err());
         assert!(prepare("127.0.0.1:1".parse().unwrap(), "invalid", &request).is_err());
-        for (status, content_type) in [
-            (401, "application/octet-stream"),
-            (302, "application/octet-stream"),
-            (200, "application/json"),
-            (200, "application/octet-stream"),
-        ] {
+        for (index, (status, content_type, response, succeeds)) in [
+            (401, "application/octet-stream", reply.clone(), false),
+            (504, "application/octet-stream", reply.clone(), false),
+            (302, "application/octet-stream", reply.clone(), false),
+            (200, "application/json", reply.clone(), false),
+            (200, "application/octet-stream", b"ATP1".to_vec(), false),
+            (200, "application/octet-stream", wrong, false),
+            (200, "application/octet-stream", reply.clone(), true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             let expected = request.encode().unwrap();
@@ -467,11 +679,27 @@ mod tests {
                 let mut body = vec![0; expected.len()];
                 stream.read_exact(&mut body).unwrap();
                 assert_eq!(body, expected);
-                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: 4\r\nConnection: close\r\n\r\nATP1").unwrap();
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
+                // Rejected headers may cause the client to close early.
+                let _ = stream.write_all(&response);
             });
-            assert!(prepare(address, &token, &request).is_err());
+            let result = prepare_retained(&root, address, &token, (index == 0).then_some(&request));
+            assert_eq!(result.is_ok(), succeeds, "{result:?}");
             server.join().unwrap();
+            let mut retained =
+                super::super::clean_store::CleanPreparationClientFile::open_or_create(&root)
+                    .unwrap();
+            assert_eq!(
+                retained.load_request().unwrap(),
+                Some(request.encode().unwrap())
+            );
+            assert_eq!(
+                retained.load_response().unwrap(),
+                succeeds.then(|| reply.clone())
+            );
         }
+        assert!(prepare_retained(&root, "127.0.0.1:1".parse().unwrap(), "", None).is_ok());
+        std::fs::remove_dir_all(parent).unwrap();
     }
 
     fn directory() -> std::path::PathBuf {

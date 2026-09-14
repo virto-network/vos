@@ -193,6 +193,8 @@ enum StoreRole {
     OperationDenials = 24,
     OperationRequest = 25,
     OperationResponse = 26,
+    PreparationRequest = 27,
+    PreparationResponse = 28,
 }
 
 impl StoreRole {
@@ -224,6 +226,8 @@ impl StoreRole {
             Self::OperationDenials => "authority-operation.denials",
             Self::OperationRequest => "operation.request",
             Self::OperationResponse => "operation.response",
+            Self::PreparationRequest => "preparation.request",
+            Self::PreparationResponse => "preparation.response",
         }
     }
 
@@ -255,6 +259,8 @@ impl StoreRole {
             Self::OperationDenials => "authority-operation.denials.next",
             Self::OperationRequest => "operation.request.next",
             Self::OperationResponse => "operation.response.next",
+            Self::PreparationRequest => "preparation.request.next",
+            Self::PreparationResponse => "preparation.response.next",
         }
     }
 
@@ -279,6 +285,11 @@ impl StoreRole {
             Self::OperationRequest => {
                 32 + vos::agent::sdk::authority_operation::MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES
                     + vos::agent::sdk::wire::MAX_INVOCATION_CONTEXT_WIRE_BYTES
+            }
+            Self::PreparationRequest => super::local_invocation::MAX_REQUEST_BYTES,
+            Self::PreparationResponse => {
+                use vos::agent::sdk::wire::CanonicalWire as _;
+                vos::agent::supervisor_adapters::AgentTargetedPreparationResponse::MAX_ENCODED_BYTES
             }
             Self::OperationResponse => {
                 #[cfg(target_os = "linux")]
@@ -326,6 +337,8 @@ impl StoreRole {
             24 => Some(Self::OperationDenials),
             25 => Some(Self::OperationRequest),
             26 => Some(Self::OperationResponse),
+            27 => Some(Self::PreparationRequest),
+            28 => Some(Self::PreparationResponse),
             1 => Some(Self::Pins),
             2 => Some(Self::Bootstrap),
             3 => Some(Self::ManagementIssuer),
@@ -1000,6 +1013,8 @@ pub(crate) struct CleanLocalCreateAcknowledgementFile {
 mod operation_client;
 #[cfg(target_os = "linux")]
 pub(crate) use operation_client::CleanOperationClientFile;
+#[cfg(target_os = "linux")]
+pub(crate) use operation_client::CleanPreparationClientFile;
 
 pub(crate) struct CleanInvocationFile {
     request: ExactFileStore,
@@ -1782,6 +1797,8 @@ impl ExactFileStore {
                 | StoreRole::OperationDispatch
                 | StoreRole::OperationRequest
                 | StoreRole::OperationResponse
+                | StoreRole::PreparationRequest
+                | StoreRole::PreparationResponse
         ) && canonical
             .iter()
             .chain(staged.iter())

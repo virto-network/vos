@@ -2,10 +2,46 @@
 use super::*;
 use vos::agent::local_lifecycle::AuthorityOperationSubmission;
 use vos::agent::sdk::wire::CanonicalWire as _;
+use vos::agent::supervisor_adapters::{
+    AgentTargetedPreparationRequest, AgentTargetedPreparationResponse,
+};
+
+#[derive(Clone, Copy)]
+enum ClientPairKind {
+    Operation,
+    Preparation,
+}
 
 pub(crate) struct CleanOperationClientFile {
+    kind: ClientPairKind,
     request: ExactFileStore,
     response: ExactFileStore,
+}
+
+/// Physical preparation is retained separately from signed authorization.
+/// Response binding is not proof of Authority approval or live applicability.
+pub(crate) struct CleanPreparationClientFile(CleanOperationClientFile);
+
+impl CleanPreparationClientFile {
+    pub(crate) fn open_or_create(root: impl AsRef<Path>) -> Result<Self, CleanFileStoreError> {
+        CleanOperationClientFile::open_pair(root, ClientPairKind::Preparation).map(Self)
+    }
+
+    pub(crate) fn load_request(&mut self) -> Result<Option<Vec<u8>>, CleanFileStoreError> {
+        self.0.load_request()
+    }
+
+    pub(crate) fn publish_request(&mut self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
+        self.0.publish_request(bytes)
+    }
+
+    pub(crate) fn load_response(&mut self) -> Result<Option<Vec<u8>>, CleanFileStoreError> {
+        self.0.load_response()
+    }
+
+    pub(crate) fn publish_response(&mut self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
+        self.0.publish_response(bytes)
+    }
 }
 
 #[cfg(test)]
@@ -326,40 +362,70 @@ impl CleanOperationClientFile {
     }
 
     pub(crate) fn open_or_create(root: impl AsRef<Path>) -> Result<Self, CleanFileStoreError> {
-        let root = Arc::new(StoreRoot::open_with_entries(
-            root.as_ref(),
-            &[
+        Self::open_pair(root, ClientPairKind::Operation)
+    }
+
+    fn open_pair(
+        root: impl AsRef<Path>,
+        kind: ClientPairKind,
+    ) -> Result<Self, CleanFileStoreError> {
+        let (request, response) = match kind {
+            ClientPairKind::Operation => {
+                (StoreRole::OperationRequest, StoreRole::OperationResponse)
+            }
+            ClientPairKind::Preparation => (
+                StoreRole::PreparationRequest,
+                StoreRole::PreparationResponse,
+            ),
+        };
+        let entries: &'static [&'static str] = match kind {
+            ClientPairKind::Operation => &[
                 LOCK_FILE,
                 "operation.request",
                 "operation.request.next",
                 "operation.response",
                 "operation.response.next",
             ],
-        )?);
+            ClientPairKind::Preparation => &[
+                LOCK_FILE,
+                "preparation.request",
+                "preparation.request.next",
+                "preparation.response",
+                "preparation.response.next",
+            ],
+        };
+        let root = Arc::new(StoreRoot::open_with_entries(root.as_ref(), entries)?);
         Ok(Self {
-            request: ExactFileStore::new(root.clone(), StoreRole::OperationRequest),
-            response: ExactFileStore::new(root, StoreRole::OperationResponse),
+            kind,
+            request: ExactFileStore::new(root.clone(), request),
+            response: ExactFileStore::new(root, response),
         })
+    }
+
+    fn validate_request(&self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
+        match self.kind {
+            ClientPairKind::Operation => AuthorityOperationSubmission::decode(bytes).map(|_| ()),
+            ClientPairKind::Preparation => {
+                AgentTargetedPreparationRequest::decode(bytes).map(|_| ())
+            }
+        }
+        .map_err(|_| CleanFileStoreError::Corrupt)
     }
 
     pub(crate) fn load_request(&mut self) -> Result<Option<Vec<u8>>, CleanFileStoreError> {
         for bytes in Self::candidates(&self.request)? {
-            AuthorityOperationSubmission::decode(&bytes)
-                .map_err(|_| CleanFileStoreError::Corrupt)?;
+            self.validate_request(&bytes)?;
         }
-        let bytes = self
-            .request
-            .load(AuthorityOperationSubmission::MAX_ENCODED_BYTES)?;
+        let bytes = self.request.load(self.request.role.maximum_bytes())?;
         if let Some(bytes) = &bytes {
-            AuthorityOperationSubmission::decode(bytes)
-                .map_err(|_| CleanFileStoreError::Corrupt)?;
+            self.validate_request(bytes)?;
             self.request.commit_with_replacement(bytes, false)?;
         }
         Ok(bytes)
     }
 
     pub(crate) fn publish_request(&mut self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
-        AuthorityOperationSubmission::decode(bytes).map_err(|_| CleanFileStoreError::Corrupt)?;
+        self.validate_request(bytes)?;
         self.load_response()?; // Never repair an orphan response from fresh input.
         self.load_request()?;
         self.request.commit_with_replacement(bytes, false)
@@ -367,10 +433,23 @@ impl CleanOperationClientFile {
 
     fn verify_response(&mut self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
         let request = self.load_request()?.ok_or(CleanFileStoreError::Corrupt)?;
-        AuthorityOperationSubmission::decode(&request)
-            .map_err(|_| CleanFileStoreError::Corrupt)?
-            .decode_response(bytes)
-            .map_err(|_| CleanFileStoreError::Corrupt)?;
+        match self.kind {
+            ClientPairKind::Operation => {
+                AuthorityOperationSubmission::decode(&request)
+                    .map_err(|_| CleanFileStoreError::Corrupt)?
+                    .decode_response(bytes)
+                    .map_err(|_| CleanFileStoreError::Corrupt)?;
+            }
+            ClientPairKind::Preparation => {
+                let request = AgentTargetedPreparationRequest::decode(&request)
+                    .map_err(|_| CleanFileStoreError::Corrupt)?;
+                let response = AgentTargetedPreparationResponse::decode(bytes)
+                    .map_err(|_| CleanFileStoreError::Corrupt)?;
+                response
+                    .for_request(&request)
+                    .ok_or(CleanFileStoreError::Corrupt)?;
+            }
+        }
         Ok(())
     }
 
@@ -378,9 +457,7 @@ impl CleanOperationClientFile {
         for bytes in Self::candidates(&self.response)? {
             self.verify_response(&bytes)?;
         }
-        let bytes = self
-            .response
-            .load(AuthorityOperationSubmission::MAX_RESPONSE_BYTES)?;
+        let bytes = self.response.load(self.response.role.maximum_bytes())?;
         if let Some(bytes) = &bytes {
             self.verify_response(bytes)?;
             self.response.commit_with_replacement(bytes, false)?;
