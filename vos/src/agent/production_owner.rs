@@ -57,6 +57,29 @@ fn completed_local_publication_matches(
             .is_some_and(|(prior, head)| prior == acknowledgement && Some(head) == accepted_head)
 }
 
+type CompletedLocalInstall = (
+    super::sdk::Hash,
+    AuthorityProjectionHead,
+    AgentRouteIdentity,
+);
+
+fn completed_local_install_matches(
+    previous: Option<CompletedLocalInstall>,
+    acknowledgement: super::sdk::Hash,
+    accepted_head: Option<AuthorityProjectionHead>,
+    had_local_attachment: bool,
+    identity: Option<AgentRouteIdentity>,
+) -> bool {
+    previous.is_some_and(|(ack, head, route)| {
+        completed_local_publication_matches(
+            Some((ack, head)),
+            acknowledgement,
+            accepted_head,
+            had_local_attachment,
+        ) && identity == Some(route)
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentProductionOwnerError {
     InvalidConfiguration,
@@ -447,6 +470,7 @@ pub(crate) struct AgentProductionOwner {
     // Bounded, process-local delivery deduplication only. Never used to
     // authorize management, recover an application, or restore publication.
     completed_local_publication: Option<(super::sdk::Hash, AuthorityProjectionHead)>,
+    completed_local_install: Option<CompletedLocalInstall>,
     reconcile_interval: Duration,
     reconcile_after: Instant,
     lifecycle: Option<(Box<dyn super::local_lifecycle::NativeLocalLifecycle>, usize)>,
@@ -562,6 +586,7 @@ impl AgentProductionOwner {
             source: Box::new(source),
             accepted_head: None,
             completed_local_publication: None,
+            completed_local_install: None,
             reconcile_interval,
             reconcile_after: Instant::now(),
             lifecycle,
@@ -632,6 +657,7 @@ impl AgentProductionOwner {
         // evidence through the lifecycle. Errors invalidate prior delivery
         // deduplication instead of leaving a stale success available.
         let previous = self.completed_local_publication.take();
+        self.completed_local_install = None;
         let started = Instant::now();
         tracing::debug!(agent = ?descriptor.identity.agent, "Local Create lifecycle started");
         let had_local_attachment = !self.local.is_empty();
@@ -665,8 +691,9 @@ impl AgentProductionOwner {
         Ok(result)
     }
 
-    /// Native Install completion includes fresh Authority/physical route
-    /// reconciliation. A lifecycle ACK alone must not become ingress success.
+    /// Native Install completion requires verified Authority/physical route
+    /// publication. Exact retries may reuse an unchanged verified publication,
+    /// but must still reopen lifecycle evidence and check the active route.
     pub(crate) fn install_local_actor(
         &mut self,
         install: super::sdk::InstallActor,
@@ -677,6 +704,8 @@ impl AgentProductionOwner {
             return Err(AgentProductionOwnerError::InvalidConfiguration);
         }
         self.completed_local_publication = None;
+        let previous = self.completed_local_install.take();
+        let had_local_attachment = !self.local.is_empty();
         let key = AgentRouteKey::new(call.managed.space, call.managed.agent, install.entry.actor)?;
         let runtime = call.managed.runtime_deployment;
         let deployment = install.entry.deployment;
@@ -691,6 +720,24 @@ impl AgentProductionOwner {
         if self.local.is_empty() {
             self.local = OwnedRouteSlot::Pending(lifecycle.local_attachment(*capacity)?);
         }
+        let current_identity = self
+            .supervisor
+            .as_ref()
+            .and_then(|supervisor| supervisor.handle().snapshot(key).ok())
+            .map(|snapshot| snapshot.identity());
+        if installed_local_route_matches(current_identity, key, runtime, deployment, program)
+            && completed_local_install_matches(
+                previous,
+                acknowledgement.commitment(),
+                self.accepted_head,
+                had_local_attachment,
+                current_identity,
+            )
+        {
+            self.completed_local_install = previous;
+            tracing::debug!(?key, "Local Install exact publication reused");
+            return Ok(acknowledgement);
+        }
         self.reconcile()?;
         let supervisor = self
             .supervisor
@@ -700,6 +747,9 @@ impl AgentProductionOwner {
         if !installed_local_route_matches(Some(identity), key, runtime, deployment, program) {
             return Err(AgentProductionOwnerError::InvalidProjection);
         }
+        self.completed_local_install = self
+            .accepted_head
+            .map(|head| (acknowledgement.commitment(), head, identity));
         Ok(acknowledgement)
     }
 
@@ -812,6 +862,7 @@ impl AgentProductionOwner {
         // Only a subsequent successful lifecycle publication may remember a
         // response again; reopening always starts without this optimization.
         self.completed_local_publication = None;
+        self.completed_local_install = None;
         let inventory = self.source.load_inventory()?;
         tracing::debug!(
             agents = inventory.agents.len(),
@@ -1708,6 +1759,54 @@ mod tests {
     }
 
     #[test]
+    fn completed_install_requires_exact_ack_head_attachment_and_incarnation() {
+        let key = AgentRouteKey::new(SpaceId([1; 32]), AgentId([2; 32]), ActorId([3; 32])).unwrap();
+        let identity = |incarnation| {
+            AgentRouteIdentity::new(
+                key,
+                Hash([incarnation; 32]),
+                DeploymentId([4; 32]),
+                DeploymentId([5; 32]),
+                ProgramId([6; 32]),
+                AgentProfile::Local,
+            )
+            .unwrap()
+        };
+        let ack = Hash([0x31; 32]);
+        let prior = Some((ack, head(1), identity(7)));
+        assert!(completed_local_install_matches(
+            prior,
+            ack,
+            Some(head(1)),
+            true,
+            Some(identity(7))
+        ));
+        for (previous, acknowledgement, accepted, attached, route) in [
+            (None, ack, Some(head(1)), true, Some(identity(7))),
+            (
+                prior,
+                Hash([0x32; 32]),
+                Some(head(1)),
+                true,
+                Some(identity(7)),
+            ),
+            (prior, ack, None, true, Some(identity(7))),
+            (prior, ack, Some(head(2)), true, Some(identity(7))),
+            (prior, ack, Some(head(1)), false, Some(identity(7))),
+            (prior, ack, Some(head(1)), true, None),
+            (prior, ack, Some(head(1)), true, Some(identity(8))),
+        ] {
+            assert!(!completed_local_install_matches(
+                previous,
+                acknowledgement,
+                accepted,
+                attached,
+                route
+            ));
+        }
+    }
+
+    #[test]
     fn completed_local_delivery_requires_exact_response_head_and_attachment() {
         let acknowledgement = super::super::sdk::Hash([0x31; 32]);
         let prior = Some((acknowledgement, head(1)));
@@ -1824,6 +1923,7 @@ mod tests {
             reconcile_after: admitted,
             lifecycle: None,
             completed_local_publication: None,
+            completed_local_install: None,
         };
         let before = Instant::now();
         let admission = Arc::new(AtomicU8::new(1));
@@ -1839,6 +1939,20 @@ mod tests {
         assert!(owner.drive_if_due(before).is_err());
         assert!(calls.lock().unwrap().is_empty());
         admission.store(0, Ordering::Release);
+        let completed_install = Some((
+            Hash([0x31; 32]),
+            head(1),
+            AgentRouteIdentity::new(
+                AgentRouteKey::new(SpaceId([1; 32]), AgentId([2; 32]), ActorId([3; 32])).unwrap(),
+                Hash([7; 32]),
+                DeploymentId([4; 32]),
+                DeploymentId([5; 32]),
+                ProgramId([6; 32]),
+                AgentProfile::Local,
+            )
+            .unwrap(),
+        ));
+        owner.completed_local_install = completed_install;
         owner.completed_local_publication = Some((super::super::sdk::Hash([0x31; 32]), head(1)));
         if lifecycle {
             assert_eq!(owner.reconcile(), Ok(()));
@@ -1851,10 +1965,13 @@ mod tests {
         assert_eq!(owner.drive_if_due(before), Ok(false));
         assert_eq!(calls.lock().unwrap().len(), 4);
         assert!(owner.completed_local_publication.is_none());
+        assert!(owner.completed_local_install.is_none());
+        owner.completed_local_install = completed_install;
         owner.completed_local_publication = Some((super::super::sdk::Hash([0x31; 32]), head(1)));
         owner.source = Box::new(client(Vec::new(), Vec::new(), head(1), calls));
         assert!(owner.reconcile().is_err());
         assert!(owner.completed_local_publication.is_none());
+        assert!(owner.completed_local_install.is_none());
         owner.shutdown_and_join().unwrap();
     }
 

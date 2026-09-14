@@ -7094,6 +7094,40 @@ This closes the demonstrated genesis collision; it does not close latency,
 protected permission setup, Shared finality, terminal/capacity recovery or the
 full final-source release matrix. Guest artifacts did not change.
 
+### Bounded exact Install publication reuse (C2)
+
+The owner now retains one process-local completed Install publication, matching
+the existing bounded Create delivery optimization. Every attempt still calls
+the native lifecycle to authenticate and reopen physical application evidence.
+Only the same acknowledgement commitment, accepted authority head, existing
+Local attachment and exact active route identity (including incarnation) can
+reuse the earlier verified publication. The expected route key, runtime,
+actor deployment, program and Local profile are checked separately.
+
+The marker is taken before processing Install, so errors cannot retain an old
+success. Create and every reconciliation attempt invalidate it; restart never
+restores it. First Install, changed identities, missing routes and changed heads
+still require full reconciliation before ingress success. The optimization
+does not cache authorization or bypass physical lifecycle recovery.
+
+This addresses the repeated inventory passes observed on queued exact Install
+retries in N5274B. It does **not** fix or waive the 130.879-second first
+post-install inventory, establish a measured end-to-end speedup, or close the
+production latency gate. No timeout, guest artifact, wire format or public API
+changed. Review remains within C2, alongside C1 recovery and C3 release; this
+checkpoint is not a fourth review batch.
+
+Validation: all **9 production-owner tests passed** (0.14s), including the
+new exact-ack/head/attachment/incarnation matrix and clearing the Install
+marker on successful and failed reconciliation. All **9 native operation
+regressions passed** (130.44s). The normal CLI build, formatting and whitespace
+checks passed. Logs in the shared disk-backed `target/task-tmp` directory:
+`r16-install-publication-owner-final.log`, `r16-install-publication-native.log`
+and `r16-install-publication-build.log`. No live campaign was run for this
+checkpoint; first-response latency and actual retry speedup remain unmeasured
+on this source. Next latency work must measure the authenticated inventory
+dispatch path; repeated-publication reuse alone is insufficient for release.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its
