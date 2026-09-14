@@ -331,6 +331,30 @@ where
         Ok(())
     }
 
+    /// Recovery routing only: require the exact retained call/context before
+    /// invoking the normal coordinator, which still verifies all policy inputs.
+    pub(crate) fn retains_call(
+        &mut self,
+        call: &AuthorityOperationCall,
+        context: Option<&InvocationContext>,
+    ) -> Result<bool, SharedAgentHostError> {
+        let Some(bytes) = self
+            .journal
+            .load(call.invocation)
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        else {
+            return Ok(false);
+        };
+        let record = operation_dispatch::RetainedAuthorityOperationDispatch::decode(&bytes)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        let request = record.request();
+        Ok(request.target == self.authority
+            && request.target == call.authority
+            && request.method == crate::agent::authority_operation_coordinator::AuthorityOperationActorMethod::AuthorizeOperation
+            && request.request == call.encode().map_err(|_| SharedAgentHostError::ScopeMismatch)?
+            && context.is_none_or(|context| context == &request.context))
+    }
+
     /// Only the native owner can supply policy results. Neither retained
     /// unsigned approval bytes nor a caller-provided dispatcher can reach the
     /// signer through this boundary. Exact contexts/slots remain caller inputs;
@@ -813,6 +837,14 @@ where
         + NativeAuthorityOperationDenialSigner
         + Send,
 {
+    fn retains_call(
+        &mut self,
+        call: &AuthorityOperationCall,
+        context: Option<&InvocationContext>,
+    ) -> Result<bool, SharedAgentHostError> {
+        self.0.retains_call(call, context)
+    }
+
     fn prepare(
         &mut self,
         owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,

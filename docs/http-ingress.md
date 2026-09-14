@@ -44,6 +44,20 @@ public operator command returns only with the clean system bootstrap.
 
 ### Operation authorization
 
+When startup restores held native operation admission, the daemon can expose a
+**recovery-only** endpoint before normal readiness. `GET /__status` returns 503,
+and ordinary HTTP routes return 503. Only the exact `/__agents/authorize` and
+`/__agents/prepare-authorization` paths remain available, with normal framing and
+signature checks plus an exact retained-call/context check. New calls are rejected.
+The ordinary supervisor and Authority ingress handles remain unpublished.
+
+For a retained managed Local invocation, use
+`vosx space authorize-local-invocation my-space --resume` to resolve authorization.
+Wait for `/__status` to return 200 after verified inventory reconciliation, then
+use `vosx space invoke-local my-space --resume` for application and retirement.
+Do not delete reservations, regenerate intent or interpret a running process as
+ready. Recovery mode does not waive expiry or permit arbitrary work.
+
 `POST /__agents/prepare-authorization` accepts canonical signed `AOC5` as
 `application/octet-stream`. API signatures are checked before queue admission;
 transport-node claims are rejected. It shares the four-entry lifecycle queue.

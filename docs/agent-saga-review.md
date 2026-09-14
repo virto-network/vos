@@ -27,27 +27,21 @@ after restart also passes. Native positive retirement and exact acknowledgement
 retries now pass before and after restart; protected/non-Public and mutating
 actor workflows remain open.
 This is not yet a usable ordinary-agent production path.
-Operation signing and retained targeted preparation are wired into an ATQ1-input
-managed authorization command; live fresh authorization and protected application
-are still unproven. Issuance leaves its credential reservation pending.
-`invoke-local` now wires retained application, continuation and positive
-retirement/credential completion; its current evidence is protocol/loopback tests,
-not live native protected mutation or ordinary Shared finality.
-The first live managed receipt-bearing query attempt now fails at native
-authorization with HTTP 503 (80.36s); exact client state is retained. See the
-campaign section below. Do not deploy this as a working ordinary-Agent path.
-The diagnostic exact retry confirms a client/physical authorization-clock
-mismatch. Native host-clock preparation now passes physical tests without rebasing
-saved AOQ1 or weakening freshness. Its HTTP/client handoff is now wired: immutable
-AOC5 precedes host preparation, and the exact returned AOQ1 precedes authorization.
-The corrected fresh live campaign now completes host preparation but still fails
-authorization with HTTP 503. Background inventory runs between preparation and
-authorization, followed by a ProjectionTransport owner/shutdown failure. See the
-fresh campaign below; this is not a live invocation pass.
-Periodic reconciliation now defers while native management admission is held;
-physical and scheduler regressions pass. Prepared-only physical reopen now passes,
-but the saved live restart fails at forced startup reconciliation before ingress;
-the client cannot yet reach its exact retry. See the recovery check below.
+Managed authorization now has a live exact-recovery pass: the saved IgQS0r call
+was authorized after recovery-only startup, followed by verified inventory,
+receipt-bearing Catalog query, positive retirement and exact retries. The live
+invocation test passed in 5.14s after readiness, and shutdown was clean. This is
+a Public query with a receipt, not non-Public mutation or ordinary Shared finality.
+Fresh first-attempt managed invocation and valid invocation succession remain to
+be checked. Historical clock/scheduler/startup failures are preserved below.
+Native host-clock preparation retains AOC5 before HTTP and exact returned AOQ1
+before authorization. Periodic reconciliation defers while admission is held;
+startup now exposes only exact retained authorization recovery until inventory
+is verified. Issuance alone leaves the credential pending; actor retirement
+completes it. No saved AOQ1 was rebased or pending reservation cleared.
+Recovery remained slow: about 217s to recovery ingress, 109s to authorization,
+then 196.952s of initial inventory reconciliation. These are release blockers,
+not acceptable production latency or grounds to waive timeouts.
 The native Local Install application and startup-recovery phases now pass
 physical tests from prepared authorization through retirement, including
 pristine client-retry admission. Native Install controller handoff, retry and
@@ -6702,6 +6696,59 @@ does not preserve a direct AOQ1 caller's separately chosen issuance time. Recove
 must preserve the actual request rather than guess or silently rebase it.
 Periodic deferral remains verified; live invocation, startup recovery, expiry/
 abort and all previously listed production/release gates remain open.
+
+### Recovery-only startup and live retained invocation pass (C2)
+
+Startup now defers initial inventory only while the native lifecycle reports held
+management admission. It keeps normal supervisor/Authority ingress unpublished.
+The recovery endpoint returns HTTP 503 for `/__status` and ordinary routes; only
+the exact authorization/preparation paths are available. Their signed requests
+must match an existing native journal call (and context for authorization).
+Missing or altered calls cannot start new work. Normal policy/issuer validation
+still runs, including exact coordinator issuance inputs on retry.
+
+After native authorization retirement releases admission, the overdue inventory
+refresh runs. Only successful authenticated reconciliation publishes ingress,
+clears the recovery flag and reports verified readiness. Create/Install also
+require readiness at the production-owner boundary. Lock/validation errors are
+not treated as free admission. No timestamp inference, journal rewrite, timeout
+increase or artifact change was introduced.
+
+Verification:
+
+- `r16-recovery-only-owner-final.log`: **eight passed**, **0.17s**.
+- `r16-recovery-only-http.log`: **four passed**, **0.27s**, including recovery
+  route restrictions, 503 status, exact path matching and return to normal status.
+- `r16-recovery-only-native.log`: **nine passed**, **172.32s**, including rejection
+  of missing calls, changed contexts and substituted signatures.
+- `r16-recovery-only-cli.log`: **239 passed**, zero failures, **six ignored**, **80.18s**.
+- `r16-recovery-only-build.log`: normal vosx build passed (about **68 seconds**).
+
+The preserved IgQS0r campaign then passed with this implementation. Its new
+`recovery-only-run.sh` began at **2026-09-14 18:09:25Z**; recovery ingress was
+observed at **18:13:02Z**. Real HTTP probes confirmed 503 for readiness and actor
+invocation. `authorize-local-invocation --resume` returned a verified retained
+**issued** decision at **18:14:51Z**, with `applied: false` and its credential still
+pending. There was no HTTP timeout during this exact authorization recovery.
+Initial inventory reconciliation took **196.952 seconds**; verified readiness
+was observed at **18:18:08Z**, and `/__status` then returned 200.
+
+The existing live managed test subsequently passed: receipt-bearing Public Catalog
+query, verified empty page, positive retirement, repeated real HTTP acknowledgement,
+and cached managed resume. Its managed application attempt took **2.98 seconds**;
+the full test passed in **5.14 seconds** (test build **13.13s**). The same daemon
+shut down cleanly at **18:18:30Z**, script exit **0**, and `.endpoint` is absent.
+Logs and JSON are `recovery-only-{daemon,authorization,invocation}.log`,
+`recovery-only-authorization.json`, and the HTTP probe bodies in
+`target/task-tmp/native-denial-head-reuse.IgQS0r`. The original nonce, signed call,
+prepared frame and reservation were reused, not replaced. Earlier failed logs
+and the separate XoaplU campaign remain intact.
+
+This closes the demonstrated recovery-only startup/authorization interleaving,
+not every recovery or release gate. Fresh first-attempt/successor invocation,
+non-Public/mutating workflows, expiry/abort, ordinary Shared finality and C3 remain
+open. The multi-minute startup/reconciliation and Create/Install results remain
+production-blocking. All changes belong to the existing **C2** review batch.
 
 ### Durable client acknowledgement before completion
 

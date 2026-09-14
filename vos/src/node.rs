@@ -1345,6 +1345,8 @@ pub struct VosNode {
     clean_agent_ingress_supervisor:
         Arc<RwLock<Option<crate::agent::production_owner::CleanAgentIngress>>>,
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    clean_agent_recovering: Arc<AtomicBool>,
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
     clean_local_lifecycle_queue: Arc<crate::agent::local_lifecycle::LocalLifecycleQueue>,
 }
 
@@ -2194,6 +2196,8 @@ pub struct IngressHandle {
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
     clean_agent_supervisor: Arc<RwLock<Option<crate::agent::production_owner::CleanAgentIngress>>>,
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    clean_agent_recovering: Arc<AtomicBool>,
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
     clean_local_lifecycle_queue: Arc<crate::agent::local_lifecycle::LocalLifecycleQueue>,
 }
 
@@ -2231,6 +2235,15 @@ impl std::error::Error for IngressNodeAttestationError {}
     allow(dead_code)
 )]
 impl IngressHandle {
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    pub fn clean_agent_recovering(&self) -> bool {
+        self.clean_agent_recovering.load(Ordering::Acquire)
+    }
+    #[cfg(all(test, feature = "network", feature = "storage", target_os = "linux"))]
+    pub(crate) fn set_clean_agent_recovering_for_test(&self, recovering: bool) {
+        self.clean_agent_recovering
+            .store(recovering, Ordering::Release);
+    }
     /// Resolve a proven API key against the currently attached clean Authority.
     /// Unlike the legacy credential-id lookup, this signs an exact projection
     /// query and never searches service_actor_routes or falls back to them.
@@ -5703,6 +5716,8 @@ impl VosNode {
             #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
             clean_agent_ingress_supervisor: Arc::new(RwLock::new(None)),
             #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            clean_agent_recovering: Arc::new(AtomicBool::new(false)),
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
             clean_local_lifecycle_queue: Arc::new(
                 crate::agent::local_lifecycle::LocalLifecycleQueue::default(),
             ),
@@ -5893,8 +5908,8 @@ impl VosNode {
             .authorize_operation(call, context, issued_at)
     }
 
-    /// Complete the node-owned half of clean production construction after
-    /// the owner has performed its initial authenticated reconciliation.
+    /// Attach the native owner. Normal ingress is exposed only after initial
+    /// authenticated reconciliation; retained recovery keeps that slot empty.
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
     pub(crate) fn attach_clean_agent_owner(
         &mut self,
@@ -5909,13 +5924,19 @@ impl VosNode {
             let _ = owner.shutdown_and_join();
             return Err(AgentProductionOwnerError::DuplicateHost);
         }
-        let handle = owner.ingress()?;
+        let handle = if owner.is_ready() {
+            Some(owner.ingress()?)
+        } else {
+            None
+        };
         let Ok(mut exposed) = self.clean_agent_ingress_supervisor.write() else {
             let _ = owner.shutdown_and_join();
             return Err(AgentProductionOwnerError::InvalidConfiguration);
         };
         self.clean_agent_owner = Some(owner);
-        *exposed = Some(handle);
+        self.clean_agent_recovering
+            .store(handle.is_none(), Ordering::Release);
+        *exposed = handle;
         Ok(())
     }
 
@@ -8367,7 +8388,28 @@ impl VosNode {
             .as_mut()
             .map(|owner| owner.drive_if_due(Instant::now()));
         match result {
-            None | Some(Ok(_)) => true,
+            None | Some(Ok(_)) => {
+                if self.clean_agent_recovering.load(Ordering::Acquire) {
+                    if let Some(owner) = self
+                        .clean_agent_owner
+                        .as_ref()
+                        .filter(|owner| owner.is_ready())
+                    {
+                        let exposure = owner.ingress().and_then(|handle| {
+                            *self.clean_agent_ingress_supervisor.write().map_err(|_| crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration)? = Some(handle);
+                            Ok(())
+                        });
+                        if let Err(error) = exposure {
+                            self.clean_agent_owner_error.get_or_insert(error);
+                            self.signal_node_shutdown();
+                            return false;
+                        }
+                        self.clean_agent_recovering.store(false, Ordering::Release);
+                        tracing::info!("Clean Agent recovery complete; verified routes ready");
+                    }
+                }
+                true
+            }
             Some(Err(error)) => {
                 self.clean_agent_owner_error.get_or_insert(error);
                 self.signal_node_shutdown();
@@ -8528,6 +8570,8 @@ impl VosNode {
             ingress_node_attester: self.ingress_node_attester.clone(),
             #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
             clean_agent_supervisor: self.clean_agent_ingress_supervisor.clone(),
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            clean_agent_recovering: self.clean_agent_recovering.clone(),
             #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
             clean_local_lifecycle_queue: self.clean_local_lifecycle_queue.clone(),
         }

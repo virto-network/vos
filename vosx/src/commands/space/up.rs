@@ -119,7 +119,15 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     register_http_ingress_from_local(&mut node, &local)?;
     register_ssh_ingress_from_local(&mut node, &local, &data_dir)?;
     publish_endpoint(&node, &data_dir, local_prefix, extension_caps)?;
-    tracing::info!(space = %entry.name, registry = %registry_id, "Space daemon ready");
+    #[cfg(target_os = "linux")]
+    let recovering = node.ingress_handle().clean_agent_recovering();
+    #[cfg(not(target_os = "linux"))]
+    let recovering = false;
+    if recovering {
+        tracing::warn!(space = %entry.name, "Space daemon recovering; exact retained authorization only, not ready");
+    } else {
+        tracing::info!(space = %entry.name, registry = %registry_id, "Space daemon ready");
+    }
 
     if args.once {
         node.run();

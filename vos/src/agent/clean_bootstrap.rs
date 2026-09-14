@@ -10421,6 +10421,7 @@ mod tests {
             // Network delay/queueing after that point must reuse this exact
             // retained context, not require equality with a newly read clock.
             assert!(!owner.management_admission_held().unwrap());
+            assert!(!operations.retains_call(&call, Some(&context)).unwrap());
             assert!(operations.prepare_call(&mut owner, &call).is_err());
             assert!(owner.management_admission_held().unwrap());
             assert_eq!(owner.ordered_index_for_test().unwrap(), before);
@@ -10431,6 +10432,14 @@ mod tests {
                 .unwrap()
                 .store(slot + 1, Ordering::Release);
             assert_eq!(operations.prepare_call(&mut owner, &call).unwrap(), context);
+            assert!(operations.retains_call(&call, Some(&context)).unwrap());
+            let mut wrong_context = context;
+            wrong_context.observed_slot += 1;
+            assert!(
+                !operations
+                    .retains_call(&call, Some(&wrong_context))
+                    .unwrap()
+            );
             assert!(owner.management_admission_held().unwrap());
             let (query, authorization) = fresh_projection_pair(&owner, 0xee);
             assert!(matches!(
@@ -10449,6 +10458,7 @@ mod tests {
                 signature[0] ^= 1;
             }
             assert!(operations.prepare_call(&mut owner, &substituted).is_err());
+            assert!(!operations.retains_call(&substituted, None).unwrap());
             // A lost preparation response may be followed by process restart
             // before any coordinator or issuer record exists. Restore only the
             // journal-backed admission, never mint a replacement context.

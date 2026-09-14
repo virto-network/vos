@@ -1049,6 +1049,13 @@ fn load_create_runtime<B: super::clean_authority_issuer::CleanManagementRuntimeS
 /// Type-erased, node-owned lifecycle access. It is deliberately not an ingress
 /// trait: only the production owner may coordinate creation and publication.
 pub(crate) trait NativeLocalLifecycle: Send {
+    fn retains_operation(
+        &mut self,
+        _call: &super::sdk::authority_operation::AuthorityOperationCall,
+        _context: Option<&super::sdk::InvocationContext>,
+    ) -> Result<bool, SharedAgentHostError> {
+        Err(SharedAgentHostError::Unavailable)
+    }
     fn management_admission_held(&self) -> Result<bool, SharedAgentHostError> {
         Err(SharedAgentHostError::Unavailable)
     }
@@ -1124,6 +1131,16 @@ where
         call: &super::sdk::authority_operation::AuthorityOperationCall,
     ) -> AuthorityOperationPreparationResult {
         LocalLifecycleController::prepare_operation(self, call)
+    }
+    fn retains_operation(
+        &mut self,
+        call: &super::sdk::authority_operation::AuthorityOperationCall,
+        context: Option<&super::sdk::InvocationContext>,
+    ) -> Result<bool, SharedAgentHostError> {
+        self.operations
+            .as_mut()
+            .ok_or(SharedAgentHostError::Unavailable)?
+            .retains_call(call, context)
     }
     fn management_admission_held(&self) -> Result<bool, SharedAgentHostError> {
         self.system
@@ -1208,6 +1225,11 @@ where
     R: CleanSystemAgentBootstrapStore,
     I: CleanManagementIssuerStore,
 {
+    fn retains_call(
+        &mut self,
+        call: &super::sdk::authority_operation::AuthorityOperationCall,
+        context: Option<&super::sdk::InvocationContext>,
+    ) -> Result<bool, SharedAgentHostError>;
     fn prepare(
         &mut self,
         owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,

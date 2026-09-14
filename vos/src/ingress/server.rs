@@ -205,7 +205,34 @@ async fn handle_request(
         }
     };
     let request = http::Request::from_parts(parts, body);
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    if handle.clean_agent_recovering()
+        && !matches!(
+            path.as_str(),
+            "/__status" | "/__agents/authorize" | "/__agents/prepare-authorization"
+        )
+    {
+        let response = simple(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Space recovering; only exact retained authorization is available",
+        );
+        inner.metrics.record_response(503);
+        return Ok(response);
+    }
     let response = if path == "/__status" {
+        #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+        if handle.clean_agent_recovering() {
+            let response = if request.method() == http::Method::GET {
+                simple(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Space recovering; not ready",
+                )
+            } else {
+                simple(StatusCode::METHOD_NOT_ALLOWED, "/__status is GET-only")
+            };
+            inner.metrics.record_response(response.status().as_u16());
+            return Ok(response);
+        }
         let mut context = HttpIngressContext::new(handle, None);
         super::routing::dispatch(&request, &inner, &mut context)
     } else {
@@ -1261,6 +1288,28 @@ mod tests {
         #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
         {
             let query_method = request(port, "/__agents/credential");
+            let ingress = node.ingress_handle();
+            ingress.set_clean_agent_recovering_for_test(true);
+            for path in [
+                "/__status",
+                "/",
+                "/openapi.json",
+                "/__agents/credential",
+                "/__agents/invoke",
+                "/__agents/prepare",
+                "/__agents/local",
+                "/__agents/local/install",
+                "/__agents/authorize/",
+            ] {
+                let response = request(port, path);
+                assert!(response.starts_with("HTTP/1.1 503"), "{path}: {response}");
+            }
+            for path in ["/__agents/authorize", "/__agents/prepare-authorization"] {
+                let response = request(port, path);
+                assert!(response.starts_with("HTTP/1.1 405"), "{path}: {response}");
+            }
+            ingress.set_clean_agent_recovering_for_test(false);
+            assert!(request(port, "/__status").starts_with("HTTP/1.1 200"));
             assert!(query_method.starts_with("HTTP/1.1 405"), "{query_method}");
             let adjacent_query = request(port, "/__agents/credential/");
             assert!(

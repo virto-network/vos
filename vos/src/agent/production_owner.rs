@@ -569,7 +569,9 @@ impl AgentProductionOwner {
         if let Some((lifecycle, capacity)) = &owner.lifecycle {
             owner.local = OwnedRouteSlot::Pending(lifecycle.local_attachment(*capacity)?);
         }
-        if let Err(error) = owner.reconcile() {
+        // Only restored native admission may defer first publication. The
+        // caller exposes recovery control, not the unpublished supervisor.
+        if let Err(error) = owner.drive_if_due(Instant::now()) {
             let _ = owner.shutdown_and_join();
             return Err(error);
         }
@@ -623,7 +625,7 @@ impl AgentProductionOwner {
         runtime: super::package_admission::AdmittedRuntimePackage,
     ) -> Result<(AgentId, super::sdk::authority::ManagementApplicationAck), AgentProductionOwnerError>
     {
-        if !self.is_running() {
+        if !self.is_ready() {
             return Err(AgentProductionOwnerError::InvalidConfiguration);
         }
         // Every attempt still authenticates and reopens physical application
@@ -671,6 +673,9 @@ impl AgentProductionOwner {
         call: super::sdk::authority::AuthorityCredentialCall,
         package: super::package_admission::AdmittedActorPackage,
     ) -> Result<super::sdk::authority::ManagementApplicationAck, AgentProductionOwnerError> {
+        if !self.is_ready() {
+            return Err(AgentProductionOwnerError::InvalidConfiguration);
+        }
         self.completed_local_publication = None;
         let key = AgentRouteKey::new(call.managed.space, call.managed.agent, install.entry.actor)?;
         let runtime = call.managed.runtime_deployment;
@@ -704,12 +709,26 @@ impl AgentProductionOwner {
             .is_some_and(|supervisor| supervisor.handle().is_running())
     }
 
+    pub(crate) fn is_ready(&self) -> bool {
+        self.is_running() && self.accepted_head.is_some()
+    }
+
     pub(crate) fn prepare_operation(
         &mut self,
         call: &super::sdk::authority_operation::AuthorityOperationCall,
     ) -> super::local_lifecycle::AuthorityOperationPreparationResult {
         if !self.is_running() {
             return Err(super::shared_host::SharedAgentHostError::Unavailable);
+        }
+        if !self.is_ready()
+            && !self
+                .lifecycle
+                .as_mut()
+                .ok_or(super::shared_host::SharedAgentHostError::Unavailable)?
+                .0
+                .retains_operation(call, None)?
+        {
+            return Err(super::shared_host::SharedAgentHostError::ScopeMismatch);
         }
         self.lifecycle
             .as_mut()
@@ -729,6 +748,16 @@ impl AgentProductionOwner {
     > {
         if !self.is_running() {
             return Err(super::shared_host::SharedAgentHostError::Unavailable);
+        }
+        if !self.is_ready()
+            && !self
+                .lifecycle
+                .as_mut()
+                .ok_or(super::shared_host::SharedAgentHostError::Unavailable)?
+                .0
+                .retains_operation(call, Some(&context))?
+        {
+            return Err(super::shared_host::SharedAgentHostError::ScopeMismatch);
         }
         self.lifecycle
             .as_mut()
@@ -1801,6 +1830,8 @@ mod tests {
         owner.lifecycle = Some((Box::new(Admission(admission.clone())), 1));
         for now in [admitted, before, before + interval * 2] {
             assert_eq!(owner.drive_if_due(now), Ok(false));
+            assert!(!owner.is_ready());
+            assert!(owner.ingress().is_err());
             assert!(calls.lock().unwrap().is_empty());
             assert_eq!(owner.reconcile_after, admitted);
         }
@@ -1816,6 +1847,7 @@ mod tests {
         }
         assert!(owner.reconcile_after >= before + interval);
         assert_eq!(calls.lock().unwrap().len(), 4);
+        assert!(owner.is_ready());
         assert_eq!(owner.drive_if_due(before), Ok(false));
         assert_eq!(calls.lock().unwrap().len(), 4);
         assert!(owner.completed_local_publication.is_none());
