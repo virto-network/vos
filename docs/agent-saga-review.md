@@ -40,7 +40,10 @@ The diagnostic exact retry confirms a client/physical authorization-clock
 mismatch. Native host-clock preparation now passes physical tests without rebasing
 saved AOQ1 or weakening freshness. Its HTTP/client handoff is now wired: immutable
 AOC5 precedes host preparation, and the exact returned AOQ1 precedes authorization.
-The corrected fresh live campaign has not yet been rerun; this is not a live pass.
+The corrected fresh live campaign now completes host preparation but still fails
+authorization with HTTP 503. Background inventory runs between preparation and
+authorization, followed by a ProjectionTransport owner/shutdown failure. See the
+fresh campaign below; this is not a live invocation pass.
 The native Local Install application and startup-recovery phases now pass
 physical tests from prepared authorization through retirement, including
 pristine client-retry admission. Native Install controller handoff, retry and
@@ -6566,6 +6569,57 @@ do not rebase that old AOQ1 or clear its pending reservation. A live pass,
 non-Public/mutating workflows, startup/Create/Install latency, Shared finality,
 expiry/abort recovery and the remaining C2/C3 release gates are still open.
 No performance improvement or master readiness is claimed.
+
+### Fresh clock-handoff campaign at 224a0ba6 (C2)
+
+A completely new Space/operator/node was created under shared disk-backed
+`target/task-tmp/native-denial-head-reuse.IgQS0r`, with isolated XDG directories,
+HTTP `127.0.0.1:18085` and SSH `127.0.0.1:2227`. The earlier XoaplU campaign,
+failed AOQ1 and pending reservation were not copied, cleared or modified.
+The campaign's `run.sh` retains exact Create retries and runs the existing
+opt-in Install and managed invocation tests. It does not raise HTTP timeouts.
+
+At **2026-09-14 17:23:21Z** the new daemon started; readiness was observed at
+**17:24:16Z** (about **55 seconds**). Fresh Local Create completed at **17:27:23Z**
+after one HTTP 504 and exact retry (about **187 seconds** from first attempt).
+Install passed its native exact-resume test in **446.90 seconds**, after two
+HTTP 504 responses, completing at **17:34:56Z**. These results reaffirm the
+first-response latency blocker; successful recovery is not a latency waiver.
+
+Managed receipt-bearing Catalog query then **failed after 224.59 seconds** at
+`/__agents/authorize` with HTTP 503. Unlike the earlier client-clock failure,
+both canonical AOC5 and returned host-prepared AOQ1 were retained, along with
+the final authorization request and one native operation dispatch record.
+No AOR1/application or native operation completion/retirement/denial was retained.
+The invocation nonce is
+`e0067faa1c43fce9a8b70044fac6b50bbe4bdc75e65560cbd3655a37491d0a04`;
+the native authorization dispatch filename is
+`c7f07b3db1061d2ee2efce04ac449410fa51860712727dc1ca853395d88339db`.
+Preserve this request and reservation for exact recovery.
+
+Logs show inventory reconciliation beginning at **17:38:31.979Z**, after native
+preparation, then authorization reporting `Unavailable` at **17:38:41.406Z**.
+Shutdown reports `ProjectionTransport` and `Agent host shutdown failed` rather
+than clean retirement. The campaign process exited **101**, the daemon exited,
+and `.endpoint` is absent. This is a terminal failed campaign, not a running
+process or a clean-shutdown pass. Evidence is in `daemon.log`, `create-*.json`,
+`create-*.log`, `install.log` and `invocation.log` in the new disposable root.
+
+Source inspection identifies the next concrete interleaving to reproduce:
+`drive_clean_agent_owner` runs `drive_if_due` immediately after replying to
+preparation; reconciliation asks for an Authority projection while the native
+operation still holds management admission. Projection reservation errors are
+mapped to `ProjectionTransport`, and a reconciliation failure shuts down the
+owner before the queued authorization can run. Native preparation tests did not
+exercise this production scheduler interleaving. Add that regression and fix
+admission-aware reconciliation without allowing stale authorization, bypassing
+physical exclusion, or clearing retained operation state. Then retry the exact
+fresh campaign state, accounting for restart/expiry rather than rebasing it.
+
+The daemon also spends tens of seconds per inventory query, with one changed-head
+reconciliation taking **139.379 seconds**. Root-cause performance work remains
+open; no speed improvement, non-Public mutation, Shared finality or release
+readiness is claimed by this campaign. This evidence remains within **C2**.
 
 ### Durable client acknowledgement before completion
 
