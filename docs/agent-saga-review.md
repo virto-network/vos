@@ -34,6 +34,9 @@ retries now pass before and after restart. Public Counter mutation, late replay
 rejection and a fresh read of seven after actual daemon restart now pass with
 the repinned runtime. Protected/non-Public actor workflows remain open.
 This is not yet a usable ordinary-agent production path.
+The latest runtime pin includes single-pass AWRK availability decoding. Its
+fixed 768KB-program ACK comparison uses about 25.3% less gas with byte-identical
+successful output; that does not establish acceptable end-to-end latency.
 Managed authorization now has a live exact-recovery pass: the saved IgQS0r call
 was authorized after recovery-only startup, followed by verified inventory,
 receipt-bearing Catalog query, positive retirement and exact retries. The live
@@ -7321,6 +7324,47 @@ This isolates decoder/ACK cost; it does not execute the synthetic actor or
 replace live Counter validation. The initial attempt modeled the large bytes
 as an application attachment and correctly hit its independent smaller input
 limit; the fixture was corrected to model the installed program instead.
+
+### Reproduced single-pass runtime candidate (C2/C3)
+
+Two separate archive exports and guest targets built immutable source
+`b4b82473af82c107d2cd7ece248011f6191d0058` with locked dependencies and
+`nightly-2026-03-20`. The existing pinned `42f3f3bf` host builder converted and
+physically ABI-probed each ELF. Both ELFs and both PVMs are byte-identical.
+Evidence: `target/task-tmp/runtime-single-pass.pOKisH/build.sh`, the `first/`
+and `second/` build/identity logs, and `comparison.log`.
+
+- Runtime ProgramId:
+  `f24a8ea3dc8ccc7e8615dec557477363095f23c09ca2089f1298fab345d3fb93`.
+- ELF BLAKE2b-256:
+  `6bc864a5bcade826f4c48f0718eee659656aae6acd40b62b8ed196f7054249f8`.
+- PVM BLAKE2b-256:
+  `47aafb374f25fbd89af87321a48782e7bdbe7e3001a4ec3cd2d9ead37152042e`.
+- PVM size: **956,476 bytes**. ABI remains `vos-agent-runtime-abi-260912-r16`.
+
+The same 793,734-byte ACK input returned **byte-identical successful output**
+from old and candidate physical runtimes. Deterministic gas fell from
+**690,622,135 to 515,787,220** (about **25.3%**); the paired wall times were
+**1.832s / 1.383s**. This is an isolated ACK/decoder result, not an end-to-end
+startup or Install latency pass. Existing authorization, terminal replay
+protection and output commitments remain required. The provenance manifest,
+standard runtime ProgramId, bundled blob and build digest now select this
+candidate. Existing system actor templates remain pinned to their original
+immutable source and are still wire-compatible; they were not rebuilt.
+
+Final validation against the repinned artifact: **240 CLI tests passed**, zero
+failures, **9 ignored**, **54.85s** (`cli-final.log`); **9 native operation
+tests passed**, **123.21s** (`native.log`); all **3 bundled-runtime tests
+passed**, **3.03s**, including late retired-Invoke rejection (`bundled.log`).
+The first CLI attempt had 11 socket-permission failures under the sandbox
+(229 otherwise passed); the complete rerun with local sockets enabled passed.
+Normal build plus clean-break surface checks passed (`clean-break.log`), as did
+normal `release bundle` and `release verify` (`release-bundle.log`,
+`release-verify.log`) and formatting/whitespace checks. Logs are under the
+candidate evidence directory above. No daemon or test process remains live.
+No new live Create/Install or protected-actor campaign was run for this repin;
+those workflow and latency gates, plus the rest of the original release
+matrix, remain open. No root-branch or master integration was performed.
 
 ### Durable client acknowledgement before completion
 
