@@ -200,6 +200,10 @@ enum StoreRole {
     AdminDispatch = 31,
     AdminResult = 32,
     AdminRetirement = 33,
+    AdminPreparationRequest = 34,
+    AdminPreparationResponse = 35,
+    AdminClientRequest = 36,
+    AdminClientResponse = 37,
 }
 
 impl StoreRole {
@@ -238,6 +242,10 @@ impl StoreRole {
             Self::AdminDispatch => "admin.dispatch",
             Self::AdminResult => "admin.result",
             Self::AdminRetirement => "admin.retirement",
+            Self::AdminPreparationRequest => "admin-preparation.request",
+            Self::AdminPreparationResponse => "admin-preparation.response",
+            Self::AdminClientRequest => "admin-client.request",
+            Self::AdminClientResponse => "admin-client.response",
         }
     }
 
@@ -276,11 +284,44 @@ impl StoreRole {
             Self::AdminDispatch => "admin.dispatch.next",
             Self::AdminResult => "admin.result.next",
             Self::AdminRetirement => "admin.retirement.next",
+            Self::AdminPreparationRequest => "admin-preparation.request.next",
+            Self::AdminPreparationResponse => "admin-preparation.response.next",
+            Self::AdminClientRequest => "admin-client.request.next",
+            Self::AdminClientResponse => "admin-client.response.next",
         }
     }
 
     const fn maximum_bytes(self) -> usize {
         match self {
+            Self::AdminPreparationRequest
+            | Self::AdminPreparationResponse
+            | Self::AdminClientRequest
+            | Self::AdminClientResponse => {
+                #[cfg(target_os = "linux")]
+                {
+                    use vos::agent::clean_bootstrap::{
+                        NativeAuthorityAdminCompletion, NativeAuthorityAdminPreparation,
+                        NativeAuthorityAdminSubmission,
+                    };
+                    use vos::agent::sdk::wire::CanonicalWire as _;
+                    match self {
+                        Self::AdminPreparationRequest => {
+                            vos::agent::sdk::authority::AuthorityAdminCall::MAX_ENCODED_BYTES
+                        }
+                        Self::AdminPreparationResponse => {
+                            NativeAuthorityAdminPreparation::MAX_ENCODED_BYTES
+                        }
+                        Self::AdminClientRequest => {
+                            NativeAuthorityAdminSubmission::MAX_ENCODED_BYTES
+                        }
+                        _ => NativeAuthorityAdminCompletion::MAX_BYTES,
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    0
+                }
+            }
             Self::AdminDispatch | Self::AdminResult | Self::AdminRetirement => {
                 #[cfg(target_os = "linux")]
                 {
@@ -376,6 +417,10 @@ impl StoreRole {
             31 => Some(Self::AdminDispatch),
             32 => Some(Self::AdminResult),
             33 => Some(Self::AdminRetirement),
+            34 => Some(Self::AdminPreparationRequest),
+            35 => Some(Self::AdminPreparationResponse),
+            36 => Some(Self::AdminClientRequest),
+            37 => Some(Self::AdminClientResponse),
             1 => Some(Self::Pins),
             2 => Some(Self::Bootstrap),
             3 => Some(Self::ManagementIssuer),
@@ -1843,6 +1888,10 @@ impl ExactFileStore {
                 | StoreRole::AdminDispatch
                 | StoreRole::AdminResult
                 | StoreRole::AdminRetirement
+                | StoreRole::AdminPreparationRequest
+                | StoreRole::AdminPreparationResponse
+                | StoreRole::AdminClientRequest
+                | StoreRole::AdminClientResponse
                 | StoreRole::OperationRequest
                 | StoreRole::OperationResponse
                 | StoreRole::PreparationRequest

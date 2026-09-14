@@ -15,6 +15,8 @@ pub mod caps;
 // and durable-directory semantics. It is intentionally unavailable where
 // those guarantees cannot be enforced.
 #[cfg(target_os = "linux")]
+mod admin_client;
+#[cfg(target_os = "linux")]
 #[allow(dead_code)] // Wired by the clean native startup owner in this chapter.
 pub(crate) mod clean_genesis_archive;
 #[allow(dead_code)]
@@ -53,6 +55,24 @@ pub mod verify;
 
 #[derive(Subcommand, Debug)]
 pub enum SpaceCommand {
+    /// Retain a signed zero-slot admin draft and its verified host preparation.
+    #[cfg(target_os = "linux")]
+    PrepareAdmin {
+        request_dir: PathBuf,
+        #[arg(long)]
+        request: Option<PathBuf>,
+        #[arg(long)]
+        http: std::net::SocketAddr,
+    },
+    /// Submit/retry exact signed NAS1 and retain verified retirement evidence.
+    #[cfg(target_os = "linux")]
+    SubmitAdmin {
+        request_dir: PathBuf,
+        #[arg(long)]
+        request: Option<PathBuf>,
+        #[arg(long)]
+        http: std::net::SocketAddr,
+    },
     /// Authorize, deliver and positively retire exact Local invocation intent.
     #[cfg(target_os = "linux")]
     InvokeLocal(local_operation::AuthorizeLocalArgs),
@@ -190,6 +210,18 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
         SpaceCommand::InvokeLocal(args) => local_operation::run_invocation(args),
         #[cfg(target_os = "linux")]
         SpaceCommand::AuthorizeLocalInvocation(args) => local_operation::run(args),
+        #[cfg(target_os = "linux")]
+        SpaceCommand::PrepareAdmin {
+            request_dir,
+            request,
+            http,
+        } => admin_client::run(&request_dir, request.as_deref(), http, true),
+        #[cfg(target_os = "linux")]
+        SpaceCommand::SubmitAdmin {
+            request_dir,
+            request,
+            http,
+        } => admin_client::run(&request_dir, request.as_deref(), http, false),
         #[cfg(target_os = "linux")]
         SpaceCommand::SubmitAgentAuthorization {
             request_dir,

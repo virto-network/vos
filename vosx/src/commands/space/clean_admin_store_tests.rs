@@ -4,6 +4,211 @@ use vos::Encode as _;
 use vos::agent::sdk::{authority::*, wire::CanonicalWire, *};
 
 // Synthetic signed storage evidence; native finality is covered in vos tests.
+fn client_evidence(denied: bool) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    use vos::agent::clean_bootstrap::{
+        NativeAuthorityAdminPreparation, NativeAuthorityAdminSubmission,
+    };
+    let (_, _, dispatch, observed, terminal) = evidence(100, denied);
+    fn field<'a>(bytes: &mut &'a [u8]) -> &'a [u8] {
+        let length = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        let (value, rest) = bytes[4..].split_at(length);
+        *bytes = rest;
+        value
+    }
+    let mut fields = &dispatch[4 + RUNTIME_ABI_ID.as_bytes().len()..];
+    let call = AuthorityAdminCall::decode(field(&mut fields)).unwrap();
+    field(&mut fields);
+    field(&mut fields);
+    let prepared = field(&mut fields).to_vec();
+    assert!(fields.is_empty());
+    let preparation = NativeAuthorityAdminPreparation::decode(&prepared).unwrap();
+    let submission = NativeAuthorityAdminSubmission::new(call.clone(), preparation)
+        .unwrap()
+        .encode()
+        .unwrap();
+    let (key, _, _, _) = crate::commands::space::local_create::tests::fixture();
+    let mut draft = call;
+    draft.observed_slot = 0;
+    draft.invocation = draft.expected_invocation();
+    draft.signature = key
+        .sign(&draft.signing_bytes())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    (
+        draft.encode().unwrap(),
+        prepared,
+        submission,
+        observed,
+        terminal,
+    )
+}
+
+#[test]
+fn admin_client_pairs_are_bound_immutable_and_recoverable() {
+    let (draft, preparation, submission, observed, terminal) = client_evidence(false);
+    for (prepare, request, response, request_role, response_role) in [
+        (
+            true,
+            draft,
+            preparation,
+            StoreRole::AdminPreparationRequest,
+            StoreRole::AdminPreparationResponse,
+        ),
+        (
+            false,
+            submission,
+            terminal,
+            StoreRole::AdminClientRequest,
+            StoreRole::AdminClientResponse,
+        ),
+    ] {
+        let fixture = Fixture::new("admin-client-pair");
+        let open = |path: &Path| {
+            if prepare {
+                CleanOperationClientFile::open_admin_preparation(path)
+            } else {
+                CleanOperationClientFile::open_admin_submission(path)
+            }
+        };
+        let mut store = open(&fixture.root).unwrap();
+        assert!(open(&fixture.root).is_err());
+        assert!(store.publish_response(&response).is_err());
+        drop(store);
+        write_private(
+            &fixture.root.join(request_role.stage_file()),
+            &encode_envelope(request_role, None, &request).unwrap(),
+        );
+        let mut store = open(&fixture.root).unwrap();
+        assert_eq!(store.load_request().unwrap(), Some(request.clone()));
+        if !prepare {
+            assert!(store.publish_response(&observed).is_err());
+        }
+        let mut corrupt = response.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(store.publish_response(&corrupt).is_err());
+        store.publish_response(&response).unwrap();
+        store.publish_request(&request).unwrap();
+        drop(store);
+        let mut store = open(&fixture.root).unwrap();
+        assert_eq!(store.load_response().unwrap(), Some(response.clone()));
+        drop(store);
+        // A validly enveloped replacement stage is still forbidden.
+        let current = fs::read(fixture.root.join(response_role.file())).unwrap();
+        let image =
+            decode_envelope(response_role, &current, response_role.maximum_bytes()).unwrap();
+        write_private(
+            &fixture.root.join(response_role.stage_file()),
+            &encode_envelope(response_role, Some(image.commitment()), &response).unwrap(),
+        );
+        let mut store = open(&fixture.root).unwrap();
+        assert!(store.load_response().is_err());
+        assert_eq!(
+            fs::read(fixture.root.join(response_role.file())).unwrap(),
+            current
+        );
+        drop(store);
+        let orphan = Fixture::new("admin-client-orphan");
+        drop(open(&orphan.root).unwrap());
+        write_private(
+            &orphan.root.join(response_role.stage_file()),
+            &encode_envelope(response_role, None, &response).unwrap(),
+        );
+        let mut store = open(&orphan.root).unwrap();
+        assert!(store.load_response().is_err());
+        assert!(store.publish_request(&request).is_err());
+        assert!(!orphan.root.join(request_role.file()).exists());
+    }
+}
+
+#[test]
+fn admin_client_http_retains_exact_requests_and_verified_responses() {
+    use crate::commands::space::admin_client::deliver;
+    use std::io::{Read as _, Write as _};
+    let (draft, preparation, submission, _, terminal) = client_evidence(true);
+    let (_, _, successful_submission, _, successful_terminal) = client_evidence(false);
+    for (prepare, request, response, status) in [
+        (true, draft, preparation, 200),
+        (false, submission, terminal, 403),
+        (false, successful_submission, successful_terminal, 200),
+    ] {
+        let fixture = Fixture::new("admin-client-http");
+        let input = fixture.parent.join("input");
+        write_private(&input, &request);
+        for attempt in 0..4 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let expected = request.clone();
+            let mut body = response.clone();
+            if attempt == 1 {
+                *body.last_mut().unwrap() ^= 1;
+            }
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    headers.push(byte[0]);
+                    assert!(headers.len() < 8192);
+                }
+                let path = if prepare {
+                    "/__agents/admin/prepare"
+                } else {
+                    "/__agents/admin"
+                };
+                assert!(
+                    String::from_utf8(headers)
+                        .unwrap()
+                        .starts_with(&format!("POST {path} HTTP/1.1"))
+                );
+                let mut received = vec![0; expected.len()];
+                stream.read_exact(&mut received).unwrap();
+                assert_eq!(received, expected);
+                let status = if attempt == 0 {
+                    503
+                } else if attempt == 2 {
+                    if status == 200 { 403 } else { 200 }
+                } else {
+                    status
+                };
+                write!(stream, "HTTP/1.1 {status} Result\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                stream.write_all(&body).unwrap();
+            });
+            let result = deliver(&fixture.root, Some(&input), address, prepare);
+            server.join().unwrap();
+            if attempt < 3 {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap(), response);
+            }
+        }
+        // Reopen from durable evidence without a listener or usable input.
+        assert_eq!(
+            deliver(
+                &fixture.root,
+                Some(&fixture.parent.join("absent")),
+                "127.0.0.1:1".parse().unwrap(),
+                prepare
+            )
+            .unwrap(),
+            response
+        );
+        assert!(
+            deliver(
+                &fixture.root,
+                None,
+                "192.0.2.1:80".parse().unwrap(),
+                prepare
+            )
+            .is_err()
+        );
+    }
+}
+
 fn evidence(
     gas: u64,
     denied: bool,

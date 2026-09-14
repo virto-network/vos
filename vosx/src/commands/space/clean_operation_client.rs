@@ -8,6 +8,8 @@ use vos::agent::supervisor_adapters::{
 
 #[derive(Clone, Copy)]
 enum ClientPairKind {
+    AdminPreparation,
+    AdminSubmission,
     Operation,
     Preparation,
     AuthorizationPreparation,
@@ -815,6 +817,16 @@ mod tests {
 }
 
 impl CleanOperationClientFile {
+    pub(crate) fn open_admin_preparation(
+        root: impl AsRef<Path>,
+    ) -> Result<Self, CleanFileStoreError> {
+        Self::open_pair(root, ClientPairKind::AdminPreparation)
+    }
+    pub(crate) fn open_admin_submission(
+        root: impl AsRef<Path>,
+    ) -> Result<Self, CleanFileStoreError> {
+        Self::open_pair(root, ClientPairKind::AdminSubmission)
+    }
     pub(crate) fn open_authorization_preparation(
         root: impl AsRef<Path>,
     ) -> Result<Self, CleanFileStoreError> {
@@ -842,6 +854,14 @@ impl CleanOperationClientFile {
         kind: ClientPairKind,
     ) -> Result<Self, CleanFileStoreError> {
         let (request, response) = match kind {
+            ClientPairKind::AdminPreparation => (
+                StoreRole::AdminPreparationRequest,
+                StoreRole::AdminPreparationResponse,
+            ),
+            ClientPairKind::AdminSubmission => (
+                StoreRole::AdminClientRequest,
+                StoreRole::AdminClientResponse,
+            ),
             ClientPairKind::Operation => {
                 (StoreRole::OperationRequest, StoreRole::OperationResponse)
             }
@@ -855,6 +875,20 @@ impl CleanOperationClientFile {
             ),
         };
         let entries: &'static [&'static str] = match kind {
+            ClientPairKind::AdminPreparation => &[
+                LOCK_FILE,
+                "admin-preparation.request",
+                "admin-preparation.request.next",
+                "admin-preparation.response",
+                "admin-preparation.response.next",
+            ],
+            ClientPairKind::AdminSubmission => &[
+                LOCK_FILE,
+                "admin-client.request",
+                "admin-client.request.next",
+                "admin-client.response",
+                "admin-client.response.next",
+            ],
             ClientPairKind::AuthorizationPreparation => &[
                 LOCK_FILE,
                 "authorization-preparation.request",
@@ -887,6 +921,22 @@ impl CleanOperationClientFile {
 
     fn validate_request(&self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
         match self.kind {
+            ClientPairKind::AdminPreparation => {
+                let draft = vos::agent::sdk::authority::AuthorityAdminCall::decode(bytes)
+                    .map_err(|_| CleanFileStoreError::Corrupt)?;
+                if draft.observed_slot != 0
+                    || draft
+                        .verify_with(&super::super::local_create::CredentialVerifier)
+                        .is_err()
+                {
+                    return Err(CleanFileStoreError::Corrupt);
+                }
+                Ok(())
+            }
+            ClientPairKind::AdminSubmission => {
+                vos::agent::clean_bootstrap::NativeAuthorityAdminSubmission::decode(bytes)
+                    .map(|_| ())
+            }
             ClientPairKind::AuthorizationPreparation => {
                 let call =
                     vos::agent::sdk::authority_operation::AuthorityOperationCall::decode(bytes)
@@ -930,6 +980,20 @@ impl CleanOperationClientFile {
     fn verify_response(&mut self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
         let request = self.load_request()?.ok_or(CleanFileStoreError::Corrupt)?;
         match self.kind {
+            ClientPairKind::AdminPreparation => {
+                let draft = vos::agent::sdk::authority::AuthorityAdminCall::decode(&request)
+                    .map_err(|_| CleanFileStoreError::Corrupt)?;
+                vos::agent::clean_bootstrap::NativeAuthorityAdminPreparation::decode(bytes)
+                    .map_err(|_| CleanFileStoreError::Corrupt)?
+                    .call_to_sign(&draft)
+                    .map_err(|_| CleanFileStoreError::Corrupt)?;
+            }
+            ClientPairKind::AdminSubmission => {
+                vos::agent::clean_bootstrap::NativeAuthorityAdminSubmission::decode(&request)
+                    .map_err(|_| CleanFileStoreError::Corrupt)?
+                    .verify_completion(bytes)
+                    .map_err(|_| CleanFileStoreError::Corrupt)?;
+            }
             ClientPairKind::AuthorizationPreparation => {
                 let call =
                     vos::agent::sdk::authority_operation::AuthorityOperationCall::decode(&request)

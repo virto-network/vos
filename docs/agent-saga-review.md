@@ -251,7 +251,8 @@ Keep these as work within C2, not new review batches:
    now discovers/replays admin evidence before routes and retains those leases
    in the lifecycle owner. Signed host-clock preparation and submission now
    have native lifecycle APIs, bounded node-owned queue delivery and dedicated
-   signed-body HTTP routes. Managed-client orchestration and the live protected
+   signed-body HTTP routes. Retained client preparation/submission commands now
+   exist; automatic signing/sequence orchestration and the live protected
    campaign remain incomplete. Keep
    its credential sequence and generation CAS distinct from operation
    authorization; do not relax anonymous HTTP invocation or
@@ -7634,6 +7635,46 @@ mutation campaign; no end-to-end transport success is claimed yet.
 Managed-client persistence/orchestration and a live protected actor campaign
 remain next. The endpoints alone do not close that campaign or the production
 latency gate. No new review batch is introduced.
+
+### Retained admin client transport (C2)
+
+`vosx space prepare-admin <request-dir> --request <signed-draft> --http
+127.0.0.1:<port>` retains a signed zero-slot draft before requesting NAP1.
+`vosx space submit-admin <request-dir> --request <signed-NAS1> --http
+127.0.0.1:<port>` retains the exact signed submission before delivery and
+retains its verified NAT2 completion before reporting applied/denied. Use
+separate request directories for preparation and submission. On retry, omit
+`--request`: retained input takes precedence and is never re-signed, rebased or
+replaced. A retained verified response avoids another network request entirely.
+These are retained transport commands, not yet automatic fresh admin signing
+or sequence selection. They do not touch operation credential reservations.
+
+The existing immutable request/response store now has separate CSF1 roles
+34/35 for admin preparation and 36/37 for admin submission/completion, using
+private exclusively leased directories, bounded reads, request-bound response
+validation and interrupted-publication recovery. Orphan responses cannot be
+repaired by supplying fresh input. Replacement stages are rejected even when
+their payload is otherwise valid. Local loopback HTTP remains mandatory, with
+proxies and redirects disabled. Signed success/denial must agree with HTTP
+200/403; unsigned errors and forged responses are never retained as completion.
+The shared HTTP helper now takes an explicit denial size bound: Create keeps
+its prior bound and admin uses NAT2's bound. No timeout was increased.
+
+Validation: focused client storage/loopback tests pass 2/2 (1.89s;
+`native-admin-client-tests-final.log`). They cover preparation, successful
+mutation and denial responses, unavailable HTTP, forged responses, contradictory
+HTTP status, exact retry, cached response after restart without networking,
+exclusive leases, staged first publication, forbidden replacement and orphan
+response preservation. The full CLI suite passes 246 with 9 ignored (55.45s;
+`native-admin-client-cli.log`), including the new command parsing and existing
+Create/Install/operation regressions. Normal vosx build passes (13.53s;
+`native-admin-client-vosx-build.log`); formatting and whitespace checks pass.
+Logs remain under shared on-disk `target/task-tmp`.
+
+Next is automatic signing and credential-local admin sequence reservation,
+followed by a live protected Local mutation/retirement/restart campaign. The
+client's current loopback tests use synthetic signed responses, not native
+daemon execution. Production latency and the other original gates stay open.
 
 ### Durable client acknowledgement before completion
 

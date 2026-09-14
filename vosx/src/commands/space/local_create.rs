@@ -240,7 +240,7 @@ pub(super) fn post_binary(
     bytes: &[u8],
     maximum: usize,
 ) -> anyhow::Result<Vec<u8>> {
-    post_binary_response(address, path, status, bytes, maximum, false, None).map(|(_, bytes)| bytes)
+    post_binary_response(address, path, status, bytes, maximum, None, None).map(|(_, bytes)| bytes)
 }
 
 pub(super) fn post_binary_authenticated(
@@ -254,25 +254,17 @@ pub(super) fn post_binary_authenticated(
         vos::ingress::decode_access_token(access_token).is_some(),
         "invalid VOS access token"
     );
-    post_binary_response(
-        address,
-        path,
-        200,
-        bytes,
-        maximum,
-        false,
-        Some(access_token),
-    )
-    .map(|(_, bytes)| bytes)
+    post_binary_response(address, path, 200, bytes, maximum, None, Some(access_token))
+        .map(|(_, bytes)| bytes)
 }
 
-fn post_binary_response(
+pub(super) fn post_binary_response(
     address: std::net::SocketAddr,
     path: &'static str,
     status: u16,
     bytes: &[u8],
     maximum: usize,
-    allow_denial: bool,
+    denial_maximum: Option<usize>,
     access_token: Option<&str>,
 ) -> anyhow::Result<(u16, Vec<u8>)> {
     use std::io::Read as _;
@@ -296,17 +288,17 @@ fn post_binary_response(
     let response = request.send_bytes(bytes);
     let response = match response {
         Ok(response) => response,
-        Err(ureq::Error::Status(403, response)) if allow_denial => response,
+        Err(ureq::Error::Status(403, response)) if denial_maximum.is_some() => response,
         Err(error) => return Err(error.into()),
     };
     let actual_status = response.status();
-    let maximum = if allow_denial && actual_status == 403 {
-        vos::agent::local_lifecycle::LocalCreateDenial::MAX_BYTES
+    let maximum = if actual_status == 403 {
+        denial_maximum.unwrap_or(maximum)
     } else {
         maximum
     };
     anyhow::ensure!(
-        actual_status == status || (allow_denial && actual_status == 403),
+        actual_status == status || (denial_maximum.is_some() && actual_status == 403),
         "Agent control expected HTTP {status}, received {}",
         response.status()
     );
@@ -619,7 +611,7 @@ fn submit_retained_disposition(
             201,
             &bytes,
             MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES,
-            true,
+            Some(vos::agent::local_lifecycle::LocalCreateDenial::MAX_BYTES),
             None,
         )?;
         if status == 403 {
