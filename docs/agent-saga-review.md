@@ -193,7 +193,9 @@ Keep these as work within C2, not new review batches:
    native decision path. Canonical AOQ1 retry inputs now enter the existing
    bounded lifecycle queue. Request-bound AOR1 responses and immutable client
    request/response storage are implemented. HTTP and retained-submission CLI delivery
-   are wired; fresh preparation and the live denial/valid-successor campaign remain open.
+   are wired. Operation-domain discovery and deterministic prepared-work signing
+   helpers are implemented; durable fresh-command orchestration and the live
+   denial/valid-successor campaign remain open.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
    retirement and restart through native ingress; then expose the same
    preparation/authorization flow in the user-facing client. A Public query
@@ -6250,6 +6252,39 @@ Output distinguishes `issued` / `denied` and explicitly reports `applied: false`
 This is retained-input delivery, not a fresh preparation/signing command or
 proof of protected actor application. The latter, its live restart/resume
 campaign, the existing latency blocker and remaining C2/C3 gates remain open.
+
+### Operation-domain discovery and deterministic prepared-work signing
+
+Verification: **230 CLI tests passed**, zero failures, five ignored, in **52.09s**
+(`.worktrees/ch08-c2-native/target/task-tmp/r16-operation-preparation-cli.log`).
+Formatting and whitespace checks pass. This is client-side preparation coverage,
+not native protected execution or a fresh end-to-end command campaign.
+
+Credential discovery now explicitly selects the management or operation request
+sequence domain while preserving exact retained query bytes. Operation requests
+use `operation_request_high_water + 1`, not the Create/Install management counter.
+Each domain fails independently on exhaustion; an exhausted management/admin
+counter does not prevent signing an operation with available operation sequence.
+Discovery remains a hint, not an exclusive reservation or policy approval.
+
+The operation preparation helper checks the supplied Agent descriptor's Authority
+binding, profile, runtime identity/package and prepared observation, then derives
+the signed intent from the exact prepared invocation work. Its signing boundary
+requires the selected operator's active API credential query/projection and
+rejects a mismatched prepared caller before invoking the key. Authorization ID
+is derived canonically; caller-selected authorization/issuance/validity slots are
+fixed inputs, with no new clock or random ID read inside the signer.
+
+Tests verify deterministic AOQ1, correct sequence-domain selection despite other
+domain exhaustion, credential revocation/kind/scope/signature mismatches, invalid
+timing and wrong prepared caller. The signing tests use shaped invocation intent;
+they do not assert host preparation or Authority policy execution.
+
+The helpers are not yet orchestrated by a fresh user-facing command. That command
+must own the credential reservation, retain initial intent and physical
+preparation, load any existing AOQ1 before fresh discovery/signing, and publish the
+exact new AOQ1 before HTTP delivery. Protected application and restart remain
+subsequent C2 work; no release or latency gate is waived.
 
 ### Durable client acknowledgement before completion
 

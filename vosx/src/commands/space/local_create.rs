@@ -345,6 +345,29 @@ pub(crate) fn query_credential(
     vos::agent::sdk::authority::AuthorityCredentialProjection,
     NonZeroU64,
 )> {
+    query_credential_for(
+        address,
+        query_bytes,
+        expected_principal,
+        CredentialSequenceDomain::Management,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum CredentialSequenceDomain {
+    Management,
+    Operation,
+}
+
+fn query_credential_for(
+    address: std::net::SocketAddr,
+    query_bytes: &[u8],
+    expected_principal: vos::agent::sdk::PrincipalId,
+    domain: CredentialSequenceDomain,
+) -> anyhow::Result<(
+    vos::agent::sdk::authority::AuthorityCredentialProjection,
+    NonZeroU64,
+)> {
     use vos::agent::sdk::authority::{AuthorityProjectionQuery, AuthorityProjectionSelector};
     use vos::agent::sdk::wire::{
         CanonicalWire as _, MAX_AUTHORITY_CREDENTIAL_PROJECTION_WIRE_BYTES,
@@ -366,7 +389,7 @@ pub(crate) fn query_credential(
         MAX_AUTHORITY_CREDENTIAL_PROJECTION_WIRE_BYTES,
     )
     .map_err(|error| anyhow::anyhow!("{error}; retry the identical retained credential query"))?;
-    validate_credential_response(&query, expected_principal, &bytes)
+    validate_credential_response_for(&query, expected_principal, &bytes, domain)
 }
 
 /// Persist a first query before sending, or resume the exact retained query.
@@ -377,6 +400,46 @@ pub(crate) fn discover_credential(
     address: std::net::SocketAddr,
     operator: &Keypair,
     authority: AuthorityActorTarget,
+) -> anyhow::Result<(
+    vos::agent::sdk::authority::AuthorityCredentialProjection,
+    NonZeroU64,
+)> {
+    discover_credential_for(
+        root,
+        address,
+        operator,
+        authority,
+        CredentialSequenceDomain::Management,
+    )
+}
+
+/// Operation issuance has its own credential-local sequence domain. Caller
+/// holds the credential reservation and must retain the resulting AOQ1 before
+/// dispatch; discovery is neither sequence reservation nor policy approval.
+pub(crate) fn discover_operation_credential(
+    root: &std::path::Path,
+    address: std::net::SocketAddr,
+    operator: &Keypair,
+    authority: AuthorityActorTarget,
+) -> anyhow::Result<(
+    vos::agent::sdk::authority::AuthorityCredentialProjection,
+    NonZeroU64,
+)> {
+    discover_credential_for(
+        root,
+        address,
+        operator,
+        authority,
+        CredentialSequenceDomain::Operation,
+    )
+}
+
+fn discover_credential_for(
+    root: &std::path::Path,
+    address: std::net::SocketAddr,
+    operator: &Keypair,
+    authority: AuthorityActorTarget,
+    domain: CredentialSequenceDomain,
 ) -> anyhow::Result<(
     vos::agent::sdk::authority::AuthorityCredentialProjection,
     NonZeroU64,
@@ -402,13 +465,30 @@ pub(crate) fn discover_credential(
             bytes
         }
     };
-    query_credential(address, &bytes, identity.principal())
+    query_credential_for(address, &bytes, identity.principal(), domain)
 }
 
 fn validate_credential_response(
     query: &vos::agent::sdk::authority::AuthorityProjectionQuery,
     expected_principal: vos::agent::sdk::PrincipalId,
     bytes: &[u8],
+) -> anyhow::Result<(
+    vos::agent::sdk::authority::AuthorityCredentialProjection,
+    NonZeroU64,
+)> {
+    validate_credential_response_for(
+        query,
+        expected_principal,
+        bytes,
+        CredentialSequenceDomain::Management,
+    )
+}
+
+fn validate_credential_response_for(
+    query: &vos::agent::sdk::authority::AuthorityProjectionQuery,
+    expected_principal: vos::agent::sdk::PrincipalId,
+    bytes: &[u8],
+    domain: CredentialSequenceDomain,
 ) -> anyhow::Result<(
     vos::agent::sdk::authority::AuthorityCredentialProjection,
     NonZeroU64,
@@ -426,13 +506,16 @@ fn validate_credential_response(
     anyhow::ensure!(
         projection.status == AuthorityCredentialStatus::Active
             && projection.kind == AuthorityCredentialKind::Api,
-        "Local Create requires an active API credential"
+        "credential discovery requires an active API credential"
     );
-    let sequence = projection
-        .management_request_high_water
+    let high_water = match domain {
+        CredentialSequenceDomain::Management => projection.management_request_high_water,
+        CredentialSequenceDomain::Operation => projection.operation_request_high_water,
+    };
+    let sequence = high_water
         .checked_add(1)
         .and_then(NonZeroU64::new)
-        .ok_or_else(|| anyhow::anyhow!("management credential sequence exhausted"))?;
+        .ok_or_else(|| anyhow::anyhow!("selected credential sequence domain exhausted"))?;
     Ok((projection, sequence))
 }
 
@@ -1202,6 +1285,46 @@ pub(crate) mod tests {
         let (decoded, next) = validate_credential_response(&query, owner, &bytes).unwrap();
         assert_eq!(decoded, projection);
         assert_eq!(next.get(), 2);
+        let (_, operation_next) = validate_credential_response_for(
+            &query,
+            owner,
+            &bytes,
+            CredentialSequenceDomain::Operation,
+        )
+        .unwrap();
+        assert_eq!(operation_next.get(), 100);
+        let mut management_exhausted = projection.clone();
+        management_exhausted.management_request_high_water = u64::MAX;
+        assert_eq!(
+            validate_credential_response_for(
+                &query,
+                owner,
+                &management_exhausted.encode().unwrap(),
+                CredentialSequenceDomain::Operation
+            )
+            .unwrap()
+            .1
+            .get(),
+            100
+        );
+        let mut operation_exhausted = projection.clone();
+        operation_exhausted.operation_request_high_water = u64::MAX;
+        assert!(
+            validate_credential_response_for(
+                &query,
+                owner,
+                &operation_exhausted.encode().unwrap(),
+                CredentialSequenceDomain::Operation
+            )
+            .is_err()
+        );
+        assert_eq!(
+            validate_credential_response(&query, owner, &operation_exhausted.encode().unwrap())
+                .unwrap()
+                .1
+                .get(),
+            2
+        );
         assert!(validate_credential_response(&query, PrincipalId([22; 32]), &bytes).is_err());
         assert!(validate_credential_response(&query, owner, &bytes[..bytes.len() - 1]).is_err());
         let mut trailing = bytes.clone();
