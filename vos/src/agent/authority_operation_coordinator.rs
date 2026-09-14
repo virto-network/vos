@@ -1764,6 +1764,30 @@ pub(crate) mod tests {
             Err(LocalLifecycleIngressError::Unavailable)
         ));
         queue.open().unwrap();
+        let mut invalid = call.clone();
+        if let AuthorityIngressAuthentication::ApiCredentialSignature { signature, .. } =
+            &mut invalid.authentication
+        {
+            signature[0] ^= 1;
+        } else {
+            panic!("expected API credential fixture");
+        }
+        assert!(matches!(
+            queue.prepare_operation(invalid),
+            Err(LocalLifecycleIngressError::Invalid)
+        ));
+        assert!(queue.pop().unwrap().is_none());
+        let preparation = queue.prepare_operation(call.clone()).unwrap();
+        drop(preparation);
+        let Some(PendingLocalLifecycle::PrepareOperation {
+            call: retained,
+            reply,
+        }) = queue.pop().unwrap()
+        else {
+            panic!("accepted preparation was cancelled or replaced");
+        };
+        assert_eq!(retained, call);
+        assert!(reply.try_send(Ok(submission.clone())).is_err());
         let receiver = queue.submit_operation(submission.clone()).unwrap();
         drop(receiver);
         let Some(PendingLocalLifecycle::AuthorizeOperation {
@@ -1781,14 +1805,23 @@ pub(crate) mod tests {
                 ))
                 .is_err()
         );
-        let receivers: Vec<_> = (0..LOCAL_LIFECYCLE_QUEUE_CAPACITY)
+        let preparation = queue.prepare_operation(call.clone()).unwrap();
+        let receivers: Vec<_> = (1..LOCAL_LIFECYCLE_QUEUE_CAPACITY)
             .map(|_| queue.submit_operation(submission.clone()).unwrap())
             .collect();
         assert!(matches!(
             queue.submit_operation(submission.clone()),
             Err(LocalLifecycleIngressError::Busy)
         ));
+        assert!(matches!(
+            queue.prepare_operation(call),
+            Err(LocalLifecycleIngressError::Busy)
+        ));
         queue.close();
+        assert!(matches!(
+            preparation.try_recv().unwrap(),
+            Err(crate::agent::shared_host::SharedAgentHostError::Unavailable)
+        ));
         for receiver in receivers {
             assert!(matches!(
                 receiver.try_recv().unwrap(),

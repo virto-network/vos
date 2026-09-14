@@ -178,58 +178,103 @@ pub(super) fn authorize_with_application(
                 "retained intent differs from reservation"
             );
             drop(retained);
-            let (credential, _) = super::local_create::discover_operation_credential(
-                &operation.join("query"),
-                address,
-                operator,
-                authority,
+            let mut host_preparation = CleanOperationClientFile::open_authorization_preparation(
+                operation.join("authorization-preparation"),
             )?;
-            let descriptor = super::local_install::discover_agent(
-                address,
-                operator,
-                authority,
-                credential.head,
-                intent.target().agent(),
-            )?;
+            host_preparation.load_response()?; // Reject orphan/corrupt preparation before discovery.
+            if host_preparation.load_request()?.is_none() {
+                let (credential, _) = super::local_create::discover_operation_credential(
+                    &operation.join("query"),
+                    address,
+                    operator,
+                    authority,
+                )?;
+                let descriptor = super::local_install::discover_agent(
+                    address,
+                    operator,
+                    authority,
+                    credential.head,
+                    intent.target().agent(),
+                )?;
+                anyhow::ensure!(
+                    descriptor.identity.profile == AgentProfile::Local
+                        && descriptor.identity.owner == identity.principal()
+                        && descriptor.identity.transition_producer
+                            == ProducerId::of_public_key(&node_public),
+                    "target is not an operator-owned Local Agent of this node"
+                );
+                let key = operator.clone().try_into_ed25519()?;
+                let secret = key.secret();
+                let token = vos::ingress::encode_access_token(secret.as_ref().try_into()?)
+                    .ok_or_else(|| anyhow::anyhow!("invalid access token"))?;
+                let prepared = super::local_invocation::prepare_retained(
+                    &preparation_root,
+                    address,
+                    &token,
+                    None,
+                )?;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs();
+                let timing = super::operation_authorization::preparation::Timing {
+                    authorization_slot: now,
+                    issued_at: now,
+                    valid_from: now.saturating_sub(60),
+                    expires_at: now
+                        .checked_add(3600)
+                        .ok_or_else(|| anyhow::anyhow!("validity overflow"))?,
+                };
+                let submission = super::operation_authorization::preparation::prepare(
+                    operator,
+                    authority,
+                    &descriptor,
+                    &credential,
+                    &prepared,
+                    timing,
+                )?;
+                // Only the signed call survives this client-side construction.
+                // The final context must come from durable native clock capture.
+                host_preparation.publish_request(
+                    &submission
+                        .call()
+                        .encode()
+                        .map_err(|e| anyhow::anyhow!("invalid AOC5: {e:?}"))?,
+                )?;
+            }
+            let mut retained = CleanPreparationClientFile::open_or_create(&preparation_root)?;
+            let response = retained
+                .load_response()?
+                .ok_or_else(|| anyhow::anyhow!("signed call is missing actor preparation"))?;
+            let response =
+                vos::agent::supervisor_adapters::AgentTargetedPreparationResponse::decode(
+                    &response,
+                )
+                .map_err(|e| anyhow::anyhow!("invalid retained ATP1: {e:?}"))?;
+            let prepared = response
+                .for_request(&intent)
+                .ok_or_else(|| anyhow::anyhow!("actor preparation differs from retained intent"))?;
+            let call = vos::agent::sdk::authority_operation::AuthorityOperationCall::decode(
+                &host_preparation
+                    .load_request()?
+                    .ok_or_else(|| anyhow::anyhow!("missing retained AOC5"))?,
+            )
+            .map_err(|e| anyhow::anyhow!("invalid retained AOC5: {e:?}"))?;
             anyhow::ensure!(
-                descriptor.identity.profile == AgentProfile::Local
-                    && descriptor.identity.owner == identity.principal()
-                    && descriptor.identity.transition_producer
-                        == ProducerId::of_public_key(&node_public),
-                "target is not an operator-owned Local Agent of this node"
+                call.authority == authority
+                    && call.principal == identity.principal()
+                    && call.credential == identity.credential()
+                    && call.intent.managed().profile == AgentProfile::Local
+                    && call.intent.managed().owner == identity.principal()
+                    && call.intent.managed().transition_producer
+                        == ProducerId::of_public_key(&node_public)
+                    && call.intent.matches_invocation_work(prepared.work()),
+                "retained call differs from operator, node or actor preparation"
             );
-            let key = operator.clone().try_into_ed25519()?;
-            let secret = key.secret();
-            let token = vos::ingress::encode_access_token(secret.as_ref().try_into()?)
-                .ok_or_else(|| anyhow::anyhow!("invalid access token"))?;
-            let prepared = super::local_invocation::prepare_retained(
-                &preparation_root,
+            let bytes = super::operation_authorization::prepare_retained(
+                &mut host_preparation,
                 address,
-                &token,
-                None,
+                prepared.observed_slot(),
             )?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs();
-            let timing = super::operation_authorization::preparation::Timing {
-                authorization_slot: now,
-                issued_at: now,
-                valid_from: now.saturating_sub(60),
-                expires_at: now
-                    .checked_add(3600)
-                    .ok_or_else(|| anyhow::anyhow!("validity overflow"))?,
-            };
-            let submission = super::operation_authorization::preparation::prepare(
-                operator,
-                authority,
-                &descriptor,
-                &credential,
-                &prepared,
-                timing,
-            )?;
-            let bytes = submission
-                .encode()
-                .map_err(|e| anyhow::anyhow!("invalid AOQ1: {e:?}"))?;
             delivery.publish_request(&bytes)?;
             bytes
         }

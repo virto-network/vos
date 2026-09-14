@@ -704,6 +704,20 @@ impl AgentProductionOwner {
             .is_some_and(|supervisor| supervisor.handle().is_running())
     }
 
+    pub(crate) fn prepare_operation(
+        &mut self,
+        call: &super::sdk::authority_operation::AuthorityOperationCall,
+    ) -> super::local_lifecycle::AuthorityOperationPreparationResult {
+        if !self.is_running() {
+            return Err(super::shared_host::SharedAgentHostError::Unavailable);
+        }
+        self.lifecycle
+            .as_mut()
+            .ok_or(super::shared_host::SharedAgentHostError::Unavailable)?
+            .0
+            .prepare_operation(call)
+    }
+
     pub(crate) fn authorize_operation(
         &mut self,
         call: &super::sdk::authority_operation::AuthorityOperationCall,

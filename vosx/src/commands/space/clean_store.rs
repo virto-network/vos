@@ -195,6 +195,8 @@ enum StoreRole {
     OperationResponse = 26,
     PreparationRequest = 27,
     PreparationResponse = 28,
+    AuthorizationPreparationRequest = 29,
+    AuthorizationPreparationResponse = 30,
 }
 
 impl StoreRole {
@@ -228,6 +230,8 @@ impl StoreRole {
             Self::OperationResponse => "operation.response",
             Self::PreparationRequest => "preparation.request",
             Self::PreparationResponse => "preparation.response",
+            Self::AuthorizationPreparationRequest => "authorization-preparation.request",
+            Self::AuthorizationPreparationResponse => "authorization-preparation.response",
         }
     }
 
@@ -261,6 +265,8 @@ impl StoreRole {
             Self::OperationResponse => "operation.response.next",
             Self::PreparationRequest => "preparation.request.next",
             Self::PreparationResponse => "preparation.response.next",
+            Self::AuthorizationPreparationRequest => "authorization-preparation.request.next",
+            Self::AuthorizationPreparationResponse => "authorization-preparation.response.next",
         }
     }
 
@@ -282,7 +288,10 @@ impl StoreRole {
             Self::OperationCompletions => 40 + 256 * (4 + 512),
             Self::OperationRetirements => 40 + 256 * (4 + 1024),
             Self::OperationDenials => 40 + 256 * (4 + 512),
-            Self::OperationRequest => {
+            Self::AuthorizationPreparationRequest => {
+                vos::agent::sdk::authority_operation::MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES
+            }
+            Self::OperationRequest | Self::AuthorizationPreparationResponse => {
                 32 + vos::agent::sdk::authority_operation::MAX_AUTHORITY_OPERATION_CALL_WIRE_BYTES
                     + vos::agent::sdk::wire::MAX_INVOCATION_CONTEXT_WIRE_BYTES
             }
@@ -339,6 +348,8 @@ impl StoreRole {
             26 => Some(Self::OperationResponse),
             27 => Some(Self::PreparationRequest),
             28 => Some(Self::PreparationResponse),
+            29 => Some(Self::AuthorizationPreparationRequest),
+            30 => Some(Self::AuthorizationPreparationResponse),
             1 => Some(Self::Pins),
             2 => Some(Self::Bootstrap),
             3 => Some(Self::ManagementIssuer),
@@ -1799,6 +1810,8 @@ impl ExactFileStore {
                 | StoreRole::OperationResponse
                 | StoreRole::PreparationRequest
                 | StoreRole::PreparationResponse
+                | StoreRole::AuthorizationPreparationRequest
+                | StoreRole::AuthorizationPreparationResponse
         ) && canonical
             .iter()
             .chain(staged.iter())

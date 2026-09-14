@@ -2400,6 +2400,22 @@ impl IngressHandle {
         self.clean_local_lifecycle_queue.submit_install(submission)
     }
 
+    /// Queue a signed call for durable native clock capture. Queue acceptance
+    /// itself is not durable; the caller must retain the exact AOC5 for retry.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    pub fn prepare_clean_agent_operation(
+        &self,
+        call: crate::agent::sdk::authority_operation::AuthorityOperationCall,
+    ) -> Result<
+        mpsc::Receiver<crate::agent::local_lifecycle::AuthorityOperationPreparationResult>,
+        crate::agent::local_lifecycle::LocalLifecycleIngressError,
+    > {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(crate::agent::local_lifecycle::LocalLifecycleIngressError::Unavailable);
+        }
+        self.clean_local_lifecycle_queue.prepare_operation(call)
+    }
+
     /// Queue exact signed authorization inputs. Queue acceptance is not a policy
     /// decision or durable retention; clients must retain the frame for retry.
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
@@ -8300,6 +8316,14 @@ impl VosNode {
             Ok(Some(request)) if !self.shutdown.load(Ordering::Acquire) => {
                 use crate::agent::local_lifecycle::PendingLocalLifecycle;
                 match request {
+                    PendingLocalLifecycle::PrepareOperation { call, reply } => {
+                        let result = self
+                            .clean_agent_owner
+                            .as_mut()
+                            .ok_or(crate::agent::shared_host::SharedAgentHostError::Unavailable)
+                            .and_then(|owner| owner.prepare_operation(&call));
+                        let _ = reply.try_send(result);
+                    }
                     PendingLocalLifecycle::AuthorizeOperation { submission, reply } => {
                         let (call, context, issued_at) = submission.into_parts();
                         let result =

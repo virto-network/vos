@@ -10,6 +10,7 @@ use vos::agent::supervisor_adapters::{
 enum ClientPairKind {
     Operation,
     Preparation,
+    AuthorizationPreparation,
 }
 
 pub(crate) struct CleanOperationClientFile {
@@ -199,6 +200,107 @@ mod tests {
     use super::super::tests::Fixture;
     use super::*;
     use vos::agent::clean_bootstrap::NativeAuthorityOperationDecision;
+
+    #[test]
+    fn authorization_preparation_retains_call_across_http_failures_and_reopen() {
+        use crate::commands::space::operation_authorization::prepare_retained;
+        use std::io::{Read as _, Write as _};
+        let fixture = Fixture::new("authorization-preparation");
+        let prepared = submission(1);
+        let call = prepared.call().encode().unwrap();
+        let response = prepared.encode().unwrap();
+        let mut store =
+            CleanOperationClientFile::open_authorization_preparation(&fixture.root).unwrap();
+        store.publish_request(&call).unwrap();
+        assert!(
+            store
+                .publish_request(&submission(2).call().encode().unwrap())
+                .is_err()
+        );
+        drop(store);
+        for (status, body, minimum, success) in [
+            (504, Vec::new(), 20, false),
+            (200, submission(2).encode().unwrap(), 20, false),
+            (200, response.clone(), 21, false),
+            (200, response.clone(), 20, true),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let expected = call.clone();
+            let root = fixture.root.clone();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    header.push(byte[0]);
+                    assert!(header.len() < 8192);
+                }
+                assert!(header.starts_with(b"POST /__agents/prepare-authorization HTTP/1.1\r\n"));
+                let mut request = vec![0; expected.len()];
+                stream.read_exact(&mut request).unwrap();
+                assert_eq!(request, expected);
+                assert!(matches!(
+                    CleanOperationClientFile::open_authorization_preparation(root),
+                    Err(CleanFileStoreError::Busy)
+                ));
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                let _ = stream.write_all(&body);
+            });
+            let mut store =
+                CleanOperationClientFile::open_authorization_preparation(&fixture.root).unwrap();
+            let result = prepare_retained(&mut store, address, minimum);
+            assert_eq!(result.is_ok(), success, "{result:?}");
+            server.join().unwrap();
+            assert_eq!(store.load_request().unwrap().unwrap(), call);
+            assert_eq!(store.load_response().unwrap().is_some(), success);
+        }
+        let mut store =
+            CleanOperationClientFile::open_authorization_preparation(&fixture.root).unwrap();
+        assert_eq!(
+            prepare_retained(&mut store, "127.0.0.1:1".parse().unwrap(), 20).unwrap(),
+            response
+        );
+        super::super::tests::stage(&store.response, None, b"invalid AOQ1");
+        let staged =
+            fs::read(fixture.root.join("authorization-preparation.response.next")).unwrap();
+        assert!(store.load_response().is_err());
+        assert_eq!(
+            fs::read(fixture.root.join("authorization-preparation.response.next")).unwrap(),
+            staged
+        );
+    }
+
+    #[test]
+    fn authorization_preparation_rejects_orphan_and_invalid_signature_without_repair() {
+        let fixture = Fixture::new("authorization-preparation-orphan");
+        let mut store =
+            CleanOperationClientFile::open_authorization_preparation(&fixture.root).unwrap();
+        let prepared = submission(1);
+        let mut invalid = prepared.call().clone();
+        if let vos::agent::sdk::authority::AuthorityIngressAuthentication::ApiCredentialSignature { signature, .. } = &mut invalid.authentication {
+            signature[0] ^= 1;
+        }
+        assert!(store.publish_request(&invalid.encode().unwrap()).is_err());
+        assert!(store.load_request().unwrap().is_none());
+        super::super::tests::stage(&store.response, None, &prepared.encode().unwrap());
+        assert!(
+            store
+                .publish_request(&prepared.call().encode().unwrap())
+                .is_err()
+        );
+        assert!(store.load_request().unwrap().is_none());
+        assert!(
+            fixture
+                .root
+                .join("authorization-preparation.response.next")
+                .exists()
+        );
+    }
 
     // Synthetic source/input commitments test signature binding and storage,
     // not native execution. Native denial proof is tested in the library.
@@ -713,6 +815,11 @@ mod tests {
 }
 
 impl CleanOperationClientFile {
+    pub(crate) fn open_authorization_preparation(
+        root: impl AsRef<Path>,
+    ) -> Result<Self, CleanFileStoreError> {
+        Self::open_pair(root, ClientPairKind::AuthorizationPreparation)
+    }
     fn candidates(file: &ExactFileStore) -> Result<Vec<Vec<u8>>, CleanFileStoreError> {
         let _guard = file.root.guard()?;
         file.root.audit_entries()?;
@@ -742,8 +849,19 @@ impl CleanOperationClientFile {
                 StoreRole::PreparationRequest,
                 StoreRole::PreparationResponse,
             ),
+            ClientPairKind::AuthorizationPreparation => (
+                StoreRole::AuthorizationPreparationRequest,
+                StoreRole::AuthorizationPreparationResponse,
+            ),
         };
         let entries: &'static [&'static str] = match kind {
+            ClientPairKind::AuthorizationPreparation => &[
+                LOCK_FILE,
+                "authorization-preparation.request",
+                "authorization-preparation.request.next",
+                "authorization-preparation.response",
+                "authorization-preparation.response.next",
+            ],
             ClientPairKind::Operation => &[
                 LOCK_FILE,
                 "operation.request",
@@ -769,6 +887,19 @@ impl CleanOperationClientFile {
 
     fn validate_request(&self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
         match self.kind {
+            ClientPairKind::AuthorizationPreparation => {
+                let call =
+                    vos::agent::sdk::authority_operation::AuthorityOperationCall::decode(bytes)
+                        .map_err(|_| CleanFileStoreError::Corrupt)?;
+                if call.authenticated_node().is_some()
+                    || call
+                        .verify_api_with(&super::super::local_create::CredentialVerifier)
+                        .is_err()
+                {
+                    return Err(CleanFileStoreError::Corrupt);
+                }
+                Ok(())
+            }
             ClientPairKind::Operation => AuthorityOperationSubmission::decode(bytes).map(|_| ()),
             ClientPairKind::Preparation => {
                 AgentTargetedPreparationRequest::decode(bytes).map(|_| ())
@@ -799,6 +930,18 @@ impl CleanOperationClientFile {
     fn verify_response(&mut self, bytes: &[u8]) -> Result<(), CleanFileStoreError> {
         let request = self.load_request()?.ok_or(CleanFileStoreError::Corrupt)?;
         match self.kind {
+            ClientPairKind::AuthorizationPreparation => {
+                let call =
+                    vos::agent::sdk::authority_operation::AuthorityOperationCall::decode(&request)
+                        .map_err(|_| CleanFileStoreError::Corrupt)?;
+                let submission = AuthorityOperationSubmission::decode(bytes)
+                    .map_err(|_| CleanFileStoreError::Corrupt)?;
+                if submission.call() != &call
+                    || submission.issued_at() != submission.context().observed_slot
+                {
+                    return Err(CleanFileStoreError::Corrupt);
+                }
+            }
             ClientPairKind::Operation => {
                 AuthorityOperationSubmission::decode(&request)
                     .map_err(|_| CleanFileStoreError::Corrupt)?

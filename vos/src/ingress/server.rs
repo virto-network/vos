@@ -238,6 +238,10 @@ async fn handle_request(
                 return handle_operation_authorization(&request, &handle);
             }
             #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            if request.uri().path() == "/__agents/prepare-authorization" {
+                return handle_operation_preparation(&request, &handle);
+            }
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
             if matches!(
                 request.uri().path(),
                 "/__agents/invoke" | "/__agents/resume" | "/__agents/acknowledge"
@@ -420,6 +424,78 @@ fn handle_local_create(
         Err(_) => text(
             504,
             "Local Create outcome unknown; retry the identical signed submission",
+        ),
+    }
+}
+
+#[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+fn handle_operation_preparation(
+    request: &super::types::Request,
+    handle: &IngressHandle,
+) -> super::types::Response {
+    use super::types::{text, with_content_type};
+    use crate::agent::local_lifecycle::LocalLifecycleIngressError;
+    use crate::agent::sdk::authority_operation::AuthorityOperationCall;
+    use crate::agent::sdk::wire::CanonicalWire as _;
+    if request.body().len() > MAX_BODY_BYTES.min(AuthorityOperationCall::MAX_ENCODED_BYTES) {
+        return text(413, "operation preparation body too large");
+    }
+    if request.method() != http::Method::POST {
+        return text(405, "operation preparation is POST-only");
+    }
+    if request.uri().query().is_some() {
+        return text(
+            400,
+            "operation preparation does not accept query parameters",
+        );
+    }
+    if request
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        != Some("application/octet-stream")
+    {
+        return text(
+            415,
+            "operation preparation requires application/octet-stream AOC5",
+        );
+    }
+    let call = match AuthorityOperationCall::decode(request.body()) {
+        Ok(call) => call,
+        Err(_) => return text(400, "invalid operation call"),
+    };
+    if call.authenticated_node().is_some() {
+        return text(
+            403,
+            "HTTP operation preparation does not accept transport-node claims",
+        );
+    }
+    let reply = match handle.prepare_clean_agent_operation(call.clone()) {
+        Ok(reply) => reply,
+        Err(LocalLifecycleIngressError::Invalid) => {
+            return text(400, "invalid signed operation call");
+        }
+        Err(LocalLifecycleIngressError::Busy) => return text(503, "Local lifecycle queue is full"),
+        Err(LocalLifecycleIngressError::Unavailable) => {
+            return text(503, "operation preparation unavailable");
+        }
+    };
+    match reply.recv_timeout(Duration::from_secs(120)) {
+        Ok(Ok(submission)) if submission.call() == &call => match submission.encode() {
+            Ok(bytes) => with_content_type(200, "application/octet-stream", bytes),
+            Err(_) => text(500, "invalid prepared operation submission"),
+        },
+        Ok(Ok(_)) => text(500, "invalid operation preparation binding"),
+        Ok(Err(error)) => {
+            tracing::warn!(?error, "native operation preparation incomplete");
+            text(
+                503,
+                "operation preparation incomplete; retry identical AOC5",
+            )
+        }
+        Err(_) => text(
+            504,
+            "operation preparation outcome unknown; retry identical AOC5",
         ),
     }
 }
@@ -877,6 +953,12 @@ mod tests {
             );
             assert_eq!(
                 handle_operation_authorization(&request, &handle)
+                    .status()
+                    .as_u16(),
+                expected
+            );
+            assert_eq!(
+                handle_operation_preparation(&request, &handle)
                     .status()
                     .as_u16(),
                 expected

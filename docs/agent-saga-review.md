@@ -38,7 +38,9 @@ authorization with HTTP 503 (80.36s); exact client state is retained. See the
 campaign section below. Do not deploy this as a working ordinary-Agent path.
 The diagnostic exact retry confirms a client/physical authorization-clock
 mismatch. Native host-clock preparation now passes physical tests without rebasing
-saved AOQ1 or weakening freshness; its HTTP/client handoff is not wired yet.
+saved AOQ1 or weakening freshness. Its HTTP/client handoff is now wired: immutable
+AOC5 precedes host preparation, and the exact returned AOQ1 precedes authorization.
+The corrected fresh live campaign has not yet been rerun; this is not a live pass.
 The native Local Install application and startup-recovery phases now pass
 physical tests from prepared authorization through retirement, including
 pristine client-retry admission. Native Install controller handoff, retry and
@@ -6525,6 +6527,45 @@ retention, and have the fresh client obtain the host context rather than select
 it from its wall clock. Do not overwrite the old failed AOQ1/timestamps to make
 the campaign pass. HTTP/client integration, a fresh native campaign, non-Public
 mutation, expiry/abort handling and the other C2/C3 gates remain open.
+
+### Retained HTTP/client host-clock handoff (C2)
+
+The native preparation boundary is now connected through the existing four-entry
+lifecycle queue and `POST /__agents/prepare-authorization`. Signed API AOC5 is
+checked before admission; HTTP transport-node claims are rejected. The response
+is exact call-bound AOQ1 using the durably captured host observation as issuance
+slot. Queue acceptance alone remains non-durable; preparation does not approve,
+issue or release anything. The 120-second wait and strict native clock check are
+unchanged.
+
+Managed fresh invocation now retains AOC5 in an exclusively leased immutable
+`authorization-preparation/` pair (CSF1 roles 29/30) before HTTP. The returned AOQ1
+must match the entire signed call, use the captured slot as issuance time, and
+not precede retained actor preparation. It is synchronized before authorization
+delivery. Retrying saved AOC5 skips discovery/signing; saved AOQ1 skips preparation
+entirely. Orphan, invalid or replacing stages fail closed and remain intact.
+The prior failed live AOQ1 and its credential reservation were not modified.
+
+CLI regression: **239 passed**, zero failures, **six ignored**, in **75.85s**
+(`r16-host-clock-client-final.log`). New loopback tests cover a lost response,
+wrong-call response, earlier-than-actor observation, exact successful retry,
+exclusive lease, reopen without HTTP, invalid signature and orphan/staged data.
+HTTP framing tests: **four passed** in **0.26s**
+(`r16-operation-preparation-http.log`). Mixed authorization/preparation queue
+test: **one passed** in **0.02s** (`r16-host-clock-queue.log`), including capacity,
+invalid signatures, dropped receivers and shutdown rejection.
+Native operation recovery regression: **nine passed**, zero failures, in
+**146.22s** (`r16-host-clock-native-final.log`). Normal vosx build passes in
+**38.05s** (`r16-host-clock-build.log`). Formatting and whitespace checks pass.
+All new logs use the shared disk-backed target's `task-tmp`; no `/tmp` scratch
+or live daemon was started for this checkpoint. Guest artifacts/pins are unchanged.
+
+This remains part of **C2**, not another review batch. Next is a corrected fresh
+native campaign using isolated new state while preserving the old failed call;
+do not rebase that old AOQ1 or clear its pending reservation. A live pass,
+non-Public/mutating workflows, startup/Create/Install latency, Shared finality,
+expiry/abort recovery and the remaining C2/C3 release gates are still open.
+No performance improvement or master readiness is claimed.
 
 ### Durable client acknowledgement before completion
 

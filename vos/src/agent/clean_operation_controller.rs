@@ -813,6 +813,14 @@ where
         + NativeAuthorityOperationDenialSigner
         + Send,
 {
+    fn prepare(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        call: &AuthorityOperationCall,
+    ) -> Result<InvocationContext, SharedAgentHostError> {
+        self.0.prepare_call(owner, call)
+    }
+
     fn coordinate(
         &mut self,
         owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,

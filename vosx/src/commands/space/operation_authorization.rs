@@ -7,6 +7,43 @@ pub(crate) mod application;
 #[path = "operation_preparation.rs"]
 pub(crate) mod preparation;
 
+/// Return only a synchronized, exact call-bound native preparation. The host
+/// chooses the observation slot; retries never sign a new call or rebase AOQ1.
+pub(crate) fn prepare_retained(
+    store: &mut super::clean_store::CleanOperationClientFile,
+    address: std::net::SocketAddr,
+    minimum_slot: u64,
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        address.ip().is_loopback() && address.port() != 0,
+        "operation preparation requires nonzero loopback HTTP"
+    );
+    let request = store
+        .load_request()?
+        .ok_or_else(|| anyhow::anyhow!("missing retained AOC5"))?;
+    let response = match store.load_response()? {
+        Some(response) => response,
+        None => super::local_create::post_binary(
+            address,
+            "/__agents/prepare-authorization",
+            200,
+            &request,
+            AuthorityOperationSubmission::MAX_ENCODED_BYTES,
+        )
+        .map_err(|error| {
+            anyhow::anyhow!("{error}; exact preparation call retained; retry identical AOC5")
+        })?,
+    };
+    let submission = AuthorityOperationSubmission::decode(&response)
+        .map_err(|e| anyhow::anyhow!("invalid prepared AOQ1: {e:?}"))?;
+    anyhow::ensure!(
+        submission.context().observed_slot >= minimum_slot,
+        "authorization observation precedes actor preparation"
+    );
+    store.publish_response(&response)?;
+    Ok(response)
+}
+
 pub(crate) fn submit(
     root: &std::path::Path,
     input: Option<&std::path::Path>,

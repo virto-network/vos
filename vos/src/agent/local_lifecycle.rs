@@ -21,6 +21,8 @@ pub use operation_submission::AuthorityOperationSubmission;
 
 pub type AuthorityOperationResult =
     Result<super::clean_bootstrap::NativeAuthorityOperationDecision, SharedAgentHostError>;
+pub type AuthorityOperationPreparationResult =
+    Result<AuthorityOperationSubmission, SharedAgentHostError>;
 
 /// Canonical signed Create submission: LCQ1 followed by length-prefixed AMRQ,
 /// ACC3 and an exact admitted VOS3 runtime package. This is untrusted request
@@ -294,6 +296,10 @@ pub type LocalInstallResult =
     Result<ManagementApplicationAck, super::production_owner::AgentProductionOwnerError>;
 
 pub(crate) enum PendingLocalLifecycle {
+    PrepareOperation {
+        call: super::sdk::authority_operation::AuthorityOperationCall,
+        reply: mpsc::SyncSender<AuthorityOperationPreparationResult>,
+    },
     AuthorizeOperation {
         submission: AuthorityOperationSubmission,
         reply: mpsc::SyncSender<AuthorityOperationResult>,
@@ -309,6 +315,9 @@ impl PendingLocalLifecycle {
     pub(crate) fn reject(self) {
         let error = super::production_owner::AgentProductionOwnerError::InvalidConfiguration;
         match self {
+            Self::PrepareOperation { reply, .. } => {
+                let _ = reply.try_send(Err(SharedAgentHostError::Unavailable));
+            }
             Self::AuthorizeOperation { reply, .. } => {
                 let _ = reply.try_send(Err(SharedAgentHostError::Unavailable));
             }
@@ -333,6 +342,35 @@ pub(crate) struct LocalLifecycleQueue {
 }
 
 impl LocalLifecycleQueue {
+    pub(crate) fn prepare_operation(
+        &self,
+        call: super::sdk::authority_operation::AuthorityOperationCall,
+    ) -> Result<mpsc::Receiver<AuthorityOperationPreparationResult>, LocalLifecycleIngressError>
+    {
+        if call.authenticated_node().is_some()
+            || call
+                .verify_api_with(&super::authority_operation_coordinator::RawEd25519Verifier)
+                .is_err()
+        {
+            return Err(LocalLifecycleIngressError::Invalid);
+        }
+        let channel = self
+            .channel
+            .lock()
+            .map_err(|_| LocalLifecycleIngressError::Unavailable)?;
+        let (sender, _) = channel
+            .as_ref()
+            .ok_or(LocalLifecycleIngressError::Unavailable)?;
+        let (reply, receiver) = mpsc::sync_channel(1);
+        sender
+            .try_send(PendingLocalLifecycle::PrepareOperation { call, reply })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => LocalLifecycleIngressError::Busy,
+                mpsc::TrySendError::Disconnected(_) => LocalLifecycleIngressError::Unavailable,
+            })?;
+        Ok(receiver)
+    }
+
     pub(crate) fn submit_operation(
         &self,
         submission: AuthorityOperationSubmission,
@@ -1011,6 +1049,12 @@ fn load_create_runtime<B: super::clean_authority_issuer::CleanManagementRuntimeS
 /// Type-erased, node-owned lifecycle access. It is deliberately not an ingress
 /// trait: only the production owner may coordinate creation and publication.
 pub(crate) trait NativeLocalLifecycle: Send {
+    fn prepare_operation(
+        &mut self,
+        _call: &super::sdk::authority_operation::AuthorityOperationCall,
+    ) -> AuthorityOperationPreparationResult {
+        Err(SharedAgentHostError::Unavailable)
+    }
     fn authorize_operation(
         &mut self,
         _call: &super::sdk::authority_operation::AuthorityOperationCall,
@@ -1071,6 +1115,12 @@ where
     ) -> Result<super::clean_bootstrap::NativeAuthorityOperationDecision, SharedAgentHostError>
     {
         LocalLifecycleController::authorize_operation(self, call, context, issued_at)
+    }
+    fn prepare_operation(
+        &mut self,
+        call: &super::sdk::authority_operation::AuthorityOperationCall,
+    ) -> AuthorityOperationPreparationResult {
+        LocalLifecycleController::prepare_operation(self, call)
     }
     fn node(&self) -> Result<super::sdk::NodeId, SharedAgentHostError> {
         Ok(self
@@ -1149,6 +1199,11 @@ where
     R: CleanSystemAgentBootstrapStore,
     I: CleanManagementIssuerStore,
 {
+    fn prepare(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        call: &super::sdk::authority_operation::AuthorityOperationCall,
+    ) -> Result<super::sdk::InvocationContext, SharedAgentHostError>;
     fn coordinate(
         &mut self,
         owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
@@ -1260,6 +1315,26 @@ where
             .map_err(|_| SharedAgentHostError::Unavailable)?;
         self.operations = Some(Box::new((operations, signer)));
         Ok(self)
+    }
+
+    /// Retain the native dispatch before returning its exact authorization
+    /// context. This does not execute policy, issue a receipt or release admission.
+    pub fn prepare_operation(
+        &mut self,
+        call: &super::sdk::authority_operation::AuthorityOperationCall,
+    ) -> AuthorityOperationPreparationResult {
+        let operations = self
+            .operations
+            .as_mut()
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        let mut system = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let context = operations.prepare(&mut system, call)?;
+        let issued_at = context.observed_slot;
+        AuthorityOperationSubmission::new(call.clone(), context, issued_at)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)
     }
 
     pub fn authorize_operation(

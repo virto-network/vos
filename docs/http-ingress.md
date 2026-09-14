@@ -44,6 +44,14 @@ public operator command returns only with the clean system bootstrap.
 
 ### Operation authorization
 
+`POST /__agents/prepare-authorization` accepts canonical signed `AOC5` as
+`application/octet-stream`. API signatures are checked before queue admission;
+transport-node claims are rejected. It shares the four-entry lifecycle queue.
+HTTP 200 returns canonical `AOQ1` only after native dispatch retention, with the
+host-captured observation slot also selected as issuance time. This is preparation,
+not policy approval, issuance or admission release. Retry the identical retained
+AOC5 after 503/504; never generate a replacement call to recover an unknown outcome.
+
 `POST /__agents/authorize` accepts `application/octet-stream` containing canonical
 `AOQ1`: the signed operation call, exact authorization context and issuance slot.
 It authenticates the embedded call and rejects transport-node claims over HTTP.
@@ -82,8 +90,13 @@ vosx space authorize-local-invocation my-space --resume
 
 ATQ1 must already contain a stable nonzero invocation ID, full target and selected
 operator principal/API credential origin. The command discovers the Local Agent,
-retains physical preparation, signs in the operation sequence domain and delivers
-the retained authorization. It supports operator-owned Local Agents of this node,
+retains physical preparation, signs in the operation sequence domain, and retains
+the AOC5 before host-clock preparation. It verifies and retains the returned AOQ1
+before authorization delivery. The host clock cannot precede the retained actor
+observation. Once AOC5 exists, preparation retry skips discovery and signing;
+once AOQ1 exists, authorization retry skips host preparation too. Existing AOQ1
+is never rebased, including requests saved by the earlier client-clock path.
+It supports operator-owned Local Agents of this node,
 not ordinary Shared finality or actor/transport impersonation. `--resume` never
 reads a new intent file. Retrying the same invocation ID uses any already retained
 intent and signed authorization; it does not replace their content.
