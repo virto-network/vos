@@ -1733,21 +1733,32 @@ where
                 else {
                     return Err(SharedJournalDriverError::CrossStoreMismatch);
                 };
+                #[cfg(all(feature = "network", target_os = "linux"))]
+                let admin_success =
+                    super::clean_bootstrap::admin_dispatch::matches_successful_admin_reply(
+                        anchor,
+                        envelope,
+                        &reply.reply,
+                    );
+                #[cfg(not(all(feature = "network", target_os = "linux")))]
+                let admin_success = false;
                 if reply.invocation != work.invocation
                     || reply.actor != work.actor
                     || reply.incarnation != work.incarnation
                     || reply.deployment != work.deployment
                     || reply.mode != work.mode
                     || reply.status != crate::agent_sdk::InvocationStatus::Done
-                    || reply.reply
-                        != crate::actors::codec::Encode::encode(
-                            &crate::actors::value::Value::Bytes(Vec::new()),
-                        )
+                    || (!admin_success
+                        && reply.reply
+                            != crate::actors::codec::Encode::encode(
+                                &crate::actors::value::Value::Bytes(Vec::new()),
+                            ))
                 {
                     return Err(SharedJournalDriverError::CrossStoreMismatch);
                 }
-                // Only a proven denial can remain pending after its positive
-                // ACK. No more Ordered slots are needed to sign/persist it.
+                // A proven denial or exactly bound admin success may remain
+                // pending after ACK while terminal evidence is persisted.
+                // Other successes still require their separate lifecycle.
                 continue;
             }
             let retained = self.management_invocation_after(anchor.ordered, envelope)?;

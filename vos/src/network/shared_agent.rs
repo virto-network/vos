@@ -958,7 +958,7 @@ impl ProposalAdmission {
 enum ReservedSubmission {
     Projection(ProjectionPairKey),
     ManagementRetirement(ProjectionPairKey),
-    ManagementDenial(ProjectionPairKey),
+    ManagementResult(ProjectionPairKey),
 }
 
 #[derive(Clone, Copy)]
@@ -973,7 +973,7 @@ enum SupervisorAdmission<'a> {
     Ordinary,
     ReservedProjection,
     ReservedManagementRetirement,
-    ReservedManagementDenial,
+    ReservedManagementResult,
     PersistedManagement(&'a crate::agent::clean_management_intent::ManagementJournalAnchor),
 }
 
@@ -1612,7 +1612,7 @@ impl SharedRouteHandler {
             (None, Some(expected), Some(ReservedSubmission::ManagementRetirement(actual)))
                 if expected.iter().any(|pair| pair.contains(&actual))
                     && matches!(&request, crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Acknowledge { .. }) => {}
-            (None, _, Some(ReservedSubmission::ManagementDenial(actual)))
+            (None, _, Some(ReservedSubmission::ManagementResult(actual)))
                 if proposal.management_pending.as_ref().is_some_and(|pending| pending.iter().any(|(key, _)| *key == actual))
                     && matches!(&request, crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Acknowledge { .. }) => {}
             _ => return Err(SharedAgentHostError::CapacityExhausted),
@@ -1623,7 +1623,7 @@ impl SharedRouteHandler {
                 reservation,
                 Some(
                     ReservedSubmission::ManagementRetirement(_)
-                        | ReservedSubmission::ManagementDenial(_)
+                        | ReservedSubmission::ManagementResult(_)
                 )
             )
         {
@@ -2852,10 +2852,10 @@ impl SharedAgentNetworkHost {
         Ok(found.cloned())
     }
 
-    /// Publish signed denial retirement before releasing its exact pending
+    /// Publish signed terminal retirement before releasing its exact pending
     /// member. A failed store callback retains both admission and refresh state.
     /// Completed signed records may release after pruning without replaying.
-    pub(crate) fn finish_management_denial_record<F>(
+    pub(crate) fn finish_pending_management_result<F>(
         &mut self,
         agent: crate::service::AgentId,
         anchor: &crate::agent::clean_management_intent::ManagementJournalAnchor,
@@ -4286,6 +4286,24 @@ impl SharedAgentNetworkHost {
         proof: &crate::agent::clean_bootstrap::VerifiedManagementDenial,
     ) -> Result<RuntimeOutcome, SharedAgentHostError> {
         let (anchor, envelope) = proof.envelope();
+        self.acknowledge_pending_management_result(expected, anchor, envelope)
+    }
+
+    pub(crate) fn supervisor_acknowledge_admin_result(
+        &self,
+        expected: crate::agent::supervisor::AgentRouteIdentity,
+        proof: &crate::agent::clean_bootstrap::admin_dispatch::terminal::RetainedAdminResult,
+    ) -> Result<RuntimeOutcome, SharedAgentHostError> {
+        let (anchor, envelope) = proof.envelope();
+        self.acknowledge_pending_management_result(expected, anchor, envelope)
+    }
+
+    fn acknowledge_pending_management_result(
+        &self,
+        expected: crate::agent::supervisor::AgentRouteIdentity,
+        anchor: &crate::agent::clean_management_intent::ManagementJournalAnchor,
+        envelope: &crate::agent_sdk::RuntimeWork,
+    ) -> Result<RuntimeOutcome, SharedAgentHostError> {
         let crate::agent_sdk::RuntimeWork::Invoke {
             invocation,
             authorization,
@@ -4306,7 +4324,7 @@ impl SharedAgentNetworkHost {
                 authorization: (**authorization).clone(),
             },
             false,
-            SupervisorAdmission::ReservedManagementDenial,
+            SupervisorAdmission::ReservedManagementResult,
         )
     }
 
@@ -4338,7 +4356,7 @@ impl SharedAgentNetworkHost {
         if matches!(
             admission,
             SupervisorAdmission::ReservedManagementRetirement
-                | SupervisorAdmission::ReservedManagementDenial
+                | SupervisorAdmission::ReservedManagementResult
         ) && (work.mode != MethodMode::Linear
             || !matches!(
                 &request,
@@ -4425,7 +4443,7 @@ impl SharedAgentNetworkHost {
             };
         match scope {
             InvocationScope::Ordered
-                if matches!(admission, SupervisorAdmission::ReservedManagementDenial) =>
+                if matches!(admission, SupervisorAdmission::ReservedManagementResult) =>
             {
                 let key = ProjectionPairKey::new(request.work(), request.authorization());
                 attached
@@ -4433,7 +4451,7 @@ impl SharedAgentNetworkHost {
                     .submit_clean_ordered_operation_with_admission(
                         request,
                         false,
-                        Some(ReservedSubmission::ManagementDenial(key)),
+                        Some(ReservedSubmission::ManagementResult(key)),
                         InvocationClock::Current,
                     )
                     .map(|submission| submission.outcome)

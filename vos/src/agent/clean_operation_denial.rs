@@ -348,7 +348,7 @@ where
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         let mut result = None;
-        self._network_host.finish_management_denial_record(
+        self._network_host.finish_pending_management_result(
             crate::service::AgentId(self.pins.agent.0),
             denial.record.anchor(),
             denial.record.envelope(),
@@ -403,7 +403,7 @@ where
         if denied.target != self.authority_target() {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        self._network_host.finish_management_denial_record(
+        self._network_host.finish_pending_management_result(
             crate::service::AgentId(self.pins.agent.0),
             denied.record.anchor(),
             denied.record.envelope(),

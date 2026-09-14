@@ -3,6 +3,8 @@
 //! Admission and the terminal reply remain retained until explicit retirement.
 
 use super::*;
+#[path = "clean_admin_terminal.rs"]
+pub(crate) mod terminal;
 use crate::agent::clean_management_intent::ManagementJournalAnchor;
 use crate::agent::sdk::authority::{AuthorityAdminCall, AuthorityAdminResult};
 use crate::agent::sdk::{InvocationContext, InvocationOrigin, InvocationWork, PublicPreflight};
@@ -28,6 +30,32 @@ fn message(call: &AuthorityAdminCall) -> Vec<u8> {
         "call",
         crate::actors::value::Value::Bytes(call.encode().expect("validated admin call")),
     )
+}
+
+/// Used only after independently replaying the exact anchored Invoke and
+/// positive ACK. Admin success has no subsequent issuance/application phase;
+/// it may remain reserved while its terminal certificate is being persisted.
+pub(crate) fn matches_successful_admin_reply(
+    anchor: &ManagementJournalAnchor,
+    envelope: &RuntimeWork,
+    reply: &[u8],
+) -> bool {
+    use crate::Decode as _;
+    let Some(crate::actors::value::Value::Bytes(bytes)) =
+        crate::actors::value::Value::try_decode(reply)
+    else {
+        return false;
+    };
+    let Ok(result) = AuthorityAdminResult::decode(&bytes) else {
+        return false;
+    };
+    result.verify_with(&RawCredentialVerifier).is_ok()
+        && RetainedAuthorityAdminDispatch {
+            call: result.call,
+            envelope: envelope.clone(),
+            anchor: anchor.clone(),
+        }
+        .validate_wire()
 }
 
 impl CanonicalWire for RetainedAuthorityAdminDispatch {

@@ -86,10 +86,55 @@ impl<'a> NativeAuthorityOperationStartupAdmission<'a> {
     pub(crate) fn include_pending_admin<
         J: super::admin_dispatch::NativeAuthorityAdminJournalStore,
     >(
-        mut self,
+        self,
         journal: &'a mut J,
         invocations: &[InvocationId],
     ) -> Result<Self, SharedAgentHostError> {
+        self.include_admin_records(journal, invocations, |_| Ok(false))
+    }
+
+    /// Only a separately signed terminal certificate excludes admin work
+    /// from admission. An observed result alone still requires ACK recovery.
+    pub(crate) fn include_admin_with_terminals<J, T>(
+        self,
+        journal: &'a mut J,
+        terminals: &'a mut T,
+        invocations: &[InvocationId],
+    ) -> Result<Self, SharedAgentHostError>
+    where
+        J: super::admin_dispatch::NativeAuthorityAdminJournalStore,
+        T: super::admin_dispatch::terminal::NativeAuthorityAdminTerminalStore,
+    {
+        self.include_admin_records(journal, invocations, |record| {
+            let Some(bytes) = terminals
+                .load(record.call.invocation, true)
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+            else {
+                return Ok(false);
+            };
+            super::admin_dispatch::terminal::verify_certificate(record, &bytes, true)?;
+            // A previous writer may have reported failure after publication
+            // but before synchronization. Confirm durability before omitting
+            // this reservation from the recovered route.
+            terminals
+                .retain(record.call.invocation, true, &bytes)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            Ok(true)
+        })
+    }
+
+    fn include_admin_records<J, F>(
+        mut self,
+        journal: &'a mut J,
+        invocations: &[InvocationId],
+        mut retired: F,
+    ) -> Result<Self, SharedAgentHostError>
+    where
+        J: super::admin_dispatch::NativeAuthorityAdminJournalStore,
+        F: FnMut(
+            &super::admin_dispatch::RetainedAuthorityAdminDispatch,
+        ) -> Result<bool, SharedAgentHostError>,
+    {
         use super::admin_dispatch::RetainedAuthorityAdminDispatch;
         let maximum = 2 * crate::agent::authority_operation_coordinator::MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS;
         if invocations.len() > maximum || self.pending.len() > maximum - invocations.len() {
@@ -119,7 +164,9 @@ impl<'a> NativeAuthorityOperationStartupAdmission<'a> {
             if record.call.authority != self.authority || record.call.invocation != *invocation {
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
-            self.pending.push((record.anchor, record.envelope));
+            if !retired(&record)? {
+                self.pending.push((record.anchor, record.envelope));
+            }
         }
         self.has_history |= !invocations.is_empty();
         Ok(self)

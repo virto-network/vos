@@ -3727,7 +3727,7 @@ where
                     .map_err(|_| SharedAgentHostError::Unavailable)?,
             )
         };
-        self._network_host.finish_management_denial_record(
+        self._network_host.finish_pending_management_result(
             crate::service::AgentId(self.pins.agent.0),
             &anchor,
             &work,
@@ -9836,10 +9836,69 @@ mod tests {
 
         #[test]
         fn native_admin_retained_dispatch_recovers_before_and_after_execution() {
+            native_admin_retained_terminal_recovery(false);
+        }
+
+        #[test]
+        fn native_admin_denial_terminal_recovery_allows_valid_successor() {
+            native_admin_retained_terminal_recovery(true);
+        }
+
+        fn native_admin_retained_terminal_recovery(denied: bool) {
+            use super::super::admin_dispatch::terminal::{
+                NativeAuthorityAdminTerminalSigner, NativeAuthorityAdminTerminalStore,
+                verify_certificate,
+            };
             use super::super::admin_dispatch::{
                 NativeAuthorityAdminJournalStore, RetainedAuthorityAdminDispatch,
             };
             use crate::agent_sdk::authority::{AuthorityAdminCall, AuthorityAdminOperation};
+            struct TerminalStore(OperationTestJournal, u8);
+            fn terminal_key(id: InvocationId, retired: bool) -> InvocationId {
+                InvocationId(Hash::digest(b"admin-terminal-test", &[&id.0, &[u8::from(retired)]]).0)
+            }
+            impl NativeAuthorityAdminTerminalStore for TerminalStore {
+                type Error = std::io::Error;
+                fn load(
+                    &mut self,
+                    id: InvocationId,
+                    retired: bool,
+                ) -> Result<Option<Vec<u8>>, Self::Error> {
+                    self.0.load(terminal_key(id, retired))
+                }
+                fn retain(
+                    &mut self,
+                    id: InvocationId,
+                    retired: bool,
+                    bytes: &[u8],
+                ) -> Result<(), Self::Error> {
+                    if (self.1 == 0 && !retired) || (self.1 == 2 && retired) {
+                        self.1 += 1;
+                        return Err(std::io::Error::other("terminal failure before publication"));
+                    }
+                    self.0.retain(terminal_key(id, retired), bytes)?;
+                    if (self.1 == 1 && !retired) || (self.1 == 3 && retired) {
+                        self.1 += 1;
+                        return Err(std::io::Error::other("terminal failure after publication"));
+                    }
+                    Ok(())
+                }
+            }
+            struct TerminalSigner(usize);
+            impl NativeAuthorityAdminTerminalSigner for TerminalSigner {
+                type Error = std::io::Error;
+                fn public_key(&self) -> [u8; 32] {
+                    SigningKey::from_bytes(&[RECEIPT_SEED; 32])
+                        .verifying_key()
+                        .to_bytes()
+                }
+                fn sign_admin_terminal(&mut self, bytes: &[u8]) -> Result<[u8; 64], Self::Error> {
+                    self.0 += 1;
+                    Ok(SigningKey::from_bytes(&[RECEIPT_SEED; 32])
+                        .sign(bytes)
+                        .to_bytes())
+                }
+            }
             struct AdminJournal(OperationTestJournal, u8);
             impl NativeAuthorityAdminJournalStore for AdminJournal {
                 type Error = std::io::Error;
@@ -9883,7 +9942,7 @@ mod tests {
                 operation: AuthorityAdminOperation::SetSpaceRole {
                     principal: owner.pins.descriptor.identity.owner,
                     role: crate::agent_sdk::RoleId([0x53; 32]),
-                    granted: true,
+                    granted: !denied,
                 },
                 signature: [1; 64],
             };
@@ -9891,6 +9950,9 @@ mod tests {
             call.signature = key.sign(&call.signing_bytes()).to_bytes();
             let mut journal = AdminJournal(OperationTestJournal(harness._directory.0.clone()), 2);
             let mut operations = OperationTestJournal(harness._directory.0.clone());
+            let mut terminals =
+                TerminalStore(OperationTestJournal(harness._directory.0.clone()), 0);
+            let mut terminal_signer = TerminalSigner(0);
             let before = owner.ordered_index_for_test().unwrap();
             assert!(owner.retain_authority_admin(&call, &mut journal).is_err());
             assert!(owner.management_admission_held().unwrap());
@@ -9953,7 +10015,7 @@ mod tests {
                 );
             }
             let mut first_result = None;
-            for restart in 0..2 {
+            for restart in 0..5 {
                 let pins = owner._pins_store.clone();
                 let record = owner.record_store.clone();
                 let issuer = owner.issuer.into_store();
@@ -9968,7 +10030,11 @@ mod tests {
                 let admission =
                     NativeAuthorityOperationStartupAdmission::load(&mut operations, target, &[])
                         .unwrap()
-                        .include_pending_admin(&mut journal, &[call.invocation])
+                        .include_admin_with_terminals(
+                            &mut journal,
+                            &mut terminals,
+                            &[call.invocation],
+                        )
                         .unwrap();
                 owner = CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
                     pins,
@@ -9988,23 +10054,73 @@ mod tests {
                     None,
                     Some(&admission),
                 )
-                .unwrap();
+                .unwrap_or_else(|error| {
+                    panic!("admin reopen {restart} (denied={denied}): {error:?}")
+                });
                 drop(admission);
-                assert_eq!(owner.ordered_index_for_test().unwrap(), before + restart);
-                let recovered = owner.retain_authority_admin(&call, &mut journal).unwrap();
-                assert_eq!(recovered, retained);
-                let result = owner.execute_authority_admin(&recovered).unwrap().unwrap();
-                assert_eq!(result.call, call);
-                assert_eq!(result.generation.get(), 2);
-                if let Some(first) = &first_result {
-                    assert_eq!(first, &result);
-                } else {
-                    first_result = Some(result);
+                assert_eq!(
+                    owner.ordered_index_for_test().unwrap(),
+                    before + [0, 1, 1, 2, 2][restart as usize]
+                );
+                if restart < 2 {
+                    let recovered = owner.retain_authority_admin(&call, &mut journal).unwrap();
+                    assert_eq!(recovered, retained);
+                    let result = owner.execute_authority_admin(&recovered).unwrap();
+                    assert_eq!(result.is_none(), denied);
+                    if let Some(result) = &result {
+                        assert_eq!(result.call, call);
+                        assert_eq!(result.generation.get(), 2);
+                    }
+                    if let Some(first) = &first_result {
+                        assert_eq!(first, &result);
+                    } else {
+                        first_result = Some(result);
+                    }
                 }
-                assert_eq!(owner.ordered_index_for_test().unwrap(), before + 1);
-                assert!(owner.management_admission_held().unwrap());
+                let finished =
+                    owner.finish_authority_admin(&retained, &mut terminals, &mut terminal_signer);
+                if restart < 4 {
+                    assert!(finished.is_err());
+                    assert!(owner.management_admission_held().unwrap());
+                    assert_eq!(
+                        owner.ordered_index_for_test().unwrap(),
+                        before + if restart < 2 { 1 } else { 2 }
+                    );
+                } else {
+                    assert_eq!(finished.unwrap(), first_result.clone().unwrap());
+                    assert!(!owner.management_admission_held().unwrap());
+                    assert_eq!(terminal_signer.0, 4);
+                    assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+                }
+                if let Some(bytes) = terminals.load(call.invocation, false).unwrap() {
+                    assert!(verify_certificate(&retained, &bytes, true).is_err());
+                    let mut corrupt = bytes;
+                    *corrupt.last_mut().unwrap() ^= 1;
+                    assert!(verify_certificate(&retained, &corrupt, false).is_err());
+                }
                 assert_eq!(journal.load(call.invocation).unwrap(), Some(bytes.clone()));
             }
+            let mut successor = call.clone();
+            successor.observed_slot = slot + 14;
+            successor.expected_generation = NonZeroU64::new(if denied { 1 } else { 2 }).unwrap();
+            successor.request_sequence = successor.expected_generation;
+            successor.operation = AuthorityAdminOperation::SetSpaceRole {
+                principal: successor.administrator,
+                role: crate::agent_sdk::RoleId([0x54; 32]),
+                granted: true,
+            };
+            successor.invocation = successor.expected_invocation();
+            successor.signature = key.sign(&successor.signing_bytes()).to_bytes();
+            let next = owner
+                .retain_authority_admin(&successor, &mut journal)
+                .unwrap();
+            assert!(
+                owner
+                    .finish_authority_admin(&next, &mut terminals, &mut terminal_signer)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(!owner.management_admission_held().unwrap());
             harness.owner = Some(owner);
             harness.stop();
         }

@@ -244,11 +244,12 @@ Keep these as work within C2, not new review batches:
    Complete the missing protected permission setup next: the real bundled
    Authority passes native signed space-role grant/revoke and rejects anonymous
    signed administration. Native retained admin dispatch now recovers across
-   publication failures and owner restart before/after execution. Terminal
-   admin result retirement, production stores, host-clock preparation and
-   host/client delivery remain unimplemented. Keep its credential sequence and
-   generation CAS distinct
-   from operation authorization; do not relax anonymous HTTP invocation or
+   publication failures and owner restart before/after execution. Native
+   success/denial terminal retirement and a valid successor now pass across
+   result/retirement publication failures and restart. Production stores,
+   host-clock preparation and host/client delivery remain unimplemented. Keep
+   its credential sequence and generation CAS distinct from operation
+   authorization; do not relax anonymous HTTP invocation or
    put this mutation in the read-only projection journal.
    A Public query or mutation alone does not close this item.
 4. Close the already-required Shared finality, Private/Attested, terminal
@@ -7420,6 +7421,40 @@ Next implement authenticated durable terminal result/denial recovery and
 retirement, then the hardened production store/controller and host-clock
 preparation/client delivery. The protected Local mutation gate remains open.
 No SDK wire ABI or bundled executable changed; no artifact repin is needed.
+
+### Native admin terminal result and retirement (C2)
+
+NAT1 certificates separately sign the observed result and completed retirement,
+binding the complete NAD1 record and phase. The result is persisted before
+positive ACK; terminal retirement is signed and persisted under native pending
+admission exclusion after ACK. Ambiguous publication retains admission, and an
+exact retry reuses the saved certificate. Startup excludes only records with a
+verified retired certificate, not merely a saved result. No admin ingress is
+enabled yet; these are internal owner APIs with test-only stores/signers.
+
+Three native admin tests pass (final rerun 46.89s;
+`target/task-tmp/native-admin-terminal-final.log`). The nine native operation
+regressions also pass (112.63s; `native-admin-terminal-operations-final.log`),
+as do the ordinary CLI build (`native-admin-terminal-vosx-final.log`), formatting
+and diff checks; all logs are under `target/task-tmp`. Success and denial each
+exercise failure before/after result publication, failure before/after terminal
+publication, five owner reopens, unchanged committed invocation/ACK counts,
+signature/phase rejection, release, and a completed valid successor. Startup
+re-synchronizes a recovered terminal certificate before excluding admission. In
+particular, a denied admin request does not consume the admin sequence.
+
+The success test initially exposed a recovery rule that allowed only empty
+denials to remain pending after ACK (`native-admin-terminal-reopen.log`, reopen
+3). The journal now additionally accepts an independently replayed successful
+admin result only when its signature and complete signed call match the exact
+anchored envelope. Arbitrary nonempty replies remain rejected. The shared
+pending-result ACK/release machinery has neutral naming; existing operation
+denial proofs remain distinct from retained admin-result proofs.
+
+Next: hardened production admin stores/controller, host-clock preparation and
+client delivery, then protected Local mutation/retirement/restart. Broader
+capacity/GC and release gates remain open. No SDK ABI, artifact pin, ingress
+policy or timeout changed.
 
 ### Durable client acknowledgement before completion
 
