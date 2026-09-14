@@ -857,7 +857,7 @@ impl CleanCredentialReservation {
         nonce: vos::agent::sdk::Hash,
         completed: Option<(vos::agent::sdk::Hash, vos::agent::sdk::Hash)>,
     ) -> Vec<u8> {
-        let mut bytes = self.magic().to_vec();
+        let mut bytes = b"CRS1".to_vec();
         bytes.extend_from_slice(self.space.as_bytes());
         bytes.extend_from_slice(self.credential.as_bytes());
         bytes.extend_from_slice(nonce.as_bytes());
@@ -869,21 +869,13 @@ impl CleanCredentialReservation {
         bytes
     }
 
-    fn magic(&self) -> &'static [u8; 4] {
-        if self.store.role == StoreRole::AdminCredentialReservation {
-            b"ACR1"
-        } else {
-            b"CRS1"
-        }
-    }
-
     fn load(&mut self) -> Result<Option<Vec<u8>>, CleanFileStoreError> {
         let bytes = self
             .store
             .load(StoreRole::CredentialReservation.maximum_bytes())?;
         if let Some(bytes) = &bytes {
             if bytes.len() != 165
-                || &bytes[..4] != self.magic()
+                || &bytes[..4] != b"CRS1"
                 || bytes[4..36] != self.space.0
                 || bytes[36..68] != self.credential.0
                 || bytes[68..100] == [0; 32]

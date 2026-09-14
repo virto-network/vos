@@ -17,6 +17,8 @@ pub mod caps;
 #[cfg(target_os = "linux")]
 mod admin_client;
 #[cfg(target_os = "linux")]
+mod admin_operation;
+#[cfg(target_os = "linux")]
 mod admin_signing;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)] // Wired by the clean native startup owner in this chapter.
@@ -57,6 +59,9 @@ pub mod verify;
 
 #[derive(Subcommand, Debug)]
 pub enum SpaceCommand {
+    /// Grant/revoke one deployment-scoped actor role, or resume retained admin work.
+    #[cfg(target_os = "linux")]
+    SetActorRole(admin_operation::SetActorRoleArgs),
     /// Retain a signed zero-slot admin draft and its verified host preparation.
     #[cfg(target_os = "linux")]
     PrepareAdmin {
@@ -212,6 +217,8 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
         SpaceCommand::InvokeLocal(args) => local_operation::run_invocation(args),
         #[cfg(target_os = "linux")]
         SpaceCommand::AuthorizeLocalInvocation(args) => local_operation::run(args),
+        #[cfg(target_os = "linux")]
+        SpaceCommand::SetActorRole(args) => admin_operation::run(args),
         #[cfg(target_os = "linux")]
         SpaceCommand::PrepareAdmin {
             request_dir,

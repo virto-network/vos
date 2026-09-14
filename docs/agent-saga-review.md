@@ -252,9 +252,9 @@ Keep these as work within C2, not new review batches:
    in the lifecycle owner. Signed host-clock preparation and submission now
    have native lifecycle APIs, bounded node-owned queue delivery and dedicated
    signed-body HTTP routes. Retained client preparation/submission commands now
-   exist; deterministic signing and a separate admin reservation are implemented,
-   but fresh-command orchestration and the live protected
-   campaign remain incomplete. Keep
+   exist; deterministic signing, a separate admin reservation and fresh
+   deployment-scoped role command/resume orchestration are implemented. The live
+   protected campaign remains incomplete. Keep
    its credential sequence and generation CAS distinct from operation
    authorization; do not relax anonymous HTTP invocation or
    put this mutation in the read-only projection journal.
@@ -7714,6 +7714,56 @@ not block selection of the admin successor. Full CLI suite: 248 passed,
 (6.70s; `native-admin-signing-vosx-build.log`), as do formatting and whitespace
 checks. Logs remain under shared on-disk `target/task-tmp`. These signing and
 reservation checks use synthetic evidence; no new live campaign ran here.
+
+### Fresh actor-role command and retained resume (C2)
+
+`vosx space set-actor-role <space> --agent <id> --actor <id> --deployment <id>
+--role <id>` grants the exact deployment-scoped role to the local operator;
+`--principal <id>` selects another principal and `--revoke` removes the grant.
+IDs are full 32-byte hex values. `--http` optionally selects a nonzero loopback
+listener; otherwise the existing local-space resolver selects the daemon's
+configured endpoint. Operator and node identities come from the existing local
+identity/endpoint paths, and the Authority target uses the same bundled root
+derivation as startup. No node private key is loaded by this command.
+
+`vosx space set-actor-role <space> --resume` recovers the current admin attempt.
+It rejects fresh role flags and never selects another credential sequence,
+generation or draft. Once NAS1 exists, it does not rediscover, reprepare or
+re-sign. The stored draft, NAP1 and NAS1 must agree; missing preparation is not
+permission to reconstruct it. Verified NAT2 is retained before the attempt is
+marked applied/denied. A pending attempt rejects a new fresh command before any
+network access. Discovery failures before draft retention create no new admin
+claim; rerun the original fresh command in that case.
+
+Wiring exposed a necessary correction to the prior ACR1 primitive: denial does
+not consume the admin sequence, so identical zero-slot drafts can occur in
+later fresh attempts. ACR2 now separates the random local attempt ID from the
+protocol invocation ID. Phase 0 binds the retained draft; phase 3 additionally
+binds the exact retained NAS1 before dispatch. Only that bound request can
+finish the attempt with NAT2. A fresh attempt after denial gets a distinct
+directory and may select a new NAP1, while resume stays exact. ACR1 is rejected
+without migration; it was only used in disposable tests before this command
+was wired. CSF1 role 38 and the 165-byte bound remain unchanged. CRS1 operation
+reservation semantics, actor ABI, PVM artifacts and timeout limits are unchanged.
+
+The command owns an exclusive admin credential lease across discovery,
+preparation, signing, delivery and terminal retention. The immutable draft is
+published before its attempt claim; NAS1 is published before its binding is
+made dispatchable. State lives under the space's private `admin-client` tree,
+separate from management/operation reservations. Tests use synthetic signed
+loopback responses, not native daemon finality. Next is the live protected
+Local mutation/retirement/restart campaign, not another admin feature. Production
+latency and all other original release gates remain open.
+
+Validation: 10 focused admin tests pass (11.36s;
+`native-admin-orchestration-acr2.log`). Full CLI suite passes 250 with 9 ignored
+(60.62s; `native-admin-orchestration-cli.log`), including failed preparation,
+failed submission, resume without discovery, cached terminal retry without
+network access, fresh identical intent after denial, wrong node, missing
+preparation and rejection of an old completion for a newly bound request.
+Command parsing and built-binary help pass. Normal vosx build passes (6.68s;
+`native-admin-orchestration-vosx-build.log`); formatting and whitespace checks
+pass. Logs are under shared on-disk `target/task-tmp`.
 
 ### Durable client acknowledgement before completion
 

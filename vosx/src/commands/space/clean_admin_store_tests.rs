@@ -5,6 +5,235 @@ use vos::agent::sdk::{authority::*, wire::CanonicalWire, *};
 
 // Synthetic signed storage evidence; native finality is covered in vos tests.
 #[test]
+fn admin_orchestration_resumes_without_rediscovery_and_finishes_only_bound_work() {
+    use crate::commands::space::admin_operation::execute;
+    use std::io::{Read as _, Write as _};
+    type Step = (&'static str, Option<Vec<u8>>, u16, Vec<u8>);
+    let serve = |draft: AuthorityAdminCall, steps: Vec<Step>| {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let thread = std::thread::spawn(move || {
+            for (path, expected, status, mut response) in steps {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    headers.push(byte[0]);
+                    assert!(headers.len() < 8192);
+                }
+                let headers = String::from_utf8(headers).unwrap();
+                assert!(
+                    headers.starts_with(&format!("POST {path} HTTP/1.1")),
+                    "{headers}"
+                );
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                assert!(length < 1024 * 1024);
+                let mut request = vec![0; length];
+                stream.read_exact(&mut request).unwrap();
+                if let Some(expected) = expected {
+                    assert_eq!(request, expected);
+                }
+                if path == "/__agents/credential" {
+                    let query = AuthorityProjectionQuery::decode(&request).unwrap();
+                    assert_eq!(query.authority, draft.authority);
+                    assert_eq!(query.credential, draft.credential);
+                    let one = core::num::NonZeroU64::new(1).unwrap();
+                    response = AuthorityCredentialProjection {
+                        query,
+                        head: AuthorityProjectionHead {
+                            state_revision: one,
+                            epoch: one,
+                            authorization_sequence: one,
+                            administration_generation: draft.expected_generation,
+                            state_commitment: Hash([0x42; 32]),
+                        },
+                        principal: draft.administrator,
+                        status: AuthorityCredentialStatus::Active,
+                        kind: AuthorityCredentialKind::Api,
+                        builtin_role: AuthorityBuiltinRole::Admin,
+                        management_request_high_water: 99,
+                        operation_request_high_water: 99,
+                        admin_request_high_water: draft.request_sequence.get() - 1,
+                        space_roles: vec![],
+                        actor_roles: vec![],
+                        capabilities: vec![],
+                    }
+                    .encode()
+                    .unwrap();
+                }
+                write!(stream, "HTTP/1.1 {status} Result\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
+                stream.write_all(&response).unwrap();
+            }
+        });
+        (address, thread)
+    };
+    for denied in [false, true] {
+        for fail_preparation in [false, true] {
+            let fixture = Fixture::new("admin-orchestration");
+            let (draft_bytes, preparation, submission, _, terminal) = client_evidence(denied);
+            let draft = AuthorityAdminCall::decode(&draft_bytes).unwrap();
+            let (key, _, _, _) = crate::commands::space::local_create::tests::fixture();
+            let mut steps = vec![
+                ("/__agents/credential", None, 200, vec![]),
+                (
+                    "/__agents/admin/prepare",
+                    Some(draft_bytes.clone()),
+                    if fail_preparation { 503 } else { 200 },
+                    preparation.clone(),
+                ),
+            ];
+            if !fail_preparation {
+                steps.push(("/__agents/admin", Some(submission.clone()), 503, vec![]));
+            }
+            let (address, server) = serve(draft.clone(), steps);
+            let result = execute(
+                &fixture.parent,
+                address,
+                &key,
+                draft.authority,
+                draft.authenticated_node,
+                Some(&draft.operation),
+            );
+            server.join().unwrap();
+            assert!(result.is_err());
+            // A fresh request must fail before touching the now-closed listener.
+            assert!(
+                execute(
+                    &fixture.parent,
+                    address,
+                    &key,
+                    draft.authority,
+                    draft.authenticated_node,
+                    Some(&draft.operation)
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("pending")
+            );
+            let mut steps = vec![];
+            if fail_preparation {
+                steps.push((
+                    "/__agents/admin/prepare",
+                    Some(draft_bytes.clone()),
+                    200,
+                    preparation.clone(),
+                ));
+            }
+            steps.push((
+                "/__agents/admin",
+                Some(submission.clone()),
+                if denied { 403 } else { 200 },
+                terminal.clone(),
+            ));
+            let (address, server) = serve(draft.clone(), steps);
+            let result = execute(
+                &fixture.parent,
+                address,
+                &key,
+                draft.authority,
+                draft.authenticated_node,
+                None,
+            );
+            server.join().unwrap();
+            let (mut root, response, status) = result.unwrap();
+            assert_eq!(response, terminal);
+            assert_eq!(
+                status,
+                if denied {
+                    CredentialReservationStatus::Denied
+                } else {
+                    CredentialReservationStatus::Completed
+                }
+            );
+            assert_eq!(
+                execute(
+                    &fixture.parent,
+                    address,
+                    &key,
+                    draft.authority,
+                    draft.authenticated_node,
+                    None
+                )
+                .unwrap(),
+                (root.clone(), response, status)
+            );
+            assert!(
+                execute(
+                    &fixture.parent,
+                    address,
+                    &key,
+                    draft.authority,
+                    NodeId([0x99; 32]),
+                    None
+                )
+                .is_err()
+            );
+            if denied {
+                let (address, server) = serve(
+                    draft.clone(),
+                    vec![
+                        ("/__agents/credential", None, 200, vec![]),
+                        (
+                            "/__agents/admin/prepare",
+                            Some(draft_bytes.clone()),
+                            200,
+                            preparation.clone(),
+                        ),
+                        (
+                            "/__agents/admin",
+                            Some(submission.clone()),
+                            403,
+                            terminal.clone(),
+                        ),
+                    ],
+                );
+                let fresh = execute(
+                    &fixture.parent,
+                    address,
+                    &key,
+                    draft.authority,
+                    draft.authenticated_node,
+                    Some(&draft.operation),
+                );
+                server.join().unwrap();
+                let (fresh_root, _, fresh_status) = fresh.unwrap();
+                assert_ne!(fresh_root, root);
+                assert_eq!(fresh_status, CredentialReservationStatus::Denied);
+                root = fresh_root;
+            }
+            // Missing retained preparation is corruption, not permission to reprepare.
+            fs::rename(
+                root.join("preparation/admin-preparation.response"),
+                root.join("saved-preparation"),
+            )
+            .unwrap();
+            assert!(
+                execute(
+                    &fixture.parent,
+                    address,
+                    &key,
+                    draft.authority,
+                    draft.authenticated_node,
+                    None
+                )
+                .is_err()
+            );
+        }
+    }
+}
+
+#[test]
 fn admin_signing_uses_only_admin_sequence_and_retained_preparation() {
     use crate::commands::space::{
         admin_signing, authority_projection_authenticator::OperatorAuthorityProjectionAuthenticator,
@@ -102,8 +331,10 @@ fn admin_reservation_requires_exact_retained_terminal_and_separates_domains() {
             )
             .is_err()
         );
+        let nonce = Hash([0x61; 32]);
+        let later_nonce = Hash([0x62; 32]);
         assert_eq!(
-            reservation.reserve(&draft).unwrap(),
+            reservation.reserve(nonce, &draft).unwrap(),
             CredentialReservationStatus::Pending
         );
         let (key, _, _, _) = crate::commands::space::local_create::tests::fixture();
@@ -111,22 +342,29 @@ fn admin_reservation_requires_exact_retained_terminal_and_separates_domains() {
         next.request_sequence = core::num::NonZeroU64::new(2).unwrap();
         next.invocation = next.expected_invocation();
         next.signature = key.sign(&next.signing_bytes()).unwrap().try_into().unwrap();
-        assert!(reservation.reserve(&next).is_err());
+        assert!(reservation.reserve(later_nonce, &next).is_err());
         let mut delivery = CleanOperationClientFile::open_admin_submission(&fixture.root).unwrap();
         delivery.publish_request(&submission).unwrap();
-        assert!(reservation.complete(&mut delivery).is_err());
+        assert!(reservation.complete(nonce, &mut delivery).is_err());
         assert!(delivery.publish_response(&observed).is_err());
         assert_eq!(
             reservation.current().unwrap().unwrap().1,
             CredentialReservationStatus::Pending
         );
         delivery.publish_response(&terminal).unwrap();
+        assert!(reservation.complete(nonce, &mut delivery).is_err());
+        let prepared_submission =
+            vos::agent::clean_bootstrap::NativeAuthorityAdminSubmission::decode(&submission)
+                .unwrap();
+        reservation
+            .bind_submission(nonce, &draft, &prepared_submission)
+            .unwrap();
         let status = if denied {
             CredentialReservationStatus::Denied
         } else {
             CredentialReservationStatus::Completed
         };
-        assert_eq!(reservation.complete(&mut delivery).unwrap(), status);
+        assert_eq!(reservation.complete(nonce, &mut delivery).unwrap(), status);
         drop(reservation);
         assert!(
             CleanCredentialReservation::open_or_create(
@@ -142,20 +380,37 @@ fn admin_reservation_requires_exact_retained_terminal_and_separates_domains() {
             draft.credential,
         )
         .unwrap();
+        assert_eq!(reservation.current().unwrap(), Some((nonce, status)));
+        assert_eq!(reservation.complete(nonce, &mut delivery).unwrap(), status);
         assert_eq!(
-            reservation.current().unwrap(),
-            Some((Hash(draft.invocation.0), status))
-        );
-        assert_eq!(reservation.complete(&mut delivery).unwrap(), status);
-        assert_eq!(
-            reservation.reserve(&next).unwrap(),
+            reservation.reserve(later_nonce, &draft).unwrap(),
             CredentialReservationStatus::Pending
         );
-        assert!(reservation.complete(&mut delivery).is_err());
-        assert_eq!(
-            reservation.current().unwrap().unwrap().0,
-            Hash(next.invocation.0)
+        assert!(reservation.complete(nonce, &mut delivery).is_err());
+        assert!(reservation.complete(later_nonce, &mut delivery).is_err());
+        // Same zero-slot draft, but a freshly signed host observation.
+        let mut preparation = prepared_submission.preparation().encode().unwrap();
+        let slot_offset = 4 + RUNTIME_ABI_ID.as_bytes().len() + 32;
+        preparation[slot_offset..slot_offset + 8].copy_from_slice(&21u64.to_le_bytes());
+        let signature_start = preparation.len() - 64;
+        let mut signed = b"vos/agent/native-admin-preparation/v1".to_vec();
+        signed.extend_from_slice(&preparation[4..signature_start - 4]);
+        preparation[signature_start..].copy_from_slice(&key.sign(&signed).unwrap());
+        let preparation =
+            vos::agent::clean_bootstrap::NativeAuthorityAdminPreparation::decode(&preparation)
+                .unwrap();
+        let fresh =
+            crate::commands::space::admin_signing::prepared(&key, &draft, &preparation).unwrap();
+        reservation
+            .bind_submission(later_nonce, &draft, &fresh)
+            .unwrap();
+        assert!(
+            reservation
+                .bind_submission(later_nonce, &draft, &prepared_submission)
+                .is_err()
         );
+        assert!(reservation.complete(later_nonce, &mut delivery).is_err());
+        assert_eq!(reservation.current().unwrap().unwrap().0, later_nonce);
     }
 }
 
