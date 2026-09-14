@@ -242,6 +242,23 @@ impl vos::agent::clean_bootstrap::NativeAuthorityOperationDenialSigner
 }
 
 /// Sign phase-separated native admin evidence with the pinned Authority key.
+impl vos::agent::clean_bootstrap::NativeAuthorityAdminPreparationSigner
+    for OwnedCleanOperatorIdentitySigner
+{
+    type Error = CleanIdentitySignerError;
+    fn public_key(&self) -> [u8; 32] {
+        self.public_key
+    }
+    fn sign_admin_preparation(&mut self, message: &[u8]) -> Result<[u8; 64], Self::Error> {
+        self.keypair
+            .sign(message)
+            .map_err(|_| CleanIdentitySignerError::SigningFailed)?
+            .try_into()
+            .map_err(|_| CleanIdentitySignerError::InvalidSignatureLength)
+    }
+}
+
+/// Sign phase-separated native admin evidence with the pinned Authority key.
 impl vos::agent::clean_bootstrap::NativeAuthorityAdminTerminalSigner
     for OwnedCleanOperatorIdentitySigner
 {

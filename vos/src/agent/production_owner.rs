@@ -763,6 +763,45 @@ impl AgentProductionOwner {
         self.is_running() && self.accepted_head.is_some()
     }
 
+    pub(crate) fn prepare_admin(
+        &mut self,
+        draft: &super::sdk::authority::AuthorityAdminCall,
+    ) -> super::local_lifecycle::AuthorityAdminPreparationResult {
+        if !self.is_ready() {
+            return Err(super::shared_host::SharedAgentHostError::Unavailable);
+        }
+        self.lifecycle
+            .as_mut()
+            .ok_or(super::shared_host::SharedAgentHostError::Unavailable)?
+            .0
+            .prepare_admin(draft)
+    }
+
+    pub(crate) fn submit_admin(
+        &mut self,
+        call: &super::sdk::authority::AuthorityAdminCall,
+        preparation: &super::clean_bootstrap::NativeAuthorityAdminPreparation,
+    ) -> super::local_lifecycle::AuthorityAdminSubmissionResult {
+        if !self.is_running() {
+            return Err(super::shared_host::SharedAgentHostError::Unavailable);
+        }
+        if !self.is_ready()
+            && !self
+                .lifecycle
+                .as_mut()
+                .ok_or(super::shared_host::SharedAgentHostError::Unavailable)?
+                .0
+                .retains_admin(call, preparation)?
+        {
+            return Err(super::shared_host::SharedAgentHostError::ScopeMismatch);
+        }
+        self.lifecycle
+            .as_mut()
+            .ok_or(super::shared_host::SharedAgentHostError::Unavailable)?
+            .0
+            .submit_admin(call, preparation)
+    }
+
     pub(crate) fn prepare_operation(
         &mut self,
         call: &super::sdk::authority_operation::AuthorityOperationCall,

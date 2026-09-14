@@ -18,6 +18,29 @@ impl<J: NativeAuthorityAdminJournalStore, T: NativeAuthorityAdminTerminalStore>
         self.authority
     }
 
+    pub fn retains_submission(
+        &mut self,
+        call: &AuthorityAdminCall,
+        preparation: &NativeAuthorityAdminPreparation,
+    ) -> Result<bool, SharedAgentHostError> {
+        if call.authority != self.authority || !preparation.matches_call(call) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let Some(bytes) = self
+            .journal
+            .load(call.invocation)
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        else {
+            return Ok(false);
+        };
+        let record = admin_dispatch::RetainedAuthorityAdminDispatch::decode(&bytes)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if record.call != *call || record.preparation != *preparation {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Ok(true)
+    }
+
     /// Resume only previously retained signed calls before ordinary routes
     /// are published. Missing/corrupt discovery members are never skipped.
     pub fn recover<P, R, I, S>(
@@ -75,6 +98,44 @@ impl<J: NativeAuthorityAdminJournalStore, T: NativeAuthorityAdminTerminalStore>
         existing.include_admin_with_terminals(&mut self.journal, &mut self.terminals, invocations)
     }
 
+    /// Submit a newly signed call with its exact host preparation. Retries
+    /// must retain that same proof; preparation never substitutes for policy.
+    pub fn submit_and_retire<P, R, I, S>(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        call: &AuthorityAdminCall,
+        preparation: &NativeAuthorityAdminPreparation,
+        signer: &mut S,
+    ) -> Result<Option<AuthorityAdminResult>, SharedAgentHostError>
+    where
+        P: CleanSystemAgentBootstrapStore,
+        R: CleanSystemAgentBootstrapStore,
+        I: CleanManagementIssuerStore,
+        S: NativeAuthorityAdminTerminalSigner,
+    {
+        if self.authority != call.authority
+            || owner.authority_target() != self.authority
+            || !preparation.matches_call(call)
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if let Some(bytes) = self
+            .journal
+            .load(call.invocation)
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            let record = admin_dispatch::RetainedAuthorityAdminDispatch::decode(&bytes)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            if record.call != *call || record.preparation != *preparation {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+        } else {
+            owner.retain_authority_admin(call, preparation, &mut self.journal)?;
+        }
+        self.coordinate_and_retire(owner, call, signer)
+    }
+
+    /// Resume an already retained call only. Fresh calls require preparation.
     /// None is a durably retired denial. Errors are never policy decisions.
     pub fn coordinate_and_retire<P, R, I, S>(
         &mut self,
@@ -111,7 +172,7 @@ impl<J: NativeAuthorityAdminJournalStore, T: NativeAuthorityAdminTerminalStore>
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
             record
         } else {
-            owner.retain_authority_admin(call, &mut self.journal)?
+            return Err(SharedAgentHostError::Unavailable);
         };
         owner.finish_authority_admin(&record, &mut self.terminals, signer)
     }

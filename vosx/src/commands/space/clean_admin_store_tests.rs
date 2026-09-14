@@ -66,9 +66,34 @@ fn evidence(
     );
     **authorization =
         InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(work, *observed_slot));
-    let mut dispatch = b"NAD1".to_vec();
+    let mut draft = call.clone();
+    draft.observed_slot = 0;
+    let intent = draft.invocation_payload_commitment();
+    let mut signed_preparation = b"vos/agent/native-admin-preparation/v1".to_vec();
+    signed_preparation.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    signed_preparation.extend_from_slice(&intent.0);
+    signed_preparation.extend_from_slice(&call.observed_slot.to_le_bytes());
+    signed_preparation.extend_from_slice(&work.incarnation.0);
+    let mut preparation = b"NAP1".to_vec();
+    preparation.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    preparation.extend_from_slice(&intent.0);
+    preparation.extend_from_slice(&call.observed_slot.to_le_bytes());
+    preparation.extend_from_slice(&work.incarnation.0);
+    preparation.extend_from_slice(&64u32.to_le_bytes());
+    preparation.extend(key.sign(&signed_preparation).unwrap());
+    assert!(
+        vos::agent::clean_bootstrap::NativeAuthorityAdminPreparation::decode(&preparation)
+            .unwrap()
+            .matches_call(&call)
+    );
+    let mut dispatch = b"NAD2".to_vec();
     dispatch.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
-    for bytes in [call.encode().unwrap(), envelope.encode().unwrap(), anchor] {
+    for bytes in [
+        call.encode().unwrap(),
+        envelope.encode().unwrap(),
+        anchor,
+        preparation,
+    ] {
         dispatch.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         dispatch.extend(bytes);
     }

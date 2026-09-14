@@ -36,6 +36,7 @@ pub(crate) struct RetainedAuthorityAdminDispatch {
     pub(super) call: AuthorityAdminCall,
     pub(super) envelope: RuntimeWork,
     pub(super) anchor: ManagementJournalAnchor,
+    pub(super) preparation: NativeAuthorityAdminPreparation,
 }
 
 fn message(call: &AuthorityAdminCall) -> Vec<u8> {
@@ -64,65 +65,76 @@ pub(crate) fn matches_successful_admin_reply(
         return false;
     };
     result.verify_with(&RawCredentialVerifier).is_ok()
-        && RetainedAuthorityAdminDispatch {
-            call: result.call,
-            envelope: envelope.clone(),
-            anchor: anchor.clone(),
-        }
-        .validate_wire()
+        && admin_envelope_matches(&result.call, envelope, anchor)
+}
+
+fn admin_envelope_matches(
+    call: &AuthorityAdminCall,
+    envelope: &RuntimeWork,
+    anchor: &ManagementJournalAnchor,
+) -> bool {
+    let RuntimeWork::Invoke {
+        context,
+        state,
+        invocation: work,
+        authorization,
+        observed_slot,
+    } = envelope
+    else {
+        return false;
+    };
+    call.verify_with(&RawCredentialVerifier).is_ok()
+        && envelope.validate_wire()
+        && ManagementJournalAnchor::decode(&anchor.encode()).is_ok_and(|a| a == *anchor)
+        && *context == RuntimeExecutionContext::Direct
+        && state.is_empty()
+        && work.space == call.authority.space
+        && work.agent == call.authority.system_agent
+        && work.runtime_deployment == call.authority.system_runtime_deployment
+        && work.deployment == call.authority.binding.issuer.deployment
+        && work.program == call.authority.binding.issuer.program
+        && !work.recovery_only
+        && call.matches_invocation_context(&InvocationContext {
+            invocation: work.invocation,
+            actor: work.actor,
+            mode: work.mode,
+            origin: work.origin,
+            roles: work.roles,
+            observed_slot: *observed_slot,
+        })
+        && work.message == message(call)
+        && **authorization
+            == InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(
+                work,
+                *observed_slot,
+            ))
 }
 
 impl CanonicalWire for RetainedAuthorityAdminDispatch {
-    const MAGIC: [u8; 4] = *b"NAD1";
+    const MAGIC: [u8; 4] = *b"NAD2";
     const MAX_ENCODED_BYTES: usize = 64
         + crate::agent_sdk::wire::MAX_AUTHORITY_ADMIN_CALL_WIRE_BYTES
         + MAX_RUNTIME_WORK_WIRE_BYTES
-        + 1024;
+        + 1024
+        + NativeAuthorityAdminPreparation::MAX_ENCODED_BYTES;
 
     fn validate_wire(&self) -> bool {
-        let call = &self.call;
-        let RuntimeWork::Invoke {
-            context,
-            state,
-            invocation: work,
-            authorization,
-            observed_slot,
-        } = &self.envelope
-        else {
-            return false;
-        };
-        call.verify_with(&RawCredentialVerifier).is_ok()
-            && self.envelope.validate_wire()
-            && ManagementJournalAnchor::decode(&self.anchor.encode())
-                .is_ok_and(|a| a == self.anchor)
-            && *context == RuntimeExecutionContext::Direct
-            && state.is_empty()
-            && work.space == call.authority.space
-            && work.agent == call.authority.system_agent
-            && work.runtime_deployment == call.authority.system_runtime_deployment
-            && work.deployment == call.authority.binding.issuer.deployment
-            && work.program == call.authority.binding.issuer.program
-            && !work.recovery_only
-            && call.matches_invocation_context(&InvocationContext {
-                invocation: work.invocation,
-                actor: work.actor,
-                mode: work.mode,
-                origin: work.origin,
-                roles: work.roles,
-                observed_slot: *observed_slot,
-            })
-            && work.message == message(call)
-            && **authorization
-                == InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(
-                    work,
-                    *observed_slot,
-                ))
+        admin_envelope_matches(&self.call, &self.envelope, &self.anchor)
+            && self.preparation.matches_call(&self.call)
+            && matches!(&self.envelope, RuntimeWork::Invoke { invocation, .. }
+                if invocation.incarnation == self.preparation.incarnation())
     }
 
     fn encode_body(&self, encoder: &mut Encoder<'_>) {
         encoder.bytes(&self.call.encode().expect("validated admin call"));
         encoder.bytes(&self.envelope.encode().expect("validated admin work"));
         encoder.bytes(&self.anchor.encode());
+        encoder.bytes(
+            &self
+                .preparation
+                .encode()
+                .expect("validated admin preparation"),
+        );
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -138,6 +150,10 @@ impl CanonicalWire for RetainedAuthorityAdminDispatch {
             call,
             envelope,
             anchor,
+            preparation: NativeAuthorityAdminPreparation::decode(
+                &decoder.bytes_bounded(NativeAuthorityAdminPreparation::MAX_ENCODED_BYTES)?,
+            )
+            .map_err(|_| DecodeError::NonCanonical)?,
         };
         value
             .validate_wire()
@@ -157,9 +173,10 @@ where
     pub(crate) fn retain_authority_admin<J: NativeAuthorityAdminJournalStore>(
         &mut self,
         call: &AuthorityAdminCall,
+        preparation: &NativeAuthorityAdminPreparation,
         journal: &mut J,
     ) -> Result<RetainedAuthorityAdminDispatch, SharedAgentHostError> {
-        if call.verify_with(&RawCredentialVerifier).is_err()
+        if !preparation.matches_call(call)
             || call.authority != self.authority_target()
             || call.authenticated_node != self.pins.node
             || self.record.pending_projection.is_some()
@@ -172,7 +189,7 @@ where
         {
             let retained = RetainedAuthorityAdminDispatch::decode(&bytes)
                 .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-            if retained.call != *call {
+            if retained.call != *call || retained.preparation != *preparation {
                 return Err(SharedAgentHostError::ScopeMismatch);
             }
             self._network_host.ensure_management_pending_member(
@@ -194,6 +211,7 @@ where
                 call: call.clone(),
                 envelope,
                 anchor,
+                preparation: preparation.clone(),
             };
             let bytes = retained
                 .encode()
@@ -206,7 +224,8 @@ where
         let mut material = self
             .supervisor_invocation_material(self.pins.agent, call.authority.binding.issuer.actor)?;
         material.root_provenance = false;
-        if material.observed_slot != call.observed_slot
+        if material.observed_slot < call.observed_slot
+            || material.actor.incarnation != preparation.incarnation()
             || material.actor.entry.deployment != call.authority.binding.issuer.deployment
             || material.actor.entry.program != call.authority.binding.issuer.program
             || material.producer != call.authority.binding.issuer.producer
@@ -250,12 +269,13 @@ where
             &work,
             call.observed_slot,
         ));
-        if !crate::agent::supervisor_adapters::physical_material_authorizes_work(
+        if !crate::agent::supervisor_adapters::physical_material_authorizes_reserved_work(
             &material,
             identity,
             RuntimeExecutionContext::Direct,
             &work,
             &authorization,
+            call.observed_slot,
         ) {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
@@ -274,6 +294,7 @@ where
                     call: call.clone(),
                     envelope: envelope.clone(),
                     anchor: anchor.clone(),
+                    preparation: preparation.clone(),
                 };
                 let bytes = retained
                     .encode()

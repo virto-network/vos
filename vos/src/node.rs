@@ -2429,6 +2429,40 @@ impl IngressHandle {
         self.clean_local_lifecycle_queue.prepare_operation(call)
     }
 
+    /// Queue a signed admin draft. This does not authenticate a transport or
+    /// grant permission; the native owner and Authority verify its node binding.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    pub fn prepare_clean_authority_admin(
+        &self,
+        draft: crate::agent::sdk::authority::AuthorityAdminCall,
+    ) -> Result<
+        mpsc::Receiver<crate::agent::local_lifecycle::AuthorityAdminPreparationResult>,
+        crate::agent::local_lifecycle::LocalLifecycleIngressError,
+    > {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(crate::agent::local_lifecycle::LocalLifecycleIngressError::Unavailable);
+        }
+        self.clean_local_lifecycle_queue.prepare_admin(draft)
+    }
+
+    /// Queue exact signed admin work. Dropping the receiver does not cancel
+    /// accepted work; retain the call and preparation for ambiguous retries.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    pub fn submit_clean_authority_admin(
+        &self,
+        call: crate::agent::sdk::authority::AuthorityAdminCall,
+        preparation: crate::agent::clean_bootstrap::NativeAuthorityAdminPreparation,
+    ) -> Result<
+        mpsc::Receiver<crate::agent::local_lifecycle::AuthorityAdminSubmissionResult>,
+        crate::agent::local_lifecycle::LocalLifecycleIngressError,
+    > {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(crate::agent::local_lifecycle::LocalLifecycleIngressError::Unavailable);
+        }
+        self.clean_local_lifecycle_queue
+            .submit_admin(call, preparation)
+    }
+
     /// Queue exact signed authorization inputs. Queue acceptance is not a policy
     /// decision or durable retention; clients must retain the frame for retry.
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
@@ -8337,6 +8371,26 @@ impl VosNode {
             Ok(Some(request)) if !self.shutdown.load(Ordering::Acquire) => {
                 use crate::agent::local_lifecycle::PendingLocalLifecycle;
                 match request {
+                    PendingLocalLifecycle::PrepareAdmin { draft, reply } => {
+                        let result = self
+                            .clean_agent_owner
+                            .as_mut()
+                            .ok_or(crate::agent::shared_host::SharedAgentHostError::Unavailable)
+                            .and_then(|owner| owner.prepare_admin(&draft));
+                        let _ = reply.try_send(result);
+                    }
+                    PendingLocalLifecycle::SubmitAdmin {
+                        call,
+                        preparation,
+                        reply,
+                    } => {
+                        let result = self
+                            .clean_agent_owner
+                            .as_mut()
+                            .ok_or(crate::agent::shared_host::SharedAgentHostError::Unavailable)
+                            .and_then(|owner| owner.submit_admin(&call, &preparation));
+                        let _ = reply.try_send(result);
+                    }
                     PendingLocalLifecycle::PrepareOperation { call, reply } => {
                         let result = self
                             .clean_agent_owner

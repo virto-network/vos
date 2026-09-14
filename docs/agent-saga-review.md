@@ -249,8 +249,9 @@ Keep these as work within C2, not new review batches:
    result/retirement publication failures and restart. Hardened admin stores
    and the lease-owning controller are implemented and tested. Daemon startup
    now discovers/replays admin evidence before routes and retains those leases
-   in the lifecycle owner. Host-clock preparation and host/client delivery
-   remain unwired. Keep
+   in the lifecycle owner. Signed host-clock preparation and submission now
+   have native lifecycle APIs and bounded node-owned queue delivery;
+   authenticated ingress/client framing remains unwired. Keep
    its credential sequence and generation CAS distinct from operation
    authorization; do not relax anonymous HTTP invocation or
    put this mutation in the read-only projection journal.
@@ -7525,6 +7526,60 @@ performance comparison. The production latency gate remains open.
 Next: host-clock preparation plus authenticated admin delivery/client wiring,
 then the deployment-scoped protected Local mutation/retirement/restart campaign.
 No runtime artifact, SDK ABI, ingress permission check or timeout changed.
+
+### Signed admin clock preparation (C2)
+
+Native preparation now accepts a credential-signed zero-slot draft, validates
+its Authority and local node binding, and signs NAP1 over the normalized intent,
+host-observed slot and physical Authority incarnation. The client verifies this
+response against its draft, then signs the returned call. Preparation is not
+permission: current actor credential, admin sequence and generation CAS checks
+remain authoritative. Delayed submission may use that authenticated earlier
+slot, never a future slot or changed incarnation. There is no new timeout or
+expiry policy.
+
+New native admin dispatch records are NAD2 and require the exact preparation.
+NAD1 is deliberately rejected, not migrated or silently repaired. Populated
+NAD1 histories in earlier checkpoints were disposable test fixtures; the live
+startup smoke had empty admin history. No runtime artifact or SDK ABI changed.
+The lifecycle owner exposes prepare/submit; resume-only administration cannot
+create unprepared work. Recovery uses retained bytes, not a fresh host clock.
+No HTTP/SSH admin endpoint or managed-client workflow is enabled by this change.
+
+Storage regressions pass 3/3 (`native-admin-preparation-stores.log`); the CLI
+suite passes 243 with 9 ignored (66.37s; `native-admin-preparation-cli.log`).
+Final native regressions pass 3/3 (63.13s;
+`native-admin-preparation-native-final.log`), including delayed capture, proof
+tampering, changed intent, NAD1 rejection, publication failures, terminal
+retirement and restart. Lifecycle fresh submission succeeds and exact retry
+adds no commits; resume-only administration rejects unretained work. Normal
+vosx build passes (52.10s; `native-admin-preparation-vosx-build.log`), as do
+formatting and whitespace checks. Logs remain on disk under shared
+`target/task-tmp`, not RAMFS.
+
+Next remains authenticated admin ingress/client delivery, followed by the
+protected Local mutation/retirement/restart campaign. Production latency and
+the other original release gates remain open; this checkpoint is not a claim
+that the branch is ready for master or production deployment.
+
+The same C2 change now connects preparation/submission through the existing
+four-entry lifecycle queue, production owner and node drive loop. Invalid
+credential signatures and mismatched preparation are rejected before queueing.
+Fresh preparation requires owner readiness; a running but recovering owner
+may submit only an exact matching retained NAD2 record, reloaded from its
+journal. Disconnecting the client does not cancel accepted work. Queue closure
+rejects waiting preparation and submission requests as unavailable. These are
+internal typed entry points, not transport authentication or a public endpoint;
+generic HTTP invocation and operation transport-node restrictions are unchanged.
+
+Queue-inclusive native regressions pass 3/3 (62.78s;
+`native-admin-queue-native.log`), exercising fresh mutation through the queued
+payload and type-erased lifecycle owner, retained classification, exact retry,
+capacity, invalid input, disconnect and shutdown. The existing operation queue
+regression passes 1/1 (0.03s; `native-admin-queue-operation-regression.log`).
+Normal vosx build, formatting and whitespace checks pass
+(`native-admin-queue-vosx-build.log`). No live transport campaign was run for
+these internal admin entry points.
 
 ### Durable client acknowledgement before completion
 

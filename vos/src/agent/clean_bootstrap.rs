@@ -9,6 +9,14 @@
 pub(crate) mod admin_dispatch;
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+#[path = "clean_admin_preparation.rs"]
+mod admin_preparation;
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+pub use admin_preparation::{
+    NativeAuthorityAdminPreparation, NativeAuthorityAdminPreparationSigner,
+};
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 #[path = "clean_admin_controller.rs"]
 mod admin_controller;
 
@@ -9902,6 +9910,22 @@ mod tests {
                 }
             }
             struct TerminalSigner(usize);
+            impl NativeAuthorityAdminPreparationSigner for TerminalSigner {
+                type Error = std::io::Error;
+                fn public_key(&self) -> [u8; 32] {
+                    SigningKey::from_bytes(&[RECEIPT_SEED; 32])
+                        .verifying_key()
+                        .to_bytes()
+                }
+                fn sign_admin_preparation(
+                    &mut self,
+                    bytes: &[u8],
+                ) -> Result<[u8; 64], Self::Error> {
+                    Ok(SigningKey::from_bytes(&[RECEIPT_SEED; 32])
+                        .sign(bytes)
+                        .to_bytes())
+                }
+            }
             impl NativeAuthorityAdminTerminalSigner for TerminalSigner {
                 type Error = std::io::Error;
                 fn public_key(&self) -> [u8; 32] {
@@ -9954,7 +9978,7 @@ mod tests {
                 request_sequence: NonZeroU64::new(1).unwrap(),
                 credential_public_key: public,
                 authenticated_node: owner.pins.node,
-                observed_slot: slot,
+                observed_slot: 0,
                 expected_generation: NonZeroU64::new(1).unwrap(),
                 operation: AuthorityAdminOperation::SetSpaceRole {
                     principal: owner.pins.descriptor.identity.owner,
@@ -9970,8 +9994,48 @@ mod tests {
             let mut terminals =
                 TerminalStore(OperationTestJournal(harness._directory.0.clone()), 0);
             let mut terminal_signer = TerminalSigner(0);
+            let draft = call.clone();
+            let preparation = owner
+                .prepare_authority_admin(&draft, &mut terminal_signer)
+                .unwrap();
+            call = preparation.call_to_sign(&draft).unwrap();
+            assert_eq!(call.signature, [0; 64]);
+            call.signature = key.sign(&call.signing_bytes()).to_bytes();
+            assert!(preparation.matches_call(&call));
+            assert_eq!(call.observed_slot, slot);
+            let mut changed_intent = call.clone();
+            changed_intent.expected_generation = NonZeroU64::new(99).unwrap();
+            changed_intent.invocation = changed_intent.expected_invocation();
+            changed_intent.signature = key.sign(&changed_intent.signing_bytes()).to_bytes();
+            assert!(!preparation.matches_call(&changed_intent));
+            let encoded_preparation = preparation.encode().unwrap();
+            for end in [0, 3, encoded_preparation.len() - 1] {
+                assert!(
+                    NativeAuthorityAdminPreparation::decode(&encoded_preparation[..end]).is_err()
+                );
+            }
+            let mut bad_proof = encoded_preparation.clone();
+            *bad_proof.last_mut().unwrap() ^= 1;
+            let bad_proof = NativeAuthorityAdminPreparation::decode(&bad_proof).unwrap();
+            assert!(!bad_proof.matches_call(&call));
+            assert!(
+                owner
+                    .retain_authority_admin(&call, &bad_proof, &mut journal)
+                    .is_err()
+            );
+            assert!(!owner.management_admission_held().unwrap());
+            harness
+                .fixture
+                .logical_slot
+                .as_ref()
+                .unwrap()
+                .store(slot + 1, Ordering::Release);
             let before = owner.ordered_index_for_test().unwrap();
-            assert!(owner.retain_authority_admin(&call, &mut journal).is_err());
+            assert!(
+                owner
+                    .retain_authority_admin(&call, &preparation, &mut journal)
+                    .is_err()
+            );
             assert!(owner.management_admission_held().unwrap());
             assert_eq!(owner.ordered_index_for_test().unwrap(), before);
             assert!(journal.load(call.invocation).unwrap().is_none());
@@ -9981,13 +10045,22 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .store(slot + 1, Ordering::Release);
-            assert!(owner.retain_authority_admin(&call, &mut journal).is_err());
+            assert!(
+                owner
+                    .retain_authority_admin(&call, &preparation, &mut journal)
+                    .is_err()
+            );
             assert_eq!(owner.ordered_index_for_test().unwrap(), before);
             let bytes = journal.load(call.invocation).unwrap().unwrap();
             let retained = RetainedAuthorityAdminDispatch::decode(&bytes).unwrap();
             assert_eq!(retained.encode().unwrap(), bytes);
+            let mut legacy = bytes.clone();
+            legacy[..4].copy_from_slice(b"NAD1");
+            assert!(RetainedAuthorityAdminDispatch::decode(&legacy).is_err());
             assert_eq!(
-                owner.retain_authority_admin(&call, &mut journal).unwrap(),
+                owner
+                    .retain_authority_admin(&call, &preparation, &mut journal)
+                    .unwrap(),
                 retained
             );
             for end in [0, 3, bytes.len() - 1] {
@@ -10080,7 +10153,9 @@ mod tests {
                     before + [0, 1, 1, 2, 2][restart as usize]
                 );
                 if restart < 2 {
-                    let recovered = owner.retain_authority_admin(&call, &mut journal).unwrap();
+                    let recovered = owner
+                        .retain_authority_admin(&call, &preparation, &mut journal)
+                        .unwrap();
                     assert_eq!(recovered, retained);
                     let result = owner.execute_authority_admin(&recovered).unwrap();
                     assert_eq!(result.is_none(), denied);
@@ -10118,7 +10193,7 @@ mod tests {
                 assert_eq!(journal.load(call.invocation).unwrap(), Some(bytes.clone()));
             }
             let mut successor = call.clone();
-            successor.observed_slot = slot + 14;
+            successor.observed_slot = 0;
             successor.expected_generation = NonZeroU64::new(if denied { 1 } else { 2 }).unwrap();
             successor.request_sequence = successor.expected_generation;
             successor.operation = AuthorityAdminOperation::SetSpaceRole {
@@ -10128,8 +10203,16 @@ mod tests {
             };
             successor.invocation = successor.expected_invocation();
             successor.signature = key.sign(&successor.signing_bytes()).to_bytes();
+            let successor_draft = successor.clone();
+            let successor_preparation = owner
+                .prepare_authority_admin(&successor_draft, &mut terminal_signer)
+                .unwrap();
+            successor = successor_preparation
+                .call_to_sign(&successor_draft)
+                .unwrap();
+            successor.signature = key.sign(&successor.signing_bytes()).to_bytes();
             owner
-                .retain_authority_admin(&successor, &mut journal)
+                .retain_authority_admin(&successor, &successor_preparation, &mut journal)
                 .unwrap();
             let mut controller = NativeAuthorityAdminController::new(target, journal, terminals);
             let mut ids = vec![call.invocation, successor.invocation];
@@ -10232,7 +10315,139 @@ mod tests {
             .with_admins(controller, terminal_signer)
             .unwrap();
             assert_eq!(lifecycle.administer(&successor).unwrap(), successor_result);
+            assert_eq!(
+                lifecycle
+                    .submit_admin(&successor, &successor_preparation)
+                    .unwrap(),
+                successor_result
+            );
+            assert!(lifecycle.submit_admin(&successor, &preparation).is_err());
             assert_eq!(lifecycle.ordered_index_for_test().unwrap(), committed);
+            let mut next_draft = successor.clone();
+            next_draft.observed_slot = 0;
+            next_draft.expected_generation =
+                NonZeroU64::new(successor.expected_generation.get() + 1).unwrap();
+            next_draft.request_sequence = next_draft.expected_generation;
+            next_draft.operation = AuthorityAdminOperation::SetSpaceRole {
+                principal: next_draft.administrator,
+                role: crate::agent_sdk::RoleId([0x55; 32]),
+                granted: true,
+            };
+            next_draft.invocation = next_draft.expected_invocation();
+            next_draft.signature = key.sign(&next_draft.signing_bytes()).to_bytes();
+            use crate::agent::local_lifecycle::{
+                LOCAL_LIFECYCLE_QUEUE_CAPACITY, LocalLifecycleIngressError, LocalLifecycleQueue,
+                NativeLocalLifecycle, PendingLocalLifecycle,
+            };
+            let next_preparation =
+                NativeLocalLifecycle::prepare_admin(&mut lifecycle, &next_draft).unwrap();
+            let mut next_call = next_preparation.call_to_sign(&next_draft).unwrap();
+            next_call.signature = key.sign(&next_call.signing_bytes()).to_bytes();
+            assert!(lifecycle.administer(&next_call).is_err());
+            assert_eq!(lifecycle.ordered_index_for_test().unwrap(), committed);
+            assert!(
+                !NativeLocalLifecycle::retains_admin(&mut lifecycle, &next_call, &next_preparation)
+                    .unwrap()
+            );
+            let queue = LocalLifecycleQueue::default();
+            assert!(matches!(
+                queue.prepare_admin(next_draft.clone()),
+                Err(LocalLifecycleIngressError::Unavailable)
+            ));
+            queue.open().unwrap();
+            let mut invalid_draft = next_draft.clone();
+            invalid_draft.signature[0] ^= 1;
+            assert!(matches!(
+                queue.prepare_admin(invalid_draft),
+                Err(LocalLifecycleIngressError::Invalid)
+            ));
+            assert!(matches!(
+                queue.submit_admin(next_call.clone(), preparation.clone()),
+                Err(LocalLifecycleIngressError::Invalid)
+            ));
+            assert!(queue.pop().unwrap().is_none());
+            let prepared_reply = queue.prepare_admin(next_draft.clone()).unwrap();
+            let Some(PendingLocalLifecycle::PrepareAdmin { draft, reply }) = queue.pop().unwrap()
+            else {
+                panic!("missing queued admin preparation");
+            };
+            assert_eq!(draft, next_draft);
+            reply
+                .try_send(NativeLocalLifecycle::prepare_admin(&mut lifecycle, &draft))
+                .unwrap();
+            assert_eq!(prepared_reply.recv().unwrap().unwrap(), next_preparation);
+            // A disconnected client must not cancel accepted mutation work.
+            drop(
+                queue
+                    .submit_admin(next_call.clone(), next_preparation.clone())
+                    .unwrap(),
+            );
+            let Some(PendingLocalLifecycle::SubmitAdmin {
+                call: queued_call,
+                preparation: queued_preparation,
+                reply,
+            }) = queue.pop().unwrap()
+            else {
+                panic!("accepted admin submission was cancelled");
+            };
+            assert_eq!(queued_call, next_call);
+            assert_eq!(queued_preparation, next_preparation);
+            let next_result = NativeLocalLifecycle::submit_admin(
+                &mut lifecycle,
+                &queued_call,
+                &queued_preparation,
+            )
+            .unwrap();
+            assert!(reply.try_send(Ok(next_result.clone())).is_err());
+            assert!(next_result.is_some());
+            assert!(
+                NativeLocalLifecycle::retains_admin(&mut lifecycle, &next_call, &next_preparation)
+                    .unwrap()
+            );
+            assert_eq!(lifecycle.ordered_index_for_test().unwrap(), committed + 2);
+            assert_eq!(
+                lifecycle
+                    .submit_admin(&next_call, &next_preparation)
+                    .unwrap(),
+                next_result
+            );
+            assert_eq!(lifecycle.ordered_index_for_test().unwrap(), committed + 2);
+            let pending_preparation = queue.prepare_admin(next_draft.clone()).unwrap();
+            let pending: Vec<_> = (1..LOCAL_LIFECYCLE_QUEUE_CAPACITY)
+                .map(|_| {
+                    queue
+                        .submit_admin(next_call.clone(), next_preparation.clone())
+                        .unwrap()
+                })
+                .collect();
+            assert!(matches!(
+                queue.prepare_admin(next_draft.clone()),
+                Err(LocalLifecycleIngressError::Busy)
+            ));
+            assert!(matches!(
+                queue.submit_admin(next_call.clone(), next_preparation.clone()),
+                Err(LocalLifecycleIngressError::Busy)
+            ));
+            queue.close();
+            assert!(matches!(
+                pending_preparation.recv().unwrap(),
+                Err(SharedAgentHostError::Unavailable)
+            ));
+            for receiver in pending {
+                assert!(matches!(
+                    receiver.recv().unwrap(),
+                    Err(SharedAgentHostError::Unavailable)
+                ));
+            }
+            assert!(queue.pop().unwrap().is_none());
+            assert!(matches!(
+                queue.prepare_admin(next_draft),
+                Err(LocalLifecycleIngressError::Unavailable)
+            ));
+            assert!(matches!(
+                queue.submit_admin(next_call, next_preparation),
+                Err(LocalLifecycleIngressError::Unavailable)
+            ));
             drop(lifecycle);
             harness.stop();
         }

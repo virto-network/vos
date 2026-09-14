@@ -23,6 +23,10 @@ pub type AuthorityOperationResult =
     Result<super::clean_bootstrap::NativeAuthorityOperationDecision, SharedAgentHostError>;
 pub type AuthorityOperationPreparationResult =
     Result<AuthorityOperationSubmission, SharedAgentHostError>;
+pub type AuthorityAdminPreparationResult =
+    Result<super::clean_bootstrap::NativeAuthorityAdminPreparation, SharedAgentHostError>;
+pub type AuthorityAdminSubmissionResult =
+    Result<Option<super::sdk::authority::AuthorityAdminResult>, SharedAgentHostError>;
 
 /// Canonical signed Create submission: LCQ1 followed by length-prefixed AMRQ,
 /// ACC3 and an exact admitted VOS3 runtime package. This is untrusted request
@@ -296,6 +300,15 @@ pub type LocalInstallResult =
     Result<ManagementApplicationAck, super::production_owner::AgentProductionOwnerError>;
 
 pub(crate) enum PendingLocalLifecycle {
+    PrepareAdmin {
+        draft: super::sdk::authority::AuthorityAdminCall,
+        reply: mpsc::SyncSender<AuthorityAdminPreparationResult>,
+    },
+    SubmitAdmin {
+        call: super::sdk::authority::AuthorityAdminCall,
+        preparation: super::clean_bootstrap::NativeAuthorityAdminPreparation,
+        reply: mpsc::SyncSender<AuthorityAdminSubmissionResult>,
+    },
     PrepareOperation {
         call: super::sdk::authority_operation::AuthorityOperationCall,
         reply: mpsc::SyncSender<AuthorityOperationPreparationResult>,
@@ -315,6 +328,12 @@ impl PendingLocalLifecycle {
     pub(crate) fn reject(self) {
         let error = super::production_owner::AgentProductionOwnerError::InvalidConfiguration;
         match self {
+            Self::PrepareAdmin { reply, .. } => {
+                let _ = reply.try_send(Err(SharedAgentHostError::Unavailable));
+            }
+            Self::SubmitAdmin { reply, .. } => {
+                let _ = reply.try_send(Err(SharedAgentHostError::Unavailable));
+            }
             Self::PrepareOperation { reply, .. } => {
                 let _ = reply.try_send(Err(SharedAgentHostError::Unavailable));
             }
@@ -342,6 +361,56 @@ pub(crate) struct LocalLifecycleQueue {
 }
 
 impl LocalLifecycleQueue {
+    pub(crate) fn prepare_admin(
+        &self,
+        draft: super::sdk::authority::AuthorityAdminCall,
+    ) -> Result<mpsc::Receiver<AuthorityAdminPreparationResult>, LocalLifecycleIngressError> {
+        if draft.observed_slot != 0
+            || draft
+                .verify_with(&super::clean_bootstrap::RawCredentialVerifier)
+                .is_err()
+        {
+            return Err(LocalLifecycleIngressError::Invalid);
+        }
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.enqueue_admin(PendingLocalLifecycle::PrepareAdmin { draft, reply })?;
+        Ok(receiver)
+    }
+
+    pub(crate) fn submit_admin(
+        &self,
+        call: super::sdk::authority::AuthorityAdminCall,
+        preparation: super::clean_bootstrap::NativeAuthorityAdminPreparation,
+    ) -> Result<mpsc::Receiver<AuthorityAdminSubmissionResult>, LocalLifecycleIngressError> {
+        if !preparation.matches_call(&call) {
+            return Err(LocalLifecycleIngressError::Invalid);
+        }
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.enqueue_admin(PendingLocalLifecycle::SubmitAdmin {
+            call,
+            preparation,
+            reply,
+        })?;
+        Ok(receiver)
+    }
+
+    fn enqueue_admin(
+        &self,
+        request: PendingLocalLifecycle,
+    ) -> Result<(), LocalLifecycleIngressError> {
+        let channel = self
+            .channel
+            .lock()
+            .map_err(|_| LocalLifecycleIngressError::Unavailable)?;
+        let (sender, _) = channel
+            .as_ref()
+            .ok_or(LocalLifecycleIngressError::Unavailable)?;
+        sender.try_send(request).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => LocalLifecycleIngressError::Busy,
+            mpsc::TrySendError::Disconnected(_) => LocalLifecycleIngressError::Unavailable,
+        })
+    }
+
     pub(crate) fn prepare_operation(
         &self,
         call: super::sdk::authority_operation::AuthorityOperationCall,
@@ -1049,6 +1118,26 @@ fn load_create_runtime<B: super::clean_authority_issuer::CleanManagementRuntimeS
 /// Type-erased, node-owned lifecycle access. It is deliberately not an ingress
 /// trait: only the production owner may coordinate creation and publication.
 pub(crate) trait NativeLocalLifecycle: Send {
+    fn prepare_admin(
+        &mut self,
+        _draft: &super::sdk::authority::AuthorityAdminCall,
+    ) -> AuthorityAdminPreparationResult {
+        Err(SharedAgentHostError::Unavailable)
+    }
+    fn submit_admin(
+        &mut self,
+        _call: &super::sdk::authority::AuthorityAdminCall,
+        _preparation: &super::clean_bootstrap::NativeAuthorityAdminPreparation,
+    ) -> AuthorityAdminSubmissionResult {
+        Err(SharedAgentHostError::Unavailable)
+    }
+    fn retains_admin(
+        &mut self,
+        _call: &super::sdk::authority::AuthorityAdminCall,
+        _preparation: &super::clean_bootstrap::NativeAuthorityAdminPreparation,
+    ) -> Result<bool, SharedAgentHostError> {
+        Err(SharedAgentHostError::Unavailable)
+    }
     fn retains_operation(
         &mut self,
         _call: &super::sdk::authority_operation::AuthorityOperationCall,
@@ -1117,6 +1206,29 @@ where
     F::Issuer: Send,
     S: CleanManagementReceiptSigner + Send,
 {
+    fn prepare_admin(
+        &mut self,
+        draft: &super::sdk::authority::AuthorityAdminCall,
+    ) -> AuthorityAdminPreparationResult {
+        LocalLifecycleController::prepare_admin(self, draft)
+    }
+    fn submit_admin(
+        &mut self,
+        call: &super::sdk::authority::AuthorityAdminCall,
+        preparation: &super::clean_bootstrap::NativeAuthorityAdminPreparation,
+    ) -> AuthorityAdminSubmissionResult {
+        LocalLifecycleController::submit_admin(self, call, preparation)
+    }
+    fn retains_admin(
+        &mut self,
+        call: &super::sdk::authority::AuthorityAdminCall,
+        preparation: &super::clean_bootstrap::NativeAuthorityAdminPreparation,
+    ) -> Result<bool, SharedAgentHostError> {
+        self.admins
+            .as_mut()
+            .ok_or(SharedAgentHostError::Unavailable)?
+            .retains(call, preparation)
+    }
     fn authorize_operation(
         &mut self,
         call: &super::sdk::authority_operation::AuthorityOperationCall,
@@ -1225,6 +1337,22 @@ where
     R: CleanSystemAgentBootstrapStore,
     I: CleanManagementIssuerStore,
 {
+    fn retains(
+        &mut self,
+        call: &super::sdk::authority::AuthorityAdminCall,
+        preparation: &super::clean_bootstrap::NativeAuthorityAdminPreparation,
+    ) -> Result<bool, SharedAgentHostError>;
+    fn prepare(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        draft: &super::sdk::authority::AuthorityAdminCall,
+    ) -> Result<super::clean_bootstrap::NativeAuthorityAdminPreparation, SharedAgentHostError>;
+    fn submit(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        call: &super::sdk::authority::AuthorityAdminCall,
+        preparation: &super::clean_bootstrap::NativeAuthorityAdminPreparation,
+    ) -> Result<Option<super::sdk::authority::AuthorityAdminResult>, SharedAgentHostError>;
     fn coordinate(
         &mut self,
         owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
@@ -1243,8 +1371,33 @@ where
     I: CleanManagementIssuerStore,
     J: super::clean_bootstrap::NativeAuthorityAdminJournalStore + Send,
     T: super::clean_bootstrap::NativeAuthorityAdminTerminalStore + Send,
-    S: super::clean_bootstrap::NativeAuthorityAdminTerminalSigner + Send,
+    S: super::clean_bootstrap::NativeAuthorityAdminTerminalSigner
+        + super::clean_bootstrap::NativeAuthorityAdminPreparationSigner
+        + Send,
 {
+    fn retains(
+        &mut self,
+        call: &super::sdk::authority::AuthorityAdminCall,
+        preparation: &super::clean_bootstrap::NativeAuthorityAdminPreparation,
+    ) -> Result<bool, SharedAgentHostError> {
+        self.0.retains_submission(call, preparation)
+    }
+    fn prepare(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        draft: &super::sdk::authority::AuthorityAdminCall,
+    ) -> Result<super::clean_bootstrap::NativeAuthorityAdminPreparation, SharedAgentHostError> {
+        owner.prepare_authority_admin(draft, &mut self.1)
+    }
+    fn submit(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        call: &super::sdk::authority::AuthorityAdminCall,
+        preparation: &super::clean_bootstrap::NativeAuthorityAdminPreparation,
+    ) -> Result<Option<super::sdk::authority::AuthorityAdminResult>, SharedAgentHostError> {
+        self.0
+            .submit_and_retire(owner, call, preparation, &mut self.1)
+    }
     fn coordinate(
         &mut self,
         owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
@@ -1340,7 +1493,10 @@ where
     where
         J: super::clean_bootstrap::NativeAuthorityAdminJournalStore + Send + 'static,
         T: super::clean_bootstrap::NativeAuthorityAdminTerminalStore + Send + 'static,
-        A: super::clean_bootstrap::NativeAuthorityAdminTerminalSigner + Send + 'static,
+        A: super::clean_bootstrap::NativeAuthorityAdminTerminalSigner
+            + super::clean_bootstrap::NativeAuthorityAdminPreparationSigner
+            + Send
+            + 'static,
     {
         let target = self
             .system
@@ -1349,7 +1505,10 @@ where
             .authority_target();
         if self.admins.is_some()
             || admins.authority() != target
-            || signer.public_key() != target.binding.public_key
+            || super::clean_bootstrap::NativeAuthorityAdminTerminalSigner::public_key(&signer)
+                != target.binding.public_key
+            || super::clean_bootstrap::NativeAuthorityAdminPreparationSigner::public_key(&signer)
+                != target.binding.public_key
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
@@ -1357,6 +1516,38 @@ where
         Ok(self)
     }
 
+    pub fn prepare_admin(
+        &mut self,
+        draft: &super::sdk::authority::AuthorityAdminCall,
+    ) -> Result<super::clean_bootstrap::NativeAuthorityAdminPreparation, SharedAgentHostError> {
+        let admins = self
+            .admins
+            .as_mut()
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        let mut system = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        admins.prepare(&mut system, draft)
+    }
+
+    pub fn submit_admin(
+        &mut self,
+        call: &super::sdk::authority::AuthorityAdminCall,
+        preparation: &super::clean_bootstrap::NativeAuthorityAdminPreparation,
+    ) -> Result<Option<super::sdk::authority::AuthorityAdminResult>, SharedAgentHostError> {
+        let admins = self
+            .admins
+            .as_mut()
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        let mut system = self
+            .system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        admins.submit(&mut system, call, preparation)
+    }
+
+    /// Resume retained work only; new calls must use prepare_admin/submit_admin.
     pub fn administer(
         &mut self,
         call: &super::sdk::authority::AuthorityAdminCall,
