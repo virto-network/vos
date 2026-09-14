@@ -204,6 +204,7 @@ enum StoreRole {
     AdminPreparationResponse = 35,
     AdminClientRequest = 36,
     AdminClientResponse = 37,
+    AdminCredentialReservation = 38,
 }
 
 impl StoreRole {
@@ -246,6 +247,7 @@ impl StoreRole {
             Self::AdminPreparationResponse => "admin-preparation.response",
             Self::AdminClientRequest => "admin-client.request",
             Self::AdminClientResponse => "admin-client.response",
+            Self::AdminCredentialReservation => "admin-credential.reservation",
         }
     }
 
@@ -288,6 +290,7 @@ impl StoreRole {
             Self::AdminPreparationResponse => "admin-preparation.response.next",
             Self::AdminClientRequest => "admin-client.request.next",
             Self::AdminClientResponse => "admin-client.response.next",
+            Self::AdminCredentialReservation => "admin-credential.reservation.next",
         }
     }
 
@@ -387,7 +390,7 @@ impl StoreRole {
             Self::LifecycleRuntime => MAX_PACKAGE_ENCODED_BYTES,
             Self::LifecycleActor => MAX_PACKAGE_ENCODED_BYTES,
             Self::LocalCreateDenial => vos::agent::local_lifecycle::LocalCreateDenial::MAX_BYTES,
-            Self::CredentialReservation => 165,
+            Self::CredentialReservation | Self::AdminCredentialReservation => 165,
             Self::LocalCreateAcknowledgement | Self::LocalInstallAcknowledgement => {
                 vos::agent::sdk::wire::MAX_MANAGEMENT_APPLICATION_ACK_WIRE_BYTES
             }
@@ -421,6 +424,7 @@ impl StoreRole {
             35 => Some(Self::AdminPreparationResponse),
             36 => Some(Self::AdminClientRequest),
             37 => Some(Self::AdminClientResponse),
+            38 => Some(Self::AdminCredentialReservation),
             1 => Some(Self::Pins),
             2 => Some(Self::Bootstrap),
             3 => Some(Self::ManagementIssuer),
@@ -812,6 +816,15 @@ impl CleanCredentialReservation {
         space: vos::agent::sdk::SpaceId,
         credential: vos::agent::sdk::CredentialId,
     ) -> Result<Self, CleanFileStoreError> {
+        Self::open_role(parent, space, credential, StoreRole::CredentialReservation)
+    }
+
+    fn open_role(
+        parent: &Path,
+        space: vos::agent::sdk::SpaceId,
+        credential: vos::agent::sdk::CredentialId,
+        role: StoreRole,
+    ) -> Result<Self, CleanFileStoreError> {
         if space == vos::agent::sdk::SpaceId::ZERO
             || credential == vos::agent::sdk::CredentialId::ZERO
         {
@@ -822,9 +835,18 @@ impl CleanCredentialReservation {
             hex::encode(space.0),
             hex::encode(credential.0)
         ));
-        let root = Arc::new(StoreRoot::open_with_entries(&path, &RESERVATION_ENTRIES)?);
+        let entries: &[&str] = if role == StoreRole::AdminCredentialReservation {
+            &[
+                LOCK_FILE,
+                "admin-credential.reservation",
+                "admin-credential.reservation.next",
+            ]
+        } else {
+            &RESERVATION_ENTRIES
+        };
+        let root = Arc::new(StoreRoot::open_with_entries(&path, entries)?);
         Ok(Self {
-            store: ExactFileStore::new(root, StoreRole::CredentialReservation),
+            store: ExactFileStore::new(root, role),
             space,
             credential,
         })
@@ -835,7 +857,7 @@ impl CleanCredentialReservation {
         nonce: vos::agent::sdk::Hash,
         completed: Option<(vos::agent::sdk::Hash, vos::agent::sdk::Hash)>,
     ) -> Vec<u8> {
-        let mut bytes = b"CRS1".to_vec();
+        let mut bytes = self.magic().to_vec();
         bytes.extend_from_slice(self.space.as_bytes());
         bytes.extend_from_slice(self.credential.as_bytes());
         bytes.extend_from_slice(nonce.as_bytes());
@@ -847,13 +869,21 @@ impl CleanCredentialReservation {
         bytes
     }
 
+    fn magic(&self) -> &'static [u8; 4] {
+        if self.store.role == StoreRole::AdminCredentialReservation {
+            b"ACR1"
+        } else {
+            b"CRS1"
+        }
+    }
+
     fn load(&mut self) -> Result<Option<Vec<u8>>, CleanFileStoreError> {
         let bytes = self
             .store
             .load(StoreRole::CredentialReservation.maximum_bytes())?;
         if let Some(bytes) = &bytes {
             if bytes.len() != 165
-                || &bytes[..4] != b"CRS1"
+                || &bytes[..4] != self.magic()
                 || bytes[4..36] != self.space.0
                 || bytes[36..68] != self.credential.0
                 || bytes[68..100] == [0; 32]
@@ -1088,11 +1118,16 @@ pub(crate) struct CleanLocalCreateAcknowledgementFile {
     request: Vec<u8>,
 }
 
+#[cfg(target_os = "linux")]
+#[path = "clean_admin_reservation.rs"]
+mod admin_reservation;
 /// Exact invocation and its first request-bound delivery under one lease.
 /// A retained response may be an error or yield, not terminal actor success.
 #[cfg(target_os = "linux")]
 #[path = "clean_operation_client.rs"]
 mod operation_client;
+#[cfg(target_os = "linux")]
+pub(crate) use admin_reservation::CleanAdminCredentialReservation;
 #[cfg(target_os = "linux")]
 pub(crate) use operation_client::CleanOperationClientFile;
 #[cfg(target_os = "linux")]

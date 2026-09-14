@@ -4,6 +4,161 @@ use vos::Encode as _;
 use vos::agent::sdk::{authority::*, wire::CanonicalWire, *};
 
 // Synthetic signed storage evidence; native finality is covered in vos tests.
+#[test]
+fn admin_signing_uses_only_admin_sequence_and_retained_preparation() {
+    use crate::commands::space::{
+        admin_signing, authority_projection_authenticator::OperatorAuthorityProjectionAuthenticator,
+    };
+    use vos::agent::clean_bootstrap::NativeAuthorityAdminPreparation;
+    use vos::agent::production_owner::AuthorityProjectionQueryAuthenticator as _;
+    let (draft_bytes, preparation, expected, _, _) = client_evidence(false);
+    let original = AuthorityAdminCall::decode(&draft_bytes).unwrap();
+    let (key, _, _, _) = crate::commands::space::local_create::tests::fixture();
+    let mut signer = OperatorAuthorityProjectionAuthenticator::new(key.clone()).unwrap();
+    let one = core::num::NonZeroU64::new(1).unwrap();
+    let mut credential = AuthorityCredentialProjection {
+        query: signer
+            .authenticate(original.authority, AuthorityProjectionSelector::Credential)
+            .unwrap(),
+        head: AuthorityProjectionHead {
+            state_revision: one,
+            epoch: one,
+            authorization_sequence: one,
+            administration_generation: original.expected_generation,
+            state_commitment: Hash([0x42; 32]),
+        },
+        principal: original.administrator,
+        status: AuthorityCredentialStatus::Active,
+        kind: AuthorityCredentialKind::Api,
+        builtin_role: AuthorityBuiltinRole::Admin,
+        management_request_high_water: u64::MAX,
+        operation_request_high_water: u64::MAX,
+        admin_request_high_water: 0,
+        space_roles: vec![],
+        actor_roles: vec![],
+        capabilities: vec![],
+    };
+    let make = |credential: &AuthorityCredentialProjection| {
+        admin_signing::draft(
+            &key,
+            original.authority,
+            original.authenticated_node,
+            credential,
+            original.operation.clone(),
+        )
+    };
+    let draft = make(&credential).unwrap();
+    assert_eq!(draft, original);
+    let preparation = NativeAuthorityAdminPreparation::decode(&preparation).unwrap();
+    assert_eq!(
+        admin_signing::prepared(&key, &draft, &preparation)
+            .unwrap()
+            .encode()
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        admin_signing::prepared(&key, &draft, &preparation)
+            .unwrap()
+            .encode()
+            .unwrap(),
+        expected
+    );
+    let other_key = libp2p::identity::Keypair::ed25519_from_bytes([0x24; 32]).unwrap();
+    assert!(admin_signing::prepared(&other_key, &draft, &preparation).is_err());
+    credential.admin_request_high_water = u64::MAX;
+    assert!(make(&credential).is_err());
+    credential.admin_request_high_water = 0;
+    credential.builtin_role = AuthorityBuiltinRole::Member;
+    assert!(make(&credential).is_err());
+    credential.builtin_role = AuthorityBuiltinRole::Admin;
+    credential.status = AuthorityCredentialStatus::Revoked;
+    assert!(make(&credential).is_err());
+    credential.status = AuthorityCredentialStatus::Active;
+    credential.principal = PrincipalId([0x44; 32]);
+    assert!(make(&credential).is_err());
+}
+
+#[test]
+fn admin_reservation_requires_exact_retained_terminal_and_separates_domains() {
+    for denied in [false, true] {
+        let fixture = Fixture::new("admin-reservation");
+        let claims = fixture.parent.join("claims");
+        ensure_private_directory(&claims).unwrap();
+        let (draft, _, submission, observed, terminal) = client_evidence(denied);
+        let draft = AuthorityAdminCall::decode(&draft).unwrap();
+        let mut reservation = CleanAdminCredentialReservation::open_or_create(
+            &claims,
+            draft.authority.space,
+            draft.credential,
+        )
+        .unwrap();
+        assert!(reservation.current().unwrap().is_none());
+        assert!(
+            CleanAdminCredentialReservation::open_or_create(
+                &claims,
+                draft.authority.space,
+                draft.credential
+            )
+            .is_err()
+        );
+        assert_eq!(
+            reservation.reserve(&draft).unwrap(),
+            CredentialReservationStatus::Pending
+        );
+        let (key, _, _, _) = crate::commands::space::local_create::tests::fixture();
+        let mut next = draft.clone();
+        next.request_sequence = core::num::NonZeroU64::new(2).unwrap();
+        next.invocation = next.expected_invocation();
+        next.signature = key.sign(&next.signing_bytes()).unwrap().try_into().unwrap();
+        assert!(reservation.reserve(&next).is_err());
+        let mut delivery = CleanOperationClientFile::open_admin_submission(&fixture.root).unwrap();
+        delivery.publish_request(&submission).unwrap();
+        assert!(reservation.complete(&mut delivery).is_err());
+        assert!(delivery.publish_response(&observed).is_err());
+        assert_eq!(
+            reservation.current().unwrap().unwrap().1,
+            CredentialReservationStatus::Pending
+        );
+        delivery.publish_response(&terminal).unwrap();
+        let status = if denied {
+            CredentialReservationStatus::Denied
+        } else {
+            CredentialReservationStatus::Completed
+        };
+        assert_eq!(reservation.complete(&mut delivery).unwrap(), status);
+        drop(reservation);
+        assert!(
+            CleanCredentialReservation::open_or_create(
+                &claims,
+                draft.authority.space,
+                draft.credential
+            )
+            .is_err()
+        );
+        let mut reservation = CleanAdminCredentialReservation::open_or_create(
+            &claims,
+            draft.authority.space,
+            draft.credential,
+        )
+        .unwrap();
+        assert_eq!(
+            reservation.current().unwrap(),
+            Some((Hash(draft.invocation.0), status))
+        );
+        assert_eq!(reservation.complete(&mut delivery).unwrap(), status);
+        assert_eq!(
+            reservation.reserve(&next).unwrap(),
+            CredentialReservationStatus::Pending
+        );
+        assert!(reservation.complete(&mut delivery).is_err());
+        assert_eq!(
+            reservation.current().unwrap().unwrap().0,
+            Hash(next.invocation.0)
+        );
+    }
+}
+
 fn client_evidence(denied: bool) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
     use vos::agent::clean_bootstrap::{
         NativeAuthorityAdminPreparation, NativeAuthorityAdminSubmission,

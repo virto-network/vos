@@ -349,6 +349,7 @@ pub(crate) fn query_credential(
 enum CredentialSequenceDomain {
     Management,
     Operation,
+    Admin,
 }
 
 fn query_credential_for(
@@ -423,6 +424,24 @@ pub(crate) fn discover_operation_credential(
         operator,
         authority,
         CredentialSequenceDomain::Operation,
+    )
+}
+
+pub(crate) fn discover_admin_credential(
+    root: &std::path::Path,
+    address: std::net::SocketAddr,
+    operator: &Keypair,
+    authority: AuthorityActorTarget,
+) -> anyhow::Result<(
+    vos::agent::sdk::authority::AuthorityCredentialProjection,
+    NonZeroU64,
+)> {
+    discover_credential_for(
+        root,
+        address,
+        operator,
+        authority,
+        CredentialSequenceDomain::Admin,
     )
 }
 
@@ -503,6 +522,7 @@ fn validate_credential_response_for(
     let high_water = match domain {
         CredentialSequenceDomain::Management => projection.management_request_high_water,
         CredentialSequenceDomain::Operation => projection.operation_request_high_water,
+        CredentialSequenceDomain::Admin => projection.admin_request_high_water,
     };
     let sequence = high_water
         .checked_add(1)
@@ -1285,6 +1305,39 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(operation_next.get(), 100);
+        let (_, admin_next) = validate_credential_response_for(
+            &query,
+            owner,
+            &bytes,
+            CredentialSequenceDomain::Admin,
+        )
+        .unwrap();
+        assert_eq!(admin_next.get(), 1000);
+        let mut other_domains_exhausted = projection.clone();
+        other_domains_exhausted.management_request_high_water = u64::MAX;
+        other_domains_exhausted.operation_request_high_water = u64::MAX;
+        assert_eq!(
+            validate_credential_response_for(
+                &query,
+                owner,
+                &other_domains_exhausted.encode().unwrap(),
+                CredentialSequenceDomain::Admin
+            )
+            .unwrap()
+            .1
+            .get(),
+            1000
+        );
+        other_domains_exhausted.admin_request_high_water = u64::MAX;
+        assert!(
+            validate_credential_response_for(
+                &query,
+                owner,
+                &other_domains_exhausted.encode().unwrap(),
+                CredentialSequenceDomain::Admin
+            )
+            .is_err()
+        );
         let mut management_exhausted = projection.clone();
         management_exhausted.management_request_high_water = u64::MAX;
         assert_eq!(

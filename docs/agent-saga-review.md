@@ -252,7 +252,8 @@ Keep these as work within C2, not new review batches:
    in the lifecycle owner. Signed host-clock preparation and submission now
    have native lifecycle APIs, bounded node-owned queue delivery and dedicated
    signed-body HTTP routes. Retained client preparation/submission commands now
-   exist; automatic signing/sequence orchestration and the live protected
+   exist; deterministic signing and a separate admin reservation are implemented,
+   but fresh-command orchestration and the live protected
    campaign remain incomplete. Keep
    its credential sequence and generation CAS distinct from operation
    authorization; do not relax anonymous HTTP invocation or
@@ -7675,6 +7676,44 @@ Next is automatic signing and credential-local admin sequence reservation,
 followed by a live protected Local mutation/retirement/restart campaign. The
 client's current loopback tests use synthetic signed responses, not native
 daemon execution. Production latency and the other original gates stay open.
+
+### Admin signing and credential-local reservation (C2)
+
+Admin discovery now selects the successor of `admin_request_high_water`, never
+the management or operation high-water marks. Deterministic signing helpers
+validate the selected operator's active Admin API credential projection, use
+its exact administration-generation CAS, sign a zero-slot draft, then sign
+NAS1 using only that retained draft and its verified NAP1. Final signing reads
+no clock, new generation or random ID. The native Authority remains responsible
+for current policy and node ownership; client discovery is not authorization.
+
+`CleanAdminCredentialReservation` gives this domain its own ACR1 image and
+CSF1 role 38, distinct from CRS1 management/operation reservation state. Its
+private wrapper exposes no Create/Install completion method. It leases one
+Space/credential claim, binds the claim to the exact zero-slot draft invocation,
+and refuses another draft while pending. Completion requires the matching
+retained NAS1 and verified, synchronized NAT2; an observed result, missing
+response or mismatched request cannot release the claim. Success and signed
+denial are distinct terminal states. Terminal retry is exact, and a later
+claim cannot be completed with an older response.
+
+These primitives are not yet connected to a fresh admin CLI command. Required
+orchestration remains: hold the admin lease across discovery, retain the draft
+and claim before host preparation, retain NAP1, sign/retain NAS1, submit, then
+retain NAT2 before finishing the claim. Retry must recover that chain without
+discovery or re-signing once NAS1 exists. The protected live campaign and all
+other original release gates remain open.
+
+Validation: all 8 focused admin tests pass (6.34s;
+`native-admin-signing-reservation.log`), including separate-domain reservation,
+pending-work conflicts, exact terminal retry, later-claim isolation, deterministic
+final signing, wrong signer, revoked/non-Admin credential and admin sequence
+exhaustion. Discovery tests confirm exhausted management/operation domains do
+not block selection of the admin successor. Full CLI suite: 248 passed,
+9 ignored (55.26s; `native-admin-signing-cli.log`). Normal vosx build passes
+(6.70s; `native-admin-signing-vosx-build.log`), as do formatting and whitespace
+checks. Logs remain under shared on-disk `target/task-tmp`. These signing and
+reservation checks use synthetic evidence; no new live campaign ran here.
 
 ### Durable client acknowledgement before completion
 

@@ -17,6 +17,8 @@ pub mod caps;
 #[cfg(target_os = "linux")]
 mod admin_client;
 #[cfg(target_os = "linux")]
+mod admin_signing;
+#[cfg(target_os = "linux")]
 #[allow(dead_code)] // Wired by the clean native startup owner in this chapter.
 pub(crate) mod clean_genesis_archive;
 #[allow(dead_code)]
