@@ -240,8 +240,13 @@ Keep these as work within C2, not new review batches:
    and broader terminal-resolution cases are not thereby complete.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
    retirement and restart through native ingress and the managed client.
-   First verify the repaired post-retirement replay behavior in a fresh Public
-   Counter campaign, then complete the missing protected permission setup.
+   The fresh Public Counter post-retirement/restart campaign now passes.
+   Complete the missing protected permission setup next: the real bundled
+   Authority passes native signed space-role grant/revoke and rejects anonymous
+   signed administration, but durable admin delivery through the host/client
+   is not implemented. Keep its credential sequence and generation CAS distinct
+   from operation authorization; do not relax anonymous HTTP invocation or
+   put this mutation in the read-only projection journal.
    A Public query or mutation alone does not close this item.
 4. Close the already-required Shared finality, Private/Attested, terminal
    resolution and physical recovery/capacity gates above before C3. These are
@@ -7365,6 +7370,24 @@ candidate evidence directory above. No daemon or test process remains live.
 No new live Create/Install or protected-actor campaign was run for this repin;
 those workflow and latency gates, plus the rest of the original release
 matrix, remain open. No root-branch or master integration was performed.
+
+### Native bundled Authority administration boundary (C2)
+
+`native_admin_bundled_authority_grants_and_revokes_with_bound_identity` passes
+against the bundled Authority executable through the native system owner
+(1 test, 13.59s; `target/task-tmp/native-admin-test.log`). It reads the enrolled
+SSH credential through a node-attested projection, signs administration using
+the separate admin sequence and generation CAS, grants and revokes a space
+role, acknowledges each terminal result, and verifies projected role membership
+and counters. An otherwise valid signed grant with anonymous invocation origin
+is denied without granting the role or consuming the administration sequence.
+
+This is a test of the existing trusted native boundary, not a new production
+admin endpoint. The fixture supplies host-bound identity directly and uses the
+existing native system runtime fixture; it does not prove end-to-end physical
+runtime latency, crash-safe admin orchestration, deployment-scoped actor grants,
+or protected Local mutation. Those gates remain open. No production code,
+artifact pins, authentication rules, or timeouts changed in this checkpoint.
 
 ### Durable client acknowledgement before completion
 

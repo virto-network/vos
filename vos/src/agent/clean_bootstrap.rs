@@ -9830,6 +9830,184 @@ mod tests {
             native_bundled_authority_fixture_with_query_catalog(false)
         }
 
+        #[test]
+        fn native_admin_bundled_authority_grants_and_revokes_with_bound_identity() {
+            use crate::agent_sdk::RoleId;
+            use crate::agent_sdk::authority::{
+                AuthorityAdminCall, AuthorityAdminOperation, AuthorityAdminResult,
+                AuthorityCredentialProjection, AuthorityIngressAuthentication,
+            };
+            use crate::value::Value;
+
+            let mut harness = NativeProjectionOwnerHarness::with_fixture(
+                "bundled-authority-admin",
+                native_bundled_authority_fixture(),
+            );
+            let owner = harness.owner.as_mut().unwrap();
+            let key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
+            let public = key.verifying_key().to_bytes();
+            let credential = CredentialId::of_public_key(&public);
+            let role = RoleId([0x51; 32]);
+            let (node_key, _, _, node) = node_material();
+            let projection = |owner: &mut CleanSystemAgentBootstrapOwner<
+                BootstrapMemoryStore,
+                BootstrapMemoryStore,
+                IssuerMemoryStore,
+            >,
+                              nonce: u8| {
+                let mut query = AuthorityProjectionQuery {
+                    authority: owner.authority_target(),
+                    credential,
+                    nonce: Hash([nonce; 32]),
+                    selector: AuthorityProjectionSelector::Credential,
+                    authentication: AuthorityIngressAuthentication::SshNodeAttestation {
+                        credential_public_key: public,
+                        node: NodeId(node.0),
+                        request_binding: Hash([nonce; 32]),
+                        signature: [1; 64],
+                    },
+                };
+                let signature = node_key.sign(&query.signing_bytes()).to_bytes();
+                query.authentication = AuthorityIngressAuthentication::SshNodeAttestation {
+                    credential_public_key: public,
+                    node: NodeId(node.0),
+                    request_binding: Hash([nonce; 32]),
+                    signature,
+                };
+                AuthorityCredentialProjection::decode(
+                    &owner.invoke_authority_projection(query).unwrap(),
+                )
+                .unwrap()
+            };
+            let mut current = projection(owner, 0xe1);
+            assert!(!current.space_roles.contains(&role));
+            for (step, granted) in [(0u8, true), (1, false)] {
+                let target = owner.authority_target();
+                let mut material = owner
+                    .supervisor_invocation_material(owner.pins.agent, target.binding.issuer.actor)
+                    .unwrap();
+                material.root_provenance = false;
+                let identity =
+                    crate::agent::supervisor_adapters::physical_material_identity(&material)
+                        .unwrap();
+                let mut call = AuthorityAdminCall {
+                    invocation: InvocationId::ZERO,
+                    authority: target,
+                    administrator: current.principal,
+                    credential,
+                    request_sequence: NonZeroU64::new(current.admin_request_high_water + 1)
+                        .unwrap(),
+                    credential_public_key: public,
+                    authenticated_node: owner.pins.node,
+                    observed_slot: material.observed_slot,
+                    expected_generation: current.head.administration_generation,
+                    operation: AuthorityAdminOperation::SetSpaceRole {
+                        principal: current.principal,
+                        role,
+                        granted,
+                    },
+                    signature: [1; 64],
+                };
+                call.invocation = call.expected_invocation();
+                call.signature = key.sign(&call.signing_bytes()).to_bytes();
+                call.verify_with(&RawCredentialVerifier).unwrap();
+                let mut availability = vec![material.program, material.schema, material.policies];
+                availability.extend(material.installation_data);
+                availability.sort_unstable_by(|a, b| a.reference.cmp(&b.reference));
+                let work = InvocationWork {
+                    space: target.space,
+                    agent: target.system_agent,
+                    runtime_deployment: target.system_runtime_deployment,
+                    invocation: call.invocation,
+                    actor: target.binding.issuer.actor,
+                    incarnation: material.actor.incarnation,
+                    deployment: target.binding.issuer.deployment,
+                    program: target.binding.issuer.program,
+                    mode: MethodMode::Linear,
+                    origin: InvocationOrigin {
+                        principal: Some(call.administrator),
+                        credential: Some(credential),
+                        transport_node: Some(call.authenticated_node),
+                        actor: None,
+                        capability: None,
+                    },
+                    roles: InvocationRoleClaims::none(),
+                    message: dynamic_message(
+                        "administer",
+                        "call",
+                        Value::Bytes(call.encode().unwrap()),
+                    ),
+                    installation_data: material.actor.entry.installation_data,
+                    availability,
+                    gas: owner.invocation_gas,
+                    recovery_only: false,
+                };
+                // This exercises the native trusted boundary, not HTTP ingress.
+                // A signed message alone must not supply its own caller identity.
+                let mut anonymous_call = call.clone();
+                anonymous_call.operation = AuthorityAdminOperation::SetSpaceRole {
+                    principal: current.principal,
+                    role: RoleId([0x52; 32]),
+                    granted: true,
+                };
+                anonymous_call.invocation = anonymous_call.expected_invocation();
+                anonymous_call.signature = key.sign(&anonymous_call.signing_bytes()).to_bytes();
+                anonymous_call.verify_with(&RawCredentialVerifier).unwrap();
+                let mut anonymous = work.clone();
+                anonymous.origin = InvocationOrigin::anonymous();
+                anonymous.invocation = anonymous_call.invocation;
+                anonymous.message = dynamic_message(
+                    "administer",
+                    "call",
+                    Value::Bytes(anonymous_call.encode().unwrap()),
+                );
+                for (candidate, accepted) in [(anonymous, false), (work, true)] {
+                    let authorization = InvocationAuthorization::PublicPreflight(
+                        crate::agent_sdk::PublicPreflight::for_work(&candidate, call.observed_slot),
+                    );
+                    let result = owner
+                        .supervisor_invoke_terminal(
+                            identity,
+                            candidate.clone(),
+                            authorization.clone(),
+                        )
+                        .unwrap();
+                    let RuntimeOutcome::Completed(Ok(reply)) = result else {
+                        panic!("admin invocation failed: {result:?}");
+                    };
+                    let Some(Value::Bytes(bytes)) = Value::try_decode(&reply.reply) else {
+                        panic!("admin reply is not bytes");
+                    };
+                    if accepted {
+                        let result = AuthorityAdminResult::decode(&bytes).unwrap();
+                        result.verify_with(&RawCredentialVerifier).unwrap();
+                        assert_eq!(result.call, call);
+                        assert_eq!(result.generation, call.next_generation().unwrap());
+                    } else {
+                        assert!(bytes.is_empty());
+                    }
+                    assert!(matches!(
+                        owner
+                            .supervisor_acknowledge(identity, candidate, authorization,)
+                            .unwrap(),
+                        RuntimeOutcome::Acknowledged(Ok(_))
+                    ));
+                }
+                current = projection(owner, 0xe2 + step);
+                assert!(!current.space_roles.contains(&RoleId([0x52; 32])));
+                assert_eq!(current.space_roles.contains(&role), granted);
+                assert_eq!(
+                    current.admin_request_high_water,
+                    call.request_sequence.get()
+                );
+                assert_eq!(
+                    current.head.administration_generation,
+                    call.next_generation().unwrap()
+                );
+            }
+            harness.stop();
+        }
+
         fn native_bundled_authority_fixture_with_query_catalog(query: bool) -> PhysicalFixture {
             fn configuration(descriptor: &AgentDescriptor) -> Vec<u8> {
                 use system_authority::{
