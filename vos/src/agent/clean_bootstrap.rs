@@ -3857,6 +3857,7 @@ where
         &mut self,
         query: AuthorityProjectionQuery,
     ) -> Result<Vec<u8>, SharedAgentHostError> {
+        let started = std::time::Instant::now();
         if query.validate_shape().is_err() || query.authority != self.authority_target() {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
@@ -3882,6 +3883,11 @@ where
         let agent = crate::service::AgentId(self.pins.agent.0);
         self._network_host.ensure_reattached(agent)?;
         let pending = self.prepare_authority_projection(query)?;
+        tracing::debug!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            phase = "prepare",
+            "Authority projection phase complete"
+        );
         let (work, authorization) = pending
             .invocation()
             .ok_or(SharedAgentHostError::ScopeMismatch)?;
@@ -3913,6 +3919,11 @@ where
         if !reserved {
             return Err(SharedAgentHostError::CapacityExhausted);
         }
+        tracing::debug!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            phase = "reserve",
+            "Authority projection phase complete"
+        );
         if let Err(error) = self.pending_authority_projection_identity(&pending, false) {
             let _ = self
                 ._network_host
@@ -3920,6 +3931,11 @@ where
             return Err(error);
         }
         let prior = self.record.clone();
+        tracing::debug!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            phase = "identity",
+            "Authority projection phase complete"
+        );
         let mut record = prior.clone();
         record.pending_projection = Some(pending);
         match commit_new_pending_projection(&mut self.record_store, &prior, &record) {
@@ -3938,6 +3954,11 @@ where
             }
         }
         self.record = record;
+        tracing::debug!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            phase = "persist",
+            "Authority projection phase complete"
+        );
         self.execute_pending_authority_projection()?
             .ok_or(SharedAgentHostError::Unavailable)
     }
@@ -4037,6 +4058,7 @@ where
         &mut self,
     ) -> Result<Option<Vec<u8>>, SharedAgentHostError> {
         use crate::actors::codec::Decode as _;
+        let started = std::time::Instant::now();
 
         let pending = self
             .record
@@ -4063,11 +4085,21 @@ where
             return Ok(None);
         }
         let identity = self.pending_authority_projection_identity(&pending, true)?;
+        tracing::debug!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            phase = "reopen",
+            "Authority projection execution phase complete"
+        );
         let outcome = self.supervisor_invoke_terminal_reserved(
             identity,
             work.clone(),
             authorization.clone(),
         )?;
+        tracing::debug!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            phase = "invoke",
+            "Authority projection execution phase complete"
+        );
         let response = match &outcome {
             super::sdk::RuntimeOutcome::Completed(Ok(reply))
                 if reply.invocation == work.invocation
@@ -4089,6 +4121,11 @@ where
         }
         let acknowledgement =
             self.supervisor_acknowledge_reserved(identity, work.clone(), authorization.clone())?;
+        tracing::debug!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            phase = "acknowledge",
+            "Authority projection execution phase complete"
+        );
         let super::sdk::RuntimeOutcome::Acknowledged(Ok(acknowledged)) = acknowledgement else {
             return Err(SharedAgentHostError::Unavailable);
         };
@@ -4103,6 +4140,11 @@ where
             return Err(SharedAgentHostError::Unavailable);
         }
         self.complete_pending_authority_projection(work, authorization)?;
+        tracing::debug!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            phase = "complete",
+            "Authority projection execution phase complete"
+        );
         Ok(response)
     }
 

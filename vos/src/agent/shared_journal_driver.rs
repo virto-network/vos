@@ -3037,12 +3037,7 @@ where
     }
 
     pub(crate) fn capacity(&self) -> Result<(u64, u64, bool), SharedJournalDriverError> {
-        let audit = self.ledger.journal_audit()?;
-        Ok((
-            audit.applied_slots,
-            audit.remaining_slots,
-            audit.reservation_pending,
-        ))
+        self.ledger.capacity().map_err(Into::into)
     }
 
     fn snapshot_boundary_claim(&self) -> Result<OrderedCommitClaim, SharedJournalDriverError> {

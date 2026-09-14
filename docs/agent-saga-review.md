@@ -7128,6 +7128,62 @@ checkpoint; first-response latency and actual retry speedup remain unmeasured
 on this source. Next latency work must measure the authenticated inventory
 dispatch path; repeated-publication reuse alone is insufficient for release.
 
+### Audited capacity without full status construction (C2)
+
+The first live phase measurement on `genesis-root-smoke.V8PTde` used the
+normal CLI built from `2161a174` plus phase-only debug instrumentation.
+`projection-phases-run.sh` restarted the corrected-genesis `genesis-one` space
+at **2026-09-14 20:15:39Z**, reached readiness at **20:17:00Z**, returned HTTP
+200, and shut down cleanly in that same second. `projection-phases.log` and
+`projection-phases-status.json` retain the evidence. No old collision fixture
+was booted. Four inventory queries took **47.948s** in total; reconciliation
+including publication took **52.263s**. Individual dispatches were roughly
+11–13s. Phase elapsed values are cumulative within either the preparation or
+execution function, not independent durations: most time was in Invoke and
+ACK, with 2–3s more in preparation/reservation and roughly 70ms per bootstrap
+record write. Pending-recovery checks were effectively zero.
+
+Code inspection identified redundant work in capacity-only admission checks:
+`SharedAgentHost::show` executes the runtime actor-directory ABI, and driver
+capacity previously built the complete journal projection after an already
+complete recovery audit. The new internal capacity path returns applied index,
+remaining slots and reservation presence directly from that **same full
+recovery audit and read transaction**, under the existing ledger write guard.
+It still validates physical log rows, canonical commands, committee history,
+snapshot boundary, application metadata and any pending reservation. It is not
+a cache or a trusted-metadata shortcut. Full cross-store journal projection
+remains in place for its existing consumers.
+
+Projection and management admission now consume those capacity facts while
+holding the host lock. Raft barrier comparisons, suffix-budget requirements,
+the extra reopen slot and exact durable-anchor validation are unchanged.
+Two identical status calls within persisted management preparation become one
+capacity read; no intervening operation mutates the host. Generic user-facing
+status and Raft status replies are unchanged. Phase timings remain debug-only
+and contain no request/signature/package bodies. This is a host-only change:
+no guest repin, wire change, timeout increase or new review batch.
+
+Validation: **14 V2 ledger tests passed** (5.90s), including capacity equality
+with the full projection after reservation/reopen/completion and certified
+snapshot compaction, plus missing physical log and corrupt audit rejection.
+All **9 native operation tests passed** (114.99s). The normal CLI build,
+formatting and whitespace checks passed. Logs: `r16-capacity-audit-tests.log`,
+`r16-capacity-audit-native.log`, `r16-capacity-audit-build.log` in the shared
+disk-backed `target/task-tmp` directory.
+
+The subsequent live run (`projection-phases-run.sh capacity-audit`) started at
+**20:24:39Z**, reached readiness at **20:26:31Z**, returned HTTP 200 and shut
+down cleanly at **20:26:31Z**, exit **0**. Evidence: `capacity-audit.log` and
+`capacity-audit-status.json` alongside the baseline. Query times were
+**12.873 / 13.484 / 13.653 / 14.272s**, totaling **54.284s**; complete inventory
+reconciliation took **58.870s**. The first reservation phase dropped from
+1.429s to 1.258s and the fourth from 2.093s to 1.613s, but this is sequential
+testing with additional retained history, **not a controlled speedup claim**.
+Overall latency is still unacceptable; this checkpoint does not close that
+gate. The larger restart and dispatch times keep history-dependent physical
+validation and Invoke/ACK execution as the next profiling targets. Do not
+replace the full recovery audit with unauthenticated cached metadata.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

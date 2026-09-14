@@ -1067,10 +1067,8 @@ impl SharedRouteHandler {
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
         drain_committed(&mut host, self.agent, &self.ordered_replies)?;
-        let status = host
-            .show(self.agent)?
-            .ok_or(SharedAgentHostError::AgentNotFound)?;
-        if status.applied_slots != barrier.commit_index {
+        let (applied_slots, remaining_slots, _) = host.capacity(self.agent)?;
+        if applied_slots != barrier.commit_index {
             return Err(SharedAgentHostError::CorruptResidue);
         }
         let Some(required) =
@@ -1083,7 +1081,7 @@ impl SharedRouteHandler {
         // one-voter reopen must still append the mandatory current-term
         // leader no-op before recovery may publish the route.
         let required_with_reopen = (required as u64).saturating_add(u64::from(required != 0));
-        if status.remaining_slots < required_with_reopen {
+        if remaining_slots < required_with_reopen {
             return Err(SharedAgentHostError::CapacityExhausted);
         }
         proposal.projection_pair = Some(key);
@@ -1128,12 +1126,7 @@ impl SharedRouteHandler {
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
         drain_committed(&mut host, self.agent, &self.ordered_replies)?;
-        if host
-            .show(self.agent)?
-            .ok_or(SharedAgentHostError::AgentNotFound)?
-            .applied_slots
-            != barrier.commit_index
-        {
+        if host.capacity(self.agent)?.0 != barrier.commit_index {
             return Err(SharedAgentHostError::CorruptResidue);
         }
         let position = host.journal_position(self.agent)?;
@@ -1256,10 +1249,8 @@ impl SharedRouteHandler {
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
         drain_committed(&mut host, self.agent, &self.ordered_replies)?;
-        let status = host
-            .show(self.agent)?
-            .ok_or(SharedAgentHostError::AgentNotFound)?;
-        if status.applied_slots != barrier.commit_index {
+        let (applied_slots, remaining_slots, _) = host.capacity(self.agent)?;
+        if applied_slots != barrier.commit_index {
             return Err(SharedAgentHostError::CorruptResidue);
         }
         let candidate = if let Some(existing) = existing {
@@ -1294,7 +1285,7 @@ impl SharedRouteHandler {
             )?
         }
         .ok_or(SharedAgentHostError::CapacityExhausted)?;
-        if status.remaining_slots < required as u64 + 1 {
+        if remaining_slots < required as u64 + 1 {
             return Err(SharedAgentHostError::CapacityExhausted);
         }
         proposal.management_pending = Some(keys);
@@ -1385,10 +1376,8 @@ impl SharedRouteHandler {
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
         drain_committed(&mut host, self.agent, &self.ordered_replies)?;
-        let status = host
-            .show(self.agent)?
-            .ok_or(SharedAgentHostError::AgentNotFound)?;
-        if status.applied_slots != barrier.commit_index {
+        let (applied_slots, remaining_slots, _) = host.capacity(self.agent)?;
+        if applied_slots != barrier.commit_index {
             return Err(SharedAgentHostError::CorruptResidue);
         }
         let required = host
@@ -1398,7 +1387,7 @@ impl SharedRouteHandler {
                 &pairs.iter().flatten().copied().collect::<Vec<_>>(),
             )?
             .ok_or(SharedAgentHostError::CapacityExhausted)?;
-        if status.remaining_slots < required as u64 + u64::from(required != 0) {
+        if remaining_slots < required as u64 + u64::from(required != 0) {
             return Err(SharedAgentHostError::CapacityExhausted);
         }
         proposal.management_retirement = Some(keys);
@@ -1666,12 +1655,8 @@ impl SharedRouteHandler {
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
             drain_committed(&mut host, self.agent, &self.ordered_replies)?;
             let anchored_input = if let InvocationClock::PersistedManagement(anchor) = clock {
-                if host
-                    .show(self.agent)?
-                    .ok_or(SharedAgentHostError::AgentNotFound)?
-                    .applied_slots
-                    != anchor_barrier.unwrap()
-                {
+                let (applied_slots, remaining_slots, _) = host.capacity(self.agent)?;
+                if applied_slots != anchor_barrier.unwrap() {
                     return Err(SharedAgentHostError::CorruptResidue);
                 }
                 let crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Invoke {
@@ -1693,12 +1678,7 @@ impl SharedRouteHandler {
                 let required = host
                     .management_pending_admission_requirement(self.agent, &[(anchor, &envelope)])?
                     .ok_or(SharedAgentHostError::CapacityExhausted)?;
-                if host
-                    .show(self.agent)?
-                    .ok_or(SharedAgentHostError::AgentNotFound)?
-                    .remaining_slots
-                    < required as u64 + 1
-                {
+                if remaining_slots < required as u64 + 1 {
                     return Err(SharedAgentHostError::CapacityExhausted);
                 }
                 Some(host.management_invocation_after_anchor(self.agent, anchor, &envelope)?)

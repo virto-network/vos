@@ -6526,6 +6526,20 @@ mod application_ledger_v2 {
         /// only through the exact snapshot certificate and the complete
         /// authority-verified committee-transition evidence it carries.
         pub(crate) fn audit_recovery(&self) -> Result<(), AgentRaftApplicationErrorV2> {
+            self.audit_recovery_capacity().map(|_| ())
+        }
+
+        /// Capacity facts from the same fully authenticated recovery pass.
+        /// No projection of the already validated command suffix is needed.
+        pub(crate) fn capacity(&self) -> Result<(u64, u64, bool), AgentRaftApplicationErrorV2> {
+            let _guard = self
+                .writes
+                .lock()
+                .map_err(|_| AgentRaftApplicationErrorV2::CorruptLedger)?;
+            self.audit_recovery_capacity()
+        }
+
+        fn audit_recovery_capacity(&self) -> Result<(u64, u64, bool), AgentRaftApplicationErrorV2> {
             let key = generation_storage_key(self.generation);
             let transaction = self.database.begin_read()?;
             ensure_v2_config_in_read(
@@ -6707,6 +6721,7 @@ mod application_ledger_v2 {
                 Ok(record)
             })
             .transpose()?;
+            let reservation_pending = reservation.is_some();
             if let Some(reservation) = reservation {
                 if reservation.generation != self.generation
                     || reservation.journal_store != self.journal_store
@@ -6724,7 +6739,12 @@ mod application_ledger_v2 {
                 }
                 verify_reservation_physical_row_in_read(&transaction, &raft, &reservation)?;
             }
-            Ok(())
+            Ok((
+                meta.applied_index,
+                (MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES as u64)
+                    .saturating_sub(meta.applied_index.saturating_sub(raft.snap_last_index)),
+                reservation_pending,
+            ))
         }
 
         /// Project the exact retained Ordered suffix so the host can reconcile
@@ -9014,6 +9034,19 @@ mod tests {
     }
 
     #[cfg(feature = "storage")]
+    fn assert_capacity_matches_full_audit(ledger: &AgentRaftApplicationLedgerV2) {
+        let audit = ledger.journal_audit().unwrap();
+        assert_eq!(
+            ledger.capacity().unwrap(),
+            (
+                audit.applied_slots,
+                audit.remaining_slots,
+                audit.reservation_pending
+            )
+        );
+    }
+
+    #[cfg(feature = "storage")]
     #[test]
     fn v2_noop_apply_is_atomic_restartable_and_duplicate_exact() {
         let directory = TempDirectory::new("v2_restart_duplicate");
@@ -9061,6 +9094,7 @@ mod tests {
         assert_eq!(ledger.generation(), generation);
         assert_eq!(ledger.cursor().unwrap().applied(), (1, 11));
         ledger.audit_recovery().unwrap();
+        assert_capacity_matches_full_audit(&ledger);
         assert!(ledger.next_committed_slot().unwrap().is_none());
     }
 
@@ -9114,6 +9148,8 @@ mod tests {
                 0
             );
             ledger.audit_recovery().unwrap();
+            assert_capacity_matches_full_audit(&ledger);
+            assert!(ledger.capacity().unwrap().2);
         }
 
         {
@@ -9132,6 +9168,7 @@ mod tests {
                 panic!("ordinary command decoded as the wrong physical kind");
             };
             let recovered = ledger.reserve_command_application(command).unwrap();
+            assert_capacity_matches_full_audit(&ledger);
             match ledger
                 .complete_artifact_command(&recovered, disposition)
                 .unwrap()
@@ -9145,6 +9182,8 @@ mod tests {
                 }
                 _ => panic!("recovered command was not newly applied"),
             }
+            assert_capacity_matches_full_audit(&ledger);
+            assert!(!ledger.capacity().unwrap().2);
             assert!(matches!(
                 ledger
                     .complete_artifact_command(&recovered, disposition)
@@ -9549,6 +9588,7 @@ mod tests {
                 .install_snapshot(&certificate, Some(certificate.claim().ordered()))
                 .unwrap();
             let audit = ledger.journal_audit().unwrap();
+            assert_capacity_matches_full_audit(&ledger);
             assert!(audit.ordered.is_empty());
             assert_eq!(
                 audit
@@ -10111,6 +10151,10 @@ mod tests {
             missing_ledger.audit_recovery(),
             Err(AgentRaftApplicationErrorV2::MissingCommittedSlot)
         ));
+        assert!(matches!(
+            missing_ledger.capacity(),
+            Err(AgentRaftApplicationErrorV2::MissingCommittedSlot)
+        ));
 
         let corrupt_directory = TempDirectory::new("v2_corrupt_audit");
         let corrupt_database = Arc::new(Database::create(corrupt_directory.database()).unwrap());
@@ -10144,6 +10188,10 @@ mod tests {
         }
         assert!(matches!(
             corrupt_ledger.audit_recovery(),
+            Err(AgentRaftApplicationErrorV2::CorruptLedger)
+        ));
+        assert!(matches!(
+            corrupt_ledger.capacity(),
             Err(AgentRaftApplicationErrorV2::CorruptLedger)
         ));
     }

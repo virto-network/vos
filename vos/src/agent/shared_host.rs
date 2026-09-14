@@ -1140,6 +1140,21 @@ impl SharedAgentHost {
             .transpose()
     }
 
+    /// Admission needs audited ledger capacity, not an actor-directory query
+    /// or the full user-facing status projection. The caller holds the host
+    /// lock while comparing these facts with its Raft barrier.
+    pub(crate) fn capacity(
+        &self,
+        agent: AgentId,
+    ) -> Result<(u64, u64, bool), SharedAgentHostError> {
+        self.agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .driver
+            .capacity()
+            .map_err(map_driver_error)
+    }
+
     /// Read only the authenticated generation/committee attachment facts.
     /// Unlike `show`, this does not execute an actor-directory query and is
     /// therefore safe to pair with one keyed invocation-material lookup on a
