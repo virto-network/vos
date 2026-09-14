@@ -229,14 +229,21 @@ pub(super) fn authorize(
     );
     drop(delivery);
     let response = super::operation_authorization::submit(&request_root, None, address)?;
-    if matches!(
-        submission
-            .decode_response(&response)
-            .map_err(|e| anyhow::anyhow!("invalid AOR1: {e:?}"))?,
-        vos::agent::clean_bootstrap::NativeAuthorityOperationDecision::Denied { .. }
-    ) {
-        let mut delivery = CleanOperationClientFile::open_or_create(&request_root)?;
-        reservation.deny_operation(&mut delivery)?;
+    match submission
+        .decode_response(&response)
+        .map_err(|e| anyhow::anyhow!("invalid AOR1: {e:?}"))?
+    {
+        vos::agent::clean_bootstrap::NativeAuthorityOperationDecision::Denied { .. } => {
+            let mut delivery = CleanOperationClientFile::open_or_create(&request_root)?;
+            reservation.deny_operation(&mut delivery)?;
+        }
+        vos::agent::clean_bootstrap::NativeAuthorityOperationDecision::Issued(_) => {
+            super::operation_authorization::application::retain(
+                &request_root,
+                &operation.join("preparation"),
+                &operation.join("application"),
+            )?;
+        }
     }
     Ok((request_root, response))
 }

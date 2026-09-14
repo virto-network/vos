@@ -2,6 +2,8 @@
 use vos::agent::local_lifecycle::AuthorityOperationSubmission;
 use vos::agent::sdk::wire::CanonicalWire as _;
 
+#[path = "operation_application.rs"]
+pub(crate) mod application;
 #[path = "operation_preparation.rs"]
 pub(crate) mod preparation;
 

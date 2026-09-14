@@ -90,7 +90,11 @@ intent and signed authorization; it does not replace their content.
 
 The credential-wide reservation remains pending on delivery errors **and on
 issuance**. Only a verified retained signed denial releases it here. Output is
-explicitly `applied: false`; an issued result still needs protected application
+explicitly `applied: false`. Issuance now also retains the exact receipt-bearing
+ASQ1 under the operation's `application/` child, after verifying that the retained
+ATQ1/ATP1 work matches the signed AOQ1/AOR1. Missing preparation or conflicting
+application state fails closed without replacing retained data. It is not sent
+to the actor by this command; an issued result still needs protected application
 and retirement wiring. Do not treat this authorization-only command as a usable
 end-to-end production invocation or delete its reservation to bypass pending work.
 

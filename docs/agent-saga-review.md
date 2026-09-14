@@ -6372,6 +6372,36 @@ Fresh-intent tests verify caller rejection before client state, immutable ATQ1
 and query retention before failed discovery, and pending-successor exclusion.
 These tests do not prove a live fresh authorization/actor mutation campaign.
 
+### Issued authorization to exact application envelope
+
+Verification: **236 CLI tests passed**, zero failures, five opt-in tests ignored,
+in **51.28s** (`.worktrees/ch08-c2-native/target/task-tmp/r16-operation-application-cli-final.log`).
+The normal CLI build passes in **4.80s** (`r16-operation-application-build.log`).
+Formatting and whitespace checks pass. No native protected invocation campaign
+is claimed at this checkpoint.
+
+The managed authorization command now retains receipt-bearing ASQ1 in the
+operation's `application/` child before returning an issued decision. The handoff
+holds the credential reservation, re-verifies/syncs retained AOQ1/AOR1 and
+ATQ1/ATP1, requires the signed operation intent to match every prepared-work
+commitment field, and uses the exact issued receipt. It never re-prepares missing
+physical work or replaces a previously retained application envelope. Orphaned
+response/progress histories remain rejected by the existing invocation store.
+
+This is durable application preparation, not actor dispatch, successful mutation
+or positive application retirement. The command still reports `applied: false`
+and leaves issuance pending. A historical receipt signature check does not bypass
+the runtime's live expiry/policy checks. Required next work is application delivery,
+continuation/retirement and credential completion, followed by the live native
+campaign. No production latency or release gate is waived.
+
+The signed fixture checks exact retained issuance, missing/corrupt decisions,
+missing or substituted preparation, stable ASQ1 on reopen, and preservation of a
+conflicting public invocation. It also verifies that a valid issued decision
+cannot use the denial-only reservation release. The fixture uses real Ed25519
+signatures and admitted Catalog artifacts but shaped evidence, not native policy
+execution or usable Catalog installation configuration.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

@@ -242,7 +242,7 @@ pub(crate) fn run(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::clean_store::CleanInvocationFile;
     use super::*;
     use std::os::unix::fs::DirBuilderExt as _;
@@ -536,6 +536,13 @@ mod tests {
     // Canonical shaped host response using admitted Catalog artifacts. This
     // tests wire binding/storage only, not native preparation or execution.
     fn preparation_fixture(seed: u8) -> (AgentTargetedPreparationRequest, Vec<u8>) {
+        preparation_fixture_with_origin(seed, InvocationOrigin::anonymous())
+    }
+
+    pub(crate) fn preparation_fixture_with_origin(
+        seed: u8,
+        origin: InvocationOrigin,
+    ) -> (AgentTargetedPreparationRequest, Vec<u8>) {
         use vos::Encode as _;
         use vos::agent::supervisor::AgentRouteKey;
         use vos::agent::supervisor_adapters::AgentInvocationIntent;
@@ -561,7 +568,7 @@ mod tests {
             AgentInvocationIntent::new(
                 InvocationId([seed; 32]),
                 MethodMode::Query,
-                InvocationOrigin::anonymous(),
+                origin,
                 InvocationRoleClaims::none(),
                 message.clone(),
                 100,
@@ -590,7 +597,19 @@ mod tests {
             inner.extend_from_slice(&field);
         }
         inner.push(MethodMode::Query as u8);
-        inner.extend_from_slice(&[0; 7]); // Anonymous origin and no role claims.
+        for field in [
+            origin.principal.map(|v| v.0),
+            origin.transport_node.map(|v| v.0),
+            origin.credential.map(|v| v.0),
+            origin.actor.map(|v| v.0),
+            origin.capability.map(|v| v.0),
+        ] {
+            inner.push(u8::from(field.is_some()));
+            if let Some(field) = field {
+                inner.extend_from_slice(&field);
+            }
+        }
+        inner.extend_from_slice(&[0; 2]); // No role claims.
         bytes(&mut inner, &message);
         let schema = vos::agent::sdk::schema::decode(actor.state_lane_schema_bytes()).unwrap();
         let mut blobs = vec![
