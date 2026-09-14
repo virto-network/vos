@@ -14,11 +14,12 @@ lifecycle-store leases and corrected clock coverage" for the correction.
 Implementation is in `.worktrees/ch08-runtime-directory` on
 `wip/ch08-runtime-directory`, not yet in the root `saga/agents` checkout.
 Use only an isolated, disposable environment for bootstrap/ingress testing.
-Fresh-space identity derivation has a newly confirmed release blocker: two
-independent operator identities received the same Space ID. The seq-zero DAG
-event is empty initialization, while `set_root` is seq one; current genesis
-selection therefore does not bind the signing root. Do not connect these test
-spaces to one another or treat their displayed identity as isolation evidence.
+Fresh-space identity derivation now selects the actual canonical `set_root`
+event instead of empty initialization, and creation commits a full-width
+per-space bootstrap identity. Two spaces under one operator now have distinct
+root-bound IDs, and corrected genesis passes native startup. Existing spaces
+whose IDs came from the empty event are intentionally mismatched, not migrated;
+preserve the earlier collision fixtures and do not relabel their IDs manually.
 Fresh-space first start and restart with bundled system actors and HTTP/SSH
 have passed. One recovered Local Create has returned a client-verified
 acknowledgement after native route reconciliation. Exact repeated delivery now
@@ -7045,6 +7046,53 @@ Final CLI regression: **239 passed**, zero failures, **9 ignored**, **52.88s**
 opt-in Counter fixture and review/checklist record changed in this checkpoint.
 The genesis derivation fix is the next implementation step; it is not included
 in these passing results.
+
+### Root-bound, independently unique space genesis (C2)
+
+Creation and verification now share `registry_genesis_cid`: it checks the
+stored CID against the complete node bytes, uses the canonical registry replay
+decoder, and accepts only the versioned/schema-compatible `set_root` request.
+An empty initialization event is never an identity anchor. Creation requires
+exactly one root candidate; verification still locates the candidate matching
+the advertised identity rather than trusting CID sort order. The second
+creation boot also uses the existing genesis-bound node validator before
+anchoring the Space ID and enrolling the initial node.
+
+Initial CRDT registration now derives its bootstrap identity from the new
+per-space node's full PeerId under `vos/space-genesis-origin/v1`. It no longer
+uses a fixed all-zero replication ID. The operator's persistent signing key
+can therefore create separate spaces without depending on a collision-prone
+16-bit node prefix. Normal replication still switches to the derived Space ID;
+neither existing IDs nor stored DAG records are rewritten.
+
+The persisted regression covers initialization exclusion, actual root binding,
+different roots, corrupted/malformed CIDs and node framing, wrong schemas,
+old empty-event identity rejection, ambiguous creation roots, and verifier
+selection in the presence of multiple candidates. An initial test-only
+`Vec<i32>` literal compile error was corrected to `Vec<u8>` before validation.
+CLI regression: **240 passed**, zero failures, **9 ignored**, **51.06s**
+(`r16-genesis-root-cli.log`); normal binary build passed
+(`r16-genesis-root-build.log`), as did formatting and whitespace checks.
+
+Real CLI evidence is `target/task-tmp/genesis-root-smoke.V8PTde`. Two successive
+`space new` commands used the **same isolated operator/config directory**, and
+both completed their cold registry replay with the root-bound validator:
+
+- `genesis-one`: Space
+  `a4d608a8d4b6063c58bb198034535d47cc329de28b4536c4984a1a65663fac6f`, root
+  `c4d736580d6a9d1a2e28ac35f35dd084b6d0f55f56f56a772cd8932b2fc76f2e`.
+- `genesis-two`: Space
+  `b752b40b5aa153c8e55e77eb545ae451f966fce472bc16ebbf46d18d3c8fa13d`, root
+  `34f7368075edbdf7e49315ca6042f27ed166f876e3894b174a49a56662ed1b03`.
+
+The first space then started normally at **2026-09-14 20:01:47Z**, explicitly
+verified the above signing-root CID, reached HTTP/SSH readiness at **20:02:39Z**,
+returned HTTP 200 from `/__status`, and shut down cleanly in the same second
+(script exit **0**). Logs/data: `one.{json,log}`, `two.{json,log}`, `up-run.sh`,
+`up.log`, and `status.json`. No old collision dataset was booted or modified.
+This closes the demonstrated genesis collision; it does not close latency,
+protected permission setup, Shared finality, terminal/capacity recovery or the
+full final-source release matrix. Guest artifacts did not change.
 
 ### Durable client acknowledgement before completion
 

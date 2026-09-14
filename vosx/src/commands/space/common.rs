@@ -204,6 +204,20 @@ pub fn derive_space_id(genesis_dag_root: &[u8; 32]) -> [u8; 32] {
     )
 }
 
+/// Select the actual signing-root anchor, never the empty initialization
+/// event. Validate the stored CID as well as the complete replay framing.
+pub(super) fn registry_genesis_cid(key: &[u8], node: &[u8]) -> Option<[u8; 32]> {
+    let cid: [u8; 32] = key.try_into().ok()?;
+    if vos::crypto::blake2b_hash::<32>(b"", &[node]) != cid {
+        return None;
+    }
+    let request = vos::node::registry_replay_node_request(node).ok()??;
+    if request.name != "set_root" || !genesis_node_validator(derive_space_id(&cid))(&cid, node) {
+        return None;
+    }
+    Some(cid)
+}
+
 /// A [`NodeValidator`](vos::commit::NodeValidator) that binds the
 /// registry's replay boundary and two genesis anchors to `space_id`: it
 /// rejects malformed/non-canonical DAG and dynamic-message wires, unknown or
@@ -464,6 +478,82 @@ mod tests {
         assert_eq!(actor, service_root_actor_id(service, "counter"));
         assert_ne!(actor, service_root_actor_id(service, "counter-child"));
         assert_ne!(actor, vos::service::ActorId::ZERO);
+    }
+
+    #[test]
+    fn genesis_selection_binds_root_not_empty_initialization() {
+        let (empty_cid, empty) = registry_node(vos::effect_log::EffectLog::for_msg(vec![]), 0, &[]);
+        let root_message = |root: u8| {
+            vos::value::Msg::new("set_root")
+                .with("root", vec![root; 38])
+                .with("schema_version", vos::registry::REGISTRY_SCHEMA_VERSION)
+                .with("schema_hash", vos::registry::REGISTRY_SCHEMA_HASH.to_vec())
+        };
+        let (root_cid, root) = registry_node(registry_log(root_message(0xaa)), 1, &[empty_cid]);
+        let (other_cid, other) = registry_node(registry_log(root_message(0xbb)), 1, &[empty_cid]);
+        assert_eq!(registry_genesis_cid(&empty_cid, &empty), None);
+        assert_eq!(registry_genesis_cid(&root_cid, &root), Some(root_cid));
+        assert_eq!(registry_genesis_cid(&other_cid, &other), Some(other_cid));
+        assert_ne!(derive_space_id(&root_cid), derive_space_id(&other_cid));
+        assert_eq!(registry_genesis_cid(&empty_cid, &root), None);
+        assert_eq!(registry_genesis_cid(&root_cid[..31], &root), None);
+        let mut malformed = root.clone();
+        malformed.push(0);
+        let malformed_cid = vos::crypto::blake2b_hash::<32>(b"", &[&malformed]);
+        assert_eq!(registry_genesis_cid(&malformed_cid, &malformed), None);
+        let (bad_cid, bad) = registry_node(
+            registry_log(
+                vos::value::Msg::new("set_root")
+                    .with("root", vec![0xaau8; 38])
+                    .with("schema_version", vos::registry::REGISTRY_SCHEMA_VERSION + 1)
+                    .with("schema_hash", vos::registry::REGISTRY_SCHEMA_HASH.to_vec()),
+            ),
+            1,
+            &[empty_cid],
+        );
+        assert_eq!(registry_genesis_cid(&bad_cid, &bad), None);
+
+        let (path, _remove) = temp_registry_db("root-anchor");
+        let write = |records: &[([u8; 32], Vec<u8>)]| {
+            let db = redb::Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn
+                    .open_table(redb::TableDefinition::<&[u8], &[u8]>::new("dag"))
+                    .unwrap();
+                for (cid, bytes) in records {
+                    table.insert(cid.as_slice(), bytes.as_slice()).unwrap();
+                }
+            }
+            txn.commit().unwrap();
+        };
+        write(&[(empty_cid, empty), (root_cid, root)]);
+        assert_eq!(
+            super::super::new::read_genesis_root(&path).unwrap(),
+            root_cid
+        );
+        let verify = |id| {
+            super::super::verify::verify_with_timeout(&path, &id, std::time::Duration::ZERO)
+                .unwrap()
+        };
+        assert!(
+            matches!(verify(derive_space_id(&root_cid)), super::super::verify::VerifyOutcome::Verified { genesis_cid } if genesis_cid == root_cid)
+        );
+        assert!(matches!(
+            verify(derive_space_id(&empty_cid)),
+            super::super::verify::VerifyOutcome::Mismatch { .. }
+        ));
+        write(&[(other_cid, other)]);
+        assert!(
+            super::super::new::read_genesis_root(&path).is_err(),
+            "creation must reject ambiguous roots"
+        );
+        assert!(
+            matches!(verify(derive_space_id(&root_cid)), super::super::verify::VerifyOutcome::Verified { genesis_cid } if genesis_cid == root_cid)
+        );
+        assert!(
+            matches!(verify(derive_space_id(&other_cid)), super::super::verify::VerifyOutcome::Verified { genesis_cid } if genesis_cid == other_cid)
+        );
     }
 
     #[test]

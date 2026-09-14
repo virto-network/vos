@@ -1,8 +1,8 @@
-//! Genesis verification — confirms the local registry's first
-//! commit matches the advertised space_id.
+//! Genesis verification — confirms the local registry's signing-root
+//! commit matches the advertised space_id, ignoring empty initialization.
 //!
 //! After `space up` boots the registry, we expect either:
-//! - **Creator**: the genesis CrdtEvent (seq=0) is in the redb
+//! - **Creator**: the canonical `set_root` CrdtEvent is in the redb
 //!   from `space new`. `derive_space_id(cid)` must match the
 //!   space_id we chose at creation, by definition.
 //! - **Joiner**: the gossipsub sync layer pulls the genesis
@@ -66,12 +66,12 @@ pub fn verify_with_timeout(
     })
 }
 
-/// Scan the DAG table for the genesis CrdtEvent (`seq == 0`) and return
+/// Scan the DAG table for the canonical signing-root event and return
 /// its CID + the space_id it derives to. Prefers the candidate whose
 /// derived id equals `advertised` — there must be exactly one genuine
-/// genesis, but a peer can merge a forged `seq == 0` node whose CID
+/// genesis, but a peer can offer another root-setting node whose CID
 /// sorts lower (redb iterates by CID), so we cannot just take the first.
-/// Returns the genuine genesis if present; otherwise the first `seq == 0`
+/// Returns the genuine genesis if present; otherwise the first root-setting
 /// node (so the caller can report the mismatch); `None` if none exist.
 fn scan_for_genesis(
     registry_db_path: &Path,
@@ -88,44 +88,22 @@ fn scan_for_genesis(
         Err(e) => anyhow::bail!("open dag table: {e}"),
     };
 
-    // The first `seq == 0` node seen (lowest CID), kept only to report a
+    // The first root-setting node seen (lowest CID), kept only to report a
     // genuine mismatch if no candidate matches `advertised`.
-    let mut first_seq0: Option<([u8; 32], [u8; 32])> = None;
+    let mut first_root: Option<([u8; 32], [u8; 32])> = None;
     for row in table.iter().map_err(|e| anyhow::anyhow!("iter dag: {e}"))? {
         let (key, value) = row.map_err(|e| anyhow::anyhow!("read dag row: {e}"))?;
-        let bytes: &[u8] = value.value();
-        // DagNode wire format: [payload_len:u64 LE][payload][n_children:u64 LE][children...]
-        if bytes.len() < 8 {
-            continue;
-        }
-        let payload_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
-        if bytes.len() < 8 + payload_len {
-            continue;
-        }
-        let payload = &bytes[8..8 + payload_len];
-        let Some(event) = vos::effect_log::CrdtEvent::from_bytes(payload) else {
+        let Some(cid) = super::common::registry_genesis_cid(key.value(), value.value()) else {
             continue;
         };
-        // Per-origin seq counter starts at 0 (see
-        // `load_next_seq.unwrap_or(0)` in `vos::commit::CrdtCommit::open`),
-        // so the first commit's CrdtEvent has `seq == 0`.
-        if event.seq != 0 {
-            continue;
-        }
-        let key_bytes: &[u8] = key.value();
-        if key_bytes.len() != 32 {
-            continue;
-        }
-        let mut cid = [0u8; 32];
-        cid.copy_from_slice(key_bytes);
         let derived = crate::commands::space::common::derive_space_id(&cid);
         // The genuine genesis is the one whose CID derives the advertised
         // space_id — return it regardless of CID sort order, so a forged
-        // lower-CID `seq == 0` sibling can't shadow it.
+        // lower-CID root-setting sibling can't shadow it.
         if &derived == advertised {
             return Ok(Some((cid, derived)));
         }
-        first_seq0.get_or_insert((cid, derived));
+        first_root.get_or_insert((cid, derived));
     }
-    Ok(first_seq0)
+    Ok(first_root)
 }

@@ -1,7 +1,7 @@
 //! `space new` — scaffold a fresh space.
 //!
 //! Boots the registry actor in a temp data dir and commits only the
-//! versioned `set_root` anchor at sequence zero. It then derives
+//! versioned `set_root` anchor after runtime initialization. It then derives
 //! `space_id = derive_space_id(genesis_dag_root)`, reopens the registry,
 //! anchors that id, and finally submits the creator's space-bound signed
 //! `add_node`. Joiners therefore derive the same id from the same sole
@@ -143,22 +143,23 @@ pub(crate) fn scaffold(
     std::fs::create_dir_all(temp_dir.join("agents"))?;
     let mut temp_guard = TempDirGuard(Some(temp_dir.clone()));
 
-    // 4. Register the registry agent. The replication_id passed
-    //    here doesn't affect the on-disk layout — it's a
-    //    network-only concern (gossipsub topic) that's not
-    //    engaged for this offline boot. The space_id-derived
-    //    replication_id will be used on subsequent `space up`.
+    // 4. Give this offline creation a full-width unique origin. The operator
+    // may create multiple spaces, and the 16-bit node prefix alone is not a
+    // sufficient namespace. This bootstrap identity is committed in the DAG;
+    // normal replication switches to the derived Space ID after genesis.
+    let genesis_origin =
+        vos::crypto::blake2b_hash::<32>(b"vos/space-genesis-origin/v1", &[&peer_id.to_bytes()]);
     let mut node = VosNode::with_prefix(local_prefix);
     let cfg = AgentConfig::new(registry_blob.clone())
         .with_name(vos::node::REGISTRY_AGENT_NAME)
         .with_consistency(Consistency::Crdt)
-        .with_replication_id([0u8; 32])
+        .with_replication_id(genesis_origin)
         .persist(&temp_dir);
     let _id = node.register_at_id(cfg, ServiceId::REGISTRY);
 
-    // 5. Commit exactly one genesis operation: the versioned immutable
-    //    signing root. No signed mutation can precede the space-id anchor,
-    //    whose value is necessarily derived from this sequence-zero node.
+    // 5. Commit the versioned immutable signing root. Runtime initialization
+    // may already have emitted an empty event; that event is not the anchor.
+    // No signed mutation may precede the space-id anchor.
     let operator_kp = crate::identity::load_or_create()?;
     crate::bundled::prepare_system_packages(&operator_kp)?;
     super::local_config::save(
@@ -174,7 +175,7 @@ pub(crate) fn scaffold(
         anyhow::bail!("genesis set_root returned status {status}");
     }
 
-    // 6. Drain the first runtime so sequence zero is fully flushed.
+    // 6. Drain the first runtime so the signing-root anchor is fully flushed.
     node.shutdown();
     let results = node.collect();
     for r in &results {
@@ -183,7 +184,7 @@ pub(crate) fn scaffold(
         }
     }
 
-    // 7. Read the sequence-zero DAG root and derive the durable space id.
+    // 7. Read the unique signing-root DAG node and derive the durable space id.
     let registry_db = temp_dir
         .join("agents")
         .join(format!("{:08x}.redb", ServiceId::REGISTRY.0));
@@ -199,6 +200,7 @@ pub(crate) fn scaffold(
         .with_name(vos::node::REGISTRY_AGENT_NAME)
         .with_consistency(Consistency::Crdt)
         .with_replication_id(space_id)
+        .with_node_validator(super::common::genesis_node_validator(space_id))
         .persist(&temp_dir);
     let _id = node.register_at_id(cfg, ServiceId::REGISTRY);
     let status = vos::block_on(reg.set_space_id(&mut &node, space_id.to_vec()))
@@ -341,16 +343,13 @@ impl Drop for TempDirGuard {
     }
 }
 
-/// Open the registry's redb and return the CID of the `seq == 0`
+/// Open the registry's redb and return the CID of the signing-root
 /// commit — the genesis anchor `space_id` derives from.
 ///
-/// Genesis has exactly one commit (`set_root`); the space-id anchor and
-/// first signed `add_node` are deliberately committed only after deriving
-/// this root and reopening the registry. This MUST key on
-/// `seq == 0` (not the DAG tip): `space up` and joiners verify the
-/// space via the same `seq == 0` scan in `verify.rs`, and the tip
-/// moves with every post-genesis commit.
-fn read_genesis_root(db_path: &std::path::Path) -> anyhow::Result<[u8; 32]> {
+/// Select the canonical `set_root` event, not a sequence number or DAG tip.
+/// The empty initialization event must never identify a space. Creation
+/// requires exactly one root-setting event; verification uses the same decoder.
+pub(super) fn read_genesis_root(db_path: &std::path::Path) -> anyhow::Result<[u8; 32]> {
     use redb::ReadableTable;
     const DAG_TABLE: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("dag");
 
@@ -363,29 +362,17 @@ fn read_genesis_root(db_path: &std::path::Path) -> anyhow::Result<[u8; 32]> {
         .open_table(DAG_TABLE)
         .map_err(|e| anyhow::anyhow!("open dag table: {e}"))?;
 
+    let mut genesis = None;
     for row in table.iter().map_err(|e| anyhow::anyhow!("iter dag: {e}"))? {
         let (key, value) = row.map_err(|e| anyhow::anyhow!("read dag row: {e}"))?;
-        let bytes: &[u8] = value.value();
-        // DagNode wire: [payload_len:u64 LE][payload][n_children:u64 LE][children…]
-        if bytes.len() < 8 {
-            continue;
-        }
-        let payload_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
-        if bytes.len() < 8 + payload_len {
-            continue;
-        }
-        let Some(event) = vos::effect_log::CrdtEvent::from_bytes(&bytes[8..8 + payload_len]) else {
-            continue;
-        };
-        if event.seq != 0 {
-            continue;
-        }
-        let key_bytes: &[u8] = key.value();
-        if key_bytes.len() == 32 {
-            let mut cid = [0u8; 32];
-            cid.copy_from_slice(key_bytes);
-            return Ok(cid);
+        if let Some(cid) = super::common::registry_genesis_cid(key.value(), value.value()) {
+            anyhow::ensure!(
+                genesis.is_none(),
+                "registry has multiple signing-root anchors"
+            );
+            genesis = Some(cid);
         }
     }
-    anyhow::bail!("registry has no seq==0 commit after genesis")
+    genesis
+        .ok_or_else(|| anyhow::anyhow!("registry has no valid signing-root anchor after genesis"))
 }
