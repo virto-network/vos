@@ -15,7 +15,7 @@ mod operation_controller;
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 pub use operation_controller::{
     NativeAuthorityOperationCompletionStore, NativeAuthorityOperationController,
-    NativeAuthorityOperationControllerError,
+    NativeAuthorityOperationControllerError, NativeAuthorityOperationDecision,
 };
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
@@ -10041,6 +10041,18 @@ mod tests {
                 completion_calls: usize,
                 retirement_calls: usize,
             }
+            impl NativeAuthorityOperationDenialSigner for Signer {
+                type Error = core::convert::Infallible;
+                fn public_key(&self) -> [u8; 32] {
+                    self.key.verifying_key().to_bytes()
+                }
+                fn sign_native_operation_denial(
+                    &mut self,
+                    _: &[u8],
+                ) -> Result<[u8; 64], Self::Error> {
+                    panic!("approved operation cannot sign a denial")
+                }
+            }
             impl NativeAuthorityOperationRetirementSigner for Signer {
                 type Error = core::convert::Infallible;
                 fn public_key(&self) -> [u8; 32] {
@@ -10175,7 +10187,7 @@ mod tests {
                     operations.with_retirements(FailOnceCompletion(retirement_path.clone(), true));
                 assert!(
                     operations
-                        .coordinate_and_retire(owner, &call, context, slot, signer)
+                        .coordinate_and_decide(owner, &call, context, slot, signer)
                         .is_err()
                 );
                 assert_eq!(signer.retirement_calls, 1);
@@ -10191,12 +10203,13 @@ mod tests {
                 ));
                 let retirement = std::fs::read(&retirement_path).unwrap();
                 for _ in 0..2 {
-                    assert_eq!(
-                        operations
-                            .coordinate_and_retire(owner, &call, context, slot, signer)
-                            .unwrap(),
-                        issued
-                    );
+                    let NativeAuthorityOperationDecision::Issued(retried) = operations
+                        .coordinate_and_decide(owner, &call, context, slot, signer)
+                        .unwrap()
+                    else {
+                        panic!("approved operation became denied")
+                    };
+                    assert_eq!(retried, issued);
                     assert_eq!(signer.retirement_calls, 1);
                     assert_eq!(signer.completion_calls, 1);
                     assert_eq!(signer.calls, 2);
@@ -11382,6 +11395,163 @@ mod tests {
         }
 
         #[test]
+        fn native_operation_controller_denial_retries_publication_without_reexecution() {
+            use crate::agent::authority_operation_coordinator::tests::unenrolled_native_dispatch;
+            use crate::agent::authority_operation_issuer::AuthorityOperationEvidenceSigner;
+            use crate::agent_sdk::authority_operation::AuthorityOperationCall;
+            struct Signer(SigningKey, usize);
+            impl AuthorityOperationEvidenceSigner for Signer {
+                type Error = core::convert::Infallible;
+                fn public_key(&self) -> [u8; 32] {
+                    self.0.verifying_key().to_bytes()
+                }
+                fn sign_authority_receipt(&mut self, _: &[u8]) -> Result<[u8; 64], Self::Error> {
+                    panic!("denial cannot issue operation evidence")
+                }
+                fn sign_issuance_ack(&mut self, _: &[u8]) -> Result<[u8; 64], Self::Error> {
+                    panic!("denial cannot sign issuance acknowledgement")
+                }
+            }
+            impl NativeAuthorityOperationCompletionSigner for Signer {
+                type Error = core::convert::Infallible;
+                fn public_key(&self) -> [u8; 32] {
+                    self.0.verifying_key().to_bytes()
+                }
+                fn sign_native_operation_completion(
+                    &mut self,
+                    _: &[u8],
+                ) -> Result<[u8; 64], Self::Error> {
+                    panic!("denial cannot sign successful completion")
+                }
+            }
+            impl NativeAuthorityOperationRetirementSigner for Signer {
+                type Error = core::convert::Infallible;
+                fn public_key(&self) -> [u8; 32] {
+                    self.0.verifying_key().to_bytes()
+                }
+                fn sign_native_operation_retirement(
+                    &mut self,
+                    _: &[u8],
+                ) -> Result<[u8; 64], Self::Error> {
+                    panic!("denial cannot sign successful retirement")
+                }
+            }
+            impl NativeAuthorityOperationDenialSigner for Signer {
+                type Error = core::convert::Infallible;
+                fn public_key(&self) -> [u8; 32] {
+                    self.0.verifying_key().to_bytes()
+                }
+                fn sign_native_operation_denial(
+                    &mut self,
+                    bytes: &[u8],
+                ) -> Result<[u8; 64], Self::Error> {
+                    self.1 += 1;
+                    Ok(self.0.sign(bytes).to_bytes())
+                }
+            }
+            struct Denials(PathBuf, u8);
+            impl NativeAuthorityOperationDenialStore for Denials {
+                type Error = SharedAgentHostError;
+                fn load(&mut self) -> Result<Vec<Vec<u8>>, Self::Error> {
+                    match std::fs::read(&self.0) {
+                        Ok(bytes) => Ok(vec![bytes]),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
+                        Err(_) => Err(SharedAgentHostError::Unavailable),
+                    }
+                }
+                fn retain(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+                    self.1 += 1;
+                    if self.1 == 1 {
+                        return Err(SharedAgentHostError::Unavailable);
+                    }
+                    write_operation_test_image(&self.0, bytes)
+                        .map_err(|_| SharedAgentHostError::Unavailable)?;
+                    if self.1 == 2 {
+                        return Err(SharedAgentHostError::Unavailable);
+                    }
+                    Ok(())
+                }
+            }
+            let mut harness = NativeProjectionOwnerHarness::with_fixture(
+                "native-controller-denial",
+                native_bundled_authority_fixture(),
+            );
+            let root = harness._directory.0.clone();
+            let owner = harness.owner.as_mut().unwrap();
+            let target = owner.authority_target();
+            let slot = owner
+                .supervisor_invocation_material(owner.pins.agent, target.binding.issuer.actor)
+                .unwrap()
+                .observed_slot;
+            let request = unenrolled_native_dispatch(target, slot);
+            let call = AuthorityOperationCall::decode(&request.request).unwrap();
+            let issuer_path = root.join("controller-denial-issuer");
+            let denial_path = root.join("controller-denial-certificate");
+            let mut controller = NativeAuthorityOperationController::new(
+                target,
+                OperationTestImageFile(root.join("controller-denial-coordinator")),
+                OperationTestImageFile(issuer_path.clone()),
+                OperationTestJournal(root.clone()),
+            )
+            .with_denials(Denials(denial_path.clone(), 0));
+            let mut signer = Signer(SigningKey::from_bytes(&[RECEIPT_SEED; 32]), 0);
+            let before = owner.ordered_index_for_test().unwrap();
+            for attempt in 1..=2 {
+                assert!(matches!(
+                    controller.coordinate_and_decide(
+                        owner,
+                        &call,
+                        request.context.clone(),
+                        slot,
+                        &mut signer
+                    ),
+                    Err(SharedAgentHostError::Unavailable)
+                ));
+                assert_eq!(signer.1, attempt);
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+                let (query, auth) = fresh_projection_pair(owner, 0xdd);
+                assert!(
+                    owner
+                        ._network_host
+                        .reserve_projection_pair(
+                            HostAgentId(owner.pins.agent.0),
+                            &query,
+                            &auth,
+                            false
+                        )
+                        .is_err()
+                );
+            }
+            let saved = std::fs::read(&denial_path).unwrap();
+            for _ in 0..2 {
+                let NativeAuthorityOperationDecision::Denied(bytes) = controller
+                    .coordinate_and_decide(owner, &call, request.context.clone(), slot, &mut signer)
+                    .unwrap()
+                else {
+                    panic!("expected signed denial")
+                };
+                assert_eq!(bytes, saved);
+            }
+            let mut wrong_context = request.context.clone();
+            wrong_context.observed_slot += 1;
+            assert!(
+                controller
+                    .coordinate_and_decide(owner, &call, wrong_context, slot + 1, &mut signer)
+                    .is_err()
+            );
+            assert_eq!(signer.1, 2);
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before + 2);
+            assert!(!issuer_path.exists());
+            let (query, auth) = fresh_projection_pair(owner, 0xdd);
+            owner
+                ._network_host
+                .reserve_projection_pair(HostAgentId(owner.pins.agent.0), &query, &auth, false)
+                .unwrap();
+            drop(controller);
+            harness.stop();
+        }
+
+        #[test]
         fn native_operation_coordinator_requires_retained_policy_before_signing() {
             use crate::agent::authority_operation_coordinator::{
                 AuthorityOperationActorDispatcher as _, AuthorityOperationCoordinatorError,
@@ -11392,6 +11562,18 @@ mod tests {
             use crate::agent::clean_bootstrap::operation_dispatch::NativeAuthorityOperationDispatcher;
             use crate::agent_sdk::authority_operation::AuthorityOperationCall;
             struct NoSigning([u8; 32]);
+            impl NativeAuthorityOperationDenialSigner for NoSigning {
+                type Error = SharedAgentHostError;
+                fn public_key(&self) -> [u8; 32] {
+                    self.0
+                }
+                fn sign_native_operation_denial(
+                    &mut self,
+                    _: &[u8],
+                ) -> Result<[u8; 64], Self::Error> {
+                    Err(SharedAgentHostError::Unavailable)
+                }
+            }
             impl NativeAuthorityOperationRetirementSigner for NoSigning {
                 type Error = core::convert::Infallible;
                 fn public_key(&self) -> [u8; 32] {
@@ -11617,7 +11799,9 @@ mod tests {
                 ),
                 Err(SharedAgentHostError::Unavailable)
             ));
-            assert_eq!(lifecycle.ordered_index_for_test().unwrap(), before + 1);
+            // The valid restored denial is now acknowledged, but unavailable
+            // signing/persistence must not return a terminal decision.
+            assert_eq!(lifecycle.ordered_index_for_test().unwrap(), before + 2);
             assert_eq!(std::fs::read(&journal_path).unwrap(), corrupt);
             drop(lifecycle);
             harness.stop();

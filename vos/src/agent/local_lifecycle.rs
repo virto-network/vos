@@ -981,7 +981,7 @@ pub(crate) trait NativeLocalLifecycle: Send {
         _call: &super::sdk::authority_operation::AuthorityOperationCall,
         _context: super::sdk::InvocationContext,
         _issued_at: u64,
-    ) -> Result<super::authority_operation_issuer::IssuedAuthorityOperation, SharedAgentHostError>
+    ) -> Result<super::clean_bootstrap::NativeAuthorityOperationDecision, SharedAgentHostError>
     {
         Err(SharedAgentHostError::Unavailable)
     }
@@ -1033,7 +1033,7 @@ where
         call: &super::sdk::authority_operation::AuthorityOperationCall,
         context: super::sdk::InvocationContext,
         issued_at: u64,
-    ) -> Result<super::authority_operation_issuer::IssuedAuthorityOperation, SharedAgentHostError>
+    ) -> Result<super::clean_bootstrap::NativeAuthorityOperationDecision, SharedAgentHostError>
     {
         LocalLifecycleController::authorize_operation(self, call, context, issued_at)
     }
@@ -1120,7 +1120,7 @@ where
         call: &super::sdk::authority_operation::AuthorityOperationCall,
         context: super::sdk::InvocationContext,
         issued_at: u64,
-    ) -> Result<super::authority_operation_issuer::IssuedAuthorityOperation, SharedAgentHostError>;
+    ) -> Result<super::clean_bootstrap::NativeAuthorityOperationDecision, SharedAgentHostError>;
 }
 
 /// Retains one system owner and one physical Local host across route-worker
@@ -1197,6 +1197,7 @@ where
         O: super::authority_operation_issuer::AuthorityOperationEvidenceSigner
             + super::clean_bootstrap::NativeAuthorityOperationCompletionSigner
             + super::clean_bootstrap::NativeAuthorityOperationRetirementSigner
+            + super::clean_bootstrap::NativeAuthorityOperationDenialSigner
             + Send
             + 'static,
     {
@@ -1214,6 +1215,8 @@ where
                 != target.binding.public_key
             || super::clean_bootstrap::NativeAuthorityOperationRetirementSigner::public_key(&signer)
                 != target.binding.public_key
+            || super::clean_bootstrap::NativeAuthorityOperationDenialSigner::public_key(&signer)
+                != target.binding.public_key
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
@@ -1229,7 +1232,7 @@ where
         call: &super::sdk::authority_operation::AuthorityOperationCall,
         context: super::sdk::InvocationContext,
         issued_at: u64,
-    ) -> Result<super::authority_operation_issuer::IssuedAuthorityOperation, SharedAgentHostError>
+    ) -> Result<super::clean_bootstrap::NativeAuthorityOperationDecision, SharedAgentHostError>
     {
         let operations = self
             .operations

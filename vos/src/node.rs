@@ -5838,8 +5838,9 @@ impl VosNode {
             .create_local_disposition(descriptor, call, runtime)
     }
 
-    /// Native policy authorization only; returned issuance is not application
-    /// or retirement. Callers must retain exact context/slot inputs for retry.
+    /// Native policy decision: issued authorization or synchronized signed denial.
+    /// Issuance is not actor application or application retirement. Callers must
+    /// retain exact context/slot inputs for retry.
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
     pub fn authorize_clean_agent_operation(
         &mut self,
@@ -5847,7 +5848,7 @@ impl VosNode {
         context: crate::agent::sdk::InvocationContext,
         issued_at: u64,
     ) -> Result<
-        crate::agent::authority_operation_issuer::IssuedAuthorityOperation,
+        crate::agent::clean_bootstrap::NativeAuthorityOperationDecision,
         crate::agent::shared_host::SharedAgentHostError,
     > {
         if self.shutdown.load(Ordering::Acquire) {

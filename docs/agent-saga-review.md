@@ -189,8 +189,9 @@ Keep these as work within C2, not new review batches:
    verification/acknowledgement and signed terminal denial release have native
    owner boundaries. Issuer-gated denial startup classification is implemented;
    the production controller/daemon now retain the hardened denial index and
-   validate it during startup. Automatic terminal denial handling and operation
-   ingress/client wiring remain open.
+   validate it during startup. Automatic terminal denial handling now has a typed
+   native decision path; operation ingress/client wiring and the live
+   denial/valid-successor campaign remain open.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
    retirement and restart through native ingress; then expose the same
    preparation/authorization flow in the user-facing client. A Public query
@@ -6088,6 +6089,53 @@ automatically sign/retire a new policy denial or return a retained denial on exa
 retry. That distinction, the valid-successor campaign, operation HTTP/client
 wiring and protected mutation remain open. No guest artifact or master branch
 change is included; no new live-daemon campaign is claimed.
+
+### Typed native operation decision and automatic denial retirement
+
+Verification: **9 targeted native tests passed, zero failures**, in **137.01s**;
+**222 CLI tests passed, zero failures, five ignored**, in **47.99s**. Evidence:
+`.worktrees/ch08-c2-native/target/task-tmp/r16-denial-decision-native-final.log`
+and `r16-denial-decision-cli-final.log` in the same directory. Formatting and
+whitespace checks pass. No full-library, live-daemon, artifact reproduction or
+performance campaign was run for this checkpoint.
+
+The first native run failed two tests: it exposed re-pledging after acknowledged
+denial/certificate-write failure, and an outdated fixture expectation that the
+restored valid denial could never reach signing. The corrected path verifies
+pledge absence before direct denial recovery. The fixture now injects signer
+unavailability and verifies that the acknowledged result still returns an error,
+not a terminal decision. Its corrupt-journal rejection checks remain intact.
+
+The production operation API now returns an explicit issued authorization or a
+signed terminal denial. Only the coordinator's exact `AuthorizationDenied`
+result reaches native denial verification, positive acknowledgement and signed
+retention. Transport, execution, signing and storage errors remain errors, never
+policy denials. All signer identities are pinned during controller adoption.
+
+An exact retained denial is checked against the original call/context, canonical
+native source and freshly read absence of issuance. The controller synchronizes
+the exact saved certificate before releasing admission or returning it; it does
+not dispatch policy or create a new coordinator pledge on that terminal retry.
+If acknowledgement succeeded but certificate retention did not, recovery also
+requires that the unissued coordinator pledge has been durably removed before
+reconstructing the native denial proof and retrying retention. A still-pledged
+call remains on the coordinator path; native evidence is not used to bypass its
+journal transition.
+Successful authorization uses the existing completion/retirement boundary.
+Neither outcome claims that the requested actor operation has been applied.
+
+The added native campaign injects failure before denial publication and failure
+after publication, checks reservation exclusion, and retries exact bytes without
+new native execution. Positive retirement coverage also exercises the typed
+decision path. The existing owner-reopen fixtures remain separate evidence;
+this is not a live operation HTTP/client or valid-successor pass.
+
+Scope remains C2. Operation ingress/client, protected application and restart,
+the remaining runtime support and recovery gates, and C3 remain unfinished.
+Create/Install latency is explicitly a production blocker: hashing-dominated
+execution and expensive inventory refresh are measured, but their underlying
+cause and acceptable fresh-response performance are not yet established.
+Timeout extensions or repeated retries do not close that gate.
 
 ### Durable client acknowledgement before completion
 

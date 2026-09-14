@@ -56,6 +56,15 @@ pub enum NativeAuthorityOperationControllerError<C, B, S> {
     Coordinate(AuthorityOperationCoordinatorError<C, B, SharedAgentHostError, S>),
 }
 
+/// A policy decision is distinct from transport, execution or persistence failure.
+/// Issuance authorizes application; it does not prove application completed.
+#[derive(Debug)]
+pub enum NativeAuthorityOperationDecision {
+    Issued(IssuedAuthorityOperation),
+    /// Exact synchronized NDR1 certificate, not an unsigned rejection reason.
+    Denied(Vec<u8>),
+}
+
 impl<C, B, J> NativeAuthorityOperationController<C, B, J>
 where
     C: AuthorityOperationCoordinatorStore,
@@ -374,6 +383,180 @@ where
         Ok(issued)
     }
 
+    /// Recover a synchronized terminal denial before considering policy dispatch.
+    /// Only the coordinator's exact policy-denial result can create a new one.
+    pub fn coordinate_and_decide<P, R, I, S>(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        call: &AuthorityOperationCall,
+        context: InvocationContext,
+        issued_at: u64,
+        signer: &mut S,
+    ) -> Result<NativeAuthorityOperationDecision, SharedAgentHostError>
+    where
+        P: CleanSystemAgentBootstrapStore,
+        R: CleanSystemAgentBootstrapStore,
+        I: CleanManagementIssuerStore,
+        S: AuthorityOperationEvidenceSigner
+            + NativeAuthorityOperationCompletionSigner
+            + NativeAuthorityOperationRetirementSigner
+            + NativeAuthorityOperationDenialSigner,
+    {
+        if owner.authority_target() != self.authority
+            || call.authority != self.authority
+            || AuthorityOperationEvidenceSigner::public_key(signer)
+                != self.authority.binding.public_key
+            || NativeAuthorityOperationCompletionSigner::public_key(signer)
+                != self.authority.binding.public_key
+            || NativeAuthorityOperationRetirementSigner::public_key(signer)
+                != self.authority.binding.public_key
+            || NativeAuthorityOperationDenialSigner::public_key(signer)
+                != self.authority.binding.public_key
+            || !call.matches_invocation_context(&context)
+            || issued_at < context.observed_slot
+            || issued_at < call.requested_valid_from
+            || issued_at > call.requested_expires_at
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self.validate()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        for certificate in self
+            .denials
+            .load()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+        {
+            let id = native_operation_denial_invocation(
+                &self.authority.binding.public_key,
+                &certificate,
+            )
+            .ok_or(SharedAgentHostError::ScopeMismatch)?;
+            if id != call.invocation {
+                continue;
+            }
+            let record = self.denial_source(call, &context)?;
+            let mut issuer = DurableAuthorityOperationIssuer::open(
+                BorrowedIssuer(&mut self.issuer),
+                self.authority,
+            )
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+            let retained =
+                owner.restore_native_operation_denial(&record, &mut issuer, &certificate)?;
+            self.denials
+                .retain(&certificate)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            owner.release_native_operation_denial(&retained)?;
+            return Ok(NativeAuthorityOperationDecision::Denied(certificate));
+        }
+        // A failed certificate write follows durable removal of the unissued
+        // coordinator pledge. Recover the native result without re-pledging an
+        // already acknowledged invocation. A still-pledged call must go through
+        // the coordinator so its journal transition is not bypassed.
+        if self
+            .journal
+            .load(call.invocation)
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .is_some()
+            && self.denial_pledge_absent(call.invocation)?
+        {
+            let record = self.denial_source(call, &context)?;
+            let mut issuer = DurableAuthorityOperationIssuer::open(
+                BorrowedIssuer(&mut self.issuer),
+                self.authority,
+            )
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+            if issuer
+                .recover_retained(call.invocation)
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .is_none()
+            {
+                if let Some(proof) = owner.verify_native_operation_denial(&record, &mut issuer)? {
+                    owner.acknowledge_native_operation_denial(&proof)?;
+                    let mut certificate = None;
+                    owner.finish_native_operation_denial(&proof, signer, |bytes| {
+                        self.denials
+                            .retain(bytes)
+                            .map_err(|_| SharedAgentHostError::Unavailable)?;
+                        certificate = Some(bytes.to_vec());
+                        Ok(())
+                    })?;
+                    return certificate
+                        .map(NativeAuthorityOperationDecision::Denied)
+                        .ok_or(SharedAgentHostError::Unavailable);
+                }
+            }
+        }
+        match self.coordinate(owner, call, context.clone(), issued_at, signer) {
+            Ok(issued) => self.retire_issued(owner, call, issued, signer)
+                .map(NativeAuthorityOperationDecision::Issued),
+            Err(NativeAuthorityOperationControllerError::Coordinate(
+                AuthorityOperationCoordinatorError::Rejected(
+                    crate::agent::authority_operation_coordinator::AuthorityOperationCoordinatorRejection::AuthorizationDenied,
+                ),
+            )) => {
+                let record = self.denial_source(call, &context)?;
+                let mut issuer = DurableAuthorityOperationIssuer::open(BorrowedIssuer(&mut self.issuer), self.authority)
+                    .map_err(|_| SharedAgentHostError::Unavailable)?;
+                let proof = owner.verify_native_operation_denial(&record, &mut issuer)?
+                    .ok_or(SharedAgentHostError::Unavailable)?;
+                owner.acknowledge_native_operation_denial(&proof)?;
+                let mut certificate = None;
+                owner.finish_native_operation_denial(&proof, signer, |bytes| {
+                    self.denials.retain(bytes).map_err(|_| SharedAgentHostError::Unavailable)?;
+                    certificate = Some(bytes.to_vec());
+                    Ok(())
+                })?;
+                certificate.map(NativeAuthorityOperationDecision::Denied)
+                    .ok_or(SharedAgentHostError::Unavailable)
+            }
+            Err(_) => Err(SharedAgentHostError::Unavailable),
+        }
+    }
+
+    fn denial_pledge_absent(
+        &mut self,
+        invocation: InvocationId,
+    ) -> Result<bool, SharedAgentHostError> {
+        let issuer =
+            DurableAuthorityOperationIssuer::open(BorrowedIssuer(&mut self.issuer), self.authority)
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let coordinator = DurableAuthorityOperationCoordinator::open(
+            BorrowedCoordinator(&mut self.coordinator),
+            self.authority,
+            ValidationOnly,
+            issuer,
+        )
+        .map_err(|_| SharedAgentHostError::Unavailable)?;
+        Ok(!coordinator
+            .required_native_dispatches()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .iter()
+            .any(|request| request.context.invocation == invocation))
+    }
+
+    fn denial_source(
+        &mut self,
+        call: &AuthorityOperationCall,
+        context: &InvocationContext,
+    ) -> Result<operation_dispatch::RetainedAuthorityOperationDispatch, SharedAgentHostError> {
+        let bytes = self
+            .journal
+            .load(call.invocation)
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        let record = operation_dispatch::RetainedAuthorityOperationDispatch::decode(&bytes)
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if record.request().context != *context
+            || record.request().request
+                != call
+                    .encode()
+                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Ok(record)
+    }
+
     fn acknowledge_issued<P, R, I, S>(
         &mut self,
         owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
@@ -478,6 +661,22 @@ where
         let issued = self
             .coordinate(owner, call, context, issued_at, signer)
             .map_err(|_| SharedAgentHostError::Unavailable)?;
+        self.retire_issued(owner, call, issued, signer)
+    }
+
+    fn retire_issued<P, R, I, S>(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        call: &AuthorityOperationCall,
+        issued: IssuedAuthorityOperation,
+        signer: &mut S,
+    ) -> Result<IssuedAuthorityOperation, SharedAgentHostError>
+    where
+        P: CleanSystemAgentBootstrapStore,
+        R: CleanSystemAgentBootstrapStore,
+        I: CleanManagementIssuerStore,
+        S: NativeAuthorityOperationCompletionSigner + NativeAuthorityOperationRetirementSigner,
+    {
         let ids = [
             call.invocation,
             issued.issuance_ack.acknowledgement_invocation,
@@ -577,6 +776,7 @@ where
     S: AuthorityOperationEvidenceSigner
         + NativeAuthorityOperationCompletionSigner
         + NativeAuthorityOperationRetirementSigner
+        + NativeAuthorityOperationDenialSigner
         + Send,
 {
     fn coordinate(
@@ -585,11 +785,9 @@ where
         call: &AuthorityOperationCall,
         context: InvocationContext,
         issued_at: u64,
-    ) -> Result<IssuedAuthorityOperation, SharedAgentHostError> {
-        // No terminal denial certificate exists here yet. Preserve errors as
-        // unavailable rather than releasing admission or declaring success.
+    ) -> Result<NativeAuthorityOperationDecision, SharedAgentHostError> {
         self.0
-            .coordinate_and_retire(owner, call, context, issued_at, &mut self.1)
+            .coordinate_and_decide(owner, call, context, issued_at, &mut self.1)
     }
 }
 

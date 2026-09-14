@@ -710,7 +710,7 @@ impl AgentProductionOwner {
         context: super::sdk::InvocationContext,
         issued_at: u64,
     ) -> Result<
-        super::authority_operation_issuer::IssuedAuthorityOperation,
+        super::clean_bootstrap::NativeAuthorityOperationDecision,
         super::shared_host::SharedAgentHostError,
     > {
         if !self.is_running() {
