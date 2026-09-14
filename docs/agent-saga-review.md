@@ -32,8 +32,10 @@ was authorized after recovery-only startup, followed by verified inventory,
 receipt-bearing Catalog query, positive retirement and exact retries. The live
 invocation test passed in 5.14s after readiness, and shutdown was clean. This is
 a Public query with a receipt, not non-Public mutation or ordinary Shared finality.
-Fresh first-attempt managed invocation and valid invocation succession remain to
-be checked. Historical clock/scheduler/startup failures are preserved below.
+A fresh successor invocation now also passes on its first managed attempt, with
+the next credential operation sequence, positive retirement and exact retries.
+It took 176.52s; the full live test took 178.76s. Historical clock/scheduler/startup
+failures are preserved below. Protected mutation and latency gates remain open.
 Native host-clock preparation retains AOC5 before HTTP and exact returned AOQ1
 before authorization. Periodic reconciliation defers while admission is held;
 startup now exposes only exact retained authorization recovery until inventory
@@ -6749,6 +6751,40 @@ not every recovery or release gate. Fresh first-attempt/successor invocation,
 non-Public/mutating workflows, expiry/abort, ordinary Shared finality and C3 remain
 open. The multi-minute startup/reconciliation and Create/Install results remain
 production-blocking. All changes belong to the existing **C2** review batch.
+
+### Fresh successor invocation after completed recovery (C2)
+
+The opt-in `real_daemon_fresh_successor_invocation_and_exact_retry` campaign uses
+a separate immutable `agent-client/managed-invocation-successor` intent. Before
+creating it, the test requires the prior credential reservation to be Completed.
+It verifies a distinct invocation ID, exactly the predecessor's operation sequence
+plus one, and unchanged predecessor AOQ1 bytes. It then performs the same actual
+receipt-bearing query, positive retirement, two real acknowledgement retries and
+cached managed resume checks. It never clears or replaces pending work.
+
+The existing IgQS0r space restarted normally with **cba908b2** production code:
+start **2026-09-14 18:23:25Z**, ready **18:25:18Z** (about **113 seconds**), without
+recovery-only mode. Fresh successor
+`1d61ca50555b8286eca69513e0aa09570ea6b198392b94bd93224012af982246` passed on its
+first managed attempt in **176.52 seconds**, without an HTTP timeout or caller
+retry. The full native test passed in **178.76 seconds** (test build **0.24s**).
+The daemon shut down cleanly at **18:30:13Z**, campaign exit **0**, and `.endpoint`
+is absent. Shutdown waited for an in-flight inventory reconciliation, whose total
+time was **120.456 seconds**. This remains a responsiveness/latency concern.
+
+Evidence remains in `successor-run.sh`, `successor-daemon.log`, and
+`successor-invocation.log` under shared disk-backed
+`target/task-tmp/native-denial-head-reuse.IgQS0r`. The predecessor and older failed
+campaigns remain intact. Ordinary CLI regression: **239 passed**, zero failures,
+**seven ignored**, in **63.70s** (`r16-successor-cli-final.log`); formatting and
+whitespace checks pass. Only the opt-in test/fixture and review record changed.
+
+Next mutation coverage must use a legitimate Local mutable actor and protected
+permission setup. The existing Counter example supplies Local mutable state, but
+the Public Catalog query is not a mutation proof. Catalog's `mutate` method is a
+signed Shared/Merge publication and must not be repurposed as evidence for Local
+protected mutation. Non-Public policy, mutation/restart, expiry/abort, ordinary
+Shared finality, performance and C3 release gates remain open. This stays in C2.
 
 ### Durable client acknowledgement before completion
 

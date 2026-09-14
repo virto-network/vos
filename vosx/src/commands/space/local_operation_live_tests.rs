@@ -13,6 +13,16 @@ use vos::{Decode as _, Encode as _};
 #[test]
 #[ignore = "requires explicitly selected disposable native managed invocation campaign"]
 fn real_daemon_managed_receipt_invocation_and_exact_retry() {
+    managed_receipt_invocation_and_exact_retry(false);
+}
+
+#[test]
+#[ignore = "requires completed disposable managed invocation and explicit native campaign"]
+fn real_daemon_fresh_successor_invocation_and_exact_retry() {
+    managed_receipt_invocation_and_exact_retry(true);
+}
+
+fn managed_receipt_invocation_and_exact_retry(successor: bool) {
     let config_path = PathBuf::from(
         std::env::var_os("VOSX_INVOKE_SMOKE_CONFIG").expect("explicit disposable configuration"),
     );
@@ -53,11 +63,65 @@ fn real_daemon_managed_receipt_invocation_and_exact_retry() {
     let operator = crate::identity::load_existing().unwrap();
     let identity =
         super::super::clean_identity::CleanOperatorIdentitySigner::new(&operator).unwrap();
-    let root = data.join("agent-client/managed-invocation-smoke");
+    let predecessor = if successor {
+        let mut prior = CleanPreparationClientFile::open_or_create(
+            data.join("agent-client/managed-invocation-smoke"),
+        )
+        .unwrap();
+        let prior = AgentTargetedPreparationRequest::decode(
+            &prior
+                .load_request()
+                .unwrap()
+                .expect("completed predecessor intent"),
+        )
+        .unwrap();
+        let nonce = Hash(prior.intent().invocation().0);
+        let request_root = data
+            .join("agent-client/operations")
+            .join(format!(
+                "{}-{}",
+                hex::encode(identity.credential().0),
+                hex::encode(nonce.0)
+            ))
+            .join("request");
+        let mut store = CleanOperationClientFile::open_or_create(&request_root).unwrap();
+        let bytes = store
+            .load_request()
+            .unwrap()
+            .expect("predecessor authorization");
+        let call = AuthorityOperationSubmission::decode(&bytes).unwrap();
+        assert!(store.load_response().unwrap().is_some());
+        Some((
+            nonce,
+            call.call().request_sequence.get(),
+            request_root,
+            bytes,
+        ))
+    } else {
+        None
+    };
+    let root = data.join(if successor {
+        "agent-client/managed-invocation-successor"
+    } else {
+        "agent-client/managed-invocation-smoke"
+    });
     let mut intent_store = CleanPreparationClientFile::open_or_create(&root).unwrap();
     let intent = match intent_store.load_request().unwrap() {
         Some(bytes) => AgentTargetedPreparationRequest::decode(&bytes).unwrap(),
         None => {
+            if let Some((nonce, _, _, _)) = &predecessor {
+                let mut reservation = CleanCredentialReservation::open_or_create(
+                    &data.join("agent-client/credentials"),
+                    space,
+                    identity.credential(),
+                )
+                .unwrap();
+                assert_eq!(
+                    reservation.current().unwrap(),
+                    Some((*nonce, CredentialReservationStatus::Completed)),
+                    "fresh successor requires completed predecessor; never clear pending state"
+                );
+            }
             let mut nonce = [0; 32];
             getrandom::getrandom(&mut nonce).unwrap();
             let mut message = vec![vos::value::TAG_DYNAMIC];
@@ -115,6 +179,21 @@ fn real_daemon_managed_receipt_invocation_and_exact_retry() {
         }
     );
     let (authorization_root, _) = result.unwrap();
+    if let Some((prior_nonce, sequence, prior_root, prior_bytes)) = predecessor {
+        assert_ne!(intent.intent().invocation().0, prior_nonce.0);
+        let mut store = CleanOperationClientFile::open_or_create(&authorization_root).unwrap();
+        let bytes = store.load_request().unwrap().unwrap();
+        assert_eq!(
+            AuthorityOperationSubmission::decode(&bytes)
+                .unwrap()
+                .call()
+                .request_sequence
+                .get(),
+            sequence.checked_add(1).unwrap()
+        );
+        let mut prior = CleanOperationClientFile::open_or_create(prior_root).unwrap();
+        assert_eq!(prior.load_request().unwrap().unwrap(), prior_bytes);
+    }
     let application_root = authorization_root.parent().unwrap().join("application");
     let mut store =
         super::super::clean_store::CleanInvocationFile::open_or_create(&application_root).unwrap();
