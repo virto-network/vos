@@ -6316,6 +6316,28 @@ credential-wide reservation and orchestration through discovery, retained
 preparation, signing, authorization and protected application. No timeout,
 latency gate, bundled artifact or review-batch boundary changed.
 
+### Operation denial and credential reservation
+
+Verification: **232 CLI tests passed**, zero failures, five opt-in tests ignored,
+in **48.56s** (`.worktrees/ch08-c2-native/target/task-tmp/r16-operation-reservation-cli.log`).
+Formatting and whitespace checks pass; no new native/live-daemon result is claimed.
+
+The credential-wide reservation now has a denial-only operation release helper.
+It loads and syncs the exact retained AOQ1/AOR1 under the delivery lease, verifies
+the signed denial/source binding, and checks Space, credential and the signed
+actor invocation ID against the reservation nonce. The denied marker commits
+both exact request and response hashes with operation-specific domains. Exact
+repeat after reopen is idempotent; a different signed decision with the same
+invocation nonce cannot replace a terminal marker. A successor reservation cannot
+be released using the predecessor's denial.
+
+Missing responses, malformed staged responses and wrong scope leave reservations
+pending. Issued authorization is explicitly rejected by this release helper:
+receipt issuance is not proof of protected application completion. This closes
+a prerequisite for managed operation orchestration, not that command itself.
+The fresh command and live protected application/restart gates remain open.
+Tests use signed protocol fixtures, not native actor denial execution.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

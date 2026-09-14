@@ -44,6 +44,68 @@ impl CleanPreparationClientFile {
     }
 }
 
+impl CleanCredentialReservation {
+    /// Release an invocation reservation only after its exact signed denial
+    /// has been verified and synchronized under the delivery lease. Issuance
+    /// is not application completion and cannot release the reservation here.
+    pub(crate) fn deny_operation(
+        &mut self,
+        delivery: &mut CleanOperationClientFile,
+    ) -> Result<(), CleanFileStoreError> {
+        use vos::agent::clean_bootstrap::NativeAuthorityOperationDecision;
+        use vos::agent::sdk::Hash;
+        use vos::agent::sdk::authority_operation::AuthorityOperationIntent;
+        let request = delivery
+            .load_request()?
+            .ok_or(CleanFileStoreError::RequestConflict)?;
+        let response = delivery
+            .load_response()?
+            .ok_or(CleanFileStoreError::RequestConflict)?;
+        let submission = AuthorityOperationSubmission::decode(&request)
+            .map_err(|_| CleanFileStoreError::Corrupt)?;
+        let call = submission.call();
+        let AuthorityOperationIntent::InvokeActor {
+            managed,
+            operation_invocation,
+            ..
+        } = &call.intent
+        else {
+            return Err(CleanFileStoreError::Corrupt);
+        };
+        if call.authority.space != self.space
+            || managed.space != self.space
+            || call.credential != self.credential
+        {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        if !matches!(
+            submission
+                .decode_response(&response)
+                .map_err(|_| CleanFileStoreError::Corrupt)?,
+            NativeAuthorityOperationDecision::Denied { .. }
+        ) {
+            return Err(CleanFileStoreError::RequestConflict);
+        }
+        let nonce = Hash(operation_invocation.0);
+        let current = self.load()?.ok_or(CleanFileStoreError::RequestConflict)?;
+        if current[68..100] != nonce.0 {
+            return Err(CleanFileStoreError::RequestConflict);
+        }
+        let mut denied = self.image(
+            nonce,
+            Some((
+                Hash::digest(b"vos/agent-operation/retained-request/v1", &[&request]),
+                Hash::digest(b"vos/agent-operation/retained-denial/v1", &[&response]),
+            )),
+        );
+        denied[100] = 2;
+        if current[100] != 0 && current != denied {
+            return Err(CleanFileStoreError::RequestConflict);
+        }
+        self.store.commit(&denied)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::operation_journal_tests::submission;
@@ -82,6 +144,89 @@ mod tests {
                 dispatch,
             })
             .unwrap()
+    }
+
+    #[test]
+    fn operation_denial_releases_only_its_exact_durable_credential_reservation() {
+        use vos::agent::sdk::{CredentialId, Hash, SpaceId};
+        let fixture = Fixture::new("operation-reservation");
+        let request = submission(1);
+        let nonce = Hash([0x61; 32]);
+        let space = request.call().authority.space;
+        let credential = request.call().credential;
+        let mut reservation =
+            CleanCredentialReservation::open_or_create(&fixture.parent, space, credential).unwrap();
+        reservation.reserve(nonce).unwrap();
+        assert!(
+            CleanCredentialReservation::open_or_create(&fixture.parent, space, credential).is_err()
+        );
+        let mut delivery = CleanOperationClientFile::open_or_create(&fixture.root).unwrap();
+        assert!(reservation.deny_operation(&mut delivery).is_err());
+        delivery
+            .publish_request(&request.encode().unwrap())
+            .unwrap();
+        assert!(reservation.deny_operation(&mut delivery).is_err());
+        assert!(reservation.reserve(Hash([0x71; 32])).is_err());
+        assert_eq!(
+            reservation.current().unwrap(),
+            Some((nonce, CredentialReservationStatus::Pending))
+        );
+        delivery.publish_response(&denial(&request)).unwrap();
+        // A published canonical response does not permit releasing the
+        // reservation while a conflicting/invalid staged response exists.
+        super::super::tests::stage(&delivery.response, None, b"invalid AOR1");
+        let staged = fs::read(fixture.root.join("operation.response.next")).unwrap();
+        assert!(reservation.deny_operation(&mut delivery).is_err());
+        assert_eq!(
+            reservation.current().unwrap(),
+            Some((nonce, CredentialReservationStatus::Pending))
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("operation.response.next")).unwrap(),
+            staged
+        );
+        fs::remove_file(fixture.root.join("operation.response.next")).unwrap();
+        for (space, credential, wrong_nonce) in [
+            (SpaceId([0x72; 32]), credential, nonce),
+            (space, CredentialId([0x73; 32]), nonce),
+        ] {
+            let mut other =
+                CleanCredentialReservation::open_or_create(&fixture.parent, space, credential)
+                    .unwrap();
+            other.reserve(wrong_nonce).unwrap();
+            assert!(other.deny_operation(&mut delivery).is_err());
+            assert_eq!(
+                other.current().unwrap(),
+                Some((wrong_nonce, CredentialReservationStatus::Pending))
+            );
+        }
+        reservation.deny_operation(&mut delivery).unwrap();
+        reservation.deny_operation(&mut delivery).unwrap();
+        assert_eq!(
+            reservation.current().unwrap(),
+            Some((nonce, CredentialReservationStatus::Denied))
+        );
+        drop(reservation);
+        drop(delivery);
+        let mut reservation =
+            CleanCredentialReservation::open_or_create(&fixture.parent, space, credential).unwrap();
+        let mut delivery = CleanOperationClientFile::open_or_create(&fixture.root).unwrap();
+        reservation.deny_operation(&mut delivery).unwrap();
+        // Same invocation nonce with a different signed sequence/decision must
+        // not replace an already committed denial marker.
+        let mut other =
+            CleanOperationClientFile::open_or_create(fixture.parent.join("other")).unwrap();
+        other
+            .publish_request(&submission(2).encode().unwrap())
+            .unwrap();
+        other.publish_response(&denial(&submission(2))).unwrap();
+        assert!(reservation.deny_operation(&mut other).is_err());
+        reservation.reserve(Hash([0x74; 32])).unwrap();
+        assert!(reservation.deny_operation(&mut delivery).is_err());
+        assert_eq!(
+            reservation.current().unwrap(),
+            Some((Hash([0x74; 32]), CredentialReservationStatus::Pending))
+        );
     }
 
     #[test]
