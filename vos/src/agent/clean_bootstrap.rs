@@ -5,6 +5,10 @@
 //! invoked through the authenticated Shared journal and Raft proposer.
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+#[path = "clean_admin_dispatch.rs"]
+pub(crate) mod admin_dispatch;
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 #[path = "clean_operation_dispatch.rs"]
 pub(crate) mod operation_dispatch;
 
@@ -9828,6 +9832,181 @@ mod tests {
 
         fn native_bundled_authority_fixture() -> PhysicalFixture {
             native_bundled_authority_fixture_with_query_catalog(false)
+        }
+
+        #[test]
+        fn native_admin_retained_dispatch_recovers_before_and_after_execution() {
+            use super::super::admin_dispatch::{
+                NativeAuthorityAdminJournalStore, RetainedAuthorityAdminDispatch,
+            };
+            use crate::agent_sdk::authority::{AuthorityAdminCall, AuthorityAdminOperation};
+            struct AdminJournal(OperationTestJournal, u8);
+            impl NativeAuthorityAdminJournalStore for AdminJournal {
+                type Error = std::io::Error;
+                fn load(&mut self, id: InvocationId) -> Result<Option<Vec<u8>>, Self::Error> {
+                    self.0.load(id)
+                }
+                fn retain(&mut self, id: InvocationId, bytes: &[u8]) -> Result<(), Self::Error> {
+                    if self.1 == 2 {
+                        self.1 = 1;
+                        return Err(std::io::Error::other("injected failure before publication"));
+                    }
+                    self.0.retain(id, bytes)?;
+                    if core::mem::take(&mut self.1) == 1 {
+                        return Err(std::io::Error::other("published before injected failure"));
+                    }
+                    Ok(())
+                }
+            }
+            let mut harness = NativeProjectionOwnerHarness::with_fixture(
+                "native-admin-retained",
+                native_bundled_authority_fixture(),
+            );
+            let mut owner = harness.owner.take().unwrap();
+            let target = owner.authority_target();
+            let slot = owner
+                .supervisor_invocation_material(owner.pins.agent, target.binding.issuer.actor)
+                .unwrap()
+                .observed_slot;
+            let key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
+            let public = key.verifying_key().to_bytes();
+            let mut call = AuthorityAdminCall {
+                invocation: InvocationId::ZERO,
+                authority: target,
+                administrator: owner.pins.descriptor.identity.owner,
+                credential: CredentialId::of_public_key(&public),
+                request_sequence: NonZeroU64::new(1).unwrap(),
+                credential_public_key: public,
+                authenticated_node: owner.pins.node,
+                observed_slot: slot,
+                expected_generation: NonZeroU64::new(1).unwrap(),
+                operation: AuthorityAdminOperation::SetSpaceRole {
+                    principal: owner.pins.descriptor.identity.owner,
+                    role: crate::agent_sdk::RoleId([0x53; 32]),
+                    granted: true,
+                },
+                signature: [1; 64],
+            };
+            call.invocation = call.expected_invocation();
+            call.signature = key.sign(&call.signing_bytes()).to_bytes();
+            let mut journal = AdminJournal(OperationTestJournal(harness._directory.0.clone()), 2);
+            let mut operations = OperationTestJournal(harness._directory.0.clone());
+            let before = owner.ordered_index_for_test().unwrap();
+            assert!(owner.retain_authority_admin(&call, &mut journal).is_err());
+            assert!(owner.management_admission_held().unwrap());
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            assert!(journal.load(call.invocation).unwrap().is_none());
+            harness
+                .fixture
+                .logical_slot
+                .as_ref()
+                .unwrap()
+                .store(slot + 1, Ordering::Release);
+            assert!(owner.retain_authority_admin(&call, &mut journal).is_err());
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            let bytes = journal.load(call.invocation).unwrap().unwrap();
+            let retained = RetainedAuthorityAdminDispatch::decode(&bytes).unwrap();
+            assert_eq!(retained.encode().unwrap(), bytes);
+            assert_eq!(
+                owner.retain_authority_admin(&call, &mut journal).unwrap(),
+                retained
+            );
+            for end in [0, 3, bytes.len() - 1] {
+                assert!(RetainedAuthorityAdminDispatch::decode(&bytes[..end]).is_err());
+            }
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert!(RetainedAuthorityAdminDispatch::decode(&trailing).is_err());
+            let mut forged = retained.clone();
+            forged.call.signature[0] ^= 1;
+            assert!(forged.encode().is_err());
+            assert!(owner.execute_authority_admin(&forged).is_err());
+            let mut wrong_anchor = retained.clone();
+            wrong_anchor.anchor.runtime = HostHash([0xf1; 32]);
+            assert!(owner.execute_authority_admin(&wrong_anchor).is_err());
+            // A structurally valid envelope still cannot replace admitted gas.
+            let mut substituted = retained.clone();
+            if let RuntimeWork::Invoke {
+                invocation,
+                authorization,
+                observed_slot,
+                ..
+            } = &mut substituted.envelope
+            {
+                invocation.gas -= 1;
+                **authorization = InvocationAuthorization::PublicPreflight(
+                    crate::agent_sdk::PublicPreflight::for_work(invocation, *observed_slot),
+                );
+            }
+            assert!(substituted.encode().is_ok());
+            assert!(owner.execute_authority_admin(&substituted).is_err());
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            for ids in [
+                vec![call.invocation, call.invocation],
+                vec![InvocationId([0xff; 32])],
+            ] {
+                assert!(
+                    NativeAuthorityOperationStartupAdmission::load(&mut operations, target, &[])
+                        .unwrap()
+                        .include_pending_admin(&mut journal, &ids)
+                        .is_err()
+                );
+            }
+            let mut first_result = None;
+            for restart in 0..2 {
+                let pins = owner._pins_store.clone();
+                let record = owner.record_store.clone();
+                let issuer = owner.issuer.into_store();
+                drop(owner._network_host);
+                drop(owner.host);
+                harness
+                    .fixture
+                    .logical_slot
+                    .as_ref()
+                    .unwrap()
+                    .store(slot + 10 + restart, Ordering::Release);
+                let admission =
+                    NativeAuthorityOperationStartupAdmission::load(&mut operations, target, &[])
+                        .unwrap()
+                        .include_pending_admin(&mut journal, &[call.invocation])
+                        .unwrap();
+                owner = CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
+                    pins,
+                    record,
+                    issuer,
+                    &mut CountingSigner::new(),
+                    || panic!("admin recovery must not recreate bootstrap"),
+                    harness._directory.host(),
+                    harness._directory.lock(),
+                    harness.fixture.plan.pins.space,
+                    harness.fixture.plan.pins.node,
+                    harness.fixture.trust.clone(),
+                    harness.fixture.merge.clone(),
+                    harness.fixture.finality.clone(),
+                    harness.provider.clone(),
+                    harness.network.clone(),
+                    None,
+                    Some(&admission),
+                )
+                .unwrap();
+                drop(admission);
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before + restart);
+                let recovered = owner.retain_authority_admin(&call, &mut journal).unwrap();
+                assert_eq!(recovered, retained);
+                let result = owner.execute_authority_admin(&recovered).unwrap().unwrap();
+                assert_eq!(result.call, call);
+                assert_eq!(result.generation.get(), 2);
+                if let Some(first) = &first_result {
+                    assert_eq!(first, &result);
+                } else {
+                    first_result = Some(result);
+                }
+                assert_eq!(owner.ordered_index_for_test().unwrap(), before + 1);
+                assert!(owner.management_admission_held().unwrap());
+                assert_eq!(journal.load(call.invocation).unwrap(), Some(bytes.clone()));
+            }
+            harness.owner = Some(owner);
+            harness.stop();
         }
 
         #[test]

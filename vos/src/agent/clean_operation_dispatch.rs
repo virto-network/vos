@@ -80,6 +80,51 @@ pub struct NativeAuthorityOperationStartupAdmission<'a> {
 }
 
 impl<'a> NativeAuthorityOperationStartupAdmission<'a> {
+    /// Add the complete pending admin discovery set while retaining its writer
+    /// lease alongside the operation stores. Admin records are never treated
+    /// as operation-domain approvals or as already retired work.
+    pub(crate) fn include_pending_admin<
+        J: super::admin_dispatch::NativeAuthorityAdminJournalStore,
+    >(
+        mut self,
+        journal: &'a mut J,
+        invocations: &[InvocationId],
+    ) -> Result<Self, SharedAgentHostError> {
+        use super::admin_dispatch::RetainedAuthorityAdminDispatch;
+        let maximum = 2 * crate::agent::authority_operation_coordinator::MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS;
+        if invocations.len() > maximum || self.pending.len() > maximum - invocations.len() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for envelope in self
+            .pending
+            .iter()
+            .map(|(_, work)| work)
+            .chain(self.retirements.iter().flatten())
+        {
+            if let RuntimeWork::Invoke { invocation, .. } = envelope {
+                seen.insert(invocation.invocation);
+            }
+        }
+        for invocation in invocations {
+            if *invocation == InvocationId::ZERO || !seen.insert(*invocation) {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            let bytes = journal
+                .load(*invocation)
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .ok_or(SharedAgentHostError::Unavailable)?;
+            let record = RetainedAuthorityAdminDispatch::decode(&bytes)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            if record.call.authority != self.authority || record.call.invocation != *invocation {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            self.pending.push((record.anchor, record.envelope));
+        }
+        self.has_history |= !invocations.is_empty();
+        Ok(self)
+    }
+
     /// Supply the complete bounded discovery set, including initial stages.
     /// Missing or duplicate records are errors, never empty recovery state.
     pub fn load<J: NativeAuthorityOperationJournalStore>(

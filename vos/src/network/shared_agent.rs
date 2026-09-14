@@ -2833,6 +2833,25 @@ impl SharedAgentNetworkHost {
         result
     }
 
+    /// Recover an exact in-process reservation after a failed publication.
+    /// This does not create admission or infer completion from a missing file.
+    pub(crate) fn retained_management_pending(
+        &self,
+        agent: crate::service::AgentId,
+        invocation: crate::agent_sdk::InvocationId,
+    ) -> Result<Option<PendingManagement>, SharedAgentHostError> {
+        let found = self.management_pending.get(&agent).and_then(|pending| {
+            pending.iter().find(|(_, envelope)| {
+                matches!(envelope, crate::agent_sdk::RuntimeWork::Invoke { invocation: work, .. }
+                    if work.invocation == invocation)
+            })
+        });
+        if let Some((anchor, envelope)) = found {
+            self.ensure_management_pending_member(agent, anchor, envelope)?;
+        }
+        Ok(found.cloned())
+    }
+
     /// Publish signed denial retirement before releasing its exact pending
     /// member. A failed store callback retains both admission and refresh state.
     /// Completed signed records may release after pruning without replaying.

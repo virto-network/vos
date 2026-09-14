@@ -243,8 +243,11 @@ Keep these as work within C2, not new review batches:
    The fresh Public Counter post-retirement/restart campaign now passes.
    Complete the missing protected permission setup next: the real bundled
    Authority passes native signed space-role grant/revoke and rejects anonymous
-   signed administration, but durable admin delivery through the host/client
-   is not implemented. Keep its credential sequence and generation CAS distinct
+   signed administration. Native retained admin dispatch now recovers across
+   publication failures and owner restart before/after execution. Terminal
+   admin result retirement, production stores, host-clock preparation and
+   host/client delivery remain unimplemented. Keep its credential sequence and
+   generation CAS distinct
    from operation authorization; do not relax anonymous HTTP invocation or
    put this mutation in the read-only projection journal.
    A Public query or mutation alone does not close this item.
@@ -7388,6 +7391,35 @@ existing native system runtime fixture; it does not prove end-to-end physical
 runtime latency, crash-safe admin orchestration, deployment-scoped actor grants,
 or protected Local mutation. Those gates remain open. No production code,
 artifact pins, authentication rules, or timeouts changed in this checkpoint.
+
+### Retained native admin dispatch and restart (C2)
+
+`clean_admin_dispatch.rs` adds the distinct signed NAD1 record, immutable journal
+contract, persistence-before-dispatch boundary, and exact native execution.
+Startup admission can include pending admin records while holding their journal
+lease alongside operation leases. It checks discovery identity, duplicate IDs,
+bounded canonical records and signed envelope binding; physical reopen separately
+authenticates each journal anchor. Admin work stays pending, never reclassified
+as an operation approval, read-only projection, or retired result.
+
+Both native admin tests pass (`target/task-tmp/native-admin-retained-test.log`).
+The nine existing native operation regressions also pass (115.15s;
+`target/task-tmp/native-admin-operation-regressions.log`), as do the ordinary
+CLI build (`target/task-tmp/native-admin-vosx-build.log`), formatting and diff checks.
+The new regression injects failure before publication, advances the clock,
+injects failure after publication, and recovers the identical signed record.
+It reopens the native owner before and after real bundled-Authority execution:
+exact retry returns generation two with only one committed admin invocation.
+Changed signatures, anchors and gas are rejected, as are truncated/trailing
+records and missing/duplicate startup records. In-process recovery after a
+missing publication uses the exact retained native reservation, not a new clock.
+
+This remains internal, with a test-only disk store. No ingress is enabled and
+no successful admin reply is acknowledged or admission released by this API.
+Next implement authenticated durable terminal result/denial recovery and
+retirement, then the hardened production store/controller and host-clock
+preparation/client delivery. The protected Local mutation gate remains open.
+No SDK wire ABI or bundled executable changed; no artifact repin is needed.
 
 ### Durable client acknowledgement before completion
 
