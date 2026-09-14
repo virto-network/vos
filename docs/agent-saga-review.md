@@ -27,8 +27,9 @@ after restart also passes. Native positive retirement and exact acknowledgement
 retries now pass before and after restart; protected/non-Public and mutating
 actor workflows remain open.
 This is not yet a usable ordinary-agent production path.
-Operation signing and retained targeted preparation helpers now pass CLI tests;
-fresh-command orchestration and live protected application are still open.
+Operation signing and retained targeted preparation are wired into an ATQ1-input
+managed authorization command; live fresh authorization and protected application
+are still unproven. Issuance leaves its credential reservation pending.
 The native Local Install application and startup-recovery phases now pass
 physical tests from prepared authorization through retirement, including
 pristine client-retry admission. Native Install controller handoff, retry and
@@ -6337,6 +6338,39 @@ receipt issuance is not proof of protected application completion. This closes
 a prerequisite for managed operation orchestration, not that command itself.
 The fresh command and live protected application/restart gates remain open.
 Tests use signed protocol fixtures, not native actor denial execution.
+
+### Managed Local invocation authorization
+
+Verification: **235 CLI tests passed**, zero failures, five opt-in tests ignored,
+in **48.62s** (`.worktrees/ch08-c2-native/target/task-tmp/r16-managed-operation-cli.log`).
+The normal CLI build also passes (**7.03s**, `r16-managed-operation-build.log`),
+and `space authorize-local-invocation --help` advertises its authorization-only
+and pending-reservation constraints. Formatting and whitespace checks pass.
+No live fresh authorization or protected
+application result is claimed.
+
+`authorize-local-invocation SPACE --intent intent.atq1` now connects the existing
+credential-wide reservation, retained ATQ1/ATP1 preparation, operation-domain
+credential discovery, Local descriptor discovery, deterministic signing and
+retained AOQ1/AOR1 delivery. `--resume` selects the current reservation and reads
+no new input. Existing AOQ1 is checked before discovery/preparation/signing; a
+missing retained intent permits retry only with the original explicit input.
+The common request namespace rejects attempts to resume a Create/Install as an
+operation. Scope checks require the selected operator, Space and Local node.
+
+This is an advanced canonical-intent authorization interface, not a complete
+invocation command. It does not generate actor messages or apply an issued
+receipt. Errors and issuance keep the reservation pending; an exact retained
+signed denial completes it with the distinct denied marker. Protected
+application, terminal retirement/reservation completion, live fresh authorization
+and restart remain required C2 work. Production latency is still blocking.
+
+The managed-resume test uses signed shaped native records. It verifies exact
+AOQ1 after HTTP 504, held credential lease during delivery, denied completion,
+wrong-node rejection and cached retry without discovery/preparation files.
+Fresh-intent tests verify caller rejection before client state, immutable ATQ1
+and query retention before failed discovery, and pending-successor exclusion.
+These tests do not prove a live fresh authorization/actor mutation campaign.
 
 ### Durable client acknowledgement before completion
 

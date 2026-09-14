@@ -117,9 +117,13 @@ mod tests {
     // not native execution. Native denial proof is tested in the library.
     fn denial(request: &AuthorityOperationSubmission) -> Vec<u8> {
         let (key, _, _, _) = crate::commands::space::local_create::tests::fixture();
-        let (_, _, dispatch) = super::super::operation_journal_tests::record(
+        let (_, _, dispatch) = super::super::operation_journal_tests::record_scoped(
             request.call().request_sequence.get(),
             100,
+            Some((
+                request.call().authority,
+                request.call().intent.managed().transition_producer,
+            )),
         );
         let fields = [
             request.call().invocation.0,
@@ -144,6 +148,135 @@ mod tests {
                 dispatch,
             })
             .unwrap()
+    }
+
+    #[test]
+    fn managed_operation_resume_skips_discovery_and_releases_only_retained_denial() {
+        use std::io::{Read as _, Write as _};
+        use vos::agent::sdk::{Hash, ProducerId};
+        let fixture = Fixture::new("managed-operation");
+        let (operator, old_authority, _, runtime) =
+            crate::commands::space::local_create::tests::fixture();
+        let identity =
+            crate::commands::space::clean_identity::CleanOperatorIdentitySigner::new(&operator)
+                .unwrap();
+        let package = crate::bundled::root_signed_actor_package(
+            crate::bundled::system_authority_package_template(),
+            "system-authority",
+            &operator,
+        )
+        .unwrap();
+        let (authority, _) = crate::commands::space::clean_startup::derive_system_authority_target(
+            old_authority.space,
+            identity.raw_public_key(),
+            &runtime,
+            &package,
+        )
+        .unwrap();
+        let node = [0x42; 32];
+        let request = super::super::operation_journal_tests::submission_scoped(
+            1,
+            Some((authority, ProducerId::of_public_key(&node))),
+        );
+        let bytes = request.encode().unwrap();
+        let response = denial(&request);
+        let root = fixture.parent.join("agent-client");
+        ensure_private_directory(&root).unwrap();
+        let claims = root.join("credentials");
+        ensure_private_directory(&claims).unwrap();
+        let mut reservation = CleanCredentialReservation::open_or_create(
+            &claims,
+            authority.space,
+            identity.credential(),
+        )
+        .unwrap();
+        let nonce = Hash([0x61; 32]);
+        reservation.reserve(nonce).unwrap();
+        drop(reservation);
+        let operations = root.join("operations");
+        ensure_private_directory(&operations).unwrap();
+        let operation = operations.join(format!(
+            "{}-{}",
+            hex::encode(identity.credential().0),
+            hex::encode(nonce.0)
+        ));
+        ensure_private_directory(&operation).unwrap();
+        let request_root = operation.join("request");
+        let mut store = CleanOperationClientFile::open_or_create(&request_root).unwrap();
+        store.publish_request(&bytes).unwrap();
+        drop(store);
+        let run = |address, node| {
+            crate::commands::space::local_operation::authorize(
+                &fixture.parent,
+                address,
+                &operator,
+                authority.space,
+                node,
+                None,
+            )
+        };
+        assert!(run("127.0.0.1:1".parse().unwrap(), [0x43; 32]).is_err());
+        for (status, success) in [(504, false), (200, true)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let expected = bytes.clone();
+            let reply = response.clone();
+            let server_claims = claims.clone();
+            let credential = identity.credential();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    header.push(byte[0]);
+                    assert!(header.len() < 8192);
+                }
+                assert!(header.starts_with(b"POST /__agents/authorize HTTP/1.1\r\n"));
+                let mut body = vec![0; expected.len()];
+                stream.read_exact(&mut body).unwrap();
+                assert_eq!(body, expected);
+                assert!(matches!(
+                    CleanCredentialReservation::open_or_create(
+                        &server_claims,
+                        authority.space,
+                        credential
+                    ),
+                    Err(CleanFileStoreError::Busy)
+                ));
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", reply.len()).unwrap();
+                let _ = stream.write_all(&reply);
+            });
+            let result = run(address, node);
+            assert_eq!(result.is_ok(), success, "{result:?}");
+            server.join().unwrap();
+            let mut reservation = CleanCredentialReservation::open_or_create(
+                &claims,
+                authority.space,
+                identity.credential(),
+            )
+            .unwrap();
+            assert_eq!(
+                reservation.current().unwrap(),
+                Some((
+                    nonce,
+                    if success {
+                        CredentialReservationStatus::Denied
+                    } else {
+                        CredentialReservationStatus::Pending
+                    }
+                ))
+            );
+            assert!(!operation.join("query").exists());
+            assert!(!operation.join("preparation").exists());
+        }
+        assert_eq!(
+            run("127.0.0.1:1".parse().unwrap(), node).unwrap(),
+            (request_root, response)
+        );
     }
 
     #[test]

@@ -40,6 +40,8 @@ pub(crate) mod local_create;
 pub(crate) mod local_install;
 #[cfg(target_os = "linux")]
 pub(crate) mod local_invocation;
+#[cfg(target_os = "linux")]
+mod local_operation;
 pub mod new;
 pub mod op_sign;
 #[cfg(target_os = "linux")]
@@ -51,6 +53,10 @@ pub mod verify;
 
 #[derive(Subcommand, Debug)]
 pub enum SpaceCommand {
+    /// Prepare and authorize exact ATQ1 intent on an operator-owned Local Agent.
+    /// Does not apply the invocation; issuance leaves the credential pending.
+    #[cfg(target_os = "linux")]
+    AuthorizeLocalInvocation(local_operation::AuthorizeLocalArgs),
     /// Submit or retry exact AOQ1 authorization; retain the verified decision.
     #[cfg(target_os = "linux")]
     SubmitAgentAuthorization {
@@ -177,6 +183,8 @@ pub enum SpaceCommand {
 
 pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
     match cmd {
+        #[cfg(target_os = "linux")]
+        SpaceCommand::AuthorizeLocalInvocation(args) => local_operation::run(args),
         #[cfg(target_os = "linux")]
         SpaceCommand::SubmitAgentAuthorization {
             request_dir,

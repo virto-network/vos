@@ -72,6 +72,28 @@ locally without sending another request. Output includes `decision: issued` or
 loopback-only, with no proxies or redirects. This command does not yet prepare or
 sign a fresh operation, apply it to an actor, or prove application retirement.
 
+The development-only managed authorization interface accepts an exact **ATQ1**
+intent rather than a pre-signed AOQ1:
+
+```sh
+vosx space authorize-local-invocation my-space --intent invocation.atq1
+vosx space authorize-local-invocation my-space --resume
+```
+
+ATQ1 must already contain a stable nonzero invocation ID, full target and selected
+operator principal/API credential origin. The command discovers the Local Agent,
+retains physical preparation, signs in the operation sequence domain and delivers
+the retained authorization. It supports operator-owned Local Agents of this node,
+not ordinary Shared finality or actor/transport impersonation. `--resume` never
+reads a new intent file. Retrying the same invocation ID uses any already retained
+intent and signed authorization; it does not replace their content.
+
+The credential-wide reservation remains pending on delivery errors **and on
+issuance**. Only a verified retained signed denial releases it here. Output is
+explicitly `applied: false`; an issued result still needs protected application
+and retirement wiring. Do not treat this authorization-only command as a usable
+end-to-end production invocation or delete its reservation to bypass pending work.
+
 ### Invocation and application routes
 
 ### Clean invocation transport (saga branch)

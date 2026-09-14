@@ -7,7 +7,14 @@ use vos::agent::sdk::{authority::*, authority_operation::*, wire::CanonicalWire 
 pub(super) fn submission(
     sequence: u64,
 ) -> vos::agent::local_lifecycle::AuthorityOperationSubmission {
-    let (authority, invocation, bytes) = record(sequence, 100);
+    submission_scoped(sequence, None)
+}
+
+pub(super) fn submission_scoped(
+    sequence: u64,
+    scope: Option<(AuthorityActorTarget, ProducerId)>,
+) -> vos::agent::local_lifecycle::AuthorityOperationSubmission {
+    let (authority, invocation, bytes) = record_scoped(sequence, 100, scope);
     let offset = 4 + RUNTIME_ABI_ID.as_bytes().len() + 1;
     let length = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
     let call = AuthorityOperationCall::decode(&bytes[offset + 4..offset + 4 + length]).unwrap();
@@ -34,7 +41,20 @@ pub(super) fn record(
     sequence: u64,
     native_gas: u64,
 ) -> (AuthorityActorTarget, InvocationId, Vec<u8>) {
-    let (operator, authority, descriptor, _) = super::super::local_create::tests::fixture();
+    record_scoped(sequence, native_gas, None)
+}
+
+pub(super) fn record_scoped(
+    sequence: u64,
+    native_gas: u64,
+    scope: Option<(AuthorityActorTarget, ProducerId)>,
+) -> (AuthorityActorTarget, InvocationId, Vec<u8>) {
+    let (operator, mut authority, mut descriptor, _) = super::super::local_create::tests::fixture();
+    if let Some((target, producer)) = scope {
+        authority = target;
+        descriptor.authority = target.binding;
+        descriptor.identity.transition_producer = producer;
+    }
     let public = operator.public().try_into_ed25519().unwrap().to_bytes();
     let origin = InvocationOrigin {
         principal: Some(descriptor.identity.owner),
