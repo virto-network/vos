@@ -95,8 +95,27 @@ ASQ1 under the operation's `application/` child, after verifying that the retain
 ATQ1/ATP1 work matches the signed AOQ1/AOR1. Missing preparation or conflicting
 application state fails closed without replacing retained data. It is not sent
 to the actor by this command; an issued result still needs protected application
-and retirement wiring. Do not treat this authorization-only command as a usable
+and retirement. Do not treat this authorization-only command as a usable
 end-to-end production invocation or delete its reservation to bypass pending work.
+
+The managed invocation command uses the same intent/reservation and then performs
+delivery, continuation and positive acknowledgement:
+
+```sh
+vosx space invoke-local my-space --intent invocation.atq1
+vosx space invoke-local my-space --resume
+```
+
+It can resume an issued `authorize-local-invocation` operation. Every application
+or continuation request is retained before HTTP. Transport failure, yield,
+missing response and failed acknowledgement leave the credential pending. Only
+the verified, synchronized positive acknowledgement of that exact receipt-bearing
+invocation completes it. Completion is idempotent after reopen.
+
+Successful retirement reports `delivery_retired: true` and
+`reservation_pending: false`, **not actor success**: a completed actor error can
+also be positively retired. This client path has protocol/loopback tests, not yet
+a live protected mutation/restart campaign. Production latency remains blocking.
 
 ### Invocation and application routes
 

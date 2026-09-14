@@ -45,6 +45,93 @@ impl CleanPreparationClientFile {
 }
 
 impl CleanCredentialReservation {
+    /// Complete only the exact receipt-bearing invocation after its retained
+    /// positive retirement exchange. Actor-level failure may retire, but an
+    /// issuance, yield, HTTP error or failed acknowledgement cannot complete.
+    pub(crate) fn complete_operation(
+        &mut self,
+        authorization: &mut CleanOperationClientFile,
+        application: &mut CleanInvocationFile,
+    ) -> Result<(), CleanFileStoreError> {
+        use vos::agent::clean_bootstrap::NativeAuthorityOperationDecision;
+        use vos::agent::sdk::authority_operation::AuthorityOperationIntent;
+        use vos::agent::sdk::{Hash, InvocationAuthorization};
+        let request = authorization
+            .load_request()?
+            .ok_or(CleanFileStoreError::RequestConflict)?;
+        let decision = authorization
+            .load_response()?
+            .ok_or(CleanFileStoreError::RequestConflict)?;
+        let submission = AuthorityOperationSubmission::decode(&request)
+            .map_err(|_| CleanFileStoreError::Corrupt)?;
+        let NativeAuthorityOperationDecision::Issued(issued) = submission
+            .decode_response(&decision)
+            .map_err(|_| CleanFileStoreError::Corrupt)?
+        else {
+            return Err(CleanFileStoreError::RequestConflict);
+        };
+        let call = submission.call();
+        let AuthorityOperationIntent::InvokeActor {
+            managed,
+            operation_invocation,
+            ..
+        } = &call.intent
+        else {
+            return Err(CleanFileStoreError::Corrupt);
+        };
+        if call.authority.space != self.space
+            || managed.space != self.space
+            || call.credential != self.credential
+        {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        let invocation = application
+            .load_request()?
+            .ok_or(CleanFileStoreError::RequestConflict)?;
+        let response = application
+            .load_response()?
+            .ok_or(CleanFileStoreError::RequestConflict)?;
+        let history = application
+            .load_progress()?
+            .ok_or(CleanFileStoreError::RequestConflict)?;
+        let envelope = super::super::local_invocation::validate_request(&invocation)
+            .map_err(|_| CleanFileStoreError::Corrupt)?;
+        if !call.intent.matches_invocation_work(envelope.work())
+            || envelope.authorization()
+                != &InvocationAuthorization::AuthorityReceipt(issued.receipt)
+        {
+            return Err(CleanFileStoreError::Corrupt);
+        }
+        let progress =
+            super::super::invocation_progress::Progress::decode(&history, &invocation, &response)
+                .map_err(|_| CleanFileStoreError::Corrupt)?;
+        if !progress
+            .is_retired(&invocation, &response)
+            .map_err(|_| CleanFileStoreError::Corrupt)?
+        {
+            return Err(CleanFileStoreError::RequestConflict);
+        }
+        let nonce = Hash(operation_invocation.0);
+        let current = self.load()?.ok_or(CleanFileStoreError::RequestConflict)?;
+        if current[68..100] != nonce.0 {
+            return Err(CleanFileStoreError::RequestConflict);
+        }
+        let completed = self.image(
+            nonce,
+            Some((
+                Hash::digest(b"vos/agent-operation/retained-request/v1", &[&request]),
+                Hash::digest(
+                    b"vos/agent-operation/retained-application/v1",
+                    &[&invocation, &response, &history],
+                ),
+            )),
+        );
+        if current[100] != 0 && current != completed {
+            return Err(CleanFileStoreError::RequestConflict);
+        }
+        self.store.commit(&completed)
+    }
+
     /// Release an invocation reservation only after its exact signed denial
     /// has been verified and synchronized under the delivery lease. Issuance
     /// is not application completion and cannot release the reservation here.

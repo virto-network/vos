@@ -28,6 +28,14 @@ pub struct AuthorizeLocalArgs {
 }
 
 pub(crate) fn run(args: AuthorizeLocalArgs) -> anyhow::Result<()> {
+    run_with_application(args, false)
+}
+
+pub(crate) fn run_invocation(args: AuthorizeLocalArgs) -> anyhow::Result<()> {
+    run_with_application(args, true)
+}
+
+fn run_with_application(args: AuthorizeLocalArgs, apply: bool) -> anyhow::Result<()> {
     use std::io::Read as _;
     let (data, space, node_public, address) =
         super::local_create::resolve_local_space(&args.space, args.http)?;
@@ -44,20 +52,27 @@ pub(crate) fn run(args: AuthorizeLocalArgs) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("invalid ATQ1: {e:?}"))
         })
         .transpose()?;
-    let (root, response) = authorize(
+    let (root, response) = authorize_with_application(
         &data,
         address,
         &operator,
         space,
         node_public,
         initial.as_ref(),
+        apply,
     )?;
     let denied = response[4] == 1; // Verified canonical AOR1.
-    crate::output::print_json(&serde_json::json!({
+    let mut output = serde_json::json!({
         "decision": if denied { "denied" } else { "issued" },
         "request_dir": root, "response": hex::encode(response),
         "decision_retained": true, "applied": false, "reservation_pending": !denied,
-    }));
+    });
+    if apply && !denied {
+        output.as_object_mut().expect("object").remove("applied");
+        output["delivery_retired"] = true.into();
+        output["reservation_pending"] = false.into();
+    }
+    crate::output::print_json(&output);
     Ok(())
 }
 
@@ -68,6 +83,18 @@ pub(super) fn authorize(
     space: SpaceId,
     node_public: [u8; 32],
     initial: Option<&AgentTargetedPreparationRequest>,
+) -> anyhow::Result<(PathBuf, Vec<u8>)> {
+    authorize_with_application(data, address, operator, space, node_public, initial, false)
+}
+
+pub(super) fn authorize_with_application(
+    data: &Path,
+    address: SocketAddr,
+    operator: &libp2p::identity::Keypair,
+    space: SpaceId,
+    node_public: [u8; 32],
+    initial: Option<&AgentTargetedPreparationRequest>,
+    apply: bool,
 ) -> anyhow::Result<(PathBuf, Vec<u8>)> {
     anyhow::ensure!(
         address.ip().is_loopback() && address.port() != 0,
@@ -238,11 +265,20 @@ pub(super) fn authorize(
             reservation.deny_operation(&mut delivery)?;
         }
         vos::agent::clean_bootstrap::NativeAuthorityOperationDecision::Issued(_) => {
+            let application_root = operation.join("application");
             super::operation_authorization::application::retain(
                 &request_root,
                 &operation.join("preparation"),
-                &operation.join("application"),
+                &application_root,
             )?;
+            if apply {
+                super::local_invocation::submit(&application_root, None, address)?;
+                super::invocation_progress::continue_retained(&application_root, address)?;
+                let mut authorization = CleanOperationClientFile::open_or_create(&request_root)?;
+                let mut application =
+                    super::clean_store::CleanInvocationFile::open_or_create(&application_root)?;
+                reservation.complete_operation(&mut authorization, &mut application)?;
+            }
         }
     }
     Ok((request_root, response))
@@ -286,7 +322,11 @@ mod tests {
             ],
             vec!["vosx", "authorize-local-invocation", "test", "--resume"],
         ] {
-            assert!(Args::try_parse_from(input).is_ok());
+            for command in ["authorize-local-invocation", "invoke-local"] {
+                let mut input = input.clone();
+                input[1] = command;
+                assert!(Args::try_parse_from(input).is_ok());
+            }
         }
         for input in [
             vec!["vosx", "authorize-local-invocation", "test"],
@@ -299,7 +339,11 @@ mod tests {
                 "other.atq1",
             ],
         ] {
-            assert!(Args::try_parse_from(input).is_err());
+            for command in ["authorize-local-invocation", "invoke-local"] {
+                let mut input = input.clone();
+                input[1] = command;
+                assert!(Args::try_parse_from(input).is_err());
+            }
         }
     }
 

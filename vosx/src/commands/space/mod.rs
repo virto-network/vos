@@ -53,6 +53,9 @@ pub mod verify;
 
 #[derive(Subcommand, Debug)]
 pub enum SpaceCommand {
+    /// Authorize, deliver and positively retire exact Local invocation intent.
+    #[cfg(target_os = "linux")]
+    InvokeLocal(local_operation::AuthorizeLocalArgs),
     /// Prepare and authorize exact ATQ1 intent on an operator-owned Local Agent.
     /// Does not apply the invocation; issuance leaves the credential pending.
     #[cfg(target_os = "linux")]
@@ -183,6 +186,8 @@ pub enum SpaceCommand {
 
 pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
     match cmd {
+        #[cfg(target_os = "linux")]
+        SpaceCommand::InvokeLocal(args) => local_operation::run_invocation(args),
         #[cfg(target_os = "linux")]
         SpaceCommand::AuthorizeLocalInvocation(args) => local_operation::run(args),
         #[cfg(target_os = "linux")]

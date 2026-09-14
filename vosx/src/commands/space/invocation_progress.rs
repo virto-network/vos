@@ -146,6 +146,18 @@ impl Progress {
         Ok(value)
     }
 
+    /// Positive retirement must come from an explicit retained acknowledgement
+    /// exchange, not merely a terminal actor result or an initial ASR1.
+    pub(crate) fn is_retired(&self, request: &[u8], response: &[u8]) -> anyhow::Result<bool> {
+        let outcome = self.outcome(request, response)?;
+        let Some(last) = self.exchanges.last() else {
+            return Ok(false);
+        };
+        Ok(last.response.is_some()
+            && AgentAcknowledgementRequest::decode(&hex::decode(&last.request)?).is_ok()
+            && matches!(outcome, RuntimeOutcome::Acknowledged(Ok(_))))
+    }
+
     fn outcome(&self, request: &[u8], response: &[u8]) -> anyhow::Result<RuntimeOutcome> {
         let call = super::local_invocation::validate_request(request)?;
         anyhow::ensure!(

@@ -75,9 +75,22 @@ mod tests {
     fn issued(
         prepared: &vos::agent::supervisor_adapters::PreparedAgentInvocation,
     ) -> (AuthorityOperationSubmission, Vec<u8>) {
-        let (operator, authority, descriptor, _) =
+        let (operator, old_authority, descriptor, runtime) =
             crate::commands::space::local_create::tests::fixture();
         let public = operator.public().try_into_ed25519().unwrap().to_bytes();
+        let package = crate::bundled::root_signed_actor_package(
+            crate::bundled::system_authority_package_template(),
+            "system-authority",
+            &operator,
+        )
+        .unwrap();
+        let (authority, _) = crate::commands::space::clean_startup::derive_system_authority_target(
+            old_authority.space,
+            public,
+            &runtime,
+            &package,
+        )
+        .unwrap();
         let work = prepared.work();
         let managed = ManagedAgentTarget {
             space: work.space,
@@ -85,7 +98,7 @@ mod tests {
             owner: descriptor.identity.owner,
             profile: AgentProfile::Local,
             runtime_deployment: work.runtime_deployment,
-            transition_producer: descriptor.identity.transition_producer,
+            transition_producer: ProducerId::of_public_key(&[0x42; 32]),
         };
         let mut call = AuthorityOperationCall {
             invocation: InvocationId::ZERO,
@@ -176,6 +189,201 @@ mod tests {
             ))
             .unwrap();
         (submission, response)
+    }
+
+    #[test]
+    fn managed_application_retries_delivery_and_retirement_before_credential_completion() {
+        use crate::commands::space::{
+            clean_store::{
+                CleanCredentialReservation, CredentialReservationStatus, ensure_private_directory,
+            },
+            local_operation,
+        };
+        use std::io::{Read as _, Write as _};
+        use vos::agent::supervisor_adapters::{
+            AgentAcknowledgementRequest, AgentInvocationResponse,
+        };
+        let (operator, _, _, _) = crate::commands::space::local_create::tests::fixture();
+        let signer =
+            crate::commands::space::clean_identity::CleanOperatorIdentitySigner::new(&operator)
+                .unwrap();
+        let origin = InvocationOrigin {
+            principal: Some(signer.principal()),
+            credential: Some(signer.credential()),
+            ..InvocationOrigin::anonymous()
+        };
+        let (intent, physical) =
+            local_invocation::tests::preparation_fixture_with_origin(61, origin);
+        let parsed = AgentTargetedPreparationResponse::decode(&physical).unwrap();
+        let (submission, decision) = issued(parsed.for_request(&intent).unwrap());
+        let space = submission.call().authority.space;
+        let nonce = Hash(intent.intent().invocation().0);
+        let mut random = [0; 8];
+        getrandom::getrandom(&mut random).unwrap();
+        let data =
+            std::env::temp_dir().join(format!("vosx-managed-application-{}", hex::encode(random)));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&data)
+            .unwrap();
+        let root = data.join("agent-client");
+        ensure_private_directory(&root).unwrap();
+        let claims = root.join("credentials");
+        ensure_private_directory(&claims).unwrap();
+        let mut reservation =
+            CleanCredentialReservation::open_or_create(&claims, space, signer.credential())
+                .unwrap();
+        reservation.reserve(nonce).unwrap();
+        drop(reservation);
+        let operations = root.join("operations");
+        ensure_private_directory(&operations).unwrap();
+        let operation = operations.join(format!(
+            "{}-{}",
+            hex::encode(signer.credential().0),
+            hex::encode(nonce.0)
+        ));
+        ensure_private_directory(&operation).unwrap();
+        let auth_root = operation.join("request");
+        let prep_root = operation.join("preparation");
+        let app_root = operation.join("application");
+        let mut auth = CleanOperationClientFile::open_or_create(&auth_root).unwrap();
+        auth.publish_request(&submission.encode().unwrap()).unwrap();
+        auth.publish_response(&decision).unwrap();
+        drop(auth);
+        let mut prep = CleanPreparationClientFile::open_or_create(&prep_root).unwrap();
+        prep.publish_request(&intent.encode().unwrap()).unwrap();
+        prep.publish_response(&physical).unwrap();
+        drop(prep);
+        let envelope = retain(&auth_root, &prep_root, &app_root).unwrap();
+        let call = local_invocation::validate_request(&envelope).unwrap();
+        let initial = AgentInvocationResponse::Direct {
+            request: call.commitment(),
+            outcome: RuntimeOutcome::Completed(Err(InvocationError::NotFound)),
+        }
+        .encode()
+        .unwrap();
+        let ack = AgentAcknowledgementRequest::new(
+            RuntimeExecutionContext::Direct,
+            None,
+            call.work().clone(),
+            call.authorization().clone(),
+        )
+        .unwrap();
+        let transition = RuntimeTransition {
+            state: RuntimeState::default(),
+            outcome: RuntimeOutcome::Acknowledged(Ok(InvocationAcknowledgement {
+                invocation: call.work().invocation,
+                actor: call.work().actor,
+                incarnation: call.work().incarnation,
+                deployment: call.work().deployment,
+                mode: call.work().mode,
+                work: call.work().commitment(),
+                authorization: call.authorization().commitment(),
+            })),
+        }
+        .encode()
+        .unwrap();
+        let mut retired = b"AAR3".to_vec();
+        retired.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+        retired.extend_from_slice(ack.commitment().as_bytes());
+        retired.extend_from_slice(&(transition.len() as u32).to_le_bytes());
+        retired.extend_from_slice(&transition);
+        let ack_bytes = ack.encode().unwrap();
+        for (exchanges, success) in [
+            (vec![("invoke", envelope.clone(), 504, vec![])], false),
+            (
+                vec![
+                    ("invoke", envelope.clone(), 200, initial),
+                    ("acknowledge", ack_bytes.clone(), 504, vec![]),
+                ],
+                false,
+            ),
+            (vec![("acknowledge", ack_bytes, 200, retired)], true),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server_claims = claims.clone();
+            let credential = signer.credential();
+            let server = std::thread::spawn(move || {
+                for (path, expected, status, response) in exchanges {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .unwrap();
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") {
+                        let mut byte = [0];
+                        stream.read_exact(&mut byte).unwrap();
+                        header.push(byte[0]);
+                        assert!(header.len() < 8192);
+                    }
+                    assert!(
+                        header
+                            .starts_with(format!("POST /__agents/{path} HTTP/1.1\r\n").as_bytes())
+                    );
+                    let mut body = vec![0; expected.len()];
+                    stream.read_exact(&mut body).unwrap();
+                    assert_eq!(body, expected);
+                    assert!(
+                        CleanCredentialReservation::open_or_create(
+                            &server_claims,
+                            space,
+                            credential
+                        )
+                        .is_err()
+                    );
+                    write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
+                    let _ = stream.write_all(&response);
+                }
+            });
+            let result = local_operation::authorize_with_application(
+                &data, address, &operator, space, [0x42; 32], None, true,
+            );
+            assert_eq!(result.is_ok(), success, "{result:?}");
+            server.join().unwrap();
+            let mut reservation =
+                CleanCredentialReservation::open_or_create(&claims, space, signer.credential())
+                    .unwrap();
+            assert_eq!(
+                reservation.current().unwrap(),
+                Some((
+                    nonce,
+                    if success {
+                        CredentialReservationStatus::Completed
+                    } else {
+                        CredentialReservationStatus::Pending
+                    }
+                ))
+            );
+            if !success {
+                assert!(reservation.reserve(Hash([0x72; 32])).is_err());
+            }
+        }
+        // No server remains: all decisions, application and retirement replies
+        // are re-verified locally and the exact completion is idempotent.
+        assert!(
+            local_operation::authorize_with_application(
+                &data,
+                "127.0.0.1:1".parse().unwrap(),
+                &operator,
+                space,
+                [0x42; 32],
+                None,
+                true
+            )
+            .is_ok()
+        );
+        let mut reservation =
+            CleanCredentialReservation::open_or_create(&claims, space, signer.credential())
+                .unwrap();
+        reservation.reserve(Hash([0x72; 32])).unwrap();
+        let mut auth = CleanOperationClientFile::open_or_create(&auth_root).unwrap();
+        let mut app = CleanInvocationFile::open_or_create(&app_root).unwrap();
+        assert!(reservation.complete_operation(&mut auth, &mut app).is_err());
+        drop(app);
+        drop(auth);
+        drop(reservation);
+        std::fs::remove_dir_all(data).unwrap();
     }
 
     #[test]

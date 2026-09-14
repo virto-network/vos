@@ -149,6 +149,7 @@ fn progress_requires_exact_predecessors_and_monotonic_publication() {
     store.publish_request(&request).unwrap();
     store.publish_response(&response).unwrap();
     let initial = Progress::new(&request).unwrap();
+    assert!(!initial.is_retired(&request, &response).unwrap());
     let mut progress = initial.clone();
     for (_, next, reply) in &exchanges {
         let mut skipped_pending = progress.clone();
@@ -167,6 +168,7 @@ fn progress_requires_exact_predecessors_and_monotonic_publication() {
             response: None,
         });
         store.publish_progress(&progress.encode().unwrap()).unwrap();
+        assert!(!progress.is_retired(&request, &response).unwrap());
         let pending = progress.encode().unwrap();
         assert!(store.publish_progress(&initial.encode().unwrap()).is_err());
         let mut forged = progress.clone();
@@ -179,6 +181,22 @@ fn progress_requires_exact_predecessors_and_monotonic_publication() {
         progress.exchanges.last_mut().unwrap().response = Some(hex::encode(reply));
         store.publish_progress(&progress.encode().unwrap()).unwrap();
     }
+    assert!(progress.is_retired(&request, &response).unwrap());
+    let ack = AgentAcknowledgementRequest::decode(&exchanges.last().unwrap().1).unwrap();
+    let transition = RuntimeTransition {
+        state: RuntimeState::default(),
+        outcome: RuntimeOutcome::Acknowledged(Err(InvocationError::NotFound)),
+    }
+    .encode()
+    .unwrap();
+    let mut failed_reply = b"AAR3".to_vec();
+    failed_reply.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+    failed_reply.extend_from_slice(ack.commitment().as_bytes());
+    failed_reply.extend_from_slice(&(transition.len() as u32).to_le_bytes());
+    failed_reply.extend_from_slice(&transition);
+    let mut failed = progress.clone();
+    failed.exchanges.last_mut().unwrap().response = Some(hex::encode(failed_reply));
+    assert!(!failed.is_retired(&request, &response).unwrap());
     let bytes = progress.encode().unwrap();
     let mut noncanonical = bytes.clone();
     noncanonical.push(b' ');

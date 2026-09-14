@@ -30,6 +30,9 @@ This is not yet a usable ordinary-agent production path.
 Operation signing and retained targeted preparation are wired into an ATQ1-input
 managed authorization command; live fresh authorization and protected application
 are still unproven. Issuance leaves its credential reservation pending.
+`invoke-local` now wires retained application, continuation and positive
+retirement/credential completion; its current evidence is protocol/loopback tests,
+not live native protected mutation or ordinary Shared finality.
 The native Local Install application and startup-recovery phases now pass
 physical tests from prepared authorization through retirement, including
 pristine client-retry admission. Native Install controller handoff, retry and
@@ -6401,6 +6404,39 @@ conflicting public invocation. It also verifies that a valid issued decision
 cannot use the denial-only reservation release. The fixture uses real Ed25519
 signatures and admitted Catalog artifacts but shaped evidence, not native policy
 execution or usable Catalog installation configuration.
+
+### Managed Local application, retirement and credential completion
+
+Verification: **237 CLI tests passed**, zero failures, five opt-in tests ignored,
+in **52.83s** (`.worktrees/ch08-c2-native/target/task-tmp/r16-operation-retirement-cli.log`).
+The normal CLI build passes in **5.04s** (`r16-operation-retirement-build.log`),
+and `space invoke-local --help` succeeds from that binary.
+Formatting and whitespace checks pass. No new native/live mutation result is claimed.
+
+`invoke-local SPACE --intent intent.atq1` and `--resume` reuse the managed
+authorization path while holding the same credential-wide reservation through
+application delivery, continuation and positive acknowledgement. The
+authorization-only command remains unchanged in purpose. Missing responses or
+HTTP errors never release the reservation, and issuance alone remains pending.
+
+Completion requires retained/synchronized AOQ1/AOR1, the exact receipt-bearing
+ASQ1, its initial response and canonical continuation history. The signed intent
+must match the complete work; Space, credential and invocation nonce must match
+the reservation. History must end with an explicit positive acknowledgement
+exchange, not an initial response, yield, completed actor reply or failed ACK.
+The terminal reservation commits exact authorization and application/history
+hashes. Exact replay is idempotent, while a successor cannot be completed with
+its predecessor's retirement. `delivery_retired` deliberately does not claim
+business success: the runtime can positively retire an actor error.
+
+The loopback fixture starts from signed retained issuance and prepared work,
+injects 504 at initial delivery and acknowledgement, verifies exact request bytes
+and the held credential lease, then proves terminal completion and no-network
+retry after reopen. Existing continuation fixtures also check that empty, pending
+and failed-ACK histories do not count as retired. These are shaped signed protocol
+records and HTTP responses, not native guest execution. Live fresh protected
+authorization/application, mutation/restart, Shared finality, latency and full
+release gates remain required. No bundled artifacts or timeouts changed.
 
 ### Durable client acknowledgement before completion
 
