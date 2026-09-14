@@ -49,12 +49,12 @@ for path in "${retired_paths[@]}"; do
     [[ ! -e $path ]] || fail "retired path remains: $path"
 done
 
-cargo build -p vosx --bin vosx
-binary=target/debug/vosx
-top_help=$($binary --help)
-space_help=$($binary space --help)
-up_help=$($binary space up --help)
-new_help=$($binary space new --help)
+cargo build --locked -p vosx --bin vosx
+binary="${CARGO_TARGET_DIR:-target}/debug/vosx"
+top_help=$("$binary" --help)
+space_help=$("$binary" space --help)
+up_help=$("$binary" space up --help)
+new_help=$("$binary" space new --help)
 
 for command in actor agent-runtime-pvm release space zk help-schema whoami; do
     grep -Eq "^  ${command}([[:space:]]|$)" <<<"$top_help" \
@@ -81,7 +81,7 @@ for flag in --service-pvm --production-trust-socket --allow-conformance --agent-
 done
 grep -Fq -- "--recipe" <<<"$new_help" && fail "retired space-new recipe flag remains"
 
-if $binary worker stop >/dev/null 2>&1; then
+if "$binary" worker stop >/dev/null 2>&1; then
     fail "unknown top-level words still enter a dynamic dispatcher"
 fi
 

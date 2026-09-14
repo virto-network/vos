@@ -41,9 +41,10 @@ then exact resume after restart returned a verified acknowledgement in about
 14 seconds. The subsequent live mutation exposed a **duplicate-execution bug**:
 the first increment returned seven and retired, but exact late Invoke returned
 fourteen. Restart-read verification was not run. A source guard now rejects
-Invoke against a retained acknowledgement; it requires rebuilt/repinned runtime
-artifacts and fresh live verification before it can be considered deployed.
-Do not deploy the old bundled runtime as fixed. The failing disposable state is
+Invoke against a retained acknowledgement. The runtime artifact is now rebuilt,
+repinned and verified by a physical-PVM regression; fresh end-to-end mutation
+and restart verification is still required. Do not deploy the old bundled
+runtime as fixed. The failing disposable state is
 preserved, not reset. A short reconciliation CPU sample was dominated by BLAKE2
 hashing; the complete caller/root cause remains unproven.
 Native host-clock preparation retains AOC5 before HTTP and exact returned AOQ1
@@ -6913,6 +6914,49 @@ and whitespace checks pass. The native operation authorization/retirement and
 physical reopen suite also passed: **9 passed, 120.50s**
 (`r16-retired-reinvoke-native.log`). None of these results closes the fresh bundled-PVM
 mutation/restart gate or the separate protected-permission gate.
+
+### Reproducible runtime repin for retired-invocation rejection (C2/C3)
+
+The standard runtime is now pinned to source commit
+`15dd53eca7f698f931fc3ffd41c7c5dae2f55af4`. Two independent clean exports with
+separate target directories built under `nightly-2026-03-20` in **22.21s** and
+**22.17s**. The pinned builder from
+`42f3f3bf2362e5189f094a1e39c7288e7a26eea7` transpiled and physically ABI-probed
+both ELF files. Both ELF and PVM comparisons were byte-identical.
+
+- Runtime ProgramId: `2b10cf4d99eab68eab90325e872052880de65bfae7fbd5fe264be5732a726b53`.
+- ELF BLAKE2b-256: `0d08c766a2b1809d8c207843fd90ad7d4bc148cf1885a764e38e6600344124d6`.
+- PVM BLAKE2b-256: `5d48a4a822c788d662d52d8ebd7f596797f511dd381918508c987ae78ee68804`.
+- PVM size: **954,004 bytes** (previously 953,887).
+
+Evidence is under shared disk-backed `target/task-tmp/runtime-repin.4Ximp6`
+and `runtime-repeat.pWRj7W`: source exports, isolated build outputs, build logs,
+and runtime-identity logs. `support/production-artifacts.toml`, the native
+ProgramId constant, build-time digest check, and committed PVM agree. System
+actor template bytes and their independent source/builder pins are unchanged;
+the rebuilt release bundle validates them alongside the new runtime.
+
+The new `bundled_runtime_rejects_retired_invocation_without_reexecution` test
+executes the committed PVM in a new VM for every call. It verifies retained
+delivery, positive acknowledgement, byte-identical state after rejected late
+Invoke with both a live and expired receipt, and positive exact ACK retry.
+It failed against the old bundled PVM (late Invoke reached `InvalidInput`
+instead of consumed-key rejection; **0.35s**) and passes against the repin
+(**0.54s**). Logs: `r16-retired-reinvoke-pvm-{red,green}.log`. The fixture uses
+canonical host-constructed terminal state; it is not a substitute for a fresh
+HTTP mutation and disk restart campaign.
+
+CLI regression passed **239 tests**, zero failures, **9 ignored**, **51.69s**
+(`r16-runtime-repin-cli.log`). The normal binary rebuilt and the clean-break
+check passed (`r16-runtime-repin-clean-break-final.log`). That script now honors
+`CARGO_TARGET_DIR` and requests a locked build, avoiding a separate target tree
+or checking a stale default-path binary. Normal `release bundle` and `release
+verify` passed for `runtime-repin.4Ximp6/release`. This is an artifact checkpoint,
+not completion of C3's full feature/release matrix or production readiness.
+With the repinned bytes, the native operation/recovery suite also passed:
+**9 passed, 120.97s**, `r16-runtime-repin-native.log`. Formatting and whitespace
+checks passed. No old disposable space was reopened with the new runtime, and
+no failed state was reset to manufacture a passing mutation result.
 
 ### Durable client acknowledgement before completion
 

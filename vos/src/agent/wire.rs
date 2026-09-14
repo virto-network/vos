@@ -9253,6 +9253,75 @@ pub(crate) mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
+    fn bundled_runtime_rejects_retired_invocation_without_reexecution() {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        use crate::agent_sdk::{
+            InvocationAuthorization, InvocationError, RuntimeExecutionContext, RuntimeOutcome,
+            RuntimeTransition, RuntimeWork,
+        };
+
+        let run = |work: RuntimeWork| {
+            let input = work.encode().unwrap();
+            let execution = vos_pvm::refine_host::RefineContext::load(
+                include_bytes!("../../../vosx/blobs/agent_runtime.pvm"),
+                &input,
+                1_000_000_000,
+            )
+            .unwrap()
+            .run();
+            assert_eq!(execution.exit, vos_pvm::ExitReason::Halt);
+            let output = execution
+                .output_bounded(RuntimeTransition::MAX_ENCODED_BYTES)
+                .unwrap();
+            RuntimeTransition::decode(&output).unwrap()
+        };
+        let (state, work, receipt, reply) = clean_terminal_fixture();
+        let authorization = InvocationAuthorization::AuthorityReceipt(receipt);
+        let retried = run(RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
+            state: state.clone(),
+            invocation: Box::new(work.clone()),
+            authorization: Box::new(authorization.clone()),
+            observed_slot: 1,
+        });
+        assert_eq!(retried.outcome, RuntimeOutcome::Completed(Ok(reply)));
+        let acknowledged = run(RuntimeWork::Acknowledge {
+            context: RuntimeExecutionContext::Direct,
+            state: retried.state,
+            invocation: Box::new(work.clone()),
+            authorization: Box::new(authorization.clone()),
+        });
+        assert!(matches!(
+            acknowledged.outcome,
+            RuntimeOutcome::Acknowledged(Ok(_))
+        ));
+        // Each run loads a new physical VM from the committed artifact. The
+        // guest must recover its retirement fact solely from serialized state.
+        for observed_slot in [1, 99] {
+            let replayed = run(RuntimeWork::Invoke {
+                context: RuntimeExecutionContext::Direct,
+                state: acknowledged.state.clone(),
+                invocation: Box::new(work.clone()),
+                authorization: Box::new(authorization.clone()),
+                observed_slot,
+            });
+            assert_eq!(replayed.state, acknowledged.state);
+            assert_eq!(
+                replayed.outcome,
+                RuntimeOutcome::Completed(Err(InvocationError::DivergentInvocation))
+            );
+        }
+        let repeated_ack = run(RuntimeWork::Acknowledge {
+            context: RuntimeExecutionContext::Direct,
+            state: acknowledged.state.clone(),
+            invocation: Box::new(work),
+            authorization: Box::new(authorization),
+        });
+        assert_eq!(repeated_ack, acknowledged);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
     fn clean_done_retries_restarts_and_requires_exact_acknowledgement() {
         use crate::agent_sdk::{
             InvocationAcknowledgement, InvocationError, RuntimeOutcome, RuntimeWork,

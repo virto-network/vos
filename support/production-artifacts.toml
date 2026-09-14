@@ -6,7 +6,7 @@ format = 1
 # toolchains. A Clerk `.vos` signature is operator-specific, so this manifest
 # pins its signed content rather than one repository-global wrapper.
 source_revision = "54ec5cca7dc5be3fc80f2f89247233719f790b95"
-agent_runtime_source_revision = "42f3f3bf2362e5189f094a1e39c7288e7a26eea7"
+agent_runtime_source_revision = "15dd53eca7f698f931fc3ffd41c7c5dae2f55af4"
 guest_toolchain = "nightly-2026-03-20"
 host_toolchain = "nightly-2025-05-09"
 
@@ -25,9 +25,9 @@ service_pvm_blake2b_256 = "1911c5b7f5ee746cfe231a81f9ec2d5355e725faad7c578514b55
 authority_program_id = "da1c25f9b2c18144a0ef346b873930a53e881429fd11cdbcbf3a3182189aba79"
 authority_pvm_blake2b_256 = "f91f993dd459a6a8107b85dc3a0b12776191faaf9cab494a443d12b92c745ac6"
 
-agent_runtime_program_id = "1152a50e0117033569ddf9e7a71869adb8650184a63e3473a8ab88c72254cb00"
-agent_runtime_elf_blake2b_256 = "8bd1f0e6c5dd2b40f2bdebd441c26f6954cd675f8a92ab30622a0c588cce8746"
-agent_runtime_pvm_blake2b_256 = "db4a1b273612689c3e49db267af775462f38bae3671b9669d9eae64372b2edd7"
+agent_runtime_program_id = "2b10cf4d99eab68eab90325e872052880de65bfae7fbd5fe264be5732a726b53"
+agent_runtime_elf_blake2b_256 = "0d08c766a2b1809d8c207843fd90ad7d4bc148cf1885a764e38e6600344124d6"
+agent_runtime_pvm_blake2b_256 = "5d48a4a822c788d662d52d8ebd7f596797f511dd381918508c987ae78ee68804"
 
 registry_elf_blake2b_256 = "461f2b368dd653698c8650b07800b81634b3072b37fd7a5f3708581021bbbd32"
 
