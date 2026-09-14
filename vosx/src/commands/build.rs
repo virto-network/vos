@@ -481,6 +481,9 @@ fn validate_constructor_metadata(
                         schema.name == metadata.name
                             && schema
                                 .type_identity
+                                // AAS2 uses stringify!, while .vos_meta uses
+                                // the macro's whitespace-free ty_string.
+                                .replace(' ', "")
                                 .strip_suffix(&metadata.ty)
                                 .is_some_and(|prefix| prefix.ends_with("::"))
                     })
@@ -1266,6 +1269,47 @@ mod tests {
             root.join("target/riscv64em-vos/release")
                 .join(format!("{}.elf", "counter".replace('-', "_")))
         );
+    }
+
+    #[test]
+    fn constructor_metadata_matches_macro_spacing_without_erasing_type_identity() {
+        use sdk::schema::{ConstructorArgument, ConstructorContract, ParsedSchema};
+        use vos::metadata::{ParsedField, ParsedMeta};
+        let metadata = ParsedMeta {
+            actor_name: "LocalSigner".into(),
+            messages: vec![],
+            constructor: vec![ParsedField {
+                name: "secret_seed".into(),
+                ty: "[u8;32]".into(),
+            }],
+            doc: String::new(),
+            crdt: false,
+            provable: false,
+        };
+        let mut schema = ParsedSchema {
+            constructor: ConstructorContract::RequiredNamed(vec![ConstructorArgument {
+                name: "secret_seed".into(),
+                type_identity: "local_signer::[u8; 32]".into(),
+            }]),
+            fields: vec![],
+            methods: vec![],
+        };
+        validate_constructor_metadata(&metadata, &schema).unwrap();
+        for bad in [
+            "local_signer::[u8; 31]",
+            "local_signer::[i8; 32]",
+            "[u8; 32]",
+            "local_signer::Other[u8; 32]",
+        ] {
+            let ConstructorContract::RequiredNamed(arguments) = &mut schema.constructor else {
+                unreachable!()
+            };
+            arguments[0].type_identity = bad.into();
+            assert!(
+                validate_constructor_metadata(&metadata, &schema).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

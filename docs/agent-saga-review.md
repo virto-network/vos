@@ -33,6 +33,10 @@ after restart also passes. Native positive retirement and exact acknowledgement
 retries now pass before and after restart. Public Counter mutation, late replay
 rejection and a fresh read of seven after actual daemon restart now pass with
 the repinned runtime. Protected/non-Public actor workflows remain open.
+The latest LocalSigner campaign passes installation and a live deployment-scoped
+role grant with retirement. Its first invocation used an incorrectly generated
+role claim and failed preparation; the corrected fixture still needs a fresh
+campaign. See "Protected LocalSigner campaign: constructor packaging correction".
 This is not yet a usable ordinary-agent production path.
 The latest runtime pin includes single-pass AWRK availability decoding. Its
 fixed 768KB-program ACK comparison uses about 25.3% less gas with byte-identical
@@ -7764,6 +7768,72 @@ preparation and rejection of an old completion for a newly bound request.
 Command parsing and built-binary help pass. Normal vosx build passes (6.68s;
 `native-admin-orchestration-vosx-build.log`); formatting and whitespace checks
 pass. Logs are under shared on-disk `target/task-tmp`.
+
+### Protected LocalSigner campaign: constructor packaging correction
+
+Continuation remains in C2, with C1/C2/C3 as the review groupings. No release
+gate is waived and timeout limits are unchanged. In the disposable on-disk
+`target/task-tmp/admin-startup-smoke.nHw46n` fixture, native readiness took
+about 81 seconds. Fresh Create returned HTTP 504 with its signed request
+retained; exact `--resume` subsequently returned a verified acknowledgement
+for Local Agent
+`aa05af450887c5a4463cb41d1b6753b037f661393c996daafc013f131702a813`.
+This proves recovery of that Create, not acceptable first-response latency.
+
+Building the existing LocalSigner example exposed a host packaging mismatch:
+AAS2 uses `stringify!` and records `local_signer::[u8; 32]`, whereas `.vos_meta`
+uses the macro's whitespace-free type rendering, `[u8;32]`. Constructor
+validation now normalizes spaces for that comparison only. Schema bytes,
+type identity, runtime ABI and bundled artifacts are unchanged. The regression
+accepts the macro-generated spelling and rejects different lengths, element
+types, missing module qualification and prefixed type names. Packaging the
+same already-built ELF then succeeds: program
+`8a46723f0a467494000778fb5a7c97111aa2c293cafd6b60b4fcb3558c9dc511`,
+deployment `e3425df32ec374fed3b15394e8e33c1bc1a154941ee39946f7f3cdfdb8bdccc9`.
+These are disposable example artifacts, not new system runtime pins.
+
+Full CLI validation after the constructor fix: 251 passed, 9 ignored, zero
+failures (69.07s; `protected-constructor-full-cli.log`). A separately opt-in
+fixture helper subsequently passed and generated canonical constructor and
+protected invocation inputs using real Rust codecs. It requires the explicitly
+selected disposable root and isolated identity, uses a public test-only seed,
+and refuses to replace different existing inputs. The first sandbox-only run
+could not see the daemon PID; the host-visible run passed. Logs are
+`protected-inputs.log` and `protected-inputs-host.log` in on-disk `task-tmp`.
+
+The protected LocalSigner installation started at 2026-09-14 23:26:16 UTC and
+returned a verified acknowledgement at 23:28:36 UTC on its first CLI attempt
+(about 140 seconds, no HTTP timeout). Evidence is `protected-install-1.json`
+and its empty error log in the fixture. This used the shared debug vosx binary;
+it is not a release-profile performance measurement and does not close latency.
+Deployment-scoped role administration started at 23:29:00 UTC and completed
+at 23:29:31 UTC: `decision=applied`, `retirement_retained=true`,
+`reservation_pending=false` (`protected-role-1.json`). This is the first live
+fresh role-grant/retirement pass in this fixture, not a revoke or restart pass.
+The protected `sign` invocation started at 23:30:25 UTC and failed during
+`/__agents/prepare` with HTTP 503 (`protected-invoke-1.log`). Inspection found
+that the new test fixture incorrectly supplied no role claim, while the
+method's AMP2 policy requires actor role `51` repeated 32 times. The fixture
+generator is corrected and has a regression for its required role claim.
+The original retained intent and pending credential reservation remain
+unchanged; this fixture must not be retried as if its bytes were corrected.
+A bare diagnostic curl lacked authentication and returned 401; it supplies
+no further evidence about the authenticated 503. A protected signature and
+retirement verifier compiles but has not passed against live evidence.
+Protected execution, revoke and restart are still open. Continue with a
+fresh disposable campaign using the corrected generator, or a separately
+reviewed safe pre-dispatch cancellation path; never edit the retained request
+or clear its reservation manually. Do not expand production APIs merely to
+repair this disposable test input.
+
+The disposable daemon was stopped gracefully at 23:34:50 UTC (no force),
+preserving its pending client reservation and all logs. `protected-down-1.json`
+contains the CLI's plain-text clean-exit report despite `--format json`.
+No live test daemon is intentionally left running by this checkpoint.
+Final CLI suite: 252 passed, 11 explicitly ignored live helpers, zero failures
+(62.89s; `protected-checkpoint-cli.log`). The fixture role regression passes;
+formatting and whitespace checks pass. The signature verifier is compiled but
+remains unexecuted because no successful protected invocation exists yet.
 
 ### Durable client acknowledgement before completion
 

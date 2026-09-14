@@ -10,10 +10,194 @@ use vos::agent::supervisor_adapters::{
 };
 use vos::{Decode as _, Encode as _};
 
+fn protected_signer_roles() -> InvocationRoleClaims {
+    InvocationRoleClaims {
+        space: None,
+        actor: Some(RoleId([0x51; 32])),
+    }
+}
+
+#[test]
+fn protected_signer_fixture_claims_the_required_actor_role() {
+    let roles = protected_signer_roles();
+    assert_eq!(roles.actor, Some(RoleId([0x51; 32])));
+    assert_eq!(roles.space, None);
+    assert!(roles.validate_for(InvocationOrigin {
+        principal: Some(PrincipalId([0x71; 32])),
+        ..InvocationOrigin::anonymous()
+    }));
+}
+
+#[test]
+#[ignore = "writes inputs only for an explicitly selected disposable protected actor campaign"]
+fn prepare_disposable_protected_signer_inputs() {
+    let root = PathBuf::from(std::env::var_os("VOSX_PROTECTED_SMOKE_ROOT").unwrap())
+        .canonicalize()
+        .unwrap();
+    let scratch = PathBuf::from(std::env::var_os("TMPDIR").unwrap())
+        .canonicalize()
+        .unwrap();
+    assert_eq!(root.parent(), Some(scratch.as_path()));
+    assert!(
+        root.file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("admin-startup-smoke.")
+    );
+    let created: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join("protected-create-resume-1.json")).unwrap(),
+    )
+    .unwrap();
+    let ack = vos::agent::sdk::authority::ManagementApplicationAck::decode(
+        &hex::decode(created["acknowledgement"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let (data, space, _, _) =
+        super::super::local_create::resolve_local_space("admin-startup", None).unwrap();
+    assert!(data.canonicalize().unwrap().starts_with(&root));
+    assert_eq!(ack.managed.space, space);
+    assert_eq!(
+        created["agent"].as_str().unwrap(),
+        hex::encode(ack.managed.agent.0)
+    );
+    let actor = ActorId::top_level(ack.managed.agent, "local-signer-smoke");
+    let operator = crate::identity::load_existing().unwrap();
+    let identity =
+        super::super::clean_identity::CleanOperatorIdentitySigner::new(&operator).unwrap();
+    // Public disposable fixture seed, never a production signing key.
+    let constructor = vos::value::Args::new()
+        .with("secret_seed", vec![0x71u8; 32])
+        .encode();
+    let mut message = vec![vos::value::TAG_DYNAMIC];
+    message.extend_from_slice(
+        &vos::value::Msg::new("sign")
+            .with("context", vec![0x72u8; 32])
+            .with("message", b"protected-local-smoke".to_vec())
+            .encode(),
+    );
+    let intent = AgentTargetedPreparationRequest::new(
+        AgentRouteKey::new(space, ack.managed.agent, actor).unwrap(),
+        AgentInvocationIntent::new(
+            InvocationId([0x73; 32]),
+            MethodMode::Linear,
+            InvocationOrigin {
+                principal: Some(identity.principal()),
+                credential: Some(identity.credential()),
+                ..InvocationOrigin::anonymous()
+            },
+            protected_signer_roles(),
+            message,
+            vos::agent::execution::MAX_EXECUTION_GAS,
+            false,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // Re-running this input generator cannot replace a retained intent.
+    for (name, bytes) in [
+        ("protected-constructor.bin", constructor),
+        ("protected-sign.intent", intent.encode().unwrap()),
+    ] {
+        let path = root.join(name);
+        if path.exists() {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        } else {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap();
+            file.write_all(&bytes).unwrap();
+            file.sync_all().unwrap();
+        }
+    }
+    eprintln!("protected actor={}", hex::encode(actor.0));
+}
+
 #[test]
 #[ignore = "requires explicitly selected disposable native managed invocation campaign"]
 fn real_daemon_managed_receipt_invocation_and_exact_retry() {
     managed_receipt_invocation_and_exact_retry(Campaign::Catalog);
+}
+
+#[test]
+#[ignore = "requires completed disposable protected signer invocation; verifies retained evidence only"]
+fn verify_disposable_protected_signer_result() {
+    let root = PathBuf::from(std::env::var_os("VOSX_PROTECTED_SMOKE_ROOT").unwrap())
+        .canonicalize()
+        .unwrap();
+    let scratch = PathBuf::from(std::env::var_os("TMPDIR").unwrap())
+        .canonicalize()
+        .unwrap();
+    assert_eq!(root.parent(), Some(scratch.as_path()));
+    assert!(
+        root.file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("admin-startup-smoke.")
+    );
+    let output: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("protected-invoke-1.json")).unwrap())
+            .unwrap();
+    assert_eq!(output["decision"], "issued");
+    assert_eq!(output["delivery_retired"], true);
+    assert_eq!(output["reservation_pending"], false);
+    let authorization = PathBuf::from(output["request_dir"].as_str().unwrap())
+        .canonicalize()
+        .unwrap();
+    assert!(authorization.starts_with(root.join("space/agent-client/operations")));
+    let application = authorization.parent().unwrap().join("application");
+    let mut store =
+        super::super::clean_store::CleanInvocationFile::open_or_create(&application).unwrap();
+    let request = store.load_request().unwrap().unwrap();
+    let response = store.load_response().unwrap().unwrap();
+    let progress = store.load_progress().unwrap().unwrap();
+    assert!(
+        super::super::invocation_progress::Progress::decode(&progress, &request, &response)
+            .unwrap()
+            .is_retired(&request, &response)
+            .unwrap()
+    );
+    let call = super::super::local_invocation::validate_request(&request).unwrap();
+    assert!(matches!(
+        call.authorization(),
+        InvocationAuthorization::AuthorityReceipt(_)
+    ));
+    let package = vos::agent::package_admission::admit_actor_package(
+        &std::fs::read(root.join("protected-signer/LocalSigner.vos")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(call.work().program, package.program());
+    assert_eq!(call.work().deployment, package.deployment());
+    let AgentInvocationResponse::Direct {
+        outcome: RuntimeOutcome::Completed(Ok(reply)),
+        ..
+    } = super::super::local_invocation::verify_response(&request, &response).unwrap()
+    else {
+        panic!("protected invocation did not succeed");
+    };
+    assert_eq!(reply.status, InvocationStatus::Done);
+    let vos::value::Value::Bytes(signature) = vos::value::Value::try_decode(&reply.reply).unwrap()
+    else {
+        panic!("expected visible signature bytes");
+    };
+    let mut signed = b"vos/local-signer/v1".to_vec();
+    signed.extend_from_slice(&[0x72; 32]);
+    signed.extend_from_slice(&(b"protected-local-smoke".len() as u64).to_le_bytes());
+    signed.extend_from_slice(b"protected-local-smoke");
+    ed25519_dalek::SigningKey::from_bytes(&[0x71; 32])
+        .verifying_key()
+        .verify_strict(
+            &signed,
+            &ed25519_dalek::Signature::from_slice(&signature).unwrap(),
+        )
+        .unwrap();
+    eprintln!(
+        "protected signature and retained retirement verified; restart and revoke remain separate gates"
+    );
 }
 
 #[test]
