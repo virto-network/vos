@@ -36,6 +36,9 @@ not live native protected mutation or ordinary Shared finality.
 The first live managed receipt-bearing query attempt now fails at native
 authorization with HTTP 503 (80.36s); exact client state is retained. See the
 campaign section below. Do not deploy this as a working ordinary-Agent path.
+The diagnostic exact retry confirms a client/physical authorization-clock
+mismatch. Native host-clock preparation now passes physical tests without rebasing
+saved AOQ1 or weakening freshness; its HTTP/client handoff is not wired yet.
 The native Local Install application and startup-recovery phases now pass
 physical tests from prepared authorization through retirement, including
 pristine client-retry admission. Native Install controller handoff, retry and
@@ -6485,6 +6488,43 @@ Normal regression verification after adding the campaign/diagnostics:
 above; the ordinary suite is not evidence that this live blocker is resolved.
 The normal diagnostic binary builds in **15.02s**
 (`r16-managed-live-diagnostic-build.log`); formatting and whitespace checks pass.
+
+### Confirmed native clock mismatch and host-owned preparation
+
+The diagnostic exact retry started at **2026-09-14 16:47:52Z**, became ready at
+**16:50:07Z**, and shut down cleanly at **16:50:31Z**, with the endpoint removed.
+It failed after **18.73s** with the same HTTP 503. The new native diagnostic
+confirms rejection of requested slot **1789404055** versus physical slot
+**1789404630**, before any native operation record was published. Logs are
+`managed-receipt-diagnostic-{daemon,client-test}.log` in the disposable root.
+The request/reservation remain untouched. This retry was not profiled; the
+different startup duration is not evidence of a performance fix.
+
+The native controller now has a host-owned signed-call preparation boundary.
+It chooses the authorization context from the same physical material used to
+build native work, captures that work under admission, and syncs NOD1 before
+returning the context. It executes no policy and signs no receipt. Existing
+records are revalidated/synchronized and returned exactly. The old submitted
+context path keeps its strict clock check; it is not silently rebased.
+
+If a journal callback fails while native admission retains the candidate, retry
+uses the original reserved envelope's clock, not the newer observation. The
+signed call and invocation work still must match exactly. A native positive
+fixture injects that first-write failure, advances the clock, recovers the old
+context, rejects a substituted signature, and then proves real policy execution,
+issuance and reopen without extra signing. The focused check passes in **30.52s**
+(`r16-operation-host-preparation-write-retry.log`).
+The complete native operation regression passes: **nine passed**, zero failures,
+in **123.87s** (`r16-operation-host-preparation-native-final.log`).
+CLI regression: **237 passed**, zero failures, **six ignored**, in **51.52s**
+(`r16-operation-host-preparation-cli.log`). Formatting and whitespace checks pass.
+These tests cover the native preparation boundary, not yet its HTTP/client use.
+
+Remaining handoff: expose this durable native preparation before final AOQ1
+retention, and have the fresh client obtain the host context rather than select
+it from its wall clock. Do not overwrite the old failed AOQ1/timestamps to make
+the campaign pass. HTTP/client integration, a fresh native campaign, non-Public
+mutation, expiry/abort handling and the other C2/C3 gates remain open.
 
 ### Durable client acknowledgement before completion
 

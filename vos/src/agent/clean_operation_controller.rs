@@ -207,6 +207,28 @@ where
         self.authority
     }
 
+    /// Prepare signed call ingress at the authoritative host clock and persist
+    /// native work before returning its immutable authorization context. This
+    /// performs no policy execution, receipt issuance or reservation release.
+    pub fn prepare_call<P, R, I>(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        call: &AuthorityOperationCall,
+    ) -> Result<InvocationContext, SharedAgentHostError>
+    where
+        P: CleanSystemAgentBootstrapStore,
+        R: CleanSystemAgentBootstrapStore,
+        I: CleanManagementIssuerStore,
+    {
+        if owner.authority_target() != self.authority || call.authority != self.authority {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self.validate()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        operation_dispatch::NativeAuthorityOperationDispatcher::new(owner, &mut self.journal)
+            .prepare_call(call)
+    }
+
     /// Read and cross-check both images without executing any operation.
     pub fn validate(
         &mut self,

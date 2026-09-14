@@ -10359,11 +10359,31 @@ mod tests {
                 roles: InvocationRoleClaims::none(),
                 observed_slot: slot,
             };
+            struct FailFirstPreparation(bool, OperationTestJournal);
+            impl NativeAuthorityOperationJournalStore for FailFirstPreparation {
+                type Error = std::io::Error;
+                fn load(
+                    &mut self,
+                    invocation: InvocationId,
+                ) -> Result<Option<Vec<u8>>, Self::Error> {
+                    self.1.load(invocation)
+                }
+                fn retain(
+                    &mut self,
+                    invocation: InvocationId,
+                    bytes: &[u8],
+                ) -> Result<(), Self::Error> {
+                    if core::mem::take(&mut self.0) {
+                        return Err(std::io::Error::other("injected preparation write failure"));
+                    }
+                    self.1.retain(invocation, bytes)
+                }
+            }
             let mut operations = NativeAuthorityOperationController::new(
                 authority,
                 OperationTestImageFile(directory.0.join("coordinator")),
                 OperationTestImageFile(directory.0.join("issuer")),
-                OperationTestJournal(directory.0.clone()),
+                FailFirstPreparation(true, OperationTestJournal(directory.0.clone())),
             );
             let mut signer = Signer {
                 key: SigningKey::from_bytes(&[RECEIPT_SEED; 32]),
@@ -10372,6 +10392,28 @@ mod tests {
                 retirement_calls: 0,
             };
             let before = owner.ordered_index_for_test().unwrap();
+            // Server-side preparation captures the authoritative clock once.
+            // Network delay/queueing after that point must reuse this exact
+            // retained context, not require equality with a newly read clock.
+            assert!(operations.prepare_call(&mut owner, &call).is_err());
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+            assert_eq!(signer.calls, 0);
+            fixture
+                .logical_slot
+                .as_ref()
+                .unwrap()
+                .store(slot + 1, Ordering::Release);
+            assert_eq!(operations.prepare_call(&mut owner, &call).unwrap(), context);
+            let mut substituted = call.clone();
+            if let AuthorityIngressAuthentication::SshNodeAttestation { signature, .. } =
+                &mut substituted.authentication
+            {
+                signature[0] ^= 1;
+            }
+            assert!(operations.prepare_call(&mut owner, &substituted).is_err());
+            let (coordinator, issuer, journal) = operations.into_parts();
+            let mut operations =
+                NativeAuthorityOperationController::new(authority, coordinator, issuer, journal.1);
             let issued = operations
                 .coordinate(&mut owner, &call, context, slot, &mut signer)
                 .unwrap();

@@ -351,6 +351,50 @@ where
             })
             .transpose()
     }
+
+    /// Capture the host observation once, before the client retains its final
+    /// submission. Exact retries return the already journaled context.
+    pub(crate) fn prepare_call(
+        &mut self,
+        call: &super::super::sdk::authority_operation::AuthorityOperationCall,
+    ) -> Result<super::super::sdk::InvocationContext, SharedAgentHostError> {
+        let bytes = call
+            .encode()
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if call.authority != self.owner.authority_target() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if let Some(record) = self.retained(call.invocation)? {
+            if record.request.method != AuthorityOperationActorMethod::AuthorizeOperation
+                || record.request.request != bytes
+            {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            self.journal
+                .retain(
+                    call.invocation,
+                    &record
+                        .encode()
+                        .map_err(|_| SharedAgentHostError::ScopeMismatch)?,
+                )
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            return Ok(record.request.context);
+        }
+        let journal = &mut self.journal;
+        let record = self
+            .owner
+            .capture_fresh_authority_operation(call, |record| {
+                journal
+                    .retain(
+                        call.invocation,
+                        &record
+                            .encode()
+                            .map_err(|_| SharedAgentHostError::ScopeMismatch)?,
+                    )
+                    .map_err(|_| SharedAgentHostError::Unavailable)
+            })?;
+        Ok(record.request.context)
+    }
 }
 
 impl<P, R, I, J> AuthorityOperationActorDispatcher
@@ -841,12 +885,35 @@ where
             return Err(SharedAgentHostError::ScopeMismatch);
         }
         let proposed = self.prepare_authority_operation_dispatch(request)?;
+        self.capture_prepared_authority_operation(request, &proposed, false, persist)
+    }
+
+    fn capture_prepared_authority_operation<F>(
+        &mut self,
+        request: &AuthorityOperationActorDispatch,
+        proposed: &RuntimeWork,
+        reuse_reserved_clock: bool,
+        persist: F,
+    ) -> Result<RetainedAuthorityOperationDispatch, SharedAgentHostError>
+    where
+        F: FnOnce(&RetainedAuthorityOperationDispatch) -> Result<(), SharedAgentHostError>,
+    {
         self._network_host.capture_management_pending(
             crate::service::AgentId(self.pins.agent.0),
-            &proposed,
+            proposed,
             |(anchor, envelope)| {
+                let mut request = request.clone();
+                if reuse_reserved_clock {
+                    // A failed journal callback may have retained a native
+                    // reservation. The host supplies its original envelope;
+                    // bind that clock, never the retry's newer observation.
+                    let RuntimeWork::Invoke { observed_slot, .. } = envelope else {
+                        return Err(SharedAgentHostError::ScopeMismatch);
+                    };
+                    request.context.observed_slot = *observed_slot;
+                }
                 let retained = RetainedAuthorityOperationDispatch::new(
-                    request.clone(),
+                    request,
                     envelope.clone(),
                     anchor.clone(),
                 )?;
@@ -854,6 +921,50 @@ where
                 Ok(retained)
             },
         )
+    }
+
+    /// Select context from the same physical material used to build the native
+    /// envelope. Never sample a second clock or rebase a retained dispatch.
+    fn capture_fresh_authority_operation<F>(
+        &mut self,
+        call: &super::super::sdk::authority_operation::AuthorityOperationCall,
+        persist: F,
+    ) -> Result<RetainedAuthorityOperationDispatch, SharedAgentHostError>
+    where
+        F: FnOnce(&RetainedAuthorityOperationDispatch) -> Result<(), SharedAgentHostError>,
+    {
+        if call.authority != self.authority_target() || self.record.pending_projection.is_some() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let material = self
+            .supervisor_invocation_material(self.pins.agent, call.authority.binding.issuer.actor)?;
+        let observed_slot = material.observed_slot;
+        if observed_slot < call.requested_valid_from || observed_slot > call.requested_expires_at {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let request = AuthorityOperationActorDispatch {
+            target: call.authority,
+            method: AuthorityOperationActorMethod::AuthorizeOperation,
+            context: super::super::sdk::InvocationContext {
+                invocation: call.invocation,
+                actor: call.authority.binding.issuer.actor,
+                mode: MethodMode::Linear,
+                origin: super::super::sdk::InvocationOrigin {
+                    principal: Some(call.principal),
+                    credential: Some(call.credential),
+                    transport_node: call.authenticated_node(),
+                    actor: None,
+                    capability: None,
+                },
+                roles: super::super::sdk::InvocationRoleClaims::none(),
+                observed_slot,
+            },
+            request: call
+                .encode()
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?,
+        };
+        let proposed = self.prepare_operation_from_material(&request, material)?;
+        self.capture_prepared_authority_operation(&request, &proposed, true, persist)
     }
 
     /// Extend only the exact retained authorization with its signed issuance
@@ -915,8 +1026,22 @@ where
         {
             return Err(SharedAgentHostError::ScopeMismatch);
         }
-        let mut material = self
+        let material = self
             .supervisor_invocation_material(self.pins.agent, request.target.binding.issuer.actor)?;
+        self.prepare_operation_from_material(request, material)
+    }
+
+    fn prepare_operation_from_material(
+        &self,
+        request: &AuthorityOperationActorDispatch,
+        mut material: super::super::invocation_preparation::PhysicalInvocationMaterial,
+    ) -> Result<RuntimeWork, SharedAgentHostError> {
+        if self.record.pending_projection.is_some()
+            || request.target != self.authority_target()
+            || !request.has_valid_request()
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
         material.root_provenance = false;
         if material.actor.entry.deployment != request.target.binding.issuer.deployment
             || material.actor.entry.program != request.target.binding.issuer.program
