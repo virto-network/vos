@@ -15,6 +15,13 @@ use super::supervisor_adapters::{AgentRouteAdapterError, AgentRouteHostAttachmen
 
 pub const LOCAL_LIFECYCLE_QUEUE_CAPACITY: usize = 4;
 
+#[path = "operation_submission.rs"]
+mod operation_submission;
+pub use operation_submission::AuthorityOperationSubmission;
+
+pub type AuthorityOperationResult =
+    Result<super::clean_bootstrap::NativeAuthorityOperationDecision, SharedAgentHostError>;
+
 /// Canonical signed Create submission: LCQ1 followed by length-prefixed AMRQ,
 /// ACC3 and an exact admitted VOS3 runtime package. This is untrusted request
 /// data, not an Authority approval or a genesis-finality proof.
@@ -287,6 +294,10 @@ pub type LocalInstallResult =
     Result<ManagementApplicationAck, super::production_owner::AgentProductionOwnerError>;
 
 pub(crate) enum PendingLocalLifecycle {
+    AuthorizeOperation {
+        submission: AuthorityOperationSubmission,
+        reply: mpsc::SyncSender<AuthorityOperationResult>,
+    },
     Create(PendingLocalCreate),
     Install {
         submission: LocalInstallSubmission,
@@ -298,6 +309,9 @@ impl PendingLocalLifecycle {
     pub(crate) fn reject(self) {
         let error = super::production_owner::AgentProductionOwnerError::InvalidConfiguration;
         match self {
+            Self::AuthorizeOperation { reply, .. } => {
+                let _ = reply.try_send(Err(SharedAgentHostError::Unavailable));
+            }
             Self::Create(request) => {
                 let _ = request.reply.try_send(Err(error));
             }
@@ -319,6 +333,27 @@ pub(crate) struct LocalLifecycleQueue {
 }
 
 impl LocalLifecycleQueue {
+    pub(crate) fn submit_operation(
+        &self,
+        submission: AuthorityOperationSubmission,
+    ) -> Result<mpsc::Receiver<AuthorityOperationResult>, LocalLifecycleIngressError> {
+        let channel = self
+            .channel
+            .lock()
+            .map_err(|_| LocalLifecycleIngressError::Unavailable)?;
+        let (sender, _) = channel
+            .as_ref()
+            .ok_or(LocalLifecycleIngressError::Unavailable)?;
+        let (reply, receiver) = mpsc::sync_channel(1);
+        sender
+            .try_send(PendingLocalLifecycle::AuthorizeOperation { submission, reply })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => LocalLifecycleIngressError::Busy,
+                mpsc::TrySendError::Disconnected(_) => LocalLifecycleIngressError::Unavailable,
+            })?;
+        Ok(receiver)
+    }
+
     pub(crate) fn open(&self) -> Result<(), LocalLifecycleIngressError> {
         let mut channel = self
             .channel

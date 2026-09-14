@@ -1607,6 +1607,124 @@ pub(crate) mod tests {
         credential_key: SigningKey,
     }
 
+    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+    #[test]
+    fn operation_submission_preserves_exact_signed_retry_inputs() {
+        use crate::agent::local_lifecycle::AuthorityOperationSubmission;
+        let fixture = Fixture::new(&CountingSigner::new(0x31));
+        let call = fixture.call(1);
+        let slot = call.requested_valid_from;
+        let context = fixture.context(&call, slot);
+        let submission =
+            AuthorityOperationSubmission::new(call.clone(), context.clone(), slot).unwrap();
+        let bytes = submission.encode().unwrap();
+        assert_eq!(&bytes[..4], b"AOQ1");
+        assert_eq!(
+            AuthorityOperationSubmission::decode(&bytes).unwrap(),
+            submission
+        );
+        assert_eq!(
+            submission.clone().into_parts(),
+            (call.clone(), context.clone(), slot)
+        );
+        for end in 0..bytes.len() {
+            assert!(AuthorityOperationSubmission::decode(&bytes[..end]).is_err());
+        }
+        let mut changed = bytes.clone();
+        changed.push(0);
+        assert!(AuthorityOperationSubmission::decode(&changed).is_err());
+        let mut changed = bytes.clone();
+        changed[0] ^= 1;
+        assert!(AuthorityOperationSubmission::decode(&changed).is_err());
+        let mut changed = bytes.clone();
+        // The AOC5 is the first length-prefixed field; changing signed content
+        // cannot manufacture another authenticated frame.
+        changed[20] ^= 1;
+        assert!(AuthorityOperationSubmission::decode(&changed).is_err());
+        let mut changed = bytes.clone();
+        // Preserve all call/context fields and alter only the final AOC5
+        // signature byte (four-byte frame tag plus four-byte field length).
+        changed[8 + call.encode().unwrap().len() - 1] ^= 1;
+        assert!(AuthorityOperationSubmission::decode(&changed).is_err());
+        assert!(
+            AuthorityOperationSubmission::decode(&vec![
+                0;
+                AuthorityOperationSubmission::MAX_ENCODED_BYTES
+                    + 1
+            ])
+            .is_err()
+        );
+        let mut wrong_context = context.clone();
+        wrong_context.invocation = InvocationId::ZERO;
+        assert!(AuthorityOperationSubmission::new(call.clone(), wrong_context, slot).is_err());
+        assert!(
+            AuthorityOperationSubmission::new(
+                call.clone(),
+                context.clone(),
+                call.requested_expires_at + 1
+            )
+            .is_err()
+        );
+        assert!(AuthorityOperationSubmission::new(call, context, slot.saturating_sub(1)).is_err());
+    }
+
+    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+    #[test]
+    fn operation_submission_queue_is_bounded_and_disconnect_does_not_cancel() {
+        use crate::agent::local_lifecycle::{
+            AuthorityOperationSubmission, LOCAL_LIFECYCLE_QUEUE_CAPACITY,
+            LocalLifecycleIngressError, LocalLifecycleQueue, PendingLocalLifecycle,
+        };
+        let fixture = Fixture::new(&CountingSigner::new(0x31));
+        let call = fixture.call(1);
+        let slot = call.requested_valid_from;
+        let submission =
+            AuthorityOperationSubmission::new(call.clone(), fixture.context(&call, slot), slot)
+                .unwrap();
+        let queue = LocalLifecycleQueue::default();
+        assert!(matches!(
+            queue.submit_operation(submission.clone()),
+            Err(LocalLifecycleIngressError::Unavailable)
+        ));
+        queue.open().unwrap();
+        let receiver = queue.submit_operation(submission.clone()).unwrap();
+        drop(receiver);
+        let Some(PendingLocalLifecycle::AuthorizeOperation {
+            submission: retained,
+            reply,
+        }) = queue.pop().unwrap()
+        else {
+            panic!("accepted operation was cancelled or replaced")
+        };
+        assert_eq!(retained, submission);
+        assert!(
+            reply
+                .try_send(Err(
+                    crate::agent::shared_host::SharedAgentHostError::Unavailable
+                ))
+                .is_err()
+        );
+        let receivers: Vec<_> = (0..LOCAL_LIFECYCLE_QUEUE_CAPACITY)
+            .map(|_| queue.submit_operation(submission.clone()).unwrap())
+            .collect();
+        assert!(matches!(
+            queue.submit_operation(submission.clone()),
+            Err(LocalLifecycleIngressError::Busy)
+        ));
+        queue.close();
+        for receiver in receivers {
+            assert!(matches!(
+                receiver.try_recv().unwrap(),
+                Err(crate::agent::shared_host::SharedAgentHostError::Unavailable)
+            ));
+        }
+        assert!(queue.pop().unwrap().is_none());
+        assert!(matches!(
+            queue.submit_operation(submission),
+            Err(LocalLifecycleIngressError::Unavailable)
+        ));
+    }
+
     impl Fixture {
         fn new(authority_signer: &CountingSigner) -> Self {
             let public_key = authority_signer.public_key();

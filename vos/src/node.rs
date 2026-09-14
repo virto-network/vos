@@ -2400,6 +2400,23 @@ impl IngressHandle {
         self.clean_local_lifecycle_queue.submit_install(submission)
     }
 
+    /// Queue exact signed authorization inputs. Queue acceptance is not a policy
+    /// decision or durable retention; clients must retain the frame for retry.
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    pub fn submit_clean_agent_operation(
+        &self,
+        submission: crate::agent::local_lifecycle::AuthorityOperationSubmission,
+    ) -> Result<
+        mpsc::Receiver<crate::agent::local_lifecycle::AuthorityOperationResult>,
+        crate::agent::local_lifecycle::LocalLifecycleIngressError,
+    > {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(crate::agent::local_lifecycle::LocalLifecycleIngressError::Unavailable);
+        }
+        self.clean_local_lifecycle_queue
+            .submit_operation(submission)
+    }
+
     /// Return the currently exposed clean-generation supervisor. The slot is
     /// populated only after authenticated owner construction and is cleared
     /// before node shutdown begins.
@@ -8283,6 +8300,12 @@ impl VosNode {
             Ok(Some(request)) if !self.shutdown.load(Ordering::Acquire) => {
                 use crate::agent::local_lifecycle::PendingLocalLifecycle;
                 match request {
+                    PendingLocalLifecycle::AuthorizeOperation { submission, reply } => {
+                        let (call, context, issued_at) = submission.into_parts();
+                        let result =
+                            self.authorize_clean_agent_operation(&call, context, issued_at);
+                        let _ = reply.try_send(result);
+                    }
                     PendingLocalLifecycle::Create(request) => {
                         let result = self.create_clean_local_agent(
                             request.descriptor,

@@ -190,7 +190,8 @@ Keep these as work within C2, not new review batches:
    owner boundaries. Issuer-gated denial startup classification is implemented;
    the production controller/daemon now retain the hardened denial index and
    validate it during startup. Automatic terminal denial handling now has a typed
-   native decision path; operation ingress/client wiring and the live
+   native decision path. Canonical AOQ1 retry inputs now enter the existing
+   bounded lifecycle queue; operation HTTP/client wiring and the live
    denial/valid-successor campaign remain open.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
    retirement and restart through native ingress; then expose the same
@@ -6136,6 +6137,39 @@ Create/Install latency is explicitly a production blocker: hashing-dominated
 execution and expensive inventory refresh are measured, but their underlying
 cause and acceptable fresh-response performance are not yet established.
 Timeout extensions or repeated retries do not close that gate.
+
+### Exact operation submission and bounded native queue
+
+Verification: **2 focused frame/queue tests passed**, zero failures, in **0.04s**;
+**222 CLI tests passed**, zero failures, five ignored, in **52.03s**. Logs under
+`.worktrees/ch08-c2-native/target/task-tmp/` are
+`r16-operation-submission-final.log` and `r16-operation-submission-cli.log`.
+Formatting and whitespace checks pass. Initial compilation required correcting
+the nested decoder's borrowed bytes and explicit wire-error conversion.
+
+The broader 23-test coordinator run is **pending**, not a pass:
+`r16-operation-submission-coordinator-final.log`. At this checkpoint its existing
+process is still exercising the full-capacity retention fixture; preserve that
+run rather than restarting it. Historical coordinator coverage took 1,254.24s.
+No native PVM execution or live HTTP campaign is claimed for this queue slice.
+
+`AuthorityOperationSubmission` adds canonical AOQ1 framing for the exact signed
+AOC5, authorization invocation context and selected issuance slot. Construction
+and decoding check the original ingress signature, call/context binding, wire
+bounds and slot range; malformed/trailing/truncated input is not a submission.
+The frame is untrusted request data, not policy approval or an issued receipt.
+
+Authorization now shares the existing bounded native lifecycle queue with
+Create/Install. The node passes the exact retained inputs to its production
+operation controller and replies with its typed decision. Full/closed queues
+fail explicitly. Receiver disconnection does not cancel accepted work, while
+shutdown rejects queued work as unavailable. Queue acceptance does not promise
+durability; the client must retain the exact frame before submitting it.
+
+This is the native request/queue boundary, not an HTTP endpoint or a completed
+client. Durable client retention, bound response verification, HTTP handling,
+fresh preparation and protected application still belong to the remaining C2
+work. No guest artifacts or performance behavior are claimed changed.
 
 ### Durable client acknowledgement before completion
 
