@@ -11,10 +11,24 @@ use crate::agent::sdk::{InvocationContext, InvocationOrigin, InvocationWork, Pub
 
 /// Immutable records under an exclusive writer lease. Implementations must
 /// bound reads before allocation and reject replacement with different bytes.
-pub(crate) trait NativeAuthorityAdminJournalStore {
+pub trait NativeAuthorityAdminJournalStore {
     type Error;
     fn load(&mut self, invocation: InvocationId) -> Result<Option<Vec<u8>>, Self::Error>;
     fn retain(&mut self, invocation: InvocationId, bytes: &[u8]) -> Result<(), Self::Error>;
+}
+
+pub const MAX_NATIVE_AUTHORITY_ADMIN_DISPATCH_BYTES: usize =
+    RetainedAuthorityAdminDispatch::MAX_ENCODED_BYTES;
+
+/// File-key and signed envelope validation, not physical journal finality.
+pub fn native_admin_record_matches(
+    authority: AuthorityActorTarget,
+    invocation: InvocationId,
+    bytes: &[u8],
+) -> bool {
+    RetainedAuthorityAdminDispatch::decode(bytes).is_ok_and(|record| {
+        record.call.authority == authority && record.call.invocation == invocation
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

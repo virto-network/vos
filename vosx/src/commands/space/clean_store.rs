@@ -197,6 +197,9 @@ enum StoreRole {
     PreparationResponse = 28,
     AuthorizationPreparationRequest = 29,
     AuthorizationPreparationResponse = 30,
+    AdminDispatch = 31,
+    AdminResult = 32,
+    AdminRetirement = 33,
 }
 
 impl StoreRole {
@@ -232,6 +235,9 @@ impl StoreRole {
             Self::PreparationResponse => "preparation.response",
             Self::AuthorizationPreparationRequest => "authorization-preparation.request",
             Self::AuthorizationPreparationResponse => "authorization-preparation.response",
+            Self::AdminDispatch => "admin.dispatch",
+            Self::AdminResult => "admin.result",
+            Self::AdminRetirement => "admin.retirement",
         }
     }
 
@@ -267,11 +273,28 @@ impl StoreRole {
             Self::PreparationResponse => "preparation.response.next",
             Self::AuthorizationPreparationRequest => "authorization-preparation.request.next",
             Self::AuthorizationPreparationResponse => "authorization-preparation.response.next",
+            Self::AdminDispatch => "admin.dispatch.next",
+            Self::AdminResult => "admin.result.next",
+            Self::AdminRetirement => "admin.retirement.next",
         }
     }
 
     const fn maximum_bytes(self) -> usize {
         match self {
+            Self::AdminDispatch | Self::AdminResult | Self::AdminRetirement => {
+                #[cfg(target_os = "linux")]
+                {
+                    if matches!(self, Self::AdminDispatch) {
+                        vos::agent::clean_bootstrap::MAX_NATIVE_AUTHORITY_ADMIN_DISPATCH_BYTES
+                    } else {
+                        vos::agent::clean_bootstrap::MAX_NATIVE_AUTHORITY_ADMIN_TERMINAL_BYTES
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    0
+                }
+            }
             Self::Pins => MAX_CLEAN_SYSTEM_AGENT_PINS_BYTES,
             Self::Bootstrap => MAX_CLEAN_SYSTEM_AGENT_BOOTSTRAP_BYTES,
             Self::ManagementIssuer => MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
@@ -350,6 +373,9 @@ impl StoreRole {
             28 => Some(Self::PreparationResponse),
             29 => Some(Self::AuthorizationPreparationRequest),
             30 => Some(Self::AuthorizationPreparationResponse),
+            31 => Some(Self::AdminDispatch),
+            32 => Some(Self::AdminResult),
+            33 => Some(Self::AdminRetirement),
             1 => Some(Self::Pins),
             2 => Some(Self::Bootstrap),
             3 => Some(Self::ManagementIssuer),
@@ -1731,6 +1757,14 @@ impl ExactFileStore {
         root: Arc<StoreRoot>,
         invocation: vos::agent::sdk::InvocationId,
     ) -> Result<Self, CleanFileStoreError> {
+        Self::invocation_record(root, invocation, StoreRole::OperationDispatch)
+    }
+
+    fn invocation_record(
+        root: Arc<StoreRoot>,
+        invocation: vos::agent::sdk::InvocationId,
+        role: StoreRole,
+    ) -> Result<Self, CleanFileStoreError> {
         if !root.operation_records || invocation == vos::agent::sdk::InvocationId::ZERO {
             return Err(CleanFileStoreError::InvalidPath);
         }
@@ -1738,7 +1772,7 @@ impl ExactFileStore {
         let stage = format!("{name}.next");
         Ok(Self {
             root,
-            role: StoreRole::OperationDispatch,
+            role,
             names: Some((name, stage)),
         })
     }
@@ -1806,6 +1840,9 @@ impl ExactFileStore {
                 | StoreRole::LocalCreateAcknowledgement
                 | StoreRole::LocalCreateDenial
                 | StoreRole::OperationDispatch
+                | StoreRole::AdminDispatch
+                | StoreRole::AdminResult
+                | StoreRole::AdminRetirement
                 | StoreRole::OperationRequest
                 | StoreRole::OperationResponse
                 | StoreRole::PreparationRequest
@@ -2484,6 +2521,10 @@ fn unlink_at(directory: &File, _root: &Path, name: &str) -> Result<(), CleanFile
 #[cfg(all(test, target_os = "linux"))]
 #[path = "clean_operation_journal_tests.rs"]
 mod operation_journal_tests;
+
+#[cfg(target_os = "linux")]
+#[path = "clean_admin_store.rs"]
+pub(crate) mod admin_store;
 
 #[cfg(target_os = "linux")]
 #[path = "clean_operation_completions.rs"]

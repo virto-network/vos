@@ -9,6 +9,23 @@
 pub(crate) mod admin_dispatch;
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+#[path = "clean_admin_controller.rs"]
+mod admin_controller;
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+pub use admin_controller::NativeAuthorityAdminController;
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+pub use admin_dispatch::terminal::{
+    MAX_NATIVE_AUTHORITY_ADMIN_TERMINAL_BYTES, NativeAuthorityAdminTerminalSigner,
+    NativeAuthorityAdminTerminalStore, native_admin_terminal_matches,
+};
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+pub use admin_dispatch::{
+    MAX_NATIVE_AUTHORITY_ADMIN_DISPATCH_BYTES, NativeAuthorityAdminJournalStore,
+    native_admin_record_matches,
+};
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 #[path = "clean_operation_dispatch.rs"]
 pub(crate) mod operation_dispatch;
 
@@ -10111,15 +10128,27 @@ mod tests {
             };
             successor.invocation = successor.expected_invocation();
             successor.signature = key.sign(&successor.signing_bytes()).to_bytes();
-            let next = owner
-                .retain_authority_admin(&successor, &mut journal)
+            let mut controller = NativeAuthorityAdminController::new(target, journal, terminals);
+            let successor_result = controller
+                .coordinate_and_retire(&mut owner, &successor, &mut terminal_signer)
                 .unwrap();
-            assert!(
-                owner
-                    .finish_authority_admin(&next, &mut terminals, &mut terminal_signer)
-                    .unwrap()
-                    .is_some()
+            assert!(successor_result.is_some());
+            let committed = owner.ordered_index_for_test().unwrap();
+            let signatures = terminal_signer.0;
+            assert_eq!(
+                controller
+                    .coordinate_and_retire(&mut owner, &successor, &mut terminal_signer)
+                    .unwrap(),
+                successor_result
             );
+            assert_eq!(
+                controller
+                    .coordinate_and_retire(&mut owner, &call, &mut terminal_signer)
+                    .unwrap(),
+                first_result.unwrap()
+            );
+            assert_eq!(owner.ordered_index_for_test().unwrap(), committed);
+            assert_eq!(terminal_signer.0, signatures);
             assert!(!owner.management_admission_held().unwrap());
             harness.owner = Some(owner);
             harness.stop();

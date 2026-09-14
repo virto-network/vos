@@ -246,8 +246,10 @@ Keep these as work within C2, not new review batches:
    signed administration. Native retained admin dispatch now recovers across
    publication failures and owner restart before/after execution. Native
    success/denial terminal retirement and a valid successor now pass across
-   result/retirement publication failures and restart. Production stores,
-   host-clock preparation and host/client delivery remain unimplemented. Keep
+   result/retirement publication failures and restart. Hardened admin stores
+   and the lease-owning controller are implemented and tested, but daemon
+   startup ownership, host-clock preparation and host/client delivery remain
+   unwired. Keep
    its credential sequence and generation CAS distinct from operation
    authorization; do not relax anonymous HTTP invocation or
    put this mutation in the read-only projection journal.
@@ -7455,6 +7457,38 @@ Next: hardened production admin stores/controller, host-clock preparation and
 client delivery, then protected Local mutation/retirement/restart. Broader
 capacity/GC and release gates remain open. No SDK ABI, artifact pin, ingress
 policy or timeout changed.
+
+### Hardened admin stores and owning controller (C2)
+
+`NativeAuthorityAdminController` owns the dispatch/result/retirement leases and
+rereads exact durable records on every attempt. Its startup adapter merges the
+complete admin discovery set into existing operation admission. Completed
+requests bypass fresh reservation only through verified terminal evidence.
+Native success and denial fixtures now complete their valid successors through
+this controller and retry both predecessor and successor with no additional
+signatures or journal entries (3 native tests, 51.50s;
+`target/task-tmp/native-admin-controller-tests.log`).
+
+The CLI now has dedicated CSF1 roles and namespaces for immutable admin dispatch,
+observed result and retirement. Reads validate staged and canonical records
+before reconciliation; terminal files must match their original signed dispatch,
+including its full native envelope commitment. All three roles reject replacement
+predecessors. Discovery includes first-publication stages, stays bounded, and
+retains exclusive leases through controller errors. Missing source records,
+wrong scope/key/phase, role-exchanged envelopes, symlinks and conflicting stages
+fail closed. The new store tests use synthetic signed storage fixtures, not
+native finality proof; native execution evidence is separately listed above.
+
+Verification: CLI suite 243 passed / 9 ignored (60.48s;
+`target/task-tmp/native-admin-store-cli-final.log`); final focused store rerun
+3 passed (1.86s; `native-admin-store-final-tests.log`) after independently checking
+each terminal namespace lease. Ordinary CLI build, formatting and diff checks
+also pass (`native-admin-controller-vosx-build.log`; logs under `target/task-tmp`).
+
+These types are not wired into daemon startup or ingress yet. Next connect
+their lifetime/discovery to daemon recovery, then implement host-clock preparation
+and client delivery before the protected Local mutation campaign. No SDK ABI,
+bundled artifact or timeout changed; this remains C2, not a new review batch.
 
 ### Durable client acknowledgement before completion
 

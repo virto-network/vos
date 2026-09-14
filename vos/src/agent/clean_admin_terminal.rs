@@ -1,7 +1,7 @@
 //! Signed admin result retention before ACK, and terminal release after ACK.
 use super::*;
 
-pub(crate) trait NativeAuthorityAdminTerminalStore {
+pub trait NativeAuthorityAdminTerminalStore {
     type Error;
     /// Both phases are immutable and separately keyed. Bound reads before
     /// allocation; successful retention synchronizes file and parent directory.
@@ -18,7 +18,7 @@ pub(crate) trait NativeAuthorityAdminTerminalStore {
     ) -> Result<(), Self::Error>;
 }
 
-pub(crate) trait NativeAuthorityAdminTerminalSigner {
+pub trait NativeAuthorityAdminTerminalSigner {
     type Error;
     fn public_key(&self) -> [u8; 32];
     fn sign_admin_terminal(&mut self, message: &[u8]) -> Result<[u8; 64], Self::Error>;
@@ -31,6 +31,25 @@ struct Certificate {
     // Empty means the bundled Authority denied the call.
     result: Vec<u8>,
     signature: [u8; 64],
+}
+
+pub const MAX_NATIVE_AUTHORITY_ADMIN_TERMINAL_BYTES: usize = Certificate::MAX_ENCODED_BYTES;
+
+/// Validate a terminal file against its original signed dispatch, key, scope
+/// and phase. Recovery separately authenticates the native journal anchor.
+pub fn native_admin_terminal_matches(
+    authority: AuthorityActorTarget,
+    invocation: InvocationId,
+    dispatch: &[u8],
+    retired: bool,
+    bytes: &[u8],
+) -> bool {
+    let Ok(record) = RetainedAuthorityAdminDispatch::decode(dispatch) else {
+        return false;
+    };
+    record.call.authority == authority
+        && record.call.invocation == invocation
+        && verify_certificate(&record, bytes, retired).is_ok()
 }
 
 impl Certificate {
