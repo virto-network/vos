@@ -14,6 +14,7 @@ mod admin_preparation;
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 pub use admin_preparation::{
     NativeAuthorityAdminPreparation, NativeAuthorityAdminPreparationSigner,
+    NativeAuthorityAdminSubmission,
 };
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
@@ -24,8 +25,9 @@ mod admin_controller;
 pub use admin_controller::NativeAuthorityAdminController;
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 pub use admin_dispatch::terminal::{
-    MAX_NATIVE_AUTHORITY_ADMIN_TERMINAL_BYTES, NativeAuthorityAdminTerminalSigner,
-    NativeAuthorityAdminTerminalStore, native_admin_terminal_matches,
+    MAX_NATIVE_AUTHORITY_ADMIN_TERMINAL_BYTES, NativeAuthorityAdminCompletion,
+    NativeAuthorityAdminTerminalSigner, NativeAuthorityAdminTerminalStore,
+    native_admin_terminal_matches,
 };
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 pub use admin_dispatch::{
@@ -9995,6 +9997,16 @@ mod tests {
                 TerminalStore(OperationTestJournal(harness._directory.0.clone()), 0);
             let mut terminal_signer = TerminalSigner(0);
             let draft = call.clone();
+            let mut wrong_node = draft.clone();
+            wrong_node.authenticated_node = crate::agent_sdk::NodeId([0xff; 32]);
+            wrong_node.invocation = wrong_node.expected_invocation();
+            wrong_node.signature = key.sign(&wrong_node.signing_bytes()).to_bytes();
+            assert!(
+                owner
+                    .prepare_authority_admin(&wrong_node, &mut terminal_signer)
+                    .is_err()
+            );
+            assert!(!owner.management_admission_held().unwrap());
             let preparation = owner
                 .prepare_authority_admin(&draft, &mut terminal_signer)
                 .unwrap();
@@ -10002,6 +10014,27 @@ mod tests {
             assert_eq!(call.signature, [0; 64]);
             call.signature = key.sign(&call.signing_bytes()).to_bytes();
             assert!(preparation.matches_call(&call));
+            let submission =
+                NativeAuthorityAdminSubmission::new(call.clone(), preparation.clone()).unwrap();
+            let submitted_bytes = submission.encode().unwrap();
+            assert_eq!(
+                NativeAuthorityAdminSubmission::decode(&submitted_bytes).unwrap(),
+                submission
+            );
+            for end in [0, 3, submitted_bytes.len() - 1] {
+                assert!(NativeAuthorityAdminSubmission::decode(&submitted_bytes[..end]).is_err());
+            }
+            let mut trailing_submission = submitted_bytes.clone();
+            trailing_submission.push(0);
+            assert!(NativeAuthorityAdminSubmission::decode(&trailing_submission).is_err());
+            assert!(
+                NativeAuthorityAdminSubmission::decode(&vec![
+                    0;
+                    NativeAuthorityAdminSubmission::MAX_ENCODED_BYTES
+                        + 1
+                ])
+                .is_err()
+            );
             assert_eq!(call.observed_slot, slot);
             let mut changed_intent = call.clone();
             changed_intent.expected_generation = NonZeroU64::new(99).unwrap();
@@ -10018,6 +10051,7 @@ mod tests {
             *bad_proof.last_mut().unwrap() ^= 1;
             let bad_proof = NativeAuthorityAdminPreparation::decode(&bad_proof).unwrap();
             assert!(!bad_proof.matches_call(&call));
+            assert!(NativeAuthorityAdminSubmission::new(call.clone(), bad_proof.clone()).is_err());
             assert!(
                 owner
                     .retain_authority_admin(&call, &bad_proof, &mut journal)
@@ -10186,12 +10220,75 @@ mod tests {
                 }
                 if let Some(bytes) = terminals.load(call.invocation, false).unwrap() {
                     assert!(verify_certificate(&retained, &bytes, true).is_err());
+                    assert!(
+                        NativeAuthorityAdminCompletion::verify(&call, &preparation, &bytes)
+                            .is_err()
+                    );
                     let mut corrupt = bytes;
                     *corrupt.last_mut().unwrap() ^= 1;
                     assert!(verify_certificate(&retained, &corrupt, false).is_err());
                 }
                 assert_eq!(journal.load(call.invocation).unwrap(), Some(bytes.clone()));
             }
+            let terminal_bytes = terminals.load(call.invocation, true).unwrap().unwrap();
+            let completion =
+                NativeAuthorityAdminCompletion::verify(&call, &preparation, &terminal_bytes)
+                    .unwrap();
+            assert_eq!(completion.result(), first_result.as_ref().unwrap().as_ref());
+            assert_eq!(
+                submission.verify_completion(&terminal_bytes).unwrap(),
+                completion
+            );
+            assert_eq!(completion.result().is_none(), denied);
+            let mut legacy_terminal = terminal_bytes.clone();
+            legacy_terminal[..4].copy_from_slice(b"NAT1");
+            assert!(submission.verify_completion(&legacy_terminal).is_err());
+            // Even a valid host signature for the same call at a different
+            // physical incarnation must not accept this terminal certificate.
+            let mut other_preparation = encoded_preparation.clone();
+            other_preparation[4 + crate::agent_sdk::RUNTIME_ABI_ID.as_bytes().len() + 32 + 8] ^= 1;
+            let signature_start = other_preparation.len() - 64;
+            let mut signing = b"vos/agent/native-admin-preparation/v1".to_vec();
+            signing.extend_from_slice(&other_preparation[4..signature_start - 4]);
+            other_preparation[signature_start..].copy_from_slice(
+                &SigningKey::from_bytes(&[RECEIPT_SEED; 32])
+                    .sign(&signing)
+                    .to_bytes(),
+            );
+            let other_preparation =
+                NativeAuthorityAdminPreparation::decode(&other_preparation).unwrap();
+            assert!(other_preparation.matches_call(&call));
+            assert!(
+                NativeAuthorityAdminCompletion::verify(&call, &other_preparation, &terminal_bytes)
+                    .is_err()
+            );
+            for end in [0, 3, terminal_bytes.len() - 1] {
+                assert!(
+                    NativeAuthorityAdminCompletion::verify(
+                        &call,
+                        &preparation,
+                        &terminal_bytes[..end]
+                    )
+                    .is_err()
+                );
+            }
+            let mut altered_terminal = terminal_bytes.clone();
+            *altered_terminal.last_mut().unwrap() ^= 1;
+            assert!(
+                NativeAuthorityAdminCompletion::verify(&call, &preparation, &altered_terminal)
+                    .is_err()
+            );
+            assert!(
+                NativeAuthorityAdminCompletion::verify(
+                    &changed_intent,
+                    &preparation,
+                    &terminal_bytes
+                )
+                .is_err()
+            );
+            assert!(
+                NativeAuthorityAdminCompletion::verify(&call, &bad_proof, &terminal_bytes).is_err()
+            );
             let mut successor = call.clone();
             successor.observed_slot = 0;
             successor.expected_generation = NonZeroU64::new(if denied { 1 } else { 2 }).unwrap();
@@ -10318,8 +10415,9 @@ mod tests {
             assert_eq!(
                 lifecycle
                     .submit_admin(&successor, &successor_preparation)
-                    .unwrap(),
-                successor_result
+                    .unwrap()
+                    .result(),
+                successor_result.as_ref()
             );
             assert!(lifecycle.submit_admin(&successor, &preparation).is_err());
             assert_eq!(lifecycle.ordered_index_for_test().unwrap(), committed);
@@ -10399,7 +10497,24 @@ mod tests {
             )
             .unwrap();
             assert!(reply.try_send(Ok(next_result.clone())).is_err());
-            assert!(next_result.is_some());
+            assert!(next_result.result().is_some());
+            assert_eq!(
+                NativeAuthorityAdminCompletion::verify(
+                    &next_call,
+                    &next_preparation,
+                    next_result.exact_bytes()
+                )
+                .unwrap(),
+                next_result
+            );
+            assert!(
+                NativeAuthorityAdminCompletion::verify(
+                    &successor,
+                    &successor_preparation,
+                    next_result.exact_bytes()
+                )
+                .is_err()
+            );
             assert!(
                 NativeLocalLifecycle::retains_admin(&mut lifecycle, &next_call, &next_preparation)
                     .unwrap()

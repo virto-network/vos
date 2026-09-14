@@ -3,6 +3,73 @@
 use super::*;
 use crate::agent::sdk::authority::AuthorityAdminCall;
 
+/// Exact signed client submission. Neither decoding nor queue acceptance
+/// grants administrative permission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeAuthorityAdminSubmission {
+    call: AuthorityAdminCall,
+    preparation: NativeAuthorityAdminPreparation,
+}
+
+impl NativeAuthorityAdminSubmission {
+    pub fn new(
+        call: AuthorityAdminCall,
+        preparation: NativeAuthorityAdminPreparation,
+    ) -> Result<Self, DecodeError> {
+        let value = Self { call, preparation };
+        value
+            .validate_wire()
+            .then_some(value)
+            .ok_or(DecodeError::NonCanonical)
+    }
+    pub fn call(&self) -> &AuthorityAdminCall {
+        &self.call
+    }
+    pub fn preparation(&self) -> &NativeAuthorityAdminPreparation {
+        &self.preparation
+    }
+    pub fn into_parts(self) -> (AuthorityAdminCall, NativeAuthorityAdminPreparation) {
+        (self.call, self.preparation)
+    }
+    pub fn verify_completion(
+        &self,
+        bytes: &[u8],
+    ) -> Result<NativeAuthorityAdminCompletion, SharedAgentHostError> {
+        NativeAuthorityAdminCompletion::verify(&self.call, &self.preparation, bytes)
+    }
+}
+
+impl CanonicalWire for NativeAuthorityAdminSubmission {
+    const MAGIC: [u8; 4] = *b"NAS1";
+    const MAX_ENCODED_BYTES: usize = 64
+        + AuthorityAdminCall::MAX_ENCODED_BYTES
+        + NativeAuthorityAdminPreparation::MAX_ENCODED_BYTES;
+    fn validate_wire(&self) -> bool {
+        self.preparation.matches_call(&self.call)
+    }
+    fn encode_body(&self, encoder: &mut Encoder<'_>) {
+        encoder.bytes(&self.call.encode().expect("validated admin call"));
+        encoder.bytes(
+            &self
+                .preparation
+                .encode()
+                .expect("validated admin preparation"),
+        );
+    }
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        Self::new(
+            AuthorityAdminCall::decode(
+                &decoder.bytes_bounded(AuthorityAdminCall::MAX_ENCODED_BYTES)?,
+            )
+            .map_err(|_| DecodeError::NonCanonical)?,
+            NativeAuthorityAdminPreparation::decode(
+                &decoder.bytes_bounded(NativeAuthorityAdminPreparation::MAX_ENCODED_BYTES)?,
+            )
+            .map_err(|_| DecodeError::NonCanonical)?,
+        )
+    }
+}
+
 pub trait NativeAuthorityAdminPreparationSigner {
     type Error;
     fn public_key(&self) -> [u8; 32];

@@ -250,8 +250,9 @@ Keep these as work within C2, not new review batches:
    and the lease-owning controller are implemented and tested. Daemon startup
    now discovers/replays admin evidence before routes and retains those leases
    in the lifecycle owner. Signed host-clock preparation and submission now
-   have native lifecycle APIs and bounded node-owned queue delivery;
-   authenticated ingress/client framing remains unwired. Keep
+   have native lifecycle APIs, bounded node-owned queue delivery and dedicated
+   signed-body HTTP routes. Managed-client orchestration and the live protected
+   campaign remain incomplete. Keep
    its credential sequence and generation CAS distinct from operation
    authorization; do not relax anonymous HTTP invocation or
    put this mutation in the read-only projection journal.
@@ -7580,6 +7581,59 @@ regression passes 1/1 (0.03s; `native-admin-queue-operation-regression.log`).
 Normal vosx build, formatting and whitespace checks pass
 (`native-admin-queue-vosx-build.log`). No live transport campaign was run for
 these internal admin entry points.
+
+### Request-verified admin completion and HTTP delivery (C2)
+
+Admin submission now returns a verified `NativeAuthorityAdminCompletion` through
+the lifecycle queue. It carries a NAT2 retired certificate and
+verifies its Authority signature, exact request-derived invocation, preparation
+commitment and phase;
+successful actor results must additionally match the complete signed call.
+The client supplies its retained call and NAP1 preparation to verification.
+An observed-but-unretired certificate cannot be completion. A signed empty
+result is a terminal denial, not a transport failure. This is the pinned
+Authority's attestation of native retirement, not independent journal replay;
+server recovery continues to verify the complete NAD2 record and physical anchor.
+NAT2 adds a signed commitment to the exact NAP1 token so the client can verify
+its incarnation binding without possessing the server's full NAD2 record.
+NAT1 is deliberately rejected; only disposable admin test histories used that
+format, and the previous live startup smoke had no admin records. No runtime
+artifact or SDK ABI changed.
+
+NAS1 is a bounded canonical host-side frame containing the signed call and
+matching NAP1. `POST /__agents/admin/prepare` accepts a signed zero-slot admin
+draft and returns NAP1; `POST /__agents/admin` accepts NAS1 and returns NAT2
+with HTTP 200 for success or 403 for a signed retired denial. Both require
+`application/octet-stream` and reject query parameters. Incomplete work returns
+503/504 and requires retry, never an unsigned terminal denial. The existing
+120-second observation deadline and queue capacity are unchanged. A client
+must retain the chosen preparation and final signed NAS1 before submitting,
+and retain a verified completion before advancing its admin sequence.
+
+These dedicated routes use signed-body authentication, not an asserted HTTP
+transport identity: the native owner pins the destination node, and the bundled
+Authority verifies credential activity, current Admin role and node ownership.
+Generic actor HTTP invocation and operation transport-node restrictions remain
+unchanged. During recovery only the exact admin submission route is available;
+the owner permits only matching retained work, not fresh preparation. Adjacent
+paths do not inherit that exception.
+
+Validation: native admin tests pass 3/3 (47.99s;
+`native-admin-nat2-native-verified.log`), including grant/denial retirement,
+restart, malformed NAS1, wrong node, altered certificate, unretired certificate,
+legacy NAT1 rejection and a validly signed different-incarnation preparation.
+HTTP ingress regressions pass 4/4 (0.27s;
+`native-admin-nat2-ingress-verified.log`), including malformed admin requests,
+unchanged anonymous invocation rejection and recovery route boundaries.
+Hardened admin stores pass 3/3 (5.23s; `native-admin-nat2-stores.log`). Normal
+vosx build passes (27.24s; `native-admin-nat2-vosx-build.log`), as do formatting
+and whitespace checks. Logs are in shared on-disk `target/task-tmp`.
+These are separate native and HTTP regression checks, not a live HTTP admin
+mutation campaign; no end-to-end transport success is claimed yet.
+
+Managed-client persistence/orchestration and a live protected actor campaign
+remain next. The endpoints alone do not close that campaign or the production
+latency gate. No new review batch is introduced.
 
 ### Durable client acknowledgement before completion
 

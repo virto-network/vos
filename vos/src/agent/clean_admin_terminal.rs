@@ -27,6 +27,7 @@ pub trait NativeAuthorityAdminTerminalSigner {
 struct Certificate {
     invocation: InvocationId,
     record: Hash,
+    preparation: Hash,
     retired: bool,
     // Empty means the bundled Authority denied the call.
     result: Vec<u8>,
@@ -34,6 +35,46 @@ struct Certificate {
 }
 
 pub const MAX_NATIVE_AUTHORITY_ADMIN_TERMINAL_BYTES: usize = Certificate::MAX_ENCODED_BYTES;
+
+/// Authority-signed native retirement, verified against the client's retained
+/// request. This is a host attestation, not independent physical journal replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeAuthorityAdminCompletion {
+    bytes: Vec<u8>,
+    result: Option<AuthorityAdminResult>,
+}
+
+impl NativeAuthorityAdminCompletion {
+    pub const MAX_BYTES: usize = MAX_NATIVE_AUTHORITY_ADMIN_TERMINAL_BYTES;
+
+    pub fn verify(
+        call: &AuthorityAdminCall,
+        preparation: &NativeAuthorityAdminPreparation,
+        bytes: &[u8],
+    ) -> Result<Self, SharedAgentHostError> {
+        if !preparation.matches_call(call) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let certificate =
+            Certificate::decode(bytes).map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+        if certificate.preparation != preparation_commitment(preparation)? {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let result = verify_call_certificate(call, &certificate, true)?;
+        Ok(Self {
+            bytes: bytes.to_vec(),
+            result,
+        })
+    }
+
+    pub fn exact_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    /// None means a signed retired denial, never a transport failure.
+    pub fn result(&self) -> Option<&AuthorityAdminResult> {
+        self.result.as_ref()
+    }
+}
 
 /// Validate a terminal file against its original signed dispatch, key, scope
 /// and phase. Recovery separately authenticates the native journal anchor.
@@ -54,10 +95,11 @@ pub fn native_admin_terminal_matches(
 
 impl Certificate {
     fn signing_bytes(&self) -> Vec<u8> {
-        let mut bytes = b"vos/agent/native-admin-terminal/v1".to_vec();
+        let mut bytes = b"vos/agent/native-admin-terminal/v2".to_vec();
         bytes.extend_from_slice(crate::agent_sdk::RUNTIME_ABI_ID.as_bytes());
         bytes.extend_from_slice(&self.invocation.0);
         bytes.extend_from_slice(&self.record.0);
+        bytes.extend_from_slice(&self.preparation.0);
         bytes.push(u8::from(self.retired));
         bytes.extend_from_slice(
             &Hash::digest(b"vos/agent/native-admin-result/v1", &[&self.result]).0,
@@ -67,17 +109,19 @@ impl Certificate {
 }
 
 impl CanonicalWire for Certificate {
-    const MAGIC: [u8; 4] = *b"NAT1";
+    const MAGIC: [u8; 4] = *b"NAT2";
     const MAX_ENCODED_BYTES: usize = 256 + AuthorityAdminResult::MAX_ENCODED_BYTES;
     fn validate_wire(&self) -> bool {
         self.invocation != InvocationId::ZERO
             && self.record != Hash::ZERO
+            && self.preparation != Hash::ZERO
             && self.signature != [0; 64]
             && (self.result.is_empty() || AuthorityAdminResult::decode(&self.result).is_ok())
     }
     fn encode_body(&self, encoder: &mut Encoder<'_>) {
         encoder.fixed(&self.invocation.0);
         encoder.fixed(&self.record.0);
+        encoder.fixed(&self.preparation.0);
         encoder.u8(u8::from(self.retired));
         encoder.bytes(&self.result);
         encoder.bytes(&self.signature);
@@ -86,6 +130,7 @@ impl CanonicalWire for Certificate {
         Ok(Self {
             invocation: InvocationId(decoder.fixed()?),
             record: Hash(decoder.fixed()?),
+            preparation: Hash(decoder.fixed()?),
             retired: match decoder.u8()? {
                 0 => false,
                 1 => true,
@@ -98,6 +143,17 @@ impl CanonicalWire for Certificate {
                 .map_err(|_| DecodeError::NonCanonical)?,
         })
     }
+}
+
+fn preparation_commitment(
+    preparation: &NativeAuthorityAdminPreparation,
+) -> Result<Hash, SharedAgentHostError> {
+    Ok(Hash::digest(
+        b"vos/agent/native-admin-preparation-commitment/v1",
+        &[&preparation
+            .encode()
+            .map_err(|_| SharedAgentHostError::ScopeMismatch)?],
+    ))
 }
 
 fn commitment(record: &RetainedAuthorityAdminDispatch) -> Result<Hash, SharedAgentHostError> {
@@ -116,11 +172,24 @@ pub(crate) fn verify_certificate(
 ) -> Result<Option<AuthorityAdminResult>, SharedAgentHostError> {
     let certificate =
         Certificate::decode(bytes).map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-    if certificate.invocation != record.call.invocation
-        || certificate.record != commitment(record)?
+    if certificate.record != commitment(record)?
+        || certificate.preparation != preparation_commitment(&record.preparation)?
+    {
+        return Err(SharedAgentHostError::ScopeMismatch);
+    }
+    verify_call_certificate(&record.call, &certificate, retired)
+}
+
+fn verify_call_certificate(
+    call: &AuthorityAdminCall,
+    certificate: &Certificate,
+    retired: bool,
+) -> Result<Option<AuthorityAdminResult>, SharedAgentHostError> {
+    if call.verify_with(&RawCredentialVerifier).is_err()
+        || certificate.invocation != call.invocation
         || certificate.retired != retired
         || !crate::agent::authority::verify_raw_ed25519(
-            &record.call.authority.binding.public_key,
+            &call.authority.binding.public_key,
             &certificate.signing_bytes(),
             &certificate.signature,
         )
@@ -132,7 +201,7 @@ pub(crate) fn verify_certificate(
     }
     let result = AuthorityAdminResult::decode(&certificate.result)
         .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-    if result.call != record.call || result.verify_with(&RawCredentialVerifier).is_err() {
+    if result.call != *call || result.verify_with(&RawCredentialVerifier).is_err() {
         return Err(SharedAgentHostError::ScopeMismatch);
     }
     Ok(Some(result))
@@ -274,6 +343,7 @@ fn sign_certificate<S: NativeAuthorityAdminTerminalSigner>(
     let mut certificate = Certificate {
         invocation: record.call.invocation,
         record: commitment(record)?,
+        preparation: preparation_commitment(&record.preparation)?,
         retired,
         result: result
             .as_ref()

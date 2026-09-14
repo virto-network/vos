@@ -24,6 +24,10 @@ use super::state::Inner;
 use super::{HttpIngressContext, decode_access_token};
 use crate::node::{IngressAuthenticationError, IngressHandle};
 
+#[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+#[path = "admin.rs"]
+mod admin;
+
 fn default_max_connections() -> usize {
     1024
 }
@@ -209,7 +213,10 @@ async fn handle_request(
     if handle.clean_agent_recovering()
         && !matches!(
             path.as_str(),
-            "/__status" | "/__agents/authorize" | "/__agents/prepare-authorization"
+            "/__status"
+                | "/__agents/authorize"
+                | "/__agents/prepare-authorization"
+                | "/__agents/admin"
         )
     {
         let response = simple(
@@ -267,6 +274,14 @@ async fn handle_request(
             #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
             if request.uri().path() == "/__agents/prepare-authorization" {
                 return handle_operation_preparation(&request, &handle);
+            }
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            if request.uri().path() == "/__agents/admin/prepare" {
+                return admin::prepare(&request, &handle);
+            }
+            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+            if request.uri().path() == "/__agents/admin" {
+                return admin::submit(&request, &handle);
             }
             #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
             if matches!(
@@ -991,6 +1006,11 @@ mod tests {
                 expected
             );
             assert_eq!(
+                admin::prepare(&request, &handle).status().as_u16(),
+                expected
+            );
+            assert_eq!(admin::submit(&request, &handle).status().as_u16(), expected);
+            assert_eq!(
                 handle_clean_preparation(&request, &handle)
                     .status()
                     .as_u16(),
@@ -1300,11 +1320,17 @@ mod tests {
                 "/__agents/local",
                 "/__agents/local/install",
                 "/__agents/authorize/",
+                "/__agents/admin/prepare",
+                "/__agents/admin/",
             ] {
                 let response = request(port, path);
                 assert!(response.starts_with("HTTP/1.1 503"), "{path}: {response}");
             }
-            for path in ["/__agents/authorize", "/__agents/prepare-authorization"] {
+            for path in [
+                "/__agents/authorize",
+                "/__agents/prepare-authorization",
+                "/__agents/admin",
+            ] {
                 let response = request(port, path);
                 assert!(response.starts_with("HTTP/1.1 405"), "{path}: {response}");
             }

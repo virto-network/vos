@@ -86,6 +86,10 @@ fn evidence(
             .unwrap()
             .matches_call(&call)
     );
+    let preparation_commitment = Hash::digest(
+        b"vos/agent/native-admin-preparation-commitment/v1",
+        &[&preparation],
+    );
     let mut dispatch = b"NAD2".to_vec();
     dispatch.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
     for bytes in [
@@ -112,16 +116,18 @@ fn evidence(
     };
     let record = Hash::digest(b"vos/agent/native-admin-dispatch/v1", &[&dispatch]);
     let certificate = |retired: bool| {
-        let mut signed = b"vos/agent/native-admin-terminal/v1".to_vec();
+        let mut signed = b"vos/agent/native-admin-terminal/v2".to_vec();
         signed.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
         signed.extend_from_slice(&call.invocation.0);
         signed.extend_from_slice(&record.0);
+        signed.extend_from_slice(&preparation_commitment.0);
         signed.push(u8::from(retired));
         signed.extend_from_slice(&Hash::digest(b"vos/agent/native-admin-result/v1", &[&result]).0);
-        let mut bytes = b"NAT1".to_vec();
+        let mut bytes = b"NAT2".to_vec();
         bytes.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
         bytes.extend_from_slice(&call.invocation.0);
         bytes.extend_from_slice(&record.0);
+        bytes.extend_from_slice(&preparation_commitment.0);
         bytes.push(u8::from(retired));
         bytes.extend_from_slice(&(result.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&result);

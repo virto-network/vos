@@ -26,7 +26,7 @@ pub type AuthorityOperationPreparationResult =
 pub type AuthorityAdminPreparationResult =
     Result<super::clean_bootstrap::NativeAuthorityAdminPreparation, SharedAgentHostError>;
 pub type AuthorityAdminSubmissionResult =
-    Result<Option<super::sdk::authority::AuthorityAdminResult>, SharedAgentHostError>;
+    Result<super::clean_bootstrap::NativeAuthorityAdminCompletion, SharedAgentHostError>;
 
 /// Canonical signed Create submission: LCQ1 followed by length-prefixed AMRQ,
 /// ACC3 and an exact admitted VOS3 runtime package. This is untrusted request
@@ -1352,7 +1352,7 @@ where
         owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
         call: &super::sdk::authority::AuthorityAdminCall,
         preparation: &super::clean_bootstrap::NativeAuthorityAdminPreparation,
-    ) -> Result<Option<super::sdk::authority::AuthorityAdminResult>, SharedAgentHostError>;
+    ) -> AuthorityAdminSubmissionResult;
     fn coordinate(
         &mut self,
         owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
@@ -1394,9 +1394,9 @@ where
         owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
         call: &super::sdk::authority::AuthorityAdminCall,
         preparation: &super::clean_bootstrap::NativeAuthorityAdminPreparation,
-    ) -> Result<Option<super::sdk::authority::AuthorityAdminResult>, SharedAgentHostError> {
+    ) -> AuthorityAdminSubmissionResult {
         self.0
-            .submit_and_retire(owner, call, preparation, &mut self.1)
+            .submit_with_completion(owner, call, preparation, &mut self.1)
     }
     fn coordinate(
         &mut self,
@@ -1535,7 +1535,7 @@ where
         &mut self,
         call: &super::sdk::authority::AuthorityAdminCall,
         preparation: &super::clean_bootstrap::NativeAuthorityAdminPreparation,
-    ) -> Result<Option<super::sdk::authority::AuthorityAdminResult>, SharedAgentHostError> {
+    ) -> AuthorityAdminSubmissionResult {
         let admins = self
             .admins
             .as_mut()

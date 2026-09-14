@@ -135,6 +135,34 @@ impl<J: NativeAuthorityAdminJournalStore, T: NativeAuthorityAdminTerminalStore>
         self.coordinate_and_retire(owner, call, signer)
     }
 
+    /// Complete native retirement before returning verifiable client evidence.
+    /// A failed evidence read remains retryable with the exact retained inputs.
+    pub fn submit_with_completion<P, R, I, S>(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        call: &AuthorityAdminCall,
+        preparation: &NativeAuthorityAdminPreparation,
+        signer: &mut S,
+    ) -> Result<NativeAuthorityAdminCompletion, SharedAgentHostError>
+    where
+        P: CleanSystemAgentBootstrapStore,
+        R: CleanSystemAgentBootstrapStore,
+        I: CleanManagementIssuerStore,
+        S: NativeAuthorityAdminTerminalSigner,
+    {
+        let result = self.submit_and_retire(owner, call, preparation, signer)?;
+        let bytes = self
+            .terminals
+            .load(call.invocation, true)
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        let completion = NativeAuthorityAdminCompletion::verify(call, preparation, &bytes)?;
+        if completion.result() != result.as_ref() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        Ok(completion)
+    }
+
     /// Resume an already retained call only. Fresh calls require preparation.
     /// None is a durably retired denial. Errors are never policy decisions.
     pub fn coordinate_and_retire<P, R, I, S>(
