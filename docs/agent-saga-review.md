@@ -14,6 +14,11 @@ lifecycle-store leases and corrected clock coverage" for the correction.
 Implementation is in `.worktrees/ch08-runtime-directory` on
 `wip/ch08-runtime-directory`, not yet in the root `saga/agents` checkout.
 Use only an isolated, disposable environment for bootstrap/ingress testing.
+Fresh-space identity derivation has a newly confirmed release blocker: two
+independent operator identities received the same Space ID. The seq-zero DAG
+event is empty initialization, while `set_root` is seq one; current genesis
+selection therefore does not bind the signing root. Do not connect these test
+spaces to one another or treat their displayed identity as isolation evidence.
 Fresh-space first start and restart with bundled system actors and HTTP/SSH
 have passed. One recovered Local Create has returned a client-verified
 acknowledgement after native route reconciliation. Exact repeated delivery now
@@ -24,8 +29,9 @@ Install delivery has passed exact recovery after restart. A Public Catalog
 query on the installed Local actor now passes through clean HTTP preparation,
 invocation, retained delivery and an exact HTTP retry. Exact HTTP invocation
 after restart also passes. Native positive retirement and exact acknowledgement
-retries now pass before and after restart; protected/non-Public and mutating
-actor workflows remain open.
+retries now pass before and after restart. Public Counter mutation, late replay
+rejection and a fresh read of seven after actual daemon restart now pass with
+the repinned runtime. Protected/non-Public actor workflows remain open.
 This is not yet a usable ordinary-agent production path.
 Managed authorization now has a live exact-recovery pass: the saved IgQS0r call
 was authorized after recovery-only startup, followed by verified inventory,
@@ -42,8 +48,8 @@ then exact resume after restart returned a verified acknowledgement in about
 the first increment returned seven and retired, but exact late Invoke returned
 fourteen. Restart-read verification was not run. A source guard now rejects
 Invoke against a retained acknowledgement. The runtime artifact is now rebuilt,
-repinned and verified by a physical-PVM regression; fresh end-to-end mutation
-and restart verification is still required. Do not deploy the old bundled
+repinned and verified by a physical-PVM regression and a fresh isolated
+end-to-end Counter mutation/restart campaign. Do not deploy the old bundled
 runtime as fixed. The failing disposable state is
 preserved, not reset. A short reconciliation CPU sample was dominated by BLAKE2
 hashing; the complete caller/root cause remains unproven.
@@ -183,7 +189,8 @@ Keep these as work within C2, not new review batches:
 1. **Done for the terminal Public query:** native invocation retirement/restart
    coverage for the newly added continuation client passes (live evidence
    below). Native yielded work still belongs to item 3.
-2. Connect `DurableAuthorityOperationCoordinator` to durable native stores and
+2. **Implemented, with edge-case gates still open:**
+   `DurableAuthorityOperationCoordinator` is connected to durable native stores and
    exact physical Authority dispatch. The CSF1 store pair and native owner
    execution boundary are implemented and tested below. The native coordinator
    adapter now passes disk-backed fixture checks; the production immutable
@@ -193,7 +200,9 @@ Keep these as work within C2, not new review batches:
    A native-only controller now retains all three store handles across calls
    and reopens parsed state on each attempt, including after open failures.
    Daemon startup now adopts those stores and native node dispatch reaches the
-   controller; operation ingress/client wiring and terminal recovery remain open. Preparation and an API
+   controller. Host-clock preparation, operation ingress/client wiring and
+   terminal recovery now have the live and native passes recorded below.
+   Mixed-pending, expiry/abort and capacity gates remain open. Preparation and an API
    credential do not issue an actor
    receipt. Retain the signed AOC5, exact authorization context and issuance
    slot before policy dispatch, and recover the exact issued preimages before
@@ -222,12 +231,14 @@ Keep these as work within C2, not new review batches:
    bounded lifecycle queue. Request-bound AOR1 responses and immutable client
    request/response storage are implemented. HTTP and retained-submission CLI delivery
    are wired. Operation-domain discovery and deterministic prepared-work signing
-   helpers are implemented; durable fresh-command orchestration and the live
-   denial/valid-successor campaign remain open.
+   helpers and durable fresh-command orchestration are implemented. A fresh
+   receipt-bearing Public successor now passes live; the protected mutation
+   and broader terminal-resolution cases are not thereby complete.
 3. Prove a protected Local mutation, yield/resume where applicable, positive
-   retirement and restart through native ingress; then expose the same
-   preparation/authorization flow in the user-facing client. A Public query
-   alone does not close this item.
+   retirement and restart through native ingress and the managed client.
+   First verify the repaired post-retirement replay behavior in a fresh Public
+   Counter campaign, then complete the missing protected permission setup.
+   A Public query or mutation alone does not close this item.
 4. Close the already-required Shared finality, Private/Attested, terminal
    resolution and physical recovery/capacity gates above before C3. These are
    implementation blockers, not merely a final test run. Do not promote the
@@ -6957,6 +6968,83 @@ With the repinned bytes, the native operation/recovery suite also passed:
 **9 passed, 120.97s**, `r16-runtime-repin-native.log`. Formatting and whitespace
 checks passed. No old disposable space was reopened with the new runtime, and
 no failed state was reset to manufacture a passing mutation result.
+
+### Fresh Counter campaign and genesis-identity collision (C2)
+
+Fresh isolated XDG/config/data/cache roots are
+`target/task-tmp/native-denial-head-reuse.N5274B`, with a newly generated operator
+identity and node peer `12D3KooWSdVoYGXS3dgeAhrMhZ7vswcNk9EfF68Y5cZeHBDptM1J`.
+The normal binary contains the **51dae8fb** repin. `space new` prepared the
+bundles and enabled HTTP/SSH defaults; only the disposable loopback ports were
+changed to **18086/2228**. No state from IgQS0r or XoaplU was copied. The only
+reused input is the unchanged signed Counter package, exercising installation
+of an independently published actor package.
+
+The Counter fixture now reads the successful Create CLI JSON acknowledgement
+via `VOSX_INVOKE_SMOKE_CONFIG`, rather than requiring an unrelated Local Catalog
+installation/constructor. Catalog campaigns continue to use their original
+constructor configuration. The fixture checks the Space/agent coordinates and
+admitted Counter program/deployment before evaluating its result.
+
+Timeline (**2026-09-14 UTC**, `run.sh` and phase-specific logs):
+
+- Start **19:27:09**, ready **19:28:00** (about **51s**).
+- Create started **19:28:00**, verified completion **19:30:56** (**176s**), after
+  one HTTP 504 and exact retry; agent
+  `46a48c769852a71dbbb8296285f32a4bfaaaf4b0eb52033dca7845b79616fc49`.
+- Counter install started **19:30:56**, verified completion **19:37:55**
+  (**419s**), after two HTTP 504 responses. A full post-install inventory pass
+  took **130.879s**; subsequent exact retries still performed refreshes.
+- Mutation `645561e2e23253ee993c413c5723e88884d99bb24b80b1d62feb6b85312bd637`
+  passed: managed attempt **298.27s**, full test **300.14s**. It returned **7**,
+  rejected both actual late HTTP Invoke replays, and retained positive exact
+  acknowledgement retries. Completion was observed at **19:42:55**.
+- Graceful shutdown completed **19:45:49**, waiting for an already-running
+  inventory pass. Restart began immediately and was ready **19:47:13**.
+- Fresh read `0784c40486bbb389b6cf9b6f9a3566742d62364a75dd194df234ab22e2fa2d79`
+  returned **7** after restart. Managed application took **157.81s**, full test
+  **159.70s**, passing at **19:49:53** with late Invoke rejection and positive
+  exact acknowledgement retries. `mutation-test.log` and `read-test.log` each
+  report one passing live test. This proves the isolated Public Counter
+  mutation happened once across the tested duplicate requests and restart,
+  not protected permission setup or ordinary Shared finality.
+- Final graceful shutdown completed **19:51:40**, campaign exit **0**, endpoint
+  removed. Its in-flight inventory pass took **110.562s**.
+
+These timings remain production-blocking. No timeout was raised and no saved
+request, reservation, or failed historical state was rewritten.
+
+The new space unexpectedly has the same genesis hash and Space ID as IgQS0r:
+genesis `2b14cd25c0705fa792db8feae161c31d5251a7c6daa159dcdc2cae52a1c1e524`,
+Space `b9e1120cb41249347b9070ec9065e81c92b4593d2c384af3ca612b0b2b6fdf3d`.
+The canonical operator key files differ (byte comparison only; no secret key
+material was printed). A copied, stopped IgQS0r registry database was inspected
+without opening or modifying its original. It contains:
+
+- seq **0**: the above genesis CID, **empty message**;
+- seq **1**: `set_root`, CID
+  `c9852b4e56fd4027bdd6d1172a1b73b1818d91ee9552e02d9e7e78ce703c8110`;
+- seq **2**: `set_space_id`;
+- seq **3**: `add_node`.
+
+Evidence: `target/task-tmp/inspect-genesis.rs`, its compiled diagnostic,
+`igqs0r-genesis-diagnostic.redb` and `igqs0r-genesis-diagnostic.log`. Both `new.rs`
+and `verify.rs` currently select seq zero, contrary to their claim that it is
+the root-setting operation. Fix genesis selection/verification consistently,
+including root binding, independent-space uniqueness and existing-data rejection
+tests; do not merely change one scanner or relabel existing spaces. This is an
+original bootstrap/isolation requirement, not a new feature. It remains open.
+After N5274B stopped, a copied registry independently confirmed the same empty
+seq-zero CID, but a different seq-one `set_root` CID:
+`1ba51dcba34d14ef2ebc26baea8f17ac65f2b36d0da6943e6907cd5e2d1942f8`.
+Evidence: `n5274b-genesis-diagnostic.{redb,log}` alongside the first diagnostic.
+The originals remain intact. This directly distinguishes the two real root
+anchors from the shared empty event mistakenly used as space genesis.
+Final CLI regression: **239 passed**, zero failures, **9 ignored**, **52.88s**
+(`r16-fresh-counter-cli.log`); formatting and whitespace checks pass. Only the
+opt-in Counter fixture and review/checklist record changed in this checkpoint.
+The genesis derivation fix is the next implementation step; it is not included
+in these passing results.
 
 ### Durable client acknowledgement before completion
 

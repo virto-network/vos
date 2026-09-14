@@ -52,29 +52,59 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
         super::super::local_create::resolve_local_space("native-denial-smoke", None).unwrap();
     assert!(data.to_string_lossy().contains("native-denial-head-reuse."));
     assert_eq!(config_path.parent(), data.parent());
-    let config =
-        system_catalog::SystemCatalogConfiguration::decode(&std::fs::read(config_path).unwrap())
-            .unwrap();
-    assert_eq!(config.space, space.0);
-    let target = CatalogActorTarget {
-        space,
-        system_agent: AgentId(config.system_agent),
-        system_runtime_deployment: DeploymentId(config.system_runtime_deployment),
-        actor: ActorId(config.actor),
-        deployment: DeploymentId(config.deployment),
-        program: ProgramId(config.program),
-        authority: AgentAuthorityBinding {
-            policy: Hash(config.authority.policy),
-            public_key: config.authority.public_key,
-            initial_epoch: config.authority.initial_epoch,
-            issuer: AuthorityIssuer {
-                principal: PrincipalId(config.authority.issuer.principal),
-                actor: ActorId(config.authority.issuer.actor),
-                deployment: DeploymentId(config.authority.issuer.deployment),
-                program: ProgramId(config.authority.issuer.program),
-                producer: ProducerId(config.authority.issuer.producer),
+    // Counter uses the already verified Create CLI result for its coordinates;
+    // it does not need an unrelated Catalog installed in the same Local agent.
+    let target = if counter {
+        let created: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        let acknowledgement = vos::agent::sdk::authority::ManagementApplicationAck::decode(
+            &hex::decode(created["acknowledgement"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(acknowledgement.managed.space, space);
+        assert_eq!(
+            created["agent"].as_str().unwrap(),
+            hex::encode(acknowledgement.managed.agent.0)
+        );
+        let package = vos::agent::package_admission::admit_actor_package(
+            &std::fs::read(data.parent().unwrap().join("counter-artifact/Counter.vos")).unwrap(),
+        )
+        .unwrap();
+        CatalogActorTarget {
+            space,
+            system_agent: acknowledgement.managed.agent,
+            system_runtime_deployment: acknowledgement.managed.runtime_deployment,
+            actor: ActorId::top_level(acknowledgement.managed.agent, "counter-smoke"),
+            deployment: package.deployment(),
+            program: package.program(),
+            authority: acknowledgement.authority.binding,
+        }
+    } else {
+        let config = system_catalog::SystemCatalogConfiguration::decode(
+            &std::fs::read(config_path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config.space, space.0);
+        CatalogActorTarget {
+            space,
+            system_agent: AgentId(config.system_agent),
+            system_runtime_deployment: DeploymentId(config.system_runtime_deployment),
+            actor: ActorId(config.actor),
+            deployment: DeploymentId(config.deployment),
+            program: ProgramId(config.program),
+            authority: AgentAuthorityBinding {
+                policy: Hash(config.authority.policy),
+                public_key: config.authority.public_key,
+                initial_epoch: config.authority.initial_epoch,
+                issuer: AuthorityIssuer {
+                    principal: PrincipalId(config.authority.issuer.principal),
+                    actor: ActorId(config.authority.issuer.actor),
+                    deployment: DeploymentId(config.authority.issuer.deployment),
+                    program: ProgramId(config.authority.issuer.program),
+                    producer: ProducerId(config.authority.issuer.producer),
+                },
             },
-        },
+        }
     };
     let query = CatalogPageRequest {
         catalog: target,
