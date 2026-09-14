@@ -34,9 +34,10 @@ retries now pass before and after restart. Public Counter mutation, late replay
 rejection and a fresh read of seven after actual daemon restart now pass with
 the repinned runtime. Protected/non-Public actor workflows remain open.
 The latest LocalSigner campaign passes installation and a live deployment-scoped
-role grant with retirement. Its first invocation used an incorrectly generated
-role claim and failed preparation; the corrected fixture still needs a fresh
-campaign. See "Protected LocalSigner campaign: constructor packaging correction".
+role grant with retirement. Package-validated protected preparation passes after
+restart. Full protected execution remains unproven: two earlier test inputs
+were malformed (missing role, then incorrect method mode), and their retained
+reservations are preserved. See the LocalSigner campaign checkpoints below.
 This is not yet a usable ordinary-agent production path.
 The latest runtime pin includes single-pass AWRK availability decoding. Its
 fixed 768KB-program ACK comparison uses about 25.3% less gas with byte-identical
@@ -7834,6 +7835,67 @@ Final CLI suite: 252 passed, 11 explicitly ignored live helpers, zero failures
 (62.89s; `protected-checkpoint-cli.log`). The fixture role regression passes;
 formatting and whitespace checks pass. The signature verifier is compiled but
 remains unexecuted because no successful protected invocation exists yet.
+
+### Protected LocalSigner: package-validated preparation after restart
+
+The fresh `target/task-tmp/admin-startup-smoke.Ju9XZz` campaign preserves the
+earlier `nHw46n` fixture unchanged. Space ID:
+`72f001368d4b60beae2b8904745f8bb7e56ff21eb1316aa97e5675277111e730`;
+Local Agent `5a922e99d23060856a0fa0458bcacdc83ee75b0fbc75a2aec3371d91e1ea401f`;
+actor `b92c9fda0626f356d597cbec3ed28d01a5d4df2c2fe1a992878a0884fc51a868`;
+LocalSigner deployment `2b30caf6201f7f433d479a36ee8557d1b0331ef14b459ed8f37465dd25a75448`.
+The same example PVM was packaged under this fixture's isolated producer.
+HTTP/SSH use loopback ports 18089/2231. No system runtime or ABI repin occurred.
+
+Observed native results (2026-09-14 UTC, shared debug binary):
+
+- Startup 23:37:58–23:38:41, about 43s.
+- Create 23:38:43–23:40:54, one HTTP 504 then exact resume.
+- Install started 23:40:55, returned HTTP 504; exact resume at 23:44:10
+  returned a verified acknowledgement at 23:45:05. No request was replaced.
+- Signed deployment-scoped role grant 23:45:43–23:46:19, applied with signed
+  retirement retained and no pending admin reservation.
+- Protected invocation failed preparation with HTTP 503. Its role claim was
+  correct, but the fixture still requested `Linear` for `#[msg(local)] sign`.
+  The earlier role-only correction was insufficient. The original retained
+  intent and pending operation reservation remain untouched.
+- Restart 23:52:01–23:53:30, about 89s. Graceful shutdown before restart exceeded
+  the CLI's five-second observation but the original daemon handle subsequently
+  exited successfully; no force kill or concurrent replacement was used.
+
+The generator now decodes the actual package's AMP2 artifact, checks `sign`
+requires Local mode and the expected actor role, and uses its method mode.
+It still refuses to overwrite different inputs. A separate `after-restart`
+fixture intent (nonce `74` repeated 32 times, distinct filenames) was generated
+without changing the pending `73` intent. Authenticated physical preparation
+of this correct Local-mode request passes in 11.00s, verifying the canonical
+ATP1 against the exact intent (`corrected-local-prepare.log`). No authorization
+or invocation was issued by this diagnostic. Repeating the original Linear
+request fails in 11.17s; server logging identifies `Route(Rejected)`
+(`retained-linear-diagnostic.log`, `up-2.log`). This isolates a fixture error,
+not evidence that protected execution has succeeded.
+
+The result verifier now checks exact target, invocation, mode, origin, role,
+message and gas as well as package identity, visible signature and retirement.
+Distinct post-restart filenames/nonces prevent a cached earlier result from
+being counted as fresh execution. The diagnostic is opt-in, loopback-only,
+bounded, with proxies and redirects disabled; credentials are never logged.
+Production preparation errors now log their typed supervisor cause without
+changing the public response, authorization rules or timeout limits.
+
+Next remains a fresh end-to-end protected campaign with these package-validated
+inputs, then fresh protected execution after restart. Neither failed
+reservation may be cleared or rewritten to make that test pass. Revoke,
+yield/resume where applicable, latency and all other C1/C2/C3 gates remain open.
+Do not expand production APIs merely to repair malformed disposable inputs.
+
+Validation: full CLI 252 passed / 12 ignored / zero failures (65.05s,
+`final-cli.log`); HTTP ingress 4 passed / zero failures (0.27s,
+`final-ingress.log`); normal vosx build passed (17.54s,
+`diagnostic-build.log`); formatting and whitespace checks pass. The final
+graceful shutdown again outlasted the CLI's five-second wait, then the exact
+daemon session exited zero without a force kill. No campaign daemon is left
+running. Slow startup/Create/Install/shutdown remain release blockers.
 
 ### Durable client acknowledgement before completion
 

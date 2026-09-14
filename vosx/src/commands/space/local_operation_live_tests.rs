@@ -17,6 +17,20 @@ fn protected_signer_roles() -> InvocationRoleClaims {
     }
 }
 
+fn protected_signer_campaign_files() -> (&'static str, &'static str, u8) {
+    match std::env::var("VOSX_PROTECTED_SMOKE_PHASE").as_deref() {
+        Err(std::env::VarError::NotPresent) => {
+            ("protected-sign.intent", "protected-invoke-1.json", 0x73)
+        }
+        Ok("after-restart") => (
+            "protected-sign-after-restart.intent",
+            "protected-invoke-after-restart.json",
+            0x74,
+        ),
+        other => panic!("unsupported protected campaign phase: {other:?}"),
+    }
+}
+
 #[test]
 fn protected_signer_fixture_claims_the_required_actor_role() {
     let roles = protected_signer_roles();
@@ -29,8 +43,79 @@ fn protected_signer_fixture_claims_the_required_actor_role() {
 }
 
 #[test]
+#[ignore = "diagnoses authenticated preparation only in the explicitly selected disposable campaign"]
+fn diagnose_disposable_protected_preparation() {
+    use std::io::Read as _;
+    use vos::agent::supervisor_adapters::AgentTargetedPreparationResponse;
+    let (intent_file, _, _) = protected_signer_campaign_files();
+    let root = PathBuf::from(std::env::var_os("VOSX_PROTECTED_SMOKE_ROOT").unwrap())
+        .canonicalize()
+        .unwrap();
+    let scratch = PathBuf::from(std::env::var_os("TMPDIR").unwrap())
+        .canonicalize()
+        .unwrap();
+    assert_eq!(root.parent(), Some(scratch.as_path()));
+    assert!(
+        root.file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("admin-startup-smoke.")
+    );
+    let (data, _, _, address) =
+        super::super::local_create::resolve_local_space("admin-startup", None).unwrap();
+    assert!(data.canonicalize().unwrap().starts_with(&root));
+    assert!(address.ip().is_loopback() && address.port() != 0);
+    let key = crate::identity::load_existing()
+        .unwrap()
+        .try_into_ed25519()
+        .unwrap();
+    let secret = key.secret();
+    let token = vos::ingress::encode_access_token(secret.as_ref().try_into().unwrap()).unwrap();
+    let bytes = std::fs::read(root.join(intent_file)).unwrap();
+    let request = AgentTargetedPreparationRequest::decode(&bytes).unwrap();
+    let result = ureq::AgentBuilder::new()
+        .try_proxy_from_env(false)
+        .redirects(0)
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(130))
+        .build()
+        .post(&format!("http://{address}/__agents/prepare"))
+        .set("Content-Type", "application/octet-stream")
+        .set("Authorization", &format!("Bearer {token}"))
+        .send_bytes(&bytes);
+    match result {
+        Ok(response) => {
+            assert_eq!(response.status(), 200);
+            let mut body = Vec::new();
+            response
+                .into_reader()
+                .take(AgentTargetedPreparationResponse::MAX_ENCODED_BYTES as u64 + 1)
+                .read_to_end(&mut body)
+                .unwrap();
+            let response = AgentTargetedPreparationResponse::decode(&body).unwrap();
+            assert!(response.for_request(&request).is_some());
+            eprintln!(
+                "authenticated preparation verified against exact intent; no authorization or invocation issued"
+            );
+        }
+        Err(ureq::Error::Status(status, response)) => {
+            let mut body = String::new();
+            response
+                .into_reader()
+                .take(256)
+                .read_to_string(&mut body)
+                .unwrap();
+            panic!("authenticated preparation status={status}: {body}");
+        }
+        Err(error) => panic!("authenticated preparation transport error: {error}"),
+    }
+}
+
+#[test]
 #[ignore = "writes inputs only for an explicitly selected disposable protected actor campaign"]
 fn prepare_disposable_protected_signer_inputs() {
+    let (intent_file, _, nonce) = protected_signer_campaign_files();
     let root = PathBuf::from(std::env::var_os("VOSX_PROTECTED_SMOKE_ROOT").unwrap())
         .canonicalize()
         .unwrap();
@@ -62,6 +147,20 @@ fn prepare_disposable_protected_signer_inputs() {
         hex::encode(ack.managed.agent.0)
     );
     let actor = ActorId::top_level(ack.managed.agent, "local-signer-smoke");
+    let package = vos::agent::package_admission::admit_actor_package(
+        &std::fs::read(root.join("protected-signer/LocalSigner.vos")).unwrap(),
+    )
+    .unwrap();
+    let policies = vos::agent::sdk::method_policy::ActorMethodPolicyArtifact::decode(
+        package.method_policy_bytes(),
+    )
+    .unwrap();
+    let method = policies.method("sign").unwrap();
+    assert_eq!(method.mode, MethodMode::Local);
+    assert_eq!(
+        method.authorization_policy,
+        vos::agent::sdk::method_policy::AuthorizationPolicySelector::ActorRole(RoleId([0x51; 32]))
+    );
     let operator = crate::identity::load_existing().unwrap();
     let identity =
         super::super::clean_identity::CleanOperatorIdentitySigner::new(&operator).unwrap();
@@ -79,8 +178,8 @@ fn prepare_disposable_protected_signer_inputs() {
     let intent = AgentTargetedPreparationRequest::new(
         AgentRouteKey::new(space, ack.managed.agent, actor).unwrap(),
         AgentInvocationIntent::new(
-            InvocationId([0x73; 32]),
-            MethodMode::Linear,
+            InvocationId([nonce; 32]),
+            method.mode,
             InvocationOrigin {
                 principal: Some(identity.principal()),
                 credential: Some(identity.credential()),
@@ -97,7 +196,7 @@ fn prepare_disposable_protected_signer_inputs() {
     // Re-running this input generator cannot replace a retained intent.
     for (name, bytes) in [
         ("protected-constructor.bin", constructor),
-        ("protected-sign.intent", intent.encode().unwrap()),
+        (intent_file, intent.encode().unwrap()),
     ] {
         let path = root.join(name);
         if path.exists() {
@@ -125,6 +224,7 @@ fn real_daemon_managed_receipt_invocation_and_exact_retry() {
 #[test]
 #[ignore = "requires completed disposable protected signer invocation; verifies retained evidence only"]
 fn verify_disposable_protected_signer_result() {
+    let (intent_file, output_file, _) = protected_signer_campaign_files();
     let root = PathBuf::from(std::env::var_os("VOSX_PROTECTED_SMOKE_ROOT").unwrap())
         .canonicalize()
         .unwrap();
@@ -140,8 +240,7 @@ fn verify_disposable_protected_signer_result() {
             .starts_with("admin-startup-smoke.")
     );
     let output: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(root.join("protected-invoke-1.json")).unwrap())
-            .unwrap();
+        serde_json::from_slice(&std::fs::read(root.join(output_file)).unwrap()).unwrap();
     assert_eq!(output["decision"], "issued");
     assert_eq!(output["delivery_retired"], true);
     assert_eq!(output["reservation_pending"], false);
@@ -162,6 +261,19 @@ fn verify_disposable_protected_signer_result() {
             .unwrap()
     );
     let call = super::super::local_invocation::validate_request(&request).unwrap();
+    let intent =
+        AgentTargetedPreparationRequest::decode(&std::fs::read(root.join(intent_file)).unwrap())
+            .unwrap();
+    assert_eq!(call.work().space, intent.target().space());
+    assert_eq!(call.work().agent, intent.target().agent());
+    assert_eq!(call.work().actor, intent.target().actor());
+    assert_eq!(call.work().invocation, intent.intent().invocation());
+    assert_eq!(call.work().mode, MethodMode::Local);
+    assert_eq!(call.work().origin, intent.intent().origin());
+    assert_eq!(call.work().roles, protected_signer_roles());
+    assert_eq!(call.work().message, intent.intent().message());
+    assert_eq!(call.work().gas, intent.intent().gas());
+    assert!(!call.work().recovery_only);
     assert!(matches!(
         call.authorization(),
         InvocationAuthorization::AuthorityReceipt(_)

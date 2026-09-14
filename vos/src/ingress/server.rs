@@ -870,7 +870,10 @@ fn handle_clean_preparation(
             Ok(bytes) => with_content_type(200, "application/octet-stream", bytes),
             Err(_) => text(503, "clean preparation response unavailable"),
         },
-        Err(_) => text(503, "clean preparation unavailable"),
+        Err(error) => {
+            tracing::warn!(?error, "clean invocation preparation failed");
+            text(503, "clean preparation unavailable")
+        }
     }
 }
 
