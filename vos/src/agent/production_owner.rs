@@ -755,6 +755,17 @@ impl AgentProductionOwner {
         if now < self.reconcile_after {
             return Ok(false);
         }
+        if let Some((lifecycle, _)) = &self.lifecycle {
+            if lifecycle
+                .management_admission_held()
+                .map_err(AgentProductionOwnerError::Lifecycle)?
+            {
+                // Preparation/issuance spans multiple client exchanges. Do not
+                // turn its intentional exclusion into a fatal projection error.
+                // Keep the deadline overdue so release triggers a fresh refresh.
+                return Ok(false);
+            }
+        }
         self.reconcile_at(now)?;
         Ok(true)
     }
@@ -1715,6 +1726,47 @@ mod tests {
     }
 
     fn check_reconciliation_deadline(lifecycle: bool) {
+        use super::super::shared_host::SharedAgentHostError;
+        use std::sync::atomic::{AtomicU8, Ordering};
+        struct Admission(Arc<AtomicU8>);
+        impl super::super::local_lifecycle::NativeLocalLifecycle for Admission {
+            fn management_admission_held(&self) -> Result<bool, SharedAgentHostError> {
+                match self.0.load(Ordering::Acquire) {
+                    0 => Ok(false),
+                    1 => Ok(true),
+                    _ => Err(SharedAgentHostError::Unavailable),
+                }
+            }
+            fn node(&self) -> Result<NodeId, SharedAgentHostError> {
+                unreachable!()
+            }
+            fn system_attachment(
+                &self,
+                _: usize,
+            ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
+                unreachable!()
+            }
+            fn local_attachment(
+                &self,
+                _: usize,
+            ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
+                unreachable!()
+            }
+            fn create(
+                &mut self,
+                _: AgentDescriptor,
+                _: super::super::sdk::authority::AuthorityCredentialCall,
+                _: super::super::package_admission::AdmittedRuntimePackage,
+            ) -> Result<
+                (
+                    AgentId,
+                    super::super::sdk::authority::ManagementApplicationAck,
+                ),
+                SharedAgentHostError,
+            > {
+                unreachable!()
+            }
+        }
         let node = NodeId([0x31; 32]);
         let descriptor = descriptor(1, AgentProfile::Shared, node);
         let actor = actor(&descriptor, true);
@@ -1745,6 +1797,17 @@ mod tests {
             completed_local_publication: None,
         };
         let before = Instant::now();
+        let admission = Arc::new(AtomicU8::new(1));
+        owner.lifecycle = Some((Box::new(Admission(admission.clone())), 1));
+        for now in [admitted, before, before + interval * 2] {
+            assert_eq!(owner.drive_if_due(now), Ok(false));
+            assert!(calls.lock().unwrap().is_empty());
+            assert_eq!(owner.reconcile_after, admitted);
+        }
+        admission.store(2, Ordering::Release);
+        assert!(owner.drive_if_due(before).is_err());
+        assert!(calls.lock().unwrap().is_empty());
+        admission.store(0, Ordering::Release);
         owner.completed_local_publication = Some((super::super::sdk::Hash([0x31; 32]), head(1)));
         if lifecycle {
             assert_eq!(owner.reconcile(), Ok(()));

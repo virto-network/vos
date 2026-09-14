@@ -2788,6 +2788,28 @@ impl SharedAgentNetworkHost {
         )
     }
 
+    /// Scheduling hint only: never authorizes work or releases exclusion.
+    /// Include retained attachment state as well as the active coordinator so
+    /// refresh/recovery cannot briefly advertise a free management lane.
+    pub(crate) fn management_admission_held(
+        &self,
+        agent: crate::service::AgentId,
+    ) -> Result<bool, SharedAgentHostError> {
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::Unavailable)?;
+        let proposal = attached
+            .coordinator
+            .proposal
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        Ok(self.management_pending.contains_key(&agent)
+            || self.management_retirements.contains_key(&agent)
+            || proposal.management_pending.is_some()
+            || proposal.management_retirement.is_some())
+    }
+
     /// Reserve the initial immutable envelope and its journal anchor before
     /// publishing the intent. Retain admission after an ambiguous store error;
     /// an exact retry receives the original clock and anchor. This reserves the

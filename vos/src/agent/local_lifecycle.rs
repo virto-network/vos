@@ -1049,6 +1049,9 @@ fn load_create_runtime<B: super::clean_authority_issuer::CleanManagementRuntimeS
 /// Type-erased, node-owned lifecycle access. It is deliberately not an ingress
 /// trait: only the production owner may coordinate creation and publication.
 pub(crate) trait NativeLocalLifecycle: Send {
+    fn management_admission_held(&self) -> Result<bool, SharedAgentHostError> {
+        Err(SharedAgentHostError::Unavailable)
+    }
     fn prepare_operation(
         &mut self,
         _call: &super::sdk::authority_operation::AuthorityOperationCall,
@@ -1121,6 +1124,12 @@ where
         call: &super::sdk::authority_operation::AuthorityOperationCall,
     ) -> AuthorityOperationPreparationResult {
         LocalLifecycleController::prepare_operation(self, call)
+    }
+    fn management_admission_held(&self) -> Result<bool, SharedAgentHostError> {
+        self.system
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .management_admission_held()
     }
     fn node(&self) -> Result<super::sdk::NodeId, SharedAgentHostError> {
         Ok(self

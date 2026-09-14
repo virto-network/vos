@@ -44,6 +44,9 @@ The corrected fresh live campaign now completes host preparation but still fails
 authorization with HTTP 503. Background inventory runs between preparation and
 authorization, followed by a ProjectionTransport owner/shutdown failure. See the
 fresh campaign below; this is not a live invocation pass.
+Periodic reconciliation now defers while native management admission is held;
+physical and scheduler regressions pass. Prepared-only startup recovery and an
+exact live retry remain unverified; forced startup reconciliation is unchanged.
 The native Local Install application and startup-recovery phases now pass
 physical tests from prepared authorization through retirement, including
 pristine client-retry admission. Native Install controller handoff, retry and
@@ -6620,6 +6623,45 @@ The daemon also spends tens of seconds per inventory query, with one changed-hea
 reconciliation taking **139.379 seconds**. Root-cause performance work remains
 open; no speed improvement, non-Public mutation, Shared finality or release
 readiness is claimed by this campaign. This evidence remains within **C2**.
+
+### Admission-aware periodic reconciliation (C2)
+
+The production scheduler now queries native management admission before starting
+an overdue periodic inventory refresh. Retained pending/retirement state and the
+active coordinator exclusion are checked; absent attachment or lock failure is
+an error, not permission to refresh. Held admission returns "no periodic work"
+without moving the overdue deadline. After durable release, the next drive can
+refresh immediately. This is scheduling only: it does not authorize work,
+release admission, manufacture fresh inventory or suppress forced reconciliation.
+
+Scheduler regressions model the multi-request preparation gap, repeated overdue
+polls, admission-query failure and subsequent release. They verify no projection
+query or deadline change while held. The native operation fixture now checks
+that admission is held even after the first preparation journal-write failure,
+remains held on retry, rejects an intervening projection reservation with
+`Conflict`, and becomes free after exact durable retirement. These tests exercise
+the exclusion behind the live failure without weakening it.
+
+Verification (logs in shared disk-backed `target/task-tmp`):
+
+- `r16-admission-scheduler.log`: **four passed**, zero failures, **0.51s**.
+- `r16-admission-owner.log`: all **eight production-owner tests passed**, **0.20s**.
+- `r16-admission-native.log`: **nine native operation tests passed**, **163.58s**.
+- `r16-admission-cli.log`: **239 passed**, zero failures, **six ignored**, **81.23s**.
+- `r16-admission-build.log`: normal vosx build passed, **49.70s**.
+
+Formatting and whitespace checks pass. No live daemon was started for this
+checkpoint; the IgQS0r and XoaplU evidence remains unchanged. Guest artifacts and
+timeouts are unchanged. This remains within C2, not a new review batch.
+
+Next required recovery check: constructor-time reconciliation is forced before
+normal readiness, unlike the periodic drive. Source inspection shows prepared-only
+operation admission can still conflict with that initial projection before a
+client gets to resume. Do not simply skip verified startup inventory, advertise
+ordinary readiness, rebase the saved AOQ1, or clear admission. Reproduce and handle
+that recovery boundary, then run the exact saved live retry. The periodic fix is
+not proof of restart recovery or end-to-end invocation. Latency, expiry/abort,
+non-Public mutation, ordinary Shared finality and C3 release gates remain open.
 
 ### Durable client acknowledgement before completion
 

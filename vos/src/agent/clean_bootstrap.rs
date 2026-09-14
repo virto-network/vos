@@ -3821,6 +3821,12 @@ where
             .audit_authority_projection(head, &[complete], Some(&self.root_lineage))
     }
 
+    /// Periodic scheduling only; actual projection admission stays authoritative.
+    pub(crate) fn management_admission_held(&self) -> Result<bool, SharedAgentHostError> {
+        self._network_host
+            .management_admission_held(crate::service::AgentId(self.pins.agent.0))
+    }
+
     /// Drain the exact authenticated operation retained before a failed
     /// dispatch. Callers must do this before minting another query nonce.
     pub(crate) fn recover_pending_authority_projection(
@@ -10215,6 +10221,7 @@ mod tests {
                     assert_eq!(signer.calls, 2);
                     assert_eq!(owner.ordered_index_for_test().unwrap(), before + 4);
                     assert_eq!(std::fs::read(&retirement_path).unwrap(), retirement);
+                    assert!(!owner.management_admission_held().unwrap());
                 }
                 owner
                     ._network_host
@@ -10395,7 +10402,9 @@ mod tests {
             // Server-side preparation captures the authoritative clock once.
             // Network delay/queueing after that point must reuse this exact
             // retained context, not require equality with a newly read clock.
+            assert!(!owner.management_admission_held().unwrap());
             assert!(operations.prepare_call(&mut owner, &call).is_err());
+            assert!(owner.management_admission_held().unwrap());
             assert_eq!(owner.ordered_index_for_test().unwrap(), before);
             assert_eq!(signer.calls, 0);
             fixture
@@ -10404,6 +10413,17 @@ mod tests {
                 .unwrap()
                 .store(slot + 1, Ordering::Release);
             assert_eq!(operations.prepare_call(&mut owner, &call).unwrap(), context);
+            assert!(owner.management_admission_held().unwrap());
+            let (query, authorization) = fresh_projection_pair(&owner, 0xee);
+            assert!(matches!(
+                owner._network_host.reserve_projection_pair(
+                    HostAgentId(owner.pins.agent.0),
+                    &query,
+                    &authorization,
+                    false,
+                ),
+                Err(SharedAgentHostError::Conflict)
+            ));
             let mut substituted = call.clone();
             if let AuthorityIngressAuthentication::SshNodeAttestation { signature, .. } =
                 &mut substituted.authentication
