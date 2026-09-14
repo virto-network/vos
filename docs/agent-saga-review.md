@@ -7285,6 +7285,43 @@ passed. The final instrumentation was exercised by the second live run.
 These are diagnostic results, **not production latency passes**. No guest
 artifact changed, and every live/test process from this checkpoint is stopped.
 
+### Single-pass availability validation during AWRK decoding (C2)
+
+Runtime work decoding previously authenticated availability bytes while
+parsing each blob, again in Invoke/Resume validation, again in RuntimeWork body
+validation, and again in the generic canonical frame decoder. The decoder now
+parses bounded availability first and authenticates it exactly once in its
+complete Invoke/Resume value. RuntimeWork's body validator reuses that nested
+validation while still checking context, state and authorization binding; its
+frame decoder still enforces size, magic, ABI and exhaustion without a second
+whole-value validation. Constructed values and encoders still use full
+validation, and runtime authorization/admission checks are unchanged.
+
+The framing helper remains private; other canonical wire types retain their
+existing final validation. The two availability-parser callers both validate
+their complete value before returning. RuntimeWork body decoding itself still
+rejects invalid nested values, so direct body-decoder users do not gain an
+unchecked path. No canonical format or ABI identifier changes.
+
+All **164 SDK tests passed** (0.05s), including a new 768KB availability matrix
+for Invoke, Resume and Acknowledge: corrupt preimages, wrong lengths, zero
+hashes, duplicate entries, missing installation references, truncated frames
+and trailing bytes are rejected. Both constructed/encoded values and hostile
+raw body/frame decoding are covered (`r16-single-validation-sdk-final.log`).
+Guest artifact validation and repinning are required before treating this
+source optimization as present in the distributed runtime.
+
+The SDK no-default-features check also passed. A new physical-PVM regression
+constructs a retained terminal result for a synthetic 768KB installed program
+and requires positive ACK. The baseline committed runtime consumed
+**690,622,135 gas**, **2.077s**, for the fixed **793,734-byte** input
+(`r16-single-validation-baseline-final.log`). An optional candidate PVM path
+must produce byte-identical output with strictly lower deterministic gas.
+This isolates decoder/ACK cost; it does not execute the synthetic actor or
+replace live Counter validation. The initial attempt modeled the large bytes
+as an application attachment and correctly hit its independent smaller input
+limit; the fixture was corrected to model the installed program instead.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

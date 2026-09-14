@@ -9108,9 +9108,42 @@ pub(crate) mod tests {
         crate::agent_sdk::authority::AuthorityReceipt,
         crate::agent_sdk::InvocationReply,
     ) {
-        let (mut runtime, work) = clean_policy_fixture(
+        clean_terminal_fixture_with_program_size(0)
+    }
+
+    #[cfg(feature = "pvm")]
+    fn clean_terminal_fixture_with_program_size(
+        program_size: usize,
+    ) -> (
+        crate::agent_sdk::RuntimeState,
+        crate::agent_sdk::InvocationWork,
+        crate::agent_sdk::authority::AuthorityReceipt,
+        crate::agent_sdk::InvocationReply,
+    ) {
+        let (mut runtime, mut work) = clean_policy_fixture(
             crate::agent_sdk::method_policy::AuthorizationPolicySelector::Public,
         );
+        if program_size != 0 {
+            // ACK consumes a retained result and never executes these
+            // synthetic program bytes. Application attachments have a
+            // separate smaller size limit; model the installed program here.
+            let program = work
+                .availability
+                .iter_mut()
+                .find(|blob| crate::agent_sdk::ProgramId::of_pvm(&blob.bytes) == work.program)
+                .unwrap();
+            let bytes = vec![0xa7; program_size];
+            work.program = crate::agent_sdk::ProgramId::of_pvm(&bytes);
+            *program = crate::agent_sdk::RuntimeBlob {
+                reference: crate::agent_sdk::BlobRef::of_bytes(&bytes),
+                bytes,
+            };
+            work.availability
+                .sort_by(|a, b| a.reference.cmp(&b.reference));
+            let mut state = runtime.snapshot();
+            state.actors[0].record.entry.program = crate::service::ProgramId(work.program.0);
+            runtime = StandardAgentRuntime::restore(state).unwrap();
+        }
         let authority = clean_authority_receipt(runtime.config().unwrap(), &work);
         let authorization =
             crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(authority.clone());
@@ -9249,6 +9282,64 @@ pub(crate) mod tests {
             Err(DecodeError::NonCanonical),
             "Acknowledge has no attested execution route",
         );
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn bundled_runtime_large_acknowledgement_validation_cost() {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        use crate::agent_sdk::{
+            InvocationAuthorization, RuntimeExecutionContext, RuntimeOutcome, RuntimeTransition,
+            RuntimeWork,
+        };
+        let (state, work, receipt, _) = clean_terminal_fixture_with_program_size(768 * 1024);
+        let input = RuntimeWork::Acknowledge {
+            context: RuntimeExecutionContext::Direct,
+            state,
+            invocation: Box::new(work),
+            authorization: Box::new(InvocationAuthorization::AuthorityReceipt(receipt)),
+        }
+        .encode()
+        .unwrap();
+        let mut programs = vec![(
+            "bundled",
+            include_bytes!("../../../vosx/blobs/agent_runtime.pvm").to_vec(),
+        )];
+        if let Some(path) = std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE") {
+            programs.push(("candidate", std::fs::read(path).unwrap()));
+        }
+        let mut baseline = None;
+        for (label, program) in programs {
+            let started = std::time::Instant::now();
+            let execution =
+                vos_pvm::refine_host::RefineContext::load(&program, &input, 2_000_000_000)
+                    .unwrap()
+                    .run();
+            assert_eq!(execution.exit, vos_pvm::ExitReason::Halt);
+            let output = execution
+                .output_bounded(RuntimeTransition::MAX_ENCODED_BYTES)
+                .unwrap();
+            let transition = RuntimeTransition::decode(&output).unwrap();
+            assert!(matches!(
+                transition.outcome,
+                RuntimeOutcome::Acknowledged(Ok(_))
+            ));
+            eprintln!(
+                "large-ack label={label} input_bytes={} gas_used={} elapsed_us={}",
+                input.len(),
+                execution.gas_used,
+                started.elapsed().as_micros()
+            );
+            if let Some((prior_output, prior_gas)) = &baseline {
+                assert_eq!(&output, prior_output);
+                assert!(
+                    execution.gas_used < *prior_gas,
+                    "candidate must reduce deterministic gas"
+                );
+            } else {
+                baseline = Some((output, execution.gas_used));
+            }
+        }
     }
 
     #[cfg(feature = "pvm")]

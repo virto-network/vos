@@ -150,25 +150,32 @@ pub trait CanonicalWire: Sized {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, WireError> {
-        if bytes.len() > Self::MAX_ENCODED_BYTES {
-            return Err(WireError::LimitExceeded);
-        }
-        let mut decoder = Decoder::new(bytes);
-        if decoder.take(4)? != Self::MAGIC {
-            return Err(DecodeError::InvalidTag.into());
-        }
-        if Hash(decoder.fixed()?) != RUNTIME_ABI_ID {
-            return Err(DecodeError::InvalidPlatform.into());
-        }
-        let value = Self::decode_body(&mut decoder)?;
-        if !decoder.exhausted() {
-            return Err(DecodeError::TrailingBytes.into());
-        }
+        let value = decode_canonical_frame::<Self>(bytes)?;
         if !value.validate_wire() {
             return Err(WireError::InvalidValue);
         }
         Ok(value)
     }
+}
+
+/// Framing only; callers must validate the returned value unless their body
+/// decoder already performs complete validation. This helper is private.
+fn decode_canonical_frame<T: CanonicalWire>(bytes: &[u8]) -> Result<T, WireError> {
+    if bytes.len() > T::MAX_ENCODED_BYTES {
+        return Err(WireError::LimitExceeded);
+    }
+    let mut decoder = Decoder::new(bytes);
+    if decoder.take(4)? != T::MAGIC {
+        return Err(DecodeError::InvalidTag.into());
+    }
+    if Hash(decoder.fixed()?) != RUNTIME_ABI_ID {
+        return Err(DecodeError::InvalidPlatform.into());
+    }
+    let value = T::decode_body(&mut decoder)?;
+    if !decoder.exhausted() {
+        return Err(DecodeError::TrailingBytes.into());
+    }
+    Ok(value)
 }
 
 fn encode_blob(encoder: &mut Encoder<'_>, value: &BlobRef) {
@@ -3603,11 +3610,10 @@ fn decode_runtime_availability(decoder: &mut Decoder<'_>) -> Result<Vec<RuntimeB
         let reference = decode_blob(decoder)?;
         let bytes = decoder.bytes_bounded(remaining)?;
         remaining -= bytes.len();
-        let value = RuntimeBlob { reference, bytes };
-        value
-            .validate()
-            .then_some(value)
-            .ok_or(DecodeError::NonCanonical)
+        // Both callers validate their complete Invoke/Resume value before
+        // returning it. Hash payloads there once, alongside ordering and
+        // installation-reference checks, after bounded parsing here.
+        Ok(RuntimeBlob { reference, bytes })
     })
 }
 
@@ -3859,6 +3865,13 @@ fn decode_runtime_execution_context(
 }
 
 fn runtime_work_valid(value: &RuntimeWork) -> bool {
+    runtime_work_valid_with_nested(value, false)
+}
+
+/// Envelope checks shared by constructed values and the body decoder. The
+/// latter has already validated its nested Invoke/Resume value, including all
+/// availability bytes; do not hash those bytes again at this layer.
+fn runtime_work_valid_with_nested(value: &RuntimeWork, nested_already_validated: bool) -> bool {
     match value {
         RuntimeWork::Manage {
             context,
@@ -3918,14 +3931,18 @@ fn runtime_work_valid(value: &RuntimeWork) -> bool {
         } => {
             context.is_valid()
                 && state.validate()
-                && invocation.validate()
+                && (nested_already_validated || invocation.validate())
                 && authorization.matches_invoke(invocation, *observed_slot)
         }
         RuntimeWork::Resume {
             context,
             state,
             resume,
-        } => context.is_valid() && state.validate() && resume.validate(),
+        } => {
+            context.is_valid()
+                && state.validate()
+                && (nested_already_validated || resume.validate())
+        }
         RuntimeWork::Acknowledge {
             context,
             state,
@@ -3934,7 +3951,7 @@ fn runtime_work_valid(value: &RuntimeWork) -> bool {
         } => {
             context.is_valid()
                 && state.validate()
-                && invocation.validate()
+                && (nested_already_validated || invocation.validate())
                 && authorization.matches_acknowledgement(invocation)
         }
     }
@@ -3943,6 +3960,12 @@ fn runtime_work_valid(value: &RuntimeWork) -> bool {
 impl CanonicalWire for RuntimeWork {
     const MAGIC: [u8; 4] = *b"AWRK";
     const MAX_ENCODED_BYTES: usize = MAX_RUNTIME_WORK_WIRE_BYTES;
+
+    fn decode(bytes: &[u8]) -> Result<Self, WireError> {
+        // decode_body validates nested values and the envelope. Repeating
+        // validate_wire here would rehash all caller-sized availability.
+        decode_canonical_frame::<Self>(bytes)
+    }
 
     fn validate_wire(&self) -> bool {
         runtime_work_valid(self)
@@ -4045,7 +4068,7 @@ impl CanonicalWire for RuntimeWork {
             },
             _ => return Err(DecodeError::InvalidTag),
         };
-        runtime_work_valid(&value)
+        runtime_work_valid_with_nested(&value, true)
             .then_some(value)
             .ok_or(DecodeError::NonCanonical)
     }
@@ -6700,6 +6723,90 @@ mod tests {
             RuntimeWork::decode(&acknowledgement.encode().unwrap()),
             Ok(acknowledgement)
         );
+    }
+
+    #[test]
+    fn runtime_work_single_pass_rejects_invalid_nested_availability() {
+        let mut invocation = invocation();
+        let bytes = alloc::vec![0xa7; 768 * 1024];
+        invocation.availability.push(RuntimeBlob {
+            reference: BlobRef::of_bytes(&bytes),
+            bytes,
+        });
+        let authorization = InvocationAuthorization::AuthorityReceipt(receipt_for(&invocation));
+        let resume = ResumeWork {
+            invocation: invocation.invocation,
+            actor: invocation.actor,
+            incarnation: invocation.incarnation,
+            deployment: invocation.deployment,
+            program: invocation.program,
+            mode: invocation.mode,
+            continuation: blob(61),
+            ready_sequence: 1,
+            installation_data: None,
+            availability: invocation.availability.clone(),
+            input: None,
+        };
+        for work in [
+            RuntimeWork::Invoke {
+                context: RuntimeExecutionContext::Direct,
+                state: RuntimeState::default(),
+                invocation: alloc::boxed::Box::new(invocation.clone()),
+                authorization: alloc::boxed::Box::new(authorization.clone()),
+                observed_slot: 45,
+            },
+            RuntimeWork::Acknowledge {
+                context: RuntimeExecutionContext::Direct,
+                state: RuntimeState::default(),
+                invocation: alloc::boxed::Box::new(invocation),
+                authorization: alloc::boxed::Box::new(authorization),
+            },
+            RuntimeWork::Resume {
+                context: RuntimeExecutionContext::Direct,
+                state: RuntimeState::default(),
+                resume: alloc::boxed::Box::new(resume),
+            },
+        ] {
+            let encoded = work.encode().unwrap();
+            assert_eq!(RuntimeWork::decode(&encoded).unwrap(), work);
+            let mut trailing = encoded.clone();
+            trailing.push(0);
+            assert!(RuntimeWork::decode(&trailing).is_err());
+            assert!(RuntimeWork::decode(&encoded[..encoded.len() - 1]).is_err());
+            for mutation in 0..5 {
+                let mut invalid = work.clone();
+                let (availability, installation_data) = match &mut invalid {
+                    RuntimeWork::Invoke { invocation, .. }
+                    | RuntimeWork::Acknowledge { invocation, .. } => (
+                        &mut invocation.availability,
+                        &mut invocation.installation_data,
+                    ),
+                    RuntimeWork::Resume { resume, .. } => {
+                        (&mut resume.availability, &mut resume.installation_data)
+                    }
+                    _ => unreachable!(),
+                };
+                match mutation {
+                    0 => availability[0].bytes[0] ^= 1,
+                    1 => availability[0].reference.len += 1,
+                    2 => availability[0].reference.hash = Hash::ZERO,
+                    3 => availability.push(availability[0].clone()),
+                    4 => *installation_data = Some(blob(62)),
+                    _ => unreachable!(),
+                }
+                assert!(!invalid.validate_wire());
+                assert_eq!(invalid.encode(), Err(WireError::InvalidValue));
+                // Bypass the validating encoder to exercise hostile wire,
+                // including callers using the body decoder directly.
+                let mut body = Vec::new();
+                invalid.encode_body(&mut Encoder(&mut body));
+                assert!(RuntimeWork::decode_body(&mut Decoder::new(&body)).is_err());
+                let mut raw = RuntimeWork::MAGIC.to_vec();
+                raw.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+                raw.extend_from_slice(&body);
+                assert!(RuntimeWork::decode(&raw).is_err());
+            }
+        }
     }
 
     #[test]
