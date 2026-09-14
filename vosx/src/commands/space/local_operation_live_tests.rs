@@ -13,16 +13,38 @@ use vos::{Decode as _, Encode as _};
 #[test]
 #[ignore = "requires explicitly selected disposable native managed invocation campaign"]
 fn real_daemon_managed_receipt_invocation_and_exact_retry() {
-    managed_receipt_invocation_and_exact_retry(false);
+    managed_receipt_invocation_and_exact_retry(Campaign::Catalog);
 }
 
 #[test]
 #[ignore = "requires completed disposable managed invocation and explicit native campaign"]
 fn real_daemon_fresh_successor_invocation_and_exact_retry() {
-    managed_receipt_invocation_and_exact_retry(true);
+    managed_receipt_invocation_and_exact_retry(Campaign::Successor);
 }
 
-fn managed_receipt_invocation_and_exact_retry(successor: bool) {
+#[test]
+#[ignore = "requires freshly installed disposable Counter and explicit native campaign"]
+fn real_daemon_counter_mutation_and_exact_retry() {
+    managed_receipt_invocation_and_exact_retry(Campaign::CounterMutation);
+}
+
+#[test]
+#[ignore = "requires completed Counter mutation followed by an explicit daemon restart"]
+fn real_daemon_counter_value_after_restart() {
+    managed_receipt_invocation_and_exact_retry(Campaign::CounterRead);
+}
+
+#[derive(Clone, Copy)]
+enum Campaign {
+    Catalog,
+    Successor,
+    CounterMutation,
+    CounterRead,
+}
+
+fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
+    let successor = matches!(campaign, Campaign::Successor);
+    let counter = matches!(campaign, Campaign::CounterMutation | Campaign::CounterRead);
     let config_path = PathBuf::from(
         std::env::var_os("VOSX_INVOKE_SMOKE_CONFIG").expect("explicit disposable configuration"),
     );
@@ -60,6 +82,10 @@ fn managed_receipt_invocation_and_exact_retry(successor: bool) {
         after: None,
         limit: 1,
     };
+    let counter_package = counter.then(|| {
+        let path = data.parent().unwrap().join("counter-artifact/Counter.vos");
+        vos::agent::package_admission::admit_actor_package(&std::fs::read(path).unwrap()).unwrap()
+    });
     let operator = crate::identity::load_existing().unwrap();
     let identity =
         super::super::clean_identity::CleanOperatorIdentitySigner::new(&operator).unwrap();
@@ -100,10 +126,11 @@ fn managed_receipt_invocation_and_exact_retry(successor: bool) {
     } else {
         None
     };
-    let root = data.join(if successor {
-        "agent-client/managed-invocation-successor"
-    } else {
-        "agent-client/managed-invocation-smoke"
+    let root = data.join(match campaign {
+        Campaign::Catalog => "agent-client/managed-invocation-smoke",
+        Campaign::Successor => "agent-client/managed-invocation-successor",
+        Campaign::CounterMutation => "agent-client/managed-counter-mutation",
+        Campaign::CounterRead => "agent-client/managed-counter-read-after-restart",
     });
     let mut intent_store = CleanPreparationClientFile::open_or_create(&root).unwrap();
     let intent = match intent_store.load_request().unwrap() {
@@ -125,16 +152,26 @@ fn managed_receipt_invocation_and_exact_retry(successor: bool) {
             let mut nonce = [0; 32];
             getrandom::getrandom(&mut nonce).unwrap();
             let mut message = vec![vos::value::TAG_DYNAMIC];
-            message.extend_from_slice(
-                &vos::value::Msg::new("page")
-                    .with("request", query.encode().unwrap())
-                    .encode(),
-            );
+            let call = match campaign {
+                Campaign::CounterMutation => vos::value::Msg::new("increment").with("by", 7u64),
+                Campaign::CounterRead => vos::value::Msg::new("value"),
+                _ => vos::value::Msg::new("page").with("request", query.encode().unwrap()),
+            };
+            message.extend_from_slice(&call.encode());
+            let actor = if counter {
+                ActorId::top_level(target.system_agent, "counter-smoke")
+            } else {
+                target.actor
+            };
             let intent = AgentTargetedPreparationRequest::new(
-                AgentRouteKey::new(space, target.system_agent, target.actor).unwrap(),
+                AgentRouteKey::new(space, target.system_agent, actor).unwrap(),
                 AgentInvocationIntent::new(
                     InvocationId(nonce),
-                    MethodMode::Query,
+                    if matches!(campaign, Campaign::CounterMutation) {
+                        MethodMode::Linear
+                    } else {
+                        MethodMode::Query
+                    },
                     InvocationOrigin {
                         principal: Some(identity.principal()),
                         credential: Some(identity.credential()),
@@ -217,18 +254,40 @@ fn managed_receipt_invocation_and_exact_retry(successor: bool) {
         ..
     } = super::super::local_invocation::verify_response(&request, &response).unwrap()
     else {
-        panic!("Catalog query did not succeed");
+        panic!("managed invocation did not succeed");
     };
     assert_eq!(reply.status, InvocationStatus::Done);
-    let vos::value::Value::Bytes(bytes) = vos::value::Value::try_decode(&reply.reply).unwrap()
-    else {
-        panic!("expected Catalog bytes");
-    };
-    let page = CatalogPage::decode(&bytes).unwrap();
-    assert_eq!(page.catalog, target);
-    assert_eq!(page.namespace, query.namespace);
-    assert!(page.entries.is_empty());
-    assert!(page.next.is_none());
+    if let Some(package) = counter_package {
+        assert_eq!(call.work().program, package.program());
+        assert_eq!(call.work().deployment, package.deployment());
+        assert_eq!(
+            vos::value::Value::try_decode(&reply.reply).unwrap(),
+            vos::value::Value::U64(7)
+        );
+        // Exercise actual duplicate delivery, not just the client response cache.
+        // The separate post-restart Query checks that mutation happened once.
+        for _ in 0..2 {
+            let repeated = super::super::local_create::post_binary(
+                address,
+                "/__agents/invoke",
+                200,
+                &request,
+                super::super::local_invocation::MAX_RESPONSE_BYTES,
+            )
+            .unwrap();
+            assert_eq!(repeated, response);
+        }
+    } else {
+        let vos::value::Value::Bytes(bytes) = vos::value::Value::try_decode(&reply.reply).unwrap()
+        else {
+            panic!("expected Catalog bytes");
+        };
+        let page = CatalogPage::decode(&bytes).unwrap();
+        assert_eq!(page.catalog, target);
+        assert_eq!(page.namespace, query.namespace);
+        assert!(page.entries.is_empty());
+        assert!(page.next.is_none());
+    }
     // Contact the real host even when all client work was already retained.
     let ack = AgentAcknowledgementRequest::new(
         RuntimeExecutionContext::Direct,
@@ -262,6 +321,6 @@ fn managed_receipt_invocation_and_exact_retry(successor: bool) {
             .is_ok()
     );
     eprintln!(
-        "native receipt-bearing Catalog query, positive retirement and exact retry passed; this is not a non-Public mutation proof"
+        "native receipt-bearing invocation, positive retirement and exact retry passed; this is not a non-Public policy proof"
     );
 }

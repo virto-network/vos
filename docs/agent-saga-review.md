@@ -36,6 +36,11 @@ A fresh successor invocation now also passes on its first managed attempt, with
 the next credential operation sequence, positive retirement and exact retries.
 It took 176.52s; the full live test took 178.76s. Historical clock/scheduler/startup
 failures are preserved below. Protected mutation and latency gates remain open.
+The next Counter installation exhausted four exact HTTP attempts with 504s;
+no client completion was verified. Its mutation/restart fixtures compile but
+remain unexecuted. Preserve the retained install for exact recovery, not a fresh
+request. A short reconciliation CPU sample was dominated by BLAKE2 hashing;
+it does not yet identify the responsible caller or establish a complete cause.
 Native host-clock preparation retains AOC5 before HTTP and exact returned AOQ1
 before authorization. Periodic reconciliation defers while admission is held;
 startup now exposes only exact retained authorization recovery until inventory
@@ -6785,6 +6790,66 @@ the Public Catalog query is not a mutation proof. Catalog's `mutate` method is a
 signed Shared/Merge publication and must not be repurposed as evidence for Local
 protected mutation. Non-Public policy, mutation/restart, expiry/abort, ordinary
 Shared finality, performance and C3 release gates remain open. This stays in C2.
+
+### Counter mutation fixture and installation checkpoint (C2)
+
+The existing Local Counter example now has two opt-in managed invocation tests:
+`real_daemon_counter_mutation_and_exact_retry` increments by seven and verifies
+two actual duplicate HTTP deliveries return the identical retained response;
+`real_daemon_counter_value_after_restart` reads seven after an externally
+performed daemon restart. Both verify the admitted Counter program/deployment,
+receipt-bearing application and positive retirement. They use separate retained
+intents and do not clear pending credentials. These are Public policy tests,
+not a substitute for the protected Local mutation gate. They have compiled but
+have **not yet passed live**; installation must finish before running them.
+
+The ordinary CLI suite passed: **239 passed**, zero failures, **nine ignored**,
+**62.47 seconds**, in `target/task-tmp/r16-counter-cli.log`. Formatting and
+whitespace checks also passed. The Counter package built with the pinned guest
+toolchain; a second build produced byte-identical PVM and VOS files. This is a
+same-worktree repeat, not the independent clean rebuild required by C3.
+`Counter.vos` is **45,585 bytes**, SHA-256
+`2a18452da6e8a33866f16896b5d587f0a86ecc8451d7ea219e44e6ff72687571`;
+program `3605c485c5a39637265d4c6666fe79a3037ad0def7e1531f1f417f5a461c167b`,
+deployment `d07f765553293c2c5f6e2e4007fab0028a7f26361ce026944671e0c1c3897023`.
+Build evidence: `r16-counter-build.log` and `r16-counter-build-repeat.log`.
+
+The existing IgQS0r disposable space began its Counter install campaign at
+**2026-09-14 18:39:27Z**, reaching readiness at **18:44:04Z** (about **277s**).
+Initial inventory reconciliation took **143.962s**. Later refreshes reused
+inventory pages at the authenticated unchanged head but still took **53.945s**
+and **32.387s**. Install has returned repeated HTTP 504 responses, retaining the
+exact request for bounded retry. This is a failed first-response latency gate,
+not evidence that the installation was rejected or that replay is safe to skip.
+Evidence is `counter-install-run.sh`, `counter-install-daemon.log` and
+`counter-install-{1,2,3,4}.{json,log}` under disk-backed
+`target/task-tmp/native-denial-head-reuse.IgQS0r`.
+
+All four attempts returned 504; the last began at **18:51:47Z**. A later full
+inventory reconciliation completed in **188.052s**, immediately followed by
+another credential refresh. The script requested graceful shutdown after the
+fourth failed wait. No Counter mutation/read test was started and no client
+completion is claimed.
+
+The campaign script exited **1** after graceful shutdown; the final inventory
+refresh finished at **18:54:40Z** in **56.027s**. The daemon process is absent
+and `.endpoint` was removed. Retained client/native stores and all failed
+attempt logs remain untouched for exact recovery.
+
+A ten-second CPU sample of the same daemon, during the later inventory queries,
+contained **502 core-cycle samples**, with **84.12%** in
+`blake2b_simd::avx2::compress1_loop` on `vos-system-agen`. The two atom-cycle
+samples were also in that function. Caller stacks were incomplete, so this
+identifies a hotspot, not the high-level root cause or whole-campaign cost.
+Evidence: disk-backed `target/task-tmp/r16-counter-install.perf.{data,txt}`.
+Do not bypass hashing, skip route verification or increase HTTP waits based on
+this sample.
+
+Next work remains within C2: resolve the exact retained install outcome, then
+run mutation/duplicate/restart verification. Protected permission setup should
+reuse existing Authority administration calls and authorization machinery;
+Counter's Public mutation does not close it. No new review batch, timeout
+increase, production artifact repin or master integration is included here.
 
 ### Durable client acknowledgement before completion
 
