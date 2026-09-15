@@ -178,6 +178,32 @@ the startup probe are terminal; no process remains to poll. Evidence is in
 `shared-reopen-phases.LP4zS4/{build.log,run.log,up.log}`, with the probe script,
 HTTP status and SSH-key evidence alongside them.
 
+### Physical runtime attribution without another rebuild
+
+The same `f2b17cb2` release executable, with the existing
+`vos::agent::local_journal_driver=debug` timer enabled, passed original-path
+startup/HTTP/SSH/shutdown in **75 seconds** (10:14:33–10:15:48 UTC). Its retained
+suffix started at 20 rows, so this is again not a fixed-history comparison.
+
+Between the driver `executor_setup` and `materialize_current` markers, replay
+took **25,048 ms**. Eighteen `physical Agent runtime execution` records total
+**24,304,768 microseconds**, approximately **97%** of replay time. The timer
+includes `RefineContext::load` and `.run`, not just interpreted instructions;
+it excludes the subsequent bounded output decode. Call inputs were roughly
+789–793 KB, with alternating calls using about 933 million and 500 million gas.
+This establishes physical runtime load/run as the dominant measured replay
+cost, not repeated host-side ledger auditing. It does not yet separate loading,
+outer-runtime execution, nested actor execution or specific guest functions.
+
+Inventory reconciliation took **44,935 ms**, including **42,885 ms** loading
+inventory. The next implementation investigation should target runtime-call
+cost (and distinguish load from execution if needed), while preserving guest
+semantics, exact outputs and gas accounting. More aggressive checkpointing
+could limit replay length but would not by itself fix expensive live queries.
+No cache, checkpoint-policy change, timeout change or new artifact pin was made.
+Logs, script and HTTP/SSH evidence are in `runtime-replay-timings.J9kxo3/`.
+The probe exited zero and its daemon is stopped.
+
 ## Local evidence and resumption
 
 Evidence is on disk under `.worktrees/ch08-c2-native/target/task-tmp/`, not `/tmp`:
