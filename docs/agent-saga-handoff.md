@@ -2,6 +2,35 @@
 
 ## Checkpoint and decision
 
+Live recovery and Counter Install now pass on release source `668a86bb` at the
+original preserved-space path. Readiness took147s; the resumed Install reservation
+then completed in92s with exit0 and a verified1,654-byte acknowledgement for
+Agent `745ce15ee9860b2b50ddd80460add47e7fe518480cb5793af525ae26010e32ae`.
+This was the first signed Install submission for the previously reserved nonce,
+not recovery of an earlier sent Install. No new nonce, store reset, migration,
+binding deletion or manual repair was used. The probe joined its own daemon
+without forced cleanup; session `85175` is terminal and the subsequent host
+process check found no remaining test/build/daemon processes.
+
+Evidence: `task-tmp/issuer-reuse-release.QR6Y4x/recovery-install{,-probe,-up}`
+JSON/logs/stderr, plus `create-probe.sh recovery-install`. Host startup passed
+the former reconciliation failure and reached lifecycle-controller setup at
+112,893ms; initial inventory/route reconciliation took31,945ms. Later Install
+reconciliation took33,260ms, with individual inventory queries around4–6s.
+These are observed phase timings, not a controlled before/after benchmark.
+The147s startup still fails the10s release gate;92s Install is still too slow.
+A subsequent restart/HTTP/SSH and Counter invocation check remain to be run
+on this fixed release. Do not infer full lifecycle or production qualification.
+
+The configured release build passed in6m50s, and bundle creation/verification
+pass with unchanged runtime/system pins. Executable SHA-256:
+`51691210f3c98f46a40feae86bd06d79ee7d6233c98fc13b54b7f0af1cf994e8`.
+Evidence directory: `task-tmp/pending-binding-release.QlSlXs/` holds `build.log`,
+`bundle/`, `vosx-before`, and pre-recovery forensic `data-before` / `config-before`.
+The same directory's `default-regression.log` records the four-case pending
+binding regression passing under default features (3.34s; build1m40s).
+Sessions `93556` (release) and `88296` (default test) are terminal.
+
 Pre-publication pending-binding recovery is now implemented and regression-tested.
 The physical test stages the actual replay-derived Shared projection/binding
 before the head CAS, both with and without the immutable entry file, and with
@@ -29,8 +58,7 @@ Evidence under shared target `task-tmp/`: `pending-binding-regression-exact.log`
 `pending-binding-snapshot-regression.log`. Tests use locked/offline host features
 `agent-transition-proof private-agent-store http-ingress ssh-ingress`.
 Sessions `71810`, `90396`, `31487`, `65063`, `17284`, and `73433` are terminal.
-The release CLI has not yet been rebuilt with this fix or the preceding
-original-successor fix; live recovery and Install remain unqualified.
+The subsequent fixed release and live recovery/Install result are recorded above.
 
 The detailed diagnostic now identifies the live failure: all 85 committed
 Ordered anchors validate, but the retained pending command at Raft index113

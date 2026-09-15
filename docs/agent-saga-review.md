@@ -2,7 +2,7 @@
 
 ## Current review checkpoint
 
-Implementation checkpoint: `3b5b7cef` on `wip/ch08-runtime-directory`;
+Implementation checkpoint: `668a86bb` on `wip/ch08-runtime-directory`;
 `saga/agents` remains at `31b0cdbb`. Nothing has been merged or pushed.
 Review the integrated Chapter 8 changes together: the old C1 boundary depends
 on clean-break corrections in C2 and is not independently merge-ready. The
@@ -14,14 +14,15 @@ reproduced from guest source `aad65049` and committed in `83737aee`.
 Two independent builds match byte-for-byte; 18 post-pin release checks and
 six physical integration tests pass. Fresh release startup/restart at
 `83737aee` passed HTTP/SSH checks in 27/37 seconds. The release executable has
-since been rebuilt at implementation source `53c98f7f`, including issuer
-validation reuse, the host pagination fix and opportunistic checkpoints;
-its bundle creation and verification pass. However, the preserved test space
-fails reopening with `CrossStoreMismatch` after replay. The latest tip is not
-a qualified working-system checkpoint. See the handoff for diagnostic evidence.
-The follow-up diagnostic release at `2624cc0a` confirms published-checkpoint
-validation succeeds and journal/ledger reconciliation fails. The specific
-conflicting binding is not identified yet; no recovery fix is claimed.
+since been rebuilt at implementation source `668a86bb`, including issuer
+validation reuse, pagination/checkpoint changes and two exact-recovery fixes;
+its bundle creation and verification pass. The preserved test space now
+recovers at its original path (147s), and Counter Install returns a verified
+acknowledgement (92s). Recovery recognizes the exact reserved binding staged
+before journal-head publication; it neither resets stores nor marks staged
+work applied. A separate retry fix preserves the original publication successor.
+Both have regression evidence in the handoff. Restart/ingress and Counter
+invocation still need current-release checks; latency remains a release blocker.
 
 For review, use two scoped batches: integrated architecture through `f79f0e3d`,
 then checkpoint/recovery closeout and final qualification. The first checkpoint
