@@ -2,6 +2,39 @@
 
 ## Checkpoint and decision
 
+Opportunistic system-projection checkpoint policy is implemented with a
+32-retained-Raft-entry soft threshold, derived from authenticated capacity
+relative to the installed snapshot. It runs before fresh projection admission,
+not during pending projection recovery. A physical command reservation skips
+the attempt; the proposal mutex atomically refuses an occupied projection,
+management-pending or management-retirement gate. Certificate, snapshot and
+reattachment failures remain fail-closed. The existing hard-capacity checkpoint
+path is unchanged; no wire, guest pin, signed capacity or issuer retention
+limit changed. The threshold is a host scheduling candidate, not a proven
+10-second startup bound.
+
+Three focused tests pass (14.25s; build 1m23s): threshold/busy-gate boundaries,
+physical snapshot preserving state and skipping a reserved pair, and existing
+checkpoint failure/reattachment recovery. Three further physical lifecycle
+tests pass (75.65s): Install handoff/retry/restart, accepted-finalization startup
+recovery, and management-finalization clock-advance exact replay. Logs:
+`task-tmp/opportunistic-checkpoint-tests.log` and
+`task-tmp/opportunistic-checkpoint-lifecycle.log`. The release CLI has not yet
+been rebuilt with this policy, and startup/Install latency remain unqualified.
+
+The combined host-feature library suite at `f79f0e3d` is now complete:
+1,862 passed, zero failed, three ignored, 2968.51s (49m28s), build 3m18s.
+Enabled features: `agent-transition-proof private-agent-store http-ingress
+ssh-ingress`, with defaults, locked/offline and serial socket-enabled tests.
+Log: `task-tmp/current-host-feature-library-suite.log`; session `12062` is
+terminal. The 514-query inventory rotation test and Shared-host attachment
+checkpoint test passed. Ignored: native-operation initial-capture headroom,
+fixed-history decode probe, and large-ACK profiling probe. The native headroom
+case still needs separate current-source qualification; the others are
+diagnostics. This suite predates both checkpoint changes above and does not
+certify their full matrix, full cryptographic proof integration or release
+readiness. No test/build processes from this checkpoint remain running.
+
 Projection checkpoint admission now uses the existing authenticated ledger
 capacity accessor instead of full host `show` status before and after snapshot
 installation. Only remaining capacity was needed; deriving the actor-directory

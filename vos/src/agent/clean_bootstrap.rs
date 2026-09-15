@@ -3945,6 +3945,13 @@ where
             .ok_or(SharedAgentHostError::ScopeMismatch)?;
         let work = work.clone();
         let authorization = authorization.clone();
+        self._network_host.checkpoint_projection_if_due(
+            agent,
+            &work,
+            &authorization,
+            &self.pins.replicas,
+            self.snapshot_signer.as_ref(),
+        )?;
         let mut reserved = false;
         for attempt in 0..3 {
             match self
@@ -18072,6 +18079,75 @@ mod tests {
             assert_eq!(owner.record.pending_projection, None);
             drop(owner);
             stop_network(network);
+        }
+
+        #[test]
+        fn opportunistic_projection_checkpoint_preserves_state_and_skips_reserved_pair() {
+            let mut harness = NativeProjectionOwnerHarness::new("projection-soft-checkpoint");
+            let owner = harness.owner.as_mut().unwrap();
+            let agent = HostAgentId(owner.pins.agent.0);
+            let maximum = crate::agent::shared_raft::MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES as u64;
+            for nonce in 1..=32 {
+                let (_, remaining, _) = owner.host.lock().unwrap().capacity(agent).unwrap();
+                if maximum - remaining >= 32 {
+                    break;
+                }
+                owner
+                    .invoke_authority_projection(signed_credential_projection_query(owner, nonce))
+                    .unwrap();
+            }
+            let (_, remaining, _) = owner.host.lock().unwrap().capacity(agent).unwrap();
+            assert!(maximum - remaining >= 32);
+            assert!(remaining > 0);
+            let (work, authorization) = fresh_projection_pair(owner, 0xe8);
+            let committee = owner.pins.replicas.clone();
+            let signer = Arc::clone(&harness.fixture.merge);
+            owner
+                ._network_host
+                .reserve_projection_pair(agent, &work, &authorization, false)
+                .unwrap();
+            let before = native_owner_physical_state(owner);
+            assert_eq!(
+                owner._network_host.checkpoint_projection_if_due(
+                    agent,
+                    &work,
+                    &authorization,
+                    &committee,
+                    signer.as_ref(),
+                ),
+                Ok(false)
+            );
+            assert_eq!(native_owner_physical_state(owner), before);
+            owner
+                ._network_host
+                .release_projection_pair(agent, &work, &authorization)
+                .unwrap();
+            assert_eq!(
+                owner._network_host.checkpoint_projection_if_due(
+                    agent,
+                    &work,
+                    &authorization,
+                    &committee,
+                    signer.as_ref(),
+                ),
+                Ok(true)
+            );
+            let after = native_owner_physical_state(owner);
+            assert_eq!(after.0, before.0);
+            assert_eq!(after.1, before.1);
+            assert_ne!(after.2.snapshots, before.2.snapshots);
+            assert_eq!(
+                owner._network_host.checkpoint_projection_if_due(
+                    agent,
+                    &work,
+                    &authorization,
+                    &committee,
+                    signer.as_ref(),
+                ),
+                Ok(false)
+            );
+            assert_projection_gate_released(owner, 0xe9);
+            harness.stop();
         }
 
         #[test]

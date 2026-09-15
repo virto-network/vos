@@ -62,6 +62,15 @@ const MAX_MERGE_SYNC_EVENTS: usize = MAX_IMPORT_EVENTS;
 const MAX_MERGE_SYNC_BYTES: usize = MAX_IMPORT_BYTES;
 const ORDERED_REPLY_WAIT: Duration = Duration::from_millis(1_800);
 
+// Host scheduling policy, not a protocol capacity or retention limit. Keep
+// ordinary system projections from accumulating a large cold-replay suffix.
+const SYSTEM_PROJECTION_CHECKPOINT_SUFFIX: u64 = 32;
+
+fn projection_checkpoint_due(remaining_slots: u64) -> bool {
+    (shared_raft::MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES as u64).saturating_sub(remaining_slots)
+        >= SYSTEM_PROJECTION_CHECKPOINT_SUFFIX
+}
+
 fn system_promotion_barrier(
     role: impl Fn() -> vos_raft::Role,
     snapshot: impl FnOnce() -> Option<(vos_raft::Role, u64, u64)>,
@@ -918,6 +927,19 @@ struct ProposalAdmission {
     projection_pair: Option<ProjectionPairKey>,
     management_retirement: Option<Vec<[ProjectionPairKey; 2]>>,
     management_pending: Option<Vec<PendingManagementKey>>,
+}
+
+impl ProposalAdmission {
+    fn reserve_idle_checkpoint(&mut self, key: ProjectionPairKey) -> bool {
+        if self.projection_pair.is_some()
+            || self.management_retirement.is_some()
+            || self.management_pending.is_some()
+        {
+            return false;
+        }
+        self.projection_pair = Some(key);
+        true
+    }
 }
 
 fn management_retirement_set_keys(
@@ -3352,6 +3374,56 @@ impl SharedAgentNetworkHost {
         expected_committee: &AgentReplicaCommittee,
         signer: &dyn LocalMergeAuthenticator,
     ) -> Result<(), SharedAgentHostError> {
+        self.certified_checkpoint_for_admission_inner(
+            agent,
+            work,
+            authorization,
+            expected_committee,
+            signer,
+            false,
+        )
+        .map(|_| ())
+    }
+
+    /// Best-effort scheduling, but never best-effort authentication: busy
+    /// admission gates are skipped atomically; certificate/storage failures
+    /// retain the existing fail-closed behavior.
+    pub(crate) fn checkpoint_projection_if_due(
+        &mut self,
+        agent: crate::service::AgentId,
+        work: &InvocationWork,
+        authorization: &InvocationAuthorization,
+        expected_committee: &AgentReplicaCommittee,
+        signer: &dyn LocalMergeAuthenticator,
+    ) -> Result<bool, SharedAgentHostError> {
+        self.ensure_reattached(agent)?;
+        let (_, remaining, reservation_pending) = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?
+            .capacity(agent)?;
+        if reservation_pending || !projection_checkpoint_due(remaining) {
+            return Ok(false);
+        }
+        self.certified_checkpoint_for_admission_inner(
+            agent,
+            work,
+            authorization,
+            expected_committee,
+            signer,
+            true,
+        )
+    }
+
+    fn certified_checkpoint_for_admission_inner(
+        &mut self,
+        agent: crate::service::AgentId,
+        work: &InvocationWork,
+        authorization: &InvocationAuthorization,
+        expected_committee: &AgentReplicaCommittee,
+        signer: &dyn LocalMergeAuthenticator,
+        only_if_idle: bool,
+    ) -> Result<bool, SharedAgentHostError> {
         if expected_committee.members().len() != 1
             || expected_committee.voter_count() != 1
             || expected_committee
@@ -3364,9 +3436,21 @@ impl SharedAgentNetworkHost {
             .generations
             .get(&agent)
             .ok_or(SharedAgentHostError::TransportNotAttached)?;
-        attached
-            .coordinator
-            .reserve_checkpoint_gate(work, authorization)?;
+        if only_if_idle {
+            let reserved = attached
+                .coordinator
+                .proposal
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .reserve_idle_checkpoint(ProjectionPairKey::new(work, authorization));
+            if !reserved {
+                return Ok(false);
+            }
+        } else {
+            attached
+                .coordinator
+                .reserve_checkpoint_gate(work, authorization)?;
+        }
         let certificate = {
             let mut host = self
                 .host
@@ -3423,7 +3507,7 @@ impl SharedAgentNetworkHost {
         // of whether retirement, signing, or installation failed.
         let reattachment = self.reattach_current(agent);
         match (checkpoint, reattachment) {
-            (Ok(_), Ok(())) => Ok(()),
+            (Ok(_), Ok(())) => Ok(true),
             (Err(error), Ok(())) => Err(error),
             (_, Err(error)) => Err(error),
         }
@@ -4825,6 +4909,53 @@ mod tests {
 
     use super::*;
     use crate::raft::RAFT_LOG;
+
+    #[test]
+    fn opportunistic_projection_checkpoint_threshold_and_gate() {
+        let maximum = shared_raft::MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES as u64;
+        assert!(!projection_checkpoint_due(maximum));
+        assert!(!projection_checkpoint_due(maximum - 31));
+        assert!(projection_checkpoint_due(maximum - 32));
+        assert!(projection_checkpoint_due(0));
+        let key = ProjectionPairKey {
+            invocation: crate::agent_sdk::InvocationId([1; 32]),
+            work: Hash([2; 32]),
+            authorization: Hash([3; 32]),
+        };
+        let mut idle = ProposalAdmission::default();
+        assert!(idle.reserve_idle_checkpoint(key));
+        assert_eq!(idle.projection_pair, Some(key));
+        assert!(!idle.reserve_idle_checkpoint(key));
+        for mut busy in [
+            ProposalAdmission {
+                projection_pair: Some(key),
+                ..Default::default()
+            },
+            ProposalAdmission {
+                management_pending: Some(Vec::new()),
+                ..Default::default()
+            },
+            ProposalAdmission {
+                management_retirement: Some(Vec::new()),
+                ..Default::default()
+            },
+        ] {
+            let before = (
+                busy.projection_pair,
+                busy.management_pending.is_some(),
+                busy.management_retirement.is_some(),
+            );
+            assert!(!busy.reserve_idle_checkpoint(key));
+            assert_eq!(
+                before,
+                (
+                    busy.projection_pair,
+                    busy.management_pending.is_some(),
+                    busy.management_retirement.is_some()
+                )
+            );
+        }
+    }
 
     struct TempDatabase(std::path::PathBuf);
 
