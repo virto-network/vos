@@ -2,6 +2,32 @@
 
 ## Checkpoint and decision
 
+Bounded production inventory CPU profiling completed on the unchanged
+`8716f6a7` release. An8s user-CPU-clock sample at99Hz captured492 samples with
+zero lost samples (4.058MiB private `perf.data`). It started at a freshly logged
+periodic Credential query after readiness64s. The logged query took4,441ms;
+inventory/route reconciliation took5,226ms. Cleanup waited for a completed
+reconciliation and joined the daemon without forced cleanup; this cleanup is
+not a busy-shutdown gate. Probe session41052 is terminal.
+
+Current symbol-level CPU sample shares: interpreter `run_inner`51.63%,
+conformance gas `dispatch_one`9.55%, `tick`8.94%, `feed`1.42%, and BLAKE2
+compression18.50%. Compact-code parsing and two SPI validation functions each
+accounted for about1%. These are sample shares during this specific interval,
+not wall-time percentages, per-invocation costs or a controlled comparison to
+the older hashing-heavy campaign. The evidence now prioritizes runtime
+execution/gas simulation over another blanket journal-hashing optimization.
+Gas accounting, authorization and replay validation must not be disabled.
+
+Evidence directory: `task-tmp/inventory-profile.BXFk2T/` contains `profile.sh`,
+`probe.log`, `up.log`, `perf-record.log`, private `perf.data`, and `callers.txt`.
+The installed profiler supports DWARF unwinding and the executable retains
+unwind/symbol sections, but most recorded caller stacks were empty/incomplete;
+the caller report cannot identify which individual runtime work dominates.
+Next measure the individual runtime executions inside a projection or improve
+stack capture before changing execution orchestration. No production source,
+gas model, runtime pin or release executable changed in this profiling turn.
+
 Safe-boundary cancellation is now live-tested on release `8716f6a7`, but the
 five-second shutdown gate is **still not fully passing**. Both probes first
 verified the retained Counter read/retirement/exact-retry path (no new mutation),
