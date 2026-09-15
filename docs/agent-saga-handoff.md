@@ -2,6 +2,44 @@
 
 ## Checkpoint and decision
 
+### Fresh-ACK bundled artifact qualification
+
+The fresh-ACK optimization is now in the checked-in guest. Two independent
+immutable exports of source `4a208b19baa9dd36b216548681f5a3ab5add3401`, built
+with nightly-2026-03-20 using separate targets, produced byte-identical ELFs
+and PVMs. Conversion used the preserved, qualified builder from
+`task-tmp/r17-release-candidate.fNbf43/builder/vosx`. Provenance, protocol
+ProgramId, build-time digest and bundled bytes were updated together.
+
+ProgramId: `25bdad0f9a1b0ca8450338d916adc41306d9d740f68bb5b2490ab8b8b9fb3da1`.
+ELF BLAKE2b-256: `1698aff38de4b34eed9ca28c4718e2d1e7be60017d1f05d017dd1f4e8d011b72`.
+PVM BLAKE2b-256: `a3cb1cfbc62cf5e5a9bb21edd892caccb41ce484da39e78577eedc9dc78f7a78`.
+ABI remains `vos-agent-runtime-abi-260915-r17`; system templates are unchanged.
+
+The fixed 793,734-byte ACK comparison has byte-identical complete output and
+gas decreases from395,232,496 to336,976,182 (14.74%). All eight candidate
+checks pass, covering malformed ACKs, retired retries, terminal failures,
+typed errors, expiry and byte-identical fail-closed rejection. Post-pin release
+checks pass18/18; ordinary physical runtime tests pass4/4 (4.08s). Both
+explicit candidate tests also pass (3.20s), checking exact install lineage
+after restart and Attested Invoke/Resume public-output binding. These are
+execution/binding checks, not full cryptographic proof qualification.
+Evidence lives in shared disk-backed
+`target/task-tmp/fresh-ack-candidate.xCeHWs/`: `build-{a,b}.log`,
+`identity-{a,b}.log`, `cost.log`, `candidate-tests.log`, `post-pin-tests.log`,
+and `post-pin-explicit-tests.log`. Sessions10956/96781 are terminal0.
+
+The release executable still contains implementation `206ea1e3` and the old
+runtime pin. Next rebuild the release, verify its bundle and test a fresh
+isolated space before making any live latency claim. Preserve old-space
+fixtures at their original paths; the new ProgramId is not permission to
+rewrite existing deployment identities. Startup/Create/Install latency,
+ordinary Shared finality wiring, authenticated issuer reclamation and the
+remaining proof/recovery/release matrix are still open. No merge or push has
+occurred. These changes belong to review batch2, not a new architecture batch.
+
+### Source optimization qualification (before repinning)
+
 Fresh-ACK source optimization now removes one redundant availability-validation
 pass within a single immutable-work call chain. `recover_clean_acknowledgement`
 already validates the work before returning no retained acknowledgement; its
@@ -20,7 +58,8 @@ Evidence: `task-tmp/fresh-ack-validation-reuse-tests.log`; session30763 terminal
 The bundled-PVM tests in that selection still execute the old pinned artifact:
 they are not candidate-gas qualification for this source change.
 
-**Not yet bundled or performance-qualified.** Next build a candidate guest,
+At this earlier source-only checkpoint, the change was not yet bundled or
+performance-qualified. The planned next step was to build a candidate guest,
 compare exact output/gas using the existing fixed large-ACK test and
 `VOS_AGENT_RUNTIME_COST_CANDIDATE`, then independently reproduce and update pins
 only after equivalence/hostile-frame checks pass. The release executable remains

@@ -2,13 +2,18 @@
 
 ## Follow-up after the frozen review snapshot
 
-Latest source-only optimization removes a duplicate blob-validation pass on
-fresh ACKs after the same immutable work was validated by acknowledgement
-recovery. Scope and signature verification remain;31 selected tests pass,
-including corrupted-preimage and signature rejection without state mutation.
-This is **not yet in the bundled guest**: candidate output/gas comparison,
-independent reproduction and pin update remain required. The release binary
-is unchanged; no additional live speedup is claimed.
+The latest fresh-ACK optimization is now bundled: source `4a208b19`, runtime
+ProgramId `25bdad0f9a1b0ca8450338d916adc41306d9d740f68bb5b2490ab8b8b9fb3da1`.
+Two independent immutable-source builds produce identical ELF/PVM bytes.
+It removes one duplicate validation of immutable work, retaining scope and
+signature checks. The fixed large-ACK comparison preserves complete output
+and reduces gas14.74%; eight candidate checks and18 post-pin release checks
+pass. All six physical runtime checks pass, including the two explicit
+candidate checks (install lineage and Attested public-output binding, not
+full cryptographic proof qualification). These changes belong to batch2 below.
+The release executable has not been rebuilt with this pin: fresh-space live
+qualification and latency remeasurement remain required. No end-to-end
+speedup or production sign-off is claimed.
 
 Latest performance diagnosis uses test-only instruction attribution with the
 real bundled outer runtime: large nested calls execute roughly275 million
