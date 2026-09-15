@@ -142,6 +142,26 @@ must not be relabelled across the intentional r16/r17 clean break.
 
 ## Three review areas, not three completed batches
 
+Ordinary Shared finality wiring audit at `9d6d378d`: the CLI constructs
+`UnavailableAgentFinality`, and `SharedAgentHost::verify_and_prepare` invokes
+the independent verifier before accepting an AuthorityFinalized provision.
+The repository has canonical decision/proof types and Standard-runtime
+`FinalizeSystemAuthority` transitions/replay support; those are not absent.
+However, no production implementation of the ordinary `AgentGenesisProvider`
+or accepting `AgentGenesisFinalityVerifier` was found in `vos`, `vosx` or actors.
+The configured `CleanSystemAgentGenesisArchive` implements the separate root
+system-genesis provider, not ordinary-Agent issuance. The deployed clean
+`actors/system-authority` application-finalization path does not by itself
+establish an ordinary host-genesis decision proof.
+
+Closing this gate therefore needs a clean production bridge spanning ordinary
+provision issuance/archive, durable live-system decision publication, and
+independent authenticated replay verification on initial admission and reopen.
+Reuse the existing canonical invariants where appropriate, but do not revive
+Standard-private-state decoding as the clean runtime-independent trust boundary,
+substitute root bootstrap QC, or accept a provider's self-consistent response.
+This audit changes no acceptance behavior and does not qualify Shared creation.
+
 Standalone C1 audit (2026-09-15): do not treat the three-commit historical
 boundary as a merge-ready recovery batch. Its `journal.rs` still encodes AJC3
 checkpoints with the v3 identity domain. The later `fd7df8ec` recovery fix,
