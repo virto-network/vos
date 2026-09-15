@@ -2,6 +2,33 @@
 
 ## Checkpoint and decision
 
+### Release `b7cfa17d`: restart and fresh Install
+
+The same exact-path `fresh-ack-release.Of5a75` fixture restarted successfully
+in54s. HTTP status passed and SSH host identity matched first startup.
+This still fails the10s readiness gate. Cumulative phases: material34ms,
+discovery48ms, admission51ms, system owner24,344ms, lifecycle controller24,605ms,
+production ready53,913ms. Initial reconciliation took28,891ms. Retained-history
+recovery and reconciliation dominate the observed restart stages; these logs
+do not attribute every interval to an individual function or runtime call.
+
+Fresh Counter Install into Agent `f7dd7306…` succeeded in65s, with a verified
+installation acknowledgement and no timeout/resume. It used a copy of the
+previously qualified `issuer-reuse-release.QR6Y4x/counter-dist/counter.vos`
+package, name `counter`, no constructor bytes. Only the immutable package was
+copied, not the old space stores or identity. Post-Install SIGTERM exited
+successfully in under1s, with no forced cleanup. Session38226 is terminal0;
+post-run inspection found no vosx/cargo/rustc. Binary checksum is unchanged.
+
+Evidence in `fresh-ack-release.Of5a75`: `install-probe.sh`, `install-probe.log`,
+`install-up.log`, `install-status.json`, `install-ssh-key.txt`, `install.txt`,
+`install.stderr`, and `counter.vos`. Keep all fixture data at its original
+absolute path. Create/Install now both succeed on the current release, but
+their43s/65s timings are not acceptable production latency or a controlled
+before/after comparison. Invocation, install retry/read-after-restart and the
+broader release gates remain to be qualified. Do not repeat fresh Install
+against this already installed actor to simulate a retry.
+
 ### Release `b7cfa17d`: fresh startup and Create
 
 The locked/offline nightly-2025-05-09 release build passed in7m08s with the
@@ -24,7 +51,7 @@ timeout/resume and returned a verified creation acknowledgement for Agent
 `f7dd7306e364c65d7de953846f215675b031a0dba5af30e5f7f4415d1cf09a00`.
 Immediate post-Create SIGTERM exited successfully within1s, without forced
 cleanup. This is one shutdown observation, not universal busy-shutdown proof.
-Install and fresh invocation have not been measured on this release. Do not
+At this first probe, Install and fresh invocation had not been measured. Do not
 compare these fresh-history timings directly with earlier retained-history
 probes or infer that the14.74% fixed ACK gas saving explains the whole change.
 
@@ -38,9 +65,9 @@ Data/config/cache remain in this directory; never relocate raw stores for boot.
 Build/probe sessions17725/70725 are terminal0; post-run process inspection
 found no vosx/cargo/rustc. No existing fixture was modified.
 
-Next bounded qualification: restart this exact fixture, measure fresh Install
-and invocation with exact retained-request retry on ambiguous outcomes, then
-update the review handoff. Startup/Create latency, ordinary Shared finality,
+The subsequent restart and Install are recorded above. Next measure invocation
+and exact retained-request retry/read-after-restart, then update the review
+handoff. Startup/Create/Install latency, ordinary Shared finality,
 authenticated reclamation and full proof/recovery/release gates remain open.
 
 ### Fresh-ACK bundled artifact qualification

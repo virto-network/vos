@@ -24,7 +24,10 @@ passing regressions from still-failing production gates.
 Release `b7cfa17d` is now built and its bundle verified. Fresh isolated startup
 took21s (still fails10s gate), HTTP/SSH passed, fresh Create succeeded in43s
 with a verified acknowledgement and no timeout, and post-Create SIGTERM exited
-within1s. Install/invocation remain unmeasured on this release. These are not
+within1s. The same fixture subsequently restarted in54s with HTTP and unchanged
+SSH identity, then completed fresh Counter Install in65s with a verified
+acknowledgement and no timeout. Post-Install shutdown passed within1s.
+Invocation and post-Install retry/read-after-restart remain unmeasured. These are not
 controlled comparisons with old retained-history probes. See the handoff for
 binary checksum, exact fixture, logs and remaining release blockers.
 
