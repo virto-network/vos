@@ -2,6 +2,20 @@
 
 ## Checkpoint and decision
 
+Feature-enabled physical qualification at source `4b3a8c54`: all six
+`agent_runtime_pvm` integration tests pass (6.19s, zero ignored), explicitly
+including compiled-guest Attested Invoke/Resume and install-lineage restart.
+The locked offline build used features
+`pvm,private-agent-store,http-ingress,agent-transition-proof` and completed in
+1m01s. `VOS_AGENT_RUNTIME_PVM` pointed to the pinned `vosx/blobs/agent_runtime.pvm`
+(`db577aff…`); execution used a 12 GiB virtual-memory limit, disabled core dumps,
+disk-backed TMPDIR, and a 180-second deadline. The isolated Attested test also
+passed in 2.63s. Logs are in the shared target's `task-tmp/` directory:
+`attested-db577-bounded-run.log` and `attested-db577-feature-physical.log`.
+This verifies exact observed public-output binding and substitution rejection,
+not generation/verification of a full cryptographic proof. That release gate
+remains open; no production latency or full-suite claim follows from this run.
+
 Current HEAD pins the independently reproduced authorization-reuse follow-up
 (`db577aff…`), with 18 release-pin and five physical lifecycle/lineage checks
 passing. Newest-pin fresh startup/restart now pass in 28/39 seconds with HTTP,
