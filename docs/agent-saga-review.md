@@ -33,11 +33,12 @@ after restart also passes. Native positive retirement and exact acknowledgement
 retries now pass before and after restart. Public Counter mutation, late replay
 rejection and a fresh read of seven after actual daemon restart now pass with
 the repinned runtime. Protected/non-Public actor workflows remain open.
-The latest LocalSigner campaign passes installation and a live deployment-scoped
-role grant with retirement. Package-validated protected preparation passes after
-restart. Full protected execution remains unproven: two earlier test inputs
-were malformed (missing role, then incorrect method mode), and their retained
-reservations are preserved. See the LocalSigner campaign checkpoints below.
+The latest LocalSigner campaign passes installation, a live deployment-scoped
+role grant, protected Local execution, visible signature verification and
+positive retirement. An exact retained client retry and a fresh protected
+execution with a new invocation ID also pass after actual daemon restart.
+Two earlier malformed test inputs and their reservations remain preserved.
+See the LocalSigner campaign checkpoints below. Latency remains unacceptable.
 This is not yet a usable ordinary-agent production path.
 The latest runtime pin includes single-pass AWRK availability decoding. Its
 fixed 768KB-program ACK comparison uses about 25.3% less gas with byte-identical
@@ -259,7 +260,9 @@ Keep these as work within C2, not new review batches:
    signed-body HTTP routes. Retained client preparation/submission commands now
    exist; deterministic signing, a separate admin reservation and fresh
    deployment-scoped role command/resume orchestration are implemented. The live
-   protected campaign remains incomplete. Keep
+   protected LocalSigner execution, signature and retirement now pass before
+   and after actual daemon restart, with a fresh post-restart invocation ID.
+   Revoke/denial and yield/resume where applicable remain separate open gates. Keep
    its credential sequence and generation CAS distinct from operation
    authorization; do not relax anonymous HTTP invocation or
    put this mutation in the read-only projection journal.
@@ -7896,6 +7899,70 @@ Validation: full CLI 252 passed / 12 ignored / zero failures (65.05s,
 graceful shutdown again outlasted the CLI's five-second wait, then the exact
 daemon session exited zero without a force kill. No campaign daemon is left
 running. Slow startup/Create/Install/shutdown remain release blockers.
+
+### Protected LocalSigner: live execution and retirement
+
+Fresh fixture: `target/task-tmp/admin-startup-smoke.hJuDDq`, isolated keys and
+loopback HTTP/SSH ports 18090/2232. Space
+`1c2d321fe40b4d01ce3effe2d78609ed814101da9a9956c2c464594d048d0de0`;
+Local Agent `e2f7872c5613e2c0f528aa8832d98ab69bc85c45f94bfd2424056b9a243363ac`;
+LocalSigner actor `ac795d819ad85a0df8c97c478778f1ea1ac7181f815adaeab0ec7d78f4441b23`;
+deployment `74163fd504a81f2bb823fbc135c64ef565b3b259047fc00abfcf9d83ef11bc87`.
+The example PVM is unchanged; it was packaged under the fresh isolated producer.
+No runtime ABI/system artifact change was needed.
+
+Native results on 2026-09-15 UTC (`timing.log`, per-attempt JSON/error logs):
+
+- Startup 00:00:35–00:01:17, about 43s.
+- Create 00:01:19–00:03:27, first attempt succeeds (128s).
+- Install 00:03:31–00:07:36, succeeds after one HTTP 504 and exact resume (245s).
+- Deployment-scoped role grant 00:07:36–00:08:23, applied with terminal retirement.
+- Package-validated authenticated preparation passes (45.18s; `preflight.log`).
+- Protected `Local` sign invocation 00:09:09–00:12:36 (207s), completes after
+  two exact host-clock preparation retries. Both initial failures logged native
+  `CapacityExhausted`; the third attempt retained its bound preparation and
+  completed authorization, execution and positive retirement. No AOC5 was
+  rebuilt or client reservation cleared (`invoke-attempt-{1,2,3}.log`).
+- `verify.log` passes (0.06s): exact target, invocation, Local mode, principal,
+  actor role, message, gas, package/deployment, Authority receipt-bearing
+  authorization, visible Ed25519 signature and retained positive retirement.
+  CLI reports `decision=issued`, `delivery_retired=true`,
+  `reservation_pending=false` (`protected-invoke-1.json`).
+
+The first scratch runner signalled its background wrapper instead of owning
+the daemon PID directly and exited 143 after the successful verification.
+Do not label that boundary a proven graceful shutdown. The exact daemon PID
+was subsequently confirmed absent; `space down` cleaned its stale endpoint
+(`down-confirmed.log`). The runner has been corrected to launch the executable
+wrapper directly. `restart-campaign.sh` uses direct PID ownership and does not
+start a replacement until prior process termination is established.
+
+Actual restart began 00:14:30 and reached readiness 00:16:14 (about 104s).
+Exact retained retry passed at 00:16:17: normalized JSON is identical before
+and after restart (`cached-after-restart.json`). This is cached client recovery,
+not proof of a new actor execution. Separately, a fresh protected invocation
+with nonce `74` repeated 32 times ran 00:16:17–00:18:11 (114s) and succeeded on
+its first CLI attempt. Its independently retained response and positive
+retirement passed the same exact-request/signature verifier in 0.06s
+(`protected-invoke-after-restart.json`, `verify-after-restart.log`). Both client
+operation reservations are completed; no retained intent was rewritten.
+This proves fresh protected signing after native restore, not merely replay of
+the prior result. The example's private signature counter is not exposed by
+its API, so these checks do not independently measure that counter's value.
+
+The directly owned restart daemon received SIGTERM at 00:18:11 and exited
+successfully at 00:19:28: a verified graceful shutdown taking 77s, without a
+force kill. `restart-campaign.sh` completed with exit zero; no campaign daemon
+is intentionally left running. This checkpoint changes review evidence only;
+no production code, artifact, timeout, or reservation format changed. The live
+signature/retirement verifier passes twice (0.06s each), package policy/input
+validation passes, and documentation whitespace checks pass. The previous
+252-test CLI and four-test ingress regression results remain the source
+baseline, not a newly rerun release matrix.
+
+These are debug-binary native correctness results, not acceptable production
+performance. The transient native admission errors, latency, revoke,
+yield/resume where applicable and other original C1/C2/C3 gates remain open.
 
 ### Durable client acknowledgement before completion
 
