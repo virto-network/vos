@@ -2661,14 +2661,35 @@ impl StandardAgentRuntime {
         authorization: &crate::agent_sdk::InvocationAuthorization,
         observed_slot: u64,
     ) -> Result<(), crate::agent_sdk::InvocationError> {
+        if self.clean_descriptor.is_none() {
+            return Err(crate::agent_sdk::InvocationError::NotCreated);
+        }
+        if !invocation.validate() {
+            return Err(crate::agent_sdk::InvocationError::InvalidAuthorization);
+        }
+        self.verify_clean_invocation_authorization_after_work_validation(
+            invocation,
+            authorization,
+            observed_slot,
+        )
+    }
+
+    // Private continuation of validation within one immutable-work call chain.
+    // This still authenticates scope and signatures; callers must have just
+    // validated all work metadata and availability preimages themselves.
+    fn verify_clean_invocation_authorization_after_work_validation(
+        &self,
+        invocation: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        observed_slot: u64,
+    ) -> Result<(), crate::agent_sdk::InvocationError> {
         use crate::agent_sdk::InvocationError;
 
         let descriptor = self
             .clean_descriptor
             .as_ref()
             .ok_or(InvocationError::NotCreated)?;
-        if !invocation.validate()
-            || !authorization.matches_invoke(invocation, observed_slot)
+        if !authorization.matches_invoke(invocation, observed_slot)
             || invocation.space != descriptor.identity.space
             || invocation.agent != descriptor.identity.agent
             || invocation.runtime_deployment != descriptor.identity.runtime_deployment
@@ -4116,7 +4137,14 @@ impl StandardAgentRuntime {
                 preflight.observed_slot
             }
         };
-        self.verify_clean_invocation_authorization(work, authorization, authorization_slot)?;
+        // recover_clean_acknowledgement just validated this same borrowed work.
+        // No mutation or external call occurs between that check and this
+        // private fresh-ack continuation. Repeat authorization, not blob hashes.
+        self.verify_clean_invocation_authorization_after_work_validation(
+            work,
+            authorization,
+            authorization_slot,
+        )?;
         let scope = clean_method_mode(work.mode).invocation_scope();
         let key = (scope, InvocationId(work.invocation.0));
         if let Some(record) = self.clean_invocation_errors.get(&key) {

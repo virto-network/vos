@@ -9639,6 +9639,26 @@ pub(crate) mod tests {
         let decoded = decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap();
         let mut runtime = StandardAgentRuntime::restore(decoded).unwrap();
         let authorization = InvocationAuthorization::AuthorityReceipt(receipt);
+        let before = encode_standard_runtime_state(&runtime.snapshot());
+        let mut corrupted_blob = work.clone();
+        corrupted_blob.availability[0].bytes[0] ^= 1;
+        assert_eq!(
+            runtime.acknowledge_clean_invocation_with_status(&corrupted_blob, &authorization),
+            Err(InvocationError::InvalidAuthorization),
+            "fresh ACK must authenticate preimages even when their references are unchanged",
+        );
+        assert_eq!(encode_standard_runtime_state(&runtime.snapshot()), before);
+        let mut bad_signature = authorization.clone();
+        let InvocationAuthorization::AuthorityReceipt(receipt) = &mut bad_signature else {
+            unreachable!()
+        };
+        receipt.signature[0] ^= 1;
+        assert_eq!(
+            runtime.acknowledge_clean_invocation_with_status(&work, &bad_signature),
+            Err(InvocationError::InvalidAuthorization),
+            "validated work does not authenticate the receipt signature",
+        );
+        assert_eq!(encode_standard_runtime_state(&runtime.snapshot()), before);
         let (acknowledgement, applied) = runtime
             .acknowledge_clean_invocation_with_status(&work, &authorization)
             .unwrap();

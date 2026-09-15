@@ -2,6 +2,14 @@
 
 ## Follow-up after the frozen review snapshot
 
+Latest source-only optimization removes a duplicate blob-validation pass on
+fresh ACKs after the same immutable work was validated by acknowledgement
+recovery. Scope and signature verification remain;31 selected tests pass,
+including corrupted-preimage and signature rejection without state mutation.
+This is **not yet in the bundled guest**: candidate output/gas comparison,
+independent reproduction and pin update remain required. The release binary
+is unchanged; no additional live speedup is claimed.
+
 Latest performance diagnosis uses test-only instruction attribution with the
 real bundled outer runtime: large nested calls execute roughly275 million
 outer instructions versus11–19 million actor instructions; other large calls

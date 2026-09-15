@@ -2,6 +2,33 @@
 
 ## Checkpoint and decision
 
+Fresh-ACK source optimization now removes one redundant availability-validation
+pass within a single immutable-work call chain. `recover_clean_acknowledgement`
+already validates the work before returning no retained acknowledgement; its
+sole private continuation previously called the full validator again. That
+continuation now calls a private authorization helper after work validation,
+retaining descriptor/scope checks, typed authorization matching and signature
+verification. Other callers still use the full validator. The original
+NotCreated-before-invalid-work error ordering is preserved. No public unchecked
+entry point, cross-call authentication cache or durable result shortcut exists.
+
+Acknowledgement-selected host-feature regressions pass:31 passed, zero failed,
+one ignored,48.93s (build27.64s). New fresh-ACK negatives corrupt blob bytes
+without changing their references, and corrupt the receipt signature; both
+reject without state mutation before a valid fresh ACK and exact retry succeed.
+Evidence: `task-tmp/fresh-ack-validation-reuse-tests.log`; session30763 terminal0.
+The bundled-PVM tests in that selection still execute the old pinned artifact:
+they are not candidate-gas qualification for this source change.
+
+**Not yet bundled or performance-qualified.** Next build a candidate guest,
+compare exact output/gas using the existing fixed large-ACK test and
+`VOS_AGENT_RUNTIME_COST_CANDIDATE`, then independently reproduce and update pins
+only after equivalence/hostile-frame checks pass. The release executable remains
+`206ea1e3` and guest pin/source remain `79c7d1f0…` / `aad65049`. Do not claim a
+live latency improvement or close any production gate from native tests alone.
+
+### Outer-runtime instruction attribution
+
 Instruction attribution now separates the outer AgentRuntime from nested
 actors using the existing read-only Refine observer. The opt-in
 `VOS_AGENT_PROFILE_REFINE_MACHINES=1` is test-only: it selects the bundled
