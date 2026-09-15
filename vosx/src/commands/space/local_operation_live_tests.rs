@@ -493,12 +493,26 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
     let fixture_prefix = match selected_space.as_str() {
         "native-denial-smoke" => "native-denial-head-reuse.",
         "r17-startup" => "r17-startup-smoke.",
+        "issuer-reuse-smoke" => "issuer-reuse-release.",
         _ => panic!("only the explicitly named disposable campaigns are supported"),
     };
     let (data, space, node_public, address) =
         super::super::local_create::resolve_local_space(&selected_space, None).unwrap();
     assert!(data.to_string_lossy().contains(fixture_prefix));
-    assert_eq!(config_path.parent(), data.parent());
+    let recovery_campaign = selected_space == "issuer-reuse-smoke";
+    let campaign_root = if recovery_campaign {
+        assert!(counter, "recovery fixture only supports Counter checks");
+        data.ancestors().nth(3).expect("isolated XDG fixture root")
+    } else {
+        data.parent().unwrap()
+    };
+    assert_eq!(config_path.parent(), Some(campaign_root));
+    let counter_name = if recovery_campaign { "counter" } else { "counter-smoke" };
+    let counter_path = campaign_root.join(if recovery_campaign {
+        "counter-dist/counter.vos"
+    } else {
+        "counter-artifact/Counter.vos"
+    });
     // Counter uses the already verified Create CLI result for its coordinates;
     // it does not need an unrelated Catalog installed in the same Local agent.
     let target = if counter {
@@ -514,14 +528,14 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
             hex::encode(acknowledgement.managed.agent.0)
         );
         let package = vos::agent::package_admission::admit_actor_package(
-            &std::fs::read(data.parent().unwrap().join("counter-artifact/Counter.vos")).unwrap(),
+            &std::fs::read(&counter_path).unwrap(),
         )
         .unwrap();
         CatalogActorTarget {
             space,
             system_agent: acknowledgement.managed.agent,
             system_runtime_deployment: acknowledgement.managed.runtime_deployment,
-            actor: ActorId::top_level(acknowledgement.managed.agent, "counter-smoke"),
+            actor: ActorId::top_level(acknowledgement.managed.agent, counter_name),
             deployment: package.deployment(),
             program: package.program(),
             authority: acknowledgement.authority.binding,
@@ -560,8 +574,7 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
         limit: 1,
     };
     let counter_package = counter.then(|| {
-        let path = data.parent().unwrap().join("counter-artifact/Counter.vos");
-        vos::agent::package_admission::admit_actor_package(&std::fs::read(path).unwrap()).unwrap()
+        vos::agent::package_admission::admit_actor_package(&std::fs::read(&counter_path).unwrap()).unwrap()
     });
     let operator = crate::identity::load_existing().unwrap();
     let identity =
@@ -642,7 +655,7 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
             };
             message.extend_from_slice(&call.encode());
             let actor = if counter {
-                ActorId::top_level(target.system_agent, "counter-smoke")
+                ActorId::top_level(target.system_agent, counter_name)
             } else {
                 target.actor
             };

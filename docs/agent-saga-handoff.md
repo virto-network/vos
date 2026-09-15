@@ -2,6 +2,41 @@
 
 ## Checkpoint and decision
 
+Current release (`668a86bb`) passes recovered-space restart/HTTP/stable SSH
+identity with clean SIGINT shutdown in the idle-ingress probe: readiness30s,
+HTTP status `ok`, SSH key equal to the original fixture, shutdown within5s.
+Logs: `task-tmp/issuer-reuse-release.QR6Y4x/fixed-restart*`; session44307 terminal.
+
+Counter functional qualification now passes against that same release:
+mutation returned7 with positive retirement and exact-retry checks (39.55s test;
+managed attempt38.01s), and a subsequent restart-read returned7 with the same
+retirement/retry checks (32.42s test; managed attempt30.92s). The second check did
+not repeat the mutation. The opt-in CLI test helper now explicitly allows this
+disposable campaign, validates its XDG fixture root, and selects the actual
+`counter` name / `counter-dist/counter.vos`; older fixtures retain their paths
+and names. No production code or release executable changed for this adaptation.
+CLI test binary build passed41.35s; log `pending-binding-release.QlSlXs/counter-campaign-build.log`.
+
+**Shutdown remains a reproduced release failure after invocation.** Both phases
+exceeded the unchanged5s SIGINT deadline; cleanup waited a further bounded5s
+then killed and reaped only its own daemon. Overall probe sessions18429 and70435
+exited1 despite their individual functional tests passing. Readiness was48s
+before mutation and57s before the post-kill read. The original data and retained
+requests remain in place. No data reset, repeated mutation or replacement nonce
+was used; the second startup recovered after forced termination. Evidence:
+`counter-check{.sh,.log}`, `counter-read-check.log`, `counter-{mutation,read}-{up,test}.log`
+under the original fixture. The two managed preparation roots are
+`agent-client/managed-counter-mutation` and `agent-client/managed-counter-read-after-restart`.
+
+Logs show inventory reconciliation still progressing around shutdown. Code
+inspection finds synchronous `drive_clean_agent_owner()` between shutdown checks
+in `VosNode::run_forever_with`, with inventory queries dispatched synchronously.
+This is the next shutdown investigation target, not yet a proven complete cause
+or an implemented cancellation fix. Do not extend the5s gate or erase these
+failures with the earlier idle-shutdown pass. Startup latency also remains above
+the10s gate. Counter results do not qualify protected/non-Public policy or the
+remaining production finality, retention and proof gates.
+
 Live recovery and Counter Install now pass on release source `668a86bb` at the
 original preserved-space path. Readiness took147s; the resumed Install reservation
 then completed in92s with exit0 and a verified1,654-byte acknowledgement for
@@ -19,8 +54,8 @@ the former reconciliation failure and reached lifecycle-controller setup at
 reconciliation took33,260ms, with individual inventory queries around4–6s.
 These are observed phase timings, not a controlled before/after benchmark.
 The147s startup still fails the10s release gate;92s Install is still too slow.
-A subsequent restart/HTTP/SSH and Counter invocation check remain to be run
-on this fixed release. Do not infer full lifecycle or production qualification.
+Subsequent restart/HTTP/SSH and Counter checks are recorded above, including
+the post-invocation shutdown failures. Do not infer production qualification.
 
 The configured release build passed in6m50s, and bundle creation/verification
 pass with unchanged runtime/system pins. Executable SHA-256:

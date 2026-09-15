@@ -21,8 +21,11 @@ recovers at its original path (147s), and Counter Install returns a verified
 acknowledgement (92s). Recovery recognizes the exact reserved binding staged
 before journal-head publication; it neither resets stores nor marks staged
 work applied. A separate retry fix preserves the original publication successor.
-Both have regression evidence in the handoff. Restart/ingress and Counter
-invocation still need current-release checks; latency remains a release blocker.
+Both have regression evidence in the handoff. Current-release idle restart,
+HTTP and stable SSH identity pass (30s startup), as do Counter mutation/exact
+retry and read-after-restart. Post-invocation shutdown fails its unchanged5s
+deadline in both probes and requires forced cleanup. Latency and shutdown
+remain release blockers; the functional passes are not production sign-off.
 
 For review, use two scoped batches: integrated architecture through `f79f0e3d`,
 then checkpoint/recovery closeout and final qualification. The first checkpoint
