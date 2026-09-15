@@ -2,6 +2,26 @@
 
 ## Checkpoint and decision
 
+Counter packaging passes with the current CLI and isolated operator identity:
+`actor build examples/actors/counter --name counter` completed its pinned guest
+build in 27.18s. Package/PVM and build log are under
+`task-tmp/issuer-reuse-release.QR6Y4x/counter-dist/` and `counter-build.log`;
+ProgramId `0d2d77723e24432b0d2af5d1d94f5937fac528d2bbb3ce1391bd0905329fd402`.
+The initial Install probe incorrectly supplied present-empty constructor data;
+Counter requires absent data, so local validation rejected it before any signed
+Install request was published or sent. Its reserved client nonce remains.
+After correcting that input and selecting `--resume` to preserve the nonce,
+the next probe exceeded its 180s daemon-readiness allowance before invoking
+Install. Startup logs show serial inventory queries taking about 11s each.
+No Install request file exists and no Install response-time result is claimed.
+The isolated space, package and pending reservation are preserved. Evidence:
+`install{,-probe,-up}` and `install-resume{,-probe,-up}` logs/JSON/stderr under
+the same probe directory, plus `create-probe.sh install-resume`. Sessions
+`5932` and `68538` are terminal and their daemons were joined without forced
+cleanup. Do not allocate a replacement nonce or interpret this as an HTTP
+Install failure: the corrected request was never submitted. The full feature
+suite remains running in session `12062`; concurrent load limits timing claims.
+
 Exact recovery of the timed-out Create now passes on the same release and
 original fixture path. `create-local-agent --resume` returned a verified
 1,520-byte acknowledgement for Agent
