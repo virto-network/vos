@@ -2977,6 +2977,14 @@ mod tests {
             MAX_AUTHORITY_OPERATION_ISSUER_RECORDS
         );
         assert!(store.image().unwrap().len() <= MAX_AUTHORITY_OPERATION_ISSUER_IMAGE_BYTES);
+        let before_image = store.image();
+        let before_commits = store.commits();
+        let before_signatures = (
+            signer.receipt_calls,
+            signer.acknowledgement_calls,
+            signer.application_calls,
+            signer.retirement_calls,
+        );
         let (call, approval) = fixture.approved(10_000, 10_000);
         assert!(matches!(
             issuer.issue(&call, &approval, 20, &mut signer),
@@ -2984,6 +2992,17 @@ mod tests {
                 AuthorityOperationIssuerRejection::JournalFull
             ))
         ));
+        assert_eq!(store.image(), before_image);
+        assert_eq!(store.commits(), before_commits);
+        assert_eq!(
+            (
+                signer.receipt_calls,
+                signer.acknowledgement_calls,
+                signer.application_calls,
+                signer.retirement_calls,
+            ),
+            before_signatures,
+        );
         let reopened = open(store, &fixture);
         assert_eq!(
             reopened.retained_operations(),

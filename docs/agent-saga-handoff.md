@@ -2,6 +2,16 @@
 
 ## Checkpoint and decision
 
+Issuer capacity safety regression: the full 256-record issuer test now
+explicitly proves overflow preserves the exact image and commit count and
+performs no receipt, acknowledgement, application or retirement signing. The
+strengthened test passes (30.34s; locked offline build 34.35s), with evidence
+in shared target `task-tmp/issuer-capacity-atomicity.log`. This does not reclaim
+capacity or alter production behavior. A separate two-test baseline sequence
+is still running its full-protocol coordinator capacity setup as of this
+checkpoint (`task-tmp/operation-capacity-baseline.log`); do not count it as
+passed or launch a replacement without checking its existing process handle.
+
 System-actor and clean-break qualification at `c9c5ecce`: explicit locked
 offline nested-workspace suites pass, with 58 Authority tests (139.27s) and
 10 Catalog tests (27.36s), zero ignored. The Authority suite includes its
