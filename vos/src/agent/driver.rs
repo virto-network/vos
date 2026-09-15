@@ -6493,6 +6493,7 @@ mod tests {
         (prior, next, invocation)
     }
 
+    #[cfg(feature = "pvm")]
     #[test]
     fn sdk_terminal_failure_successor_requires_the_exact_retained_reply() {
         use crate::agent_sdk::{RuntimeOutcome, RuntimeWork};
@@ -6582,6 +6583,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "pvm")]
     #[test]
     fn sdk_terminal_failure_resume_successor_requires_continuation_consumption() {
         use crate::agent_sdk::{RuntimeOutcome, RuntimeWork};

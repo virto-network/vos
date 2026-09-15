@@ -8466,6 +8466,53 @@ updating the runtime blob, ProgramId and provenance together. The dirty-tree
 candidate alone is not reproducibility evidence. No bundled pin changed and
 no live space was started during this step.
 
+### Reproduced terminal-failure runtime pin (C2)
+
+Source chunk **`2ef2220e035fb713a7dced8b6e49ef8d9bcd306b`** contains the
+cooperative-yield export fix, authenticated terminal-failure retention,
+clean dispatch/native verification, and scoped regression/live-test fixtures.
+It is committed on `wip/ch08-runtime-directory`, not merged into `saga/agents`.
+Two fresh source exports and independent targets reproduce byte-identical
+ELF and PVM artifacts, also identical to the physically tested candidate.
+Evidence: `task-tmp/runtime-failure-candidate.t49q9i/reproduce.sh`,
+`first/`, `second/`, and `reproduction.log`. The pinned identity and digests
+are the candidate values recorded immediately above; both guest builds used
+locked/offline nightly-2026-03-20 and the immutable 42f3f3bf host builder.
+
+The bundled PVM, `STANDARD_RUNTIME_PROGRAM_ID`, build-time digest, and
+`support/production-artifacts.toml` now agree on that reproduced artifact.
+System actor templates and ABI/schema remain unchanged. The physical
+terminal-failure lifecycle test is now an ordinary bundled regression (an
+explicit candidate environment variable remains available for future probes).
+
+The normal native feature build initially exposed PVM-only gates on shared
+validation helpers. Those pure helpers now compile under either `std` or
+`pvm`; guest-only test fixtures retain their PVM gates. This does not alter
+the reproduced guest code selection. The failed attempts remain in `cli.log`
+and `build-cli.log`; they are not passing validation evidence.
+
+Post-pin checks in the same evidence directory:
+
+- `bundled.log`: **4 passed**, 0 failed, 1 optional profiling probe ignored,
+  **4.01s**;
+- `native.log`: **10 passed**, 0 failed, 1 expensive capacity diagnostic
+  ignored, **90.55s**;
+- `clean-break.log`: normal CLI build and retained/retired command surface
+  checks pass; normal build **22.44s**;
+- `cli-native-features.log`: **252 passed**, 0 failed, **17 ignored**, **67.29s**.
+  Ignored diagnostics/live campaigns remain unproved by this suite.
+
+Formatting and whitespace checks pass. All build/test process handles are
+terminal; no daemon is running from this step.
+
+The prior source/artifact mismatch warning is superseded by this coordinated
+pin and successful normal build, not by a production-readiness declaration.
+Existing spaces still pin their own old runtime; no implicit migration or
+repair of the original negative CIP1 occurred. Next run the corrected
+compiled-yield and failure-retirement campaign in a fresh disposable space,
+then address typed-error retirement and the remaining original C1/C2/C3
+gates, including production latency. No live space ran during this pin step.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

@@ -2877,7 +2877,7 @@ fn standard_state_limit(state: &StandardRuntimeState) -> usize {
     })
 }
 
-#[cfg(feature = "pvm")]
+#[cfg(any(feature = "pvm", feature = "std"))]
 pub(crate) fn clean_reply(reply: ActorExecutionReply) -> crate::agent_sdk::InvocationReply {
     crate::agent_sdk::InvocationReply {
         invocation: crate::agent_sdk::InvocationId(reply.invocation.0),
@@ -2906,7 +2906,7 @@ pub(crate) fn clean_reply(reply: ActorExecutionReply) -> crate::agent_sdk::Invoc
     }
 }
 
-#[cfg(feature = "pvm")]
+#[cfg(any(feature = "pvm", feature = "std"))]
 const fn clean_lane(lane: StateLane) -> crate::agent_sdk::StateLane {
     match lane {
         StateLane::Linear => crate::agent_sdk::StateLane::Linear,
@@ -2915,7 +2915,7 @@ const fn clean_lane(lane: StateLane) -> crate::agent_sdk::StateLane {
     }
 }
 
-#[cfg(feature = "pvm")]
+#[cfg(any(feature = "pvm", feature = "std"))]
 const fn clean_mode(mode: super::MethodMode) -> crate::agent_sdk::MethodMode {
     match mode {
         super::MethodMode::Query => crate::agent_sdk::MethodMode::Query,
@@ -9475,15 +9475,15 @@ pub(crate) mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
-    #[ignore = "requires an explicit candidate until the failure-retaining runtime is repinned"]
-    fn candidate_runtime_terminal_failure_lifecycle_matches_source() {
+    fn bundled_runtime_terminal_failure_lifecycle_matches_source() {
         use crate::agent_sdk::wire::CanonicalWire as _;
         use crate::agent_sdk::{
             RuntimeExecutionContext, RuntimeOutcome, RuntimeTransition, RuntimeWork,
         };
-        let path = std::env::var_os("VOS_AGENT_RUNTIME_FAILURE_CANDIDATE")
-            .expect("supply the compiled failure-retaining runtime candidate");
-        let program = std::fs::read(path).unwrap();
+        let program = match std::env::var_os("VOS_AGENT_RUNTIME_FAILURE_CANDIDATE") {
+            Some(path) => std::fs::read(path).unwrap(),
+            None => include_bytes!("../../../vosx/blobs/agent_runtime.pvm").to_vec(),
+        };
         let execute = |work: RuntimeWork| {
             let expected = apply_standard_runtime_work(work.clone()).unwrap();
             let input = work.encode().unwrap();

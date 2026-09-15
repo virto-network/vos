@@ -2468,7 +2468,7 @@ impl StandardAgentRuntime {
         Ok(LifecycleReply::Installed(entry))
     }
 
-    #[cfg(feature = "pvm")]
+    #[cfg(any(feature = "pvm", feature = "std"))]
     fn validate_invocation_target(
         &self,
         invocation: &super::execution::ActorInvocation,
@@ -2683,7 +2683,7 @@ impl StandardAgentRuntime {
         }
     }
 
-    #[cfg(feature = "pvm")]
+    #[cfg(any(feature = "pvm", feature = "std"))]
     pub(crate) fn validate_clean_unseen_invocation_slot(
         &self,
         authorization: &crate::agent_sdk::InvocationAuthorization,
@@ -3884,7 +3884,7 @@ impl StandardAgentRuntime {
     /// This primitive is intentionally separate from the legacy clock-only
     /// failure path. Clean guest dispatch and the native successor verifier
     /// both derive terminal failure successors through this operation.
-    #[cfg(feature = "pvm")]
+    #[cfg(any(feature = "pvm", feature = "std"))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn retain_clean_terminal_failure(
         &mut self,
