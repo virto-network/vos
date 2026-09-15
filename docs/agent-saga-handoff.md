@@ -4,8 +4,8 @@
 
 Current HEAD pins the independently reproduced authorization-reuse follow-up
 (`db577aff…`), with 18 release-pin and five physical lifecycle/lineage checks
-passing. The fresh-space daemon smoke below refers to the preceding pin; no
-newest-pin daemon latency result is claimed.
+passing. Newest-pin fresh startup/restart now pass in 28/39 seconds with HTTP,
+unchanged SSH key and clean shutdown; production latency remains failing.
 
 Latest source qualification: the independently reproduced acknowledgement
 optimization is now pinned, with 18 release-pin tests and five physical
@@ -493,6 +493,28 @@ the `first/` and `second/` source/build/artifact directories, `physical-tests.lo
 `post-pin-cli.log`, `post-pin-physical.log` and `post-pin-lineage.log`. No guest
 ABI or system-template change was made; no existing fixture was relabelled.
 All builds/tests from this checkpoint are terminal.
+
+### Newest-pin release smoke
+
+The locked release CLI build from `c5260e9f` completed in **6m26s**; its runtime
+and production source match the `bb6c35b9` C2 review checkpoint (the intervening
+commit only records review references). A new isolated space named
+`authorization-pin-smoke` was created, generating the default HTTP/SSH config.
+That generated config was retained, then only the test ports were changed to
+loopback **18098/2240**. Prior fixtures and services were untouched.
+
+The complete smoke script exited zero: **28 s first startup, 39 s restart**,
+HTTP `status == ok` on both, exactly one SSH key record per run, identical
+non-comment key records, and clean SIGINT shutdown after each run. No test
+daemon remains. These are new-history observations, not controlled wall-time
+speedup measurements. The 10-second startup test and Create/Install latency,
+capacity, Shared finality and remaining release/profile gates are still open.
+
+Evidence: `authorization-pin-smoke.thZJrt/` contains `build.log`, `new.json`,
+`new.stderr`, `generated-local.toml`, `cli.sh`, `smoke.sh`, `smoke.log`,
+`first-up.log`, `restart-up.log`, HTTP responses and SSH key records. All
+scratch and fixture stores are disk-backed. Review refs remain frozen; neither
+`saga/agents` nor master was advanced.
 
 ## Local evidence and resumption
 

@@ -3,8 +3,9 @@
 Latest pin: the authorization-reuse follow-up from `126657f7` is independently
 reproduced and bundled as ProgramId `db577aff…`. Nine candidate checks, 18
 post-pin release checks and five physical lifecycle/lineage checks pass. Fixed
-large-ACK gas is 13.6% lower than the preceding pin with identical output. No
-daemon smoke or startup latency pass exists for this newest pin yet.
+large-ACK gas is 13.6% lower than the preceding pin with identical output.
+Newest-pin fresh startup/restart now pass in 28/39 seconds with HTTP, unchanged
+SSH key and clean shutdown. This remains above the 10-second startup gate.
 
 Previous pin update: the acknowledgement optimization from `e3e9cb85` was
 bundled with matching provenance, ProgramId and build-time digest. Two independent
