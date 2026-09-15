@@ -21,6 +21,10 @@ cause remains unproven. Exact retained Install recovery now passes, as below.
 The updated release executable at `2a4f17ea`, including both subsequent host
 optimizations, passes startup/HTTP/SSH in 99 seconds. Startup remains too slow;
 different retained histories prevent treating these runs as a controlled A/B.
+The newer release executable at `ec8bdb70`, including the nested decoder
+changes, passes the same startup/HTTP/SSH/shutdown check in 112 seconds.
+The fixed-history decode improvement below has not established an end-to-end
+startup improvement; production latency remains open.
 See the current closeout plan below; later checkpoint sections retain historical
 results, including failures that have since been fixed.
 Earlier clock-test pass counts had a fixture-dispatch gap; see "Retained
@@ -9769,6 +9773,24 @@ improvement, not a daemon startup or Create/Install latency pass. The last
 measured daemon still predates these decoder changes; production latency,
 authenticated reclamation, finality and other original release gates remain
 open. All comparison/build/test processes from this checkpoint have exited.
+
+The actual release CLI was then built at `ec8bdb70` (production code unchanged
+from `d2aa1efe`), using the same configured profile/toolchain: build passed in
+6m12s. The isolated existing r17 fixture started at **09:20:26 UTC** on
+2026-09-15 and reported ready at **09:22:18 UTC**, **112 seconds**. HTTP status
+was `ok`, the SSH public-key output matched the original fixture byte-for-byte,
+and shutdown completed cleanly at 09:22:18. No Create/Install or actor mutation
+was submitted. The original 300-second observation deadline was unchanged.
+Evidence in the same fixed-history directory: `daemon-ec8bdb70-build.log`,
+`startup-ec8bdb70.sh`, `daemon-ec8bdb70-startup.log`, `daemon-ec8bdb70-up.log`,
+`daemon-ec8bdb70-status.json` and `daemon-ec8bdb70-ssh-key.txt`.
+
+This closes the startup functional regression check, not the latency gate.
+The earlier 99-second startup and this 112-second startup are not a controlled
+fixed-history A/B; this run provides no evidence of improved startup latency.
+The scoped physical-decoder benchmark cannot substitute for locating and
+reducing the remaining end-to-end startup work. No daemon from this smoke
+test remains running.
 
 ### Durable client acknowledgement before completion
 
