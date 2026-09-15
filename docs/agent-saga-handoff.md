@@ -2,6 +2,21 @@
 
 ## Checkpoint and decision
 
+Release qualification of preflight reuse at `c1ab75a5`: locked offline release
+build passed in 6m29s. The existing disposable space reopened, passed HTTP
+status and the exact original SSH key check, and shut down cleanly. Each of
+the four inventory queries emitted exactly one preflight-consumption event
+and nine physical executions (previous probe: ten). Summed physical load/run
+times per query were 3.029, 3.068, 3.036 and 3.000 seconds; inventory loading
+took 23.834 seconds. Total readiness was 63 seconds, with more retained history
+than the previous 55-second probe: do not report an end-to-end speedup or
+production-latency closure. This confirms the production reuse path and smoke
+behavior, not a controlled full-output equivalence benchmark. Evidence in
+shared target `task-tmp/preflight-release.1ft0DF/`: `build.log`, `probe.sh`,
+`up.log`, `status.json`, `ssh-key.txt`; the prior CLI is preserved as
+`vosx-before`. The current shared-target release CLI now contains the reuse
+change. Further substitution/invalidation coverage and final regression remain.
+
 Terminal preflight reuse candidate: the host executor now retains at most one
 completed Direct terminal-admission transition, matching full runtime program
 bytes, canonical work bytes and gas before one-shot consumption by authenticated
