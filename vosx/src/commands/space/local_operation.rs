@@ -102,6 +102,32 @@ pub(super) fn authorize_with_application(
     initial: Option<&AgentTargetedPreparationRequest>,
     apply: bool,
 ) -> anyhow::Result<(PathBuf, Vec<u8>)> {
+    authorize_with_application_validity(
+        data,
+        address,
+        operator,
+        space,
+        node_public,
+        initial,
+        apply,
+        3600,
+    )
+}
+
+// The CLI always uses its original one-hour validity. The explicit internal
+// parameter lets the disposable live test sign a genuinely short-lived call,
+// without backdating requests or changing any server clock/timeout.
+fn authorize_with_application_validity(
+    data: &Path,
+    address: SocketAddr,
+    operator: &libp2p::identity::Keypair,
+    space: SpaceId,
+    node_public: [u8; 32],
+    initial: Option<&AgentTargetedPreparationRequest>,
+    apply: bool,
+    validity_secs: u64,
+) -> anyhow::Result<(PathBuf, Vec<u8>)> {
+    anyhow::ensure!(validity_secs > 0, "authorization validity must be positive");
     anyhow::ensure!(
         address.ip().is_loopback() && address.port() != 0,
         "Local authorization requires nonzero loopback HTTP"
@@ -224,7 +250,7 @@ pub(super) fn authorize_with_application(
                     issued_at: now,
                     valid_from: now.saturating_sub(60),
                     expires_at: now
-                        .checked_add(3600)
+                        .checked_add(validity_secs)
                         .ok_or_else(|| anyhow::anyhow!("validity overflow"))?,
                 };
                 let submission = super::operation_authorization::preparation::prepare(

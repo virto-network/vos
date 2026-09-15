@@ -4,7 +4,8 @@ Current Ch08 WIP warning: `wip/ch08-runtime-directory` now has matching r17
 source and independently reproduced runtime/system-template bundles. Fresh r17
 bootstrap/restart and HTTP/SSH checks now pass (39 s first start, 58 s restart).
 Recovered r17 Create/Install and Counter mutation/exact-retry/restart-read also
-pass; this is not live expiry retirement. Ordinary-agent finality,
+pass. Live unseen-expiry retirement and unchanged Counter state after restart
+now pass too. Ordinary-agent finality,
 cross-runtime actor lifecycle, production latency
 and full release gates remain open. This is not a master-ready branch.
 Timing qualification: earlier live campaigns used the debug CLI. The configured
@@ -27,7 +28,8 @@ with the matching frozen builder and bundled together. Post-pin physical expiry
 and failure-retirement checks pass without candidate overrides; see the r17
 checkpoint below for the current validation results. Fresh r17 bootstrap/restart
 now passes, as do recovered r17 Create/Install and Counter mutation/exact-retry/
-restart-read against the release daemon; live native expiry remains open.
+restart-read against the release daemon. Live unseen-expiry retirement and
+post-expiry restart-read also pass; broader expiry/abort recovery remains open.
 Do not reuse or relabel r16 fixture data.
 The earlier r16 `.lU4S5Z` live campaign passes compiled protected Local yield/resume,
 retirement, two restarts and final-state query, plus Panicked-result retirement
@@ -9363,13 +9365,51 @@ executable, so this is release-daemon correctness coverage, not a pure release
 CLI benchmark or protected/non-Public policy proof.
 
 Scoped handoff: the r17 Counter install/mutate/restart-read baseline is closed;
-do not rerun it merely for status. Next C2 work is live post-issuance expiry
-retirement and a caller-attributed investigation of release startup/operation
+do not rerun it merely for status. The live post-issuance unseen-expiry check
+below now also passes. Next C2 work includes a caller-attributed investigation of release startup/operation
 latency, preserving all validation and timeout limits. Original C1 recovery/
 crash/capacity and C2 finality/profile/lifecycle gates remain open, followed by
 C3 final-source release verification and review. No new feature work or review
 batch is added by this campaign. The branch is not ready for master or ordinary
 production use; disposable functional testing remains the supported scope.
+
+### Live r17 unseen-expiry retirement campaign
+
+The existing disposable r17 Counter harness now includes an expiry phase and
+a distinct post-expiry restart-read intent. The client authorizes an increment
+using a genuinely signed 180-second validity, retains but does not deliver the
+application, and waits until wall-clock time is strictly after receipt expiry.
+An internal helper accepts this test validity; the normal CLI still uses 3600
+seconds. No server timeout, trusted clock, signature validation or bundled
+runtime changes. Retried operations retain their original signed bytes.
+
+`real_daemon_counter_unseen_expiry_and_retirement` passes against the configured
+release daemon: one test, 234.39s including issuance and the real expiry wait.
+The post-expiry managed attempt completed in 0.94s. It verifies the exact
+`ExpiredBeforeExecution` result, durable positive retirement, late Invoke
+rejection, positive ACK retries and completed managed retry. Invocation:
+`c2abb3a44a524195bfa093167b20d73f3d878b107ec06060e3dcba959867c60d`;
+signed expiry Unix slot `1789454148`. Startup ran 06:30:33–06:31:57 UTC on
+2026-09-15; the test completed and daemon stopped cleanly at 06:35:51.
+The separate restart-read phase also passes: one test, 63.56s (managed attempt
+62.08s), returning seven rather than fourteen, with positive retirement and
+exact retries. Its fresh invocation is
+`c1a3ed0bf993a21faf0bc2a86741b8c8aeebe32dd9e4799469dcfbd2765292b4`.
+Restart ran 06:35:51–06:39:00 (189s), the read completed at 06:40:03, and shutdown
+completed cleanly at 06:40:46. The script exited zero; no test daemon remains.
+Evidence: `expiry-release.sh`, `expiry-release-run.log`, `expiry-test.log`,
+`expiry-up.log`, `expiry-read-test.log` and `expiry-read-up.log` in the same r17
+fixture. This proves the expired increment did not mutate the Counter across
+restart; the startup delay remains unacceptable.
+
+The harness compiles. Focused managed-client regressions pass (3 tests, 0.38s,
+14 explicitly ignored live tests); all three managed application/retirement
+regressions pass (8.41s), including negative-ACK pending-evidence preservation.
+Logs: `expiry-harness-build.log`, `expiry-client-regression.log`, and
+`expiry-retirement-regression.log`. This is C2 coverage, not pre-expiry abort,
+management expiry, mixed-pending/crash/capacity, Shared finality or full release
+closure. The release daemon predates only this client/test harness refactor;
+guest and server code are unchanged.
 
 ### Durable client acknowledgement before completion
 

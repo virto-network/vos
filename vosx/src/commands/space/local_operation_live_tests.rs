@@ -444,22 +444,52 @@ fn real_daemon_counter_value_after_restart() {
     managed_receipt_invocation_and_exact_retry(Campaign::CounterRead);
 }
 
+#[test]
+#[ignore = "requires disposable r17 Counter baseline; waits for real receipt expiry"]
+fn real_daemon_counter_unseen_expiry_and_retirement() {
+    managed_receipt_invocation_and_exact_retry(Campaign::CounterExpiry);
+}
+
+#[test]
+#[ignore = "requires completed disposable r17 expiry followed by daemon restart"]
+fn real_daemon_counter_value_after_expiry_restart() {
+    managed_receipt_invocation_and_exact_retry(Campaign::CounterReadAfterExpiry);
+}
+
 #[derive(Clone, Copy)]
 enum Campaign {
     Catalog,
     Successor,
     CounterMutation,
     CounterRead,
+    CounterExpiry,
+    CounterReadAfterExpiry,
 }
 
 fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
     let successor = matches!(campaign, Campaign::Successor);
-    let counter = matches!(campaign, Campaign::CounterMutation | Campaign::CounterRead);
+    let expiry = matches!(campaign, Campaign::CounterExpiry);
+    let counter = matches!(
+        campaign,
+        Campaign::CounterMutation
+            | Campaign::CounterRead
+            | Campaign::CounterExpiry
+            | Campaign::CounterReadAfterExpiry
+    );
     let config_path = PathBuf::from(
         std::env::var_os("VOSX_INVOKE_SMOKE_CONFIG").expect("explicit disposable configuration"),
     );
-    let selected_space = std::env::var("VOSX_INVOKE_SMOKE_SPACE")
-        .unwrap_or_else(|_| "native-denial-smoke".into());
+    let selected_space =
+        std::env::var("VOSX_INVOKE_SMOKE_SPACE").unwrap_or_else(|_| "native-denial-smoke".into());
+    if matches!(
+        campaign,
+        Campaign::CounterExpiry | Campaign::CounterReadAfterExpiry
+    ) {
+        assert_eq!(
+            selected_space, "r17-startup",
+            "expiry requires the r17 fixture"
+        );
+    }
     let fixture_prefix = match selected_space.as_str() {
         "native-denial-smoke" => "native-denial-head-reuse.",
         "r17-startup" => "r17-startup-smoke.",
@@ -578,6 +608,8 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
         Campaign::Successor => "agent-client/managed-invocation-successor",
         Campaign::CounterMutation => "agent-client/managed-counter-mutation",
         Campaign::CounterRead => "agent-client/managed-counter-read-after-restart",
+        Campaign::CounterExpiry => "agent-client/managed-counter-unseen-expiry",
+        Campaign::CounterReadAfterExpiry => "agent-client/managed-counter-read-after-expiry",
     });
     let mut intent_store = CleanPreparationClientFile::open_or_create(&root).unwrap();
     let intent = match intent_store.load_request().unwrap() {
@@ -600,8 +632,12 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
             getrandom::getrandom(&mut nonce).unwrap();
             let mut message = vec![vos::value::TAG_DYNAMIC];
             let call = match campaign {
-                Campaign::CounterMutation => vos::value::Msg::new("increment").with("by", 7u64),
-                Campaign::CounterRead => vos::value::Msg::new("value"),
+                Campaign::CounterMutation | Campaign::CounterExpiry => {
+                    vos::value::Msg::new("increment").with("by", 7u64)
+                }
+                Campaign::CounterRead | Campaign::CounterReadAfterExpiry => {
+                    vos::value::Msg::new("value")
+                }
                 _ => vos::value::Msg::new("page").with("request", query.encode().unwrap()),
             };
             message.extend_from_slice(&call.encode());
@@ -614,7 +650,10 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
                 AgentRouteKey::new(space, target.system_agent, actor).unwrap(),
                 AgentInvocationIntent::new(
                     InvocationId(nonce),
-                    if matches!(campaign, Campaign::CounterMutation) {
+                    if matches!(
+                        campaign,
+                        Campaign::CounterMutation | Campaign::CounterExpiry
+                    ) {
                         MethodMode::Linear
                     } else {
                         MethodMode::Query
@@ -639,6 +678,49 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
         }
     };
     drop(intent_store);
+    if expiry {
+        // Authorize and retain the application, but do not submit it until the
+        // real signed receipt has expired. No forged clock or fixture receipt.
+        let (authorization_root, _) = authorize_with_application_validity(
+            &data,
+            address,
+            &operator,
+            space,
+            node_public,
+            Some(&intent),
+            false,
+            180,
+        )
+        .unwrap();
+        let application_root = authorization_root.parent().unwrap().join("application");
+        let mut application =
+            super::super::clean_store::CleanInvocationFile::open_or_create(&application_root)
+                .unwrap();
+        let request = application
+            .load_request()
+            .unwrap()
+            .expect("retained unseen invocation");
+        let call = super::super::local_invocation::validate_request(&request).unwrap();
+        let InvocationAuthorization::AuthorityReceipt(receipt) = call.authorization() else {
+            panic!("expiry campaign requires an issued receipt");
+        };
+        let expires_at = receipt.selector.expires_at;
+        drop(application);
+        let now = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        assert!(
+            expires_at.saturating_sub(now()) <= 180,
+            "unexpected receipt window"
+        );
+        eprintln!("issued receipt retained without application; waiting until after {expires_at}");
+        while now() <= expires_at {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
     let start = std::time::Instant::now();
     eprintln!(
         "starting native managed receipt invocation {}",
@@ -696,21 +778,30 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
         call.authorization(),
         InvocationAuthorization::AuthorityReceipt(_)
     ));
-    let AgentInvocationResponse::Direct {
-        outcome: RuntimeOutcome::Completed(Ok(reply)),
-        ..
-    } = super::super::local_invocation::verify_response(&request, &response).unwrap()
-    else {
-        panic!("managed invocation did not succeed");
+    let verified = super::super::local_invocation::verify_response(&request, &response).unwrap();
+    let reply = match verified {
+        AgentInvocationResponse::Direct {
+            outcome: RuntimeOutcome::Completed(Err(InvocationError::ExpiredBeforeExecution)),
+            ..
+        } if expiry => None,
+        AgentInvocationResponse::Direct {
+            outcome: RuntimeOutcome::Completed(Ok(reply)),
+            ..
+        } if !expiry => {
+            assert_eq!(reply.status, InvocationStatus::Done);
+            Some(reply)
+        }
+        other => panic!("unexpected managed outcome: {other:?}"),
     };
-    assert_eq!(reply.status, InvocationStatus::Done);
     if let Some(package) = counter_package {
         assert_eq!(call.work().program, package.program());
         assert_eq!(call.work().deployment, package.deployment());
-        assert_eq!(
-            vos::value::Value::try_decode(&reply.reply).unwrap(),
-            vos::value::Value::U64(7)
-        );
+        if let Some(reply) = &reply {
+            assert_eq!(
+                vos::value::Value::try_decode(&reply.reply).unwrap(),
+                vos::value::Value::U64(7)
+            );
+        }
         // The managed path already acknowledged (and deleted) the reply.
         // Late Invoke must reject the consumed identity, not execute it again.
         // ACK retries below remain positive; a fresh post-restart Query checks
@@ -733,6 +824,7 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
             ));
         }
     } else {
+        let reply = reply.expect("successful Catalog reply");
         let vos::value::Value::Bytes(bytes) = vos::value::Value::try_decode(&reply.reply).unwrap()
         else {
             panic!("expected Catalog bytes");
