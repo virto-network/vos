@@ -9596,12 +9596,117 @@ new test accepts valid reordered coordinator records, checks iterator results
 against individual recovery, and rejects missing/duplicate rows, changed slots
 and changed acknowledgement commitments. Evidence: `cross-image-linear-final.log`
 in the r17 fixture. The long full coordinator-capacity test was explicitly
-filtered in this debug run; its earlier release pass does not certify this
-new source. Re-run it with the final optimized source before release closure.
+filtered in this debug run. The final optimized source at `4e8aa893` now
+passes that full 256-record population, overflow and reopen test: **1 passed,
+zero failures/ignored, 24.27s**, after a 12m59s configured release build
+(`cross-image-full-capacity-release.log`). The remaining issuer/coordinator
+tests pass from that same optimized executable: **45 passed, zero
+failures/ignored, 0.96s** (`cross-image-release-regressions.log`). Together
+these cover all 46 issuer/coordinator tests without filtering out capacity.
+The earlier capacity run took 19.30s; these observations do not demonstrate
+a performance improvement from the lookup change.
 Normal CLI compilation passes (5.21s, existing warnings,
 `cross-image-linear-cli.log`); formatting and diff checks pass.
+The SDK no-default-features check also passes on `4e8aa893` (1.46s,
+`final-source-sdk-no-std.log`): `cargo +nightly-2025-05-09 check --offline
+--locked -p vos-agent-sdk --no-default-features`, using the shared disk-backed
+target and scratch directory. This is the SDK check, not the whole workspace
+feature matrix.
+The unfiltered optimized library run uses the same `4e8aa893` executable with
+`--test-threads=2` and disk-backed `TMPDIR`; its output is retained in
+`final-source-release-library.log`. At this checkpoint the 1,024-entry
+inventory rotation test remains running, so this is not a completed suite
+result. Comparing the executable's test list with terminal per-test log lines
+finds that test as the only outstanding case. The three default-ignored cases
+are native initial-capture capacity and two profiling probes.
+The ignored native initial-capture case was then explicitly run from the same
+optimized executable with `--exact
+agent::clean_bootstrap::tests::physical::native_operation_initial_capture_requires_more_headroom_than_projection
+--ignored --test-threads=1`: **1 passed, zero failures/ignored, 544.26s**,
+`final-source-native-capacity.log`. It ran concurrently with the large
+inventory test and used disk-backed scratch. This requalifies the real 64 MiB
+admission/checkpoint boundary on the updated source; the duration is not a
+controlled latency comparison with the earlier 259.78s run. Only the two
+profiling probes remain intentionally unexecuted in this verification pass.
+
+The restricted run reported 20 socket-dependent failures. The Merge test was
+reproduced alone: it failed waiting for any local listening address, then
+passed unchanged with socket access (1.09s, `final-source-merge-socket.log`).
+The network/HTTP groups pass with socket access (**42 passed**, 8.97s,
+`final-source-network-sockets.log`), and the node-level colliding-prefix Raft
+test passes separately (0.02s, `final-source-node-socket.log`). Matching test
+names confirms these reruns cover every failure reported so far. These are
+separate passing reruns, not a successful exit from the restricted full run;
+no timeout, assertion, or production behavior was changed.
 No end-to-end latency gain is claimed. Authenticated history reclamation and
 the 256-record lifetime ceiling remain unresolved.
+
+A five-second CPU sample of the running optimized native library tests used
+`perf record -F 99 --call-graph dwarf,16384` (270 samples, zero lost samples;
+`library-native-profile.data` and `library-native-profile.txt` in the same
+fixture). BLAKE2 compression accounts for roughly 67% of core-cycle samples
+across the sampled thread names. Even with DWARF stack capture, higher-level
+callers remain unresolved. This is a concurrently running test workload, not
+a daemon latency measurement or evidence identifying a safe validation to
+remove. The sampled library run's elapsed time includes this diagnostic.
+
+A later brief debugger attachment resolved one live inventory-worker stack
+using the explicit local executable and `set sysroot /` (the first attempt's
+automatic target executable lookup failed across PID namespaces). Evidence:
+`inventory-worker-local-symbols.log`; both attempts detached immediately after
+stack capture. The resolved worker path is `reserve_projection_pair` → host
+`capacity` → `audit_recovery_capacity` → physical-row verification → journal
+RuntimeWork decoding → `InvocationWork::validate` → `availability_valid` →
+BLAKE2. The inventory caller was waiting for `load_replicas`. This identifies
+one actual hashing caller in the optimized workload, not its statistical share
+or a production timing result. Source inspection confirms the capacity audit
+walks the retained suffix within one read transaction and authenticates each
+physical row. Any optimization must preserve those fresh row checks; the
+snapshot is not justification for trusting cached capacity across reads.
+
+The follow-up source audit confirms that reclamation cannot be an isolated
+coordinator-vector deletion: native controller startup also bounds retirement
+certificates to `MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS`, while dispatch
+journal bounds allow twice that number for the authorization/issuance pair.
+`NativeAuthorityOperationController::retire_issued` reloads both exact dispatch
+records even for a previously certified retirement, then restores and releases
+the native reservation. Any archive/reclamation implementation must retain a
+verified retry lookup for those records, preserve invocation collisions and
+slot high waters, and recover interrupted publication across the affected
+stores. Raising one limit or deleting only coordinator/issuer rows would not
+close the sustained-operation gate. No retention limits or records were changed
+by this verification pass.
+
+### Reuse validated invocation work within journal decoding
+
+The resolved inventory-worker stack above led to a host-only duplicate check:
+`decode_replay_operation` decodes and validates the complete SDK RuntimeWork,
+then `ReplayInput::decode_body` called a validator that rehashed the same owned
+invocation's availability preimages. Decoding now checks the enclosing runtime
+and operation bindings without repeating that work validation. Constructed or
+subsequently mutated ReplayInput values still validate invocation work in full.
+Invoke, Resume and Acknowledge decoder paths all obtain their work from the
+canonical SDK decoder; authorization, context, lifecycle-proof and yielded
+result bindings remain checked. No validity is cached across calls or physical
+reads. No SDK, wire format, guest artifact or retention limit changed.
+
+The journal suite passes **41 tests**, zero failures/ignored (0.19s,
+`journal-decoded-work-tests.log`). Added enclosing-journal checks verify exact
+Invoke/ACK roundtrips, corrupted blob rejection, runtime substitution rejection
+and full validation after mutation of a decoded value. The existing validation
+equivalence test now exercises the complete constructed ReplayInput validator.
+Physical command byte/shape validation, native issuance/reopen and snapshot
+rotation pass **3 tests** (42.91s, `journal-decoded-work-physical.log`); committee
+transition, corrupt/missing rows and wrong-generation/authority rejection pass
+**3 tests** (4.51s, `journal-decoded-work-ledger.log`). Normal CLI check passes
+(13.06s, existing warnings, `journal-decoded-work-cli.log`). Formatting and
+diff checks pass.
+
+These are focused checks on the new host change. The still-running optimized
+inventory/full-library executable is built from the preceding `4e8aa893`
+source, not this edit. Do not attribute its result to the new decoder. Neither
+an end-to-end latency improvement nor completion of the remaining production
+gates is established by this change.
 
 ### Durable client acknowledgement before completion
 

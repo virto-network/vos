@@ -1606,6 +1606,23 @@ impl ReplayInput {
     }
 
     fn validate_inner(&self) -> Result<(), DecodeError> {
+        match &self.operation {
+            ReplayOperation::CleanInvoke { work, .. }
+            | ReplayOperation::CleanResume { work, .. }
+            | ReplayOperation::CleanAcknowledge { work, .. } => {
+                if !work.validate() {
+                    return Err(DecodeError::NonCanonical);
+                }
+            }
+            _ => {}
+        }
+        self.validate_runtime_and_operation_bindings()
+    }
+
+    /// The caller must have validated the owned invocation work: either above
+    /// for a constructed value, or in decode_replay_operation's SDK decoder.
+    /// This check does not establish any validity that survives mutation.
+    fn validate_runtime_and_operation_bindings(&self) -> Result<(), DecodeError> {
         self.runtime.validate()?;
         // Logical-slot freshness is execution state, not wire canonicality.
         // Both lifecycle and invocation runtimes recover an exact committed
@@ -1644,7 +1661,7 @@ impl ReplayInput {
                 if !context.is_valid() {
                     return Err(DecodeError::NonCanonical);
                 }
-                validate_clean_invocation_authorization(
+                validate_clean_invocation_authorization_binding(
                     &self.runtime,
                     work,
                     authorization,
@@ -1663,7 +1680,7 @@ impl ReplayInput {
                     return Err(DecodeError::NonCanonical);
                 }
                 validate_transition_proof_lifecycle_condition(*context, *expected_live, work)?;
-                validate_clean_invocation_authorization(
+                validate_clean_invocation_authorization_binding(
                     &self.runtime,
                     work,
                     authorization,
@@ -1694,7 +1711,7 @@ impl ReplayInput {
                 authorization,
             } => {
                 validate_transition_proof_lifecycle_condition(*context, *expected_live, work)?;
-                validate_clean_exact_request(&self.runtime, work, authorization)?;
+                validate_clean_exact_request_binding(&self.runtime, work, authorization)?;
             }
             ReplayOperation::Acknowledge {
                 invocation,
@@ -1721,7 +1738,10 @@ impl ServiceWire for ReplayInput {
             runtime: decode_runtime_binding(decoder)?,
             operation: decode_replay_operation(decoder)?,
         };
-        input.validate_inner()?;
+        // Each clean invocation variant came from decode_canonical_runtime_work,
+        // which authenticated its blob preimages. Nothing has mutated the owned
+        // work since then; still verify every enclosing runtime/operation binding.
+        input.validate_runtime_and_operation_bindings()?;
         Ok(input)
     }
 }
@@ -3463,13 +3483,12 @@ fn decode_replay_operation(decoder: &mut Decoder<'_>) -> Result<ReplayOperation,
     }
 }
 
-fn validate_clean_exact_request(
+fn validate_clean_exact_request_binding(
     runtime: &RuntimeBinding,
     work: &crate::agent_sdk::InvocationWork,
     authorization: &crate::agent_sdk::InvocationAuthorization,
 ) -> Result<(), DecodeError> {
-    if !work.validate()
-        || !authorization.matches_work(work)
+    if !authorization.matches_work(work)
         || work.space.0 != runtime.space.0
         || work.agent.0 != runtime.agent.0
         || work.runtime_deployment.0 != runtime.deployment.0
@@ -3567,14 +3586,15 @@ fn validate_clean_management_request(
     Ok(())
 }
 
-fn validate_clean_invocation_authorization(
+fn validate_clean_invocation_authorization_binding(
     runtime: &RuntimeBinding,
     work: &crate::agent_sdk::InvocationWork,
     authorization: &crate::agent_sdk::InvocationAuthorization,
     observed_slot: u64,
 ) -> Result<(), DecodeError> {
     // This is the SDK Invoke predicate with a known-valid Direct context and
-    // empty state. Validate the borrowed inputs, not a cloned serialized copy.
+    // empty state and an already validated work value. Check the borrowed
+    // authorization and enclosing runtime, not a cloned serialized copy.
     // The bounded message, <=16 blob references and fixed authorization fit
     // comfortably within AWRK's non-state/non-preimage framing allowance.
     const _: () = assert!(
@@ -3585,8 +3605,7 @@ fn validate_clean_invocation_authorization(
             <= crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES
                 - crate::agent_sdk::MAX_RUNTIME_AVAILABILITY_BYTES
     );
-    if !work.validate()
-        || !authorization.matches_invoke(work, observed_slot)
+    if !authorization.matches_invoke(work, observed_slot)
         || work.space.0 != runtime.space.0
         || work.agent.0 != runtime.agent.0
         || work.runtime_deployment.0 != runtime.deployment.0
@@ -5517,12 +5536,16 @@ mod tests {
                     && work.agent.0 == input.runtime.agent.0
                     && work.runtime_deployment.0 == input.runtime.deployment.0;
                 assert_eq!(
-                    validate_clean_invocation_authorization(
-                        &input.runtime,
-                        &work,
-                        &authorization,
-                        slot
-                    )
+                    ReplayInput {
+                        runtime: input.runtime.clone(),
+                        operation: ReplayOperation::CleanInvoke {
+                            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                            work,
+                            authorization,
+                            observed_slot: slot,
+                        },
+                    }
+                    .validate_inner()
                     .is_ok(),
                     expected,
                     "public={public} case={case}"
@@ -5588,6 +5611,48 @@ mod tests {
             trailing.push(0);
             assert!(decode_canonical_runtime_work(&trailing).is_err());
             assert!(decode_canonical_runtime_work(&bytes[..bytes.len() - 1]).is_err());
+
+            let replay = ReplayInput {
+                runtime: input.runtime.clone(),
+                operation: if acknowledgement {
+                    ReplayOperation::CleanAcknowledge {
+                        context,
+                        expected_live: None,
+                        work: work.clone(),
+                        authorization: authorization.clone(),
+                    }
+                } else {
+                    ReplayOperation::CleanInvoke {
+                        context,
+                        work: work.clone(),
+                        authorization: authorization.clone(),
+                        observed_slot,
+                    }
+                },
+            };
+            let encoded = replay.encode();
+            let mut decoded = ReplayInput::decode(&encoded).unwrap();
+            assert_eq!(decoded, replay);
+            decoded.validate().unwrap();
+            let offset = encoded
+                .windows(payload.len())
+                .position(|part| part == payload)
+                .unwrap();
+            let mut corrupted = encoded;
+            corrupted[offset] ^= 1;
+            assert!(ReplayInput::decode(&corrupted).is_err());
+
+            let mut wrong_runtime = replay.clone();
+            wrong_runtime.runtime.agent = AgentId([0x77; 32]);
+            assert!(ReplayInput::decode(&wrong_runtime.encode()).is_err());
+
+            let (ReplayOperation::CleanInvoke { work, .. }
+            | ReplayOperation::CleanAcknowledge { work, .. }) = &mut decoded.operation
+            else {
+                unreachable!()
+            };
+            work.availability[0].bytes[0] ^= 1;
+            assert_eq!(decoded.validate(), Err(DecodeError::NonCanonical));
         }
     }
 
