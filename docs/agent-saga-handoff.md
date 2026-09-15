@@ -2,6 +2,20 @@
 
 ## Checkpoint and decision
 
+Current full CLI default suite at `1c787774`: 260 passed, 19 ignored, one
+failure. Unit tests passed 255/255 selected (92.16s); actor-build integration
+passed 4/4 (32.96s); task-build integration passed 1/1 (32.98s). Shutdown smoke
+failed before SIGTERM at its unchanged 10-second endpoint-readiness deadline
+(11.71s test duration). The exact test daemon was reaped; host process
+inspection showed no remaining `vosx` process. This is a debug CLI suite,
+not a release-mode latency benchmark, and it does not qualify the 19 ignored
+tests. Evidence: shared target `task-tmp/review-head-cli-suite.log`.
+The task-build test refreshed its stale `clerk-apply` fixture lockfile with
+the SDK/protocol dependencies now required by `vos`; locked offline metadata
+resolution passes with the corrected lock. No dependency version changed.
+The separate coordinator capacity baseline remains live (session `99095`),
+with over 21 minutes of CPU time observed; it is not counted as passed.
+
 Review-head qualification at source `4f0b6ffb`: all 18 CLI
 `production_release` tests pass (2.17s, locked offline build 24.38s).
 The integration test binaries selected zero tests by this filter; this does

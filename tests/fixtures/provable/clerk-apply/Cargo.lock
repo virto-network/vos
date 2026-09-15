@@ -377,8 +377,17 @@ dependencies = [
  "blake2b_simd",
  "log",
  "rkyv",
+ "vos-agent-sdk",
  "vos-macros",
+ "vos-protocol",
  "vos-pvm-program",
+]
+
+[[package]]
+name = "vos-agent-sdk"
+version = "0.1.0"
+dependencies = [
+ "vos-protocol",
 ]
 
 [[package]]
@@ -388,6 +397,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "vos-protocol"
+version = "0.1.0"
+dependencies = [
+ "blake2b_simd",
+ "rkyv",
 ]
 
 [[package]]
