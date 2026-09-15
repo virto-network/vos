@@ -2,6 +2,18 @@
 
 ## Checkpoint and decision
 
+Review-head qualification at source `4f0b6ffb`: all 18 CLI
+`production_release` tests pass (2.17s, locked offline build 24.38s).
+The integration test binaries selected zero tests by this filter; this does
+not rerun shutdown or the full CLI suite. Evidence: shared target
+`task-tmp/review-head-release-pins.log`. The matching release rebuild, which
+includes the host pagination fix, is still running at this checkpoint
+(exec session `81791`, log `task-tmp/review-head-release-build.log`). Do not
+count it as passed or start a replacement without checking that handle.
+The review guide now identifies the current `79c7d1f0…` pin and separates
+historical results; the old C1 boundary remains unsuitable for standalone
+merge. No merge, push, runtime change or release-gate waiver was performed.
+
 Issuer capacity safety regression: the full 256-record issuer test now
 explicitly proves overflow preserves the exact image and commit count and
 performs no receipt, acknowledgement, application or retirement signing. The

@@ -1,6 +1,36 @@
 # Reviewing the Agent architecture saga
 
-Latest pin: the authorization-reuse follow-up from `126657f7` is independently
+## Current review checkpoint
+
+Implementation checkpoint: `4f0b6ffb` on `wip/ch08-runtime-directory`;
+`saga/agents` remains at `31b0cdbb`. Nothing has been merged or pushed.
+Review the integrated Chapter 8 changes together: the old C1 boundary depends
+on clean-break corrections in C2 and is not independently merge-ready. The
+frozen C2 review ref (`bb6c35b9`) does not include the subsequent fixes and
+qualifications through this checkpoint. No C3 release sign-off is claimed.
+
+Current runtime pin: `79c7d1f0ed2feff40eaca198951656c705d687ab83bbd581a8895a13db0022a7`,
+reproduced from guest source `aad65049` and committed in `83737aee`.
+Two independent builds match byte-for-byte; 18 post-pin release checks and
+six physical integration tests pass. Fresh release startup/restart at
+`83737aee` passed HTTP/SSH checks in 27/37 seconds. That executable predates
+the host inventory pagination fix `ec779164`; rebuilding it does not by itself
+qualify live pagination or ordinary Create/Install latency.
+
+This is a disposable-test/review checkpoint, not production readiness.
+Remaining blockers include production ordinary Shared-agent genesis/finality
+wiring, authenticated reclamation of the host's 256-record operation journal,
+startup/Create/Install latency and shutdown gates, and the final integrated
+release matrix including full cryptographic proof qualification. See
+[the handoff](agent-saga-handoff.md) for exact evidence and remaining work.
+
+## Historical checkpoints
+
+The entries below describe earlier pins and source revisions, not the current
+release identity. Timings with different retained histories are not controlled
+before/after comparisons.
+
+Previous pin: the authorization-reuse follow-up from `126657f7` is independently
 reproduced and bundled as ProgramId `db577aff…`. Nine candidate checks, 18
 post-pin release checks and five physical lifecycle/lineage checks pass. Fixed
 large-ACK gas is 13.6% lower than the preceding pin with identical output.
