@@ -2,7 +2,8 @@
 
 ## Current review checkpoint
 
-Implementation checkpoint: `8716f6a7` on `wip/ch08-runtime-directory`;
+Review snapshot: `2d88d540` on `wip/ch08-runtime-directory`;
+latest production implementation and release executable: `8716f6a7`.
 `saga/agents` remains at `31b0cdbb`. Nothing has been merged or pushed.
 Review the integrated Chapter 8 changes together: the old C1 boundary depends
 on clean-break corrections in C2 and is not independently merge-ready. The
@@ -14,29 +15,85 @@ reproduced from guest source `aad65049` and committed in `83737aee`.
 Two independent builds match byte-for-byte; 18 post-pin release checks and
 six physical integration tests pass. Fresh release startup/restart at
 `83737aee` passed HTTP/SSH checks in 27/37 seconds. The release executable has
-since been rebuilt at implementation source `668a86bb`, including issuer
+subsequently rebuilt at implementation source `668a86bb`, including issuer
 validation reuse, pagination/checkpoint changes and two exact-recovery fixes;
 its bundle creation and verification pass. The preserved test space now
 recovers at its original path (147s), and Counter Install returns a verified
 acknowledgement (92s). Recovery recognizes the exact reserved binding staged
 before journal-head publication; it neither resets stores nor marks staged
 work applied. A separate retry fix preserves the original publication successor.
-Both have regression evidence in the handoff. Current-release idle restart,
+Both have regression evidence in the handoff. At `668a86bb`, idle restart,
 HTTP and stable SSH identity pass (30s startup), as do Counter mutation/exact
 retry and read-after-restart. Post-invocation shutdown fails its unchanged5s
 deadline in both earlier probes and requires forced cleanup. The follow-up
-`8716f6a7` release stops inventory pagination at shutdown-safe boundaries:
+`8716f6a7` release (the current executable; bundle verification passes) stops
+inventory pagination at shutdown-safe boundaries:
 busy-inventory SIGINT passed within5s, but SIGTERM exceeded5s before exiting
 during cleanup without SIGKILL. This does not establish a signal-type difference
 or close the shutdown gate. Latency and shutdown remain release blockers;
 the functional passes are not production sign-off.
 
-For review, use two scoped batches: integrated architecture through `f79f0e3d`,
-then checkpoint/recovery closeout and final qualification. The first checkpoint
-has 1,429 passing default library tests and 1,862 passing host-feature library
-tests, but still fails latency/release gates. Do not infer merge readiness from
-library tests or merge the old C1 boundary independently. The later checkpoint
-changes have focused test coverage, not a passing final integrated matrix.
+### Two review batches, not 318 individual commit reviews
+
+These immutable ranges define the review snapshot. They are sequential, not
+independently deployable alternatives. No new review refs or merges were made.
+
+| Batch | Exact diff range | Scope and size |
+| --- | --- | --- |
+| 1: Integrated architecture | `31b0cdbb..f79f0e3d` | Clean-break architecture, runtime/artifacts and native lifecycle; 225 files, +72,934/-58,875 lines. |
+| 2: Recovery and qualification follow-up | `f79f0e3d..2d88d540` | Checkpoint admission, exact replay/publication recovery, safe-boundary shutdown, live tests and evidence; 12 files, +1,171/-39 lines. |
+
+From this worktree, review without changing branches:
+
+```sh
+git diff --stat 31b0cdbb..f79f0e3d
+git diff 31b0cdbb..f79f0e3d -- vos/src/agent
+git diff --stat f79f0e3d..2d88d540
+git diff f79f0e3d..2d88d540 -- vos/src vosx/src
+```
+
+The first batch remains large; two batches simplify review sequencing, not the
+underlying change size. Batch 2's primary correctness questions are whether
+recovery accepts only the exact authenticated pending reservation, exact replay
+retains its original successor, and shutdown stops new pagination without
+interrupting durable work or treating incomplete work as applied.
+
+Test baselines: 1,429 default library tests passed at `0bf97332`; 1,862
+host-feature library tests passed at `f79f0e3d`. Later recovery changes have
+focused regression coverage; the shutdown implementation has 11 passing
+production-owner tests and eight passing selected shutdown tests. These do not
+constitute a passing final integrated matrix. Do not infer production readiness
+from library tests or merge the old C1 boundary independently.
+
+### Measured performance and the next bounded fix
+
+On unchanged release `8716f6a7`, one periodic Credential query took 4.780s:
+10 runtime load/run spans totaled 2.950s, with two roughly 790KB inputs taking
+2.302s together. About 1.83s remains outside those measured spans. A separate
+8s CPU sample attributed roughly 52% to interpreter execution, 20% to
+conformance gas-cost simulation functions and 19% to BLAKE2. Sample shares are
+not wall-time fractions or a controlled before/after benchmark.
+
+Refine currently repeats immutable program parsing, validation, instruction
+decoding and block-gas-cost preparation on each load. The next bounded candidate
+is opaque, validated, bounded prepared-program reuse, with fresh memory,
+registers, arguments, gas and inner-machine state per invocation. It is **not
+implemented or qualified**. Require cold/prepared equivalence for output, exit,
+gas and state isolation, then measure the gain before rebuilding the release.
+Do not change charged gas, omit authenticated work bytes or reuse results to
+achieve a latency target. The profiling evidence does not yet fully explain
+the 92s Install or startup delays.
+
+### Test deployment boundary and remaining release work
+
+The checkpoint supports initial testing in a disposable environment, not a
+production rollout or master release. Start with a fresh isolated space and
+retain logs and exact client requests; do not migrate existing production
+stores through this clean-break branch. Preserved fixtures must stay at their
+original absolute paths because their host bindings include path identity.
+Expect startup delays, possible request timeouts and a failing busy-shutdown
+deadline. An HTTP timeout does not prove that a mutation failed: preserve and
+resume the exact operation rather than issuing a fresh replacement mutation.
 
 This is a review checkpoint, not production readiness.
 Remaining blockers include production ordinary Shared-agent genesis/finality
