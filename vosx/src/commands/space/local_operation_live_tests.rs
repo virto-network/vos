@@ -458,9 +458,16 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
     let config_path = PathBuf::from(
         std::env::var_os("VOSX_INVOKE_SMOKE_CONFIG").expect("explicit disposable configuration"),
     );
+    let selected_space = std::env::var("VOSX_INVOKE_SMOKE_SPACE")
+        .unwrap_or_else(|_| "native-denial-smoke".into());
+    let fixture_prefix = match selected_space.as_str() {
+        "native-denial-smoke" => "native-denial-head-reuse.",
+        "r17-startup" => "r17-startup-smoke.",
+        _ => panic!("only the explicitly named disposable campaigns are supported"),
+    };
     let (data, space, node_public, address) =
-        super::super::local_create::resolve_local_space("native-denial-smoke", None).unwrap();
-    assert!(data.to_string_lossy().contains("native-denial-head-reuse."));
+        super::super::local_create::resolve_local_space(&selected_space, None).unwrap();
+    assert!(data.to_string_lossy().contains(fixture_prefix));
     assert_eq!(config_path.parent(), data.parent());
     // Counter uses the already verified Create CLI result for its coordinates;
     // it does not need an unrelated Catalog installed in the same Local agent.

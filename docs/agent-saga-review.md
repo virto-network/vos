@@ -9298,6 +9298,17 @@ The 39/58-second startup times are still a production-latency concern, not an
 acceptable-latency claim. Reuse only this disposable r17 fixture for the next
 native lifecycle campaign; keep older r16 fixtures untouched.
 
+The next native r17 Create attempt returned HTTP 504 after startup; its saved
+`local-create.request` and pending credential were preserved, with no positive
+acknowledgement inferred. The first test daemon stopped. Exact `--resume` after
+restart is now running under `resume-create.sh` in the same fixture; inspect
+`create-resume-run.log` and its process completion before claiming recovery.
+`create.json` is the failed first output, not usable Create evidence. Meanwhile
+the normal CLI built the r17 Counter package in `counter-artifact/` successfully.
+The existing live Counter tests now accept explicitly selected `r17-startup`
+only with the matching disposable-directory guard (`VOSX_INVOKE_SMOKE_SPACE`);
+their CLI test executable compiles, but no r17 Counter invocation has run yet.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its
