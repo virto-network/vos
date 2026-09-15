@@ -117,6 +117,31 @@ certify release readiness while those implementation gates remain open.
 
 ## Performance: measured facts and remaining uncertainty
 
+Newest-pin inventory phase probe (2026-09-15): the existing disposable fixture
+reopened with the same release binary and additional debug filters, reached
+HTTP readiness in 55 seconds, returned status `ok`, and shut down cleanly.
+Evidence: shared target `task-tmp/authorization-pin-smoke.thZJrt/`
+`inventory-probe.sh` and `inventory-probe.log`. Retained history advanced; this
+is not a controlled comparison with the previous 28/39-second runs.
+
+Inventory loading took 27.614 seconds across four sequential authenticated
+queries (Credential, Agents, AgentReplicas, Actors): 6.696, 6.763, 6.990 and
+7.163 seconds. Each query caused ten physical runtime executions; their summed
+load/run times were 4.556, 4.530, 4.541 and 4.568 seconds respectively (about
+66% of total inventory loading). Pending recovery rounded to zero milliseconds
+in the earlier first-start log; it did not explain that log's 20.081-second load.
+
+For the Credential query, the Invoke phase alone took 4.082 seconds after its
+reopen marker; acknowledgement added 1.501 seconds. Two large physical runs
+during Invoke each consumed exactly 919,907,960 gas on 783,846-byte inputs,
+taking 1.616/1.624 seconds. Identical lengths and gas are not proof of identical
+bytes or redundant authorization: trace their proposal/commit callers before
+attempting reuse. The remaining eight executions include smaller runtime
+inspection work and the large acknowledgement. The next optimization target
+is the repeated Invoke execution path, not removing authenticated inventory
+queries, skipping ACK, or relaxing readiness. No implementation change or
+end-to-end speedup is claimed by this diagnostic run.
+
 Repeated authenticated history validation can rehash embedded artifact blobs.
 A resolved library-test stack reached that work through capacity admission:
 `reserve_projection_pair` → `audit_recovery_capacity` → physical-row validation
