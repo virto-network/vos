@@ -37,6 +37,8 @@ The latest LocalSigner campaign passes installation, a live deployment-scoped
 role grant, protected Local execution, visible signature verification and
 positive retirement. An exact retained client retry and a fresh protected
 execution with a new invocation ID also pass after actual daemon restart.
+Deployment-scoped role revocation now produces a verified signed denial with
+no actor application; exact denial retry and fresh success after re-grant pass.
 Two earlier malformed test inputs and their reservations remain preserved.
 See the LocalSigner campaign checkpoints below. Latency remains unacceptable.
 This is not yet a usable ordinary-agent production path.
@@ -262,7 +264,10 @@ Keep these as work within C2, not new review batches:
    deployment-scoped role command/resume orchestration are implemented. The live
    protected LocalSigner execution, signature and retirement now pass before
    and after actual daemon restart, with a fresh post-restart invocation ID.
-   Revoke/denial and yield/resume where applicable remain separate open gates. Keep
+   Deployment-scoped role revoke, signed denial, exact denial retry and fresh
+   success after re-grant now pass without consuming the denied operation's
+   credential sequence. Yield/resume where applicable and the broader terminal
+   resolution/recovery cases remain open. Keep
    its credential sequence and generation CAS distinct from operation
    authorization; do not relax anonymous HTTP invocation or
    put this mutation in the read-only projection journal.
@@ -7963,6 +7968,53 @@ baseline, not a newly rerun release matrix.
 These are debug-binary native correctness results, not acceptable production
 performance. The transient native admission errors, latency, revoke,
 yield/resume where applicable and other original C1/C2/C3 gates remain open.
+
+### Protected LocalSigner: revoke, terminal denial and valid successor
+
+The same `admin-startup-smoke.hJuDDq` fixture now passes the live
+deployment-scoped role revocation workflow. No new space, actor, system artifact
+or production API was introduced. Prior successful/failed requests are unchanged.
+On 2026-09-15 UTC (`revoke-timing.log`):
+
+- Restore began 00:20:56, ready 00:24:25 (209s).
+- Role revoke 00:24:25–00:25:13 (48s), first attempt; signed admin terminal
+  applied and retained, admin reservation not pending (`revoke.json`).
+- Fresh protected call, nonce `75` repeated 32 times, 00:25:16–00:27:51 (155s),
+  first attempt; returns `decision=denied`, `decision_retained=true`,
+  `applied=false`, `reservation_pending=false` (`protected-invoke-revoked.json`).
+- The denial verifier passes (0.32s; `verify-revoked.log`). It verifies canonical
+  signed AOR1 denial against its exact retained AOQ1, exact ATP1/work commitment,
+  actor/deployment, origin and actor-role claim. The credential reservation is
+  terminal Denied for this nonce, and no actor application directory exists.
+  This is not merely an HTTP error. Exact `--resume` returns identical normalized
+  JSON (`revoked-cached.json`), without replacing the retained request.
+- Role re-grant 00:27:52–00:28:20 (28s), first attempt; signed terminal applied
+  and retained (`regrant.json`).
+- A fresh protected call, nonce `76` repeated 32 times, 00:28:21–00:30:38 (137s),
+  first attempt; successful signature and positive retirement verify (0.43s;
+  `verify-regranted.log`, `protected-invoke-regranted.json`). Its retained
+  authorization uses the same operation credential sequence as the denied
+  request, but a different intent and directory. Thus denial did not consume
+  the sequence or strand the client reservation. Admin sequencing stays separate.
+
+The fixture helpers add explicit revoked/regranted phases with distinct files
+and nonces. The denial-state assertion is intentionally run before the next
+fresh call takes the credential reservation; the successor verification also
+revalidates the historical signed denial without assuming it is still the
+current reservation. Actor method mode and claims still come from the validated
+package policy. This proves the actor-role revoke/deny/re-grant path, not every
+credential revocation, expiry, abort, mixed-pending or recovery-capacity case.
+Latency, yield/resume where applicable and the remaining original release gates
+remain open. No timeout, ABI, runtime artifact or production policy changed.
+
+Validation: full CLI 252 passed, 12 opt-in helpers ignored, zero failures
+(63.24s; `revocation-full-cli.log`); live denied/successor verifiers pass as
+above; formatting and whitespace checks pass. SIGTERM was requested at
+00:32:01. The CLI's five-second observation expired, but the same daemon session
+later exited zero and its exact PID was confirmed absent. No force kill was
+used. Regression tests ran during this shutdown interval, so it is not an
+isolated shutdown benchmark. All campaign data remains on disk under `target`;
+the root `saga/agents` checkout is untouched.
 
 ### Durable client acknowledgement before completion
 

@@ -27,6 +27,16 @@ fn protected_signer_campaign_files() -> (&'static str, &'static str, u8) {
             "protected-invoke-after-restart.json",
             0x74,
         ),
+        Ok("revoked") => (
+            "protected-sign-revoked.intent",
+            "protected-invoke-revoked.json",
+            0x75,
+        ),
+        Ok("after-regrant") => (
+            "protected-sign-regranted.intent",
+            "protected-invoke-regranted.json",
+            0x76,
+        ),
         other => panic!("unsupported protected campaign phase: {other:?}"),
     }
 }
@@ -222,7 +232,7 @@ fn real_daemon_managed_receipt_invocation_and_exact_retry() {
 }
 
 #[test]
-#[ignore = "requires completed disposable protected signer invocation; verifies retained evidence only"]
+#[ignore = "requires terminal disposable protected signer campaign; verifies retained evidence only"]
 fn verify_disposable_protected_signer_result() {
     let (intent_file, output_file, _) = protected_signer_campaign_files();
     let root = PathBuf::from(std::env::var_os("VOSX_PROTECTED_SMOKE_ROOT").unwrap())
@@ -241,14 +251,113 @@ fn verify_disposable_protected_signer_result() {
     );
     let output: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join(output_file)).unwrap()).unwrap();
-    assert_eq!(output["decision"], "issued");
-    assert_eq!(output["delivery_retired"], true);
     assert_eq!(output["reservation_pending"], false);
     let authorization = PathBuf::from(output["request_dir"].as_str().unwrap())
         .canonicalize()
         .unwrap();
     assert!(authorization.starts_with(root.join("space/agent-client/operations")));
     let application = authorization.parent().unwrap().join("application");
+    if std::env::var("VOSX_PROTECTED_SMOKE_PHASE").as_deref() == Ok("revoked") {
+        use vos::agent::supervisor_adapters::AgentTargetedPreparationResponse;
+        assert_eq!(output["decision"], "denied");
+        assert_eq!(output["decision_retained"], true);
+        assert_eq!(output["applied"], false);
+        assert!(
+            !application.exists(),
+            "denied work must not create an actor application"
+        );
+        let mut delivery = CleanOperationClientFile::open_or_create(&authorization).unwrap();
+        let request = delivery.load_request().unwrap().unwrap();
+        let response = delivery.load_response().unwrap().unwrap();
+        assert_eq!(hex::encode(&response), output["response"].as_str().unwrap());
+        let submission = AuthorityOperationSubmission::decode(&request).unwrap();
+        assert!(matches!(
+            submission.decode_response(&response).unwrap(),
+            vos::agent::clean_bootstrap::NativeAuthorityOperationDecision::Denied { .. }
+        ));
+        let intent_bytes = std::fs::read(root.join(intent_file)).unwrap();
+        let intent = AgentTargetedPreparationRequest::decode(&intent_bytes).unwrap();
+        let mut preparation = CleanPreparationClientFile::open_or_create(
+            authorization.parent().unwrap().join("preparation"),
+        )
+        .unwrap();
+        assert_eq!(preparation.load_request().unwrap().unwrap(), intent_bytes);
+        let prepared = AgentTargetedPreparationResponse::decode(
+            &preparation.load_response().unwrap().unwrap(),
+        )
+        .unwrap();
+        let prepared = prepared.for_request(&intent).unwrap();
+        let AuthorityOperationIntent::InvokeActor {
+            managed,
+            operation_invocation,
+            actor,
+            actor_deployment,
+            work,
+            origin,
+            roles,
+        } = &submission.call().intent
+        else {
+            panic!("denial was not for actor invocation");
+        };
+        assert_eq!(managed.space, intent.target().space());
+        assert_eq!(managed.agent, intent.target().agent());
+        assert_eq!(*actor, intent.target().actor());
+        assert_eq!(*operation_invocation, intent.intent().invocation());
+        assert_eq!(*actor_deployment, prepared.work().deployment);
+        assert_eq!(*work, prepared.work().commitment());
+        assert_eq!(*origin, intent.intent().origin());
+        assert_eq!(*roles, protected_signer_roles());
+        let mut reservation = CleanCredentialReservation::open_or_create(
+            &root.join("space/agent-client/credentials"),
+            managed.space,
+            submission.call().credential,
+        )
+        .unwrap();
+        assert_eq!(
+            reservation.current().unwrap(),
+            Some((
+                Hash(operation_invocation.0),
+                CredentialReservationStatus::Denied
+            ))
+        );
+        eprintln!(
+            "signed request-bound denial retained; credential reservation denied; no actor application created"
+        );
+        return;
+    }
+    assert_eq!(output["decision"], "issued");
+    assert_eq!(output["delivery_retired"], true);
+    if std::env::var("VOSX_PROTECTED_SMOKE_PHASE").as_deref() == Ok("after-regrant") {
+        let denied: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join("protected-invoke-revoked.json")).unwrap(),
+        )
+        .unwrap();
+        let denied_root = PathBuf::from(denied["request_dir"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        assert!(denied_root.starts_with(root.join("space/agent-client/operations")));
+        assert_ne!(denied_root, authorization);
+        let mut previous = CleanOperationClientFile::open_or_create(&denied_root).unwrap();
+        let previous_call =
+            AuthorityOperationSubmission::decode(&previous.load_request().unwrap().unwrap())
+                .unwrap();
+        assert!(matches!(
+            previous_call
+                .decode_response(&previous.load_response().unwrap().unwrap())
+                .unwrap(),
+            vos::agent::clean_bootstrap::NativeAuthorityOperationDecision::Denied { .. }
+        ));
+        let mut current = CleanOperationClientFile::open_or_create(&authorization).unwrap();
+        let current_call =
+            AuthorityOperationSubmission::decode(&current.load_request().unwrap().unwrap())
+                .unwrap();
+        assert_eq!(
+            current_call.call().request_sequence,
+            previous_call.call().request_sequence,
+            "denial must not consume the operation credential sequence"
+        );
+        assert_ne!(current_call.call().intent, previous_call.call().intent);
+    }
     let mut store =
         super::super::clean_store::CleanInvocationFile::open_or_create(&application).unwrap();
     let request = store.load_request().unwrap().unwrap();
@@ -308,7 +417,7 @@ fn verify_disposable_protected_signer_result() {
         )
         .unwrap();
     eprintln!(
-        "protected signature and retained retirement verified; restart and revoke remain separate gates"
+        "protected signature and retained retirement verified for the exact selected fixture intent"
     );
 }
 
