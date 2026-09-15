@@ -2,6 +2,38 @@
 
 ## Checkpoint and decision
 
+Existing per-runtime diagnostics captured one complete periodic Credential
+cycle on unchanged release `8716f6a7`; no diagnostic code or rebuild was needed.
+Readiness40s, Credential dispatch4,780ms, full route reconciliation5,602ms.
+Ten physical runtime executions inside the query total2,950,015us. Two large
+inputs dominate those spans:788,374bytes /1,480,849us /875,295,164gas and
+790,499bytes /821,093us /385,264,799gas. Eight smaller calls take roughly77–98ms
+each; four additional route-audit calls after the query take88–92ms each.
+Two pre-dispatch retry lookups take about99ms each. Roughly1.83s of the query
+lies outside the measured runtime load/run spans; do not attribute it all to
+one host subsystem without further measurement.
+
+Evidence: `task-tmp/runtime-timings.Ti3CYX/{probe.sh,probe.log,up.log}`. The probe
+enabled existing `local_journal_driver` debug logs, waited for one complete
+post-readiness reconciliation, then joined the daemon without forced cleanup.
+Session95824 is terminal. No new actor mutation or client operation was submitted.
+The larger gas allowance and executor source locate the large-input calls in
+the invocation-transition path; there is no operation label in these timing
+events, so don't claim each exact subtype solely from input size/order.
+
+A specific next optimization candidate follows from source inspection:
+`ConformanceState` gas simulation is used to precompute block costs in
+`Interpreter::with_memory_and_mode`; `Machine::load_with` parses/validates and
+rebuilds this immutable program preparation on every Refine load. Existing
+`Interpreter::predecode` produces reusable tables for another backend path,
+but Refine does not currently reuse them. Investigate an opaque, validated,
+bounded prepared-program cache in the Agent executor/Refine path, with fresh
+memory, registers, arguments, gas and inner-machine state for every call.
+Do not expose caller-forgeable gas tables, reuse execution results, omit
+availability bytes from exact acknowledgements, or alter charged gas. Require
+cold/prepared differential tests for exits, gas, outputs and state isolation,
+then measure the actual gain. This candidate is not implemented or qualified.
+
 Bounded production inventory CPU profiling completed on the unchanged
 `8716f6a7` release. An8s user-CPU-clock sample at99Hz captured492 samples with
 zero lost samples (4.058MiB private `perf.data`). It started at a freshly logged
