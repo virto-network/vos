@@ -9693,10 +9693,14 @@ pub(crate) mod tests {
             RuntimeTransition, RuntimeWork,
         };
 
+        let candidate = std::env::var_os("VOS_AGENT_RUNTIME_ACK_CANDIDATE")
+            .map(|path| std::fs::read(path).expect("read acknowledgement candidate"));
         let run = |work: RuntimeWork| {
             let input = work.encode().unwrap();
             let execution = vos_pvm::refine_host::RefineContext::load(
-                include_bytes!("../../../vosx/blobs/agent_runtime.pvm"),
+                candidate
+                    .as_deref()
+                    .unwrap_or(include_bytes!("../../../vosx/blobs/agent_runtime.pvm")),
                 &input,
                 1_000_000_000,
             )
@@ -9751,6 +9755,45 @@ pub(crate) mod tests {
             authorization: Box::new(authorization),
         });
         assert_eq!(repeated_ack, acknowledged);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn bundled_runtime_acknowledgement_rejects_malformed_frames() {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        use crate::agent_sdk::{InvocationAuthorization, RuntimeExecutionContext, RuntimeWork};
+
+        let candidate = std::env::var_os("VOS_AGENT_RUNTIME_ACK_CANDIDATE")
+            .map(|path| std::fs::read(path).expect("read acknowledgement candidate"));
+        let program = candidate
+            .as_deref()
+            .unwrap_or(include_bytes!("../../../vosx/blobs/agent_runtime.pvm"));
+        let (state, work, receipt, _) = clean_terminal_fixture();
+        let input = RuntimeWork::Acknowledge {
+            context: RuntimeExecutionContext::Direct,
+            state,
+            invocation: Box::new(work),
+            authorization: Box::new(InvocationAuthorization::AuthorityReceipt(receipt)),
+        }
+        .encode()
+        .unwrap();
+        let valid = vos_pvm::refine_host::RefineContext::load(program, &input, 2_000_000_000)
+            .unwrap()
+            .run();
+        assert_eq!(valid.exit, vos_pvm::ExitReason::Halt);
+        let mut trailing = input.clone();
+        trailing.push(0);
+        for malformed in [&input[..input.len() - 1], trailing.as_slice()] {
+            assert!(RuntimeWork::decode(malformed).is_err());
+            let execution = vos_pvm::refine_host::RefineContext::load(
+                program,
+                malformed,
+                2_000_000_000,
+            )
+            .unwrap()
+            .run();
+            assert_eq!(execution.exit, vos_pvm::ExitReason::Panic);
+        }
     }
 
     #[cfg(feature = "pvm")]
@@ -11220,21 +11263,41 @@ pub(crate) mod tests {
     #[cfg(feature = "pvm")]
     #[test]
     fn clean_acknowledgement_errors_are_byte_identical_and_fail_closed() {
+        use crate::agent_sdk::wire::CanonicalWire as _;
         use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeWork};
 
+        let candidate = std::env::var_os("VOS_AGENT_RUNTIME_ACK_CANDIDATE")
+            .map(|path| std::fs::read(path).expect("read acknowledgement candidate"));
         let (state, work, authority, _) = clean_terminal_fixture();
         let assert_error = |work: crate::agent_sdk::InvocationWork,
                             authority: crate::agent_sdk::authority::AuthorityReceipt,
                             expected| {
-            let transition = apply_standard_runtime_work(RuntimeWork::Acknowledge {
+            let request = RuntimeWork::Acknowledge {
                 context: crate::agent_sdk::RuntimeExecutionContext::Direct,
                 state: state.clone(),
                 invocation: Box::new(work),
                 authorization: Box::new(
                     crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(authority),
                 ),
-            })
-            .unwrap();
+            };
+            let transition = apply_standard_runtime_work(request.clone()).unwrap();
+            if let Some(program) = &candidate {
+                let execution = vos_pvm::refine_host::RefineContext::load(
+                    program,
+                    &request.encode().unwrap(),
+                    2_000_000_000,
+                )
+                .unwrap()
+                .run();
+                assert_eq!(execution.exit, vos_pvm::ExitReason::Halt);
+                assert_eq!(
+                    execution
+                        .output_bounded(crate::agent_sdk::RuntimeTransition::MAX_ENCODED_BYTES)
+                        .unwrap(),
+                    transition.encode().unwrap(),
+                    "candidate must preserve the entire rejection transition",
+                );
+            }
             assert_eq!(transition.state, state);
             assert_eq!(
                 transition.outcome,

@@ -262,6 +262,38 @@ The candidate is **not pinned**. Broader physical malformed/retry qualification,
 atomic provenance/pin updates and final-source fresh-space checks remain before
 promoting it; no production latency gate is closed by the gas result.
 
+### Physical rejection qualification and native-test failure
+
+`VOS_AGENT_RUNTIME_ACK_CANDIDATE` now selects the candidate in the physical
+retired-invocation test and optionally adds physical output comparison to the
+five forged/divergent acknowledgement rejection cases. A new physical test
+requires truncated and trailing acknowledgement frames to produce `Panic`,
+with a valid-frame `Halt` control. Five focused tests passed in 1.25 s, covering
+those checks plus capacity and exact-retry status. The changes are test-only;
+the previously reproduced candidate remains the same guest source.
+
+The broader 31-test `acknowledgement` filter **aborted with stack overflow**;
+it is not a passing qualification run. Isolated native Install/reopen before
+acknowledgement passed in 12.00 s. The isolated startup-finalizes-saved-ACK
+case still overflows at the normal stack limit. A debugger located the fault
+in BTreeMap insertion during `StandardAgentRuntime::restore`, called from
+`decode_standard_runtime_state` → `apply_clean_invoke` → native-test replay
+inside Shared driver reopen. The sampled path does not reach acknowledgement
+application, but there is no same-profile baseline comparison proving this is
+pre-existing. Do not promote the candidate on the focused passes alone.
+
+Evidence under `ack-recovery-candidate.dHhhcp/`: `ack-qualification.log`,
+`ack-focused.log`, `native-ack-isolated.log`, `native-ack-remaining.log` and
+`stack-diagnosis.log`. The debugger accidentally used the default temporary
+directory; its exact failed fixture was moved from
+`/tmp/vos-clean-system-bootstrap-bundled-authority-management-49266-1` to
+`debugger-failed-fixture/` in this evidence directory, preserving it on disk
+and removing that RAM-backed copy. The moved raw fixture is forensic evidence,
+not a reopenable replacement for its path-bound original. Test/debugger
+sessions are terminal. Next: resolve or establish the baseline for this native
+stack failure without increasing stack limits or weakening assertions, then
+finish pin qualification.
+
 ## Local evidence and resumption
 
 Evidence is on disk under `.worktrees/ch08-c2-native/target/task-tmp/`, not `/tmp`:
