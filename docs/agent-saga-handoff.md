@@ -2,6 +2,18 @@
 
 ## Checkpoint and decision
 
+System-actor and clean-break qualification at `c9c5ecce`: explicit locked
+offline nested-workspace suites pass, with 58 Authority tests (139.27s) and
+10 Catalog tests (27.36s), zero ignored. The Authority suite includes its
+4,096-operation compaction regression; that does not close the distinct host
+issuer's 256-record ceiling. `scripts/check-agent-clean-break.sh` also passes
+with offline Cargo and isolated XDG directories: retired paths, CLI commands,
+flags, unknown-command fallback and selected documentation references are
+checked. Logs: shared target `task-tmp/system-actor-qualification.Rnl5Ia/`
+`authority.log`, `catalog.log`, `clean-break.log`. The script rebuilt the debug
+CLI, not the release executable. These are source actor tests and CLI-surface
+checks, not full release or physical Shared-genesis qualification.
+
 Portable documentation / wasm qualification at `ec779164`: the locked offline
 SDK no-default-features documentation build passes with
 `-D rustdoc::broken_intra_doc_links` (0.77s), and the standalone proof verifier
