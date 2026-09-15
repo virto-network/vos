@@ -41,6 +41,13 @@ the committee-binding step before its marker); inventory reconciliation took
 56.682 seconds. See the handoff for the failed raw-copy attempt, path-bound
 lease constraint, and successful original-path run. This is still a latency
 failure, not a fixed-history before/after result.
+At `f2b17cb2`, the instrumented release restart passed in 54 seconds after the
+previous run reduced the retained suffix from 92 rows to zero and ended at
+seven rows. Direct driver timings now locate 7.898 seconds in journal replay;
+inventory reconciliation still took 41.798 seconds. This is a different-history
+measurement, not a speedup from instrumentation. The prior 119-second open
+contained only 0.847 seconds of completed ledger recovery audits. See the
+handoff's replay attribution before choosing another performance change.
 See the current closeout plan below; later checkpoint sections retain historical
 results, including failures that have since been fixed.
 Earlier clock-test pass counts had a fixture-dispatch gap; see "Retained

@@ -136,6 +136,48 @@ Source inspection shows `audit_recovery` is invoked by ledger opening,
 committee-history loading and journal auditing. Their duration and safe scope
 for reuse are not yet established; no audit was removed or cached.
 
+### Replay attribution at `f2b17cb2`
+
+The locked release CLI build passed in 6m35s. The original-path r17 restart
+passed HTTP status, unchanged SSH identity and clean shutdown in **54 seconds**
+(10:10:20–10:11:14 UTC). This was instrumentation-only source, not a performance
+fix. The retained suffix started at **7 rows**, versus **85** in the preceding
+183-second run. That prior log shows 92 rows at 09:59:55.374682, zero at
+09:59:55.731954, and seven at shutdown. The shorter restart must not be
+attributed to the new timing markers. The capacity-triggered certified
+checkpoint path is present in `query_authority`; the row-count transition is
+consistent with that path, not evidence of manual history deletion.
+
+Measured generation-open durations on the seven-row suffix:
+
+| Stage | Duration |
+| --- | ---: |
+| Journal-store opening | 44 ms |
+| Raft ledger opening | 24 ms |
+| Artifact-store opening | below 1 ms timer resolution |
+| Journal driver total | 8,054 ms |
+| Within driver: `materialize_current` replay | 7,898 ms |
+| Within driver: committee history | 19 ms |
+| Within driver: profile/ledger audit | 56 ms |
+| Within driver: cross-store reconciliation | 80 ms |
+| Exposure/restore after driver | 43 ms |
+| Inventory reconciliation after owner startup | 41,798 ms |
+
+In the earlier 119.009-second host-open interval, the three completed recovery
+audits total only 847,082 microseconds (299,300 + 251,223 + 296,559). Auditing
+therefore does not account for most of that interval. The new run directly
+locates most driver-open time in replay; attributing the earlier interval to
+replay is an inference from the call order and audit timestamps, not a direct
+replay timing on the same 85-row history.
+
+Next work should focus on replay execution and safe certified-checkpoint policy,
+while separately addressing inventory-query execution. Do not remove audit
+checks based on the earlier BLAKE2 sample: the sample and decoding benchmark
+identify real work but do not explain most startup latency. Both builds and
+the startup probe are terminal; no process remains to poll. Evidence is in
+`shared-reopen-phases.LP4zS4/{build.log,run.log,up.log}`, with the probe script,
+HTTP status and SSH-key evidence alongside them.
+
 ## Local evidence and resumption
 
 Evidence is on disk under `.worktrees/ch08-c2-native/target/task-tmp/`, not `/tmp`:
