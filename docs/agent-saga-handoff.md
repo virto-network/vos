@@ -123,6 +123,19 @@ history, then address the measured repeated work while preserving recovery
 proofs. Do not clear history, increase timeouts, skip checks, or infer that
 retirement alone permits deleting issuer/coordinator records.
 
+The next diagnostic source adds cumulative debug timings in
+`SharedAgentHost::open_generation` for journal-store opening, Raft ledger,
+artifact store, journal driver and exposure/restore. Nested driver timings
+separate artifact audit, committee history, executor setup, materialization,
+profile/ledger audit, reconciliation and final reverified-open bookkeeping.
+Enable `vos::agent::shared_host=debug` and
+`vos::agent::shared_journal_driver=debug` in addition to the prior modules.
+These markers have only a CLI check pass (5.28 seconds, with warnings), not a
+release timing result. Its log is `owner-startup-phases.5se4bH/shared-open-check.log`.
+Source inspection shows `audit_recovery` is invoked by ledger opening,
+committee-history loading and journal auditing. Their duration and safe scope
+for reuse are not yet established; no audit was removed or cached.
+
 ## Local evidence and resumption
 
 Evidence is on disk under `.worktrees/ch08-c2-native/target/task-tmp/`, not `/tmp`:

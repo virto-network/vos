@@ -2662,6 +2662,14 @@ impl SharedAgentHost {
         files: GenerationFiles,
         portable_restore: Option<&PreparedPortableRestore>,
     ) -> Result<HostedSharedAgent, SharedAgentHostError> {
+        let started = std::time::Instant::now();
+        let report_phase = |phase: &'static str| {
+            tracing::debug!(
+                phase,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Shared generation open phase complete"
+            );
+        };
         let agent = intent.agent()?;
         let scope = self.scope();
         if portable_restore.is_some_and(|recovery| recovery.bundle.intent != intent) {
@@ -2715,6 +2723,7 @@ impl SharedAgentHost {
                 .map_err(|_| SharedAgentHostError::CorruptResidue)?;
         }
 
+        report_phase("journal_store");
         let generation = AgentGenerationRouteKey::new(
             scope.space,
             agent,
@@ -2742,10 +2751,12 @@ impl SharedAgentHost {
                 .map_err(map_ledger_error)?;
         }
 
+        report_phase("raft_ledger");
         let artifact_path = self.artifact_path(agent);
         validate_artifact_path(&artifact_path, externally_exposed)?;
         let artifacts = FileSharedArtifactStager::open(&artifact_path, generation)
             .map_err(map_artifact_error)?;
+        report_phase("artifact_store");
         let mut driver = match state {
             (None, None) | (Some(_), None) => match sealed {
                 PreparedSharedGenesis::AuthorityFinalized(sealed) => {
@@ -2782,6 +2793,7 @@ impl SharedAgentHost {
         }
         .map_err(map_driver_error)?;
 
+        report_phase("journal_driver");
         self.lease
             .arm_after_agent_open()
             .map_err(map_outer_lease_error)?;
@@ -2816,6 +2828,7 @@ impl SharedAgentHost {
                 .map_err(map_driver_error)?;
         }
         self.lease.validate_live().map_err(map_outer_lease_error)?;
+        report_phase("exposure_and_restore");
         Ok(HostedSharedAgent {
             intent,
             raft_path,

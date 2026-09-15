@@ -967,12 +967,22 @@ where
         merge: Arc<dyn LocalMergeAuthenticator>,
         provider: Option<Box<dyn AttestedReplayTransitionProvider>>,
     ) -> Result<Self, SharedJournalDriverError> {
+        let started = std::time::Instant::now();
+        let report_phase = |phase: &'static str| {
+            tracing::debug!(
+                phase,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Shared journal driver open phase complete"
+            );
+        };
         let local_node = merge.node();
         if local_node != ledger.local_node() {
             return Err(SharedJournalDriverError::WrongReplica);
         }
         artifacts.audit(ledger.generation())?;
+        report_phase("artifact_audit");
         let committees = ledger.committee_history()?;
+        report_phase("committee_history");
         let resolver = store.catalog_blob_resolver()?;
         let mut executor = StandardLocalReplayExecutor::new_shared(
             resolver,
@@ -983,8 +993,10 @@ where
         if let Some(provider) = provider {
             executor.replace_attested_transition_provider(provider);
         }
+        report_phase("executor_setup");
         let materialization =
             materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases)?;
+        report_phase("materialize_current");
         let active = ledger.active_committee()?;
         let route = ledger.generation();
         let (space, agent, shared_profile) = if executor.seeded_clean_descriptor().is_some() {
@@ -1021,12 +1033,15 @@ where
             return Err(SharedJournalDriverError::WrongReplica);
         }
         let audit = ledger.journal_audit()?;
+        report_phase("profile_and_ledger_audit");
         if let Some(snapshot) = &audit.snapshot {
             validate_published_shared_checkpoint(&store, &materialization, &snapshot.claim)
                 .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
         }
         reconcile_journal_ledger(&store, &materialization, ledger.journal_store(), &audit)?;
+        report_phase("reconcile_journal_ledger");
         store.finish_reverified_open()?;
+        report_phase("finish_reverified_open");
         Ok(Self {
             store,
             artifacts,
