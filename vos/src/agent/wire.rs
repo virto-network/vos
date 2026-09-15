@@ -2426,13 +2426,10 @@ fn apply_clean_invoke(
     let state_limit = standard_state_limit(&decoded);
     let mut runtime =
         StandardAgentRuntime::restore(decoded).map_err(|_| DecodeError::NonCanonical)?;
-    if let Err(error) =
-        runtime.verify_clean_invocation_authorization(&work, &authorization, observed_slot)
-    {
-        return Ok(clean_completed(state, Err(error)));
-    }
     // Retained authenticated errors can name a missing or stale actor.
-    // Recover them before consulting the current actor policy.
+    // Recovery begins with full work/authorization verification before any
+    // mutation, so do not repeat that verification (including blob hashes and
+    // receipt signatures) here. Recover before consulting current actor policy.
     match runtime.recover_clean_invocation_error(&work, &authorization, observed_slot) {
         Ok(Some(error)) => {
             let candidate = encode_standard_runtime_state(&runtime.snapshot());
@@ -10392,6 +10389,58 @@ pub(crate) mod tests {
     fn source_typed_error_retirement() {
         assert_typed_error_retirement(false, false);
         assert_typed_error_retirement(true, false);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_invoke_recovery_authentication_rejects_substitution_without_mutation() {
+        use crate::agent_sdk::{
+            InvocationAuthorization, InvocationError, RuntimeOutcome, RuntimeWork,
+        };
+        for mutation in 0..3 {
+            let mut input = clean_failing_actor_fixture(Some(0xff));
+            let RuntimeWork::Invoke {
+                state,
+                invocation,
+                authorization,
+                observed_slot,
+                ..
+            } = &mut input
+            else {
+                unreachable!()
+            };
+            let before = state.clone();
+            match mutation {
+                0 => {
+                    let InvocationAuthorization::AuthorityReceipt(receipt) = authorization.as_mut()
+                    else {
+                        unreachable!()
+                    };
+                    receipt.signature[0] ^= 1;
+                }
+                1 => invocation.space.0[0] ^= 1,
+                2 => invocation.availability[0].bytes[0] ^= 1,
+                _ => unreachable!(),
+            }
+            let runtime = StandardAgentRuntime::restore(
+                decode_standard_runtime_state(&clean_state_to_legacy(state)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                runtime.verify_clean_invocation_authorization(
+                    invocation,
+                    authorization,
+                    *observed_slot
+                ),
+                Err(InvocationError::InvalidAuthorization)
+            );
+            let returned = apply_standard_runtime_work(input).unwrap();
+            assert_eq!(returned.state, before);
+            assert_eq!(
+                returned.outcome,
+                RuntimeOutcome::Completed(Err(InvocationError::InvalidAuthorization))
+            );
+        }
     }
 
     #[cfg(feature = "pvm")]

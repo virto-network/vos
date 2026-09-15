@@ -2,6 +2,21 @@
 
 ## Checkpoint and decision
 
+Invoke authorization candidate: `apply_clean_invoke` no longer calls full
+authorization verification immediately before `recover_clean_invocation_error`,
+whose first operation is the identical full verification on unchanged arguments
+and runtime state. The latter still checks blob preimages, scope and signature
+before any mutation. Seven source-runtime regressions pass (0.54s): explicit
+signature/scope/blob substitution preserves state, typed-error retirement,
+unseen-expiry retirement, three expiry-fence cases, and unsupported-method
+retirement. Locked offline build passed in 32.35s. Logs: shared target
+`task-tmp/invoke-authorization-substitution.log` and
+`task-tmp/invoke-authorization-regressions.log`. A preliminary legacy-execution
+test also passed but does not qualify this clean Invoke change. The committed
+guest pin and release CLI remain unchanged; independently reproduce and
+physically compare this candidate before replacing any artifact. Source and
+bundle qualification are not yet closed for this new optimization.
+
 Preflight reuse regression follow-up: a small admitted scripted PVM produces
 the same replay transition and exact RuntimeOutcome with and without reuse.
 The same test proves a prepared computation cannot grant a missing replay
