@@ -142,6 +142,28 @@ is the repeated Invoke execution path, not removing authenticated inventory
 queries, skipping ACK, or relaxing readiness. No implementation change or
 end-to-end speedup is claimed by this diagnostic run.
 
+Source follow-up at `af132614` identifies the two execution sites:
+`SharedRouteHandler::submit_clean_ordered_operation_with_admission` prepares
+the reserved terminal-only query before Raft proposal. In
+`SharedAgentJournalDriver::prepare_clean_ordered_operation_with_policy`,
+`clean_invocation_is_terminal` executes the complete guest against current
+materialized state to reject Yielded before consuming durable capacity.
+`clean_invocation_terminal_outcome` returns only the outcome, discarding the
+computed transition. After proposal, committed replay reaches
+`StandardLocalReplayExecutor::execute_clean_invocation_transition` and executes
+the guest again. This is terminal-admission preflight followed by replay, not
+two inventory client dispatches or a five-second timer.
+
+Do not remove the terminal check. A possible bounded optimization is a
+single-use prepared transition consumed only after normal replay authentication
+and exact equality of runtime program, canonical work (including every state
+lane, authorization, availability bytes and observed slot), gas and execution
+context. Mismatch, intervening state changes, restart, follower replay and
+Attested contexts must retain normal execution/proof behavior. Returned outcome,
+state/resource and publication checks must remain unchanged. This optimization
+is not implemented or qualified; it needs substitution, one-shot consumption,
+yield refusal, reopen and physical equivalence tests before performance claims.
+
 Repeated authenticated history validation can rehash embedded artifact blobs.
 A resolved library-test stack reached that work through capacity admission:
 `reserve_projection_pair` → `audit_recovery_capacity` → physical-row validation
