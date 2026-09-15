@@ -1,5 +1,10 @@
 # Reviewing the Agent architecture saga
 
+For the frozen `f76dabe1` review checkpoint, current evidence limits, and the
+three scoped review areas, start with [the review handoff](agent-saga-handoff.md).
+The later sections of this document retain historical results; they are not
+all measurements of the current source or the same retained history.
+
 Current Ch08 WIP warning: `wip/ch08-runtime-directory` now has matching r17
 source and independently reproduced runtime/system-template bundles. Fresh r17
 bootstrap/restart and HTTP/SSH checks now pass (39 s first start, 58 s restart).
@@ -25,6 +30,11 @@ The newer release executable at `ec8bdb70`, including the nested decoder
 changes, passes the same startup/HTTP/SSH/shutdown check in 112 seconds.
 The fixed-history decode improvement below has not established an end-to-end
 startup improvement; production latency remains open.
+The instrumented `f76dabe1` release restart completed in 159 seconds, with
+HTTP status, unchanged SSH identity, and clean shutdown passing. System-owner
+open/recovery took 95.515 seconds; inventory reconciliation took 59.784 seconds.
+These phase measurements locate the delay but do not establish its complete
+internal cause or a controlled end-to-end performance comparison.
 See the current closeout plan below; later checkpoint sections retain historical
 results, including failures that have since been fixed.
 Earlier clock-test pass counts had a fixture-dispatch gap; see "Retained
