@@ -294,6 +294,26 @@ sessions are terminal. Next: resolve or establish the baseline for this native
 stack failure without increasing stack limits or weakening assertions, then
 finish pin qualification.
 
+### Native stack failure resolved without changing the stack limit
+
+The install fixture called its restart/recovery helper while retaining large
+installation-setup frames. `check_install_startup` now runs that same recovery
+helper on a normal-sized scoped worker, following the existing lifecycle-test
+pattern. No assertions, production code, thread stack sizes or guest artifacts
+changed. The previously overflowing exact native saved-ack startup test passes
+in **16.80 s**. The original broader acknowledgement filter then passes:
+**30 passed, zero failed, one ignored profiling probe**, **29.56 s**, with
+`VOS_AGENT_RUNTIME_ACK_CANDIDATE` selecting the candidate where supported.
+This resolves the observed stack failure; it does not establish when it first
+appeared or replace final-source full-suite qualification.
+
+Evidence: `ack-recovery-candidate.dHhhcp/native-stack-fixed.log` and
+`ack-qualification-fixed.log`. `native-stack-build.log` records the 32.03-second
+test build but selected zero tests due to a short filter combined with
+`--exact`; it is build evidence only. The subsequent exact fully qualified
+invocation and broader run above are the actual test evidence. Both are
+terminal. Artifact pins remain unchanged pending promotion qualification.
+
 ## Local evidence and resumption
 
 Evidence is on disk under `.worktrees/ch08-c2-native/target/task-tmp/`, not `/tmp`:

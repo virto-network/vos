@@ -15841,6 +15841,34 @@ mod tests {
             request: ManagementRequest,
             intent: IssuerMemoryStore,
             issuer: IssuerMemoryStore,
+            signer: CountingSigner,
+            scenario: u8,
+        ) {
+            // Installation setup retains large by-value runtime and management
+            // fixtures. Reopen performs a full native replay, so keep those
+            // setup frames off its stack. Use the normal-sized scoped worker,
+            // as in the other native lifecycle fixture boundaries above.
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        check_install_startup_recovery(
+                            harness, root, descriptor, call, request, intent, issuer, signer,
+                            scenario,
+                        )
+                    })
+                    .join()
+                    .unwrap()
+            });
+        }
+
+        fn check_install_startup_recovery(
+            harness: &mut NativeProjectionOwnerHarness,
+            root: &Path,
+            descriptor: AgentDescriptor,
+            call: AuthorityCredentialCall,
+            request: ManagementRequest,
+            intent: IssuerMemoryStore,
+            issuer: IssuerMemoryStore,
             mut signer: CountingSigner,
             scenario: u8,
         ) {
