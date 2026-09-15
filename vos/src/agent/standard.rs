@@ -4077,11 +4077,38 @@ impl StandardAgentRuntime {
         authorization: &crate::agent_sdk::InvocationAuthorization,
     ) -> Result<crate::agent_sdk::InvocationAcknowledgement, crate::agent_sdk::InvocationError>
     {
-        use crate::agent_sdk::{InvocationAcknowledgement, InvocationError};
+        self.acknowledge_clean_invocation_with_status(work, authorization)
+            .map(|(acknowledgement, _)| acknowledgement)
+    }
 
+    /// Return the exact acknowledgement and whether this call applied it.
+    /// An already retained acknowledgement must preserve the caller's original
+    /// encoded state without reserializing it. Keep recovery and application in
+    /// one call so that fresh work is not validated twice just to learn this bit.
+    pub(crate) fn acknowledge_clean_invocation_with_status(
+        &mut self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+    ) -> Result<
+        (crate::agent_sdk::InvocationAcknowledgement, bool),
+        crate::agent_sdk::InvocationError,
+    > {
         if let Some(retained) = self.recover_clean_acknowledgement(work, authorization)? {
-            return Ok(retained);
+            return Ok((retained, false));
         }
+        self.acknowledge_new_clean_invocation(work, authorization)
+            .map(|acknowledgement| (acknowledgement, true))
+    }
+
+    // Only called immediately after authenticated recovery found no retained
+    // acknowledgement; never expose an entry point that skips that check.
+    fn acknowledge_new_clean_invocation(
+        &mut self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+    ) -> Result<crate::agent_sdk::InvocationAcknowledgement, crate::agent_sdk::InvocationError>
+    {
+        use crate::agent_sdk::{InvocationAcknowledgement, InvocationError};
 
         let authorization_slot = match authorization {
             crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(_) => 0,

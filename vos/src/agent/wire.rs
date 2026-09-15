@@ -2907,29 +2907,22 @@ fn apply_clean_acknowledge(
     let state_limit = standard_state_limit(&decoded);
     let mut runtime =
         StandardAgentRuntime::restore(decoded).map_err(|_| DecodeError::NonCanonical)?;
-    match runtime.recover_clean_acknowledgement(&work, &authorization) {
-        Ok(Some(acknowledgement)) => {
-            return Ok(RuntimeTransition {
-                state,
-                outcome: RuntimeOutcome::Acknowledged(Ok(acknowledgement)),
-            });
-        }
-        Err(error) => {
-            return Ok(RuntimeTransition {
-                state,
-                outcome: RuntimeOutcome::Acknowledged(Err(error)),
-            });
-        }
-        Ok(None) => {}
-    }
     // Acknowledge retires an already retained exact result; it does not
     // execute the actor method again. Re-running the current AMP2 method
     // policy here would make a Required-attestation result impossible to
     // retire through the deliberately Direct housekeeping route. The runtime
     // below authenticates the original work, authorization, preflight, and
     // exact retained result before removing anything.
-    let acknowledgement = match runtime.acknowledge_clean_invocation(&work, &authorization) {
-        Ok(acknowledgement) => acknowledgement,
+    let acknowledgement = match runtime
+        .acknowledge_clean_invocation_with_status(&work, &authorization)
+    {
+        Ok((acknowledgement, true)) => acknowledgement,
+        Ok((acknowledgement, false)) => {
+            return Ok(RuntimeTransition {
+                state,
+                outcome: RuntimeOutcome::Acknowledged(Ok(acknowledgement)),
+            });
+        }
         Err(error) => {
             return Ok(RuntimeTransition {
                 state,
@@ -9593,6 +9586,35 @@ pub(crate) mod tests {
             Err(DecodeError::NonCanonical),
             "Acknowledge has no attested execution route",
         );
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_acknowledgement_status_preserves_exact_retry_and_rejection() {
+        use crate::agent_sdk::{InvocationAuthorization, InvocationError};
+
+        let (state, work, receipt, _) = clean_terminal_fixture_with_program_size(4096);
+        let decoded = decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap();
+        let mut runtime = StandardAgentRuntime::restore(decoded).unwrap();
+        let authorization = InvocationAuthorization::AuthorityReceipt(receipt);
+        let (acknowledgement, applied) = runtime
+            .acknowledge_clean_invocation_with_status(&work, &authorization)
+            .unwrap();
+        assert!(applied);
+        let after = encode_standard_runtime_state(&runtime.snapshot());
+        assert_eq!(
+            runtime.acknowledge_clean_invocation_with_status(&work, &authorization),
+            Ok((acknowledgement, false)),
+        );
+        assert_eq!(encode_standard_runtime_state(&runtime.snapshot()), after);
+
+        let mut substituted = work.clone();
+        substituted.message.push(0xff);
+        assert_eq!(
+            runtime.acknowledge_clean_invocation_with_status(&substituted, &authorization),
+            Err(InvocationError::InvalidAuthorization),
+        );
+        assert_eq!(encode_standard_runtime_state(&runtime.snapshot()), after);
     }
 
     #[cfg(feature = "pvm")]

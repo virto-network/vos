@@ -2,6 +2,10 @@
 
 ## Checkpoint and decision
 
+Latest source qualification: the acknowledgement optimization described below
+is ahead of the bundled r17 runtime. The frozen checkpoint remains unchanged;
+current HEAD requires candidate PVM validation and final artifact reproduction.
+
 Implementation checkpoint: `f76dabe1` on `wip/ch08-runtime-directory`.
 At that checkpoint, `saga/agents` is `31b0cdbb`: 258 commits ahead, zero behind,
 221 changed files, 71,025 insertions and 58,780 deletions. These counts exclude
@@ -203,6 +207,32 @@ could limit replay length but would not by itself fix expensive live queries.
 No cache, checkpoint-policy change, timeout change or new artifact pin was made.
 Logs, script and HTTP/SSH evidence are in `runtime-replay-timings.J9kxo3/`.
 The probe exited zero and its daemon is stopped.
+
+### Source-only acknowledgement candidate
+
+The wire acknowledgement path first called `recover_clean_acknowledgement`,
+then called `acknowledge_clean_invocation`, which repeated the same recovery
+validation before applying fresh work. That validation includes `work.validate`
+on the large availability payload. The candidate introduces one combined
+recovery/application method returning the acknowledgement and whether it was
+newly applied. The wire layer preserves its original state for retained retries
+and errors. Fresh application still performs all original authorization,
+result-binding, capacity and retirement checks. The unchecked fresh helper is
+private and only called immediately after successful recovery validation.
+
+Three focused acknowledgement tests passed (0.86 s), including a new status,
+exact-retry and substituted-request state-preservation test. Seven additional
+terminal-failure/restart/exact-acknowledgement/Required-attestation tests passed
+(0.23 s). The CLI check passed (5.55 s, warnings). Only whitespace formatting
+changed between the focused test build and the final CLI check. Logs are
+`runtime-replay-timings.J9kxo3/ack-status-{tests,recovery,check}.log`.
+
+This is **not yet in the bundled PVM** and has no measured gas or production
+latency improvement. Next: build a candidate runtime without changing the pin,
+compare its fixed large-ACK output and gas against the bundle, run rejection
+and retry coverage against the physical candidate, then independently reproduce
+and repin only when the candidate is qualified. Preserve the frozen review
+checkpoint for matching-source/bundle testing in the meantime.
 
 ## Local evidence and resumption
 

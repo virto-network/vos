@@ -1,5 +1,12 @@
 # Reviewing the Agent architecture saga
 
+Source-ahead warning: the latest acknowledgement candidate consolidates a
+duplicated recovery validation in `standard.rs`/`wire.rs`. Native targeted tests
+pass, but the bundled r17 PVM does not contain that change yet. Use the frozen
+handoff checkpoint for matching-source/bundle review; do not treat current HEAD
+as an independently reproduced release until candidate measurement and repinning
+are complete. The matching r17 results below predate this source-only change.
+
 For the frozen `f76dabe1` review checkpoint, current evidence limits, and the
 three scoped review areas, start with [the review handoff](agent-saga-handoff.md).
 The later sections of this document retain historical results; they are not
