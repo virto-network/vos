@@ -760,7 +760,7 @@ fn bundled_runtime_identity_and_vos3_package_are_exactly_pinned() {
     );
     assert_eq!(
         sdk::RUNTIME_ABI_ID,
-        Hash(*b"vos-agent-runtime-abi-260911-r15")
+        Hash(*b"vos-agent-runtime-abi-260915-r17")
     );
 
     let mut previous_generation = bytes;
@@ -1029,7 +1029,9 @@ fn bundled_runtime_installs_exact_catalog_executes_retries_and_acknowledges() {
     );
     assert_eq!(replayed.state, restarted.state);
 
-    let expired = apply_runtime(RuntimeWork::Invoke {
+    // Retirement wins over later expiry: replaying an acknowledged invocation
+    // must never reopen its result lifecycle or execute the actor again.
+    let retired = apply_runtime(RuntimeWork::Invoke {
         context: RuntimeExecutionContext::Direct,
         state: restarted.state.clone(),
         invocation: Box::new(work),
@@ -1037,10 +1039,10 @@ fn bundled_runtime_installs_exact_catalog_executes_retries_and_acknowledges() {
         observed_slot: 100,
     });
     assert_eq!(
-        expired.outcome,
-        RuntimeOutcome::Completed(Err(InvocationError::AuthorityExpired))
+        retired.outcome,
+        RuntimeOutcome::Completed(Err(InvocationError::DivergentInvocation))
     );
-    assert_eq!(expired.state, restarted.state);
+    assert_eq!(retired.state, restarted.state);
 }
 
 #[test]

@@ -2,9 +2,10 @@
 
 ## Checkpoint and decision
 
-Latest source qualification: the acknowledgement optimization described below
-is ahead of the bundled r17 runtime. The frozen checkpoint remains unchanged;
-current HEAD requires candidate PVM validation and final artifact reproduction.
+Latest source qualification: the independently reproduced acknowledgement
+optimization is now pinned, with 18 release-pin tests and five physical
+lifecycle/lineage tests passing. Fresh-space daemon smoke and final release
+qualification remain open. The frozen checkpoint below remains unchanged.
 
 Implementation checkpoint: `f76dabe1` on `wip/ch08-runtime-directory`.
 At that checkpoint, `saga/agents` is `31b0cdbb`: 258 commits ahead, zero behind,
@@ -313,6 +314,35 @@ test build but selected zero tests due to a short filter combined with
 `--exact`; it is build evidence only. The subsequent exact fully qualified
 invocation and broader run above are the actual test evidence. Both are
 terminal. Artifact pins remain unchanged pending promotion qualification.
+
+### Reproduced acknowledgement runtime pinned
+
+The runtime PVM, `support/production-artifacts.toml`, protocol ProgramId and
+`vosx/build.rs` digest now use the independently reproduced `e3e9cb85` artifact
+and identities listed above. The r17 ABI and system actor templates are
+unchanged; the runtime ProgramId is new. Preserve old fixtures and do not
+relabel their pinned identity. Use a new disposable space for the next smoke.
+
+Post-pin verification without candidate overrides:
+
+- CLI release-pin tests: **18 passed**, 0.88 s (34.71-second test build).
+- Physical `agent_runtime_pvm` suite: **4 passed, one ignored**, 1.75 s.
+- The ignored compiled directory-lineage/restart test was explicitly run with
+  the new bundled PVM: **passed**. The Attested output-binding test is gated by
+  `agent-transition-proof` and was not compiled/run in this feature selection.
+
+The first integration run failed two stale assertions: a hardcoded r15 ABI
+despite r17 source, and `AuthorityExpired` for an invocation already acknowledged
+and retired. The latter is now asserted as `DivergentInvocation`, consistent
+with the existing physical retired-invocation test and the runtime's retained
+retirement check. State-preservation assertions remain. The final rerun above
+uses corrected expectations, not changes to guest behavior.
+
+Evidence under `ack-recovery-candidate.dHhhcp/`: `post-pin-cli.log`, initial
+`post-pin-physical.log`, corrected `post-pin-physical-final.log`, and
+`post-pin-lineage.log`. No full-suite or new-pin daemon latency pass is claimed.
+Next: build the pinned CLI and run fresh-space bootstrap/restart/HTTP/SSH with
+the matching runtime, then finish the remaining original release gates.
 
 ## Local evidence and resumption
 
