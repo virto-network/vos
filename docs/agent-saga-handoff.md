@@ -377,6 +377,34 @@ the final production release matrix. Different histories make earlier timing
 comparisons uncontrolled; the measured 11.3% gas reduction remains limited to
 the fixed large acknowledgement test.
 
+### Full CLI run: startup deadline remains failing
+
+At `c441fabd`, the full socket-enabled `cargo test --locked -p vosx` run
+reported **255 unit tests passed, 19 ignored**, four package-build integration
+tests passed, and one build-task integration test passed. Shutdown smoke failed
+to observe an endpoint within its unchanged **10-second startup deadline**.
+Its preserved daemon log later reported `Address already in use`; the process
+had exited when checked. The command is therefore **not green**: 260 passed,
+19 ignored, one failed across its binaries. The SDK locked/offline
+`--no-default-features` check also passed (0.20 s).
+
+The shutdown test now uses loopback ephemeral ingress ports, detects early
+child exit, and owns a guard that kills/reaps its exact child on panic paths.
+Both startup (10 s) and SIGTERM-exit (5 s) deadlines and endpoint-removal
+assertions are unchanged. The isolated rerun still failed startup readiness in
+11.43 s overall; the child was subsequently confirmed absent. The guard fixes
+test cleanup and port isolation, **not** the production latency gate. The
+successful 32/42-second manual release smoke does not satisfy this test's
+deadline or prove SIGTERM-after-readiness through this test. Earlier manual
+smoke shutdown used SIGINT.
+
+Logs: `ack-pin-fresh-smoke.31JLq5/full-cli.log`, `sdk-no-std.log` and
+`shutdown-isolated.log`. The first failure's retained fixture is
+`target/task-tmp/vosx-shutdown-69213-data-1789469988435677136` with its paired
+config directory; all are disk-backed. The build-task test incidentally updated
+its tracked fixture lockfile; only that generated change was reverted before
+committing the shutdown-test patch. Tests and child processes are terminal.
+
 ## Local evidence and resumption
 
 Evidence is on disk under `.worktrees/ch08-c2-native/target/task-tmp/`, not `/tmp`:

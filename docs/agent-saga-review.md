@@ -8,6 +8,10 @@ the runtime ProgramId changed. Fresh-space release startup/restart now pass in
 32/42 seconds with HTTP, SSH key identity and clean shutdown checks. Final release
 qualification and production latency remain open. Historical r17 timings below
 used the old pin; see the handoff for the new-pin smoke's exact qualifications.
+The subsequent full CLI run is not green: 260 tests passed, 19 were ignored,
+and shutdown smoke failed its unchanged 10-second startup-readiness deadline,
+including after test ingress ports were isolated. Production latency remains
+an explicit release-test failure; see the handoff for cleanup and exact logs.
 
 For the frozen `f76dabe1` review checkpoint, current evidence limits, and the
 three scoped review areas, start with [the review handoff](agent-saga-handoff.md).
