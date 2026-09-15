@@ -20,11 +20,16 @@ The 256-record ceiling and authenticated reclamation requirement remain.
 No guest or ABI change; the previously qualified release CLI does not yet
 include this host optimization.
 
-An attempted default-feature issuer test build failed before execution:
-`driver.rs` tests at the public-descriptor and clean-image descriptor cases
-reference `completed_clean_policy_fixture`, which is gated behind `pvm`.
-The PVM-enabled suite above passes, but the default library test-build gate
-remains open. Failure log: `task-tmp/issuer-validation-reuse.log`.
+The default-feature library test-build failure is now fixed: the two
+`driver.rs` descriptor tests use a fixture that commits a PVM execution result,
+so they now carry the same `pvm` guard as the fixture and execution method.
+Default-feature library tests compile (1m06s), and both validation-reuse
+regressions pass (0.35s). With `agent-transition-proof`, both descriptor tests
+remain enabled and pass, together with the selected package descriptor test
+(3/3, 0.01s; build 1m14s including Cargo lock wait). Logs:
+`task-tmp/default-feature-test-gate.log` and `task-tmp/pvm-descriptor-test-gate.log`.
+The original failure is preserved in `task-tmp/issuer-validation-reuse.log`.
+This qualifies compilation and the selected tests, not the full library suite.
 
 Current full CLI default suite at `1c787774`: 260 passed, 19 ignored, one
 failure. Unit tests passed 255/255 selected (92.16s); actor-build integration

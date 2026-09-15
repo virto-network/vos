@@ -6295,6 +6295,8 @@ mod tests {
         );
     }
 
+    // The completed clean-runtime fixture commits a PVM execution result.
+    #[cfg(feature = "pvm")]
     #[test]
     fn public_descriptor_transitions_preserve_current_metadata_on_historical_retry() {
         use crate::agent_sdk::{
@@ -6392,6 +6394,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "pvm")]
     #[test]
     fn clean_image_descriptor_roundtrips_without_decoding_opaque_state() {
         let (state, _, _) = super::super::wire::tests::completed_clean_policy_fixture(
