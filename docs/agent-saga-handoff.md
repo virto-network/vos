@@ -2,6 +2,29 @@
 
 ## Checkpoint and decision
 
+Full default-feature `vos` library regression suite at source `206ea1e3`
+(documentation-only HEAD `06008adf`) passes:1,434 passed, zero failed, one
+ignored,219.66s. Command: `cargo +nightly-2025-05-09 test --locked --offline
+-p vos --lib -- --test-threads=1`, with the shared target and disk-backed
+TMPDIR. Evidence: `task-tmp/prepared-runtime-default-library-suite.log`;
+session77273 is terminal0. This supersedes the older default-library baseline
+for the current recovery and preparation-cache implementation. It does not
+replace the host-feature matrix, CLI suite, cryptographic proof qualification,
+or production release gates. No implementation change in this qualification.
+
+Further analysis of the already-recorded `prepared-runtime-release.cJZtXj`
+startup log (no new probe) isolates the pre-inventory phase:30 runtime calls
+total23,634,791us, including20 large calls totaling23,203,656us. Registry
+verification is logged at16:38:02.494, first inventory reconciliation starts
+at16:38:30.493, and readiness at16:39:01.010. Thus roughly28s precedes the
+30.516s initial inventory reconciliation. Both portions contain substantial
+runtime execution; the59s startup is not explained solely by a readiness
+timer or by the one periodic Credential query. These timing events lack
+operation subtypes: do not label every pre-inventory call as replay or assume
+it can be skipped without following its authenticated recovery requirements.
+
+### Latest release probe
+
 Release `206ea1e3` is now built and live-probed. Build passed6m48s with the
 unchanged release profile (`cargo +nightly-2025-05-09 build --locked --offline
 --release -p vosx`); bundle creation and verification pass with unchanged guest

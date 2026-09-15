@@ -2,6 +2,12 @@
 
 ## Follow-up after the frozen review snapshot
 
+The full default-feature `vos` library suite now passes on implementation
+`206ea1e3`:1,434 passed, zero failed, one ignored,219.66s. This replaces the
+old default-library baseline for current source; the full host-feature matrix
+has not yet been rerun after these changes. See the handoff for the exact
+command and retained log.
+
 Latest release implementation: `206ea1e3`. Its release build and bundle
 verification pass. The preserved-space probe passed HTTP, unchanged SSH
 identity, retained Counter read/exact retry, and one busy SIGTERM shutdown
