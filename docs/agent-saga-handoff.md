@@ -2,6 +2,51 @@
 
 ## Checkpoint and decision
 
+Release `206ea1e3` is now built and live-probed. Build passed6m48s with the
+unchanged release profile (`cargo +nightly-2025-05-09 build --locked --offline
+--release -p vosx`); bundle creation and verification pass with unchanged guest
+pins. Executable SHA-256:
+`8a7eda3426da2c74086881a0577516fa8e817c53672bc9df6f38118789b6e2ee`.
+
+On the preserved space at its original absolute path, readiness took59s;
+HTTP status and the original SSH identity passed. One complete periodic
+Credential query took3,439ms and route reconciliation3,884ms. Its ten runtime
+load/run spans totaled2,510,839us. Eight smaller executions took19.8–25.5ms;
+the two large inputs still dominate:788,374bytes /1,535,769us /875,226,651gas
+and790,499bytes /806,345us /385,264,799gas. They total2,342,114us, roughly93%
+of measured runtime time. About928ms of the query is outside these spans.
+The two earlier retry lookups took10,576/11,130us; four post-query route-audit
+executions took23.8–24.3ms each. The earlier `8716f6a7` sample was4,780ms for
+the query and5,602ms for reconciliation, with small calls77–98ms; retained
+history and workload differ, so these are observations, not a controlled
+end-to-end speedup or evidence that changed gas was charged for identical work.
+The large calls remain about2.3s together: preparation reuse does not solve
+their execution cost. No fresh Create or Install latency was measured.
+
+Retained Counter read/positive retirement/exact retry passed (test2.04s,
+managed attempt0.58s); no fresh actor mutation or replacement nonce. SIGTERM
+sent during the next newly started Credential query passed the unchanged5s
+deadline without forced cleanup. This is one busy-shutdown pass, not universal
+qualification. Startup still fails the10s gate. Resident memory was225.4MiB
+at readiness and232.1MiB after reconciliation; observed process high-water was
+261.0MiB. There is no matching old-release memory baseline, so these values
+do not isolate cache overhead or establish deployment-scale memory bounds.
+
+Evidence: shared target `task-tmp/prepared-runtime-release.cJZtXj/` contains
+`build.log`, `bundle/`, `probe.sh`, `probe.log`, `up.log`, `counter-test.log`,
+HTTP/SSH evidence, and `memory-{ready,reconciled}.txt`. `vosx-before`,
+`data-before` and `config-before` preserve pre-probe evidence, not a space to
+boot at a new path. Build session16999 and probe session40044 are terminal0;
+post-probe host process inspection found no vosx daemon. No merge or push.
+
+Next bounded performance work should attribute the two large invocation
+transitions and the startup work preceding readiness, not repeat immutable
+preparation optimization. Keep exact authenticated work and gas semantics.
+The full integrated release matrix, ordinary Shared finality wiring,
+authenticated256-record reclamation, and proof qualification remain open.
+
+### Preparation implementation checkpoint
+
 Validated program-preparation reuse is now implemented after review checkpoint
 `97c08c88`. `refine::PreparedProgram` owns executor-validated standard bytes and
 private Conformance/standard-latency tables. Cold and prepared loads share the

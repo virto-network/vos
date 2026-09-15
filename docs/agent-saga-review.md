@@ -2,15 +2,26 @@
 
 ## Follow-up after the frozen review snapshot
 
+Latest release implementation: `206ea1e3`. Its release build and bundle
+verification pass. The preserved-space probe passed HTTP, unchanged SSH
+identity, retained Counter read/exact retry, and one busy SIGTERM shutdown
+within5s. Startup took59s and remains a failed gate. Periodic Credential query
+3.439s / route reconciliation3.884s; the two large runtime executions still
+take2.342s together. These are not controlled before/after measurements or
+fresh Create/Install timings. Resident memory after reconciliation232.1MiB,
+observed high-water261.0MiB; no comparable old-release memory baseline.
+The release is suitable for continued disposable testing, not production
+sign-off. Exact logs and release checksum are in the newest handoff entry.
+
 Program-preparation reuse has been implemented after `97c08c88`: opaque
 validated Refine preparation plus a single-entry, exact-byte-keyed Agent
 executor cache. This belongs in the performance portion of batch 2; the frozen
 ranges below remain reproducible and do not include it. Runtime tests (260)
 and default-feature local-driver tests (32) pass, as does the runtime no_std
 check. Load-only measurement fell from67ms to3ms on the bundled program; this
-does **not** establish an end-to-end speedup. The release executable remains
-`8716f6a7`; rebuild/live timing, memory measurement and release qualification
-are still required. See the newest handoff entry before using historical
+does **not** establish an end-to-end speedup. Live qualification of `206ea1e3`
+is summarized above; the final integrated matrix and release gates remain
+open. See the newest handoff entry before using historical
 statements below that describe this optimization as unimplemented.
 
 ## Current review checkpoint
