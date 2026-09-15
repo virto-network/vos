@@ -13,6 +13,13 @@ lifecycle-store leases and corrected clock coverage" for the correction.
 
 Implementation is in `.worktrees/ch08-runtime-directory` on
 `wip/ch08-runtime-directory`, not yet in the root `saga/agents` checkout.
+Latest C2 runtime pin is `fc7e4c0e`, reproduced from `2ef2220e`. The fresh
+`.lU4S5Z` live campaign now passes compiled protected Local yield/resume,
+retirement, two restarts and final-state query, plus Panicked-result retirement
+after restart with a released credential reservation. Its daemon is stopped.
+Typed-error retirement, expiry/abort/mixed-pending recovery, Shared finality,
+Private/Attested and production latency/release gates remain open. These are
+still C1/C2/C3 work, not new review batches or a master-readiness declaration.
 Use only an isolated, disposable environment for bootstrap/ingress testing.
 Fresh-space identity derivation now selects the actual canonical `set_root`
 event instead of empty initialization, and creation commits a full-width
@@ -32,7 +39,8 @@ invocation, retained delivery and an exact HTTP retry. Exact HTTP invocation
 after restart also passes. Native positive retirement and exact acknowledgement
 retries now pass before and after restart. Public Counter mutation, late replay
 rejection and a fresh read of seven after actual daemon restart now pass with
-the repinned runtime. Protected/non-Public actor workflows remain open.
+the repinned runtime. Protected Local mutation and yield/restart now pass as
+detailed below; other profiles and broader failure categories remain open.
 The latest LocalSigner campaign passes installation, a live deployment-scoped
 role grant, protected Local execution, visible signature verification and
 positive retirement. An exact retained client retry and a fresh protected
@@ -249,10 +257,11 @@ Keep these as work within C2, not new review batches:
    helpers and durable fresh-command orchestration are implemented. A fresh
    receipt-bearing Public successor now passes live; the protected mutation
    and broader terminal-resolution cases are not thereby complete.
-3. Prove a protected Local mutation, yield/resume where applicable, positive
-   retirement and restart through native ingress and the managed client.
+3. **Protected Local scenario passed; broader terminal recovery remains open:**
+   protected mutation, compiled yield/resume, positive retirement and actual
+   restart now pass through native ingress and the managed client.
    The fresh Public Counter post-retirement/restart campaign now passes.
-   Complete the missing protected permission setup next: the real bundled
+   The protected permission setup is now exercised: the real bundled
    Authority passes native signed space-role grant/revoke and rejects anonymous
    signed administration. Native retained admin dispatch now recovers across
    publication failures and owner restart before/after execution. Native
@@ -269,8 +278,10 @@ Keep these as work within C2, not new review batches:
    and after actual daemon restart, with a fresh post-restart invocation ID.
    Deployment-scoped role revoke, signed denial, exact denial retry and fresh
    success after re-grant now pass without consuming the denied operation's
-   credential sequence. Yield/resume where applicable and the broader terminal
-   resolution/recovery cases remain open. Keep
+   credential sequence. The compiled yield actor now retains two cooperative
+   yields, resumes after an actual restart, completes with 111, retires, and
+   returns 111 through a fresh query after another restart (`.lU4S5Z` evidence
+   below). The broader terminal resolution/recovery cases remain open. Keep
    its credential sequence and generation CAS distinct from operation
    authorization; do not relax anonymous HTTP invocation or
    put this mutation in the read-only projection journal.
@@ -8512,6 +8523,133 @@ repair of the original negative CIP1 occurred. Next run the corrected
 compiled-yield and failure-retirement campaign in a fresh disposable space,
 then address typed-error retirement and the remaining original C1/C2/C3
 gates, including production latency. No live space ran during this pin step.
+
+### Fresh native compiled-yield first slice (C2, restart continuation pending)
+
+Fresh disposable fixture `task-tmp/admin-startup-smoke.lU4S5Z` uses the
+reproduced failure-retaining runtime and a new isolated operator/data tree.
+Space `f9c20b4335a578d48b1fd9f719189aa0bc69c96f979419b0f831a2d498abff47`
+has loopback HTTP `18091` and SSH `2233`; no old space was migrated or edited.
+The actor rebuild produced corrected program
+`c372e1d40942975057b990870d77f70a5b1f5f2354a9165f2422ddcda6d09458`,
+new operator-signed deployment
+`6f8eb2662d7a79446946c024bca1b1a8e6e99205dde4517d248ba3acab079344`.
+
+Observed UTC timings on 2026-09-15:
+
+- initial network start **02:40:31**, ready **02:41:08** (~36.5s);
+- Local Create **02:41:37–02:43:39**, **122s**, first attempt;
+- Install **02:43:43–02:47:33**, **230s**, one HTTP 504 followed by exact
+  retained-request resume;
+- actor-role grant **02:47:33–02:48:20**, **47s**, applied and retired;
+- first slice **02:48:20–02:51:32**, **192.17s**, helper passed and retained
+  cooperative Yielded sequence **1**, nonce `0x80`, with no progress past it.
+
+The daemon recorded an initial management replay-headroom exhaustion at
+**02:51:06.988**, applied slots **110**, remaining slots **3986**, one pending
+member and no retiring pairs; checkpoint admission recovered within the
+successful first-slice workflow. These timings are not acceptable production
+latency evidence. Logs: `first-yield-timing.log`, `create-1.json`,
+`install-{1,2}.{json,log}`, `grant-1.json`, `first-slice-1.log`, `up-1.log`.
+Exact first-yield paths/sequence are in `yield-fixed-first-slice.json`.
+
+SIGTERM was sent at **02:51:52 UTC** to PID **3762847**. The down command's
+five-second observation expired, but the original foreground handle exited
+**0** without force. A second daemon was started with `up-2.log` to test
+actual continuation recovery. Resume, positive retirement, final value 111,
+second restart, and live terminal-failure retirement remain unproved at this
+checkpoint. The old `.hJuDDq` negative CIP1 and reservation are untouched.
+
+### Native compiled-yield continuation after restart (C2)
+
+The `.lU4S5Z` daemon restarted at **02:52:43 UTC** and became ready at
+**02:54:07 UTC** on 2026-09-15 (~84.6s). The normal retained-client helper
+`disposable_yield_resume_and_retire` then passed in **3.20s** (`resume-1.log`).
+It verified exactly two Resume exchanges followed by ACK: second cooperative
+yield sequence **2**, terminal Done with decoded value **111**, positive
+retirement, and cached exact retry of the same authorization/application.
+The original invocation nonce `0x80` and AuthorityReceipt remained unchanged.
+This is the actual compiled actor running through native ingress after a
+real daemon restart, not the synthetic continuation fixture.
+
+Graceful shutdown was requested at **02:55:07 UTC** for PID **3780176**.
+Again the down command's five-second observation expired, while the original
+daemon handle exited **0** without force (`down-2.log`). A third start in
+`up-3.log` is for the final fresh LocalQuery after another actual restart;
+that query and live terminal-failure retirement are not yet proved here.
+
+### Native compiled-yield final state verified (C2 live scenario passed)
+
+The third `.lU4S5Z` start ran from **02:55:56 to 02:58:05 UTC** on
+2026-09-15 (~129.1s). The fresh `0x81` LocalQuery through normal preparation,
+invocation and acknowledgement passed in **116.80s**:
+`value-after-restart-1.log` confirms decoded value **111** and positive
+retirement. Together with the first-yield and resume checks above, this
+proves the protected compiled Local actor's two cooperative yields, recovery
+after a real restart, final completion, exact retirement/cached retry, and
+durable final state after a second real restart. This specific live C2
+scenario is passed; it is not a general lifecycle or production release pass.
+
+Live terminal-failure retirement still needs a fresh failure on the new
+runtime (the old `.hJuDDq` negative acknowledgement cannot be overwritten).
+Typed errors, expiry/abort/mixed pending recovery, ordinary Shared finality,
+Private/Attested and original release checks remain separate. Observed
+Create/Install/first-invocation/query/replay latency remains a release concern.
+
+At this handoff the **third disposable daemon is intentionally still running**
+for the next failure-retirement campaign, avoiding an unnecessary replay.
+Its foreground process handle is **25034**, with `up-3.log`; the first-yield
+campaign and both follow-up helper handles are terminal and successful. No
+new client invocation is pending from the successful yield/query scenario.
+The wrapper is `task-tmp/admin-startup-smoke.lU4S5Z/cli.sh`, using isolated
+XDG paths and disk scratch. Revalidate that handle/readiness before proceeding;
+do not launch another daemon while this one is active. These evidence notes
+remain uncommitted pending the related native failure result.
+
+### Native Panicked-result retirement after restart (C2 live gap closed)
+
+Reused the running `.lU4S5Z` disposable space with a separate actor
+`7ec877c35afbb24b660dd7b9c2cc0f02a5dc821917992ad002320c7ab2dc0492`.
+The known failing package was copied byte-identically from `.hJuDDq` without
+editing its source evidence; its program is `5a18bc74…` and deployment
+`747b21b0…`. This deliberately reproduces the old actor-side panic on the
+**new runtime**, rather than migrating or repairing the old space.
+
+UTC timings on 2026-09-15 (`failure-timing.log`): Install
+**03:04:07–03:06:31** (**144s**, first attempt), role grant
+**03:06:31–03:07:05** (**34s**, applied/retired), fresh nonce `0x78`
+invocation **03:07:05–03:09:35** (**150.25s**). Inspection of
+`failure-first-slice.log` confirmed the exact retained Direct
+`Completed(Ok(InvocationReply { status: Panicked, ... }))`, empty reply,
+gas remaining **999878404**, and no committed observation. The yield helper
+intentionally failed its Yielded assertion; that failure is not reported as
+a passing test or a transport failure.
+
+Graceful shutdown was requested at **03:10:02 UTC** for PID **3783919**;
+the down command's five-second observation expired, but the original daemon
+exited **0** without force (`down-3.log`). Actual restart ran
+**03:11:30–03:15:06 UTC** (~**216.8s**, `up-4.log`). Only after readiness,
+`disposable_yield_retire_failed_first_slice` passed in **1.20s**
+(`failure-retirement-1.log`): it verified the exact original program,
+deployment, invocation and Panicked reply, preserved the original request
+and response bytes, and obtained positive retirement through normal managed
+continuation. `yield-failed-retired.json` records its exact store paths.
+
+A subsequent normal `space invoke-local --resume --format json` returned
+`decision=issued`, `decision_retained=true`, **`delivery_retired=true`** and
+**`reservation_pending=false`** (`failure-cached-retry.json`). Thus the
+new runtime fixes the observed Panicked-result/NotFound retirement defect
+across native restart. The old `.hJuDDq` negative CIP1 and reservation remain
+unchanged; this is not evidence that they were repaired.
+
+Final shutdown was requested at **03:16:50 UTC** for PID **3804562**;
+both the normal down command and original foreground handle exited **0**
+without force (`down-4.log`). All campaign and daemon handles are terminal.
+This supersedes the earlier running-daemon handoff. No production source or
+artifact changed during these live campaigns; only this C2 evidence/closeout
+summary changed. Typed errors still lack a general retained-error retirement
+path, and the original expiry/abort/mixed-pending, profile/finality and release
+gates remain open. Multi-minute fresh-work/replay latency remains unacceptable.
 
 ### Durable client acknowledgement before completion
 
