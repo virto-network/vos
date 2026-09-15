@@ -3509,6 +3509,9 @@ impl SharedAgentNetworkHost {
             host.supervisor_attachment_status(agent)?
                 .ok_or(SharedAgentHostError::AgentNotFound)?
         };
+        // Recovery admission below needs only audited ledger capacity. Keep
+        // each fresh audit under the same host lock, but do not ask `show` to
+        // query actor lanes and snapshots whose results would be discarded.
         if let Some(pending) = &pending_management {
             let host = self
                 .host
@@ -3526,10 +3529,7 @@ impl SharedAgentNetworkHost {
                         .collect::<Vec<_>>(),
                 )?
                 .ok_or(SharedAgentHostError::CapacityExhausted)?;
-            let remaining = host
-                .show(agent)?
-                .ok_or(SharedAgentHostError::AgentNotFound)?
-                .remaining_slots;
+            let (_, remaining, _) = host.capacity(agent)?;
             // Preserve every anchor; never checkpoint to make this set fit.
             if remaining < required as u64 + 1 {
                 return Err(SharedAgentHostError::CapacityExhausted);
@@ -3548,10 +3548,7 @@ impl SharedAgentNetworkHost {
                     &envelopes.iter().flatten().collect::<Vec<_>>(),
                 )?
                 .ok_or(SharedAgentHostError::CapacityExhausted)?;
-            let remaining = host
-                .show(agent)?
-                .ok_or(SharedAgentHostError::AgentNotFound)?
-                .remaining_slots;
+            let (_, remaining, _) = host.capacity(agent)?;
             // The new one-voter worker must append its current-term no-op.
             if remaining < required as u64 + 1 {
                 return Err(SharedAgentHostError::CapacityExhausted);
@@ -3563,9 +3560,7 @@ impl SharedAgentNetworkHost {
                     .host
                     .lock()
                     .map_err(|_| SharedAgentHostError::Unavailable)?;
-                let status = host
-                    .show(agent)?
-                    .ok_or(SharedAgentHostError::AgentNotFound)?;
+                let (_, remaining, _) = host.capacity(agent)?;
                 (
                     host.projection_admission_requirement(
                         agent,
@@ -3573,7 +3568,7 @@ impl SharedAgentNetworkHost {
                         recovering.authorization,
                         true,
                     )?,
-                    status.remaining_slots,
+                    remaining,
                 )
             };
             let needs_checkpoint = required.is_none_or(|required| {
@@ -3676,12 +3671,7 @@ impl SharedAgentNetworkHost {
                 .lock()
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
             drain_committed(&mut host, agent, &ordered_replies)?;
-            if host
-                .show(agent)?
-                .ok_or(SharedAgentHostError::AgentNotFound)?
-                .applied_slots
-                != committed
-            {
+            if host.capacity(agent)?.0 != committed {
                 return Err(SharedAgentHostError::CorruptResidue);
             }
         }
@@ -3691,9 +3681,7 @@ impl SharedAgentNetworkHost {
                     .host
                     .lock()
                     .map_err(|_| SharedAgentHostError::Unavailable)?;
-                let status = host
-                    .show(agent)?
-                    .ok_or(SharedAgentHostError::AgentNotFound)?;
+                let (_, remaining, _) = host.capacity(agent)?;
                 (
                     host.projection_admission_requirement(
                         agent,
@@ -3701,7 +3689,7 @@ impl SharedAgentNetworkHost {
                         recovering.authorization,
                         true,
                     )?,
-                    status.remaining_slots,
+                    remaining,
                 )
             };
             let capacity = required
@@ -3744,9 +3732,7 @@ impl SharedAgentNetworkHost {
                 .host
                 .lock()
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
-            let status = host
-                .show(agent)?
-                .ok_or(SharedAgentHostError::AgentNotFound)?;
+            let (_, remaining, _) = host.capacity(agent)?;
             let Some(required) = host.projection_admission_requirement(
                 agent,
                 recovering.work,
@@ -3756,7 +3742,7 @@ impl SharedAgentNetworkHost {
             else {
                 return Err(SharedAgentHostError::CapacityExhausted);
             };
-            if status.remaining_slots < required as u64 {
+            if remaining < required as u64 {
                 return Err(SharedAgentHostError::CapacityExhausted);
             }
             ProposalAdmission {
@@ -3783,10 +3769,7 @@ impl SharedAgentNetworkHost {
                         .collect::<Vec<_>>(),
                 )?
                 .ok_or(SharedAgentHostError::CapacityExhausted)?;
-            let remaining = host
-                .show(agent)?
-                .ok_or(SharedAgentHostError::AgentNotFound)?
-                .remaining_slots;
+            let (_, remaining, _) = host.capacity(agent)?;
             if remaining < required as u64 {
                 return Err(SharedAgentHostError::CapacityExhausted);
             }
@@ -3811,10 +3794,7 @@ impl SharedAgentNetworkHost {
                     &envelopes.iter().flatten().collect::<Vec<_>>(),
                 )?
                 .ok_or(SharedAgentHostError::CapacityExhausted)?;
-            let remaining = host
-                .show(agent)?
-                .ok_or(SharedAgentHostError::AgentNotFound)?
-                .remaining_slots;
+            let (_, remaining, _) = host.capacity(agent)?;
             if remaining < required as u64 {
                 return Err(SharedAgentHostError::CapacityExhausted);
             }

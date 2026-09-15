@@ -5382,6 +5382,19 @@ mod tests {
         };
         let full_status = host.show(fixture.shared.agent).unwrap().unwrap();
         assert_eq!(
+            host.capacity(fixture.shared.agent).unwrap(),
+            (
+                full_status.applied_slots,
+                full_status.remaining_slots,
+                full_status.reservation_pending,
+            ),
+            "capacity-only recovery admission must match the full status facts",
+        );
+        assert!(matches!(
+            host.capacity(AgentId::ZERO),
+            Err(SharedAgentHostError::AgentNotFound)
+        ));
+        assert_eq!(
             full_status.engines,
             SharedAgentEnginePlan {
                 control_raft: true,

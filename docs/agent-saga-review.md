@@ -9411,6 +9411,45 @@ management expiry, mixed-pending/crash/capacity, Shared finality or full release
 closure. The release daemon predates only this client/test harness refactor;
 guest and server code are unchanged.
 
+### Recovery attachment capacity-only projection (C2 latency)
+
+Sampled test-only Rust backtraces finally provide usable caller attribution for
+repeated journal Invoke encoding. The native issuance/reopen/retirement test
+passes in 20.95s with instrumentation (`journal-callers.log`, same r17 fixture).
+Of 38 periodic caller samples, 16 include `audit_recovery_capacity`, 11 include
+physical-row verification, and seven include full `SharedAgentHost::show` from
+recovery attachment. These are overlapping call-stack samples, not percentages
+of CPU time or an exhaustive hash profile.
+
+Eight recovery attachment checks read only applied/remaining ledger capacity
+from a full status projection. They now use the existing `host.capacity` method
+under the same host locks instead. Every fresh authenticated ledger audit,
+physical-row verification, admission requirement, checkpoint decision and
+barrier comparison remains. Only the unused actor-lane and snapshot status
+queries are removed; no cached trust, capacity waiver or timeout change.
+The initial attachment status and user-facing status still use their existing
+paths. A physical host regression compares capacity-only facts to full status
+after runtime upgrade/actor installation and checks missing-agent rejection.
+
+The same instrumented native test passes after the change in 20.01s
+(`journal-callers-capacity-only.log`). This single small timing difference does
+not establish a production latency improvement. All temporary backtrace code
+was removed; no profiling feature or source hook remains. Final-code checks:
+
+- Six focused tests pass, 54.98s: native issuance/reopen, completion-write retry,
+  partial result retirement, physical host capacity equivalence, exact Raft
+  restart/duplicate behavior, and missing/corrupt physical-row rejection.
+  Evidence: `capacity-only-recovery-tests.log`.
+- Normal `vosx` compile check passes, 5.31s (existing warnings), in
+  `capacity-only-cli-check.log`; diff checks pass.
+
+This is a host-only change; no guest artifact or pin changed. The release binary
+used by the preceding live campaigns does not yet include it. Multi-minute
+release startup remains open: the measured caller paths still authenticate and
+re-encode complete retained command history on capacity/recovery reads. Further
+work must establish a safe immutable verification boundary there, not repeat
+the failed perf unwind settings or infer a release gain from this small test.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its
