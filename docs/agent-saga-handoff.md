@@ -2,6 +2,45 @@
 
 ## Checkpoint and decision
 
+### Inventory latency attribution from current release evidence
+
+Analysis of existing `fresh-ack-release.Of5a75/framed-invoke-up.log` (no new
+daemon/build) separates each completed startup inventory query from its
+enclosed `physical Agent runtime execution` events. For two visible agents,
+initial inventory required six sequential authenticated queries:
+
+| Selector | Query ms | Runtime ms | Large calls (>700KB) | Outside runtime spans ms |
+| --- | ---: | ---: | ---: | ---: |
+| Credential | 4,466 | 2,351.5 | 2 | 2,114.5 |
+| Agents | 4,579 | 2,330.1 | 2 | 2,248.9 |
+| System-agent replicas | 4,708 | 2,275.3 | 2 | 2,432.7 |
+| System-agent actors | 4,806 | 2,299.9 | 2 | 2,506.1 |
+| Local-agent replicas | 4,824 | 2,218.4 | 2 | 2,605.6 |
+| Local-agent actors | 5,191 | 2,269.5 | 2 | 2,921.5 |
+
+Totals: queries28,574ms;61 runtime spans13,744.7ms;12 large calls12,687.8ms.
+About14,829.3ms is outside those runtime spans. Rounding and outer query
+boundaries apply; this residual is NOT attributed to one function, disk I/O,
+or a replay category. Initial route reconciliation then totals29,554ms.
+The later unchanged-head Credential refresh takes3,527ms, including2,336.8ms
+in10 runtime spans, so the existing authenticated inventory reuse is active.
+
+Source confirms each full refresh queries Credential, agent pages, then replica
+and actor pages per agent; pagination can add queries. Each query still requires
+authenticated dispatch and completion. Do not bypass these boundaries or use
+stale unauthenticated inventory to satisfy readiness. Guest-only optimization
+cannot remove the measured host-side residual.
+
+Next bounded measurement: enable
+`vos::agent::clean_bootstrap=debug` alongside current owner/driver logging in
+the next release qualification. Existing `Authority projection phase complete`
+events cover prepare/reserve/identity/persist, and execution events cover
+reopen/invoke/acknowledge/complete. Each family reports cumulative elapsed time
+from its own start; subtract consecutive values within a family, not across
+families. These events were filtered out of the retained run, so their missing
+attribution cannot be inferred. Combine this with the pending conflict-reporting
+release rebuild rather than launching another independent optimization build.
+
 ### Lifecycle conflict reporting corrected (source, not rebuilt release)
 
 Local Create/Install now map `Lifecycle(Conflict)` to HTTP409 with guidance to

@@ -1,6 +1,6 @@
 # Reviewing the Agent architecture saga
 
-## Review entry point: bundled checkpoint `b7cfa17d`
+## Review entry point: source checkpoint `12e45422`
 
 Use these two ranges for the current review; the older snapshot below remains
 historical evidence. No merge or push is implied by this breakdown.
@@ -8,7 +8,7 @@ historical evidence. No merge or push is implied by this breakdown.
 | Batch | Exact range | Scope and size |
 | --- | --- | --- |
 | 1 | `31b0cdbb..f79f0e3d` | Integrated clean-break architecture and lifecycle;225 files,+72,934/-58,875. |
-| 2 | `f79f0e3d..b7cfa17d` | Recovery, checkpointing, shutdown, prepared-runtime reuse, ACK validation reuse, reproduced pin and qualification;23 files,+2,115/-88. |
+| 2 | `f79f0e3d..12e45422` | Recovery, checkpointing, shutdown, prepared-runtime/ACK reuse, reproduced pin, lifecycle conflict reporting and qualification;26 files,+2,458/-112. |
 
 Batch1 remains large and cannot be presented as an independently safe old C1
 cut. Batch2 contains all subsequent fixes together, not one review per commit.
@@ -20,6 +20,13 @@ to immutable source and provenance. The following evidence distinguishes
 passing regressions from still-failing production gates.
 
 ## Follow-up after the frozen review snapshot
+
+Current-release inventory attribution: six sequential startup queries for two
+agents total28.6s;61 runtime spans account for13.7s, leaving14.8s outside those
+spans. Existing unchanged-head inventory reuse is active. Next enable existing
+projection phase logs during the pending release rebuild/probe to attribute
+the residual; do not assume guest execution or disk I/O explains it. Exact
+per-query measurements and logging boundaries are in the handoff.
 
 Source follow-up corrects conflict reporting: Local lifecycle conflicts return
 409, not temporary503; CLI preserves requests and recommends inspecting
