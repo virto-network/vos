@@ -1658,6 +1658,14 @@ where
         lifecycle: Option<&super::local_lifecycle::LocalLifecycleStartupAdmission>,
         operations: Option<&NativeAuthorityOperationStartupAdmission<'_>>,
     ) -> Result<Self, CleanSystemAgentBootstrapError> {
+        let started = std::time::Instant::now();
+        let report_phase = |phase: &'static str| {
+            tracing::debug!(
+                phase,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Clean system owner recovery phase complete"
+            );
+        };
         plan.validate()
             .map_err(CleanSystemAgentBootstrapError::Rejected)?;
         if lifecycle.is_some_and(|admission| admission.authority != plan.authority_target())
@@ -1777,6 +1785,7 @@ where
                 .ok_or_else(|| rejected(CleanSystemAgentBootstrapRejection::WrongReceipt))?
         };
         validate_exact_receipt(plan, &plan.create_decision, &create_receipt, 1, 0)?;
+        report_phase("record_and_issuer");
 
         let runtime = plan.runtime().map_err(rejected)?;
         let (create, supplied_catalog) =
@@ -1799,6 +1808,7 @@ where
         .map_err(|_| rejected(CleanSystemAgentBootstrapRejection::InvalidDecision))?;
         validate_prepared_system_agent_genesis_root(&prepared, &plan.pins.root)
             .map_err(CleanSystemAgentBootstrapError::Bootstrap)?;
+        report_phase("prepare_genesis");
         let locator = SystemAgentGenesisLocator {
             space: crate::service::SpaceId(plan.pins.space.0),
             agent: crate::service::AgentId(plan.pins.agent.0),
@@ -1837,6 +1847,7 @@ where
             ));
         }
 
+        report_phase("reproduce_genesis_archive");
         let scope = AgentHostScope {
             space: crate::service::SpaceId(expected_space.0),
             node: crate::service::NodeId(expected_node.0),
@@ -1852,6 +1863,7 @@ where
         )
         .map_err(CleanSystemAgentBootstrapError::Host)?;
         let committee_authority = committee_authority_binding(plan)?;
+        report_phase("open_shared_host");
         shared_host
             .provision_system_bootstrap(
                 provision,
@@ -1860,6 +1872,7 @@ where
                 committee_authority,
             )
             .map_err(CleanSystemAgentBootstrapError::Host)?;
+        report_phase("provision_system_bootstrap");
         // Reopen may find Raft commit evidence ahead of the clean journal
         // application cursor.  Drain it while the route is still detached so
         // an exact terminal Ack can be proved before any startup checkpoint
@@ -1874,6 +1887,7 @@ where
                 crate::agent::shared_host::SharedAgentApplyOutcome::Idle => break,
             }
         }
+        report_phase("drain_committed_entries");
         let host = Arc::new(Mutex::new(shared_host));
         // A crash may follow the exact positive Ack but precede clearing PAP.
         // Prove that terminal boundary directly from authenticated replay and
@@ -1901,6 +1915,7 @@ where
                 record = cleared;
             }
         }
+        report_phase("pending_projection_recovery");
         let management = lifecycle.filter(|admission| !admission.is_empty());
         let operations = operations.filter(|admission| !admission.is_empty());
         if (management.is_some() || operations.is_some()) && record.pending_projection.is_some() {
@@ -1957,6 +1972,7 @@ where
         }
         .map_err(CleanSystemAgentBootstrapError::Host)?;
 
+        report_phase("attach_network_host");
         if issuer.acknowledged_through() < 1 {
             issuer
                 .observe_durable(&create_receipt)
@@ -1997,6 +2013,7 @@ where
             commit_bootstrap_record(&mut record_store, &record)?;
         }
         ensure_actor_installed(&host, plan, &plan.authority_request)?;
+        report_phase("ensure_authority");
         if issuer.acknowledged_through() < 2 {
             issuer
                 .observe_durable(&authority_receipt)
@@ -2058,6 +2075,7 @@ where
             commit_bootstrap_record(&mut record_store, &record)?;
         }
         ensure_actor_installed(&host, plan, &plan.catalog_request)?;
+        report_phase("ensure_catalog");
 
         let acknowledgement = if record.phase < CleanSystemAgentBootstrapPhase::CatalogAcknowledged
         {

@@ -75,6 +75,16 @@ history changes between runs: these are not a controlled before/after series.
 The decoder benchmark has **not** established acceptable startup or operation
 latency. The internal split of system-owner recovery remains unmeasured.
 
+Post-checkpoint diagnostic preparation adds debug-only cumulative owner-stage
+timings for record/issuer validation, genesis preparation/archive reproduction,
+Shared host open/provision, committed-entry draining, pending-projection recovery,
+network attachment, and Authority/Catalog checks. Only static phase names and
+elapsed milliseconds are logged; no payloads or identity material are added.
+`cargo check --locked -p vosx` passed in 5.35 seconds with warnings. These new
+markers have not yet been measured in a rebuilt release daemon and do not alter
+the checkpoint's evidence or claim a speedup. Successive cumulative timestamps
+must be subtracted to obtain each stage's duration.
+
 Next performance work should measure that owner stage internally on fixed
 history, then address the measured repeated work while preserving recovery
 proofs. Do not clear history, increase timeouts, skip checks, or infer that
