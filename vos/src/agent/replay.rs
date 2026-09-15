@@ -4916,6 +4916,21 @@ pub(crate) struct PreparedSharedOrderedPublication<'store, S: AgentJournalStore>
 #[cfg(feature = "std")]
 impl<'store, S: AgentJournalStore> PreparedSharedOrderedPublication<'store, S> {
     #[cfg(test)]
+    pub(crate) fn stage_binding_before_heads_for_test(
+        self,
+        include_anchor: bool,
+    ) -> Result<(), JournalStoreError>
+    where
+        S: SharedOrderedCommitStore,
+    {
+        super::journal_store::stage_shared_binding_before_heads_for_test(
+            self.inner.store,
+            &self.inner.sealed,
+            include_anchor,
+        )
+    }
+
+    #[cfg(test)]
     fn with_staged_transition_proofs_for_test(
         mut self,
         staged: Vec<StagedTransitionProof>,

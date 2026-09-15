@@ -2,6 +2,36 @@
 
 ## Checkpoint and decision
 
+Pre-publication pending-binding recovery is now implemented and regression-tested.
+The physical test stages the actual replay-derived Shared projection/binding
+before the head CAS, both with and without the immutable entry file, and with
+empty and non-empty committed prefixes. Before the fix it failed reopening
+with `CorruptResidue` (0.65s). After the fix all four cases reopen with the
+applied cursor unchanged and reservation still pending, apply exactly once,
+clear the reservation, and reopen again with identical completed status (2.86s).
+Seven altered/missing reservation cases are rejected in every setup: no pending
+record, different Ordered index/parent, physical index/term, payload commitment,
+or entry ID. An initial test-helper compile error and a zero-ID error-variant
+expectation were corrected; neither is counted as a production regression.
+
+The ledger audit now projects Ordered index/parent from the authenticated
+physical pending command. Reconciliation accepts a staged binding outside the
+committed chain only for that exact next Ordered successor; all existing store,
+route, payload, claim index/term/head and committee comparisons remain. This
+does not mark the staged command applied or rewrite data: normal replay must
+reconstruct and publish it before the ledger anchor advances. No wire, guest
+pin, signed capacity or persisted-record format changes. The existing physical
+snapshot/compaction/suffix-reopen regression also passes (2.12s).
+
+Evidence under shared target `task-tmp/`: `pending-binding-regression-exact.log`
+(reproduced failure), `pending-binding-fixed-exact.log` (initial passing cases),
+`pending-binding-prefix-fixed.log` (four-case pass), and
+`pending-binding-snapshot-regression.log`. Tests use locked/offline host features
+`agent-transition-proof private-agent-store http-ingress ssh-ingress`.
+Sessions `71810`, `90396`, `31487`, `65063`, `17284`, and `73433` are terminal.
+The release CLI has not yet been rebuilt with this fix or the preceding
+original-successor fix; live recovery and Install remain unqualified.
+
 The detailed diagnostic now identifies the live failure: all 85 committed
 Ordered anchors validate, but the retained pending command at Raft index113
 has a binding for entry `4c26180c…` which is not in the committed Ordered chain.

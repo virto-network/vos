@@ -6034,6 +6034,65 @@ mod tests {
     }
 
     #[test]
+    fn pending_shared_binding_before_head_publication_reopens_and_applies_once() {
+        for (include_anchor, prefix_slots) in [(false, 0), (true, 0), (false, 1), (true, 1)] {
+            let directory = TempDirectory::new("pending_binding_before_heads");
+            let fixture = fixture(0x25);
+            let mut host = open_host(&directory, &fixture);
+            host.provision(
+                fixture.provision.clone(),
+                fixture.catalog.clone(),
+                fixture.committee_authority,
+            )
+            .unwrap();
+            if prefix_slots == 1 {
+                host.agents.get_mut(&fixture.agent).unwrap().driver
+                    .append_ordered_for_test(7, authorized_management(&fixture, 2, 0xb3))
+                    .unwrap();
+                assert_eq!(
+                    host.apply_next(fixture.agent).unwrap(),
+                    SharedAgentApplyOutcome::Applied { index: 1 }
+                );
+            }
+            let pending_index = prefix_slots + 1;
+            let driver = &mut host.agents.get_mut(&fixture.agent).unwrap().driver;
+            assert_eq!(
+                driver
+                    .append_ordered_for_test(7, authorized_management(&fixture, 3, 0xb4))
+                    .unwrap(),
+                pending_index
+            );
+            driver
+                .stage_next_ordered_before_heads_for_test(include_anchor)
+                .unwrap();
+            driver.assert_staged_binding_requires_exact_reservation_for_test();
+            assert_eq!(driver.capacity().unwrap().0, prefix_slots);
+            assert!(driver.capacity().unwrap().2);
+            drop(host);
+
+            let mut reopened = open_host(&directory, &fixture);
+            assert_eq!(reopened.capacity(fixture.agent).unwrap().0, prefix_slots);
+            assert!(reopened.capacity(fixture.agent).unwrap().2);
+            assert_eq!(
+                reopened.apply_next(fixture.agent).unwrap(),
+                SharedAgentApplyOutcome::Applied {
+                    index: pending_index,
+                }
+            );
+            assert_eq!(
+                reopened.apply_next(fixture.agent).unwrap(),
+                SharedAgentApplyOutcome::Idle
+            );
+            let completed = reopened.show(fixture.agent).unwrap().unwrap();
+            assert_eq!(completed.applied_slots, pending_index);
+            assert!(!reopened.capacity(fixture.agent).unwrap().2);
+            drop(reopened);
+            let reopened = open_host(&directory, &fixture);
+            assert_eq!(reopened.show(fixture.agent).unwrap().unwrap(), completed);
+        }
+    }
+
+    #[test]
     fn filesystem_snapshot_is_authenticated_compacted_repeated_and_reopened_with_suffix() {
         let directory = TempDirectory::new("snapshot_compact_restart");
         let fixture = fixture(0x15);

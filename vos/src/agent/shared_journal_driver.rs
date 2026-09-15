@@ -3312,6 +3312,71 @@ where
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn stage_next_ordered_before_heads_for_test(
+        &mut self,
+        include_anchor: bool,
+    ) -> Result<(), SharedJournalDriverError> {
+        let Some(CommittedSharedRaftSlot::Command(command)) = self.ledger.next_committed_slot()?
+        else {
+            panic!("fixture requires an Ordered command");
+        };
+        let reserved = self.ledger.reserve_command_application(&command)?;
+        let committee = self.ledger.active_committee()?;
+        let committed = CommittedSharedOrdered::from_reserved_raft_application(
+            reserved,
+            &committee,
+            None,
+        )
+        .expect("valid fixture reservation");
+        match prepare_shared_ordered(
+            &mut self.store,
+            &mut self.executor,
+            &NoPrunedOrderedBases,
+            &self.materialization,
+            committed,
+        )? {
+            SharedReplayPreparation::Ready(prepared) => {
+                prepared.stage_binding_before_heads_for_test(include_anchor)?;
+                Ok(())
+            }
+            SharedReplayPreparation::AlreadyCommitted { .. } => panic!("fixture already published"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_staged_binding_requires_exact_reservation_for_test(&self) {
+        for mutation in 0..7 {
+            let mut audit = self.ledger.journal_audit().unwrap();
+            if mutation == 0 {
+                audit.pending_ordered = None;
+            } else {
+                let pending = audit.pending_ordered.as_mut().unwrap();
+                match mutation {
+                    1 => pending.ordered_index += 1,
+                    2 => pending.ordered_parent = Some(pending.entry),
+                    3 => pending.index += 1,
+                    4 => pending.term += 1,
+                    5 => pending.command_commitment = Hash::ZERO,
+                    6 => pending.entry = super::journal::OrderedEntryId([0xa5; 32]),
+                    _ => unreachable!(),
+                }
+            }
+            assert!(
+                matches!(
+                    reconcile_journal_ledger(
+                        &self.store,
+                        &self.materialization,
+                        self.ledger.journal_store(),
+                        &audit,
+                    ),
+                    Err(SharedJournalDriverError::CrossStoreMismatch)
+                ),
+                "accepted altered pending reservation {mutation}"
+            );
+        }
+    }
+
     /// Drain exactly one committed physical Raft slot through its typed
     /// storage/replay boundary.
     pub(crate) fn apply_next(
@@ -3852,7 +3917,7 @@ fn reconcile_journal_ledger<S: AgentJournalStore + SharedOrderedCommitStore>(
     if let Some(pending) = &audit.pending_ordered {
         match store.shared_ordered_commit(pending.entry)? {
             Some(binding) => {
-                validate_pending_binding(store, &chain, journal_store, pending, &binding)
+                validate_pending_binding(heads, &chain, journal_store, pending, &binding)
                     .map_err(|error| {
                         tracing::warn!(
                             ?error,
@@ -3980,16 +4045,26 @@ fn validate_ordered_anchor<S: AgentJournalStore + SharedOrderedCommitStore>(
     Ok(())
 }
 
-fn validate_pending_binding<S: AgentJournalStore + SharedOrderedCommitStore>(
-    _store: &S,
+fn validate_pending_binding(
+    heads: &super::journal::JournalHeads,
     chain: &BTreeMap<super::journal::OrderedEntryId, super::journal::OrderedEntry>,
     journal_store: super::shared_raft::JournalStoreInstanceId,
     pending: &AgentRaftPendingOrderedV2,
     binding: &super::journal_store::SharedOrderedCommitBinding,
 ) -> Result<(), SharedJournalDriverError> {
-    let entry = chain
-        .get(&pending.entry)
-        .ok_or(SharedJournalDriverError::CrossStoreMismatch)?;
+    match chain.get(&pending.entry) {
+        Some(entry)
+            if entry.index == pending.ordered_index
+                && entry.parent == pending.ordered_parent => {}
+        // Shared dependencies are durable before the head CAS, possibly even
+        // before the entry file. Only the exact reserved next Ordered command
+        // may account for such a binding. It remains pending, not applied;
+        // normal replay must reconstruct and publish the exact binding later.
+        None
+            if heads.ordered_index.checked_add(1) == Some(pending.ordered_index)
+                && heads.ordered_head == pending.ordered_parent => {}
+        _ => return Err(SharedJournalDriverError::CrossStoreMismatch),
+    }
     let claim = binding.claim();
     if binding.journal_store() != journal_store
         || binding.entry() != pending.entry
@@ -3998,7 +4073,7 @@ fn validate_pending_binding<S: AgentJournalStore + SharedOrderedCommitStore>(
         || claim.raft_index() != pending.index
         || claim.raft_term() != pending.term
         || claim.ordered().head != Some(pending.entry)
-        || claim.ordered().index != entry.index
+        || claim.ordered().index != pending.ordered_index
         || claim.space() != pending.route.space()
         || claim.agent() != pending.route.agent()
         || claim.genesis() != pending.route.genesis()

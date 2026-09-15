@@ -4965,6 +4965,9 @@ mod application_ledger_v2 {
         pub(crate) term: u64,
         pub(crate) command_commitment: Hash,
         pub(crate) entry: OrderedEntryId,
+        // Taken from the authenticated physical command, not staged journal files.
+        pub(crate) ordered_index: u64,
+        pub(crate) ordered_parent: Option<OrderedEntryId>,
     }
 
     /// Cross-store restart projection and explicit bounded capacity.
@@ -6872,6 +6875,8 @@ mod application_ledger_v2 {
                             term: reservation.term,
                             command_commitment: command.commitment(),
                             entry: entry.id(),
+                            ordered_index: entry.index,
+                            ordered_parent: entry.parent,
                         })
                     }
                     _ => None,

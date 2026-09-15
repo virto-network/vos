@@ -6881,6 +6881,27 @@ fn stage_shared_ordered_commit<S: SharedOrderedCommitStore>(
     Ok(created)
 }
 
+/// Reproduce the real dependency-write boundary before the mutable head CAS.
+#[cfg(test)]
+pub(crate) fn stage_shared_binding_before_heads_for_test<S: SharedOrderedCommitStore>(
+    store: &mut S,
+    publication: &ReplaySealedPublication,
+    include_anchor: bool,
+) -> Result<(), JournalStoreError> {
+    validate_shared_merge_projection(publication)?;
+    let binding = validate_shared_ordered_commit(publication)?
+        .ok_or(JournalStoreError::NonCanonical)?;
+    stage_shared_merge_projection(store, publication)?;
+    stage_shared_ordered_commit(store, &binding)?;
+    if include_anchor {
+        let ReplayPublicationAnchor::Ordered(entry) = publication.anchor() else {
+            return Err(JournalStoreError::NonCanonical);
+        };
+        store.put(entry)?;
+    }
+    Ok(())
+}
+
 fn persist_and_read_back_authority_record<S, R>(
     store: &mut S,
     record: &R,
