@@ -1886,6 +1886,73 @@ mod tests {
     }
 
     #[test]
+    fn self_consistent_provision_never_bypasses_independent_finality() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ControlledFinality {
+            calls: AtomicUsize,
+            failure: Option<AgentGenesisFinalityError>,
+        }
+        impl AgentGenesisFinalityVerifier for ControlledFinality {
+            fn verify_finalized(
+                &self,
+                provision: &AgentGenesisProvision,
+            ) -> Result<(), AgentGenesisFinalityError> {
+                provision.validate().unwrap();
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.failure.map_or(Ok(()), Err)
+            }
+        }
+
+        let provision = fixture().provision;
+        provision.validate().unwrap();
+        for failure in [
+            AgentGenesisFinalityError::Unavailable,
+            AgentGenesisFinalityError::NotFinalized,
+            AgentGenesisFinalityError::WrongSystemAgent,
+            AgentGenesisFinalityError::Conflict,
+            AgentGenesisFinalityError::Corrupt,
+        ] {
+            let verifier = ControlledFinality {
+                calls: AtomicUsize::new(0),
+                failure: Some(failure),
+            };
+            for attempt in 1..=2 {
+                assert!(matches!(
+                    VerifiedAgentGenesisProvision::verify(provision.clone(), &verifier),
+                    Err(AgentGenesisProvisionVerificationError::Finality(error)) if error == failure
+                ));
+                assert_eq!(verifier.calls.load(Ordering::SeqCst), attempt);
+            }
+            // Invalid provider contents must not even reach external trust.
+            let mut substituted = provision.clone();
+            substituted.decision.system_genesis = AgentJournalGenesisId::new([0xf1; 32]);
+            assert!(matches!(
+                VerifiedAgentGenesisProvision::verify(substituted, &verifier),
+                Err(AgentGenesisProvisionVerificationError::InvalidProvision(_))
+            ));
+            assert_eq!(verifier.calls.load(Ordering::SeqCst), 2);
+        }
+        // A prior successful promotion is not permission to skip the next
+        // verification when reopening. This fake verifier tests sequencing,
+        // not authenticity of the fixture's synthetic certificate.
+        let mut verifier = ControlledFinality {
+            calls: AtomicUsize::new(0),
+            failure: None,
+        };
+        let verified = VerifiedAgentGenesisProvision::verify(provision.clone(), &verifier).unwrap();
+        assert_eq!(verified.provision(), &provision);
+        verifier.failure = Some(AgentGenesisFinalityError::Unavailable);
+        assert!(matches!(
+            VerifiedAgentGenesisProvision::verify(provision, &verifier),
+            Err(AgentGenesisProvisionVerificationError::Finality(
+                AgentGenesisFinalityError::Unavailable
+            ))
+        ));
+        assert_eq!(verifier.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn ordinary_provision_roundtrips_and_links_every_component() {
         let fixture = fixture();
         assert_eq!(

@@ -2,6 +2,17 @@
 
 ## Checkpoint and decision
 
+Ordinary-genesis promotion regression: all eight `agent::genesis::tests` pass
+with a new test that rejects every independent-finality error even for a
+self-consistent provision, checks repeated attempts consult the verifier,
+rejects substituted contents before the trust call, and confirms a previous
+successful promotion cannot bypass a later unavailable verifier. The test's
+controlled verifier is deliberately synthetic; it proves call sequencing and
+fail-closed promotion, not authenticated live-system publication or physical
+Shared reopen. Production behavior remains unchanged. Final run log: shared
+target `task-tmp/ordinary-genesis-finality-gate-final.log`. The production
+issuance/publication/replay bridge identified below is still unimplemented.
+
 No-std build qualification at `80362c21`: five explicit locked offline commands
 pass: SDK check with no default features; `vos-raft` builds with no default
 features for `thumbv7em-none-eabihf` and `riscv32imc-unknown-none-elf`;
