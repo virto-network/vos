@@ -2,6 +2,36 @@
 
 ## Checkpoint and decision
 
+The full host-feature library run on implementation `206ea1e3` is terminal
+with **1,867 passed, one failed, three ignored**,1671.06s (build2m23s).
+Command: `cargo +nightly-2025-05-09 test --locked --offline -p vos --features
+'agent-transition-proof private-agent-store http-ingress ssh-ingress' --lib
+-- --test-threads=1`. Evidence: shared target
+`task-tmp/prepared-runtime-host-feature-library-suite.log`; session99230 exit101.
+The sole failure is `same_head_inventory_rotates_authenticated_suffix_past_1024_entries`:
+its line18475 expected the original certified snapshot at query513 (Raft10),
+but opportunistic checkpointing had legitimately advanced it to Raft1033.
+All descriptor/selector/nonce and preceding exact ordered-index checks passed.
+The old assertion predates the idle32-entry checkpoint scheduling policy.
+
+A test-only correction is now verified: sample every query's certified
+snapshot and audited retained-entry count; require monotonic snapshot progress,
+unchanged certificate at an unchanged index, repeated rotations, and at most34
+retained entries (32-entry trigger plus a completed two-entry pair). Retain all
+514 queries, exact selectors/nonces/descriptors,1,028-entry ordered progress,
+final snapshot equality and no-pending-work/join checks. No production behavior
+or gate was changed. Focused full-workload rerun passed:one test, zero failures,
+279.07s (build38.69s); session37290 is terminal0. Log:
+`task-tmp/prepared-runtime-inventory-rotation-regression.log`. The observation
+helper has only this one test caller. The original failing log is preserved.
+Evidence is a full suite with one outdated assertion plus its passing corrected
+full-workload rerun, not a second all-green full-suite invocation. No known
+host-feature regression remains from this run. Production latency, ordinary
+Shared finality, authenticated reclamation and full proof/release gates remain
+open; this test-only change does not require rebuilding the release executable.
+
+### Default-feature qualification
+
 Full default-feature `vos` library regression suite at source `206ea1e3`
 (documentation-only HEAD `06008adf`) passes:1,434 passed, zero failed, one
 ignored,219.66s. Command: `cargo +nightly-2025-05-09 test --locked --offline

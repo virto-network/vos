@@ -2,10 +2,20 @@
 
 ## Follow-up after the frozen review snapshot
 
+The current full host-feature run completed with1,867 passed, one failed,
+three ignored (27m51s). The failure is an inventory stress-test assertion that
+expected the original snapshot to survive until the hard history boundary,
+despite the newer32-entry opportunistic checkpoint policy. A test-only update
+retains the complete514-query workload and checks bounded history and monotonic
+certified snapshots throughout; its focused rerun **passed in279.07s**.
+The original failure log is retained; see the newest handoff entry. This is
+full-suite evidence plus a passing corrected regression, not a second all-green
+full-suite invocation. No production behavior changed in this correction.
+
 The full default-feature `vos` library suite now passes on implementation
 `206ea1e3`:1,434 passed, zero failed, one ignored,219.66s. This replaces the
-old default-library baseline for current source; the full host-feature matrix
-has not yet been rerun after these changes. See the handoff for the exact
+old default-library baseline for current source; the host-feature result and
+corrected regression verification are above. See the handoff for the exact
 command and retained log.
 
 Latest release implementation: `206ea1e3`. Its release build and bundle

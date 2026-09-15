@@ -8270,7 +8270,8 @@ mod tests {
         struct InventoryProjectionObservation {
             query: AuthorityProjectionQuery,
             ordered_index: u64,
-            snapshot: Option<crate::agent::shared_host::SharedAgentSnapshotState>,
+            snapshot: crate::agent::shared_host::SharedAgentSnapshotState,
+            retained_entries: u64,
         }
 
         struct InventoryProjectionAuthenticator {
@@ -8306,17 +8307,14 @@ mod tests {
                     crate::agent::production_owner::AgentProductionOwnerError::InventoryLimit,
                 )?;
                 let query = inventory_template_query(authority, selector, group, *counter);
-                let call = self
-                    .counters
-                    .iter()
-                    .map(|counter| usize::from(*counter))
-                    .sum::<usize>();
-                let (ordered_index, snapshot) = {
+                let (ordered_index, snapshot, retained_entries) = {
                     let host = self.host.lock().unwrap();
+                    let (_, remaining, _) = host.capacity(self.agent).unwrap();
                     (
                         host.journal_position(self.agent).unwrap().ordered_index,
-                        matches!(call, 513 | 514)
-                            .then(|| host.snapshot_state_for_test(self.agent).unwrap()),
+                        host.snapshot_state_for_test(self.agent).unwrap(),
+                        crate::agent::shared_raft::MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES as u64
+                            - remaining,
                     )
                 };
                 self.observations
@@ -8326,6 +8324,7 @@ mod tests {
                         query: query.clone(),
                         ordered_index,
                         snapshot,
+                        retained_entries,
                     });
                 Ok(query)
             }
@@ -18465,26 +18464,48 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>();
             assert_eq!(unique_nonces.len(), 514);
             assert_eq!(unique_queries.len(), 514);
+            let snapshot_index = |snapshot| match snapshot {
+                crate::agent::shared_host::SharedAgentSnapshotState::Installed {
+                    raft_index,
+                    ..
+                } => raft_index,
+                other => panic!("inventory lost its certified checkpoint: {other:?}"),
+            };
+            let mut previous_snapshot = initial.2.snapshots;
+            let mut rotations = 0;
             for (index, observation) in observations.iter().enumerate() {
                 assert_eq!(
                     observation.ordered_index,
                     initial.0.ordered_index + 2 * index as u64
                 );
-                if index <= 512 {
-                    if index == 512 {
-                        assert_eq!(observation.snapshot, Some(initial.2.snapshots));
-                    } else {
-                        assert_eq!(observation.snapshot, None);
-                    }
+                // Checkpoint scheduling now rotates idle projections at 32
+                // retained entries, not only at the hard history boundary.
+                // Sampling before dispatch allows one completed two-entry pair
+                // beyond that threshold before the next checkpoint attempt.
+                assert!(
+                    observation.retained_entries <= 34,
+                    "query {index} retained {} entries",
+                    observation.retained_entries
+                );
+                let previous_index = snapshot_index(previous_snapshot);
+                let current_index = snapshot_index(observation.snapshot);
+                assert!(
+                    current_index >= previous_index,
+                    "checkpoint regressed at query {index}"
+                );
+                if current_index == previous_index {
+                    assert_eq!(observation.snapshot, previous_snapshot);
+                } else {
+                    rotations += 1;
                 }
+                previous_snapshot = observation.snapshot;
             }
-            let rotated_snapshot = observations[513].snapshot.unwrap();
+            assert!(
+                rotations > 1,
+                "long inventory must rotate its bounded history repeatedly"
+            );
+            let rotated_snapshot = observations[513].snapshot;
             assert_ne!(rotated_snapshot, initial.2.snapshots);
-            assert!(matches!(
-                rotated_snapshot,
-                crate::agent::shared_host::SharedAgentSnapshotState::Installed { raft_index, .. }
-                    if raft_index == initial.2.applied_slots + 1_024
-            ));
             drop(observations);
 
             let final_state = {
