@@ -2,6 +2,14 @@
 
 ## Checkpoint and decision
 
+Portable documentation / wasm qualification at `ec779164`: the locked offline
+SDK no-default-features documentation build passes with
+`-D rustdoc::broken_intra_doc_links` (0.77s), and the standalone proof verifier
+builds for `wasm32-unknown-unknown` (1m22s). These cover `agent-sdk-doc-check`
+and `check-pvm-proof-wasm`; they do not verify external documentation links or
+execute a cryptographic proof in a browser. Logs: shared target
+`task-tmp/sdk-doc-current.log` and `task-tmp/verifier-wasm-current.log`.
+
 Inventory pagination fix: the host now accepts non-final pages shortened by
 the Authority's encoded-reply size bound. Previously it incorrectly required
 every continuation page to fill the requested entry count and budgeted only
