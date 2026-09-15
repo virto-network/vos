@@ -2,8 +2,10 @@
 
 ## Checkpoint and decision
 
-Current HEAD has a source-only authorization-reuse follow-up, described below;
-the bundled runtime and its smoke evidence still refer to the earlier pin.
+Current HEAD pins the independently reproduced authorization-reuse follow-up
+(`db577aff…`), with 18 release-pin and five physical lifecycle/lineage checks
+passing. The fresh-space daemon smoke below refers to the preceding pin; no
+newest-pin daemon latency result is claimed.
 
 Latest source qualification: the independently reproduced acknowledgement
 optimization is now pinned, with 18 release-pin tests and five physical
@@ -431,6 +433,37 @@ end-to-end speedup yet. Next: freeze and independently build a candidate,
 compare exact output and gas against the current `891e74d4…` pin, and qualify
 physical retry/rejection behavior before another pin change. The unchanged
 10-second startup deadline remains failing.
+
+### Authorization-reuse candidate reproduced and pinned
+
+Independent exports of `126657f70b6e8523f57b6cfd3e476a75adaa048c` built with
+locked/offline `nightly-2026-03-20` in **26.80 s** and **28.78 s**, using distinct
+guest targets and the frozen r17 converter. ELF and PVM match byte-for-byte.
+The PVM and matching provenance/build-time/protocol pins now use:
+
+- ProgramId: `db577aff938689516493e01de59536218388e780dd7bf1f9f81ce056dbb764a9`
+- ELF BLAKE2b-256: `ba471081c021bc0ada12d091941ed7b7099f44e7e72a75223b6066a28b1ef0fd`
+- PVM BLAKE2b-256: `90774afca15a8911b9690f4621c838b4ef46b1aa1c1c11e739eff113ac49c8a7`
+
+The fixed 793,734-byte acknowledgement output is identical to the preceding
+`891e74d4…` pin, with gas **457,383,570 → 395,232,496** (13.6% lower). Relative
+to the earlier 515,760,196 baseline, the two optimizations together reduce this
+specific test's gas by about 23.4%. Single concurrent debug-host wall timings
+are not evidence of production latency improvement.
+
+Nine selected checks passed (4.69 s), including the gas comparison, candidate
+physical malformed-frame/rejection/retry/retirement and terminal-failure/typed
+error coverage, plus native acknowledgement capacity/status tests. Post-pin,
+without candidate overrides, **18 CLI release checks** passed (0.72 s), **four
+physical lifecycle tests** passed (1.68 s), and the separately enabled compiled
+directory-lineage test passed. The Attested proof-feature gate and newest-pin
+daemon smoke remain open, as does the original 10-second startup failure.
+
+Evidence: `ack-authorization-candidate.rYKE8M/` contains `build.sh`, `build.log`,
+the `first/` and `second/` source/build/artifact directories, `physical-tests.log`,
+`post-pin-cli.log`, `post-pin-physical.log` and `post-pin-lineage.log`. No guest
+ABI or system-template change was made; no existing fixture was relabelled.
+All builds/tests from this checkpoint are terminal.
 
 ## Local evidence and resumption
 

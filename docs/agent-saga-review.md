@@ -1,12 +1,12 @@
 # Reviewing the Agent architecture saga
 
-Latest source-only follow-up: fresh acknowledgement now reuses its first full
-authorization verification and repeats only the slot-dependent match at the
-retained result's observation slot. 31 acknowledgement tests pass, including
-receipt/PublicPreflight slot-equivalence coverage. This follow-up is not in the
-bundled PVM yet; the matching-pin and smoke evidence below predates it.
+Latest pin: the authorization-reuse follow-up from `126657f7` is independently
+reproduced and bundled as ProgramId `db577aff…`. Nine candidate checks, 18
+post-pin release checks and five physical lifecycle/lineage checks pass. Fixed
+large-ACK gas is 13.6% lower than the preceding pin with identical output. No
+daemon smoke or startup latency pass exists for this newest pin yet.
 
-Current pin update: the acknowledgement optimization from `e3e9cb85` is now
+Previous pin update: the acknowledgement optimization from `e3e9cb85` was
 bundled with matching provenance, ProgramId and build-time digest. Two independent
 candidate builds matched; 18 release-pin tests and five physical lifecycle/lineage
 tests pass after pinning. The r17 ABI and system templates are unchanged, but
