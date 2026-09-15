@@ -234,6 +234,34 @@ and retry coverage against the physical candidate, then independently reproduce
 and repin only when the candidate is qualified. Preserve the frozen review
 checkpoint for matching-source/bundle testing in the meantime.
 
+### Acknowledgement candidate built and reproduced
+
+Two independent exports of `e3e9cb85a23c6122743ef641f209c670d4d8b70f`, separate
+guest targets and locked/offline `nightly-2026-03-20` builds completed in
+27.62 s and 28.66 s. The existing frozen r17 builder converted both. ELF and
+PVM comparisons are byte-identical. Candidate identities (BLAKE2b-256 for
+files, ProgramId for the program):
+
+- ELF: `192eb3707f5028c23bdb283b5ac27949d6c3b9a634265481bad7558eb1c19811`
+- PVM: `039393a40e61e25096533dedd24354ad38fb2d2ec05182bc08d60d11ffeb2933`
+- ProgramId: `891e74d48bed26dc93f744a48cc34a001fddf1f348d3e19570133be282117cb0`
+
+The fixed 793,734-byte large-ACK test passes byte-identical complete output
+against the bundled r17 runtime. Gas decreases from **515,760,196 to
+457,383,570** (about **11.3%**). Single debug-host timings of 1.089 s and 1.048 s
+are not a controlled production wall-time comparison. The candidate also
+passes the physical terminal-failure lifecycle test (five cases with retries,
+acknowledgement and repeated acknowledgement) and two physical typed-error
+retirement tests, comparing complete guest output to source: three tests total,
+2.56 s. Together with the gas comparison, four candidate physical tests passed.
+
+Evidence is under `ack-recovery-candidate.dHhhcp/`: `build.sh`, `build.log`,
+`runtime-build.log`, `identity.log`, `cost.log`, `physical-recovery.log`, and
+the independent `second/` export/build/artifacts. Builds and tests are terminal.
+The candidate is **not pinned**. Broader physical malformed/retry qualification,
+atomic provenance/pin updates and final-source fresh-space checks remain before
+promoting it; no production latency gate is closed by the gas result.
+
 ## Local evidence and resumption
 
 Evidence is on disk under `.worktrees/ch08-c2-native/target/task-tmp/`, not `/tmp`:
