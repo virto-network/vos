@@ -1967,6 +1967,11 @@ pub struct OrderedEntry {
 impl OrderedEntry {
     fn validate_inner(&self) -> Result<(), DecodeError> {
         self.input.validate()?;
+        self.validate_ordering_bindings()
+    }
+
+    /// Requires a validated input, either from validate_inner or its decoder.
+    fn validate_ordering_bindings(&self) -> Result<(), DecodeError> {
         if self.genesis == AgentJournalGenesisId::ZERO
             || self.index == 0
             || (self.index == 1) != self.parent.is_none()
@@ -2020,7 +2025,9 @@ impl ServiceWire for OrderedEntry {
             merge_seal,
             input,
         };
-        entry.validate_inner()?;
+        // ReplayInput::decode already validated this owned, unchanged input
+        // and its complete wire bound. Check only the enclosing entry fields.
+        entry.validate_ordering_bindings()?;
         Ok(entry)
     }
 }
@@ -5808,8 +5815,7 @@ mod tests {
         assert!(ReplayInput::decode(&corrupted).is_err());
         let mut mutated = ReplayInput::decode(&resume.encode()).unwrap();
         let ReplayOperation::CleanResume {
-            work: mutated_work,
-            ..
+            work: mutated_work, ..
         } = &mut mutated.operation
         else {
             unreachable!()

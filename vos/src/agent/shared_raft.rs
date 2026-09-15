@@ -926,8 +926,22 @@ impl AgentRaftCommand {
     }
 
     pub fn validate(&self) -> Result<(), AgentRaftWireError> {
+        self.validate_enclosing_bindings()?;
         match self {
             Self::ArtifactChunk(chunk) => chunk.validate()?,
+            Self::Ordered { entry, .. } => entry
+                .validate()
+                .map_err(|_| AgentRaftWireError::InvalidOrderedCommand)?,
+            Self::PrepareCommitteeChange(change) => change.validate()?,
+            Self::ArtifactAbort { .. } => {}
+        }
+        enforce_wire_bound(self, MAX_AGENT_RAFT_COMMAND_BYTES)
+    }
+
+    /// Does not validate nested records. Public validation checks them
+    /// separately; the decoder owns validated values from decode_nested.
+    fn validate_enclosing_bindings(&self) -> Result<(), AgentRaftWireError> {
+        match self {
             Self::ArtifactAbort { route, batch } => {
                 route.validate()?;
                 if *batch == ArtifactBatchId::ZERO {
@@ -947,13 +961,10 @@ impl AgentRaftCommand {
                 {
                     return Err(AgentRaftWireError::InvalidOrderedCommand);
                 }
-                entry
-                    .validate()
-                    .map_err(|_| AgentRaftWireError::InvalidOrderedCommand)?;
             }
-            Self::PrepareCommitteeChange(change) => change.validate()?,
+            Self::ArtifactChunk(_) | Self::PrepareCommitteeChange(_) => {}
         }
-        enforce_wire_bound(self, MAX_AGENT_RAFT_COMMAND_BYTES)
+        Ok(())
     }
 }
 
@@ -1014,7 +1025,12 @@ impl ServiceWire for AgentRaftCommand {
             )?),
             _ => return Err(DecodeError::InvalidTag),
         };
-        command.validate().map_err(map_wire_decode_error)?;
+        // The complete incoming frame was bounded above, and decode_nested
+        // validated each child and compared its exact canonical encoding.
+        // Revalidating those owned children would repeat blob authentication.
+        command
+            .validate_enclosing_bindings()
+            .map_err(map_wire_decode_error)?;
         Ok(command)
     }
 }
@@ -8708,6 +8724,53 @@ mod tests {
             AgentGenerationRouteKey::decode(&route.generation().encode()).unwrap(),
             route.generation()
         );
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn decoded_ordered_command_preserves_child_and_enclosing_validation() {
+        let route = route(&committee(&[key(1)], &[]));
+        let original = AgentRaftCommand::Ordered {
+            route,
+            artifact_batch: None,
+            entry: ordered_entry(route),
+        };
+        original.validate().unwrap();
+        assert_eq!(
+            AgentRaftCommand::decode(&original.encode()).unwrap(),
+            original
+        );
+        for case in 0..7 {
+            let mut changed = AgentRaftCommand::decode(&original.encode()).unwrap();
+            let AgentRaftCommand::Ordered {
+                artifact_batch,
+                entry,
+                ..
+            } = &mut changed
+            else {
+                unreachable!()
+            };
+            match case {
+                0 => entry.index = 0,
+                1 => entry.parent = Some(OrderedEntryId::ZERO),
+                2 => entry.merge_seal = None,
+                3 => entry.input.runtime.agent = AgentId([0x77; 32]),
+                4 => entry.genesis = AgentJournalGenesisId([0x78; 32]),
+                5 => *artifact_batch = Some(ArtifactBatchId::ZERO),
+                6 => entry.input.runtime.agent = AgentId::ZERO,
+                _ => unreachable!(),
+            }
+            assert!(changed.validate().is_err(), "constructed case {case}");
+            assert!(
+                AgentRaftCommand::decode(&changed.encode()).is_err(),
+                "decoded case {case}"
+            );
+        }
+        let canonical = original.encode();
+        let mut trailing = canonical.clone();
+        trailing.push(0);
+        assert!(AgentRaftCommand::decode(&trailing).is_err());
+        assert!(AgentRaftCommand::decode(&canonical[..canonical.len() - 1]).is_err());
     }
 
     #[cfg(feature = "storage")]

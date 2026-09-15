@@ -170,10 +170,13 @@ The integrated library run at `37d6a5720e7e45e4a19850a16a531e6cb316e299`
 completed: **1,663 passed, zero failed, one filtered**, in 1,771.43 seconds.
 It used `pvm,private-agent-store`, serial tests and socket access. Evidence:
 `.worktrees/ch08-c2-native/target/task-tmp/r16-integrated-library.log` (path
-relative to the main checkout). The filtered large inventory test still needs
-a final-source run. Later SDK and host persistence/recovery edits have separate
-passing targeted checks documented below, not a completed full-library rerun
-on the current source.
+relative to the main checkout). A newer optimized run at `4e8aa893` completed
+in 3,696.62s, including the formerly filtered large inventory test: 1,813 passed,
+20 socket-dependent failures (all passed unchanged with socket access), and
+three ignored cases. The ignored native capacity gate also passed separately;
+only two diagnostic probes remained unexecuted. Later decoder changes have
+targeted passes, not a full-library rerun on their updated source. See the
+cross-image and nested-decoder checkpoints below for exact scope and logs.
 
 Keep the remaining work in three scoped Chapter 08 batches, without adding
 review endpoints for individual fixes:
@@ -9614,11 +9617,13 @@ target and scratch directory. This is the SDK check, not the whole workspace
 feature matrix.
 The unfiltered optimized library run uses the same `4e8aa893` executable with
 `--test-threads=2` and disk-backed `TMPDIR`; its output is retained in
-`final-source-release-library.log`. At this checkpoint the 1,024-entry
-inventory rotation test remains running, so this is not a completed suite
-result. Comparing the executable's test list with terminal per-test log lines
-finds that test as the only outstanding case. The three default-ignored cases
-are native initial-capture capacity and two profiling probes.
+`final-source-release-library.log`. It completed with **1,813 passed, 20 failed,
+three ignored, zero filtered**, in **3,696.62s** (exit 101). The 1,024-entry
+inventory rotation test passed: all 514 authenticated queries, exact contents,
+snapshot rotation and cleared pending reservations were checked. The failures
+are the socket cases reconciled below. The three default-ignored cases are
+native initial-capture capacity and two profiling probes. This long concurrent
+test run is not an inventory latency benchmark.
 The ignored native initial-capture case was then explicitly run from the same
 optimized executable with `--exact
 agent::clean_bootstrap::tests::physical::native_operation_initial_capture_requires_more_headroom_than_projection
@@ -9635,9 +9640,11 @@ passed unchanged with socket access (1.09s, `final-source-merge-socket.log`).
 The network/HTTP groups pass with socket access (**42 passed**, 8.97s,
 `final-source-network-sockets.log`), and the node-level colliding-prefix Raft
 test passes separately (0.02s, `final-source-node-socket.log`). Matching test
-names confirms these reruns cover every failure reported so far. These are
+names confirms these reruns cover every failure in the final failure list. These are
 separate passing reruns, not a successful exit from the restricted full run;
 no timeout, assertion, or production behavior was changed.
+Across these commands, all 1,834 non-profiling library tests have passing
+evidence on `4e8aa893`. No test process from that campaign remains running.
 No end-to-end latency gain is claimed. Authenticated history reclamation and
 the 256-record lifetime ceiling remain unresolved.
 
@@ -9708,11 +9715,33 @@ transition, corrupt/missing rows and wrong-generation/authority rejection pass
 (13.06s, existing warnings, `journal-decoded-work-cli.log`). Formatting and
 diff checks pass.
 
-These are focused checks on the new host change. The still-running optimized
-inventory/full-library executable is built from the preceding `4e8aa893`
+These are focused checks on the new host change. The completed optimized
+inventory/full-library executable was built from the preceding `4e8aa893`
 source, not this edit. Do not attribute its result to the new decoder. Neither
 an end-to-end latency improvement nor completion of the remaining production
 gates is established by this change.
+
+### Reuse validated children at ordered-entry and Raft-command decode boundaries
+
+The next two enclosing decode layers now also separate child validation from
+enclosing-field validation. OrderedEntry decoding uses the already-validated,
+bounded ReplayInput; Raft command decoding uses children returned by the
+strict canonical `decode_nested` path. Constructed-value validation still
+validates children, and fresh physical reads still check term, commitment,
+strict frame bounds, canonical encodings and disposition compatibility.
+No decoded object or validation result is cached across observations. No wire
+format, SDK, guest artifact or admission/retention limit changes.
+
+A new regression checks seven malformed child/enclosing-field cases through
+both constructed validation and decoding, plus trailing/truncated command
+frames. Final-source journal/Raft tests, physical byte/shape validation and
+native approved issuance/reopen pass **74 tests**, zero failures/ignored,
+27.75s (`nested-decoded-validation-final.log`). The initial 73-test run also
+passed; the final run includes native issuance. Normal CLI check passes (6.17s,
+existing warnings, `nested-decoded-validation-cli.log`); formatting and diff
+checks pass. These tests do not establish an end-to-end latency improvement
+or a full-suite pass on this newer host source. The completed `4e8aa893`
+library run remains baseline evidence only.
 
 ### Durable client acknowledgement before completion
 
