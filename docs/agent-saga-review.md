@@ -9094,7 +9094,9 @@ in 3.12 s (`post-approval-expiry-bounded.log`, under shared C2 `target/task-tmp`
 The original 26-test run was deliberately interrupted after more than ten
 minutes of active CPU in the 256-record capacity case; its log is preserved as
 `post-approval-expiry-and-runtime.log`. The bounded rerun explicitly excludes
-that case. Capacity is deferred, not passed or waived. No production behavior,
+that case. Capacity was deferred, not passed or waived at that checkpoint;
+the later "Full coordinator retention capacity verified in release mode"
+checkpoint records its eventual full-size pass. No production behavior,
 artifact or timeout changed.
 
 The outstanding gate is still **post-issuance expiry/abort resolution**. SDK
@@ -9503,6 +9505,33 @@ latency gate. No Create/Install/mutation was repeated merely for status. Next
 latency work must address repeated retained-history verification beyond these
 small reductions. Ordinary Shared finality, broader terminal/recovery/profile
 coverage and final-source release gates remain open in C1/C2/C3.
+
+### Full coordinator retention capacity verified in release mode
+
+The previously interrupted 256-record coordinator capacity test now completes
+at its original full size. Every record is filled through `coordinate`; there
+is no synthetic prefilled image, reduced limit, skipped validation or replaced
+dispatcher path. The existing scripted actor and real Ed25519 signer remain
+unchanged. New assertions require the overflowing call to preserve both store
+images, both commit counts, both signer counts and the complete retained count,
+in addition to the existing no-dispatch assertion. Reopening the full stores
+must retain all 256 records and reject overflow without dispatch/signing again.
+
+The configured release test build passes (10m56s); the full-capacity test passes
+in **19.30s**, one test, zero failures or ignored tests. Evidence:
+`full-capacity-release.log` in the r17 fixture. The named host toolchain,
+offline locked dependencies and disk-backed scratch were used; the release
+profile was not overridden. The debug-mode attempt remains historically
+interrupted, not retroactively passed. This closes the full coordinator
+retention-boundary check, not live mixed-pending/crash/GC capacity coverage or
+acceptable production latency. No production code, artifact or limit changed.
+
+The remaining 24 coordinator tests pass in the same release executable (0.08s),
+with the already completed capacity case explicitly filtered, not rerun.
+`coordinator-release-regressions.log` covers this complementary run: together
+the two commands execute all 25 coordinator tests, zero failures/ignored.
+Formatting and diff checks pass. The reusable release test executable is
+shared target `release/deps/vos-215e14785cbfaec4`; its build is complete.
 
 ### Durable client acknowledgement before completion
 

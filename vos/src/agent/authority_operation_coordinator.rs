@@ -3202,8 +3202,8 @@ pub(crate) mod tests {
         let fixture = Fixture::new(&signer);
         let dispatcher = FakeDispatcher::new(fixture.authority);
         let mut coordinator = open(
-            coordinator_store,
-            issuer_store,
+            coordinator_store.clone(),
+            issuer_store.clone(),
             dispatcher.clone(),
             &fixture,
         );
@@ -3218,6 +3218,9 @@ pub(crate) mod tests {
             MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS
         );
         let before = dispatcher.counts();
+        let before_images = (coordinator_store.image(), issuer_store.image());
+        let before_commits = (coordinator_store.commits(), issuer_store.commits());
+        let before_signatures = (signer.receipt_calls, signer.acknowledgement_calls);
         let overflow = fixture.call(MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS as u64 + 1);
         assert!(matches!(
             coordinator.coordinate(&overflow, fixture.context(&overflow, 20), 20, &mut signer),
@@ -3226,6 +3229,44 @@ pub(crate) mod tests {
             ))
         ));
         assert_eq!(dispatcher.counts(), before);
+        assert_eq!(
+            (coordinator_store.image(), issuer_store.image()),
+            before_images
+        );
+        assert_eq!(
+            (coordinator_store.commits(), issuer_store.commits()),
+            before_commits
+        );
+        assert_eq!(
+            (signer.receipt_calls, signer.acknowledgement_calls),
+            before_signatures
+        );
+        assert_eq!(
+            coordinator.retained_operations(),
+            MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS
+        );
+        drop(coordinator);
+        let mut reopened = open(
+            coordinator_store,
+            issuer_store,
+            dispatcher.clone(),
+            &fixture,
+        );
+        assert_eq!(
+            reopened.retained_operations(),
+            MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS
+        );
+        assert!(matches!(
+            reopened.coordinate(&overflow, fixture.context(&overflow, 20), 20, &mut signer),
+            Err(AuthorityOperationCoordinatorError::Rejected(
+                AuthorityOperationCoordinatorRejection::JournalFull
+            ))
+        ));
+        assert_eq!(dispatcher.counts(), before);
+        assert_eq!(
+            (signer.receipt_calls, signer.acknowledgement_calls),
+            before_signatures
+        );
     }
 
     #[test]
