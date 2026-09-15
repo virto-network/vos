@@ -14,6 +14,9 @@ and the first Counter Install returned HTTP 504. This is also a release-mode
 latency failure, not just debug overhead. A short CPU sample during installation
 attributed 77.57% of core-cycle samples to BLAKE2 compression; the caller/root
 cause remains unproven. Exact retained Install recovery now passes, as below.
+The updated release executable at `2a4f17ea`, including both subsequent host
+optimizations, passes startup/HTTP/SSH in 99 seconds. Startup remains too slow;
+different retained histories prevent treating these runs as a controlled A/B.
 See the current closeout plan below; later checkpoint sections retain historical
 results, including failures that have since been fixed.
 Earlier clock-test pass counts had a fixture-dispatch gap; see "Retained
@@ -194,8 +197,11 @@ review endpoints for individual fixes:
    route reconciliation. The latest live test recovered a timeout and then
    returned two identical verified responses; initial latency remains high.
    Install ingress and retained CLI delivery are now wired, with live exact
-   recovery passing; fresh completion latency and protected/mutating invocation
-   remain open. Prove
+   recovery passing. Public Counter mutation/restart and protected Local
+   mutation/yield/restart have live passes; the latter campaigns predate r17.
+   Live r17 unseen-expiry retirement and unchanged Counter state after restart
+   also pass. Fresh completion latency and broader failure/profile coverage
+   remain open. Complete
    authorization, durable issuance, physical application, acknowledgement and
    route publication as one restartable workflow. Replace the deliberately unavailable ordinary-Agent
    finality adapter with authenticated live system-Agent decision publication
@@ -206,7 +212,7 @@ review endpoints for individual fixes:
    The owner now has tested Local Create/application and Authority-finalization
    adapters, including fresh journal replay before the issuer's finalization
    marker. These are now wired into native startup and the node Create API;
-   initial Create/retry completion remains unreliable, and they do not close
+   first-response Create latency remains unacceptable, and they do not close
    ordinary Shared-Agent finality.
    Implement the Local native entry point first without pretending it replaces
    the Shared finality gate: image-backed `LocalAgentHost::open` does not use
@@ -9473,6 +9479,30 @@ formatting and diff checks. This removes one command re-encoding per ordinary re
 row, but does not establish a release wall-time improvement. No guest artifact,
 timeout or release gate changes; the release executable still needs rebuilding
 before measuring this and the preceding host-only change together.
+
+### Updated release startup after host optimizations
+
+The configured fat-LTO release build at code revision `2a4f17ea` passes in
+5m49s, using offline locked dependencies, host nightly-2025-05-09 and `-j 2`.
+This executable includes the capacity-only recovery projection and single-read
+physical command canonicality reuse, plus the unchanged normal one-hour client
+validity. No source diagnostic, guest artifact, validation or timeout change.
+Build evidence: `release-host-2a4f17ea-build.log` in the existing r17 fixture.
+
+`host-2a4f17ea-startup.sh` completed with exit zero. The disposable r17 space
+became ready in **99 seconds**, 07:01:19–07:02:58 UTC on 2026-09-15. HTTP health
+returned `status: ok`; SSH keyscan output exactly matched the original host key.
+The daemon shut down cleanly at 07:02:58; none remains running. Evidence:
+`host-2a4f17ea-startup.log`, `host-2a4f17ea-up.log`,
+`host-2a4f17ea-status.json`, and `host-2a4f17ea-ssh-key.txt`.
+
+This is updated release-mode correctness and latency evidence, not a controlled
+before/after speedup: the fixture accumulated more retained history between
+measurements. Ninety-nine seconds remains unacceptable; do not close the
+latency gate. No Create/Install/mutation was repeated merely for status. Next
+latency work must address repeated retained-history verification beyond these
+small reductions. Ordinary Shared finality, broader terminal/recovery/profile
+coverage and final-source release gates remain open in C1/C2/C3.
 
 ### Durable client acknowledgement before completion
 
