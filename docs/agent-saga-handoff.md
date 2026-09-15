@@ -2,6 +2,19 @@
 
 ## Checkpoint and decision
 
+Newest-pin release smoke at source `83737aee`: the locked offline CLI release
+build passed in 6m49s. Fresh space `invoke-pin-smoke` was created with HTTP and
+SSH enabled in its generated config; only test ports were changed to
+127.0.0.1:18099/2241. First startup and restart passed in 27/37 seconds, with
+HTTP status `ok`, identical SSH host key, and clean shutdown after both runs.
+Evidence: shared target `task-tmp/invoke-pin-smoke.PqzkGQ/` contains `build.log`,
+`new.json`, preserved `generated-local.toml`, `cli.sh`, `smoke.sh`, `smoke.log`,
+both daemon logs/status/key files, and the prior CLI as `vosx-before`. The
+current release CLI now contains the `79c7d1f0…` runtime pin and host preflight
+reuse. This qualifies basic new-space/restart usability, not initial ordinary
+Create/Install response times or the failing 10-second startup gate. Existing
+older spaces were not migrated or relabelled; all original release gates remain.
+
 The reproduced Invoke-authorization candidate (`79c7d1f0…`, frozen guest source
 `aad65049`) is now pinned consistently in the production manifest, protocol
 ProgramId, CLI build checksum and bundled PVM. Candidate Attested public-output
