@@ -2,6 +2,31 @@
 
 ## Checkpoint and decision
 
+Current CLI qualification on HEAD `04454ef0` (production implementation still
+`206ea1e3`): unit/binary suite255 passed, zero failed,19 ignored,70.78s
+(build50.41s). Separate integration targets: actor-build4 passed24.21s;
+task-build1 passed24.76s; shutdown smoke failed11.24s because no endpoint was
+published within the unchanged10s startup deadline. The SIGTERM/5s shutdown
+phase was never reached, so this result is a startup failure, not a shutdown
+failure. Combined CLI evidence:260 passed, one failed,19 ignored. No startup
+gate extension or new production behavior was introduced.
+
+Commands used locked/offline nightly-2025-05-09 and the shared target/disk
+TMPDIR: `cargo test -p vosx --bin vosx -- --test-threads=1`, followed by
+`cargo test -p vosx --test build_actor_e2e --test build_task_e2e --test
+shutdown_smoke -- --test-threads=1`. Logs under shared `task-tmp`:
+`prepared-runtime-cli-suite.log` and `prepared-runtime-cli-integration.log`.
+Sessions64072 and22388 are terminal (exit0 and101). Failure cleanup kills and
+joins only its own daemon; post-run process inspection found no vosx, cargo
+or rustc. Failing data/config directories remain at their original paths:
+`task-tmp/vosx-shutdown-426457-data-1789493399736676170` and
+`task-tmp/vosx-shutdown-426457-config-1789493399736745123`. Daemon stderr was
+empty; it does not identify the precise startup phase. Do not reset or move
+this fixture as a substitute for diagnosing startup. The release executable
+and pinned artifacts remain unchanged; current CLI qualification is not green.
+
+### Host-feature qualification
+
 The full host-feature library run on implementation `206ea1e3` is terminal
 with **1,867 passed, one failed, three ignored**,1671.06s (build2m23s).
 Command: `cargo +nightly-2025-05-09 test --locked --offline -p vos --features

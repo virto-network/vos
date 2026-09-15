@@ -2,6 +2,12 @@
 
 ## Follow-up after the frozen review snapshot
 
+Current CLI result at `04454ef0`:255 unit tests and five actor/task-build
+integration tests passed;19 tests ignored. Shutdown smoke still fails because
+startup exceeds its10s endpoint deadline; it never reaches the SIGTERM phase.
+The failing isolated fixture and logs are preserved in the handoff. This is
+an unresolved production-latency gate, not a fully green CLI qualification.
+
 The current full host-feature run completed with1,867 passed, one failed,
 three ignored (27m51s). The failure is an inventory stress-test assertion that
 expected the original snapshot to survive until the hard history boundary,
