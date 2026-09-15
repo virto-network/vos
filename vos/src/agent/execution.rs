@@ -1465,6 +1465,37 @@ mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
+    fn yielded_status_requires_an_actual_suspend_capture() {
+        use vos_pvm_compiler::assembler::{Assembler, Reg};
+        let mut output = actor_output([0, 0, 0], 0);
+        output[0] = crate::actors::STATUS_YIELDED;
+        let mut program = Assembler::new();
+        program
+            .set_rw_data(output)
+            .load_imm_64(Reg::A0, 2 * u64::from(vos_pvm::PVM_ZONE_SIZE))
+            .load_imm_64(Reg::A1, 13)
+            .jump_ind(Reg::RA, 0);
+        let mut call = invocation();
+        call.gas = 100_000;
+        assert!(matches!(
+            run_inner_actor(
+                &call,
+                None,
+                &program.build_standard(),
+                None,
+                &ActorStateLanes {
+                    linear: None,
+                    merge: None,
+                    local: None
+                },
+                None
+            ),
+            Err(ActorExecutionError::InvalidActorOutput)
+        ));
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
     fn actor_output_accepts_exact_aggregate_state_and_reply_limits() {
         let lane = MAX_EXECUTION_STATE_TOTAL_BYTES / 3;
         let remainder = MAX_EXECUTION_STATE_TOTAL_BYTES - lane * 2;

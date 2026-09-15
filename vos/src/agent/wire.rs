@@ -2497,9 +2497,11 @@ fn apply_clean_invoke(
                             },
                             Ok(Some(_)) => unreachable!("exact recovery returned above"),
                         };
-                        let committed = finalize_unseen_standard_outcome(
+                        let committed = finalize_unseen_clean_outcome(
                             &mut runtime,
                             pristine,
+                            &work,
+                            &authorization,
                             &invocation,
                             observed_slot,
                             None,
@@ -2653,9 +2655,11 @@ fn apply_clean_resume(
     if matches!(&result, Err(error) if error.is_durable_exact_outcome()) {
         terminal_sequence = Some(record.ready_sequence);
     }
-    let commit_candidate = finalize_unseen_standard_outcome(
+    let commit_candidate = finalize_unseen_clean_outcome(
         &mut runtime,
         pristine,
+        &work,
+        &authorization,
         &invocation,
         observed_slot,
         terminal_sequence,
@@ -2874,7 +2878,7 @@ fn standard_state_limit(state: &StandardRuntimeState) -> usize {
 }
 
 #[cfg(feature = "pvm")]
-fn clean_reply(reply: ActorExecutionReply) -> crate::agent_sdk::InvocationReply {
+pub(crate) fn clean_reply(reply: ActorExecutionReply) -> crate::agent_sdk::InvocationReply {
     crate::agent_sdk::InvocationReply {
         invocation: crate::agent_sdk::InvocationId(reply.invocation.0),
         actor: crate::agent_sdk::ActorId(reply.actor.0),
@@ -2968,6 +2972,55 @@ fn finish_standard_execution_candidate(
     } else {
         candidate
     }
+}
+
+/// Clean terminal replies retain their exact authenticated result, not actor
+/// writes. Typed errors continue to use the explicitly separate clock-only
+/// outcome policy until they have their own durable acknowledgement schema.
+#[cfg(feature = "pvm")]
+#[allow(clippy::too_many_arguments)]
+fn finalize_unseen_clean_outcome(
+    runtime: &mut StandardAgentRuntime,
+    pristine: StandardAgentRuntime,
+    work: &crate::agent_sdk::InvocationWork,
+    authorization: &crate::agent_sdk::InvocationAuthorization,
+    invocation: &ActorInvocation,
+    observed_slot: u64,
+    terminal_continuation: Option<u64>,
+    result: &mut Result<ActorExecutionReply, ActorExecutionError>,
+) -> bool {
+    if let Ok(reply) = result
+        && matches!(
+            reply.status,
+            ActorExecutionStatus::Forbidden
+                | ActorExecutionStatus::Panicked
+                | ActorExecutionStatus::OutOfGas
+        )
+    {
+        *runtime = pristine;
+        return match runtime.retain_clean_terminal_failure(
+            work,
+            authorization,
+            invocation,
+            reply,
+            observed_slot,
+            terminal_continuation,
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                *result = Err(error);
+                false
+            }
+        };
+    }
+    finalize_unseen_standard_outcome(
+        runtime,
+        pristine,
+        invocation,
+        observed_slot,
+        terminal_continuation,
+        result,
+    )
 }
 
 /// Finish a fresh, authenticated execution result. `Done` has already passed
@@ -9418,6 +9471,529 @@ pub(crate) mod tests {
             authorization: Box::new(authorization),
         });
         assert_eq!(repeated_ack, acknowledged);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    #[ignore = "requires an explicit candidate until the failure-retaining runtime is repinned"]
+    fn candidate_runtime_terminal_failure_lifecycle_matches_source() {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        use crate::agent_sdk::{
+            RuntimeExecutionContext, RuntimeOutcome, RuntimeTransition, RuntimeWork,
+        };
+        let path = std::env::var_os("VOS_AGENT_RUNTIME_FAILURE_CANDIDATE")
+            .expect("supply the compiled failure-retaining runtime candidate");
+        let program = std::fs::read(path).unwrap();
+        let execute = |work: RuntimeWork| {
+            let expected = apply_standard_runtime_work(work.clone()).unwrap();
+            let input = work.encode().unwrap();
+            let execution = vos_pvm::refine_host::RefineContext::load(
+                &program,
+                &input,
+                super::super::driver::DEFAULT_MANAGEMENT_GAS,
+            )
+            .unwrap()
+            .run();
+            assert_eq!(execution.exit, vos_pvm::ExitReason::Halt);
+            let output = execution
+                .output_bounded(RuntimeTransition::MAX_ENCODED_BYTES)
+                .unwrap();
+            assert_eq!(
+                output,
+                expected.encode().unwrap(),
+                "physical guest must match the entire source transition"
+            );
+            eprintln!(
+                "failure-lifecycle input_bytes={} gas_used={}",
+                input.len(),
+                execution.gas_used
+            );
+            RuntimeTransition::decode(&output).unwrap()
+        };
+        let cases = [
+            clean_failing_actor_fixture(Some(crate::actors::STATUS_FORBIDDEN)),
+            clean_failing_actor_fixture(Some(crate::actors::STATUS_PANICKED)),
+            clean_failing_actor_fixture(Some(crate::actors::STATUS_OOG)),
+            clean_failing_actor_fixture(None),
+            clean_failing_resume_fixture(),
+        ];
+        for work in cases {
+            let (invocation, authorization) = match &work {
+                RuntimeWork::Invoke {
+                    invocation,
+                    authorization,
+                    ..
+                } => ((**invocation).clone(), (**authorization).clone()),
+                RuntimeWork::Resume { state, resume, .. } => {
+                    let runtime = StandardAgentRuntime::restore(
+                        decode_standard_runtime_state(&clean_state_to_legacy(state)).unwrap(),
+                    )
+                    .unwrap();
+                    let (record, invocation) = runtime.resolve_clean_resume(resume).unwrap();
+                    (invocation, record.authorization.unwrap())
+                }
+                _ => unreachable!(),
+            };
+            let first = execute(work);
+            assert!(matches!(first.outcome, RuntimeOutcome::Completed(Ok(_))));
+            let reopened = StandardAgentRuntime::restore(
+                decode_standard_runtime_state(&clean_state_to_legacy(&first.state)).unwrap(),
+            )
+            .unwrap();
+            let retry = execute(RuntimeWork::Invoke {
+                context: RuntimeExecutionContext::Direct,
+                state: legacy_state_to_clean(encode_standard_runtime_state(&reopened.snapshot())),
+                invocation: Box::new(invocation.clone()),
+                authorization: Box::new(authorization.clone()),
+                observed_slot: 99,
+            });
+            assert_eq!(retry.outcome, first.outcome);
+            let ack_work = RuntimeWork::Acknowledge {
+                context: RuntimeExecutionContext::Direct,
+                state: retry.state,
+                invocation: Box::new(invocation),
+                authorization: Box::new(authorization),
+            };
+            let ack = execute(ack_work.clone());
+            assert!(matches!(ack.outcome, RuntimeOutcome::Acknowledged(Ok(_))));
+            let RuntimeWork::Acknowledge {
+                context,
+                invocation,
+                authorization,
+                ..
+            } = ack_work
+            else {
+                unreachable!()
+            };
+            let repeated = execute(RuntimeWork::Acknowledge {
+                context,
+                state: ack.state.clone(),
+                invocation,
+                authorization,
+            });
+            assert_eq!(repeated, ack);
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_terminal_failure_retention_survives_restart_and_exact_acknowledgement() {
+        use crate::agent_sdk::{InvocationAuthorization, InvocationError};
+
+        for status in [
+            ActorExecutionStatus::Forbidden,
+            ActorExecutionStatus::Panicked,
+            ActorExecutionStatus::OutOfGas,
+        ] {
+            let (mut runtime, work) = clean_policy_fixture(
+                crate::agent_sdk::method_policy::AuthorizationPolicySelector::Public,
+            );
+            let authorization = InvocationAuthorization::AuthorityReceipt(clean_authority_receipt(
+                runtime.config().unwrap(),
+                &work,
+            ));
+            let (invocation, ..) = runtime.resolve_clean_invocation(&work).unwrap();
+            let reply = exact_reply(&invocation, status);
+            let before = runtime.snapshot();
+            runtime
+                .retain_clean_terminal_failure(&work, &authorization, &invocation, &reply, 1, None)
+                .unwrap();
+            let retained = runtime.snapshot();
+            assert_eq!(retained.lane_state, before.lane_state);
+            assert_eq!(
+                (
+                    retained.lane_revisions.linear,
+                    retained.lane_revisions.merge,
+                    retained.lane_revisions.local
+                ),
+                (
+                    before.lane_revisions.linear,
+                    before.lane_revisions.merge,
+                    before.lane_revisions.local
+                ),
+                "a failed slice never commits actor writes or revisions"
+            );
+            assert_only_result_component_changed(
+                &encode_standard_runtime_state(&before),
+                &encode_standard_runtime_state(&retained),
+                invocation.mode,
+            );
+            let mut runtime = StandardAgentRuntime::restore(
+                decode_standard_runtime_state(&encode_standard_runtime_state(&retained)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(runtime.snapshot(), retained);
+            assert_eq!(
+                runtime
+                    .recover_clean_execution(&work, &authorization, 99)
+                    .unwrap(),
+                Some(reply),
+                "the exact failure remains recoverable after receipt expiry"
+            );
+
+            let mut divergent = work.clone();
+            divergent.message.push(0xff);
+            let before_rejected_ack = runtime.snapshot();
+            assert!(
+                runtime
+                    .acknowledge_clean_invocation(&divergent, &authorization)
+                    .is_err()
+            );
+            assert_eq!(runtime.snapshot(), before_rejected_ack);
+
+            let ack = runtime
+                .acknowledge_clean_invocation(&work, &authorization)
+                .unwrap();
+            assert!(runtime.snapshot().invocation_results.is_empty());
+            let mut reopened = StandardAgentRuntime::restore(runtime.snapshot()).unwrap();
+            assert_eq!(
+                reopened.acknowledge_clean_invocation(&work, &authorization),
+                Ok(ack)
+            );
+            assert_eq!(
+                reopened.recover_clean_execution(&work, &authorization, 99),
+                Err(InvocationError::DivergentInvocation),
+                "acknowledgement never permits re-execution of failed work"
+            );
+
+            let mut unbound = retained.clone();
+            unbound.invocation_results[0].clean = None;
+            assert!(StandardAgentRuntime::restore(unbound).is_err());
+            let mut yielded = retained;
+            yielded.invocation_results[0].reply.status = ActorExecutionStatus::Yielded;
+            assert!(StandardAgentRuntime::restore(yielded).is_err());
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    pub(crate) fn clean_failing_actor_fixture(status: Option<u8>) -> crate::agent_sdk::RuntimeWork {
+        use vos_pvm_compiler::assembler::{Assembler, Reg};
+        let (runtime, mut work) = clean_policy_fixture(
+            crate::agent_sdk::method_policy::AuthorizationPolicySelector::Public,
+        );
+        let mut program = Assembler::new();
+        if let Some(status) = status {
+            let mut output = vec![0; 14];
+            output[0] = status;
+            output[1..5].copy_from_slice(&1_u32.to_le_bytes());
+            output[13] = 0xee; // A failed actor must not commit this lane image.
+            program
+                .set_rw_data(output)
+                .load_imm_64(Reg::A0, 2 * u64::from(vos_pvm::PVM_ZONE_SIZE))
+                .load_imm_64(Reg::A1, 14)
+                .jump_ind(Reg::RA, 0);
+        } else {
+            program.trap();
+        }
+        let bytes = program.build_standard();
+        let blob = work
+            .availability
+            .iter_mut()
+            .find(|blob| crate::agent_sdk::ProgramId::of_pvm(&blob.bytes) == work.program)
+            .unwrap();
+        work.program = crate::agent_sdk::ProgramId::of_pvm(&bytes);
+        *blob = crate::agent_sdk::RuntimeBlob {
+            reference: crate::agent_sdk::BlobRef::of_bytes(&bytes),
+            bytes,
+        };
+        work.availability
+            .sort_by(|a, b| a.reference.cmp(&b.reference));
+        work.gas = 100_000;
+        let mut state = runtime.snapshot();
+        state.actors[0].record.entry.program = crate::service::ProgramId(work.program.0);
+        let record = &state.actors[0].record;
+        let installation = &mut state.clean_actor_installations.as_mut().unwrap()[0];
+        installation.original.entry =
+            super::super::standard::legacy_actor_record_to_clean(record, installation.commitment)
+                .entry;
+        installation.commitment = installation.original.lineage_commitment();
+        let runtime = StandardAgentRuntime::restore(state).unwrap();
+        let authority = clean_authority_receipt(runtime.config().unwrap(), &work);
+        crate::agent_sdk::RuntimeWork::Invoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            state: legacy_state_to_clean(encode_standard_runtime_state(&runtime.snapshot())),
+            invocation: Box::new(work),
+            authorization: Box::new(crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
+                authority,
+            )),
+            observed_slot: 1,
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_terminal_failure_dispatch_rolls_back_writes_and_retires_after_restart() {
+        use crate::agent_sdk::{InvocationStatus, RuntimeOutcome, RuntimeWork};
+        for (status, expected) in [
+            (
+                Some(crate::actors::STATUS_FORBIDDEN),
+                InvocationStatus::Forbidden,
+            ),
+            (
+                Some(crate::actors::STATUS_PANICKED),
+                InvocationStatus::Panicked,
+            ),
+            (Some(crate::actors::STATUS_OOG), InvocationStatus::OutOfGas),
+            (None, InvocationStatus::Panicked),
+        ] {
+            let work = clean_failing_actor_fixture(status);
+            let RuntimeWork::Invoke {
+                state,
+                invocation,
+                authorization,
+                ..
+            } = work.clone()
+            else {
+                unreachable!()
+            };
+            let before = decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap();
+            let transition = apply_standard_runtime_work(work).unwrap();
+            let RuntimeOutcome::Completed(Ok(reply)) = &transition.outcome else {
+                panic!(
+                    "failure did not produce a retained terminal reply: {:?}",
+                    transition.outcome
+                )
+            };
+            assert_eq!(reply.status, expected);
+            let retained =
+                decode_standard_runtime_state(&clean_state_to_legacy(&transition.state)).unwrap();
+            assert_eq!(retained.invocation_results.len(), 1);
+            assert_eq!(retained.lane_state, before.lane_state);
+            assert_eq!(retained.lane_revisions.linear, before.lane_revisions.linear);
+            let reopened = StandardAgentRuntime::restore(retained).unwrap();
+            let reopened =
+                legacy_state_to_clean(encode_standard_runtime_state(&reopened.snapshot()));
+            let retry = apply_standard_runtime_work(RuntimeWork::Invoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                state: reopened,
+                invocation: invocation.clone(),
+                authorization: authorization.clone(),
+                observed_slot: 99,
+            })
+            .unwrap();
+            assert_eq!(retry.outcome, transition.outcome);
+            let ack = apply_standard_runtime_work(RuntimeWork::Acknowledge {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                state: retry.state,
+                invocation,
+                authorization,
+            })
+            .unwrap();
+            assert!(matches!(ack.outcome, RuntimeOutcome::Acknowledged(Ok(_))));
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    pub(crate) fn clean_failing_resume_fixture() -> crate::agent_sdk::RuntimeWork {
+        use crate::agent_sdk::{RuntimeExecutionContext, RuntimeWork};
+        let RuntimeWork::Invoke {
+            state,
+            invocation: work,
+            authorization,
+            observed_slot,
+            ..
+        } = clean_failing_actor_fixture(None)
+        else {
+            unreachable!()
+        };
+        let mut runtime = StandardAgentRuntime::restore(
+            decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap(),
+        )
+        .unwrap();
+        let (invocation, actor_pvm, ..) = runtime.resolve_clean_invocation(&work).unwrap();
+        let before = runtime.prepare_execution_state(&invocation).unwrap();
+        let mut continuation = portable_continuation(&invocation, 1, 0).continuation;
+        continuation.machine = super::super::machine::ActorMachine::load(&actor_pvm, &[0])
+            .unwrap()
+            .capture()
+            .unwrap();
+        continuation.machine.gas_remaining = 100;
+        runtime
+            .commit_yielded_execution(
+                &invocation,
+                &exact_reply(&invocation, ActorExecutionStatus::Yielded),
+                &before,
+                before.clone(),
+                observed_slot,
+                None,
+                continuation,
+                Some((
+                    super::super::standard::StandardAcceptedInvocation::from_work(&work),
+                    (*authorization).clone(),
+                )),
+            )
+            .unwrap();
+        let yielded = runtime
+            .recover_clean_yield(&work, &authorization, observed_slot)
+            .unwrap()
+            .unwrap();
+        RuntimeWork::Resume {
+            context: RuntimeExecutionContext::Direct,
+            state: legacy_state_to_clean(encode_standard_runtime_state(&runtime.snapshot())),
+            resume: Box::new(clean_resume(&yielded, work.availability)),
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_terminal_failure_resume_dispatch_consumes_continuation_and_can_acknowledge() {
+        use crate::agent_sdk::{
+            InvocationStatus, RuntimeExecutionContext, RuntimeOutcome, RuntimeWork,
+        };
+        let work = clean_failing_resume_fixture();
+        let RuntimeWork::Resume { state, resume, .. } = &work else {
+            unreachable!()
+        };
+        let runtime = StandardAgentRuntime::restore(
+            decode_standard_runtime_state(&clean_state_to_legacy(state)).unwrap(),
+        )
+        .unwrap();
+        let (record, accepted) = runtime.resolve_clean_resume(resume).unwrap();
+        let before = runtime.snapshot();
+        let transition = apply_standard_runtime_work(work).unwrap();
+        assert!(
+            matches!(&transition.outcome, RuntimeOutcome::Completed(Ok(reply)) if reply.status == InvocationStatus::Panicked),
+            "{:?}",
+            transition.outcome
+        );
+        let retained =
+            decode_standard_runtime_state(&clean_state_to_legacy(&transition.state)).unwrap();
+        assert!(retained.machine_continuations.is_empty());
+        assert_eq!(retained.invocation_results.len(), 1);
+        assert_eq!(retained.lane_state, before.lane_state);
+        assert_eq!(retained.lane_revisions.linear, before.lane_revisions.linear);
+        let reopened = StandardAgentRuntime::restore(retained).unwrap();
+        let ack = apply_standard_runtime_work(RuntimeWork::Acknowledge {
+            context: RuntimeExecutionContext::Direct,
+            state: legacy_state_to_clean(encode_standard_runtime_state(&reopened.snapshot())),
+            invocation: Box::new(accepted),
+            authorization: Box::new(record.authorization.unwrap()),
+        })
+        .unwrap();
+        assert!(matches!(ack.outcome, RuntimeOutcome::Acknowledged(Ok(_))));
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_terminal_failure_retention_consumes_only_its_resumed_continuation() {
+        let (state, work, _) = yielded_clean_policy_fixture(crate::agent_sdk::Hash([0x93; 32]));
+        let mut runtime = StandardAgentRuntime::restore(
+            decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap(),
+        )
+        .unwrap();
+        let before = runtime.snapshot();
+        assert_eq!(before.machine_continuations.len(), 1);
+        let record = &before.machine_continuations[0];
+        let authorization = record.authorization.as_ref().unwrap();
+        let (invocation, ..) = runtime.resolve_clean_invocation(&work).unwrap();
+        let reply = exact_reply(&invocation, ActorExecutionStatus::Panicked);
+        runtime
+            .retain_clean_terminal_failure(
+                &work,
+                authorization,
+                &invocation,
+                &reply,
+                record.observed_slot,
+                Some(record.ready_sequence),
+            )
+            .unwrap();
+        let retained = runtime.snapshot();
+        assert!(retained.machine_continuations.is_empty());
+        assert_eq!(retained.lane_state, before.lane_state);
+        assert_eq!(
+            (
+                retained.lane_revisions.linear,
+                retained.lane_revisions.merge,
+                retained.lane_revisions.local
+            ),
+            (
+                before.lane_revisions.linear,
+                before.lane_revisions.merge,
+                before.lane_revisions.local
+            ),
+        );
+        let mut reopened = StandardAgentRuntime::restore(retained).unwrap();
+        reopened
+            .acknowledge_clean_invocation(&work, authorization)
+            .unwrap();
+        assert!(reopened.snapshot().invocation_results.is_empty());
+        assert!(reopened.snapshot().machine_continuations.is_empty());
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_terminal_failure_retention_rejects_invalid_or_unbounded_results_atomically() {
+        let (mut runtime, work) = clean_policy_fixture(
+            crate::agent_sdk::method_policy::AuthorizationPolicySelector::Public,
+        );
+        let authorization = crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
+            clean_authority_receipt(runtime.config().unwrap(), &work),
+        );
+        let (invocation, ..) = runtime.resolve_clean_invocation(&work).unwrap();
+        let reply = exact_reply(&invocation, ActorExecutionStatus::Panicked);
+        let before = runtime.snapshot();
+        for status in [ActorExecutionStatus::Done, ActorExecutionStatus::Yielded] {
+            let mut invalid = reply.clone();
+            invalid.status = status;
+            assert!(
+                runtime
+                    .retain_clean_terminal_failure(
+                        &work,
+                        &authorization,
+                        &invocation,
+                        &invalid,
+                        1,
+                        None,
+                    )
+                    .is_err()
+            );
+            assert_eq!(runtime.snapshot(), before);
+        }
+        let mut oversized = reply.clone();
+        oversized.reply = vec![0; super::super::standard::MAX_INVOCATION_RESULT_BYTES_PER_LANE + 1];
+        assert_eq!(
+            runtime.retain_clean_terminal_failure(
+                &work,
+                &authorization,
+                &invocation,
+                &oversized,
+                1,
+                None,
+            ),
+            Err(ActorExecutionError::ResultCapacity)
+        );
+        assert_eq!(runtime.snapshot(), before);
+        assert!(
+            runtime
+                .retain_clean_terminal_failure(
+                    &work,
+                    &authorization,
+                    &invocation,
+                    &reply,
+                    1,
+                    Some(999),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            runtime.snapshot(),
+            before,
+            "a missing continuation cannot partially retain a result"
+        );
+        runtime
+            .retain_clean_terminal_failure(&work, &authorization, &invocation, &reply, 1, None)
+            .unwrap();
+        let retained = runtime.snapshot();
+        assert!(
+            runtime
+                .retain_clean_terminal_failure(&work, &authorization, &invocation, &reply, 1, None,)
+                .is_err()
+        );
+        assert_eq!(
+            runtime.snapshot(),
+            retained,
+            "an existing result cannot be overwritten"
+        );
     }
 
     #[cfg(feature = "pvm")]

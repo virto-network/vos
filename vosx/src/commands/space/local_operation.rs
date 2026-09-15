@@ -3,6 +3,9 @@
 #[cfg(test)]
 #[path = "local_operation_live_tests.rs"]
 mod live_tests;
+#[cfg(test)]
+#[path = "local_yield_live_tests.rs"]
+mod yield_live_tests;
 use super::clean_store::{
     CleanCredentialReservation, CleanOperationClientFile, CleanPreparationClientFile,
     CredentialReservationStatus, ensure_private_directory,

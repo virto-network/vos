@@ -1906,7 +1906,17 @@ impl StandardAgentRuntime {
                 || result.reply.invocation != result.invocation
                 || result.reply.incarnation != result.incarnation
                 || result.request == Hash::ZERO
-                || result.reply.status != super::execution::ActorExecutionStatus::Done
+                || !match result.reply.status {
+                    super::execution::ActorExecutionStatus::Done => true,
+                    super::execution::ActorExecutionStatus::Forbidden
+                    | super::execution::ActorExecutionStatus::Panicked
+                    | super::execution::ActorExecutionStatus::OutOfGas => {
+                        result.clean.is_some()
+                            && result.reply.observation
+                                == super::execution::ActorObservation::default()
+                    }
+                    super::execution::ActorExecutionStatus::Yielded => false,
+                }
                 || actor.is_none_or(|actor| {
                     actor.record.state_generation != result.incarnation
                         || actor.record.entry.deployment != result.reply.deployment
@@ -3862,6 +3872,98 @@ impl StandardAgentRuntime {
             authorization.clone(),
             observed_slot,
         ));
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Retain an authenticated terminal actor failure without committing any
+    /// actor writes or lane revision. Unlike a successful execution, a failure
+    /// has no committed observation. Its result and optional continuation
+    /// retirement are one bounded, atomic update.
+    ///
+    /// This primitive is intentionally separate from the legacy clock-only
+    /// failure path. Clean guest dispatch and the native successor verifier
+    /// both derive terminal failure successors through this operation.
+    #[cfg(feature = "pvm")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn retain_clean_terminal_failure(
+        &mut self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        invocation: &super::execution::ActorInvocation,
+        reply: &super::execution::ActorExecutionReply,
+        observed_slot: u64,
+        terminal_continuation: Option<u64>,
+    ) -> Result<(), super::execution::ActorExecutionError> {
+        use super::execution::{ActorExecutionError, ActorExecutionStatus, ActorObservation};
+
+        self.verify_clean_invocation_authorization(work, authorization, observed_slot)
+            .map_err(|_| ActorExecutionError::InvalidAuthorization)?;
+        if !clean_authorization_is_live_at(authorization, observed_slot) {
+            return Err(ActorExecutionError::AuthorityExpired);
+        }
+        let (resolved, ..) = self
+            .resolve_clean_invocation(work)
+            .map_err(|_| ActorExecutionError::InvalidActorOutput)?;
+        self.validate_invocation_target(invocation)?;
+        let key = (invocation.mode.invocation_scope(), invocation.invocation);
+        if resolved.commitment() != invocation.commitment()
+            || !matches!(
+                reply.status,
+                ActorExecutionStatus::Forbidden
+                    | ActorExecutionStatus::Panicked
+                    | ActorExecutionStatus::OutOfGas
+            )
+            || reply.invocation != invocation.invocation
+            || reply.actor != invocation.actor
+            || reply.incarnation != invocation.incarnation
+            || reply.deployment != invocation.deployment
+            || reply.mode != invocation.mode
+            || reply.lane != invocation.mode.write_lane()
+            || reply.gas_remaining > invocation.gas
+            || reply.observation != ActorObservation::default()
+            || self.invocation_results.contains_key(&key)
+            || self
+                .recover_clean_acknowledgement(work, authorization)
+                .map_err(|_| ActorExecutionError::InvalidAuthorization)?
+                .is_some()
+        {
+            return Err(ActorExecutionError::InvalidActorOutput);
+        }
+        let storage = invocation.mode.result_storage();
+        if !self.result_storage_supported(storage) {
+            return Err(ActorExecutionError::UnsupportedResultStorage);
+        }
+        if self.invocation_result_count(storage) >= MAX_INVOCATION_RESULTS_PER_LANE
+            || self
+                .invocation_result_bytes(storage)
+                .saturating_add(reply.reply.len())
+                > MAX_INVOCATION_RESULT_BYTES_PER_LANE
+        {
+            return Err(ActorExecutionError::ResultCapacity);
+        }
+
+        let mut candidate = self.clone();
+        if let Some(sequence) = terminal_continuation {
+            candidate.consume_machine_continuation(invocation, sequence)?;
+        }
+        candidate.advance_result_authority_slot(storage, observed_slot);
+        candidate.invocation_results.insert(
+            key,
+            StandardInvocationResult {
+                scope: key.0,
+                invocation: invocation.invocation,
+                incarnation: invocation.incarnation,
+                request: invocation.commitment(),
+                reply: reply.clone(),
+                storage,
+                clean: Some(StandardCleanInvocationResult::from_work(
+                    work,
+                    authorization.clone(),
+                    observed_slot,
+                )),
+            },
+        );
         *self = candidate;
         Ok(())
     }

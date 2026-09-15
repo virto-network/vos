@@ -1597,7 +1597,9 @@ impl<A: Actor> Context<A> {
             || !self.pending_actor_calls.is_empty()
             || !self.pending_actor_spawns.is_empty()
             || self.stop_requested
-            || self.self_schedule
+            // Cooperative scheduling is exported by lifecycle::exit_status
+            // as STATUS_YIELDED. The Agent runtime independently requires a
+            // matching SUSPEND capture; it is not an unexported side effect.
             || self.checkpoint.is_some()
             || self.host_io_request.is_some()
             || self.host_io_result.is_some()
@@ -1951,6 +1953,30 @@ mod tests {
     use crate::actors::auth::{NO_ROLES_MAP, NoRoles};
     #[cfg(feature = "pvm")]
     use crate::actors::codec::Encode;
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn agent_cooperative_yield_is_exported_but_other_effects_still_fail_closed() {
+        let mut ctx = Context::<TestActor>::new(ServiceId(0));
+        assert!(!ctx.__has_unexported_agent_effects());
+        ctx.self_schedule = true;
+        assert!(!ctx.__has_unexported_agent_effects());
+        assert_eq!(
+            super::super::lifecycle::exit_status(&ctx),
+            alloc::vec![super::super::run::STATUS_YIELDED]
+        );
+        ctx.stop_requested = true;
+        assert!(ctx.__has_unexported_agent_effects());
+        ctx.stop_requested = false;
+        ctx.host_io_request = Some(alloc::vec![1]);
+        assert!(ctx.__has_unexported_agent_effects());
+        ctx.host_io_request = None;
+        ctx.self_schedule = false;
+        assert_eq!(
+            super::super::lifecycle::exit_status(&ctx),
+            alloc::vec![super::super::run::STATUS_DONE]
+        );
+    }
 
     // Minimal fixture Actor — just enough to satisfy the trait
     // bounds for Context<A> construction. Roles default to

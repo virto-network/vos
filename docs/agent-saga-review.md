@@ -8242,6 +8242,230 @@ Other checks overlapped this diagnostic, so its elapsed time is not a latency
 benchmark. Its temporary journal was removed by harness cleanup and all test
 and build handles exited 0. No live space was started for this fix.
 
+### Compiled protected yield fixture prepared (C2, gate still open)
+
+`vos/tests/fixtures/agent-yield` adds a separately locked test actor, not a
+production example or system bundle. Its role-protected Local `run` mutates
+state by 1/10/100 around two `Context::yield_now` awaits; completed value is
+111. A LocalQuery exposes the final value for restart verification. Existing
+host and client yield tests use scripted boundaries; this fixture enables the
+missing compiled-actor native-ingress campaign without changing LocalSigner.
+
+Host check, pinned-nightly PVM build and signed VOS3 packaging pass. The first
+guest link lacked `pvm.ld`; the fixture now includes the canonical example
+layout through a small linker-script include. Program ID:
+`5a18bc7455ddf53d63691d6f91bb09c326ce3895fdd4397b11f22a71f47d254c`.
+Disposable package is `admin-startup-smoke.hJuDDq/yield-probe/AgentYieldProbe.vos`
+under disk-backed task-tmp. Evidence: `agent-yield-host-check.log`,
+`agent-yield-guest-build.log` (first link failure),
+`agent-yield-guest-build-linked.log`, `agent-yield-package.log`.
+No daemon was started and no install, invocation or yield execution is claimed.
+Next: the fixture README specifies the retained first yield, daemon restart,
+exact resumes, terminal value, positive retirement and post-restart query.
+This remains within C2; no runtime artifact repin or release gate is closed.
+
+### Compiled yield campaign exposed actor-side export rejection (C2)
+
+The disposable `admin-startup-smoke.hJuDDq` daemon restored from **01:36:22**
+to **01:38:35 UTC** on 2026-09-15. Installing `AgentYieldProbe` as `yield-probe`
+took **270s** (01:39:45–01:44:15), with one retained HTTP 504 and exact resume.
+The deployment-scoped role grant then passed on its first client attempt in
+**52s**. During that grant the new diagnostic reported
+`initial=true retained=false limit=replay_headroom`; the checkpoint fallback
+recovered and returned applied, retired, non-pending success. This is live
+evidence of the admission repair, not an acceptable latency result.
+
+The first protected invocation (`0x78` repeated 32 bytes) failed the yield
+assertion after **104.25s**: native ingress retained `Completed(Ok(reply))`
+with **status Panicked**, not a yielded continuation. Two exact retries returned
+the same result. No resume or positive retirement was performed; the operation
+reservation remains pending. Preserve its signed request and original package.
+The daemon was stopped with SIGTERM at **01:48:26 UTC**, and the CLI and original
+foreground session both confirmed clean exit. No daemon remains running.
+
+Source inspection found an inconsistent actor-side guard: `yield_now` sets
+`self_schedule`, `exit_status` exports that flag as `STATUS_YIELDED`, but
+`__has_unexported_agent_effects` rejected the flag first. It now permits that
+exported status while retaining checks for unsupported queues, stop, checkpoint
+tokens and host I/O. The runtime still requires an actual SUSPEND capture and
+rejects forged yielded output. The new context guard regression passes;
+all **12 execution tests** pass, including a new physical forged-yield rejection
+and existing continuation gas/work-budget checks. This is a source-level fix
+for the inconsistency; a corrected compiled-actor live pass is still required.
+
+Rebuilt the actor into a separate `yield-probe-fixed/AgentYieldProbe.vos`:
+program `c372e1d40942975057b990870d77f70a5b1f5f2354a9165f2422ddcda6d09458`,
+deployment `cc1ae24388142a49050c085191bcf0d20047fc116338eb903ae459d5e30883e7`.
+**The fix requires rebuilding actor packages; a new host alone cannot repair
+already installed actor code.** Existing runtime/system bundles were not
+repinned; the final source/artifact rebuild remains part of C3.
+
+Evidence: fixture `yield-install-timing.log`, `yield-install-{1,2}.*`,
+`yield-grant-1.json`, `yield-first-slice-{1,2,3}.log`, `up-yield-1.log`;
+task-tmp `yield-export-guard.log`, `yield-execution-guards.log`,
+`yield-fixed-guest-build.log`, `yield-fixed-package.log`.
+The new opt-in client helpers retain the first slice separately and verify two
+resume exchanges, final 111, retirement and a separate post-restart LocalQuery.
+They are not a completed campaign. Next: retire the exact retained Panicked
+result through normal acknowledgement/reservation completion, preserve its
+evidence, then install the corrected fixture under a fresh actor identity and
+use new invocation IDs. Never overwrite `yield-run.intent` or its reservation.
+CLI regression: **252 passed / 16 opt-in tests ignored**, zero failures
+(61.58s; `yield-guard-cli.log`). Workspace/fixture formatting and whitespace
+checks pass. All build/test/daemon handles from this campaign are terminal.
+The fixture, helpers and source correction remain uncommitted for grouping
+with the corrected native campaign; the root `saga/agents` checkout is unchanged.
+
+### Native failure retirement returns NotFound (C2 terminal-result gap)
+
+Restarted the disposable yield space: network start **01:56:00 UTC**, ready
+**01:58:29 UTC**, 2026-09-15. Before any corrected install, the guarded helper
+loaded the original `0x78` invocation, checked its original package/deployment
+and retained Panicked reply, then used normal managed continuation to retire it.
+The first attempt at **01:59:14 UTC** retained
+**`Acknowledged(Err(NotFound))`**. Exact retries fail closed on that same saved
+acknowledgement; the credential reservation was not released. The corrected
+fixture was neither installed nor invoked. No signed request, reservation,
+response, or progress record was replaced or cleared.
+
+This is distinct from the actor-side yield export bug. Source tracing shows
+`finalize_unseen_standard_outcome` preserves terminal failure by advancing only
+its result-component clock. `StandardAgentRuntime::restore` accepts retained
+invocation results only with status Done, and `acknowledge_clean_invocation`
+looks up `invocation_results`, returning NotFound for this failure. The native
+driver's exact-outcome verifier likewise derives a clock-only successor. The
+client retains the Panicked response, but that is not a guest-authenticated
+positive retirement fact. Do not manufacture one or treat absence as success.
+
+Next required work is failure-result retention and acknowledgement across the
+guest runtime, restored state and native exact-outcome validation, preserving
+rollback of actor state, continuation consumption, authorization binding and
+bounded result storage. This needs an updated/reproduced runtime artifact and
+fresh native proof; changing the host alone cannot fix the already-pinned
+guest. The saved negative CIP1 acknowledgement must remain immutable. Do not
+claim the original failure recovered merely because a fresh fixture works.
+
+The helper now has an explicit `VOSX_YIELD_SMOKE_PHASE=fixed` using separate
+`yield-fixed-*` files, actor name `yield-probe-fixed`, invocation `0x80`, and
+query `0x81`; original `0x78`/`0x79` inputs remain intact. Only the helper code
+was prepared: the fixed campaign stopped at retirement before generating or
+submitting fresh work. Build passes; the live retirement test intentionally
+reports failure, not a passed gate. Evidence: fixture `up-yield-fixed.log`,
+`yield-fixed-timing.log`, `yield-retire-original-{1,2,3}.log`,
+`yield-retirement-diagnostic.log`; task-tmp `yield-fixed-helper-build.log`.
+
+SIGTERM was sent at **02:03:24 UTC** to daemon PID 3719486. The CLI's five-second
+observation expired, but the original daemon session then exited **0**, without
+force. All daemon, campaign and diagnostic handles are terminal. Formatting
+and whitespace checks pass; the changes remain uncommitted with the yield work.
+
+### Terminal failure retention primitive (C2, staged; not yet dispatched)
+
+Added `StandardAgentRuntime::retain_clean_terminal_failure` as the bounded,
+atomic building block for the native NotFound retirement defect above. It
+authenticates the original work, checks the exact resolved invocation and
+terminal reply, retains its clean authorization binding, and optionally
+consumes the exact resumed continuation. It does not accept actor lane output
+or increment actor lane revisions. Duplicate results, retired identities,
+invalid terminal status, excess result bytes, and missing continuations fail
+without changing state. Restore now admits Forbidden/Panicked/OutOfGas only
+with a valid clean binding and no committed observation; unbound legacy
+failures and Yielded results remain rejected.
+
+Three focused tests pass: failure retry/restart/exact positive ACK for all
+three statuses; atomic rejection/capacity checks; resumed failure consumption
+and retirement without actor-state changes. Four existing regression tests
+also pass: Done retry/restart/ACK, both clean ACK capacity/error tests, and
+the legacy clock-only terminal/error successor test. Focused build/test log:
+`task-tmp/terminal-failure-retention-resume.log` (**3 passed**, 0 failed);
+the four regressions were run directly from the same compiled test binary.
+Formatting and whitespace checks pass.
+
+**This is not an end-to-end fix or a closed gate.** The new primitive is not
+called by guest dispatch yet. Clean Invoke/Resume still use the existing
+clock-only failure finalizer, and the native exact-outcome verifier still
+requires that successor. Keep those two paths coordinated: next wire the
+clean terminal-reply path and independently derive/validate its exact retained
+successor, including retries and resumed failures; leave legacy and typed-error
+semantics explicit. Then rebuild/reproduce the runtime artifact and repeat
+native failure retirement plus the corrected compiled yield campaign in a
+fresh disposable space. Preserve the old fixture's immutable negative CIP1
+and pending reservation. No new daemon, live mutation, artifact repin or
+commit occurred in this step; changes stay in the existing C2 worktree chunk.
+Production latency and all other original release gates remain open.
+
+### Terminal failure dispatch and native verification (C2, artifact pending)
+
+The preceding staged primitive is now connected in source. Clean Invoke and
+Resume rebase Forbidden/Panicked/OutOfGas on pristine state and atomically
+retain the authenticated reply; failure to retain leaves the prior state
+unchanged. Typed `InvocationError` outcomes deliberately retain their existing
+clock-only policy and remain a separate unresolved retirement case. Legacy
+execution behavior is unchanged.
+
+The native failed-reply verifier now derives the exact successor from prior
+state and accepted work/authorization. It validates exact reply recovery on
+Invoke retries, unseen admission slots, resumed continuation consumption, and
+the entire resulting state. It rejects a clock-only failure successor, changed
+reply bytes, changed accepted-work binding, and a continuation left behind
+after terminal completion.
+
+**Seven focused tests pass** (`task-tmp/terminal-failure-captured-resume.log`):
+the three retention tests, interpreter-backed Invoke failure/rollback/retry/
+restart/ACK, resumed failure/restart/ACK, and two native successor-validation
+tests. Invoke covers all three terminal statuses with attempted actor writes
+and a physical interpreter trap. Resume starts from a captured machine image
+at the trap, inserted through the continuation commit path: this is a focused
+restoration test, not the compiled actor's live two-yield campaign. The first
+synthetic Resume fixture failed closed with InvalidAvailability because its
+memory layout did not match the program; the captured image corrects that
+fixture (`terminal-failure-resume-dispatch.log` preserves the failed attempt).
+The full runtime-wire test group also passes: **74 passed, 0 failed, 1 ignored**
+in **17.82s** (`task-tmp/terminal-failure-wire-regressions.log`); the ignored
+case is the opt-in repeated-ACK CPU profiling probe. Formatting and whitespace
+checks pass. These are source/interpreter checks, not bundled-guest release
+certification.
+
+**Do not deploy a fresh binary from this dirty tree yet:** the source verifier
+expects retained failures while the bundled runtime still emits clock-only
+failures. No bundled artifact or provenance pin changed in this step. Next
+build a runtime candidate, verify the physical outer guest path, freeze and
+independently reproduce its source/artifact, repin consistently, then rerun the
+native and CLI checks and fresh disposable failure/yield/restart campaign.
+The old negative CIP1 remains immutable. No daemon was started, no external
+operation was submitted, and no commit/merge/push occurred. All changes remain
+in the scoped C2 lifecycle worktree chunk; original release gates stay open.
+
+### Physical terminal-failure runtime candidate (C2, reproduction next)
+
+Built the dirty-tree guest with locked/offline `nightly-2026-03-20` and
+converted it with the existing immutable `42f3f3bf` host builder. Candidate
+evidence is in disk-backed `task-tmp/runtime-failure-candidate.t49q9i/`:
+`build.log`, `identity.log`, `agent-runtime.pvm`, and `physical-lifecycle.log`.
+The build completed in **21.74s**. Candidate identity:
+
+- ProgramId `e701b268823d5ec276c4f9083448df114057d414b3c1d4d7336ef2c1d6a03247`;
+- ELF BLAKE2b-256 `7172f949715231e3b6d7fceda10af20b9dee2b12dc05aaa7761809d815b96443`;
+- PVM BLAKE2b-256 `bb2055e07d17028fc3504d5563229fc29735b0b0071dfc40563c054202edee9d`;
+- PVM size **958,851 bytes**; ABI remains r16 (no wire schema change).
+
+The opt-in `candidate_runtime_terminal_failure_lifecycle_matches_source`
+test passes (**1 test, 2.26s**): five cases (Forbidden, Panicked, OutOfGas,
+physical trap, restored trap) each execute completion, post-reopen exact
+Invoke retry, ACK and repeated ACK through the compiled outer guest. All
+**20 exchanges** match the full source transition bytes, including state.
+The test requires `VOS_AGENT_RUNTIME_FAILURE_CANDIDATE` and is ignored by
+default until the bundled artifact is repinned; make it a normal bundled
+regression when that happens. This complements rather than replaces the
+native-verifier rejection tests and the still-pending live compiled-yield
+campaign. Typed-error retirement and production latency remain open.
+
+Freeze this scoped C2 source chunk before independent reproduction, then
+rebuild twice from that immutable revision and compare ELF/PVM bytes before
+updating the runtime blob, ProgramId and provenance together. The dirty-tree
+candidate alone is not reproducibility evidence. No bundled pin changed and
+no live space was started during this step.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

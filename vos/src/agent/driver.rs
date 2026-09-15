@@ -4126,11 +4126,12 @@ impl<S: AgentImageStore> AgentDriver<S> {
                     return Err(AgentDriverError::InvalidRuntime);
                 }
                 if reply.status != crate::agent_sdk::InvocationStatus::Done {
-                    validate_sdk_exact_execution_transition(
+                    validate_sdk_failed_reply_transition(
                         self.image.runtime_program,
                         &self.image.runtime_state,
                         &next,
                         &work,
+                        reply,
                     )?;
                 }
             }
@@ -4996,6 +4997,110 @@ fn validate_exact_execution_transition(
         .map_err(|_| AgentDriverError::InvalidRuntime)?;
     let expected = super::wire::encode_standard_runtime_state(&runtime.snapshot());
     if next == &expected {
+        Ok(())
+    } else {
+        Err(AgentDriverError::InvalidRuntime)
+    }
+}
+
+fn validate_sdk_failed_reply_transition(
+    runtime_program: ProgramId,
+    prior: &RuntimeState,
+    next: &RuntimeState,
+    work: &crate::agent_sdk::RuntimeWork,
+    reply: &crate::agent_sdk::InvocationReply,
+) -> Result<(), AgentDriverError> {
+    use crate::agent_sdk::{InvocationStatus, RuntimeWork};
+
+    if !matches!(
+        reply.status,
+        InvocationStatus::Forbidden | InvocationStatus::Panicked | InvocationStatus::OutOfGas
+    ) {
+        return Err(AgentDriverError::InvalidRuntime);
+    }
+    if runtime_program != super::STANDARD_RUNTIME_PROGRAM_ID {
+        return validate_execution_transition(prior, next, sdk_mode_as_legacy(reply.mode));
+    }
+    fn invalid<T>(_: T) -> AgentDriverError {
+        AgentDriverError::InvalidRuntime
+    }
+    let state = super::wire::decode_standard_runtime_state(prior).map_err(invalid)?;
+    let mut runtime = super::standard::StandardAgentRuntime::restore(state).map_err(invalid)?;
+    let (accepted, authorization, observed_slot, terminal_continuation) = match work {
+        RuntimeWork::Invoke {
+            invocation,
+            authorization,
+            observed_slot,
+            ..
+        } => {
+            if let Some(retained) = runtime
+                .recover_clean_execution(invocation, authorization, *observed_slot)
+                .map_err(invalid)?
+            {
+                let expected = super::wire::encode_standard_runtime_state(&runtime.snapshot());
+                return if super::wire::clean_reply(retained) == *reply && expected == *next {
+                    Ok(())
+                } else {
+                    Err(AgentDriverError::InvalidRuntime)
+                };
+            }
+            runtime
+                .validate_clean_unseen_invocation_slot(authorization, *observed_slot)
+                .map_err(invalid)?;
+            (
+                (**invocation).clone(),
+                (**authorization).clone(),
+                *observed_slot,
+                None,
+            )
+        }
+        RuntimeWork::Resume { resume, .. } => {
+            let (record, accepted) = runtime.resolve_clean_resume(resume).map_err(invalid)?;
+            let authorization = record
+                .authorization
+                .clone()
+                .ok_or(AgentDriverError::InvalidRuntime)?;
+            (
+                accepted,
+                authorization,
+                record.observed_slot,
+                Some(record.ready_sequence),
+            )
+        }
+        _ => return Err(AgentDriverError::InvalidRuntime),
+    };
+    let (invocation, ..) = runtime
+        .resolve_clean_invocation(&accepted)
+        .map_err(invalid)?;
+    // Read only the claimed reply from the successor. The authenticated binding,
+    // clock, continuation consumption and every other byte are independently
+    // derived from the prior state below, never accepted from this snapshot.
+    let claimed = super::wire::decode_standard_runtime_state(next).map_err(invalid)?;
+    let retained = claimed
+        .invocation_results
+        .iter()
+        .find(|result| {
+            result.invocation == invocation.invocation
+                && result.scope == invocation.mode.invocation_scope()
+        })
+        .ok_or(AgentDriverError::InvalidRuntime)?;
+    if retained.reply.status == ActorExecutionStatus::Yielded
+        || super::wire::clean_reply(retained.reply.clone()) != *reply
+    {
+        return Err(AgentDriverError::InvalidRuntime);
+    }
+    runtime
+        .retain_clean_terminal_failure(
+            &accepted,
+            &authorization,
+            &invocation,
+            &retained.reply,
+            observed_slot,
+            terminal_continuation,
+        )
+        .map_err(invalid)?;
+    let expected = super::wire::encode_standard_runtime_state(&runtime.snapshot());
+    if expected == *next {
         Ok(())
     } else {
         Err(AgentDriverError::InvalidRuntime)
@@ -6386,6 +6491,127 @@ mod tests {
             gas: 1,
         };
         (prior, next, invocation)
+    }
+
+    #[test]
+    fn sdk_terminal_failure_successor_requires_the_exact_retained_reply() {
+        use crate::agent_sdk::{RuntimeOutcome, RuntimeWork};
+        let work = super::super::wire::tests::clean_failing_actor_fixture(None);
+        let RuntimeWork::Invoke {
+            state,
+            invocation,
+            observed_slot,
+            ..
+        } = &work
+        else {
+            unreachable!()
+        };
+        let prior = sdk_state_as_legacy(state);
+        let transition = super::super::wire::apply_standard_runtime_work(work.clone()).unwrap();
+        let next = sdk_state_as_legacy(&transition.state);
+        let RuntimeOutcome::Completed(Ok(reply)) = &transition.outcome else {
+            panic!("expected failure reply")
+        };
+        let validate = |next: &RuntimeState, reply: &crate::agent_sdk::InvocationReply| {
+            validate_sdk_failed_reply_transition(
+                super::super::STANDARD_RUNTIME_PROGRAM_ID,
+                &prior,
+                next,
+                &work,
+                reply,
+            )
+        };
+        assert_eq!(validate(&next, reply), Ok(()));
+        let mut wrong_reply = reply.clone();
+        wrong_reply.reply.push(0xaa);
+        assert_eq!(
+            validate(&next, &wrong_reply),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+
+        let mut runtime = super::super::standard::StandardAgentRuntime::restore(
+            super::super::wire::decode_standard_runtime_state(&prior).unwrap(),
+        )
+        .unwrap();
+        runtime
+            .commit_clean_exact_outcome_clock(invocation.mode, *observed_slot)
+            .unwrap();
+        let clock_only = super::super::wire::encode_standard_runtime_state(&runtime.snapshot());
+        assert_eq!(
+            validate(&clock_only, reply),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+        let mut altered = super::super::wire::decode_standard_runtime_state(&next).unwrap();
+        altered.invocation_results[0].clean.as_mut().unwrap().work =
+            crate::agent_sdk::Hash([0xff; 32]);
+        assert_eq!(
+            validate(
+                &super::super::wire::encode_standard_runtime_state(&altered),
+                reply
+            ),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+
+        let RuntimeWork::Invoke {
+            context,
+            invocation,
+            authorization,
+            ..
+        } = work
+        else {
+            unreachable!()
+        };
+        let retry_work = RuntimeWork::Invoke {
+            context,
+            state: transition.state,
+            invocation,
+            authorization,
+            observed_slot: 99,
+        };
+        let retry = super::super::wire::apply_standard_runtime_work(retry_work.clone()).unwrap();
+        assert_eq!(retry.outcome, transition.outcome);
+        assert_eq!(
+            validate_sdk_failed_reply_transition(
+                super::super::STANDARD_RUNTIME_PROGRAM_ID,
+                &next,
+                &sdk_state_as_legacy(&retry.state),
+                &retry_work,
+                reply,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn sdk_terminal_failure_resume_successor_requires_continuation_consumption() {
+        use crate::agent_sdk::{RuntimeOutcome, RuntimeWork};
+        let work = super::super::wire::tests::clean_failing_resume_fixture();
+        let RuntimeWork::Resume { state, .. } = &work else {
+            unreachable!()
+        };
+        let prior = sdk_state_as_legacy(state);
+        let transition = super::super::wire::apply_standard_runtime_work(work.clone()).unwrap();
+        let RuntimeOutcome::Completed(Ok(reply)) = &transition.outcome else {
+            panic!("expected resumed failure")
+        };
+        let next = sdk_state_as_legacy(&transition.state);
+        let validate = |next: &RuntimeState| {
+            validate_sdk_failed_reply_transition(
+                super::super::STANDARD_RUNTIME_PROGRAM_ID,
+                &prior,
+                next,
+                &work,
+                reply,
+            )
+        };
+        assert_eq!(validate(&next), Ok(()));
+        let before = super::super::wire::decode_standard_runtime_state(&prior).unwrap();
+        let mut altered = super::super::wire::decode_standard_runtime_state(&next).unwrap();
+        altered.machine_continuations = before.machine_continuations;
+        assert_eq!(
+            validate(&super::super::wire::encode_standard_runtime_state(&altered)),
+            Err(AgentDriverError::InvalidRuntime)
+        );
     }
 
     #[test]
