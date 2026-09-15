@@ -522,17 +522,47 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
     // Counter uses the already verified Create CLI result for its coordinates;
     // it does not need an unrelated Catalog installed in the same Local agent.
     let target = if counter {
-        let created: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
-        let acknowledgement = vos::agent::sdk::authority::ManagementApplicationAck::decode(
-            &hex::decode(created["acknowledgement"].as_str().unwrap()).unwrap(),
-        )
-        .unwrap();
+        let acknowledgement = if selected_space == "fresh-ack-smoke" {
+            // After successor handoff the server no longer retains the older
+            // Create decision. Verify the client's exact durable request/ACK;
+            // do not reissue Create to manufacture test coordinates.
+            use super::super::clean_store::{
+                CleanLocalCreateAcknowledgementFile, CleanLocalCreateRequestFile,
+            };
+            let candidates: Vec<_> = std::fs::read_dir(data.join("agent-client/operations"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.join("request/local-create.request").is_file())
+                .collect();
+            assert_eq!(candidates.len(), 1, "fixture must have one retained Create");
+            let mut request =
+                CleanLocalCreateRequestFile::open_or_create(candidates[0].join("request"))
+                    .unwrap();
+            let request = request.load().unwrap().expect("retained Create request");
+            let mut ack = CleanLocalCreateAcknowledgementFile::open_or_create(
+                candidates[0].join("acknowledgement"),
+                &request,
+            )
+            .unwrap();
+            super::super::local_create::verify_acknowledgement(
+                &request,
+                &ack.load().unwrap().expect("retained Create acknowledgement"),
+            )
+            .unwrap()
+        } else {
+            let created: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+            let acknowledgement = vos::agent::sdk::authority::ManagementApplicationAck::decode(
+                &hex::decode(created["acknowledgement"].as_str().unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                created["agent"].as_str().unwrap(),
+                hex::encode(acknowledgement.managed.agent.0)
+            );
+            acknowledgement
+        };
         assert_eq!(acknowledgement.managed.space, space);
-        assert_eq!(
-            created["agent"].as_str().unwrap(),
-            hex::encode(acknowledgement.managed.agent.0)
-        );
         let package = vos::agent::package_admission::admit_actor_package(
             &std::fs::read(&counter_path).unwrap(),
         )

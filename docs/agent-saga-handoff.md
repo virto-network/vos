@@ -2,6 +2,44 @@
 
 ## Checkpoint and decision
 
+### Counter invocation and read-after-restart qualified
+
+Unchanged release `b7cfa17d` passes the full Public Counter campaign on the
+original `fresh-ack-release.Of5a75` fixture. Latest Install exact retry verified.
+Increment-by7 completed in29.12s (full test31.03s), returned7 and completed
+positive retirement. Two late Invoke replays rejected the consumed identity;
+two ACK retries returned identical positive responses. After restart a fresh
+value query returned7, completed in34.80s (full test36.71s), and passed the same
+retirement/retry checks. Restarts54s/53s still fail the10s gate; both SIGTERM
+shutdowns passed within2s without forced cleanup. Session11199 terminal0;
+post-run inspection found no vosx/cargo/rustc. Not non-Public policy/proof
+qualification; latency remains a production blocker.
+
+Mutation: `79d4818fb02562f45c35a14e7285fe5ecc60ed624da2bb622f41076543fd23b6`.
+Read: `f82147371d7a3ea729659a1362ef10cc8657344f295bd2f4616f92403247e02e`.
+Do not issue another fresh increment to repeat this test; reuse retained intent.
+Evidence under the same fixture: `framed-invoke-probe.sh`,
+`framed-invoke-probe.log`, `framed-invoke-up.log`, `invoke-test-framed.log`,
+`read-up.log`, `read-test.log`, `install-retry-framed.json`,
+`framed-ack-test-build-fixed.log` (build3.03s).
+
+Correction to prior diagnosis: the issuer deliberately retains only the latest
+acknowledged decision plus bounded unacknowledged decisions. Its authorization
+high-water rejects reuse of older acknowledged identifiers, and finalized
+recovery consults only the latest acknowledged record. Moving lookup before
+`pledge` would not recover old Create after Install. Extending historical server
+retry requires an explicit retention/protocol decision, not bypassing checks.
+The observed503 and its retry guidance remain limitations, not evidence of
+failed creation. No production retry fix or expanded retention is claimed.
+
+The test uses the existing framed stores at their original paths to load the
+one retained Create request/ACK, verifies the signature against that exact
+request, and checks SpaceID before deriving Counter coordinates. First loader
+attempt treated framed bytes as raw wire and failed before mutation
+(session70857 exit101, `invoke-test.log`; latest Install retry passed).
+Corrected loader and full campaign pass above; failed logs and earlier503
+evidence remain intact. Only test code changed, not the guest or release.
+
 ### Completed Create retry after Install: conflict found
 
 The invocation qualification probe stopped before any mutation. Restart of the
@@ -21,8 +59,9 @@ Consequently an older completed Create cannot reach finalized issuer recovery
 after that slot has advanced to Install. This is a retry-lifetime limitation,
 not evidence that the previously acknowledged creation or installation failed.
 Do not weaken slot authentication or relabel/reset the store to avoid it.
-Resolve completed-request recovery across successor handoff with regression
-coverage and authenticated physical evidence before claiming broad exact retry.
+The correction above explains the bounded-retention contract: changing lookup
+order is insufficient. Current retained retries and older retired replay must
+not be conflated when qualifying the release.
 
 Evidence: `invoke-probe.sh`, `invoke-probe.log`, `invoke-up.log`,
 `create-retry.stderr` (503 error), and empty `create-retry.json` under the same

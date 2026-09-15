@@ -21,6 +21,18 @@ passing regressions from still-failing production gates.
 
 ## Follow-up after the frozen review snapshot
 
+Current release now passes Counter increment and fresh read-after-restart:
+both return7; managed calls29.12s/34.80s. Retired Invoke replays reject and ACK
+retries match exactly. Latest Install retry verified. Restarts54s/53s still
+fail readiness; both shutdowns pass within2s. The test verifies the original
+client Create request/ACK through framed stores. See the handoff for evidence.
+
+Correction to the diagnosis below: the issuer deliberately keeps only the
+latest acknowledged decision, so moving lookup before intent pledge cannot
+restore older Create replies after Install. Such historical retry support
+requires a retention/protocol decision. No production fix or expanded
+retention is claimed; the503 reporting limitation remains documented.
+
 Latest retry qualification found a limitation: replaying the original completed
 Create after Install/restart returns503 `Lifecycle(Conflict)`. Install advances
 the single retired lifecycle intent slot; Create pledges against that slot
@@ -35,7 +47,7 @@ with a verified acknowledgement and no timeout, and post-Create SIGTERM exited
 within1s. The same fixture subsequently restarted in54s with HTTP and unchanged
 SSH identity, then completed fresh Counter Install in65s with a verified
 acknowledgement and no timeout. Post-Install shutdown passed within1s.
-Invocation and post-Install retry/read-after-restart remain unmeasured. These are not
+Invocation and post-Install retry/read-after-restart are now qualified above. These are not
 controlled comparisons with old retained-history probes. See the handoff for
 binary checksum, exact fixture, logs and remaining release blockers.
 
