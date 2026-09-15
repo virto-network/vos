@@ -2,6 +2,46 @@
 
 ## Checkpoint and decision
 
+Instruction attribution now separates the outer AgentRuntime from nested
+actors using the existing read-only Refine observer. The opt-in
+`VOS_AGENT_PROFILE_REFINE_MACHINES=1` is test-only: it selects the bundled
+outer runtime for the native system fixture, disables that fixture's native
+clean-runtime shortcut, and profiles physical calls with inputs over700KB.
+Ordinary test defaults and the production `RefineContext::run` path remain
+unchanged. No guest memory or request bytes are recorded. Deliberately invalid
+shape-only packages used by negative tests remain shape-only in profiling mode.
+
+The existing `native_management_intent_executes_bundled_authority_and_recovers_receipt`
+test passes with real-system-runtime profiling (149.94s, build29.89s), including
+its lifecycle, exact receipt, negative-scope and recovery assertions. The same
+test passes with normal defaults/profiling disabled (45.44s). Large nested calls
+show274.6–276.9 million outer instructions versus11.2–19.5 million inner actor
+instructions. Six large calls perform142.0–143.6 million outer instructions
+with zero inner instructions and zero host calls. Thus the outer runtime is
+the dominant instruction workload here; optimizing the nested Authority actor
+alone cannot remove the measured cost. Machine identity and instruction count
+do not identify a specific outer function: investigate outer work decoding,
+validation and commitment computation rather than assuming any check is
+redundant. Preserve exact authenticated bytes and gas semantics.
+
+Observed slice times (roughly5.6–6.0s outer versus0.3–0.6s inner in nested
+calls) include tracing overhead and are **not production latency measurements**.
+This is a deterministic fixture with bundled code, not the preserved live-space
+query. No new performance fix or release qualification is claimed.
+
+Evidence under shared target `task-tmp`:
+`prepared-runtime-real-machine-attribution-fixed.log` (session78827 exit0),
+`prepared-runtime-machine-attribution-default.log` (session50103 exit0).
+The initial `prepared-runtime-machine-attribution.log` run passed but emitted
+no large profiles because its system fixture took the native shortcut.
+`prepared-runtime-real-machine-attribution.log` records the first diagnostic
+attempt's negative-fixture mismatch; the scoped fixture correction fixes it,
+and the final complete run passes. Sessions48310/59846 are terminal0/101.
+Reproduce via the host-feature library command with the exact test above,
+`--nocapture --test-threads=1`, the opt-in variable and disk-backed TMPDIR.
+
+### Fresh startup phase diagnosis
+
 Targeted startup-smoke diagnosis used existing logging only; no source or
 deadline change. With `RUST_LOG=info,vosx::commands::space::clean_startup=debug,
 vos::agent::local_journal_driver=debug`, the isolated fresh-space test again

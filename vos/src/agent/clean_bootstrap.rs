@@ -5477,7 +5477,7 @@ mod tests {
             }
 
             fn use_native_clean_runtime_for_test(&self) -> bool {
-                true
+                std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_none()
             }
         }
 
@@ -7152,8 +7152,18 @@ mod tests {
         }
 
         fn shape_only_runtime() -> AdmittedRuntimePackage {
+            test_runtime_package(false)
+        }
+
+        fn test_runtime_package(bundled: bool) -> AdmittedRuntimePackage {
             let mut assembler = Assembler::new();
-            let program = assembler.load_imm_64(Reg::A0, 0x63).trap().build_standard();
+            // Profiling must measure the real outer runtime, not this fixture's
+            // native Standard shortcut. Ordinary tests retain their fast path.
+            let program = if bundled {
+                include_bytes!("../../../vosx/blobs/agent_runtime.pvm").to_vec()
+            } else {
+                assembler.load_imm_64(Reg::A0, 0x63).trap().build_standard()
+            };
             let signing = SigningKey::from_bytes(&[0x63; 32]);
             let public_key = signing.verifying_key().to_bytes();
             let mut package = PackageEnvelope {
@@ -7768,7 +7778,9 @@ mod tests {
         ) -> PhysicalFixture {
             let receipt_key = SigningKey::from_bytes(&[RECEIPT_SEED; 32]);
             let credential_key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
-            let runtime = shape_only_runtime();
+            let runtime = test_runtime_package(
+                std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some(),
+            );
             let space = SpaceId([0x31; 32]);
             let owner = PrincipalId([0x32; 32]);
             let nonce = Hash([0x33; 32]);

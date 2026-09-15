@@ -1246,6 +1246,45 @@ impl RuntimePreparationCache {
     }
 }
 
+/// Opt-in instruction attribution for physical tests only. It reports no work
+/// bytes or guest memory and does not change the production execution path.
+#[cfg(test)]
+fn profile_refine_machines(
+    context: RefineContext,
+    input_bytes: usize,
+) -> vos_pvm::refine::Invocation {
+    use vos_pvm::refine_host::{RefineMachineIdentity, RefineObservation};
+    let index = |identity| usize::from(!matches!(identity, RefineMachineIdentity::Outer));
+    let mut instructions = [0u64; 2];
+    let mut elapsed = [0u128; 2];
+    let mut entered = [None; 2];
+    let mut host_calls = 0u64;
+    let result = context.run_observed(|event| match event {
+        RefineObservation::MachineEnter { identity, .. } => {
+            entered[index(identity)] = Some(std::time::Instant::now());
+        }
+        RefineObservation::Instruction { identity, .. } => instructions[index(identity)] += 1,
+        RefineObservation::MachineExit { identity, .. } => {
+            let i = index(identity);
+            elapsed[i] += entered[i]
+                .take()
+                .expect("machine entered before exit")
+                .elapsed()
+                .as_micros();
+        }
+        RefineObservation::HostCall {
+            phase: vos_pvm::refine_host::RefineHostPhase::Before,
+            ..
+        } => host_calls += 1,
+        _ => {}
+    });
+    eprintln!(
+        "refine_machine_profile input_bytes={input_bytes} gas_used={} outer_instructions={} inner_instructions={} outer_observed_us={} inner_observed_us={} host_calls={host_calls}",
+        result.gas_used, instructions[0], instructions[1], elapsed[0], elapsed[1]
+    );
+    result
+}
+
 /// One local computation, never durable evidence or an authentication cache.
 /// Canonical input includes all state lanes, authorization and blob preimages.
 struct TerminalPreflight {
@@ -3219,11 +3258,20 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         input: &[u8],
     ) -> Result<T, LocalReplayExecutorError> {
         let started = std::time::Instant::now();
-        let invocation = self
+        let context = self
             .runtime_preparation
             .load(runtime_pvm, input, gas)
-            .map_err(|_| LocalReplayExecutorError::RuntimeOutput)?
-            .run();
+            .map_err(|_| LocalReplayExecutorError::RuntimeOutput)?;
+        #[cfg(test)]
+        let invocation = if input.len() > 700_000
+            && std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some()
+        {
+            profile_refine_machines(context, input.len())
+        } else {
+            context.run()
+        };
+        #[cfg(not(test))]
+        let invocation = context.run();
         tracing::debug!(
             elapsed_us = started.elapsed().as_micros() as u64,
             input_bytes = input.len(),

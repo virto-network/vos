@@ -2,6 +2,15 @@
 
 ## Follow-up after the frozen review snapshot
 
+Latest performance diagnosis uses test-only instruction attribution with the
+real bundled outer runtime: large nested calls execute roughly275 million
+outer instructions versus11–19 million actor instructions; other large calls
+execute142–144 million outer instructions with no actor execution at all.
+The lifecycle/recovery regression passes in both profiling and normal modes.
+This points the next optimization toward outer-runtime work, not solely actor
+execution. It is not a new production speedup; instrumented timings are not
+production benchmarks. Exact evidence and opt-in instructions are in the handoff.
+
 Current CLI result at `04454ef0`:255 unit tests and five actor/task-build
 integration tests passed;19 tests ignored. Shutdown smoke still fails because
 startup exceeds its10s endpoint deadline; it never reaches the SIGTERM phase.
