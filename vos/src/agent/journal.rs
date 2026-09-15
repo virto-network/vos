@@ -1735,7 +1735,17 @@ impl CanonicalJournalRecord for ReplayInput {
 
     fn validate(&self) -> Result<(), DecodeError> {
         self.validate_inner()?;
-        validate_encoded_bound(self, MAX_REPLAY_INPUT_BYTES)
+        // `self` stays immutably borrowed: the size pass can reuse the exact
+        // Invoke validation above, but ordinary public encoding cannot.
+        let mut body = Vec::new();
+        let mut encoder = Encoder(&mut body);
+        encode_runtime_binding(&mut encoder, &self.runtime);
+        encode_replay_operation_inner(&mut encoder, &self.operation, true);
+        body.len()
+            .checked_add(SERVICE_WIRE_HEADER_BYTES)
+            .filter(|length| *length <= MAX_REPLAY_INPUT_BYTES)
+            .map(|_| ())
+            .ok_or(DecodeError::LimitExceeded)
     }
 
     fn id(&self) -> Self::Id {
@@ -3137,6 +3147,14 @@ fn decode_transition_proof_lifecycle_key(
 }
 
 fn encode_replay_operation(encoder: &mut Encoder<'_>, operation: &ReplayOperation) {
+    encode_replay_operation_inner(encoder, operation, false);
+}
+
+fn encode_replay_operation_inner(
+    encoder: &mut Encoder<'_>,
+    operation: &ReplayOperation,
+    invocation_already_validated: bool,
+) {
     match operation {
         ReplayOperation::Management { request } => {
             encoder.u8(0);
@@ -3186,9 +3204,9 @@ fn encode_replay_operation(encoder: &mut Encoder<'_>, operation: &ReplayOperatio
                 invocation: alloc::boxed::Box::new(work.clone()),
                 authorization: alloc::boxed::Box::new(authorization.clone()),
                 observed_slot: *observed_slot,
-            }
-            .encode()
-            .expect("validated CleanInvoke must have a canonical SDK encoding");
+            };
+            let canonical = encode_journal_invoke(&canonical, invocation_already_validated)
+                .expect("validated CleanInvoke must have a canonical SDK encoding");
             encoder.bytes(&canonical);
         }
         ReplayOperation::CleanResume {
@@ -3206,9 +3224,9 @@ fn encode_replay_operation(encoder: &mut Encoder<'_>, operation: &ReplayOperatio
                 invocation: alloc::boxed::Box::new(work.clone()),
                 authorization: alloc::boxed::Box::new(authorization.clone()),
                 observed_slot: *observed_slot,
-            }
-            .encode()
-            .expect("validated CleanResume must have a canonical exact-work encoding");
+            };
+            let canonical = encode_journal_invoke(&canonical, invocation_already_validated)
+                .expect("validated CleanResume must have a canonical exact-work encoding");
             encoder.bytes(&canonical);
             let yielded = crate::agent_sdk::RuntimeTransition {
                 state: crate::agent_sdk::RuntimeState::default(),
@@ -3247,6 +3265,26 @@ fn encode_replay_operation(encoder: &mut Encoder<'_>, operation: &ReplayOperatio
         }
         ReplayOperation::SealMerge => encoder.u8(3),
     }
+}
+
+/// Only the immutable size pass after ReplayInput::validate_inner may bypass
+/// repeated Invoke validation. The public ServiceWire encoder passes false.
+fn encode_journal_invoke(
+    work: &crate::agent_sdk::RuntimeWork,
+    already_validated: bool,
+) -> Result<Vec<u8>, crate::agent_sdk::wire::WireError> {
+    if !already_validated {
+        return work.encode();
+    }
+    debug_assert!(matches!(work, crate::agent_sdk::RuntimeWork::Invoke { .. }));
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&crate::agent_sdk::RuntimeWork::MAGIC);
+    bytes.extend_from_slice(crate::agent_sdk::RUNTIME_ABI_ID.as_bytes());
+    work.encode_body(&mut vos_protocol::wire::Encoder(&mut bytes));
+    if bytes.len() > crate::agent_sdk::RuntimeWork::MAX_ENCODED_BYTES {
+        return Err(crate::agent_sdk::wire::WireError::LimitExceeded);
+    }
+    Ok(bytes)
 }
 
 /// Check exact canonical bytes after the SDK decoder has authenticated all
@@ -5356,6 +5394,56 @@ mod tests {
         let mut wrong_runtime = create.clone();
         wrong_runtime.runtime.runtime_abi = Hash([0xff; 32]);
         assert_eq!(wrong_runtime.validate(), Err(DecodeError::NonCanonical));
+    }
+
+    #[test]
+    fn replay_size_pass_matches_normal_encoding_and_rejects_changed_blobs() {
+        for mode in [
+            crate::agent_sdk::MethodMode::Query,
+            crate::agent_sdk::MethodMode::LinearizableQuery,
+            crate::agent_sdk::MethodMode::Linear,
+            crate::agent_sdk::MethodMode::Merge,
+            crate::agent_sdk::MethodMode::LocalQuery,
+            crate::agent_sdk::MethodMode::Local,
+        ] {
+            let mut input = public_clean_replay_input(mode);
+            let ReplayOperation::CleanInvoke {
+                work,
+                authorization,
+                observed_slot,
+                ..
+            } = &mut input.operation
+            else {
+                unreachable!()
+            };
+            let bytes = vec![0xab; 128 * 1024];
+            work.availability.push(crate::agent_sdk::RuntimeBlob {
+                reference: crate::agent_sdk::BlobRef::of_bytes(&bytes),
+                bytes,
+            });
+            *authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+                crate::agent_sdk::PublicPreflight::for_work(work, *observed_slot),
+            );
+            input.validate_inner().unwrap();
+            let normal = input.encode();
+            let mut checked = Vec::new();
+            checked.extend_from_slice(&ReplayInput::MAGIC);
+            checked.extend_from_slice(&crate::service::PLATFORM_ID.0);
+            let mut encoder = Encoder(&mut checked);
+            encode_runtime_binding(&mut encoder, &input.runtime);
+            encode_replay_operation_inner(&mut encoder, &input.operation, true);
+            assert_eq!(checked, normal);
+            input.validate().unwrap();
+            let ReplayOperation::CleanInvoke { work, .. } = &mut input.operation else {
+                unreachable!()
+            };
+            work.availability[0].bytes[0] ^= 1;
+            assert_eq!(
+                input.validate(),
+                Err(DecodeError::NonCanonical),
+                "no validation survives mutation of its borrowed input"
+            );
+        }
     }
 
     #[test]

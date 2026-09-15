@@ -9022,6 +9022,32 @@ No artifact, timeout, or release gate changed. The production latency blocker
 remains; further work must address the larger repeated validation boundaries,
 not infer an end-to-end gain from this allocation-only change.
 
+### ReplayInput size pass reuses its invocation validation (C2)
+
+`ReplayInput::validate` previously authenticated its clean invocation inside
+`validate_inner`, then invoked the ordinary encoder to measure size, hashing
+the same preimages again. The size pass now calls a private encoder path that
+reuses the completed Invoke validation while the same input is immutably
+borrowed. It still serializes the complete record and enforces both nested SDK
+and complete journal byte limits. Ordinary public encoding passes the normal
+validation flag; persisted decoding still authenticates every incoming blob.
+CleanManage, ACK and yielded-selector encoding retain their existing checks.
+There is no cache or validation fact surviving mutation or a later call.
+
+A six-mode regression compares the optimized bytes with ordinary encoding and
+then mutates a blob to require rejection on the next validation. All **42**
+selected tests pass (41 journal tests plus native issuance/reopen/retirement),
+zero failed/ignored, 19.96 s; evidence is shared C2
+`target/task-tmp/journal-size-single-pass-final.log`. Normal CLI compile check
+passes (5.78 s, warnings, `journal-size-single-pass-native-check.log`), along with
+formatting/diff checks. No diagnostic feature or runtime pin changed.
+
+This removes a redundant hash pass by construction, but the overall native
+test timing remains around 20 s: **no production latency improvement is proven**.
+The multi-minute live workflows and the remaining finality/recovery/release
+gates remain open. Avoid interpreting these narrowly passing tests as a fresh
+live campaign or a completed final release matrix.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its
