@@ -2,6 +2,29 @@
 
 ## Checkpoint and decision
 
+Inventory reconciliation now observes the node's shared shutdown signal between
+durable projection calls. The node wires its existing signal into the owned
+inventory source; the client checks before recovery/authenticated dispatch and
+after each completed call, refusing further pages and discarding partial/cache
+reuse. A `ShutdownRequested` result is a normal node stop only when that same
+node signal is set; other errors remain fatal. No worker is detached and no
+in-flight journal operation is interrupted or relabelled as complete.
+
+All11 production-owner tests pass (0.17s), including a new transport-controlled
+regression that stops before dispatch or after the Agents page, never starts
+replica/actor pagination after the signal, and invalidates cached inventory.
+All8 selected shutdown tests also pass (2.42s), including physical lifecycle
+refusal after shutdown, owner/route join ordering and busy-outbox signal handling.
+Logs: `task-tmp/inventory-shutdown-regressions.log` and
+`task-tmp/inventory-shutdown-node-regressions.log`; sessions47472 and57808 terminal.
+Configuration: locked/offline host features `agent-transition-proof
+private-agent-store http-ingress ssh-ingress`.
+
+This is safe-boundary cancellation, **not yet a passing five-second live gate**.
+A single already-running projection call may itself be too slow. The release
+binary still predates this change, and the two post-invocation shutdown failures
+below remain authoritative until a new live probe qualifies the fix.
+
 Current release (`668a86bb`) passes recovered-space restart/HTTP/stable SSH
 identity with clean SIGINT shutdown in the idle-ingress probe: readiness30s,
 HTTP status `ok`, SSH key equal to the original fixture, shutdown within5s.

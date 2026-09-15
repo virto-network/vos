@@ -5947,7 +5947,7 @@ impl VosNode {
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
     pub(crate) fn attach_clean_agent_owner(
         &mut self,
-        owner: crate::agent::production_owner::AgentProductionOwner,
+        mut owner: crate::agent::production_owner::AgentProductionOwner,
     ) -> Result<(), crate::agent::production_owner::AgentProductionOwnerError> {
         use crate::agent::production_owner::AgentProductionOwnerError;
 
@@ -5967,6 +5967,7 @@ impl VosNode {
             let _ = owner.shutdown_and_join();
             return Err(AgentProductionOwnerError::InvalidConfiguration);
         };
+        owner.set_shutdown_signal(Arc::clone(&self.shutdown));
         self.clean_agent_owner = Some(owner);
         self.clean_agent_recovering
             .store(handle.is_none(), Ordering::Release);
@@ -8464,6 +8465,8 @@ impl VosNode {
                 }
                 true
             }
+            Some(Err(crate::agent::production_owner::AgentProductionOwnerError::ShutdownRequested))
+                if self.shutdown.load(Ordering::Acquire) => false,
             Some(Err(error)) => {
                 self.clean_agent_owner_error.get_or_insert(error);
                 self.signal_node_shutdown();

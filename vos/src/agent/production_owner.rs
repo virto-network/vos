@@ -8,6 +8,10 @@
 //! publication is touched.
 
 use core::fmt;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use super::sdk::authority::{
@@ -82,6 +86,7 @@ fn completed_local_install_matches(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentProductionOwnerError {
+    ShutdownRequested,
     InvalidConfiguration,
     Authentication,
     ProjectionTransport,
@@ -183,6 +188,7 @@ struct AgentAuthorityInventory {
 }
 
 trait AuthorityInventorySource: Send {
+    fn set_shutdown_signal(&mut self, shutdown: Arc<AtomicBool>);
     fn load_inventory(&mut self) -> Result<AgentAuthorityInventory, AgentProductionOwnerError>;
 }
 
@@ -190,6 +196,7 @@ struct CleanAuthorityProjectionClient {
     transport: Box<dyn AuthorityProjectionTransport>,
     authenticator: Box<dyn AuthorityProjectionQueryAuthenticator>,
     inventory: Option<(AuthorityCredentialProjection, AgentAuthorityInventory)>,
+    shutdown: Option<Arc<AtomicBool>>,
 }
 
 impl CleanAuthorityProjectionClient {
@@ -201,6 +208,19 @@ impl CleanAuthorityProjectionClient {
             transport,
             authenticator,
             inventory: None,
+            shutdown: None,
+        }
+    }
+
+    fn check_shutdown(&self) -> Result<(), AgentProductionOwnerError> {
+        if self
+            .shutdown
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            Err(AgentProductionOwnerError::ShutdownRequested)
+        } else {
+            Ok(())
         }
     }
 
@@ -209,8 +229,10 @@ impl CleanAuthorityProjectionClient {
         selector: AuthorityProjectionSelector,
     ) -> Result<(AuthorityProjectionQuery, T), AgentProductionOwnerError> {
         let started = Instant::now();
+        self.check_shutdown()?;
         tracing::debug!(?selector, "Authority inventory query started");
         self.transport.recover_pending()?;
+        self.check_shutdown()?;
         tracing::debug!(
             ?selector,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -225,7 +247,11 @@ impl CleanAuthorityProjectionClient {
         {
             return Err(AgentProductionOwnerError::Authentication);
         }
+        self.check_shutdown()?;
         let bytes = self.transport.dispatch(query.clone())?;
+        // Finish the durable projection call, but never start another page
+        // or publish a partially collected inventory after shutdown.
+        self.check_shutdown()?;
         tracing::debug!(
             ?selector,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -319,6 +345,10 @@ impl CleanAuthorityProjectionClient {
 }
 
 impl AuthorityInventorySource for CleanAuthorityProjectionClient {
+    fn set_shutdown_signal(&mut self, shutdown: Arc<AtomicBool>) {
+        self.shutdown = Some(shutdown);
+    }
+
     fn load_inventory(&mut self) -> Result<AgentAuthorityInventory, AgentProductionOwnerError> {
         // Any failed refresh invalidates reuse, including authentication and
         // partial pagination errors. No cached value is a fallback on failure.
@@ -860,6 +890,10 @@ impl AgentProductionOwner {
         attachment: AgentRouteHostAttachment,
     ) -> Result<(), AgentProductionOwnerError> {
         install_pending(&mut self.shared, attachment)
+    }
+
+    pub(crate) fn set_shutdown_signal(&mut self, shutdown: Arc<AtomicBool>) {
+        self.source.set_shutdown_signal(shutdown);
     }
 
     pub(crate) fn drive_if_due(&mut self, now: Instant) -> Result<bool, AgentProductionOwnerError> {
@@ -1665,6 +1699,70 @@ mod tests {
         assert!(source.inventory.is_none());
         assert_eq!(source.load_inventory().unwrap(), original);
         assert_eq!(calls.lock().unwrap().len(), 22);
+    }
+
+    #[test]
+    fn inventory_shutdown_stops_between_pages_and_discards_partial_cache() {
+        struct StoppingTransport {
+            inner: ProjectionTransport,
+            shutdown: Arc<AtomicBool>,
+            armed: Arc<AtomicBool>,
+        }
+        impl AuthorityProjectionTransport for StoppingTransport {
+            fn target(&self) -> AuthorityActorTarget {
+                self.inner.target()
+            }
+            fn dispatch(
+                &mut self,
+                query: AuthorityProjectionQuery,
+            ) -> Result<Vec<u8>, AgentProductionOwnerError> {
+                let stop = matches!(query.selector, AuthorityProjectionSelector::Agents { .. })
+                    && self.armed.load(Ordering::Acquire);
+                let result = self.inner.dispatch(query);
+                if stop {
+                    self.shutdown.store(true, Ordering::Release);
+                }
+                result
+            }
+        }
+        let node = NodeId([0x31; 32]);
+        let descriptor = descriptor(1, AgentProfile::Shared, node);
+        let actor = actor(&descriptor, true);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let armed = Arc::new(AtomicBool::new(true));
+        let mut source = CleanAuthorityProjectionClient::new(
+            Box::new(StoppingTransport {
+                inner: ProjectionTransport {
+                    page_cap: usize::MAX,
+                    target: target(),
+                    head: head(1),
+                    actor_head: head(1),
+                    descriptors: vec![descriptor],
+                    actors: vec![actor],
+                    calls: calls.clone(),
+                },
+                shutdown: shutdown.clone(),
+                armed: armed.clone(),
+            }),
+            Box::new(TestAuthenticator { ordinal: 0 }),
+        );
+        source.set_shutdown_signal(shutdown.clone());
+        assert_eq!(source.load_inventory(), Err(AgentProductionOwnerError::ShutdownRequested));
+        assert!(calls.lock().unwrap().is_empty());
+        shutdown.store(false, Ordering::Release);
+        assert_eq!(source.load_inventory(), Err(AgentProductionOwnerError::ShutdownRequested));
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        assert!(source.inventory.is_none());
+        armed.store(false, Ordering::Release);
+        shutdown.store(false, Ordering::Release);
+        assert_eq!(source.load_inventory().unwrap().agents.len(), 1);
+        assert!(source.inventory.is_some());
+        let completed_calls = calls.lock().unwrap().len();
+        shutdown.store(true, Ordering::Release);
+        assert_eq!(source.load_inventory(), Err(AgentProductionOwnerError::ShutdownRequested));
+        assert_eq!(calls.lock().unwrap().len(), completed_calls);
+        assert!(source.inventory.is_none());
     }
 
     #[test]
