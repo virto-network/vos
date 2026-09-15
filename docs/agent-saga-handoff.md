@@ -2,6 +2,19 @@
 
 ## Checkpoint and decision
 
+No-std build qualification at `80362c21`: five explicit locked offline commands
+pass: SDK check with no default features; `vos-raft` builds with no default
+features for `thumbv7em-none-eabihf` and `riscv32imc-unknown-none-elf`;
+`vos-pvm-proof` build with no default features; and `vos-pvm-proof-verifier`
+build. These cover the commands in `just check-no-std` and
+`just check-pvm-proof-no-std`, plus the SDK check. The two required embedded
+targets were initially absent and were installed for nightly-2025-05-09 with
+approved toolchain access; the skip-capable test wrapper was not counted as
+qualification. Rerunnable evidence: shared target
+`task-tmp/no-std-qualification.e0pLKx/check.sh` and `check.log` (one successful
+command sequence, source revision recorded). This is build evidence, not
+cryptographic proving, wasm qualification, or closure of the full release matrix.
+
 Newest-pin release smoke at source `83737aee`: the locked offline CLI release
 build passed in 6m49s. Fresh space `invoke-pin-smoke` was created with HTTP and
 SSH enabled in its generated config; only test ports were changed to
