@@ -2,6 +2,17 @@
 
 ## Checkpoint and decision
 
+Full default-feature `vos` library suite at `0bf97332` passes: 1,429 passed,
+zero failed, one ignored, 212.30s. Command: `cargo test --offline --locked
+-p vos --lib -- --test-threads=1`, with approved local sockets and disk-backed
+TMPDIR. The sole ignored test is
+`agent::shared_raft::application_ledger_v2::fixed_history_physical_decode_probe`,
+an opt-in timing probe requiring `VOS_AGENT_RAFT_BENCH_COPIED_DB`, not a release
+gate. Evidence: shared target `task-tmp/current-default-library-suite.log`.
+This includes the issuer validation optimization and default-feature test
+guard correction. It does not qualify feature-gated PVM/Private/Attested
+coverage, CLI startup/SIGTERM deadlines, live latency or the full release matrix.
+
 Issuer validation reuse: candidate commits now reuse signature validation only
 for byte-identical records at the same index under the exact same authority
 in the live, already-validated issuer image. There is no persisted cache.
