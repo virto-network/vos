@@ -6,6 +6,10 @@ bootstrap/restart and HTTP/SSH checks now pass (39 s first start, 58 s restart).
 This is bootstrap coverage, not live expiry retirement. Ordinary-agent finality,
 cross-runtime actor lifecycle, production latency
 and full release gates remain open. This is not a master-ready branch.
+Timing qualification: the live campaigns recorded so far use the debug CLI.
+Its interpreter/BLAKE2 are optimized, but much host code is not. Those timeouts
+are real development-mode failures; production-release latency still needs its
+own measurement. A configured release build is now in progress for that check.
 See the current closeout plan below; later checkpoint sections retain historical
 results, including failures that have since been fixed.
 Earlier clock-test pass counts had a fixture-dispatch gap; see "Retained
@@ -9299,15 +9303,25 @@ acceptable-latency claim. Reuse only this disposable r17 fixture for the next
 native lifecycle campaign; keep older r16 fixtures untouched.
 
 The next native r17 Create attempt returned HTTP 504 after startup; its saved
-`local-create.request` and pending credential were preserved, with no positive
-acknowledgement inferred. The first test daemon stopped. Exact `--resume` after
-restart is now running under `resume-create.sh` in the same fixture; inspect
-`create-resume-run.log` and its process completion before claiming recovery.
-`create.json` is the failed first output, not usable Create evidence. Meanwhile
-the normal CLI built the r17 Counter package in `counter-artifact/` successfully.
+`local-create.request` and pending credential were preserved. Exact `--resume`
+after restart now **passes**, yielding verified Create acknowledgement for Agent
+`1e0e2f54ccfc602777b5a45a1a975a2689471f0341ea64a6585ebea1ca2f65fb`.
+Recovery startup was 05:53:53–05:56:28 UTC; exact resume completed at 05:56:43,
+with byte-identical saved request, followed by clean shutdown at 05:56:44.
+`create-resume.json` and `create-resume-run.log` are the successful evidence;
+`create.json` remains the failed first output, not usable Create evidence.
+The normal CLI also built the r17 Counter package in `counter-artifact/`.
 The existing live Counter tests now accept explicitly selected `r17-startup`
 only with the matching disposable-directory guard (`VOSX_INVOKE_SMOKE_SPACE`);
 their CLI test executable compiles, but no r17 Counter invocation has run yet.
+
+Production-mode latency check: started an offline, locked `cargo build --release
+-p vosx --bin vosx -j 2` using the configured fat-LTO release profile and named
+host toolchain. Build log: `release-build.log` in this fixture. Scratch stays on
+disk; no timeout, validation or optimization profile was weakened. The planned
+`install-release.sh` uses that executable against the same disposable space and
+verified Create result. It has not run yet; wait for the existing release build
+to complete before installation. No test daemon remains running at this point.
 
 ### Durable client acknowledgement before completion
 
