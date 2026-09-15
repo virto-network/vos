@@ -5256,7 +5256,7 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "pvm")]
-    fn clean_authority_receipt(
+    pub(crate) fn clean_authority_receipt(
         config: &AgentConfig,
         work: &crate::agent_sdk::InvocationWork,
     ) -> crate::agent_sdk::authority::AuthorityReceipt {
@@ -9945,17 +9945,21 @@ pub(crate) mod tests {
     #[cfg(feature = "pvm")]
     #[test]
     fn bundled_unseen_expired_invocation_preserves_state_after_restore() {
-        assert_unseen_expired_invocation_retirement(true);
+        for missing_availability in [false, true] {
+            assert_unseen_expired_invocation_retirement(true, missing_availability);
+        }
     }
 
     #[cfg(feature = "pvm")]
     #[test]
     fn source_unseen_expired_invocation_retires_after_restore() {
-        assert_unseen_expired_invocation_retirement(false);
+        for missing_availability in [false, true] {
+            assert_unseen_expired_invocation_retirement(false, missing_availability);
+        }
     }
 
     #[cfg(feature = "pvm")]
-    fn assert_unseen_expired_invocation_retirement(bundled: bool) {
+    fn assert_unseen_expired_invocation_retirement(bundled: bool, missing_availability: bool) {
         use crate::agent_sdk::wire::CanonicalWire as _;
         use crate::agent_sdk::{
             InvocationAuthorization, InvocationError, RuntimeOutcome, RuntimeTransition,
@@ -9990,11 +9994,24 @@ pub(crate) mod tests {
         let RuntimeWork::Invoke {
             authorization,
             observed_slot,
+            state,
+            invocation,
             ..
         } = &mut work
         else {
             unreachable!()
         };
+        if missing_availability {
+            invocation.availability.clear();
+            let runtime = StandardAgentRuntime::restore(
+                decode_standard_runtime_state(&clean_state_to_legacy(state)).unwrap(),
+            )
+            .unwrap();
+            **authorization = InvocationAuthorization::AuthorityReceipt(clean_authority_receipt(
+                runtime.config().unwrap(),
+                invocation,
+            ));
+        }
         let InvocationAuthorization::AuthorityReceipt(receipt) = authorization.as_ref() else {
             unreachable!()
         };

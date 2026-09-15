@@ -3817,13 +3817,18 @@ impl<S: AgentImageStore> AgentDriver<S> {
         if !invocation.validate() {
             return Err(AgentDriverError::InvalidRuntime);
         }
-        if self.image.runtime_program == super::STANDARD_RUNTIME_PROGRAM_ID {
-            validate_standard_sdk_invoke_preflight(&self.image.runtime_state, &invocation)?;
-        }
         let observed_slot = self
             .trust
             .current_logical_slot()
             .ok_or(AgentDriverError::TrustUnavailable)?;
+        if self.image.runtime_program == super::STANDARD_RUNTIME_PROGRAM_ID {
+            validate_standard_sdk_invoke_preflight(
+                &self.image.runtime_state,
+                &invocation,
+                &authorization,
+                observed_slot,
+            )?;
+        }
         let gas = self
             .management_gas
             .checked_add(invocation.gas)
@@ -4892,6 +4897,8 @@ fn validate_execution_transition(
 fn validate_standard_sdk_invoke_preflight(
     prior: &RuntimeState,
     invocation: &crate::agent_sdk::InvocationWork,
+    authorization: &crate::agent_sdk::InvocationAuthorization,
+    observed_slot: u64,
 ) -> Result<(), AgentDriverError> {
     if !invocation.validate() {
         return Err(AgentDriverError::InvalidRuntime);
@@ -4900,6 +4907,17 @@ fn validate_standard_sdk_invoke_preflight(
         .map_err(|_| AgentDriverError::InvalidRuntime)?;
     let runtime = super::standard::StandardAgentRuntime::restore(state)
         .map_err(|_| AgentDriverError::InvalidRuntime)?;
+    if matches!(authorization, crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(receipt)
+        if observed_slot > receipt.selector.expires_at)
+    {
+        // Non-execution does not require executable artifact availability.
+        // Authenticate the exact receipt before allowing it to reach the guest;
+        // only the guest's independently verified successor can retain a fence.
+        runtime
+            .verify_clean_invocation_authorization(invocation, authorization, observed_slot)
+            .map_err(|_| AgentDriverError::InvalidRuntime)?;
+        return Ok(());
+    }
     match runtime.resolve_clean_invocation(invocation) {
         Ok(_) => Ok(()),
         Err(
@@ -6576,6 +6594,89 @@ mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
+    fn sdk_expiry_preflight_authenticates_non_executable_work_without_mutation() {
+        use crate::agent_sdk::{
+            InvocationAuthorization, InvocationError, RuntimeOutcome, RuntimeWork,
+        };
+        let RuntimeWork::Invoke {
+            state,
+            mut invocation,
+            ..
+        } = super::super::wire::tests::clean_failing_actor_fixture(None)
+        else {
+            unreachable!()
+        };
+        let prior = sdk_state_as_legacy(&state);
+        let runtime = super::super::standard::StandardAgentRuntime::restore(
+            super::super::wire::decode_standard_runtime_state(&prior).unwrap(),
+        )
+        .unwrap();
+        invocation.availability.clear();
+        assert!(invocation.validate());
+        let authorization = InvocationAuthorization::AuthorityReceipt(
+            super::super::wire::tests::clean_authority_receipt(
+                runtime.config().unwrap(),
+                &invocation,
+            ),
+        );
+        assert_eq!(
+            validate_standard_sdk_invoke_preflight(&prior, &invocation, &authorization, 1),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+        assert_eq!(
+            validate_standard_sdk_invoke_preflight(&prior, &invocation, &authorization, 3),
+            Ok(())
+        );
+        let mut forged = authorization.clone();
+        let InvocationAuthorization::AuthorityReceipt(receipt) = &mut forged else {
+            unreachable!()
+        };
+        receipt.signature[0] ^= 1;
+        assert_eq!(
+            validate_standard_sdk_invoke_preflight(&prior, &invocation, &forged, 3),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+        let work = RuntimeWork::Invoke {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            state,
+            invocation,
+            authorization: Box::new(authorization),
+            observed_slot: 3,
+        };
+        let transition = super::super::wire::apply_standard_runtime_work(work.clone()).unwrap();
+        assert_eq!(
+            transition.outcome,
+            RuntimeOutcome::Completed(Err(InvocationError::ExpiredBeforeExecution))
+        );
+        let next = sdk_state_as_legacy(&transition.state);
+        assert_eq!(
+            validate_sdk_error_transition(
+                super::super::STANDARD_RUNTIME_PROGRAM_ID,
+                &prior,
+                &next,
+                &work,
+                InvocationError::ExpiredBeforeExecution
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_sdk_error_transition(
+                super::super::STANDARD_RUNTIME_PROGRAM_ID,
+                &prior,
+                &prior,
+                &work,
+                InvocationError::ExpiredBeforeExecution
+            ),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+        assert_eq!(
+            prior,
+            super::super::wire::encode_standard_runtime_state(&runtime.snapshot())
+        );
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
     fn sdk_expiry_fence_requires_exact_non_execution_successor() {
         use crate::agent_sdk::{InvocationError, RuntimeWork};
         let mut work = super::super::wire::tests::clean_failing_actor_fixture(Some(0xff));
@@ -7319,7 +7420,9 @@ mod tests {
         let (prior, exact, invocation) = standard_exact_transition_fixture(observed_slot);
         let work = sdk_exact_invoke_work(&prior, &invocation, observed_slot);
         let crate::agent_sdk::RuntimeWork::Invoke {
-            invocation: clean, ..
+            invocation: clean,
+            authorization,
+            ..
         } = &work
         else {
             unreachable!()
@@ -7328,7 +7431,12 @@ mod tests {
         actor_origin.origin.actor = Some(crate::agent_sdk::ActorId([0x38; 32]));
         assert!(actor_origin.validate());
         assert_eq!(
-            validate_standard_sdk_invoke_preflight(&prior, &actor_origin),
+            validate_standard_sdk_invoke_preflight(
+                &prior,
+                &actor_origin,
+                authorization,
+                observed_slot
+            ),
             Ok(()),
             "actor provenance is a valid independently authenticated origin field"
         );
@@ -7339,11 +7447,21 @@ mod tests {
         assert!(!malformed_origin.validate());
         let unchanged = prior.clone();
         assert_eq!(
-            validate_standard_sdk_invoke_preflight(&prior, &malformed_origin),
+            validate_standard_sdk_invoke_preflight(
+                &prior,
+                &malformed_origin,
+                authorization,
+                observed_slot
+            ),
             Err(AgentDriverError::InvalidRuntime)
         );
         assert_eq!(
-            validate_standard_sdk_invoke_preflight(&prior, &malformed_origin),
+            validate_standard_sdk_invoke_preflight(
+                &prior,
+                &malformed_origin,
+                authorization,
+                observed_slot
+            ),
             Err(AgentDriverError::InvalidRuntime),
             "an exact retry is the same nonterminal host rejection"
         );

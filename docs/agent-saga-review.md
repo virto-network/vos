@@ -16,9 +16,11 @@ Implementation is in `.worktrees/ch08-runtime-directory` on
 The C2 typed-error runtime is reproduced from source `373d2520` and bundled;
 post-pin validation is recorded below. Source runtime dispatch now emits the
 expiry fence for unseen expired signed work, but that change is not yet in the
-bundle. Candidate-PVM expiry/retirement verification now passes; live native
-retirement/reservation recovery and the ABI/artifact release audit remain
-outstanding. The updated bundled-expiry
+bundle. Candidate-PVM expiry/retirement verification and independent candidate
+reproduction now pass; live native retirement/reservation recovery and the
+ABI/artifact cutover remain outstanding. The new error tag requires a new clean
+ABI/schema identity before release; do not pin this r16 candidate as final.
+The updated bundled-expiry
 regression requires the new candidate (or a completed repin); the old bundle
 cannot pass the new terminal-resolution expectation.
 The fresh
@@ -9191,6 +9193,39 @@ the corrected test preserves that evidence and does not change client behavior.
 issuance and scripted loopback HTTP, not a live daemon or a live clock advance.
 The physical guest and client checks are complementary boundaries, not a single
 end-to-end native expiry campaign. Live verification and final pinning remain open.
+
+### Native expiry admission and candidate reproduction (C2)
+
+Native `invoke_sdk` now captures its trusted logical slot before standard-runtime
+preflight. For a structurally valid expired signed invocation, preflight verifies
+the exact receipt/signature and lets the guest resolve non-execution without
+requiring executable actor availability. Live-work availability rejection is
+unchanged. Preflight does not mutate state or declare completion; the guest and
+the native exact-successor verifier still enforce retention/clock/capacity rules.
+
+The new host regression rejects unavailable live work and forged expired
+receipts, allows the authenticated expired request, and verifies the source's
+exact fence while rejecting an unchanged successor. The source/physical lifecycle
+helper now covers both complete and missing availability through expiry, retry,
+restore, positive ACK and late Invoke. **Five tests passed**, 1.17 s, in shared
+C2 `target/task-tmp/expiry-native-preflight-physical.log`, using the independent
+candidate copy. This is not a live daemon/trusted-clock campaign.
+CLI `cargo check` also passed (5.14 s); evidence is
+`target/task-tmp/expiry-native-preflight-cli-check.log` under shared C2.
+
+The candidate's second isolated export/build of immutable `e2a95935` completed
+successfully. Both ELF and PVM compare byte-identical with the first clean build;
+the identities above are unchanged. Script/log/artifacts:
+`target/task-tmp/runtime-expiry-candidate.0bMrdx/reproduce.sh`,
+`reproduction.log` and `reproduction/`. All scratch remains on disk.
+
+ABI audit: `vos-agent-sdk/src/contract.rs::CONTROL_SCHEMA_DESCRIPTOR` is the SDK
+ABI identity itself; package/schema decoders also bind that identity. The new
+canonical outcome tag changes the accepted runtime wire grammar. Therefore the
+next artifact cutover must advance the clean ABI/schema identity and rebuild the
+runtime plus affected system actor templates with matching tooling. The reproduced
+r16 candidate proves the implementation, not that release cutover. Preserve old
+fixtures; do not migrate/relabel them or claim the old bundle handles expiry.
 
 ### Durable client acknowledgement before completion
 
