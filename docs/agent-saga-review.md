@@ -1,7 +1,9 @@
 # Reviewing the Agent architecture saga
 
-Current Ch08 WIP warning: `wip/ch08-runtime-directory` has independently
-reproduced r16 bundles and passing fresh-space startup/restart ingress checks,
+Current Ch08 WIP warning: `wip/ch08-runtime-directory` is cutting over source
+to r17 while committed bundles are still r16. Do not deploy this intermediate
+checkout until matching artifacts are pinned and bootstrap is revalidated.
+Earlier r16 bundles were independently reproduced and passed startup/restart checks,
 but ordinary-agent finality, cross-runtime actor lifecycle, and full release gates
 remain open. This is not a master-ready branch.
 See the current closeout plan below; later checkpoint sections retain historical
@@ -9226,6 +9228,23 @@ next artifact cutover must advance the clean ABI/schema identity and rebuild the
 runtime plus affected system actor templates with matching tooling. The reproduced
 r16 candidate proves the implementation, not that release cutover. Preserve old
 fixtures; do not migrate/relabel them or claim the old bundle handles expiry.
+
+### r17 ABI source cutover (artifact rebuild pending)
+
+The SDK ABI is now `vos-agent-runtime-abi-260915-r17`; the corresponding
+control schema is `8f7633be7ce92ce465f98ad1f4276b6d13bba987ba4c27c335bac560eb172b48`.
+The schema hash test checks the constant against its ABI descriptor. Canonical
+expiry-outcome coverage explicitly rejects an r16 header. Fifteen fixed golden
+commitments across Authority, Catalog, invocation context and proof/public-I/O
+fixtures were regenerated for the new ABI; bounds, round trips and mutation
+rejection assertions remain intact. **All 165 SDK tests passed** in shared C2
+`target/task-tmp/r17-sdk-goldens-3.log`. Earlier logs retain the expected stale
+golden failures rather than hiding them.
+
+Freeze this source for the r17 builder, runtime and system templates, then build
+and independently reproduce matching artifacts before updating release pins.
+Old r16 fixtures stay untouched. The current source/committed-blob mismatch is
+an explicit intermediate cutover state, not a deployable build or a gate waiver.
 
 ### Durable client acknowledgement before completion
 
