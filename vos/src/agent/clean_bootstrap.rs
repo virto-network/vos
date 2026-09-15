@@ -12190,6 +12190,14 @@ mod tests {
                     found_boundary = true;
                     break;
                 }
+                // Reserve this exact pair before dispatch so the opportunistic
+                // scheduler must respect an occupied gate. This lets real
+                // authenticated history reach the hard boundary without
+                // disabling production checkpoint or admission checks.
+                owner
+                    ._network_host
+                    .reserve_projection_pair(agent, &query, &query_auth, false)
+                    .unwrap();
                 owner
                     .invoke_authority_projection(signed_credential_projection_query(owner, nonce))
                     .unwrap();

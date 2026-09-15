@@ -2,6 +2,37 @@
 
 ## Checkpoint and decision
 
+Current preserved-space reopen is blocked: the checkpoint-policy release
+exited during bootstrap at 2026-09-15T14:32:15Z with
+`Shared journal operation failed error=CrossStoreMismatch`, surfaced as
+`Host(CorruptResidue)`, before readiness or Install submission. Cause is not yet
+localized; do not attribute it to the new policy or treat the fixture as
+repairable without further evidence. The prior probe had stopped during
+inventory startup, so interrupted-startup recovery is part of the investigation.
+The original fixture path and all stores/request reservations remain untouched
+after this failure. Log: `task-tmp/issuer-reuse-release.QR6Y4x/soft-install-up.log`;
+probe session `6547` is terminal. No Install request was sent. Do not reset,
+relabel, migrate or delete this failing fixture.
+
+Release build at `53c98f7f` passes in 8m02s; `release bundle` and
+`release verify` pass with the unchanged runtime pin. Build/bundle logs,
+previous executable and SHA-256 evidence are in
+`task-tmp/soft-checkpoint-release.CU2mct/`. Executable SHA-256:
+`c6b4706944fcab89b13079d90257ccfdcd24e9139d0a19c40c795f55fa8b2d71`.
+Build session `24832` is terminal; this build is not a passing live qualification.
+
+Explicit native initial-capture headroom test now passes (320.79s; build30.99s).
+The first policy-enabled run failed setup after192.07s because opportunistic
+checkpoints prevented history reaching the hard boundary. The fixture now
+reserves each exact projection pair before dispatch, using the real occupied
+gate to suppress optional checkpoints during fill; no production knob or
+synthetic capacity counter is used. Original budget, refusal-before-publication,
+unchanged-state and authenticated management-repair assertions are unchanged.
+Logs: `task-tmp/soft-checkpoint-headroom-exact.log` (failed setup) and
+`task-tmp/soft-checkpoint-headroom-reserved.log` (pass). An earlier short-name
+`--exact` command selected zero tests and is not counted. Test sessions `39390`
+and `42310` are terminal. No task-owned test/build/daemon process remains live.
+
 Opportunistic system-projection checkpoint policy is implemented with a
 32-retained-Raft-entry soft threshold, derived from authenticated capacity
 relative to the installed snapshot. It runs before fresh projection admission,
