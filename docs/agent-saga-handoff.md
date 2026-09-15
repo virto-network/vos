@@ -6,10 +6,16 @@ Review-head qualification at source `4f0b6ffb`: all 18 CLI
 `production_release` tests pass (2.17s, locked offline build 24.38s).
 The integration test binaries selected zero tests by this filter; this does
 not rerun shutdown or the full CLI suite. Evidence: shared target
-`task-tmp/review-head-release-pins.log`. The matching release rebuild, which
-includes the host pagination fix, is still running at this checkpoint
-(exec session `81791`, log `task-tmp/review-head-release-build.log`). Do not
-count it as passed or start a replacement without checking that handle.
+`task-tmp/review-head-release-pins.log`. The matching locked offline release
+rebuild passed in 8m12s and includes the host pagination fix. Its process
+(exec session `81791`) is terminal. Build log:
+`task-tmp/review-head-release-build.log`. The resulting executable successfully
+ran `release bundle` and `release verify`, retaining runtime pin `79c7d1f0…`.
+Bundle, command logs and executable SHA-256 are preserved in
+`task-tmp/review-head-bundle.LV6R83/`; executable SHA-256 is
+`af3e2372489cd8461ce36c95e997a3f16cf21322c6158b283dd88a9328f1453c`.
+This closes the stale release-executable gap, not live pagination qualification,
+fresh-space smoke on this host revision, or ordinary Create/Install latency.
 The review guide now identifies the current `79c7d1f0…` pin and separates
 historical results; the old C1 boundary remains unsuitable for standalone
 merge. No merge, push, runtime change or release-gate waiver was performed.

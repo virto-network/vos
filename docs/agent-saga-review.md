@@ -13,9 +13,10 @@ Current runtime pin: `79c7d1f0ed2feff40eaca198951656c705d687ab83bbd581a8895a13db
 reproduced from guest source `aad65049` and committed in `83737aee`.
 Two independent builds match byte-for-byte; 18 post-pin release checks and
 six physical integration tests pass. Fresh release startup/restart at
-`83737aee` passed HTTP/SSH checks in 27/37 seconds. That executable predates
-the host inventory pagination fix `ec779164`; rebuilding it does not by itself
-qualify live pagination or ordinary Create/Install latency.
+`83737aee` passed HTTP/SSH checks in 27/37 seconds. The release executable has
+since been rebuilt at implementation source `4f0b6ffb`, including the host
+pagination fix `ec779164`; its bundle creation and verification pass. This
+does not rerun the live smoke or qualify ordinary Create/Install latency.
 
 This is a disposable-test/review checkpoint, not production readiness.
 Remaining blockers include production ordinary Shared-agent genesis/finality
