@@ -193,6 +193,22 @@ mod tests {
 
     #[test]
     fn managed_application_retries_delivery_and_retirement_before_credential_completion() {
+        assert_managed_terminal_retirement(InvocationError::NotFound, false);
+    }
+
+    #[test]
+    fn managed_expiry_requires_positive_retirement_before_credential_completion() {
+        // Scripted HTTP proves the client reservation boundary, not the node's
+        // clock. The separate physical test covers the guest transition.
+        assert_managed_terminal_retirement(InvocationError::ExpiredBeforeExecution, false);
+    }
+
+    #[test]
+    fn managed_expiry_negative_ack_preserves_pending_evidence() {
+        assert_managed_terminal_retirement(InvocationError::ExpiredBeforeExecution, true);
+    }
+
+    fn assert_managed_terminal_retirement(error: InvocationError, negative_ack: bool) {
         use crate::commands::space::{
             clean_store::{
                 CleanCredentialReservation, CredentialReservationStatus, ensure_private_directory,
@@ -258,7 +274,7 @@ mod tests {
         let call = local_invocation::validate_request(&envelope).unwrap();
         let initial = AgentInvocationResponse::Direct {
             request: call.commitment(),
-            outcome: RuntimeOutcome::Completed(Err(InvocationError::NotFound)),
+            outcome: RuntimeOutcome::Completed(Err(error)),
         }
         .encode()
         .unwrap();
@@ -289,6 +305,17 @@ mod tests {
         retired.extend_from_slice(&(transition.len() as u32).to_le_bytes());
         retired.extend_from_slice(&transition);
         let ack_bytes = ack.encode().unwrap();
+        let failed_transition = RuntimeTransition {
+            state: RuntimeState::default(),
+            outcome: RuntimeOutcome::Acknowledged(Err(InvocationError::NotFound)),
+        }
+        .encode()
+        .unwrap();
+        let mut refused = b"AAR3".to_vec();
+        refused.extend_from_slice(RUNTIME_ABI_ID.as_bytes());
+        refused.extend_from_slice(ack.commitment().as_bytes());
+        refused.extend_from_slice(&(failed_transition.len() as u32).to_le_bytes());
+        refused.extend_from_slice(&failed_transition);
         for (exchanges, success) in [
             (vec![("invoke", envelope.clone(), 504, vec![])], false),
             (
@@ -298,7 +325,15 @@ mod tests {
                 ],
                 false,
             ),
-            (vec![("acknowledge", ack_bytes, 200, retired)], true),
+            (
+                vec![(
+                    "acknowledge",
+                    ack_bytes,
+                    200,
+                    if negative_ack { refused } else { retired },
+                )],
+                !negative_ack,
+            ),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
@@ -358,6 +393,42 @@ mod tests {
             if !success {
                 assert!(reservation.reserve(Hash([0x72; 32])).is_err());
             }
+        }
+        if negative_ack {
+            let saved = {
+                let mut app = CleanInvocationFile::open_or_create(&app_root).unwrap();
+                (
+                    app.load_request().unwrap(),
+                    app.load_response().unwrap(),
+                    app.load_progress().unwrap(),
+                )
+            };
+            // A retained negative ACK is evidence, not a retryable empty slot.
+            // It must not be overwritten with a later success to free a claim.
+            assert!(
+                local_operation::authorize_with_application(
+                    &data,
+                    "127.0.0.1:1".parse().unwrap(),
+                    &operator,
+                    space,
+                    [0x42; 32],
+                    None,
+                    true,
+                )
+                .is_err()
+            );
+            let mut app = CleanInvocationFile::open_or_create(&app_root).unwrap();
+            assert_eq!(
+                (
+                    app.load_request().unwrap(),
+                    app.load_response().unwrap(),
+                    app.load_progress().unwrap()
+                ),
+                saved
+            );
+            drop(app);
+            std::fs::remove_dir_all(data).unwrap();
+            return;
         }
         // No server remains: all decisions, application and retirement replies
         // are re-verified locally and the exact completion is idempotent.

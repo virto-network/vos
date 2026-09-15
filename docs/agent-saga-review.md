@@ -16,8 +16,9 @@ Implementation is in `.worktrees/ch08-runtime-directory` on
 The C2 typed-error runtime is reproduced from source `373d2520` and bundled;
 post-pin validation is recorded below. Source runtime dispatch now emits the
 expiry fence for unseen expired signed work, but that change is not yet in the
-bundle. Candidate-PVM verification, native retirement/reservation recovery and
-the ABI/artifact release audit remain outstanding. The updated bundled-expiry
+bundle. Candidate-PVM expiry/retirement verification now passes; live native
+retirement/reservation recovery and the ABI/artifact release audit remain
+outstanding. The updated bundled-expiry
 regression requires the new candidate (or a completed repin); the old bundle
 cannot pass the new terminal-resolution expectation.
 The fresh
@@ -9159,9 +9160,37 @@ result clock advances as required. No production timeout changed.
 The same lifecycle helper compares all guest output bytes with source using
 `VOS_AGENT_RUNTIME_EXPIRY_CANDIDATE`, defaulting to the bundled runtime when no
 candidate is specified. The old pin is deliberately not counted as passing this
-new expectation. Build and verify the candidate next, then independently
-reproduce/pin only after the remaining native delivery/retirement checks.
+new expectation. Independently reproduce/pin only after the remaining native
+delivery/retirement checks.
 Management expiry and pre-expiry abort remain separate unfinished original gates.
+
+Candidate compiled from immutable source `e2a959354b613e3b60c30a9f50ca107ee0b56302`
+using guest `nightly-2026-03-20` and the existing frozen `42f3f3bf` converter.
+Evidence is in shared C2 `target/task-tmp/runtime-expiry-candidate.0bMrdx`:
+
+- ProgramId `e83dda7dcbd3d5ca1827a1f7d70bb43ea0b930d497fc868024bf3e586627fd5c`;
+  PVM size 983,895 bytes.
+- ELF BLAKE2b-256 `f0c81c6ca300cdeaedf179cf2c1e79d22387a90071418127324f5b91a5b42632`;
+  PVM BLAKE2b-256 `d0f03ebfec60e063ecbe86729dc362c164d3fa2f416593fe9d16aa9f4aa4eafe`.
+- `physical-expiry.log`: **one passed**, 0.49 s, comparing full source/guest
+  outputs for expiry, exact retry, restore, positive ACK and old-slot late Invoke.
+- `physical-regressions.log`: **four passed**, 3.31 s, additionally covering the
+  candidate's existing typed-error and terminal-failure lifecycle exchanges.
+
+This is one isolated candidate build, not independent reproduction or a repin.
+`build.sh`, source export, ELF/PVM and logs are retained on disk, not `/tmp`.
+
+The managed-client reservation fixture now covers the expiry result through
+delivery timeout, ACK timeout, exact positive ACK, offline completion replay and
+successor reservation. A separate negative-ACK case proves the credential stays
+pending and the saved request/response/progress remain identical on offline retry.
+An initial test incorrectly expected a retained negative ACK to be overwritten;
+the corrected test preserves that evidence and does not change client behavior.
+**Three client tests passed**, 6.84 s, in shared C2
+`target/task-tmp/expiry-delivery-client-preservation.log`. These use signed
+issuance and scripted loopback HTTP, not a live daemon or a live clock advance.
+The physical guest and client checks are complementary boundaries, not a single
+end-to-end native expiry campaign. Live verification and final pinning remain open.
 
 ### Durable client acknowledgement before completion
 
