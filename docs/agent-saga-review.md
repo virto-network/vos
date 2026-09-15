@@ -9450,6 +9450,30 @@ re-encode complete retained command history on capacity/recovery reads. Further
 work must establish a safe immutable verification boundary there, not repeat
 the failed perf unwind settings or infer a release gain from this small test.
 
+### Single-read physical command canonicality reuse (C2)
+
+The physical-row verifier already strictly decodes each command and compares
+its complete canonical encoding with the authenticated payload. Recovery then
+consumes that owned `ValidatedPhysicalEntry` directly, without mutation, but
+was encoding the same command again solely to repeat the same equality check.
+That second encoding is removed. The private wrapper has one construction
+site, in `validate_physical_kind`; its ownership invariant is now documented.
+Each new storage observation still verifies term, physical commitment, frame,
+command canonicality and shape. Replay still checks generation, committee,
+disposition and authority; no verification fact is cached across reads.
+
+Six selected final-code tests pass (20.40s): native issuance/reopen, physical
+command validation, authorized committee rotation/restart, snapshot rotation
+evidence recovery, wrong generation/committee/authority refusal, and missing/
+corrupt-row rejection. New cases rehash outer entries containing trailing or
+truncated inner command bytes and still require rejection. Evidence:
+`physical-canonical-reuse-tests.log` in the r17 fixture. Normal CLI compile check
+passes (4.86s, existing warnings, `physical-canonical-reuse-cli.log`), as do
+formatting and diff checks. This removes one command re-encoding per ordinary replayed audit
+row, but does not establish a release wall-time improvement. No guest artifact,
+timeout or release gate changes; the release executable still needs rebuilding
+before measuring this and the preceding host-only change together.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

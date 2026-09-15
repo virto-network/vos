@@ -7026,11 +7026,14 @@ mod application_ledger_v2 {
                 if payload.is_empty() && state.pending.is_none() => {}
             (
                 AgentRaftApplyDispositionV2::Command(disposition),
-                vos_raft::EntryKind::Data { payload },
+                vos_raft::EntryKind::Data { .. },
             ) if state.pending.is_none() => {
                 let command = command.ok_or(AgentRaftApplicationErrorV2::CorruptLedger)?;
-                if command.encode() != payload
-                    || command.route().generation() != state.generation
+                // validate_physical_kind already compared this owned command's
+                // complete encoding with the physical payload. It has not been
+                // mutated since that check; repeat only the replay-specific
+                // generation, committee and disposition validation here.
+                if command.route().generation() != state.generation
                     || command.route().committee() != state.active.id()
                 {
                     return Err(AgentRaftApplicationErrorV2::CorruptLedger);
@@ -7764,6 +7767,8 @@ mod application_ledger_v2 {
     /// Carries the canonical command decoded while checking physical shape.
     /// Consumers still check their own route, disposition and authority.
     /// This is per-read evidence, never a cache across storage observations.
+    /// Construct only in validate_physical_kind, which proves exact payload
+    /// equality. Pass the owned value directly to its consumer without mutation.
     struct ValidatedPhysicalEntry {
         kind: vos_raft::EntryKind<AgentNodeId>,
         command: Option<AgentRaftCommand>,
@@ -7937,6 +7942,18 @@ mod application_ledger_v2 {
             verify_physical_bytes(1, 7, malformed_commitment, disposition, &malformed_stored)
                 .is_err()
         );
+        // Recomputed outer commitments must not admit a noncanonical inner
+        // command. Each read still performs the complete strict decode/check.
+        let canonical = command.encode();
+        let mut trailing = canonical.clone();
+        trailing.push(0);
+        for payload in [trailing, canonical[..canonical.len() - 1].to_vec()] {
+            let raw = encode_agent_raft_entry_kind(&vos_raft::EntryKind::Data { payload }).unwrap();
+            let commitment = Hash::digest(AGENT_RAFT_PHYSICAL_SLOT_COMMITMENT_DOMAIN, &[&raw]);
+            let mut stored = 7u64.to_le_bytes().to_vec();
+            stored.extend_from_slice(&raw);
+            assert!(verify_physical_bytes(1, 7, commitment, disposition, &stored).is_err());
+        }
     }
 
     /// Diagnostic only: provide a disk-backed COPY of a stopped space's Raft
