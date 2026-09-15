@@ -19,6 +19,9 @@ validation reuse, the host pagination fix and opportunistic checkpoints;
 its bundle creation and verification pass. However, the preserved test space
 fails reopening with `CrossStoreMismatch` after replay. The latest tip is not
 a qualified working-system checkpoint. See the handoff for diagnostic evidence.
+The follow-up diagnostic release at `2624cc0a` confirms published-checkpoint
+validation succeeds and journal/ledger reconciliation fails. The specific
+conflicting binding is not identified yet; no recovery fix is claimed.
 
 For review, use two scoped batches: integrated architecture through `f79f0e3d`,
 then checkpoint/recovery closeout and final qualification. The first checkpoint

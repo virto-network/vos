@@ -6155,6 +6155,24 @@ mod tests {
             host.apply_next(fixture.agent).unwrap(),
             SharedAgentApplyOutcome::Applied { index: 2 }
         );
+        // Reopen before taking the next snapshot: otherwise the final reopen
+        // below only exercises an empty suffix at the second checkpoint.
+        let suffix_status = host.show(fixture.agent).unwrap().unwrap();
+        assert_eq!(
+            suffix_status.snapshots,
+            SharedAgentSnapshotState::Installed {
+                raft_index: 1,
+                raft_term: 7,
+                certificate: first_certificate.commitment(),
+            }
+        );
+        drop(host);
+        host = open_host(&directory, &fixture);
+        assert_eq!(host.show(fixture.agent).unwrap().unwrap(), suffix_status);
+        assert_eq!(
+            host.apply_next(fixture.agent).unwrap(),
+            SharedAgentApplyOutcome::Idle
+        );
         let second_candidate = host.request_snapshot_compaction(fixture.agent).unwrap();
         assert_eq!(
             second_candidate.claim().previous_snapshot(),

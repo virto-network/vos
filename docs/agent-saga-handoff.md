@@ -2,6 +2,35 @@
 
 ## Checkpoint and decision
 
+Diagnostic release at `2624cc0a` now localizes the preserved-space failure to
+**journal/ledger reconciliation**: `published_checkpoint_validation` completed
+successfully at 107,811ms, followed by `Shared journal open ledger reconciliation
+failed error=CrossStoreMismatch` at 2026-09-15T14:53:17Z. Materialization completed
+at 106,999ms. The process exited 1 before readiness or Install; no timeout,
+repair or reset was used. The exact conflicting chain/anchor/binding remains
+unknown, so this is localization, not a fix or proof the new policy caused it.
+Next inspect reconciliation's ordered chain, ledger anchors, pending binding
+and extra pre-snapshot bindings; do not weaken checkpoint authentication.
+
+Build passed in 6m59s with the configured release profile. Binary SHA-256:
+`5f7f2f2e879e0637a540462c36934dde81c3c7639a95e11499fe7c82d2434d9a`.
+Evidence directory: `task-tmp/reopen-diagnostic-release.hiE5mF/`, containing
+`build.log`, `reopen-debug.log`, `vosx-before`, and forensic `data-before` /
+`config-before` copies taken before this run. Copies are evidence only, not
+bootable replacements for the path-bound original. Sessions `64830` (build),
+`99294` (test) and `16823` (reopen) are terminal.
+
+The existing filesystem snapshot test now actually reopens after applying an
+ordered suffix and before installing the second snapshot. It asserts exact
+status preservation and no remaining command to apply. Previously its final
+reopen tested only the second snapshot's empty suffix. The strengthened test
+passes: 1 test, 2.35s, build31.52s, locked/offline host-feature configuration
+`agent-transition-proof private-agent-store http-ingress ssh-ingress`.
+Log: `suffix-reopen-test.log` in the same evidence directory. This rules out
+a general suffix-reopen failure in that fixture, not the live failure above.
+The test-only addition was made during the diagnostic release build; no
+production source beyond `2624cc0a` was changed for that executable.
+
 Follow-up diagnostic at the original fixture path reproduced the failure at
 2026-09-15T14:37:19Z. Journal-driver materialization completed at 98,258ms
 (executor setup completed at 320ms), and profile/ledger audit completed at
@@ -13,7 +42,7 @@ That directory also holds forensic `data-before` and `config-before` copies,
 taken before this diagnostic; they must not be booted at a different path.
 No store repair or replacement was attempted. Narrow driver-open diagnostics
 now distinguish those two validation stages while preserving their errors and
-fail-closed behavior; the release binary has not yet been rebuilt with them.
+fail-closed behavior; the subsequent diagnostic release and result are above.
 The three `projection_checkpoint` tests pass with those diagnostics (14.69s;
 build 1m44s), using the locked/offline host-feature library configuration
 `agent-transition-proof private-agent-store http-ingress ssh-ingress`.
