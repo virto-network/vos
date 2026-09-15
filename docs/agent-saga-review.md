@@ -13,11 +13,13 @@ lifecycle-store leases and corrected clock coverage" for the correction.
 
 Implementation is in `.worktrees/ch08-runtime-directory` on
 `wip/ch08-runtime-directory`, not yet in the root `saga/agents` checkout.
-Latest C2 runtime pin is `fc7e4c0e`, reproduced from `2ef2220e`. The fresh
+The C2 typed-error runtime is reproduced from source `373d2520` and bundled;
+post-pin validation is recorded in the latest checkpoint below. The fresh
 `.lU4S5Z` live campaign now passes compiled protected Local yield/resume,
 retirement, two restarts and final-state query, plus Panicked-result retirement
 after restart with a released credential reservation. Its daemon is stopped.
-Typed-error retirement, expiry/abort/mixed-pending recovery, Shared finality,
+Compiled typed-error retirement passes; live typed-error coverage,
+expiry/abort/mixed-pending recovery, Shared finality,
 Private/Attested and production latency/release gates remain open. These are
 still C1/C2/C3 work, not new review batches or a master-readiness declaration.
 Use only an isolated, disposable environment for bootstrap/ingress testing.
@@ -8833,6 +8835,43 @@ two bundled regressions normally. The current bundled blob/manifest are unchange
 the ignored bundled gates must not be counted as passing for the shipped artifact.
 No old retained negative acknowledgement was edited. Existing latency, finality,
 recovery/profile and final integration/release gates remain open.
+
+### Reproduced typed-error runtime pinned and regressions enabled (C2)
+
+The runtime from immutable source `373d2520e50b1ebbd7ba2c6746515fcc977ca64f`
+was independently built twice in isolated source/target/tmp directories by
+`runtime-typed-error-candidate.Wzrzuj/reproduce.sh` under shared C2
+`target/task-tmp`. The process completed successfully: both ELF files match,
+both PVM files match, and the reproduced PVM matches the physically tested
+candidate. No `/tmp` RAMFS build directory was used.
+
+Pinned `vosx/blobs/agent_runtime.pvm` is **981474 bytes**:
+
+- ProgramId `0084d2f44458bd730e41dfeb40cee0e067ad4be4c33aa4659ba84dcfdae9b1ed`.
+- ELF BLAKE2b-256 `9ad799e6e5313f3b3fc215b50c3e58684c0349687c9cb7c44cffcbe965685b4e`.
+- PVM BLAKE2b-256 `ba22d85015db112b4c959c61d866e249f31405c76bf0c187a0bda6bdb9889958`.
+
+The manifest source/identity/digests, native standard-runtime ProgramId, CLI
+build-time digest, and bundled PVM were updated together. Both formerly ignored
+typed-error retirement regressions now run normally against the bundled artifact.
+The SDK ABI identity and system template pins are unchanged.
+
+Post-pin checks, without candidate overrides (logs in shared C2 `target/task-tmp`):
+
+- `typed-error-pinned-wire-bundled.log`: **5 passed, 0 ignored**, 8.99 s,
+  including invalid-output and stale-target positive retirement after restore.
+- `typed-error-pinned-bundled.log`: broader physical authority/management and
+  bundled tests **9 passed, 1 ignored profiling probe**, 115.09 s.
+- `typed-error-pinned-cli.log`: **253 passed, 17 ignored**, 83.75 s.
+- `typed-error-pinned-clean-break.log`: normal CLI build and retained/negative
+  CLI-surface check passed; formatting/diff checks passed.
+
+The source/artifact mismatch is closed for this C2 fix. This is not a claim that
+all CLI ignores or release gates are satisfied. Live typed-error coverage,
+expiry/abort/mixed-pending recovery, production latency, Shared finality,
+Private/Attested and cross-runtime lifecycle coverage, and final C1/C2/C3
+integration/release checks remain open. Old immutable negative-ACK fixtures are
+untouched, no daemon was started, and root `saga/agents`/master were not changed.
 
 ### Durable client acknowledgement before completion
 

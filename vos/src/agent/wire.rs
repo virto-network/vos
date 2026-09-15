@@ -9900,14 +9900,12 @@ pub(crate) mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
-    #[ignore = "known C2 gap: durable typed error has no retained runtime result; must close before release"]
     fn bundled_typed_error_invalid_output_requires_retirement() {
         assert_typed_error_retirement(false, true);
     }
 
     #[cfg(feature = "pvm")]
     #[test]
-    #[ignore = "known C2 gap: stale target error has no retained runtime result; must close before release"]
     fn bundled_typed_error_stale_target_requires_retirement() {
         assert_typed_error_retirement(true, true);
     }
