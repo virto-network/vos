@@ -3304,13 +3304,10 @@ impl SharedAgentNetworkHost {
                 .host
                 .lock()
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
-            let status = host
-                .show(agent)?
-                .ok_or(SharedAgentHostError::AgentNotFound)?;
+            let (_, remaining_slots, _) = host.capacity(agent)?;
             let required = host.projection_admission_records(agent, work, authorization, false)?;
             (
-                status.remaining_slots
-                    >= (required as u64).saturating_add(u64::from(required != 0)),
+                remaining_slots >= (required as u64).saturating_add(u64::from(required != 0)),
                 host.projection_pair_fits(agent, work, authorization)?,
             )
         };
@@ -3332,10 +3329,7 @@ impl SharedAgentNetworkHost {
             .host
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
-        let remaining = host
-            .show(agent)?
-            .ok_or(SharedAgentHostError::AgentNotFound)?
-            .remaining_slots;
+        let (_, remaining, _) = host.capacity(agent)?;
         let required = host
             .projection_admission_requirement(agent, work, authorization, false)?
             .ok_or(SharedAgentHostError::CapacityExhausted)?;

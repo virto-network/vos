@@ -2,6 +2,17 @@
 
 ## Checkpoint and decision
 
+Projection checkpoint admission now uses the existing authenticated ledger
+capacity accessor instead of full host `show` status before and after snapshot
+installation. Only remaining capacity was needed; deriving the actor-directory
+status was unnecessary. The physical checkpoint failure/recovery regression
+passes (10.22s; locked offline PVM-enabled build 32.83s), covering committee
+mismatch, signing refusal, bad certificate installation and attachment/gate
+recovery. Log: shared target `task-tmp/checkpoint-capacity-accessor.log`.
+This is not an earlier-checkpoint policy or a measured startup improvement.
+The release executable and ongoing full feature suite predate this small host
+change; their evidence must remain tied to their recorded source revisions.
+
 Counter packaging passes with the current CLI and isolated operator identity:
 `actor build examples/actors/counter --name counter` completed its pinned guest
 build in 27.18s. Package/PVM and build log are under
