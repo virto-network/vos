@@ -494,12 +494,16 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
         "native-denial-smoke" => "native-denial-head-reuse.",
         "r17-startup" => "r17-startup-smoke.",
         "issuer-reuse-smoke" => "issuer-reuse-release.",
+        "fresh-ack-smoke" => "fresh-ack-release.",
         _ => panic!("only the explicitly named disposable campaigns are supported"),
     };
     let (data, space, node_public, address) =
         super::super::local_create::resolve_local_space(&selected_space, None).unwrap();
     assert!(data.to_string_lossy().contains(fixture_prefix));
-    let recovery_campaign = selected_space == "issuer-reuse-smoke";
+    let recovery_campaign = matches!(
+        selected_space.as_str(),
+        "issuer-reuse-smoke" | "fresh-ack-smoke"
+    );
     let campaign_root = if recovery_campaign {
         assert!(counter, "recovery fixture only supports Counter checks");
         data.ancestors().nth(3).expect("isolated XDG fixture root")
@@ -508,7 +512,9 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
     };
     assert_eq!(config_path.parent(), Some(campaign_root));
     let counter_name = if recovery_campaign { "counter" } else { "counter-smoke" };
-    let counter_path = campaign_root.join(if recovery_campaign {
+    let counter_path = campaign_root.join(if selected_space == "fresh-ack-smoke" {
+        "counter.vos"
+    } else if recovery_campaign {
         "counter-dist/counter.vos"
     } else {
         "counter-artifact/Counter.vos"

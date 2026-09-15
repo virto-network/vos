@@ -21,6 +21,14 @@ passing regressions from still-failing production gates.
 
 ## Follow-up after the frozen review snapshot
 
+Latest retry qualification found a limitation: replaying the original completed
+Create after Install/restart returns503 `Lifecycle(Conflict)`. Install advances
+the single retired lifecycle intent slot; Create pledges against that slot
+before reaching finalized issuer recovery. The original requests and fixture
+are preserved. Invocation/read-after-restart checks were not reached. Broad
+exact-retry qualification remains open; see the handoff for evidence and the
+required authenticated successor-handoff recovery boundary.
+
 Release `b7cfa17d` is now built and its bundle verified. Fresh isolated startup
 took21s (still fails10s gate), HTTP/SSH passed, fresh Create succeeded in43s
 with a verified acknowledgement and no timeout, and post-Create SIGTERM exited

@@ -2,6 +2,41 @@
 
 ## Checkpoint and decision
 
+### Completed Create retry after Install: conflict found
+
+The invocation qualification probe stopped before any mutation. Restart of the
+same `fresh-ack-release.Of5a75` fixture reached readiness in60s, then
+`space submit-local-create` with the original retained signed Create request
+returned HTTP503. Server log: `Local Create did not complete:
+Lifecycle(Conflict)`. No fresh Create or replacement nonce was submitted.
+The probe exited1 (session54647); its cleanup stopped the exact daemon without
+forced cleanup, and subsequent process inspection found no vosx/cargo/rustc.
+Install retry, mutation and read-after-restart were NOT reached.
+
+Source explanation: Local Install uses `CleanManagementIntentSlot::handoff_retired`
+to replace the single retired per-Agent intent with its next signed request.
+`CleanSystemAgentBootstrapOwner::create_local_agent` calls `slot.pledge` before
+`recover_finalized_application`; `pledge` rejects a different current request.
+Consequently an older completed Create cannot reach finalized issuer recovery
+after that slot has advanced to Install. This is a retry-lifetime limitation,
+not evidence that the previously acknowledged creation or installation failed.
+Do not weaken slot authentication or relabel/reset the store to avoid it.
+Resolve completed-request recovery across successor handoff with regression
+coverage and authenticated physical evidence before claiming broad exact retry.
+
+Evidence: `invoke-probe.sh`, `invoke-probe.log`, `invoke-up.log`,
+`create-retry.stderr` (503 error), and empty `create-retry.json` under the same
+fixture. The original `create.json` acknowledgement text and all retained
+requests/acknowledgements remain intact. The failed probe script is guarded
+against reuse; use a new evidence path for further attempts.
+
+The existing ignored Counter test now explicitly allows `fresh-ack-smoke`
+only with the `fresh-ack-release.` fixture prefix and Counter-only checks.
+It reuses the existing parent-directory guard and points to `counter.vos`.
+The test binary builds successfully (4.97s; session62055 terminal0), but its
+new campaign path has not executed because the prerequisite retry failed.
+No production implementation or guest pin changed in this follow-up.
+
 ### Release `b7cfa17d`: restart and fresh Install
 
 The same exact-path `fresh-ack-release.Of5a75` fixture restarted successfully
