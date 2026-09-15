@@ -3790,6 +3790,13 @@ fn reconcile_journal_ledger<S: AgentJournalStore + SharedOrderedCommitStore>(
         .snapshot
         .as_ref()
         .map(|snapshot| snapshot.claim.ordered().ordered());
+    tracing::debug!(
+        ordered_index = heads.ordered_index,
+        snapshot_index = snapshot_base.map_or(0, |base| base.index),
+        anchors = audit.ordered.len(),
+        pending = audit.pending_ordered.is_some(),
+        "Reconciling Shared journal ordered bindings"
+    );
     let mut chain = BTreeMap::new();
     let mut next = heads.ordered_head;
     let mut expected_index = heads.ordered_index;
@@ -3825,26 +3832,49 @@ fn reconcile_journal_ledger<S: AgentJournalStore + SharedOrderedCommitStore>(
     }
 
     let mut expected_bindings = BTreeSet::new();
+    tracing::debug!(entries = chain.len(), "Shared reconciliation chain validated");
     for anchor in &audit.ordered {
-        validate_ordered_anchor(store, &chain, journal_store, anchor)?;
+        validate_ordered_anchor(store, &chain, journal_store, anchor).map_err(|error| {
+            tracing::warn!(
+                ?error,
+                entry = ?anchor.entry,
+                raft_index = anchor.index,
+                in_chain = chain.contains_key(&anchor.entry),
+                "Shared reconciliation ordered anchor failed"
+            );
+            error
+        })?;
         if !expected_bindings.insert(anchor.entry) {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
     }
+    tracing::debug!("Shared reconciliation ordered anchors validated");
     if let Some(pending) = &audit.pending_ordered {
         match store.shared_ordered_commit(pending.entry)? {
             Some(binding) => {
-                validate_pending_binding(store, &chain, journal_store, pending, &binding)?;
+                validate_pending_binding(store, &chain, journal_store, pending, &binding)
+                    .map_err(|error| {
+                        tracing::warn!(
+                            ?error,
+                            entry = ?pending.entry,
+                            raft_index = pending.index,
+                            in_chain = chain.contains_key(&pending.entry),
+                            "Shared reconciliation pending binding failed"
+                        );
+                        error
+                    })?;
                 if !expected_bindings.insert(pending.entry) {
                     return Err(SharedJournalDriverError::CrossStoreMismatch);
                 }
             }
             None if chain.contains_key(&pending.entry) => {
+                tracing::warn!("Shared reconciliation pending chain entry has no binding");
                 return Err(SharedJournalDriverError::CrossStoreMismatch);
             }
             None => {}
         }
     }
+    tracing::debug!("Shared reconciliation pending binding validated");
     let actual = store.shared_ordered_commit_ids()?;
     for entry in &actual {
         if expected_bindings.contains(entry) {
@@ -3867,6 +3897,20 @@ fn reconcile_journal_ledger<S: AgentJournalStore + SharedOrderedCommitStore>(
             || claim.ordered().index > snapshot.claim.ordered().ordered().index
             || claim.ordered().head != Some(*entry)
         {
+            tracing::warn!(
+                entry = ?entry,
+                same_store = binding.journal_store() == journal_store,
+                same_space = claim.space() == snapshot.claim.ordered().space(),
+                same_agent = claim.agent() == snapshot.claim.ordered().agent(),
+                same_genesis = claim.genesis() == snapshot.claim.ordered().genesis(),
+                same_admission = claim.admission() == snapshot.claim.ordered().admission(),
+                same_head = claim.ordered().head == Some(*entry),
+                binding_raft_index = claim.raft_index(),
+                snapshot_raft_index = snapshot.claim.raft_index(),
+                binding_ordered_index = claim.ordered().index,
+                snapshot_ordered_index = snapshot.claim.ordered().ordered().index,
+                "Shared reconciliation extra binding is outside snapshot prefix"
+            );
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         }
     }
@@ -3875,6 +3919,11 @@ fn reconcile_journal_ledger<S: AgentJournalStore + SharedOrderedCommitStore>(
         .any(|entry| !actual.contains(entry))
         || chain.keys().any(|entry| !expected_bindings.contains(entry))
     {
+        tracing::warn!(
+            missing_expected = expected_bindings.iter().filter(|entry| !actual.contains(entry)).count(),
+            missing_chain = chain.keys().filter(|entry| !expected_bindings.contains(entry)).count(),
+            "Shared reconciliation binding coverage failed"
+        );
         return Err(SharedJournalDriverError::CrossStoreMismatch);
     }
     Ok(())
@@ -3909,6 +3958,23 @@ fn validate_ordered_anchor<S: AgentJournalStore + SharedOrderedCommitStore>(
         || claim.admission() != anchor.route.admission()
         || claim.committee() != anchor.route.committee()
     {
+        tracing::warn!(
+            same_entry = entry.id() == anchor.entry && binding.entry() == anchor.entry,
+            same_store = binding.journal_store() == journal_store,
+            same_payload = binding.raft_payload_commitment() == anchor.command_commitment,
+            same_successor = binding.successor() == anchor.successor,
+            same_claim = claim.commitment() == anchor.claim,
+            same_raft_index = claim.raft_index() == anchor.index,
+            same_term = claim.raft_term() == anchor.term,
+            same_head = claim.ordered().head == Some(anchor.entry),
+            same_ordered_index = claim.ordered().index == entry.index,
+            same_space = claim.space() == anchor.route.space(),
+            same_agent = claim.agent() == anchor.route.agent(),
+            same_genesis = claim.genesis() == anchor.route.genesis(),
+            same_admission = claim.admission() == anchor.route.admission(),
+            same_committee = claim.committee() == anchor.route.committee(),
+            "Shared reconciliation ordered anchor fields differ"
+        );
         return Err(SharedJournalDriverError::CrossStoreMismatch);
     }
     Ok(())
