@@ -3,13 +3,16 @@
 Current Ch08 WIP warning: `wip/ch08-runtime-directory` now has matching r17
 source and independently reproduced runtime/system-template bundles. Fresh r17
 bootstrap/restart and HTTP/SSH checks now pass (39 s first start, 58 s restart).
-This is bootstrap coverage, not live expiry retirement. Ordinary-agent finality,
+Recovered r17 Create/Install and Counter mutation/exact-retry/restart-read also
+pass; this is not live expiry retirement. Ordinary-agent finality,
 cross-runtime actor lifecycle, production latency
 and full release gates remain open. This is not a master-ready branch.
-Timing qualification: the live campaigns recorded so far use the debug CLI.
-Its interpreter/BLAKE2 are optimized, but much host code is not. Those timeouts
-are real development-mode failures; production-release latency still needs its
-own measurement. A configured release build is now in progress for that check.
+Timing qualification: earlier live campaigns used the debug CLI. The configured
+fat-LTO release build now passes, but its r17 recovery startup took 161 seconds
+and the first Counter Install returned HTTP 504. This is also a release-mode
+latency failure, not just debug overhead. A short CPU sample during installation
+attributed 77.57% of core-cycle samples to BLAKE2 compression; the caller/root
+cause remains unproven. Exact retained Install recovery now passes, as below.
 See the current closeout plan below; later checkpoint sections retain historical
 results, including failures that have since been fixed.
 Earlier clock-test pass counts had a fixture-dispatch gap; see "Retained
@@ -23,7 +26,9 @@ The C2 r17 runtime and system templates are reproduced from source `5bbab66b`
 with the matching frozen builder and bundled together. Post-pin physical expiry
 and failure-retirement checks pass without candidate overrides; see the r17
 checkpoint below for the current validation results. Fresh r17 bootstrap/restart
-now passes; live native expiry remains open. Do not reuse or relabel r16 fixture data.
+now passes, as do recovered r17 Create/Install and Counter mutation/exact-retry/
+restart-read against the release daemon; live native expiry remains open.
+Do not reuse or relabel r16 fixture data.
 The earlier r16 `.lU4S5Z` live campaign passes compiled protected Local yield/resume,
 retirement, two restarts and final-state query, plus Panicked-result retirement
 after restart with a released credential reservation. Its daemon is stopped.
@@ -9313,15 +9318,58 @@ with byte-identical saved request, followed by clean shutdown at 05:56:44.
 The normal CLI also built the r17 Counter package in `counter-artifact/`.
 The existing live Counter tests now accept explicitly selected `r17-startup`
 only with the matching disposable-directory guard (`VOSX_INVOKE_SMOKE_SPACE`);
-their CLI test executable compiles, but no r17 Counter invocation has run yet.
+their compiled CLI test executable is used for the passing r17 campaign below.
 
-Production-mode latency check: started an offline, locked `cargo build --release
+Production-mode latency check: completed an offline, locked `cargo build --release
 -p vosx --bin vosx -j 2` using the configured fat-LTO release profile and named
-host toolchain. Build log: `release-build.log` in this fixture. Scratch stays on
-disk; no timeout, validation or optimization profile was weakened. The planned
-`install-release.sh` uses that executable against the same disposable space and
-verified Create result. It has not run yet; wait for the existing release build
-to complete before installation. No test daemon remains running at this point.
+host toolchain (8m50s). Build log: `release-build.log` in this fixture. Scratch
+stays on disk; no timeout, validation or optimization profile was weakened.
+`install-release.sh` used that executable against the same disposable space and
+verified Create result. Startup ran 06:07:11–06:09:52 UTC on 2026-09-15 (161s);
+Install then returned HTTP 504 and the script exited 1, stopping its own daemon.
+`install.stderr` explicitly reports an unknown outcome and retained exact bytes.
+Do not treat the failed `install.json` as an acknowledgement or issue a fresh
+Install intent. The retained nonce is
+`3349341529a55cc2c75b4040de86fd840c81f8b4a5b9223cf6aa622ea640cd05`.
+
+A five-second CPU sample of this release daemon during Install had 524 core
+cycle samples, 77.57% in BLAKE2 compression, plus five atom samples all there.
+See `release-install-profile.txt` and its raw `release-install.perf.data`.
+Caller unwinding is insufficient to attribute that hashing to a precise path;
+these samples do not justify removing validation or claiming a proven fix.
+`resume-install-release.sh` completed with exit zero: release restart ran
+06:15:33–06:16:33 UTC, then exact Install recovery completed at 06:16:41 (8s).
+The before/after digest of the saved request matched, the CLI verified the
+acknowledgement in `install-resume.json`, and the daemon shut down cleanly at
+06:16:41. See `install-resume-run.log` and `install-resume-up.log`. This passes
+recovered installation, not acceptable first-response latency.
+
+The existing `real_daemon_counter_mutation_and_exact_retry` now passes on this
+r17 fixture against the release daemon (one test, 90.67s). Readiness took 86s
+(06:17:56–06:19:22 UTC); the managed invocation completed in 89.27s. The test
+verifies the value seven, receipt-bearing authorization, positive retirement,
+two rejected late Invoke retries and positive ACK retries. Invocation ID:
+`f05af44532142c53c476f102d9e826387a03a8f4c80e9b408b804c5a800848d1`.
+The daemon shut down cleanly at 06:21:52. `counter-release.sh` then started a
+separate daemon for `real_daemon_counter_value_after_restart`. Readiness took
+168s (06:21:52–06:24:40 UTC), then the test passed (one test, 90.33s; managed
+attempt 88.87s), verifying the persisted value seven, positive retirement and
+exact retries. Read invocation ID:
+`5eb2acb17f5babdeafc5267e7b006c0da27fdbb5706ea0711e638c79f87ee534`.
+The daemon shut down cleanly at 06:26:50 and the campaign exited zero. No test
+daemon remains running. Evidence is in `counter-release-run.log` and
+`counter-{mutation,read}-{up,test}.log`. The client is the existing debug test
+executable, so this is release-daemon correctness coverage, not a pure release
+CLI benchmark or protected/non-Public policy proof.
+
+Scoped handoff: the r17 Counter install/mutate/restart-read baseline is closed;
+do not rerun it merely for status. Next C2 work is live post-issuance expiry
+retirement and a caller-attributed investigation of release startup/operation
+latency, preserving all validation and timeout limits. Original C1 recovery/
+crash/capacity and C2 finality/profile/lifecycle gates remain open, followed by
+C3 final-source release verification and review. No new feature work or review
+batch is added by this campaign. The branch is not ready for master or ordinary
+production use; disposable functional testing remains the supported scope.
 
 ### Durable client acknowledgement before completion
 
