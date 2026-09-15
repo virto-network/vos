@@ -458,8 +458,8 @@ fn handle_local_create(
         ))) => text(403, "Local Create scope or authorization rejected"),
         Ok(Err(error)) => {
             crate::log::warn!("Local Create did not complete: {error:?}");
-            text(
-                503,
+            local_lifecycle_failure(
+                error,
                 "Local Create incomplete; retry the identical signed submission",
             )
         }
@@ -664,8 +664,8 @@ fn handle_local_install(
         },
         Ok(Err(error)) => {
             crate::log::warn!("Local Install did not complete: {error:?}");
-            text(
-                503,
+            local_lifecycle_failure(
+                error,
                 "Local Install incomplete; retry the identical signed submission",
             )
         }
@@ -673,6 +673,24 @@ fn handle_local_install(
             504,
             "Local Install outcome unknown; retry the identical signed submission",
         ),
+    }
+}
+
+#[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+fn local_lifecycle_failure(
+    error: crate::agent::production_owner::AgentProductionOwnerError,
+    unavailable: &'static str,
+) -> super::types::Response {
+    use crate::agent::{
+        production_owner::AgentProductionOwnerError, shared_host::SharedAgentHostError,
+    };
+    if matches!(
+        error,
+        AgentProductionOwnerError::Lifecycle(SharedAgentHostError::Conflict)
+    ) {
+        super::types::text(409, "Local lifecycle conflicts with retained state; inspect retained operation evidence before retrying")
+    } else {
+        super::types::text(503, unavailable)
     }
 }
 
@@ -940,6 +958,32 @@ fn load_tls(config: &HttpTlsConfig) -> Result<TlsAcceptor, HttpIngressError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    #[test]
+    fn lifecycle_conflict_is_not_temporary_unavailability() {
+        use crate::agent::{
+            production_owner::AgentProductionOwnerError, shared_host::SharedAgentHostError,
+        };
+        let conflict = super::local_lifecycle_failure(
+            AgentProductionOwnerError::Lifecycle(SharedAgentHostError::Conflict),
+            "unavailable",
+        );
+        assert_eq!(conflict.status().as_u16(), 409);
+        assert!(
+            std::str::from_utf8(conflict.body())
+                .unwrap()
+                .contains("inspect retained")
+        );
+        for error in [
+            AgentProductionOwnerError::Lifecycle(SharedAgentHostError::Unavailable),
+            AgentProductionOwnerError::InvalidProjection,
+        ] {
+            assert_eq!(
+                super::local_lifecycle_failure(error, "unavailable").status().as_u16(),
+                503
+            );
+        }
+    }
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
     #[test]
     fn local_lifecycle_rejects_noncanonical_http_and_unsigned_frames() {

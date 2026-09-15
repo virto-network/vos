@@ -2,6 +2,32 @@
 
 ## Checkpoint and decision
 
+### Lifecycle conflict reporting corrected (source, not rebuilt release)
+
+Local Create/Install now map `Lifecycle(Conflict)` to HTTP409 with guidance to
+inspect retained evidence. Other unavailable cases remain503; timeout remains
+504. Create's existing scope/authorization403 mapping is unchanged. The CLI's
+retained submission paths preserve requests and distinguish409 from transient
+errors, explicitly warning that unsigned HTTP conflict is not a signed outcome
+and does not prove the original operation failed. No lifecycle/issuer retention,
+authentication, signed wire format, guest pin or completion state changed.
+
+Tests: server conflict/unavailability mapping1 passed; client acknowledgement
+and real-loopback409/request-preservation regression1 passed (2.58s); adjacent
+Install tests7 passed/1 ignored (2.81s); noncanonical/unsigned ingress1 passed.
+Logs under shared `target/task-tmp`: `lifecycle-conflict-server-test.log`,
+`lifecycle-conflict-client-test.log`, `lifecycle-conflict-install-tests.log`,
+`lifecycle-conflict-ingress-tests.log`. Sessions66512/4744/36573 terminal0.
+The release binary remains `b7cfa17d`; this reporting fix needs its next release
+rebuild and live qualification. It does not restore historical retired retries.
+
+Evidence clarification: `submit-local-install` verifies and returns a retained
+client ACK without contacting the server when one exists. The successful
+Install retry commands below establish client exact-retry verification, NOT
+server-side Install replay. Counter Invoke rejection and ACK retry tests do
+contact the daemon, and fresh post-restart reads prove the value remains7.
+Server-side Install replay remains unqualified by those CLI retry commands.
+
 ### Counter invocation and read-after-restart qualified
 
 Unchanged release `b7cfa17d` passes the full Public Counter campaign on the

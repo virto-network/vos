@@ -491,11 +491,7 @@ pub(crate) fn submit_retained(
         store.publish_acknowledgement(&response)?;
         Ok(acknowledgement)
     })();
-    result.map_err(|error: anyhow::Error| {
-        anyhow::anyhow!(
-            "{error}; Install request retained: retry identical bytes, outcome may be unknown"
-        )
-    })
+    result.map_err(super::local_create::retained_submission_error)
 }
 
 pub(crate) fn run_submit(

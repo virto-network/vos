@@ -21,6 +21,15 @@ passing regressions from still-failing production gates.
 
 ## Follow-up after the frozen review snapshot
 
+Source follow-up corrects conflict reporting: Local lifecycle conflicts return
+409, not temporary503; CLI preserves requests and recommends inspecting
+evidence without treating unsigned conflict as a failed signed operation.
+Ten focused/adjacent tests pass (one additional ignored live Install test).
+Release binary remains `b7cfa17d`; no retention/protocol change or historical
+retry recovery is claimed. Also, prior Install CLI retries can use cached
+verified ACKs: they are not server-replay evidence. Counter's Invoke/ACK retry
+checks explicitly contact the daemon. See the handoff for exact coverage.
+
 Current release now passes Counter increment and fresh read-after-restart:
 both return7; managed calls29.12s/34.80s. Retired Invoke replays reject and ACK
 retries match exactly. Latest Install retry verified. Restarts54s/53s still

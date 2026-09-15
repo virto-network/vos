@@ -318,6 +318,17 @@ pub(super) fn post_binary_response(
     Ok((actual_status, reply))
 }
 
+pub(super) fn retained_submission_error(error: anyhow::Error) -> anyhow::Error {
+    if matches!(
+        error.downcast_ref::<ureq::Error>(),
+        Some(ureq::Error::Status(409, _))
+    ) {
+        anyhow::anyhow!("{error}; request retained: lifecycle conflicts with retained state; inspect operation evidence before retrying. HTTP conflict is not a signed outcome and does not prove the original operation failed")
+    } else {
+        anyhow::anyhow!("{error}; request retained: retry these exact bytes, outcome may be unknown")
+    }
+}
+
 pub(super) struct CredentialVerifier;
 impl vos::agent::sdk::authority::AuthorityCredentialVerifier for CredentialVerifier {
     fn verify(&self, public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
@@ -645,11 +656,7 @@ fn submit_retained_disposition(
         }
     })();
     // The store and its exclusive lease remain alive through verification.
-    result.map_err(|error| {
-        anyhow::anyhow!(
-            "{error}; request retained: retry these exact bytes, outcome may be unknown"
-        )
-    })
+    result.map_err(retained_submission_error)
 }
 
 pub(crate) fn run_submit(
@@ -1501,6 +1508,16 @@ pub(crate) mod tests {
         let mut http = format!("HTTP/1.1 201 Created\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).into_bytes();
         http.extend_from_slice(&bytes);
         assert_eq!(submit_fixture(&request, &http).unwrap(), ack);
+        let conflict = submit_fixture(
+            &request,
+            b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(conflict.contains("request retained"));
+        assert!(conflict.contains("inspect operation evidence"));
+        assert!(conflict.contains("does not prove the original operation failed"));
+        assert!(!conflict.contains("retry these exact bytes"));
         for response in [
             b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
             b"HTTP/1.1 503 Busy\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
