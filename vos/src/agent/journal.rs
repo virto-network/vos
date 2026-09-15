@@ -5740,7 +5740,24 @@ mod tests {
 
     #[test]
     fn clean_resume_and_acknowledgement_replay_inputs_are_exact_bounded_and_state_free() {
-        let invoked = public_clean_replay_input(crate::agent_sdk::MethodMode::Linear);
+        let mut invoked = public_clean_replay_input(crate::agent_sdk::MethodMode::Linear);
+        let payload = b"resume decoder blob authentication".to_vec();
+        let ReplayOperation::CleanInvoke {
+            work,
+            authorization,
+            observed_slot,
+            ..
+        } = &mut invoked.operation
+        else {
+            unreachable!()
+        };
+        work.availability.push(crate::agent_sdk::RuntimeBlob {
+            reference: crate::agent_sdk::BlobRef::of_bytes(&payload),
+            bytes: payload.clone(),
+        });
+        *authorization = crate::agent_sdk::InvocationAuthorization::PublicPreflight(
+            crate::agent_sdk::PublicPreflight::for_work(work, *observed_slot),
+        );
         let ReplayOperation::CleanInvoke {
             context,
             work,
@@ -5782,6 +5799,23 @@ mod tests {
         assert_eq!(resume.persisted_lane(), PersistedLane::Linear);
         assert!(resume.encode().len() <= MAX_REPLAY_INPUT_BYTES);
         roundtrip(&resume);
+        let mut corrupted = resume.encode();
+        let offset = corrupted
+            .windows(payload.len())
+            .position(|part| part == payload)
+            .unwrap();
+        corrupted[offset] ^= 1;
+        assert!(ReplayInput::decode(&corrupted).is_err());
+        let mut mutated = ReplayInput::decode(&resume.encode()).unwrap();
+        let ReplayOperation::CleanResume {
+            work: mutated_work,
+            ..
+        } = &mut mutated.operation
+        else {
+            unreachable!()
+        };
+        mutated_work.availability[0].bytes[0] ^= 1;
+        assert_eq!(mutated.validate(), Err(DecodeError::NonCanonical));
 
         let acknowledgement = ReplayInput {
             runtime: invoked.runtime.clone(),
@@ -5863,6 +5897,7 @@ mod tests {
         };
         substituted_yielded.actor = crate::agent_sdk::ActorId([0xd1; 32]);
         assert_eq!(substituted.validate(), Err(DecodeError::NonCanonical));
+        assert!(ReplayInput::decode(&substituted.encode()).is_err());
 
         let hidden_invoke = crate::agent_sdk::RuntimeWork::Invoke {
             context: crate::agent_sdk::RuntimeExecutionContext::Direct,

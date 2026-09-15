@@ -9695,6 +9695,12 @@ The journal suite passes **41 tests**, zero failures/ignored (0.19s,
 Invoke/ACK roundtrips, corrupted blob rejection, runtime substitution rejection
 and full validation after mutation of a decoded value. The existing validation
 equivalence test now exercises the complete constructed ReplayInput validator.
+The follow-up Resume fixture now includes an actual availability blob and
+checks corrupted wire, post-decode blob mutation and substituted yielded-actor
+rejection at the decoder boundary. The complete journal suite passes again
+on the final test source: **41 passed**, zero failures/ignored (0.16s,
+`journal-decoded-work-resume-final.log`). Production code is unchanged from
+`d80c837d` by this test-only follow-up.
 Physical command byte/shape validation, native issuance/reopen and snapshot
 rotation pass **3 tests** (42.91s, `journal-decoded-work-physical.log`); committee
 transition, corrupt/missing rows and wrong-generation/authority rejection pass
