@@ -15194,9 +15194,15 @@ mod aggregate {
                     merge_seal: entry.merge_seal,
                 },
             };
-            let publication =
-                PublishedSharedOrdered::from_binding(&binding, current.id(), committed)
-                    .map_err(journal)?;
+            // Recovery must anchor the original Ordered publication, not a
+            // later Local/Merge head. The independently durable binding is
+            // what journal/ledger reconciliation compares with that anchor.
+            let publication = PublishedSharedOrdered::from_binding(
+                &binding,
+                stored_commit.successor(),
+                committed,
+            )
+            .map_err(journal)?;
             return Ok(SharedReplayPreparation::AlreadyCommitted {
                 recovery,
                 publication,
@@ -23710,6 +23716,71 @@ pub(crate) mod tests {
             Err(ReplayError::InvalidRecord)
         ));
         assert_eq!(transplant.heads().unwrap().unwrap(), transplant_heads);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn shared_retry_after_local_publication_preserves_original_ordered_successor() {
+        let mut store = initialized_shared_replay_store();
+        let mut executor = ExactCreateRejectInvocations::default();
+        let base = materialize_current(&mut store, &mut executor, &NoPrunedOrderedBases).unwrap();
+        let entry = OrderedEntry {
+            genesis: base.heads().genesis,
+            index: 1,
+            parent: None,
+            merge_frontier: base.merge_frontier(),
+            merge_seal: None,
+            input: clean_admitted_invocation(base.runtime(), MethodMode::Linear, 0x78),
+        };
+        let committed =
+            committed_shared_for_test(entry.clone(), &base, store.instance_id()).unwrap();
+        let prepared = match prepare_shared_ordered(
+            &mut store,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &base,
+            committed,
+        )
+        .unwrap()
+        {
+            SharedReplayPreparation::Ready(prepared) => prepared,
+            SharedReplayPreparation::AlreadyCommitted { .. } => panic!("fresh Ordered entry"),
+        };
+        let (_, ordered, _, original) = prepared.publish_shared().unwrap();
+        let local = LocalEntry {
+            genesis: ordered.heads().genesis,
+            node: ordered.heads().node,
+            revision: ordered.heads().local_revision + 1,
+            parent: ordered.heads().local_head,
+            ordered_base: ordered.ordered_base(),
+            merge_frontier: ordered.merge_frontier(),
+            input: clean_admitted_invocation(ordered.runtime(), MethodMode::Local, 0x79),
+        };
+        let prepared = match prepare_local(&mut store, &mut executor, &ordered, &local).unwrap() {
+            ReplayPreparation::Ready(prepared) => prepared,
+            ReplayPreparation::AlreadyCommitted(_) => panic!("fresh Local entry"),
+        };
+        let (_, advanced, _) = prepared.publish().unwrap();
+        assert_ne!(advanced.heads_id(), original.successor());
+        let before = executor.executions;
+        let retry = committed_shared_for_test(entry, &advanced, store.instance_id()).unwrap();
+        match prepare_shared_ordered(
+            &mut store,
+            &mut executor,
+            &NoPrunedOrderedBases,
+            &advanced,
+            retry,
+        )
+        .unwrap()
+        {
+            SharedReplayPreparation::AlreadyCommitted { publication, .. } => {
+                assert_eq!(publication.claim(), original.claim());
+                assert_eq!(publication.successor(), original.successor());
+            }
+            SharedReplayPreparation::Ready(_) => panic!("retry re-executed Ordered entry"),
+        }
+        assert_eq!(executor.executions, before);
+        assert_eq!(store.heads().unwrap().unwrap(), *advanced.heads());
     }
 
     #[cfg(feature = "std")]

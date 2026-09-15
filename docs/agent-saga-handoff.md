@@ -2,6 +2,24 @@
 
 ## Checkpoint and decision
 
+A deterministic Shared replay regression now reproduces an original-successor
+bug: publish an Ordered entry, publish a Local entry, then retry the exact
+Ordered entry. `AlreadyCommitted` previously constructed its publication
+receipt with `current.id()`, so the receipt's successor differed from the
+independently durable Ordered binding's successor. The regression failed on
+that exact comparison (0.39s). Recovery now uses `stored_commit.successor()`;
+the regression passes (0.52s), and all seven Shared replay tests pass (2.77s).
+The retry does not re-execute the Ordered work or change current heads, and
+the claim remains exact. No wire/guest pin or persisted record is changed.
+This prevents new inconsistent recovery anchors; it does not repair an
+already-inconsistent ledger. Whether the preserved fixture has this exact
+mismatch still requires the detailed reconciliation diagnostic.
+Evidence: `task-tmp/reconciliation-release.B0uTZ2/local-successor-regression.log`,
+`local-successor-fixed.log`, and `shared-replay-fixed.log`. Test sessions
+`53822`, `55289`, and `65621` are terminal. The ongoing diagnostic release build
+session `64899` was started at `66805f3e` before this fix; it is not the fixed
+release candidate. Its previous executable is preserved as `vosx-before`.
+
 Diagnostic release at `2624cc0a` now localizes the preserved-space failure to
 **journal/ledger reconciliation**: `published_checkpoint_validation` completed
 successfully at 107,811ms, followed by `Shared journal open ledger reconciliation
