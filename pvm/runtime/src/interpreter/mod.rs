@@ -244,6 +244,48 @@ impl Interpreter {
         );
         let gas_block_start_by_pc =
             compute_gas_block_start_by_pc(&code, &bitmask, &basic_block_starts, isa_mode);
+        Self::from_predecoded(
+            crate::backend::InterpreterProgram {
+                decoded_insts,
+                pc_to_idx,
+                basic_block_starts,
+                block_gas_costs,
+                gas_block_start_by_pc,
+                code,
+                bitmask,
+                jump_table,
+                mem_cycles,
+            },
+            registers,
+            mem,
+            gas,
+            configured_mem_cycles,
+            isa_mode,
+        )
+    }
+
+    // Crate-private: public InterpreterProgram fields are not a trusted source
+    // of gas tables. Callers here must supply tables derived by this interpreter
+    // for exactly the supplied ISA and memory-cycle configuration.
+    pub(crate) fn from_predecoded(
+        program: crate::backend::InterpreterProgram,
+        registers: [u64; PVM_REGISTER_COUNT],
+        mem: Memory,
+        gas: Gas,
+        configured_mem_cycles: u8,
+        isa_mode: crate::IsaMode,
+    ) -> Self {
+        let crate::backend::InterpreterProgram {
+            decoded_insts,
+            pc_to_idx,
+            basic_block_starts,
+            block_gas_costs,
+            gas_block_start_by_pc,
+            code,
+            bitmask,
+            jump_table,
+            mem_cycles,
+        } = program;
         Self {
             gas,
             registers,

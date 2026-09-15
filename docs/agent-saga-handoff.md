@@ -2,6 +2,51 @@
 
 ## Checkpoint and decision
 
+Validated program-preparation reuse is now implemented after review checkpoint
+`97c08c88`. `refine::PreparedProgram` owns executor-validated standard bytes and
+private Conformance/standard-latency tables. Cold and prepared loads share the
+fresh-state initializer; every invocation gets its own memory, permissions,
+registers, arguments, gas, pending-call state and inner-machine dictionary.
+The Agent replay executor retains one preparation keyed by exact program bytes,
+bounded by the existing 1,280KiB program limit. Cache replacement/invalid-input
+tests pass. Oversized programs and poisoned cache locks fall back to the cold
+loader rather than introducing new execution admission rules. No authorization
+or execution result is cached by this mechanism. Tables are cloned into each
+interpreter; this avoids repeated derivation, not all allocation. Retained
+tables add memory per executor; deployment-scale memory impact is unmeasured.
+
+Release-mode load-only measurement on the bundled 983,442-byte runtime with a
+790,499-byte input buffer, 20 alternating samples per path: first run cold mean
+67,057us versus prepared 3,039us (one-time preparation74,970us). A repeat while
+other checks were active measured87,139us versus3,492us (preparation99,356us).
+The synthetic zero input is never executed; these are load measurements, not
+valid management requests or end-to-end Create/Install improvements. The
+ignored `refine::tests::prepared_program_load_measurement` test is reproducible
+with `VOS_PVM_PREPARE_BENCH_PROGRAM` pointing to `vosx/blobs/agent_runtime.pvm`,
+using `cargo +nightly-2025-05-09 test --locked --offline --release -p vos-pvm
+--lib refine::tests::prepared_program_load_measurement -- --exact --ignored
+--nocapture --test-threads=1` and the existing disk-backed target/TMPDIR.
+
+Qualification: current `vos-pvm` library260 passed/zero failed/two ignored
+(0.73s), including cold/prepared flat/sparse corpus equivalence, gas/exit/output/
+register/permission/mapped-memory comparisons, invalid input, changed arguments,
+fresh writable state, and repeated nested-machine execution. `vos-pvm
+--no-default-features` check passes. Default-feature local-journal-driver module
+32 passed/zero failed (42.43s), including cache admission/replacement and existing
+exact-retry/authentication/preflight regressions. Focused host build1m44s.
+Evidence in shared target `task-tmp/prepared-program-{runtime-tests,
+local-driver-tests,load-measurement}.log`; sessions11202,10149,62749,94489,
+85355,17719 are terminal. No probe daemon was started or fixture mutated.
+
+Next: rebuild the host-feature release, verify its unchanged guest bundle,
+repeat the preserved-space inventory timing and busy-shutdown probes, and
+measure memory. The release executable is still source `8716f6a7`; this new
+source is **not yet live-qualified**. Runtime guest pins and frozen two-batch
+review ranges remain unchanged. No production latency gate is closed, and the
+Shared finality, authenticated reclamation and final proof/matrix work remains.
+
+### Previous profiling checkpoint
+
 Existing per-runtime diagnostics captured one complete periodic Credential
 cycle on unchanged release `8716f6a7`; no diagnostic code or rebuild was needed.
 Readiness40s, Credential dispatch4,780ms, full route reconciliation5,602ms.

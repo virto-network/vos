@@ -88,6 +88,19 @@ impl RefineContext {
         })
     }
 
+    /// Reuse validated program preparation, never per-invocation machines.
+    pub fn load_prepared(
+        program: &crate::refine::PreparedProgram,
+        args: &[u8],
+        gas: Gas,
+        model: MemoryModel,
+    ) -> Result<Self, RefineError> {
+        Ok(Self {
+            outer: Machine::load_prepared(program, args, gas, model)?,
+            inner: InnerMachines::new(),
+        })
+    }
+
     /// Run the outer program, transparently servicing host calls 9 through
     /// 14. Other host calls are returned to the embedder unchanged.
     pub fn run(mut self) -> Invocation {
@@ -551,6 +564,22 @@ mod tests {
         let expected = RefineContext::load_with(&outer, &args, 1_000_000, MemoryModel::Sparse)
             .unwrap()
             .run();
+        let prepared = crate::refine::PreparedProgram::new(&outer).unwrap();
+        for _ in 0..2 {
+            let reused =
+                RefineContext::load_prepared(&prepared, &args, 1_000_000, MemoryModel::Sparse)
+                    .unwrap()
+                    .run();
+            assert_eq!(reused.exit, expected.exit);
+            assert_eq!(reused.pc, expected.pc);
+            assert_eq!(reused.registers, expected.registers);
+            assert_eq!(reused.gas_used, expected.gas_used);
+            let mut cold_frame = [0; 112];
+            let mut reused_frame = [0; 112];
+            expected.memory().read_bytes(RW_BASE, &mut cold_frame);
+            reused.memory().read_bytes(RW_BASE, &mut reused_frame);
+            assert_eq!(reused_frame, cold_frame);
+        }
 
         let mut events = Vec::new();
         let observed = RefineContext::load_with(&outer, &args, 1_000_000, MemoryModel::Sparse)

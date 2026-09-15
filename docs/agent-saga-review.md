@@ -1,5 +1,18 @@
 # Reviewing the Agent architecture saga
 
+## Follow-up after the frozen review snapshot
+
+Program-preparation reuse has been implemented after `97c08c88`: opaque
+validated Refine preparation plus a single-entry, exact-byte-keyed Agent
+executor cache. This belongs in the performance portion of batch 2; the frozen
+ranges below remain reproducible and do not include it. Runtime tests (260)
+and default-feature local-driver tests (32) pass, as does the runtime no_std
+check. Load-only measurement fell from67ms to3ms on the bundled program; this
+does **not** establish an end-to-end speedup. The release executable remains
+`8716f6a7`; rebuild/live timing, memory measurement and release qualification
+are still required. See the newest handoff entry before using historical
+statements below that describe this optimization as unimplemented.
+
 ## Current review checkpoint
 
 Review snapshot: `2d88d540` on `wip/ch08-runtime-directory`;

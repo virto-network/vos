@@ -22,6 +22,7 @@ pub enum PvmBackend {
 ///
 /// Contains the instruction stream pre-decoded for the fast interpreter path.
 /// Created by `Interpreter::predecode()` and stored in a `CodeCap`.
+#[derive(Clone)]
 pub struct InterpreterProgram {
     /// Pre-decoded instruction stream.
     pub decoded_insts: Vec<crate::interpreter::DecodedInst>,

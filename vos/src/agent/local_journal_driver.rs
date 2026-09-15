@@ -1204,6 +1204,46 @@ pub(crate) struct StandardLocalReplayExecutor<R> {
     pending_transition_proof: Option<PendingReplayTransitionProof>,
     staged_transition_proofs: Vec<StagedTransitionProof>,
     terminal_preflight: std::sync::Mutex<Option<TerminalPreflight>>,
+    runtime_preparation: RuntimePreparationCache,
+}
+
+/// One bounded immutable preparation per executor; no results or authorization
+/// decisions are cached. Exact bytes, not a caller-supplied identity, select it.
+#[derive(Default)]
+struct RuntimePreparationCache {
+    entry: std::sync::Mutex<Option<(Vec<u8>, Arc<vos_pvm::refine::PreparedProgram>)>>,
+}
+
+impl RuntimePreparationCache {
+    fn load(
+        &self,
+        program: &[u8],
+        input: &[u8],
+        gas: Gas,
+    ) -> Result<RefineContext, vos_pvm::refine::RefineError> {
+        // Preserve the cold loader's behavior outside the cache admission
+        // bound; this optimization must not introduce a new execution rule.
+        if program.len() > super::execution::MAX_EXECUTION_PROGRAM_BYTES {
+            return RefineContext::load(program, input, gas);
+        }
+        let prepared = {
+            let Ok(mut entry) = self.entry.lock() else {
+                return RefineContext::load(program, input, gas);
+            };
+            if let Some((_, prepared)) = entry
+                .as_ref()
+                .filter(|(bytes, _)| bytes.as_slice() == program)
+            {
+                Arc::clone(prepared)
+            } else {
+                let prepared = Arc::new(vos_pvm::refine::PreparedProgram::new(program)?);
+                *entry = Some((program.to_vec(), Arc::clone(&prepared)));
+                prepared
+            }
+        };
+        // Do not hold the cache lock while allocating or running a machine.
+        RefineContext::load_prepared(&prepared, input, gas, vos_pvm::refine::MemoryModel::Auto)
+    }
 }
 
 /// One local computation, never durable evidence or an authentication cache.
@@ -2053,6 +2093,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             pending_transition_proof: None,
             staged_transition_proofs: Vec::new(),
             terminal_preflight: std::sync::Mutex::new(None),
+            runtime_preparation: RuntimePreparationCache::default(),
         }
     }
 
@@ -2086,6 +2127,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             pending_transition_proof: None,
             staged_transition_proofs: Vec::new(),
             terminal_preflight: std::sync::Mutex::new(None),
+            runtime_preparation: RuntimePreparationCache::default(),
         }
     }
 
@@ -3153,7 +3195,9 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         gas: Gas,
         input: &[u8],
     ) -> Result<T, LocalReplayExecutorError> {
-        let invocation = RefineContext::load(runtime_pvm, input, gas)
+        let invocation = self
+            .runtime_preparation
+            .load(runtime_pvm, input, gas)
             .map_err(|_| LocalReplayExecutorError::RuntimeOutput)?
             .run();
         if invocation.exit != ExitReason::Halt {
@@ -3175,7 +3219,9 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         input: &[u8],
     ) -> Result<T, LocalReplayExecutorError> {
         let started = std::time::Instant::now();
-        let invocation = RefineContext::load(runtime_pvm, input, gas)
+        let invocation = self
+            .runtime_preparation
+            .load(runtime_pvm, input, gas)
             .map_err(|_| LocalReplayExecutorError::RuntimeOutput)?
             .run();
         tracing::debug!(
@@ -6944,6 +6990,56 @@ mod tests {
         Mutex,
         atomic::{AtomicU64, Ordering},
     };
+
+    #[test]
+    fn runtime_preparation_cache_is_exact_bounded_and_state_independent() {
+        fn wrap(code_blob: &[u8]) -> Vec<u8> {
+            let mut blob = vec![0; 11];
+            blob.extend_from_slice(&(code_blob.len() as u32).to_le_bytes());
+            blob.extend_from_slice(code_blob);
+            blob
+        }
+        let halt = wrap(&[0, 1, 2, 50, 0, 1]);
+        let trap = wrap(&[0, 1, 1, 0, 1]);
+        let cache = RuntimePreparationCache::default();
+        assert_eq!(
+            cache.load(&halt, &[], 1_000_000).unwrap().run().exit,
+            ExitReason::Halt
+        );
+        let original = Arc::clone(&cache.entry.lock().unwrap().as_ref().unwrap().1);
+        for (args, gas) in [(&b""[..], 0), (&b"different arguments"[..], 1_000_000)] {
+            let cold = RefineContext::load(&halt, args, gas).unwrap().run();
+            let reused = cache.load(&halt, args, gas).unwrap().run();
+            assert_eq!(cold.exit, reused.exit);
+            assert_eq!(cold.gas_used, reused.gas_used);
+            assert_eq!(cold.registers, reused.registers);
+            assert!(Arc::ptr_eq(
+                &original,
+                &cache.entry.lock().unwrap().as_ref().unwrap().1
+            ));
+        }
+        assert_eq!(
+            cache.load(&trap, &[], 1_000_000).unwrap().run().exit,
+            ExitReason::Panic
+        );
+        let replacement = Arc::clone(&cache.entry.lock().unwrap().as_ref().unwrap().1);
+        assert!(!Arc::ptr_eq(&original, &replacement));
+        for invalid in [
+            vec![0xff; 4],
+            vec![0xff; super::super::execution::MAX_EXECUTION_PROGRAM_BYTES + 1],
+        ] {
+            assert!(cache.load(&invalid, &[], 1_000_000).is_err());
+            assert!(Arc::ptr_eq(
+                &replacement,
+                &cache.entry.lock().unwrap().as_ref().unwrap().1
+            ));
+        }
+        assert_eq!(cache.entry.lock().unwrap().as_ref().unwrap().0, trap);
+        assert_eq!(
+            cache.load(&halt, &[], 1_000_000).unwrap().run().exit,
+            ExitReason::Halt
+        );
+    }
 
     struct StaticTrust {
         slot: Option<u64>,

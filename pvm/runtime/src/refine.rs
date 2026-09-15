@@ -101,6 +101,33 @@ pub enum MemoryModel {
     Sparse,
 }
 
+/// Executor-validated standard program and immutable interpreter preparation.
+///
+/// Private fields prevent callers from supplying forged gas tables. Preparing
+/// binds the tables to the standard ISA and memory latency; loading still
+/// checks each invocation's layout and gas and creates independent state.
+pub struct PreparedProgram {
+    program: crate::spi::StandardProgram,
+    interpreter: crate::backend::InterpreterProgram,
+}
+
+impl PreparedProgram {
+    pub fn new(blob: &[u8]) -> Result<Self, RefineError> {
+        let program = parse_standard_program(blob).ok_or(RefineError::InvalidBlob)?;
+        let interpreter = Interpreter::predecode(
+            &program.code.code,
+            &program.code.bitmask,
+            &program.code.jump_table,
+            STANDARD_MEM_CYCLES,
+            IsaMode::Conformance,
+        );
+        Ok(Self {
+            program,
+            interpreter,
+        })
+    }
+}
+
 /// The result of a completed refine-style invocation.
 #[derive(Debug, Clone)]
 pub struct Invocation {
@@ -204,7 +231,32 @@ impl Machine {
         model: MemoryModel,
     ) -> Result<Self, RefineError> {
         let prog = parse_standard_program(spi_blob).ok_or(RefineError::InvalidBlob)?;
+        Self::load_program(&prog, None, args, gas, model)
+    }
 
+    /// Instantiate fresh execution state from validated immutable preparation.
+    pub fn load_prepared(
+        prepared: &PreparedProgram,
+        args: &[u8],
+        gas: Gas,
+        model: MemoryModel,
+    ) -> Result<Self, RefineError> {
+        Self::load_program(
+            &prepared.program,
+            Some(&prepared.interpreter),
+            args,
+            gas,
+            model,
+        )
+    }
+
+    fn load_program(
+        prog: &crate::spi::StandardProgram,
+        prepared: Option<&crate::backend::InterpreterProgram>,
+        args: &[u8],
+        gas: Gas,
+        model: MemoryModel,
+    ) -> Result<Self, RefineError> {
         if args.len() as u64 > PVM_INIT_INPUT_SIZE as u64 {
             return Err(RefineError::LayoutOverflow);
         }
@@ -255,17 +307,26 @@ impl Machine {
             }
         }
 
-        let code = prog.code;
-        let mut interp = Interpreter::with_memory_and_mode(
-            code.code,
-            code.bitmask,
-            code.jump_table,
-            registers,
-            mem,
-            gas - init_gas,
-            mem_cycles,
-            IsaMode::Conformance,
-        );
+        let mut interp = match prepared {
+            Some(program) => Interpreter::from_predecoded(
+                program.clone(),
+                registers,
+                mem,
+                gas - init_gas,
+                mem_cycles,
+                IsaMode::Conformance,
+            ),
+            None => Interpreter::with_memory_and_mode(
+                prog.code.code.clone(),
+                prog.code.bitmask.clone(),
+                prog.code.jump_table.clone(),
+                registers,
+                mem,
+                gas - init_gas,
+                mem_cycles,
+                IsaMode::Conformance,
+            ),
+        };
         interp.set_page_perms(page_perms);
 
         Ok(Self {
@@ -595,6 +656,37 @@ mod tests {
     ) -> Option<(Invocation, Invocation)> {
         let f = execute_with(blob, args, gas, MemoryModel::Flat);
         let s = execute_with(blob, args, gas, MemoryModel::Sparse);
+        let prepared = PreparedProgram::new(blob);
+        for (model, cold) in [(MemoryModel::Flat, &f), (MemoryModel::Sparse, &s)] {
+            let reused = prepared.as_ref().map_err(|e| *e).and_then(|program| {
+                let mut machine = Machine::load_prepared(program, args, gas, model)?;
+                let exit = machine.resume();
+                Ok(machine.finish(exit))
+            });
+            match (cold, reused) {
+                (Ok(cold), Ok(reused)) => {
+                    assert_eq!(cold.exit, reused.exit);
+                    assert_eq!(cold.gas_used, reused.gas_used);
+                    assert_eq!(cold.registers, reused.registers);
+                    assert_eq!(cold.pc, reused.pc);
+                    assert_eq!(cold.output_bounded(4096), reused.output_bounded(4096));
+                    assert_eq!(cold.memory().span(), reused.memory().span());
+                    assert_eq!(cold.memory().page_perms(), reused.memory().page_perms());
+                    let prog = parse_standard_program(blob).unwrap();
+                    let layout = prog.layout(args).unwrap();
+                    for region in [layout.ro, layout.rw, layout.stack, layout.args] {
+                        assert_image_range_eq(
+                            cold,
+                            &reused,
+                            region.base,
+                            region.base + region.size,
+                        );
+                    }
+                }
+                (Err(cold), Err(reused)) => assert_eq!(*cold, reused),
+                (cold, reused) => panic!("cold/prepared mismatch: {cold:?} / {reused:?}"),
+            }
+        }
         match (f, s) {
             (Ok(f), Ok(s)) => {
                 assert_eq!(f.exit, s.exit, "exit reasons agree");
@@ -776,6 +868,88 @@ mod tests {
         assert_eq!(
             execute(&[0xFF; 4], &[], 1_000_000).unwrap_err(),
             RefineError::InvalidBlob
+        );
+        assert!(matches!(
+            PreparedProgram::new(&[0xFF; 4]),
+            Err(RefineError::InvalidBlob)
+        ));
+    }
+
+    #[test]
+    fn prepared_program_keeps_invocations_independent() {
+        let blob = round_trip_blob();
+        let prepared = PreparedProgram::new(&blob).unwrap();
+        for model in [MemoryModel::Flat, MemoryModel::Sparse] {
+            for args in [[1, 2, 3, 4], [9, 8, 7, 6], [1, 2, 3, 4]] {
+                let mut machine =
+                    Machine::load_prepared(&prepared, &args, 1_000_000, model).unwrap();
+                let mut initial = [0; 4];
+                machine.memory().read_bytes(RW_BASE, &mut initial);
+                assert_eq!(initial, [0; 4]);
+                assert_eq!(machine.interpreter().pc, 0);
+                assert!(!machine.gas_charged());
+                let exit = machine.resume();
+                let invocation = machine.finish(exit);
+                assert_eq!(invocation.exit, ExitReason::Halt);
+                assert_eq!(invocation.output_bounded(4).unwrap(), args);
+                let cold = execute_with(&blob, &args, 1_000_000, model).unwrap();
+                assert_eq!(invocation.gas_used, cold.gas_used);
+            }
+            assert!(matches!(
+                Machine::load_prepared(&prepared, &ARGS, 0, model),
+                Err(RefineError::OutOfGas)
+            ));
+            let oversized = vec![0; PVM_INIT_INPUT_SIZE as usize + 1];
+            assert!(matches!(
+                Machine::load_prepared(&prepared, &oversized, 1_000_000, model),
+                Err(RefineError::LayoutOverflow)
+            ));
+        }
+    }
+
+    /// Load-only measurement, not an execution or end-to-end latency gate.
+    #[cfg(feature = "std")]
+    #[test]
+    #[ignore = "requires VOS_PVM_PREPARE_BENCH_PROGRAM; run with --release --nocapture"]
+    fn prepared_program_load_measurement() {
+        use std::{hint::black_box, time::Instant};
+        let path = std::env::var("VOS_PVM_PREPARE_BENCH_PROGRAM").unwrap();
+        let blob = std::fs::read(path).unwrap();
+        let started = Instant::now();
+        let prepared = PreparedProgram::new(&blob).unwrap();
+        let preparation = started.elapsed();
+        // Representative input size from the recorded Authority query; these
+        // bytes are not a valid work request and are deliberately never run.
+        let args = vec![0; 790_499];
+        let mut cold_time = std::time::Duration::ZERO;
+        let mut reused_time = std::time::Duration::ZERO;
+        for i in 0..20 {
+            // Alternate ordering to avoid always timing one path first.
+            for reuse in [i % 2 == 0, i % 2 != 0] {
+                let started = Instant::now();
+                let machine = if reuse {
+                    Machine::load_prepared(&prepared, &args, 6_000_000_000, MemoryModel::Auto)
+                } else {
+                    Machine::load(&blob, &args, 6_000_000_000)
+                }
+                .unwrap();
+                let elapsed = started.elapsed();
+                if reuse {
+                    reused_time += elapsed;
+                } else {
+                    cold_time += elapsed;
+                }
+                black_box(&machine);
+                drop(machine);
+            }
+        }
+        std::eprintln!(
+            "program_bytes={} input_bytes={} samples_per_path=20 preparation_us={} cold_load_mean_us={} prepared_load_mean_us={}",
+            blob.len(),
+            args.len(),
+            preparation.as_micros(),
+            cold_time.as_micros() / 20,
+            reused_time.as_micros() / 20
         );
     }
 
