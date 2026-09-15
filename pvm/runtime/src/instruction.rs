@@ -289,6 +289,7 @@ impl Opcode {
     }
 
     /// Whether this opcode is a basic-block termination instruction (set T).
+    #[cfg_attr(feature = "std", inline(always))]
     pub fn is_terminator(self) -> bool {
         matches!(
             self,

@@ -45,6 +45,9 @@ This is not yet a usable ordinary-agent production path.
 The latest runtime pin includes single-pass AWRK availability decoding. Its
 fixed 768KB-program ACK comparison uses about 25.3% less gas with byte-identical
 successful output; that does not establish acceptable end-to-end latency.
+The latest host-only interpreter inlining probe reduces median time for the
+same fixed ACK by about 20% with identical gas; no live latency gate is closed
+by that microbenchmark. See "Native interpreter helper inlining" below.
 Managed authorization now has a live exact-recovery pass: the saved IgQS0r call
 was authorized after recovery-only startup, followed by verified inventory,
 receipt-bearing Catalog query, positive retirement and exact retries. The live
@@ -8015,6 +8018,58 @@ later exited zero and its exact PID was confirmed absent. No force kill was
 used. Regression tests ran during this shutdown interval, so it is not an
 isolated shutdown benchmark. All campaign data remains on disk under `target`;
 the root `saga/agents` checkout is untouched.
+
+### Native interpreter helper inlining (C2 latency)
+
+After protected grant/revoke/restart coverage, the latency investigation returned
+to the measured physical execution cost. Standard Refine intentionally uses the
+conformance interpreter, independently of the capability kernel's backend
+selection. No backend, ISA, gas, authorization or memory-check change is made.
+
+The opt-in `profile_bundled_runtime_large_acknowledgement` probe repeats the
+existing fixed ACK regression eight times. Its 793,734-byte input contains a
+768KB installed program and a retained terminal result. Each run must halt and
+decode a positive acknowledgement. It does not execute the synthetic actor and
+does not append live-space history. Logs and CPU profiles are under shared
+disk-backed `target/task-tmp`, not `/tmp`.
+
+The baseline CPU profile (`ack-fixed-baseline.perf`) attributes 75.20% of the
+main-core samples to the interpreter loop, 6.14% to readable-range checks,
+3.60% to writable-range checks and 5.29% to opcode-terminator classification.
+The change adds std-only inlining hints to those two memory wrappers, their
+private range predicate and opcode classification. Constant scalar widths and
+permissions can then be optimized at the caller while retaining all existing
+checks, including wrapped-address fault ordering and atomic failing stores.
+The no-std code path is unchanged. No guest artifact or ABI was repinned.
+
+The candidate profile removes those out-of-line helper hotspots. Its first
+timing run overlapped a PVM test build and is not the clean comparison. Separate
+eight-run, unprofiled measurements, with no concurrent task build, give:
+
+- Baseline restored by removing only the inlining attributes: median
+  **1,278,893.5 us**, range 1,265,335–1,289,063 us
+  (`ack-baseline-clean-repeat.log`).
+- Inlining candidate: median **1,024,132 us**, range 1,006,396–1,076,125 us
+  (`ack-inline-clean-repeat.log`), about **19.9% lower** for this fixed path.
+- Every measured run consumes exactly **515,787,220 gas**. The same bundled
+  PVM and fixed input are used; no validation or gas discount is responsible.
+
+The candidate attributes were restored after the baseline recheck. This is
+sequential microbenchmark evidence, not a production latency guarantee.
+Startup, Create/Install/Invoke, shutdown and transient native admission failures
+remain release blockers requiring end-to-end measurement on equivalent history.
+
+Validation: PVM library **259 passed / 1 ignored** (0.47s), PVM vectors **20
+passed** (0.21s; the vector runner also reports its filtered one-test subprocess),
+SPI boundary **4 passed** (0.01s), and `vos-pvm --no-default-features` check
+passes. Evidence: `ack-inline-pvm-tests.log`, `ack-inline-pvm-vectors.log`,
+`ack-inline-no-std.log`. These include scalar fault ordering, flat/sparse memory
+and standard execution boundaries. The full release matrix remains open.
+Final CLI regression: **252 passed / 12 ignored / zero failures** (62.99s;
+`ack-inline-cli-tests.log`). Normal vosx build passes (11.44s;
+`ack-inline-vosx-build.log`); formatting and whitespace checks pass. No live
+space was started or modified for this profiling checkpoint, and no profiler,
+test or build process is left running.
 
 ### Durable client acknowledgement before completion
 

@@ -9286,6 +9286,15 @@ pub(crate) mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
+    #[ignore = "fixed-work CPU profiling probe; runs the same validated ACK eight times"]
+    fn profile_bundled_runtime_large_acknowledgement() {
+        for _ in 0..8 {
+            bundled_runtime_large_acknowledgement_validation_cost();
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
     fn bundled_runtime_large_acknowledgement_validation_cost() {
         use crate::agent_sdk::wire::CanonicalWire as _;
         use crate::agent_sdk::{

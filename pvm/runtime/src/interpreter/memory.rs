@@ -228,6 +228,10 @@ impl PagePerms {
             .expect("permission revision cannot wrap in one invocation");
     }
 
+    // Native scalar loads/stores reach this through standard exception
+    // classification. Inlining exposes their constant width/permission;
+    // keep the portable guest compilation unchanged.
+    #[cfg_attr(feature = "std", inline(always))]
     fn range_has_at_least(&self, addr: u32, len: usize, permission: u8) -> bool {
         if len == 0 {
             return true;
@@ -650,12 +654,14 @@ impl Memory {
 
     /// Whether the whole byte range is readable under the installed page
     /// map. Zero-length ranges are always accessible.
+    #[cfg_attr(feature = "std", inline(always))]
     pub fn is_readable(&self, addr: u32, len: usize) -> bool {
         dispatch!(self, m => m.perms.range_has_at_least(addr, len, super::PERM_RO))
     }
 
     /// Whether the whole byte range is writable under the installed page
     /// map. Zero-length ranges are always accessible.
+    #[cfg_attr(feature = "std", inline(always))]
     pub fn is_writable(&self, addr: u32, len: usize) -> bool {
         dispatch!(self, m => m.perms.range_has_at_least(addr, len, PERM_RW))
     }
