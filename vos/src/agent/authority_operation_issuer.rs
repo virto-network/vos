@@ -369,6 +369,14 @@ impl AuthorityOperationIssuerImage {
     }
 
     fn is_valid(&self) -> bool {
+        self.is_valid_reusing(None)
+    }
+
+    // `validated` must be the live issuer image: open fully verifies it, and
+    // commit_candidate is its only mutation boundary. Never pass a decoded but
+    // unverified image here. Reuse is local to one exact record and authority;
+    // all image-wide ordering, uniqueness and envelope checks still run.
+    fn is_valid_reusing(&self, validated: Option<&Self>) -> bool {
         if !self.has_valid_envelope() {
             return false;
         }
@@ -376,7 +384,10 @@ impl AuthorityOperationIssuerImage {
         let mut invocation_ids = Vec::new();
         let mut sequences = Vec::new();
         let mut previous_issued_at = None;
-        for record in &self.records {
+        for (index, record) in self.records.iter().enumerate() {
+            let verify_signatures = !validated.is_some_and(|previous| {
+                previous.authority == self.authority && previous.records.get(index) == Some(record)
+            });
             let Ok(call) = AuthorityOperationCall::decode(&record.call) else {
                 return false;
             };
@@ -385,7 +396,8 @@ impl AuthorityOperationIssuerImage {
             };
             if call.encode().ok().as_deref() != Some(record.call.as_slice())
                 || approval.encode().ok().as_deref() != Some(record.approval.as_slice())
-                || !operation_call_has_valid_ingress_envelope(&call, &verifier)
+                || (verify_signatures
+                    && !operation_call_has_valid_ingress_envelope(&call, &verifier))
                 || call.authority != self.authority
                 || approval.authority != self.authority
                 || !approval.matches_call(&call)
@@ -409,9 +421,10 @@ impl AuthorityOperationIssuerImage {
                         return false;
                     };
                     if receipt.encode().ok().as_deref() != Some(bytes.as_slice())
-                        || approval
-                            .verify_receipt_at(&receipt, record.issued_at, &verifier)
-                            .is_err()
+                        || (verify_signatures
+                            && approval
+                                .verify_receipt_at(&receipt, record.issued_at, &verifier)
+                                .is_err())
                     {
                         return false;
                     }
@@ -427,7 +440,8 @@ impl AuthorityOperationIssuerImage {
                     if ack.encode().ok().as_deref() != Some(bytes.as_slice())
                         || &ack.receipt != receipt
                         || !ack.matches_pending(&call, &approval)
-                        || ack.verify_with(self.authority.binding, &verifier).is_err()
+                        || (verify_signatures
+                            && ack.verify_with(self.authority.binding, &verifier).is_err())
                     {
                         return false;
                     }
@@ -476,16 +490,17 @@ impl AuthorityOperationIssuerImage {
                     };
                     if ack.encode().ok().as_deref() != Some(bytes.as_slice())
                         || !ack.matches_pending(&call, &approval, issuance, application)
-                        || ack
-                            .verify_pending_with(
-                                &call,
-                                &approval,
-                                issuance,
-                                application,
-                                self.authority.binding,
-                                &verifier,
-                            )
-                            .is_err()
+                        || (verify_signatures
+                            && ack
+                                .verify_pending_with(
+                                    &call,
+                                    &approval,
+                                    issuance,
+                                    application,
+                                    self.authority.binding,
+                                    &verifier,
+                                )
+                                .is_err())
                     {
                         return false;
                     }
@@ -510,15 +525,16 @@ impl AuthorityOperationIssuerImage {
                         if ack.encode().ok().as_deref() != Some(bytes.as_slice())
                             || ack.resolved_at != *resolved_at
                             || !ack.matches_pending(&call, &approval, issuance)
-                            || ack
-                                .verify_pending_with(
-                                    &call,
-                                    &approval,
-                                    issuance,
-                                    self.authority.binding,
-                                    &verifier,
-                                )
-                                .is_err()
+                            || (verify_signatures
+                                && ack
+                                    .verify_pending_with(
+                                        &call,
+                                        &approval,
+                                        issuance,
+                                        self.authority.binding,
+                                        &verifier,
+                                    )
+                                    .is_err())
                         {
                             return false;
                         }
@@ -1449,7 +1465,7 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
         &mut self,
         candidate: AuthorityOperationIssuerImage,
     ) -> Result<(), AuthorityOperationIssuerError<B::Error, SignerError>> {
-        if !candidate.is_valid() {
+        if !candidate.is_valid_reusing(Some(&self.image)) {
             self.poisoned = true;
             return Err(AuthorityOperationIssuerError::InvalidState);
         }
@@ -2468,6 +2484,84 @@ mod tests {
     }
 
     #[test]
+    fn validation_reuse_preserves_signature_and_image_invariants() {
+        let store = MemoryImageStore::default();
+        let mut signer = CountingSigner::new(0x19);
+        let fixture = Fixture::new(&signer);
+        let mut issuer = open(store.clone(), &fixture);
+        for sequence in 1..=2 {
+            let (call, approval) = fixture.approved(sequence, sequence);
+            issuer.issue(&call, &approval, 20, &mut signer).unwrap();
+        }
+        let validated = issuer.image.clone();
+        assert!(validated.is_valid());
+        assert!(validated.is_valid_reusing(Some(&validated)));
+
+        let mut candidates = Vec::new();
+        let mut candidate = validated.clone();
+        let mut receipt =
+            AuthorityReceipt::decode(candidate.records[0].receipt.as_ref().unwrap()).unwrap();
+        receipt.signature[0] ^= 1;
+        candidate.records[0].receipt = Some(receipt.encode().unwrap());
+        candidates.push(candidate);
+        let mut candidate = validated.clone();
+        let mut ack = AuthorityOperationIssuanceAck::decode(
+            candidate.records[0].issuance_ack.as_ref().unwrap(),
+        )
+        .unwrap();
+        ack.signature[0] ^= 1;
+        candidate.records[0].issuance_ack = Some(ack.encode().unwrap());
+        candidates.push(candidate);
+        let mut candidate = validated.clone();
+        candidate.records[1] = candidate.records[0].clone();
+        candidates.push(candidate);
+        let mut candidate = validated.clone();
+        candidate.issuance_slot_high_water = Some(21);
+        candidates.push(candidate);
+        let mut candidate = validated.clone();
+        candidate.resolution_slot_high_water = Some(20);
+        candidates.push(candidate);
+        let mut candidate = validated.clone();
+        candidate.authority = Fixture::new(&CountingSigner::new(0x72)).authority;
+        candidates.push(candidate);
+
+        for candidate in candidates {
+            assert!(!candidate.is_valid());
+            assert!(!candidate.is_valid_reusing(Some(&validated)));
+            // Disk input must never inherit the live image's verified status.
+            store.replace_image(candidate.encode());
+            assert!(matches!(
+                DurableAuthorityOperationIssuer::open(store.clone(), fixture.authority),
+                Err(AuthorityOperationIssuerError::InvalidState)
+            ));
+        }
+    }
+
+    #[test]
+    fn validation_reuse_rejects_changed_signature_before_commit() {
+        let store = MemoryImageStore::default();
+        let mut signer = CountingSigner::new(0x19);
+        let fixture = Fixture::new(&signer);
+        let mut issuer = open(store.clone(), &fixture);
+        let (call, approval) = fixture.approved(1, 1);
+        issuer.issue(&call, &approval, 20, &mut signer).unwrap();
+        let before = (store.image(), store.commits());
+        let mut candidate = issuer.image.clone();
+        let mut ack = AuthorityOperationIssuanceAck::decode(
+            candidate.records[0].issuance_ack.as_ref().unwrap(),
+        )
+        .unwrap();
+        ack.signature[0] ^= 1;
+        candidate.records[0].issuance_ack = Some(ack.encode().unwrap());
+        assert!(matches!(
+            issuer.commit_candidate::<Infallible>(candidate),
+            Err(AuthorityOperationIssuerError::InvalidState)
+        ));
+        assert!(issuer.is_poisoned());
+        assert_eq!((store.image(), store.commits()), before);
+    }
+
+    #[test]
     fn exact_retry_and_restart_return_retained_evidence_without_signing() {
         let store = MemoryImageStore::default();
         let mut signer = CountingSigner::new(0x19);
@@ -2949,9 +3043,8 @@ mod tests {
         for sequence in 1..=MAX_AUTHORITY_OPERATION_ISSUER_RECORDS as u64 {
             let (call, approval) = fixture.approved(sequence, sequence);
             // Materialize each fully signed record against a one-record image.
-            // Production candidate commits deliberately validate the complete
-            // image; driving all 256 records through that boundary here would
-            // turn this ceiling test into an avoidable O(n^2) crypto loop.
+            // Keep ceiling setup independent of incremental commit performance;
+            // the coordinator test exercises the full growing-image path.
             let one_record_store = MemoryImageStore::default();
             let mut one_record_issuer = open(one_record_store.clone(), &fixture);
             one_record_issuer

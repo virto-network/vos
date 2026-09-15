@@ -2,6 +2,30 @@
 
 ## Checkpoint and decision
 
+Issuer validation reuse: candidate commits now reuse signature validation only
+for byte-identical records at the same index under the exact same authority
+in the live, already-validated issuer image. There is no persisted cache.
+Changed/new records and all disk reopen paths still receive full verification;
+image-wide envelope, ordering, invocation/sequence uniqueness, canonical bytes,
+time and private-resolution relationships remain checked. All 22 issuer tests
+pass with `--features agent-transition-proof` (28.94s; build 1m54s), including
+new forged-signature, duplicate-record, high-water, authority, reopen and
+precommit side-effect regressions. Log: `task-tmp/issuer-validation-reuse-pvm.log`.
+The original two-test capacity baseline completed successfully in 1559.66s
+(session `99095` is terminal). The candidate's same two selected capacity tests
+pass in 52.04s (`task-tmp/operation-capacity-validation-reuse.log`, session
+`99058` terminal). Feature sets and concurrent build load differ, so these
+are indicative timings, not a controlled speedup or production latency result.
+The 256-record ceiling and authenticated reclamation requirement remain.
+No guest or ABI change; the previously qualified release CLI does not yet
+include this host optimization.
+
+An attempted default-feature issuer test build failed before execution:
+`driver.rs` tests at the public-descriptor and clean-image descriptor cases
+reference `completed_clean_policy_fixture`, which is gated behind `pvm`.
+The PVM-enabled suite above passes, but the default library test-build gate
+remains open. Failure log: `task-tmp/issuer-validation-reuse.log`.
+
 Current full CLI default suite at `1c787774`: 260 passed, 19 ignored, one
 failure. Unit tests passed 255/255 selected (92.16s); actor-build integration
 passed 4/4 (32.96s); task-build integration passed 1/1 (32.98s). Shutdown smoke
