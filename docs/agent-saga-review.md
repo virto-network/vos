@@ -9743,6 +9743,33 @@ checks pass. These tests do not establish an end-to-end latency improvement
 or a full-suite pass on this newer host source. The completed `4e8aa893`
 library run remains baseline evidence only.
 
+The configured optimized build of `d2aa1efe` subsequently passed in 10m41s.
+The same 74 focused tests pass in release mode: **74 passed**, zero
+failures/ignored, 12.22s. Evidence is under the shared disk-backed target's
+`task-tmp/decoder-fixed-history.Q5oYmW/`: `candidate-d2aa1efe-build.log` and
+`candidate-release-regressions.log`.
+
+A fixed-history comparison now establishes a scoped performance improvement.
+The r17 daemon was confirmed stopped; its original database was not opened by
+the probes. Two copies had identical initial SHA-256
+`9a233b5e2354591794e6d9ca3dc2ca201b7cc229bf6e6767456bf90e0dcbebfb`.
+The preserved `4e8aa893` and new `d2aa1efe` release executables used the same
+toolchain/profile/features and the unchanged physical-decode probe. All four
+ABBA runs passed with 46 rows, 44 commands and 33,750,544 bytes, checking exact
+canonical command encodings. Compare `duplicate=false` across revisions;
+the probe's separate duplicate mode is not the primary comparison.
+
+Across eight measurements per revision, baseline median was **366.874 ms**
+and candidate median **141.168 ms**, a **61.52% reduction** (2.60x ratio).
+Ranges were 316.838–384.487 ms and 132.160–198.483 ms; timings varied, but every
+candidate measurement was below every baseline measurement. `comparison.log`,
+the individual paired logs, `compare.sh` and the scratch README retain the
+procedure, inputs and executable digests. This is a fixed-history validation
+improvement, not a daemon startup or Create/Install latency pass. The last
+measured daemon still predates these decoder changes; production latency,
+authenticated reclamation, finality and other original release gates remain
+open. All comparison/build/test processes from this checkpoint have exited.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its
