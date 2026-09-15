@@ -1,11 +1,10 @@
 # Reviewing the Agent architecture saga
 
-Current Ch08 WIP warning: `wip/ch08-runtime-directory` is cutting over source
-to r17 while committed bundles are still r16. Do not deploy this intermediate
-checkout until matching artifacts are pinned and bootstrap is revalidated.
-Earlier r16 bundles were independently reproduced and passed startup/restart checks,
-but ordinary-agent finality, cross-runtime actor lifecycle, and full release gates
-remain open. This is not a master-ready branch.
+Current Ch08 WIP warning: `wip/ch08-runtime-directory` now has matching r17
+source and independently reproduced runtime/system-template bundles. Fresh r17
+bootstrap/restart still needs validation; earlier r16 live results do not prove
+it. Ordinary-agent finality, cross-runtime actor lifecycle, production latency
+and full release gates remain open. This is not a master-ready branch.
 See the current closeout plan below; later checkpoint sections retain historical
 results, including failures that have since been fixed.
 Earlier clock-test pass counts had a fixture-dispatch gap; see "Retained
@@ -15,18 +14,12 @@ lifecycle-store leases and corrected clock coverage" for the correction.
 
 Implementation is in `.worktrees/ch08-runtime-directory` on
 `wip/ch08-runtime-directory`, not yet in the root `saga/agents` checkout.
-The C2 typed-error runtime is reproduced from source `373d2520` and bundled;
-post-pin validation is recorded below. Source runtime dispatch now emits the
-expiry fence for unseen expired signed work, but that change is not yet in the
-bundle. Candidate-PVM expiry/retirement verification and independent candidate
-reproduction now pass; live native retirement/reservation recovery and the
-ABI/artifact cutover remain outstanding. The new error tag requires a new clean
-ABI/schema identity before release; do not pin this r16 candidate as final.
-The updated bundled-expiry
-regression requires the new candidate (or a completed repin); the old bundle
-cannot pass the new terminal-resolution expectation.
-The fresh
-`.lU4S5Z` live campaign now passes compiled protected Local yield/resume,
+The C2 r17 runtime and system templates are reproduced from source `5bbab66b`
+with the matching frozen builder and bundled together. Post-pin physical expiry
+and failure-retirement checks pass without candidate overrides; see the r17
+checkpoint below for the current validation results. Live native expiry and
+fresh r17 bootstrap/restart remain open. Do not reuse or relabel r16 fixture data.
+The earlier r16 `.lU4S5Z` live campaign passes compiled protected Local yield/resume,
 retirement, two restarts and final-state query, plus Panicked-result retirement
 after restart with a released credential reservation. Its daemon is stopped.
 Compiled typed-error retirement passes; live typed-error coverage,
@@ -9245,6 +9238,40 @@ Freeze this source for the r17 builder, runtime and system templates, then build
 and independently reproduce matching artifacts before updating release pins.
 Old r16 fixtures stay untouched. The current source/committed-blob mismatch is
 an explicit intermediate cutover state, not a deployable build or a gate waiver.
+
+### r17 runtime and system-template pin
+
+Runtime, system-authority and system-catalog bundles now use immutable source
+`5bbab66b98b2e26cf0e57ccc964c17687c66e8ca`, with a matching frozen vosx builder,
+host `nightly-2025-05-09` and guest `nightly-2026-03-20`. Two independent source
+exports and clean guest builds produced byte-identical runtime ELF/PVM and both
+signed system templates. Public template signing remains non-authoritative;
+spaces re-sign with their actual root. No operator identity or old space changed.
+
+Runtime ProgramId is
+`91b0a2176e1e3c12a0fc1673a738ad6492238bd07c33a959c3d41d2fb9cab893`.
+The runtime PVM is 983,895 bytes; Authority/Catalog templates are 767,221/187,364
+bytes. Exact hashes and source/builder revisions are pinned together in
+`support/production-artifacts.toml`, `vosx/build.rs` and the protocol runtime ID.
+The established service/registry/space-authority artifacts are unchanged.
+
+Evidence under shared C2 `target/task-tmp/r17-release-candidate.fNbf43`:
+
+- `build.log`, `reproduction.log`, scripts and retained source/target trees:
+  both builds completed and all four byte comparisons passed.
+- `physical-candidate.log`: **4 passed**, 4.06 s, against the r17 candidate.
+- `post-pin-physical.log`: **7 passed**, 4.11 s, against the actual new bundle
+  without candidate overrides, including expiry with missing availability.
+- `post-pin-cli.log`: **255 passed, zero failed, 17 ignored**, 74.25 s. Ignored
+  live/campaign cases remain gates, not inferred passes.
+- `clean-break.log`: normal CLI rebuilt (52.04 s), retained commands and
+  rejected legacy surfaces verified. The executable now embeds the new bundles.
+
+All build/test handles from this checkpoint completed. Next is a new isolated r17
+bootstrap/restart/ingress check, then live native expiry retirement. Earlier r16
+fixture outcomes are historical only. Full library/features, Shared finality,
+Private/Attested, management expiry/abort and production latency remain open;
+this pin does not declare the branch master-ready.
 
 ### Durable client acknowledgement before completion
 
