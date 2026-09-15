@@ -2,6 +2,18 @@
 
 ## Checkpoint and decision
 
+Preflight reuse regression follow-up: a small admitted scripted PVM produces
+the same replay transition and exact RuntimeOutcome with and without reuse.
+The same test proves a prepared computation cannot grant a missing replay
+authentication capability and cannot bypass the runtime state-size limit.
+The existing Attested provider test now injects an exact-match prepared tuple;
+the proof provider remains authoritative. These three focused tests (including
+the byte/gas/runtime mismatch and one-shot test) pass, with a locked offline
+test build in 34.24s. Logs: shared target `task-tmp/terminal-preflight-equivalence.log`
+and `task-tmp/terminal-preflight-equivalence-final.log`. Formatting followed the
+build; no additional production behavior changed. This is physical scripted
+runtime equivalence, not full bundled-system-workload qualification.
+
 Release qualification of preflight reuse at `c1ab75a5`: locked offline release
 build passed in 6m29s. The existing disposable space reopened, passed HTTP
 status and the exact original SSH key check, and shut down cleanly. Each of

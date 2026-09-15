@@ -2369,8 +2369,14 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                 &encoded,
             )?
         };
-        if retain && matches!(returned.outcome, crate::agent_sdk::RuntimeOutcome::Completed(_)) {
-            *self.terminal_preflight
+        if retain
+            && matches!(
+                returned.outcome,
+                crate::agent_sdk::RuntimeOutcome::Completed(_)
+            )
+        {
+            *self
+                .terminal_preflight
                 .lock()
                 .map_err(|_| LocalReplayExecutorError::InvalidState)? = Some(TerminalPreflight {
                 runtime_pvm: runtime.program_bytes().to_vec(),
@@ -6880,12 +6886,14 @@ mod tests {
                 crate::agent_sdk::InvocationError::NotFound,
             )),
         };
-        let prepare = || Some(TerminalPreflight {
-            runtime_pvm: vec![1, 2, 3],
-            input: vec![4, 5, 6, 7],
-            gas: 100,
-            transition: transition.clone(),
-        });
+        let prepare = || {
+            Some(TerminalPreflight {
+                runtime_pvm: vec![1, 2, 3],
+                input: vec![4, 5, 6, 7],
+                gas: 100,
+                transition: transition.clone(),
+            })
+        };
         let mut slot = prepare();
         assert_eq!(
             TerminalPreflight::consume(&mut slot, &[1, 2, 3], &[4, 5, 6, 7], 100),
@@ -8808,8 +8816,115 @@ mod tests {
     }
 
     #[test]
+    fn terminal_preflight_matches_physical_output_without_bypassing_authentication_or_limits() {
+        let (mut input, before, published) = scripted_attested_transition(0xb1);
+        let ReplayOperation::CleanInvoke { context, work, .. } = &mut input.operation else {
+            unreachable!()
+        };
+        *context = crate::agent_sdk::RuntimeExecutionContext::Direct;
+        let gas = DEFAULT_MANAGEMENT_GAS.saturating_add(work.gas);
+        let mut sdk_work =
+            crate::agent_sdk::RuntimeWork::decode(&published.canonical_work).unwrap();
+        let crate::agent_sdk::RuntimeWork::Invoke { context, .. } = &mut sdk_work else {
+            unreachable!()
+        };
+        *context = crate::agent_sdk::RuntimeExecutionContext::Direct;
+        let encoded = sdk_work.encode().unwrap();
+        let runtime = super::super::package_admission::admitted_scripted_runtime_for_test(
+            "terminal-preflight-equivalence",
+            0xb2,
+            vec![super::super::package_admission::ScriptedRuntimeCase {
+                input: encoded.clone(),
+                output: published.canonical_transition,
+                copies: Vec::new(),
+            }],
+        );
+        let resolver = SuppliedCatalogBlobResolver::from_catalog(&[]).unwrap();
+        let trust: Arc<dyn AgentTrustProvider> = Arc::new(StaticTrust {
+            slot: Some(20),
+            authority: None,
+            trust_packages: false,
+        });
+        let merge: Arc<dyn LocalMergeAuthenticator> = Arc::new(StaticMerge(NodeId([0xb3; 32])));
+        let mut executor = StandardLocalReplayExecutor::new(resolver, trust, merge);
+        let transition: crate::agent_sdk::RuntimeTransition = executor
+            .execute_agent_wire(runtime.program_bytes(), gas, &encoded)
+            .unwrap();
+        let candidate = || {
+            Some(TerminalPreflight {
+                runtime_pvm: runtime.program_bytes().to_vec(),
+                input: encoded.clone(),
+                gas,
+                transition: transition.clone(),
+            })
+        };
+        let position = ReplayPosition::Merge {
+            id: MergeEventId([0xb4; 32]),
+            causal_height: 1,
+            ordered_base: super::super::journal::OrderedBase::post_genesis(),
+        };
+        *executor.terminal_preflight.get_mut().unwrap() = candidate();
+        assert!(
+            matches!(
+                executor.execute(&input, &before, position),
+                Err(LocalReplayExecutorError::InvalidAuthority)
+            ),
+            "prepared computation must not grant an authentication capability"
+        );
+
+        // Exercise the post-authentication execution helper directly, just as
+        // the Attested provider tests do. Only the first call can consume reuse.
+        let cached = executor
+            .execute_clean_invocation_transition(
+                &input,
+                &before,
+                position,
+                ReplayTransitionProofAccess::PublishedOnly,
+                runtime.program_bytes(),
+                super::super::execution::MAX_RUNTIME_STATE_BYTES,
+                false,
+            )
+            .unwrap();
+        assert!(executor.terminal_preflight.get_mut().unwrap().is_none());
+        let cached_outcome = executor.take_clean_invocation_result(input.id()).unwrap();
+        let physical = executor
+            .execute_clean_invocation_transition(
+                &input,
+                &before,
+                position,
+                ReplayTransitionProofAccess::PublishedOnly,
+                runtime.program_bytes(),
+                super::super::execution::MAX_RUNTIME_STATE_BYTES,
+                false,
+            )
+            .unwrap();
+        assert_eq!(cached, physical);
+        assert_eq!(
+            cached_outcome,
+            executor.take_clean_invocation_result(input.id()).unwrap()
+        );
+        assert_eq!(cached_outcome, transition.outcome);
+
+        *executor.terminal_preflight.get_mut().unwrap() = candidate();
+        assert!(matches!(
+            executor.execute_clean_invocation_transition(
+                &input,
+                &before,
+                position,
+                ReplayTransitionProofAccess::PublishedOnly,
+                runtime.program_bytes(),
+                0,
+                false,
+            ),
+            Err(LocalReplayExecutorError::RuntimeStateTooLarge)
+        ));
+        assert!(executor.terminal_preflight.get_mut().unwrap().is_none());
+    }
+
+    #[test]
     fn standard_executor_consumes_exact_verified_binding_once_and_reuses_published_merge_work() {
         let (input, before, published) = scripted_attested_transition(0xc1);
+        let hostile_preflight_input = published.canonical_work.clone();
         let prepare_calls = Arc::new(AtomicU64::new(0));
         let published_calls = Arc::new(AtomicU64::new(0));
         let provider = ScriptedAttestedProvider {
@@ -8831,6 +8946,19 @@ mod tests {
         let mut executor = StandardLocalReplayExecutor::new(resolver, trust, merge);
         executor.replace_attested_transition_provider(Box::new(provider));
         executor.begin_transition_proof_batch();
+        // Even a test-injected exact Attested tuple must not bypass the proof
+        // provider. Production preflight only prepares Direct work.
+        *executor.terminal_preflight.get_mut().unwrap() = Some(TerminalPreflight {
+            runtime_pvm: Vec::new(),
+            input: hostile_preflight_input,
+            gas: DEFAULT_MANAGEMENT_GAS + 100,
+            transition: crate::agent_sdk::RuntimeTransition {
+                state: crate::agent_sdk::RuntimeState::default(),
+                outcome: crate::agent_sdk::RuntimeOutcome::Completed(Err(
+                    crate::agent_sdk::InvocationError::NotFound,
+                )),
+            },
+        });
 
         let first_position = ReplayPosition::Merge {
             id: MergeEventId([0xc3; 32]),
