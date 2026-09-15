@@ -2,6 +2,26 @@
 
 ## Checkpoint and decision
 
+Release qualification at `f79f0e3d`: locked offline CLI release build passes
+in 7m44s and now includes issuer validation reuse. Fresh `issuer-reuse-smoke`
+creation generated HTTP and SSH ingress configuration without manual enabling;
+only test ports changed to 18099/2241. First startup/restart passed in 30/44s,
+with HTTP status `ok`, identical SSH host keys, and successful SIGINT shutdown
+within the smoke's five-second allowance after both runs. The diagnostic smoke
+permits 180s readiness; the unchanged 10s production startup gate still fails.
+The concurrent feature suite makes these timings unsuitable for a controlled
+performance comparison. Ordinary Create/Install latency is not requalified.
+`release bundle` and `release verify` both pass with the unchanged `79c7d1f0…`
+runtime pin. Evidence, rerunnable scripts, generated original config, preserved
+previous executable, bundle, logs and executable SHA-256 are in shared target
+`task-tmp/issuer-reuse-release.QR6Y4x/`. New executable SHA-256:
+`317c92505ea7e1cf640b3e0da5a66851c0b595fc5b57d5f6efe94925dab7ae44`.
+SpaceId: `1c041f9e9e00eaa4dbc719b45b3942851c7032cc508c6001ba7eb7574039a872`.
+Build session `88238` and smoke session `14101` are terminal; no smoke daemon
+is left running. The combined host-feature library suite remains active in
+session `12062` (`task-tmp/current-host-feature-library-suite.log`); do not
+count it as passed or launch a duplicate.
+
 Full default-feature `vos` library suite at `0bf97332` passes: 1,429 passed,
 zero failed, one ignored, 212.30s. Command: `cargo test --offline --locked
 -p vos --lib -- --test-threads=1`, with approved local sockets and disk-backed
