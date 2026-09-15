@@ -2,6 +2,19 @@
 
 ## Checkpoint and decision
 
+The reproduced Invoke-authorization candidate (`79c7d1f0…`, frozen guest source
+`aad65049`) is now pinned consistently in the production manifest, protocol
+ProgramId, CLI build checksum and bundled PVM. Candidate Attested public-output
+binding and restart-lineage checks passed before pinning (2.76s). After pinning,
+all 18 CLI release-pin tests passed (1.28s), and all six feature-enabled physical
+runtime integration tests passed with zero ignored. Logs are in shared target
+`task-tmp/invoke-authorization-candidate.PGfgHq/post-pin-cli.log` and
+`post-pin-physical.log`. The ABI and system templates are unchanged. A new
+release CLI build and fresh-space smoke are still required: the existing
+release executable and disposable spaces use the previous `db577aff…` pin.
+Do not relabel those spaces to the new ProgramId. Full proof qualification,
+production latency and the other original release gates remain open.
+
 Invoke candidate reproduction at frozen source `aad6504974307698bd0484f65f29c5191832fe6a`:
 two separate source/target/tmp guest builds passed in 29.88/30.46s, with
 byte-identical ELF and PVM outputs. Frozen builder remains the previously
