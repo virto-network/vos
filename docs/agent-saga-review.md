@@ -9048,6 +9048,61 @@ The multi-minute live workflows and the remaining finality/recovery/release
 gates remain open. Avoid interpreting these narrowly passing tests as a fresh
 live campaign or a completed final release matrix.
 
+### Expiry recovery boundary audit (C2, abort remains unimplemented)
+
+Two new regression boundaries distinguish exact historical recovery from fresh
+application after expiry:
+
+- Coordinator approval followed by a receipt-signing or acknowledgement-signing
+  failure is reopened from retained stores. Changing its issuance slot to
+  `requested_expires_at + 1` is rejected without changing either store, commit
+  counts, dispatch counts or signer counts. A successor remains blocked by the
+  pending operation. Recovery with the original immutable tuple succeeds, and
+  another reopen returns identical evidence without signing/dispatching again.
+  This is a coordinator/fake-dispatch test, **not** fresh application of an
+  expired receipt or an authenticated advance of the live clock.
+- The actual bundled runtime receives a previously unseen invocation observed
+  after the signed receipt expiry. It returns non-durable `AuthorityExpired`
+  with byte-identical state, both initially and after canonical restore. It
+  retains neither an actor reply nor a typed-error outcome. Full guest output
+  matches source dispatch; it cannot be counted as terminal delivery.
+
+The bounded coordinator/compiled-expiry group passes **25 tests, zero failures**
+in 3.12 s (`post-approval-expiry-bounded.log`, under shared C2 `target/task-tmp`).
+The original 26-test run was deliberately interrupted after more than ten
+minutes of active CPU in the 256-record capacity case; its log is preserved as
+`post-approval-expiry-and-runtime.log`. The bounded rerun explicitly excludes
+that case. Capacity is deferred, not passed or waived. No production behavior,
+artifact or timeout changed.
+
+The outstanding gate is still **post-issuance expiry/abort resolution**. SDK
+issuance retirement evidence is not proof of application retirement, and the
+system authority's pending-application checks must not be bypassed. Closing this
+requires a durable, authenticated terminal resolution bound to the exact work,
+proof that subsequent application cannot occur, and native/client recovery that
+releases the reservation only after that resolution is retained and verified.
+An expired rejection, deleting a store, or reusing a fresh issuance slot is not
+such evidence. Live expiry/abort and mixed-pending gates remain open.
+
+The historical-response regression now covers `AuthorityExpired`,
+`InvalidAuthorization` and `StaleContinuation` alongside `ResultCapacity`.
+Each preserves the exact stored request/response and refuses to create an ACK
+progress step. The targeted CLI test passes (0.04 s), evidence in shared C2
+`target/task-tmp/expiry-client-preservation.log`. This does not turn any of those
+non-durable rejections into completed delivery or authorize reservation release.
+
+Tracing the native completion path confirms NOC1 certifies the Authority's
+authorization/issuance result pair, not application retirement. The current SDK
+has Invoke/Resume/Acknowledge/Manage but no terminal abort/expiry work outcome.
+Runtime ACK requires a retained result; client retirement requires a positive
+bound ACK. These protections must remain intact.
+
+Continue with the durable expiry/abort resolution described above, inside C2;
+do not open another optimization or review batch. These source tests are not
+that missing implementation. Post-issuance expiry/abort, mixed-pending, finality
+and production latency remain release blockers. All test processes from this
+checkpoint are stopped; no daemon was started and no artifact repin is needed.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

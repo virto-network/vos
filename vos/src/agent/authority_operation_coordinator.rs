@@ -2607,6 +2607,117 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn post_approval_expired_rebase_preserves_pending_evidence_after_reopen() {
+        for fail_acknowledgement in [false, true] {
+            let coordinator_store = MemoryImageStore::default();
+            let issuer_store = MemoryImageStore::default();
+            let mut signer = CountingSigner::new(0x19);
+            let fixture = Fixture::new(&signer);
+            let dispatcher = FakeDispatcher::new(fixture.authority);
+            let call = fixture.call(1);
+            let context = fixture.context(&call, 20);
+            signer.fail_receipt = !fail_acknowledgement;
+            signer.fail_acknowledgement = fail_acknowledgement;
+            let mut coordinator = open(
+                coordinator_store.clone(),
+                issuer_store.clone(),
+                dispatcher.clone(),
+                &fixture,
+            );
+            assert!(matches!(
+                coordinator.coordinate(&call, context, 20, &mut signer),
+                Err(AuthorityOperationCoordinatorError::Issuer(
+                    AuthorityOperationIssuerError::Signer(TestSignerError)
+                ))
+            ));
+            drop(coordinator);
+            let mut reopened = open(
+                coordinator_store.clone(),
+                issuer_store.clone(),
+                dispatcher.clone(),
+                &fixture,
+            );
+            let before = (
+                coordinator_store.image(),
+                issuer_store.image(),
+                coordinator_store.commits(),
+                issuer_store.commits(),
+                dispatcher.counts(),
+                signer.receipt_calls,
+                signer.acknowledgement_calls,
+            );
+            assert!(matches!(
+                reopened.coordinate(&call, context, call.requested_expires_at + 1, &mut signer),
+                Err(AuthorityOperationCoordinatorError::Rejected(
+                    AuthorityOperationCoordinatorRejection::InvalidIssuanceSlot
+                ))
+            ));
+            assert_eq!(
+                (
+                    coordinator_store.image(),
+                    issuer_store.image(),
+                    coordinator_store.commits(),
+                    issuer_store.commits(),
+                    dispatcher.counts(),
+                    signer.receipt_calls,
+                    signer.acknowledgement_calls
+                ),
+                before
+            );
+            let successor = fixture.call(2);
+            assert!(matches!(
+                reopened.coordinate(&successor, fixture.context(&successor, 20), 20, &mut signer),
+                Err(AuthorityOperationCoordinatorError::Rejected(
+                    AuthorityOperationCoordinatorRejection::PendingOperation
+                ))
+            ));
+            assert_eq!(
+                (
+                    coordinator_store.image(),
+                    issuer_store.image(),
+                    coordinator_store.commits(),
+                    issuer_store.commits(),
+                    dispatcher.counts(),
+                    signer.receipt_calls,
+                    signer.acknowledgement_calls
+                ),
+                before
+            );
+            // Recovery uses the saved acceptance tuple; this is not fresh
+            // application with an expired receipt or permission to rebase it.
+            let issued = reopened
+                .coordinate(&call, context, 20, &mut signer)
+                .unwrap();
+            let counts = (
+                dispatcher.counts(),
+                signer.receipt_calls,
+                signer.acknowledgement_calls,
+            );
+            drop(reopened);
+            let mut completed = open(
+                coordinator_store,
+                issuer_store,
+                dispatcher.clone(),
+                &fixture,
+            );
+            assert_eq!(
+                completed
+                    .coordinate(&call, context, 20, &mut signer)
+                    .unwrap(),
+                issued
+            );
+            assert_eq!(
+                (
+                    dispatcher.counts(),
+                    signer.receipt_calls,
+                    signer.acknowledgement_calls
+                ),
+                counts
+            );
+        }
+    }
+
+    #[test]
     fn signer_failures_resume_after_exact_actor_approval_revalidation() {
         for fail_acknowledgement in [false, true] {
             let coordinator_store = MemoryImageStore::default();

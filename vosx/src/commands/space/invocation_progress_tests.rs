@@ -224,32 +224,39 @@ fn progress_requires_exact_predecessors_and_monotonic_publication() {
 
 #[test]
 fn historical_non_durable_response_is_preserved_without_creating_an_acknowledgement() {
-    let (request, _, _) = fixture();
-    let call = AgentInvocationRequest::decode(&request).unwrap();
-    let response = AgentInvocationResponse::Direct {
-        request: call.commitment(),
-        outcome: RuntimeOutcome::Completed(Err(InvocationError::ResultCapacity)),
+    for rejection in [
+        InvocationError::ResultCapacity,
+        InvocationError::AuthorityExpired,
+        InvocationError::InvalidAuthorization,
+        InvocationError::StaleContinuation,
+    ] {
+        let (request, _, _) = fixture();
+        let call = AgentInvocationRequest::decode(&request).unwrap();
+        let response = AgentInvocationResponse::Direct {
+            request: call.commitment(),
+            outcome: RuntimeOutcome::Completed(Err(rejection)),
+        }
+        .encode()
+        .unwrap();
+        let root = directory();
+        let path = root.join("delivery");
+        let mut store = CleanInvocationFile::open_or_create(&path).unwrap();
+        store.publish_request(&request).unwrap();
+        store.publish_response(&response).unwrap();
+        drop(store);
+        let error = continue_retained(&path, "127.0.0.1:1".parse().unwrap()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("non-durable invocation rejection {rejection:?}"))
+        );
+        let mut reopened = CleanInvocationFile::open_or_create(&path).unwrap();
+        assert_eq!(reopened.load_request().unwrap(), Some(request));
+        assert_eq!(reopened.load_response().unwrap(), Some(response));
+        assert!(reopened.load_progress().unwrap().is_none());
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
     }
-    .encode()
-    .unwrap();
-    let root = directory();
-    let path = root.join("delivery");
-    let mut store = CleanInvocationFile::open_or_create(&path).unwrap();
-    store.publish_request(&request).unwrap();
-    store.publish_response(&response).unwrap();
-    drop(store);
-    let error = continue_retained(&path, "127.0.0.1:1".parse().unwrap()).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("non-durable invocation rejection ResultCapacity")
-    );
-    let mut reopened = CleanInvocationFile::open_or_create(&path).unwrap();
-    assert_eq!(reopened.load_request().unwrap(), Some(request));
-    assert_eq!(reopened.load_response().unwrap(), Some(response));
-    assert!(reopened.load_progress().unwrap().is_none());
-    drop(reopened);
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
