@@ -2,6 +2,25 @@
 
 ## Checkpoint and decision
 
+Invoke candidate reproduction at frozen source `aad6504974307698bd0484f65f29c5191832fe6a`:
+two separate source/target/tmp guest builds passed in 29.88/30.46s, with
+byte-identical ELF and PVM outputs. Frozen builder remains the previously
+qualified `r17-release-candidate.fNbf43/builder/vosx`. Candidate ProgramId is
+`79c7d1f0ed2feff40eaca198951656c705d687ab83bbd581a8895a13db0022a7`;
+ELF BLAKE2b-256 `4d7f50c53208f69fea06a670895dd211dfcf08fda4c2f5d02b244a5bc7e5e90c`;
+PVM BLAKE2b-256 `5e2a82c86cccb70b7320487b8e627d879b78924de2a6774670b4dd03ee96ff8b`.
+Six candidate-selected tests passed (5.09s), covering physical terminal-failure
+lifecycle, two typed-error retirements, unseen expiry, retired Invoke, and
+fail-closed ACK errors. The baseline lifecycle also passed (2.46s). Both guest
+versions match the entire source transition in the fixed lifecycle cases.
+The first 6,049-byte Invoke consumed 40,164,903 gas on the current pin versus
+36,041,920 on the candidate (10.3% less); corresponding ACK gas is unchanged.
+This is a fixed-fixture gas result, not startup/Create/Install latency proof.
+Evidence: shared target `task-tmp/invoke-authorization-candidate.PGfgHq/`
+(`build.sh`, two build/identity logs, `physical-tests.log`,
+`baseline-lifecycle.log`). Candidate remains unpinned pending remaining
+artifact/integration qualification; the previously qualified CLI is unchanged.
+
 Invoke authorization candidate: `apply_clean_invoke` no longer calls full
 authorization verification immediately before `recover_clean_invocation_error`,
 whose first operation is the identical full verification on unchanged arguments
