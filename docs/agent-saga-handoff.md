@@ -2,6 +2,31 @@
 
 ## Checkpoint and decision
 
+Targeted startup-smoke diagnosis used existing logging only; no source or
+deadline change. With `RUST_LOG=info,vosx::commands::space::clean_startup=debug,
+vos::agent::local_journal_driver=debug`, the isolated fresh-space test again
+failed its10s endpoint deadline (test11.16s). Cumulative clean-startup phases:
+bootstrap material89ms, lifecycle discovery93ms, operation admission107ms,
+system owner7,254ms, admin recovery7,254ms, Local host7,256ms, lifecycle
+controller7,257ms. `production_ready` was not reached. Source places the
+remaining wait inside `node.start_clean_local_agent_production`; it is not a
+delay in configuration generation or discovery. Two completed large runtime
+calls before `system_owner` took1,503,768us and1,516,560us, with771,614/782,000
+input bytes. Later logs show small calls and retry lookups before the deadline;
+they do not report a completed large invocation in that final partial stage.
+Do not attribute the unmeasured interval to one specific runtime subtype.
+
+Evidence: `task-tmp/prepared-runtime-startup-phase-regression.log`; session72049
+is terminal101. Failing directories remain at original paths under shared
+task-tmp: `vosx-shutdown-427703-data-1789493555590592188` and
+`vosx-shutdown-427703-config-1789493555590691458`. The diagnostic run preserved
+the prior failure as well. Post-run inspection found no vosx or cargo process.
+Next performance diagnosis should separate bundled system-owner bootstrap work
+from initial production reconciliation, preserving authenticated completion
+before readiness. Do not publish an endpoint early to bypass this gate.
+
+### CLI qualification
+
 Current CLI qualification on HEAD `04454ef0` (production implementation still
 `206ea1e3`): unit/binary suite255 passed, zero failed,19 ignored,70.78s
 (build50.41s). Separate integration targets: actor-build4 passed24.21s;
