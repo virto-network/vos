@@ -2,6 +2,22 @@
 
 ## Checkpoint and decision
 
+Terminal preflight reuse candidate: the host executor now retains at most one
+completed Direct terminal-admission transition, matching full runtime program
+bytes, canonical work bytes and gas before one-shot consumption by authenticated
+replay. Mismatches consume the candidate and execute normally; other replay
+operation kinds clear it. Restart starts empty. Attested execution still uses
+the proof provider, and all existing transition/resource/publication checks
+remain after reuse. Guest artifacts and checkpoint formats are unchanged.
+The locked offline test build completed in 2m11s. Four focused tests passed
+in 12.36s: exact-byte/gas/runtime substitution and single-use behavior, physical
+pending projection Invoke/ACK recovery, checkpoint-failure gate recovery, and
+existing Attested proof-binding consumption. Evidence in shared target
+`task-tmp/terminal-preflight-build-test.log` and
+`task-tmp/terminal-preflight-recovery-tests.log`. This is provisional: a fresh
+release binary and physical reuse-count/output/latency comparison are still
+required; the previously qualified CLI does not contain this host change.
+
 Feature-enabled physical qualification at source `4b3a8c54`: all six
 `agent_runtime_pvm` integration tests pass (6.19s, zero ignored), explicitly
 including compiled-guest Attested Invoke/Resume and install-lineage restart.

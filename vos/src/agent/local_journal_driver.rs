@@ -1203,6 +1203,29 @@ pub(crate) struct StandardLocalReplayExecutor<R> {
     allow_attested_preparation: bool,
     pending_transition_proof: Option<PendingReplayTransitionProof>,
     staged_transition_proofs: Vec<StagedTransitionProof>,
+    terminal_preflight: std::sync::Mutex<Option<TerminalPreflight>>,
+}
+
+/// One local computation, never durable evidence or an authentication cache.
+/// Canonical input includes all state lanes, authorization and blob preimages.
+struct TerminalPreflight {
+    runtime_pvm: Vec<u8>,
+    input: Vec<u8>,
+    gas: Gas,
+    transition: crate::agent_sdk::RuntimeTransition,
+}
+
+impl TerminalPreflight {
+    fn consume(
+        slot: &mut Option<Self>,
+        runtime_pvm: &[u8],
+        input: &[u8],
+        gas: Gas,
+    ) -> Option<crate::agent_sdk::RuntimeTransition> {
+        let prepared = slot.take()?;
+        (prepared.runtime_pvm == runtime_pvm && prepared.input == input && prepared.gas == gas)
+            .then_some(prepared.transition)
+    }
 }
 
 /// One-shot capability minted by [`ReplayExecutor::authenticate`] and consumed
@@ -1698,6 +1721,17 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             }
         );
         let mut pending_transition_proof = None;
+        // This function is reached only after ReplayExecutor consumed the
+        // authentication capability. Reuse is computational only: every
+        // transition, resource, outcome and publication check below still runs.
+        let preflight = TerminalPreflight::consume(
+            self.terminal_preflight
+                .get_mut()
+                .map_err(|_| LocalReplayExecutorError::InvalidState)?,
+            runtime_pvm,
+            &encoded,
+            self.management_gas.saturating_add(work.gas),
+        );
         let returned: crate::agent_sdk::RuntimeTransition = if attested {
             let provider = self
                 .attested_transition_provider
@@ -1762,6 +1796,9 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
                 publication: publication.publication(),
                 staged,
             });
+            transition
+        } else if let Some(transition) = preflight {
+            tracing::debug!("consumed exact single-use terminal preflight transition");
             transition
         } else {
             #[cfg(all(test, feature = "pvm"))]
@@ -2015,6 +2052,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             allow_attested_preparation: false,
             pending_transition_proof: None,
             staged_transition_proofs: Vec::new(),
+            terminal_preflight: std::sync::Mutex::new(None),
         }
     }
 
@@ -2047,6 +2085,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             allow_attested_preparation: false,
             pending_transition_proof: None,
             staged_transition_proofs: Vec::new(),
+            terminal_preflight: std::sync::Mutex::new(None),
         }
     }
 
@@ -2259,7 +2298,7 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         binding: &RuntimeBinding,
     ) -> Result<bool, LocalReplayExecutorError> {
         Ok(self
-            .clean_invocation_terminal_outcome(operation, state, binding)?
+            .clean_invocation_terminal_preflight(operation, state, binding, true)?
             .is_some())
     }
 
@@ -2269,6 +2308,22 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         state: &RuntimeState,
         binding: &RuntimeBinding,
     ) -> Result<Option<crate::agent_sdk::RuntimeOutcome>, LocalReplayExecutorError> {
+        self.clean_invocation_terminal_preflight(operation, state, binding, false)
+    }
+
+    fn clean_invocation_terminal_preflight(
+        &self,
+        operation: &ReplayOperation,
+        state: &RuntimeState,
+        binding: &RuntimeBinding,
+        retain: bool,
+    ) -> Result<Option<crate::agent_sdk::RuntimeOutcome>, LocalReplayExecutorError> {
+        if retain {
+            self.terminal_preflight
+                .lock()
+                .map_err(|_| LocalReplayExecutorError::InvalidState)?
+                .take();
+        }
         let ReplayOperation::CleanInvoke {
             context: crate::agent_sdk::RuntimeExecutionContext::Direct,
             work,
@@ -2291,15 +2346,15 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             authorization: Box::new(authorization.clone()),
             observed_slot: *observed_slot,
         };
+        let encoded = runtime_work
+            .encode()
+            .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
         #[cfg(all(test, feature = "pvm"))]
         let returned: crate::agent_sdk::RuntimeTransition =
             if self.trust.use_native_clean_runtime_for_test() {
                 super::wire::apply_standard_runtime_work(runtime_work)
                     .map_err(|_| LocalReplayExecutorError::RuntimeOutput)?
             } else {
-                let encoded = runtime_work
-                    .encode()
-                    .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
                 self.execute_agent_wire(
                     runtime.program_bytes(),
                     self.management_gas.saturating_add(work.gas),
@@ -2308,15 +2363,22 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             };
         #[cfg(any(not(test), all(test, not(feature = "pvm"))))]
         let returned: crate::agent_sdk::RuntimeTransition = {
-            let encoded = runtime_work
-                .encode()
-                .map_err(|_| LocalReplayExecutorError::InvalidRequest)?;
             self.execute_agent_wire(
                 runtime.program_bytes(),
                 self.management_gas.saturating_add(work.gas),
                 &encoded,
             )?
         };
+        if retain && matches!(returned.outcome, crate::agent_sdk::RuntimeOutcome::Completed(_)) {
+            *self.terminal_preflight
+                .lock()
+                .map_err(|_| LocalReplayExecutorError::InvalidState)? = Some(TerminalPreflight {
+                runtime_pvm: runtime.program_bytes().to_vec(),
+                input: encoded,
+                gas: self.management_gas.saturating_add(work.gas),
+                transition: returned.clone(),
+            });
+        }
         Ok(match returned.outcome {
             outcome @ crate::agent_sdk::RuntimeOutcome::Completed(_) => Some(outcome),
             _ => None,
@@ -3600,6 +3662,18 @@ impl<R: CatalogBlobResolver> ReplayExecutor for StandardLocalReplayExecutor<R> {
         transition_proof_access: ReplayTransitionProofAccess,
         journal_context: Option<RuntimeJournalContext>,
     ) -> Result<ReplayTransition, Self::Error> {
+        if !matches!(
+            &input.operation,
+            ReplayOperation::CleanInvoke {
+                context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                ..
+            }
+        ) {
+            self.terminal_preflight
+                .get_mut()
+                .map_err(|_| LocalReplayExecutorError::InvalidState)?
+                .take();
+        }
         let authenticated = self
             .authenticated_execution
             .take()
@@ -6797,6 +6871,47 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_preflight_reuse_is_exact_and_single_use() {
+        let transition = crate::agent_sdk::RuntimeTransition {
+            state: crate::agent_sdk::RuntimeState::default(),
+            outcome: crate::agent_sdk::RuntimeOutcome::Completed(Err(
+                crate::agent_sdk::InvocationError::NotFound,
+            )),
+        };
+        let prepare = || Some(TerminalPreflight {
+            runtime_pvm: vec![1, 2, 3],
+            input: vec![4, 5, 6, 7],
+            gas: 100,
+            transition: transition.clone(),
+        });
+        let mut slot = prepare();
+        assert_eq!(
+            TerminalPreflight::consume(&mut slot, &[1, 2, 3], &[4, 5, 6, 7], 100),
+            Some(transition.clone())
+        );
+        assert!(TerminalPreflight::consume(&mut slot, &[1, 2, 3], &[4, 5, 6, 7], 100).is_none());
+
+        for offset in 0..4 {
+            let mut input = vec![4, 5, 6, 7];
+            input[offset] ^= 1;
+            let mut slot = prepare();
+            assert!(TerminalPreflight::consume(&mut slot, &[1, 2, 3], &input, 100).is_none());
+            assert!(slot.is_none(), "a mismatch must consume the candidate");
+        }
+        for (runtime, input, gas) in [
+            (vec![1, 2, 4], vec![4, 5, 6, 7], 100),
+            (vec![1, 2, 3, 0], vec![4, 5, 6, 7], 100),
+            (vec![1, 2, 3], vec![4, 5, 6], 100),
+            (vec![1, 2, 3], vec![4, 5, 6, 7, 0], 100),
+            (vec![1, 2, 3], vec![4, 5, 6, 7], 101),
+        ] {
+            let mut slot = prepare();
+            assert!(TerminalPreflight::consume(&mut slot, &runtime, &input, gas).is_none());
+            assert!(slot.is_none());
+        }
+    }
 
     use super::super::authority::{
         ActorInvocationClaim, AgentAuthorityBinding, AgentAuthorityClaim,
