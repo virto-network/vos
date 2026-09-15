@@ -8071,6 +8071,110 @@ Final CLI regression: **252 passed / 12 ignored / zero failures** (62.99s;
 space was started or modified for this profiling checkpoint, and no profiler,
 test or build process is left running.
 
+### Management admission capacity diagnostics (C2, investigation only)
+
+The two authorization-preparation `CapacityExhausted` responses in
+`admin-startup-smoke.hJuDDq/up-1.log` cannot be attributed to a specific budget
+from the retained logs. The native initial-capture path reserves the complete
+authorization/ACK lifecycle plus conservative finalization/ACK headroom before
+publishing the immutable management intent. It can reject either the composite
+replay suffix budget or the remaining Ordered log slots; both previously
+returned the same unqualified error.
+
+The coordinator now logs `limit=replay_headroom` versus `limit=ordered_slots`,
+along with the public Agent ID, initial/extension and retained-retry flags,
+applied/remaining slots and pending/retiring counts. Slot exhaustion also logs
+the required slot count including its existing safety margin. No signed
+request, credential, message, or envelope bytes are logged. Admission limits,
+callback ordering, retained envelopes and HTTP responses are unchanged.
+
+The read-only projection path has a bounded certified-checkpoint retry, while
+initial management capture has no corresponding retry. This is a candidate
+gap, not a demonstrated cause of the historical errors. In particular, a
+projection-pair budget check does not establish that the larger management
+reservation fits. Do not simply wrap capture in that retry or rebase a retained
+authorization clock. The next equivalent live campaign must identify the
+failed budget before selecting a checkpoint change, and then verify exact
+retained recovery and end-to-end timing. No live space was modified during
+this investigation; the capacity and production-latency gates remain open.
+
+Validation: focused `native_operation_` regressions **9 passed / zero failures**
+(90.60s), including admission reopen, retained policy/issuance, denial and
+partial retirement recovery. Normal vosx build passes (15.18s), as do formatting
+and whitespace checks. Evidence in disk-backed `target/task-tmp`:
+`management-capacity-native-operation.log` and
+`management-capacity-vosx-build.log`. These are regression checks, not a
+reproduction of either capacity rejection or a live latency measurement.
+
+### Live capacity probe after native helper inlining (C2)
+
+Restarted only the existing disposable `admin-startup-smoke.hJuDDq` space with
+the capacity diagnostics enabled. Added an explicit ignored-fixture
+`capacity-probe` phase using new invocation nonce `0x77` repeated 32 times;
+earlier signed intents and reservations were not edited. The input generator
+first refused before daemon readiness, with no request written; after readiness
+it passed and created the new package-policy-validated LocalSigner intent.
+
+- Restore: network start **00:58:34.789 UTC**, ready **01:01:37.125 UTC** on
+  2026-09-15, approximately **182.34s**. History includes the prior revoke/regrant
+  campaign, so this is not an equivalent-history before/after comparison.
+- Fresh protected invocation: **01:02:08–01:04:11 UTC**, **123s**, first attempt.
+  Verified signature and exact retained retirement (verifier 0.06s); issued,
+  decision retained, delivery retired, reservation not pending. Exact cached
+  retry returned identical normalized JSON before shutdown was requested.
+- **No capacity failure reproduced.** This does not explain or close the two
+  historical authorization-preparation failures. Do not infer that helper
+  inlining repaired admission or that two-minute execution is acceptable.
+- Ten-second restore CPU sample (99Hz): main-core samples **54.11%** in
+  `blake2b_simd::avx2::compress1_loop`, **23.12%** in interpreter `run_inner`,
+  **3.18%** in conformance `tick`, **2.26%** in conformance `dispatch_one`.
+  Only three efficiency-core samples were collected and are not representative.
+  Frame-pointer unwinding did not identify the hashing callers reliably; this
+  sample identifies a hotspot, not the responsible validation layer. Both
+  BLAKE2 and PVM already have optimized dev-profile package overrides.
+
+Evidence: `up-capacity.log`, `inputs-capacity.log` (early refusal),
+`inputs-capacity-ready.log`, `capacity-timing.log`, `capacity-attempt-1.json`,
+`protected-invoke-capacity.json`, `verify-capacity.log`, `capacity-cached.json`
+inside the disposable fixture. CPU evidence is in disk-backed task-tmp
+`capacity-restore.perf` and `capacity-restore-perf.log`. No RAMFS scratch was
+created. Next C2 action: isolate the restore hashing callers and construct a
+repeatable initial-management admission boundary case before changing
+checkpoint behavior. Production latency and admission gates remain open.
+
+Shutdown: SIGTERM was sent at **01:04:33 UTC** to the exact daemon PID 3646916.
+The CLI's five-second observation window expired, but the original foreground
+session subsequently exited **0**, without force or restart. All campaign,
+profiler, build and daemon handles from this probe are terminal. Formatting
+and whitespace checks pass; no additional full release matrix is claimed.
+
+### Restore phase sampling follow-up (C2)
+
+Reopened the same disposable space after the capacity-probe invocation and
+clean shutdown, without submitting another operation. Network started at
+**01:06:25 UTC**, ready at **01:07:57.097 UTC** on 2026-09-15 (about **91s**).
+This is different durable history from the preceding 182s restore; do not
+attribute the difference to a code speedup (the daemon binary was unchanged).
+The next latency comparison needs an identical saved journal baseline.
+
+Ten-second DWARF-stack samples at 49Hz show phase variation: early main-core
+samples were **76.09%** interpreter `run_inner`; later samples were **38.82%**
+interpreter, **33.52%** BLAKE2 compression, **4.15%** conformance `tick`, and
+**3.90%** conformance `dispatch_one`. Neither sample reliably resolved the
+hashing call chain: the report contains unknown frames and an addr2line debug
+record warning. Thus the earlier 54% hashing sample is not a whole-restore
+breakdown and does not justify removing any particular validation pass.
+
+Evidence: fixture `up-restore-callers.log`; disk-backed task-tmp
+`restore-callers.perf`, `restore-callers-report.log`,
+`restore-callers-hash.perf`. A larger-stack sample attempt exited 255 without
+diagnostics and is not evidence; the subsequent 16KiB-stack sample completed.
+The space was stopped with SIGTERM; the CLI confirmed clean exit and the
+original daemon session exited 0. No live profiler or daemon remains.
+No runtime, guest artifact, validation rule, or admission behavior changed in
+this sampling follow-up. The C2 capacity diagnostics and protected probe are
+one scoped review unit, not an additional release batch.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

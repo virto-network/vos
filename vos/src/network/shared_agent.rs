@@ -1283,9 +1283,34 @@ impl SharedRouteHandler {
                 &pending_management_refs(&combined),
                 &retiring.iter().flatten().collect::<Vec<_>>(),
             )?
-        }
-        .ok_or(SharedAgentHostError::CapacityExhausted)?;
+        };
+        let Some(required) = required else {
+            tracing::warn!(
+                agent = ?self.agent,
+                initial = predecessor.is_none(),
+                retained = existing.is_some(),
+                applied_slots,
+                remaining_slots,
+                pending_members = combined.len(),
+                retiring_pairs = retiring.len(),
+                limit = "replay_headroom",
+                "management admission capacity exhausted"
+            );
+            return Err(SharedAgentHostError::CapacityExhausted);
+        };
         if remaining_slots < required as u64 + 1 {
+            tracing::warn!(
+                agent = ?self.agent,
+                initial = predecessor.is_none(),
+                retained = existing.is_some(),
+                applied_slots,
+                remaining_slots,
+                required_slots = required as u64 + 1,
+                pending_members = combined.len(),
+                retiring_pairs = retiring.len(),
+                limit = "ordered_slots",
+                "management admission capacity exhausted"
+            );
             return Err(SharedAgentHostError::CapacityExhausted);
         }
         proposal.management_pending = Some(keys);

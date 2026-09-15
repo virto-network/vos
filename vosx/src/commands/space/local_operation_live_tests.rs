@@ -37,6 +37,11 @@ fn protected_signer_campaign_files() -> (&'static str, &'static str, u8) {
             "protected-invoke-regranted.json",
             0x76,
         ),
+        Ok("capacity-probe") => (
+            "protected-sign-capacity.intent",
+            "protected-invoke-capacity.json",
+            0x77,
+        ),
         other => panic!("unsupported protected campaign phase: {other:?}"),
     }
 }
