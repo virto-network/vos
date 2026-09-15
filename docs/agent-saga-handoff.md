@@ -2,6 +2,47 @@
 
 ## Checkpoint and decision
 
+### Release `b7cfa17d`: fresh startup and Create
+
+The locked/offline nightly-2025-05-09 release build passed in7m08s with the
+unchanged production profile. Executable SHA-256:
+`2b9b205e82d066b66683fe9e018ae353ba160b2cfa66fee4e1fd76606a770613`.
+Its release bundle verifies and contains runtime `25bdad0f…`; authority/catalog
+template identities are unchanged. This supersedes the older executable below.
+
+A newly created isolated space automatically generated active HTTP/SSH config.
+Only ports were changed to18098/2242 for isolation. First startup reached
+readiness in21s; HTTP status was `ok` and SSH keyscan succeeded. The unchanged
+10s startup gate therefore still fails. Cumulative startup phases were:
+material36ms, discovery40ms, admission50ms, system owner5,359ms, lifecycle
+controller5,361ms and production ready20,672ms. Initial route reconciliation
+took15,180ms. These identify the remaining startup stages, not individual
+hot functions.
+
+Fresh `space create-local-agent fresh-ack-smoke` succeeded in43s without a
+timeout/resume and returned a verified creation acknowledgement for Agent
+`f7dd7306e364c65d7de953846f215675b031a0dba5af30e5f7f4415d1cf09a00`.
+Immediate post-Create SIGTERM exited successfully within1s, without forced
+cleanup. This is one shutdown observation, not universal busy-shutdown proof.
+Install and fresh invocation have not been measured on this release. Do not
+compare these fresh-history timings directly with earlier retained-history
+probes or infer that the14.74% fixed ACK gas saving explains the whole change.
+
+Evidence and exact original-path fixture:
+`target/task-tmp/fresh-ack-release.Of5a75/` in the shared target. Files include
+`build.log`, `bundle/`, `new.json`, `probe.sh`, `probe.log`, `up.log`,
+`status.json`, `ssh-key.txt`, `create.json` (CLI acknowledgement text, not JSON)
+and `create.stderr`; the previous binary is preserved as `vosx-before`.
+SpaceID: `0119ae586ab102b90dd606b390ef18d0d68a3c1422f2617f497d5bdf2cd971a1`.
+Data/config/cache remain in this directory; never relocate raw stores for boot.
+Build/probe sessions17725/70725 are terminal0; post-run process inspection
+found no vosx/cargo/rustc. No existing fixture was modified.
+
+Next bounded qualification: restart this exact fixture, measure fresh Install
+and invocation with exact retained-request retry on ambiguous outcomes, then
+update the review handoff. Startup/Create latency, ordinary Shared finality,
+authenticated reclamation and full proof/recovery/release gates remain open.
+
 ### Fresh-ACK bundled artifact qualification
 
 The fresh-ACK optimization is now in the checked-in guest. Two independent
@@ -29,8 +70,9 @@ Evidence lives in shared disk-backed
 `identity-{a,b}.log`, `cost.log`, `candidate-tests.log`, `post-pin-tests.log`,
 and `post-pin-explicit-tests.log`. Sessions10956/96781 are terminal0.
 
-The release executable still contains implementation `206ea1e3` and the old
-runtime pin. Next rebuild the release, verify its bundle and test a fresh
+At the artifact-only checkpoint, the release executable still contained
+implementation `206ea1e3` and the old runtime pin. The next step was to rebuild
+the release, verify its bundle and test a fresh
 isolated space before making any live latency claim. Preserve old-space
 fixtures at their original paths; the new ProgramId is not permission to
 rewrite existing deployment identities. Startup/Create/Install latency,

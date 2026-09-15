@@ -1,6 +1,32 @@
 # Reviewing the Agent architecture saga
 
+## Review entry point: bundled checkpoint `b7cfa17d`
+
+Use these two ranges for the current review; the older snapshot below remains
+historical evidence. No merge or push is implied by this breakdown.
+
+| Batch | Exact range | Scope and size |
+| --- | --- | --- |
+| 1 | `31b0cdbb..f79f0e3d` | Integrated clean-break architecture and lifecycle;225 files,+72,934/-58,875. |
+| 2 | `f79f0e3d..b7cfa17d` | Recovery, checkpointing, shutdown, prepared-runtime reuse, ACK validation reuse, reproduced pin and qualification;23 files,+2,115/-88. |
+
+Batch1 remains large and cannot be presented as an independently safe old C1
+cut. Batch2 contains all subsequent fixes together, not one review per commit.
+For batch2, review exact pending-binding recovery and original retry successor;
+safe-boundary shutdown; cold/prepared output and gas equivalence with fresh
+machine state; and the private fresh-ACK continuation's preceding immutable
+work validation plus retained signature/scope checks. Match the new artifact
+to immutable source and provenance. The following evidence distinguishes
+passing regressions from still-failing production gates.
+
 ## Follow-up after the frozen review snapshot
+
+Release `b7cfa17d` is now built and its bundle verified. Fresh isolated startup
+took21s (still fails10s gate), HTTP/SSH passed, fresh Create succeeded in43s
+with a verified acknowledgement and no timeout, and post-Create SIGTERM exited
+within1s. Install/invocation remain unmeasured on this release. These are not
+controlled comparisons with old retained-history probes. See the handoff for
+binary checksum, exact fixture, logs and remaining release blockers.
 
 The latest fresh-ACK optimization is now bundled: source `4a208b19`, runtime
 ProgramId `25bdad0f9a1b0ca8450338d916adc41306d9d740f68bb5b2490ab8b8b9fb3da1`.
@@ -11,9 +37,8 @@ and reduces gas14.74%; eight candidate checks and18 post-pin release checks
 pass. All six physical runtime checks pass, including the two explicit
 candidate checks (install lineage and Attested public-output binding, not
 full cryptographic proof qualification). These changes belong to batch2 below.
-The release executable has not been rebuilt with this pin: fresh-space live
-qualification and latency remeasurement remain required. No end-to-end
-speedup or production sign-off is claimed.
+The release executable now includes this pin; initial live qualification is
+above. No controlled end-to-end speedup or production sign-off is claimed.
 
 Latest performance diagnosis uses test-only instruction attribution with the
 real bundled outer runtime: large nested calls execute roughly275 million
