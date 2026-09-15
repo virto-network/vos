@@ -735,6 +735,22 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
         }) else {
             return Ok(None);
         };
+        Self::decode_retained_record(record).map(Some)
+    }
+
+    /// Decode each immutable retained record once for cross-image validation.
+    /// No index or validation fact survives this borrow or a storage reopen.
+    pub(crate) fn retained_records(
+        &self,
+    ) -> impl Iterator<
+        Item = Result<RetainedAuthorityOperation, AuthorityOperationIssuerError<B::Error>>,
+    > + '_ {
+        self.image.records.iter().map(Self::decode_retained_record)
+    }
+
+    fn decode_retained_record(
+        record: &RetainedOperation,
+    ) -> Result<RetainedAuthorityOperation, AuthorityOperationIssuerError<B::Error>> {
         let call = AuthorityOperationCall::decode(&record.call)
             .map_err(|_| AuthorityOperationIssuerError::InvalidState)?;
         let approval = AuthorityOperationApproval::decode(&record.approval)
@@ -779,14 +795,14 @@ impl<B: AuthorityOperationIssuerStore> DurableAuthorityOperationIssuer<B> {
                     .map_err(|_| AuthorityOperationIssuerError::InvalidState)?,
             }),
         };
-        Ok(Some(RetainedAuthorityOperation {
+        Ok(RetainedAuthorityOperation {
             call,
             approval,
             issued_at: record.issued_at,
             receipt,
             issuance_ack,
             private_resolution,
-        }))
+        })
     }
 
     /// Issue and retain exact receipt evidence for one actor-approved call.

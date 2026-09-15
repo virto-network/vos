@@ -905,16 +905,31 @@ fn coordinator_matches_issuer<I: AuthorityOperationIssuerStore>(
     image: &AuthorityOperationCoordinatorImage,
     issuer: &DurableAuthorityOperationIssuer<I>,
 ) -> bool {
-    let mut issuer_records = 0usize;
+    // The bounded images are immutably borrowed for this check. Decode issuer
+    // records once instead of rescanning and decoding their call prefix for
+    // every coordinator row. Consuming keys enforces one-to-one membership;
+    // no lookup state is retained across mutations or storage observations.
+    let mut issuer_records = alloc::collections::BTreeMap::new();
+    for retained in issuer.retained_records() {
+        let Ok(retained) = retained else {
+            return false;
+        };
+        if issuer_records
+            .insert(retained.call.invocation, retained)
+            .is_some()
+        {
+            return false;
+        }
+    }
+    let mut seen = alloc::collections::BTreeSet::new();
     for record in &image.records {
         let Ok(call) = AuthorityOperationCall::decode(&record.call) else {
             return false;
         };
-        let Ok(retained) = issuer.recover_retained(call.invocation) else {
+        if !seen.insert(call.invocation) {
             return false;
-        };
-        if let Some(retained) = retained {
-            issuer_records += 1;
+        }
+        if let Some(retained) = issuer_records.remove(&call.invocation) {
             if retained.call != call || retained.issued_at != record.issued_at {
                 return false;
             }
@@ -931,7 +946,7 @@ fn coordinator_matches_issuer<I: AuthorityOperationIssuerStore>(
             return false;
         }
     }
-    issuer_records == issuer.retained_operations()
+    issuer_records.is_empty()
 }
 
 fn retained_invocation_pair(record: &CoordinatorRecord) -> Option<(InvocationId, InvocationId)> {
@@ -3267,6 +3282,60 @@ pub(crate) mod tests {
             (signer.receipt_calls, signer.acknowledgement_calls),
             before_signatures
         );
+    }
+
+    #[test]
+    fn cross_image_lookup_binds_identity_not_record_position() {
+        let mut signer = CountingSigner::new(0x19);
+        let fixture = Fixture::new(&signer);
+        let mut coordinator = open(
+            MemoryImageStore::default(),
+            MemoryImageStore::default(),
+            FakeDispatcher::new(fixture.authority),
+            &fixture,
+        );
+        for sequence in 1..=3 {
+            let call = fixture.call(sequence);
+            coordinator
+                .coordinate(&call, fixture.context(&call, 20), 20, &mut signer)
+                .unwrap();
+        }
+        let mut reordered = coordinator.image.clone();
+        reordered.records.reverse();
+        assert!(reordered.is_valid());
+        assert!(coordinator_matches_issuer(&reordered, &coordinator.issuer));
+        let decoded: Vec<_> = coordinator
+            .issuer
+            .retained_records()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(decoded.len(), 3);
+        for record in &decoded {
+            let original = coordinator
+                .issuer
+                .recover_retained(record.call.invocation)
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.call, original.call);
+            assert_eq!(record.approval, original.approval);
+            assert_eq!(record.issued_at, original.issued_at);
+            assert_eq!(record.receipt, original.receipt);
+            assert_eq!(record.issuance_ack, original.issuance_ack);
+        }
+        let mut missing = reordered.clone();
+        missing.records.pop();
+        assert!(!coordinator_matches_issuer(&missing, &coordinator.issuer));
+        let mut duplicate = reordered.clone();
+        duplicate.records[1] = duplicate.records[0].clone();
+        assert!(!coordinator_matches_issuer(&duplicate, &coordinator.issuer));
+        let mut changed_slot = reordered.clone();
+        changed_slot.records[0].issued_at += 1;
+        assert!(!coordinator_matches_issuer(
+            &changed_slot,
+            &coordinator.issuer
+        ));
+        reordered.records[0].consumed_issuance_ack = Some(Hash([0x55; 32]));
+        assert!(!coordinator_matches_issuer(&reordered, &coordinator.issuer));
     }
 
     #[test]

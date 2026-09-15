@@ -9572,6 +9572,37 @@ This remains a concrete retention/GC implementation gate alongside mixed-pending
 recovery, pre-expiry abort/management expiry, Shared finality, profile coverage,
 latency and final-source release verification. Keep the C1/C2/C3 grouping.
 
+### Bounded single-pass issuer lookup for cross-image validation
+
+Retention audit confirms that NRT1 binds the retired policy-result pair, not
+actor application. Reclamation also has to preserve both exact images' call/
+context/issuance bindings, signed responses, collision protection and source
+dispatch evidence across interrupted multi-store publication. No record is
+deleted based solely on a terminal certificate in this change.
+
+The existing cross-image validator decoded the issuer's call prefix again for
+each coordinator record, producing quadratic lookup work as retained history
+grew. It now decodes each issuer record once into a temporary bounded BTreeMap,
+then consumes matching invocation keys. All call, issuance-slot and consumed
+acknowledgement comparisons remain, with explicit duplicate/orphan refusal.
+The issuer's single-record and iterator paths share the complete decoder,
+including private-resolution preimages. Full image verification on open and
+publication is unchanged. No index survives the immutable check, no on-disk
+format changes, and no trust is cached across writes or reopen.
+
+Final-code targeted tests pass: **46 passed, zero failures/ignored**, 52.73s,
+covering issuer/coordinator regression suites and native issuance/reopen. The
+new test accepts valid reordered coordinator records, checks iterator results
+against individual recovery, and rejects missing/duplicate rows, changed slots
+and changed acknowledgement commitments. Evidence: `cross-image-linear-final.log`
+in the r17 fixture. The long full coordinator-capacity test was explicitly
+filtered in this debug run; its earlier release pass does not certify this
+new source. Re-run it with the final optimized source before release closure.
+Normal CLI compilation passes (5.21s, existing warnings,
+`cross-image-linear-cli.log`); formatting and diff checks pass.
+No end-to-end latency gain is claimed. Authenticated history reclamation and
+the 256-record lifetime ceiling remain unresolved.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its
