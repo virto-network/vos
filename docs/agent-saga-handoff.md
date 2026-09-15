@@ -2,6 +2,9 @@
 
 ## Checkpoint and decision
 
+Current HEAD has a source-only authorization-reuse follow-up, described below;
+the bundled runtime and its smoke evidence still refer to the earlier pin.
+
 Latest source qualification: the independently reproduced acknowledgement
 optimization is now pinned, with 18 release-pin tests and five physical
 lifecycle/lineage tests passing. Fresh-space startup/restart with HTTP/SSH now
@@ -404,6 +407,30 @@ Logs: `ack-pin-fresh-smoke.31JLq5/full-cli.log`, `sdk-no-std.log` and
 config directory; all are disk-backed. The build-task test incidentally updated
 its tracked fixture lockfile; only that generated change was reverted before
 committing the shutdown-test patch. Tests and child processes are terminal.
+
+### Source-only reuse of fresh acknowledgement authorization
+
+Fresh acknowledgement already fully verified immutable work, authorization
+and runtime identity before loading the retained result. It then called that
+full verifier again with only a different observation slot. The follow-up keeps
+the first full verification (blob validation, scope, issuer and signature) and
+uses `matches_invoke` for the second slot-dependent check. PublicPreflight's
+lower-bound slot condition and `InvalidAuthorization` error are retained. There
+is no intervening mutation, no persistent validation cache and no weakening of
+retained result/liveness/retirement checks.
+
+A new test compares full verification with slot-only rechecking after admission
+for signed receipts and PublicPreflight at zero, below/at/above the admission
+slot and `u64::MAX`. The final acknowledgement run reports **31 passed, zero
+failed, one ignored profiling probe**, **29.16 s**. Evidence:
+`ack-recovery-candidate.dHhhcp/authorization-reuse-final.log` (the earlier pass
+without the added equivalence test is `authorization-reuse-tests.log`).
+
+This follow-up is not built into the bundled PVM and has no measured gas or
+end-to-end speedup yet. Next: freeze and independently build a candidate,
+compare exact output and gas against the current `891e74d4…` pin, and qualify
+physical retry/rejection behavior before another pin change. The unchanged
+10-second startup deadline remains failing.
 
 ## Local evidence and resumption
 

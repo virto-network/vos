@@ -9590,6 +9590,51 @@ pub(crate) mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
+    fn acknowledgement_slot_recheck_matches_full_authorization_verification() {
+        use crate::agent_sdk::{InvocationAuthorization, InvocationError};
+
+        let (receipt_state, receipt_work, receipt, _) = clean_terminal_fixture();
+        let receipt_authorization = InvocationAuthorization::AuthorityReceipt(receipt);
+        let (preflight_state, preflight_work, preflight_authorization) =
+            completed_clean_policy_fixture(crate::agent_sdk::Hash([0xe1; 32]));
+        for (state, work, authorization) in [
+            (receipt_state, receipt_work, receipt_authorization),
+            (preflight_state, preflight_work, preflight_authorization),
+        ] {
+            let runtime = StandardAgentRuntime::restore(
+                decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap(),
+            )
+            .unwrap();
+            let initial_slot = match &authorization {
+                InvocationAuthorization::AuthorityReceipt(_) => 0,
+                InvocationAuthorization::PublicPreflight(preflight) => preflight.observed_slot,
+            };
+            runtime
+                .verify_clean_invocation_authorization(&work, &authorization, initial_slot)
+                .unwrap();
+            for slot in [
+                0,
+                initial_slot.saturating_sub(1),
+                initial_slot,
+                initial_slot.saturating_add(1),
+                u64::MAX,
+            ] {
+                let rechecked = if authorization.matches_invoke(&work, slot) {
+                    Ok(())
+                } else {
+                    Err(InvocationError::InvalidAuthorization)
+                };
+                assert_eq!(
+                    runtime.verify_clean_invocation_authorization(&work, &authorization, slot),
+                    rechecked,
+                    "slot-only recheck must match full validation after immutable admission",
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
     fn clean_acknowledgement_status_preserves_exact_retry_and_rejection() {
         use crate::agent_sdk::{InvocationAuthorization, InvocationError};
 

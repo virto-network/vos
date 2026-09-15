@@ -4144,7 +4144,13 @@ impl StandardAgentRuntime {
             .clean
             .as_ref()
             .ok_or(InvocationError::DivergentInvocation)?;
-        self.verify_clean_invocation_authorization(work, authorization, binding.observed_slot)?;
+        // The full check above authenticated these same immutable work,
+        // authorization and runtime values. Only the observation slot differs
+        // here: preserve that check (notably PublicPreflight's lower bound)
+        // without hashing availability and verifying the signature again.
+        if !authorization.matches_invoke(work, binding.observed_slot) {
+            return Err(InvocationError::InvalidAuthorization);
+        }
         if !binding.matches(work, authorization)
             || !clean_authorization_is_live_at(&binding.authorization, binding.observed_slot)
             || self

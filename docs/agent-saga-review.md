@@ -1,5 +1,11 @@
 # Reviewing the Agent architecture saga
 
+Latest source-only follow-up: fresh acknowledgement now reuses its first full
+authorization verification and repeats only the slot-dependent match at the
+retained result's observation slot. 31 acknowledgement tests pass, including
+receipt/PublicPreflight slot-equivalence coverage. This follow-up is not in the
+bundled PVM yet; the matching-pin and smoke evidence below predates it.
+
 Current pin update: the acknowledgement optimization from `e3e9cb85` is now
 bundled with matching provenance, ProgramId and build-time digest. Two independent
 candidate builds matched; 18 release-pin tests and five physical lifecycle/lineage
