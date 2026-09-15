@@ -8991,6 +8991,37 @@ diagnostic feature (20.10 s, `single-pass-journal-native-test.log`).
 Most repeated runtime-work encoding validation remains to be addressed;
 this reduction does not close the multi-minute production-latency gate.
 
+### Borrowed journal authorization validation (C2)
+
+`validate_clean_invocation_authorization` no longer clones an entire work item
+and serializes an empty-state Direct Invoke solely to test whether encoding
+succeeds. It calls the same SDK work-validity and authorization-binding
+predicates on borrowed inputs, retaining runtime identity checks. All blob
+preimages are still authenticated. A compile-time conservative bound covers
+the bounded message, blob-reference framing, authorization and fixed fields
+inside the SDK work envelope limit; actual journal encoding remains checked.
+
+An equivalence regression compares the new predicate with the previous SDK
+encoder-based result for both PublicPreflight and AuthorityReceipt, including
+zero gas/identity, oversized messages, valid/altered/duplicate blobs,
+maximum aggregate availability, and early observation slots.
+
+Validation (shared C2 `target/task-tmp`):
+
+- `borrowed-journal-authorization-tests.log`: **40 passed**, 0 failed, 0 ignored.
+- `borrowed-journal-authorization-native-test.log`: native issuance/reopen/
+  retirement test passed (19.98 s), without diagnostic features.
+- `borrowed-journal-authorization-native-check.log`: normal CLI compile passed
+  (4.71 s, warnings); formatting/diff checks passed.
+- The pre-change same-test run passed in 19.84 s
+  (`journal-authorization-baseline.log`). These timings do **not** demonstrate
+  a wall-time improvement. The established reduction is removal of payload
+  clones and temporary serialized buffers, not fewer blob authentications.
+
+No artifact, timeout, or release gate changed. The production latency blocker
+remains; further work must address the larger repeated validation boundaries,
+not infer an end-to-end gain from this allocation-only change.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

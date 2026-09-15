@@ -3535,14 +3535,20 @@ fn validate_clean_invocation_authorization(
     authorization: &crate::agent_sdk::InvocationAuthorization,
     observed_slot: u64,
 ) -> Result<(), DecodeError> {
-    let canonical = crate::agent_sdk::RuntimeWork::Invoke {
-        context: crate::agent_sdk::RuntimeExecutionContext::Direct,
-        state: crate::agent_sdk::RuntimeState::default(),
-        invocation: alloc::boxed::Box::new(work.clone()),
-        authorization: alloc::boxed::Box::new(authorization.clone()),
-        observed_slot,
-    };
-    if canonical.encode().is_err()
+    // This is the SDK Invoke predicate with a known-valid Direct context and
+    // empty state. Validate the borrowed inputs, not a cloned serialized copy.
+    // The bounded message, <=16 blob references and fixed authorization fit
+    // comfortably within AWRK's non-state/non-preimage framing allowance.
+    const _: () = assert!(
+        crate::agent_sdk::MAX_INVOCATION_MESSAGE_BYTES
+            + crate::agent_sdk::MAX_RUNTIME_AVAILABILITY_ITEMS * (32 + 8 + 4)
+            + crate::agent_sdk::wire::MAX_INVOCATION_AUTHORIZATION_WIRE_BYTES
+            + 4096
+            <= crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES
+                - crate::agent_sdk::MAX_RUNTIME_AVAILABILITY_BYTES
+    );
+    if !work.validate()
+        || !authorization.matches_invoke(work, observed_slot)
         || work.space.0 != runtime.space.0
         || work.agent.0 != runtime.agent.0
         || work.runtime_deployment.0 != runtime.deployment.0
@@ -5350,6 +5356,91 @@ mod tests {
         let mut wrong_runtime = create.clone();
         wrong_runtime.runtime.runtime_abi = Hash([0xff; 32]);
         assert_eq!(wrong_runtime.validate(), Err(DecodeError::NonCanonical));
+    }
+
+    #[test]
+    fn borrowed_invocation_authorization_matches_sdk_encoder_validation() {
+        use crate::agent_sdk::{InvocationAuthorization, PublicPreflight, RuntimeWork};
+        for public in [false, true] {
+            let input = if public {
+                public_clean_replay_input(crate::agent_sdk::MethodMode::Linear)
+            } else {
+                clean_replay_input(crate::agent_sdk::MethodMode::Linear)
+            };
+            let ReplayOperation::CleanInvoke {
+                work,
+                authorization,
+                observed_slot,
+                ..
+            } = input.operation
+            else {
+                unreachable!()
+            };
+            for case in 0..9 {
+                let mut work = work.clone();
+                let mut authorization = authorization.clone();
+                match case {
+                    1 => work.gas = 0,
+                    2 => work.agent = crate::agent_sdk::AgentId::ZERO,
+                    3 => work.message = vec![0; crate::agent_sdk::MAX_INVOCATION_MESSAGE_BYTES + 1],
+                    4..=7 => {
+                        let bytes = vec![
+                            0xa7;
+                            if case == 7 {
+                                crate::agent_sdk::MAX_RUNTIME_AVAILABILITY_BYTES
+                            } else {
+                                128
+                            }
+                        ];
+                        let blob = crate::agent_sdk::RuntimeBlob {
+                            reference: crate::agent_sdk::BlobRef::of_bytes(&bytes),
+                            bytes,
+                        };
+                        work.availability.push(blob.clone());
+                        if case == 5 {
+                            work.availability[0].bytes[0] ^= 1;
+                        }
+                        if case == 6 {
+                            work.availability.push(blob);
+                        }
+                    }
+                    _ => {}
+                }
+                // Refresh only the work binding, preserving the malformed
+                // preimages/shape being compared by the two validators.
+                match &mut authorization {
+                    InvocationAuthorization::PublicPreflight(value) => {
+                        *value = PublicPreflight::for_work(&work, observed_slot)
+                    }
+                    InvocationAuthorization::AuthorityReceipt(value) => {
+                        value.selector.request = work.commitment()
+                    }
+                }
+                let slot = if case == 8 { 0 } else { observed_slot };
+                let sdk = RuntimeWork::Invoke {
+                    context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+                    state: crate::agent_sdk::RuntimeState::default(),
+                    invocation: Box::new(work.clone()),
+                    authorization: Box::new(authorization.clone()),
+                    observed_slot: slot,
+                };
+                let expected = sdk.encode().is_ok()
+                    && work.space.0 == input.runtime.space.0
+                    && work.agent.0 == input.runtime.agent.0
+                    && work.runtime_deployment.0 == input.runtime.deployment.0;
+                assert_eq!(
+                    validate_clean_invocation_authorization(
+                        &input.runtime,
+                        &work,
+                        &authorization,
+                        slot
+                    )
+                    .is_ok(),
+                    expected,
+                    "public={public} case={case}"
+                );
+            }
+        }
     }
 
     #[test]
