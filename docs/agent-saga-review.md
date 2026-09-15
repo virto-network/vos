@@ -2,7 +2,7 @@
 
 ## Current review checkpoint
 
-Implementation checkpoint: `668a86bb` on `wip/ch08-runtime-directory`;
+Implementation checkpoint: `8716f6a7` on `wip/ch08-runtime-directory`;
 `saga/agents` remains at `31b0cdbb`. Nothing has been merged or pushed.
 Review the integrated Chapter 8 changes together: the old C1 boundary depends
 on clean-break corrections in C2 and is not independently merge-ready. The
@@ -24,8 +24,12 @@ work applied. A separate retry fix preserves the original publication successor.
 Both have regression evidence in the handoff. Current-release idle restart,
 HTTP and stable SSH identity pass (30s startup), as do Counter mutation/exact
 retry and read-after-restart. Post-invocation shutdown fails its unchanged5s
-deadline in both probes and requires forced cleanup. Latency and shutdown
-remain release blockers; the functional passes are not production sign-off.
+deadline in both earlier probes and requires forced cleanup. The follow-up
+`8716f6a7` release stops inventory pagination at shutdown-safe boundaries:
+busy-inventory SIGINT passed within5s, but SIGTERM exceeded5s before exiting
+during cleanup without SIGKILL. This does not establish a signal-type difference
+or close the shutdown gate. Latency and shutdown remain release blockers;
+the functional passes are not production sign-off.
 
 For review, use two scoped batches: integrated architecture through `f79f0e3d`,
 then checkpoint/recovery closeout and final qualification. The first checkpoint

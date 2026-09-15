@@ -2,6 +2,37 @@
 
 ## Checkpoint and decision
 
+Safe-boundary cancellation is now live-tested on release `8716f6a7`, but the
+five-second shutdown gate is **still not fully passing**. Both probes first
+verified the retained Counter read/retirement/exact-retry path (no new mutation),
+then waited for a newly logged Credential inventory query before signalling.
+SIGINT passed within5s without forced cleanup (startup61s; session90632 exit0).
+SIGTERM exceeded5s (startup37s; session82499 exit1); the daemon exited during
+the following bounded cleanup after a further SIGINT, without SIGKILL. Do not
+attribute the difference to signal type: both handlers set the same flag, and
+per-call workload/timing differs. These are separate probe results, not a
+controlled signal comparison or proof of a universal shutdown bound.
+
+Logs/scripts under `task-tmp/issuer-reuse-release.QR6Y4x/`:
+`counter-check.sh shutdown-read` / `shutdown-term-read`,
+`counter-shutdown{,-term}-read-check.log`, and corresponding `-up.log` /
+`-test.log` files. Each client test passed; retained managed attempt durations
+were0.49/0.55s, not fresh invocation latency measurements. New logs preserve the
+earlier forced-kill failures. Original state and requests remain unchanged in
+identity. Host process inspection after the probes found no test/build/daemon
+processes. Sessions30284 (build),90632 and82499 are terminal.
+
+Release build passed6m34s and bundle/verification pass with unchanged guest pins.
+Binary SHA-256: `4e7aa7dfa0b6e9680d33c4f46c5bf68e1553a439ad289e7703bbeb7919185d5a`.
+`task-tmp/inventory-shutdown-release.DYH4h7/` contains build log, bundle,
+previous executable and pre-probe forensic data/config copies. Remaining issue:
+source cancellation cannot preempt one in-flight projection call; production
+transport uses synchronous response waits. Profile that call and its durable
+work before choosing further optimization/cancellation changes. `/usr/bin/perf`
+is available; no new sampling has yet been run. Do not replace joins with
+detached workers, shorten receive waits as a substitute for completion, or
+extend the shutdown gate. Startup latency and other production gates remain open.
+
 Inventory reconciliation now observes the node's shared shutdown signal between
 durable projection calls. The node wires its existing signal into the owned
 inventory source; the client checks before recovery/authenticated dispatch and
@@ -21,9 +52,8 @@ Configuration: locked/offline host features `agent-transition-proof
 private-agent-store http-ingress ssh-ingress`.
 
 This is safe-boundary cancellation, **not yet a passing five-second live gate**.
-A single already-running projection call may itself be too slow. The release
-binary still predates this change, and the two post-invocation shutdown failures
-below remain authoritative until a new live probe qualifies the fix.
+A single already-running projection call may itself be too slow. The new
+release/probe results above still do not close the gate.
 
 Current release (`668a86bb`) passes recovered-space restart/HTTP/stable SSH
 identity with clean SIGINT shutdown in the idle-ingress probe: readiness30s,
