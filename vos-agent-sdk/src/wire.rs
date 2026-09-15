@@ -4412,6 +4412,7 @@ fn encode_invocation_error(encoder: &mut Encoder<'_>, value: InvocationError) {
         }
         InvocationError::StaleContinuation => encoder.u8(18),
         InvocationError::NotReady => encoder.u8(19),
+        InvocationError::ExpiredBeforeExecution => encoder.u8(20),
     }
 }
 
@@ -4437,6 +4438,7 @@ fn decode_invocation_error(decoder: &mut Decoder<'_>) -> Result<InvocationError,
         17 => Ok(InvocationError::UnsupportedHostCall(decoder.u64()?)),
         18 => Ok(InvocationError::StaleContinuation),
         19 => Ok(InvocationError::NotReady),
+        20 => Ok(InvocationError::ExpiredBeforeExecution),
         _ => Err(DecodeError::InvalidTag),
     }
 }
@@ -6807,6 +6809,24 @@ mod tests {
                 assert!(RuntimeWork::decode(&raw).is_err());
             }
         }
+    }
+
+    #[test]
+    fn expiry_fence_has_a_distinct_canonical_outcome() {
+        let transition = RuntimeTransition {
+            state: RuntimeState::default(),
+            outcome: RuntimeOutcome::Completed(Err(InvocationError::ExpiredBeforeExecution)),
+        };
+        let encoded = transition.encode().unwrap();
+        assert_eq!(RuntimeTransition::decode(&encoded).unwrap(), transition);
+        let rejection = RuntimeTransition {
+            state: RuntimeState::default(),
+            outcome: RuntimeOutcome::Completed(Err(InvocationError::AuthorityExpired)),
+        };
+        assert_ne!(encoded, rejection.encode().unwrap());
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(RuntimeTransition::decode(&trailing).is_err());
     }
 
     #[test]

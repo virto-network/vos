@@ -791,6 +791,9 @@ pub enum InvocationError {
     UnsupportedHostCall(u64),
     StaleContinuation,
     NotReady,
+    /// Authenticated non-execution fence retained after receipt expiry.
+    /// Unlike `AuthorityExpired`, this is an exact, acknowledgeable outcome.
+    ExpiredBeforeExecution,
 }
 
 impl InvocationError {
@@ -810,6 +813,7 @@ impl InvocationError {
                 | Self::InvalidInput
                 | Self::InvalidActorOutput
                 | Self::UnsupportedHostCall(_)
+                | Self::ExpiredBeforeExecution
         )
     }
 }

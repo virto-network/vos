@@ -519,7 +519,7 @@ fn decode_clean_invocation_errors(
         decoder,
         super::standard::MAX_INVOCATION_RESULTS_PER_LANE,
         |decoder| {
-            let binding = decode_clean_invocation_result(decoder)?;
+            let binding = decode_clean_invocation_result_binding(decoder)?;
             let bytes = decoder.bytes_ref()?;
             if bytes.len() > 256 {
                 return Err(DecodeError::LimitExceeded);
@@ -533,6 +533,11 @@ fn decode_clean_invocation_errors(
             if transition.state != crate::agent_sdk::RuntimeState::default()
                 || !error.is_durable_exact_outcome()
                 || value.storage() != storage
+                || !StandardAgentRuntime::clean_error_authorization_window_is_valid(
+                    &value.binding.authorization,
+                    error,
+                    value.binding.observed_slot,
+                )
             {
                 return Err(DecodeError::NonCanonical);
             }
@@ -1793,6 +1798,18 @@ fn encode_clean_invocation_result(
 fn decode_clean_invocation_result(
     decoder: &mut Decoder<'_>,
 ) -> Result<super::standard::StandardCleanInvocationResult, DecodeError> {
+    let value = decode_clean_invocation_result_binding(decoder)?;
+    if !super::standard::clean_authorization_is_live_at(&value.authorization, value.observed_slot) {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(value)
+}
+
+// Ordinary results require live acceptance; expiry fences require the opposite
+// window. Their callers validate that distinction after decoding the error tag.
+fn decode_clean_invocation_result_binding(
+    decoder: &mut Decoder<'_>,
+) -> Result<super::standard::StandardCleanInvocationResult, DecodeError> {
     use crate::agent_sdk::wire::CanonicalWire as _;
 
     let work = crate::agent_sdk::Hash(decoder.fixed()?);
@@ -1806,7 +1823,6 @@ fn decode_clean_invocation_result(
         .map_err(|_| DecodeError::NonCanonical)?;
     if work == crate::agent_sdk::Hash::ZERO
         || super::standard::clean_authorization_work(&authorization) != Hash(work.0)
-        || !super::standard::clean_authorization_is_live_at(&authorization, observed_slot)
     {
         return Err(DecodeError::NonCanonical);
     }
@@ -9966,6 +9982,200 @@ pub(crate) mod tests {
                 unreachable!()
             };
             *state = legacy_state_to_clean(encode_standard_runtime_state(&restored.snapshot()));
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_expiry_fence_survives_restore_and_positive_retirement() {
+        use crate::agent_sdk::{InvocationAuthorization, InvocationError, RuntimeWork};
+        let RuntimeWork::Invoke {
+            state,
+            invocation,
+            authorization,
+            ..
+        } = clean_failing_actor_fixture(Some(0xff))
+        else {
+            unreachable!()
+        };
+        let InvocationAuthorization::AuthorityReceipt(receipt) = authorization.as_ref() else {
+            unreachable!()
+        };
+        let expired_slot = receipt.selector.expires_at.checked_add(1).unwrap();
+        let mut runtime = StandardAgentRuntime::restore(
+            decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap(),
+        )
+        .unwrap();
+        let before = runtime.snapshot();
+        let error = InvocationError::ExpiredBeforeExecution;
+        assert!(error.is_durable_exact_outcome());
+        assert!(!InvocationError::AuthorityExpired.is_durable_exact_outcome());
+        assert_eq!(
+            runtime.retain_clean_invocation_error(
+                &invocation,
+                &authorization,
+                error,
+                receipt.selector.expires_at,
+                None,
+            ),
+            Err(InvocationError::AuthorityExpired)
+        );
+        let mut corrupt_authorization = (*authorization).clone();
+        let InvocationAuthorization::AuthorityReceipt(corrupt) = &mut corrupt_authorization else {
+            unreachable!()
+        };
+        corrupt.signature[0] ^= 1;
+        assert_eq!(
+            runtime.retain_clean_invocation_error(
+                &invocation,
+                &corrupt_authorization,
+                error,
+                expired_slot,
+                None,
+            ),
+            Err(InvocationError::InvalidAuthorization)
+        );
+        assert_eq!(runtime.snapshot(), before);
+        runtime
+            .retain_clean_invocation_error(&invocation, &authorization, error, expired_slot, None)
+            .unwrap();
+        let retained = runtime.snapshot();
+        assert_only_result_component_changed(
+            &encode_standard_runtime_state(&before),
+            &encode_standard_runtime_state(&retained),
+            clean_mode_as_legacy_for_test(invocation.mode),
+        );
+        assert!(retained.invocation_results.is_empty());
+        assert_eq!(retained.clean_invocation_errors.len(), 1);
+        let mut corrupt = retained.clone();
+        corrupt.clean_invocation_errors[0].binding.observed_slot = receipt.selector.expires_at;
+        assert!(StandardAgentRuntime::restore(corrupt).is_err());
+        let mut corrupt = retained.clone();
+        corrupt.clean_invocation_errors[0].error = InvocationError::InvalidActorOutput;
+        assert!(StandardAgentRuntime::restore(corrupt).is_err());
+        let mut reopened = StandardAgentRuntime::restore(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&retained)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.recover_clean_invocation_error(&invocation, &authorization, expired_slot,),
+            Ok(Some(error))
+        );
+        assert_eq!(
+            reopened.recover_clean_invocation_error(
+                &invocation,
+                &authorization,
+                receipt.selector.expires_at,
+            ),
+            Err(InvocationError::DivergentInvocation)
+        );
+        let ack = reopened
+            .acknowledge_clean_invocation(&invocation, &authorization)
+            .unwrap();
+        assert_eq!(ack.work, invocation.commitment());
+        assert_eq!(ack.authorization, authorization.commitment());
+        let mut retired = StandardAgentRuntime::restore(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&reopened.snapshot()))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            retired.acknowledge_clean_invocation(&invocation, &authorization),
+            Ok(ack)
+        );
+        assert_eq!(
+            retired.recover_clean_invocation_error(&invocation, &authorization, expired_slot + 1,),
+            Err(InvocationError::DivergentInvocation)
+        );
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_expiry_fence_rejects_clock_regression_and_shared_capacity_exhaustion() {
+        use crate::agent_sdk::{
+            InvocationAuthorization, InvocationError, PublicPreflight, RuntimeWork,
+        };
+        let RuntimeWork::Invoke {
+            state,
+            mut invocation,
+            authorization,
+            ..
+        } = clean_failing_actor_fixture(None)
+        else {
+            unreachable!()
+        };
+        let mut runtime = StandardAgentRuntime::restore(
+            decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap(),
+        )
+        .unwrap();
+        let before = runtime.snapshot();
+        let error = InvocationError::ExpiredBeforeExecution;
+        let public =
+            InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&invocation, 3));
+        assert_eq!(
+            runtime.retain_clean_invocation_error(&invocation, &public, error, 3, None,),
+            Err(InvocationError::AuthorityExpired)
+        );
+        assert_eq!(runtime.snapshot(), before);
+        runtime
+            .retain_clean_invocation_error(&invocation, &authorization, error, 4, None)
+            .unwrap();
+        let retained = runtime.snapshot();
+        invocation.invocation = crate::agent_sdk::InvocationId([0xa0; 32]);
+        let authorization = InvocationAuthorization::AuthorityReceipt(clean_authority_receipt(
+            runtime.config().unwrap(),
+            &invocation,
+        ));
+        assert_eq!(
+            runtime.retain_clean_invocation_error(&invocation, &authorization, error, 3, None,),
+            Err(InvocationError::AuthoritySlotRegressed)
+        );
+        assert_eq!(runtime.snapshot(), retained);
+        for index in 1..super::super::standard::MAX_INVOCATION_RESULTS_PER_LANE {
+            invocation.invocation = crate::agent_sdk::InvocationId([0x60 + index as u8; 32]);
+            let authorization = InvocationAuthorization::AuthorityReceipt(clean_authority_receipt(
+                runtime.config().unwrap(),
+                &invocation,
+            ));
+            runtime
+                .retain_clean_invocation_error(&invocation, &authorization, error, 4, None)
+                .unwrap();
+        }
+        let full = runtime.snapshot();
+        invocation.invocation = crate::agent_sdk::InvocationId([0xa0; 32]);
+        assert_eq!(
+            runtime.retain_clean_invocation_error(&invocation, &authorization, error, 4, None,),
+            Err(InvocationError::ResultCapacity)
+        );
+        assert_eq!(runtime.snapshot(), full);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_expiry_fence_cannot_replace_accepted_continuation() {
+        use crate::agent_sdk::{InvocationError, RuntimeWork};
+        let RuntimeWork::Resume { state, resume, .. } = clean_failing_resume_fixture() else {
+            unreachable!()
+        };
+        let mut runtime = StandardAgentRuntime::restore(
+            decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap(),
+        )
+        .unwrap();
+        let (record, invocation) = runtime.resolve_clean_resume(&resume).unwrap();
+        let authorization = record.authorization.unwrap();
+        let before = runtime.snapshot();
+        for terminal in [None, Some(record.ready_sequence)] {
+            assert_eq!(
+                runtime.retain_clean_invocation_error(
+                    &invocation,
+                    &authorization,
+                    InvocationError::ExpiredBeforeExecution,
+                    99,
+                    terminal,
+                ),
+                Err(InvocationError::StaleContinuation)
+            );
+            assert_eq!(runtime.snapshot(), before);
         }
     }
 

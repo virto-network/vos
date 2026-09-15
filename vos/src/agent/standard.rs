@@ -4203,7 +4203,11 @@ impl StandardAgentRuntime {
             && binding.accepted.validate()
             && binding.work != crate::agent_sdk::Hash::ZERO
             && self.result_storage_supported(record.storage())
-            && clean_authorization_is_live_at(&binding.authorization, binding.observed_slot)
+            && Self::clean_error_authorization_window_is_valid(
+                &binding.authorization,
+                record.error,
+                binding.observed_slot,
+            )
             && self
                 .result_authority_slot(record.storage())
                 .is_some_and(|slot| slot >= binding.observed_slot)
@@ -4249,6 +4253,20 @@ impl StandardAgentRuntime {
         Ok(Some(error))
     }
 
+    pub(crate) fn clean_error_authorization_window_is_valid(
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        error: crate::agent_sdk::InvocationError,
+        observed_slot: u64,
+    ) -> bool {
+        if error == crate::agent_sdk::InvocationError::ExpiredBeforeExecution {
+            matches!(authorization,
+                crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(receipt)
+                    if observed_slot > receipt.selector.expires_at)
+        } else {
+            clean_authorization_is_live_at(authorization, observed_slot)
+        }
+    }
+
     /// Retain only an authenticated durable rejection, including a stale or
     /// absent target. No actor state/revision is ever accepted by this path.
     pub(crate) fn retain_clean_invocation_error(
@@ -4264,8 +4282,21 @@ impl StandardAgentRuntime {
         if !error.is_durable_exact_outcome() {
             return Err(InvocationError::InvalidInput);
         }
-        if !clean_authorization_is_live_at(authorization, observed_slot) {
+        if !Self::clean_error_authorization_window_is_valid(authorization, error, observed_slot) {
             return Err(InvocationError::AuthorityExpired);
+        }
+        if error == InvocationError::ExpiredBeforeExecution {
+            // This fence only resolves work that never started. Continuations
+            // must retain their accepted execution semantics across expiry.
+            if terminal_continuation.is_some() {
+                return Err(InvocationError::StaleContinuation);
+            }
+            if self
+                .logical_slot_high_water()
+                .is_some_and(|high_water| observed_slot < high_water)
+            {
+                return Err(InvocationError::AuthoritySlotRegressed);
+            }
         }
         let record = StandardCleanInvocationError {
             binding: StandardCleanInvocationResult::from_work(

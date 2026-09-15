@@ -14,7 +14,10 @@ lifecycle-store leases and corrected clock coverage" for the correction.
 Implementation is in `.worktrees/ch08-runtime-directory` on
 `wip/ch08-runtime-directory`, not yet in the root `saga/agents` checkout.
 The C2 typed-error runtime is reproduced from source `373d2520` and bundled;
-post-pin validation is recorded in the latest checkpoint below. The fresh
+post-pin validation is recorded below. New source-only expiry-fence support is
+not yet emitted by runtime dispatch or included in that bundle; its native
+delivery/retirement wiring and ABI/artifact release audit remain outstanding.
+The fresh
 `.lU4S5Z` live campaign now passes compiled protected Local yield/resume,
 retirement, two restarts and final-state query, plus Panicked-result retirement
 after restart with a released credential reservation. Its daemon is stopped.
@@ -9102,6 +9105,35 @@ do not open another optimization or review batch. These source tests are not
 that missing implementation. Post-issuance expiry/abort, mixed-pending, finality
 and production latency remain release blockers. All test processes from this
 checkpoint are stopped; no daemon was started and no artifact repin is needed.
+
+### Durable expiry fence primitive (C2, delivery wiring remains open)
+
+SDK `ExpiredBeforeExecution` now has its own canonical error tag (20), distinct
+from non-durable `AuthorityExpired`. Standard-runtime retention validates the
+signed exact-work receipt, requires a strictly post-expiry, non-regressing slot,
+and refuses an existing result, acknowledgement or continuation. It shares the
+bounded error ledger and never accepts actor writes. Restore validates the
+post-expiry window for this error only; ordinary result/error acceptance still
+requires a live receipt. Exact positive acknowledgement retires the fence.
+The native verifier independently reconstructs and compares the entire successor,
+rejecting unchanged state, substituted outcomes and extra state writes.
+
+Validation: **11 targeted native/source/retention regressions passed** (1.32 s),
+**165 SDK tests passed**, and CLI `cargo check` passed (15.52 s). Logs in shared
+C2 `target/task-tmp`: `expiry-fence-native-regressions.log`,
+`expiry-fence-sdk.log`, `expiry-fence-cli-check.log`. The initial restore test
+failed because the binding decoder required a live receipt; the corrected
+decoder preserves that requirement for ordinary results and validates expiry
+fences separately. The final run above covers this correction.
+
+This is a retention/verification primitive, **not** a live expiry-resolution pass.
+Runtime Invoke still emits the existing non-durable expiry rejection; the current
+bundle is unchanged and the physical regression confirms that behavior. Next,
+connect authenticated native expiry delivery to this fence while preserving
+recovery of already accepted work, then verify positive application retirement
+before releasing the credential. ABI/schema audit, rebuilt/reproduced bundles,
+management expiry, pre-expiry abort and live recovery remain required. Keep this
+inside C2; do not treat the wire extension as a completed release cutover.
 
 ### Durable client acknowledgement before completion
 

@@ -5144,9 +5144,13 @@ fn validate_sdk_exact_execution_transition(
                 Some(retained) if retained == error => {}
                 Some(_) => return Err(AgentDriverError::InvalidRuntime),
                 None => {
-                    runtime
-                        .validate_clean_unseen_invocation_slot(authorization, *observed_slot)
-                        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+                    if error != crate::agent_sdk::InvocationError::ExpiredBeforeExecution {
+                        runtime
+                            .validate_clean_unseen_invocation_slot(authorization, *observed_slot)
+                            .map_err(|_| AgentDriverError::InvalidRuntime)?;
+                    }
+                    // Expiry has its own strict post-expiry/non-regression
+                    // checks in retention; reconstruct the full fence below.
                     runtime
                         .retain_clean_invocation_error(
                             invocation,
@@ -6568,6 +6572,65 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(ack.outcome, RuntimeOutcome::Acknowledged(Ok(_))));
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn sdk_expiry_fence_requires_exact_non_execution_successor() {
+        use crate::agent_sdk::{InvocationError, RuntimeWork};
+        let mut work = super::super::wire::tests::clean_failing_actor_fixture(Some(0xff));
+        let RuntimeWork::Invoke { observed_slot, .. } = &mut work else {
+            unreachable!()
+        };
+        *observed_slot = 99;
+        let RuntimeWork::Invoke {
+            state,
+            invocation,
+            authorization,
+            observed_slot,
+            ..
+        } = &work
+        else {
+            unreachable!()
+        };
+        let prior = sdk_state_as_legacy(state);
+        let mut runtime = super::super::standard::StandardAgentRuntime::restore(
+            super::super::wire::decode_standard_runtime_state(&prior).unwrap(),
+        )
+        .unwrap();
+        let error = InvocationError::ExpiredBeforeExecution;
+        runtime
+            .retain_clean_invocation_error(invocation, authorization, error, *observed_slot, None)
+            .unwrap();
+        let next = super::super::wire::encode_standard_runtime_state(&runtime.snapshot());
+        let validate = |next: &RuntimeState, error| {
+            validate_sdk_error_transition(
+                super::super::STANDARD_RUNTIME_PROGRAM_ID,
+                &prior,
+                next,
+                &work,
+                error,
+            )
+        };
+        assert_eq!(validate(&next, error), Ok(()));
+        assert_eq!(
+            validate(&prior, error),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+        assert_eq!(
+            validate(&next, InvocationError::AuthorityExpired),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+        assert_eq!(
+            validate(&next, InvocationError::InvalidActorOutput),
+            Err(AgentDriverError::InvalidRuntime)
+        );
+        let mut corrupt = next;
+        corrupt.linear.push(0xff);
+        assert_eq!(
+            validate(&corrupt, error),
+            Err(AgentDriverError::InvalidRuntime)
+        );
     }
 
     #[cfg(feature = "pvm")]
