@@ -25,6 +25,20 @@ must not be relabelled across the intentional r16/r17 clean break.
 
 ## Three review areas, not three completed batches
 
+Standalone C1 audit (2026-09-15): do not treat the three-commit historical
+boundary as a merge-ready recovery batch. Its `journal.rs` still encodes AJC3
+checkpoints with the v3 identity domain. The later `fd7df8ec` recovery fix,
+contained in the C2 range, introduces authenticated host-owned management
+evidence and AJC4 checkpoints, deliberately rejecting AJC3. It also replaces
+the Shared projection comparator's Standard-state decoding with that evidence.
+Thus even a green historical C1 test run would not establish completion of the
+required runtime-independent recovery / clean-break gate. `git diff --check`
+passes for the historical C1 range; no historical build was run in this audit.
+Review C1 as the portable-recovery foundation, then review its later recovery
+follow-ups in C2 before deciding on integration. A separately mergeable complete
+C1 batch requires dependency-aware extraction and fresh qualification; these
+existing refs do not provide it. Preserve the integrated branch and its evidence.
+
 Keep the agreed C1/C2/C3 grouping. Internal checkpoint commits are not additional
 review endpoints. Two local review references now expose existing ancestry
 boundaries, without rewriting or cherry-picking history. They are review
