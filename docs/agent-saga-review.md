@@ -2,8 +2,9 @@
 
 Current Ch08 WIP warning: `wip/ch08-runtime-directory` now has matching r17
 source and independently reproduced runtime/system-template bundles. Fresh r17
-bootstrap/restart still needs validation; earlier r16 live results do not prove
-it. Ordinary-agent finality, cross-runtime actor lifecycle, production latency
+bootstrap/restart and HTTP/SSH checks now pass (39 s first start, 58 s restart).
+This is bootstrap coverage, not live expiry retirement. Ordinary-agent finality,
+cross-runtime actor lifecycle, production latency
 and full release gates remain open. This is not a master-ready branch.
 See the current closeout plan below; later checkpoint sections retain historical
 results, including failures that have since been fixed.
@@ -17,8 +18,8 @@ Implementation is in `.worktrees/ch08-runtime-directory` on
 The C2 r17 runtime and system templates are reproduced from source `5bbab66b`
 with the matching frozen builder and bundled together. Post-pin physical expiry
 and failure-retirement checks pass without candidate overrides; see the r17
-checkpoint below for the current validation results. Live native expiry and
-fresh r17 bootstrap/restart remain open. Do not reuse or relabel r16 fixture data.
+checkpoint below for the current validation results. Fresh r17 bootstrap/restart
+now passes; live native expiry remains open. Do not reuse or relabel r16 fixture data.
 The earlier r16 `.lU4S5Z` live campaign passes compiled protected Local yield/resume,
 retirement, two restarts and final-state query, plus Panicked-result retirement
 after restart with a released credential reservation. Its daemon is stopped.
@@ -9272,6 +9273,30 @@ bootstrap/restart/ingress check, then live native expiry retirement. Earlier r16
 fixture outcomes are historical only. Full library/features, Shared finality,
 Private/Attested, management expiry/abort and production latency remain open;
 this pin does not declare the branch master-ready.
+
+### Fresh r17 bootstrap/restart/ingress smoke
+
+Using the normal rebuilt CLI at source/pin `c4063a1e`, created a new isolated space
+`acaa563eea78491062c30dc70b743f6bd6316d5199b666e058777a1e1548a5a8`
+in shared C2 `target/task-tmp/r17-startup-smoke.ncMr4z`. Creation automatically
+generated HTTP (8080) and SSH (2222) configuration. Only those fixture ports were
+changed to loopback 18096/2238 to avoid collisions; no default feature was manually
+enabled, no old identity was reused and no arbitrary actor was preinstalled.
+
+`run.sh` completed both phases with exit zero: first start 05:43:12–05:43:51 UTC,
+restart 05:43:51–05:44:49 UTC on 2026-09-15. Both reached `Space daemon ready`
+(not recovery-only mode), returned HTTP `status: ok`, and completed SSH keyscan.
+SSH public host-key output was byte-identical after restart. Both processes shut
+down cleanly; no daemon is left running. Evidence: `new.json`, `run.log`,
+`first.log`, `restart.log`, status JSON and SSH-key files alongside the scripts.
+The native system-Agent startup path runs before the ready marker, and both
+phases retained the same verified registry genesis root.
+
+This closes the fresh r17 bootstrap/restart/ingress smoke, not ordinary-Agent
+Create/Install, protected invocation or post-issuance expiry retirement on r17.
+The 39/58-second startup times are still a production-latency concern, not an
+acceptable-latency claim. Reuse only this disposable r17 fixture for the next
+native lifecycle campaign; keep older r16 fixtures untouched.
 
 ### Durable client acknowledgement before completion
 
