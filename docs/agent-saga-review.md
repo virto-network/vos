@@ -9792,6 +9792,35 @@ The scoped physical-decoder benchmark cannot substitute for locating and
 reducing the remaining end-to-end startup work. No daemon from this smoke
 test remains running.
 
+### Startup timing separates pre-inventory recovery from query execution
+
+A stack-only daemon diagnostic was refused by the OS (`ptrace: Operation not
+permitted`). Its script stopped the daemon through its cleanup handler; a
+process check confirmed no daemon remained. No debugger protection was changed
+and no recovery store was reset. The failed attempt is preserved in
+`startup-profile-run.log`, `startup-profile-stack-0.log` and
+`startup-profile-up.log` in the fixed-history scratch directory.
+
+The next run used the existing debug timing events from production_owner,
+clean_bootstrap and shared_raft, with the same release executable and isolated
+fixture. It started at **09:28:10 UTC**, became ready at **09:30:15 UTC**
+(125 seconds), passed HTTP status and the byte-identical SSH identity check,
+and shut down cleanly at **09:30:16 UTC** on 2026-09-15. Evidence:
+`startup-timing.sh`, `startup-timing-run.log`, `startup-timing-up.log`, status
+and SSH output files. This follows an interrupted diagnostic startup and has
+extra logging; it is not a controlled performance comparison.
+
+Inventory reconciliation began at 09:29:24.412900, roughly **74 seconds after
+startup**. Inventory loading took **47.946 seconds**, across six authenticated
+queries taking 7.726, 7.831, 7.970, 8.083, 8.132 and 8.201 seconds. Route
+reconciliation completed at **50.527 seconds** from its start, about 2.581
+seconds after inventory loading. The two agents yielded Credential, Agents,
+and per-agent Replicas/Actors queries. The observed delay therefore includes
+both a large pre-inventory interval and multi-second query execution; faster
+physical decoding alone does not close either end-to-end gate. Finer
+pre-inventory stage attribution and query execution attribution remain needed
+before further changes. No process from this diagnostic remains running.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its
