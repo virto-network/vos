@@ -26,9 +26,38 @@ must not be relabelled across the intentional r16/r17 clean break.
 ## Three review areas, not three completed batches
 
 Keep the agreed C1/C2/C3 grouping. Internal checkpoint commits are not additional
-review endpoints. The current integrated history has not yet been consolidated
-into three independently verified commit ranges; do not assume that selecting
-commits by title produces independently usable branches.
+review endpoints. Two local review references now expose existing ancestry
+boundaries, without rewriting or cherry-picking history. They are review
+checkpoints, not declarations of completed batches or independently qualified
+release branches. C3 remains pending.
+
+| Review reference | Compare range | Size at frozen tip |
+| --- | --- | --- |
+| `review/agent-saga-ch08-c1-recovery` | `31b0cdbb..2eb94e4b` | 3 commits; 13 files; +3,278/-199 |
+| `review/agent-saga-ch08-c2-native-integration` | `2eb94e4b..bb6c35b9` | 270 commits; 217 files; +68,596/-58,623 |
+| C3 — final release | Not yet created | Depends on unfinished implementation and release gates |
+
+The C1 tip is an ancestor of the C2 tip (integrated through merge `e72566ee`).
+The two ranges cover the 273 commits ahead of `saga/agents` at `bb6c35b9`
+without duplicating C1 commits. C2 includes later C1 recovery follow-ups and
+provisional artifact/release work; it is not a pure native-lifecycle-only diff.
+It remains a large review, not a small merge-ready patch. The old C1 boundary
+was not rebuilt in this audit, so current integrated test results must not be
+attributed to that historical tip. These refs are local and were not pushed;
+`saga/agents` is unchanged.
+
+Start review with:
+
+```sh
+git diff --stat saga/agents..review/agent-saga-ch08-c1-recovery
+git diff saga/agents..review/agent-saga-ch08-c1-recovery -- vos/src/agent
+git diff --stat review/agent-saga-ch08-c1-recovery..review/agent-saga-ch08-c2-native-integration
+```
+
+Use the per-area gates below to separate review comments from production
+acceptance. Do not merge or declare C3 complete solely because the review refs
+exist. Consolidating commits further, if desired, requires dependency-aware
+preparation on separate branches, preserving this integrated evidence history.
 
 | Area | Review focus | Still required |
 | --- | --- | --- |
