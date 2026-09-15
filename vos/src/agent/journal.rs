@@ -3249,6 +3249,28 @@ fn encode_replay_operation(encoder: &mut Encoder<'_>, operation: &ReplayOperatio
     }
 }
 
+/// Check exact canonical bytes after the SDK decoder has authenticated all
+/// nested blob preimages. The owned value cannot change between decode and
+/// this comparison, so encode its body without re-running blob validation.
+/// Keep this private: constructed or mutated work must use normal SDK encode.
+fn decode_canonical_runtime_work(
+    encoded: &[u8],
+) -> Result<crate::agent_sdk::RuntimeWork, DecodeError> {
+    use crate::agent_sdk::RuntimeWork;
+    let canonical = RuntimeWork::decode(encoded).map_err(|_| DecodeError::NonCanonical)?;
+    let mut checked = Vec::new();
+    checked
+        .try_reserve_exact(encoded.len())
+        .map_err(|_| DecodeError::LimitExceeded)?;
+    checked.extend_from_slice(&RuntimeWork::MAGIC);
+    checked.extend_from_slice(crate::agent_sdk::RUNTIME_ABI_ID.as_bytes());
+    canonical.encode_body(&mut vos_protocol::wire::Encoder(&mut checked));
+    if checked != encoded {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(canonical)
+}
+
 fn decode_replay_operation(decoder: &mut Decoder<'_>) -> Result<ReplayOperation, DecodeError> {
     match decoder.u8()? {
         0 => {
@@ -3280,11 +3302,7 @@ fn decode_replay_operation(decoder: &mut Decoder<'_>) -> Result<ReplayOperation,
         4 => {
             let encoded =
                 bounded_bytes_ref(decoder, crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES)?;
-            let canonical = crate::agent_sdk::RuntimeWork::decode(encoded)
-                .map_err(|_| DecodeError::NonCanonical)?;
-            if canonical.encode().map_err(|_| DecodeError::NonCanonical)? != encoded {
-                return Err(DecodeError::NonCanonical);
-            }
+            let canonical = decode_canonical_runtime_work(encoded)?;
             let crate::agent_sdk::RuntimeWork::Invoke {
                 context,
                 state,
@@ -3308,11 +3326,7 @@ fn decode_replay_operation(decoder: &mut Decoder<'_>) -> Result<ReplayOperation,
         5 => {
             let encoded =
                 bounded_bytes_ref(decoder, crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES)?;
-            let canonical = crate::agent_sdk::RuntimeWork::decode(encoded)
-                .map_err(|_| DecodeError::NonCanonical)?;
-            if canonical.encode().map_err(|_| DecodeError::NonCanonical)? != encoded {
-                return Err(DecodeError::NonCanonical);
-            }
+            let canonical = decode_canonical_runtime_work(encoded)?;
             let crate::agent_sdk::RuntimeWork::Manage {
                 context,
                 space,
@@ -3344,11 +3358,7 @@ fn decode_replay_operation(decoder: &mut Decoder<'_>) -> Result<ReplayOperation,
         6 => {
             let encoded =
                 bounded_bytes_ref(decoder, crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES)?;
-            let canonical = crate::agent_sdk::RuntimeWork::decode(encoded)
-                .map_err(|_| DecodeError::NonCanonical)?;
-            if canonical.encode().map_err(|_| DecodeError::NonCanonical)? != encoded {
-                return Err(DecodeError::NonCanonical);
-            }
+            let canonical = decode_canonical_runtime_work(encoded)?;
             let crate::agent_sdk::RuntimeWork::Invoke {
                 context,
                 state,
@@ -3390,11 +3400,7 @@ fn decode_replay_operation(decoder: &mut Decoder<'_>) -> Result<ReplayOperation,
         7 => {
             let encoded =
                 bounded_bytes_ref(decoder, crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES)?;
-            let canonical = crate::agent_sdk::RuntimeWork::decode(encoded)
-                .map_err(|_| DecodeError::NonCanonical)?;
-            if canonical.encode().map_err(|_| DecodeError::NonCanonical)? != encoded {
-                return Err(DecodeError::NonCanonical);
-            }
+            let canonical = decode_canonical_runtime_work(encoded)?;
             let crate::agent_sdk::RuntimeWork::Acknowledge {
                 context,
                 state,
@@ -5344,6 +5350,66 @@ mod tests {
         let mut wrong_runtime = create.clone();
         wrong_runtime.runtime.runtime_abi = Hash([0xff; 32]);
         assert_eq!(wrong_runtime.validate(), Err(DecodeError::NonCanonical));
+    }
+
+    #[test]
+    fn canonical_runtime_roundtrip_keeps_blob_authentication() {
+        use crate::agent_sdk::{
+            InvocationAuthorization, PublicPreflight, RuntimeState, RuntimeWork,
+        };
+        let input = public_clean_replay_input(crate::agent_sdk::MethodMode::Linear);
+        let ReplayOperation::CleanInvoke {
+            context,
+            mut work,
+            observed_slot,
+            ..
+        } = input.operation
+        else {
+            unreachable!()
+        };
+        let payload = b"journal single-pass blob validation regression".to_vec();
+        work.availability.push(crate::agent_sdk::RuntimeBlob {
+            reference: crate::agent_sdk::BlobRef::of_bytes(&payload),
+            bytes: payload.clone(),
+        });
+        let authorization = InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(
+            &work,
+            observed_slot,
+        ));
+        for acknowledgement in [false, true] {
+            let canonical = if acknowledgement {
+                RuntimeWork::Acknowledge {
+                    context,
+                    state: RuntimeState::default(),
+                    invocation: Box::new(work.clone()),
+                    authorization: Box::new(authorization.clone()),
+                }
+            } else {
+                RuntimeWork::Invoke {
+                    context,
+                    state: RuntimeState::default(),
+                    invocation: Box::new(work.clone()),
+                    authorization: Box::new(authorization.clone()),
+                    observed_slot,
+                }
+            };
+            let bytes = canonical.encode().unwrap();
+            assert_eq!(decode_canonical_runtime_work(&bytes).unwrap(), canonical);
+            let offset = bytes
+                .windows(payload.len())
+                .position(|part| part == payload)
+                .unwrap();
+            let mut corrupted = bytes.clone();
+            corrupted[offset] ^= 1;
+            assert!(
+                decode_canonical_runtime_work(&corrupted).is_err(),
+                "the first validation must still authenticate every blob"
+            );
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert!(decode_canonical_runtime_work(&trailing).is_err());
+            assert!(decode_canonical_runtime_work(&bytes[..bytes.len() - 1]).is_err());
+        }
     }
 
     #[test]

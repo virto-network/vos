@@ -8873,6 +8873,124 @@ Private/Attested and cross-runtime lifecycle coverage, and final C1/C2/C3
 integration/release checks remain open. Old immutable negative-ACK fixtures are
 untouched, no daemon was started, and root `saga/agents`/master were not changed.
 
+### Repeatable native issuance latency probe (C2, no optimization claimed)
+
+After pin `690df3de`, the existing physical test
+`native_operation_approved_issuance_reopens_without_new_signatures` was profiled
+in isolation, without a live disposable-space daemon or concurrent build.
+Both runs passed against the newly bundled runtime. This provides a smaller
+repeatable native recovery/retirement workload than the multi-minute live flow;
+it does not reproduce equivalent live history or establish production timing.
+
+- CPU-clock sampling at 99 Hz with 16 KiB DWARF stack snapshots: 20.02 s test,
+  1703 samples, 27.109 MB on disk. BLAKE2 compression: **43.10% self**;
+  interpreter loop: **10.75% self**.
+- Repeat at 49 Hz with 65528-byte snapshots: 20.17 s test, 846 samples,
+  52.971 MB on disk. BLAKE2: **43.50% self**; interpreter: **10.64% self**.
+- Neither DWARF capture reliably unwound the hashing callers. Increasing the
+  captured stack did not solve attribution. Do not interpret self samples as
+  proof that a particular validation/replay layer is redundant.
+
+Evidence is under shared C2 `target/task-tmp`, prefix
+`typed-runtime-native-issuance` (`.perf`, `-profile.log`, `-self.txt`,
+`-callers.txt`, `-stacks.txt`, and `-wide.*`/`-wide-callers.txt`). No `/tmp`
+RAMFS scratch was used; both profiler processes finished. Source/runtime
+behavior and pins are unchanged. Next latency step: obtain reliable caller
+attribution with an instrumented host build or bounded test-only hashing
+counters; repeating these same failed unwind settings is not useful. No
+validation bypass, timeout increase, or latency-gate waiver is justified.
+
+### Bounded host hashing counters (C2 latency attribution)
+
+Opt-in test-only counters now cover `vos::crypto::blake2b_hash`, with source
+caller propagation through the host `Hash::digest` wrapper. The native issuance
+fixture enables them only with `VOS_TEST_HASH_PROFILE=1`. At most 128 domain/site
+rows are retained; output contains time, calls, byte totals and source locations,
+not hash payloads or digests. Production/guest code excludes these counters.
+
+The existing native issuance/reopen/retirement test passed with instrumentation
+(21.92 s). It recorded **53 rows, 41223 calls, 1620806767 bytes, 1.208 s** of
+hash-wrapper time, so the row cap was not reached. Largest measured callers:
+
+- Journal ordered-entry content IDs: 1607 calls, 865196157 bytes, 0.643 s.
+- Raft physical-slot verification: 2679 calls, 389741136 bytes, 0.289 s.
+- Artifact-batch chunk validation: 3636 calls, 158816806 bytes, 0.117 s.
+- Journal replay-input content IDs: 313 calls, 116815173 bytes, 0.087 s.
+
+Evidence: shared C2 `target/task-tmp/native-issuance-hash-counters.log`.
+Crypto reference tests pass **8/8** (`native-hash-counter-crypto-tests.log`).
+These are attribution measurements, not a latency improvement. The counters
+do **not** cover the separate `vos-protocol`/SDK digest implementation or direct
+SIMD users; 1.208 s of timed host wrappers does not account for the earlier
+43% CPU hotspot. Next, attribute that remaining path before choosing a change.
+Repeated journal/slot verification is measured, not proven redundant: preserve
+all persisted-data validation until equivalent correctness is demonstrated.
+No runtime artifact, timeout, or release gate changed.
+
+### Protocol hashing attribution identifies repeated RuntimeBlob validation (C2)
+
+An explicitly selected temporary `vos-protocol/hash-profile` diagnostic adds
+per-thread, capped domain/site counters and caller propagation through protocol
+blob identities. It is disabled by default, not enabled in guest/release builds,
+and remains uncommitted diagnostic work. No payload bytes or digests are logged.
+The same native issuance/reopen/retirement test passed (21.31 s), with both host
+and protocol counters enabled. Evidence: shared C2
+`target/task-tmp/native-issuance-protocol-hash-counters.log`.
+
+Aggregating protocol rows by caller identifies the dominant path:
+
+- `RuntimeBlob::validate` (`vos-agent-sdk/src/runtime.rs:85`): **44877 calls,
+  8550121362 bytes, 6.270 s**.
+- Owned package-artifact validation: 4717 calls, 291170761 bytes, 0.219 s.
+- Program identity: 659 calls, 99219892 bytes, 0.075 s.
+- Package decoder's borrowed-artifact hash check: 825 calls, 45977905 bytes,
+  0.036 s. Its subsequent owned-copy revalidation is not the primary hotspot.
+
+This accounts for the previously unattributed hashing cost without guessing a
+caller from broken perf stacks. It does not yet identify which higher-level
+validators repeatedly invoke `RuntimeBlob::validate`, nor prove that any check
+can be removed. Next: propagate attribution through availability/work validation
+and isolate duplicate verification within one immutable boundary. Preserve
+verification at untrusted-byte boundaries; do not replace it with a global
+cache. The temporary diagnostic must be removed or deliberately finalized before
+release. No runtime pin, production behavior, timeout or latency gate changed.
+
+### Single-pass journal runtime-work round-trip validation (C2 latency)
+
+Caller propagation through availability/work validation identified SDK encoding
+validation as the main measured blob-hashing layer: Invoke encoding hashed
+5761172792 bytes (30152 blob calls, 4.225 s), ACK encoding 1143368864 bytes
+(5984 calls, 0.842 s). The diagnostic native test passed in 21.60 s; evidence:
+shared C2 `target/task-tmp/native-issuance-work-hash-counters.log`.
+
+The journal decoder had a concrete duplicate pass: after SDK decoding had
+fully validated a runtime-work value and its blob preimages, its canonical
+round-trip check called SDK `encode`, which validated those same bytes again.
+A private helper now decodes once and immediately re-encodes that untouched
+owned value's body with the exact SDK header. The full byte-for-byte comparison
+remains; constructed or mutated work still uses the normal validating encoder.
+The helper handles the four clean journal tags without caching across calls or
+skipping validation of persisted input.
+
+The same instrumented native test passes after the change (21.37 s). Invoke
+encoding drops to 5286552428 hashed bytes/27668 blob calls; ACK encoding drops
+to 1014969152 bytes/5312 calls. This eliminates **603020076 hashed bytes and
+3156 blob checks** from that workload. The wall-time difference is too small
+for a production speedup claim. Evidence: `native-issuance-single-pass-journal.log`.
+
+All temporary protocol/SDK features, profiling modules, host counters and caller
+annotations were removed after measurement. The diagnostic source file was
+deleted; the logs and measured inputs remain under disk-backed target. The
+retained implementation change is only in `vos/src/agent/journal.rs`, with
+regressions checking positive Invoke/ACK round trips and rejection of changed
+blob bytes, trailing bytes and truncation. Journal tests pass **39/39**
+(`single-pass-journal-tests.log`); normal CLI compile check passes (29.30 s,
+warnings, `single-pass-journal-native-check.log`). No artifact pin or timeout
+changed. The native issuance/reopen/retirement test also passes without any
+diagnostic feature (20.10 s, `single-pass-journal-native-test.log`).
+Most repeated runtime-work encoding validation remains to be addressed;
+this reduction does not close the multi-minute production-latency gate.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its
