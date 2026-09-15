@@ -81,9 +81,42 @@ Shared host open/provision, committed-entry draining, pending-projection recover
 network attachment, and Authority/Catalog checks. Only static phase names and
 elapsed milliseconds are logged; no payloads or identity material are added.
 `cargo check --locked -p vosx` passed in 5.35 seconds with warnings. These new
-markers have not yet been measured in a rebuilt release daemon and do not alter
-the checkpoint's evidence or claim a speedup. Successive cumulative timestamps
-must be subtracted to obtain each stage's duration.
+markers were subsequently measured at `824b2c9c`, as below. Successive cumulative
+timestamps must be subtracted to obtain each stage's duration.
+
+### Owner-stage measurement at `824b2c9c`
+
+The locked production-profile CLI build passed in 6m45s. A release restart of
+the original disposable r17 fixture passed HTTP status, unchanged SSH identity
+and clean shutdown, but readiness took **183 seconds** (09:57:13–10:00:16 UTC).
+Within this run:
+
+| Stage | Duration |
+| --- | ---: |
+| Owner record/issuer through genesis/archive preparation | 0.174 s |
+| Shared host open, including committee binding before the marker | 119.009 s |
+| System bootstrap provisioning | 0.784 s |
+| Explicit post-open committed-entry drain and pending-projection check | about 0.001 s |
+| Network attachment | 2.235 s |
+| Authority/Catalog checks after attachment | 0.202 s |
+| Inventory reconciliation | 56.682 s |
+
+The dominant owner interval is `SharedAgentHost::open_with_root`, not genesis
+preparation or the explicit post-open drain. Its internal replay/verification
+split still needs measurement; this does not show that replay itself is cheap,
+because reopening the host includes recovery. Retained history differs from
+earlier runs, so 183 seconds is not an optimization comparison.
+
+A preceding raw-copy probe failed with `Host(CorruptResidue)` before host open
+completed; networking also reported sandbox `Operation not permitted`. Source
+inspection found that the outer lease commits to the absolute host path and
+the authority namespace is derived from that path. Relocating a directory copy
+is not a supported reopen fixture. Neither copy nor original was repaired or
+cleared. The successful probe instead used socket permission at the original
+fixture path and therefore could advance that fixture's authenticated history.
+The raw copy's Raft DB initially matched the original at SHA256
+`ddef123679ad07d43c374f0340f14f36b4462a11642f2bd57bc7f750063a4a6a`;
+matching bytes alone does not preserve the outer lease's path binding.
 
 Next performance work should measure that owner stage internally on fixed
 history, then address the measured repeated work while preserving recovery
@@ -101,6 +134,10 @@ Evidence is on disk under `.worktrees/ch08-c2-native/target/task-tmp/`, not `/tm
 - `r17-startup-smoke.ncMr4z/`: `final-source-release-library.log`,
   `final-source-network-sockets.log`, `final-source-merge-socket.log`,
   `final-source-node-socket.log`, and `final-source-native-capacity.log`.
+- `owner-startup-phases.5se4bH/`: `build.log`, failed relocated-copy `run.log`
+  and `up.log`, successful `original-run.log` and `original-up.log`, HTTP/SSH
+  evidence and both probe scripts. The successful probe exited zero; neither
+  probe remains running.
 
 These are local evidence paths, not committed or portable release artifacts.
 Preserve the fixture's config/locks authority stores as well as its data,

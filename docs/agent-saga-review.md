@@ -35,6 +35,12 @@ HTTP status, unchanged SSH identity, and clean shutdown passing. System-owner
 open/recovery took 95.515 seconds; inventory reconciliation took 59.784 seconds.
 These phase measurements locate the delay but do not establish its complete
 internal cause or a controlled end-to-end performance comparison.
+The subsequent `824b2c9c` release restart passed HTTP/SSH/shutdown in 183 seconds.
+Owner-stage timings attribute 119.009 seconds to Shared host opening (including
+the committee-binding step before its marker); inventory reconciliation took
+56.682 seconds. See the handoff for the failed raw-copy attempt, path-bound
+lease constraint, and successful original-path run. This is still a latency
+failure, not a fixed-history before/after result.
 See the current closeout plan below; later checkpoint sections retain historical
 results, including failures that have since been fixed.
 Earlier clock-test pass counts had a fixture-dispatch gap; see "Retained
