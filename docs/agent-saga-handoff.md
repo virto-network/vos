@@ -2,6 +2,23 @@
 
 ## Checkpoint and decision
 
+Initial Local Create was rechecked on the issuer-reuse release (`f79f0e3d`)
+and is still not usable: one `create-local-agent` call returned HTTP 504 after
+127 seconds, explicitly retaining the request with unknown outcome. The daemon
+logged lifecycle completion at 66.976s and publication completion at 114.953s;
+post-create inventory/reconciliation consumed 47.778s (inventory 46.551s).
+These timings locate remaining work but are not controlled benchmarks: the
+feature suite was running concurrently. The daemon reached readiness in 58s
+on this third open of the disposable fixture. Evidence in shared target
+`task-tmp/issuer-reuse-release.QR6Y4x/`: `create-probe.sh`, `create-probe.log`,
+`create.stderr`, `create.json`, `create-up.log`. Session `56740` exited 1 and
+its daemon was joined by cleanup without forced kill. All retained client and
+space state is preserved in the original isolated directories. No retry or
+Install was attempted. Publication in the daemon log is not proof the client
+received its acknowledgement; use only exact retained recovery next, not a
+fresh Create request. This result supersedes the earlier unmeasured-Create
+qualification below; Install latency remains unqualified.
+
 Release qualification at `f79f0e3d`: locked offline CLI release build passes
 in 7m44s and now includes issuer validation reuse. Fresh `issuer-reuse-smoke`
 creation generated HTTP and SSH ingress configuration without manual enabling;
