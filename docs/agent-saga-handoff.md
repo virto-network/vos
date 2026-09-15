@@ -2,6 +2,52 @@
 
 ## Checkpoint and decision
 
+### Conflict-reporting release and phase qualification
+
+Release source `1c9ebdab` (production change `12e45422`) built locked/offline
+with nightly-2025-05-09 in6m49s. SHA-256:
+`46c64811783cedc96c0b676f68edcdfca7c85fbea27bce2d23f00d3f53d767a2`.
+Bundle creation/verification pass with unchanged guest/system pins. On the
+original `fresh-ack-release.Of5a75` fixture, readiness took53s (fails10s gate),
+HTTP passed and SSH identity matched. Original retired Create now reports409
+with inspect-evidence guidance; SHA-256 confirms its request file unchanged.
+Retained Counter read/retirement/exact ACK retry passed2.07s (managed0.54s;
+this reuses the old read, not a fresh invocation latency measurement).
+SIGTERM exited within1s without forced cleanup. Sessions53595/46572 terminal0;
+post-run inspection found no vosx/cargo/rustc. No new functional speedup claimed.
+
+Evidence under shared target `task-tmp/lifecycle-conflict-release.1bE9kx/`:
+`build.log`, `probe.sh`, `probe.log`, `bundle/`, `up.log`, `status.json`,
+`ssh-key.txt`, `conflict.stderr`, `request-before.sha256`, `read-test.log`.
+Previous executable preserved as `vosx-before`. Fixture remains at its original
+absolute path; this separate evidence directory does not contain relocated
+host stores.
+
+Enabled existing projection-phase logging. Summing deltas within each of the
+two cumulative timing families for six initial inventory queries yields:
+
+| Phase | Total ms | Enclosed runtime ms | Outside runtime spans ms |
+| --- | ---: | ---: | ---: |
+| Prepare | 1,733 | 272.6 | 1,460.4 |
+| Reserve/checkpoint | 3,588 | 270.8 | 3,317.2 |
+| Identity | 396 | 130.7 | 265.3 |
+| Persist pending | 219 | 0 | 219 |
+| Reopen/check retained ACK | 1,258 | 136.4 | 1,121.6 |
+| Invoke | 13,451 | 9,504.8 | 3,946.2 |
+| Acknowledge | 7,041 | 3,857.7 | 3,183.3 |
+| Complete pending | 201 | 0 | 201 |
+
+These are phase attribution on one run, not CPU profiling or controlled
+before/after results. Preparation includes reattachment; reserve includes
+opportunistic checkpoint and bounded reservation attempts. Runtime spans
+include program load/run, not every surrounding validation. Logging/rounding
+and boundary overhead remain. The explicit pending-record persist/clear
+phases total420ms, so they cannot alone explain the multi-second residual.
+Next bounded diagnosis should examine reserve/checkpoint's3.3s host residual
+and repeated host validation around Invoke/ACK, retaining all binding, admission
+and crash-recovery checks. Do not remove authenticated queries or infer that
+all remaining cost is disk I/O. Full production release gates remain open.
+
 ### Inventory latency attribution from current release evidence
 
 Analysis of existing `fresh-ack-release.Of5a75/framed-invoke-up.log` (no new

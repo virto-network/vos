@@ -21,6 +21,14 @@ passing regressions from still-failing production gates.
 
 ## Follow-up after the frozen review snapshot
 
+Conflict-reporting release now built from `1c9ebdab`, bundle verified. Live
+retired Create returns409 with correct guidance and unchanged request bytes.
+HTTP/SSH, retained Counter read and exact ACK retries pass; shutdown1s.
+Startup53s still fails readiness. Existing phase logging attributes substantial
+host overhead to reservation/checkpoint and Invoke/ACK, while explicit pending
+record persistence/clear totals420ms across six queries. See the handoff for
+checksum, exact phase table and limits; no performance improvement is claimed.
+
 Current-release inventory attribution: six sequential startup queries for two
 agents total28.6s;61 runtime spans account for13.7s, leaving14.8s outside those
 spans. Existing unchanged-head inventory reuse is active. Next enable existing
