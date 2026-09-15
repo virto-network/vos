@@ -4,8 +4,10 @@ Current pin update: the acknowledgement optimization from `e3e9cb85` is now
 bundled with matching provenance, ProgramId and build-time digest. Two independent
 candidate builds matched; 18 release-pin tests and five physical lifecycle/lineage
 tests pass after pinning. The r17 ABI and system templates are unchanged, but
-the runtime ProgramId changed. A fresh-space daemon smoke and final release
-qualification remain open. Historical r17 daemon timings below used the old pin.
+the runtime ProgramId changed. Fresh-space release startup/restart now pass in
+32/42 seconds with HTTP, SSH key identity and clean shutdown checks. Final release
+qualification and production latency remain open. Historical r17 timings below
+used the old pin; see the handoff for the new-pin smoke's exact qualifications.
 
 For the frozen `f76dabe1` review checkpoint, current evidence limits, and the
 three scoped review areas, start with [the review handoff](agent-saga-handoff.md).

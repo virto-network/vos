@@ -4,8 +4,9 @@
 
 Latest source qualification: the independently reproduced acknowledgement
 optimization is now pinned, with 18 release-pin tests and five physical
-lifecycle/lineage tests passing. Fresh-space daemon smoke and final release
-qualification remain open. The frozen checkpoint below remains unchanged.
+lifecycle/lineage tests passing. Fresh-space startup/restart with HTTP/SSH now
+pass; final release qualification and production latency remain open. The frozen
+checkpoint below remains unchanged.
 
 Implementation checkpoint: `f76dabe1` on `wip/ch08-runtime-directory`.
 At that checkpoint, `saga/agents` is `31b0cdbb`: 258 commits ahead, zero behind,
@@ -343,6 +344,38 @@ Evidence under `ack-recovery-candidate.dHhhcp/`: `post-pin-cli.log`, initial
 `post-pin-lineage.log`. No full-suite or new-pin daemon latency pass is claimed.
 Next: build the pinned CLI and run fresh-space bootstrap/restart/HTTP/SSH with
 the matching runtime, then finish the remaining original release gates.
+
+### Fresh-space smoke at `725f6240`
+
+The pinned release CLI build passed in **6m32s**. A new isolated identity and
+space were created successfully, with the generated `local.toml` enabling HTTP
+on loopback 8080 and SSH on loopback 2222. The original default-port smoke
+refused to start because a default port was already occupied; that service was
+not touched. The generated config was preserved, then only this fixture's ports
+were changed to loopback **18097/2239**.
+
+First startup reached readiness in **32 s**, restart in **42 s**. Both passed
+HTTP `status == ok`, SSH key acquisition and clean SIGINT shutdown. The final
+raw `ssh-keyscan` file comparison failed because comment/banner lines arrived
+in different order. A separate comparison established exactly one actual key
+record in each file and byte-identical sorted non-comment records; no key data
+was ignored. The script now compares key records rather than comment order.
+Thus the original script exited one, while the explicit corrected identity
+check passed; do not describe this as an unmodified one-command green run.
+
+SpaceId: `b609a179190b8678f0b1223f0a25fec4e6dfb1390c3acda20add17cca978ba07`.
+Genesis root: `60394853bfae8f28af589c52411a8de93181ddf6ee17c35bc44dfd38e061d072`.
+Evidence: `ack-pin-fresh-smoke.31JLq5/` contains `build.log`, `new.json`,
+`new.stderr`, `generated-local.toml`, initial `smoke.log`,
+`isolated-smoke.log`, `first-up.log`, `restart-up.log`, HTTP responses,
+SSH key records and the corrected `smoke.sh`. Both daemon runs and build are
+terminal. Previous fixtures were untouched and all scratch is disk-backed.
+
+This validates fresh bootstrap and restart with the new bundle, not new-pin
+Create/Install latency, sustained capacity, ordinary Shared-agent finality or
+the final production release matrix. Different histories make earlier timing
+comparisons uncontrolled; the measured 11.3% gas reduction remains limited to
+the fixed large acknowledgement test.
 
 ## Local evidence and resumption
 
