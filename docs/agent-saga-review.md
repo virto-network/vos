@@ -2,7 +2,7 @@
 
 ## Current review checkpoint
 
-Implementation checkpoint: `4f0b6ffb` on `wip/ch08-runtime-directory`;
+Implementation checkpoint: `3b5b7cef` on `wip/ch08-runtime-directory`;
 `saga/agents` remains at `31b0cdbb`. Nothing has been merged or pushed.
 Review the integrated Chapter 8 changes together: the old C1 boundary depends
 on clean-break corrections in C2 and is not independently merge-ready. The
@@ -14,11 +14,20 @@ reproduced from guest source `aad65049` and committed in `83737aee`.
 Two independent builds match byte-for-byte; 18 post-pin release checks and
 six physical integration tests pass. Fresh release startup/restart at
 `83737aee` passed HTTP/SSH checks in 27/37 seconds. The release executable has
-since been rebuilt at implementation source `4f0b6ffb`, including the host
-pagination fix `ec779164`; its bundle creation and verification pass. This
-does not rerun the live smoke or qualify ordinary Create/Install latency.
+since been rebuilt at implementation source `53c98f7f`, including issuer
+validation reuse, the host pagination fix and opportunistic checkpoints;
+its bundle creation and verification pass. However, the preserved test space
+fails reopening with `CrossStoreMismatch` after replay. The latest tip is not
+a qualified working-system checkpoint. See the handoff for diagnostic evidence.
 
-This is a disposable-test/review checkpoint, not production readiness.
+For review, use two scoped batches: integrated architecture through `f79f0e3d`,
+then checkpoint/recovery closeout and final qualification. The first checkpoint
+has 1,429 passing default library tests and 1,862 passing host-feature library
+tests, but still fails latency/release gates. Do not infer merge readiness from
+library tests or merge the old C1 boundary independently. The later checkpoint
+changes have focused test coverage, not a passing final integrated matrix.
+
+This is a review checkpoint, not production readiness.
 Remaining blockers include production ordinary Shared-agent genesis/finality
 wiring, authenticated reclamation of the host's 256-record operation journal,
 startup/Create/Install latency and shutdown gates, and the final integrated

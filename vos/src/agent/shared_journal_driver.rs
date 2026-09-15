@@ -1036,9 +1036,24 @@ where
         report_phase("profile_and_ledger_audit");
         if let Some(snapshot) = &audit.snapshot {
             validate_published_shared_checkpoint(&store, &materialization, &snapshot.claim)
-                .map_err(|_| SharedJournalDriverError::CrossStoreMismatch)?;
+                .map_err(|error| {
+                    tracing::warn!(
+                        ?error,
+                        checkpoint_matches = materialization.heads().checkpoint
+                            == Some(snapshot.claim.checkpoint()),
+                        current_ordered_index = materialization.heads().ordered_index,
+                        snapshot_ordered_index = snapshot.claim.ordered().ordered().index,
+                        "Shared journal open checkpoint validation failed"
+                    );
+                    SharedJournalDriverError::CrossStoreMismatch
+                })?;
         }
-        reconcile_journal_ledger(&store, &materialization, ledger.journal_store(), &audit)?;
+        report_phase("published_checkpoint_validation");
+        reconcile_journal_ledger(&store, &materialization, ledger.journal_store(), &audit)
+            .map_err(|error| {
+                tracing::warn!(?error, "Shared journal open ledger reconciliation failed");
+                error
+            })?;
         report_phase("reconcile_journal_ledger");
         store.finish_reverified_open()?;
         report_phase("finish_reverified_open");

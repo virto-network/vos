@@ -2,6 +2,24 @@
 
 ## Checkpoint and decision
 
+Follow-up diagnostic at the original fixture path reproduced the failure at
+2026-09-15T14:37:19Z. Journal-driver materialization completed at 98,258ms
+(executor setup completed at 320ms), and profile/ledger audit completed at
+98,957ms. The failure is therefore after successful replay, in published
+checkpoint validation or journal/ledger reconciliation, not in materialization
+itself. It remains unproven which check fails or whether the checkpoint policy
+caused the mismatch. Evidence: `task-tmp/cross-store-audit.bDsrWd/reopen-debug.log`.
+That directory also holds forensic `data-before` and `config-before` copies,
+taken before this diagnostic; they must not be booted at a different path.
+No store repair or replacement was attempted. Narrow driver-open diagnostics
+now distinguish those two validation stages while preserving their errors and
+fail-closed behavior; the release binary has not yet been rebuilt with them.
+The three `projection_checkpoint` tests pass with those diagnostics (14.69s;
+build 1m44s), using the locked/offline host-feature library configuration
+`agent-transition-proof private-agent-store http-ingress ssh-ingress`.
+This is focused regression coverage, not a reproduction or fix of the live
+reopen failure.
+
 Current preserved-space reopen is blocked: the checkpoint-policy release
 exited during bootstrap at 2026-09-15T14:32:15Z with
 `Shared journal operation failed error=CrossStoreMismatch`, surfaced as
@@ -50,8 +68,8 @@ checkpoint failure/reattachment recovery. Three further physical lifecycle
 tests pass (75.65s): Install handoff/retry/restart, accepted-finalization startup
 recovery, and management-finalization clock-advance exact replay. Logs:
 `task-tmp/opportunistic-checkpoint-tests.log` and
-`task-tmp/opportunistic-checkpoint-lifecycle.log`. The release CLI has not yet
-been rebuilt with this policy, and startup/Install latency remain unqualified.
+`task-tmp/opportunistic-checkpoint-lifecycle.log`. The release CLI was subsequently
+rebuilt with this policy as recorded above; startup/Install latency remain unqualified.
 
 The combined host-feature library suite at `f79f0e3d` is now complete:
 1,862 passed, zero failed, three ignored, 2968.51s (49m28s), build 3m18s.
@@ -61,7 +79,7 @@ Log: `task-tmp/current-host-feature-library-suite.log`; session `12062` is
 terminal. The 514-query inventory rotation test and Shared-host attachment
 checkpoint test passed. Ignored: native-operation initial-capture headroom,
 fixed-history decode probe, and large-ACK profiling probe. The native headroom
-case still needs separate current-source qualification; the others are
+case subsequently passed separately as recorded above; the others are
 diagnostics. This suite predates both checkpoint changes above and does not
 certify their full matrix, full cryptographic proof integration or release
 readiness. No test/build processes from this checkpoint remain running.
