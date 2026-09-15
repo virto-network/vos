@@ -2,6 +2,35 @@
 
 ## Checkpoint and decision
 
+The detailed diagnostic now identifies the live failure: all 85 committed
+Ordered anchors validate, but the retained pending command at Raft index113
+has a binding for entry `4c26180c…` which is not in the committed Ordered chain.
+Log: `task-tmp/reconciliation-release.B0uTZ2/reopen-debug.log`, failure at
+2026-09-15T15:07:01Z. Reported ordered index85, snapshot base0, pending=true;
+materialization completed at109,826ms. The process exited1 before readiness.
+This is **not** the original-successor bug fixed below: its committed anchor
+comparisons all passed. No store repair/reset or Install submission occurred.
+
+Code inspection explains a legitimate crash boundary missing from reconciliation:
+`journal_store::stage_sealed_dependencies` durably writes the Shared binding
+before writing the Ordered anchor and before the head CAS. In contrast,
+`validate_pending_binding` currently requires the pending entry in the committed
+chain whenever a binding exists. A crash after dependency staging but before
+head publication can therefore leave a recoverable reservation which open
+rejects. Next add a physical regression at that boundary, then validate a
+pre-CAS binding against the exact authenticated pending command and current
+Ordered predecessor without treating it as applied. Recompute/replay the exact
+reserved command before anchoring; do not drop the binding, skip mismatches, or
+advance Raft merely because staged material exists. The binding may precede
+even its immutable entry file, so tests must cover that earlier boundary too.
+
+Diagnostic build at `66805f3e` passed in7m26s; executable SHA-256
+`3ff273a7993621651afd911413a0538198cb0a382a33b883462bf35129ca617b`.
+It predates the original-successor fix. Build log and pre-probe forensic copies
+are in the same evidence directory. Sessions `64899` (build) and `47296`
+(reopen) are terminal. The diagnostic-only suffix regression also passed1.99s;
+log `task-tmp/reconciliation-diagnostic-test.log`, session `32539` terminal.
+
 A deterministic Shared replay regression now reproduces an original-successor
 bug: publish an Ordered entry, publish a Local entry, then retry the exact
 Ordered entry. `AlreadyCommitted` previously constructed its publication
@@ -13,10 +42,10 @@ The retry does not re-execute the Ordered work or change current heads, and
 the claim remains exact. No wire/guest pin or persisted record is changed.
 This prevents new inconsistent recovery anchors; it does not repair an
 already-inconsistent ledger. Whether the preserved fixture has this exact
-mismatch still requires the detailed reconciliation diagnostic.
+mismatch was subsequently disproved by the detailed diagnostic above.
 Evidence: `task-tmp/reconciliation-release.B0uTZ2/local-successor-regression.log`,
 `local-successor-fixed.log`, and `shared-replay-fixed.log`. Test sessions
-`53822`, `55289`, and `65621` are terminal. The ongoing diagnostic release build
+`53822`, `55289`, and `65621` are terminal. The diagnostic release build
 session `64899` was started at `66805f3e` before this fix; it is not the fixed
 release candidate. Its previous executable is preserved as `vosx-before`.
 
