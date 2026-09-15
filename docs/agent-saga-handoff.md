@@ -2,6 +2,20 @@
 
 ## Checkpoint and decision
 
+Inventory pagination fix: the host now accepts non-final pages shortened by
+the Authority's encoded-reply size bound. Previously it incorrectly required
+every continuation page to fill the requested entry count and budgeted only
+`ceil(entries / page_size)` calls, despite SDK-valid shorter pages. Agent,
+replica and actor loops now permit at most the total-entry bound plus one page;
+existing shape validation requires every non-final page to be nonempty and
+advance its cursor. Exact query/head, total-entry, roster-count and descriptor
+checks remain. All ten production-owner tests pass (0.16s), including a new
+one-entry-per-page test spanning three agents with three replicas and actors
+each, and the existing revocation/head/limit checks. Evidence: shared target
+`task-tmp/inventory-short-pages.log`. This fixes host pagination correctness,
+not the number of initial inventory calls. No guest ABI/artifact changed; the
+previously built release CLI does not yet contain this host fix.
+
 Ordinary-genesis promotion regression: all eight `agent::genesis::tests` pass
 with a new test that rejects every independent-finality error even for a
 self-consistent provision, checks repeated attempts consult the verifier,
