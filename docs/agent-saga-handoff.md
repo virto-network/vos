@@ -2,6 +2,20 @@
 
 ## Checkpoint and decision
 
+Exact recovery of the timed-out Create now passes on the same release and
+original fixture path. `create-local-agent --resume` returned a verified
+1,520-byte acknowledgement for Agent
+`745ce15ee9860b2b50ddd80460add47e7fe518480cb5793af525ae26010e32ae`
+in 12s after readiness. The sole retained request compares byte-identically
+to the saved pre-resume copy; the acknowledgement is durably present in that
+same operation directory. No new Create request was generated. Startup on this
+retained-history fixture took 129s, with the feature suite still concurrent;
+this does not repair the initial 127s/HTTP-504 failure below. Evidence:
+`task-tmp/issuer-reuse-release.QR6Y4x/create-resume{,-probe,-up}` JSON/logs,
+`create-request-before-resume`, and `create-probe.sh resume`. Session `20128`
+exited successfully and joined its daemon without forced cleanup. Install
+latency is still unqualified. Feature-suite session `12062` remains live.
+
 Initial Local Create was rechecked on the issuer-reuse release (`f79f0e3d`)
 and is still not usable: one `create-local-agent` call returned HTTP 504 after
 127 seconds, explicitly retaining the request with unknown outcome. The daemon
