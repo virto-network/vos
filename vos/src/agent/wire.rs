@@ -2447,6 +2447,22 @@ fn apply_clean_invoke(
         Err(error) => return Ok(clean_completed(state, Err(error))),
         Ok(None) => {}
     }
+    // A signed non-execution fence needs no actor execution/proof admission.
+    // Existing results/continuations are left to their exact recovery below.
+    match runtime.retain_clean_unseen_expiry(&work, &authorization, observed_slot) {
+        Ok(true) => {
+            let candidate = encode_standard_runtime_state(&runtime.snapshot());
+            if candidate.encoded_len().is_none_or(|len| len > state_limit) {
+                return Ok(clean_completed(state, Err(InvocationError::ResultCapacity)));
+            }
+            return Ok(clean_completed(
+                legacy_state_to_clean(candidate),
+                Err(InvocationError::ExpiredBeforeExecution),
+            ));
+        }
+        Err(error) => return Ok(clean_completed(state, Err(error))),
+        Ok(false) => {}
+    }
     let policy_admission = match &admission {
         #[cfg(feature = "std")]
         CleanExecutionAdmission::Attested(authenticated) => {
@@ -9929,12 +9945,48 @@ pub(crate) mod tests {
     #[cfg(feature = "pvm")]
     #[test]
     fn bundled_unseen_expired_invocation_preserves_state_after_restore() {
+        assert_unseen_expired_invocation_retirement(true);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn source_unseen_expired_invocation_retires_after_restore() {
+        assert_unseen_expired_invocation_retirement(false);
+    }
+
+    #[cfg(feature = "pvm")]
+    fn assert_unseen_expired_invocation_retirement(bundled: bool) {
         use crate::agent_sdk::wire::CanonicalWire as _;
         use crate::agent_sdk::{
             InvocationAuthorization, InvocationError, RuntimeOutcome, RuntimeTransition,
             RuntimeWork,
         };
         let mut work = clean_failing_actor_fixture(Some(0xff));
+        let candidate = std::env::var_os("VOS_AGENT_RUNTIME_EXPIRY_CANDIDATE")
+            .map(|path| std::fs::read(path).unwrap());
+        let runtime_pvm = candidate
+            .as_deref()
+            .unwrap_or(include_bytes!("../../../vosx/blobs/agent_runtime.pvm"));
+        let execute = |work: RuntimeWork| {
+            let expected = apply_standard_runtime_work(work.clone()).unwrap();
+            if bundled {
+                let execution = vos_pvm::refine_host::RefineContext::load(
+                    runtime_pvm,
+                    &work.encode().unwrap(),
+                    super::super::driver::DEFAULT_MANAGEMENT_GAS,
+                )
+                .unwrap()
+                .run();
+                assert_eq!(execution.exit, vos_pvm::ExitReason::Halt);
+                assert_eq!(
+                    execution
+                        .output_bounded(RuntimeTransition::MAX_ENCODED_BYTES)
+                        .unwrap(),
+                    expected.encode().unwrap()
+                );
+            }
+            expected
+        };
         let RuntimeWork::Invoke {
             authorization,
             observed_slot,
@@ -9951,38 +10003,67 @@ pub(crate) mod tests {
             let RuntimeWork::Invoke { state: prior, .. } = &work else {
                 unreachable!()
             };
-            let expected = apply_standard_runtime_work(work.clone()).unwrap();
-            assert_eq!(expected.state, *prior);
+            let before = decode_standard_runtime_state(&clean_state_to_legacy(prior)).unwrap();
+            let expected = execute(work.clone());
             assert_eq!(
                 expected.outcome,
-                RuntimeOutcome::Completed(Err(InvocationError::AuthorityExpired))
+                RuntimeOutcome::Completed(Err(InvocationError::ExpiredBeforeExecution))
             );
             assert!(!InvocationError::AuthorityExpired.is_durable_exact_outcome());
-            let execution = vos_pvm::refine_host::RefineContext::load(
-                include_bytes!("../../../vosx/blobs/agent_runtime.pvm"),
-                &work.encode().unwrap(),
-                super::super::driver::DEFAULT_MANAGEMENT_GAS,
-            )
-            .unwrap()
-            .run();
-            assert_eq!(execution.exit, vos_pvm::ExitReason::Halt);
-            assert_eq!(
-                execution
-                    .output_bounded(RuntimeTransition::MAX_ENCODED_BYTES)
-                    .unwrap(),
-                expected.encode().unwrap()
-            );
             let restored = StandardAgentRuntime::restore(
                 decode_standard_runtime_state(&clean_state_to_legacy(&expected.state)).unwrap(),
             )
             .unwrap();
             assert!(restored.snapshot().invocation_results.is_empty());
-            assert!(restored.snapshot().clean_invocation_errors.is_empty());
+            assert_eq!(restored.snapshot().clean_invocation_errors.len(), 1);
+            assert_eq!(restored.snapshot().lane_state, before.lane_state);
+            let revisions = restored.snapshot().lane_revisions;
+            assert_eq!(revisions.linear, before.lane_revisions.linear);
+            assert_eq!(revisions.merge, before.lane_revisions.merge);
+            assert_eq!(revisions.local, before.lane_revisions.local);
             let RuntimeWork::Invoke { state, .. } = &mut work else {
                 unreachable!()
             };
             *state = legacy_state_to_clean(encode_standard_runtime_state(&restored.snapshot()));
         }
+        let RuntimeWork::Invoke {
+            context,
+            state,
+            invocation,
+            authorization,
+            ..
+        } = work.clone()
+        else {
+            unreachable!()
+        };
+        let ack = execute(RuntimeWork::Acknowledge {
+            context,
+            state,
+            invocation,
+            authorization,
+        });
+        assert!(matches!(ack.outcome, RuntimeOutcome::Acknowledged(Ok(_))));
+        let restored = StandardAgentRuntime::restore(
+            decode_standard_runtime_state(&clean_state_to_legacy(&ack.state)).unwrap(),
+        )
+        .unwrap();
+        assert!(restored.snapshot().clean_invocation_errors.is_empty());
+        let RuntimeWork::Invoke {
+            state,
+            observed_slot,
+            ..
+        } = &mut work
+        else {
+            unreachable!()
+        };
+        *state = legacy_state_to_clean(encode_standard_runtime_state(&restored.snapshot()));
+        *observed_slot = 1;
+        let late = execute(work);
+        assert_eq!(late.state, ack.state);
+        assert_eq!(
+            late.outcome,
+            RuntimeOutcome::Completed(Err(InvocationError::DivergentInvocation))
+        );
     }
 
     #[cfg(feature = "pvm")]

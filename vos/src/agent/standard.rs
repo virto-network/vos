@@ -4267,6 +4267,41 @@ impl StandardAgentRuntime {
         }
     }
 
+    /// Resolve only an unseen signed invocation whose execution window ended.
+    /// Existing results and continuations stay on their exact recovery paths.
+    pub(crate) fn retain_clean_unseen_expiry(
+        &mut self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        observed_slot: u64,
+    ) -> Result<bool, crate::agent_sdk::InvocationError> {
+        use crate::agent_sdk::{InvocationAuthorization, InvocationError};
+        if !matches!(authorization, InvocationAuthorization::AuthorityReceipt(receipt)
+            if observed_slot > receipt.selector.expires_at)
+        {
+            return Ok(false);
+        }
+        let key = (
+            clean_method_mode(work.mode).invocation_scope(),
+            InvocationId(work.invocation.0),
+        );
+        if self.invocation_results.contains_key(&key)
+            || self.machine_continuations.iter().any(|record| {
+                (record.mode.invocation_scope(), record.invocation) == key
+            })
+        {
+            return Ok(false);
+        }
+        self.retain_clean_invocation_error(
+            work,
+            authorization,
+            InvocationError::ExpiredBeforeExecution,
+            observed_slot,
+            None,
+        )?;
+        Ok(true)
+    }
+
     /// Retain only an authenticated durable rejection, including a stale or
     /// absent target. No actor state/revision is ever accepted by this path.
     pub(crate) fn retain_clean_invocation_error(

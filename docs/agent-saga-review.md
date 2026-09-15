@@ -14,9 +14,12 @@ lifecycle-store leases and corrected clock coverage" for the correction.
 Implementation is in `.worktrees/ch08-runtime-directory` on
 `wip/ch08-runtime-directory`, not yet in the root `saga/agents` checkout.
 The C2 typed-error runtime is reproduced from source `373d2520` and bundled;
-post-pin validation is recorded below. New source-only expiry-fence support is
-not yet emitted by runtime dispatch or included in that bundle; its native
-delivery/retirement wiring and ABI/artifact release audit remain outstanding.
+post-pin validation is recorded below. Source runtime dispatch now emits the
+expiry fence for unseen expired signed work, but that change is not yet in the
+bundle. Candidate-PVM verification, native retirement/reservation recovery and
+the ABI/artifact release audit remain outstanding. The updated bundled-expiry
+regression requires the new candidate (or a completed repin); the old bundle
+cannot pass the new terminal-resolution expectation.
 The fresh
 `.lU4S5Z` live campaign now passes compiled protected Local yield/resume,
 retirement, two restarts and final-state query, plus Panicked-result retirement
@@ -9134,6 +9137,31 @@ recovery of already accepted work, then verify positive application retirement
 before releasing the credential. ABI/schema audit, rebuilt/reproduced bundles,
 management expiry, pre-expiry abort and live recovery remain required. Keep this
 inside C2; do not treat the wire extension as a completed release cutover.
+
+### Runtime expiry delivery (C2 source cutover)
+
+Invoke now retains `ExpiredBeforeExecution` after signature/exact-work validation
+when its signed receipt has expired and no result or continuation exists.
+Existing retained outcomes recover first; existing actor replies/continuations
+continue through their prior recovery paths. Actor proof/execution admission is
+not needed to retain authenticated non-execution. Failure to retain, including
+clock/capacity rejection, returns the original state. The runtime never resets
+the invocation identity or changes actor state to resolve expiry.
+
+The source lifecycle test exercises first delivery, exact retry, restore,
+positive ACK and an old-slot Invoke after retirement. **16 source/native/error
+and terminal-failure regressions passed**, 1.41 s, in shared C2
+`target/task-tmp/expiry-delivery-source-final.log`. Its first assertion incorrectly
+compared the authority clock as an actor revision; the corrected test asserts
+unchanged actor lane bytes and linear/merge/local revision counters, while the
+result clock advances as required. No production timeout changed.
+
+The same lifecycle helper compares all guest output bytes with source using
+`VOS_AGENT_RUNTIME_EXPIRY_CANDIDATE`, defaulting to the bundled runtime when no
+candidate is specified. The old pin is deliberately not counted as passing this
+new expectation. Build and verify the candidate next, then independently
+reproduce/pin only after the remaining native delivery/retirement checks.
+Management expiry and pre-expiry abort remain separate unfinished original gates.
 
 ### Durable client acknowledgement before completion
 
