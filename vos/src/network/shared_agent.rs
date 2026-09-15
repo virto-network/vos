@@ -2858,6 +2858,52 @@ impl SharedAgentNetworkHost {
         result
     }
 
+    /// Repair capacity only before a fresh management reservation exists.
+    /// The full capture check (not the smaller projection budget) decides
+    /// whether compaction is needed and rechecks both budgets afterwards.
+    pub(crate) fn capture_management_pending_with_checkpoint<F, T>(
+        &mut self,
+        agent: crate::service::AgentId,
+        proposed: &crate::agent_sdk::RuntimeWork,
+        expected_committee: &AgentReplicaCommittee,
+        signer: &dyn LocalMergeAuthenticator,
+        record: F,
+    ) -> Result<T, SharedAgentHostError>
+    where
+        F: FnOnce(&PendingManagement) -> Result<T, SharedAgentHostError>,
+    {
+        self.ensure_reattached(agent)?;
+        let mut record = Some(record);
+        let result = self.capture_management_pending(agent, proposed, |pending| {
+            record.take().expect("capture callback runs once")(pending)
+        });
+        if !matches!(result, Err(SharedAgentHostError::CapacityExhausted))
+            || record.is_none()
+            || self.management_pending.contains_key(&agent)
+            || self.management_retirements.contains_key(&agent)
+        {
+            // A callback error (even CapacityExhausted) is publication
+            // ambiguity, never permission to compact or retry the callback.
+            return result;
+        }
+        let crate::agent_sdk::RuntimeWork::Invoke {
+            invocation,
+            authorization,
+            ..
+        } = proposed
+        else {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        };
+        self.certified_checkpoint_for_admission(
+            agent,
+            invocation,
+            authorization,
+            expected_committee,
+            signer,
+        )?;
+        self.capture_management_pending(agent, proposed, record.expect("unpublished callback"))
+    }
+
     /// Recover an exact in-process reservation after a failed publication.
     /// This does not create admission or infer completion from a missing file.
     pub(crate) fn retained_management_pending(
@@ -3275,6 +3321,43 @@ impl SharedAgentNetworkHost {
         if !forced && raft_fits && replay_fits {
             return Ok(false);
         }
+        self.certified_checkpoint_for_admission(
+            agent,
+            work,
+            authorization,
+            expected_committee,
+            signer,
+        )?;
+        let host = self
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let remaining = host
+            .show(agent)?
+            .ok_or(SharedAgentHostError::AgentNotFound)?
+            .remaining_slots;
+        let required = host
+            .projection_admission_requirement(agent, work, authorization, false)?
+            .ok_or(SharedAgentHostError::CapacityExhausted)?;
+        if remaining < (required as u64).saturating_add(u64::from(required != 0))
+            || !host.projection_pair_fits(agent, work, authorization)?
+        {
+            return Err(SharedAgentHostError::CapacityExhausted);
+        }
+        Ok(true)
+    }
+
+    /// Shared certificate/attachment mechanics; callers retain their own
+    /// exact admission predicates. The gate excludes pending management and
+    /// retirement before any snapshot can replace their anchored history.
+    fn certified_checkpoint_for_admission(
+        &mut self,
+        agent: crate::service::AgentId,
+        work: &InvocationWork,
+        authorization: &InvocationAuthorization,
+        expected_committee: &AgentReplicaCommittee,
+        signer: &dyn LocalMergeAuthenticator,
+    ) -> Result<(), SharedAgentHostError> {
         if expected_committee.members().len() != 1
             || expected_committee.voter_count() != 1
             || expected_committee
@@ -3346,25 +3429,7 @@ impl SharedAgentNetworkHost {
         // of whether retirement, signing, or installation failed.
         let reattachment = self.reattach_current(agent);
         match (checkpoint, reattachment) {
-            (Ok(_), Ok(())) => {
-                let host = self
-                    .host
-                    .lock()
-                    .map_err(|_| SharedAgentHostError::Unavailable)?;
-                let remaining = host
-                    .show(agent)?
-                    .ok_or(SharedAgentHostError::AgentNotFound)?
-                    .remaining_slots;
-                let required = host
-                    .projection_admission_requirement(agent, work, authorization, false)?
-                    .ok_or(SharedAgentHostError::CapacityExhausted)?;
-                if remaining < (required as u64).saturating_add(u64::from(required != 0))
-                    || !host.projection_pair_fits(agent, work, authorization)?
-                {
-                    return Err(SharedAgentHostError::CapacityExhausted);
-                }
-                Ok(true)
-            }
+            (Ok(_), Ok(())) => Ok(()),
             (Err(error), Ok(())) => Err(error),
             (_, Err(error)) => Err(error),
         }

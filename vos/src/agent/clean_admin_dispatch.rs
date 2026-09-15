@@ -286,25 +286,28 @@ where
             authorization: Box::new(authorization),
             observed_slot: call.observed_slot,
         };
-        self._network_host.capture_management_pending(
-            crate::service::AgentId(self.pins.agent.0),
-            &proposed,
-            |(anchor, envelope)| {
-                let retained = RetainedAuthorityAdminDispatch {
-                    call: call.clone(),
-                    envelope: envelope.clone(),
-                    anchor: anchor.clone(),
-                    preparation: preparation.clone(),
-                };
-                let bytes = retained
-                    .encode()
-                    .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
-                journal
-                    .retain(call.invocation, &bytes)
-                    .map_err(|_| SharedAgentHostError::Unavailable)?;
-                Ok(retained)
-            },
-        )
+        self._network_host
+            .capture_management_pending_with_checkpoint(
+                crate::service::AgentId(self.pins.agent.0),
+                &proposed,
+                &self.pins.replicas,
+                self.snapshot_signer.as_ref(),
+                |(anchor, envelope)| {
+                    let retained = RetainedAuthorityAdminDispatch {
+                        call: call.clone(),
+                        envelope: envelope.clone(),
+                        anchor: anchor.clone(),
+                        preparation: preparation.clone(),
+                    };
+                    let bytes = retained
+                        .encode()
+                        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+                    journal
+                        .retain(call.invocation, &bytes)
+                        .map_err(|_| SharedAgentHostError::Unavailable)?;
+                    Ok(retained)
+                },
+            )
     }
 
     /// None means a durable actor denial, not a transport failure. Neither

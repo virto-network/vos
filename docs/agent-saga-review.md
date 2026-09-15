@@ -8175,6 +8175,73 @@ No runtime, guest artifact, validation rule, or admission behavior changed in
 this sampling follow-up. The C2 capacity diagnostics and protected probe are
 one scoped review unit, not an additional release batch.
 
+### Reproduced initial-management admission boundary (C2)
+
+The explicit diagnostic
+`native_operation_initial_capture_requires_more_headroom_than_projection`
+passes against the real bundled Authority and native journal (**323.02s**;
+`target/task-tmp/management-boundary-run.log`). It builds authenticated
+projection Invoke/ACK history until initial management no longer fits. At that
+point it proves all of the following:
+
+- Initial capture returns `CapacityExhausted` before its publication callback;
+  physical state is unchanged and no pending reservation exists.
+- The smaller projection pair still fits, so its ordinary certified-checkpoint
+  helper returns false and does not repair management capacity.
+- Forcing an actual certified checkpoint makes the same management request
+  admissible, with the exact same runtime envelope.
+
+This confirms a missing initial-management capacity repair path. It does not
+prove that either historical HTTP 503 had this cause, and production behavior
+is not fixed yet. Next change: budget-aware certified checkpoint before fresh
+management reservation, with exclusion against existing pending work and
+retirement, preserving retained clocks and callback-failure retry semantics.
+Do not reuse the smaller projection's fit predicate.
+
+The test is ignored by default because filling and checkpointing the real
+64MiB suffix takes several minutes. Run the named test with the existing vos
+native feature set and `-- --ignored --test-threads=1`. Its body passed before
+adding only this explicit-run annotation. The first compile failed for a
+missing closure return type; `management-boundary.log` preserves that failure.
+The successful test exited 0 and its disposable journal directory was removed
+by the existing harness cleanup. No daemon or test remains running.
+
+### Budget-aware initial management checkpoint repair (C2)
+
+Fresh Create/Install, operation authorization and admin capture now use one
+bounded checkpoint fallback on initial admission exhaustion. The existing
+capture check supplies the full management lifecycle budget; after a certified
+checkpoint it checks that same budget again, rather than a projection's
+smaller Invoke/ACK budget. No limits or HTTP timeouts were increased.
+
+The shared certificate/attachment implementation is extracted from the
+existing projection checkpoint path; each caller retains its own fit check.
+Committee authentication, signer refusal, proposal exclusion and reattachment
+behavior are preserved. Existing pending management or retirement prevents
+the fallback. The persistence callback is consumed at most once: its errors,
+including `CapacityExhausted`, retain the exact reservation and never trigger
+compaction. No signed request or retained observation clock is regenerated.
+
+The explicit real-journal boundary test now calls production capture after
+demonstrating that the projection helper does not compact; it no longer forces
+a checkpoint. A separate routine regression checks a callback capacity error,
+unchanged physical state, retained reservation and byte-identical exact retry.
+This fixes the reproduced admission path, not the broader latency gate or
+every possible source of the historical HTTP 503 responses.
+
+Validation: native operation regressions **10 passed / 1 explicit diagnostic
+ignored** (95.56s), checkpoint failure/attachment recovery **1 passed** (8.82s),
+native admin regressions **3 passed** (51.76s), CLI **252 passed / 12 ignored**
+(68.81s), normal vosx build passes (15.99s), formatting and whitespace checks
+pass. Logs in disk-backed task-tmp: `management-checkpoint-regressions.log`,
+`management-checkpoint-projection.log`, `management-checkpoint-admin.log`,
+`management-checkpoint-cli.log`, `management-checkpoint-build.log`.
+The explicit real-journal regression also **passed** against production capture
+(357.53s; `management-checkpoint-boundary.log`), with no forced checkpoint.
+Other checks overlapped this diagnostic, so its elapsed time is not a latency
+benchmark. Its temporary journal was removed by harness cleanup and all test
+and build handles exited 0. No live space was started for this fix.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

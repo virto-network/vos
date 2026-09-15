@@ -990,29 +990,32 @@ where
     where
         F: FnOnce(&RetainedAuthorityOperationDispatch) -> Result<(), SharedAgentHostError>,
     {
-        self._network_host.capture_management_pending(
-            crate::service::AgentId(self.pins.agent.0),
-            proposed,
-            |(anchor, envelope)| {
-                let mut request = request.clone();
-                if reuse_reserved_clock {
-                    // A failed journal callback may have retained a native
-                    // reservation. The host supplies its original envelope;
-                    // bind that clock, never the retry's newer observation.
-                    let RuntimeWork::Invoke { observed_slot, .. } = envelope else {
-                        return Err(SharedAgentHostError::ScopeMismatch);
-                    };
-                    request.context.observed_slot = *observed_slot;
-                }
-                let retained = RetainedAuthorityOperationDispatch::new(
-                    request,
-                    envelope.clone(),
-                    anchor.clone(),
-                )?;
-                persist(&retained)?;
-                Ok(retained)
-            },
-        )
+        self._network_host
+            .capture_management_pending_with_checkpoint(
+                crate::service::AgentId(self.pins.agent.0),
+                proposed,
+                &self.pins.replicas,
+                self.snapshot_signer.as_ref(),
+                |(anchor, envelope)| {
+                    let mut request = request.clone();
+                    if reuse_reserved_clock {
+                        // A failed journal callback may have retained a native
+                        // reservation. The host supplies its original envelope;
+                        // bind that clock, never the retry's newer observation.
+                        let RuntimeWork::Invoke { observed_slot, .. } = envelope else {
+                            return Err(SharedAgentHostError::ScopeMismatch);
+                        };
+                        request.context.observed_slot = *observed_slot;
+                    }
+                    let retained = RetainedAuthorityOperationDispatch::new(
+                        request,
+                        envelope.clone(),
+                        anchor.clone(),
+                    )?;
+                    persist(&retained)?;
+                    Ok(retained)
+                },
+            )
     }
 
     /// Select context from the same physical material used to build the native

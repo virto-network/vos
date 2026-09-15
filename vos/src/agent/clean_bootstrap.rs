@@ -2470,14 +2470,17 @@ where
                 observed_slot: material.observed_slot,
             };
             if capture {
-                self._network_host.capture_management_pending(
-                    crate::service::AgentId(self.pins.agent.0),
-                    &envelope,
-                    |(anchor, work)| {
-                        slot.pledge_authorization_work(work.clone(), anchor.clone())
-                            .map_err(|_| SharedAgentHostError::Unavailable)
-                    },
-                )?;
+                self._network_host
+                    .capture_management_pending_with_checkpoint(
+                        crate::service::AgentId(self.pins.agent.0),
+                        &envelope,
+                        &self.pins.replicas,
+                        self.snapshot_signer.as_ref(),
+                        |(anchor, work)| {
+                            slot.pledge_authorization_work(work.clone(), anchor.clone())
+                                .map_err(|_| SharedAgentHostError::Unavailable)
+                        },
+                    )?;
             } else {
                 self._network_host.record_management_anchor(
                     crate::service::AgentId(self.pins.agent.0),
@@ -12085,6 +12088,138 @@ mod tests {
             drop(operations);
             drop(owner);
             stop_network(network);
+        }
+
+        #[test]
+        #[ignore = "fills the real 64MiB journal boundary; explicit native capacity diagnostic"]
+        fn native_operation_initial_capture_requires_more_headroom_than_projection() {
+            use crate::agent::authority_operation_coordinator::tests::unenrolled_native_dispatch;
+
+            let mut harness = NativeProjectionOwnerHarness::with_fixture(
+                "native-operation-capacity-boundary",
+                native_bundled_authority_fixture(),
+            );
+            let owner = harness.owner.as_mut().unwrap();
+            let agent = HostAgentId(owner.pins.agent.0);
+            let target = owner.authority_target();
+            let slot = owner
+                .supervisor_invocation_material(owner.pins.agent, target.binding.issuer.actor)
+                .unwrap()
+                .observed_slot;
+            let request = unenrolled_native_dispatch(target, slot);
+            let mut found_boundary = false;
+            // Populate real authenticated history, not a synthetic capacity
+            // counter. Check every completed Invoke/ACK pair because initial
+            // management reserves a larger lifecycle than a projection.
+            for nonce in 1..=64 {
+                let envelope = owner
+                    .prepare_authority_operation_dispatch(&request)
+                    .unwrap();
+                let (query, query_auth) = fresh_projection_pair(owner, nonce);
+                let initial_fits = {
+                    let host = owner.host.lock().unwrap();
+                    let anchor = management_anchor_for_test(&host.journal_position(agent).unwrap());
+                    host.management_initial_admission_requirement(agent, &anchor, &envelope)
+                        .unwrap()
+                        .is_some()
+                };
+                if !initial_fits {
+                    let before = native_owner_physical_state(owner);
+                    assert!(matches!(
+                        owner._network_host.capture_management_pending(
+                            agent,
+                            &envelope,
+                            |_| -> Result<(), SharedAgentHostError> {
+                                panic!("capacity rejection must precede intent publication")
+                            }
+                        ),
+                        Err(SharedAgentHostError::CapacityExhausted)
+                    ));
+                    assert_eq!(native_owner_physical_state(owner), before);
+                    assert!(
+                        owner
+                            ._network_host
+                            .retained_management_pending(agent, request.context.invocation)
+                            .unwrap()
+                            .is_none()
+                    );
+                    // The projection helper need not compact when its smaller
+                    // pair fits: it is not a management admission repair.
+                    let checkpointed = owner
+                        ._network_host
+                        .certified_checkpoint_for_projection_pair(
+                            agent,
+                            &query,
+                            &query_auth,
+                            &owner.pins.replicas,
+                            owner.snapshot_signer.as_ref(),
+                        )
+                        .unwrap();
+                    assert!(!checkpointed, "fixture missed the distinct-budget boundary");
+                    // Production capture must repair the larger budget;
+                    // no test-only forced checkpoint participates here.
+                    let captured = owner
+                        .capture_authority_operation_dispatch(&request, |_| Ok(()))
+                        .unwrap();
+                    assert_eq!(captured.envelope(), &envelope);
+                    found_boundary = true;
+                    break;
+                }
+                owner
+                    .invoke_authority_projection(signed_credential_projection_query(owner, nonce))
+                    .unwrap();
+            }
+            assert!(
+                found_boundary,
+                "bounded fixture did not exhaust initial admission"
+            );
+            harness.stop();
+        }
+
+        #[test]
+        fn native_operation_capture_callback_capacity_error_retains_exact_reservation() {
+            use crate::agent::authority_operation_coordinator::tests::unenrolled_native_dispatch;
+            let mut harness = NativeProjectionOwnerHarness::with_fixture(
+                "native-operation-callback-capacity",
+                native_bundled_authority_fixture(),
+            );
+            let owner = harness.owner.as_mut().unwrap();
+            let agent = HostAgentId(owner.pins.agent.0);
+            let target = owner.authority_target();
+            let slot = owner
+                .supervisor_invocation_material(owner.pins.agent, target.binding.issuer.actor)
+                .unwrap()
+                .observed_slot;
+            let request = unenrolled_native_dispatch(target, slot);
+            let before = native_owner_physical_state(owner);
+            let mut saved = None;
+            let mut callbacks = 0;
+            assert!(matches!(
+                owner.capture_authority_operation_dispatch(&request, |record| {
+                    callbacks += 1;
+                    saved = Some(record.clone());
+                    Err(SharedAgentHostError::CapacityExhausted)
+                }),
+                Err(SharedAgentHostError::CapacityExhausted)
+            ));
+            assert_eq!(callbacks, 1);
+            assert_eq!(native_owner_physical_state(owner), before);
+            let saved = saved.unwrap();
+            let pending = owner
+                ._network_host
+                .retained_management_pending(agent, request.context.invocation)
+                .unwrap()
+                .unwrap();
+            assert_eq!(&pending.1, saved.envelope());
+            let retried = owner
+                .capture_authority_operation_dispatch(&request, |record| {
+                    assert_eq!(record.encode().unwrap(), saved.encode().unwrap());
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(retried.encode().unwrap(), saved.encode().unwrap());
+            assert_eq!(native_owner_physical_state(owner), before);
+            harness.stop();
         }
 
         #[test]
