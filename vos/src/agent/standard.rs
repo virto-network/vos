@@ -173,6 +173,8 @@ pub struct StandardAgentRuntime {
     retired_installation_ids: BTreeSet<InstallationId>,
     lane_state: StandardLaneState,
     invocation_results: BTreeMap<(InvocationScope, InvocationId), StandardInvocationResult>,
+    clean_invocation_errors:
+        BTreeMap<(InvocationScope, InvocationId), StandardCleanInvocationError>,
     /// Bounded, insertion-ordered facts for successfully retired clean
     /// results. These are guest state (not host retry cache), survive journal
     /// checkpoints, and are encoded in the same physical component as the
@@ -221,6 +223,7 @@ pub struct StandardRuntimeState {
     pub retired_installation_ids: Vec<InstallationId>,
     pub lane_state: StandardLaneState,
     pub invocation_results: Vec<StandardInvocationResult>,
+    pub(crate) clean_invocation_errors: Vec<StandardCleanInvocationError>,
     pub clean_invocation_acknowledgements: Vec<crate::agent_sdk::InvocationAcknowledgement>,
     pub(crate) machine_continuations: Vec<StandardMachineContinuation>,
     pub lane_revisions: StandardLaneRevisions,
@@ -325,6 +328,27 @@ pub struct StandardInvocationResult {
     /// Clean-generation acceptance data. Legacy execution results keep this
     /// absent and can never be retired through the clean acknowledgement ABI.
     pub(crate) clean: Option<StandardCleanInvocationResult>,
+}
+
+/// A durable clean rejection is not an actor reply. Its accepted work remains
+/// authoritative even when the actor/installation no longer resolves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StandardCleanInvocationError {
+    pub binding: StandardCleanInvocationResult,
+    pub error: crate::agent_sdk::InvocationError,
+}
+
+impl StandardCleanInvocationError {
+    pub(crate) fn key(&self) -> (InvocationScope, InvocationId) {
+        (
+            clean_method_mode(self.binding.accepted.mode).invocation_scope(),
+            InvocationId(self.binding.accepted.invocation.0),
+        )
+    }
+
+    pub(crate) fn storage(&self) -> InvocationResultStorage {
+        clean_method_mode(self.binding.accepted.mode).result_storage()
+    }
 }
 
 /// One guest-owned yielded inner-machine continuation.
@@ -1276,6 +1300,7 @@ impl StandardAgentRuntime {
                 local: Vec::new(),
             },
             invocation_results: BTreeMap::new(),
+            clean_invocation_errors: BTreeMap::new(),
             clean_invocation_acknowledgements: Vec::new(),
             machine_continuations: Vec::new(),
             lane_revisions: StandardLaneRevisions {
@@ -1389,6 +1414,7 @@ impl StandardAgentRuntime {
             retired_installation_ids: self.retired_installation_ids.iter().copied().collect(),
             lane_state: self.lane_state.clone(),
             invocation_results: self.invocation_results.values().cloned().collect(),
+            clean_invocation_errors: self.clean_invocation_errors.values().cloned().collect(),
             clean_invocation_acknowledgements: self.clean_invocation_acknowledgements.clone(),
             machine_continuations: self.machine_continuations.clone(),
             lane_revisions: self.lane_revisions,
@@ -1453,6 +1479,7 @@ impl StandardAgentRuntime {
                 && state.system_authority.is_none()
                 && state.lane_state == StandardLaneState::default()
                 && state.invocation_results.is_empty()
+                && state.clean_invocation_errors.is_empty()
                 && state.clean_invocation_acknowledgements.is_empty()
                 && state.machine_continuations.is_empty()
                 && state.lane_revisions == StandardLaneRevisions::default()
@@ -1932,6 +1959,21 @@ impl StandardAgentRuntime {
                 .invocation_results
                 .insert((result.scope, result.invocation), result);
         }
+        if state
+            .clean_invocation_errors
+            .windows(2)
+            .any(|pair| pair[0].key() >= pair[1].key())
+        {
+            return Err(LifecycleError::InvalidRequest);
+        }
+        for error in state.clean_invocation_errors {
+            if !runtime.clean_invocation_error_is_valid(&error)
+                || runtime.invocation_results.contains_key(&error.key())
+            {
+                return Err(LifecycleError::InvalidRequest);
+            }
+            runtime.clean_invocation_errors.insert(error.key(), error);
+        }
         if runtime.clean_descriptor.is_none() && !state.clean_invocation_acknowledgements.is_empty()
         {
             return Err(LifecycleError::InvalidRequest);
@@ -1941,7 +1983,9 @@ impl StandardAgentRuntime {
                 clean_method_mode(acknowledgement.mode).invocation_scope(),
                 InvocationId(acknowledgement.invocation.0),
             );
-            if runtime.invocation_results.contains_key(&key) {
+            if runtime.invocation_results.contains_key(&key)
+                || runtime.clean_invocation_errors.contains_key(&key)
+            {
                 return Err(LifecycleError::InvalidRequest);
             }
             runtime
@@ -1991,6 +2035,12 @@ impl StandardAgentRuntime {
                     continuation.invocation,
                 ))
             {
+                return Err(LifecycleError::InvalidRequest);
+            }
+            if runtime.clean_invocation_errors.contains_key(&(
+                continuation.mode.invocation_scope(),
+                continuation.invocation,
+            )) {
                 return Err(LifecycleError::InvalidRequest);
             }
             runtime.machine_continuations.push(continuation);
@@ -2505,6 +2555,9 @@ impl StandardAgentRuntime {
         use super::execution::ActorExecutionError;
         invocation.validate()?;
         let key = (invocation.mode.invocation_scope(), invocation.invocation);
+        if self.clean_invocation_errors.contains_key(&key) {
+            return Err(ActorExecutionError::DivergentInvocation);
+        }
         if let Some(result) = self.invocation_results.get(&key) {
             if result.request != invocation.commitment() {
                 return Err(ActorExecutionError::DivergentInvocation);
@@ -2544,6 +2597,9 @@ impl StandardAgentRuntime {
         }
         let scope = clean_method_mode(work.mode).invocation_scope();
         let key = (scope, InvocationId(work.invocation.0));
+        if self.clean_invocation_errors.contains_key(&key) {
+            return Err(InvocationError::DivergentInvocation);
+        }
         let Some(result) = self.invocation_results.get(&key) else {
             return Ok(None);
         };
@@ -3171,6 +3227,9 @@ impl StandardAgentRuntime {
             || reply.mode != invocation.mode
             || reply.lane != invocation.mode.write_lane()
             || reply.status != ActorExecutionStatus::Yielded
+            || self
+                .clean_invocation_errors
+                .contains_key(&(invocation.mode.invocation_scope(), invocation.invocation))
             || reply.observation != super::execution::ActorObservation::default()
             || !continuation.validate()
         {
@@ -3532,7 +3591,12 @@ impl StandardAgentRuntime {
             (AttestationRequirement::None, Some(_))
             | (AttestationRequirement::Required { .. }, None) => false,
         };
-        if policy.mode != work.mode || !attestation_matches {
+        // A missing/wrong proof is a retryable admission rejection, not an
+        // executed method's durable UnsupportedMethod outcome.
+        if !attestation_matches {
+            return Err(ActorExecutionError::InvalidAuthorization);
+        }
+        if policy.mode != work.mode {
             return Err(ActorExecutionError::UnsupportedMethod);
         }
         Ok(match authorization {
@@ -3738,6 +3802,9 @@ impl StandardAgentRuntime {
             || self
                 .invocation_results
                 .contains_key(&(invocation.mode.invocation_scope(), invocation.invocation))
+            || self
+                .clean_invocation_errors
+                .contains_key(&(invocation.mode.invocation_scope(), invocation.invocation))
         {
             return Err(ActorExecutionError::InvalidActorOutput);
         }
@@ -3923,6 +3990,7 @@ impl StandardAgentRuntime {
             || reply.gas_remaining > invocation.gas
             || reply.observation != ActorObservation::default()
             || self.invocation_results.contains_key(&key)
+            || self.clean_invocation_errors.contains_key(&key)
             || self
                 .recover_clean_acknowledgement(work, authorization)
                 .map_err(|_| ActorExecutionError::InvalidAuthorization)?
@@ -4024,6 +4092,23 @@ impl StandardAgentRuntime {
         self.verify_clean_invocation_authorization(work, authorization, authorization_slot)?;
         let scope = clean_method_mode(work.mode).invocation_scope();
         let key = (scope, InvocationId(work.invocation.0));
+        if let Some(record) = self.clean_invocation_errors.get(&key) {
+            if !self.clean_invocation_error_is_valid(record)
+                || !record.binding.matches(work, authorization)
+            {
+                return Err(InvocationError::DivergentInvocation);
+            }
+            let acknowledgement = InvocationAcknowledgement {
+                invocation: work.invocation,
+                actor: work.actor,
+                incarnation: work.incarnation,
+                deployment: work.deployment,
+                mode: work.mode,
+                work: record.binding.work,
+                authorization: record.binding.authorization.commitment(),
+            };
+            return self.commit_clean_acknowledgement(work, authorization, acknowledgement);
+        }
         let result = self
             .invocation_results
             .get(&key)
@@ -4061,6 +4146,21 @@ impl StandardAgentRuntime {
             work: binding.work,
             authorization: binding.authorization.commitment(),
         };
+        self.commit_clean_acknowledgement(work, authorization, acknowledgement)
+    }
+
+    fn commit_clean_acknowledgement(
+        &mut self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        acknowledgement: crate::agent_sdk::InvocationAcknowledgement,
+    ) -> Result<crate::agent_sdk::InvocationAcknowledgement, crate::agent_sdk::InvocationError>
+    {
+        use crate::agent_sdk::InvocationError;
+        let key = (
+            clean_method_mode(work.mode).invocation_scope(),
+            InvocationId(work.invocation.0),
+        );
         if self.clean_descriptor.as_ref().is_some_and(|descriptor| {
             is_system_authority_projection_query(descriptor, work, authorization)
         }) {
@@ -4070,6 +4170,7 @@ impl StandardAgentRuntime {
             // response-bound, while no positive guest fact or live proof edge
             // remains to consume bounded lifecycle capacity.
             self.invocation_results.remove(&key);
+            self.clean_invocation_errors.remove(&key);
             return Ok(acknowledgement);
         }
         let storage = clean_method_mode(work.mode).result_storage();
@@ -4083,6 +4184,7 @@ impl StandardAgentRuntime {
             return Err(InvocationError::ResultCapacity);
         }
         self.invocation_results.remove(&key);
+        self.clean_invocation_errors.remove(&key);
         let storage_tag = clean_acknowledgement_storage_tag(acknowledgement.mode);
         let insertion = self
             .clean_invocation_acknowledgements
@@ -4094,11 +4196,153 @@ impl StandardAgentRuntime {
         Ok(acknowledgement)
     }
 
+    fn clean_invocation_error_is_valid(&self, record: &StandardCleanInvocationError) -> bool {
+        let binding = &record.binding;
+        self.clean_descriptor.is_some()
+            && record.error.is_durable_exact_outcome()
+            && binding.accepted.validate()
+            && binding.work != crate::agent_sdk::Hash::ZERO
+            && self.result_storage_supported(record.storage())
+            && clean_authorization_is_live_at(&binding.authorization, binding.observed_slot)
+            && self
+                .result_authority_slot(record.storage())
+                .is_some_and(|slot| slot >= binding.observed_slot)
+            && self
+                .verify_clean_accepted_authorization(
+                    &binding.accepted,
+                    &binding.authorization,
+                    Hash(binding.work.0),
+                    binding.observed_slot,
+                )
+                .is_ok()
+    }
+
+    pub(crate) fn recover_clean_invocation_error(
+        &mut self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        observed_slot: u64,
+    ) -> Result<Option<crate::agent_sdk::InvocationError>, crate::agent_sdk::InvocationError> {
+        use crate::agent_sdk::InvocationError;
+        self.verify_clean_invocation_authorization(work, authorization, observed_slot)?;
+        if self
+            .recover_clean_acknowledgement(work, authorization)?
+            .is_some()
+        {
+            return Err(InvocationError::DivergentInvocation);
+        }
+        let key = (
+            clean_method_mode(work.mode).invocation_scope(),
+            InvocationId(work.invocation.0),
+        );
+        let Some(record) = self.clean_invocation_errors.get(&key) else {
+            return Ok(None);
+        };
+        if !self.clean_invocation_error_is_valid(record)
+            || !record.binding.matches(work, authorization)
+            || observed_slot < record.binding.observed_slot
+        {
+            return Err(InvocationError::DivergentInvocation);
+        }
+        let (error, storage) = (record.error, record.storage());
+        self.advance_result_authority_slot(storage, observed_slot);
+        Ok(Some(error))
+    }
+
+    /// Retain only an authenticated durable rejection, including a stale or
+    /// absent target. No actor state/revision is ever accepted by this path.
+    pub(crate) fn retain_clean_invocation_error(
+        &mut self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        error: crate::agent_sdk::InvocationError,
+        observed_slot: u64,
+        terminal_continuation: Option<u64>,
+    ) -> Result<(), crate::agent_sdk::InvocationError> {
+        use crate::agent_sdk::InvocationError;
+        self.verify_clean_invocation_authorization(work, authorization, observed_slot)?;
+        if !error.is_durable_exact_outcome() {
+            return Err(InvocationError::InvalidInput);
+        }
+        if !clean_authorization_is_live_at(authorization, observed_slot) {
+            return Err(InvocationError::AuthorityExpired);
+        }
+        let record = StandardCleanInvocationError {
+            binding: StandardCleanInvocationResult::from_work(
+                work,
+                authorization.clone(),
+                observed_slot,
+            ),
+            error,
+        };
+        let key = record.key();
+        let storage = record.storage();
+        if !self.result_storage_supported(storage) {
+            return Err(InvocationError::UnsupportedResultStorage);
+        }
+        if self.invocation_results.contains_key(&key)
+            || self.clean_invocation_errors.contains_key(&key)
+            || self
+                .recover_clean_acknowledgement(work, authorization)?
+                .is_some()
+        {
+            return Err(InvocationError::DivergentInvocation);
+        }
+        if self.invocation_result_count(storage) >= MAX_INVOCATION_RESULTS_PER_LANE
+            || self
+                .invocation_result_bytes(storage)
+                .saturating_add(super::wire::encode_clean_invocation_error(&record).len())
+                > MAX_INVOCATION_RESULT_BYTES_PER_LANE
+        {
+            return Err(InvocationError::ResultCapacity);
+        }
+        let continuation = self
+            .machine_continuations
+            .iter()
+            .position(|item| (item.mode.invocation_scope(), item.invocation) == key);
+        match (terminal_continuation, continuation) {
+            (None, None) => {}
+            (Some(sequence), Some(index)) => {
+                let item = &self.machine_continuations[index];
+                if item.ready_sequence != sequence
+                    || item.observed_slot != observed_slot
+                    || item.accepted.as_ref() != Some(&record.binding.accepted)
+                    || item.authorization.as_ref() != Some(authorization)
+                    || item.work != Hash(record.binding.work.0)
+                    || self
+                        .machine_continuations
+                        .iter()
+                        .position(|item| item.storage() == storage)
+                        != Some(index)
+                {
+                    return Err(InvocationError::StaleContinuation);
+                }
+            }
+            _ => return Err(InvocationError::StaleContinuation),
+        }
+        let mut candidate = self.clone();
+        if let Some(index) = continuation {
+            candidate.machine_continuations.remove(index);
+        }
+        candidate.advance_result_authority_slot(storage, observed_slot);
+        if !candidate.clean_invocation_error_is_valid(&record) {
+            return Err(InvocationError::InvalidAuthorization);
+        }
+        candidate.clean_invocation_errors.insert(key, record);
+        *self = candidate;
+        Ok(())
+    }
+
     fn invocation_result_count(&self, storage: InvocationResultStorage) -> usize {
         self.invocation_results
             .values()
             .filter(|result| result.storage == storage)
             .count()
+            + self
+                .clean_invocation_errors
+                .values()
+                .filter(|item| item.storage() == storage)
+                .count()
     }
 
     fn invocation_result_bytes(&self, storage: InvocationResultStorage) -> usize {
@@ -4108,6 +4352,14 @@ impl StandardAgentRuntime {
             .fold(0usize, |total, result| {
                 total.saturating_add(result.reply.reply.len())
             })
+            .saturating_add(
+                self.clean_invocation_errors
+                    .values()
+                    .filter(|item| item.storage() == storage)
+                    .fold(0usize, |total, item| {
+                        total.saturating_add(super::wire::encode_clean_invocation_error(item).len())
+                    }),
+            )
     }
 
     #[cfg(feature = "pvm")]
@@ -4406,6 +4658,10 @@ impl StandardAgentRuntime {
                         if !config.identity.profile.supports(lane)
                             || !capabilities.lanes.contains(lane)
                 )
+            })
+            || self.clean_invocation_errors.values().any(|result| {
+                matches!(result.storage(), InvocationResultStorage::Lane(lane)
+                    if !config.identity.profile.supports(lane) || !capabilities.lanes.contains(lane))
             })
         {
             return Err(LifecycleError::UnsupportedRuntime);
@@ -6088,6 +6344,15 @@ impl AgentRuntime for StandardAgentRuntime {
                 self.invocation_results
                     .values()
                     .filter(|result| result.reply.actor == actor)
+                    .count(),
+            )
+            .unwrap_or(u32::MAX),
+        );
+        debt.lifecycle_operations = debt.lifecycle_operations.saturating_add(
+            u32::try_from(
+                self.clean_invocation_errors
+                    .values()
+                    .filter(|record| record.binding.accepted.actor.0 == actor.0)
                     .count(),
             )
             .unwrap_or(u32::MAX),

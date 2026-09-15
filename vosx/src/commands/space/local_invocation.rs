@@ -215,12 +215,31 @@ pub(crate) fn submit(
             MAX_RESPONSE_BYTES,
         )?;
         let response = verify_response(&request, &bytes)?;
+        if let AgentInvocationResponse::Direct { outcome, .. } = &response {
+            ensure_durable_delivery(outcome)?;
+        }
         store.publish_response(&bytes)?;
         Ok(response)
     })();
     result.map_err(|error: anyhow::Error| {
         anyhow::anyhow!("{error}; exact invocation retained, execution outcome may be unknown")
     })
+}
+
+/// A non-durable rejection did not consume the invocation. Preserve the exact
+/// pending request so it can be retried; freezing this reply as terminal would
+/// instead send it to ACK and make a transient rejection permanent. Historical
+/// response/progress files are never cleared or replaced by this rule.
+pub(crate) fn ensure_durable_delivery(
+    outcome: &vos::agent::sdk::RuntimeOutcome,
+) -> anyhow::Result<()> {
+    if let vos::agent::sdk::RuntimeOutcome::Completed(Err(error)) = outcome {
+        anyhow::ensure!(
+            error.is_durable_exact_outcome(),
+            "non-durable invocation rejection {error:?}; keep exact work pending, not eligible for terminal acknowledgement"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn run(
@@ -774,6 +793,13 @@ pub(crate) mod tests {
         let path = root.join("request");
         let (request, response) = fixture(13);
         let (_, wrong) = fixture(14);
+        let call = AgentInvocationRequest::decode(&request).unwrap();
+        let capacity = AgentInvocationResponse::Direct {
+            request: call.commitment(),
+            outcome: RuntimeOutcome::Completed(Err(InvocationError::ResultCapacity)),
+        }
+        .encode()
+        .unwrap();
         let input = root.join("initial.asq1");
         std::fs::write(&input, &request).unwrap();
         for (status, content_type, body, succeeds) in [
@@ -781,6 +807,7 @@ pub(crate) mod tests {
             (302, "application/octet-stream", response.clone(), false),
             (200, "application/json", response.clone(), false),
             (200, "application/octet-stream", wrong, false),
+            (200, "application/octet-stream", capacity, false),
             (
                 200,
                 "application/octet-stream",

@@ -5112,6 +5112,7 @@ fn validate_sdk_exact_execution_transition(
     prior: &RuntimeState,
     next: &RuntimeState,
     work: &crate::agent_sdk::RuntimeWork,
+    error: crate::agent_sdk::InvocationError,
 ) -> Result<(), AgentDriverError> {
     let mode = match work {
         crate::agent_sdk::RuntimeWork::Invoke { invocation, .. } => invocation.mode,
@@ -5132,23 +5133,48 @@ fn validate_sdk_exact_execution_transition(
     match work {
         crate::agent_sdk::RuntimeWork::Invoke {
             invocation,
+            authorization,
             observed_slot,
             ..
-        } => runtime
-            .commit_clean_exact_outcome_clock(invocation.mode, *observed_slot)
-            .map_err(|_| AgentDriverError::InvalidRuntime)?,
+        } => {
+            match runtime
+                .recover_clean_invocation_error(invocation, authorization, *observed_slot)
+                .map_err(|_| AgentDriverError::InvalidRuntime)?
+            {
+                Some(retained) if retained == error => {}
+                Some(_) => return Err(AgentDriverError::InvalidRuntime),
+                None => {
+                    runtime
+                        .validate_clean_unseen_invocation_slot(authorization, *observed_slot)
+                        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+                    runtime
+                        .retain_clean_invocation_error(
+                            invocation,
+                            authorization,
+                            error,
+                            *observed_slot,
+                            None,
+                        )
+                        .map_err(|_| AgentDriverError::InvalidRuntime)?;
+                }
+            }
+        }
         crate::agent_sdk::RuntimeWork::Resume { resume, .. } => {
             let (record, accepted) = runtime
                 .resolve_clean_resume(resume)
                 .map_err(|_| AgentDriverError::InvalidRuntime)?;
-            let (invocation, _, _, _, _) = runtime
-                .resolve_clean_invocation(&accepted)
-                .map_err(|_| AgentDriverError::InvalidRuntime)?;
+            let authorization = record
+                .authorization
+                .as_ref()
+                .ok_or(AgentDriverError::InvalidRuntime)?;
             runtime
-                .consume_machine_continuation(&invocation, record.ready_sequence)
-                .map_err(|_| AgentDriverError::InvalidRuntime)?;
-            runtime
-                .commit_clean_exact_outcome_clock(resume.mode, record.observed_slot)
+                .retain_clean_invocation_error(
+                    &accepted,
+                    authorization,
+                    error,
+                    record.observed_slot,
+                    Some(record.ready_sequence),
+                )
                 .map_err(|_| AgentDriverError::InvalidRuntime)?;
         }
         crate::agent_sdk::RuntimeWork::Manage { .. }
@@ -5183,7 +5209,7 @@ fn validate_sdk_error_transition(
         return validate_execution_transition(prior, next, sdk_mode_as_legacy(mode));
     }
     if error.is_durable_exact_outcome() {
-        validate_sdk_exact_execution_transition(runtime_program, prior, next, work)
+        validate_sdk_exact_execution_transition(runtime_program, prior, next, work, error)
     } else if next == prior {
         Ok(())
     } else {
@@ -6495,6 +6521,127 @@ mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
+    fn sdk_typed_error_resume_consumes_continuation_and_retires_after_restore() {
+        use crate::agent_sdk::{
+            InvocationError, RuntimeExecutionContext, RuntimeOutcome, RuntimeWork,
+        };
+        let work = super::super::wire::tests::clean_failing_resume_fixture_with_status(Some(0xff));
+        let RuntimeWork::Resume { state, resume, .. } = &work else {
+            unreachable!()
+        };
+        let prior = sdk_state_as_legacy(state);
+        let runtime = super::super::standard::StandardAgentRuntime::restore(
+            super::super::wire::decode_standard_runtime_state(&prior).unwrap(),
+        )
+        .unwrap();
+        let (record, accepted) = runtime.resolve_clean_resume(resume).unwrap();
+        let transition = super::super::wire::apply_standard_runtime_work(work.clone()).unwrap();
+        assert_eq!(
+            transition.outcome,
+            RuntimeOutcome::Completed(Err(InvocationError::InvalidActorOutput))
+        );
+        let next = sdk_state_as_legacy(&transition.state);
+        assert_eq!(
+            validate_sdk_error_transition(
+                super::super::STANDARD_RUNTIME_PROGRAM_ID,
+                &prior,
+                &next,
+                &work,
+                InvocationError::InvalidActorOutput
+            ),
+            Ok(())
+        );
+        let restored = super::super::standard::StandardAgentRuntime::restore(
+            super::super::wire::decode_standard_runtime_state(&next).unwrap(),
+        )
+        .unwrap();
+        assert!(restored.snapshot().machine_continuations.is_empty());
+        assert_eq!(
+            restored.snapshot().lane_state,
+            runtime.snapshot().lane_state
+        );
+        let ack = super::super::wire::apply_standard_runtime_work(RuntimeWork::Acknowledge {
+            context: RuntimeExecutionContext::Direct,
+            state: transition.state,
+            invocation: Box::new(accepted),
+            authorization: Box::new(record.authorization.unwrap()),
+        })
+        .unwrap();
+        assert!(matches!(ack.outcome, RuntimeOutcome::Acknowledged(Ok(_))));
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn sdk_typed_error_successor_requires_exact_retention_and_recovery() {
+        use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeWork};
+        let mut work = super::super::wire::tests::clean_failing_actor_fixture(Some(0xff));
+        for retry in [false, true] {
+            let RuntimeWork::Invoke {
+                state,
+                invocation,
+                observed_slot,
+                ..
+            } = &work
+            else {
+                unreachable!()
+            };
+            let prior = sdk_state_as_legacy(state);
+            let transition = super::super::wire::apply_standard_runtime_work(work.clone()).unwrap();
+            assert_eq!(
+                transition.outcome,
+                RuntimeOutcome::Completed(Err(InvocationError::InvalidActorOutput))
+            );
+            let next = sdk_state_as_legacy(&transition.state);
+            let validate = |next: &RuntimeState, error| {
+                validate_sdk_error_transition(
+                    super::super::STANDARD_RUNTIME_PROGRAM_ID,
+                    &prior,
+                    next,
+                    &work,
+                    error,
+                )
+            };
+            assert_eq!(validate(&next, InvocationError::InvalidActorOutput), Ok(()));
+            assert_eq!(
+                validate(&next, InvocationError::InvalidInput),
+                Err(AgentDriverError::InvalidRuntime)
+            );
+            let mut runtime = super::super::standard::StandardAgentRuntime::restore(
+                super::super::wire::decode_standard_runtime_state(&prior).unwrap(),
+            )
+            .unwrap();
+            runtime
+                .commit_clean_exact_outcome_clock(invocation.mode, *observed_slot)
+                .unwrap();
+            if !retry {
+                let clock_only =
+                    super::super::wire::encode_standard_runtime_state(&runtime.snapshot());
+                assert_eq!(
+                    validate(&clock_only, InvocationError::InvalidActorOutput),
+                    Err(AgentDriverError::InvalidRuntime)
+                );
+            }
+            let mut altered = next.clone();
+            altered.linear.push(0xff);
+            assert_eq!(
+                validate(&altered, InvocationError::InvalidActorOutput),
+                Err(AgentDriverError::InvalidRuntime)
+            );
+            let RuntimeWork::Invoke {
+                state,
+                observed_slot,
+                ..
+            } = &mut work
+            else {
+                unreachable!()
+            };
+            *state = transition.state;
+            *observed_slot = 99;
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
     fn sdk_terminal_failure_successor_requires_the_exact_retained_reply() {
         use crate::agent_sdk::{RuntimeOutcome, RuntimeWork};
         let work = super::super::wire::tests::clean_failing_actor_fixture(None);
@@ -7146,7 +7293,8 @@ mod tests {
                 &work,
                 InvocationError::InvalidActorOutput,
             ),
-            Ok(())
+            Err(AgentDriverError::InvalidRuntime),
+            "clock-only errors are not retained exact outcomes"
         );
         let mut forged_exact = exact.clone();
         forged_exact.linear.push(0xff);

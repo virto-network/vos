@@ -8651,6 +8651,189 @@ summary changed. Typed errors still lack a general retained-error retirement
 path, and the original expiry/abort/mixed-pending, profile/finality and release
 gates remain open. Multi-minute fresh-work/replay latency remains unacceptable.
 
+### Typed-error split: retryable client rejection versus durable runtime result (C2)
+
+Tracing typed errors exposed two different paths. `InvocationError` already
+classifies structurally admitted durable outcomes via
+`is_durable_exact_outcome`. Non-durable errors such as ResultCapacity leave
+runtime work unconsumed, but the client previously froze their response and
+then constructed an ACK. The client now checks the verified outcome before
+publishing an initial ASR1 or filling a pending Resume response: non-durable
+rejection leaves the exact request pending and returns an error. It does not
+reprepare, generate another invocation, advance to ACK, or clear historical
+response/progress files. Existing poisoned historical responses are preserved
+and refused for ACK; they are not silently repaired. Negative ACK records
+keep their existing immutable behavior.
+
+Loopback HTTP tests now inject a bound ResultCapacity reply, then prove the
+same retained Invoke/Resume bytes are retried successfully. Resume progress
+remains byte-identical across both transport failure and capacity rejection.
+A separate historical-response test proves no ACK step is created and no
+existing bytes are replaced. Validation: `typed-error-client-invoke.log`
+**1 passed**; `typed-error-client-cli.log` **253 passed, 0 failed, 17 ignored**
+in **66.12s**; final continuation checks after an error-message clarification
+in `typed-error-client-resume.log` **4 passed**, **0.15s**; normal CLI build
+`typed-error-client-build.log` passes in **11.84s**. All logs use disk-backed
+task-tmp. Formatting/whitespace checks pass; no daemon was started.
+
+**Durable typed errors remain broken, with executable evidence.** Two new
+compiled-bundled-runtime regressions exercise InvalidActorOutput (after an
+attempted actor write) and StaleIncarnation (before actor execution). Both
+verify their expected error, full physical/source transition equality,
+unchanged actor state and canonical restore, then require exact positive
+ACK. Both fail with **`Acknowledged(Err(NotFound))`**:
+`typed-error-runtime-red.log`, **0 passed, 2 failed**, **0.52s**. They are
+explicitly marked ignored known C2 gaps so they are not mistaken for ordinary
+passing tests; they **must pass and be unignored before release**:
+
+```sh
+cargo test --offline --locked -p vos --lib --features pvm,private-agent-store,http-ingress bundled_typed_error_ -- --ignored --nocapture --test-threads=1
+```
+
+Next within this C2 batch: retain an actual typed-error record with original
+accepted work/authorization and storage scope, rather than fabricate an actor
+reply. Cover unresolved/stale targets as well as failures after execution.
+Recovery and ACK must use that exact binding without requiring the now-invalid
+actor incarnation to become live again. Include errors in result capacity,
+lifecycle debt, continuation consumption and positive-ACK mutual exclusion;
+retain rollback and reject non-durable errors from terminal storage. Wire the
+versioned state encoding, guest finalizers and native exact-error successor
+verifier together, then reproduce/repin and run the two red gates plus existing
+success/yield/Panicked regressions. No runtime artifact changed in this step;
+client changes and these diagnostics remain uncommitted for the scoped batch.
+
+### Typed-error ledger foundation checkpoint (C2, dispatch still pending)
+
+The same C2 change now includes a private, canonical `SCER` v1 section for
+authenticated durable invocation errors. Empty ledgers add no wire bytes.
+Records bind the exact accepted work, authorization, and observed slot without
+inventing a successful actor reply or requiring the failed target to exist.
+Restore rejects malformed, duplicate, wrong-lane, and overlapping records.
+Errors share the existing reply count/byte limits and participate in actor
+lifecycle debt and runtime capability-change checks. Retention and positive
+acknowledgement are atomic; failed admission preserves the original state.
+
+Validation: the runtime wire group passed **78 tests, 0 failed, 3 ignored**
+(`target/task-tmp/typed-error-ledger-wire.log` in the shared C2 target). New tests
+cover control/Linear round trips, stale-target retirement after restore, exact
+retry and divergence, positive ACK replay, combined capacity, resumed
+continuation consumption, and noncanonical sections. The ignored bundled
+typed-error regressions remain open release gates, not waived tests.
+The normal `vosx` feature path also passed `cargo check --offline --locked -p
+vosx --bin vosx` (13.76 s, warnings reported); formatting and diff checks passed.
+
+This is a foundation checkpoint, **not end-to-end completion**: Invoke/Resume
+dispatch and the native typed-error successor verifier still use the old
+clock-only error path. Next, connect both to the ledger in this same C2 review
+batch, run the source/native regression tests, then reproduce and pin a runtime
+that passes the compiled typed-error retirement regressions. No runtime artifact
+or ABI pin changed at this checkpoint. Multi-minute startup/Create/Install
+latency and the previously listed finality/recovery/release gates remain open;
+no timeout increase or production-readiness claim is implied.
+
+### Typed-error dispatch and native verification checkpoint (C2)
+
+Superseding the foundation-only checkpoint above, clean Invoke now recovers an
+exact retained error before current actor lookup, retains authenticated durable
+target errors from preflight, and retains durable execution errors on pristine
+state. Resume terminal errors consume the exact continuation in that same
+retention transaction. Native verification independently derives the retained
+successor (including exact recovery), rejects clock-only/forged successors, and
+checks the claimed typed error against the retained one. Positive ACK after
+restore works for invalid actor output and stale incarnation in source dispatch.
+
+Tests exposed and corrected two ordering issues: stale-target preflight returned
+before retention, and route-policy rejection was incorrectly considered a fresh
+actor outcome. Early retention is now limited to target-resolution errors; it
+does not overwrite an existing attested result with a Direct-route rejection.
+
+Validation on the final source of this checkpoint:
+
+- Runtime wire tests: **79 passed, 0 failed, 3 ignored**, 21.17 s,
+  `typed-error-dispatch-wire-verified.log` in shared C2 `target/task-tmp`.
+- Native typed-error/hostile-successor/terminal-failure tests: **4 passed**,
+  `typed-error-dispatch-native-tests.log`.
+- Focused typed-error tests before the final policy-boundary adjustment:
+  **6 passed, 2 bundled tests ignored**, `typed-error-dispatch-resume.log`.
+- Normal CLI feature-path compile check passed (14.51 s, warnings),
+  `typed-error-dispatch-native-final.log`; formatting and diff checks passed.
+
+Still pending in this same uncommitted C2 batch: audit the policy-rejection
+classification (`UnsupportedMethod` is also used for missing attestation, which
+must not become a falsely durable client outcome), the remaining pre-admission
+and resumed-target boundaries, then physical guest/native tests and reproducible
+artifact pinning. **The bundled runtime remains unchanged and does not contain
+the source fix.** Its two ignored typed-error regressions are still release
+gates. Do not deploy this intermediate source/artifact combination as a completed
+fix. Latency, finality, recovery/profile coverage, and final release gates remain
+open exactly as previously recorded; root `saga/agents` and master are untouched.
+
+### Attestation admission versus durable method rejection (C2)
+
+The policy-classification gap from the preceding checkpoint is now corrected in
+source. `authorize_clean_execution_with_proof` returns non-durable
+`InvalidAuthorization` for missing, unexpected, or mismatched attestation;
+`UnsupportedMethod` remains the durable error for an unsupported method/mode.
+Invoke can therefore retain genuine durable preflight errors without mistaking
+a wrong proof route for a completed actor result. No ABI variant was added.
+
+The existing attested Invoke and Resume restart tests now assert both the
+non-durable rejection and byte-identical runtime state, preserving the completed
+result or pending continuation for the authenticated route. The AMP2 None-method
+test rejects an unexpected attested route with `InvalidAuthorization`. A new
+unsupported-method test verifies error retention, unchanged actor state, restore,
+and positive ACK.
+
+Validation (shared C2 `target/task-tmp`):
+
+- `typed-error-policy-wire.log`: **79 passed, 0 failed, 3 ignored**, 20.98 s.
+- `typed-error-unsupported-method.log`: new regression **1 passed**.
+- `typed-error-policy-native-tests.log`: native successor tests **4 passed**.
+- `typed-error-policy-native-check.log`: normal CLI `cargo check` passed,
+  16.29 s (warnings); formatting and diff checks passed.
+
+This supersedes the preceding policy-classification TODO, not the remaining
+release gates. Next: finish the pre-admission/resumed-target audit, verify guest
+feature/build compatibility, freeze the source, reproduce the runtime twice,
+and pass the compiled typed-error regressions before pinning. The source batch
+is still uncommitted and the bundled runtime unchanged. No timeout or latency
+gate has been relaxed; production readiness remains unproven.
+
+### Typed-error candidate passes physical retirement (C2 source freeze)
+
+The remaining cooperative-Resume payload boundary now returns non-durable
+`StaleContinuation`, not durable `InvalidInput`: an external Ready/Failed payload
+does not match the supported saved continuation. The existing validation matrix
+asserts unchanged state and non-durable classification for every rejected resume.
+Native entry already rejects these payloads before execution. Restored standard
+continuations require an existing, unsuspended actor with the exact incarnation,
+deployment, program and lane; stale/deleted resumed targets are rejected at
+restore, not admitted through a permissive host preflight.
+
+Guest compilation passed with locked offline nightly-2026-03-20 (12.93 s,
+`typed-error-guest-build-final.log`). A candidate converted with the frozen
+42f3f3bf host builder is stored in shared C2
+`target/task-tmp/runtime-typed-error-candidate.Wzrzuj/agent-runtime.pvm`:
+
+- ProgramId: `0084d2f44458bd730e41dfeb40cee0e067ad4be4c33aa4659ba84dcfdae9b1ed`.
+- PVM BLAKE2b-256: `ba22d85015db112b4c959c61d866e249f31405c76bf0c187a0bda6bdb9889958`.
+- Both explicitly invoked compiled typed-error retirement regressions passed
+  (2/2, 0.56 s), `physical-retirement.log`. The candidate hook is
+  `VOS_AGENT_RUNTIME_TYPED_ERROR_CANDIDATE`; without it tests use the bundled blob.
+- Broader wire/native tests passed **84/84, 3 ignored**, 21.43 s,
+  `source-native-wire.log`, including the physical terminal-failure lifecycle
+  with `VOS_AGENT_RUNTIME_FAILURE_CANDIDATE` pointing at this candidate.
+- Resume admission regression passed; normal CLI compile check passed (4.77 s,
+  warnings), `typed-error-admission-native-check.log`. Formatting/diff checks pass.
+
+This proves the candidate fix, **not reproducibility or release readiness**.
+Freeze this C2 source as one scoped commit, then independently rebuild it twice,
+compare ELF/PVM bytes and identities, pin the reproduced runtime, and enable the
+two bundled regressions normally. The current bundled blob/manifest are unchanged;
+the ignored bundled gates must not be counted as passing for the shipped artifact.
+No old retained negative acknowledgement was edited. Existing latency, finality,
+recovery/profile and final integration/release gates remain open.
+
 ### Durable client acknowledgement before completion
 
 The fresh Create CLI now persists the full verified MAA2 before marking its

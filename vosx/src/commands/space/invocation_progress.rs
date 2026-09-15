@@ -36,6 +36,7 @@ impl Action {
         request: &AgentInvocationRequest,
         outcome: &RuntimeOutcome,
     ) -> anyhow::Result<Option<Self>> {
+        super::local_invocation::ensure_durable_delivery(outcome)?;
         Ok(match outcome {
             RuntimeOutcome::Yielded(yielded) => Some(Self::Resume(
                 AgentResumeRequest::new(
@@ -276,7 +277,8 @@ pub(crate) fn continue_retained(
             &bytes,
             super::local_invocation::MAX_RESPONSE_BYTES,
         )?;
-        action.verify(&reply)?;
+        let outcome = action.verify(&reply)?;
+        super::local_invocation::ensure_durable_delivery(&outcome)?;
         progress
             .exchanges
             .last_mut()

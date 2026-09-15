@@ -223,6 +223,36 @@ fn progress_requires_exact_predecessors_and_monotonic_publication() {
 }
 
 #[test]
+fn historical_non_durable_response_is_preserved_without_creating_an_acknowledgement() {
+    let (request, _, _) = fixture();
+    let call = AgentInvocationRequest::decode(&request).unwrap();
+    let response = AgentInvocationResponse::Direct {
+        request: call.commitment(),
+        outcome: RuntimeOutcome::Completed(Err(InvocationError::ResultCapacity)),
+    }
+    .encode()
+    .unwrap();
+    let root = directory();
+    let path = root.join("delivery");
+    let mut store = CleanInvocationFile::open_or_create(&path).unwrap();
+    store.publish_request(&request).unwrap();
+    store.publish_response(&response).unwrap();
+    drop(store);
+    let error = continue_retained(&path, "127.0.0.1:1".parse().unwrap()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("non-durable invocation rejection ResultCapacity")
+    );
+    let mut reopened = CleanInvocationFile::open_or_create(&path).unwrap();
+    assert_eq!(reopened.load_request().unwrap(), Some(request));
+    assert_eq!(reopened.load_response().unwrap(), Some(response));
+    assert!(reopened.load_progress().unwrap().is_none());
+    drop(reopened);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn continuation_command_requires_the_retained_directory_and_endpoint() {
     use clap::Parser as _;
     let parsed = crate::Cli::try_parse_from([
@@ -260,7 +290,7 @@ fn continuation_retries_pending_bytes_then_resumes_and_retires_under_one_lease()
     let address = listener.local_addr().unwrap();
     let leased = path.clone();
     let server = std::thread::spawn(move || {
-        for (index, exchange) in std::iter::once(&exchanges[0])
+        for (index, exchange) in std::iter::repeat_n(&exchanges[0], 2)
             .chain(exchanges.iter())
             .enumerate()
         {
@@ -295,11 +325,34 @@ fn continuation_retries_pending_bytes_then_resumes_and_retires_under_one_lease()
                     .any(|window| window == expected.as_bytes())
             );
             let status = if index == 0 { 503 } else { 200 };
-            write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", exchange.2.len()).unwrap();
-            stream.write_all(&exchange.2).unwrap();
+            let reply = if index == 1 {
+                let resume = AgentResumeRequest::decode(&exchange.1).unwrap();
+                AgentResumeResponse::Direct {
+                    request: resume.commitment(),
+                    outcome: RuntimeOutcome::Completed(Err(InvocationError::ResultCapacity)),
+                }
+                .encode()
+                .unwrap()
+            } else {
+                exchange.2.clone()
+            };
+            write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", reply.len()).unwrap();
+            stream.write_all(&reply).unwrap();
         }
     });
     assert!(continue_retained(&path, address).is_err());
+    let pending = std::fs::read(path.join("invocation.progress")).unwrap();
+    assert!(
+        continue_retained(&path, address)
+            .unwrap_err()
+            .to_string()
+            .contains("ResultCapacity")
+    );
+    assert_eq!(
+        std::fs::read(path.join("invocation.progress")).unwrap(),
+        pending,
+        "a non-durable resume rejection must not replace its pending request with an ACK step"
+    );
     continue_retained(&path, address).unwrap();
     server.join().unwrap();
     continue_retained(&path, "127.0.0.1:1".parse().unwrap()).unwrap();

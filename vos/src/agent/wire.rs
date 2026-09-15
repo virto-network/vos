@@ -460,6 +460,90 @@ fn decode_bounded_list<T>(
 pub(crate) const MAX_CLEAN_MANAGEMENT_RESULT_BYTES: usize = 8 * 1024;
 const STANDARD_CLEAN_ACTOR_PACKAGES_MAGIC: [u8; 4] = *b"SCAP";
 const STANDARD_CLEAN_ACTOR_INSTALLATIONS_MAGIC: [u8; 4] = *b"SCI2";
+const STANDARD_CLEAN_INVOCATION_ERRORS_MAGIC: [u8; 4] = *b"SCER";
+
+pub(crate) fn encode_clean_invocation_error(
+    value: &super::standard::StandardCleanInvocationError,
+) -> Vec<u8> {
+    use crate::agent_sdk::wire::CanonicalWire as _;
+    let mut bytes = Vec::new();
+    let mut encoder = Encoder(&mut bytes);
+    encode_clean_invocation_result(&mut encoder, &value.binding);
+    encoder.bytes(
+        &crate::agent_sdk::RuntimeTransition {
+            state: crate::agent_sdk::RuntimeState::default(),
+            outcome: crate::agent_sdk::RuntimeOutcome::Completed(Err(value.error)),
+        }
+        .encode()
+        .expect("typed invocation error is canonical"),
+    );
+    bytes
+}
+
+fn encode_clean_invocation_errors(
+    encoder: &mut Encoder<'_>,
+    state: &StandardRuntimeState,
+    storage: super::InvocationResultStorage,
+) {
+    let errors = state
+        .clean_invocation_errors
+        .iter()
+        .filter(|item| item.storage() == storage)
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        return;
+    }
+    encoder
+        .0
+        .extend_from_slice(&STANDARD_CLEAN_INVOCATION_ERRORS_MAGIC);
+    encoder.u16(1);
+    encoder.list(&errors, |encoder, item| {
+        encoder
+            .0
+            .extend_from_slice(&encode_clean_invocation_error(item))
+    });
+}
+
+fn decode_clean_invocation_errors(
+    decoder: &mut Decoder<'_>,
+    storage: super::InvocationResultStorage,
+) -> Result<Vec<super::standard::StandardCleanInvocationError>, DecodeError> {
+    use crate::agent_sdk::wire::CanonicalWire as _;
+    if decoder.exhausted() {
+        return Ok(Vec::new());
+    }
+    if decoder.take(4)? != STANDARD_CLEAN_INVOCATION_ERRORS_MAGIC || decoder.u16()? != 1 {
+        return Err(DecodeError::NonCanonical);
+    }
+    let errors = decode_bounded_list(
+        decoder,
+        super::standard::MAX_INVOCATION_RESULTS_PER_LANE,
+        |decoder| {
+            let binding = decode_clean_invocation_result(decoder)?;
+            let bytes = decoder.bytes_ref()?;
+            if bytes.len() > 256 {
+                return Err(DecodeError::LimitExceeded);
+            }
+            let transition = crate::agent_sdk::RuntimeTransition::decode(bytes)
+                .map_err(|_| DecodeError::NonCanonical)?;
+            let crate::agent_sdk::RuntimeOutcome::Completed(Err(error)) = transition.outcome else {
+                return Err(DecodeError::NonCanonical);
+            };
+            let value = super::standard::StandardCleanInvocationError { binding, error };
+            if transition.state != crate::agent_sdk::RuntimeState::default()
+                || !error.is_durable_exact_outcome()
+                || value.storage() != storage
+            {
+                return Err(DecodeError::NonCanonical);
+            }
+            Ok(value)
+        },
+    )?;
+    if errors.is_empty() || errors.windows(2).any(|pair| pair[0].key() >= pair[1].key()) {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(errors)
+}
 
 pub(crate) fn encode_clean_management_result(
     result: &Result<crate::agent_sdk::ManagementReply, crate::agent_sdk::ManagementError>,
@@ -685,6 +769,7 @@ pub fn encode_standard_runtime_state(state: &StandardRuntimeState) -> RuntimeSta
             encoder.bytes(&plan.encode().expect("valid original install plan"));
         });
     }
+    encode_clean_invocation_errors(&mut encoder, state, super::InvocationResultStorage::Control);
     RuntimeState {
         control,
         linear: encode_standard_lane(state, StateLane::Linear),
@@ -1130,6 +1215,8 @@ pub fn decode_standard_runtime_state(
             },
         )?)
     };
+    let mut clean_invocation_errors =
+        decode_clean_invocation_errors(&mut decoder, super::InvocationResultStorage::Control)?;
     if !decoder.exhausted() {
         return Err(DecodeError::TrailingBytes);
     }
@@ -1164,10 +1251,12 @@ pub fn decode_standard_runtime_state(
             StateLane::Local => lane_state.local = decoded.values,
         }
         invocation_results.extend(decoded.invocation_results);
+        clean_invocation_errors.extend(decoded.clean_invocation_errors);
         clean_invocation_acknowledgements.extend(decoded.clean_invocation_acknowledgements);
         machine_continuations.extend(decoded.machine_continuations);
     }
     invocation_results.sort_unstable_by_key(|result| (result.scope, result.invocation));
+    clean_invocation_errors.sort_unstable_by_key(|item| item.key());
     if invocation_results
         .windows(2)
         .any(|pair| (pair[0].scope, pair[0].invocation) >= (pair[1].scope, pair[1].invocation))
@@ -1206,6 +1295,7 @@ pub fn decode_standard_runtime_state(
         retired_installation_ids,
         lane_state,
         invocation_results,
+        clean_invocation_errors,
         clean_invocation_acknowledgements,
         machine_continuations,
         lane_revisions,
@@ -1303,6 +1393,11 @@ fn encode_standard_lane(state: &StandardRuntimeState, lane: StateLane) -> Vec<u8
             .collect::<Vec<_>>(),
         |encoder, continuation| encode_machine_continuation(encoder, continuation),
     );
+    encode_clean_invocation_errors(
+        &mut encoder,
+        state,
+        super::InvocationResultStorage::Lane(lane),
+    );
     output
 }
 
@@ -1311,6 +1406,7 @@ struct DecodedStandardLane {
     authority_slot: Option<u64>,
     values: Vec<StandardLaneEntry>,
     invocation_results: Vec<StandardInvocationResult>,
+    clean_invocation_errors: Vec<super::standard::StandardCleanInvocationError>,
     clean_invocation_acknowledgements: Vec<crate::agent_sdk::InvocationAcknowledgement>,
     machine_continuations: Vec<StandardMachineContinuation>,
 }
@@ -1869,6 +1965,10 @@ fn decode_standard_lane(
     {
         return Err(DecodeError::NonCanonical);
     }
+    let clean_invocation_errors = decode_clean_invocation_errors(
+        &mut decoder,
+        super::InvocationResultStorage::Lane(expected_lane),
+    )?;
     if !decoder.exhausted() {
         return Err(DecodeError::NonCanonical);
     }
@@ -1877,6 +1977,7 @@ fn decode_standard_lane(
         authority_slot,
         values,
         invocation_results,
+        clean_invocation_errors,
         clean_invocation_acknowledgements,
         machine_continuations,
     })
@@ -2314,6 +2415,22 @@ fn apply_clean_invoke(
     {
         return Ok(clean_completed(state, Err(error)));
     }
+    // Retained authenticated errors can name a missing or stale actor.
+    // Recover them before consulting the current actor policy.
+    match runtime.recover_clean_invocation_error(&work, &authorization, observed_slot) {
+        Ok(Some(error)) => {
+            let candidate = encode_standard_runtime_state(&runtime.snapshot());
+            if candidate.encoded_len().is_none_or(|len| len > state_limit) {
+                return Ok(clean_completed(state, Err(InvocationError::ResultCapacity)));
+            }
+            return Ok(clean_completed(
+                legacy_state_to_clean(candidate),
+                Err(error),
+            ));
+        }
+        Err(error) => return Ok(clean_completed(state, Err(error))),
+        Ok(None) => {}
+    }
     let policy_admission = match &admission {
         #[cfg(feature = "std")]
         CleanExecutionAdmission::Attested(authenticated) => {
@@ -2328,6 +2445,32 @@ fn apply_clean_invoke(
         }
     };
     if let Err(error) = policy_admission {
+        // Missing proof/authorization is non-durable. An authenticated
+        // unsupported method or target must retain its exact rejection.
+        if error.is_durable_exact_outcome() {
+            if let Err(error) = runtime
+                .validate_clean_unseen_invocation_slot(&authorization, observed_slot)
+                .and_then(|()| {
+                    runtime.retain_clean_invocation_error(
+                        &work,
+                        &authorization,
+                        error,
+                        observed_slot,
+                        None,
+                    )
+                })
+            {
+                return Ok(clean_completed(state, Err(error)));
+            }
+            let candidate = encode_standard_runtime_state(&runtime.snapshot());
+            if candidate.encoded_len().is_none_or(|len| len > state_limit) {
+                return Ok(clean_completed(state, Err(InvocationError::ResultCapacity)));
+            }
+            return Ok(clean_completed(
+                legacy_state_to_clean(candidate),
+                Err(error),
+            ));
+        }
         return Ok(clean_completed(state, Err(error)));
     }
     match runtime.recover_clean_yield(&work, &authorization, observed_slot) {
@@ -2367,10 +2510,14 @@ fn apply_clean_invoke(
                 {
                     return Ok(clean_completed(state, Err(slot_error)));
                 }
-                if let Err(clock_error) =
-                    runtime.commit_clean_exact_outcome_clock(work.mode, observed_slot)
-                {
-                    return Ok(clean_completed(state, Err(clock_error)));
+                if let Err(retention_error) = runtime.retain_clean_invocation_error(
+                    &work,
+                    &authorization,
+                    error,
+                    observed_slot,
+                    None,
+                ) {
+                    return Ok(clean_completed(state, Err(retention_error)));
                 }
                 let candidate = encode_standard_runtime_state(&runtime.snapshot());
                 if candidate.encoded_len().is_none_or(|len| len > state_limit) {
@@ -2546,7 +2693,13 @@ fn apply_clean_resume(
     use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeTransition};
 
     if resume.input.is_some() {
-        return Ok(clean_completed(state, Err(InvocationError::InvalidInput)));
+        // Cooperative continuations accept no external completion payload.
+        // A mismatched resume must not become a durable error for the
+        // original invocation or retire its still-valid continuation.
+        return Ok(clean_completed(
+            state,
+            Err(InvocationError::StaleContinuation),
+        ));
     }
     let original_state = clean_state_to_legacy(&state);
     let decoded = decode_standard_runtime_state(&original_state)?;
@@ -2557,9 +2710,32 @@ fn apply_clean_resume(
         Ok(value) => value,
         Err(error) => return Ok(clean_completed(state, Err(error))),
     };
+    let authorization = record
+        .authorization
+        .clone()
+        .ok_or(DecodeError::NonCanonical)?;
     let (invocation, actor_pvm, actor_schema, actor_policies, installation_data) =
         match runtime.resolve_clean_invocation(&work) {
             Ok(value) => value,
+            Err(error) if error.is_durable_exact_outcome() => {
+                if let Err(error) = runtime.retain_clean_invocation_error(
+                    &work,
+                    &authorization,
+                    error,
+                    record.observed_slot,
+                    Some(record.ready_sequence),
+                ) {
+                    return Ok(clean_completed(state, Err(error)));
+                }
+                let candidate = encode_standard_runtime_state(&runtime.snapshot());
+                if candidate.encoded_len().is_none_or(|len| len > state_limit) {
+                    return Ok(clean_completed(state, Err(InvocationError::ResultCapacity)));
+                }
+                return Ok(clean_completed(
+                    legacy_state_to_clean(candidate),
+                    Err(error),
+                ));
+            }
             Err(error) => return Ok(clean_completed(state, Err(error))),
         };
     if invocation.commitment() != record.request {
@@ -2568,10 +2744,6 @@ fn apply_clean_resume(
             Err(InvocationError::StaleContinuation),
         ));
     }
-    let authorization = record
-        .authorization
-        .clone()
-        .ok_or(DecodeError::NonCanonical)?;
     let accepted = record.accepted.clone().ok_or(DecodeError::NonCanonical)?;
     let observed_slot = record.observed_slot;
     let pristine = runtime.clone();
@@ -2974,9 +3146,8 @@ fn finish_standard_execution_candidate(
     }
 }
 
-/// Clean terminal replies retain their exact authenticated result, not actor
-/// writes. Typed errors continue to use the explicitly separate clock-only
-/// outcome policy until they have their own durable acknowledgement schema.
+/// Clean terminal replies and durable typed errors retain the exact
+/// authenticated outcome, never candidate actor writes.
 #[cfg(feature = "pvm")]
 #[allow(clippy::too_many_arguments)]
 fn finalize_unseen_clean_outcome(
@@ -2989,6 +3160,44 @@ fn finalize_unseen_clean_outcome(
     terminal_continuation: Option<u64>,
     result: &mut Result<ActorExecutionReply, ActorExecutionError>,
 ) -> bool {
+    if let Err(error) = result
+        && error.is_durable_exact_outcome()
+    {
+        let error = clean_error(*error);
+        *runtime = pristine;
+        return match runtime.retain_clean_invocation_error(
+            work,
+            authorization,
+            error,
+            observed_slot,
+            terminal_continuation,
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                // Retention failures are nonterminal and commit nothing.
+                *result = Err(match error {
+                    crate::agent_sdk::InvocationError::ResultCapacity => {
+                        ActorExecutionError::ResultCapacity
+                    }
+                    crate::agent_sdk::InvocationError::AuthorityExpired => {
+                        ActorExecutionError::AuthorityExpired
+                    }
+                    crate::agent_sdk::InvocationError::AuthoritySlotRegressed => {
+                        ActorExecutionError::AuthoritySlotRegressed
+                    }
+                    crate::agent_sdk::InvocationError::UnsupportedResultStorage => {
+                        ActorExecutionError::UnsupportedResultStorage
+                    }
+                    crate::agent_sdk::InvocationError::DivergentInvocation
+                    | crate::agent_sdk::InvocationError::StaleContinuation => {
+                        ActorExecutionError::DivergentInvocation
+                    }
+                    _ => ActorExecutionError::InvalidAuthorization,
+                });
+                false
+            }
+        };
+    }
     if let Ok(reply) = result
         && matches!(
             reply.status,
@@ -8457,7 +8666,7 @@ pub(crate) mod tests {
         let (invocation, _, schema, policy, _) = runtime.resolve_clean_invocation(&work).unwrap();
         assert!(matches!(
             runtime.authorize_clean_execution(&work, &authorization, &schema, &policy),
-            Err(ActorExecutionError::UnsupportedMethod),
+            Err(ActorExecutionError::InvalidAuthorization),
         ));
         let before = runtime.prepare_execution_state(&invocation).unwrap();
         let mut after = before.clone();
@@ -8561,10 +8770,17 @@ pub(crate) mod tests {
             unreachable!()
         };
         *context = RuntimeExecutionContext::Direct;
-        assert!(matches!(
-            apply_standard_runtime_work(direct).unwrap().outcome,
-            RuntimeOutcome::Completed(Err(InvocationError::UnsupportedMethod)),
-        ));
+        let RuntimeWork::Invoke { state: prior, .. } = &direct else {
+            unreachable!()
+        };
+        let prior = prior.clone();
+        let rejected = apply_standard_runtime_work(direct).unwrap();
+        assert_eq!(rejected.state, prior);
+        assert_eq!(
+            rejected.outcome,
+            RuntimeOutcome::Completed(Err(InvocationError::InvalidAuthorization))
+        );
+        assert!(!InvocationError::InvalidAuthorization.is_durable_exact_outcome());
         let applied =
             apply_authenticated_attested_standard_runtime_work(&authenticated, exact.clone())
                 .unwrap();
@@ -8712,7 +8928,7 @@ pub(crate) mod tests {
             apply_authenticated_attested_standard_runtime_work(&authenticated, exact.clone())
                 .unwrap()
                 .outcome,
-            RuntimeOutcome::Completed(Err(InvocationError::UnsupportedMethod)),
+            RuntimeOutcome::Completed(Err(InvocationError::InvalidAuthorization)),
         ));
 
         let mut direct = exact;
@@ -8753,10 +8969,19 @@ pub(crate) mod tests {
             unreachable!()
         };
         *context = RuntimeExecutionContext::Direct;
-        assert!(matches!(
-            apply_standard_runtime_work(direct).unwrap().outcome,
-            RuntimeOutcome::Completed(Err(InvocationError::UnsupportedMethod)),
-        ));
+        let RuntimeWork::Resume { state: prior, .. } = &direct else {
+            unreachable!()
+        };
+        let prior = prior.clone();
+        let rejected = apply_standard_runtime_work(direct).unwrap();
+        assert_eq!(
+            rejected.state, prior,
+            "missing proof must preserve the pending continuation"
+        );
+        assert_eq!(
+            rejected.outcome,
+            RuntimeOutcome::Completed(Err(InvocationError::InvalidAuthorization))
+        );
         let applied =
             apply_authenticated_attested_standard_runtime_work(&authenticated, exact.clone())
                 .unwrap();
@@ -9076,6 +9301,7 @@ pub(crate) mod tests {
             .unwrap();
             assert_eq!(transition.state, state);
             assert_eq!(transition.outcome, RuntimeOutcome::Completed(Err(expected)));
+            assert!(!expected.is_durable_exact_outcome());
         };
 
         let mut wrong_actor = clean_resume(&yielded, work.availability.clone());
@@ -9120,10 +9346,10 @@ pub(crate) mod tests {
 
         let mut ready = clean_resume(&yielded, work.availability.clone());
         ready.input = Some(ResumeInput::Ready(vec![1]));
-        assert_rejected(ready, InvocationError::InvalidInput);
+        assert_rejected(ready, InvocationError::StaleContinuation);
         let mut failed = clean_resume(&yielded, work.availability.clone());
         failed.input = Some(ResumeInput::Failed(7));
-        assert_rejected(failed, InvocationError::InvalidInput);
+        assert_rejected(failed, InvocationError::StaleContinuation);
 
         let mut divergent = work.clone();
         let mut divergent_message = vec![crate::actors::value::TAG_DYNAMIC];
@@ -9576,6 +9802,466 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "pvm")]
+    fn assert_typed_error_retirement(stale_target: bool, bundled: bool) {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        use crate::agent_sdk::{
+            InvocationAcknowledgement, InvocationAuthorization, InvocationError, RuntimeOutcome,
+            RuntimeTransition, RuntimeWork,
+        };
+        let mut work = clean_failing_actor_fixture(Some(0xff));
+        let RuntimeWork::Invoke {
+            state,
+            invocation,
+            authorization,
+            ..
+        } = &mut work
+        else {
+            unreachable!()
+        };
+        let before = decode_standard_runtime_state(&clean_state_to_legacy(state)).unwrap();
+        if stale_target {
+            invocation.incarnation = crate::agent_sdk::Hash([0x91; 32]);
+            *authorization = Box::new(InvocationAuthorization::AuthorityReceipt(
+                clean_authority_receipt(before.config.as_ref().unwrap(), invocation),
+            ));
+        }
+        let expected_ack = InvocationAcknowledgement {
+            invocation: invocation.invocation,
+            actor: invocation.actor,
+            incarnation: invocation.incarnation,
+            deployment: invocation.deployment,
+            mode: invocation.mode,
+            work: invocation.commitment(),
+            authorization: authorization.commitment(),
+        };
+        let execute = |work: &RuntimeWork| {
+            if !bundled {
+                return apply_standard_runtime_work(work.clone()).unwrap();
+            }
+            let candidate = std::env::var_os("VOS_AGENT_RUNTIME_TYPED_ERROR_CANDIDATE")
+                .map(|path| std::fs::read(path).expect("read typed-error runtime candidate"));
+            let execution = vos_pvm::refine_host::RefineContext::load(
+                candidate
+                    .as_deref()
+                    .unwrap_or(include_bytes!("../../../vosx/blobs/agent_runtime.pvm")),
+                &work.encode().unwrap(),
+                super::super::driver::DEFAULT_MANAGEMENT_GAS,
+            )
+            .unwrap()
+            .run();
+            assert_eq!(execution.exit, vos_pvm::ExitReason::Halt);
+            let output = execution
+                .output_bounded(RuntimeTransition::MAX_ENCODED_BYTES)
+                .unwrap();
+            assert_eq!(
+                output,
+                apply_standard_runtime_work(work.clone())
+                    .unwrap()
+                    .encode()
+                    .unwrap()
+            );
+            RuntimeTransition::decode(&output).unwrap()
+        };
+        let failed = execute(&work);
+        assert_eq!(
+            failed.outcome,
+            RuntimeOutcome::Completed(Err(if stale_target {
+                InvocationError::StaleIncarnation
+            } else {
+                InvocationError::InvalidActorOutput
+            }))
+        );
+        let restored = StandardAgentRuntime::restore(
+            decode_standard_runtime_state(&clean_state_to_legacy(&failed.state)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored.snapshot().lane_state, before.lane_state);
+        let RuntimeWork::Invoke {
+            context,
+            invocation,
+            authorization,
+            ..
+        } = work
+        else {
+            unreachable!()
+        };
+        let acknowledged = execute(&RuntimeWork::Acknowledge {
+            context,
+            invocation,
+            authorization,
+            state: legacy_state_to_clean(encode_standard_runtime_state(&restored.snapshot())),
+        });
+        assert_eq!(
+            acknowledged.outcome,
+            RuntimeOutcome::Acknowledged(Ok(expected_ack)),
+            "durable typed errors need guest-owned exact retirement after restore"
+        );
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    #[ignore = "known C2 gap: durable typed error has no retained runtime result; must close before release"]
+    fn bundled_typed_error_invalid_output_requires_retirement() {
+        assert_typed_error_retirement(false, true);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    #[ignore = "known C2 gap: stale target error has no retained runtime result; must close before release"]
+    fn bundled_typed_error_stale_target_requires_retirement() {
+        assert_typed_error_retirement(true, true);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn source_typed_error_retirement() {
+        assert_typed_error_retirement(false, false);
+        assert_typed_error_retirement(true, false);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn unsupported_method_is_retained_and_acknowledged_without_actor_writes() {
+        use crate::agent_sdk::{
+            InvocationAuthorization, InvocationError, PublicPreflight, RuntimeExecutionContext,
+            RuntimeOutcome, RuntimeWork,
+        };
+        let (runtime, mut invocation) = clean_policy_fixture(
+            crate::agent_sdk::method_policy::AuthorizationPolicySelector::Public,
+        );
+        invocation.message = vec![0xff];
+        let authorization =
+            InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&invocation, 1));
+        let before = runtime.snapshot();
+        let failed = apply_standard_runtime_work(RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
+            state: legacy_state_to_clean(encode_standard_runtime_state(&before)),
+            invocation: Box::new(invocation.clone()),
+            authorization: Box::new(authorization.clone()),
+            observed_slot: 1,
+        })
+        .unwrap();
+        assert_eq!(
+            failed.outcome,
+            RuntimeOutcome::Completed(Err(InvocationError::UnsupportedMethod))
+        );
+        let retained =
+            decode_standard_runtime_state(&clean_state_to_legacy(&failed.state)).unwrap();
+        assert_eq!(retained.clean_invocation_errors.len(), 1);
+        assert_eq!(retained.lane_state, before.lane_state);
+        let reopened = StandardAgentRuntime::restore(retained).unwrap();
+        let ack = apply_standard_runtime_work(RuntimeWork::Acknowledge {
+            context: RuntimeExecutionContext::Direct,
+            state: legacy_state_to_clean(encode_standard_runtime_state(&reopened.snapshot())),
+            invocation: Box::new(invocation),
+            authorization: Box::new(authorization),
+        })
+        .unwrap();
+        assert!(matches!(ack.outcome, RuntimeOutcome::Acknowledged(Ok(_))));
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_typed_error_ledger_round_trips_and_retires_stale_work() {
+        use crate::agent_sdk::{InvocationAuthorization, InvocationError, RuntimeWork};
+        for (mode, error) in [
+            (
+                crate::agent_sdk::MethodMode::Query,
+                InvocationError::StaleIncarnation,
+            ),
+            (
+                crate::agent_sdk::MethodMode::Linear,
+                InvocationError::InvalidActorOutput,
+            ),
+        ] {
+            let RuntimeWork::Invoke {
+                state,
+                mut invocation,
+                ..
+            } = clean_failing_actor_fixture(None)
+            else {
+                unreachable!()
+            };
+            let mut runtime = StandardAgentRuntime::restore(
+                decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap(),
+            )
+            .unwrap();
+            invocation.mode = mode;
+            if error == InvocationError::StaleIncarnation {
+                invocation.incarnation = crate::agent_sdk::Hash([0x91; 32]);
+            }
+            let authorization = InvocationAuthorization::AuthorityReceipt(clean_authority_receipt(
+                runtime.config().unwrap(),
+                &invocation,
+            ));
+            let before = runtime.snapshot();
+            runtime
+                .retain_clean_invocation_error(&invocation, &authorization, error, 1, None)
+                .unwrap();
+            let retained = runtime.snapshot();
+            assert_eq!(retained.clean_invocation_errors.len(), 1);
+            assert_eq!(retained.lane_state, before.lane_state);
+            assert_eq!(retained.lane_revisions.linear, before.lane_revisions.linear);
+            assert_only_result_component_changed(
+                &encode_standard_runtime_state(&before),
+                &encode_standard_runtime_state(&retained),
+                clean_mode_as_legacy_for_test(mode),
+            );
+            let encoded = encode_standard_runtime_state(&retained);
+            let decoded = decode_standard_runtime_state(&encoded).unwrap();
+            assert_eq!(decoded, retained);
+            let mut reopened = StandardAgentRuntime::restore(decoded).unwrap();
+            assert_eq!(
+                reopened.recover_clean_invocation_error(&invocation, &authorization, 99),
+                Ok(Some(error))
+            );
+            let mut different = (*invocation).clone();
+            different.message.push(0xff);
+            let before_rejection = reopened.snapshot();
+            assert!(
+                reopened
+                    .acknowledge_clean_invocation(&different, &authorization)
+                    .is_err()
+            );
+            assert_eq!(reopened.snapshot(), before_rejection);
+            let ack = reopened
+                .acknowledge_clean_invocation(&invocation, &authorization)
+                .unwrap();
+            assert_eq!(ack.work, invocation.commitment());
+            assert!(reopened.snapshot().clean_invocation_errors.is_empty());
+            let mut restarted = StandardAgentRuntime::restore(reopened.snapshot()).unwrap();
+            assert_eq!(
+                restarted.acknowledge_clean_invocation(&invocation, &authorization),
+                Ok(ack)
+            );
+            assert_eq!(
+                restarted.recover_clean_invocation_error(&invocation, &authorization, 99),
+                Err(InvocationError::DivergentInvocation)
+            );
+            let mut corrupt = retained.clone();
+            corrupt.clean_invocation_errors[0].error = InvocationError::ResultCapacity;
+            assert!(
+                decode_standard_runtime_state(&encode_standard_runtime_state(&corrupt)).is_err()
+            );
+            let mut corrupt = retained.clone();
+            corrupt.clean_invocation_errors[0].binding.work = crate::agent_sdk::Hash([0xff; 32]);
+            assert!(StandardAgentRuntime::restore(corrupt).is_err());
+            let mut conflicting = retained;
+            conflicting.clean_invocation_acknowledgements.push(ack);
+            assert!(StandardAgentRuntime::restore(conflicting).is_err());
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    fn clean_mode_as_legacy_for_test(mode: crate::agent_sdk::MethodMode) -> MethodMode {
+        match mode {
+            crate::agent_sdk::MethodMode::Query => MethodMode::Query,
+            crate::agent_sdk::MethodMode::Linear => MethodMode::Linear,
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_typed_error_ledger_is_bounded_and_failed_admission_is_atomic() {
+        use crate::agent_sdk::{InvocationAuthorization, InvocationError, RuntimeWork};
+        let RuntimeWork::Invoke {
+            state,
+            mut invocation,
+            ..
+        } = clean_failing_actor_fixture(None)
+        else {
+            unreachable!()
+        };
+        let mut runtime = StandardAgentRuntime::restore(
+            decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap(),
+        )
+        .unwrap();
+        let authorization = InvocationAuthorization::AuthorityReceipt(clean_authority_receipt(
+            runtime.config().unwrap(),
+            &invocation,
+        ));
+        let before = runtime.snapshot();
+        assert_eq!(
+            runtime.retain_clean_invocation_error(
+                &invocation,
+                &authorization,
+                InvocationError::ResultCapacity,
+                1,
+                None
+            ),
+            Err(InvocationError::InvalidInput)
+        );
+        assert!(
+            runtime
+                .retain_clean_invocation_error(
+                    &invocation,
+                    &authorization,
+                    InvocationError::InvalidActorOutput,
+                    1,
+                    Some(999)
+                )
+                .is_err()
+        );
+        assert_eq!(runtime.snapshot(), before);
+        for index in 0..super::super::standard::MAX_INVOCATION_RESULTS_PER_LANE {
+            invocation.invocation = crate::agent_sdk::InvocationId([0x60 + index as u8; 32]);
+            let authorization = InvocationAuthorization::AuthorityReceipt(clean_authority_receipt(
+                runtime.config().unwrap(),
+                &invocation,
+            ));
+            runtime
+                .retain_clean_invocation_error(
+                    &invocation,
+                    &authorization,
+                    InvocationError::InvalidActorOutput,
+                    1,
+                    None,
+                )
+                .unwrap();
+        }
+        let retained = runtime.snapshot();
+        invocation.invocation = crate::agent_sdk::InvocationId([0xa0; 32]);
+        let authorization = InvocationAuthorization::AuthorityReceipt(clean_authority_receipt(
+            runtime.config().unwrap(),
+            &invocation,
+        ));
+        assert_eq!(
+            runtime.retain_clean_invocation_error(
+                &invocation,
+                &authorization,
+                InvocationError::InvalidActorOutput,
+                1,
+                None
+            ),
+            Err(InvocationError::ResultCapacity)
+        );
+        assert_eq!(runtime.snapshot(), retained);
+        let mut reopened = StandardAgentRuntime::restore(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&retained)).unwrap(),
+        )
+        .unwrap();
+        let (resolved, ..) = reopened.resolve_clean_invocation(&invocation).unwrap();
+        assert_eq!(
+            reopened.prepare_execution_state(&resolved),
+            Err(ActorExecutionError::ResultCapacity)
+        );
+        let before = StandardAgentRuntime::restore(before)
+            .unwrap()
+            .prepare_execution_state(&resolved)
+            .unwrap();
+        let mut reply = exact_reply(&resolved, ActorExecutionStatus::Done);
+        assert_eq!(
+            reopened.commit_clean_execution(
+                &invocation,
+                &authorization,
+                &resolved,
+                &mut reply,
+                &before,
+                before.clone(),
+                1,
+                None
+            ),
+            Err(ActorExecutionError::ResultCapacity)
+        );
+        assert_eq!(
+            reopened.snapshot(),
+            retained,
+            "errors and actor replies share the result budget"
+        );
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_typed_error_ledger_consumes_resumed_work_and_rejects_noncanonical_sections() {
+        use crate::agent_sdk::{InvocationError, RuntimeWork};
+        let RuntimeWork::Resume { state, resume, .. } = clean_failing_resume_fixture() else {
+            unreachable!()
+        };
+        let mut runtime = StandardAgentRuntime::restore(
+            decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap(),
+        )
+        .unwrap();
+        let (record, work) = runtime.resolve_clean_resume(&resume).unwrap();
+        let authorization = record.authorization.unwrap();
+        let before = runtime.snapshot();
+        assert!(
+            runtime
+                .retain_clean_invocation_error(
+                    &work,
+                    &authorization,
+                    InvocationError::InvalidActorOutput,
+                    record.observed_slot,
+                    None
+                )
+                .is_err()
+        );
+        assert_eq!(runtime.snapshot(), before);
+        runtime
+            .retain_clean_invocation_error(
+                &work,
+                &authorization,
+                InvocationError::InvalidActorOutput,
+                record.observed_slot,
+                Some(record.ready_sequence),
+            )
+            .unwrap();
+        let retained = runtime.snapshot();
+        assert_eq!(retained.lane_state, before.lane_state);
+        assert!(retained.machine_continuations.is_empty());
+        let mut reopened = StandardAgentRuntime::restore(
+            decode_standard_runtime_state(&encode_standard_runtime_state(&retained)).unwrap(),
+        )
+        .unwrap();
+        reopened
+            .acknowledge_clean_invocation(&work, &authorization)
+            .unwrap();
+        assert!(reopened.snapshot().clean_invocation_errors.is_empty());
+
+        let mut overlap = retained.clone();
+        overlap.machine_continuations = before.machine_continuations;
+        assert!(StandardAgentRuntime::restore(overlap).is_err());
+        let mut duplicate = retained.clone();
+        duplicate
+            .clean_invocation_errors
+            .push(retained.clean_invocation_errors[0].clone());
+        assert!(decode_standard_runtime_state(&encode_standard_runtime_state(&duplicate)).is_err());
+        let mut section = Vec::new();
+        encode_clean_invocation_errors(
+            &mut Encoder(&mut section),
+            &retained,
+            super::super::InvocationResultStorage::Lane(StateLane::Linear),
+        );
+        assert!(
+            decode_clean_invocation_errors(
+                &mut Decoder::new(&section),
+                super::super::InvocationResultStorage::Control
+            )
+            .is_err()
+        );
+        section[4..6].copy_from_slice(&2_u16.to_le_bytes());
+        assert!(
+            decode_clean_invocation_errors(
+                &mut Decoder::new(&section),
+                super::super::InvocationResultStorage::Lane(StateLane::Linear)
+            )
+            .is_err()
+        );
+        let mut empty = STANDARD_CLEAN_INVOCATION_ERRORS_MAGIC.to_vec();
+        let mut encoder = Encoder(&mut empty);
+        encoder.u16(1);
+        encoder.list::<u8>(&[], |encoder, value| encoder.u8(*value));
+        assert!(
+            decode_clean_invocation_errors(
+                &mut Decoder::new(&empty),
+                super::super::InvocationResultStorage::Control
+            )
+            .is_err(),
+            "empty ledgers have only the absent-section encoding"
+        );
+    }
+
+    #[cfg(feature = "pvm")]
     #[test]
     fn clean_terminal_failure_retention_survives_restart_and_exact_acknowledgement() {
         use crate::agent_sdk::{InvocationAuthorization, InvocationError};
@@ -9785,6 +10471,13 @@ pub(crate) mod tests {
 
     #[cfg(feature = "pvm")]
     pub(crate) fn clean_failing_resume_fixture() -> crate::agent_sdk::RuntimeWork {
+        clean_failing_resume_fixture_with_status(None)
+    }
+
+    #[cfg(feature = "pvm")]
+    pub(crate) fn clean_failing_resume_fixture_with_status(
+        status: Option<u8>,
+    ) -> crate::agent_sdk::RuntimeWork {
         use crate::agent_sdk::{RuntimeExecutionContext, RuntimeWork};
         let RuntimeWork::Invoke {
             state,
@@ -9792,7 +10485,7 @@ pub(crate) mod tests {
             authorization,
             observed_slot,
             ..
-        } = clean_failing_actor_fixture(None)
+        } = clean_failing_actor_fixture(status)
         else {
             unreachable!()
         };
@@ -9807,7 +10500,7 @@ pub(crate) mod tests {
             .unwrap()
             .capture()
             .unwrap();
-        continuation.machine.gas_remaining = 100;
+        continuation.machine.gas_remaining = if status.is_some() { 100_000 } else { 100 };
         runtime
             .commit_yielded_execution(
                 &invocation,
