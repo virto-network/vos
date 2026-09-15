@@ -8,6 +8,10 @@ pass. Live unseen-expiry retirement and unchanged Counter state after restart
 now pass too. Ordinary-agent finality,
 cross-runtime actor lifecycle, production latency
 and full release gates remain open. This is not a master-ready branch.
+Capacity qualification: successful issued coordinator/issuer records still
+accumulate to a 256-record ceiling. Passing overflow-rejection tests does not
+prove sustained operation beyond that ceiling; authenticated reclamation and
+exact-retry preservation remain required before production readiness.
 Timing qualification: earlier live campaigns used the debug CLI. The configured
 fat-LTO release build now passes, but its r17 recovery startup took 161 seconds
 and the first Counter Install returned HTTP 504. This is also a release-mode
@@ -9532,6 +9536,41 @@ with the already completed capacity case explicitly filtered, not rerun.
 the two commands execute all 25 coordinator tests, zero failures/ignored.
 Formatting and diff checks pass. The reusable release test executable is
 shared target `release/deps/vos-215e14785cbfaec4`; its build is complete.
+
+### Native recovery and physical capacity release matrix
+
+At `c8788f98`, the existing release test executable completes the selected
+native Create/Install startup, administration, operation retirement and pending
+projection recovery matrix: **36 passed, zero failures, one explicit capacity
+diagnostic ignored**, 262.63s. The ignored diagnostic was then run separately
+with `--exact --ignored`: `native_operation_initial_capture_requires_more_headroom_than_projection`
+passes, 259.78s. Together all 37 selected cases executed successfully; none is
+counted as passed solely because it was filtered or ignored.
+
+The capacity diagnostic fills authenticated Invoke/ACK history at the actual
+64MiB journal boundary. It verifies management-capture refusal before intent
+publication with unchanged physical state, distinguishes the smaller projection
+budget, and successfully uses the production capture/checkpoint repair path.
+It does not replace this history with a synthetic capacity counter. These are
+native host fixtures with bundled artifacts and local network harnesses, not a
+full daemon mixed-pending campaign. The 20 issuer regressions also pass (0.52s).
+
+Evidence in the r17 fixture: `native-recovery-release-matrix.log`,
+`native-64mib-capacity-release.log`, `issuer-release-regressions.log`.
+Both native processes completed; no build or test process remains from these
+runs. No production source, artifact, capacity limit or timeout changed.
+
+Source audit distinguishes physical-journal checkpoint repair from operation
+history reclamation. `DurableAuthorityOperationCoordinator` and
+`DurableAuthorityOperationIssuer` retain successful issued records permanently
+in their bounded images; fresh work is rejected at 256. Native terminal
+retirement releases admission but does not prune those images. The passing
+coordinator/issuer ceiling tests prove fail-closed behavior, not unbounded
+service life. Removing records without independently reopenable consumption
+evidence and preserved exact-retry/collision protection would be unsafe.
+This remains a concrete retention/GC implementation gate alongside mixed-pending
+recovery, pre-expiry abort/management expiry, Shared finality, profile coverage,
+latency and final-source release verification. Keep the C1/C2/C3 grouping.
 
 ### Durable client acknowledgement before completion
 
