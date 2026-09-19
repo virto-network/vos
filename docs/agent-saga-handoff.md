@@ -10,6 +10,24 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: ingress and extension qualification boundaries clarified
+
+HTTP guide now reflects native operator API bootstrap and the live receipt-bearing
+Public Counter mutation/restart campaign; it retains non-Public, yield/resume,
+Private/Attested and crash-matrix gaps. Name-based adapter behavior is explicitly
+separate from the qualified clean binary workflow. SSH guide and compact status
+now distinguish listener/host-key smoke checks from unqualified authenticated
+shell/route/proof behavior; an operator API credential is not evidence of SSH
+credential enrollment. Extension guides no longer claim Local installation is
+absent, but do not claim Counter evidence qualifies Substrate transactions.
+
+Source boundaries checked: native startup bootstrap credential kind is Api;
+SSH authenticates via `authenticate_ssh_public_key`; clean HTTP preparation
+authenticates via `authenticate_clean_api`. No runtime changes or external
+network transactions. Static clean-break gate and `git diff --check` pass;
+evidence `target/task-tmp/current-latency.p7U3OE/ingress-docs-clean-break.log`.
+Broader adapter/extension integration remains unqualified by this docs update.
+
 ### 2026-09-19: operator documentation aligned with qualified Local workflow
 
 README, getting-started, operations, actor and example guides still advertised

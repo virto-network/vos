@@ -130,7 +130,10 @@ Transaction preparation, submission, and cancellation accept trusted local
 system calls. The host binds any caller grant to its exact actor identity;
 Noise transport identity alone does not authorize nonce reservations or
 signing capabilities. The current `vosx` cutover can load and persist an
-extension but exposes no actor-installation or dynamic-invocation command.
+extension and exposes Linux Local actor installation and canonical managed
+invocation. It has no dynamic text-command fallback. The Local Counter release
+checks do not qualify an end-to-end extension transaction/signing workflow;
+see [current status](agent-saga-status.md).
 Signing request IDs and map snapshot IDs remain non-sequential and
 caller-bound; unauthenticated map reads use bearer cursors and share one
 anonymous caller quota.

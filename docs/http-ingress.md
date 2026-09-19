@@ -34,11 +34,12 @@ already enables it.
 
 ## Authorization boundary
 
-The listener requires credentials admitted by the clean Space authority. The
-current `vosx` cutover does not issue, list, or revoke credentials, so merely
-adding this listener to `local.toml` does not create usable production access.
-Embedders may provision authority state through the typed host interfaces; a
-public operator command returns only with the clean system bootstrap.
+Protected routes require credentials admitted by the clean Space authority.
+Native bootstrap enrolls the configured operator's API credential for the Local
+workflow; the Linux CLI exposes Local creation, installation and managed
+invocation. This is not general credential-management tooling or anonymous
+access. Merely adding a listener does not enroll other clients. Production
+latency and other gates remain open; see [current status](agent-saga-status.md).
 
 ## Routes
 
@@ -141,8 +142,10 @@ invocation completes it. Completion is idempotent after reopen.
 
 Successful retirement reports `delivery_retired: true` and
 `reservation_pending: false`, **not actor success**: a completed actor error can
-also be positively retired. This client path has protocol/loopback tests, not yet
-a live protected mutation/restart campaign. Production latency remains blocking.
+also be positively retired. Current-release live tests cover receipt-bearing
+Public Counter mutation, read after restart, positive retirement and exact ACK
+retries. They do not qualify non-Public method policies, Private/Attested proofs,
+or the complete crash matrix. Production latency remains blocking.
 
 ### Invocation and application routes
 
@@ -179,10 +182,12 @@ dispatcher cannot provide verified attested delivery yet.
 A 200 binary response is canonical `ASR1`, bound to the exact request. Inspect
 its runtime outcome: HTTP 200 does not itself mean actor success. On transport
 failure or 503, retain the original bytes; do not assume execution did not
-occur or generate a new invocation identity. The transport does not yet supply
-fresh client preparation/receipt issuance,
-or the friendly JSON route below. A full live invocation/restart campaign is
-still required before ordinary-agent testing is considered ready.
+occur or generate a new invocation identity. This endpoint does not itself
+prepare work or issue receipts; the separate preparation/authorization endpoints
+and managed Local CLI above perform that workflow. Its canonical binary
+contract is distinct from the name-based JSON adapter described below. The
+qualified disposable Local Counter campaign is not ordinary Shared-Agent or
+full production readiness.
 
 An already prepared Direct ASQ1 can be durably delivered with:
 
@@ -219,8 +224,9 @@ the same anonymous-Public/receipt boundary, exact live route checks, bounded
 framing and request-bound responses. An HTTP error does not prove non-execution
 or non-retirement. Native terminal Public-query retirement and exact HTTP
 acknowledgement retries pass before and after restart on disposable Local
-state. Native guest yield/resume and protected mutation remain unverified;
-this is not a full ordinary-agent readiness pass.
+state. Receipt-bearing Public Counter mutation and restart/read now pass too;
+native guest yield/resume and non-Public-policy qualification remain separate
+gates. This is not a full ordinary-agent readiness pass.
 
 After retaining initial delivery, continue it with:
 
@@ -242,6 +248,11 @@ its response is allowed; predecessors cannot be rewritten. At capacity the
 command preserves history and stops without silently discarding evidence.
 
 ### Existing name-based routes
+
+The following describes the separate name-based adapter, not the tested clean
+binary Local workflow. The current Counter qualification does not establish
+these routes, their keyed-result retention, or attested delivery end to end.
+Do not substitute them for the canonical Local invocation commands above.
 
 | Route | Required authority |
 | --- | --- |

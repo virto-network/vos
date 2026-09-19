@@ -38,6 +38,12 @@ non-regular files, and insecure existing modes are rejected.
 
 ## Authorization boundary
 
+Current release smoke checks establish listener availability and host-key
+persistence only; they do not establish authenticated shell access or the full
+route/proof behavior described below. The Local HTTP workflow bootstraps an
+operator API credential, not evidence of an enrolled SSH credential. See
+[current status](agent-saga-status.md) for the qualified test boundary.
+
 SSH keys must already be admitted by the clean Space authority. The current
 `vosx` cutover has no credential-management command, so configuring the
 listener alone does not create production access. Embedders may provision

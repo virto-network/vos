@@ -11,7 +11,8 @@ SHA-256: `697324387cf98331f0c237e228dfc9e98947c8a97f9f1204dfa3d8eca985ce20`.
 The current runtime is independently reproduced; new spaces automatically
 receive system packages and enabled HTTP/SSH configuration. The Local workflow
 has live evidence for Create, Counter Install, increment, retirement/ACK retry,
-and reading7 after restart. Latest release rechecks HTTP/SSH, retained Counter
+and reading7 after restart. Latest release rechecks HTTP status and SSH
+listener/host-key persistence (not authenticated shell access), retained Counter
 recovery and conflict reporting. A separate new-space probe on the same release
 also verifies fresh Create (38s) and Counter Install (45s), with no retry/resume.
 Fresh Counter increment takes25.33s and read-after-restart25.76s on this release;

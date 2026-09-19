@@ -63,8 +63,11 @@ name = "substrate"
 path = "target/release/libsubstrate_extension.so"
 ```
 
-The current `vosx` clean-cutover surface loads this extension but does not
-offer package installation or dynamic actor invocation.
+The current `vosx` clean-cutover surface loads this extension and offers Linux
+Local actor installation and canonical managed invocation, not a dynamic
+text-command dispatcher. The Local Counter release checks do not qualify an
+end-to-end Substrate transaction/signing workflow; see
+[current status](../../docs/agent-saga-status.md).
 
 The node-local route permits at most eight calls per Refine and 64 KiB per
 request or reply. It is installed only for roots using `consistency = "local"`:
