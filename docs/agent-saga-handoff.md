@@ -12,6 +12,20 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-20: reusable pre-publication receipt/approval binding
+
+The SDK's existing `receipt_matches_approval` comparison is now public for
+pre-publication admission; its predicate and existing acknowledgement caller
+are unchanged. Documentation explicitly separates this comparison from shape,
+signature, validity-window and retained credential-call verification. A new
+regression confirms that changing only the issuer decision sequence does not
+change the comparison (it is not the actor authorization clock), while signature
+verification still rejects that unsigned change. Agent/request substitutions
+reject. Full SDK167/167 tests pass (session51078 exit0,0 ignored,0.07s); formatting
+and diff checks pass. Log: shared
+`target/task-tmp/final-review-release.HbPbex/receipt-approval-binding.log`.
+No actor publisher is wired yet and no artifacts were repinned.
+
 ### 2026-09-20: Authority strict-backend QC regression passes
 
 A test in the nested Authority actor uses its existing

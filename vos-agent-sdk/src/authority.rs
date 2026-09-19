@@ -1938,7 +1938,14 @@ fn management_application_reply_shape_matches(
     }
 }
 
-fn receipt_matches_approval(receipt: &AuthorityReceipt, approval: &ManagementApproval) -> bool {
+/// Compare receipt selectors with the exact retained management approval.
+///
+/// This is a binding comparison, not signature, validity-window, or policy
+/// verification. Callers must validate both values and independently verify
+/// the receipt and approval's retained credential call before admission.
+/// The issuer's decision sequence is deliberately not compared with the
+/// actor's authorization sequence: they are independently allocated clocks.
+pub fn receipt_matches_approval(receipt: &AuthorityReceipt, approval: &ManagementApproval) -> bool {
     let selector = &receipt.selector;
     let actor = approval.plan.authority_actor();
     selector.policy == approval.authority.binding.policy
@@ -2816,6 +2823,29 @@ mod tests {
             wrong_request.validate_shape(),
             Err(AuthorityActorProtocolError::InvalidRequest)
         );
+    }
+
+    #[test]
+    fn receipt_approval_binding_keeps_issuer_and_authorization_clocks_separate() {
+        let call = credential_call(mutating_request());
+        let approval = approval(&call);
+        let ack = application_ack(&call, &approval);
+        assert!(receipt_matches_approval(&ack.receipt, &approval));
+        let mut later_issuer_sequence = ack.receipt.clone();
+        later_issuer_sequence.selector.decision_sequence += 100;
+        assert!(receipt_matches_approval(&later_issuer_sequence, &approval));
+        // Matching does not claim that the changed receipt is signed.
+        assert!(
+            later_issuer_sequence
+                .verify_at(ack.applied_at, &TestCredentialVerifier)
+                .is_err()
+        );
+        let mut substituted = ack.receipt.clone();
+        substituted.selector.request = Hash([0x91; 32]);
+        assert!(!receipt_matches_approval(&substituted, &approval));
+        substituted = ack.receipt.clone();
+        substituted.selector.agent = AgentId([0x92; 32]);
+        assert!(!receipt_matches_approval(&substituted, &approval));
     }
 
     #[test]
