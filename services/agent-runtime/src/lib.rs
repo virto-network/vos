@@ -27,15 +27,7 @@ mod guest {
         // SAFETY: the standard PVM loader maps the complete argument window
         // read-only and supplies its base/length in a0/a1.
         let input = unsafe { core::slice::from_raw_parts(arguments, arguments_len) };
-        let work = vos::agent_sdk::RuntimeWork::decode(input).unwrap_or_else(|_| fail_closed());
-        let output = match work.execution_context() {
-            vos::agent_sdk::RuntimeExecutionContext::Direct => {
-                vos::agent::wire::apply_standard_runtime_work(work)
-            }
-            vos::agent_sdk::RuntimeExecutionContext::Attested { .. } => {
-                vos::agent::wire::apply_proof_host_attested_standard_runtime_work(work)
-            }
-        }
+        let output = vos::agent::wire::apply_standard_runtime_input(input)
             .unwrap_or_else(|_| fail_closed())
             .encode()
             .unwrap_or_else(|_| fail_closed());

@@ -6,6 +6,14 @@ checkpoint, not production or master sign-off. `saga/agents` remains at
 
 ## What can be tested
 
+Source now also contains an **unbundled decoded-input validation-reuse
+candidate**: paired exact-output tests use12.6% less fresh-Invoke gas and20.9%
+less ACK gas. Its two new rejection/equivalence tests, wire suite97/1 ignored,
+and real bundled-Authority query pass. Independent reproduction, repinning,
+release rebuild and live latency qualification are still pending. The
+qualified release and all production pins below remain unchanged; see the
+handoff for candidate identity and exact evidence.
+
 Latest source now pins the independently reproduced artifact-role length
 optimization from `19d73390`, ProgramId
 `e61dc1dacd564ac9371512eaaf9d35ad8f1e081f8e3b638ca9da9425e887e86b`.
@@ -49,8 +57,9 @@ review-handoff documentation and disposable-fixture test updates belong with bat
 is not independently merge-ready.
 See [review guide](agent-saga-review.md) and [evidence handoff](agent-saga-handoff.md).
 
-Freeze implementation here for review and disposable Local-space testing; do
-not start another guest/artifact change merely to fill the remaining budget.
+The qualified implementation remains the review/disposable Local-space
+checkpoint. The separately measured source candidate above is not a new
+deployment checkpoint until its reproduction and release gates pass.
 The post-`36e63581` uncommitted Shared-finality experiment has been removed:
 it depended on legacy embedded authority state absent from clean Create. Its
 failed test and patch are preserved in the evidence directory; see the handoff.

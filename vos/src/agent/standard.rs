@@ -4157,6 +4157,25 @@ impl StandardAgentRuntime {
             .map(|acknowledgement| (acknowledgement, true))
     }
 
+    #[cfg(feature = "pvm")]
+    pub(super) fn acknowledge_validated_clean_invocation_with_status(
+        &mut self,
+        validated: super::wire::ValidatedInvocationWork<'_>,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+    ) -> Result<
+        (crate::agent_sdk::InvocationAcknowledgement, bool),
+        crate::agent_sdk::InvocationError,
+    > {
+        let work = validated.work();
+        if let Some(retained) =
+            self.recover_clean_acknowledgement_after_work_validation(work, authorization)?
+        {
+            return Ok((retained, false));
+        }
+        self.acknowledge_new_clean_invocation(work, authorization)
+            .map(|acknowledgement| (acknowledgement, true))
+    }
+
     // Only called immediately after authenticated recovery found no retained
     // acknowledgement; never expose an entry point that skips that check.
     fn acknowledge_new_clean_invocation(
@@ -4324,8 +4343,33 @@ impl StandardAgentRuntime {
         authorization: &crate::agent_sdk::InvocationAuthorization,
         observed_slot: u64,
     ) -> Result<Option<crate::agent_sdk::InvocationError>, crate::agent_sdk::InvocationError> {
-        use crate::agent_sdk::InvocationError;
         self.verify_clean_invocation_authorization(work, authorization, observed_slot)?;
+        self.recover_clean_invocation_error_after_authorization(work, authorization, observed_slot)
+    }
+
+    #[cfg(feature = "pvm")]
+    pub(super) fn recover_validated_clean_invocation_error(
+        &mut self,
+        validated: super::wire::ValidatedInvocationWork<'_>,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        observed_slot: u64,
+    ) -> Result<Option<crate::agent_sdk::InvocationError>, crate::agent_sdk::InvocationError> {
+        let work = validated.work();
+        self.verify_clean_invocation_authorization_after_work_validation(
+            work,
+            authorization,
+            observed_slot,
+        )?;
+        self.recover_clean_invocation_error_after_authorization(work, authorization, observed_slot)
+    }
+
+    fn recover_clean_invocation_error_after_authorization(
+        &mut self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+        observed_slot: u64,
+    ) -> Result<Option<crate::agent_sdk::InvocationError>, crate::agent_sdk::InvocationError> {
+        use crate::agent_sdk::InvocationError;
         if self
             .recover_clean_acknowledgement_after_work_validation(work, authorization)?
             .is_some()

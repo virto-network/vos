@@ -2190,9 +2190,62 @@ pub fn apply_standard_execution(
     Ok(RuntimeExecutionReturn { state, result })
 }
 
-/// Apply the clean portable AgentRuntime work ABI. Every branch consumes
-/// exactly one canonical AWRK generation; no transitional lifecycle message
-/// is decoded by this entry.
+/// Borrowed proof of complete canonical invocation validation. Only this
+/// module can construct it, immediately after decoding the exact work bytes.
+#[cfg(feature = "pvm")]
+pub(super) struct ValidatedInvocationWork<'a>(&'a crate::agent_sdk::InvocationWork);
+
+#[cfg(feature = "pvm")]
+impl<'a> ValidatedInvocationWork<'a> {
+    pub(super) fn work(&self) -> &'a crate::agent_sdk::InvocationWork {
+        self.0
+    }
+}
+
+/// Decode and execute one canonical work item. The decoder validates all
+/// availability preimages before this module mints a borrowed validation
+/// capability. It cannot escape this immutable invocation or authorize a
+/// different work item. Constructed-value entry points still validate fully.
+#[cfg(feature = "pvm")]
+pub fn apply_standard_runtime_input(
+    input: &[u8],
+) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
+    use crate::agent_sdk::wire::CanonicalWire as _;
+
+    let work =
+        crate::agent_sdk::RuntimeWork::decode(input).map_err(|_| DecodeError::NonCanonical)?;
+    if !work.execution_context().is_direct() {
+        #[cfg(all(feature = "agent-runtime", target_arch = "riscv64"))]
+        return apply_proof_host_attested_standard_runtime_work(work);
+        #[cfg(not(all(feature = "agent-runtime", target_arch = "riscv64")))]
+        return Err(DecodeError::NonCanonical);
+    }
+    match work {
+        crate::agent_sdk::RuntimeWork::Invoke {
+            state,
+            invocation,
+            authorization,
+            observed_slot,
+            ..
+        } => apply_clean_invoke_inner(
+            state,
+            *invocation,
+            *authorization,
+            observed_slot,
+            CleanExecutionAdmission::direct(),
+            true,
+        ),
+        crate::agent_sdk::RuntimeWork::Acknowledge {
+            state,
+            invocation,
+            authorization,
+            ..
+        } => apply_clean_acknowledge_inner(state, *invocation, *authorization, true),
+        other => apply_standard_runtime_work(other),
+    }
+}
+
+/// Execute constructed Direct work, validating its invocation preimages.
 #[cfg(feature = "pvm")]
 pub fn apply_standard_runtime_work(
     work: crate::agent_sdk::RuntimeWork,
@@ -2419,6 +2472,18 @@ fn apply_clean_invoke(
     observed_slot: u64,
     admission: CleanExecutionAdmission<'_>,
 ) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
+    apply_clean_invoke_inner(state, work, authorization, observed_slot, admission, false)
+}
+
+#[cfg(feature = "pvm")]
+fn apply_clean_invoke_inner(
+    state: crate::agent_sdk::RuntimeState,
+    work: crate::agent_sdk::InvocationWork,
+    authorization: crate::agent_sdk::InvocationAuthorization,
+    observed_slot: u64,
+    admission: CleanExecutionAdmission<'_>,
+    decoded_work: bool,
+) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
     use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeTransition};
 
     let original_state = clean_state_to_legacy(&state);
@@ -2430,7 +2495,16 @@ fn apply_clean_invoke(
     // Recovery begins with full work/authorization verification before any
     // mutation, so do not repeat that verification (including blob hashes and
     // receipt signatures) here. Recover before consulting current actor policy.
-    match runtime.recover_clean_invocation_error(&work, &authorization, observed_slot) {
+    let recovered = if decoded_work {
+        runtime.recover_validated_clean_invocation_error(
+            ValidatedInvocationWork(&work),
+            &authorization,
+            observed_slot,
+        )
+    } else {
+        runtime.recover_clean_invocation_error(&work, &authorization, observed_slot)
+    };
+    match recovered {
         Ok(Some(error)) => {
             let candidate = encode_standard_runtime_state(&runtime.snapshot());
             if candidate.encoded_len().is_none_or(|len| len > state_limit) {
@@ -2897,6 +2971,16 @@ fn apply_clean_acknowledge(
     work: crate::agent_sdk::InvocationWork,
     authorization: crate::agent_sdk::InvocationAuthorization,
 ) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
+    apply_clean_acknowledge_inner(state, work, authorization, false)
+}
+
+#[cfg(feature = "pvm")]
+fn apply_clean_acknowledge_inner(
+    state: crate::agent_sdk::RuntimeState,
+    work: crate::agent_sdk::InvocationWork,
+    authorization: crate::agent_sdk::InvocationAuthorization,
+    decoded_work: bool,
+) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
     use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeTransition};
 
     let original_state = clean_state_to_legacy(&state);
@@ -2910,22 +2994,29 @@ fn apply_clean_acknowledge(
     // retire through the deliberately Direct housekeeping route. The runtime
     // below authenticates the original work, authorization, preflight, and
     // exact retained result before removing anything.
-    let acknowledgement =
-        match runtime.acknowledge_clean_invocation_with_status(&work, &authorization) {
-            Ok((acknowledgement, true)) => acknowledgement,
-            Ok((acknowledgement, false)) => {
-                return Ok(RuntimeTransition {
-                    state,
-                    outcome: RuntimeOutcome::Acknowledged(Ok(acknowledgement)),
-                });
-            }
-            Err(error) => {
-                return Ok(RuntimeTransition {
-                    state,
-                    outcome: RuntimeOutcome::Acknowledged(Err(error)),
-                });
-            }
-        };
+    let acknowledged = if decoded_work {
+        runtime.acknowledge_validated_clean_invocation_with_status(
+            ValidatedInvocationWork(&work),
+            &authorization,
+        )
+    } else {
+        runtime.acknowledge_clean_invocation_with_status(&work, &authorization)
+    };
+    let acknowledgement = match acknowledged {
+        Ok((acknowledgement, true)) => acknowledgement,
+        Ok((acknowledgement, false)) => {
+            return Ok(RuntimeTransition {
+                state,
+                outcome: RuntimeOutcome::Acknowledged(Ok(acknowledgement)),
+            });
+        }
+        Err(error) => {
+            return Ok(RuntimeTransition {
+                state,
+                outcome: RuntimeOutcome::Acknowledged(Err(error)),
+            });
+        }
+    };
     let successor = encode_standard_runtime_state(&runtime.snapshot());
     if successor
         .encoded_len()
@@ -9792,6 +9883,147 @@ pub(crate) mod tests {
                     Ok(None)
                 );
             }
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn decoded_runtime_input_preserves_fresh_retry_ack_and_retired_transitions() {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        use crate::agent_sdk::{RuntimeOutcome, RuntimeWork};
+
+        let fresh = clean_actor_fixture_with_padding(Some(crate::actors::STATUS_DONE), 4096);
+        let mut attested = fresh.clone();
+        if let RuntimeWork::Invoke { context, .. } = &mut attested {
+            *context = crate::agent_sdk::RuntimeExecutionContext::Attested {
+                proof_system: crate::agent_sdk::Hash([0xb9; 32]),
+            };
+        }
+        assert_eq!(
+            apply_standard_runtime_input(&attested.encode().unwrap()),
+            Err(DecodeError::NonCanonical),
+            "native callers cannot use decoded input as attested admission",
+        );
+        let compare = |work: &RuntimeWork| {
+            let expected = apply_standard_runtime_work(work.clone()).unwrap();
+            let actual = apply_standard_runtime_input(&work.encode().unwrap()).unwrap();
+            assert_eq!(actual.encode().unwrap(), expected.encode().unwrap());
+            actual
+        };
+        let completed = compare(&fresh);
+        assert!(matches!(
+            completed.outcome,
+            RuntimeOutcome::Completed(Ok(_))
+        ));
+        let RuntimeWork::Invoke {
+            context,
+            invocation,
+            authorization,
+            observed_slot,
+            ..
+        } = fresh
+        else {
+            unreachable!()
+        };
+        let retry = RuntimeWork::Invoke {
+            context,
+            state: completed.state.clone(),
+            invocation: invocation.clone(),
+            authorization: authorization.clone(),
+            observed_slot,
+        };
+        compare(&retry);
+        let mut ack = RuntimeWork::Acknowledge {
+            context,
+            state: completed.state,
+            invocation,
+            authorization,
+        };
+        let retired = compare(&ack);
+        assert!(matches!(
+            retired.outcome,
+            RuntimeOutcome::Acknowledged(Ok(_))
+        ));
+        let RuntimeWork::Acknowledge { state, .. } = &mut ack else {
+            unreachable!()
+        };
+        *state = retired.state.clone();
+        compare(&ack);
+        // Rebuild with the retired state: Invoke must remain divergent, not
+        // execute a second time just because decode supplied validation.
+        let mut retired_invoke = retry;
+        if let RuntimeWork::Invoke { state, .. } = &mut retired_invoke {
+            *state = retired.state;
+        }
+        assert!(matches!(
+            compare(&retired_invoke).outcome,
+            RuntimeOutcome::Completed(Err(_))
+        ));
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn decoded_runtime_input_rejects_corruption_and_still_authenticates_receipts() {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        use crate::agent_sdk::{InvocationAuthorization, RuntimeExecutionContext, RuntimeWork};
+
+        let (state, invocation, receipt, _) = clean_terminal_fixture_with_program_size(4096);
+        for acknowledge in [false, true] {
+            let authorization =
+                Box::new(InvocationAuthorization::AuthorityReceipt(receipt.clone()));
+            let work = if acknowledge {
+                RuntimeWork::Acknowledge {
+                    context: RuntimeExecutionContext::Direct,
+                    state: state.clone(),
+                    invocation: Box::new(invocation.clone()),
+                    authorization,
+                }
+            } else {
+                RuntimeWork::Invoke {
+                    context: RuntimeExecutionContext::Direct,
+                    state: state.clone(),
+                    invocation: Box::new(invocation.clone()),
+                    authorization,
+                    observed_slot: 1,
+                }
+            };
+            let input = work.encode().unwrap();
+            let largest = invocation
+                .availability
+                .iter()
+                .max_by_key(|blob| blob.bytes.len())
+                .unwrap();
+            let offset = input
+                .windows(largest.bytes.len())
+                .position(|bytes| bytes == largest.bytes)
+                .unwrap();
+            let mut corrupt = input.clone();
+            corrupt[offset] ^= 1;
+            assert!(apply_standard_runtime_input(&corrupt).is_err());
+            assert!(apply_standard_runtime_input(&input[..input.len() - 1]).is_err());
+            let mut trailing = input;
+            trailing.push(0);
+            assert!(apply_standard_runtime_input(&trailing).is_err());
+
+            let mut forged = work.clone();
+            let (RuntimeWork::Invoke { authorization, .. }
+            | RuntimeWork::Acknowledge { authorization, .. }) = &mut forged
+            else {
+                unreachable!()
+            };
+            let InvocationAuthorization::AuthorityReceipt(receipt) = authorization.as_mut() else {
+                unreachable!()
+            };
+            receipt.signature[0] ^= 1;
+            let expected = apply_standard_runtime_work(forged.clone()).unwrap();
+            let actual = apply_standard_runtime_input(&forged.encode().unwrap()).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(actual.state, state);
+            assert!(matches!(
+                actual.outcome,
+                crate::agent_sdk::RuntimeOutcome::Completed(Err(_))
+                    | crate::agent_sdk::RuntimeOutcome::Acknowledged(Err(_))
+            ));
         }
     }
 

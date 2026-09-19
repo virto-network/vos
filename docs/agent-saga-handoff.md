@@ -10,6 +10,71 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: decoded-input validation reuse candidate reduces fresh Invoke/ACK gas
+
+Implemented the next bounded optimization identified by the profile. The
+guest now enters through `apply_standard_runtime_input`, which performs the
+same complete SDK canonical decode before execution. Only its private Direct
+Invoke/ACK continuations can mint the borrowed `ValidatedInvocationWork` token
+for that exact immutable work. Standard recovery skips the redundant complete
+availability validation, not scope/signature/slot checks, actor/ProgramId
+resolution, exact retained-result matching, or public-I/O hashing. Public
+constructed-work entry points still perform full validation. Guest Attested
+Invoke/Resume retains the prior proof-host path and full validation; native
+byte-input callers cannot select it. No ABI/domain/generation change.
+
+Two new source regressions compare complete encoded transitions for fresh
+Invoke, exact retry, ACK, ACK retry and retired Invoke. They also reject
+corrupt preimages, truncation/trailing bytes, forged receipt signatures and
+native Attested selection. Both pass with the four host features (session61937
+exit0). The initial default-feature filtered probe selected zero tests and is
+not qualification; the first compile exposed a WireError conversion, fixed
+by mapping failed canonical decode to the existing fail-closed error.
+
+Pinned guest build succeeds in14.30s (session13843 exit0). The isolated
+candidate is NOT bundled or release-qualified. Candidate ProgramId:
+`ebed0967a4d987e2f50f6e8908b294f713b0cf74583d1b5dc6648a8a542a049c`.
+ELF BLAKE2b256:
+`4a1930c4b8b6ba38daad3079ace97bb34903e446596346f3814d24eac11a505f`.
+PVM BLAKE2b256:
+`dfcf70ef5a335125176eb350e6fe3d857e9efc593a55860dee9761e4f2ac112f`.
+
+Paired exact-input large-artifact tests compare complete output bytes:
+
+| Work | Bundled gas | Candidate gas | Reduction |
+| --- | ---: | ---: | ---: |
+| Fresh Invoke | 463,462,521 | 405,201,877 | 12.6% |
+| Retained Invoke retry | 404,577,747 | 346,317,879 | 14.4% |
+| Fresh ACK | 278,766,249 | 220,499,368 | 20.9% |
+
+The wire suite with both candidate environment selectors passes97 tests,
+0 failed,1 ignored in29.71s (session25383 exit0). Tests without a candidate
+selector retain their existing source/bundled coverage; do not describe this
+as every case executing both PVMs. Formatting and diff checks pass.
+
+The real bundled-Authority fresh credential query also passes on the candidate
+outer PVM, including positive exact ACK and cleared pending projection
+(session2212 exit0,15.01s with instruction observation). Observed candidate
+Invoke gas555,039,116; ACK207,065,357. Its fixture runtime identity changes
+with the candidate package, so this is successful real-workload qualification,
+not identical-input/output A/B evidence or deployed wall-time speedup.
+The test-only runtime fixture now accepts the explicit candidate selector only
+when bundled-PVM profiling is requested; normal fixtures are unchanged.
+
+Evidence is preserved in shared disk-backed
+`target/task-tmp/decoded-input-candidate.81qO9E/`: `guest-build-fixed.log`,
+`decoded-input-tests-fixed.log`, `wire-candidate.log`,
+`authority-query-candidate.log`, `runtime.pvm`, and the guest target ELF.
+Prior failed compile logs remain. Production artifact manifest, guest bundle,
+runtime identity constants and release binary remain unchanged.
+
+Before promotion: independently reproduce from the immutable candidate source
+in two isolated source/target trees, require equality with the measured bytes,
+atomically repin, rebuild the release and repeat fresh disposable lifecycle /
+restart qualification plus the full regression gates. Do not boot preserved
+older-pin stores with a candidate release or claim the production latency
+gate is fixed. Ordinary Shared/finality and all other outstanding gates remain.
+
 ### 2026-09-19: exact-binary PC attribution identifies BLAKE2b as dominant cost
 
 Extended the opt-in test observer with bounded-by-code-length outer instruction

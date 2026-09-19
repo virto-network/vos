@@ -7160,7 +7160,13 @@ mod tests {
             // Profiling must measure the real outer runtime, not this fixture's
             // native Standard shortcut. Ordinary tests retain their fast path.
             let program = if bundled {
-                include_bytes!("../../../vosx/blobs/agent_runtime.pvm").to_vec()
+                // Explicit profiling can compare an unpinned candidate;
+                // ordinary fixture runs still use the bundled artifact.
+                std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE")
+                    .map(|path| std::fs::read(path).expect("read runtime profile candidate"))
+                    .unwrap_or_else(|| {
+                        include_bytes!("../../../vosx/blobs/agent_runtime.pvm").to_vec()
+                    })
             } else {
                 assembler.load_imm_64(Reg::A0, 0x63).trap().build_standard()
             };
