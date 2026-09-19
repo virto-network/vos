@@ -136,10 +136,10 @@ test: build-test-artifacts
 # Build and test the concise runtime examples in their nested workspace.
 test-examples:
     cd examples/actors; cargo test --workspace
-    cd examples/actors; cargo +nightly actor -p counter
-    cd examples/actors; cargo +nightly actor -p shared-board
-    cd examples/actors; cargo +nightly actor -p private-notes
-    cd examples/actors; cargo +nightly actor -p local-signer
+    cd examples/actors; cargo actor --locked -p counter
+    cd examples/actors; cargo actor --locked -p shared-board
+    cd examples/actors; cargo actor --locked -p private-notes
+    cd examples/actors; cargo actor --locked -p local-signer
     cd services/agent-runtime-guest; cargo test
     cd examples/agent-runtimes/custom-linear; cargo actor
     cd examples/agent-runtimes/custom-linear; cargo test

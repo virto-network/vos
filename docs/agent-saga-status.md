@@ -78,7 +78,7 @@ with bounded equivalence/recovery checks and repeat release qualification.
 | Recovery/proof qualification | Remaining mixed pending/crash/capacity cases, pre-expiry Abort/management expiry, cross-runtime portable positive ACK, and full Private/Attested cryptographic proof matrix. |
 | Formatting | Pinned-host formatting passes, including after decoded-input validation reuse. No lint allowances added. |
 | Workspace lint | Full `check-all` at cb01ae08 passes formatting and fails in vos Clippy with351 diagnostics. Host/journal cleanup and boxed network command reduce this to338; driver34, Local50, journal-store97 and network96 tests pass. No warning allowances added. Later `check-all` steps remain unrun and downstream lint completion is unproven. |
-| Cutover supporting gates | Full `just clean-break-check` passes at bf013ff1 with all nonzero test selections, nested actors, SDK intra-doc links and CLI/docs surface checks. Atcda6c997, SDK165/165 tests and vos no-default-feature library check pass. The broader `just check-all` recipe, workspace lint and all examples remain unqualified. |
+| Cutover supporting gates | Full `just clean-break-check` passes at bf013ff1 with all nonzero test selections, nested actors, SDK intra-doc links and CLI/docs surface checks. Full `just test-examples` now also passes; see the qualification below. Atcda6c997, SDK165/165 tests and vos no-default-feature library check pass. The broader `just check-all` recipe and workspace lint remain unqualified. |
 | Release integration | At8f96fad8: release build/bundle and fresh Local lifecycle pass; CLI255/19 ignored, release18/18 and wire97/1 ignored pass. Post-pin default library1,434/1 ignored and host-feature1,876/3 ignored pass with unchanged runtime source. Prior-pin actor-build4/task-build1 pass atcda6c997. Full cryptographic proof qualification and remaining sign-off stay open. |
 
 The post-pin `scripts/check-agent-clean-break.sh` gate also passes: retained CLI,
@@ -93,6 +93,11 @@ control-flow and7 memory tests, with zero failures/ignored. This does not close
 the full Private/Attested cryptographic proof matrix.
 Atbe0b54f4, `just check-pvm-proof-no-std` and `just check-pvm-proof-wasm` also
 pass. These are verifier portability builds, not WASM execution qualification.
+The full `just test-examples` recipe now passes after correcting the custom
+runtime test's target-directory lookup and removing moving-nightly overrides
+from actor builds. All four actors build; guest entry, host examples and the
+explicit compiled custom-runtime scheduling/rejection test pass. This does not
+close the broader `check-all` recipe or production profile gaps.
 
 Post-pin broad library regressions are complete; the production gaps above remain.
 The subsequent host/journal cleanup and boxed network command have targeted

@@ -10,6 +10,34 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: complete examples recipe passes after artifact-path correction
+
+Following `c3ce5261`, `test-examples` no longer overrides the actor workspaces'
+nightly-2026-03-20 pin with the moving `+nightly` alias; its four actor builds
+use `cargo actor --locked`, matching the maintained build recipe.
+
+The first full run (session33615 exit101, `examples-recipe.log`) passed actor
+tests/builds, the guest entry tests and custom-runtime host tests, but failed the
+explicit compiled-runtime execution check with Panic rather than Halt. The test
+read its hard-coded package-local ELF (505,800 bytes, dated September12), while
+the build wrote the new ELF to CARGO_TARGET_DIR (504,720 bytes, September19).
+Both original files and the failure log were preserved. No fixture was relabelled.
+
+The test now honors CARGO_TARGET_DIR and has a pure path regression covering
+default, absolute and package-relative target directories. The complete recipe
+rerun passes (session36911 exit0, `examples-recipe-fixed.log`):6 actor unit tests
+across four crates; all four actor guest builds;5 guest-entry tests;11 custom
+runtime host tests; and the explicit compiled scheduling/attested-context rejection
+test (1 passed,7.23s). The compiled test remains ignored in the ordinary host run
+and is explicitly executed by the recipe; empty doctest sets are not test passes.
+
+Logs are in shared `target/task-tmp/decoded-input-release.RIkx3j/`. The run unsets
+RUSTUP_TOOLCHAIN so each workspace honors its checked-in toolchain file, uses
+offline Cargo dependencies, the shared target, disk-backed TMPDIR and bounded
+test/prover concurrency. Root and nested formatting/diff checks pass; lockfiles
+and bundled production artifacts are unchanged. This closes `just test-examples`,
+not the remaining full `check-all`, Shared finality or production latency gates.
+
 ### 2026-09-19: verifier portability build gates pass
 
 At `be0b54f4`, both unchanged recipes complete with exit0 using

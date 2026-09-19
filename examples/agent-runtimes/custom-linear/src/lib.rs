@@ -1352,9 +1352,42 @@ mod tests {
         transition
     }
 
+    fn compiled_runtime_elf_path(
+        manifest: &std::path::Path,
+        target_dir: Option<&std::ffi::OsStr>,
+    ) -> std::path::PathBuf {
+        // The example recipes invoke Cargo from this package. Match their
+        // target-dir override rather than silently reading an old local ELF.
+        let target = target_dir
+            .map(|target| manifest.join(target))
+            .unwrap_or_else(|| manifest.join("target"));
+        target.join("riscv64em-vos/release/custom_linear_agent_runtime.elf")
+    }
+
+    #[test]
+    fn compiled_runtime_artifact_path_honors_target_override() {
+        use std::path::Path;
+        let manifest = Path::new("/example");
+        let suffix = "riscv64em-vos/release/custom_linear_agent_runtime.elf";
+        assert_eq!(
+            compiled_runtime_elf_path(manifest, None),
+            manifest.join("target").join(suffix)
+        );
+        assert_eq!(
+            compiled_runtime_elf_path(manifest, Some(std::ffi::OsStr::new("/shared-target"))),
+            Path::new("/shared-target").join(suffix)
+        );
+        assert_eq!(
+            compiled_runtime_elf_path(manifest, Some(std::ffi::OsStr::new("custom-target"))),
+            manifest.join("custom-target").join(suffix)
+        );
+    }
+
     fn compiled_runtime_pvm() -> Vec<u8> {
-        let elf = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target/riscv64em-vos/release/custom_linear_agent_runtime.elf");
+        let elf = compiled_runtime_elf_path(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+            std::env::var_os("CARGO_TARGET_DIR").as_deref(),
+        );
         let elf = std::fs::read(&elf).unwrap_or_else(|error| {
             panic!(
                 "read freshly built custom runtime ELF {}: {error}; run `cargo actor` first",
