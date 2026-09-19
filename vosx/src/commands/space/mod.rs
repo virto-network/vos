@@ -1,8 +1,8 @@
 //! `vosx space *` — local space lifecycle and daemon control.
 //!
 //! Clean-generation administration includes fresh Local Create and exact
-//! retained-request retries. Install and ordinary Shared-Agent provisioning
-//! remain unwired.
+//! retained-request retries, Local Install, and managed Local invocation.
+//! Ordinary Shared-Agent provisioning remains unwired.
 
 use clap::Subcommand;
 use std::path::PathBuf;

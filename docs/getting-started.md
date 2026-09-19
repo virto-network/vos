@@ -1,10 +1,11 @@
 # Getting started
 
-The current `vosx` surface deliberately separates buildable clean-generation
-primitives from lifecycle operations that are not connected yet. You can
-create and run a local Space, author AgentActor packages, inspect local
-extension policy, and perform verified offline backup/restore. There is no
-compatibility fallback for creating or operating Agents.
+You can create and run a local Space, author AgentActor packages, and on Linux
+create a Local Agent and install a signed actor. This is a disposable-test
+checkpoint, not production sign-off: startup and operations remain slow,
+ordinary Shared-Agent genesis/finality is not connected, and further recovery
+and proof gates remain. See [current status](agent-saga-status.md). There is no
+compatibility fallback for older Agent generations.
 
 ## Create and run a Space
 
@@ -43,10 +44,37 @@ vosx actor build board --name board
 
 The scaffold uses the public lane-aware SDK. `actor build` creates a signed
 `VOS3` package with exact program, schema, policy, dependency, capability, and
-producer identities. Building a package does not install it; operational Agent
-and actor lifecycle commands remain unavailable until ordinary-Agent genesis
-issuance/finality and lifecycle wiring are complete. Automatic system bootstrap
-does not create an application Agent or remove that current limitation.
+producer identities. Building a package does not install it. Automatic system
+bootstrap prepares Authority and Catalog, not an application Agent.
+
+## Create a Local Agent and install an actor (Linux)
+
+With `space up demo` running and ready in another terminal:
+
+```bash
+vosx space create-local-agent demo
+```
+
+The command reports the full Agent ID and a verified creation acknowledgement.
+To try the maintained Counter from a repository checkout, build its package,
+then replace `AGENT_HEX` below with that reported ID:
+
+```bash
+vosx actor build examples/actors/counter --name counter --out-dir dist
+vosx space install-local-actor demo AGENT_HEX dist/counter.vos --name counter
+```
+
+Counter requires no constructor input. Other packages may require exact encoded
+`--constructor-data`; arbitrary text or JSON is not a substitute. Installation
+must report a verified acknowledgement before being treated as complete.
+Current-release observations are Create38s and Install45s, not a latency promise.
+
+Do not issue a new operation to retry an uncertain result. Preserve the client
+request stores and use the command's `--resume` option with the same coordinates.
+A timeout or unsigned HTTP error does not prove failure. Historical Create
+replay after Install may return409 because server retention is bounded; inspect
+the retained signed evidence. See [Operations](operations.md) for invocation and
+recovery boundaries.
 
 ## Back up a stopped Space
 

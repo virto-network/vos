@@ -17,11 +17,28 @@ vosx space down team
 unless `--yes` is supplied. `space up` accepts repeatable `--listen` and
 `--connect` addresses and has a one-shot `--once` smoke mode.
 
-There are currently no public Agent creation, actor lifecycle, invocation,
-membership, credential, or recovery verbs. An unknown top-level word is a
-usage error; it is never treated as a dynamic actor name. This keeps the
-intermediate cutover fail-closed while system authority/catalog bootstrap is
-completed.
+On Linux the clean Local workflow also exposes `space create-local-agent`,
+`space install-local-actor`, `space invoke-local` and exact retained-request
+submission/recovery commands. Use each command's `--help`; these are not the
+retired generic Agent/actor commands. An unknown top-level word is a usage
+error, never a dynamic actor name. Ordinary Shared-Agent genesis/finality is
+still unavailable. See [Getting started](getting-started.md) for Local setup
+and [current status](agent-saga-status.md) for test evidence and release gaps.
+
+`space invoke-local SPACE --intent PATH` consumes canonical ATQ1 bytes with a
+stable invocation ID and operator origin; it is not a method-name/JSON command.
+It authorizes, delivers and positively retires the exact intent.
+`space invoke-local SPACE --resume` resumes the retained credential reservation
+without reading a new intent. Lower-level `submit-agent-*` and
+`continue-agent-invocation` commands operate on exact retained protocol stores;
+they do not make arbitrary bytes valid. Deployment-scoped role administration
+is exposed through `space set-actor-role` and retained admin commands.
+
+Preserve operation stores on timeout or failure. An unsigned HTTP error is not
+a signed outcome, and retrying with a new identity can create a different
+operation. Server retention is bounded: a retired historical Create may return
+409 after Install; inspect retained signed evidence rather than assuming the
+original Create failed. Do not copy host stores to another path to test recovery.
 
 ## Backup and restore
 
@@ -44,8 +61,9 @@ Agent/service generations rather than copying their raw stores.
 
 Persistent listen addresses, built-in HTTP/SSH ingress, and native extensions
 are configured in `<space-data>/local.toml`. `space caps` reports the effective
-extension relay ceilings stored in the running endpoint. The cutover CLI does
-not provision ingress credentials or dispatch actor methods.
+extension relay ceilings stored in the running endpoint. Enabled ingress does
+not grant anonymous access. Local managed invocation uses the authenticated
+operator workflow above, not a generic text-command dispatcher.
 
 ## Verification
 

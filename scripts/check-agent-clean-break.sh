@@ -95,7 +95,18 @@ documentation=(
     docs/operations.md
     extensions/substrate/README.md
 )
-retired_docs='vosx (agent (create|list|show|invite-node|revoke-node|recover)|actor (install|upgrade|suspend|resume|remove)|call|new|build|service-pvm)|vosx space (access|agents|apply|call|describe|export|install|invite|members|programs|publish|raft-status|role|subs|uninstall|unpublish|upgrade)|--(service-pvm|production-trust-socket|allow-conformance|agent-root-pins|agent-authority-socket|recipe)'
+retired_docs='(vosx (agent (create|list|show|invite-node|revoke-node|recover)|actor (install|upgrade|suspend|resume|remove)|call|new|build|service-pvm)|vosx space (access|agents|apply|call|describe|export|install|invite|members|programs|publish|raft-status|role|subs|uninstall|unpublish|upgrade))([^[:alnum:]_-]|$)|--(service-pvm|production-trust-socket|allow-conformance|agent-root-pins|agent-authority-socket|recipe)'
+# Match complete command words: clean install-local-actor must not be confused
+# with retired install. Keep end-of-line and Markdown punctuation covered.
+for example in 'vosx space install-local-actor demo' 'vosx space create-local-agent demo' 'vosx space invoke-local demo'; do
+    if rg -q "$retired_docs" <<<"$example"; then
+        fail "documentation matcher rejects a retained command: $example"
+    fi
+done
+for example in 'vosx space install demo' 'vosx space install' 'vosx actor install`' 'vosx agent create demo'; do
+    rg -q "$retired_docs" <<<"$example" \
+        || fail "documentation matcher misses a retired command: $example"
+done
 if rg -n "$retired_docs" "${documentation[@]}"; then
     fail "documentation advertises retired compatibility commands"
 fi

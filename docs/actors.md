@@ -85,8 +85,11 @@ actors may spawn package-authorized owned children. Stable actor identity is
 separate from its mutable name and current deployment.
 
 The current CLI authors packages with `vosx actor new` and `vosx actor build`.
-It intentionally does not expose install, upgrade, suspend, resume, or remove:
-those operations return only with the clean system authority/catalog path.
+On Linux, `vosx space install-local-actor` installs a signed package into an
+operator-owned Local Agent through the clean Authority path. Generic upgrade,
+suspend, resume and remove commands are not exposed. See
+[Getting started](getting-started.md) for the qualified Local workflow; runtime
+lifecycle contracts below are not claims that every CLI operation is available.
 
 Upgrade preserves identity while changing the exact deployment under a signed
 lifecycle transition. Removal is rejected unless the actor is a leaf and has

@@ -5,12 +5,13 @@ Agent owns an immutable profile, a runtime, a replica set, explicit authority,
 and a forest of signed actors. The clean-generation host contracts and the
 standard AgentRuntime are implemented in this repository.
 
-This branch is an intentional CLI cutover. `vosx` currently exposes actor
-authoring plus local Space lifecycle; it does not expose Agent creation,
-installation, invocation, membership, or recovery commands. Those operations
-return only when the clean system authority and catalog bootstrap path can own
-them end to end. No legacy service executable or dynamic command fallback is
-used in the interim.
+This branch is an intentional CLI cutover. On Linux, `vosx` exposes Local Agent
+creation, signed actor installation, canonical invocation and retained-request
+recovery, alongside actor authoring and Space lifecycle. Ordinary Shared-Agent
+genesis/finality and other production gates remain incomplete. Use disposable
+test spaces, not valuable older-generation stores; see the
+[current checkpoint and limitations](docs/agent-saga-status.md).
+No legacy service executable or dynamic command fallback is provided.
 
 ## Local Space lifecycle
 

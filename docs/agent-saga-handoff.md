@@ -10,6 +10,27 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: operator documentation aligned with qualified Local workflow
+
+README, getting-started, operations, actor and example guides still advertised
+the earlier absence of Local Create/Install/invocation. Updated them to the
+implemented Linux commands, with Counter build/install instructions, canonical
+ATQ1 invocation boundary, exact-resume guidance, bounded historical retention
+and explicit disposable-test/Shared/proof limitations. Current release help
+was checked for actor build, Local Install and managed invocation arguments;
+package output naming was checked against the builder. The space-module header
+was corrected; no executable production logic or artifact changed.
+
+The static retired-command regex also falsely classified `install-local-actor`
+as retired `install`. Added a complete-word boundary and executable matcher
+regressions for retained Local verbs and retired whitespace/end-of-line/Markdown
+forms. `bash scripts/check-agent-clean-break.sh` passes with offline Cargo,
+shared target and disk-backed TMPDIR (build45.29s, session21222 terminal0).
+Evidence: `target/task-tmp/current-latency.p7U3OE/docs-clean-break.log`.
+`bash -n` and `git diff --check` pass. This is the static CLI/documentation gate,
+not the entire `just clean-break-check` recipe or a full release documentation
+audit. Remaining ingress/extension/example and proof/deployment gates stay open.
+
 ### 2026-09-19: complete current host-feature library regression
 
 At `ba2d08ad`, the complete host-feature library suite passes1,869 tests,

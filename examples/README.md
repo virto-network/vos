@@ -26,5 +26,9 @@ cargo run -p vosx -- actor build examples/actors/counter --name counter
 
 The scheduled runtime lives in `examples/agent-runtimes/custom-linear`; it
 implements the mandatory management ABI and declares scheduling explicitly.
-`actor` is the portable authoring namespace, while `agent` is reserved for
-operations on durable Agent instances.
+`actor` is the portable authoring namespace. The Linux Local lifecycle uses
+`space create-local-agent` and `space install-local-actor`; there is no current
+top-level `agent` command. See [Getting started](../docs/getting-started.md).
+The profile/lane table describes SDK examples, not production deployment
+qualification for every profile; ordinary Shared genesis and Private/Attested
+proof qualification remain release gates.
