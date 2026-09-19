@@ -10,6 +10,17 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: complete post-pin default-library regression
+
+At `e63db78b` (release implementation `b131edc3`), full default-feature library
+suite passes1,434 tests, zero failures,1 ignored,198.17s. Command:
+`cargo +nightly-2025-05-09 test --locked --offline -p vos --lib -- --test-threads=1`,
+shared target and disk-backed TMPDIR. Session24727 terminal0; evidence
+`target/task-tmp/invoke-reproduction.OS8HAC/post-pin-default-suite.log`.
+No implementation changes needed. This supersedes the earlier default-feature
+baseline for the repinned runtime, not the still-pending full post-pin host-feature
+suite, cryptographic proof matrix or production gates.
+
 ### 2026-09-19: complete post-pin CLI regression
 
 At `c1614b96` (release implementation `b131edc3`), full CLI unit/binary suite
