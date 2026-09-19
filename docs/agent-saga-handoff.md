@@ -10,6 +10,17 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: complete post-pin CLI regression
+
+At `c1614b96` (release implementation `b131edc3`), full CLI unit/binary suite
+passes255 tests, zero failures,19 ignored,68.54s. Command:
+`cargo +nightly-2025-05-09 test --locked --offline -p vosx --bin vosx -- --test-threads=1`,
+shared target, disk-backed TMPDIR and loopback socket access. Session40371
+terminal0; evidence `target/task-tmp/invoke-reproduction.OS8HAC/post-pin-cli-suite.log`.
+No source changes required. Ignored live campaigns are not counted as passes;
+the completed new-generation Counter campaign is recorded below. Full post-pin
+library and production gates remain outstanding.
+
 ### 2026-09-19: repinned release and fresh Local lifecycle qualification
 
 Release source `b131edc3` built locked/offline nightly-2025-05-09 in6m05s,
