@@ -14,7 +14,9 @@ has live evidence for Create, Counter Install, increment, retirement/ACK retry,
 and reading7 after restart. Latest release rechecks HTTP/SSH, retained Counter
 recovery and conflict reporting. A separate new-space probe on the same release
 also verifies fresh Create (38s) and Counter Install (45s), with no retry/resume.
-Fresh invocation latency has not been remeasured on this host release.
+Fresh Counter increment takes25.33s and read-after-restart25.76s on this release;
+value7, positive retirement and exact ACK retries pass. This is Public-policy
+qualification, not the remaining Private/Attested proof matrix.
 
 Use disposable spaces only. Do not migrate valuable older-generation stores.
 Preserve failed operations and exact request bytes; a timeout or unsigned HTTP
@@ -31,23 +33,23 @@ Keep two scoped batches, not one review per work-in-progress commit:
 
 The integrated diff remains large (229 files, +75,715/-58,972 at `97503f48`).
 These are review groupings, not independently deployable slices. Subsequent
-review-handoff-only documentation edits belong with batch2. The old C1 boundary
+review-handoff documentation and disposable-fixture test updates belong with batch2. The old C1 boundary
 is not independently merge-ready.
 See [review guide](agent-saga-review.md) and [evidence handoff](agent-saga-handoff.md).
 
 Freeze implementation here for review and disposable Local-space testing; do
 not start another guest/artifact change merely to fill the remaining budget.
-No merge or push is authorized by this checkpoint. When implementation resumes,
-measure fresh invocation on the current release; Create/Install have now been
-remeasured, but not as a controlled before/after comparison. Preserve original
-fixture paths and failure evidence. Then address authenticated inventory
+No merge or push is authorized by this checkpoint. Fresh Create/Install/invocation
+have now been measured, but not as a controlled before/after comparison.
+Preserve original fixture paths and failure evidence. When implementation
+resumes, address authenticated inventory
 with bounded equivalence/recovery checks and repeat release qualification.
 
 ## Remaining production work
 
 | Requirement | Current evidence / gap |
 | --- | --- |
-| Startup and operation latency | Latest two restarts36s/29s; separate fresh-space readiness18s;10s gate fails. Current-release fresh Create38s, Install45s. Earlier fresh managed calls29–35s remain unremeasured on latest host release. |
+| Startup and operation latency | Recovery-fixture restarts36s/29s; new-fixture readiness18s then restarts27s/33s;10s gate fails. Current-release fresh Create38s, Install45s, managed increment25.33s and read-after-restart25.76s. |
 | Recovery performance | With8-entry scheduling, second pass system owner8.02s, including14 runtime calls6.39s. Shorter history helps; not a same-history A/B. |
 | Inventory performance | Two agents require six sequential authenticated queries; restart inventory20.42s/19.77s. Fresh Create lifecycle13.03s is followed by route reconciliation20.71s (inventory20.46s), so this also materially delays operation completion. |
 | Shutdown | Latest disposable probes pass within1–2s; general busy/crash matrix still incomplete. |

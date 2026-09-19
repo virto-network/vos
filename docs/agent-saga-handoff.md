@@ -10,6 +10,33 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: current-release fresh invocation and restart/read
+
+Extended only the ignored live-test fixture whitelist for `current-latency-smoke`
+with required `current-latency.` path prefix. It uses the same exact retained
+Create request/ACK verification as `fresh-ack-smoke`; no success, retirement,
+retry or value assertions were removed. No production runtime or artifact changed.
+Locked/offline vosx test compilation passes26.03s (session69735 terminal0).
+
+On the original `current-latency.p7U3OE` fixture, restart27s precedes a fresh
+Counter increment: managed attempt25.33s, full test27.20s, pass. Shutdown2s;
+next restart33s precedes a fresh read: managed attempt25.76s, full test27.56s,
+pass. Both tests verify positive retirement, rejected post-retirement Invoke,
+exact positive ACK retry and managed resume; read verifies persisted value7.
+Both shutdowns complete within2s without forced cleanup. Probe session80905
+terminal0; host process inspection finds no matching remaining daemon.
+Both restarts still fail10s readiness. These Public-policy checks do not qualify
+Private/Attested proofs or a general crash matrix. No controlled speedup claim.
+
+Evidence under the same fixture root: `invoke-build.log`, `invoke-probe.sh`,
+`invoke-probe.log`, `mutation-up.log`, `mutation-test.log`, `read-up.log`,
+`read-test.log`. Release SHA-256 unchanged. Test executable SHA-256:
+`ee6ab0da7f2063ef996ebfd8a17539028e4a4a489dc5f8ff00e201e7176a0116`.
+Mutation ID `dea0f17e60e4b1b2ece77ab530f159c10f585edc8cdf8fc7a1bf22dc40751d8f`;
+read ID `d74795a0cd4cd3d296bee5e8636fc38bf84ca8d708722a25477958b13bb484e6`.
+Counter value is now7: preserve request stores; do not issue another fresh
+increment when reproducing recovery. The probe guards against log overwrites.
+
 ### 2026-09-19: current-release fresh Create/Install measurement
 
 No implementation or artifact changes. Verified release SHA-256 remains

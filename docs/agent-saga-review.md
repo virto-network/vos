@@ -10,8 +10,8 @@ historical evidence. No merge or push is implied by this breakdown.
 | 1 | `31b0cdbb..f79f0e3d` | Integrated clean-break architecture and lifecycle;225 files,+72,934/-58,875. |
 | 2 | `f79f0e3d..97503f48` | Recovery, checkpointing, shutdown, prepared-runtime/ACK reuse, reproduced pin, lifecycle conflict reporting, attachment refresh and qualification;27 files,+2,844/-160. |
 
-Counts are frozen at that checkpoint; subsequent handoff-only documentation
-updates belong with batch2. Neither batch is an independently deployable slice.
+Counts are frozen at that checkpoint; subsequent handoff documentation and
+disposable-fixture test updates belong with batch2. Neither batch is an independently deployable slice.
 The integrated diff is229 files,+75,715/-58,972. No production sign-off is implied.
 
 Batch1 remains large and cannot be presented as an independently safe old C1
@@ -28,8 +28,10 @@ passing regressions from still-failing production gates.
 An additional fresh-space probe of the same release reaches readiness in18s,
 verifies fresh Create in38s and Counter Install in45s, and shuts down within1s.
 HTTP/SSH pass. No retry/resume was needed. Create lifecycle13.03s is followed by
-20.71s route reconciliation, including20.46s authenticated inventory. Fresh
-invocation is not remeasured, and differing fixture histories prevent a
+20.71s route reconciliation, including20.46s authenticated inventory. Subsequent
+fresh managed Counter increment25.33s and read-after-restart25.76s pass value,
+positive retirement and exact ACK retry checks. Test-only fixture support was
+extended; runtime/artifact bytes are unchanged. Differing fixture histories prevent a
 controlled speedup claim. Evidence is recorded in the handoff; production
 latency remains unresolved.
 

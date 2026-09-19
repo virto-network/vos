@@ -495,6 +495,7 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
         "r17-startup" => "r17-startup-smoke.",
         "issuer-reuse-smoke" => "issuer-reuse-release.",
         "fresh-ack-smoke" => "fresh-ack-release.",
+        "current-latency-smoke" => "current-latency.",
         _ => panic!("only the explicitly named disposable campaigns are supported"),
     };
     let (data, space, node_public, address) =
@@ -502,7 +503,7 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
     assert!(data.to_string_lossy().contains(fixture_prefix));
     let recovery_campaign = matches!(
         selected_space.as_str(),
-        "issuer-reuse-smoke" | "fresh-ack-smoke"
+        "issuer-reuse-smoke" | "fresh-ack-smoke" | "current-latency-smoke"
     );
     let campaign_root = if recovery_campaign {
         assert!(counter, "recovery fixture only supports Counter checks");
@@ -512,7 +513,11 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
     };
     assert_eq!(config_path.parent(), Some(campaign_root));
     let counter_name = if recovery_campaign { "counter" } else { "counter-smoke" };
-    let counter_path = campaign_root.join(if selected_space == "fresh-ack-smoke" {
+    let retained_create_campaign = matches!(
+        selected_space.as_str(),
+        "fresh-ack-smoke" | "current-latency-smoke"
+    );
+    let counter_path = campaign_root.join(if retained_create_campaign {
         "counter.vos"
     } else if recovery_campaign {
         "counter-dist/counter.vos"
@@ -522,7 +527,7 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
     // Counter uses the already verified Create CLI result for its coordinates;
     // it does not need an unrelated Catalog installed in the same Local agent.
     let target = if counter {
-        let acknowledgement = if selected_space == "fresh-ack-smoke" {
+        let acknowledgement = if retained_create_campaign {
             // After successor handoff the server no longer retains the older
             // Create decision. Verify the client's exact durable request/ACK;
             // do not reissue Create to manufacture test coordinates.
