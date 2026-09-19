@@ -1201,8 +1201,7 @@ impl HistoryRetirementRecord {
             || self.retired_cursor as usize > self.retired_node_ids.len()
             || self
                 .retired_node_ids
-                .iter()
-                .any(|id| *id == InvocationHistoryNodeId::ZERO)
+                .contains(&InvocationHistoryNodeId::ZERO)
             || self
                 .retired_node_ids
                 .windows(2)
@@ -2529,7 +2528,7 @@ fn validate_sealed_genesis_shape(
         InvocationIndexManifest::empty(genesis.id(), InvocationOwnershipScope::Ordered);
     let expected_merge =
         InvocationIndexManifest::empty(genesis.id(), InvocationOwnershipScope::Merge);
-    let local_invocations = sealed.local_invocations().clone();
+    let local_invocations = *sealed.local_invocations();
     if sealed.ordered_invocations() != &expected_ordered
         || sealed.merge_invocations() != &expected_merge
         || local_invocations
@@ -2643,7 +2642,7 @@ fn validate_sealed_ordinary_genesis_shape<T: ReplaySealedOrdinaryGenesis>(
         InvocationIndexManifest::empty(genesis.id(), InvocationOwnershipScope::Ordered);
     let expected_merge =
         InvocationIndexManifest::empty(genesis.id(), InvocationOwnershipScope::Merge);
-    let local_invocations = sealed.local_invocations().clone();
+    let local_invocations = *sealed.local_invocations();
     if sealed.ordered_invocations() != &expected_ordered
         || sealed.merge_invocations() != &expected_merge
         || local_invocations
@@ -6738,9 +6737,9 @@ fn validate_sealed_fence_ancestry<S: AgentJournalStore>(
     Ok(())
 }
 
-fn validate_shared_merge_projection<'a>(
-    publication: &'a ReplaySealedPublication,
-) -> Result<Option<&'a ReplaySealedSharedMergeProjection>, JournalStoreError> {
+fn validate_shared_merge_projection(
+    publication: &ReplaySealedPublication,
+) -> Result<Option<&ReplaySealedSharedMergeProjection>, JournalStoreError> {
     let projection = publication.shared_merge_projection();
     match publication.mode() {
         ReplayPublicationMode::Canonical => {
@@ -12681,7 +12680,7 @@ impl FileAgentJournalStore {
             max_fetches,
         )?;
         if let Some(bytes) = &read.staged {
-            decode_object::<InvocationHistoryNode>(&bytes, id)?;
+            decode_object::<InvocationHistoryNode>(bytes, id)?;
         }
         let canonical = read
             .canonical
@@ -13353,7 +13352,7 @@ impl FileAgentJournalStore {
             max_fetches,
         )?;
         if let Some(bytes) = &read.staged {
-            validate_stored_blob(class, reference, &bytes)?;
+            validate_stored_blob(class, reference, bytes)?;
         }
         let bytes = read
             .canonical

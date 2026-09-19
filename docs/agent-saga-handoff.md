@@ -10,6 +10,24 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: journal-store lint cleanup verified
+
+Following `21fb4bab`, journal-store cleanup removes six further diagnostics:
+zero-ID membership uses `contains`, two Copy manifests are dereferenced instead
+of cloned, a private helper's explicit lifetime is elided, and two redundant
+borrows are removed. Wire/storage formats, validation conditions/order, bounds,
+error propagation and persistence ordering are unchanged. No lint allowances.
+
+`cargo +nightly-2025-05-09 test --locked --offline -p vos --features pvm --lib
+agent::journal_store::tests -- --test-threads=1` passes 97 tests, zero failures or
+ignored, in21.10s (session56405 exit0). Log:
+`decoded-input-release.RIkx3j/lint-journal-tests.log` in the shared target.
+Formatting and `git diff --check` pass. Workspace Clippy with `check-all` flags
+now reports339 diagnostics (session10601 exit101,
+`lint-after-journal-cleanup.log`); the six targeted diagnostics are gone.
+This remains targeted source qualification, not a new release build or full
+regression run. The qualified executable and guest artifact pins are unchanged.
+
 ### 2026-09-19: check-all blocked by lint; six host-only diagnostics fixed
 
 At `cb01ae08`, the full `just check-all` passes formatting and fails at workspace

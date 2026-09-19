@@ -77,7 +77,7 @@ with bounded equivalence/recovery checks and repeat release qualification.
 | Authenticated reclamation | Issuer/coordinator bounded-record reclamation remains unfinished; invocation retirement is not proof of Authority application. |
 | Recovery/proof qualification | Remaining mixed pending/crash/capacity cases, pre-expiry Abort/management expiry, cross-runtime portable positive ACK, and full Private/Attested cryptographic proof matrix. |
 | Formatting | Pinned-host formatting passes, including after decoded-input validation reuse. No lint allowances added. |
-| Workspace lint | Full `check-all` at cb01ae08 passes formatting and fails in vos Clippy with351 diagnostics. Six host-only lint fixes reduce this to345; driver34 and Local50 tests pass. No warning allowances added. Later `check-all` steps remain unrun and downstream lint completion is unproven. |
+| Workspace lint | Full `check-all` at cb01ae08 passes formatting and fails in vos Clippy with351 diagnostics. Host/journal lint fixes reduce this to339; driver34, Local50 and journal-store97 tests pass. No warning allowances added. Later `check-all` steps remain unrun and downstream lint completion is unproven. |
 | Cutover supporting gates | Full `just clean-break-check` passes at bf013ff1 with all nonzero test selections, nested actors, SDK intra-doc links and CLI/docs surface checks. Atcda6c997, SDK165/165 tests and vos no-default-feature library check pass. The broader `just check-all` recipe, workspace lint and all examples remain unqualified. |
 | Release integration | At8f96fad8: release build/bundle and fresh Local lifecycle pass; CLI255/19 ignored, release18/18 and wire97/1 ignored pass. Post-pin default library1,434/1 ignored and host-feature1,876/3 ignored pass with unchanged runtime source. Prior-pin actor-build4/task-build1 pass atcda6c997. Full cryptographic proof qualification and remaining sign-off stay open. |
 
@@ -90,7 +90,7 @@ Post-pin supporting gates also pass: system-authority 58/58, system-catalog
 These do not qualify all examples/external links or host issuer reclamation.
 
 Post-pin broad library regressions are complete; the production gaps above remain.
-The subsequent six-diagnostic host-only lint cleanup has targeted driver/Local
+The subsequent host/journal lint cleanup has targeted driver/Local/journal-store
 test coverage. It is not included in the qualified 8f96fad8 release executable;
 the broad suites and full clean-break recipe precede that cleanup.
 Performance work must remain focused on the14–16s authenticated two-agent
