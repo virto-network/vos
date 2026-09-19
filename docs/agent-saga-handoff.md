@@ -10,6 +10,48 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: post-pin default regression passes; host-feature run started
+
+At source `ea13d293` (runtime/release implementation unchanged from `8f96fad8`),
+the full default-library suite finished: 1,434 passed, zero failed, one ignored,
+195.71s. Terminal test summary is in
+`target/task-tmp/decoded-input-release.RIkx3j/default-suite.log`; process inspection
+confirmed the previous Cargo/test processes were no longer running.
+
+The broader host-feature suite was then started, with source frozen, using:
+
+```sh
+cargo +nightly-2025-05-09 test --locked --offline -p vos --features 'agent-transition-proof private-agent-store http-ingress ssh-ingress' --lib -- --test-threads=1
+```
+
+Live exec session: `55057`. Evidence log:
+`target/task-tmp/decoded-input-release.RIkx3j/host-feature-suite.log` in the shared
+`ch08-c2-native` target. Both runs use that shared target and its disk-backed
+`task-tmp` as TMPDIR, with local socket permission. Poll the existing session or
+inspect authoritative processes before starting another run. The host-feature
+result is pending, not a pass; the previous run took about 25 minutes. No runtime
+source or artifact changes accompany this qualification update.
+
+The post-pin `bash scripts/check-agent-clean-break.sh` also passes (session13949,
+exit0): locked offline CLI build, retained/retired help surfaces, rejection of
+the removed dynamic dispatcher, retired-path absence, and the script's selected
+operator-documentation checks. Log: `decoded-input-release.RIkx3j/clean-break-surface.log`.
+This is only the surface gate, not the full `just clean-break-check` recipe or
+the full documentation/examples sign-off. Build warnings remain; no lint
+allowances or automatic fixes were applied. Host-feature session55057 remains
+running and has passed the fresh bundled Authority query test.
+
+Read-only inventory follow-up: `CleanAuthorityProjectionClient::load_inventory`
+issues Credential + Agents + (AgentReplicas + Actors) per agent: six queries for
+two agents with single-page results. Existing unchanged-complete-head reuse
+already reduces a valid unchanged refresh to the fresh Credential query. The
+projection route serializes execution through one worker and the system-owner
+mutex (`supervisor_adapters.rs`), so caller-side parallel requests alone would
+not parallelize guest execution. Aggregating authenticated bounded projections
+would require protocol/actor changes and artifact requalification; this has not
+been implemented or measured. Do not replace fresh credential checks with stale
+inventory, assume parallel dispatch is safe, or infer an end-to-end speedup.
+
 ### 2026-09-19: decoded-input release and fresh Local lifecycle qualified
 
 Release source `8f96fad8d46ab5f5421ddd3afb1fbe6011b09bea` builds locked/offline

@@ -28,8 +28,9 @@ qualification, not the remaining Private/Attested proof matrix.
 Readiness13s, then19s/26s after restarts, still fails the10s production gate.
 All three clean shutdowns completed below1s at the probe's whole-second
 resolution, with no forced cleanup. Fresh fixture: `current-latency.coTfCk`.
-Older fixtures must stay with their original pins. Full default/host-feature
-regressions still require a post-repin run; previous successes are historical.
+Older fixtures must stay with their original pins. The post-repin default-library
+suite passes 1,434 tests, zero failures, one ignored in 195.71s. The post-repin
+host-feature regression is running; its previous success remains historical.
 
 Use disposable spaces only. Do not migrate valuable older-generation stores.
 Preserve failed operations and exact request bytes; a timeout or unsigned HTTP
@@ -77,9 +78,13 @@ with bounded equivalence/recovery checks and repeat release qualification.
 | Formatting | Pinned-host formatting passes, including after decoded-input validation reuse. No lint allowances added. |
 | Workspace lint | At7b45d2f0, the `check-all` Clippy flags fail in vos with351 diagnostics (258 unused/dead-code,1 unused-mut,92 others). Downstream workspace lint completion is unproven; no broad lint allowances added. |
 | Cutover supporting gates | At7bc52924, system-authority58/58 and system-catalog10/10 tests pass; SDK no-default-feature intra-doc-link check and static clean-break CLI/docs check pass. Atcda6c997, SDK165/165 tests and vos no-default-feature library check pass. These do not substitute for the entire `just clean-break-check` or `just check-all` recipes. |
-| Release integration | At8f96fad8: release build/bundle and fresh Local lifecycle pass; CLI255/19 ignored, release18/18 and wire97/1 ignored pass. Prior-pin default library1,434/1 ignored and host-feature1,873/3 ignored predate this repin and require reruns. Prior-pin actor-build4/task-build1 pass atcda6c997. Full cryptographic proof qualification and remaining sign-off stay open. |
+| Release integration | At8f96fad8: release build/bundle and fresh Local lifecycle pass; CLI255/19 ignored, release18/18 and wire97/1 ignored pass. Post-pin default library1,434/1 ignored passes at ea13d293 with unchanged runtime source. Post-pin host-feature suite is running; prior-pin1,873/3 ignored remains historical. Prior-pin actor-build4/task-build1 pass atcda6c997. Full cryptographic proof qualification and remaining sign-off stay open. |
 
-Next verification is the full default/host-feature regression on the new pin.
+The post-pin `scripts/check-agent-clean-break.sh` gate also passes: retained CLI,
+removed compatibility surfaces/paths, and selected operator documentation.
+This does not establish the full `just clean-break-check` recipe or workspace lint.
+
+Next verification is completion of the full host-feature regression on the new pin.
 Performance work must remain focused on the14–16s authenticated two-agent
 inventory. Exact-binary profiling identified outer BLAKE2b cost, leading to
 the now-released decoded-input validation reuse. Paired gas savings are proven;

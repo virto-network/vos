@@ -9,7 +9,8 @@ The subsequent decoded-input optimization is now independently reproduced and
 pinned from `330274bb`, with18 release checks and97 bundled wire tests passing
 (1 ignored). It belongs with batch2. Release rebuild, bundle verification,
 CLI255/19 ignored and a fresh Local lifecycle/restart probe now pass. Broad
-default/host-feature regressions and production gates remain open.
+host-feature regression and production gates remain open. The post-repin
+default-library suite passes 1,434 tests, zero failures, one ignored in 195.71s.
 
 Earlier default-library and host-feature successes belong to the preceding
 `19d73390` runtime pin; do not treat them as post-repin runs. See the handoff
@@ -43,7 +44,8 @@ passes HTTP status/SSH keyscan, Create25s, Install36s, managed increment20.04s,
 read-after-restart20.33s, value7, positive retirement and exact ACK retries.
 Readiness13s then19s/26s still fails10s. Shutdowns report0s at whole-second
 resolution without forced cleanup. Full CLI255/19 ignored passes with loopback;
-full default/host-feature suites still need post-pin runs. This is disposable
+the post-pin default suite passes 1,434/1 ignored and the host-feature suite is
+running. This is disposable
 Local/Public-policy testing, not authenticated SSH shell or full proof coverage.
 Previous release and fixtures remain preserved at their original paths.
 
