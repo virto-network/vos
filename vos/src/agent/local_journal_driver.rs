@@ -5315,10 +5315,9 @@ where
         if installation_data
             .as_ref()
             .is_some_and(|bytes| bytes.len() > super::MAX_INSTALLATION_DATA_BYTES)
-            || package
+            || !package
                 .accepts_installation_data(installation_data.as_deref())
                 .map_err(LocalReplayExecutorError::Package)?
-                == false
         {
             return Err(LocalJournalDriverError::Lifecycle(
                 LifecycleError::InvalidRequest,
@@ -5427,10 +5426,9 @@ where
             .map_err(LocalReplayExecutorError::Package)?;
         match self.inspect_actor(actor) {
             Ok(record) if record.entry.deployment == from_deployment => {
-                if package
+                if !package
                     .accepts_installation_data_reference(record.entry.installation_data.as_ref())
                     .map_err(LocalReplayExecutorError::Package)?
-                    == false
                 {
                     return Err(LocalReplayExecutorError::InvalidRequest.into());
                 }

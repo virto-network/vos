@@ -10,6 +10,36 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: check-all blocked by lint; six host-only diagnostics fixed
+
+At `cb01ae08`, the full `just check-all` passes formatting and fails at workspace
+Clippy with 351 diagnostics (session72212 exit101). Later recipe steps did not
+run. Log: `decoded-input-release.RIkx3j/check-all.log` in the shared target.
+
+A narrow host-only cleanup removes four redundant boolean comparisons in the
+whole-image/local-journal installation paths, replaces one manual error-forwarding
+match with `?`, and removes unnecessary mutability when observing a Local
+management application. No validation, error mapping, persistence ordering,
+public API, guest source, protocol, or artifact pin changes. No warning allowances
+were added and unused integration code was not deleted to hide missing wiring.
+
+Verification with nightly-2025-05-09, locked/offline dependencies and disk-backed
+TMPDIR:
+
+- `cargo fmt -- --check` and `git diff --check` pass.
+- `cargo test -p vos --features pvm --lib agent::driver::tests -- --test-threads=1`:
+  34 passed, zero failed/ignored, 1.25s; session76921 exit0, `lint-driver-tests.log`.
+- Same test command with filter `agent::local_`: 50 passed, zero failed/ignored,
+  51.52s; session66541 exit0, `lint-local-tests.log` (local socket permission).
+- Workspace Clippy with the exact `check-all` lint flags now reports 345
+  diagnostics; session4176 exit101, `lint-after-host-cleanup.log`. All six targeted
+  diagnostics are gone; the lint gate still fails.
+
+Logs share `decoded-input-release.RIkx3j/`. The release executable remains the
+qualified `8f96fad8` build; this subsequent source cleanup has targeted coverage,
+not a new release rebuild or broad-suite qualification. The full clean-break
+and broad-suite results below belong to the preceding source checkpoint.
+
 ### 2026-09-19: complete clean-break recipe passes
 
 At `bf013ff1`, the full `just clean-break-check` recipe was started unchanged,

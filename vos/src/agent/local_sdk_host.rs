@@ -608,7 +608,7 @@ impl LocalAgentHost {
             .agents
             .get(&agent)
             .ok_or(LocalAgentHostError::NotFound)?;
-        let mut store = FileAgentStore::new(image_path(&self.root.join(encode_agent_id(agent))));
+        let store = FileAgentStore::new(image_path(&self.root.join(encode_agent_id(agent))));
         let image = store
             .load()
             .map_err(AgentDriverError::Store)?

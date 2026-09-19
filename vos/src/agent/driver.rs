@@ -2925,10 +2925,9 @@ impl<S: AgentImageStore> AgentDriver<S> {
         if installation_data
             .as_ref()
             .is_some_and(|bytes| bytes.len() > super::MAX_INSTALLATION_DATA_BYTES)
-            || package
+            || !package
                 .accepts_installation_data(installation_data.as_deref())
                 .map_err(AgentDriverError::Package)?
-                == false
         {
             return Err(AgentDriverError::Lifecycle(LifecycleError::InvalidRequest));
         }
@@ -3164,10 +3163,9 @@ impl<S: AgentImageStore> AgentDriver<S> {
             .map_err(AgentDriverError::Package)?;
         match self.inspect_actor(actor) {
             Ok(record) if record.entry.deployment == from_deployment => {
-                if package
+                if !package
                     .accepts_installation_data_reference(record.entry.installation_data.as_ref())
                     .map_err(AgentDriverError::Package)?
-                    == false
                 {
                     return Err(AgentDriverError::Lifecycle(LifecycleError::InvalidRequest));
                 }
@@ -3584,10 +3582,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
             StagedSdkArtifacts::default()
         } else {
             validate_sdk_management_artifacts(&current, &request, artifacts)?;
-            match self.stage_sdk_management_artifacts(&request, artifacts) {
-                Ok(staged) => staged,
-                Err(error) => return Err(error),
-            }
+            self.stage_sdk_management_artifacts(&request, artifacts)?
         };
         let runtime_deployment = match authority.as_ref() {
             Some(receipt) => receipt.selector.runtime_deployment,
