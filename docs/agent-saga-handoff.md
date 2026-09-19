@@ -10,6 +10,26 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: post-pin portable SDK and build-integration gates
+
+At `cda6c997`, without changing the frozen runtime source:
+
+- `cargo check -p vos --no-default-features --lib`:exit0 in2.04s;
+  existing272 warnings remain, so this does not supersede the failed lint gate.
+- `cargo test -p vos-agent-sdk --lib -- --test-threads=1`:165 passed,0 failed,
+  none ignored in0.18s.
+- `cargo test -p vosx --test build_actor_e2e --test build_task_e2e --
+  --test-threads=1`:actor-build4 passed in29.27s, task-build1 passed in29.53s;
+  session80400 exit0. This updates the older-generation build-integration
+  evidence, not signed package reproduction or live deployment proof.
+
+All commands use host nightly-2025-05-09, `--locked --offline`, shared target
+and disk-backed TMPDIR; nested build integration also sets CARGO_NET_OFFLINE.
+Logs under `target/task-tmp/role-length-release.UnaSE1/`: `no-std-check.log`,
+`sdk-suite.log`, `build-integration.log`. The original host-feature run remains
+active on its long inventory-rotation workload (session38510); do not restart it.
+Source/release pins and fixture contents were not changed by this work.
+
 ### 2026-09-19: workspace Clippy release gate fails
 
 At `7b45d2f0`, ran pinned-host offline/locked `cargo clippy --workspace` with
