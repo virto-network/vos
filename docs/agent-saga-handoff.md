@@ -2,6 +2,23 @@
 
 ## Checkpoint and decision
 
+For a compact review/test-deployment summary, start with
+[the current status](agent-saga-status.md). It does not replace this evidence
+history or narrow the full saga objective.
+
+### System-owner latency boundary confirmed
+
+Existing `attachment-refresh-release.uESjEc/up.log` contains38 physical runtime
+executions before `system_owner`, totaling30,946.6ms;30 inputs over700KB account
+for30,588.7ms. System-owner cumulative time is34,937ms. These spans explain
+most of that stage, but the logs do not label each runtime call as a particular
+replay/management subtype. Avoid attributing all38 to one subtype without
+further evidence. The source's opportunistic checkpoint trigger is32 retained
+physical entries, not a10s replay-cost bound. Next inspect authenticated replay
+and checkpoint scheduling; another administrative-status micro-optimization
+cannot remove30s of guest execution. No new build or fixture mutation was
+needed for this analysis.
+
 ### 2026-09-19: attachment-refresh release qualified
 
 Release source `3a990280` built locked/offline with nightly-2025-05-09 in6m18s.
