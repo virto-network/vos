@@ -56,7 +56,7 @@ with bounded equivalence/recovery checks and repeat release qualification.
 | Ordinary Shared genesis/finality | Native startup still installs `UnavailableAgentFinality`; production accepting bridge missing. System genesis is a separate path. |
 | Authenticated reclamation | Issuer/coordinator bounded-record reclamation remains unfinished; invocation retirement is not proof of Authority application. |
 | Recovery/proof qualification | Remaining mixed pending/crash/capacity cases, pre-expiry Abort/management expiry, cross-runtime portable positive ACK, and full Private/Attested cryptographic proof matrix. |
-| Release integration | At14b81955 CLI unit suite255 passed/19 ignored; actor-build4 and task-build1 pass. Shutdown smoke still fails10s startup before reaching SIGTERM. Full library/proof matrix, docs/examples/inventory audit and review sign-off remain. |
+| Release integration | At7e096a31 default library1,434 passed/1 ignored; at14b81955 CLI255 passed/19 ignored, actor-build4 and task-build1 pass. Shutdown smoke still fails10s startup before SIGTERM. Current full host-feature/proof matrix, docs/examples/inventory audit and review sign-off remain. |
 
 Next performance step: address the roughly20s authenticated initial inventory.
 Released checkpoint scheduling now triggers at8 retained physical entries;

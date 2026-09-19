@@ -10,6 +10,17 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: current-source default-feature library regression
+
+At `7e096a31`, the complete default-feature library suite passes1,434 tests,
+zero failures,1 ignored,200.90s. Command:
+`cargo +nightly-2025-05-09 test --locked --offline -p vos --lib -- --test-threads=1`,
+using the shared target and disk-backed TMPDIR. Session6085 terminal0;
+evidence `target/task-tmp/current-latency.p7U3OE/default-library-suite.log`.
+No source fixes or reduced workloads were needed. This updates the older
+`206ea1e3` default-feature baseline, but does not substitute for a current full
+host-feature suite, proof qualification or failing production readiness gate.
+
 ### 2026-09-19: current-source CLI regression and integration gates
 
 Source `14b81955`, nightly-2025-05-09, locked/offline, shared CARGO_TARGET_DIR and

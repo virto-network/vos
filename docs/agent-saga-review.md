@@ -28,8 +28,9 @@ passing regressions from still-failing production gates.
 Current-source CLI regression at `14b81955`:255 unit tests pass,19 ignored;
 actor-build4 and task-build1 integration tests pass. Shutdown smoke fails the
 unchanged10s startup deadline before SIGTERM, so the integration command exits101.
-This is not an all-green matrix or a shutdown failure. Full library/proof
-qualification remains outstanding; see the evidence handoff.
+This is not an all-green matrix or a shutdown failure. Current default-feature
+library qualification at `7e096a31` passes1,434 tests with1 ignored in200.90s.
+The current full host-feature/proof matrix remains outstanding; see the handoff.
 
 An additional fresh-space probe of the same release reaches readiness in18s,
 verifies fresh Create in38s and Counter Install in45s, and shuts down within1s.
