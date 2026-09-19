@@ -12,6 +12,18 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-20: explicit compiled external-transfer fixture passes
+
+At `ab7fb7bb`, `just check-probe-fixture` completes successfully (session30453
+exit0). The recipe builds the probe with its nested pinned actor toolchain and
+`cargo actor --locked`, then explicitly selects the normally ignored
+`node::tests::dispatch_routes_external_transfers_only_after_commit` test.
+Result:1 passed,0 failed,0 ignored,1436 filtered in0.38s; host test build42.31s.
+Offline dependencies, shared target and disk-backed TMPDIR were used. Log:
+`target/task-tmp/final-review-release.HbPbex/probe-fixture.log` in the shared
+target. This is nonzero artifact-dependent coverage, not a pass for the whole
+`check-all` recipe. No implementation changes were made.
+
 ### 2026-09-20: final-release logs confirm the latency concentration
 
 Read-only analysis of `current-latency.KD6UwR/{up,mutation-up,read-up}.log`
