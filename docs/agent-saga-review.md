@@ -7,16 +7,18 @@ historical evidence. No merge or push is implied by this breakdown.
 
 Latest source includes the artifact-role length optimization and independently
 reproduced pin from `19d73390`; these also belong in batch2. Its release rebuild,
-fresh-space qualification, full CLI and default-library suites pass. The full
-post-pin host-feature library suite remains pending.
+fresh-space qualification, full CLI, default-library and host-feature suites
+pass. The latter completes1,873 tests/3 ignored before the subsequent mechanical
+formatting cleanup; see the handoff for exact qualification boundaries.
 
 | Batch | Exact range | Scope and size |
 | --- | --- | --- |
 | 1 | `31b0cdbb..f79f0e3d` | Integrated clean-break architecture and lifecycle;225 files,+72,934/-58,875. |
 | 2 | `f79f0e3d..b16abf81` | Recovery, checkpointing, shutdown, prepared-runtime/ACK/Invoke validation reuse, artifact-role length filtering, reproduced pin, lifecycle conflict reporting, attachment refresh, operator docs and qualification;40 files,+3,862/-216. |
 
-Counts are frozen at that checkpoint; subsequent handoff documentation and
-disposable-fixture test updates belong with batch2. Neither batch is an independently deployable slice.
+Counts are frozen at that checkpoint; subsequent handoff documentation,
+mechanical formatting and disposable-fixture test updates belong with batch2.
+Neither batch is an independently deployable slice.
 The integrated diff is231 files,+76,679/-58,974. No production sign-off is implied.
 
 Batch1 remains large and cannot be presented as an independently safe old C1
@@ -39,9 +41,9 @@ pass, not authenticated SSH shell qualification. See current status and handoff
 for checksum and original-path fixture. No controlled overall speedup claim.
 Current-pin CLI at `b16abf81` passes255 tests/19 ignored in87.64s.
 Current-pin default library at `02dbc8c6` passes1,434 tests/1 ignored in199.41s.
-The previous-pin host-feature suite at `bf7ced06` passes1,871 tests/3 ignored in
-1,450.60s; default library at `e63db78b` passes1,434/1 ignored and CLI at
-`c1614b96` passes255/19 ignored. Ignored cases are not counted as passes.
+Current-pin host-feature suite on the same frozen runtime source passes1,873
+tests/3 ignored in1,509.36s. These full suites precede the mechanical formatting
+cleanup; ignored cases are not counted as passes.
 These regression results do not close the remaining production/proof gates.
 
 ### Prior-generation qualification

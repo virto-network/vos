@@ -4383,9 +4383,10 @@ impl StandardAgentRuntime {
             InvocationId(work.invocation.0),
         );
         if self.invocation_results.contains_key(&key)
-            || self.machine_continuations.iter().any(|record| {
-                (record.mode.invocation_scope(), record.invocation) == key
-            })
+            || self
+                .machine_continuations
+                .iter()
+                .any(|record| (record.mode.invocation_scope(), record.invocation) == key)
         {
             return Ok(false);
         }

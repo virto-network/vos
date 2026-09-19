@@ -688,7 +688,10 @@ fn local_lifecycle_failure(
         error,
         AgentProductionOwnerError::Lifecycle(SharedAgentHostError::Conflict)
     ) {
-        super::types::text(409, "Local lifecycle conflicts with retained state; inspect retained operation evidence before retrying")
+        super::types::text(
+            409,
+            "Local lifecycle conflicts with retained state; inspect retained operation evidence before retrying",
+        )
     } else {
         super::types::text(503, unavailable)
     }
@@ -979,7 +982,9 @@ mod tests {
             AgentProductionOwnerError::InvalidProjection,
         ] {
             assert_eq!(
-                super::local_lifecycle_failure(error, "unavailable").status().as_u16(),
+                super::local_lifecycle_failure(error, "unavailable")
+                    .status()
+                    .as_u16(),
                 503
             );
         }

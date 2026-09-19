@@ -1039,8 +1039,8 @@ where
                 .map_err(|error| {
                     tracing::warn!(
                         ?error,
-                        checkpoint_matches = materialization.heads().checkpoint
-                            == Some(snapshot.claim.checkpoint()),
+                        checkpoint_matches =
+                            materialization.heads().checkpoint == Some(snapshot.claim.checkpoint()),
                         current_ordered_index = materialization.heads().ordered_index,
                         snapshot_ordered_index = snapshot.claim.ordered().ordered().index,
                         "Shared journal open checkpoint validation failed"
@@ -3323,12 +3323,9 @@ where
         };
         let reserved = self.ledger.reserve_command_application(&command)?;
         let committee = self.ledger.active_committee()?;
-        let committed = CommittedSharedOrdered::from_reserved_raft_application(
-            reserved,
-            &committee,
-            None,
-        )
-        .expect("valid fixture reservation");
+        let committed =
+            CommittedSharedOrdered::from_reserved_raft_application(reserved, &committee, None)
+                .expect("valid fixture reservation");
         match prepare_shared_ordered(
             &mut self.store,
             &mut self.executor,
@@ -3897,7 +3894,10 @@ fn reconcile_journal_ledger<S: AgentJournalStore + SharedOrderedCommitStore>(
     }
 
     let mut expected_bindings = BTreeSet::new();
-    tracing::debug!(entries = chain.len(), "Shared reconciliation chain validated");
+    tracing::debug!(
+        entries = chain.len(),
+        "Shared reconciliation chain validated"
+    );
     for anchor in &audit.ordered {
         validate_ordered_anchor(store, &chain, journal_store, anchor).map_err(|error| {
             tracing::warn!(
@@ -3917,8 +3917,8 @@ fn reconcile_journal_ledger<S: AgentJournalStore + SharedOrderedCommitStore>(
     if let Some(pending) = &audit.pending_ordered {
         match store.shared_ordered_commit(pending.entry)? {
             Some(binding) => {
-                validate_pending_binding(heads, &chain, journal_store, pending, &binding)
-                    .map_err(|error| {
+                validate_pending_binding(heads, &chain, journal_store, pending, &binding).map_err(
+                    |error| {
                         tracing::warn!(
                             ?error,
                             entry = ?pending.entry,
@@ -3927,7 +3927,8 @@ fn reconcile_journal_ledger<S: AgentJournalStore + SharedOrderedCommitStore>(
                             "Shared reconciliation pending binding failed"
                         );
                         error
-                    })?;
+                    },
+                )?;
                 if !expected_bindings.insert(pending.entry) {
                     return Err(SharedJournalDriverError::CrossStoreMismatch);
                 }
@@ -3985,8 +3986,14 @@ fn reconcile_journal_ledger<S: AgentJournalStore + SharedOrderedCommitStore>(
         || chain.keys().any(|entry| !expected_bindings.contains(entry))
     {
         tracing::warn!(
-            missing_expected = expected_bindings.iter().filter(|entry| !actual.contains(entry)).count(),
-            missing_chain = chain.keys().filter(|entry| !expected_bindings.contains(entry)).count(),
+            missing_expected = expected_bindings
+                .iter()
+                .filter(|entry| !actual.contains(entry))
+                .count(),
+            missing_chain = chain
+                .keys()
+                .filter(|entry| !expected_bindings.contains(entry))
+                .count(),
             "Shared reconciliation binding coverage failed"
         );
         return Err(SharedJournalDriverError::CrossStoreMismatch);
@@ -4054,15 +4061,13 @@ fn validate_pending_binding(
 ) -> Result<(), SharedJournalDriverError> {
     match chain.get(&pending.entry) {
         Some(entry)
-            if entry.index == pending.ordered_index
-                && entry.parent == pending.ordered_parent => {}
+            if entry.index == pending.ordered_index && entry.parent == pending.ordered_parent => {}
         // Shared dependencies are durable before the head CAS, possibly even
         // before the entry file. Only the exact reserved next Ordered command
         // may account for such a binding. It remains pending, not applied;
         // normal replay must reconstruct and publish the exact binding later.
-        None
-            if heads.ordered_index.checked_add(1) == Some(pending.ordered_index)
-                && heads.ordered_head == pending.ordered_parent => {}
+        None if heads.ordered_index.checked_add(1) == Some(pending.ordered_index)
+            && heads.ordered_head == pending.ordered_parent => {}
         _ => return Err(SharedJournalDriverError::CrossStoreMismatch),
     }
     let claim = binding.claim();

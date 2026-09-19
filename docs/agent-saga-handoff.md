@@ -10,6 +10,39 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: complete host-feature regression and mechanical formatting cleanup
+
+Original host-feature session38510 completes successfully, exit0:1,873 passed,
+0 failed,3 ignored in1,509.36s (25m09s). Started at `02dbc8c6`; runtime source
+remained unchanged throughout, with only documentation commits added. Command:
+offline/locked host nightly-2025-05-09 `cargo test -p vos --features
+'agent-transition-proof private-agent-store http-ingress ssh-ingress' --lib --
+--test-threads=1`. Loopback access and disk-backed TMPDIR were available.
+Both the full inventory-rotation workload and system-attachment checkpoint/drain
+passed. No workload reductions, source fixes, restarts or retries. Concurrent
+supporting checks mean suite duration is not a controlled performance result.
+
+The three ignored tests remain the explicit64MiB initial-capture diagnostic,
+fixed-history copied-database timing probe and repeated large-ACK CPU profile.
+Feature-enabled test success is not the remaining full cryptographic proof
+qualification. Evidence: `target/task-tmp/role-length-release.UnaSE1/host-suite.log`.
+
+Only after the suite terminated, applied pinned-host `cargo fmt --all`. Reviewed
+all15 changed files: indentation, line wrapping and formatter-supplied trailing
+commas only (117 insertions/80 deletions before documentation updates). The exact
+recipe formatting check now exits0, as does `git diff --check`;
+`format-fixed-check.log` is empty on success. No lint suppression, schema,
+protocol, release artifact or source-provenance pin changed. The bundle continues
+to reproduce from immutable `19d73390`; no claim is made that a rebuild of the
+reformatted checkout has identical guest bytes. Full-suite evidence above is
+explicitly pre-formatting. Workspace lint and functional production gaps remain.
+
+Post-format focused verification passes: full wire module95 passed/1 ignored
+in26.80s (session36530 exit0), including complete bundled/source transitions;
+SDK165 passed/0 ignored in0.20s (session49262 exit0), including golden wire
+commitments. Logs: `post-format-wire.log`, `post-format-sdk.log` in the same
+evidence directory. These are not a rerun of all full-suite feature combinations.
+
 ### 2026-09-19: post-pin portable SDK and build-integration gates
 
 At `cda6c997`, without changing the frozen runtime source:

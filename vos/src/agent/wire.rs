@@ -2910,23 +2910,22 @@ fn apply_clean_acknowledge(
     // retire through the deliberately Direct housekeeping route. The runtime
     // below authenticates the original work, authorization, preflight, and
     // exact retained result before removing anything.
-    let acknowledgement = match runtime
-        .acknowledge_clean_invocation_with_status(&work, &authorization)
-    {
-        Ok((acknowledgement, true)) => acknowledgement,
-        Ok((acknowledgement, false)) => {
-            return Ok(RuntimeTransition {
-                state,
-                outcome: RuntimeOutcome::Acknowledged(Ok(acknowledgement)),
-            });
-        }
-        Err(error) => {
-            return Ok(RuntimeTransition {
-                state,
-                outcome: RuntimeOutcome::Acknowledged(Err(error)),
-            });
-        }
-    };
+    let acknowledgement =
+        match runtime.acknowledge_clean_invocation_with_status(&work, &authorization) {
+            Ok((acknowledgement, true)) => acknowledgement,
+            Ok((acknowledgement, false)) => {
+                return Ok(RuntimeTransition {
+                    state,
+                    outcome: RuntimeOutcome::Acknowledged(Ok(acknowledgement)),
+                });
+            }
+            Err(error) => {
+                return Ok(RuntimeTransition {
+                    state,
+                    outcome: RuntimeOutcome::Acknowledged(Err(error)),
+                });
+            }
+        };
     let successor = encode_standard_runtime_state(&runtime.snapshot());
     if successor
         .encoded_len()
@@ -9305,7 +9304,11 @@ pub(crate) mod tests {
         // must never select a role. Supplied references remain unchanged.
         assert_eq!(expected.2.bytes.len(), expected.3.bytes.len());
         for role in [&expected.2, &expected.3] {
-            let index = work.availability.iter().position(|blob| blob == role).unwrap();
+            let index = work
+                .availability
+                .iter()
+                .position(|blob| blob == role)
+                .unwrap();
             for change_length in [false, true] {
                 let mut corrupted = work.clone();
                 if change_length {
@@ -9895,7 +9898,10 @@ pub(crate) mod tests {
                 .output_bounded(RuntimeTransition::MAX_ENCODED_BYTES)
                 .unwrap();
             let transition = RuntimeTransition::decode(&output).unwrap();
-            assert_eq!(transition.outcome, RuntimeOutcome::Completed(Ok(reply.clone())));
+            assert_eq!(
+                transition.outcome,
+                RuntimeOutcome::Completed(Ok(reply.clone()))
+            );
             eprintln!(
                 "large-invoke-retry label={label} input_bytes={} gas_used={} elapsed_us={}",
                 input.len(),
@@ -10073,13 +10079,10 @@ pub(crate) mod tests {
         trailing.push(0);
         for malformed in [&input[..input.len() - 1], trailing.as_slice()] {
             assert!(RuntimeWork::decode(malformed).is_err());
-            let execution = vos_pvm::refine_host::RefineContext::load(
-                program,
-                malformed,
-                2_000_000_000,
-            )
-            .unwrap()
-            .run();
+            let execution =
+                vos_pvm::refine_host::RefineContext::load(program, malformed, 2_000_000_000)
+                    .unwrap()
+                    .run();
             assert_eq!(execution.exit, vos_pvm::ExitReason::Panic);
         }
     }

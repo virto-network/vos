@@ -6889,8 +6889,8 @@ pub(crate) fn stage_shared_binding_before_heads_for_test<S: SharedOrderedCommitS
     include_anchor: bool,
 ) -> Result<(), JournalStoreError> {
     validate_shared_merge_projection(publication)?;
-    let binding = validate_shared_ordered_commit(publication)?
-        .ok_or(JournalStoreError::NonCanonical)?;
+    let binding =
+        validate_shared_ordered_commit(publication)?.ok_or(JournalStoreError::NonCanonical)?;
     stage_shared_merge_projection(store, publication)?;
     stage_shared_ordered_commit(store, &binding)?;
     if include_anchor {

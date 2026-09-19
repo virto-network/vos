@@ -512,7 +512,11 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
         data.parent().unwrap()
     };
     assert_eq!(config_path.parent(), Some(campaign_root));
-    let counter_name = if recovery_campaign { "counter" } else { "counter-smoke" };
+    let counter_name = if recovery_campaign {
+        "counter"
+    } else {
+        "counter-smoke"
+    };
     let retained_create_campaign = matches!(
         selected_space.as_str(),
         "fresh-ack-smoke" | "current-latency-smoke"
@@ -541,8 +545,7 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
                 .collect();
             assert_eq!(candidates.len(), 1, "fixture must have one retained Create");
             let mut request =
-                CleanLocalCreateRequestFile::open_or_create(candidates[0].join("request"))
-                    .unwrap();
+                CleanLocalCreateRequestFile::open_or_create(candidates[0].join("request")).unwrap();
             let request = request.load().unwrap().expect("retained Create request");
             let mut ack = CleanLocalCreateAcknowledgementFile::open_or_create(
                 candidates[0].join("acknowledgement"),
@@ -551,7 +554,9 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
             .unwrap();
             super::super::local_create::verify_acknowledgement(
                 &request,
-                &ack.load().unwrap().expect("retained Create acknowledgement"),
+                &ack.load()
+                    .unwrap()
+                    .expect("retained Create acknowledgement"),
             )
             .unwrap()
         } else {
@@ -615,7 +620,8 @@ fn managed_receipt_invocation_and_exact_retry(campaign: Campaign) {
         limit: 1,
     };
     let counter_package = counter.then(|| {
-        vos::agent::package_admission::admit_actor_package(&std::fs::read(&counter_path).unwrap()).unwrap()
+        vos::agent::package_admission::admit_actor_package(&std::fs::read(&counter_path).unwrap())
+            .unwrap()
     });
     let operator = crate::identity::load_existing().unwrap();
     let identity =

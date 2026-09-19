@@ -1748,10 +1748,16 @@ mod tests {
             Box::new(TestAuthenticator { ordinal: 0 }),
         );
         source.set_shutdown_signal(shutdown.clone());
-        assert_eq!(source.load_inventory(), Err(AgentProductionOwnerError::ShutdownRequested));
+        assert_eq!(
+            source.load_inventory(),
+            Err(AgentProductionOwnerError::ShutdownRequested)
+        );
         assert!(calls.lock().unwrap().is_empty());
         shutdown.store(false, Ordering::Release);
-        assert_eq!(source.load_inventory(), Err(AgentProductionOwnerError::ShutdownRequested));
+        assert_eq!(
+            source.load_inventory(),
+            Err(AgentProductionOwnerError::ShutdownRequested)
+        );
         assert_eq!(calls.lock().unwrap().len(), 2);
         assert!(source.inventory.is_none());
         armed.store(false, Ordering::Release);
@@ -1760,7 +1766,10 @@ mod tests {
         assert!(source.inventory.is_some());
         let completed_calls = calls.lock().unwrap().len();
         shutdown.store(true, Ordering::Release);
-        assert_eq!(source.load_inventory(), Err(AgentProductionOwnerError::ShutdownRequested));
+        assert_eq!(
+            source.load_inventory(),
+            Err(AgentProductionOwnerError::ShutdownRequested)
+        );
         assert_eq!(calls.lock().unwrap().len(), completed_calls);
         assert!(source.inventory.is_none());
     }

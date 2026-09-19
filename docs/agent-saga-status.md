@@ -13,8 +13,9 @@ Paired synthetic tests show20.1% less fresh-Invoke gas with identical complete
 output. Two isolated ELF/PVM builds match each other and the measured candidate.
 Release rebuild, fresh Local lifecycle/restart qualification and the full CLI
 suite pass. Full post-pin default-library regression passes1,434 tests/1 ignored;
-host-feature regression remains pending. Do not boot older fixtures with the
-new pin. See the handoff for evidence.
+host-feature regression passes1,873 tests/3 ignored. These runs precede the
+subsequent mechanical formatting cleanup. Do not boot older fixtures with the
+new pin. See the handoff for exact evidence and qualification boundaries.
 
 Release implementation `b16abf81` builds and verifies its bundled artifacts.
 SHA-256: `e76cf5428ebc443ec7cc6859c162ee7b9ec67e5fb03706b2ee9798051fa84106`.
@@ -67,10 +68,10 @@ with bounded equivalence/recovery checks and repeat release qualification.
 | Ordinary Shared genesis/finality | Native startup still installs `UnavailableAgentFinality`; ordinary `AgentGenesisProvider` has no implementation/caller in current Rust sources. Production archive/issuance plus authenticated replay-backed finality integration are missing, not just a verifier switch. System genesis is a separate path. |
 | Authenticated reclamation | Issuer/coordinator bounded-record reclamation remains unfinished; invocation retirement is not proof of Authority application. |
 | Recovery/proof qualification | Remaining mixed pending/crash/capacity cases, pre-expiry Abort/management expiry, cross-runtime portable positive ACK, and full Private/Attested cryptographic proof matrix. |
-| Formatting | Pinned-host `cargo fmt -- --check` atb437af09 fails:40 diff locations across15 files; `--all` reports the same output. No formatting applied while the host-feature suite runs. |
+| Formatting | Pinned-host `cargo fmt -- --check` now passes after mechanical rustfmt cleanup of15 files, applied only after the full host-feature suite completed. No release artifact or lint configuration changed. |
 | Workspace lint | At7b45d2f0, the `check-all` Clippy flags fail in vos with351 diagnostics (258 unused/dead-code,1 unused-mut,92 others). Downstream workspace lint completion is unproven; no broad lint allowances added. |
 | Cutover supporting gates | At7bc52924, system-authority58/58 and system-catalog10/10 tests pass; SDK no-default-feature intra-doc-link check and static clean-break CLI/docs check pass. Atcda6c997, SDK165/165 tests and vos no-default-feature library check pass. These do not substitute for the entire `just clean-break-check` or `just check-all` recipes. |
-| Release integration | Current-pin CLI atb16abf81:255 passed/19 ignored; default library at02dbc8c6:1,434 passed/1 ignored. Last full host-feature library atbf7ced06:1,871 passed/3 ignored predates the latest pin; the new run remains pending. Current-pin actor-build4/task-build1 integration tests pass atcda6c997. Startup still fails10s. Full cryptographic proof qualification and remaining release audit/sign-off stay open. |
+| Release integration | Current-pin CLI atb16abf81:255 passed/19 ignored; default library at02dbc8c6:1,434 passed/1 ignored; host-feature library on the same frozen runtime source:1,873 passed/3 ignored. These full suites predate the mechanical formatting cleanup. Current-pin actor-build4/task-build1 integration tests pass atcda6c997. Startup still fails10s. Full cryptographic proof qualification and remaining release audit/sign-off stay open. |
 
 Next performance step: address the roughly17s authenticated two-agent inventory.
 Released checkpoint scheduling now triggers at8 retained physical entries;

@@ -8465,8 +8465,9 @@ impl VosNode {
                 }
                 true
             }
-            Some(Err(crate::agent::production_owner::AgentProductionOwnerError::ShutdownRequested))
-                if self.shutdown.load(Ordering::Acquire) => false,
+            Some(Err(
+                crate::agent::production_owner::AgentProductionOwnerError::ShutdownRequested,
+            )) if self.shutdown.load(Ordering::Acquire) => false,
             Some(Err(error)) => {
                 self.clean_agent_owner_error.get_or_insert(error);
                 self.signal_node_shutdown();

@@ -323,9 +323,13 @@ pub(super) fn retained_submission_error(error: anyhow::Error) -> anyhow::Error {
         error.downcast_ref::<ureq::Error>(),
         Some(ureq::Error::Status(409, _))
     ) {
-        anyhow::anyhow!("{error}; request retained: lifecycle conflicts with retained state; inspect operation evidence before retrying. HTTP conflict is not a signed outcome and does not prove the original operation failed")
+        anyhow::anyhow!(
+            "{error}; request retained: lifecycle conflicts with retained state; inspect operation evidence before retrying. HTTP conflict is not a signed outcome and does not prove the original operation failed"
+        )
     } else {
-        anyhow::anyhow!("{error}; request retained: retry these exact bytes, outcome may be unknown")
+        anyhow::anyhow!(
+            "{error}; request retained: retry these exact bytes, outcome may be unknown"
+        )
     }
 }
 

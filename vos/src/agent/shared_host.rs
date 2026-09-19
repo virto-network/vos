@@ -6060,7 +6060,10 @@ mod tests {
             )
             .unwrap();
             if prefix_slots == 1 {
-                host.agents.get_mut(&fixture.agent).unwrap().driver
+                host.agents
+                    .get_mut(&fixture.agent)
+                    .unwrap()
+                    .driver
                     .append_ordered_for_test(7, authorized_management(&fixture, 2, 0xb3))
                     .unwrap();
                 assert_eq!(
