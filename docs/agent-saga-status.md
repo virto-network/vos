@@ -9,22 +9,22 @@ checkpoint, not production or master sign-off. `saga/agents` remains at
 Latest source pins the independently reproduced Invoke-recovery optimization
 from `24000c8a`, ProgramId `e815f4b010f7213290850189f5bc20fc54533068f0d73ea4982de9414b1135e9`.
 Its large-retry benchmark reduces gas18.3% with identical output; focused
-rejection/retirement and release-pin regressions pass. Release rebuild and live
-qualification remain pending. The older executable below is still the tested
-release, not a claim that the new pin improves end-to-end latency. Do not boot
+rejection/retirement and release-pin regressions pass. Release rebuild and fresh
+Local lifecycle/restart qualification now pass. This is not a controlled
+end-to-end speedup claim. Do not boot
 old-generation fixtures with the new pin or claim the prior full-suite counts
 qualify this new artifact.
 
-Release implementation `cca4c911` builds and verifies its bundled artifacts.
-SHA-256: `697324387cf98331f0c237e228dfc9e98947c8a97f9f1204dfa3d8eca985ce20`.
+Release implementation `b131edc3` builds and verifies its bundled artifacts.
+SHA-256: `a2e12ecd77cf393c3ddf8ecfabecb4d366fb3e55d0d0d14dcc4f221fca8ef08b`.
 The current runtime is independently reproduced; new spaces automatically
 receive system packages and enabled HTTP/SSH configuration. The Local workflow
 has live evidence for Create, Counter Install, increment, retirement/ACK retry,
-and reading7 after restart. Latest release rechecks HTTP status and SSH
-listener/host-key persistence (not authenticated shell access), retained Counter
-recovery and conflict reporting. A separate new-space probe on the same release
-also verifies fresh Create (38s) and Counter Install (45s), with no retry/resume.
-Fresh Counter increment takes25.33s and read-after-restart25.76s on this release;
+and reading7 after restart. Latest release checks HTTP status and SSH listener
+availability (not authenticated shell access). Earlier-generation probes cover
+host-key persistence and conflict reporting. New-space probes verify fresh
+Create (35s) and Counter Install (43s), with no retry/resume.
+Fresh Counter increment takes23.48s and read-after-restart24.50s on this release;
 value7, positive retirement and exact ACK retries pass. This is Public-policy
 qualification, not the remaining Private/Attested proof matrix.
 
@@ -38,10 +38,10 @@ returns409; retention is bounded, not indefinite server reply caching.
 Keep two scoped batches, not one review per work-in-progress commit:
 
 1. `31b0cdbb..f79f0e3d`: integrated clean-break architecture/lifecycle.
-2. `f79f0e3d..97503f48`: recovery, performance, artifact and qualification follow-ups
-   (27 files, +2,844/-160 at this frozen checkpoint).
+2. `f79f0e3d..b131edc3`: recovery, performance, artifact and qualification follow-ups
+   (40 files, +3,463/-214 at this frozen checkpoint).
 
-The integrated diff remains large (229 files, +75,715/-58,972 at `97503f48`).
+The integrated diff remains large (231 files, +76,282/-58,974 at `b131edc3`).
 These are review groupings, not independently deployable slices. Subsequent
 review-handoff documentation and disposable-fixture test updates belong with batch2. The old C1 boundary
 is not independently merge-ready.
@@ -59,9 +59,9 @@ with bounded equivalence/recovery checks and repeat release qualification.
 
 | Requirement | Current evidence / gap |
 | --- | --- |
-| Startup and operation latency | Recovery-fixture restarts36s/29s; new-fixture readiness18s then restarts27s/33s;10s gate fails. Current-release fresh Create38s, Install45s, managed increment25.33s and read-after-restart25.76s. |
+| Startup and operation latency | Current-release fresh readiness17s, restarts21s/29s;10s gate fails. Fresh Create35s, Install43s, managed increment23.48s and read-after-restart24.50s. |
 | Recovery performance | With8-entry scheduling, second pass system owner8.02s, including14 runtime calls6.39s. Shorter history helps; not a same-history A/B. |
-| Inventory performance | Two agents require six sequential authenticated queries; restart inventory20.42s/19.77s. Fresh Create lifecycle13.03s is followed by route reconciliation20.71s (inventory20.46s), so this also materially delays operation completion. |
+| Inventory performance | Two agents require six sequential authenticated queries. Current fresh Create lifecycle11.20s is followed by route reconciliation20.02s (inventory19.77s), so inventory still materially delays operation completion. |
 | Shutdown | Latest disposable probes pass within1–2s; general busy/crash matrix still incomplete. |
 | Ordinary Shared genesis/finality | Native startup still installs `UnavailableAgentFinality`; production accepting bridge missing. System genesis is a separate path. |
 | Authenticated reclamation | Issuer/coordinator bounded-record reclamation remains unfinished; invocation retirement is not proof of Authority application. |

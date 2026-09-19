@@ -1,6 +1,6 @@
 # Reviewing the Agent architecture saga
 
-## Review entry point: checkpoint `97503f48`, release source `cca4c911`
+## Review entry point: checkpoint and release source `b131edc3`
 
 Use these two ranges for the current review; the older snapshot below remains
 historical evidence. No merge or push is implied by this breakdown.
@@ -8,11 +8,11 @@ historical evidence. No merge or push is implied by this breakdown.
 | Batch | Exact range | Scope and size |
 | --- | --- | --- |
 | 1 | `31b0cdbb..f79f0e3d` | Integrated clean-break architecture and lifecycle;225 files,+72,934/-58,875. |
-| 2 | `f79f0e3d..97503f48` | Recovery, checkpointing, shutdown, prepared-runtime/ACK reuse, reproduced pin, lifecycle conflict reporting, attachment refresh and qualification;27 files,+2,844/-160. |
+| 2 | `f79f0e3d..b131edc3` | Recovery, checkpointing, shutdown, prepared-runtime/ACK/Invoke validation reuse, reproduced pin, lifecycle conflict reporting, attachment refresh, operator docs and qualification;40 files,+3,463/-214. |
 
 Counts are frozen at that checkpoint; subsequent handoff documentation and
 disposable-fixture test updates belong with batch2. Neither batch is an independently deployable slice.
-The integrated diff is229 files,+75,715/-58,972. No production sign-off is implied.
+The integrated diff is231 files,+76,282/-58,974. No production sign-off is implied.
 
 Batch1 remains large and cannot be presented as an independently safe old C1
 cut. Batch2 contains all subsequent fixes together, not one review per commit.
@@ -24,6 +24,17 @@ to immutable source and provenance. The following evidence distinguishes
 passing regressions from still-failing production gates.
 
 ## Current release qualification
+
+Release `b131edc3` includes the independently reproduced Invoke validation
+optimization. Bundle verification and fresh Local Create/Counter Install pass;
+fresh increment and read-after-restart verify value7, retirement and exact ACK
+retries. Readiness17s then restarts21s/29s all fail10s. Create35s, Install43s,
+managed increment23.48s/read24.50s; shutdown0–1s. HTTP status and SSH keyscan
+pass, not authenticated SSH shell qualification. See current status and handoff
+for checksum and original-path fixture. No controlled overall speedup claim.
+Full suites below predate this repin; focused post-pin checks do not replace them.
+
+### Prior-generation qualification
 
 Current-source CLI regression at `14b81955`:255 unit tests pass,19 ignored;
 actor-build4 and task-build1 integration tests pass. Shutdown smoke fails the

@@ -2,13 +2,49 @@
 
 ## Checkpoint and decision
 
-Review freeze: checkpoint `97503f48`, qualified release source `cca4c911`.
+Review checkpoint and qualified Local-test release source: `b131edc3`.
 Use [current status](agent-saga-status.md) for remaining gates and
 [the review guide](agent-saga-review.md) for the two current review ranges.
 This log is reverse chronological: older statements about pending builds or
 the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
+
+### 2026-09-19: repinned release and fresh Local lifecycle qualification
+
+Release source `b131edc3` built locked/offline nightly-2025-05-09 in6m05s,
+session53025 terminal0. SHA-256:
+`a2e12ecd77cf393c3ddf8ecfabecb4d366fb3e55d0d0d14dcc4f221fca8ef08b`.
+Bundle creation/verification passes with the reproduced e815f4b0 runtime and
+unchanged system template pins. Build, bundle and preserved previous executable
+are under `target/task-tmp/invoke-release.HNhVWg/`. Previous executable checksum
+remains69732438…; old fixtures were not reopened, relocated or reset.
+
+Fresh fixture `target/task-tmp/current-latency.qEl4ba/` uses isolated XDG roots,
+name `current-latency-smoke`, generated HTTP/SSH configuration with ports changed
+only to18099/2243. Only the immutable Counter package was copied. Space ID:
+`7852fc0a55f4d599fd461794ead6454321b96f0647b36f5347ffae51e470de7b`;
+Local Agent `e690502f9954db2c631385fc35ce0c38cb23ad5f239107c955de18d020b2662c`.
+First readiness17s; HTTP status/SSH keyscan pass; fresh Create35s and Install43s
+both verify their signed acknowledgement without retry/resume. Shutdown<1s;
+session19944 terminal0. Logs: probe.sh/probe.log/up.log, new.json, create.txt,
+install.txt and HTTP/SSH evidence.
+
+Next restart21s; fresh Counter increment managed23.48s/full test25.19s, pass;
+shutdown<1s. Next restart29s; fresh read managed24.50s/full test26.29s, pass;
+shutdown1s. Both test exact retirement, late-Invoke rejection, positive ACK retry
+and managed resume; read verifies value7. Session52775 terminal0; host process
+inspection finds no matching daemon. Logs: invoke-probe.sh/invoke-probe.log,
+mutation-up.log/mutation-test.log, read-up.log/read-test.log. Counter is now7;
+preserve original-path state and retained requests, do not fresh-increment again.
+
+First-start system owner4,776ms, initial one-agent inventory11,283ms and route
+reconciliation11,609ms. Create lifecycle11,198ms; publication31,359ms including
+20,016ms reconciliation/19,772ms inventory. Final Install reconciliation18,570ms
+includes17,942ms inventory. The large-retry deterministic gas improvement is
+proven; these differing fixture/historical runs are not a controlled overall
+speedup comparison. Startup still fails10s, and tens-of-seconds operations remain
+unacceptable. Full post-pin suites and other production gates remain open.
 
 ### 2026-09-19: independently reproduced Invoke candidate and atomic repin
 
