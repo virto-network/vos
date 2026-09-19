@@ -75,6 +75,8 @@ const REPLICA_COMMITTEE_ID_DOMAIN: &[u8] = b"vos/agent/replica-committee/v1";
 const GENESIS_EVIDENCE_ID_DOMAIN: &[u8] = b"vos/agent/genesis-evidence/v1";
 const GENESIS_DECISION_ID_DOMAIN: &[u8] = b"vos/agent/system-authority/agent-genesis-decision/v1";
 const GENESIS_ADMISSION_ID_DOMAIN: &[u8] = b"vos/agent/genesis-admission/v2";
+const GENESIS_PUBLICATION_INVOCATION_DOMAIN: &[u8] =
+    b"vos/agent/system-authority/genesis-publication/v1";
 
 macro_rules! genesis_id_type {
     ($name:ident, $label:literal) => {
@@ -1226,6 +1228,30 @@ impl AgentGenesisProvision {
         &self.decision
     }
 
+    /// Exact Linear invocation identity for publishing this provision against
+    /// one retained management authorization. This derives an identity only;
+    /// it performs no signature verification and grants no publication right.
+    pub fn publication_invocation(
+        &self,
+        authorization_invocation: crate::agent_sdk::InvocationId,
+    ) -> Result<crate::agent_sdk::InvocationId, AgentGenesisError> {
+        self.validate()?;
+        if authorization_invocation == crate::agent_sdk::InvocationId::ZERO {
+            return Err(AgentGenesisError::InvalidProvision);
+        }
+        Ok(crate::agent_sdk::InvocationId(
+            Hash::digest(
+                GENESIS_PUBLICATION_INVOCATION_DOMAIN,
+                &[
+                    crate::agent_sdk::RUNTIME_ABI_ID.as_bytes(),
+                    authorization_invocation.as_bytes(),
+                    &self.encode(),
+                ],
+            )
+            .0,
+        ))
+    }
+
     /// Validate a fresh clean Shared Create publication against the exact
     /// pending call and approval selected from trusted Authority state.
     ///
@@ -2297,6 +2323,33 @@ mod tests {
         let evidence = AgentGenesisEvidence::new(claim, qc).unwrap();
         let decision = AgentGenesisDecision::new(&proposal, &replicas, &evidence).unwrap();
         let provision = AgentGenesisProvision::new(proposal, replicas, evidence, decision).unwrap();
+        let publication = provision.publication_invocation(call.invocation).unwrap();
+        assert_ne!(publication, sdk::InvocationId::ZERO);
+        assert_ne!(publication, call.invocation);
+        assert_ne!(publication, approval.acknowledgement_invocation);
+        let reopened = AgentGenesisProvision::decode(&provision.encode()).unwrap();
+        assert_eq!(
+            reopened.publication_invocation(call.invocation),
+            Ok(publication)
+        );
+        assert_ne!(
+            provision
+                .publication_invocation(sdk::InvocationId([0xb1; 32]))
+                .unwrap(),
+            publication
+        );
+        assert_ne!(
+            baseline
+                .provision
+                .publication_invocation(call.invocation)
+                .unwrap(),
+            publication
+        );
+        assert!(
+            provision
+                .publication_invocation(sdk::InvocationId::ZERO)
+                .is_err()
+        );
         assert_eq!(
             provision.verify_pending_create_at(&call, &approval, &committee, 20, &Strict),
             Ok(())

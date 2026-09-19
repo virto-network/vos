@@ -12,6 +12,21 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-20: exact genesis-publication invocation identity
+
+`AgentGenesisProvision::publication_invocation` derives a distinct-domain ID
+from the ABI, nonzero retained authorization invocation and complete canonical
+provision. It validates structural consistency but does not verify signatures
+or grant publication rights. The clean signed fixture checks exact decode/reopen
+stability, separation from authorization/acknowledgement IDs, changed authorization
+and provision separation, and zero-authorization rejection. Genesis10/10 pass
+(session59232 exit0,0 ignored,1429 filtered,0.09s), with formatting/diff checks
+passing. Log: shared
+`target/task-tmp/final-review-release.HbPbex/genesis-publication-identity.log`.
+The Authority still needs to retain and collision-check this ID as part of
+durable publication; this derivation alone does not implement those operations.
+Qualified release and artifact pins remain unchanged.
+
 ### 2026-09-20: pending clean Shared Create admission prerequisite
 
 `AgentGenesisProvision::verify_pending_create_at` validates the full provision,
