@@ -11,6 +11,21 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: full current-source CLI regression passes
+
+The current-source CLI test executable built in session74483 (SHA-256
+`91c89f24a051e28705d8fe555f3507737ce6b22a291a21e7db009e53125258c4`)
+passes the complete ordinary suite:255 passed,0 failed,19 ignored,0 filtered
+in80.29s (session73341 exit0). It was run directly with `--test-threads=1`,
+loopback access, RAYON_NUM_THREADS=2 and disk-backed TMPDIR. Source remained
+unchanged apart from handoff documentation since d4d38ebb. Log: shared
+`target/task-tmp/review-checkpoint-release.6a7GXF/cli-suite.log`.
+
+Ignored tests are not counted as passes; the two explicit fresh Counter live
+tests have their separate qualification below. This closes the current-source
+ordinary CLI rerun gap, not the explicit host-feature suite, full integration
+matrix, lint, Shared finality, proof/crash or production-performance requirements.
+
 ### 2026-09-19: current checkpoint fresh Local lifecycle passes
 
 Release d4d38ebb (SHA-256 `1ddcc3c99ea16c5982d7ac8f2e752cfdbf91ceb9145d34d087f1524110668a08`)

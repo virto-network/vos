@@ -55,6 +55,8 @@ Counter mutation21.55s and read-after-restart21.48s with value7, positive
 retirement and exact ACK retries. HTTP status/SSH keyscan pass. Readiness
 16s/20s/26s still fails10s; shutdown0s/0s/1s passes with no forced cleanup.
 This is Local/Public-policy coverage, not production sign-off or a speedup.
+The full current-source CLI suite also passes255 tests,0 failures,19 ignored
+in80.29s; see `review-checkpoint-release.6a7GXF/cli-suite.log` in shared task-tmp.
 The following older qualification remains attached to the preserved8f96fad8 binary.
 
 Release `8f96fad8` / SHA-256

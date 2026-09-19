@@ -15,6 +15,9 @@ shutdowns0s/0s/1s at whole-second resolution pass without forced cleanup.
 HTTP status and SSH keyscan pass, not authenticated shell access. Fresh fixture
 `current-latency.VF0MXp` remains at its original path; no old store was reused.
 The older detailed live results below belong to8f96fad8 and are historical.
+The current-source full CLI suite also passes255 tests,0 failures,19 ignored
+in80.29s with loopback access; explicit host-feature and full clean-break reruns
+still retain their older source qualification boundaries.
 Evidence and the preserved previous executable are in shared
 `target/task-tmp/review-checkpoint-release.6a7GXF/`.
 
