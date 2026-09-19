@@ -10,6 +10,24 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: bounded replay-result cache updates verified
+
+Following `133d4307`, the ordered and management recent-result caches replace
+existing values through one `get_mut` lookup instead of contains-key plus insert.
+Capacity remains1,024 entries; replacement does not refresh FIFO position or
+change durable journal state. The existing bounded-handoff regression now covers
+replacement at capacity, unchanged ordering, one-shot response handoff and
+eviction of the same oldest entry on the next insertion.
+
+The complete `agent::local_journal_driver::tests` selection with `--features pvm`
+passes33 tests, zero failed/ignored,36.44s (session12450 exit0). Formatting and
+diff checks pass. Workspace Clippy with `check-all` flags reports336 remaining
+diagnostics (session82803 exit101), down from338; both duplicate-lookup diagnostics
+are gone. Logs in shared `target/task-tmp/decoded-input-release.RIkx3j/`:
+`cache-update-tests.log` and `lint-after-cache-update.log`.
+No wire/artifact changes or measured latency improvement are claimed. This is
+targeted source qualification, not a rebuilt release or a passing `check-all`.
+
 ### 2026-09-19: PVM vectors and voucher release catalog gates pass
 
 At `4817e479`, unchanged release recipes pass with nightly-2025-05-09,

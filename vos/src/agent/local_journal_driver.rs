@@ -2607,8 +2607,8 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         }
         self.pending_clean_invocation_results
             .insert(input, result.clone());
-        if self.recent_clean_ordered_results.contains_key(&input) {
-            self.recent_clean_ordered_results.insert(input, result);
+        if let Some(cached) = self.recent_clean_ordered_results.get_mut(&input) {
+            *cached = result;
             return;
         }
         if self.recent_clean_ordered_results.len() == MAX_PENDING_CLEAN_INVOCATION_RESULTS
@@ -2626,8 +2626,8 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
         result: crate::agent_sdk::RuntimeOutcome,
     ) {
         self.record_clean_invocation_result(input, result.clone());
-        if self.recent_clean_management_results.contains_key(&input) {
-            self.recent_clean_management_results.insert(input, result);
+        if let Some(cached) = self.recent_clean_management_results.get_mut(&input) {
+            *cached = result;
             return;
         }
         if self.recent_clean_management_results.len() == MAX_PENDING_CLEAN_INVOCATION_RESULTS
@@ -8965,6 +8965,50 @@ mod tests {
         );
         assert_eq!(
             driver.core.executor.recent_clean_management_order.len(),
+            MAX_PENDING_CLEAN_INVOCATION_RESULTS
+        );
+
+        let executor = &mut driver.core.executor;
+        let ordered_before = executor.recent_clean_ordered_order.clone();
+        let management_before = executor.recent_clean_management_order.clone();
+        let oldest_live = *management_before.front().unwrap();
+        let replacement = crate::agent_sdk::RuntimeOutcome::Management(Err(
+            crate::agent_sdk::ManagementError::InvalidRequest,
+        ));
+        executor.record_clean_management_result(oldest_live, replacement.clone());
+        assert_eq!(executor.recent_clean_ordered_order, ordered_before);
+        assert_eq!(executor.recent_clean_management_order, management_before);
+        assert_eq!(
+            executor.clean_ordered_result(oldest_live),
+            Some(replacement.clone())
+        );
+        assert_eq!(
+            executor.clean_management_result(oldest_live),
+            Some(replacement.clone())
+        );
+        assert_eq!(
+            executor.take_clean_invocation_result(oldest_live),
+            Some(replacement)
+        );
+        assert_eq!(executor.take_clean_invocation_result(oldest_live), None);
+
+        executor.record_clean_management_result(ReplayInputId([0xff; 32]), management_outcome);
+        assert_eq!(executor.clean_ordered_result(oldest_live), None);
+        assert_eq!(executor.clean_management_result(oldest_live), None);
+        assert_eq!(
+            executor.recent_clean_ordered_results.len(),
+            MAX_PENDING_CLEAN_INVOCATION_RESULTS
+        );
+        assert_eq!(
+            executor.recent_clean_management_results.len(),
+            MAX_PENDING_CLEAN_INVOCATION_RESULTS
+        );
+        assert_eq!(
+            executor.recent_clean_ordered_order.len(),
+            MAX_PENDING_CLEAN_INVOCATION_RESULTS
+        );
+        assert_eq!(
+            executor.recent_clean_management_order.len(),
             MAX_PENDING_CLEAN_INVOCATION_RESULTS
         );
     }
