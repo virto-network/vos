@@ -12,6 +12,23 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-20: final-release logs confirm the latency concentration
+
+Read-only analysis of `current-latency.KD6UwR/{up,mutation-up,read-up}.log`
+finds45 complete eight-phase Authority query sequences. Each sequence was
+checked in prepare/reserve/identity/persist/reopen/invoke/acknowledge/complete
+order. Timings are cumulative within two separate clocks: subtract the prior
+phase, resetting at prepare and reopen. Summing raw elapsed fields is invalid.
+Incremental totals in milliseconds: prepare3793, reserve13795, identity3270,
+persist1827, reopen4073, invoke59665, acknowledge33811, complete1644;
+total121878. Invoke+ACK is76.70%; persistence+clear is2.85%. These are host-plus-
+guest phase spans, not pure CPU samples or a controlled before/after benchmark.
+Post-Install inventory takes16275ms and route reconciliation16999ms. Its six
+serial query durations total16272ms. An unchanged-head credential-only refresh
+takes2986ms (route3252ms). The final host decode cleanup has not removed the
+dominant repeated execution cost. Do not infer that weakening authentication,
+retirement, or readiness checks is an acceptable optimization.
+
 ### 2026-09-20: final-source CLI regression passes
 
 At frozen `93e63c5f` (documentation-only changes since release sourcee20cbb76),
