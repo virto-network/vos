@@ -35,14 +35,21 @@ All15 Raft worker tests pass (session87856 exit0,2.34s). The corrected test also
 passes50 separate-process repetitions (session37688 exit0). Formatting/diff
 checks pass. Evidence in shared `target/task-tmp/single-preflight-release.pE0Yxy/`:
 `host-feature-suite.log`, `raft-status-race-fix.log`, `raft-status-race-repeat.log`.
-The original full-suite failure remains preserved; targeted repair/repeats are
-not a claim that the full corrected-source suite passed. Unified rerun remains
-in progress at45ff53e0 in session25218, using the same command and environment.
-Its log is `host-feature-suite-fixed.log` in the same evidence directory.
-The live handle was re-polled and continued through the native Local lifecycle
-tests; no terminal full-suite result is established yet. Resume the same handle
-instead of starting another run. Guest artifacts and the qualified release
-executable are unchanged.
+The original full-suite failure remains preserved. The unified rerun at45ff53e0
+now terminates successfully:1878 passed,0 failed,4 ignored,0 filtered in1587.02s
+(session25218 exit0), using the same command and environment. Its log is
+`host-feature-suite-fixed.log` in the same evidence directory. Both complete
+inventory rotation and system-attachment checkpoint tests, the startup-admission
+regression and the repaired Raft status test pass in this full run. The nested
+one-test child summary is not added to the parent count.
+
+The four ignored cases are the explicit real64MiB capacity diagnostic, copied-DB
+decode timing probe, large-ACK profiling probe, and compiled external-transfer
+fixture test (separate `just check-probe-fixture` gate). Ignored cases are not
+claimed as coverage here. Guest artifacts and the a732e079 live-qualified release
+executable are unchanged. This closes the pending host-feature rerun only, not
+ordinary Shared finality/issuance, reclamation, remaining proof/crash coverage,
+production latency/lint gates or final-source release qualification.
 
 ### 2026-09-19: native operation startup reuses its checked decode
 

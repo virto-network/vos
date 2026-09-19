@@ -15,11 +15,11 @@ handoff-only edits. Neither batch is independently deployable. `saga/agents`
 remains at `31b0cdbb`; no merge or push has been performed.
 
 Live-qualified executable source remains `a732e079`, not `45ff53e0`.
-The corrected-source host-feature suite is running in session25218, with log
+The corrected-source host-feature suite at `45ff53e0` passes: 1,878 passed,
+zero failed, four ignored, zero filtered in 1,587.02s (session25218 exit0). Log:
 `target/task-tmp/single-preflight-release.pE0Yxy/host-feature-suite-fixed.log`
-under the shared target. Its final result is not yet established. Finish that
-existing run before deciding integration readiness; do not substitute the
-targeted Raft successes for the full-suite result. The frozen release details
+under the shared target. Both long inventory/system-attachment tests and the
+corrected Raft status test pass in this full run. The frozen release details
 below remain useful for disposable Local/Public-policy testing only.
 
 This checkpoint does not close ordinary Shared finality/issuance, bounded

@@ -31,9 +31,11 @@ executable and has no measured latency claim; reclamation remains incomplete.
 Full host-feature run at c9990ed6 finishes1877 passed,1 failed,4 ignored. The
 failure was an immediate cached-status read racing AppendEntries publication
 in a Raft test. Its test-only fix passes all15 worker tests and50 isolated
-repetitions; the full corrected-source rerun is running in session25218 at
-45ff53e0, logging to `single-preflight-release.pE0Yxy/host-feature-suite-fixed.log`
-under shared `target/task-tmp`. No final result is established yet. See the handoff.
+repetitions. The full corrected-source rerun at45ff53e0 now passes1878 tests,
+zero failed,4 ignored,0 filtered in1587.02s (session25218 exit0), logged to
+`single-preflight-release.pE0Yxy/host-feature-suite-fixed.log` under shared
+`target/task-tmp`. Both long inventory/system-attachment tests and the repaired
+Raft test pass in this run. This does not close the remaining production gates.
 Use the d4d38ebb release checkpoint below only with its original-pin fixtures;
 do not boot those stores with the new pin.
 
