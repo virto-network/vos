@@ -85,6 +85,11 @@ Current-pin log attribution puts9.56s of the post-Create16.68s inside runtime:
 Profile the actual bundled Authority Invoke/ACK workloads and the separate
 reserve/checkpoint host overhead before adding another cache. See the handoff
 for phase counts, corroborating post-Install data and reproducible analysis.
+The fresh bundled-Authority query regression now passes with both the native
+outer-runtime shortcut and bundled outer PVM. Machine observation attributes
+97.1% of Invoke instructions and100% of ACK instructions to the outer runtime,
+not Authority actor execution. Next localize outer validation/encoding/hash
+cost; the machine split does not yet identify the hot function or prove a fix.
 Released checkpoint scheduling now triggers at8 retained physical entries;
 safety tests, the complete514-query workload and two live restart passes succeed.
 Observed periodic reconciliation3.71s/3.57s is not a broad throughput proof. Do not

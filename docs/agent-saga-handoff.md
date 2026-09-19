@@ -10,6 +10,45 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: real bundled Authority query profile localizes cost to outer runtime
+
+Added `native_bundled_authority_fresh_credential_query_retires_exact_pair`.
+It uses the actual bundled Authority executable/schema/policies, re-signed only
+for the existing fixture issuer. A valid enrolled SSH-node credential query
+must return the exact query, active status and expected principal; no positive
+ACK exists beforehand, and the exact retained positive ACK and cleared pending
+projection are required afterward. This is a fresh successful query, not an
+unknown-credential rejection or retained-result timing probe.
+
+The normal test passes (session18710 exit0,3.62s). With
+`VOS_AGENT_PROFILE_REFINE_MACHINES=1`, the existing fixture disables the native
+outer-runtime shortcut and uses the bundled `agent_runtime.pvm`; the same test
+passes (session74286 exit0,12.82s). Markers delimit just the measured query
+after bootstrap. Both runs use locked/offline nightly-2025-05-09, the four host
+features, shared target and disk-backed TMPDIR. No guest pin or executable
+bytes changed. This is fixture-based attribution, not a deployed wall-time A/B.
+
+| Fresh query transition | Input bytes | Gas | Outer instructions | Inner instructions |
+| --- | ---: | ---: | ---: | ---: |
+| Invoke | 772,026 | 611,555,466 | 182,482,309 | 5,442,329 |
+| ACK | 774,351 | 263,780,712 | 95,650,075 | 0 |
+
+Outer instructions account for97.1% of observed Invoke instructions and100%
+of ACK instructions. Observer wall spans are3.804s outer/0.168s inner for
+Invoke and2.024s outer for ACK; instrumentation adds overhead, so these are
+not release latency numbers. Invoke has26 host calls; ACK has none. The outer
+and inner observation intervals are separated at host calls by the observer.
+
+This changes the next optimization target: first localize outer runtime
+validation/encoding/hash work, rather than optimizing Authority actor policy
+execution or its state. Do not infer the exact hot outer function from this
+machine-level split alone. Retain this successful real-workload regression
+alongside the synthetic large-artifact equivalence test for any candidate.
+Logs: shared `target/task-tmp/role-length-release.UnaSE1/authority-query-native.log`
+and `authority-query-pvm-profile.log`. Formatting and diff checks pass.
+The full suites remain qualified at their earlier recorded source revisions;
+this new test does not close the remaining production gates.
+
 ### 2026-09-19: current-pin inventory attribution narrows the performance target
 
 Analyzed the retained current-release `current-latency.VSCZEK/up.log` without

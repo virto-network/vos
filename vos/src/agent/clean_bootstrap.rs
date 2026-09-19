@@ -9901,6 +9901,70 @@ mod tests {
         }
 
         #[test]
+        fn native_bundled_authority_fresh_credential_query_retires_exact_pair() {
+            let mut harness = NativeProjectionOwnerHarness::with_fixture(
+                "bundled-authority-fresh-query",
+                native_bundled_authority_fixture(),
+            );
+            let owner = harness.owner.as_mut().unwrap();
+            let credential_key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
+            let public = credential_key.verifying_key().to_bytes();
+            let (node_key, _, _, node) = node_material();
+            let mut query = AuthorityProjectionQuery {
+                authority: owner.authority_target(),
+                credential: CredentialId::of_public_key(&public),
+                nonce: Hash([0xd5; 32]),
+                selector: AuthorityProjectionSelector::Credential,
+                authentication: AuthorityIngressAuthentication::SshNodeAttestation {
+                    credential_public_key: public,
+                    node: NodeId(node.0),
+                    request_binding: Hash([0xd6; 32]),
+                    signature: [1; 64],
+                },
+            };
+            let signature = node_key.sign(&query.signing_bytes()).to_bytes();
+            if let AuthorityIngressAuthentication::SshNodeAttestation {
+                signature: value, ..
+            } = &mut query.authentication
+            {
+                *value = signature;
+            }
+            let pending = owner.prepare_authority_projection(query.clone()).unwrap();
+            let (work, authorization) = pending.invocation().unwrap();
+            let agent = HostAgentId(owner.pins.agent.0);
+            assert!(owner.record.pending_projection.is_none());
+            assert!(
+                !owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .retained_positive_clean_acknowledgement(agent, work, authorization)
+                    .unwrap()
+            );
+            // With VOS_AGENT_PROFILE_REFINE_MACHINES set, the fixture uses
+            // the bundled outer PVM too. These markers separate this fresh
+            // query's Invoke/ACK from bootstrap/replay machine observations.
+            eprintln!("bundled_authority_fresh_query begin");
+            let response = owner.invoke_authority_projection(query.clone()).unwrap();
+            eprintln!("bundled_authority_fresh_query end");
+            let projection = AuthorityCredentialProjection::decode(&response).unwrap();
+            projection.validate_shape().unwrap();
+            assert_eq!(projection.query, query);
+            assert_eq!(projection.status, AuthorityCredentialStatus::Active);
+            assert_eq!(projection.principal, owner.pins.descriptor.identity.owner);
+            assert!(owner.record.pending_projection.is_none());
+            assert!(
+                owner
+                    .host
+                    .lock()
+                    .unwrap()
+                    .retained_positive_clean_acknowledgement(agent, work, authorization)
+                    .unwrap()
+            );
+            harness.stop();
+        }
+
+        #[test]
         fn native_admin_retained_dispatch_recovers_before_and_after_execution() {
             native_admin_retained_terminal_recovery(false);
         }
