@@ -7,8 +7,8 @@ historical evidence. No merge or push is implied by this breakdown.
 
 Latest source includes the artifact-role length optimization and independently
 reproduced pin from `19d73390`; these also belong in batch2. Its release rebuild,
-fresh-space qualification and full CLI suite pass. Full post-pin default and
-host-feature library suites remain pending.
+fresh-space qualification, full CLI and default-library suites pass. The full
+post-pin host-feature library suite remains pending.
 
 | Batch | Exact range | Scope and size |
 | --- | --- | --- |
@@ -38,6 +38,7 @@ managed increment20.71s/read19.90s; shutdown1s. HTTP status and SSH keyscan
 pass, not authenticated SSH shell qualification. See current status and handoff
 for checksum and original-path fixture. No controlled overall speedup claim.
 Current-pin CLI at `b16abf81` passes255 tests/19 ignored in87.64s.
+Current-pin default library at `02dbc8c6` passes1,434 tests/1 ignored in199.41s.
 The previous-pin host-feature suite at `bf7ced06` passes1,871 tests/3 ignored in
 1,450.60s; default library at `e63db78b` passes1,434/1 ignored and CLI at
 `c1614b96` passes255/19 ignored. Ignored cases are not counted as passes.

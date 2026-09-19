@@ -10,6 +10,18 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: complete post-pin default-library regression
+
+At `02dbc8c6d50acdbc06b984cff651cfa61c5fc136`, the offline/locked default
+`cargo +nightly-2025-05-09 test -p vos --lib -- --test-threads=1` completes:
+1,434 passed,0 failed,1 ignored in199.41s (session32510, exit0). Loopback
+network access was available and TMPDIR remained in disk-backed shared target.
+No fixes, retries or filters. Evidence:
+`target/task-tmp/role-length-release.UnaSE1/default-suite.log`.
+The full host-feature suite is the next gate; do not substitute this narrower
+feature selection or earlier-generation host results for it. Production
+latency, Shared integration, reclamation and remaining proof gates stay open.
+
 ### 2026-09-19: repinned release and fresh Local lifecycle qualified
 
 Release `b16abf81948d64cc08ea34f683316f60c7f8759c` builds offline/locked with
