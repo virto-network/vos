@@ -12,6 +12,28 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-20: no-std caller-supplied certificate signature backend
+
+The Authority guest does not enable vos `std` or `agent-runtime`, so the default
+QC Ed25519 backend fails closed there. Enabling `agent-runtime` merely to obtain
+cryptography would also select unrelated infrastructure runtime features.
+`AuthorityQuorumCertificate::verify_with` now accepts the trusted caller's strict
+signature backend while retaining committee/binding/epoch/quorum/signer/claim
+checks in the shared implementation. Existing `verify` delegates to it with
+the unchanged default backend. `AgentGenesisEvidence::verify_certificate_with`
+adds the same exact-space validation as its default-backend counterpart.
+
+Real-signature tests exercise positive backend dispatch, rejection by the
+backend, and wrong-committee/space rejection before dispatch. Genesis9/9
+(session57842 exit0) and committee14/14 pass, with no ignored tests; the
+no-default-features library build passes (session22252 exit0). Logs under
+shared `target/task-tmp/final-review-release.HbPbex/`:
+`genesis-certificate-backend.log`, `committee-certificate-backend.log`,
+`certificate-backend-no-std.log`. No guest execution is claimed by those host
+tests/builds. The hook is not yet connected to an Authority publication method;
+permanent publication and independent replay-backed finality remain required.
+No artifact was repinned; the e20cbb76 qualified release is unchanged.
+
 ### 2026-09-20: scoped ordinary-genesis certificate verification prerequisite
 
 `AgentGenesisEvidence::verify_certificate` now checks structural consistency,

@@ -573,6 +573,24 @@ impl AuthorityQuorumCertificate {
         trusted_committee: &AuthorityCommittee,
         expected_claim: AuthorityClaimCommitment,
     ) -> Result<(), AuthorityCommitteeError> {
+        self.verify_with(trusted_committee, expected_claim, verify_ed25519)
+    }
+
+    /// Verify with a cryptographic backend supplied by the trusted caller.
+    /// This supports no-std policy actors without enabling runtime features.
+    /// The backend must perform strict Ed25519 verification; it must never
+    /// come from the certificate or another untrusted request field.
+    /// Committee, quorum, signer membership and claim checks remain here.
+    pub fn verify_with(
+        &self,
+        trusted_committee: &AuthorityCommittee,
+        expected_claim: AuthorityClaimCommitment,
+        mut verify_signature: impl FnMut(
+            &[u8; AUTHORITY_ED25519_PUBLIC_KEY_BYTES],
+            &[u8],
+            &[u8; AUTHORITY_ED25519_SIGNATURE_BYTES],
+        ) -> bool,
+    ) -> Result<(), AuthorityCommitteeError> {
         trusted_committee.validate()?;
         self.validate_shape()?;
         if self.authority_binding != trusted_committee.authority_binding {
@@ -599,7 +617,7 @@ impl AuthorityQuorumCertificate {
             if member.role != AuthorityMemberRole::Voter {
                 return Err(AuthorityCommitteeError::ObserverSignature);
             }
-            if !verify_ed25519(
+            if !verify_signature(
                 &member.public_key,
                 &message.0,
                 &authority_signature.signature,

@@ -889,6 +889,26 @@ impl AgentGenesisEvidence {
             .map_err(AgentGenesisError::Authority)
     }
 
+    /// Certificate authorization with a trusted caller's strict Ed25519
+    /// backend, for no-std policy actors. This still does not prove finality.
+    pub fn verify_certificate_with(
+        &self,
+        trusted_committee: &AuthorityCommittee,
+        verify_signature: impl FnMut(&[u8; 32], &[u8], &[u8; 64]) -> bool,
+    ) -> Result<(), AgentGenesisError> {
+        self.validate()?;
+        if trusted_committee.space() != self.claim.space() {
+            return Err(AgentGenesisError::InvalidEvidence);
+        }
+        self.certificate
+            .verify_with(
+                trusted_committee,
+                self.claim.authority_claim(),
+                verify_signature,
+            )
+            .map_err(AgentGenesisError::Authority)
+    }
+
     pub fn validate(&self) -> Result<(), AgentGenesisError> {
         self.claim.validate()?;
         if self.certificate.claim() != self.claim.authority_claim()
@@ -1947,7 +1967,32 @@ mod tests {
         let trusted = committee_for(fixture.proposal.locator().space);
         let evidence = sign(&trusted);
         assert_eq!(evidence.verify_certificate(&trusted), Ok(()));
+        let mut verified_signatures = 0;
+        assert_eq!(
+            evidence.verify_certificate_with(&trusted, |public, message, signature| {
+                verified_signatures += 1;
+                ed25519_dalek::VerifyingKey::from_bytes(public)
+                    .unwrap()
+                    .verify_strict(message, &ed25519_dalek::Signature::from_bytes(signature))
+                    .is_ok()
+            }),
+            Ok(())
+        );
+        assert_eq!(verified_signatures, 1);
+        assert_eq!(
+            evidence.verify_certificate_with(&trusted, |_, _, _| false),
+            Err(AgentGenesisError::Authority(
+                AuthorityCommitteeError::InvalidSignature
+            ))
+        );
         assert!(evidence.verify_certificate(&fixture.authority).is_err());
+        assert!(
+            evidence
+                .verify_certificate_with(&fixture.authority, |_, _, _| {
+                    panic!("wrong committee must fail before signature dispatch")
+                })
+                .is_err()
+        );
         let mut substituted = evidence.clone();
         substituted.claim.post_create_state = Hash([0x73; 32]);
         assert!(substituted.verify_certificate(&trusted).is_err());
@@ -1961,6 +2006,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             cross_space.verify_certificate(&other_space),
+            Err(AgentGenesisError::InvalidEvidence)
+        );
+        assert_eq!(
+            cross_space.verify_certificate_with(&other_space, |_, _, _| {
+                panic!("wrong space must fail before signature dispatch")
+            }),
             Err(AgentGenesisError::InvalidEvidence)
         );
     }
