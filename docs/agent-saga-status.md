@@ -24,11 +24,22 @@ returns409; retention is bounded, not indefinite server reply caching.
 Keep two scoped batches, not one review per work-in-progress commit:
 
 1. `31b0cdbb..f79f0e3d`: integrated clean-break architecture/lifecycle.
-2. `f79f0e3d..c88a2729`: recovery, performance, artifact and qualification follow-ups.
+2. `f79f0e3d..97503f48`: recovery, performance, artifact and qualification follow-ups
+   (27 files, +2,844/-160 at this frozen checkpoint).
 
-The integrated diff remains large (228 files, about75.6k additions/59.0k
-deletions at `c88a2729`). The old C1 boundary is not independently merge-ready.
+The integrated diff remains large (229 files, +75,715/-58,972 at `97503f48`).
+These are review groupings, not independently deployable slices. Subsequent
+review-handoff-only documentation edits belong with batch2. The old C1 boundary
+is not independently merge-ready.
 See [review guide](agent-saga-review.md) and [evidence handoff](agent-saga-handoff.md).
+
+Freeze implementation here for review and disposable Local-space testing; do
+not start another guest/artifact change merely to fill the remaining budget.
+No merge or push is authorized by this checkpoint. When implementation resumes,
+measure fresh Create/Install/invocation on the current release before claiming
+that the startup optimizations improved operation latency. Preserve original
+fixture paths and failure evidence. Then address authenticated initial inventory
+with bounded equivalence/recovery checks and repeat release qualification.
 
 ## Remaining production work
 

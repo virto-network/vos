@@ -2,6 +2,14 @@
 
 ## Checkpoint and decision
 
+Review freeze: checkpoint `97503f48`, qualified release source `cca4c911`.
+Use [current status](agent-saga-status.md) for remaining gates and
+[the review guide](agent-saga-review.md) for the two current review ranges.
+This log is reverse chronological: older statements about pending builds or
+the then-current executable are historical, not additional current blockers.
+The checkpoint is suitable for review/disposable Local testing only; the full
+saga remains unfinished. No merge or push has been performed.
+
 ### 2026-09-19: eight-entry release, two restart passes
 
 Release `cca4c911` built locked/offline nightly-2025-05-09 in6m35s; SHA-256:

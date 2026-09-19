@@ -1,6 +1,6 @@
 # Reviewing the Agent architecture saga
 
-## Review entry point: source checkpoint `12e45422`
+## Review entry point: checkpoint `97503f48`, release source `cca4c911`
 
 Use these two ranges for the current review; the older snapshot below remains
 historical evidence. No merge or push is implied by this breakdown.
@@ -8,7 +8,11 @@ historical evidence. No merge or push is implied by this breakdown.
 | Batch | Exact range | Scope and size |
 | --- | --- | --- |
 | 1 | `31b0cdbb..f79f0e3d` | Integrated clean-break architecture and lifecycle;225 files,+72,934/-58,875. |
-| 2 | `f79f0e3d..12e45422` | Recovery, checkpointing, shutdown, prepared-runtime/ACK reuse, reproduced pin, lifecycle conflict reporting and qualification;26 files,+2,458/-112. |
+| 2 | `f79f0e3d..97503f48` | Recovery, checkpointing, shutdown, prepared-runtime/ACK reuse, reproduced pin, lifecycle conflict reporting, attachment refresh and qualification;27 files,+2,844/-160. |
+
+Counts are frozen at that checkpoint; subsequent handoff-only documentation
+updates belong with batch2. Neither batch is an independently deployable slice.
+The integrated diff is229 files,+75,715/-58,972. No production sign-off is implied.
 
 Batch1 remains large and cannot be presented as an independently safe old C1
 cut. Batch2 contains all subsequent fixes together, not one review per commit.
@@ -19,7 +23,7 @@ work validation plus retained signature/scope checks. Match the new artifact
 to immutable source and provenance. The following evidence distinguishes
 passing regressions from still-failing production gates.
 
-## Follow-up after the frozen review snapshot
+## Current release qualification
 
 Release `cca4c911` now qualifies8-entry scheduling in two successive live
 restarts: readiness36s/29s (both fail10s), system-owner recovery14.45s/8.02s,
@@ -28,6 +32,11 @@ retained recovery,409 guidance and shutdown within1s pass. Shorter replay helps,
 but these differing-history observations are not controlled A/B evidence.
 Inventory remains the largest observed startup cost. See the current compact
 status and handoff; previous source-only notes below are historical.
+
+## Historical follow-ups (newest first)
+
+Release references and next steps below describe their recording time, not the
+current executable. The qualification above supersedes their pending rebuilds.
 
 Source candidate schedules authenticated idle system-projection checkpoints
 at8 retained physical entries, down from32. Protocol capacity, pending-work
