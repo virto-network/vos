@@ -10,6 +10,37 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: post-pin nested system-actor suites pass
+
+With runtime source frozen at the current checkpoint, both nested actor suites
+pass using nightly-2025-05-09, `--locked --offline --lib -- --test-threads=1`,
+the shared target and disk-backed TMPDIR:
+
+- `actors/system-authority/Cargo.toml`: 58 passed, zero failures/ignored,
+  111.93s, session82369 exit0; `decoded-input-release.RIkx3j/system-authority-tests.log`.
+- `actors/system-catalog/Cargo.toml`: 10 passed, zero failures/ignored,
+  26.08s, session22543 exit0; `decoded-input-release.RIkx3j/system-catalog-tests.log`.
+
+These nested workspaces are not covered by root workspace tests. The passing
+Authority compaction tests do not close host issuer/coordinator reclamation.
+Host-feature session55057 is still running the full authenticated-inventory
+rotation workload; it has not been restarted, filtered, or shortened.
+
+### 2026-09-19: post-pin SDK documentation gate passes
+
+At `c22015ea`, with unchanged runtime source/pins, the SDK no-default-feature
+documentation build passes with broken intra-doc links denied:
+
+```sh
+RUSTDOCFLAGS='-D rustdoc::broken_intra_doc_links' cargo +nightly-2025-05-09 doc --locked --offline -p vos-agent-sdk --no-default-features --no-deps
+```
+
+Exit0, 0.83s; log: shared
+`target/task-tmp/decoded-input-release.RIkx3j/sdk-doc-check.log`. This checks SDK
+intra-doc links only, not all examples or external links. Host-feature session
+`55057` remains live, progressing through Local lifecycle recovery cases; poll
+that same session before any rerun. No runtime source or artifact edits.
+
 ### 2026-09-19: post-pin default regression passes; host-feature run started
 
 At source `ea13d293` (runtime/release implementation unchanged from `8f96fad8`),

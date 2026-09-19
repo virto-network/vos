@@ -83,6 +83,9 @@ with bounded equivalence/recovery checks and repeat release qualification.
 The post-pin `scripts/check-agent-clean-break.sh` gate also passes: retained CLI,
 removed compatibility surfaces/paths, and selected operator documentation.
 This does not establish the full `just clean-break-check` recipe or workspace lint.
+Post-pin supporting gates also pass: system-authority 58/58, system-catalog
+10/10, and SDK no-default-feature documentation with broken intra-doc links denied.
+These do not qualify all examples/external links or host issuer reclamation.
 
 Next verification is completion of the full host-feature regression on the new pin.
 Performance work must remain focused on the14–16s authenticated two-agent
