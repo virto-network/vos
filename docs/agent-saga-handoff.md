@@ -10,6 +10,34 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: full post-pin host-feature regression passes
+
+Session55057 finished with exit0: **1,876 passed, zero failed, three ignored**,
+zero filtered, 1,403.60s. Full log:
+`target/task-tmp/decoded-input-release.RIkx3j/host-feature-suite.log` in the shared
+`ch08-c2-native` target. The run started at `ea13d293`; only documentation changed
+during execution (HEAD at completion `45a22e3f`). Runtime source and pins remained
+unchanged from the qualified `8f96fad8` implementation. Command:
+
+```sh
+cargo +nightly-2025-05-09 test --locked --offline -p vos --features 'agent-transition-proof private-agent-store http-ingress ssh-ingress' --lib -- --test-threads=1
+```
+
+Both `same_head_inventory_rotates_authenticated_suffix_past_1024_entries` and
+`system_attach_checkpoints_and_drains_raw_tail_before_publishing_route` passed
+in full, without shortened workloads or restarts. Three ignored diagnostics:
+
+- `native_operation_initial_capture_requires_more_headroom_than_projection`:
+  fills the real 64MiB journal boundary; capacity diagnostic not qualified here.
+- `fixed_history_physical_decode_probe`: requires the explicit copied-DB fixture;
+  timing diagnostic, not a release gate.
+- `profile_bundled_runtime_large_acknowledgement`: fixed-work CPU profiling probe.
+
+This closes the broad post-pin library reruns, not the full Private/Attested
+cryptographic proof matrix, ordinary Shared integration, issuer reclamation,
+workspace lint/recipes, remaining crash cases, or production latency gates.
+Session55057 is terminal: do not poll or restart it as unfinished work.
+
 ### 2026-09-19: post-pin nested system-actor suites pass
 
 With runtime source frozen at the current checkpoint, both nested actor suites
