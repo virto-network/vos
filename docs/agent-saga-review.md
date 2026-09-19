@@ -21,6 +21,14 @@ passing regressions from still-failing production gates.
 
 ## Follow-up after the frozen review snapshot
 
+Release `3a990280` is built and qualified against the preserved fixture: bundle,
+HTTP/SSH, live409/request preservation, retained Counter read and ACK retries
+pass; shutdown within1s. Startup58s still fails. Initial inventory now uses43
+runtime calls versus61 in the preceding phase-logged run and takes21.3s;
+system-owner recovery takes34.9s. Different histories/conditions prevent a
+controlled overall speedup claim. The handoff records exact phase evidence,
+checksum and remaining scope. No new guest pin or fresh mutation was required.
+
 2026-09-19 source follow-up: unchanged transport refresh now uses authenticated
 attachment facts instead of full administrative status/actor-directory queries.
 New/stale/changed attachment still uses full status and existing rebuild checks.

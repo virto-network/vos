@@ -2,6 +2,43 @@
 
 ## Checkpoint and decision
 
+### 2026-09-19: attachment-refresh release qualified
+
+Release source `3a990280` built locked/offline with nightly-2025-05-09 in6m18s.
+Executable SHA-256:
+`15f23e7bd959356c7f7a5997efb5f4ddb245b8fa07de84f67a358d78329a7e5a`.
+Bundle creation/verification pass with unchanged runtime/system pins. On the
+original `fresh-ack-release.Of5a75` fixture, HTTP status and unchanged SSH key
+pass, retired Create reports409 with inspect-evidence guidance, and request
+bytes match their pre-probe SHA-256. Retained Counter read/retirement/exact ACK
+retry passes2.54s (managed0.66s, NOT fresh invocation latency). SIGTERM exits
+within1s without forced cleanup. Build/probe sessions90004/80115 terminal0;
+post-run inspection found no vosx/cargo/rustc.
+
+Startup58s still fails10s gate. Cumulative system-owner recovery34,937ms,
+lifecycle controller35,391ms, production ready57,945ms. Initial inventory
+loads in21,342ms and route reconciliation completes in22,328ms. Its six
+queries now execute43 runtime calls: Credential8, each remaining page7.
+The prior phase-logged release executed61 calls. This verifies removal of
+repeated directory-query work, not a controlled end-to-end speedup: history,
+checkpoint placement and host conditions differ, and owner recovery grew.
+
+Across those six queries, phase totals (runtime contribution in parentheses):
+prepare475ms (134.9), reserve/checkpoint1,976ms (21.5), identity403ms (136.5),
+persist216ms (0), reopen593ms (132.6), Invoke11,428ms (9,419.7),
+ACK6,029ms (4,025.2), complete214ms (0). Cumulative families were differenced
+separately as documented below. Remaining reservation/Invoke/ACK host residuals
+are roughly1.95/2.01/2.00s; physical runtime execution still dominates inventory.
+System-owner recovery is now the largest observed startup stage and needs
+its own bounded attribution before claiming readiness can meet10s.
+
+Evidence: shared `target/task-tmp/attachment-refresh-release.uESjEc/`, including
+`build.log`, `probe.sh`, `probe.log`, `bundle/`, `up.log`, `read-test.log`,
+`conflict.stderr`, `request-before.sha256`, HTTP/SSH outputs and preserved
+`vosx-before`. No old fixture was relocated or reset. No fresh Create/Install
+or invocation latency was measured on this release. Full production gates
+remain open; the existing two-batch review organization is unchanged.
+
 ### 2026-09-19: unchanged attachment refresh no longer queries actor lanes
 
 `SharedAgentNetworkHost::refresh` previously called full host `list()`, which
