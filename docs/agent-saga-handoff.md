@@ -10,6 +10,32 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: boxed network command payload verified
+
+Following `a4f22004`, the network mailbox now owns each Agent outbound request
+through a Box, unboxed at the same dispatch point. The test-only untracked frame
+is boxed consistently. Requests still own their original admission permit and
+reply sender; failed enqueue, queue drop and normal dispatch retain their prior
+ownership semantics. No wire types, request encoding, route authentication,
+capacity limits or artifact pins changed.
+
+Clippy previously measured the production NetworkCmd enum at at least3,216
+bytes because it embedded AgentOutboundRequest. A new layout/queue-drop test
+measures NetworkCmd at280 bytes in the test build (AgentOutboundRequest3,216),
+enforces a512-byte command bound and verifies queued-request drop releases both
+the permit and reply sender. The payload itself remains allocated on the heap;
+this adds an allocation per outbound request and is not a measured latency or
+total-memory improvement.
+
+`cargo +nightly-2025-05-09 test --locked --offline -p vos --lib network:: --
+--test-threads=1 --nocapture` passes96 tests, zero failed/ignored,10.57s with
+loopback permission (session35806 exit0). Log:
+`decoded-input-release.RIkx3j/boxed-network-tests.log` in the shared target.
+Formatting/diff checks pass. Workspace Clippy reports338 remaining diagnostics
+(session77367 exit101, `lint-after-network-box.log`); the NetworkCmd size
+diagnostic is gone. Qualified release binary remains8f96fad8; this is targeted
+source qualification, not a rebuilt/requalified release.
+
 ### 2026-09-19: journal-store lint cleanup verified
 
 Following `21fb4bab`, journal-store cleanup removes six further diagnostics:

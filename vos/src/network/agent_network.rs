@@ -764,7 +764,7 @@ impl Network {
     }
 
     fn queue_agent_request(&self, request: AgentOutboundRequest) {
-        if let Err(error) = self.cmd_tx.send(NetworkCmd::SendAgent(request)) {
+        if let Err(error) = self.cmd_tx.send(NetworkCmd::SendAgent(Box::new(request))) {
             let NetworkCmd::SendAgent(request) = error.0 else {
                 unreachable!("the failed command is the command that was sent")
             };
@@ -1076,9 +1076,10 @@ impl Network {
 
     #[cfg(test)]
     pub(crate) fn send_agent_frame_for_test(&self, peer: PeerId, frame: AgentFrame) {
-        let _ = self
-            .cmd_tx
-            .send(NetworkCmd::SendAgentUntracked { peer, frame });
+        let _ = self.cmd_tx.send(NetworkCmd::SendAgentUntracked {
+            peer,
+            frame: Box::new(frame),
+        });
     }
 }
 
@@ -1877,6 +1878,58 @@ mod tests {
         drop(admitted.pop());
         assert!(ingress.try_acquire(AgentTrafficClass::Application).is_ok());
         drop(raft);
+    }
+
+    #[test]
+    fn boxed_agent_commands_keep_queue_slots_small_and_release_permits_on_drop() {
+        let command_bytes = core::mem::size_of::<NetworkCmd>();
+        let request_bytes = core::mem::size_of::<AgentOutboundRequest>();
+        assert!(
+            command_bytes <= 512,
+            "network command grew to {command_bytes} bytes"
+        );
+        assert!(command_bytes < request_bytes);
+        println!("network command bytes={command_bytes}, Agent request bytes={request_bytes}");
+
+        let permits = new_agent_outbound_permits();
+        let peer = key(83).public().to_peer_id();
+        let route = test_route(83);
+        let (reply, receiver) = std_mpsc::channel();
+        let request = AgentOutboundRequest {
+            peer,
+            frame: frame(peer, route, AgentMessage::Merge(MergeMessage::FetchHeads)),
+            pending: PendingAgentReply::MergeHeads {
+                meta: PendingMeta {
+                    route,
+                    target_node: node(peer),
+                    target_peer: peer,
+                },
+                reply,
+            },
+            permit: reserve_agent_outbound_permit(&permits, AgentTrafficClass::Application)
+                .unwrap(),
+        };
+        let (commands, queue) = tokio::sync::mpsc::unbounded_channel();
+        assert!(
+            commands
+                .send(NetworkCmd::SendAgent(Box::new(request)))
+                .is_ok()
+        );
+        assert_eq!(
+            permits.available(AgentTrafficClass::Application),
+            MAX_AGENT_OUTBOUND_APPLICATION_REQUESTS - 1
+        );
+        // Dropping the mailbox must drop the entire boxed request, including
+        // its exact reply sender and admission permit, without dispatch.
+        drop(queue);
+        assert_eq!(
+            permits.available(AgentTrafficClass::Application),
+            MAX_AGENT_OUTBOUND_APPLICATION_REQUESTS
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std_mpsc::TryRecvError::Disconnected)
+        ));
     }
 
     #[test]

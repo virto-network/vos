@@ -893,11 +893,11 @@ impl Default for NetworkConfig {
 
 pub(in crate::network) enum NetworkCmd {
     Connect(Multiaddr),
-    SendAgent(agent_network::AgentOutboundRequest),
+    SendAgent(Box<agent_network::AgentOutboundRequest>),
     #[cfg(test)]
     SendAgentUntracked {
         peer: PeerId,
-        frame: AgentFrame,
+        frame: Box<AgentFrame>,
     },
     SendTell {
         target_peer: PeerId,
@@ -1917,7 +1917,7 @@ async fn network_main(
                     Some(NetworkCmd::SendAgent(request)) => {
                         send_agent_request(
                             &mut swarm,
-                            request,
+                            *request,
                             &mut agent_outbound_replies,
                         );
                     }
@@ -1926,7 +1926,7 @@ async fn network_main(
                         let _ = swarm
                             .behaviour_mut()
                             .agent_req_resp
-                            .send_request(&peer, frame);
+                            .send_request(&peer, *frame);
                     }
                     Some(NetworkCmd::SendTell { target_peer, from, to, payload }) => {
                         let frame = Frame::Tell { from, to, payload };
