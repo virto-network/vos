@@ -10,6 +10,35 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: probe fixture build and real outbox invariant qualified
+
+Following `48379340`, the retained probe fixture is pinned to guest
+nightly-2026-03-20 and its recipe uses `cargo actor --locked`. The first locked
+build failed because the fixture's tracked lockfile was stale; it was refreshed
+offline (fixture lockfile only), then the pinned build passed (session73044
+exit0). Logs: `probe-fixture-build.log` and `probe-fixture-build-fixed.log` under
+shared `target/task-tmp/decoded-input-release.RIkx3j/`.
+
+Its remaining consumer, `node::tests::dispatch_routes_external_transfers_only_after_commit`,
+previously read a fixed package-local ELF and returned success without executing
+when missing. It now honors CARGO_TARGET_DIR and fails on missing artifact. It is
+explicitly ignored in ordinary library runs, with `just check-probe-fixture`
+building the fixture then selecting that exact ignored test. `check-all` invokes
+this stronger build-and-execute gate instead of only building the fixture.
+
+The full `check-probe-fixture` recipe passes (session58804 exit0):1 test passed,
+zero failed/ignored,0.24s; `probe-fixture-check.log`. It verifies no outbox delivery
+after failed commit and exactly one delivery after successful retry. Running the
+same binary against a verified nonexistent target directory fails as expected
+with exit101 and an explicit missing-ELF error (`probe-missing-negative.log`),
+not a silent pass. Earlier library success alone did not prove this artifact was
+executed; this dedicated run does. Ordinary library ignored counts now increase
+by one, while the explicit gate executes the case.
+
+All temporary data remains disk-backed; old fixture bytes/logs were preserved.
+Root formatting/diff checks pass. Production runtime code and bundled pins are
+unchanged; this is fixture/test/gate maintenance, not full release sign-off.
+
 ### 2026-09-19: full workspace library regression passes
 
 At frozen source `23f98d4b`, the complete command

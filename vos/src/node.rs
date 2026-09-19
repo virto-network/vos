@@ -22409,19 +22409,23 @@ mod tests {
     /// commit routes nothing (no leak); a subsequent successful attempt
     /// routes exactly once (the failed attempt did not duplicate).
     #[test]
+    #[ignore = "requires the compiled probe fixture; run just check-probe-fixture"]
     fn dispatch_routes_external_transfers_only_after_commit() {
         use crate::actors::codec::Encode;
         use crate::value::{Msg, TAG_DYNAMIC};
         use std::sync::mpsc;
 
-        let workspace = env!("CARGO_MANIFEST_DIR");
-        let elf_path = format!(
-            "{workspace}/../vos/tests/fixtures/probe/target/riscv64em-vos/release/probe.elf"
-        );
-        let Ok(elf) = std::fs::read(&elf_path) else {
-            eprintln!("SKIP: probe ELF not built — run: just build-pvm");
-            return;
-        };
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe");
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(|target| fixture.join(target))
+            .unwrap_or_else(|| fixture.join("target"));
+        let elf_path = target.join("riscv64em-vos/release/probe.elf");
+        let elf = std::fs::read(&elf_path).unwrap_or_else(|error| {
+            panic!(
+                "read probe ELF {}: {error}; run just check-probe-fixture",
+                elf_path.display()
+            )
+        });
         let blob = vos_pvm_compiler::link_elf(&elf).expect("probe transpiles");
 
         let mut runtime = VosRuntime::new();

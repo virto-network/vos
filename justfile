@@ -38,7 +38,12 @@ build-examples:
 build-pvm-test-artifacts: build-probe-fixture
 
 build-probe-fixture:
-    cd vos/tests/fixtures/probe; cargo +nightly actor
+    cd vos/tests/fixtures/probe; cargo actor --locked
+
+# Execute the artifact-dependent invariant explicitly; it must not silently
+# pass when the fixture is missing from an ordinary library-only test run.
+check-probe-fixture: build-probe-fixture
+    cargo test --locked -p vos --lib node::tests::dispatch_routes_external_transfers_only_after_commit -- --ignored --exact --test-threads=1
 
 # Build a single built-in PVM actor by name (e.g., just build-actor space-registry).
 build-actor name:
@@ -217,7 +222,7 @@ check-all:
     just test-pvm-vectors
     just verify-voucher-check-release
     just build-pvm
-    just build-probe-fixture
+    just check-probe-fixture
     just test-examples
     just clean-break-check
 
