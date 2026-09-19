@@ -11,6 +11,44 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: PublicPreflight candidate independently reproduced and checked
+
+Immutable source `ba7be4575ca060990180e0c95d7b8223c3633f59` was exported twice
+with git archive into separate source/target directories, built sequentially
+with nightly-2026-03-20 `cargo actor --locked` and offline dependencies.
+Both ELF files match byte-for-byte; both converted PVMs match each other and
+the earlier measured candidate. Session11956 exits0; builds29.84s/32.49s.
+
+- ProgramId: `8071ad67661c6539ab504ccecc18c9e8d6d858803b52fca05389823f8109d3cc`
+- ELF BLAKE2b256: `4bfc4f3e3e1cc3bb58971dc1f0cf4851305231f105278d265cd9f60568702d68`
+- PVM BLAKE2b256: `50927c9c8e0d4daf1bb30b7f6948d197da7f53ec5f3b0e8027469b5e2b3b3776`
+
+The converter is the preserved d4d38ebb release, SHA-256 checked by the runner
+as `1ddcc3c99ea16c5982d7ac8f2e752cfdbf91ceb9145d34d087f1524110668a08`.
+Evidence: shared `target/task-tmp/single-preflight-reproduction.rSz92N/` contains
+`reproduce.sh`, `reproduction.log`, both source exports, targets, PVMs, build logs
+and identity logs. No source export, older fixture or failure evidence was removed;
+all temporary files were disk-backed.
+
+Full runtime-wire suite with ACK/FAILURE/TYPED_ERROR/EXPIRY candidate overrides
+passes98 tests,0 failures,1 ignored in36.26s (session1918, `candidate-wire.log`).
+Those explicit override paths execute the candidate for retained-invocation
+rejection, malformed ACK frames, terminal failure, typed error and expiry
+coverage; other tests retain their bundled/native selection. This is not98
+candidate-only tests. The prior paired PublicPreflight cost test remains the
+fixed-input bundled/candidate gas comparison.
+
+The real bundled Authority fresh Credential query/retirement regression also
+passes against `first.pvm` using its existing COST_CANDIDATE override with full
+host features (session6591,1 passed,1881 filtered,3.74s; `authority-query.log`).
+This executes the physical outer runtime and the actual Authority actor,
+not the fixture's native runtime shortcut. It is not a full host-feature run
+or an end-to-end latency benchmark.
+
+Production pins and the live-tested d4d38ebb executable remain unchanged.
+Reproduction and these targeted candidate gates pass; coordinated repin and
+post-pin artifact/release checks remain due before this candidate is bundled.
+
 ### 2026-09-19: candidate removes duplicate PublicPreflight commitment hash
 
 Following08139275, `InvocationAuthorization::matches_invoke` still performs its

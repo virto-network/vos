@@ -9,8 +9,11 @@ duplicate work-commitment hash. SDK166 tests and full runtime-wire98/1 ignored
 pass. A paired guest test preserves exact Invoke/ACK transition bytes and saves
 1.43%/0.76% gas on its fixed4KiB-padding fixture. This is not a live speedup.
 Candidate ProgramId `8071ad67661c6539ab504ccecc18c9e8d6d858803b52fca05389823f8109d3cc`
-is NOT bundled or independently reproduced. Current source therefore no longer
-reproduces the old bundle; repin/reproduction/release qualification remains due.
+is independently reproduced from immutable ba7be457 in two isolated builds;
+ELF/PVM bytes match the measured candidate. Candidate-enabled wire98/1 ignored
+and the actual bundled-Authority fresh-query regression also pass. It is NOT
+bundled. Current source therefore no longer reproduces the old bundle;
+coordinated repin and post-pin release qualification remain due.
 Use the preserved d4d38ebb release checkpoint below for already-qualified testing.
 
 Latest source/review checkpoint: `d4d38ebb`. Its locked/offline release build
