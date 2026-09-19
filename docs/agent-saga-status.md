@@ -4,6 +4,19 @@ The complete saga is **not finished**. This is a review/test-environment
 checkpoint, not production or master sign-off. `saga/agents` remains at
 `31b0cdbb`; nothing has merged or pushed.
 
+Latest qualified release source: `e20cbb76`, including the host startup-decode
+fix. Locked/offline build7m05s, bundle creation/verification and fresh Local
+lifecycle pass. SHA-256:
+`d11e52eed2e917a53e025536972f375363d30355d602dee2e9e23a3f6950e2cc`.
+Fixture `current-latency.KD6UwR`: Create29s, Install38s, mutation21.95s,
+read-after-restart21.88s (full retry tests23.79s/23.68s). Positive retirement,
+exact retry, HTTP status and SSH keyscan pass; authenticated shell not tested.
+Readiness16s/20s/26s still fails10s. Shutdown0s/0s/1s needs no forced cleanup;
+daemon/listeners are gone. This remains disposable Local/Public-policy
+qualification, not production. See the handoff for exact evidence and the
+preserved initial fixture-prefix setup failure. Earlier release results below
+retain their original source boundaries.
+
 Runtime repin after9cdc1ff1: PublicPreflight Invoke matching now avoids one
 duplicate work-commitment hash. SDK166 tests and full runtime-wire98/1 ignored
 pass. A paired guest test preserves exact Invoke/ACK transition bytes and saves

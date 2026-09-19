@@ -3,14 +3,41 @@
 ## Checkpoint and decision
 
 Review source checkpoint: `45ff53e0` (two batches; see review guide).
-Build/bundle checkpoint: `e20cbb76`; live qualification remains at `a732e079`.
-Live-qualified Local-test release source: `a732e079`.
+Build/bundle checkpoint: `e20cbb76`.
+Live-qualified Local/Public-policy test release source: `e20cbb76`.
 Use [current status](agent-saga-status.md) for remaining gates and
 [the review guide](agent-saga-review.md) for the two current review ranges.
 This log is reverse chronological: older statements about pending builds or
 the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
+
+### 2026-09-20: final review release passes fresh Local lifecycle
+
+Release source `e20cbb76`, SHA-256
+`d11e52eed2e917a53e025536972f375363d30355d602dee2e9e23a3f6950e2cc`,
+passes the fresh `current-latency.KD6UwR` probe (session62056 exit0). Evidence
+is under shared `target/task-tmp/current-latency.KD6UwR/`; stores remain there.
+Create29s, Install38s, first readiness16s, restart readiness20s/26s. Counter
+mutation and read-after-restart each pass, including positive retirement and
+exact retry. Attempt timings are21.95s/21.88s; entire tests including retry
+take23.79s/23.68s (each1 passed,273 filtered). HTTP status and SSH keyscan pass,
+not authenticated shell access. Shutdowns0s/0s/1s at whole-second resolution
+require no forced cleanup; subsequent listener/process checks find no daemon.
+
+New-space system packages and HTTP/SSH defaults are automatic. Only isolated
+test ports were changed to18099/2243. No old stores were copied or migrated.
+The unchanged test client executable has SHA-256
+`a9405e57d7aa03e9c068918c50edf37d651e2ef8369f9512ca58d93059ec88d9`.
+This qualifies Local/Public-policy behavior, not the full Private/Attested
+proof matrix. Readiness still fails10s; no controlled wall-time improvement
+is established. Production blockers remain open, with no merge or push.
+
+An initial fixture `final-review-live.vzPl9A` is preserved as failed evidence:
+Create29s and Install37s passed, but the mutation test rejected its directory
+prefix before executing (session8295 exit101). This was harness setup error;
+the existing `current-latency.` safety guard was kept unchanged. Its daemon
+and listeners were confirmed gone before creating the new fixture above.
 
 ### 2026-09-19: final review-source release builds and verifies
 

@@ -14,7 +14,13 @@ The integrated source diff is 241 files, +79,264/-59,066. Counts exclude later
 handoff-only edits. Neither batch is independently deployable. `saga/agents`
 remains at `31b0cdbb`; no merge or push has been performed.
 
-Live-qualified executable source remains `a732e079`, not `45ff53e0`.
+Live-qualified executable source is now `e20cbb76` (documentation-only commits
+after `45ff53e0`). It includes the final host fix and passes build, bundle
+verification and fresh Local/Public-policy lifecycle/restart testing in
+`current-latency.KD6UwR`. SHA-256:
+`d11e52eed2e917a53e025536972f375363d30355d602dee2e9e23a3f6950e2cc`.
+Readiness16s/20s/26s still fails10s; production gates remain open. See the handoff
+for precise timings and qualification boundaries.
 The corrected-source host-feature suite at `45ff53e0` passes: 1,878 passed,
 zero failed, four ignored, zero filtered in 1,587.02s (session25218 exit0). Log:
 `target/task-tmp/single-preflight-release.pE0Yxy/host-feature-suite-fixed.log`
