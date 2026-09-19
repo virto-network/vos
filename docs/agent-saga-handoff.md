@@ -10,6 +10,30 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: post-pin nested actor, SDK documentation and static cutover gates
+
+At `7bc52924`, with runtime source unchanged during the live host-feature run:
+
+- `actors/system-authority` separate-workspace library suite:58 passed,0 failed,
+  none ignored in129.70s; session24810 exit0.
+- `actors/system-catalog` separate-workspace library suite:10 passed,0 failed,
+  none ignored in32.46s; session97673 exit0.
+- SDK no-default-feature/no-deps docs with
+  `RUSTDOCFLAGS=-D rustdoc::broken_intra_doc_links`:exit0. This is an intra-doc
+  gate, not a whole-book or external-link audit.
+- `scripts/check-agent-clean-break.sh`:exit0, retained CLI and negative surface
+  verified; session3434 exit0. Its debug vosx build took18.09s. This script alone
+  is not the complete `just clean-break-check` recipe.
+
+All cargo work used pinned host nightly-2025-05-09, locked/offline resolution
+(the script via `CARGO_NET_OFFLINE=true`), shared target and disk-backed TMPDIR.
+Evidence under `target/task-tmp/role-length-release.UnaSE1/`:
+`system-authority-suite.log`, `system-catalog-suite.log`, `sdk-doc-check.log`,
+`clean-break-static.log`. No release binary, source, guest artifact or fixture
+changed. System-actor tests do not close host issuer/coordinator reclamation or
+ordinary Shared issuance/finality. Host-feature session38510 still requires its
+own terminal result; no restart occurred. Formatting remains a failed gate.
+
 ### 2026-09-19: pinned-toolchain formatting gate fails (read-only check)
 
 At `b437af09`, both `cargo +nightly-2025-05-09 fmt --all -- --check` and the
