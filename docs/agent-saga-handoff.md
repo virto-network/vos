@@ -10,6 +10,39 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: full build-pvm gate uses fresh Cargo output and passes
+
+Following `4e4cf613`, the runtime-candidate recipe uses Cargo metadata to locate
+the actual guest target directory, rather than building in CARGO_TARGET_DIR and
+then reading a stale hard-coded service-local ELF. Guest build and converter use
+locked dependencies. The metadata lookup is isolated in a Nushell `do` block so
+the host converter still runs from the root workspace. An initial unscoped
+attempt failed before conversion (session10438 exit101, `build-pvm-recipe.log`);
+the corrected recipe passed (session13781 exit0, `build-pvm-recipe-fixed.log`).
+
+The registry portion exposed its stale lockfile: the generated diff adds only
+the current local vos-agent-sdk/vos-protocol packages and dependency edges,
+without external package upgrades. Registry now pins nightly-2026-03-20 and the
+generic actor recipe uses `cargo actor --locked`, honoring each actor workspace's
+toolchain rather than overriding it with moving nightly. Other actor workspaces
+retain their own existing pins; this does not claim all are pinned or qualified.
+
+The final full `just build-pvm` rerun passes (session48823 exit0,
+`build-pvm-recipe-pinned.log`). It builds current runtime source, converts the
+actual shared-target ELF, requires byte equality with the bundled runtime,
+builds all four actor examples/custom runtime and builds the registry. Candidate
+and bundle BLAKE2b256 both equal
+`dfcf70ef5a335125176eb350e6fe3d857e9efc593a55860dee9761e4f2ac112f`,
+ProgramId `ebed0967a4d987e2f50f6e8908b294f713b0cf74583d1b5dc6648a8a542a049c`.
+This current-source comparison complements, but does not replace, the earlier
+two-isolated-build reproduction. No production artifact/pin was replaced.
+Logs are in shared `target/task-tmp/decoded-input-release.RIkx3j/`; the candidate
+is the recipe's normal `target/agent-runtime-candidate.pvm` build output.
+RUSTUP_TOOLCHAIN was unset to honor workspace pins; dependencies were offline,
+and temporary files disk-backed. Formatting/diff checks pass. The complete
+`check-all` result remains blocked by lint, and production functionality/latency
+requirements remain open.
+
 ### 2026-09-19: probe fixture build and real outbox invariant qualified
 
 Following `48379340`, the retained probe fixture is pinned to guest

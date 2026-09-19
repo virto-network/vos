@@ -108,6 +108,10 @@ The probe fixture now builds with a pinned guest toolchain/locked dependencies,
 and `just check-probe-fixture` passes its real commit-before-outbox test. The
 missing-artifact negative check fails explicitly instead of silently passing.
 That test is now ignored in ordinary library runs and executed by the release gate.
+Full `just build-pvm` also passes after fixing current-runtime artifact lookup
+to follow Cargo's target directory and locking/pinning the registry build.
+The current-source runtime candidate exactly matches the bundled PVM; no
+production artifacts or pins were replaced. The complete `check-all` gate still fails at lint.
 
 Post-pin broad library regressions are complete; the production gaps above remain.
 The subsequent host/journal/network/cache changes have targeted tests and the

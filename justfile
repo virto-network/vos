@@ -47,7 +47,7 @@ check-probe-fixture: build-probe-fixture
 
 # Build a single built-in PVM actor by name (e.g., just build-actor space-registry).
 build-actor name:
-    cd actors/{{name}}; cargo +nightly actor
+    cd actors/{{name}}; cargo actor --locked
 
 # Build all generated artifacts consumed by the test suite.
 build-test-artifacts: build-extensions build-pvm build-probe-fixture build-actors build-voucher-check
@@ -88,9 +88,9 @@ build-clerk-package signer:
 # Build and physically validate the bundled standard agent runtime without
 # replacing its committed release artifact.
 build-agent-runtime-candidate:
-    cd services/agent-runtime; cargo actor
-    cargo run -p vosx -- agent-runtime-pvm \
-      services/agent-runtime/target/riscv64em-vos/release/agent_runtime.elf \
+    cd services/agent-runtime; cargo actor --locked
+    let guest_target = (do { cd services/agent-runtime; cargo metadata --locked --format-version 1 --no-deps | from json | get target_directory }); cargo run --locked -p vosx -- agent-runtime-pvm \
+      ($guest_target | path join "riscv64em-vos" "release" "agent_runtime.elf") \
       --out target/agent-runtime-candidate.pvm
     @echo "candidate PVM: target/agent-runtime-candidate.pvm"
 
