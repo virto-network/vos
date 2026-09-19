@@ -10,6 +10,59 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: exact-binary PC attribution identifies BLAKE2b as dominant cost
+
+Extended the opt-in test observer with bounded-by-code-length outer instruction
+counters, top PCs and4KiB regions. Count totals are asserted against all outer
+instructions. Re-ran the successful bundled Authority query: session30885
+exit0,19.29s; gas and instruction totals exactly match the preceding profile.
+Instrumentation time is not release latency.
+
+A compiler-test diagnostic maps observed PCs through the preserved ELF only
+after `link_elf_spi(ELF)` matches the bundled PVM byte-for-byte. The diagnostic
+also applies the final branch-target insertion offset map; the raw translation
+map is NOT sufficient. The preliminary `authority-query-pc-map.log` omits that
+relocation and must not be used for symbol attribution. Its corrected successor
+is `authority-query-pc-map-relocated.log`; region mapping is in
+`authority-query-region-map.log`. All corrected selected PCs map exactly, with
+no nearest-address gap. The preserved ELF is
+`role-length-reproduction.IeXBpW/target-a/riscv64em-vos/release/agent_runtime.elf`.
+
+Five whole4KiB regions at PVM PCs `[16384,36864)` lie within ELF function
+`blake2b_simd::portable::compress1_loop` (RISC-V symbols `0x3004cec` to
+`0x300c5d4`). Together they account for:
+
+- Invoke:144,017,192 of182,482,309 outer instructions, **at least78.9%**.
+- ACK:82,520,526 of95,650,075 outer instructions, **at least86.3%**.
+
+These are conservative lower bounds excluding partial boundary regions, not
+percentages of wall time. `llvm-addr2line` may print local `.Lpcrel_hi17` labels;
+the surrounding function range comes from `llvm-nm --numeric-sort --demangle`.
+Other frequent PCs map to `vos_pvm_program::parse_compact_code_blob`,
+`ActorMachine::load_at`, and compiler-builtins `memcpy`. Top individual-PC
+counts alone would overemphasize those small loops and miss the large unrolled
+hash function, which is why region aggregation was necessary.
+
+Next bounded optimization target: redundant hashing of identical immutable
+availability bytes across the canonical decoder and execution boundary.
+The decoder already avoids duplicate nested-envelope and per-blob checks;
+do not redo those optimizations. The canonical decode still validates Invoke
+availability, while Standard recovery independently validates constructed work.
+Any reuse must be unforgeably tied to the exact decoded value; public
+constructed-value entry points must continue full validation. ProgramId and
+BlobRef are separate digest domains, and public-I/O hashing is proof binding,
+not removable overhead. No validation or hashing was removed in this step.
+
+Compiler regression passes65 unit tests (1 opt-in diagnostic ignored) and
+8 integration tests; the explicit exact-binary mapping diagnostic also passes.
+New tests prove offset-map reporting preserves emitted code and handles both
+inserted and unchanged boundaries. Production linker API/output is unchanged;
+the optional relocation observer shares the existing implementation. Formatting
+and diff checks pass. Evidence in shared `role-length-release.UnaSE1/`:
+`authority-query-region-profile.log`, `authority-query-region-map.log`,
+`compiler-profile-support-tests.log`. No guest repin, release rebuild or
+deployment was performed; remaining production gates stay open.
+
 ### 2026-09-19: real bundled Authority query profile localizes cost to outer runtime
 
 Added `native_bundled_authority_fresh_credential_query_retires_exact_pair`.

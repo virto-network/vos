@@ -89,7 +89,10 @@ The fresh bundled-Authority query regression now passes with both the native
 outer-runtime shortcut and bundled outer PVM. Machine observation attributes
 97.1% of Invoke instructions and100% of ACK instructions to the outer runtime,
 not Authority actor execution. Next localize outer validation/encoding/hash
-cost; the machine split does not yet identify the hot function or prove a fix.
+cost. Subsequent exact-binary PC mapping now identifies BLAKE2b compression:
+whole regions inside that function account for at least78.9% of outer Invoke
+instructions and86.3% of ACK instructions. Audit duplicate immutable-byte
+validation across decode/execution next; no production speedup is claimed.
 Released checkpoint scheduling now triggers at8 retained physical entries;
 safety tests, the complete514-query workload and two live restart passes succeed.
 Observed periodic reconciliation3.71s/3.57s is not a broad throughput proof. Do not

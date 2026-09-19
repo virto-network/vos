@@ -106,6 +106,8 @@ struct LinkedElf {
 /// capability manifest ([`link_elf`]) and the GP standard program
 /// ([`link_elf_spi`]) — are serializations of exactly these fields.
 struct TranspiledElf {
+    #[cfg(test)]
+    address_map: HashMap<u64, u32>,
     code: Vec<u8>,
     bitmask: Vec<u8>,
     jump_table: Vec<u32>,
@@ -353,13 +355,27 @@ fn transpile_elf(
     crate::peephole_fuse_load_imm_alu(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
     crate::peephole_fuse_load_imm_memory(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
     crate::peephole_eliminate_dead_load_imm(&mut ctx.code, &mut ctx.bitmask, &ctx.jump_table);
+    #[cfg(not(test))]
     crate::ensure_branch_targets_are_block_starts(
         &mut ctx.code,
         &mut ctx.bitmask,
         &mut ctx.jump_table,
     );
+    #[cfg(test)]
+    crate::ensure_branch_targets_with_pc_map(
+        &mut ctx.code,
+        &mut ctx.bitmask,
+        &mut ctx.jump_table,
+        |offsets| {
+            for pc in ctx.address_map.values_mut() {
+                *pc = offsets[*pc as usize];
+            }
+        },
+    );
 
     Ok(TranspiledElf {
+        #[cfg(test)]
+        address_map: ctx.address_map,
         code: ctx.code,
         bitmask: ctx.bitmask,
         jump_table: ctx.jump_table,
@@ -1200,6 +1216,31 @@ fn translate_section_linked(
 mod tests {
     use super::*;
     use vos_pvm::{ExitReason, refine};
+
+    /// Translate a preserved ELF and resolve observed PVM PCs without changing
+    /// the production linker API or emitted program. Use only with exact-byte
+    /// equality to the observed standard program.
+    #[test]
+    #[ignore = "diagnostic requires VOS_PROFILE_ELF, VOS_PROFILE_PVM and VOS_PROFILE_PCS"]
+    fn resolve_observed_standard_program_pcs() {
+        let elf = std::fs::read(std::env::var_os("VOS_PROFILE_ELF").unwrap()).unwrap();
+        let expected = std::fs::read(std::env::var_os("VOS_PROFILE_PVM").unwrap()).unwrap();
+        assert_eq!(link_elf_spi(&elf).unwrap(), expected);
+        let translated = transpile_elf(&elf, true, OpcodeEncoding::Standard).unwrap();
+        let mut addresses: Vec<_> = translated.address_map.into_iter().collect();
+        addresses.sort_unstable_by_key(|&(rv, pc)| (pc, rv));
+        for value in std::env::var("VOS_PROFILE_PCS").unwrap().split(',') {
+            let pc: u32 = value.parse().unwrap();
+            assert!((pc as usize) < translated.code.len());
+            assert_eq!(translated.bitmask[pc as usize], 1);
+            let &(rv, mapped_pc) = addresses
+                .iter()
+                .rev()
+                .find(|&&(_, mapped)| mapped <= pc)
+                .unwrap();
+            eprintln!("observed_pc pc={pc} mapped_pc={mapped_pc} riscv={rv:#x}");
+        }
+    }
 
     const TEXT_VADDR: u64 = 0x40_0000;
     const RA: u32 = 1;

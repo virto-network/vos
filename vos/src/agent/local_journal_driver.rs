@@ -1259,11 +1259,23 @@ fn profile_refine_machines(
     let mut elapsed = [0u128; 2];
     let mut entered = [None; 2];
     let mut host_calls = 0u64;
+    let mut outer_pc_counts = Vec::<u64>::new();
     let result = context.run_observed(|event| match event {
-        RefineObservation::MachineEnter { identity, .. } => {
+        RefineObservation::MachineEnter { identity, machine } => {
+            if matches!(identity, RefineMachineIdentity::Outer) && outer_pc_counts.is_empty() {
+                outer_pc_counts.resize(machine.code.len(), 0);
+            }
             entered[index(identity)] = Some(std::time::Instant::now());
         }
-        RefineObservation::Instruction { identity, .. } => instructions[index(identity)] += 1,
+        RefineObservation::Instruction {
+            identity,
+            instruction,
+        } => {
+            instructions[index(identity)] += 1;
+            if matches!(identity, RefineMachineIdentity::Outer) {
+                outer_pc_counts[instruction.pc_before as usize] += 1;
+            }
+        }
         RefineObservation::MachineExit { identity, .. } => {
             let i = index(identity);
             elapsed[i] += entered[i]
@@ -1282,6 +1294,36 @@ fn profile_refine_machines(
         "refine_machine_profile input_bytes={input_bytes} gas_used={} outer_instructions={} inner_instructions={} outer_observed_us={} inner_observed_us={} host_calls={host_calls}",
         result.gas_used, instructions[0], instructions[1], elapsed[0], elapsed[1]
     );
+    assert_eq!(outer_pc_counts.iter().sum::<u64>(), instructions[0]);
+    let mut regions: Vec<_> = outer_pc_counts
+        .chunks(4096)
+        .enumerate()
+        .map(|(index, counts)| {
+            let (offset, _) = counts
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, count)| count)
+                .unwrap();
+            (
+                index * 4096,
+                index * 4096 + offset,
+                counts.iter().sum::<u64>(),
+            )
+        })
+        .collect();
+    regions.sort_unstable_by_key(|&(start, _, count)| (core::cmp::Reverse(count), start));
+    for (start, pc, count) in regions
+        .into_iter()
+        .take(16)
+        .filter(|&(_, _, count)| count != 0)
+    {
+        eprintln!("refine_outer_hot_region start={start} pc={pc} instructions={count}");
+    }
+    let mut hot: Vec<_> = outer_pc_counts.into_iter().enumerate().collect();
+    hot.sort_unstable_by_key(|&(pc, count)| (core::cmp::Reverse(count), pc));
+    for (pc, count) in hot.into_iter().take(16).filter(|&(_, count)| count != 0) {
+        eprintln!("refine_outer_hot_pc pc={pc} instructions={count}");
+    }
     result
 }
 
