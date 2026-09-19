@@ -2,6 +2,37 @@
 
 ## Checkpoint and decision
 
+### 2026-09-19: earlier idle checkpoint scheduling candidate
+
+Existing owner-phase events now locate the expensive startup boundary:
+`reproduce_genesis_archive`163ms → `open_shared_host`33,094ms; later provision,
+drain and attachment finish the owner. This is32,931ms in the shared-host open
+step, not evidence of two identical expensive owner opens. Runtime calls in
+that interval need authenticated replay; do not skip them or trust an unsigned
+materialized image.
+
+Host scheduling now triggers idle system-projection checkpoints at8 retained
+physical entries instead of32. This is not the protocol history/capacity limit,
+issuer retention limit, or authorization policy. It uses the unchanged signed
+snapshot/reattachment path and still skips reserved projections or management
+work. Earlier scheduling trades more checkpoint work for a shorter future
+cold-replay suffix; it cannot shorten the first reopen of an existing longer
+suffix retroactively or guarantee10s startup (inventory remains expensive).
+
+Tests:3 checkpoint threshold/exclusion/failure-recovery regressions pass11.19s;
+full514-query rotation workload passes229.53s. It checks every ordered index,
+authenticated monotonic snapshot and unchanged query result, now requiring at
+most10 retained entries at each pre-dispatch sample (8 trigger plus completed
+two-entry query). No workload or crash assertions removed. Evidence:
+`target/task-tmp/eight-entry-checkpoint-tests.log`, session23585 terminal0;
+build30.70s. These tests are not controlled production throughput measurements.
+
+Release executable remains `3a990280` with32-entry scheduling. Candidate is
+source-only until release rebuild and live qualification. Next measure a first
+restart, a completed authenticated inventory cycle and a second restart on the
+same original-path disposable fixture; record both replay and checkpoint/steady
+state costs. Preserve all pending/crash evidence and unchanged readiness gates.
+
 For a compact review/test-deployment summary, start with
 [the current status](agent-saga-status.md). It does not replace this evidence
 history or narrow the full saga objective.

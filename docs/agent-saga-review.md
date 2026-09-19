@@ -21,6 +21,14 @@ passing regressions from still-failing production gates.
 
 ## Follow-up after the frozen review snapshot
 
+Source candidate schedules authenticated idle system-projection checkpoints
+at8 retained physical entries, down from32. Protocol capacity, pending-work
+exclusion and snapshot authentication are unchanged. Three checkpoint regressions
+and the full514-query rotation workload pass with a tighter10-entry sampled
+bound. Release is still `3a990280`; live restart and steady-state overhead
+measurements are required before claiming benefit. See the handoff for the
+shared-host-open bottleneck and exact next qualification.
+
 Release `3a990280` is built and qualified against the preserved fixture: bundle,
 HTTP/SSH, live409/request preservation, retained Counter read and ACK retries
 pass; shutdown within1s. Startup58s still fails. Initial inventory now uses43

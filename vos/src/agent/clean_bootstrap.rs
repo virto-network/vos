@@ -18108,7 +18108,7 @@ mod tests {
             let maximum = crate::agent::shared_raft::MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES as u64;
             for nonce in 1..=32 {
                 let (_, remaining, _) = owner.host.lock().unwrap().capacity(agent).unwrap();
-                if maximum - remaining >= 32 {
+                if maximum - remaining >= 8 {
                     break;
                 }
                 owner
@@ -18116,7 +18116,7 @@ mod tests {
                     .unwrap();
             }
             let (_, remaining, _) = owner.host.lock().unwrap().capacity(agent).unwrap();
-            assert!(maximum - remaining >= 32);
+            assert!(maximum - remaining >= 8);
             assert!(remaining > 0);
             let (work, authorization) = fresh_projection_pair(owner, 0xe8);
             let committee = owner.pins.replicas.clone();
@@ -18490,12 +18490,12 @@ mod tests {
                     observation.ordered_index,
                     initial.0.ordered_index + 2 * index as u64
                 );
-                // Checkpoint scheduling now rotates idle projections at 32
+                // Checkpoint scheduling now rotates idle projections at 8
                 // retained entries, not only at the hard history boundary.
                 // Sampling before dispatch allows one completed two-entry pair
                 // beyond that threshold before the next checkpoint attempt.
                 assert!(
-                    observation.retained_entries <= 34,
+                    observation.retained_entries <= 10,
                     "query {index} retained {} entries",
                     observation.retained_entries
                 );

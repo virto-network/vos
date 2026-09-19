@@ -64,7 +64,10 @@ const ORDERED_REPLY_WAIT: Duration = Duration::from_millis(1_800);
 
 // Host scheduling policy, not a protocol capacity or retention limit. Keep
 // ordinary system projections from accumulating a large cold-replay suffix.
-const SYSTEM_PROJECTION_CHECKPOINT_SUFFIX: u64 = 32;
+// Thirty large runtime calls in a below-threshold suffix took about30s in
+// release recovery. Schedule earlier at idle boundaries; this does not change
+// protocol capacity, snapshot authentication, or pending-operation exclusion.
+const SYSTEM_PROJECTION_CHECKPOINT_SUFFIX: u64 = 8;
 
 fn projection_checkpoint_due(remaining_slots: u64) -> bool {
     (shared_raft::MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES as u64).saturating_sub(remaining_slots)
@@ -4877,8 +4880,8 @@ mod tests {
     fn opportunistic_projection_checkpoint_threshold_and_gate() {
         let maximum = shared_raft::MAX_AGENT_RAFT_ORDERED_EVIDENCE_ENTRIES as u64;
         assert!(!projection_checkpoint_due(maximum));
-        assert!(!projection_checkpoint_due(maximum - 31));
-        assert!(projection_checkpoint_due(maximum - 32));
+        assert!(!projection_checkpoint_due(maximum - 7));
+        assert!(projection_checkpoint_due(maximum - 8));
         assert!(projection_checkpoint_due(0));
         let key = ProjectionPairKey {
             invocation: crate::agent_sdk::InvocationId([1; 32]),

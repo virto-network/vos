@@ -45,7 +45,9 @@ See [review guide](agent-saga-review.md) and [evidence handoff](agent-saga-hando
 
 Next performance step: attribute repeated large runtime calls during system
 recovery and evaluate authenticated checkpoint scheduling/replay cost. Current
-opportunistic checkpoint policy waits for32 retained physical entries. Do not
+released checkpoint policy waits for32 retained physical entries. A source
+candidate schedules at8 using the same authenticated path; checkpoint safety
+tests and the complete514-query workload pass, but live cost is unmeasured. Do not
 lower safety/retention bounds, omit replay, or publish readiness before recovery
 to meet a latency number. Any scheduling change must prove exact recovery and
 measure both restart and steady-state cost. The other gates remain in scope.
