@@ -1499,6 +1499,83 @@ fn resolve_private_application(
 
 struct Ed25519CredentialVerifier;
 
+#[cfg(test)]
+mod genesis_certificate_backend_tests {
+    use super::*;
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use vos::agent::committee::{
+        AuthorityClaimCommitment, AuthorityClaimDomain, AuthorityCommittee,
+        AuthorityCommitteeMember, AuthorityMemberRole, AuthorityQuorumCertificate,
+        AuthoritySignature,
+    };
+
+    #[test]
+    fn authority_strict_backend_verifies_exact_genesis_qc() {
+        let key = SigningKey::from_bytes(&[0x61; 32]);
+        let member = AuthorityCommitteeMember::new(
+            vos::service::NodeId([0x62; 32]),
+            key.verifying_key().to_bytes(),
+            AuthorityMemberRole::Voter,
+        )
+        .unwrap();
+        let signer = member.signer();
+        let committee = AuthorityCommittee::new(
+            vos::service::SpaceId([0x63; 32]),
+            vos::service::Hash([0x64; 32]),
+            1,
+            None,
+            vec![member],
+        )
+        .unwrap();
+        let claim = AuthorityClaimCommitment::of_bytes(
+            AuthorityClaimDomain::AgentGenesis,
+            3,
+            b"exact ordinary genesis claim",
+        );
+        let message = AuthorityQuorumCertificate::signing_message(
+            committee.authority_binding(),
+            committee.epoch(),
+            committee.commitment(),
+            claim,
+        );
+        let signature = key.sign(&message.0).to_bytes();
+        let certificate = AuthorityQuorumCertificate::new(
+            &committee,
+            claim,
+            vec![AuthoritySignature::new(signer, signature).unwrap()],
+        )
+        .unwrap();
+        let strict = |public: &[u8; 32], message: &[u8], signature: &[u8; 64]| {
+            AuthorityCredentialVerifier::verify(
+                &Ed25519CredentialVerifier,
+                public,
+                message,
+                signature,
+            )
+        };
+        assert!(certificate.verify_with(&committee, claim, strict).is_ok());
+        let mut invalid_signature = signature;
+        invalid_signature[0] ^= 1;
+        let invalid = AuthorityQuorumCertificate::new(
+            &committee,
+            claim,
+            vec![AuthoritySignature::new(signer, invalid_signature).unwrap()],
+        )
+        .unwrap();
+        assert!(invalid.verify_with(&committee, claim, strict).is_err());
+        let other_claim = AuthorityClaimCommitment::of_bytes(
+            AuthorityClaimDomain::AgentGenesis,
+            3,
+            b"substituted ordinary genesis claim",
+        );
+        assert!(
+            certificate
+                .verify_with(&committee, other_claim, strict)
+                .is_err()
+        );
+    }
+}
+
 fn canonical_credential_public_key(public_key: &[u8; 32]) -> bool {
     VerifyingKey::from_bytes(public_key).is_ok_and(|key| !key.is_weak())
 }

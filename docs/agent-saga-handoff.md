@@ -12,6 +12,21 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-20: Authority strict-backend QC regression passes
+
+A test in the nested Authority actor uses its existing
+`Ed25519CredentialVerifier` with `AuthorityQuorumCertificate::verify_with`.
+A real signed AgentGenesis-domain claim verifies; altered signature and
+substituted claim reject. Targeted test1 passed,0 ignored,58 filtered,0.02s
+(session69539 exit0). Nested formatting/diff checks pass. Initial test compile
+failed because an infallible claim constructor was incorrectly unwrapped;
+the two test-only calls were corrected. Both logs remain under shared
+`target/task-tmp/final-review-release.HbPbex/`:
+`authority-genesis-backend.log` and `authority-genesis-backend-fixed.log`.
+This is native actor-library coverage, not a compiled PVM execution or durable
+publication test. Production actor methods/state, artifacts and qualified
+release remain unchanged; no publication/finality completion is claimed.
+
 ### 2026-09-20: no-std caller-supplied certificate signature backend
 
 The Authority guest does not enable vos `std` or `agent-runtime`, so the default
