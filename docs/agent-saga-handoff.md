@@ -10,6 +10,28 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: pinned-toolchain formatting gate fails (read-only check)
+
+At `b437af09`, both `cargo +nightly-2025-05-09 fmt --all -- --check` and the
+`just check-all` recipe's exact formatting command, `cargo fmt -- --check`
+with that same pinned toolchain, exit1. Their logs are byte-identical and show
+40 diff locations across15 files. This is a real remaining release gate, not
+a compiler/test failure or a missing formatter. No source files were changed.
+
+Files: vos agent journal_store, production_owner, shared_host,
+shared_journal_driver, standard and wire; vos ingress/server and node; SDK
+authority_operation, catalog, proof, runtime and wire; CLI local_create and
+local_operation_live_tests. Several differences are in tests, but guest-linked
+files also appear. Apply the mechanical formatting as one scoped follow-up after
+the running host-feature suite completes, check the resulting diff, and rerun
+the gate. Do not assume rebuilt guest bytes are identical after source-location
+changes; retain the immutable reproduced source pin unless a measured rebuild
+and the required qualification justify another repin.
+
+Evidence under shared `target/task-tmp/role-length-release.UnaSE1/`:
+`format-check.log`, `format-recipe-check.log`. The host-feature suite remains a
+separate live run, session38510, and must be polled rather than restarted.
+
 ### 2026-09-19: ordinary Shared finality read and ownership audit
 
 Read-only source audit while the post-pin host-feature suite runs. The exact
