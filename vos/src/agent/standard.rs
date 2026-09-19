@@ -2830,6 +2830,23 @@ impl StandardAgentRuntime {
                     return Err(InvocationError::InvalidAvailability);
                 }
             }
+            // Artifact references bind both length and digest. Reject an
+            // impossible role by the actual preimage length before hashing;
+            // never use the caller-supplied reference as proof of its bytes.
+            // In particular, large program blobs usually cannot be schema,
+            // policy or constructor data. Program identity above remains an
+            // independent, domain-separated digest of the complete bytes.
+            let len = blob.bytes.len() as u64;
+            if len != actor.record.agent_schema.len
+                && len != actor.record.role_policies.len
+                && actor
+                    .record
+                    .installation_data
+                    .as_ref()
+                    .is_none_or(|expected| len != expected.len)
+            {
+                continue;
+            }
             let portable = crate::agent_sdk::BlobRef::of_bytes(&blob.bytes);
             if portable.hash.0 == actor.record.agent_schema.hash.0
                 && portable.len == actor.record.agent_schema.len

@@ -10,6 +10,47 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: artifact-role length rejection candidate
+
+`resolve_clean_invocation` now checks actual preimage length before computing
+the domain-separated blob digest for schema/policy/constructor roles. If none
+of those references has that length, the preimage cannot match any role.
+Program identity is still computed independently from complete bytes. Possible
+matches are still hashed; caller-supplied references are not trusted. Duplicate
+and aliased-role rejection, application availability construction, signatures,
+expiry, readiness and recovery are unchanged. This is not a validation cache.
+
+New native regression checks same-length corruption of both schema and policy,
+changed lengths with unchanged supplied references, and duplicates. Existing
+role-alias regression also passes. Whole wire suite against the existing bundle:
+95 passed/1 ignored in30.78s, including empty installation-data/resume coverage.
+Repeated with COST/ACK/FAILURE/TYPED_ERROR/EXPIRY candidate overrides:95 passed/
+1 ignored in30.18s (`wire-candidate.log`). Only tests consuming those overrides
+execute the candidate PVM; the others remain native or bundled checks. This
+covers candidate malformed ACK, retirement, terminal failures, durable typed
+errors and expiry; it is not full Private/Attested proof qualification.
+
+Candidate guest builds with pinned guest toolchain in16.99s. Paired benchmarks
+against current bundle pass with identical complete output:
+
+| Work | Bundled gas | Candidate gas | Reduction |
+| --- | ---: | ---: | ---: |
+| Fresh Invoke | 579,883,967 | 463,462,521 | 20.1% |
+| Retained Invoke retry | 520,997,765 | 404,577,747 | 22.3% |
+| Fresh ACK of retained result | 336,976,258 | 278,766,249 | 17.3% |
+
+These are synthetic768KiB-program tests, not live inventory latency or a new
+production release. Candidate ProgramId:
+`e61dc1dacd564ac9371512eaaf9d35ad8f1e081f8e3b638ca9da9425e887e86b`.
+ELF BLAKE2b-256: `c9c3e01f31e2b5939fe5e13f71cfdfecf9b68faeebf8e7192c94fdd34ed2c081`.
+PVM BLAKE2b-256: `8f4dd034314963408c2f7650147aeb7311094a4528f936881155eb238eff9fd7`.
+Evidence: shared `target/task-tmp/role-length-candidate.D59PGi/` contains saved
+ELF/PVM and `cost.log`; adjacent `role-length-native-20260919.log`,
+`role-length-guest-build-20260919.log`, `role-length-wire-regressions-20260919.log`.
+No release pins changed. Independent reproduction, atomic repin and fresh
+release qualification remain required. Preserve existing fixtures at their
+original paths and do not boot them using a new-generation pin.
+
 ### 2026-09-19: fresh large-program Invoke baseline added without changing release pins
 
 Added `bundled_runtime_large_fresh_invoke_validation_cost`: a valid tiny Public

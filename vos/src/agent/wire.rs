@@ -9296,6 +9296,40 @@ pub(crate) mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
+    fn clean_resolution_length_filter_still_hashes_matching_roles() {
+        use crate::agent_sdk::InvocationError;
+
+        let (runtime, work) = clean_resolvable_fixture(false);
+        let expected = runtime.resolve_clean_invocation(&work).unwrap();
+        // Schema and policy deliberately have the same length; length alone
+        // must never select a role. Supplied references remain unchanged.
+        assert_eq!(expected.2.bytes.len(), expected.3.bytes.len());
+        for role in [&expected.2, &expected.3] {
+            let index = work.availability.iter().position(|blob| blob == role).unwrap();
+            for change_length in [false, true] {
+                let mut corrupted = work.clone();
+                if change_length {
+                    corrupted.availability[index].bytes.push(0xff);
+                } else {
+                    corrupted.availability[index].bytes[0] ^= 1;
+                }
+                assert_eq!(
+                    runtime.resolve_clean_invocation(&corrupted),
+                    Err(InvocationError::InvalidAvailability),
+                );
+            }
+            let mut duplicated = work.clone();
+            duplicated.availability.push(role.clone());
+            assert_eq!(
+                runtime.resolve_clean_invocation(&duplicated),
+                Err(InvocationError::InvalidAvailability),
+            );
+        }
+        assert_eq!(runtime.resolve_clean_invocation(&work).unwrap(), expected);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
     fn clean_pending_retry_and_resume_validation_are_exact_and_state_preserving() {
         use crate::actors::codec::Encode as _;
         use crate::agent_sdk::{InvocationError, ResumeInput, RuntimeOutcome, RuntimeWork};

@@ -6,6 +6,14 @@ checkpoint, not production or master sign-off. `saga/agents` remains at
 
 ## What can be tested
 
+There is now an **unpinned source optimization candidate** after the qualified
+release: artifact resolution checks actual byte length before computing a blob
+digest for impossible schema/policy/constructor roles. Paired synthetic tests
+show20.1% less fresh-Invoke gas with identical complete output. Independent
+reproduction, repinning and release requalification are still required before
+claiming that improvement for the shipped bundle. The release described below
+remains unchanged; see the handoff for candidate evidence.
+
 Latest source pins the independently reproduced Invoke-recovery optimization
 from `24000c8a`, ProgramId `e815f4b010f7213290850189f5bc20fc54533068f0d73ea4982de9414b1135e9`.
 Its large-retry benchmark reduces gas18.3% with identical output; focused
