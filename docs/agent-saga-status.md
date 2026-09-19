@@ -91,6 +91,8 @@ These do not qualify all examples/external links or host issuer reclamation.
 At2c340623, `just test-pvm-proof-fast` passes120 library,1 arithmetic,15
 control-flow and7 memory tests, with zero failures/ignored. This does not close
 the full Private/Attested cryptographic proof matrix.
+Atbe0b54f4, `just check-pvm-proof-no-std` and `just check-pvm-proof-wasm` also
+pass. These are verifier portability builds, not WASM execution qualification.
 
 Post-pin broad library regressions are complete; the production gaps above remain.
 The subsequent host/journal cleanup and boxed network command have targeted

@@ -10,6 +10,22 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: verifier portability build gates pass
+
+At `be0b54f4`, both unchanged recipes complete with exit0 using
+nightly-2025-05-09, offline Cargo dependencies and the shared disk-backed
+target/TMPDIR:
+
+- `just check-pvm-proof-no-std`: proof crate without default features and the
+  standalone verifier build,1.23s/0.24s (session76266).
+- `just check-pvm-proof-wasm`: the existing wasm32-unknown-unknown target is
+  reported up to date, then the verifier cross-build passes in1.34s (session86619).
+
+Logs: shared `target/task-tmp/decoded-input-release.RIkx3j/pvm-proof-no-std.log`
+and `pvm-proof-wasm.log`. These prove the specified build configurations, not
+WASM execution, target performance, or full Private/Attested proof coverage.
+No runtime source or artifact pins changed; both processes are terminal.
+
 ### 2026-09-19: fast PVM proof recipe passes
 
 At `2c340623`, `just test-pvm-proof-fast` completed unchanged with exit0
