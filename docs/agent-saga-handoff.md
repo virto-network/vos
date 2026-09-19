@@ -10,6 +10,45 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: independently reproduce and atomically pin decoded-input runtime
+
+Exported immutable `330274bb139885b61e833bb63768a3024b5b9797` twice with
+`git archive`, into separate source and target trees under shared disk-backed
+`target/task-tmp/decoded-input-reproduction.ge5gNd/`. Both locked/offline
+nightly-2026-03-20 builds pass in30.92s/30.88s. The preserved frozen converter
+produces identical PVMs. Both ELF files, both PVMs, and the previously measured
+candidate match byte-for-byte (session81910 exit0). Identities are exactly the
+candidate IDs recorded below. Script, build logs, source trees, ELF/PVM bytes
+and converter identity logs remain in that evidence directory.
+
+Updated the runtime source/program/ELF/PVM provenance manifest, protocol
+ProgramId, CLI build digest and committed PVM together. The PVM grows from
+983,825 to984,164 bytes. System templates, public signing seed, outer ABI,
+guest/host toolchains and other production artifacts remain unchanged.
+No old space/store was opened or modified, and no release binary was rebuilt.
+
+Focused post-pin verification (locked/offline nightly-2025-05-09, shared target
+and disk-backed TMPDIR):
+
+- CLI production-release checks:18 passed,0 failed in1.56s; session85573 exit0,
+  `release-pin-tests.log`. Filtered integration binaries ran zero tests and
+  are not counted as passes. Runtime byte/ProgramId pins, host-call surface,
+  release-manifest semantics and self-contained bundle checks pass.
+- Full wire module with the new bundled artifact and no candidate override:
+  97 passed,0 failed,1 ignored in31.40s; session90601 exit0,
+  `bundled-wire-tests.log`. The ignored test remains the fixed-work ACK CPU
+  profiling diagnostic. Formatting, diff checks and bundled/independent PVM
+  equality pass.
+
+Next: rebuild the release from this pin, preserve the previous executable,
+verify its bundle and use a NEW disposable space for Create/Install/Invoke,
+restart, positive retirement/ACK and readiness/shutdown measurements. Previous
+fixtures including `current-latency.VSCZEK` are now older-pin evidence: do not
+boot them with the new executable. The old live-qualified release remains
+`b16abf81`/SHA-256 `e76cf5428ebc443ec7cc6859c162ee7b9ec67e5fb03706b2ee9798051fa84106`.
+New full CLI/default/host regression gates and all outstanding production work
+remain open. A reproduced artifact and focused tests are not production sign-off.
+
 ### 2026-09-19: decoded-input validation reuse candidate reduces fresh Invoke/ACK gas
 
 Implemented the next bounded optimization identified by the profile. The

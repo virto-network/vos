@@ -5,7 +5,13 @@
 Use these two ranges for the current review; the older snapshot below remains
 historical evidence. No merge or push is implied by this breakdown.
 
-Latest source includes the artifact-role length optimization and independently
+The subsequent decoded-input optimization is now independently reproduced and
+pinned from `330274bb`, with18 release checks and97 bundled wire tests passing
+(1 ignored). It belongs with batch2. Its release rebuild and fresh live
+qualification are still pending; the frozen ranges below remain the previous
+live-qualified checkpoint, not evidence for the new pin.
+
+That checkpoint includes the artifact-role length optimization and independently
 reproduced pin from `19d73390`; these also belong in batch2. Its release rebuild,
 fresh-space qualification, full CLI, default-library and host-feature suites
 pass. The latter completes1,873 tests/3 ignored before the subsequent mechanical

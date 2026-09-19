@@ -6,16 +6,19 @@ checkpoint, not production or master sign-off. `saga/agents` remains at
 
 ## What can be tested
 
-Source now also contains an **unbundled decoded-input validation-reuse
-candidate**: paired exact-output tests use12.6% less fresh-Invoke gas and20.9%
-less ACK gas. Its two new rejection/equivalence tests, wire suite97/1 ignored,
-and real bundled-Authority query pass. Independent reproduction, repinning,
-release rebuild and live latency qualification are still pending. The
-qualified release and all production pins below remain unchanged; see the
-handoff for candidate identity and exact evidence.
+Latest source now pins decoded-input validation reuse from immutable
+`330274bb139885b61e833bb63768a3024b5b9797`, ProgramId
+`ebed0967a4d987e2f50f6e8908b294f713b0cf74583d1b5dc6648a8a542a049c`.
+Two isolated ELF/PVM builds match each other and the measured candidate.
+Paired exact-output tests use12.6% less fresh-Invoke gas and20.9% less ACK gas
+than the preceding bundle. Post-pin release checks18/18 and bundled wire
+checks97/1 ignored pass. The real candidate Authority-query test also passes.
+**Release rebuild and fresh live qualification for this new pin are pending.**
+Do not boot any preserved older-pin fixture with a newly built binary.
+See the handoff for exact evidence and qualification boundaries.
 
-Latest source now pins the independently reproduced artifact-role length
-optimization from `19d73390`, ProgramId
+The last live-qualified release pins the artifact-role length optimization
+from `19d73390`, ProgramId
 `e61dc1dacd564ac9371512eaaf9d35ad8f1e081f8e3b638ca9da9425e887e86b`.
 Paired synthetic tests show20.1% less fresh-Invoke gas with identical complete
 output. Two isolated ELF/PVM builds match each other and the measured candidate.
@@ -58,8 +61,8 @@ is not independently merge-ready.
 See [review guide](agent-saga-review.md) and [evidence handoff](agent-saga-handoff.md).
 
 The qualified implementation remains the review/disposable Local-space
-checkpoint. The separately measured source candidate above is not a new
-deployment checkpoint until its reproduction and release gates pass.
+checkpoint. The newly reproduced/pinned source above is not a new deployment
+checkpoint until its remaining release gates pass.
 The post-`36e63581` uncommitted Shared-finality experiment has been removed:
 it depended on legacy embedded authority state absent from clean Create. Its
 failed test and patch are preserved in the evidence directory; see the handoff.
@@ -86,7 +89,7 @@ with bounded equivalence/recovery checks and repeat release qualification.
 | Formatting | Pinned-host `cargo fmt -- --check` now passes after mechanical rustfmt cleanup of15 files, applied only after the full host-feature suite completed. No release artifact or lint configuration changed. |
 | Workspace lint | At7b45d2f0, the `check-all` Clippy flags fail in vos with351 diagnostics (258 unused/dead-code,1 unused-mut,92 others). Downstream workspace lint completion is unproven; no broad lint allowances added. |
 | Cutover supporting gates | At7bc52924, system-authority58/58 and system-catalog10/10 tests pass; SDK no-default-feature intra-doc-link check and static clean-break CLI/docs check pass. Atcda6c997, SDK165/165 tests and vos no-default-feature library check pass. These do not substitute for the entire `just clean-break-check` or `just check-all` recipes. |
-| Release integration | Current-pin CLI atb16abf81:255 passed/19 ignored; default library at02dbc8c6:1,434 passed/1 ignored; host-feature library on the same frozen runtime source:1,873 passed/3 ignored. These full suites predate the mechanical formatting cleanup. Current-pin actor-build4/task-build1 integration tests pass atcda6c997. Startup still fails10s. Full cryptographic proof qualification and remaining release audit/sign-off stay open. |
+| Release integration | Prior-pin CLI atb16abf81:255 passed/19 ignored; default library at02dbc8c6:1,434 passed/1 ignored; host-feature library on the same frozen runtime source:1,873 passed/3 ignored. These full suites predate the mechanical formatting cleanup and decoded-input repin. Prior-pin actor-build4/task-build1 integration tests pass atcda6c997. New pin:18 release checks and97 wire tests pass (1 ignored). Full regressions, new release rebuild/live qualification, full cryptographic proof qualification and remaining sign-off stay open. |
 
 Next performance step: address the roughly17s authenticated two-agent inventory.
 Current-pin log attribution puts9.56s of the post-Create16.68s inside runtime:
