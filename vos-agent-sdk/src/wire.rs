@@ -6651,6 +6651,67 @@ mod tests {
     }
 
     #[test]
+    fn invoke_authorization_single_work_check_matches_previous_predicate() {
+        fn previous(
+            authorization: &InvocationAuthorization,
+            work: &InvocationWork,
+            observed_slot: u64,
+        ) -> bool {
+            if !authorization.matches_work(work) {
+                return false;
+            }
+            match authorization {
+                InvocationAuthorization::AuthorityReceipt(_) => true,
+                InvocationAuthorization::PublicPreflight(preflight) => {
+                    preflight.matches_work(work) && observed_slot >= preflight.observed_slot
+                }
+            }
+        }
+
+        let mut original = invocation();
+        original.origin.capability = None;
+        original.roles = InvocationRoleClaims::none();
+        let mut variants = alloc::vec![original.clone()];
+        let mut changed = original.clone();
+        changed.message.push(0x91);
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.origin.transport_node = Some(NodeId([0x92; 32]));
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.roles.space = Some(RoleId([0x93; 32]));
+        variants.push(changed);
+
+        let preflight = PublicPreflight::for_work(&original, 45);
+        let mut zero_commitment = preflight;
+        zero_commitment.work = Hash::ZERO;
+        let mut different_origin = preflight;
+        different_origin.origin.transport_node = Some(NodeId([0x94; 32]));
+        let authorizations = [
+            InvocationAuthorization::PublicPreflight(preflight),
+            InvocationAuthorization::PublicPreflight(zero_commitment),
+            InvocationAuthorization::PublicPreflight(different_origin),
+            // Even a self-consistent commitment must not admit public role claims.
+            InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&variants[3], 45)),
+            InvocationAuthorization::AuthorityReceipt(receipt_for(&original)),
+        ];
+        for authorization in &authorizations {
+            for work in &variants {
+                for slot in [0, 44, 45, 46, u64::MAX] {
+                    assert_eq!(
+                        authorization.matches_invoke(work, slot),
+                        previous(authorization, work, slot),
+                        "authorization matching differs at observation {slot}"
+                    );
+                }
+            }
+        }
+        assert!(authorizations[0].matches_invoke(&original, 45));
+        assert!(!authorizations[0].matches_invoke(&original, 44));
+        assert!(!authorizations[3].matches_invoke(&variants[3], 45));
+    }
+
+    #[test]
     fn public_preflight_wire_binds_exact_work_origin_and_acceptance_slot() {
         let mut invocation = invocation();
         invocation.origin.capability = None;

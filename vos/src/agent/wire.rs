@@ -10029,6 +10029,96 @@ pub(crate) mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
+    fn bundled_runtime_public_preflight_matching_cost() {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        use crate::agent_sdk::{
+            InvocationAuthorization, PublicPreflight, RuntimeOutcome, RuntimeTransition,
+            RuntimeWork,
+        };
+
+        let mut fresh = clean_actor_fixture_with_padding(Some(crate::actors::STATUS_DONE), 4096);
+        let RuntimeWork::Invoke {
+            invocation,
+            authorization,
+            observed_slot,
+            ..
+        } = &mut fresh
+        else {
+            unreachable!()
+        };
+        invocation.origin.capability = None;
+        invocation.roles = crate::agent_sdk::InvocationRoleClaims::none();
+        *authorization = Box::new(InvocationAuthorization::PublicPreflight(
+            PublicPreflight::for_work(invocation, *observed_slot),
+        ));
+        let completed = apply_standard_runtime_work(fresh.clone()).unwrap();
+        assert!(matches!(
+            completed.outcome,
+            RuntimeOutcome::Completed(Ok(_))
+        ));
+        let RuntimeWork::Invoke {
+            context,
+            invocation,
+            authorization,
+            ..
+        } = fresh.clone()
+        else {
+            unreachable!()
+        };
+        let ack = RuntimeWork::Acknowledge {
+            context,
+            state: completed.state,
+            invocation,
+            authorization,
+        };
+        let mut programs = vec![(
+            "bundled",
+            include_bytes!("../../../vosx/blobs/agent_runtime.pvm").to_vec(),
+        )];
+        if let Some(path) = std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE") {
+            programs.push(("candidate", std::fs::read(path).unwrap()));
+        }
+        for (operation, work) in [("invoke", fresh), ("ack", ack)] {
+            let expected = apply_standard_runtime_work(work.clone()).unwrap();
+            if operation == "ack" {
+                assert!(matches!(
+                    expected.outcome,
+                    RuntimeOutcome::Acknowledged(Ok(_))
+                ));
+            }
+            let input = work.encode().unwrap();
+            let mut baseline_gas = None;
+            for (label, program) in &programs {
+                let execution =
+                    vos_pvm::refine_host::RefineContext::load(program, &input, 2_000_000_000)
+                        .unwrap()
+                        .run();
+                assert_eq!(execution.exit, vos_pvm::ExitReason::Halt);
+                assert_eq!(
+                    execution
+                        .output_bounded(RuntimeTransition::MAX_ENCODED_BYTES)
+                        .unwrap(),
+                    expected.encode().unwrap(),
+                    "{label} {operation} changed exact transition bytes",
+                );
+                eprintln!(
+                    "public-preflight operation={operation} label={label} gas_used={}",
+                    execution.gas_used
+                );
+                if let Some(prior) = baseline_gas {
+                    assert!(
+                        execution.gas_used < prior,
+                        "candidate must reduce deterministic gas"
+                    );
+                } else {
+                    baseline_gas = Some(execution.gas_used);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
     fn bundled_runtime_large_fresh_invoke_validation_cost() {
         use crate::agent_sdk::wire::CanonicalWire as _;
         use crate::agent_sdk::{InvocationStatus, RuntimeOutcome, RuntimeTransition, RuntimeWork};

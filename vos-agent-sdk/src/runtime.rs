@@ -367,7 +367,10 @@ impl InvocationAuthorization {
             // those cases from its retained result/continuation before it can
             // execute application code.
             Self::PublicPreflight(preflight) => {
-                preflight.matches_work(work) && observed_slot >= preflight.observed_slot
+                // matches_work above already checked this exact immutable
+                // preflight/work pair, including the work commitment. Only
+                // the observation bound remains; do not hash the work twice.
+                observed_slot >= preflight.observed_slot
             }
         }
     }

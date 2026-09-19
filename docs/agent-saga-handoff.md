@@ -11,6 +11,48 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: candidate removes duplicate PublicPreflight commitment hash
+
+Following08139275, `InvocationAuthorization::matches_invoke` still performs its
+initial full immutable `matches_work` check. Its PublicPreflight branch now only
+checks the observation-slot lower bound rather than repeating matches_work and
+hashing the same work again. Receipt matching, origin/role restrictions, blob
+validation, signature verification and wire encodings are unchanged.
+
+SDK166 tests pass, including100 predicate comparisons against the previous
+implementation (five authorization variants, four work variants, five slots).
+No-default-feature SDK check and pinned-host formatting pass. Full PVM-enabled
+runtime-wire module passes98 tests,0 failures,1 ignored in30.04s (session5841).
+This includes decoded-input/corruption checks. Initial commands without `pvm`
+selected0 runtime tests; those logs are preserved and are not coverage.
+
+Pinned guest build passes (session2031,23.92s). Existing released converter
+produces candidate `single-preflight-candidate.pvm`, ProgramId
+`8071ad67661c6539ab504ccecc18c9e8d6d858803b52fca05389823f8109d3cc`.
+The new paired physical test runs bundled and candidate programs on identical
+PublicPreflight Invoke and ACK bytes with4KiB inert actor padding, requiring
+complete transition-byte equality and strictly reduced gas (session94424,
+1 passed,0 failed,0 ignored,0.62s):
+
+| Operation | Bundled gas | Candidate gas |
+| --- | ---: | ---: |
+| Invoke | 25,637,967 | 25,272,180 |
+| ACK | 23,843,674 | 23,661,467 |
+
+Savings1.43%/0.76% are modest and do not establish an end-to-end latency gain.
+The full wire suite uses the existing bundle against native source expectations;
+only the explicit paired cost test executes the candidate too. Logs are under
+shared `target/task-tmp/review-checkpoint-release.6a7GXF/`, named
+`single-preflight-{sdk,runtime,guest,cost,cost-pvm,no-std,wire}.log`.
+
+Production manifest, embedded artifacts and release executable remain unchanged.
+This source change intentionally creates a new candidate, not a qualified repin:
+current-source bundle reproduction no longer matches until artifact release work
+is completed. Independently reproduce from committed source, qualify remaining
+candidate paths and evaluate whether the saving warrants release work before
+replacing any pin. The d4d38ebb live-tested executable remains the review/test
+deployment checkpoint. No old fixture was migrated and no merge/push occurred.
+
 ### 2026-09-19: current live query phase attribution
 
 Read-only analysis of `current-latency.VF0MXp/up.log` finds21 complete projection
