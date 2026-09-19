@@ -10,6 +10,25 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: large Invoke retry validation baseline
+
+Added `bundled_runtime_large_invoke_retry_validation_cost`, using a retained
+receipt-bearing terminal result with768KiB availability. It isolates outer
+validation/recovery, not fresh actor execution. The committed guest completes
+with the exact expected reply: input793,742 bytes,637,510,333 gas,1,347,866us
+in this run. With `VOS_AGENT_RUNTIME_COST_CANDIDATE`, the same test additionally
+requires byte-identical whole output and strictly lower deterministic gas.
+No production implementation or artifact changed.
+
+The focused host-feature test passes1/1 in1.36s, session70838 terminal0;
+evidence `target/task-tmp/current-latency.p7U3OE/large-invoke-retry-baseline.log`.
+Source inspection locates a candidate duplicate: both `recover_clean_execution`
+and `recover_clean_invocation_error` perform full work/authorization validation
+then call `recover_clean_acknowledgement`, which validates the same immutable
+work again. Any private continuation must retain signature/scope checks, error
+precedence, exact retirement comparisons and malformed-preimage rejection.
+This observation is not a measured candidate improvement or a release gate pass.
+
 ### 2026-09-19: no-std boundary and pinned maintained-example builds
 
 `cargo +nightly-2025-05-09 check --locked --offline -p vos --no-default-features --lib`

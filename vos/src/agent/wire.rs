@@ -9690,6 +9690,65 @@ pub(crate) mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
+    fn bundled_runtime_large_invoke_retry_validation_cost() {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        use crate::agent_sdk::{
+            InvocationAuthorization, RuntimeExecutionContext, RuntimeOutcome, RuntimeTransition,
+            RuntimeWork,
+        };
+
+        // A retained result isolates outer-runtime validation/recovery from
+        // actor execution. This is not fresh actor execution throughput.
+        let (state, work, receipt, reply) = clean_terminal_fixture_with_program_size(768 * 1024);
+        let input = RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
+            state,
+            invocation: Box::new(work),
+            authorization: Box::new(InvocationAuthorization::AuthorityReceipt(receipt)),
+            observed_slot: 1,
+        }
+        .encode()
+        .unwrap();
+        let mut programs = vec![(
+            "bundled",
+            include_bytes!("../../../vosx/blobs/agent_runtime.pvm").to_vec(),
+        )];
+        if let Some(path) = std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE") {
+            programs.push(("candidate", std::fs::read(path).unwrap()));
+        }
+        let mut baseline = None;
+        for (label, program) in programs {
+            let started = std::time::Instant::now();
+            let execution =
+                vos_pvm::refine_host::RefineContext::load(&program, &input, 2_000_000_000)
+                    .unwrap()
+                    .run();
+            assert_eq!(execution.exit, vos_pvm::ExitReason::Halt);
+            let output = execution
+                .output_bounded(RuntimeTransition::MAX_ENCODED_BYTES)
+                .unwrap();
+            let transition = RuntimeTransition::decode(&output).unwrap();
+            assert_eq!(transition.outcome, RuntimeOutcome::Completed(Ok(reply.clone())));
+            eprintln!(
+                "large-invoke-retry label={label} input_bytes={} gas_used={} elapsed_us={}",
+                input.len(),
+                execution.gas_used,
+                started.elapsed().as_micros()
+            );
+            if let Some((prior_output, prior_gas)) = &baseline {
+                assert_eq!(&output, prior_output);
+                assert!(
+                    execution.gas_used < *prior_gas,
+                    "candidate must reduce deterministic gas"
+                );
+            } else {
+                baseline = Some((output, execution.gas_used));
+            }
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
     fn bundled_runtime_large_acknowledgement_validation_cost() {
         use crate::agent_sdk::wire::CanonicalWire as _;
         use crate::agent_sdk::{
