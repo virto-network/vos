@@ -51,6 +51,12 @@ See [review guide](agent-saga-review.md) and [evidence handoff](agent-saga-hando
 
 Freeze implementation here for review and disposable Local-space testing; do
 not start another guest/artifact change merely to fill the remaining budget.
+The post-`36e63581` uncommitted Shared-finality experiment has been removed:
+it depended on legacy embedded authority state absent from clean Create. Its
+failed test and patch are preserved in the evidence directory; see the handoff.
+The review implementation checkpoint is `36e63581`, with the separately built
+and qualified release still at `b16abf81`. Ordinary Shared finality needs clean
+system-authority actor integration, not a switch to the legacy replay helper.
 No merge or push is authorized by this checkpoint. Fresh Create/Install/invocation
 have now been measured, but not as a controlled before/after comparison.
 Preserve original fixture paths and failure evidence. When implementation

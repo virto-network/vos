@@ -10,6 +10,42 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: reject legacy-state Shared finality experiment; keep review checkpoint clean
+
+The uncommitted ordinary-finality experiment following `36e63581` was removed
+after its live-reader test failed: it returned `Unavailable`, not the expected
+`NotFinalized`. Evidence remains in shared disk-backed
+`target/task-tmp/role-length-release.UnaSE1/finality-reader-test.log` and
+`rejected-finality-experiment.patch`; no fixture or failure log was deleted.
+The experiment's constructed-view unit test passed, but did not establish
+compatibility with clean production replay.
+
+This corrects the earlier ordinary Shared read/ownership audit below:
+`materialized_system_authority_view` requires decoded Standard runtime
+`system_authority` state. Clean descriptor conversion explicitly sets
+`system_authority_genesis: None`; it does not initialize that legacy embedded
+ledger. The failing clean replay fixture also uses opaque control bytes, so
+its failure alone is not evidence about production decoding. Source inspection
+establishes the separate embedded-ledger mismatch. Do not initialize legacy
+authority state or weaken provenance checks to make this approach pass.
+
+Ordinary Shared issuance/archive/finality must instead be integrated with the
+clean system-authority actor's authenticated decision evidence and lifecycle.
+The root-first reopen and non-reentrant ownership requirements from the prior
+audit still apply. Native admission remains fail-closed. No production finality
+implementation, guest artifact change, merge or push was made. The committed
+`36e63581` implementation remains the review checkpoint; the reproduced release
+binary is still the separately qualified `b16abf81` build.
+
+After removing only the experiment's211 added Rust lines, all three source
+files exactly match `36e63581`. Pinned-host formatting and `git diff --check`
+pass. The restored provenance regression
+`memory_clone_drops_root_provenance_while_original_remains_reverified` passes
+(1 passed, 0 failed, 1,875 filtered out; session34702 exit0), using the same
+four host features as the full host suite, offline/locked and disk-backed
+TMPDIR. Log: `finality-experiment-removal-test.log` in the same evidence
+directory. This verifies restoration, not completion of Shared finality.
+
 ### 2026-09-19: complete host-feature regression and mechanical formatting cleanup
 
 Original host-feature session38510 completes successfully, exit0:1,873 passed,
@@ -132,8 +168,10 @@ separate live run, session38510, and must be polled rather than restarted.
 
 ### 2026-09-19: ordinary Shared finality read and ownership audit
 
-Read-only source audit while the post-pin host-feature suite runs. The exact
-permanent-fact read can be built from existing authenticated components:
+Historical read-only audit while the post-pin host-feature suite ran. The
+later experiment above invalidates this as a clean-production implementation
+plan: these components require legacy embedded authority state. The proposed
+permanent-fact read was:
 
 1. `replay::materialized_system_authority_view` authenticates materialization,
    compares durable Heads with the materialized Heads/ID and reverified root
