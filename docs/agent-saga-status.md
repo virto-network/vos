@@ -78,12 +78,13 @@ with bounded equivalence/recovery checks and repeat release qualification.
 | Recovery/proof qualification | Remaining mixed pending/crash/capacity cases, pre-expiry Abort/management expiry, cross-runtime portable positive ACK, and full Private/Attested cryptographic proof matrix. |
 | Formatting | Pinned-host formatting passes, including after decoded-input validation reuse. No lint allowances added. |
 | Workspace lint | At7b45d2f0, the `check-all` Clippy flags fail in vos with351 diagnostics (258 unused/dead-code,1 unused-mut,92 others). Downstream workspace lint completion is unproven; no broad lint allowances added. |
-| Cutover supporting gates | At7bc52924, system-authority58/58 and system-catalog10/10 tests pass; SDK no-default-feature intra-doc-link check and static clean-break CLI/docs check pass. Atcda6c997, SDK165/165 tests and vos no-default-feature library check pass. These do not substitute for the entire `just clean-break-check` or `just check-all` recipes. |
+| Cutover supporting gates | Full `just clean-break-check` passes at bf013ff1 with all nonzero test selections, nested actors, SDK intra-doc links and CLI/docs surface checks. Atcda6c997, SDK165/165 tests and vos no-default-feature library check pass. The broader `just check-all` recipe, workspace lint and all examples remain unqualified. |
 | Release integration | At8f96fad8: release build/bundle and fresh Local lifecycle pass; CLI255/19 ignored, release18/18 and wire97/1 ignored pass. Post-pin default library1,434/1 ignored and host-feature1,876/3 ignored pass with unchanged runtime source. Prior-pin actor-build4/task-build1 pass atcda6c997. Full cryptographic proof qualification and remaining sign-off stay open. |
 
 The post-pin `scripts/check-agent-clean-break.sh` gate also passes: retained CLI,
 removed compatibility surfaces/paths, and selected operator documentation.
-This does not establish the full `just clean-break-check` recipe or workspace lint.
+The full `just clean-break-check` recipe now also passes at bf013ff1; workspace
+lint and the broader `just check-all` recipe remain open.
 Post-pin supporting gates also pass: system-authority 58/58, system-catalog
 10/10, and SDK no-default-feature documentation with broken intra-doc links denied.
 These do not qualify all examples/external links or host issuer reclamation.

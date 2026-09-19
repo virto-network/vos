@@ -12,6 +12,9 @@ CLI255/19 ignored and a fresh Local lifecycle/restart probe now pass. The post-r
 default-library suite passes 1,434 tests, zero failures, one ignored in 195.71s;
 host-feature passes 1,876 tests, zero failures, three ignored in 1,403.60s.
 Production gates remain open.
+The full `just clean-break-check` recipe also passes at `bf013ff1`, with nonzero
+test selections and completed nested actor, SDK documentation and CLI-surface
+checks. This is not a pass for the broader `just check-all` recipe.
 
 Earlier default-library and host-feature successes belong to the preceding
 `19d73390` runtime pin; do not treat them as post-repin runs. See the handoff

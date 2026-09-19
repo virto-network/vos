@@ -10,6 +10,40 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: complete clean-break recipe passes
+
+At `bf013ff1`, the full `just clean-break-check` recipe was started unchanged,
+with `RUSTUP_TOOLCHAIN=nightly-2025-05-09`, `CARGO_NET_OFFLINE=true`, the shared
+`ch08-c2-native/target`, disk-backed TMPDIR, and local socket permission.
+Exec session `74299` finished with exit0; log:
+`target/task-tmp/decoded-input-release.RIkx3j/clean-break-recipe.log`.
+Every test selection ran nonzero tests and passed:
+
+| Selection | Passed | Ignored | Test time |
+| --- | ---: | ---: | ---: |
+| Clean bootstrap (`pvm`) | 75 | 1 | 805.26s |
+| Production owner | 11 | 0 | 0.13s |
+| Supervisor adapters | 27 | 0 | 0.03s |
+| CLI clean-space modules | 94 | 0 | 51.22s |
+| Private host | 63 | 0 | 81.91s |
+| Private store | 40 | 0 | 3.31s |
+| Private runtime | 21 | 0 | 0.02s |
+| Portable recovery selection | 6 | 0 | 5.70s |
+| System Authority actor | 58 | 0 | 102.52s |
+| System Catalog actor | 10 | 0 | 24.77s |
+
+SDK no-default-feature intra-doc-link checking and the final retained CLI/negative
+surface script also pass. The ignored bootstrap case is the explicit 64MiB
+initial-capture capacity diagnostic, not a pass. The full inventory-rotation
+workload ran unchanged. Counts overlap other suites; do not add them as unique
+coverage. Runtime source, lockfiles and artifacts are unchanged. Nested actor/docs
+recipes used this worktree's disk-backed `target/task-tmp`, not `/tmp`.
+Session74299 is terminal; there is no pending clean-break run to resume.
+This closes `just clean-break-check`, not `just check-all`, workspace Clippy,
+all examples, remaining proof/crash qualification, or production functionality
+and latency gaps. The six portable tests do not independently close the missing
+cross-runtime positive-ACK matrix.
+
 ### 2026-09-19: full post-pin host-feature regression passes
 
 Session55057 finished with exit0: **1,876 passed, zero failed, three ignored**,
