@@ -12,6 +12,31 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-20: pending clean Shared Create admission prerequisite
+
+`AgentGenesisProvision::verify_pending_create_at` validates the full provision,
+requires clean Shared Create, and binds its exact authorization plan, signer,
+system-Agent identity and receipt selectors to an independently selected pending
+call/approval. It verifies the credential signature, receipt signature at the
+genesis observation slot, publication-time liveness, and QC against the trusted
+committee using the caller's verifier. Publication before the recorded genesis
+observation rejects. Existing durable exact publication retries must bypass
+fresh admission only by reopening their exact retained record, not by weakening
+expiry checks. This method itself neither retains a decision nor grants finality.
+
+A clean-generation fixture with real Ed25519 credential/receipt/QC signatures
+passes using distinct authorization73/issuer7 clocks. Wrong timing, forged call,
+changed approval and wrong committee reject. All10 genesis tests pass
+(session28079 exit0,0 ignored,1429 filtered,0.08s). No-default-features library
+check passes (session37415 exit0,2.63s), and pinned formatting/diff checks pass.
+Evidence: `pending-genesis-admission-check.log` and
+`pending-genesis-admission-tests.log` under shared
+`target/task-tmp/final-review-release.HbPbex/`.
+This is a library admission prerequisite, not a wired publisher or a production
+Shared creation success. Actor durable state/methods, provider issuance,
+authenticated retrieval and replay-backed finality still require integration.
+The qualified e20cbb76 executable/artifact pins remain unchanged.
+
 ### 2026-09-20: reusable pre-publication receipt/approval binding
 
 The SDK's existing `receipt_matches_approval` comparison is now public for

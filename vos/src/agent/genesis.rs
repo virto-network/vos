@@ -1226,6 +1226,66 @@ impl AgentGenesisProvision {
         &self.decision
     }
 
+    /// Validate a fresh clean Shared Create publication against the exact
+    /// pending call and approval selected from trusted Authority state.
+    ///
+    /// The caller must independently select the committee and pending record;
+    /// accepting these from the publication request would not establish policy
+    /// authorization. Success neither retains the decision nor proves finality.
+    /// An already published exact retry must use its durable publication record,
+    /// rather than rerunning this fresh-admission check after receipt expiry.
+    pub fn verify_pending_create_at<V>(
+        &self,
+        call: &crate::agent_sdk::authority::AuthorityCredentialCall,
+        approval: &crate::agent_sdk::authority::ManagementApproval,
+        trusted_committee: &AuthorityCommittee,
+        publication_slot: u64,
+        verifier: &V,
+    ) -> Result<(), AgentGenesisError>
+    where
+        V: crate::agent_sdk::authority::AuthorityCredentialVerifier
+            + crate::agent_sdk::authority::AuthorityVerifier,
+    {
+        use crate::agent_sdk::authority::{AuthorityVerifier, receipt_matches_approval};
+
+        self.validate()?;
+        let ReplayOperation::CleanManage {
+            request,
+            authority,
+            observed_slot,
+        } = &self.proposal.create().operation
+        else {
+            return Err(AgentGenesisError::InvalidProposal);
+        };
+        let crate::agent_sdk::ManagementRequest::Create(descriptor) = request else {
+            return Err(AgentGenesisError::InvalidProposal);
+        };
+        if descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared
+            || publication_slot < *observed_slot
+            || self.evidence.claim().system_agent().0 != call.authority.system_agent.0
+            || descriptor.authority != call.authority.binding
+            || request.authorization_plan().as_ref() != Some(&approval.plan)
+            || approval.validate_shape().is_err()
+            || !approval.matches_call(call)
+            || !receipt_matches_approval(authority, approval)
+            || !call.authority.binding.accepts(authority)
+        {
+            return Err(AgentGenesisError::InvalidProvision);
+        }
+        call.verify_with(verifier)
+            .map_err(|_| AgentGenesisError::InvalidEvidence)?;
+        authority
+            .verify_at(*observed_slot, verifier)
+            .map_err(|_| AgentGenesisError::InvalidEvidence)?;
+        if !authority.selector.is_live_at(publication_slot) {
+            return Err(AgentGenesisError::InvalidEvidence);
+        }
+        self.evidence
+            .verify_certificate_with(trusted_committee, |public, message, signature| {
+                AuthorityVerifier::verify(verifier, public, message, signature)
+            })
+    }
+
     pub fn admission_record(&self) -> Result<AgentGenesisAdmissionRecord, AgentGenesisError> {
         AgentGenesisAdmissionRecord::system_authorized(
             &self.decision,
@@ -2013,6 +2073,259 @@ mod tests {
                 panic!("wrong space must fail before signature dispatch")
             }),
             Err(AgentGenesisError::InvalidEvidence)
+        );
+    }
+
+    #[test]
+    fn pending_clean_create_requires_exact_signed_authorization_before_publication() {
+        use crate::agent_sdk as sdk;
+        use core::num::NonZeroU64;
+        use ed25519_dalek::{Signer as _, SigningKey};
+        use sdk::authority::*;
+
+        struct Strict;
+        impl AuthorityVerifier for Strict {
+            fn verify(&self, key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+                ed25519_dalek::VerifyingKey::from_bytes(key).is_ok_and(|key| {
+                    key.verify_strict(message, &ed25519_dalek::Signature::from_bytes(signature))
+                        .is_ok()
+                })
+            }
+        }
+        impl AuthorityCredentialVerifier for Strict {
+            fn verify(&self, key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+                AuthorityVerifier::verify(self, key, message, signature)
+            }
+        }
+        let baseline = fixture();
+        let key = SigningKey::from_bytes(&[0x81; 32]);
+        let public = key.verifying_key().to_bytes();
+        let owner = sdk::PrincipalId::of_public_key(&public);
+        let space = sdk::SpaceId(baseline.proposal.locator().space.0);
+        let nonce = sdk::Hash([0x82; 32]);
+        let agent = sdk::AgentId::derive(space, owner, nonce.as_bytes());
+        let binding = sdk::authority::AgentAuthorityBinding {
+            policy: sdk::Hash([0x83; 32]),
+            issuer: AuthorityIssuer {
+                principal: owner,
+                actor: sdk::ActorId([0x84; 32]),
+                deployment: sdk::DeploymentId([0x85; 32]),
+                program: sdk::ProgramId([0x86; 32]),
+                producer: sdk::ProducerId::of_public_key(&public),
+            },
+            public_key: public,
+            initial_epoch: 1,
+        };
+        let descriptor = sdk::AgentDescriptor {
+            identity: sdk::AgentIdentity {
+                space,
+                agent,
+                owner,
+                profile: sdk::AgentProfile::Shared,
+                runtime_deployment: sdk::DeploymentId([0x87; 32]),
+                runtime_program: sdk::ProgramId([0x88; 32]),
+                runtime_producer: sdk::ProducerId([0x89; 32]),
+                transition_producer: sdk::ProducerId([0x90; 32]),
+            },
+            creation_nonce: nonce,
+            authority: binding,
+            private_recovery: None,
+            runtime_package: sdk::BlobRef::of_bytes(RUNTIME_BYTES),
+            runtime_contract: sdk::contract::RuntimePackageContract::canonical(),
+            capabilities: sdk::RuntimeCapabilities::standard(),
+            replicas: baseline
+                .replicas
+                .members()
+                .iter()
+                .map(|member| {
+                    let replica = member.replica();
+                    sdk::AgentReplica {
+                        node: sdk::NodeId(replica.node.0),
+                        principal: sdk::PrincipalId(replica.principal.0),
+                        role: match replica.role {
+                            ReplicaRole::Voter => sdk::ReplicaRole::Voter,
+                            ReplicaRole::Observer => sdk::ReplicaRole::Observer,
+                        },
+                    }
+                })
+                .collect(),
+        };
+        descriptor.validate().unwrap();
+        let request = sdk::ManagementRequest::Create(Box::new(descriptor.clone()));
+        let mut call = AuthorityCredentialCall {
+            invocation: sdk::InvocationId::ZERO,
+            authority: AuthorityActorTarget {
+                space,
+                system_agent: sdk::AgentId([0xa1; 32]),
+                system_runtime_deployment: sdk::DeploymentId([0xa2; 32]),
+                binding,
+            },
+            managed: ManagedAgentTarget {
+                space,
+                agent,
+                owner,
+                profile: sdk::AgentProfile::Shared,
+                runtime_deployment: descriptor.identity.runtime_deployment,
+                transition_producer: descriptor.identity.transition_producer,
+            },
+            principal: owner,
+            credential: sdk::CredentialId::of_public_key(&public),
+            request_sequence: NonZeroU64::new(1).unwrap(),
+            credential_public_key: public,
+            authenticated_node: None,
+            requested_valid_from: 10,
+            requested_expires_at: 30,
+            plan: request.authorization_plan().unwrap(),
+            signature: [1; 64],
+        };
+        call.invocation = call.expected_invocation();
+        call.signature = key.sign(&call.signing_bytes()).to_bytes();
+        let approval = ManagementApproval::from_call(
+            &call,
+            NonZeroU64::new(73).unwrap(),
+            AuthorityEvidence {
+                package: None,
+                proof: None,
+                commitment: sdk::Hash([0xa3; 32]),
+            },
+            AuthorityLaneRoots {
+                control: Some(sdk::Hash([0xa4; 32])),
+                linear: None,
+                merge: None,
+                local: None,
+            },
+            1,
+            10,
+            30,
+        )
+        .unwrap();
+        let mut receipt = AuthorityReceipt {
+            selector: AuthorityReceiptSelector {
+                policy: binding.policy,
+                issuer: binding.issuer,
+                space,
+                agent,
+                operation: approval.plan.authority_operation(),
+                runtime_deployment: descriptor.identity.runtime_deployment,
+                actor: None,
+                actor_deployment: None,
+                evidence: approval.evidence.clone(),
+                lane_roots: approval.lane_roots,
+                epoch: 1,
+                decision_sequence: 7,
+                acknowledged_through: 6,
+                valid_from: 10,
+                expires_at: 30,
+                request: approval.plan_commitment,
+            },
+            public_key: public,
+            signature: [1; 64],
+        };
+        receipt.signature = key.sign(&receipt.signing_bytes()).to_bytes();
+        let mut runtime = baseline.proposal.create().runtime.clone();
+        runtime.agent = AgentId(agent.0);
+        runtime.deployment = DeploymentId(descriptor.identity.runtime_deployment.0);
+        runtime.program = ProgramId(descriptor.identity.runtime_program.0);
+        runtime.producer = ProducerId(descriptor.identity.runtime_producer.0);
+        runtime.package = BlobRef::of_bytes(RUNTIME_BYTES);
+        let create = ReplayInput {
+            runtime,
+            operation: ReplayOperation::CleanManage {
+                request: request.clone(),
+                authority: receipt,
+                observed_slot: 20,
+            },
+        };
+        let catalog = vec![create.runtime.package.clone()];
+        let expectations = AgentGenesisExpectations::new(
+            create.runtime.commitment(),
+            Hash(request.commitment().0),
+            Hash([0xa5; 32]),
+            system_genesis_artifact_closure_commitment(&catalog).unwrap(),
+            7,
+        )
+        .unwrap();
+        let proposal = AgentGenesisProposal::new(
+            AgentGenesisLocator {
+                space: SpaceId(space.0),
+                agent: AgentId(agent.0),
+            },
+            create,
+            expectations,
+            catalog,
+        )
+        .unwrap();
+        let replicas = AgentReplicaCommittee::new(
+            SpaceId(space.0),
+            AgentId(agent.0),
+            AgentProfile::Shared,
+            baseline.replicas.members().to_vec(),
+        )
+        .unwrap();
+        let member =
+            AuthorityCommitteeMember::new(NodeId([0xa6; 32]), public, AuthorityMemberRole::Voter)
+                .unwrap();
+        let signer = member.signer();
+        let committee = AuthorityCommittee::new(
+            SpaceId(space.0),
+            Hash(binding.commitment().0),
+            1,
+            None,
+            vec![member],
+        )
+        .unwrap();
+        let claim = AgentGenesisClaim::new(
+            AgentId(call.authority.system_agent.0),
+            AgentJournalGenesisId::new([0xa7; 32]),
+            AgentGenesisAdmissionId::from_bytes([0xa8; 32]),
+            &proposal,
+            &replicas,
+        )
+        .unwrap();
+        let message = AuthorityQuorumCertificate::signing_message(
+            committee.authority_binding(),
+            committee.epoch(),
+            committee.commitment(),
+            claim.authority_claim(),
+        );
+        let qc = AuthorityQuorumCertificate::new(
+            &committee,
+            claim.authority_claim(),
+            vec![AuthoritySignature::new(signer, key.sign(&message.0).to_bytes()).unwrap()],
+        )
+        .unwrap();
+        let evidence = AgentGenesisEvidence::new(claim, qc).unwrap();
+        let decision = AgentGenesisDecision::new(&proposal, &replicas, &evidence).unwrap();
+        let provision = AgentGenesisProvision::new(proposal, replicas, evidence, decision).unwrap();
+        assert_eq!(
+            provision.verify_pending_create_at(&call, &approval, &committee, 20, &Strict),
+            Ok(())
+        );
+        for slot in [19, 31] {
+            assert!(
+                provision
+                    .verify_pending_create_at(&call, &approval, &committee, slot, &Strict)
+                    .is_err()
+            );
+        }
+        let mut forged = call.clone();
+        forged.signature[0] ^= 1;
+        assert!(
+            provision
+                .verify_pending_create_at(&forged, &approval, &committee, 20, &Strict)
+                .is_err()
+        );
+        let mut changed = approval.clone();
+        changed.plan_commitment = sdk::Hash([0xaf; 32]);
+        assert!(
+            provision
+                .verify_pending_create_at(&call, &changed, &committee, 20, &Strict)
+                .is_err()
+        );
+        assert!(
+            provision
+                .verify_pending_create_at(&call, &approval, &baseline.authority, 20, &Strict)
+                .is_err()
         );
     }
 
