@@ -10,6 +10,59 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: current-pin inventory attribution narrows the performance target
+
+Analyzed the retained current-release `current-latency.VSCZEK/up.log` without
+opening, copying or mutating any store or starting another daemon. Unlike the
+older phase table below, these measurements include the latest reproduced
+runtime pin. The post-Create inventory (lines226–361) contains six authenticated
+queries and takes16,677ms:
+
+| Phase | Wall ms | Enclosed runtime ms | Runtime calls |
+| --- | ---: | ---: | ---: |
+| Prepare | 426 | 118.741 | 6 |
+| Reserve/checkpoint | 2,208 | 44.256 | 2 |
+| Identity | 400 | 126.324 | 6 |
+| Persist pending | 224 | 0 | 0 |
+| Reopen/check retained ACK | 504 | 121.696 | 6 |
+| Invoke | 8,036 | 6,245.987 | 12 |
+| Acknowledge | 4,679 | 2,905.777 | 12 |
+| Complete pending | 195 | 0 | 0 |
+
+The two cumulative timing families are differenced independently, resetting
+at `reopen`. Phase totals are16,672ms;5ms remain between logged boundaries.
+Runtime spans total9,562.781ms across44 calls. Of these,12 calls with encoded
+inputs at least512KiB consume8,890.561ms; the other32 consume672.220ms.
+In the inspected fresh-query trace, Invoke and ACK each contain one small
+inspection and one large execution, not two large executions. Exact terminal
+preflight reuse is logged. Do not count every runtime span as a repeated full
+invocation, or remove replay based on that assumption.
+
+The post-Install inventory (lines500–635) corroborates the concentration:
+15,483ms total,44 runtime calls taking9,017.575ms, of which12 large-input calls
+take8,372.321ms. Fresh unchanged-head credential-only refresh (lines405–429)
+still costs2,450ms. Thus existing page reuse helps but does not make even one
+authenticated query cheap. These are phase observations, not controlled A/B
+or CPU instruction profiles; non-runtime residuals are not proven to be I/O.
+Explicit pending persist/clear contributes only419ms after Create.
+
+This rules out small inspection execution as the primary remaining target:
+even eliminating all32 smaller runtime spans would recover only0.672s in the
+measured16.677s inventory, before any associated host overhead. The next
+bounded performance investigation should profile the actual bundled Authority
+fresh Invoke/ACK workloads (not just the synthetic Counter) and separately
+attribute reserve/checkpoint's2.164s and Invoke/ACK's3.563s outside runtime.
+Preserve authenticated complete-head pagination, exact pending recovery and
+positive ACK semantics. Do not introduce a new batch protocol or repin guests
+without measured evidence and equivalence/recovery qualification.
+
+Reproduction script and full output are in shared disk-backed
+`target/task-tmp/role-length-release.UnaSE1/inventory-phases.py` and
+`current-inventory-phases.json`. The parser asserts sequential complete phase
+sequences, monotonic cumulative timing and at most5ms query boundary residual;
+all four completed inventories in this log pass. No implementation, pin,
+fixture or release binary changed. Full production gates remain open.
+
 ### 2026-09-19: reject legacy-state Shared finality experiment; keep review checkpoint clean
 
 The uncommitted ordinary-finality experiment following `36e63581` was removed

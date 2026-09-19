@@ -80,6 +80,11 @@ with bounded equivalence/recovery checks and repeat release qualification.
 | Release integration | Current-pin CLI atb16abf81:255 passed/19 ignored; default library at02dbc8c6:1,434 passed/1 ignored; host-feature library on the same frozen runtime source:1,873 passed/3 ignored. These full suites predate the mechanical formatting cleanup. Current-pin actor-build4/task-build1 integration tests pass atcda6c997. Startup still fails10s. Full cryptographic proof qualification and remaining release audit/sign-off stay open. |
 
 Next performance step: address the roughly17s authenticated two-agent inventory.
+Current-pin log attribution puts9.56s of the post-Create16.68s inside runtime:
+12 large-input Invoke/ACK calls take8.89s, while32 smaller calls take0.67s.
+Profile the actual bundled Authority Invoke/ACK workloads and the separate
+reserve/checkpoint host overhead before adding another cache. See the handoff
+for phase counts, corroborating post-Install data and reproducible analysis.
 Released checkpoint scheduling now triggers at8 retained physical entries;
 safety tests, the complete514-query workload and two live restart passes succeed.
 Observed periodic reconciliation3.71s/3.57s is not a broad throughput proof. Do not
