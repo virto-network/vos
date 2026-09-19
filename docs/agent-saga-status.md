@@ -6,6 +6,12 @@ checkpoint, not production or master sign-off. `saga/agents` remains at
 
 ## What can be tested
 
+Latest source includes an unpinned Invoke-recovery validation optimization.
+Its large-retry benchmark reduces gas18.3% with identical output; focused
+rejection/retirement regressions pass. It is not yet independently reproduced,
+repinned or release-qualified. The executable and runtime pins below remain
+the tested release, not a claim that the candidate improves end-to-end latency.
+
 Release implementation `cca4c911` builds and verifies its bundled artifacts.
 SHA-256: `697324387cf98331f0c237e228dfc9e98947c8a97f9f1204dfa3d8eca985ce20`.
 The current runtime is independently reproduced; new spaces automatically

@@ -9690,6 +9690,76 @@ pub(crate) mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
+    fn clean_invoke_recovery_validation_preserves_rejection_and_retirement() {
+        use crate::agent_sdk::{InvocationAuthorization, InvocationError};
+
+        let (state, work, receipt, _) = clean_terminal_fixture_with_program_size(4096);
+        let mut runtime = StandardAgentRuntime::restore(
+            decode_standard_runtime_state(&clean_state_to_legacy(&state)).unwrap(),
+        )
+        .unwrap();
+        let authorization = InvocationAuthorization::AuthorityReceipt(receipt);
+        let mut corrupted = work.clone();
+        corrupted.availability[0].bytes[0] ^= 1;
+        let mut substituted = work.clone();
+        substituted.message.push(0xff);
+        let mut forged = authorization.clone();
+        let InvocationAuthorization::AuthorityReceipt(receipt) = &mut forged else {
+            unreachable!()
+        };
+        receipt.signature[0] ^= 1;
+
+        for retired in [false, true] {
+            if retired {
+                runtime
+                    .acknowledge_clean_invocation(&work, &authorization)
+                    .unwrap();
+            }
+            let before = encode_standard_runtime_state(&runtime.snapshot());
+            for (input, auth) in [
+                (&corrupted, &authorization),
+                (&substituted, &authorization),
+                (&work, &forged),
+            ] {
+                assert_eq!(
+                    runtime.recover_clean_execution(input, auth, 1).map(|_| ()),
+                    Err(InvocationError::InvalidAuthorization),
+                );
+                assert_eq!(
+                    runtime.recover_clean_invocation_error(input, auth, 1),
+                    Err(InvocationError::InvalidAuthorization),
+                );
+                assert_eq!(encode_standard_runtime_state(&runtime.snapshot()), before);
+            }
+            if retired {
+                assert_eq!(
+                    runtime
+                        .recover_clean_execution(&work, &authorization, 1)
+                        .map(|_| ()),
+                    Err(InvocationError::DivergentInvocation),
+                );
+                assert_eq!(
+                    runtime.recover_clean_invocation_error(&work, &authorization, 1),
+                    Err(InvocationError::DivergentInvocation),
+                );
+                assert_eq!(encode_standard_runtime_state(&runtime.snapshot()), before);
+            } else {
+                assert!(
+                    runtime
+                        .recover_clean_execution(&work, &authorization, 1)
+                        .unwrap()
+                        .is_some()
+                );
+                assert_eq!(
+                    runtime.recover_clean_invocation_error(&work, &authorization, 1),
+                    Ok(None)
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
     fn bundled_runtime_large_invoke_retry_validation_cost() {
         use crate::agent_sdk::wire::CanonicalWire as _;
         use crate::agent_sdk::{

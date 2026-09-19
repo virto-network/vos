@@ -2590,7 +2590,7 @@ impl StandardAgentRuntime {
         // execute the same mutation again. Keep exact ACK retries available,
         // but never admit Invoke through a retained retirement fact.
         if self
-            .recover_clean_acknowledgement(work, authorization)?
+            .recover_clean_acknowledgement_after_work_validation(work, authorization)?
             .is_some()
         {
             return Err(InvocationError::DivergentInvocation);
@@ -4070,7 +4070,26 @@ impl StandardAgentRuntime {
     > {
         use crate::agent_sdk::InvocationError;
 
-        if !work.validate() || !authorization.matches_acknowledgement(work) {
+        if !work.validate() {
+            return Err(InvocationError::InvalidAuthorization);
+        }
+        self.recover_clean_acknowledgement_after_work_validation(work, authorization)
+    }
+
+    // Private continuation for the same immutable work. Invoke recovery has
+    // just performed full work and authorization validation; standalone ACK
+    // recovery above must still validate every availability preimage itself.
+    fn recover_clean_acknowledgement_after_work_validation(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        authorization: &crate::agent_sdk::InvocationAuthorization,
+    ) -> Result<
+        Option<crate::agent_sdk::InvocationAcknowledgement>,
+        crate::agent_sdk::InvocationError,
+    > {
+        use crate::agent_sdk::InvocationError;
+
+        if !authorization.matches_acknowledgement(work) {
             return Err(InvocationError::InvalidAuthorization);
         }
         let scope = clean_method_mode(work.mode).invocation_scope();
@@ -4291,7 +4310,7 @@ impl StandardAgentRuntime {
         use crate::agent_sdk::InvocationError;
         self.verify_clean_invocation_authorization(work, authorization, observed_slot)?;
         if self
-            .recover_clean_acknowledgement(work, authorization)?
+            .recover_clean_acknowledgement_after_work_validation(work, authorization)?
             .is_some()
         {
             return Err(InvocationError::DivergentInvocation);

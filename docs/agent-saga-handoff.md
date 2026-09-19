@@ -10,6 +10,40 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: same-call Invoke validation reuse candidate
+
+`recover_clean_execution` and `recover_clean_invocation_error` now call a private
+ACK-recovery continuation immediately after full work/authorization validation.
+It retains acknowledgement matching and every exact retirement comparison.
+Standalone ACK recovery still validates all availability preimages. No trust
+cache, protocol change, signature bypass or unvalidated public entry point.
+The initial full verifier and its NotCreated precedence are unchanged.
+
+New native regression checks corrupted preimages, altered message and forged
+signature through both recovering entry points before/after retirement, with
+byte-identical state on rejection; valid retained reply and retired-Invoke
+rejection pass. Session99870 terminal0 (build34.32s, test0.05s). Existing
+acknowledgement selection31 passed/1 ignored in48.24s, session11541 terminal0.
+
+Source candidate built locked/offline nightly-2026-03-20 in28.01s, session79735
+terminal0. Frozen converter produces candidate ProgramId
+`e815f4b010f7213290850189f5bc20fc54533068f0d73ea4982de9414b1135e9`.
+Large Invoke retry input793,742 bytes: bundled637,510,333 gas versus candidate
+520,997,765 (18.3% reduction), with byte-identical complete output. Timing in
+that paired run1.707s/1.331s is diagnostic, not fresh-operation throughput.
+Cost test session35567 terminal0. Bundled-runtime selection6 pass/1 ignored
+in5.37s, session25630 terminal0; candidate override is consumed only by the
+retired-Invoke and malformed-ACK cases in that selection, not every test.
+The explicit `clean_acknowledgement_errors_are_byte_identical_and_fail_closed`
+test also passes against the candidate (`candidate-errors.log`).
+
+Evidence: shared `target/task-tmp/invoke-validation.5C7sn0/` with build, identity,
+cost, acknowledgement and candidate logs. Native regression log remains in
+`current-latency.p7U3OE/invoke-validation-regression.log`. Candidate uses current
+worktree source; independent immutable-source reproduction, atomic provenance
+repin, broader regression and release/live qualification remain required.
+Committed runtime pins and the qualified release executable are unchanged.
+
 ### 2026-09-19: large Invoke retry validation baseline
 
 Added `bundled_runtime_large_invoke_retry_validation_cost`, using a retained
