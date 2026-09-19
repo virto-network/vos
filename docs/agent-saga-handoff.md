@@ -11,6 +11,34 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: capacity retry boundary and reclamation dependencies
+
+After65ef39e0, the existing256-record coordinator-capacity test now retains the
+first/last issued results and verifies exact retries of both at capacity, before
+and after reopen. Receipts/AOI1 values stay identical; dispatcher calls,
+signatures, both stored images and commit counts stay unchanged. A257th new
+operation still fails before side effects. All26 coordinator tests pass
+(session28518 exit0,34.09s); pinned-host formatting/diff checks pass. Log: shared
+`target/task-tmp/single-preflight-release.pE0Yxy/coordinator-capacity-retry.log`.
+This is memory-store/coordinator coverage, not sustained live operation beyond256.
+
+The reclamation audit identifies the existing evidence boundary precisely:
+NOC1 signs two NOD1 record commitments and NRT1 signs that completion after
+positive runtime ACKs. `restore_completion` / `restore_retirement` still require
+both exact full dispatch records; signature verification alone is not a
+self-contained consumption proof. Coordinator reopen also requires one-to-one
+issuer membership and binds consumed_issuance_ack to the retained issuer AOI1.
+`retire_issued` loads both dispatches before considering retirement certificates.
+Thus deleting issuer/coordinator/dispatch records independently breaks current
+recovery, and the completion/retirement indexes themselves remain append-only
+and bounded. Invocation retirement is not a general deletion authorization.
+
+The next implementation dependency is independently verifiable compact terminal
+evidence and authenticated replay/collision fences, followed by crash-safe
+cross-store reclamation and sustained >256-operation qualification. Preserve
+recoverability until that evidence is durable; no automatic deletion, eviction,
+limit increase, production-code or release-pin change was made in this step.
+
 ### 2026-09-19: repinned release and fresh Local lifecycle qualified
 
 Frozen source `a732e079f7792e953434f3dfe7f83a899c8ea057` builds locked/offline

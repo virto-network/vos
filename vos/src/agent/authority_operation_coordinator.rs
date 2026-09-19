@@ -3222,11 +3222,17 @@ pub(crate) mod tests {
             dispatcher.clone(),
             &fixture,
         );
+        let mut boundary_retries = Vec::new();
         for discriminator in 1..=MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS as u64 {
             let call = fixture.call(discriminator);
-            coordinator
+            let issued = coordinator
                 .coordinate(&call, fixture.context(&call, 20), 20, &mut signer)
                 .unwrap();
+            if discriminator == 1
+                || discriminator == MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS as u64
+            {
+                boundary_retries.push((call, issued));
+            }
         }
         assert_eq!(
             coordinator.retained_operations(),
@@ -3236,6 +3242,17 @@ pub(crate) mod tests {
         let before_images = (coordinator_store.image(), issuer_store.image());
         let before_commits = (coordinator_store.commits(), issuer_store.commits());
         let before_signatures = (signer.receipt_calls, signer.acknowledgement_calls);
+        // A full journal may reject new issuance, never an exact retained
+        // retry. Check both ends so a future compactor cannot quietly discard
+        // the oldest evidence while preserving only recent completions.
+        for (call, issued) in &boundary_retries {
+            assert_eq!(
+                coordinator
+                    .coordinate(call, fixture.context(call, 20), 20, &mut signer)
+                    .unwrap(),
+                *issued
+            );
+        }
         let overflow = fixture.call(MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS as u64 + 1);
         assert!(matches!(
             coordinator.coordinate(&overflow, fixture.context(&overflow, 20), 20, &mut signer),
@@ -3262,8 +3279,8 @@ pub(crate) mod tests {
         );
         drop(coordinator);
         let mut reopened = open(
-            coordinator_store,
-            issuer_store,
+            coordinator_store.clone(),
+            issuer_store.clone(),
             dispatcher.clone(),
             &fixture,
         );
@@ -3271,6 +3288,14 @@ pub(crate) mod tests {
             reopened.retained_operations(),
             MAX_AUTHORITY_OPERATION_COORDINATOR_RECORDS
         );
+        for (call, issued) in &boundary_retries {
+            assert_eq!(
+                reopened
+                    .coordinate(call, fixture.context(call, 20), 20, &mut signer)
+                    .unwrap(),
+                *issued
+            );
+        }
         assert!(matches!(
             reopened.coordinate(&overflow, fixture.context(&overflow, 20), 20, &mut signer),
             Err(AuthorityOperationCoordinatorError::Rejected(
@@ -3278,6 +3303,14 @@ pub(crate) mod tests {
             ))
         ));
         assert_eq!(dispatcher.counts(), before);
+        assert_eq!(
+            (coordinator_store.image(), issuer_store.image()),
+            before_images
+        );
+        assert_eq!(
+            (coordinator_store.commits(), issuer_store.commits()),
+            before_commits
+        );
         assert_eq!(
             (signer.receipt_calls, signer.acknowledgement_calls),
             before_signatures
