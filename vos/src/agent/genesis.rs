@@ -2016,6 +2016,27 @@ mod tests {
             validate_agent_genesis_catalog(&fixture.proposal, &[runtime.clone()]),
             Ok(())
         );
+        assert_eq!(
+            validate_agent_genesis_catalog(&fixture.proposal, &[]),
+            Err(AgentGenesisError::InvalidCatalog)
+        );
+        assert_eq!(
+            validate_agent_genesis_catalog(&fixture.proposal, &[runtime.clone(), runtime.clone()]),
+            Err(AgentGenesisError::InvalidCatalog)
+        );
+        // An internally valid package is still not the package committed by
+        // this proposal. Provider-supplied hashes cannot redefine that binding.
+        let replacement_bytes = b"different ordinary genesis runtime".to_vec();
+        let replacement = RuntimeBlob {
+            reference: BlobRef::of_bytes(&replacement_bytes),
+            bytes: replacement_bytes,
+        };
+        assert!(replacement.reference.matches(&replacement.bytes));
+        assert_ne!(replacement.reference, runtime.reference);
+        assert_eq!(
+            validate_agent_genesis_catalog(&fixture.proposal, &[replacement]),
+            Err(AgentGenesisError::InvalidCatalog)
+        );
         let mut corrupt = runtime;
         corrupt.bytes.push(0);
         assert_eq!(

@@ -12,6 +12,21 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-20: ordinary genesis catalog rejection coverage
+
+Extended the existing ordinary genesis catalog regression to reject an empty
+catalog, duplicate runtime entries, and an internally valid replacement package
+whose hash differs from the proposal's exact committed reference. Existing
+corrupt-preimage coverage remains. All8 genesis tests pass (session62428 exit0,
+0 ignored,1429 filtered,0.02s), including the independent-finality negative
+test. Formatting and diff checks pass. Log: shared
+`target/task-tmp/final-review-release.HbPbex/genesis-catalog-negatives.log`.
+This is test-only coverage after the frozen review checkpoint; production
+code and the qualified executable/artifact pins are unchanged. It does not
+implement ordinary Shared issuance, permanent decision publication or finality.
+Include it with batch2 if reviewing the later tip; full-suite evidence above
+retains its original source boundary.
+
 ### 2026-09-20: explicit compiled external-transfer fixture passes
 
 At `ab7fb7bb`, `just check-probe-fixture` completes successfully (session30453
