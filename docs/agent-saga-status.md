@@ -68,6 +68,7 @@ with bounded equivalence/recovery checks and repeat release qualification.
 | Authenticated reclamation | Issuer/coordinator bounded-record reclamation remains unfinished; invocation retirement is not proof of Authority application. |
 | Recovery/proof qualification | Remaining mixed pending/crash/capacity cases, pre-expiry Abort/management expiry, cross-runtime portable positive ACK, and full Private/Attested cryptographic proof matrix. |
 | Formatting | Pinned-host `cargo fmt -- --check` atb437af09 fails:40 diff locations across15 files; `--all` reports the same output. No formatting applied while the host-feature suite runs. |
+| Workspace lint | At7b45d2f0, the `check-all` Clippy flags fail in vos with351 diagnostics (258 unused/dead-code,1 unused-mut,92 others). Downstream workspace lint completion is unproven; no broad lint allowances added. |
 | Cutover supporting gates | At7bc52924, system-authority58/58 and system-catalog10/10 tests pass; SDK no-default-feature intra-doc-link check and static clean-break CLI/docs check pass. These do not substitute for the entire `just clean-break-check` or `just check-all` recipes. |
 | Release integration | Current-pin CLI atb16abf81:255 passed/19 ignored; default library at02dbc8c6:1,434 passed/1 ignored. Last full host-feature library atbf7ced06:1,871 passed/3 ignored predates the latest pin; the new run remains pending. Actor-build4/task-build1 baseline also predates repin. Startup still fails10s. Full cryptographic proof qualification and remaining release audit/sign-off stay open. |
 

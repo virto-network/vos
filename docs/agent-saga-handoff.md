@@ -10,6 +10,27 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: workspace Clippy release gate fails
+
+At `7b45d2f0`, ran pinned-host offline/locked `cargo clippy --workspace` with
+the exact `just check-all` lint flags: `-D warnings`, allowing only
+`clippy::too_many_arguments`, `clippy::type_complexity`,
+`clippy::result_unit_err`, `clippy::manual_async_fn`. Session48040 exits101:
+vos library compilation reports351 prior errors. Counting diagnostic headers
+(not individual methods/fields) gives258 unused/dead-code,1 unused-mut and92
+other diagnostics. Large enum variants are among the latter. Do not assume
+downstream workspace crates have passed: this run fails at vos.
+
+Evidence: `target/task-tmp/role-length-release.UnaSE1/clippy-workspace.log`.
+No source or lint configuration changed, and no autofix was applied. This is
+another concrete release gate, separate from the passing targeted suites and
+still-running host-feature session38510. Triage after the frozen suite: retire
+only genuinely obsolete clean-break code; wire required production paths;
+apply justified test/feature scoping and scoped lint fixes. Do not delete needed
+Shared/authority integration or add a blanket dead-code allowance merely to
+make this check green. The read-only check does not identify which diagnostics
+predate this branch, and does not establish a new runtime correctness failure.
+
 ### 2026-09-19: post-pin nested actor, SDK documentation and static cutover gates
 
 At `7bc52924`, with runtime source unchanged during the live host-feature run:
