@@ -10,6 +10,38 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: ordinary Shared finality gap traced to both production boundaries
+
+Read-only audit at `00921e04`: native `clean_startup.rs` installs
+`UnavailableAgentFinality` at line340; its verifier always returns Unavailable.
+Repository-wide exact-word search for `AgentGenesisProvider` finds only its
+trait and trust-boundary documentation in `vos/src/agent/genesis.rs`, no
+implementation or caller. `CleanSystemAgentGenesisArchive` implements the
+different `SystemAgentGenesisProvider` for root system bootstrap. The ordinary
+gap therefore includes archive/issuance and lifecycle wiring, not merely
+replacing a finality stub with an accepting implementation.
+
+Reusable existing pieces: `AgentGenesisProvision` validates canonical links;
+`SystemAuthorityDecisionFact` and `verify_provision_fact` exact-compare provision
+content; `SystemAuthorityState::verify_historical_provision` checks trusted
+scope, exact fact and historical committee/QC together. Their comments explicitly
+say data validation alone is not an admission/sealing capability. The independent
+`AgentGenesisFinalityVerifier` must source the permanent decision from authenticated
+live system replay and must run again on generation reopen. Existing
+`self_consistent_provision_never_bypasses_independent_finality` covers refusal
+propagation/reverification sequencing using a fake verifier, not production proof.
+
+Bounded implementation order within the existing goal: expose an authenticated
+replay-backed exact genesis-fact read (scope, decision, committee/QC); connect
+that read to an independent finality verifier; implement durable ordinary
+proposal/catalog/provision issuance and reproduction; wire Shared provisioning
+and reopen through both boundaries. Require negative tests for provider-only
+self-consistency, wrong system generation, absent/unfinalized fact, altered
+committee/evidence, and verifier unavailability after a prior successful open.
+Do not grant acceptance from root bootstrap QC, provider response, or decoding
+private Standard state outside authenticated replay. No source change or new
+production readiness claim follows from this audit.
+
 ### 2026-09-19: complete post-pin host-feature regression
 
 At `bf7ced06` (release implementation `b131edc3`), full host-feature library
