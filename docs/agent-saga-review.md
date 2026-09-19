@@ -25,6 +25,14 @@ passing regressions from still-failing production gates.
 
 ## Current release qualification
 
+An additional fresh-space probe of the same release reaches readiness in18s,
+verifies fresh Create in38s and Counter Install in45s, and shuts down within1s.
+HTTP/SSH pass. No retry/resume was needed. Create lifecycle13.03s is followed by
+20.71s route reconciliation, including20.46s authenticated inventory. Fresh
+invocation is not remeasured, and differing fixture histories prevent a
+controlled speedup claim. Evidence is recorded in the handoff; production
+latency remains unresolved.
+
 Release `cca4c911` now qualifies8-entry scheduling in two successive live
 restarts: readiness36s/29s (both fail10s), system-owner recovery14.45s/8.02s,
 initial inventory20.42s/19.77s. Periodic reconciliation3.71s/3.57s; HTTP/SSH,

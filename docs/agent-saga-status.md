@@ -12,7 +12,9 @@ The current runtime is independently reproduced; new spaces automatically
 receive system packages and enabled HTTP/SSH configuration. The Local workflow
 has live evidence for Create, Counter Install, increment, retirement/ACK retry,
 and reading7 after restart. Latest release rechecks HTTP/SSH, retained Counter
-recovery and conflict reporting; it does not remeasure fresh mutations.
+recovery and conflict reporting. A separate new-space probe on the same release
+also verifies fresh Create (38s) and Counter Install (45s), with no retry/resume.
+Fresh invocation latency has not been remeasured on this host release.
 
 Use disposable spaces only. Do not migrate valuable older-generation stores.
 Preserve failed operations and exact request bytes; a timeout or unsigned HTTP
@@ -36,18 +38,18 @@ See [review guide](agent-saga-review.md) and [evidence handoff](agent-saga-hando
 Freeze implementation here for review and disposable Local-space testing; do
 not start another guest/artifact change merely to fill the remaining budget.
 No merge or push is authorized by this checkpoint. When implementation resumes,
-measure fresh Create/Install/invocation on the current release before claiming
-that the startup optimizations improved operation latency. Preserve original
-fixture paths and failure evidence. Then address authenticated initial inventory
+measure fresh invocation on the current release; Create/Install have now been
+remeasured, but not as a controlled before/after comparison. Preserve original
+fixture paths and failure evidence. Then address authenticated inventory
 with bounded equivalence/recovery checks and repeat release qualification.
 
 ## Remaining production work
 
 | Requirement | Current evidence / gap |
 | --- | --- |
-| Startup and operation latency | Latest two restarts36s/29s;10s gate fails. Earlier current-guest Create43s, Install65s, fresh managed calls29–35s; not remeasured on latest host release. |
+| Startup and operation latency | Latest two restarts36s/29s; separate fresh-space readiness18s;10s gate fails. Current-release fresh Create38s, Install45s. Earlier fresh managed calls29–35s remain unremeasured on latest host release. |
 | Recovery performance | With8-entry scheduling, second pass system owner8.02s, including14 runtime calls6.39s. Shorter history helps; not a same-history A/B. |
-| Inventory performance | Two agents require six sequential authenticated queries; latest inventory20.42s/19.77s. It now dominates observed startup. |
+| Inventory performance | Two agents require six sequential authenticated queries; restart inventory20.42s/19.77s. Fresh Create lifecycle13.03s is followed by route reconciliation20.71s (inventory20.46s), so this also materially delays operation completion. |
 | Shutdown | Latest disposable probes pass within1–2s; general busy/crash matrix still incomplete. |
 | Ordinary Shared genesis/finality | Native startup still installs `UnavailableAgentFinality`; production accepting bridge missing. System genesis is a separate path. |
 | Authenticated reclamation | Issuer/coordinator bounded-record reclamation remains unfinished; invocation retirement is not proof of Authority application. |

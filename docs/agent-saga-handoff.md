@@ -10,6 +10,40 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: current-release fresh Create/Install measurement
+
+No implementation or artifact changes. Verified release SHA-256 remains
+`697324387cf98331f0c237e228dfc9e98947c8a97f9f1204dfa3d8eca985ce20`.
+A new disposable `current-latency-smoke` space was generated with the release,
+using isolated XDG roots under the shared target, not `/tmp`. Generated HTTP/SSH
+configuration was enabled automatically; only ports changed to18099/2243.
+Only the immutable Counter package was copied from the earlier fixture; no
+host store was copied, moved or reset.
+
+Results: first readiness18s (fails10s gate); HTTP status and SSH keyscan pass;
+fresh Create38s and fresh Counter Install45s both exit0 with verified signed
+acknowledgements and empty stderr, without retry/resume. SIGTERM completes in
+less than1s; no forced cleanup. Probe session89278 terminal0; subsequent host
+process inspection finds no matching qualification daemon. This is not a
+controlled before/after comparison and does not remeasure fresh invocation.
+
+The logs narrow the operation bottleneck: Create lifecycle takes13,029ms;
+publication completes at33,901ms from lifecycle start, including20,705ms route
+reconciliation (20,463ms inventory). Both Create and Install synchronously call
+`self.reconcile()` before returning their successful result in
+`vos/src/agent/production_owner.rs`. Install's final reconciliation takes19,570ms
+(18,942ms inventory); do not attribute its entire45s wall time to this stage.
+The initial one-agent inventory takes11,989ms across four queries; after Create,
+two-agent inventory requires six queries. This explains why inventory work
+matters beyond startup. Do not bypass authenticated publication to reduce it.
+
+Evidence: shared `target/task-tmp/current-latency.p7U3OE/`, including `new.json`,
+`probe.sh`, `probe.log`, `up.log`, HTTP/SSH output and `create.txt`/`install.txt`.
+Space ID: `64877d8203099e9bb2ab739487853708087a7b380bb14507f2d8e7ac0847c6bf`.
+Local Agent: `ba7d547d71e6e54f276abcd5bcc49486e103606b27393693eb63194646dc5fb2`.
+Preserve this fixture at its original absolute path with its operation evidence.
+The previous `fresh-ack-release.Of5a75` recovery fixture remains untouched.
+
 ### 2026-09-19: eight-entry release, two restart passes
 
 Release `cca4c911` built locked/offline nightly-2025-05-09 in6m35s; SHA-256:
