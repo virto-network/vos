@@ -10,6 +10,27 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: complete current host-feature library regression
+
+At `ba2d08ad`, the complete host-feature library suite passes1,869 tests,
+zero failures,3 ignored,1,411.11s (23m31s); build13.02s. Command:
+`cargo +nightly-2025-05-09 test --locked --offline -p vos --features 'agent-transition-proof private-agent-store http-ingress ssh-ingress' --lib -- --test-threads=1`.
+Shared CARGO_TARGET_DIR and disk-backed TMPDIR; session14453 terminal0.
+Evidence: `target/task-tmp/current-latency.p7U3OE/host-library-suite.log`.
+One uninterrupted run, no source fixes, no narrowed workloads. The complete
+514-query inventory rotation and system-attachment checkpoint/drain tests pass.
+This supersedes the earlier full host-feature run with one outdated assertion
+and its separate corrected rerun; current regression evidence is now all-green
+for this precise suite, not for all production gates.
+
+Ignored (not claimed as passing in this run): native-operation initial-capture
+headroom diagnostic at the real64MiB journal boundary; fixed-history physical
+decode timing probe requiring an explicit copied-db fixture; repeated large-ACK
+CPU profiling probe. Their older evidence remains historical. Enabling
+`agent-transition-proof` does not by itself establish the full Private/Attested
+cryptographic proof matrix. Startup10s, ordinary Shared finality, authenticated
+reclamation and remaining crash/proof/release requirements stay open.
+
 ### 2026-09-19: current-source default-feature library regression
 
 At `7e096a31`, the complete default-feature library suite passes1,434 tests,

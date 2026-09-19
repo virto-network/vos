@@ -30,7 +30,10 @@ actor-build4 and task-build1 integration tests pass. Shutdown smoke fails the
 unchanged10s startup deadline before SIGTERM, so the integration command exits101.
 This is not an all-green matrix or a shutdown failure. Current default-feature
 library qualification at `7e096a31` passes1,434 tests with1 ignored in200.90s.
-The current full host-feature/proof matrix remains outstanding; see the handoff.
+The full host-feature library suite at `ba2d08ad` also passes1,869 tests with
+3 ignored in1,411.11s, including the complete inventory-rotation and attachment
+checkpoint workloads. Full cryptographic proof qualification and production
+gates remain outstanding; see the handoff for ignored cases and evidence.
 
 An additional fresh-space probe of the same release reaches readiness in18s,
 verifies fresh Create in38s and Counter Install in45s, and shuts down within1s.
