@@ -15,7 +15,15 @@ and the actual bundled-Authority fresh-query regression also pass. Manifest,
 host ProgramId, build-time digest and embedded PVM are now updated together.
 Post-pin artifact-release18/18 and bundled wire98/1 ignored pass; the full
 current-source `just verify-agent-runtime-release` build/byte-comparison passes.
-A new release executable and fresh Local smoke test remain due for this pin.
+Release a732e079 now builds in7m14s and passes bundle creation/verification.
+SHA-256: `4f7f48048679b0a0ecc2283e128c7996d62e5f34d87ab1a9e1817d3aa305cd94`.
+Full post-pin CLI255/19 ignored passes in96.44s. Fresh fixture
+`current-latency.bWPsi4` passes Create30s, Install37s, Counter mutation21.64s,
+read-after-restart21.96s with value7, positive retirement and exact ACK retries.
+HTTP status/SSH keyscan pass, not authenticated shell access. Readiness16s/20s/26s
+still fails10s; shutdowns0s/0s/1s require no forced cleanup. Probe daemon/listeners
+are gone. No controlled end-to-end speedup is established.
+Build/bundle/CLI evidence: shared `target/task-tmp/single-preflight-release.pE0Yxy/`.
 Use the d4d38ebb release checkpoint below only with its original-pin fixtures;
 do not boot those stores with the new pin.
 
@@ -36,9 +44,9 @@ still retain their older source qualification boundaries.
 Evidence and the preserved previous executable are in shared
 `target/task-tmp/review-checkpoint-release.6a7GXF/`.
 
-## What can be tested
+## Previous-pin qualification (historical)
 
-Latest source now pins decoded-input validation reuse from immutable
+The preceding release pinned decoded-input validation reuse from immutable
 `330274bb139885b61e833bb63768a3024b5b9797`, ProgramId
 `ebed0967a4d987e2f50f6e8908b294f713b0cf74583d1b5dc6648a8a542a049c`.
 Two isolated ELF/PVM builds match each other and the measured candidate.
@@ -75,10 +83,10 @@ returns409; retention is bounded, not indefinite server reply caching.
 Keep two scoped batches, not one review per work-in-progress commit:
 
 1. `31b0cdbb..f79f0e3d`: integrated clean-break architecture/lifecycle.
-2. `f79f0e3d..d4d38ebb`: recovery, performance, artifact, host/build fixes and qualification follow-ups
-   (57 files, +5,802/-330 at this frozen checkpoint).
+2. `f79f0e3d..a732e079`: recovery, performance, artifact, host/build fixes and qualification follow-ups
+   (57 files, +6,231/-331 at this frozen checkpoint).
 
-The integrated diff remains large (240 files, +78,596/-59,065 at `d4d38ebb`).
+The integrated diff remains large (240 files, +79,025/-59,066 at `a732e079`).
 These are review groupings, not independently deployable slices. Subsequent
 review-handoff documentation and disposable-fixture test updates belong with batch2. The old C1 boundary
 is not independently merge-ready.
@@ -89,7 +97,7 @@ not production/master sign-off.
 The post-`36e63581` uncommitted Shared-finality experiment has been removed:
 it depended on legacy embedded authority state absent from clean Create. Its
 failed test and patch are preserved in the evidence directory; see the handoff.
-The latest live-qualified Local release checkpoint is `d4d38ebb`. Ordinary Shared finality needs clean
+The latest live-qualified Local release checkpoint is `a732e079`. Ordinary Shared finality needs clean
 system-authority actor integration, not a switch to the legacy replay helper.
 No merge or push is authorized by this checkpoint. Fresh Create/Install/invocation
 have now been measured, but not as a controlled before/after comparison.
@@ -101,9 +109,9 @@ with bounded equivalence/recovery checks and repeat release qualification.
 
 | Requirement | Current evidence / gap |
 | --- | --- |
-| Startup and operation latency | Latest d4d38ebb fresh readiness16s, restarts20s/26s;10s gate fails. Fresh Create29s, Install37s, managed increment21.55s and read-after-restart21.48s. No controlled before/after speedup is established. |
+| Startup and operation latency | Latest a732e079 fresh readiness16s, restarts20s/26s;10s gate fails. Fresh Create30s, Install37s, managed increment21.64s and read-after-restart21.96s. No controlled before/after speedup is established. |
 | Recovery performance | With8-entry scheduling, second pass system owner8.02s, including14 runtime calls6.39s. Shorter history helps; not a same-history A/B. |
-| Inventory performance | Two agents require six sequential authenticated queries. Latest fresh Create lifecycle9.37s is followed by route reconciliation16.18s (inventory15.92s); post-Install inventory16.10s. Inventory still materially delays operation completion. |
+| Inventory performance | Two agents require six sequential authenticated queries. Latest fresh Create lifecycle9.54s is followed by route reconciliation16.52s (inventory16.24s); post-Install inventory16.16s. Inventory still materially delays operation completion. |
 | Shutdown | Latest disposable probes report0s at whole-second resolution and no forced cleanup; general busy/crash matrix still incomplete. |
 | Ordinary Shared genesis/finality | Native startup still installs `UnavailableAgentFinality`; ordinary `AgentGenesisProvider` has no implementation/caller in current Rust sources. Production archive/issuance plus authenticated replay-backed finality integration are missing, not just a verifier switch. System genesis is a separate path. |
 | Authenticated reclamation | Issuer/coordinator bounded-record reclamation remains unfinished; invocation retirement is not proof of Authority application. |

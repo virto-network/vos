@@ -3,11 +3,11 @@
 Current source has a subsequent runtime repin from immutable ba7be457 (ProgramId
 `8071ad67661c6539ab504ccecc18c9e8d6d858803b52fca05389823f8109d3cc`).
 It belongs with batch2. Independent reproduction, post-pin artifact18/18,
-bundled wire98/1 ignored and current-source reproduction pass. A new release
-executable/fresh Local smoke remain due. The frozen review sizes and live
-qualification below refer to the previous d4d38ebb checkpoint, not the new pin.
+bundled wire98/1 ignored and current-source reproduction pass. Release a732e079
+also builds, verifies its bundle and passes full CLI255/19 ignored and fresh
+Local lifecycle/restart testing. Production gates remain open.
 
-## Review entry point: source checkpoint `d4d38ebb`
+## Review entry point: source checkpoint `a732e079`
 
 The latest source checkpoint includes the subsequent host/cache/network fixes,
 build-fixture corrections and inventory-refresh regression. Its two review ranges
@@ -35,11 +35,11 @@ for exact qualification boundaries.
 | Batch | Exact range | Scope and size |
 | --- | --- | --- |
 | 1 | `31b0cdbb..f79f0e3d` | Integrated clean-break architecture and lifecycle;225 files,+72,934/-58,875. |
-| 2 | `f79f0e3d..d4d38ebb` | Recovery, checkpointing, shutdown, validation reuse, artifact-role length filtering, exact-binary profiling, reproduced pins, lifecycle conflict reporting, attachment refresh, host/cache/network fixes, build-fixture corrections, operator docs and qualification;57 files,+5,802/-330. |
+| 2 | `f79f0e3d..a732e079` | Recovery, checkpointing, shutdown, validation reuse, artifact-role length filtering, exact-binary profiling, reproduced pins, lifecycle conflict reporting, attachment refresh, host/cache/network fixes, build-fixture corrections, PublicPreflight hash reuse, operator docs and qualification;57 files,+6,231/-331. |
 
-Counts are frozen at `d4d38ebb`; subsequent handoff documentation belongs with batch2.
+Counts are frozen at `a732e079`; subsequent handoff documentation belongs with batch2.
 Neither batch is an independently deployable slice.
-The integrated diff is240 files,+78,596/-59,065. No production sign-off is implied.
+The integrated diff is240 files,+79,025/-59,066. No production sign-off is implied.
 
 Batch1 remains large and cannot be presented as an independently safe old C1
 cut. Batch2 contains all subsequent fixes together, not one review per commit.
@@ -51,6 +51,18 @@ to immutable source and provenance. The following evidence distinguishes
 passing regressions from still-failing production gates.
 
 ## Current release qualification
+
+Release a732e079 SHA-256:
+`4f7f48048679b0a0ecc2283e128c7996d62e5f34d87ab1a9e1817d3aa305cd94`.
+Build and bundle verification pass; full CLI255/19 ignored passes. Fresh
+`current-latency.bWPsi4` passes Create30s, Install37s, mutation21.64s and
+read-after-restart21.96s with value7, positive retirement and exact ACK retries.
+HTTP status/SSH keyscan pass. Readiness16s/20s/26s fails10s; shutdown0s/0s/1s
+passes without forced cleanup. Evidence: shared
+`target/task-tmp/single-preflight-release.pE0Yxy/` and the fresh fixture.
+This is Local/Public-policy qualification, not a production latency improvement.
+
+### Previous same-generation release (different runtime pin)
 
 Source `d4d38ebb` now builds a release executable and passes bundle creation
 and verification. SHA-256:

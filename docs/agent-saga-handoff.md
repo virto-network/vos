@@ -2,14 +2,54 @@
 
 ## Checkpoint and decision
 
-Review and build/bundle checkpoint: `d4d38ebb`.
-Live-qualified Local-test release source: `d4d38ebb`.
+Review and build/bundle checkpoint: `a732e079`.
+Live-qualified Local-test release source: `a732e079`.
 Use [current status](agent-saga-status.md) for remaining gates and
 [the review guide](agent-saga-review.md) for the two current review ranges.
 This log is reverse chronological: older statements about pending builds or
 the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
+
+### 2026-09-19: repinned release and fresh Local lifecycle qualified
+
+Frozen source `a732e079f7792e953434f3dfe7f83a899c8ea057` builds locked/offline
+with nightly-2025-05-09 in7m14s (session31541 exit0). Executable SHA-256:
+`4f7f48048679b0a0ecc2283e128c7996d62e5f34d87ab1a9e1817d3aa305cd94`.
+Its release bundle/verify commands pass. Evidence directory: shared
+`target/task-tmp/single-preflight-release.pE0Yxy/`, including build/bundle/verify
+logs, verified `bundle/`, and `vosx-before` preserving the d4d38ebb executable
+(SHA-256 `1ddcc3c99ea16c5982d7ac8f2e752cfdbf91ceb9145d34d087f1524110668a08`).
+
+Full CLI255 passed,0 failed,19 ignored in96.44s (session88849 exit0,
+`cli-suite.log`), using the current post-pin test executable SHA-256
+`a9405e57d7aa03e9c068918c50edf37d651e2ef8369f9512ca58d93059ec88d9`.
+CLI and release compilation overlapped with sufficient available RAM; neither
+their durations nor the following distinct-history fixtures are controlled A/B
+performance evidence. Both jobs finished before the live probe began.
+
+Fresh `current-latency.bWPsi4/probe.sh` passes (session69210 exit0) using isolated
+XDG roots. `space new` automatically supplies system packages and HTTP8080/
+SSH2222 configuration; only test ports changed to18099/2243. No old store was
+copied or reopened; only immutable Counter package bytes were reused.
+
+Readiness16s, Create30s, Install37s, restart20s, Counter mutation21.64s,
+restart26s, read21.96s. Both explicit tests pass1 test with273 filtered and
+require value7, positive retirement and exact ACK retry. HTTP status and SSH
+keyscan pass, not authenticated shell or full Private/Attested proof coverage.
+Shutdowns0s/0s/1s at whole-second resolution need no forced cleanup. Post-probe
+checks confirm no matching daemon or test listeners. Logs/new/Create/Install/
+mutation/read outputs stay at the original fixture path; TMPDIR is disk-backed.
+
+Create lifecycle9.543s is followed by route reconciliation16.518s (inventory
+16.244s); post-Install inventory16.155s/reconciliation16.896s. The unchanged-head
+inventory refresh is3.011s. All readiness measurements still exceed10s. The
+small paired gas saving does not establish usable production latency.
+
+Two review ranges now freeze at a732e079: batch1 unchanged; batch2 is57 files,
++6,231/-331, integrated240 files,+79,025/-59,066. Later documentation belongs
+with batch2. This completes the new pin's release/Local smoke handoff, not the
+remaining full saga, host-feature/proof/crash/lint or performance gates.
 
 ### 2026-09-19: reproduced PublicPreflight runtime is pinned
 
