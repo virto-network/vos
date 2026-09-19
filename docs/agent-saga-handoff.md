@@ -3,7 +3,7 @@
 ## Checkpoint and decision
 
 Review source checkpoint: `45ff53e0` (two batches; see review guide).
-Build/bundle checkpoint: `a732e079`.
+Build/bundle checkpoint: `e20cbb76`; live qualification remains at `a732e079`.
 Live-qualified Local-test release source: `a732e079`.
 Use [current status](agent-saga-status.md) for remaining gates and
 [the review guide](agent-saga-review.md) for the two current review ranges.
@@ -11,6 +11,22 @@ This log is reverse chronological: older statements about pending builds or
 the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
+
+### 2026-09-19: final review-source release builds and verifies
+
+Frozen source `e20cbb76` builds with
+`cargo +nightly-2025-05-09 build --release --locked --offline -p vosx`
+in7m05s (session6875 exit0), using the shared target and disk-backed TMPDIR.
+The resulting executable includes the host-only startup decode fix. SHA-256:
+`d11e52eed2e917a53e025536972f375363d30355d602dee2e9e23a3f6950e2cc`.
+Its `release bundle --out .../bundle` and `release verify .../bundle` both pass.
+Evidence: shared `target/task-tmp/final-review-release.HbPbex/`, with `build.log`,
+`bundle.log`, `verify.log` and materialized `bundle/`. The prior live-qualified
+binary is preserved there as `vosx-before`; its verified SHA-256 remains
+`4f7f48048679b0a0ecc2283e128c7996d62e5f34d87ab1a9e1817d3aa305cd94`.
+No stores were copied, migrated or reopened. Fresh live qualification of this
+new executable is still pending. Guest pins are unchanged; production gates
+remain open. No merge or push has been performed.
 
 ### 2026-09-19: full host-feature run exposes and fixes a status-test race
 
