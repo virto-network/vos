@@ -15,7 +15,7 @@ use alloc::{vec, vec::Vec};
 use core::fmt;
 
 use super::committee::{
-    AuthorityClaimCommitment, AuthorityClaimDomain, AuthorityCommitteeError,
+    AuthorityClaimCommitment, AuthorityClaimDomain, AuthorityCommittee, AuthorityCommitteeError,
     AuthorityQuorumCertificate, GenesisIntentId, MAX_AUTHORITY_QC_WIRE_BYTES,
     MAX_SYSTEM_GENESIS_ADMISSION_BYTES, SystemAgentGenesisAdmissionRecord,
 };
@@ -869,6 +869,24 @@ impl AgentGenesisEvidence {
 
     pub fn id(&self) -> AgentGenesisEvidenceId {
         AgentGenesisEvidenceId(Hash::digest(GENESIS_EVIDENCE_ID_DOMAIN, &[&self.encode()]).0)
+    }
+
+    /// Verify this exact claim against an independently trusted system
+    /// committee. The target Agent's replica roster is not that committee.
+    ///
+    /// Success proves certificate authorization only, not durable publication
+    /// or finality. It cannot replace [`AgentGenesisFinalityVerifier`].
+    pub fn verify_certificate(
+        &self,
+        trusted_committee: &AuthorityCommittee,
+    ) -> Result<(), AgentGenesisError> {
+        self.validate()?;
+        if trusted_committee.space() != self.claim.space() {
+            return Err(AgentGenesisError::InvalidEvidence);
+        }
+        self.certificate
+            .verify(trusted_committee, self.claim.authority_claim())
+            .map_err(AgentGenesisError::Authority)
     }
 
     pub fn validate(&self) -> Result<(), AgentGenesisError> {
@@ -1883,6 +1901,68 @@ mod tests {
             decision,
             provision,
         }
+    }
+
+    #[test]
+    fn genesis_certificate_requires_independent_committee_and_exact_space_claim() {
+        use ed25519_dalek::{Signer as _, SigningKey};
+
+        let fixture = fixture();
+        let key = SigningKey::from_bytes(&[0x71; 32]);
+        let member = AuthorityCommitteeMember::new(
+            NodeId([0x72; 32]),
+            key.verifying_key().to_bytes(),
+            AuthorityMemberRole::Voter,
+        )
+        .unwrap();
+        let committee_for = |space| {
+            AuthorityCommittee::new(
+                space,
+                fixture.evidence.claim().authority_binding(),
+                1,
+                None,
+                vec![member.clone()],
+            )
+            .unwrap()
+        };
+        let sign = |committee: &AuthorityCommittee| {
+            let claim = fixture.evidence.claim().clone();
+            let message = AuthorityQuorumCertificate::signing_message(
+                committee.authority_binding(),
+                committee.epoch(),
+                committee.commitment(),
+                claim.authority_claim(),
+            );
+            let certificate = AuthorityQuorumCertificate::new(
+                committee,
+                claim.authority_claim(),
+                vec![
+                    AuthoritySignature::new(member.signer(), key.sign(&message.0).to_bytes())
+                        .unwrap(),
+                ],
+            )
+            .unwrap();
+            AgentGenesisEvidence::new(claim, certificate).unwrap()
+        };
+        let trusted = committee_for(fixture.proposal.locator().space);
+        let evidence = sign(&trusted);
+        assert_eq!(evidence.verify_certificate(&trusted), Ok(()));
+        assert!(evidence.verify_certificate(&fixture.authority).is_err());
+        let mut substituted = evidence.clone();
+        substituted.claim.post_create_state = Hash([0x73; 32]);
+        assert!(substituted.verify_certificate(&trusted).is_err());
+
+        // Even valid signatures must not authorize a claim in another space.
+        let other_space = committee_for(SpaceId([0x74; 32]));
+        let cross_space = sign(&other_space);
+        cross_space
+            .certificate()
+            .verify(&other_space, cross_space.claim().authority_claim())
+            .unwrap();
+        assert_eq!(
+            cross_space.verify_certificate(&other_space),
+            Err(AgentGenesisError::InvalidEvidence)
+        );
     }
 
     #[test]

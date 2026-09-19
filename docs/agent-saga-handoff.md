@@ -12,6 +12,30 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-20: scoped ordinary-genesis certificate verification prerequisite
+
+`AgentGenesisEvidence::verify_certificate` now checks structural consistency,
+exact claim-space equality with an independently supplied trusted committee,
+and the existing QC verifier's binding/epoch/committee/claim/signature checks.
+It returns no admission capability and is explicitly not publication or finality.
+The target Agent replica roster must not be substituted for the system authority
+committee. Real Ed25519 regression coverage accepts the correct committee,
+rejects a different committee and substituted claim, and rejects cross-space
+evidence even when the underlying QC signatures are valid for that committee.
+All9 genesis tests pass (session23260 exit0,0 ignored,1429 filtered,0.03s),
+including the existing independent-finality gate regression. Pinned-host fmt
+and diff checks pass; no-default-features library check passes (session62732
+exit0,2.46s). Logs: `genesis-certificate-admission.log` and
+`genesis-certificate-no-std.log` under shared
+`target/task-tmp/final-review-release.HbPbex/`.
+
+This helper is not yet called by a production publisher. Durable exact-decision
+publication, provider issuance and authenticated retrieval/finality remain
+unimplemented. The qualified release remains frozen at e20cbb76 and does not
+include this new helper. No guest artifact repin or branch integration occurred.
+Authority actor baseline at d1b1cdc7 also passes58/58 in119.87s (session9460
+exit0; `authority-baseline.log` in the same directory).
+
 ### 2026-09-20: ordinary genesis catalog rejection coverage
 
 Extended the existing ordinary genesis catalog regression to reject an empty
