@@ -10,6 +10,25 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: PVM vectors and voucher release catalog gates pass
+
+At `4817e479`, unchanged release recipes pass with nightly-2025-05-09,
+offline dependencies, shared disk-backed target/TMPDIR and serial tests:
+
+- `just test-pvm-vectors`:20 passed, zero failed/ignored/filtered,0.22s;
+  session85189 exit0, `decoded-input-release.RIkx3j/pvm-vectors.log`.
+  The integration test checks the reviewed173 v0.8 semantic cases and16 block-gas
+  oracle cases, corpus/opcode completeness and interpreter/JIT parity on this
+  Linux/x86-64 host. The historical v0.7.2 corpus is separately labelled.
+- `just verify-voucher-check-release`:2 passed, zero failed/ignored,9 filtered,
+  0.48s; session47641 exit0, `voucher-catalog-release.log` in the same directory.
+  Tests validate the production catalog pin and re-measure the checked-in
+  released voucher PVM's blob/profile/AIR commitment. This is not the filtered
+  maintenance-only current-source reproduction test or full voucher proving.
+
+Source, production artifacts and lockfiles are unchanged. These individual
+gates do not make the still-failing workspace `check-all` recipe pass.
+
 ### 2026-09-19: complete examples recipe passes after artifact-path correction
 
 Following `c3ce5261`, `test-examples` no longer overrides the actor workspaces'

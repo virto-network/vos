@@ -98,6 +98,9 @@ runtime test's target-directory lookup and removing moving-nightly overrides
 from actor builds. All four actors build; guest entry, host examples and the
 explicit compiled custom-runtime scheduling/rejection test pass. This does not
 close the broader `check-all` recipe or production profile gaps.
+At4817e479, `just test-pvm-vectors` passes20 tests and
+`just verify-voucher-check-release` passes2 catalog checks. The latter verifies
+the checked-in released artifact, not a new source reproduction or full proof.
 
 Post-pin broad library regressions are complete; the production gaps above remain.
 The subsequent host/journal cleanup and boxed network command have targeted
