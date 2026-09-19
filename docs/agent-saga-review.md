@@ -21,6 +21,8 @@ verification and fresh Local/Public-policy lifecycle/restart testing in
 `d11e52eed2e917a53e025536972f375363d30355d602dee2e9e23a3f6950e2cc`.
 Readiness16s/20s/26s still fails10s; production gates remain open. See the handoff
 for precise timings and qualification boundaries.
+Final-source CLI regression at93e63c5f also passes255 tests,0 failed,19 ignored
+in81.76s. No implementation changes were added after the release build.
 The corrected-source host-feature suite at `45ff53e0` passes: 1,878 passed,
 zero failed, four ignored, zero filtered in 1,587.02s (session25218 exit0). Log:
 `target/task-tmp/single-preflight-release.pE0Yxy/host-feature-suite-fixed.log`

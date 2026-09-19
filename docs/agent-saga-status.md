@@ -8,6 +8,8 @@ Latest qualified release source: `e20cbb76`, including the host startup-decode
 fix. Locked/offline build7m05s, bundle creation/verification and fresh Local
 lifecycle pass. SHA-256:
 `d11e52eed2e917a53e025536972f375363d30355d602dee2e9e23a3f6950e2cc`.
+Final-source CLI regression at93e63c5f passes255 tests,0 failed,19 ignored
+in81.76s; no implementation changes since the qualified release source.
 Fixture `current-latency.KD6UwR`: Create29s, Install38s, mutation21.95s,
 read-after-restart21.88s (full retry tests23.79s/23.68s). Positive retirement,
 exact retry, HTTP status and SSH keyscan pass; authenticated shell not tested.

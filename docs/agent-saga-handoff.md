@@ -12,6 +12,20 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-20: final-source CLI regression passes
+
+At frozen `93e63c5f` (documentation-only changes since release sourcee20cbb76),
+the complete CLI binary suite passes255 tests,0 failed,19 ignored,0 filtered
+in81.76s (session57739 exit0). Command:
+`cargo +nightly-2025-05-09 test --locked --offline -p vosx --bin vosx -- --test-threads=1`.
+Shared target, disk-backed TMPDIR, RUST_TEST_THREADS=1, RAYON_NUM_THREADS=2,
+and localhost socket access were used. Log: shared
+`target/task-tmp/final-review-release.HbPbex/cli-suite.log`.
+Ignored live campaigns are not coverage from this command; the explicit fresh
+Counter mutation/read campaigns below provide their own separate evidence.
+This closes the final host-fix CLI regression gap, not the remaining production
+gates or all workspace integration tests. No implementation changes were added.
+
 ### 2026-09-20: final review release passes fresh Local lifecycle
 
 Release source `e20cbb76`, SHA-256
