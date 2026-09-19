@@ -2,13 +2,76 @@
 
 ## Checkpoint and decision
 
-Review checkpoint and qualified Local-test release source: `b16abf81`.
+Review checkpoint and qualified Local-test release source: `8f96fad8`.
 Use [current status](agent-saga-status.md) for remaining gates and
 [the review guide](agent-saga-review.md) for the two current review ranges.
 This log is reverse chronological: older statements about pending builds or
 the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
+
+### 2026-09-19: decoded-input release and fresh Local lifecycle qualified
+
+Release source `8f96fad8d46ab5f5421ddd3afb1fbe6011b09bea` builds locked/offline
+with nightly-2025-05-09 in7m11s (session97380 exit0). SHA-256:
+`ee49a636c477c1e3ef21d56f16e2c181307bd1e740ad20bee80b6da27e30e76d`.
+`release bundle` and `release verify` pass with reproduced runtime ProgramId
+`ebed0967a4d987e2f50f6e8908b294f713b0cf74583d1b5dc6648a8a542a049c`.
+Evidence: shared `target/task-tmp/decoded-input-release.RIkx3j/`, including
+`build.log`, verified `bundle/`, and preserved prior executable `vosx-before`
+(SHA-256 `e76cf5428ebc443ec7cc6859c162ee7b9ec67e5fb03706b2ee9798051fa84106`).
+
+Full CLI suite passes255 tests,0 failed,19 ignored in98.76s with loopback access
+(session9925 exit0, `cli-suite-loopback.log`). The initial sandboxed run failed
+15 socket-listener tests with `PermissionDenied`/`Operation not permitted`;
+240 passed,19 ignored. Its `cli-suite.log` is preserved. No source fixes,
+skipped failing tests or changed timeouts: the same binary/suite was rerun with
+local socket permission. Its concurrent release build means suite wall time is
+not a performance benchmark. Both jobs finished before the live probe started.
+
+New disposable fixture `target/task-tmp/current-latency.coTfCk/` has isolated
+XDG roots and name `current-latency-smoke`. SpaceId:
+`2a6d0bf2c2eea7b123763caf399640fd1701b64899515f014ea5f54cea0eaab0`.
+AgentId: `0b8915bf7b808aa62f68519a451f2de2b9dc794c3032a026b988fa7237f1c761`.
+Generated config enabled HTTP8080 and SSH2222; only ports changed to18099/2243.
+Only the immutable Counter package was copied, never a raw store. System
+packages were installed automatically during startup. All prior fixtures remain
+at original paths and were not opened with the new pin.
+
+Guarded `probe.sh` passes (session59543 exit0):
+
+- Initial readiness13s; HTTP status and SSH keyscan pass.
+- Fresh Create25s and Install36s both return verified acknowledgements without
+  retry/resume.
+- Restart readiness19s; fresh managed increment20.04s (full test21.84s).
+- Restart readiness26s; managed read20.33s (full test22.12s), value7 persists.
+- Positive retirement, retired Invoke rejection and exact ACK retries pass.
+  All shutdowns report0s at whole-second resolution; no forced cleanup.
+  Post-probe process/listener checks find no test daemon or occupied test ports.
+
+Mutation invocation `6c1869a1694bc23258f3a2fe5218d2e21e1831d1d9f0adde4660184da3b53b78`;
+read invocation `590702442883dc4c3503182a808c3c8d498b6c8048c427b4adcedcc80918ee71`.
+CLI test executable SHA-256:
+`1eadc4862b50c9ec67a9b138f888d81316a8b13310045ed4bb06bd4768d5a3ad`.
+Do not rerun the fresh mutation campaign or move/relabel the fixture stores.
+The logs are `probe.log`, `up.log`, `mutation-up.log`, `read-up.log`,
+`mutation-test.log`, `read-test.log`, plus exact Create/Install outputs.
+
+Post-Create lifecycle8,058ms is followed by14,079ms route reconciliation,
+including13,845ms inventory (six queries). Post-Install inventory15,681ms;
+final route reconciliation16,353ms. Existing phase analysis parses all four
+completed inventory loads; output is `decoded-input-release.RIkx3j/inventory-phases.json`.
+Create/inventory are lower than the preceding fixture, but Install remains36s
+and managed calls remain about20s. These differing generations/histories are
+not controlled A/B evidence. All three readiness observations fail the10s gate.
+SSH keyscan is not authenticated shell qualification; Counter Public-policy
+success is not the full Private/Attested cryptographic matrix.
+
+Review remains two groups, frozen at this implementation checkpoint:
+`31b0cdbb..f79f0e3d` and `f79f0e3d..8f96fad8`. Batch2 is48 files,+4,946/-258;
+integrated234 files,+77,744/-58,997. No merge/push. Full post-pin default/host
+regressions and all remaining Shared, reclamation, proof and production gates
+stay open. This closes release rebuild/fresh Local-test qualification only.
 
 ### 2026-09-19: independently reproduce and atomically pin decoded-input runtime
 

@@ -1,31 +1,29 @@
 # Reviewing the Agent architecture saga
 
-## Review entry point: checkpoint and release source `b16abf81`
+## Review entry point: checkpoint and release source `8f96fad8`
 
 Use these two ranges for the current review; the older snapshot below remains
 historical evidence. No merge or push is implied by this breakdown.
 
 The subsequent decoded-input optimization is now independently reproduced and
 pinned from `330274bb`, with18 release checks and97 bundled wire tests passing
-(1 ignored). It belongs with batch2. Its release rebuild and fresh live
-qualification are still pending; the frozen ranges below remain the previous
-live-qualified checkpoint, not evidence for the new pin.
+(1 ignored). It belongs with batch2. Release rebuild, bundle verification,
+CLI255/19 ignored and a fresh Local lifecycle/restart probe now pass. Broad
+default/host-feature regressions and production gates remain open.
 
-That checkpoint includes the artifact-role length optimization and independently
-reproduced pin from `19d73390`; these also belong in batch2. Its release rebuild,
-fresh-space qualification, full CLI, default-library and host-feature suites
-pass. The latter completes1,873 tests/3 ignored before the subsequent mechanical
-formatting cleanup; see the handoff for exact qualification boundaries.
+Earlier default-library and host-feature successes belong to the preceding
+`19d73390` runtime pin; do not treat them as post-repin runs. See the handoff
+for exact qualification boundaries.
 
 | Batch | Exact range | Scope and size |
 | --- | --- | --- |
 | 1 | `31b0cdbb..f79f0e3d` | Integrated clean-break architecture and lifecycle;225 files,+72,934/-58,875. |
-| 2 | `f79f0e3d..b16abf81` | Recovery, checkpointing, shutdown, prepared-runtime/ACK/Invoke validation reuse, artifact-role length filtering, reproduced pin, lifecycle conflict reporting, attachment refresh, operator docs and qualification;40 files,+3,862/-216. |
+| 2 | `f79f0e3d..8f96fad8` | Recovery, checkpointing, shutdown, validation reuse, artifact-role length filtering, exact-binary profiling, decoded-input validation reuse, reproduced pins, lifecycle conflict reporting, attachment refresh, operator docs and qualification;48 files,+4,946/-258. |
 
 Counts are frozen at that checkpoint; subsequent handoff documentation,
 mechanical formatting and disposable-fixture test updates belong with batch2.
 Neither batch is an independently deployable slice.
-The integrated diff is231 files,+76,679/-58,974. No production sign-off is implied.
+The integrated diff is234 files,+77,744/-58,997. No production sign-off is implied.
 
 Batch1 remains large and cannot be presented as an independently safe old C1
 cut. Batch2 contains all subsequent fixes together, not one review per commit.
@@ -37,6 +35,19 @@ to immutable source and provenance. The following evidence distinguishes
 passing regressions from still-failing production gates.
 
 ## Current release qualification
+
+Release `8f96fad8` / SHA-256
+`ee49a636c477c1e3ef21d56f16e2c181307bd1e740ad20bee80b6da27e30e76d`
+builds and verifies its reproduced bundle. Fresh fixture `current-latency.coTfCk`
+passes HTTP status/SSH keyscan, Create25s, Install36s, managed increment20.04s,
+read-after-restart20.33s, value7, positive retirement and exact ACK retries.
+Readiness13s then19s/26s still fails10s. Shutdowns report0s at whole-second
+resolution without forced cleanup. Full CLI255/19 ignored passes with loopback;
+full default/host-feature suites still need post-pin runs. This is disposable
+Local/Public-policy testing, not authenticated SSH shell or full proof coverage.
+Previous release and fixtures remain preserved at their original paths.
+
+### Previous release qualification
 
 Release `b16abf81` includes the independently reproduced artifact-role length
 optimization. Bundle verification and fresh Local Create/Counter Install pass;

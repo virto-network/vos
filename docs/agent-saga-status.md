@@ -13,33 +13,23 @@ Two isolated ELF/PVM builds match each other and the measured candidate.
 Paired exact-output tests use12.6% less fresh-Invoke gas and20.9% less ACK gas
 than the preceding bundle. Post-pin release checks18/18 and bundled wire
 checks97/1 ignored pass. The real candidate Authority-query test also passes.
-**Release rebuild and fresh live qualification for this new pin are pending.**
-Do not boot any preserved older-pin fixture with a newly built binary.
-See the handoff for exact evidence and qualification boundaries.
-
-The last live-qualified release pins the artifact-role length optimization
-from `19d73390`, ProgramId
-`e61dc1dacd564ac9371512eaaf9d35ad8f1e081f8e3b638ca9da9425e887e86b`.
-Paired synthetic tests show20.1% less fresh-Invoke gas with identical complete
-output. Two isolated ELF/PVM builds match each other and the measured candidate.
-Release rebuild, fresh Local lifecycle/restart qualification and the full CLI
-suite pass. Full post-pin default-library regression passes1,434 tests/1 ignored;
-host-feature regression passes1,873 tests/3 ignored. These runs precede the
-subsequent mechanical formatting cleanup. Do not boot older fixtures with the
-new pin. See the handoff for exact evidence and qualification boundaries.
-
-Release implementation `b16abf81` builds and verifies its bundled artifacts.
-SHA-256: `e76cf5428ebc443ec7cc6859c162ee7b9ec67e5fb03706b2ee9798051fa84106`.
-The runtime is independently reproduced; new spaces automatically
+Release implementation **`8f96fad8`** builds and verifies its bundled artifacts.
+SHA-256: `ee49a636c477c1e3ef21d56f16e2c181307bd1e740ad20bee80b6da27e30e76d`.
+Full CLI regression passes255 tests/19 ignored with loopback access. New spaces automatically
 receive system packages and enabled HTTP/SSH configuration. The Local workflow
 has live evidence for Create, Counter Install, increment, retirement/ACK retry,
 and reading7 after restart. Latest release checks HTTP status and SSH listener
 availability (not authenticated shell access). Earlier-generation probes cover
 host-key persistence and conflict reporting. New-space probes verify fresh
-Create (30s) and Counter Install (36s), with no retry/resume.
-Fresh Counter increment takes20.71s and read-after-restart19.90s on this release;
+Create (25s) and Counter Install (36s), with no retry/resume.
+Fresh Counter increment takes20.04s and read-after-restart20.33s on this release;
 value7, positive retirement and exact ACK retries pass. This is Public-policy
 qualification, not the remaining Private/Attested proof matrix.
+Readiness13s, then19s/26s after restarts, still fails the10s production gate.
+All three clean shutdowns completed below1s at the probe's whole-second
+resolution, with no forced cleanup. Fresh fixture: `current-latency.coTfCk`.
+Older fixtures must stay with their original pins. Full default/host-feature
+regressions still require a post-repin run; previous successes are historical.
 
 Use disposable spaces only. Do not migrate valuable older-generation stores.
 Preserve failed operations and exact request bytes; a timeout or unsigned HTTP
@@ -51,23 +41,21 @@ returns409; retention is bounded, not indefinite server reply caching.
 Keep two scoped batches, not one review per work-in-progress commit:
 
 1. `31b0cdbb..f79f0e3d`: integrated clean-break architecture/lifecycle.
-2. `f79f0e3d..b16abf81`: recovery, performance, artifact and qualification follow-ups
-   (40 files, +3,862/-216 at this frozen checkpoint).
+2. `f79f0e3d..8f96fad8`: recovery, performance, artifact and qualification follow-ups
+   (48 files, +4,946/-258 at this frozen checkpoint).
 
-The integrated diff remains large (231 files, +76,679/-58,974 at `b16abf81`).
+The integrated diff remains large (234 files, +77,744/-58,997 at `8f96fad8`).
 These are review groupings, not independently deployable slices. Subsequent
 review-handoff documentation and disposable-fixture test updates belong with batch2. The old C1 boundary
 is not independently merge-ready.
 See [review guide](agent-saga-review.md) and [evidence handoff](agent-saga-handoff.md).
 
-The qualified implementation remains the review/disposable Local-space
-checkpoint. The newly reproduced/pinned source above is not a new deployment
-checkpoint until its remaining release gates pass.
+The qualified implementation is a review/disposable Local-space checkpoint,
+not production/master sign-off.
 The post-`36e63581` uncommitted Shared-finality experiment has been removed:
 it depended on legacy embedded authority state absent from clean Create. Its
 failed test and patch are preserved in the evidence directory; see the handoff.
-The review implementation checkpoint is `36e63581`, with the separately built
-and qualified release still at `b16abf81`. Ordinary Shared finality needs clean
+The review and built release checkpoint is now `8f96fad8`. Ordinary Shared finality needs clean
 system-authority actor integration, not a switch to the legacy replay helper.
 No merge or push is authorized by this checkpoint. Fresh Create/Install/invocation
 have now been measured, but not as a controlled before/after comparison.
@@ -79,35 +67,23 @@ with bounded equivalence/recovery checks and repeat release qualification.
 
 | Requirement | Current evidence / gap |
 | --- | --- |
-| Startup and operation latency | Current-release fresh readiness15s, restarts19s/24s;10s gate fails. Fresh Create30s, Install36s, managed increment20.71s and read-after-restart19.90s. |
+| Startup and operation latency | Current-release fresh readiness13s, restarts19s/26s;10s gate fails. Fresh Create25s, Install36s, managed increment20.04s and read-after-restart20.33s. |
 | Recovery performance | With8-entry scheduling, second pass system owner8.02s, including14 runtime calls6.39s. Shorter history helps; not a same-history A/B. |
-| Inventory performance | Two agents require six sequential authenticated queries. Current fresh Create lifecycle9.62s is followed by route reconciliation16.93s (inventory16.68s), so inventory still materially delays operation completion. |
-| Shutdown | Latest disposable probes pass within1–2s; general busy/crash matrix still incomplete. |
+| Inventory performance | Two agents require six sequential authenticated queries. Current fresh Create lifecycle8.06s is followed by route reconciliation14.08s (inventory13.85s); post-Install inventory15.68s. Inventory still materially delays operation completion. |
+| Shutdown | Latest disposable probes report0s at whole-second resolution and no forced cleanup; general busy/crash matrix still incomplete. |
 | Ordinary Shared genesis/finality | Native startup still installs `UnavailableAgentFinality`; ordinary `AgentGenesisProvider` has no implementation/caller in current Rust sources. Production archive/issuance plus authenticated replay-backed finality integration are missing, not just a verifier switch. System genesis is a separate path. |
 | Authenticated reclamation | Issuer/coordinator bounded-record reclamation remains unfinished; invocation retirement is not proof of Authority application. |
 | Recovery/proof qualification | Remaining mixed pending/crash/capacity cases, pre-expiry Abort/management expiry, cross-runtime portable positive ACK, and full Private/Attested cryptographic proof matrix. |
-| Formatting | Pinned-host `cargo fmt -- --check` now passes after mechanical rustfmt cleanup of15 files, applied only after the full host-feature suite completed. No release artifact or lint configuration changed. |
+| Formatting | Pinned-host formatting passes, including after decoded-input validation reuse. No lint allowances added. |
 | Workspace lint | At7b45d2f0, the `check-all` Clippy flags fail in vos with351 diagnostics (258 unused/dead-code,1 unused-mut,92 others). Downstream workspace lint completion is unproven; no broad lint allowances added. |
 | Cutover supporting gates | At7bc52924, system-authority58/58 and system-catalog10/10 tests pass; SDK no-default-feature intra-doc-link check and static clean-break CLI/docs check pass. Atcda6c997, SDK165/165 tests and vos no-default-feature library check pass. These do not substitute for the entire `just clean-break-check` or `just check-all` recipes. |
-| Release integration | Prior-pin CLI atb16abf81:255 passed/19 ignored; default library at02dbc8c6:1,434 passed/1 ignored; host-feature library on the same frozen runtime source:1,873 passed/3 ignored. These full suites predate the mechanical formatting cleanup and decoded-input repin. Prior-pin actor-build4/task-build1 integration tests pass atcda6c997. New pin:18 release checks and97 wire tests pass (1 ignored). Full regressions, new release rebuild/live qualification, full cryptographic proof qualification and remaining sign-off stay open. |
+| Release integration | At8f96fad8: release build/bundle and fresh Local lifecycle pass; CLI255/19 ignored, release18/18 and wire97/1 ignored pass. Prior-pin default library1,434/1 ignored and host-feature1,873/3 ignored predate this repin and require reruns. Prior-pin actor-build4/task-build1 pass atcda6c997. Full cryptographic proof qualification and remaining sign-off stay open. |
 
-Next performance step: address the roughly17s authenticated two-agent inventory.
-Current-pin log attribution puts9.56s of the post-Create16.68s inside runtime:
-12 large-input Invoke/ACK calls take8.89s, while32 smaller calls take0.67s.
-Profile the actual bundled Authority Invoke/ACK workloads and the separate
-reserve/checkpoint host overhead before adding another cache. See the handoff
-for phase counts, corroborating post-Install data and reproducible analysis.
-The fresh bundled-Authority query regression now passes with both the native
-outer-runtime shortcut and bundled outer PVM. Machine observation attributes
-97.1% of Invoke instructions and100% of ACK instructions to the outer runtime,
-not Authority actor execution. Next localize outer validation/encoding/hash
-cost. Subsequent exact-binary PC mapping now identifies BLAKE2b compression:
-whole regions inside that function account for at least78.9% of outer Invoke
-instructions and86.3% of ACK instructions. Audit duplicate immutable-byte
-validation across decode/execution next; no production speedup is claimed.
-Released checkpoint scheduling now triggers at8 retained physical entries;
-safety tests, the complete514-query workload and two live restart passes succeed.
-Observed periodic reconciliation3.71s/3.57s is not a broad throughput proof. Do not
-lower safety/retention bounds, omit replay, or publish readiness before recovery
-to meet a latency number. Any scheduling change must prove exact recovery and
-measure both restart and steady-state cost. The other gates remain in scope.
+Next verification is the full default/host-feature regression on the new pin.
+Performance work must remain focused on the14–16s authenticated two-agent
+inventory. Exact-binary profiling identified outer BLAKE2b cost, leading to
+the now-released decoded-input validation reuse. Paired gas savings are proven;
+the different live fixtures do not establish a controlled end-to-end speedup.
+Create improved in this observation, but Install and managed operations remain
+slow. Preserve complete-head authentication, recovery and positive ACKs;
+do not lower safety/retention bounds or publish readiness before recovery.
