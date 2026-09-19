@@ -4,19 +4,22 @@ The complete saga is **not finished**. This is a review/test-environment
 checkpoint, not production or master sign-off. `saga/agents` remains at
 `31b0cdbb`; nothing has merged or pushed.
 
-Pending candidate after08139275: PublicPreflight Invoke matching now avoids one
+Runtime repin after9cdc1ff1: PublicPreflight Invoke matching now avoids one
 duplicate work-commitment hash. SDK166 tests and full runtime-wire98/1 ignored
 pass. A paired guest test preserves exact Invoke/ACK transition bytes and saves
 1.43%/0.76% gas on its fixed4KiB-padding fixture. This is not a live speedup.
-Candidate ProgramId `8071ad67661c6539ab504ccecc18c9e8d6d858803b52fca05389823f8109d3cc`
+Bundled ProgramId `8071ad67661c6539ab504ccecc18c9e8d6d858803b52fca05389823f8109d3cc`
 is independently reproduced from immutable ba7be457 in two isolated builds;
 ELF/PVM bytes match the measured candidate. Candidate-enabled wire98/1 ignored
-and the actual bundled-Authority fresh-query regression also pass. It is NOT
-bundled. Current source therefore no longer reproduces the old bundle;
-coordinated repin and post-pin release qualification remain due.
-Use the preserved d4d38ebb release checkpoint below for already-qualified testing.
+and the actual bundled-Authority fresh-query regression also pass. Manifest,
+host ProgramId, build-time digest and embedded PVM are now updated together.
+Post-pin artifact-release18/18 and bundled wire98/1 ignored pass; the full
+current-source `just verify-agent-runtime-release` build/byte-comparison passes.
+A new release executable and fresh Local smoke test remain due for this pin.
+Use the d4d38ebb release checkpoint below only with its original-pin fixtures;
+do not boot those stores with the new pin.
 
-Latest source/review checkpoint: `d4d38ebb`. Its locked/offline release build
+Previous live-tested release checkpoint: `d4d38ebb`. Its locked/offline release build
 passes in7m03s, and its `release bundle` / `release verify` commands pass.
 Executable SHA-256:
 `1ddcc3c99ea16c5982d7ac8f2e752cfdbf91ceb9145d34d087f1524110668a08`.

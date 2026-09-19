@@ -1,5 +1,12 @@
 # Reviewing the Agent architecture saga
 
+Current source has a subsequent runtime repin from immutable ba7be457 (ProgramId
+`8071ad67661c6539ab504ccecc18c9e8d6d858803b52fca05389823f8109d3cc`).
+It belongs with batch2. Independent reproduction, post-pin artifact18/18,
+bundled wire98/1 ignored and current-source reproduction pass. A new release
+executable/fresh Local smoke remain due. The frozen review sizes and live
+qualification below refer to the previous d4d38ebb checkpoint, not the new pin.
+
 ## Review entry point: source checkpoint `d4d38ebb`
 
 The latest source checkpoint includes the subsequent host/cache/network fixes,

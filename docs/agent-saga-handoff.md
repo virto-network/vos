@@ -11,6 +11,34 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: reproduced PublicPreflight runtime is pinned
+
+Following9cdc1ff1, production manifest, `STANDARD_RUNTIME_PROGRAM_ID`, vosx
+build-time PVM digest and embedded `agent_runtime.pvm` are updated together to
+the independently reproduced ba7be457 runtime. ProgramId
+`8071ad67661c6539ab504ccecc18c9e8d6d858803b52fca05389823f8109d3cc`,
+PVM BLAKE2b256 `50927c9c8e0d4daf1bb30b7f6948d197da7f53ec5f3b0e8027469b5e2b3b3776`,
+984,302bytes. Source/ELF digest are the immutable reproduction values below.
+System templates, actor pins and execution ABI are unchanged.
+
+Post-pin gates pass with no candidate overrides:
+
+- Artifact-release18 tests,0 failed,0 ignored,1.52s (session43821).
+- Full bundled runtime-wire98 tests,0 failed,1 ignored,30.54s (session26450).
+- `just verify-agent-runtime-release` rebuilds current guest source with the
+  pinned toolchain and locked/offline dependencies, converts actual shared
+  Cargo output, then requires byte equality with the committed bundle
+  (session90688 exit0). This complements the two immutable-source reproductions.
+- Pinned-host formatting and diff checks pass.
+
+Logs: shared `target/task-tmp/single-preflight-reproduction.rSz92N/`, named
+`post-pin-release.log`, `post-pin-wire.log`, `post-pin-source-reproduction.log`.
+The existing d4d38ebb release executable is untouched and still embeds its old
+pin. It and `current-latency.VF0MXp` are previous-pin evidence now. Do not boot
+that or any older fixture with the new runtime. Release rebuild, bundle check
+and NEW disposable Local lifecycle remain due; no live speedup or production
+sign-off is claimed. This is a coordinated source/artifact repin, not a merge.
+
 ### 2026-09-19: PublicPreflight candidate independently reproduced and checked
 
 Immutable source `ba7be4575ca060990180e0c95d7b8223c3633f59` was exported twice
