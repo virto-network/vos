@@ -6,11 +6,14 @@ checkpoint, not production or master sign-off. `saga/agents` remains at
 
 ## What can be tested
 
-Latest source includes an unpinned Invoke-recovery validation optimization.
+Latest source pins the independently reproduced Invoke-recovery optimization
+from `24000c8a`, ProgramId `e815f4b010f7213290850189f5bc20fc54533068f0d73ea4982de9414b1135e9`.
 Its large-retry benchmark reduces gas18.3% with identical output; focused
-rejection/retirement regressions pass. It is not yet independently reproduced,
-repinned or release-qualified. The executable and runtime pins below remain
-the tested release, not a claim that the candidate improves end-to-end latency.
+rejection/retirement and release-pin regressions pass. Release rebuild and live
+qualification remain pending. The older executable below is still the tested
+release, not a claim that the new pin improves end-to-end latency. Do not boot
+old-generation fixtures with the new pin or claim the prior full-suite counts
+qualify this new artifact.
 
 Release implementation `cca4c911` builds and verifies its bundled artifacts.
 SHA-256: `697324387cf98331f0c237e228dfc9e98947c8a97f9f1204dfa3d8eca985ce20`.

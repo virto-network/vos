@@ -10,6 +10,36 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: independently reproduced Invoke candidate and atomic repin
+
+Exported immutable `24000c8add0a93ffbdf0a45f4ab3945d48583195` twice into
+separate source directories with separate empty guest targets. Both locked/offline
+nightly-2026-03-20 builds succeed, with identical ELF and PVM bytes. Reproduced
+PVM also matches the earlier measured worktree candidate. Session45039 terminal0;
+evidence `target/task-tmp/invoke-reproduction.OS8HAC/`, including `reproduce.sh`,
+source-a/b, target-a/b, build/identity logs and runtime-a/b.pvm.
+
+ProgramId `e815f4b010f7213290850189f5bc20fc54533068f0d73ea4982de9414b1135e9`;
+ELF BLAKE2b256 `07c26a66d0fb477c116a158f296e8b72ba83de88bc937bcd54b70c7feea815ef`;
+PVM BLAKE2b256 `cf0c0cb6799b2a808aa27300597110bd2df1e4225bc79fa268c5edf8dc907778`.
+Updated provenance, host Standard ProgramId, CLI blob digest and embedded runtime
+together. System templates and ABI generation unchanged.
+
+Reproduced cost comparison again passes byte-identical output and
+637,510,333→520,997,765 gas; explicit malformed/error ACK candidate test passes
+(session30595 terminal0, cost.log/errors.log). Post-pin CLI compilation passes;
+an initial incorrect test filter selected zero tests (pin-tests.log), not a pass
+claim. Corrected selection passes18 release tests,4 bundled admission tests and
+1 outer-surface test, session69863 terminal0; separate logs retained.
+Post-pin physical bundled-runtime selection also passes6 tests/1 ignored in5.16s,
+session48426 terminal0, `post-pin-runtime-tests.log`; no candidate override used.
+
+The installed release executable is still the older `cca4c911` artifact. Rebuild,
+fresh-space live qualification and broader post-pin regression remain required.
+Do not reopen or relocate prior-generation fixtures under the new pin. The
+earlier full-suite and live evidence applies to its recorded source/artifact,
+not automatically to this repin. No end-to-end latency improvement claimed.
+
 ### 2026-09-19: same-call Invoke validation reuse candidate
 
 `recover_clean_execution` and `recover_clean_invocation_error` now call a private
