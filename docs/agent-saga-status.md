@@ -101,11 +101,15 @@ close the broader `check-all` recipe or production profile gaps.
 At4817e479, `just test-pvm-vectors` passes20 tests and
 `just verify-voucher-check-release` passes2 catalog checks. The latter verifies
 the checked-in released artifact, not a new source reproduction or full proof.
+At23f98d4b, full workspace library regression passes2,314 tests, zero failures,
+5 ignored across22 library binaries. This covers current source integration,
+not all explicit feature combinations, nested workspaces or binary/integration tests.
 
 Post-pin broad library regressions are complete; the production gaps above remain.
-The subsequent host/journal cleanup and boxed network command have targeted
-driver/Local/journal-store/network coverage. They are not in the qualified 8f96fad8 release executable;
-the broad suites and full clean-break recipe precede that cleanup.
+The subsequent host/journal/network/cache changes have targeted tests and the
+current workspace library pass. They are not in the qualified 8f96fad8 release
+executable; the explicit host-feature suite and full clean-break recipe precede
+those changes and retain their recorded qualification boundaries.
 Performance work must remain focused on the14–16s authenticated two-agent
 inventory. Exact-binary profiling identified outer BLAKE2b cost, leading to
 the now-released decoded-input validation reuse. Paired gas savings are proven;

@@ -10,6 +10,32 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: full workspace library regression passes
+
+At frozen source `23f98d4b`, the complete command
+`cargo +nightly-2025-05-09 test --locked --offline --workspace --lib` passes
+(session28998 exit0). Log: shared
+`target/task-tmp/decoded-input-release.RIkx3j/workspace-lib.log`.
+Used disk-backed TMPDIR, loopback permission, `RUST_TEST_THREADS=1` and
+`RAYON_NUM_THREADS=2`. No source/pin/lockfile changes during the run.
+
+Final per-crate summaries total2,314 passed, zero failed and5 ignored across22
+library binaries. Child-process subtest summaries are excluded from the total.
+Nonempty suites: vos1,516/1 ignored (198.63s), SDK165, PVM260/2 ignored,
+compiler65/1 ignored, proof120, codec44, macros23, protocol12, precompiles11,
+program9, Raft27, merkle-crdt22, prover-extension19, substrate-extension20/1
+ignored and clerk-witness1. Seven libraries have no unit tests; their successful
+empty runs are not additional test coverage.
+
+Ignored cases: public Kreivo/Kusama network smoke; fixed-history physical decode
+diagnostic; flat-memory performance smoke; prepared-program load measurement;
+and exact-PC symbol diagnostic. None is counted as a pass. This qualifies current
+workspace library integration after the host/network/cache cleanups, not the
+separate explicit host-feature matrix, CLI binary, integration tests or nested
+workspaces. Their prior results retain their recorded source boundaries. This
+completes the library-test step independently, not the failing `check-all` recipe
+or the outstanding production functionality/performance requirements.
+
 ### 2026-09-19: bounded replay-result cache updates verified
 
 Following `133d4307`, the ordered and management recent-result caches replace
