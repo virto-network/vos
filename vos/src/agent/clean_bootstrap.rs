@@ -12363,6 +12363,40 @@ mod tests {
                 .unwrap();
             let original = journal.load(request.context.invocation).unwrap().unwrap();
             let before = owner.ordered_index_for_test().unwrap();
+            // Binding validation must apply to the exact record retained by
+            // startup, even when a store returns valid bytes under a wrong key.
+            struct SuppliedRecord(Vec<u8>);
+            impl NativeAuthorityOperationJournalStore for SuppliedRecord {
+                type Error = ();
+                fn load(&mut self, _: InvocationId) -> Result<Option<Vec<u8>>, ()> {
+                    Ok(Some(self.0.clone()))
+                }
+                fn retain(&mut self, _: InvocationId, _: &[u8]) -> Result<(), ()> {
+                    panic!("startup binding checks must not write")
+                }
+            }
+            let mut wrong_target = target;
+            wrong_target.system_agent = AgentId([0xf2; 32]);
+            let mut trailing = original.clone();
+            trailing.push(0);
+            for (scope, key, bytes) in [
+                (wrong_target, request.context.invocation, original.clone()),
+                (target, InvocationId([0xf3; 32]), original.clone()),
+                (target, request.context.invocation, trailing),
+                (
+                    target,
+                    request.context.invocation,
+                    original[..original.len() - 1].to_vec(),
+                ),
+            ] {
+                assert!(!native_operation_record_matches(scope, key, &bytes));
+                let mut supplied = SuppliedRecord(bytes);
+                assert!(matches!(
+                    NativeAuthorityOperationStartupAdmission::load(&mut supplied, scope, &[key]),
+                    Err(SharedAgentHostError::ScopeMismatch)
+                ));
+            }
+            assert_eq!(owner.ordered_index_for_test().unwrap(), before);
             assert!(
                 NativeAuthorityOperationStartupAdmission::load(
                     &mut journal,

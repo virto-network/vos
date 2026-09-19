@@ -50,11 +50,25 @@ pub fn native_operation_record_matches(
     invocation: InvocationId,
     bytes: &[u8],
 ) -> bool {
-    RetainedAuthorityOperationDispatch::decode(bytes).is_ok_and(|record| {
-        record.request.target == authority
-            && record.request.context.invocation == invocation
-            && record.encode().ok().as_deref() == Some(bytes)
-    })
+    decode_bound_operation_record(authority, invocation, bytes).is_ok()
+}
+
+/// Return the same fully decoded record whose canonical bytes and file scope
+/// were checked. Startup must not decode its potentially large envelope twice.
+fn decode_bound_operation_record(
+    authority: AuthorityActorTarget,
+    invocation: InvocationId,
+    bytes: &[u8],
+) -> Result<RetainedAuthorityOperationDispatch, SharedAgentHostError> {
+    let record = RetainedAuthorityOperationDispatch::decode(bytes)
+        .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+    if record.request.target != authority
+        || record.request.context.invocation != invocation
+        || record.encode().ok().as_deref() != Some(bytes)
+    {
+        return Err(SharedAgentHostError::ScopeMismatch);
+    }
+    Ok(record)
 }
 
 /// Immutable per-invocation native dispatch records under one writer lease.
@@ -285,11 +299,7 @@ impl<'a> NativeAuthorityOperationStartupAdmission<'a> {
                 .load(invocation)
                 .map_err(|_| SharedAgentHostError::Unavailable)?
                 .ok_or(SharedAgentHostError::Unavailable)?;
-            if !native_operation_record_matches(authority, invocation, &bytes) {
-                return Err(SharedAgentHostError::ScopeMismatch);
-            }
-            let record = RetainedAuthorityOperationDispatch::decode(&bytes)
-                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            let record = decode_bound_operation_record(authority, invocation, &bytes)?;
             records.insert(invocation, record);
         }
         let mut denied = std::collections::BTreeSet::new();

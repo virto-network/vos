@@ -24,6 +24,10 @@ HTTP status/SSH keyscan pass, not authenticated shell access. Readiness16s/20s/2
 still fails10s; shutdowns0s/0s/1s require no forced cleanup. Probe daemon/listeners
 are gone. No controlled end-to-end speedup is established.
 Build/bundle/CLI evidence: shared `target/task-tmp/single-preflight-release.pE0Yxy/`.
+Subsequent host-only startup cleanup removes a duplicate NOD1 decode while
+preserving canonical/scope checks. Physical native-operation tests10/1 ignored
+pass, including added malformed/wrong-scope cases. It is not in the a732e079
+executable and has no measured latency claim; reclamation remains incomplete.
 Use the d4d38ebb release checkpoint below only with its original-pin fixtures;
 do not boot those stores with the new pin.
 

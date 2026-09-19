@@ -11,6 +11,31 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: native operation startup reuses its checked decode
+
+Following33489588, `load_evidence` no longer decodes each full NOD1 dispatch
+twice. A shared private helper returns the decoded record only after checking
+its Authority target, invocation/file key and exact canonical re-encoding.
+`native_operation_record_matches` uses the same helper, preserving its public
+boolean contract. All later admission, signature, predecessor and retirement
+checks remain unchanged. No cached result crosses a store read or mutation.
+
+The physical startup regression now supplies otherwise valid record bytes under
+a wrong Authority/file key and supplies truncated/trailing bytes. Each fails
+closed without journal writes or advancing the owner's ordered head. Valid
+before/after-policy reopen still passes. The native-operation physical selection
+passes10 tests,0 failures,1 ignored in86.36s (session56270 exit0); the ignored
+case remains the explicit real64MiB journal-capacity diagnostic. Log: shared
+`target/task-tmp/single-preflight-release.pE0Yxy/single-decode-native-operation.log`.
+Pinned-host formatting/diff checks pass.
+
+This removes a redundant host decode while the existing full dispatch records
+remain required. It does not add compaction or establish a wall-time speedup.
+Runtime guest/artifact pins and the a732e079 live-tested executable are unchanged;
+that executable does not include this subsequent host-only source fix.
+Independently recoverable compact terminal evidence and cross-store reclamation
+remain the functional dependency, not a deletion based on NRT1 alone.
+
 ### 2026-09-19: capacity retry boundary and reclamation dependencies
 
 After65ef39e0, the existing256-record coordinator-capacity test now retains the
