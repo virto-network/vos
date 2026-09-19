@@ -4,6 +4,15 @@ The complete saga is **not finished**. This is a review/test-environment
 checkpoint, not production or master sign-off. `saga/agents` remains at
 `31b0cdbb`; nothing has merged or pushed.
 
+Latest source/review checkpoint: `d4d38ebb`. Its locked/offline release build
+passes in7m03s, and its `release bundle` / `release verify` commands pass.
+Executable SHA-256:
+`1ddcc3c99ea16c5982d7ac8f2e752cfdbf91ceb9145d34d087f1524110668a08`.
+This closes the release-build gap for the subsequent host/build fixes, not their
+live lifecycle qualification. The live results below still belong to8f96fad8.
+Evidence and the preserved previous executable are in shared
+`target/task-tmp/review-checkpoint-release.6a7GXF/`.
+
 ## What can be tested
 
 Latest source now pins decoded-input validation reuse from immutable
@@ -43,10 +52,10 @@ returns409; retention is bounded, not indefinite server reply caching.
 Keep two scoped batches, not one review per work-in-progress commit:
 
 1. `31b0cdbb..f79f0e3d`: integrated clean-break architecture/lifecycle.
-2. `f79f0e3d..8f96fad8`: recovery, performance, artifact and qualification follow-ups
-   (48 files, +4,946/-258 at this frozen checkpoint).
+2. `f79f0e3d..d4d38ebb`: recovery, performance, artifact, host/build fixes and qualification follow-ups
+   (57 files, +5,802/-330 at this frozen checkpoint).
 
-The integrated diff remains large (234 files, +77,744/-58,997 at `8f96fad8`).
+The integrated diff remains large (240 files, +78,596/-59,065 at `d4d38ebb`).
 These are review groupings, not independently deployable slices. Subsequent
 review-handoff documentation and disposable-fixture test updates belong with batch2. The old C1 boundary
 is not independently merge-ready.
@@ -57,7 +66,7 @@ not production/master sign-off.
 The post-`36e63581` uncommitted Shared-finality experiment has been removed:
 it depended on legacy embedded authority state absent from clean Create. Its
 failed test and patch are preserved in the evidence directory; see the handoff.
-The review and built release checkpoint is now `8f96fad8`. Ordinary Shared finality needs clean
+The live-qualified release checkpoint remains `8f96fad8`. Ordinary Shared finality needs clean
 system-authority actor integration, not a switch to the legacy replay helper.
 No merge or push is authorized by this checkpoint. Fresh Create/Install/invocation
 have now been measured, but not as a controlled before/after comparison.

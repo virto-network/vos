@@ -1,6 +1,11 @@
 # Reviewing the Agent architecture saga
 
-## Review entry point: checkpoint and release source `8f96fad8`
+## Review entry point: source checkpoint `d4d38ebb`
+
+The latest source checkpoint includes the subsequent host/cache/network fixes,
+build-fixture corrections and inventory-refresh regression. Its two review ranges
+are below. Live lifecycle evidence remains tied to release `8f96fad8` unless a
+later qualification explicitly says otherwise; see the current status and handoff.
 
 Use these two ranges for the current review; the older snapshot below remains
 historical evidence. No merge or push is implied by this breakdown.
@@ -23,12 +28,11 @@ for exact qualification boundaries.
 | Batch | Exact range | Scope and size |
 | --- | --- | --- |
 | 1 | `31b0cdbb..f79f0e3d` | Integrated clean-break architecture and lifecycle;225 files,+72,934/-58,875. |
-| 2 | `f79f0e3d..8f96fad8` | Recovery, checkpointing, shutdown, validation reuse, artifact-role length filtering, exact-binary profiling, decoded-input validation reuse, reproduced pins, lifecycle conflict reporting, attachment refresh, operator docs and qualification;48 files,+4,946/-258. |
+| 2 | `f79f0e3d..d4d38ebb` | Recovery, checkpointing, shutdown, validation reuse, artifact-role length filtering, exact-binary profiling, reproduced pins, lifecycle conflict reporting, attachment refresh, host/cache/network fixes, build-fixture corrections, operator docs and qualification;57 files,+5,802/-330. |
 
-Counts are frozen at that checkpoint; subsequent handoff documentation,
-mechanical formatting and disposable-fixture test updates belong with batch2.
+Counts are frozen at `d4d38ebb`; subsequent handoff documentation belongs with batch2.
 Neither batch is an independently deployable slice.
-The integrated diff is234 files,+77,744/-58,997. No production sign-off is implied.
+The integrated diff is240 files,+78,596/-59,065. No production sign-off is implied.
 
 Batch1 remains large and cannot be presented as an independently safe old C1
 cut. Batch2 contains all subsequent fixes together, not one review per commit.
@@ -40,6 +44,13 @@ to immutable source and provenance. The following evidence distinguishes
 passing regressions from still-failing production gates.
 
 ## Current release qualification
+
+Source `d4d38ebb` now builds a release executable and passes bundle creation
+and verification. SHA-256:
+`1ddcc3c99ea16c5982d7ac8f2e752cfdbf91ceb9145d34d087f1524110668a08`.
+This includes subsequent host/build fixes, but no new live lifecycle or timing
+qualification. Evidence: shared `target/task-tmp/review-checkpoint-release.6a7GXF/`.
+The following live qualification remains attached to the preserved older binary.
 
 Release `8f96fad8` / SHA-256
 `ee49a636c477c1e3ef21d56f16e2c181307bd1e740ad20bee80b6da27e30e76d`

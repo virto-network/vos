@@ -2,13 +2,38 @@
 
 ## Checkpoint and decision
 
-Review checkpoint and qualified Local-test release source: `8f96fad8`.
+Review and build/bundle checkpoint: `d4d38ebb`.
+Live-qualified Local-test release source: `8f96fad8`.
 Use [current status](agent-saga-status.md) for remaining gates and
 [the review guide](agent-saga-review.md) for the two current review ranges.
 This log is reverse chronological: older statements about pending builds or
 the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
+
+### 2026-09-19: current review checkpoint release builds and verifies
+
+Frozen source `d4d38ebb704e1e024f36bf4ce98974edb526d81b` builds with
+`cargo +nightly-2025-05-09 build --release --locked --offline -p vosx` in7m03s
+(session18262 exit0). Only review documentation changed during the build.
+The resulting shared `target/release/vosx` SHA-256 is
+`1ddcc3c99ea16c5982d7ac8f2e752cfdbf91ceb9145d34d087f1524110668a08`.
+Its `release bundle --out <evidence>/bundle` and `release verify <evidence>/bundle`
+both exit0. Guest artifacts and production pins are unchanged.
+
+Evidence directory: shared `target/task-tmp/review-checkpoint-release.6a7GXF/`,
+containing `build.log`, `bundle.log`, `verify.log`, verified `bundle/`, and
+`vosx-before` preserving the8f96fad8 executable with SHA-256
+`ee49a636c477c1e3ef21d56f16e2c181307bd1e740ad20bee80b6da27e30e76d`.
+Temporary files were disk-backed; no fixture was migrated or removed.
+The new binary includes the host/cache/network changes, but has not yet had
+their fresh live lifecycle, full CLI or explicit host-feature release rerun.
+Earlier live timings and lifecycle evidence remain tied to the preserved binary.
+No performance improvement, full saga completion or master sign-off is claimed.
+
+The two review ranges now end at d4d38ebb: batch1 unchanged; batch2 is57 files,
++5,802/-330; integrated240 files,+78,596/-59,065. Later handoff documentation
+belongs with batch2. No merge or push occurred.
 
 ### 2026-09-19: two-agent inventory refresh regression
 
