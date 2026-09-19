@@ -21,6 +21,14 @@ passing regressions from still-failing production gates.
 
 ## Follow-up after the frozen review snapshot
 
+Release `cca4c911` now qualifies8-entry scheduling in two successive live
+restarts: readiness36s/29s (both fail10s), system-owner recovery14.45s/8.02s,
+initial inventory20.42s/19.77s. Periodic reconciliation3.71s/3.57s; HTTP/SSH,
+retained recovery,409 guidance and shutdown within1s pass. Shorter replay helps,
+but these differing-history observations are not controlled A/B evidence.
+Inventory remains the largest observed startup cost. See the current compact
+status and handoff; previous source-only notes below are historical.
+
 Source candidate schedules authenticated idle system-projection checkpoints
 at8 retained physical entries, down from32. Protocol capacity, pending-work
 exclusion and snapshot authentication are unchanged. Three checkpoint regressions

@@ -6,8 +6,8 @@ checkpoint, not production or master sign-off. `saga/agents` remains at
 
 ## What can be tested
 
-Release implementation `3a990280` builds and verifies its bundled artifacts.
-SHA-256: `15f23e7bd959356c7f7a5997efb5f4ddb245b8fa07de84f67a358d78329a7e5a`.
+Release implementation `cca4c911` builds and verifies its bundled artifacts.
+SHA-256: `697324387cf98331f0c237e228dfc9e98947c8a97f9f1204dfa3d8eca985ce20`.
 The current runtime is independently reproduced; new spaces automatically
 receive system packages and enabled HTTP/SSH configuration. The Local workflow
 has live evidence for Create, Counter Install, increment, retirement/ACK retry,
@@ -34,20 +34,19 @@ See [review guide](agent-saga-review.md) and [evidence handoff](agent-saga-hando
 
 | Requirement | Current evidence / gap |
 | --- | --- |
-| Startup and operation latency | Latest restart58s;10s gate fails. Earlier current-guest Create43s, Install65s, fresh managed calls29–35s. |
-| Recovery performance | Before system owner:38 runtime executions30.95s, of which30 large calls30.59s; system owner34.94s total. Removing host bookkeeping alone cannot fix this. |
-| Inventory performance | Two agents require six sequential authenticated queries; latest inventory21.34s. Calls reduced61→43, but no controlled overall speedup demonstrated. |
+| Startup and operation latency | Latest two restarts36s/29s;10s gate fails. Earlier current-guest Create43s, Install65s, fresh managed calls29–35s; not remeasured on latest host release. |
+| Recovery performance | With8-entry scheduling, second pass system owner8.02s, including14 runtime calls6.39s. Shorter history helps; not a same-history A/B. |
+| Inventory performance | Two agents require six sequential authenticated queries; latest inventory20.42s/19.77s. It now dominates observed startup. |
 | Shutdown | Latest disposable probes pass within1–2s; general busy/crash matrix still incomplete. |
 | Ordinary Shared genesis/finality | Native startup still installs `UnavailableAgentFinality`; production accepting bridge missing. System genesis is a separate path. |
 | Authenticated reclamation | Issuer/coordinator bounded-record reclamation remains unfinished; invocation retirement is not proof of Authority application. |
 | Recovery/proof qualification | Remaining mixed pending/crash/capacity cases, pre-expiry Abort/management expiry, cross-runtime portable positive ACK, and full Private/Attested cryptographic proof matrix. |
 | Release integration | Final integrated test matrix, docs/examples/inventory audit and review sign-off remain. Focused passes do not replace them. |
 
-Next performance step: attribute repeated large runtime calls during system
-recovery and evaluate authenticated checkpoint scheduling/replay cost. Current
-released checkpoint policy waits for32 retained physical entries. A source
-candidate schedules at8 using the same authenticated path; checkpoint safety
-tests and the complete514-query workload pass, but live cost is unmeasured. Do not
+Next performance step: address the roughly20s authenticated initial inventory.
+Released checkpoint scheduling now triggers at8 retained physical entries;
+safety tests, the complete514-query workload and two live restart passes succeed.
+Observed periodic reconciliation3.71s/3.57s is not a broad throughput proof. Do not
 lower safety/retention bounds, omit replay, or publish readiness before recovery
 to meet a latency number. Any scheduling change must prove exact recovery and
 measure both restart and steady-state cost. The other gates remain in scope.

@@ -2,6 +2,44 @@
 
 ## Checkpoint and decision
 
+### 2026-09-19: eight-entry release, two restart passes
+
+Release `cca4c911` built locked/offline nightly-2025-05-09 in6m35s; SHA-256:
+`697324387cf98331f0c237e228dfc9e98947c8a97f9f1204dfa3d8eca985ce20`.
+Both bundle verifications pass with unchanged runtime/system pins. Two
+successive probes used the original `fresh-ack-release.Of5a75` space without
+relocation/reset or fresh mutation. Both pass HTTP, unchanged SSH identity,
+live409 guidance, unchanged retained Create request, retained Counter read,
+retirement and exact ACK retry. SIGTERM completes within1s in both, without
+forced cleanup. Build/probe sessions86622/79561 terminal0; no remaining
+vosx/cargo/rustc found after the run.
+
+| Measurement | First pass | Second pass |
+| --- | ---: | ---: |
+| Readiness (10s gate) | 36s, fail | 29s, fail |
+| System-owner cumulative | 14,447ms | 8,022ms |
+| Runtime work before owner | 20 calls /12,307.4ms | 14 calls /6,385.3ms |
+| Initial inventory | 20,422ms | 19,772ms |
+| Initial full route reconciliation | 21,264ms | 20,562ms |
+| Next periodic full reconciliation | 3,707ms | 3,567ms |
+
+The first pass recovers existing history before the new policy can schedule
+checkpoints. The second shows a shorter subsequent replay workload. These are
+two observations, not a same-history A/B or a broad steady-state throughput
+proof. Both complete one post-ready periodic refresh; more frequent checkpoint
+work did not prevent these checks completing. Inventory now dominates this
+fixture's remaining startup delay. No readiness gate is closed and no fresh
+Create/Install/invocation latency improvement is inferred.
+
+Evidence: shared `target/task-tmp/eight-entry-release.1zodLo/`: `build.log`,
+`probe.sh`, `first-probe.log`, `second-probe.log`, and separate `first/`,
+`second/` bundle/phase logs, HTTP/SSH output, conflict/request-integrity checks
+and `read-test.log`. Prior release preserved as `vosx-before`. The release
+and compact status now include8-entry scheduling; next investigate the roughly
+20s authenticated initial inventory while preserving projection-head/credential
+validation. Ordinary Shared finality, reclamation and proof/recovery gates also
+remain part of the full objective.
+
 ### 2026-09-19: earlier idle checkpoint scheduling candidate
 
 Existing owner-phase events now locate the expensive startup boundary:
