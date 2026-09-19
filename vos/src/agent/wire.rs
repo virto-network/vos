@@ -9760,6 +9760,69 @@ pub(crate) mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
+    fn bundled_runtime_large_fresh_invoke_validation_cost() {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        use crate::agent_sdk::{InvocationStatus, RuntimeOutcome, RuntimeTransition, RuntimeWork};
+
+        // A real, tiny actor with inert read-only padding exercises fresh
+        // validation and execution, not a retained reply or malformed program.
+        let work = clean_actor_fixture_with_padding(Some(crate::actors::STATUS_DONE), 768 * 1024);
+        let RuntimeWork::Invoke { state, .. } = &work else {
+            unreachable!()
+        };
+        let before = decode_standard_runtime_state(&clean_state_to_legacy(state)).unwrap();
+        assert!(before.invocation_results.is_empty());
+        let expected = apply_standard_runtime_work(work.clone()).unwrap();
+        let RuntimeOutcome::Completed(Ok(reply)) = &expected.outcome else {
+            panic!("fresh invocation did not succeed: {:?}", expected.outcome);
+        };
+        assert_eq!(reply.status, InvocationStatus::Done);
+        let after = decode_standard_runtime_state(&clean_state_to_legacy(&expected.state)).unwrap();
+        assert_eq!(after.invocation_results.len(), 1);
+        assert_ne!(after.lane_state, before.lane_state);
+        let expected_bytes = expected.encode().unwrap();
+        let input = work.encode().unwrap();
+        let mut programs = vec![(
+            "bundled",
+            include_bytes!("../../../vosx/blobs/agent_runtime.pvm").to_vec(),
+        )];
+        if let Some(path) = std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE") {
+            programs.push(("candidate", std::fs::read(path).unwrap()));
+        }
+        let mut baseline_gas = None;
+        for (label, program) in programs {
+            let started = std::time::Instant::now();
+            let execution =
+                vos_pvm::refine_host::RefineContext::load(&program, &input, 2_000_000_000)
+                    .unwrap()
+                    .run();
+            assert_eq!(execution.exit, vos_pvm::ExitReason::Halt);
+            let output = execution
+                .output_bounded(RuntimeTransition::MAX_ENCODED_BYTES)
+                .unwrap();
+            assert_eq!(
+                output, expected_bytes,
+                "entire fresh transition must match source"
+            );
+            eprintln!(
+                "large-fresh-invoke label={label} input_bytes={} gas_used={} elapsed_us={}",
+                input.len(),
+                execution.gas_used,
+                started.elapsed().as_micros()
+            );
+            if let Some(prior_gas) = baseline_gas {
+                assert!(
+                    execution.gas_used < prior_gas,
+                    "candidate must reduce deterministic gas"
+                );
+            } else {
+                baseline_gas = Some(execution.gas_used);
+            }
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
     fn bundled_runtime_large_invoke_retry_validation_cost() {
         use crate::agent_sdk::wire::CanonicalWire as _;
         use crate::agent_sdk::{
@@ -11026,19 +11089,30 @@ pub(crate) mod tests {
 
     #[cfg(feature = "pvm")]
     pub(crate) fn clean_failing_actor_fixture(status: Option<u8>) -> crate::agent_sdk::RuntimeWork {
+        clean_actor_fixture_with_padding(status, 0)
+    }
+
+    #[cfg(feature = "pvm")]
+    fn clean_actor_fixture_with_padding(
+        status: Option<u8>,
+        padding_bytes: usize,
+    ) -> crate::agent_sdk::RuntimeWork {
         use vos_pvm_compiler::assembler::{Assembler, Reg};
         let (runtime, mut work) = clean_policy_fixture(
             crate::agent_sdk::method_policy::AuthorizationPolicySelector::Public,
         );
         let mut program = Assembler::new();
+        program.set_ro_data(vec![0xa7; padding_bytes]);
+        let zone = u64::from(vos_pvm::PVM_ZONE_SIZE);
+        let output_address = 2 * zone + (padding_bytes as u64).div_ceil(zone) * zone;
         if let Some(status) = status {
             let mut output = vec![0; 14];
             output[0] = status;
             output[1..5].copy_from_slice(&1_u32.to_le_bytes());
-            output[13] = 0xee; // A failed actor must not commit this lane image.
+            output[13] = 0xee; // Only a successful actor may commit this lane image.
             program
                 .set_rw_data(output)
-                .load_imm_64(Reg::A0, 2 * u64::from(vos_pvm::PVM_ZONE_SIZE))
+                .load_imm_64(Reg::A0, output_address)
                 .load_imm_64(Reg::A1, 14)
                 .jump_ind(Reg::RA, 0);
         } else {

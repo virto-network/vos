@@ -10,6 +10,76 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: fresh large-program Invoke baseline added without changing release pins
+
+Added `bundled_runtime_large_fresh_invoke_validation_cost`: a valid tiny Public
+actor has768KiB of inert read-only padding, starts without a retained invocation
+result, returns Done and commits a lane change. The complete bundled guest
+transition must equal native source output. An optional
+`VOS_AGENT_RUNTIME_COST_CANDIDATE` must also preserve those bytes and use less
+gas. This measures fresh execution rather than the existing retained-retry
+benchmark, but is still synthetic, not Authority inventory throughput.
+
+Current bundle baseline:792,481 input bytes,579,883,967 gas,1,400,409us in the
+first passing run. Initial fixture development failed with InvalidActorOutput
+because read-only padding relocates writable data; the helper now computes the
+output address using zone-rounded read-only length. Zero-padding failure
+fixtures retain their original address. No production code or artifact pin
+changed. Host-feature `bundled_runtime_` filter passes7 tests/1 ignored in6.69s,
+including the fresh baseline and existing failure/retirement/ACK cases.
+Logs under shared `target/task-tmp`: `fresh-invoke-baseline-20260919.log` and
+`fresh-invoke-bundled-regressions-20260919.log`.
+
+The source trace finds full work/authorization verification in both
+`recover_clean_invocation_error` and later `recover_clean_execution`, with
+expiry and policy admission between them. Artifact resolution also occurs in
+preflight and again before execution. These are optimization candidates, not
+permission to drop checks: any reuse must be scoped to exact immutable work,
+authorization, runtime identity and observed slot, preserve error precedence,
+and not cross the interposed mutation/early-return paths unchecked. Production
+latency remains unresolved; this test supplies the missing fresh-work baseline.
+
+### 2026-09-19: current-pin inventory attribution for the review handoff
+
+Read-only attribution at `97dac482`, using the already completed current-release
+probe `target/task-tmp/current-latency.qEl4ba/read-up.log` in the shared
+`ch08-c2-native` target. No daemon rerun, store mutation, or rebuild. This is the
+initial inventory on the read-after-restart run, not fresh Create or Install.
+
+The six query durations sum to17,909ms; the enclosing inventory log reports
+17,912ms. They contain44 physical runtime calls, including12 inputs over700KB.
+Runtime spans sum to11,471.194ms (64%);6,437.806ms lies outside those spans.
+Summing successive cumulative phase deltas, resetting at each query and at the
+execution family's `reopen`, gives:
+
+| Phase | Total ms | Enclosed runtime ms | Outside runtime spans ms |
+| --- | ---: | ---: | ---: |
+| Prepare | 447 | 129.383 | 317.617 |
+| Reserve/checkpoint | 1,778 | 42.320 | 1,735.680 |
+| Identity | 377 | 126.858 | 250.142 |
+| Persist pending | 218 | 0 | 218 |
+| Reopen/check retained ACK | 466 | 125.869 | 340.131 |
+| Invoke | 9,125 | 7,434.812 | 1,690.188 |
+| Acknowledge | 5,302 | 3,611.952 | 1,690.048 |
+| Complete pending | 194 | 0 | 194 |
+
+Phase totals differ from summed query times by2ms due to boundaries/rounding.
+This is wall-time attribution, not a CPU profile: the outside-runtime residual
+must not be labelled disk I/O or a single validation function. Explicit pending
+persist/complete phases total412ms and cannot explain the overall delay.
+Invoke plus ACK account for14,427ms (81% of query time). The earlier18.3% gas
+benchmark measures retained Invoke retries, not these fresh inventory Invokes.
+
+Source audit confirms unchanged-head reuse is already implemented in
+`CleanAuthorityProjectionClient::load_inventory`, with a fresh authenticated
+active credential and exact claims; failed refreshes invalidate reuse. Parallel
+dispatch is not a drop-in fix: the clean projection path persists one pending
+query and rejects a different query while it is pending. Next bounded performance
+work should measure fresh Invoke/ACK validation against this current pin, then
+isolate reserve/checkpoint's host residual. Do not add another unchanged-head
+cache, omit ACKs, or bypass authentication/readiness. Existing historical
+measurements are not a controlled before/after comparison with this run.
+
 ### 2026-09-19: ordinary Shared finality gap traced to both production boundaries
 
 Read-only audit at `00921e04`: native `clean_startup.rs` installs
