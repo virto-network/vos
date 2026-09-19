@@ -10,6 +10,24 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: two-agent inventory refresh regression
+
+On top of `50607708`, a transport-level unit regression now checks the measured
+two-agent query pattern: six queries on first load, one fresh Credential query
+at the unchanged complete head, six after a simulated Install advances the
+transport head, then one at the new unchanged head. The refreshed inventory must
+contain the installed actor despite unchanged Agent descriptors. The test changes
+the transport state rather than editing the client's cache. This is mock-transport
+cache/invalidation coverage, not a live Install or latency benchmark.
+
+All 12 production-owner tests pass (session48881 exit0, 0.15s test time), using
+`cargo +nightly-2025-05-09 test --locked --offline -p vos --lib agent::production_owner::tests::`.
+Log: shared `target/task-tmp/decoded-input-release.RIkx3j/inventory-refresh-regression.log`.
+Pinned-host formatting passes. No production code, artifacts or release pins
+changed. The unchanged-head shortcut already exists; skipping the full refresh
+at a changed head is not justified by that shortcut. Inventory latency remains
+open, and this test supplies a regression boundary for its eventual optimization.
+
 ### 2026-09-19: full build-pvm gate uses fresh Cargo output and passes
 
 Following `4e4cf613`, the runtime-candidate recipe uses Cargo metadata to locate

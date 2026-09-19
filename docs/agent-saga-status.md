@@ -125,3 +125,8 @@ the different live fixtures do not establish a controlled end-to-end speedup.
 Create improved in this observation, but Install and managed operations remain
 slow. Preserve complete-head authentication, recovery and positive ACKs;
 do not lower safety/retention bounds or publish readiness before recovery.
+An additional mock-transport regression after50607708 verifies the two-agent
+query pattern (6 initial, 1 unchanged, 6 after an Install-like head change,
+1 unchanged) and requires the newly installed actor in the refreshed inventory.
+All12 production-owner tests pass. This is cache correctness coverage, not a
+latency improvement or new live-release qualification.

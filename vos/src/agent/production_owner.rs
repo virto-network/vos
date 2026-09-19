@@ -1702,6 +1702,84 @@ mod tests {
     }
 
     #[test]
+    fn two_agent_inventory_reuses_only_unchanged_head_and_observes_install() {
+        struct MutableTransport(Arc<Mutex<ProjectionTransport>>);
+
+        impl AuthorityProjectionTransport for MutableTransport {
+            fn target(&self) -> AuthorityActorTarget {
+                self.0.lock().unwrap().target()
+            }
+
+            fn dispatch(
+                &mut self,
+                query: AuthorityProjectionQuery,
+            ) -> Result<Vec<u8>, AgentProductionOwnerError> {
+                self.0.lock().unwrap().dispatch(query)
+            }
+        }
+
+        let node = NodeId([0x31; 32]);
+        let first = descriptor(1, AgentProfile::Shared, node);
+        let second = descriptor(2, AgentProfile::Shared, node);
+        let installed = actor(&second, true);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let transport = Arc::new(Mutex::new(ProjectionTransport {
+            target: target(),
+            head: head(1),
+            actor_head: head(1),
+            descriptors: vec![first.clone(), second.clone()],
+            actors: vec![actor(&first, true)],
+            calls: calls.clone(),
+            page_cap: usize::MAX,
+        }));
+        let mut source = CleanAuthorityProjectionClient::new(
+            Box::new(MutableTransport(transport.clone())),
+            Box::new(TestAuthenticator { ordinal: 0 }),
+        );
+
+        let original = source.load_inventory().unwrap();
+        assert_eq!(original.agents.len(), 2);
+        let initial_queries = calls.lock().unwrap().clone();
+        // Credential + Agents + (Replicas + Actors) for each Agent.
+        assert_eq!(initial_queries.len(), 6);
+        calls.lock().unwrap().clear();
+        assert_eq!(source.load_inventory().unwrap(), original);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![AuthorityProjectionSelector::Credential]
+        );
+
+        // Change the transport's real state, not the client's cached head.
+        // An Install must invalidate reuse even if descriptors are unchanged.
+        {
+            let mut state = transport.lock().unwrap();
+            state.head = head(2);
+            state.actor_head = head(2);
+            state.actors.push(installed.clone());
+        }
+        calls.lock().unwrap().clear();
+        let refreshed = source.load_inventory().unwrap();
+        assert_eq!(*calls.lock().unwrap(), initial_queries);
+        assert_eq!(refreshed.head, head(2));
+        let mut expected = original;
+        expected.head = head(2);
+        expected.agents[1] = AgentAuthorityRouteProjection::new(
+            second.replica_generation(),
+            second,
+            vec![installed],
+        )
+        .unwrap();
+        assert_eq!(refreshed, expected);
+
+        calls.lock().unwrap().clear();
+        assert_eq!(source.load_inventory().unwrap(), refreshed);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![AuthorityProjectionSelector::Credential]
+        );
+    }
+
+    #[test]
     fn inventory_shutdown_stops_between_pages_and_discards_partial_cache() {
         struct StoppingTransport {
             inner: ProjectionTransport,
