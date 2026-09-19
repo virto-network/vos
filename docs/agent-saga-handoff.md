@@ -10,6 +10,45 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: ordinary Shared finality read and ownership audit
+
+Read-only source audit while the post-pin host-feature suite runs. The exact
+permanent-fact read can be built from existing authenticated components:
+
+1. `replay::materialized_system_authority_view` authenticates materialization,
+   compares durable Heads with the materialized Heads/ID and reverified root
+   identity, then constructs the opaque scope and authority view. Use this
+   boundary; caller-supplied state/IDs do not substitute for replay.
+2. `prove_decision(view.authority_state().decisions_root(), target, loader)`
+   can follow `SystemAuthorityHistoryStore::load_system_authority_decision_node`.
+   It verifies bounded canonical paths and exact node IDs against that root.
+   A vacant proof is not finality. An occupied proof supplies the exact fact.
+3. Load the content-addressed committee named by that fact, and call
+   `verify_historical_provision(scope, provision, fact, committee)`. This checks
+   root-generation scope, exact provision/fact closure and the original QC.
+   That helper alone does NOT prove inclusion: it must follow step2 against
+   the authenticated root, with no stale-head or alternate-store substitution.
+
+There is also a startup/ownership dependency missing from the earlier bounded
+plan. `SharedAgentHost::open_with_lease_and_root` scans a BTreeMap keyed by
+AgentId, verifies each intent, then opens/inserts that generation. Thus an
+ordinary generation can be verified before its system generation is opened.
+`verify_and_prepare` calls the external finality verifier during construction
+and synchronous `provision_intent`; the production bootstrap owner holds this
+same host as `Arc<Mutex<SharedAgentHost>>`. A verifier that simply reacquires
+that host is not a safe integration: construction has no completed host yet,
+and provisioning while its mutex is held would deadlock on recursive locking.
+This is an integration hazard inferred from the call graph, not an observed
+deadlock in the current unavailable verifier.
+
+Before wiring ordinary issuance, define a root-first authenticated reopen and
+non-reentrant ownership path (or an equally strong independently pinned proof
+source). Test both AgentId orderings, missing/corrupt root generation, changed
+Heads/store identity, vacant/conflicting decisions, missing/wrong committee,
+and repeated verification after restart. Keep admission fail-closed until the
+root is ready; do not solve ordering with an accepting cache or root-bootstrap
+QC standing in for ordinary finality. No runtime source changed in this audit.
+
 ### 2026-09-19: complete post-pin default-library regression
 
 At `02dbc8c6d50acdbc06b984cff651cfa61c5fc136`, the offline/locked default
