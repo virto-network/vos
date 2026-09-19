@@ -10,6 +10,30 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: current-source CLI regression and integration gates
+
+Source `14b81955`, nightly-2025-05-09, locked/offline, shared CARGO_TARGET_DIR and
+disk-backed TMPDIR. CLI binary/unit suite passes255 tests, zero failures,
+19 ignored,73.34s (build0.27s). Command:
+`cargo +nightly-2025-05-09 test --locked --offline -p vosx --bin vosx -- --test-threads=1`.
+Session67943 terminal0. Ignored campaigns are not counted as passes; the two
+explicit live Counter campaigns are recorded separately below.
+
+Integration command:
+`cargo +nightly-2025-05-09 test --locked --offline -p vosx --test build_actor_e2e --test build_task_e2e --test shutdown_smoke --no-fail-fast -- --test-threads=1`.
+Actor-build4 pass25.48s; task-build1 passes28.19s; shutdown smoke fails11.68s
+because no endpoint is published within the unchanged10s startup deadline.
+It never reaches SIGTERM or the5s shutdown assertion. Build4.95s;
+session9276 terminal101. No gates relaxed and no source changes required.
+
+Evidence: `target/task-tmp/current-latency.p7U3OE/cli-suite.log` and
+`cli-integration.log`. Failed smoke fixtures remain at their original paths:
+`target/task-tmp/vosx-shutdown-450908-data-1789827038495611180` and
+`target/task-tmp/vosx-shutdown-450908-config-1789827038495713962`.
+The test child guard reaped its daemon; subsequent host process inspection found
+no `vosx space up shutdown-smoke` process. Do not remove or relocate failure
+evidence. Full library/proof and production gates are not closed by these runs.
+
 ### 2026-09-19: current-release fresh invocation and restart/read
 
 Extended only the ignored live-test fixture whitelist for `current-latency-smoke`

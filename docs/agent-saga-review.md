@@ -25,6 +25,12 @@ passing regressions from still-failing production gates.
 
 ## Current release qualification
 
+Current-source CLI regression at `14b81955`:255 unit tests pass,19 ignored;
+actor-build4 and task-build1 integration tests pass. Shutdown smoke fails the
+unchanged10s startup deadline before SIGTERM, so the integration command exits101.
+This is not an all-green matrix or a shutdown failure. Full library/proof
+qualification remains outstanding; see the evidence handoff.
+
 An additional fresh-space probe of the same release reaches readiness in18s,
 verifies fresh Create in38s and Counter Install in45s, and shuts down within1s.
 HTTP/SSH pass. No retry/resume was needed. Create lifecycle13.03s is followed by
