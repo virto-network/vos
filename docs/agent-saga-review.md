@@ -32,7 +32,10 @@ retries. Readiness17s then restarts21s/29s all fail10s. Create35s, Install43s,
 managed increment23.48s/read24.50s; shutdown0–1s. HTTP status and SSH keyscan
 pass, not authenticated SSH shell qualification. See current status and handoff
 for checksum and original-path fixture. No controlled overall speedup claim.
-Full suites below predate this repin; focused post-pin checks do not replace them.
+Full post-pin host-feature suite at `bf7ced06` passes1,871 tests/3 ignored in
+1,450.60s; default library at `e63db78b` passes1,434/1 ignored and CLI at
+`c1614b96` passes255/19 ignored. Ignored cases are not counted as passes.
+These regression results do not close the remaining production/proof gates.
 
 ### Prior-generation qualification
 

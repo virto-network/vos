@@ -12,8 +12,8 @@ Its large-retry benchmark reduces gas18.3% with identical output; focused
 rejection/retirement and release-pin regressions pass. Release rebuild and fresh
 Local lifecycle/restart qualification now pass. This is not a controlled
 end-to-end speedup claim. Do not boot
-old-generation fixtures with the new pin or claim the prior full-suite counts
-qualify this new artifact.
+old-generation fixtures with the new pin. Post-pin CLI, default-library and
+host-feature suites now pass at the revisions recorded below.
 
 Release implementation `b131edc3` builds and verifies its bundled artifacts.
 SHA-256: `a2e12ecd77cf393c3ddf8ecfabecb4d366fb3e55d0d0d14dcc4f221fca8ef08b`.
@@ -66,7 +66,7 @@ with bounded equivalence/recovery checks and repeat release qualification.
 | Ordinary Shared genesis/finality | Native startup still installs `UnavailableAgentFinality`; production accepting bridge missing. System genesis is a separate path. |
 | Authenticated reclamation | Issuer/coordinator bounded-record reclamation remains unfinished; invocation retirement is not proof of Authority application. |
 | Recovery/proof qualification | Remaining mixed pending/crash/capacity cases, pre-expiry Abort/management expiry, cross-runtime portable positive ACK, and full Private/Attested cryptographic proof matrix. |
-| Release integration | Post-pin default library ate63db78b:1,434 passed/1 ignored; CLI atc1614b96:255 passed/19 ignored. Pre-pin baselines: host-feature library1,869 passed/3 ignored atba2d08ad, actor-build4/task-build1 at14b81955. Full post-pin host-feature suite remains pending. Shutdown smoke fails10s startup before SIGTERM. Full cryptographic proof qualification and remaining release audit/sign-off stay open. |
+| Release integration | Post-pin host-feature library atbf7ced06:1,871 passed/3 ignored; default library ate63db78b:1,434 passed/1 ignored; CLI atc1614b96:255 passed/19 ignored. Actor-build4/task-build1 baseline predates repin. Startup still fails10s. Full cryptographic proof qualification and remaining release audit/sign-off stay open. |
 
 Next performance step: address the roughly20s authenticated initial inventory.
 Released checkpoint scheduling now triggers at8 retained physical entries;

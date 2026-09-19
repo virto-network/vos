@@ -10,6 +10,25 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: complete post-pin host-feature regression
+
+At `bf7ced06` (release implementation `b131edc3`), full host-feature library
+suite passes1,871 tests, zero failures,3 ignored,1,450.60s (24m11s). Command:
+`cargo +nightly-2025-05-09 test --locked --offline -p vos --features 'agent-transition-proof private-agent-store http-ingress ssh-ingress' --lib -- --test-threads=1`.
+Shared target, disk-backed TMPDIR, serial socket-enabled run; session59361
+terminal0. Evidence: `target/task-tmp/invoke-reproduction.OS8HAC/post-pin-host-suite.log`.
+No source fixes, retries or workload reductions. The514-query inventory rotation,
+system-attachment checkpoint/drain, new Invoke validation rejection/retirement
+and large-retry benchmark all pass in this uninterrupted run.
+
+Ignored: native-operation initial-capture64MiB headroom diagnostic, explicit
+fixed-history physical decode timing probe, and repeated large-ACK CPU profiling
+probe. They are not claimed as passes. This updates the earlier full host-feature
+baseline for the new pin. It does not prove the missing ordinary Shared finality
+bridge, authenticated reclamation, full Private/Attested cryptographic proofs,
+the unimplemented/unqualified recovery cases, or acceptable production latency.
+No merge, push or master/production sign-off follows from this regression result.
+
 ### 2026-09-19: complete post-pin default-library regression
 
 At `e63db78b` (release implementation `b131edc3`), full default-feature library
