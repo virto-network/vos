@@ -3,13 +3,43 @@
 ## Checkpoint and decision
 
 Review and build/bundle checkpoint: `d4d38ebb`.
-Live-qualified Local-test release source: `8f96fad8`.
+Live-qualified Local-test release source: `d4d38ebb`.
 Use [current status](agent-saga-status.md) for remaining gates and
 [the review guide](agent-saga-review.md) for the two current review ranges.
 This log is reverse chronological: older statements about pending builds or
 the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
+
+### 2026-09-19: current checkpoint fresh Local lifecycle passes
+
+Release d4d38ebb (SHA-256 `1ddcc3c99ea16c5982d7ac8f2e752cfdbf91ceb9145d34d087f1524110668a08`)
+passes the guarded disposable `current-latency.VF0MXp/probe.sh` (session53847
+exit0). `space new` generated HTTP8080/SSH2222 configuration; only ports were
+changed to isolated18099/2243. System packages required no manual installation.
+Only immutable Counter package bytes were copied; no older store was reused.
+
+Readiness16s, Create29s, Install37s, restart20s, Counter mutation21.55s,
+restart26s, read21.48s. Both invocation tests assert value7, positive retirement
+and exact ACK retry; each passes1 test with273 filtered. HTTP status and SSH
+keyscan pass, not authenticated SSH shell or Private/Attested proof coverage.
+Shutdowns0s/0s/1s at whole-second resolution require no forced cleanup; a
+post-probe process/listener check confirms no matching daemon or test listeners.
+
+Current-source test client rebuilt locked/offline with nightly-2025-05-09
+(session74483 exit0,38.07s), SHA-256
+`91c89f24a051e28705d8fe555f3507737ce6b22a291a21e7db009e53125258c4`.
+Build log: `review-checkpoint-release.6a7GXF/live-test-build.log`.
+Probe/new/Create/Install/HTTP/SSH/mutation/read logs stay in the fresh fixture
+under shared `target/task-tmp/`; all temporary files are disk-backed.
+
+Performance remains failing: Create lifecycle9.373s followed by route
+reconciliation16.180s (inventory15.917s); post-Install inventory16.098s and
+reconciliation16.786s. An unchanged-head refresh still costs3.054s inventory.
+All readiness observations exceed the unchanged10s gate. Different fixture
+histories prevent a controlled before/after comparison. No speedup is claimed.
+This closes the rebuilt executable's fresh Local smoke gap, not full CLI,
+host-feature, busy/crash, proof, Shared-finality or production qualification.
 
 ### 2026-09-19: current review checkpoint release builds and verifies
 

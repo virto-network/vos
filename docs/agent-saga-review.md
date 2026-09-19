@@ -4,8 +4,8 @@
 
 The latest source checkpoint includes the subsequent host/cache/network fixes,
 build-fixture corrections and inventory-refresh regression. Its two review ranges
-are below. Live lifecycle evidence remains tied to release `8f96fad8` unless a
-later qualification explicitly says otherwise; see the current status and handoff.
+are below. Fresh Local lifecycle evidence now covers this release; older results
+retain their original qualification boundaries in the status and handoff.
 
 Use these two ranges for the current review; the older snapshot below remains
 historical evidence. No merge or push is implied by this breakdown.
@@ -48,9 +48,14 @@ passing regressions from still-failing production gates.
 Source `d4d38ebb` now builds a release executable and passes bundle creation
 and verification. SHA-256:
 `1ddcc3c99ea16c5982d7ac8f2e752cfdbf91ceb9145d34d087f1524110668a08`.
-This includes subsequent host/build fixes, but no new live lifecycle or timing
-qualification. Evidence: shared `target/task-tmp/review-checkpoint-release.6a7GXF/`.
-The following live qualification remains attached to the preserved older binary.
+This includes subsequent host/build fixes. Evidence: shared
+`target/task-tmp/review-checkpoint-release.6a7GXF/`.
+Fresh Local probe `current-latency.VF0MXp` passes Create29s, Install37s,
+Counter mutation21.55s and read-after-restart21.48s with value7, positive
+retirement and exact ACK retries. HTTP status/SSH keyscan pass. Readiness
+16s/20s/26s still fails10s; shutdown0s/0s/1s passes with no forced cleanup.
+This is Local/Public-policy coverage, not production sign-off or a speedup.
+The following older qualification remains attached to the preserved8f96fad8 binary.
 
 Release `8f96fad8` / SHA-256
 `ee49a636c477c1e3ef21d56f16e2c181307bd1e740ad20bee80b6da27e30e76d`

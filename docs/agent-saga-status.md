@@ -8,8 +8,13 @@ Latest source/review checkpoint: `d4d38ebb`. Its locked/offline release build
 passes in7m03s, and its `release bundle` / `release verify` commands pass.
 Executable SHA-256:
 `1ddcc3c99ea16c5982d7ac8f2e752cfdbf91ceb9145d34d087f1524110668a08`.
-This closes the release-build gap for the subsequent host/build fixes, not their
-live lifecycle qualification. The live results below still belong to8f96fad8.
+Fresh Local/Public-policy lifecycle qualification also passes on this executable:
+Create29s, Install37s, Counter mutation21.55s, read-after-restart21.48s with value7,
+positive retirement and exact ACK retries. Readiness16s/20s/26s still fails10s;
+shutdowns0s/0s/1s at whole-second resolution pass without forced cleanup.
+HTTP status and SSH keyscan pass, not authenticated shell access. Fresh fixture
+`current-latency.VF0MXp` remains at its original path; no old store was reused.
+The older detailed live results below belong to8f96fad8 and are historical.
 Evidence and the preserved previous executable are in shared
 `target/task-tmp/review-checkpoint-release.6a7GXF/`.
 
@@ -66,7 +71,7 @@ not production/master sign-off.
 The post-`36e63581` uncommitted Shared-finality experiment has been removed:
 it depended on legacy embedded authority state absent from clean Create. Its
 failed test and patch are preserved in the evidence directory; see the handoff.
-The live-qualified release checkpoint remains `8f96fad8`. Ordinary Shared finality needs clean
+The latest live-qualified Local release checkpoint is `d4d38ebb`. Ordinary Shared finality needs clean
 system-authority actor integration, not a switch to the legacy replay helper.
 No merge or push is authorized by this checkpoint. Fresh Create/Install/invocation
 have now been measured, but not as a controlled before/after comparison.
@@ -78,9 +83,9 @@ with bounded equivalence/recovery checks and repeat release qualification.
 
 | Requirement | Current evidence / gap |
 | --- | --- |
-| Startup and operation latency | Current-release fresh readiness13s, restarts19s/26s;10s gate fails. Fresh Create25s, Install36s, managed increment20.04s and read-after-restart20.33s. |
+| Startup and operation latency | Latest d4d38ebb fresh readiness16s, restarts20s/26s;10s gate fails. Fresh Create29s, Install37s, managed increment21.55s and read-after-restart21.48s. No controlled before/after speedup is established. |
 | Recovery performance | With8-entry scheduling, second pass system owner8.02s, including14 runtime calls6.39s. Shorter history helps; not a same-history A/B. |
-| Inventory performance | Two agents require six sequential authenticated queries. Current fresh Create lifecycle8.06s is followed by route reconciliation14.08s (inventory13.85s); post-Install inventory15.68s. Inventory still materially delays operation completion. |
+| Inventory performance | Two agents require six sequential authenticated queries. Latest fresh Create lifecycle9.37s is followed by route reconciliation16.18s (inventory15.92s); post-Install inventory16.10s. Inventory still materially delays operation completion. |
 | Shutdown | Latest disposable probes report0s at whole-second resolution and no forced cleanup; general busy/crash matrix still incomplete. |
 | Ordinary Shared genesis/finality | Native startup still installs `UnavailableAgentFinality`; ordinary `AgentGenesisProvider` has no implementation/caller in current Rust sources. Production archive/issuance plus authenticated replay-backed finality integration are missing, not just a verifier switch. System genesis is a separate path. |
 | Authenticated reclamation | Issuer/coordinator bounded-record reclamation remains unfinished; invocation retirement is not proof of Authority application. |
@@ -124,8 +129,8 @@ production artifacts or pins were replaced. The complete `check-all` gate still 
 
 Post-pin broad library regressions are complete; the production gaps above remain.
 The subsequent host/journal/network/cache changes have targeted tests and the
-current workspace library pass. They are not in the qualified 8f96fad8 release
-executable; the explicit host-feature suite and full clean-break recipe precede
+current workspace library pass. They are now in the d4d38ebb release executable
+with fresh Local lifecycle coverage; the explicit host-feature suite and full clean-break recipe precede
 those changes and retain their recorded qualification boundaries.
 Performance work must remain focused on the14–16s authenticated two-agent
 inventory. Exact-binary profiling identified outer BLAKE2b cost, leading to
