@@ -11,27 +11,20 @@ optimization from `19d73390`, ProgramId
 `e61dc1dacd564ac9371512eaaf9d35ad8f1e081f8e3b638ca9da9425e887e86b`.
 Paired synthetic tests show20.1% less fresh-Invoke gas with identical complete
 output. Two isolated ELF/PVM builds match each other and the measured candidate.
-**Release rebuild, fresh Local lifecycle/restart qualification and full post-pin
-regression are still pending for this new generation.** Do not boot older
-fixtures with the new pin. See the handoff for focused evidence.
+Release rebuild, fresh Local lifecycle/restart qualification and the full CLI
+suite pass. Full post-pin default-library and host-feature regression remain
+pending. Do not boot older fixtures with the new pin. See the handoff for evidence.
 
-### Last live-qualified release (previous runtime generation)
-
-The following measurements and full-suite counts apply to the prior pin from
-`24000c8a`, ProgramId
-`e815f4b010f7213290850189f5bc20fc54533068f0d73ea4982de9414b1135e9`,
-not to the latest pin. They do not establish an end-to-end speedup.
-
-Release implementation `b131edc3` builds and verifies its bundled artifacts.
-SHA-256: `a2e12ecd77cf393c3ddf8ecfabecb4d366fb3e55d0d0d14dcc4f221fca8ef08b`.
-That runtime is independently reproduced; new spaces automatically
+Release implementation `b16abf81` builds and verifies its bundled artifacts.
+SHA-256: `e76cf5428ebc443ec7cc6859c162ee7b9ec67e5fb03706b2ee9798051fa84106`.
+The runtime is independently reproduced; new spaces automatically
 receive system packages and enabled HTTP/SSH configuration. The Local workflow
 has live evidence for Create, Counter Install, increment, retirement/ACK retry,
 and reading7 after restart. Latest release checks HTTP status and SSH listener
 availability (not authenticated shell access). Earlier-generation probes cover
 host-key persistence and conflict reporting. New-space probes verify fresh
-Create (35s) and Counter Install (43s), with no retry/resume.
-Fresh Counter increment takes23.48s and read-after-restart24.50s on this release;
+Create (30s) and Counter Install (36s), with no retry/resume.
+Fresh Counter increment takes20.71s and read-after-restart19.90s on this release;
 value7, positive retirement and exact ACK retries pass. This is Public-policy
 qualification, not the remaining Private/Attested proof matrix.
 
@@ -45,10 +38,10 @@ returns409; retention is bounded, not indefinite server reply caching.
 Keep two scoped batches, not one review per work-in-progress commit:
 
 1. `31b0cdbb..f79f0e3d`: integrated clean-break architecture/lifecycle.
-2. `f79f0e3d..b131edc3`: recovery, performance, artifact and qualification follow-ups
-   (40 files, +3,463/-214 at this frozen checkpoint).
+2. `f79f0e3d..b16abf81`: recovery, performance, artifact and qualification follow-ups
+   (40 files, +3,862/-216 at this frozen checkpoint).
 
-The integrated diff remains large (231 files, +76,282/-58,974 at `b131edc3`).
+The integrated diff remains large (231 files, +76,679/-58,974 at `b16abf81`).
 These are review groupings, not independently deployable slices. Subsequent
 review-handoff documentation and disposable-fixture test updates belong with batch2. The old C1 boundary
 is not independently merge-ready.
@@ -66,16 +59,16 @@ with bounded equivalence/recovery checks and repeat release qualification.
 
 | Requirement | Current evidence / gap |
 | --- | --- |
-| Startup and operation latency | Current-release fresh readiness17s, restarts21s/29s;10s gate fails. Fresh Create35s, Install43s, managed increment23.48s and read-after-restart24.50s. |
+| Startup and operation latency | Current-release fresh readiness15s, restarts19s/24s;10s gate fails. Fresh Create30s, Install36s, managed increment20.71s and read-after-restart19.90s. |
 | Recovery performance | With8-entry scheduling, second pass system owner8.02s, including14 runtime calls6.39s. Shorter history helps; not a same-history A/B. |
-| Inventory performance | Two agents require six sequential authenticated queries. Current fresh Create lifecycle11.20s is followed by route reconciliation20.02s (inventory19.77s), so inventory still materially delays operation completion. |
+| Inventory performance | Two agents require six sequential authenticated queries. Current fresh Create lifecycle9.62s is followed by route reconciliation16.93s (inventory16.68s), so inventory still materially delays operation completion. |
 | Shutdown | Latest disposable probes pass within1–2s; general busy/crash matrix still incomplete. |
 | Ordinary Shared genesis/finality | Native startup still installs `UnavailableAgentFinality`; ordinary `AgentGenesisProvider` has no implementation/caller in current Rust sources. Production archive/issuance plus authenticated replay-backed finality integration are missing, not just a verifier switch. System genesis is a separate path. |
 | Authenticated reclamation | Issuer/coordinator bounded-record reclamation remains unfinished; invocation retirement is not proof of Authority application. |
 | Recovery/proof qualification | Remaining mixed pending/crash/capacity cases, pre-expiry Abort/management expiry, cross-runtime portable positive ACK, and full Private/Attested cryptographic proof matrix. |
-| Release integration | Post-pin host-feature library atbf7ced06:1,871 passed/3 ignored; default library ate63db78b:1,434 passed/1 ignored; CLI atc1614b96:255 passed/19 ignored. Actor-build4/task-build1 baseline predates repin. Startup still fails10s. Full cryptographic proof qualification and remaining release audit/sign-off stay open. |
+| Release integration | Current-pin CLI atb16abf81:255 passed/19 ignored. Last full host-feature library atbf7ced06:1,871 passed/3 ignored and default library ate63db78b:1,434 passed/1 ignored both predate the latest pin and need rerunning. Actor-build4/task-build1 baseline also predates repin. Startup still fails10s. Full cryptographic proof qualification and remaining release audit/sign-off stay open. |
 
-Next performance step: address the roughly20s authenticated initial inventory.
+Next performance step: address the roughly17s authenticated two-agent inventory.
 Released checkpoint scheduling now triggers at8 retained physical entries;
 safety tests, the complete514-query workload and two live restart passes succeed.
 Observed periodic reconciliation3.71s/3.57s is not a broad throughput proof. Do not

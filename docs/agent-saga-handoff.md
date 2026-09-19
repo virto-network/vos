@@ -2,13 +2,53 @@
 
 ## Checkpoint and decision
 
-Review checkpoint and qualified Local-test release source: `b131edc3`.
+Review checkpoint and qualified Local-test release source: `b16abf81`.
 Use [current status](agent-saga-status.md) for remaining gates and
 [the review guide](agent-saga-review.md) for the two current review ranges.
 This log is reverse chronological: older statements about pending builds or
 the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
+
+### 2026-09-19: repinned release and fresh Local lifecycle qualified
+
+Release `b16abf81948d64cc08ea34f683316f60c7f8759c` builds offline/locked with
+host nightly-2025-05-09 in6m20s. Executable SHA-256:
+`e76cf5428ebc443ec7cc6859c162ee7b9ec67e5fb03706b2ee9798051fa84106`.
+Bundle creation and verification pass. The prior release is preserved as
+`target/task-tmp/role-length-release.UnaSE1/vosx-before` (SHA-256 `a2e12ecd77cf393c3ddf8ecfabecb4d366fb3e55d0d0d14dcc4f221fca8ef08b`).
+That directory also contains `build.log`, verified `bundle/` and `cli-suite.log`.
+Full current-pin CLI suite passes255 tests/19 ignored in87.64s. Build and test
+sessions47890/71145 both terminated successfully; no overlapping build ran
+during the live latency probe.
+
+Fresh fixture `target/task-tmp/current-latency.VSCZEK/` has isolated XDG roots;
+space name `current-latency-smoke`, SpaceId
+`85fcc4bcb030fafe9bb56f5acfffea0330132f2e160237d475b2c674bb71e01a`.
+Generated config enables HTTP8080/SSH2222; only test ports changed to18099/2243.
+System packages are automatic; only the immutable Counter package was copied.
+Created AgentId: `59fe9c9ab2a9f9ac50893058e50333273ccbe490754597824964388345ce913b`.
+
+Guarded `probe.sh` completed successfully (session77977, exit0): first readiness
+15s; HTTP status/SSH keyscan pass; fresh Create30s and Install36s both return
+verified acknowledgements without resume. Shutdown1s. Restart19s; managed fresh
+increment20.71s (full test22.42s); shutdown1s. Restart24s; managed read19.90s
+(full test21.51s), persisted value7, retirement/late-Invoke rejection and exact
+ACK retry pass; shutdown1s. No forced cleanup; host process inspection after
+completion found no vosx/cargo/rustc. SSH listener checks are not authenticated
+shell qualification; these Public-policy probes do not prove non-Public policy.
+
+Fresh Create lifecycle9,618ms is followed by route reconciliation16,930ms,
+including16,677ms inventory. Install's final reconciliation16,108ms includes
+15,483ms inventory. Readiness still fails10s and operation latency remains too
+high. Older release timings are not a controlled same-history A/B.
+CLI test executable SHA-256:
+`7a5b078dbf5b911d87112b5766419a832e4a9a8b23507fe99f987370955336d4`.
+Mutation invocation `60376c6faa3dcd95f2a813d15b2d9b2078abcffb0175fd23595f7be52f760273`;
+read invocation `11b10d2bae585d9b3a807176fd08763af5217624f6da3e2596ad8bd8d6f65406`.
+Do not rerun the fresh increment: retain its exact request/ACK files. Keep all
+stores at original absolute paths. Full post-pin default/host library suites,
+Shared integration, reclamation and remaining production gates stay open.
 
 ### 2026-09-19: independently reproduced artifact-role optimization repinned
 

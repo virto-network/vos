@@ -1,24 +1,23 @@
 # Reviewing the Agent architecture saga
 
-## Review entry point: checkpoint and release source `b131edc3`
+## Review entry point: checkpoint and release source `b16abf81`
 
 Use these two ranges for the current review; the older snapshot below remains
 historical evidence. No merge or push is implied by this breakdown.
 
-Latest source has a newer artifact-role length optimization and independently
+Latest source includes the artifact-role length optimization and independently
 reproduced pin from `19d73390`; these also belong in batch2. Its release rebuild,
-fresh-space qualification and full post-pin regression remain pending. The
-live measurements below apply only to the last qualified `b131edc3` release,
-not the new runtime generation.
+fresh-space qualification and full CLI suite pass. Full post-pin default and
+host-feature library suites remain pending.
 
 | Batch | Exact range | Scope and size |
 | --- | --- | --- |
 | 1 | `31b0cdbb..f79f0e3d` | Integrated clean-break architecture and lifecycle;225 files,+72,934/-58,875. |
-| 2 | `f79f0e3d..b131edc3` | Recovery, checkpointing, shutdown, prepared-runtime/ACK/Invoke validation reuse, reproduced pin, lifecycle conflict reporting, attachment refresh, operator docs and qualification;40 files,+3,463/-214. |
+| 2 | `f79f0e3d..b16abf81` | Recovery, checkpointing, shutdown, prepared-runtime/ACK/Invoke validation reuse, artifact-role length filtering, reproduced pin, lifecycle conflict reporting, attachment refresh, operator docs and qualification;40 files,+3,862/-216. |
 
 Counts are frozen at that checkpoint; subsequent handoff documentation and
 disposable-fixture test updates belong with batch2. Neither batch is an independently deployable slice.
-The integrated diff is231 files,+76,282/-58,974. No production sign-off is implied.
+The integrated diff is231 files,+76,679/-58,974. No production sign-off is implied.
 
 Batch1 remains large and cannot be presented as an independently safe old C1
 cut. Batch2 contains all subsequent fixes together, not one review per commit.
@@ -31,14 +30,15 @@ passing regressions from still-failing production gates.
 
 ## Current release qualification
 
-Release `b131edc3` includes the independently reproduced Invoke validation
+Release `b16abf81` includes the independently reproduced artifact-role length
 optimization. Bundle verification and fresh Local Create/Counter Install pass;
 fresh increment and read-after-restart verify value7, retirement and exact ACK
-retries. Readiness17s then restarts21s/29s all fail10s. Create35s, Install43s,
-managed increment23.48s/read24.50s; shutdown0–1s. HTTP status and SSH keyscan
+retries. Readiness15s then restarts19s/24s all fail10s. Create30s, Install36s,
+managed increment20.71s/read19.90s; shutdown1s. HTTP status and SSH keyscan
 pass, not authenticated SSH shell qualification. See current status and handoff
 for checksum and original-path fixture. No controlled overall speedup claim.
-Full post-pin host-feature suite at `bf7ced06` passes1,871 tests/3 ignored in
+Current-pin CLI at `b16abf81` passes255 tests/19 ignored in87.64s.
+The previous-pin host-feature suite at `bf7ced06` passes1,871 tests/3 ignored in
 1,450.60s; default library at `e63db78b` passes1,434/1 ignored and CLI at
 `c1614b96` passes255/19 ignored. Ignored cases are not counted as passes.
 These regression results do not close the remaining production/proof gates.
