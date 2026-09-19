@@ -2,7 +2,8 @@
 
 ## Checkpoint and decision
 
-Review and build/bundle checkpoint: `a732e079`.
+Review source checkpoint: `45ff53e0` (two batches; see review guide).
+Build/bundle checkpoint: `a732e079`.
 Live-qualified Local-test release source: `a732e079`.
 Use [current status](agent-saga-status.md) for remaining gates and
 [the review guide](agent-saga-review.md) for the two current review ranges.
@@ -36,7 +37,12 @@ checks pass. Evidence in shared `target/task-tmp/single-preflight-release.pE0Yxy
 `host-feature-suite.log`, `raft-status-race-fix.log`, `raft-status-race-repeat.log`.
 The original full-suite failure remains preserved; targeted repair/repeats are
 not a claim that the full corrected-source suite passed. Unified rerun remains
-due. Guest artifacts and the qualified release executable are unchanged.
+in progress at45ff53e0 in session25218, using the same command and environment.
+Its log is `host-feature-suite-fixed.log` in the same evidence directory.
+The live handle was re-polled and continued through the native Local lifecycle
+tests; no terminal full-suite result is established yet. Resume the same handle
+instead of starting another run. Guest artifacts and the qualified release
+executable are unchanged.
 
 ### 2026-09-19: native operation startup reuses its checked decode
 

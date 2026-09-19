@@ -1,5 +1,31 @@
 # Reviewing the Agent architecture saga
 
+## Review freeze: `45ff53e0`
+
+Review the integrated source in two batches:
+
+1. `31b0cdbb..f79f0e3d`: architecture and lifecycle (unchanged first batch).
+2. `f79f0e3d..45ff53e0`: all follow-up fixes and qualification (60 files,
+   +6,484/-345). This includes startup decode reuse, capacity retry coverage,
+   and the Raft cached-status test repair; do not create separate review batches
+   for those commits.
+
+The integrated source diff is 241 files, +79,264/-59,066. Counts exclude later
+handoff-only edits. Neither batch is independently deployable. `saga/agents`
+remains at `31b0cdbb`; no merge or push has been performed.
+
+Live-qualified executable source remains `a732e079`, not `45ff53e0`.
+The corrected-source host-feature suite is running in session25218, with log
+`target/task-tmp/single-preflight-release.pE0Yxy/host-feature-suite-fixed.log`
+under the shared target. Its final result is not yet established. Finish that
+existing run before deciding integration readiness; do not substitute the
+targeted Raft successes for the full-suite result. The frozen release details
+below remain useful for disposable Local/Public-policy testing only.
+
+This checkpoint does not close ordinary Shared finality/issuance, bounded
+issuer reclamation, remaining proof/crash coverage, or production latency/lint
+gates. No production or master sign-off is implied.
+
 Current source has a subsequent runtime repin from immutable ba7be457 (ProgramId
 `8071ad67661c6539ab504ccecc18c9e8d6d858803b52fca05389823f8109d3cc`).
 It belongs with batch2. Independent reproduction, post-pin artifact18/18,

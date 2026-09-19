@@ -31,7 +31,9 @@ executable and has no measured latency claim; reclamation remains incomplete.
 Full host-feature run at c9990ed6 finishes1877 passed,1 failed,4 ignored. The
 failure was an immediate cached-status read racing AppendEntries publication
 in a Raft test. Its test-only fix passes all15 worker tests and50 isolated
-repetitions; the full corrected-source rerun remains due. See the handoff.
+repetitions; the full corrected-source rerun is running in session25218 at
+45ff53e0, logging to `single-preflight-release.pE0Yxy/host-feature-suite-fixed.log`
+under shared `target/task-tmp`. No final result is established yet. See the handoff.
 Use the d4d38ebb release checkpoint below only with its original-pin fixtures;
 do not boot those stores with the new pin.
 
@@ -91,8 +93,8 @@ returns409; retention is bounded, not indefinite server reply caching.
 Keep two scoped batches, not one review per work-in-progress commit:
 
 1. `31b0cdbb..f79f0e3d`: integrated clean-break architecture/lifecycle.
-2. `f79f0e3d..a732e079`: recovery, performance, artifact, host/build fixes and qualification follow-ups
-   (57 files, +6,231/-331 at this frozen checkpoint).
+2. `f79f0e3d..45ff53e0`: recovery, performance, artifact, host/build fixes and qualification follow-ups
+   (60 files, +6,484/-345 at this frozen source checkpoint).
 
 The integrated diff remains large (240 files, +79,025/-59,066 at `a732e079`).
 These are review groupings, not independently deployable slices. Subsequent
