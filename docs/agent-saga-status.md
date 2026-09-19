@@ -142,6 +142,10 @@ the different live fixtures do not establish a controlled end-to-end speedup.
 Create improved in this observation, but Install and managed operations remain
 slow. Preserve complete-head authentication, recovery and positive ACKs;
 do not lower safety/retention bounds or publish readiness before recovery.
+Latest live phase attribution across21 complete queries places75.64% of56.284s
+in Invoke+ACK,12.31% in reservation/checkpoint and3.00% in pending-record
+persist+clear. These are disjoint wall-time spans, not guest-only CPU samples;
+see the handoff. Optimizing record writes alone cannot solve the measured delay.
 An additional mock-transport regression after50607708 verifies the two-agent
 query pattern (6 initial, 1 unchanged, 6 after an Install-like head change,
 1 unchanged) and requires the newly installed actor in the refreshed inventory.

@@ -11,6 +11,41 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: current live query phase attribution
+
+Read-only analysis of `current-latency.VF0MXp/up.log` finds21 complete projection
+sequences and0 unmatched phase records. The trace clocks are cumulative: subtract
+prepare/reserve/identity/persist predecessors, then start a separate execution
+clock for reopen/invoke/acknowledge/complete. Do not sum raw elapsed_ms fields.
+Across those sequences the disjoint totals in milliseconds are:
+
+| Phase | Total ms |
+| --- | ---: |
+| Prepare | 1,732 |
+| Reserve/checkpoint | 6,931 |
+| Pending identity | 1,445 |
+| Persist pending record | 925 |
+| Reopen/recovery identity | 1,915 |
+| Invoke | 26,988 |
+| Acknowledge | 15,583 |
+| Clear pending record | 765 |
+
+Total56,284ms: Invoke+ACK75.64%, reservation12.31%, pending-record persist+clear
+3.00%. These span host work plus runtime execution; they are not pure guest CPU
+measurements. Reservation includes potential certified checkpoint work. The
+sample includes bootstrap and unchanged-head queries as well as changed-head
+inventory, not just one Create. Per-query mean is2.680s; Invoke+ACK alone2.027s.
+
+This narrows the next performance action: pending-record write optimization
+cannot address most measured latency. Preserve durability and positive ACKs;
+concentrate on reducing repeated execution/hash work or authenticated bounded
+projection aggregation. The latter needs protocol/actor/artifact qualification,
+not merely parallelizing callers or reusing inventory across a changed head.
+`crypto/blake2b.rs` deliberately excludes the actor ECALL100 path when
+agent-runtime is enabled: the outer runtime only permits standard PVM machine
+management calls. Re-enabling that host trap is not an equivalent optimization.
+No runtime code, fixture state, artifact pin or performance gate changed here.
+
 ### 2026-09-19: full current-source CLI regression passes
 
 The current-source CLI test executable built in session74483 (SHA-256
