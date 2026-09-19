@@ -88,6 +88,9 @@ lint and the broader `just check-all` recipe remain open.
 Post-pin supporting gates also pass: system-authority 58/58, system-catalog
 10/10, and SDK no-default-feature documentation with broken intra-doc links denied.
 These do not qualify all examples/external links or host issuer reclamation.
+At2c340623, `just test-pvm-proof-fast` passes120 library,1 arithmetic,15
+control-flow and7 memory tests, with zero failures/ignored. This does not close
+the full Private/Attested cryptographic proof matrix.
 
 Post-pin broad library regressions are complete; the production gaps above remain.
 The subsequent host/journal cleanup and boxed network command have targeted

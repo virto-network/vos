@@ -10,6 +10,56 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: fast PVM proof recipe passes
+
+At `2c340623`, `just test-pvm-proof-fast` completed unchanged with exit0
+(session2436). It ran120 library tests (2.27s),1 add64 end-to-end test (2.06s),
+15 control-flow tests (29.13s), and7 memory tests (21.98s), with zero failures,
+ignored or filtered tests in each binary. This includes actual proof verification
+and expected rejection cases; it is not the full Private/Attested proof matrix.
+Log: shared `target/task-tmp/decoded-input-release.RIkx3j/pvm-proof-fast.log`.
+Environment: nightly-2025-05-09, offline dependencies, shared disk-backed target
+and TMPDIR, `RUST_TEST_THREADS=1`, `RAYON_NUM_THREADS=2` to limit memory pressure.
+No source/artifact changes accompanied the run; existing warnings remain.
+
+### 2026-09-19: Shared finality dependency audit
+
+Read-only follow-up at `2c340623` rechecked the C2 requirements in the review
+guide: ordinary provisioning requires authenticated live system-Agent decision
+publication and independent replay verification on both admission and reopen.
+The blocker is not a safe one-line replacement for UnavailableAgentFinality.
+
+Concrete source boundaries:
+
+- `agent::genesis` is public and not std-gated. Its decision records already
+  have bounded canonical encoding/decoding and are available through the
+  Authority actor's existing vos dependency. A duplicate SDK record is not
+  necessary merely for parsing; publishing valid, correctly authorized facts
+  and proving their permanence remains the missing integration.
+- `genesis.rs::AgentGenesisDecision` binds exact system genesis/admission,
+  proposal, replica committee, evidence and authority claim. Provider output is
+  explicitly not proof of permanent publication.
+- `shared_host.rs::verify_and_prepare` requires independent finality before
+  preparing ordinary Shared genesis. The system bootstrap path separately checks
+  root pins; it must not be reused to authorize ordinary agents.
+- `system-authority::finalize_application` replaces `latest_management_acks` by
+  credential when the request sequence advances. MAA2 is therefore not a
+  permanent genesis-decision archive, even when its signature is valid.
+- `ManagedAgentRow`/`AuthorityAgentProjection` describe current runtime, replicas
+  and capabilities, not an immutable exact AgentGenesisDecision. Matching a
+  current inventory row cannot substitute for that decision's finality.
+
+Next implementation dependency is a bounded permanent exact-decision publication
+path in the clean Authority, with authenticated retrieval/replay evidence that
+survives later management, credential turnover and checkpoint/GC. Durable archive
+creation/reproduction must remain separate from independent trust promotion.
+Only then wire native issuance/provisioning and reopen verification, accounting
+for root-first recovery and the non-reentrant system-owner lock. Required checks
+include self-consistent-but-unpublished rejection, exact retry, conflicting
+decision rejection, retention after later operations and restart, and native
+ordinary Shared Create/Install/invoke/restart. No new implementation, artifact
+repin or test pass is claimed by this audit; no auth/retention bypass was added.
+
 ### 2026-09-19: boxed network command payload verified
 
 Following `a4f22004`, the network mailbox now owns each Agent outbound request
