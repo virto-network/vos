@@ -6,26 +6,25 @@ checkpoint, not production or master sign-off. `saga/agents` remains at
 
 ## What can be tested
 
-There is now an **unpinned source optimization candidate** after the qualified
-release: artifact resolution checks actual byte length before computing a blob
-digest for impossible schema/policy/constructor roles. Paired synthetic tests
-show20.1% less fresh-Invoke gas with identical complete output. Independent
-reproduction, repinning and release requalification are still required before
-claiming that improvement for the shipped bundle. The release described below
-remains unchanged; see the handoff for candidate evidence.
+Latest source now pins the independently reproduced artifact-role length
+optimization from `19d73390`, ProgramId
+`e61dc1dacd564ac9371512eaaf9d35ad8f1e081f8e3b638ca9da9425e887e86b`.
+Paired synthetic tests show20.1% less fresh-Invoke gas with identical complete
+output. Two isolated ELF/PVM builds match each other and the measured candidate.
+**Release rebuild, fresh Local lifecycle/restart qualification and full post-pin
+regression are still pending for this new generation.** Do not boot older
+fixtures with the new pin. See the handoff for focused evidence.
 
-Latest source pins the independently reproduced Invoke-recovery optimization
-from `24000c8a`, ProgramId `e815f4b010f7213290850189f5bc20fc54533068f0d73ea4982de9414b1135e9`.
-Its large-retry benchmark reduces gas18.3% with identical output; focused
-rejection/retirement and release-pin regressions pass. Release rebuild and fresh
-Local lifecycle/restart qualification now pass. This is not a controlled
-end-to-end speedup claim. Do not boot
-old-generation fixtures with the new pin. Post-pin CLI, default-library and
-host-feature suites now pass at the revisions recorded below.
+### Last live-qualified release (previous runtime generation)
+
+The following measurements and full-suite counts apply to the prior pin from
+`24000c8a`, ProgramId
+`e815f4b010f7213290850189f5bc20fc54533068f0d73ea4982de9414b1135e9`,
+not to the latest pin. They do not establish an end-to-end speedup.
 
 Release implementation `b131edc3` builds and verifies its bundled artifacts.
 SHA-256: `a2e12ecd77cf393c3ddf8ecfabecb4d366fb3e55d0d0d14dcc4f221fca8ef08b`.
-The current runtime is independently reproduced; new spaces automatically
+That runtime is independently reproduced; new spaces automatically
 receive system packages and enabled HTTP/SSH configuration. The Local workflow
 has live evidence for Create, Counter Install, increment, retirement/ACK retry,
 and reading7 after restart. Latest release checks HTTP status and SSH listener

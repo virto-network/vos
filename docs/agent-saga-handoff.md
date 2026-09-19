@@ -10,6 +10,31 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: independently reproduced artifact-role optimization repinned
+
+Exported immutable source `19d733903930b1e8cf5ef861e5ce0440336cde6a` twice into
+separate source and target directories. Offline locked guest builds with
+nightly-2026-03-20 took25.53s/26.55s. Both ELF files match each other and the
+saved measured candidate ELF; both converted PVMs likewise match the candidate.
+ProgramId and hashes are those recorded in the candidate entry below.
+
+Updated `support/production-artifacts.toml`, `STANDARD_RUNTIME_PROGRAM_ID`,
+the vosx build-time digest and bundled PVM together. System templates and ABI
+identity remain unchanged. Post-pin tests without candidate overrides pass:
+release verifier18/18 (0.92s), bundled signing/admission4/4 (0.30s), clean outer
+surface1/1 (0.11s), bundled runtime7 passed/1 ignored (5.97s). This is focused
+qualification, not the full host-feature/CLI/default matrix or live release.
+
+Evidence: shared `target/task-tmp/role-length-reproduction.IeXBpW/` contains
+`reproduce.sh`, `reproduce.log`, independent source/target trees, build/identity
+logs, both PVMs, `post-pin-release-tests.log`, `post-pin-runtime-tests.log`.
+The existing release executable is still the prior `b131edc3` generation;
+it has not been rebuilt or replaced. Next: preserve that executable, build and
+verify the new release, create a fresh disposable space, and qualify
+Create/Install/Invoke/ACK/restart before reporting new live latency. Do not boot
+the previous runtime's fixtures with the new pin. Full production gates in the
+status page remain open; no merge or push occurred.
+
 ### 2026-09-19: artifact-role length rejection candidate
 
 `resolve_clean_invocation` now checks actual preimage length before computing

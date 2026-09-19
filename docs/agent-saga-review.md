@@ -5,6 +5,12 @@
 Use these two ranges for the current review; the older snapshot below remains
 historical evidence. No merge or push is implied by this breakdown.
 
+Latest source has a newer artifact-role length optimization and independently
+reproduced pin from `19d73390`; these also belong in batch2. Its release rebuild,
+fresh-space qualification and full post-pin regression remain pending. The
+live measurements below apply only to the last qualified `b131edc3` release,
+not the new runtime generation.
+
 | Batch | Exact range | Scope and size |
 | --- | --- | --- |
 | 1 | `31b0cdbb..f79f0e3d` | Integrated clean-break architecture and lifecycle;225 files,+72,934/-58,875. |
