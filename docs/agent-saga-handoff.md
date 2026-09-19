@@ -2,6 +2,34 @@
 
 ## Checkpoint and decision
 
+### 2026-09-19: unchanged attachment refresh no longer queries actor lanes
+
+`SharedAgentNetworkHost::refresh` previously called full host `list()`, which
+builds administrative status and executes `engine_lanes()` through the runtime
+actor-directory query. Refresh consumed only ownership/committee facts.
+It now lists the existing authenticated attachment view and compares the same
+generation, route, membership, committee-transition and role fingerprint.
+An absent/stale/changed attachment still loads full status (including snapshot)
+and follows the existing retire/rebuild path. Dispatch, capacity, Raft barrier,
+admission and physical recovery checks remain in their existing owners.
+No long-lived validation cache, guest change or new trust assertion is added.
+Obsolete full-status fingerprint wrappers were removed.
+
+The expanded attachment regression checks every narrow field against full
+status, preserves the owner through three unchanged refreshes, then verifies
+stale replacement, retired-handler rejection and restart recovery. Final-source
+verification:8 network tests passed (0.60s), attachment regression passed
+(3.37s),16 repeated system promotions passed (9.98s), native management
+application/receipt recovery passed (42.19s). Session80564 terminal0; evidence
+`target/task-tmp/attachment-refresh-final-tests.log`. Initial attachment check
+also passed (`attachment-refresh-regression.log`, session5495).
+
+The release executable remains `1c9ebdab` with SHA-256 `46c64811…`. This source
+change is not yet release-built or live-performance-qualified. Next measure
+the same preserved fixture and phase counters before attributing any startup
+gain; the eliminated directory work is identified in source, not a measured
+end-to-end improvement. All broader release gates remain open.
+
 ### Conflict-reporting release and phase qualification
 
 Release source `1c9ebdab` (production change `12e45422`) built locked/offline

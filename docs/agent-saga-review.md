@@ -21,6 +21,14 @@ passing regressions from still-failing production gates.
 
 ## Follow-up after the frozen review snapshot
 
+2026-09-19 source follow-up: unchanged transport refresh now uses authenticated
+attachment facts instead of full administrative status/actor-directory queries.
+New/stale/changed attachment still uses full status and existing rebuild checks.
+Eight network tests and three attachment/native lifecycle regressions pass.
+No guest pin changed; the release executable is still `1c9ebdab`. Live speedup
+is unmeasured. This belongs in batch2's existing performance/recovery scope;
+the handoff records precise boundaries and evidence.
+
 Conflict-reporting release now built from `1c9ebdab`, bundle verified. Live
 retired Create returns409 with correct guidance and unchanged request bytes.
 HTTP/SSH, retained Counter read and exact ACK retries pass; shutdown1s.

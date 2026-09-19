@@ -474,10 +474,6 @@ impl Storage<NodeId> for AgentNodeStorage {
     }
 }
 
-fn protocol_route(status: &SharedAgentStatus) -> AgentGenerationRoute {
-    protocol_route_from(status.generation, status.replication_id)
-}
-
 fn protocol_route_from(
     generation: crate::agent::shared_raft::AgentGenerationRouteKey,
     replication_id: [u8; 32],
@@ -487,12 +483,6 @@ fn protocol_route_from(
         agent: vos_agent_sdk::AgentId(generation.agent().0),
         generation: Hash(replication_id),
     }
-}
-
-fn route_members(
-    status: &SharedAgentStatus,
-) -> Result<Vec<(NodeId, PeerId)>, SharedAgentHostError> {
-    route_members_from(&status.replicas, status.committee_transition.as_ref())
 }
 
 fn route_members_from(
@@ -530,10 +520,6 @@ fn voter_nodes(replicas: &[crate::agent::shared_host::SharedReplicaRoute]) -> Ve
         .collect::<Vec<_>>();
     voters.sort_unstable();
     voters
-}
-
-fn raft_configuration(status: &SharedAgentStatus) -> (Vec<NodeId>, Option<Vec<NodeId>>) {
-    raft_configuration_from(&status.replicas, status.committee_transition.as_ref())
 }
 
 fn raft_configuration_from(
@@ -701,38 +687,6 @@ struct AttachmentFingerprint {
 }
 
 impl AttachmentFingerprint {
-    fn from_status(status: &SharedAgentStatus) -> Result<Self, SharedAgentHostError> {
-        let members = route_members(status)?;
-        let (voters, joint_old) = raft_configuration(status);
-        let next_voters = status
-            .committee_transition
-            .as_ref()
-            .map(|transition| voter_nodes(&transition.next_replicas));
-        if !valid_nodes(&voters)
-            || joint_old.as_ref().is_some_and(|nodes| !valid_nodes(nodes))
-            || next_voters
-                .as_ref()
-                .is_some_and(|nodes| !valid_nodes(nodes))
-        {
-            return Err(SharedAgentHostError::ScopeMismatch);
-        }
-        Ok(Self {
-            protocol_route: protocol_route(status),
-            durable_route: status.route,
-            members,
-            next_committee: status
-                .committee_transition
-                .as_ref()
-                .map(|transition| transition.next_committee),
-            next_voters,
-            voters,
-            joint_old,
-            local_role: status
-                .local_role
-                .ok_or(SharedAgentHostError::ScopeMismatch)?,
-        })
-    }
-
     fn from_attachment_status(
         status: &crate::agent::shared_host::SharedAgentAttachmentStatus,
     ) -> Result<Self, SharedAgentHostError> {
@@ -4097,7 +4051,7 @@ impl SharedAgentNetworkHost {
             .host
             .lock()
             .map_err(|_| SharedAgentHostError::Unavailable)?
-            .list()?;
+            .attachment_statuses()?;
         let live = statuses
             .iter()
             .filter(|status| status.local_role.is_some())
@@ -4117,7 +4071,7 @@ impl SharedAgentNetworkHost {
                 continue;
             }
             let agent = status.generation.agent();
-            let fingerprint = AttachmentFingerprint::from_status(&status)?;
+            let fingerprint = AttachmentFingerprint::from_attachment_status(&status)?;
             let rebuild = self.generations.get(&agent).is_some_and(|attached| {
                 attached.stale.load(Ordering::Acquire) || attached.fingerprint != fingerprint
             });
@@ -4125,6 +4079,15 @@ impl SharedAgentNetworkHost {
                 self.retire(agent)?;
             }
             if !self.generations.contains_key(&agent) {
+                // Initial/rebuilt attachment still needs the complete status
+                // (including its authenticated snapshot). Refreshing an
+                // unchanged fingerprint must not query unrelated actor lanes.
+                let status = self
+                    .host
+                    .lock()
+                    .map_err(|_| SharedAgentHostError::Unavailable)?
+                    .show(agent)?
+                    .ok_or(SharedAgentHostError::AgentNotFound)?;
                 self.attach_status(status, None, false)?;
             }
         }

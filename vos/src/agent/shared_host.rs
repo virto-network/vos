@@ -1133,6 +1133,20 @@ impl SharedAgentHost {
             .collect()
     }
 
+    /// Authenticated ownership facts for transport refresh. Full status also
+    /// executes an actor-directory query to derive lanes, which unchanged
+    /// network attachments do not consume.
+    pub(crate) fn attachment_statuses(
+        &self,
+    ) -> Result<Vec<SharedAgentAttachmentStatus>, SharedAgentHostError> {
+        self.agents
+            .iter()
+            .map(|(agent, hosted)| {
+                attachment_status_for(hosted, self.transport_is_attached(*agent))
+            })
+            .collect()
+    }
+
     pub fn show(&self, agent: AgentId) -> Result<Option<SharedAgentStatus>, SharedAgentHostError> {
         self.agents
             .get(&agent)
@@ -7349,6 +7363,29 @@ mod tests {
         ));
         let (first_owner, owns_worker) = attachment.attachment_for_test(fixture.agent).unwrap();
         assert!(owns_worker, "an active voter owns the full-NodeId worker");
+
+        {
+            let host = host.lock().unwrap();
+            let full = host.show(fixture.agent).unwrap().unwrap();
+            let narrow = host.attachment_statuses().unwrap();
+            assert_eq!(narrow.len(), 1);
+            let narrow = &narrow[0];
+            assert_eq!(narrow.identity, full.identity);
+            assert_eq!(narrow.generation, full.generation);
+            assert_eq!(narrow.route, full.route);
+            assert_eq!(narrow.replication_id, full.replication_id);
+            assert_eq!(narrow.local_role, full.local_role);
+            assert_eq!(narrow.replicas, full.replicas);
+            assert_eq!(narrow.committee_transition, full.committee_transition);
+            assert_eq!(narrow.transport, full.transport);
+        }
+        for _ in 0..3 {
+            attachment.refresh().unwrap();
+            let (unchanged_owner, owns_worker) =
+                attachment.attachment_for_test(fixture.agent).unwrap();
+            assert!(Arc::ptr_eq(&first_owner, &unchanged_owner));
+            assert!(owns_worker);
+        }
 
         assert!(attachment.mark_stale_for_test(fixture.agent));
         attachment.refresh().unwrap();
