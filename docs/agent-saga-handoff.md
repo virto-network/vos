@@ -10,6 +10,24 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: no-std boundary and pinned maintained-example builds
+
+`cargo +nightly-2025-05-09 check --locked --offline -p vos --no-default-features --lib`
+passes5.04s (session4019 terminal0), with existing warnings. This is a library
+compile boundary check, not embedded-target execution or a warning-free lint gate.
+Evidence: `target/task-tmp/current-latency.p7U3OE/no-std-check.log`.
+
+The actor example workspace used floating `nightly`, and `just build-examples`
+overrode it explicitly. Pinned the actor workspace to `nightly-2026-03-20`,
+matching the custom runtime workspace; removed the floating recipe override
+and added `--locked` to all five builds. `CARGO_NET_OFFLINE=true just build-examples`
+passes for Counter, Shared Board, Private Notes, Local Signer and the custom
+Linear runtime. Session52550 terminal0; evidence
+`target/task-tmp/current-latency.p7U3OE/build-examples.log`. Shared target and
+disk-backed TMPDIR used throughout; no lockfile or production-pin changes.
+`git diff --check` passes. These are source guest builds, not signed-package
+reproduction, cross-profile deployment or full cryptographic proof qualification.
+
 ### 2026-09-19: ingress and extension qualification boundaries clarified
 
 HTTP guide now reflects native operator API bootstrap and the live receipt-bearing

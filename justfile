@@ -28,11 +28,11 @@ build-pvm: verify-agent-runtime-release build-examples (build-actor "space-regis
 
 # Build the small maintained public Agent example set.
 build-examples:
-    cd examples/actors; cargo +nightly actor -p counter
-    cd examples/actors; cargo +nightly actor -p shared-board
-    cd examples/actors; cargo +nightly actor -p private-notes
-    cd examples/actors; cargo +nightly actor -p local-signer
-    cd examples/agent-runtimes/custom-linear; cargo actor
+    cd examples/actors; cargo actor --locked -p counter
+    cd examples/actors; cargo actor --locked -p shared-board
+    cd examples/actors; cargo actor --locked -p private-notes
+    cd examples/actors; cargo actor --locked -p local-signer
+    cd examples/agent-runtimes/custom-linear; cargo actor --locked
 
 # Build the one retained physical PVM fixture.
 build-pvm-test-artifacts: build-probe-fixture

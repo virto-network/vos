@@ -18,6 +18,11 @@ Build all examples:
 just build-examples
 ```
 
+The example workspaces pin `nightly-2026-03-20` with `rust-src`; the recipe
+honors those toolchain files and uses locked dependencies. Set `TMPDIR` to a
+disk-backed directory if your system mounts `/tmp` in RAM. Building these
+examples does not replace the independent production-artifact reproduction gate.
+
 Package one example:
 
 ```bash
