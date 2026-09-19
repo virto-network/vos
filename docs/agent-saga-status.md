@@ -28,6 +28,10 @@ Subsequent host-only startup cleanup removes a duplicate NOD1 decode while
 preserving canonical/scope checks. Physical native-operation tests10/1 ignored
 pass, including added malformed/wrong-scope cases. It is not in the a732e079
 executable and has no measured latency claim; reclamation remains incomplete.
+Full host-feature run at c9990ed6 finishes1877 passed,1 failed,4 ignored. The
+failure was an immediate cached-status read racing AppendEntries publication
+in a Raft test. Its test-only fix passes all15 worker tests and50 isolated
+repetitions; the full corrected-source rerun remains due. See the handoff.
 Use the d4d38ebb release checkpoint below only with its original-pin fixtures;
 do not boot those stores with the new pin.
 

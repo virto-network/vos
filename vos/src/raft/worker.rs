@@ -802,7 +802,21 @@ mod tests {
         );
         assert!(response.success);
 
-        let status = h.local_status().expect("running worker publishes status");
+        // AppendEntries replies before the event loop publishes its cached
+        // status. Wait for this append, not for the membership assertions we
+        // are testing, so a stale pre-append snapshot cannot race the check.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let status = loop {
+            let status = h.local_status().expect("running worker publishes status");
+            if status.last_log_index == response.match_index {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker did not publish the joint-configuration append"
+            );
+            std::thread::yield_now();
+        };
         assert_eq!(status.members, alloc::vec![retained, peer]);
         assert_eq!(
             status.joint_old,

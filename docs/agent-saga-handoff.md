@@ -11,6 +11,33 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-19: full host-feature run exposes and fixes a status-test race
+
+The full host-feature suite at frozen c9990ed6 terminates with1877 passed,
+1 failed,4 ignored,0 filtered in1601.17s (session45034 exit101). Both complete
+inventory rotation and system-attachment checkpoint tests pass. Command:
+`cargo +nightly-2025-05-09 test --locked --offline -p vos --features 'agent-transition-proof private-agent-store http-ingress ssh-ingress' --lib -- --test-threads=1`.
+Dependencies were offline, RAYON_NUM_THREADS=2, loopback available and TMPDIR
+disk-backed. No workload was shortened or restarted. The nested1-test child
+summary is not the parent suite result and is not added to its count.
+
+The sole failure, `raft::worker::tests::status_preserves_old_voters_during_joint_consensus`,
+read the cached pre-append membership. Generic worker `handle_msg` sends the
+AppendEntries response before the event loop calls `publish_status`; therefore
+receipt of the response is not a cache-publication barrier. The test now waits
+at most1s for `last_log_index == response.match_index`, then performs its original
+new-members/joint-old/old-only-voter assertions unchanged. It waits for the append,
+not for the membership answer under test. This matches neighboring cached-status
+tests and changes no production consensus behavior or readiness deadline.
+
+All15 Raft worker tests pass (session87856 exit0,2.34s). The corrected test also
+passes50 separate-process repetitions (session37688 exit0). Formatting/diff
+checks pass. Evidence in shared `target/task-tmp/single-preflight-release.pE0Yxy/`:
+`host-feature-suite.log`, `raft-status-race-fix.log`, `raft-status-race-repeat.log`.
+The original full-suite failure remains preserved; targeted repair/repeats are
+not a claim that the full corrected-source suite passed. Unified rerun remains
+due. Guest artifacts and the qualified release executable are unchanged.
+
 ### 2026-09-19: native operation startup reuses its checked decode
 
 Following33489588, `load_evidence` no longer decodes each full NOD1 dispatch
