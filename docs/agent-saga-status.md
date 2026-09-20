@@ -12,8 +12,9 @@ The complete Agent Architecture Saga remains the objective.
   discovers and owns Shared recovery before route publication. Ordinary Shared
   creation/serving is still incomplete; recovery wiring is not deployment
   qualification.
-- Next functional batch: reproduce/pin the Authority publication stack fix,
-  qualify nonempty published-state recovery, complete
+- The Authority publication stack fix is now bundled from immutable source
+  `26f8f004`; runtime binary and ABI remain unchanged. See artifact evidence below.
+- Next functional batch: qualify nonempty published-state recovery, complete
   ordinary Shared provisioning/network/route ownership, and verify store
   ownership through worker retirement. Do not bypass
   finality or broaden this batch into unrelated performance redesign.
@@ -66,8 +67,10 @@ unqualified profiles.
   publication, signature cost or durable ordering. No native fallback or
   custom-runtime private-state decoding was introduced.
 
-ABI remains r19. Runtime and both system templates pin immutable source
-`2ccfacb82089f804dbdbfea7ebfcabf377e7dde3`; template builder remains `3c5e44c7`.
+At this reviewer checkpoint, ABI r19 runtime and both system templates pin source
+`2ccfacb82089f804dbdbfea7ebfcabf377e7dde3`; template builder is `3c5e44c7`.
+Later implementation template repinning is recorded below, not applied to that
+fixed review boundary. The standard runtime pin remains unchanged.
 Exact ProgramIds/digests are in `support/production-artifacts.toml`.
 Use fresh disposable spaces; older stores and directory relocation are not
 qualified migration or backup/restore workflows.
@@ -133,7 +136,7 @@ Test-client SHA-256:
 (managed attempt 26.76s) and read-after-restart in 30.80s (managed 28.65s).
 Invocation readiness is 10s/11s, shutdown 2s/1s. Both scripts exited zero and
 all four probe daemons stopped. This is Local/Public-policy acceptance only.
-**The ten-second readiness gate still fails.**
+**This historical debug-host campaign failed the ten-second readiness gate.**
 
 Earlier diagnostic `indexed-lifecycle.inventory.kCJ8Bt/` also passed, but a
 test-client build replaced its CLI during the campaign. Keep it as diagnostic
@@ -209,8 +212,10 @@ The initial one-Agent inventory takes 2.528s; the post-Create two-Agent refresh
 takes 2.750s, still one query. First restart spends about 5.936s opening the
 Shared host (difference between cumulative recovery markers), then 2.815s in
 inventory. Release optimization improves but does not eliminate execution/replay
-cost. **The released-host readiness gate still fails**, and managed operations
-remain seconds-long. Do not attribute all remaining delay to debug compilation.
+cost. **This historical released-host campaign failed the readiness gate**;
+the later optimized-host qualification below supersedes that readiness result,
+not the seconds-long managed-operation finding. Do not attribute all remaining
+delay to debug compilation.
 The retained CLI/documentation clean-break check also passes
 (`inventory-clean-break.log`).
 
@@ -372,7 +377,10 @@ one test); management finalization across clock advancement also passes
 (`terminal-replay-tracing-finalization.log`, one test). CLI build, shell syntax
 and diff checks pass. The instrumentation is diagnostic, not a performance fix.
 
-## Next sequence
+## Historical workspace gates and subsequent integration evidence
+
+This section records completed experiments and their limits, not a second work
+plan. Follow the continuation plan below for the current sequence.
 
 Workspace gate follow-up: `cargo +nightly-2025-05-09 test --workspace --no-run
 --offline --locked` passes at source `496c4ea0` (6m10s), log
@@ -518,9 +526,9 @@ The optional harness mode is recorded in `recovery-mode.txt`; default campaigns
 remain unchanged. Source was the tracked implementation delta atop `9c2f19bf`;
 the frozen binaries and script, rather than that base hash alone, identify the run.
 
-### Publication stack failure and source fix (not bundled yet)
+### Publication stack failure and artifact integration
 
-The full opt-in publication test against the **currently bundled Authority**
+The full opt-in publication test against the **pre-fix Authority from `2ccfacb8`**
 fails before its reply-store fault injection. Authenticated replay returns
 `InvocationStatus::Panicked` with 925,777,243 gas remaining, not OutOfGas.
 Inner diagnostics locate a fault at `0xfefcf000`, just below the actor's 64 KiB
@@ -553,9 +561,29 @@ Compiler library tests pass: 66, one diagnostic opt-in ignored
 separately with explicit inputs and passed.
 The publication fixture still has **no provisioned ordinary generation** and
 uses the native outer-runtime shortcut; this does not qualify nonempty recovery
-or a released Shared lifecycle. Bundled artifacts/manifest remain unchanged and
-retain the demonstrated publication failure until immutable-source reproduction
-and artifact integration are completed. No fallback or quota increase masks it.
+or a released Shared lifecycle. No fallback or quota increase masks it.
+
+Independent reproduction from committed source
+`26f8f0046d96713bc7d778855f8bd278c8f1ff83` with pinned builder `3c5e44c7` is at
+implementation `target/agent-release-reproduction/stackfix.ieuhLw/` (`build.log`).
+Both actor PVMs and signed templates match the first candidate byte-for-byte.
+The bundled Authority/Catalog templates, build-time digest constants and
+`support/production-artifacts.toml` now use those verified bytes. Runtime source,
+runtime binary, runtime ProgramId and ABI r19 are unchanged. Fresh disposable
+spaces only: changed system package identities do not establish old-store migration.
+
+The new non-ignored `native_shared_bundled_publication_and_recovery` regression
+passes against the installed bytes (`shared-stack-bundled-publication.log`, one
+test, 36.02s). It covers the previously missed publication boundary, but still
+uses the native outer-runtime shortcut and has no ordinary provisioned generation.
+The initial CLI build correctly rejected stale hard-coded build pins
+(`shared-stack-bundled-cli.log`); those pins have been updated, not bypassed.
+Release CLI validation now passes all 18 tests in 1.16s
+(`shared-stack-release-cli-tests.log`). The compiled Authority fresh/cached
+Inventory query and exact retirement test also passes through the real outer
+PVM in 23.06s (`shared-stack-physical-inventory-test.log`). That test qualifies
+artifact integration on the Inventory path, not full physical Shared publication.
+Workspace formatting and diff checks pass (`shared-stack-artifact-format.log`).
 
 ## Continuation plan
 

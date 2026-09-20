@@ -19344,6 +19344,17 @@ mod tests {
         }
 
         #[test]
+        fn native_shared_bundled_publication_and_recovery() {
+            // Keep actual bundled execution in the default feature-qualified
+            // suite. A candidate-only opt-in test missed the shipped stack
+            // overflow even though package admission and query tests passed.
+            check_shared_proposal_and_committee_preparation(
+                native_bundled_authority_fixture(),
+                true,
+            );
+        }
+
+        #[test]
         #[ignore = "requires an explicit Authority candidate package for full publication/recovery qualification"]
         fn native_shared_committee_query_preparation_uses_candidate_package() {
             let bytes = std::fs::read(
