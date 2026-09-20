@@ -9,6 +9,7 @@ use crate::agent::clean_management_intent::{CleanManagementIntentSlot, Managemen
 /// The owner must replay the authorization and reproduce its candidate before
 /// executing any subsequent genesis phase.
 pub struct NativeSharedGenesisRecovery<I, J: CleanManagementIssuerStore, Q, R, W, P> {
+    locator: super::super::genesis::AgentGenesisLocator,
     pub(super) authority: AuthorityActorTarget,
     pub(super) pending: Vec<(ManagementJournalAnchor, RuntimeWork)>,
     pub(super) intent: CleanManagementIntentSlot<I>,
@@ -219,6 +220,7 @@ impl<
             _ => return Err(SharedAgentHostError::ScopeMismatch),
         }
         Ok(Self {
+            locator,
             authority,
             pending,
             intent,
@@ -231,6 +233,12 @@ impl<
             issued,
             admission_valid: true,
         })
+    }
+
+    /// The exact locator checked against the signed Create during opening.
+    /// This identifies the reservation; it is not proof of publication/finality.
+    pub fn locator(&self) -> super::super::genesis::AgentGenesisLocator {
+        self.locator
     }
 
     /// Admitted, descriptor-bound package retained before authorization.

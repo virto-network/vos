@@ -790,6 +790,92 @@ pub(crate) type CleanSharedGenesisRecovery =
         CleanAgentGenesisCommitteeFile,
     >;
 
+/// One startup reservation with every acquired lease still owned. An absent
+/// archive or absent record represents incomplete publication, never a route
+/// eligible for admission. Even a present record requires independent replay.
+pub(crate) struct CleanSharedGenesisStartupEntry {
+    pub(crate) recovery: CleanSharedGenesisRecovery,
+    pub(crate) archive: Option<(
+        CleanAgentGenesisArchiveFile,
+        Option<vos::agent::genesis::AgentGenesisArchiveRecord>,
+    )>,
+}
+
+impl CleanAgentGenesisArchiveStoreFactory {
+    pub(crate) fn discover_recovery(
+        &self,
+        lifecycle: &mut CleanManagementLifecycleStoreFactory,
+        committee: &CleanAgentGenesisCommitteeStoreFactory,
+        authority: vos::agent::sdk::authority::AuthorityActorTarget,
+        maximum: usize,
+    ) -> Result<Vec<CleanSharedGenesisStartupEntry>, CleanFileStoreError> {
+        use vos::agent::genesis_archive::AgentGenesisArchiveStore as _;
+        use vos::agent::local_lifecycle::LocalLifecycleStoreFactory as _;
+        use vos::service::ServiceWire as _;
+        if !authority.is_valid()
+            || authority.space.0 != self.space.0
+            || committee.space != self.space
+        {
+            return Err(CleanFileStoreError::InvalidPath);
+        }
+        let agents = lifecycle.discover(authority.space, maximum)?;
+        let archives = self.discover(maximum)?;
+        // Refuse orphan archives before recovery may establish an empty query
+        // slot for a legitimate pre-query crash.
+        if archives.iter().any(|locator| {
+            agents
+                .binary_search(&vos::agent::sdk::AgentId(locator.agent.0))
+                .is_err()
+        }) {
+            return Err(CleanFileStoreError::UnexpectedResidue);
+        }
+        let recoveries = committee.discover_recovery(lifecycle, authority, maximum)?;
+        if recoveries.len() != agents.len()
+            || recoveries.iter().zip(&agents).any(|(recovery, agent)| {
+                recovery.locator().space != self.space || recovery.locator().agent.0 != agent.0
+            })
+        {
+            return Err(CleanFileStoreError::UnexpectedResidue);
+        }
+        let mut entries = Vec::with_capacity(recoveries.len());
+        for recovery in recoveries {
+            let locator = recovery.locator();
+            let archive = if archives
+                .binary_search_by_key(&locator.agent, |entry| entry.agent)
+                .is_ok()
+            {
+                let store = self.open_archive(locator)?;
+                let record = store
+                    .load(locator)?
+                    .map(|bytes| {
+                        let record = vos::agent::genesis::AgentGenesisArchiveRecord::decode(&bytes)
+                            .map_err(|_| CleanFileStoreError::Corrupt)?;
+                        if record.provision().proposal().locator() != locator {
+                            return Err(CleanFileStoreError::Corrupt);
+                        }
+                        Ok(record)
+                    })
+                    .transpose()?;
+                Some((store, record))
+            } else {
+                None
+            };
+            entries.push(CleanSharedGenesisStartupEntry { recovery, archive });
+        }
+        let expected_committees: Vec<_> = entries
+            .iter()
+            .map(|entry| entry.recovery.locator())
+            .collect();
+        if self.discover(maximum)? != archives
+            || lifecycle.discover(authority.space, maximum)? != agents
+            || committee.discover(maximum)? != expected_committees
+        {
+            return Err(CleanFileStoreError::UnexpectedResidue);
+        }
+        Ok(entries)
+    }
+}
+
 impl CleanAgentGenesisCommitteeStoreFactory {
     /// Discover the complete two-directory set before opening records. Returned
     /// recovery entries own both lifecycle and committee leases. The caller
@@ -4809,6 +4895,64 @@ pub(crate) mod tests {
             };
             assert!(publication.load().is_err());
         }
+    }
+
+    #[test]
+    fn ordinary_genesis_joint_discovery_refuses_orphans_before_creating_query_slots() {
+        use vos::agent::local_lifecycle::LocalLifecycleStoreFactory as _;
+        let fixture = Fixture::new("ordinary-genesis-joint-discovery");
+        let (_, authority, _, _) = super::super::local_create::tests::fixture();
+        let space = vos::service::SpaceId(authority.space.0);
+        let parent = fixture.parent.join("archives");
+        ensure_private_directory(&parent).unwrap();
+        let archives = CleanAgentGenesisArchiveStoreFactory::open_existing(&parent, space).unwrap();
+        let committee = CleanAgentGenesisCommitteeStoreFactory::open_or_create(
+            &fixture.parent.join("committee"),
+            space,
+        )
+        .unwrap();
+        let mut lifecycle = CleanManagementLifecycleStoreFactory::open_or_create(
+            fixture.parent.join("lifecycle"),
+            authority.space,
+        )
+        .unwrap();
+        assert!(
+            archives
+                .discover_recovery(&mut lifecycle, &committee, authority, 0)
+                .unwrap()
+                .is_empty()
+        );
+        let locator = vos::agent::genesis::AgentGenesisLocator {
+            space,
+            agent: vos::service::AgentId([2; 32]),
+        };
+        let archive = CleanAgentGenesisArchiveFile::open_or_create(&parent, locator).unwrap();
+        assert!(matches!(
+            archives.discover_recovery(&mut lifecycle, &committee, authority, 4),
+            Err(CleanFileStoreError::UnexpectedResidue)
+        ));
+        assert!(committee.discover(0).unwrap().is_empty());
+        assert!(lifecycle.discover(authority.space, 0).unwrap().is_empty());
+        drop(archive);
+        let (mut intent, issuer) = lifecycle
+            .open(authority.space, vos::agent::sdk::AgentId(locator.agent.0))
+            .unwrap();
+        intent.commit(b"not a signed Shared Create").unwrap();
+        drop((intent, issuer));
+        assert!(matches!(
+            archives.discover_recovery(&mut lifecycle, &committee, authority, 4),
+            Err(CleanFileStoreError::Corrupt)
+        ));
+        // Failure releases acquired leases, without accepting the empty archive
+        // as proof or replacing the malformed reservation with a new intent.
+        let _archive = archives.open_archive(locator).unwrap();
+        let (mut intent, _issuer) = lifecycle
+            .open_existing(authority.space, vos::agent::sdk::AgentId(locator.agent.0))
+            .unwrap();
+        assert_eq!(
+            intent.load().unwrap(),
+            Some(b"not a signed Shared Create".to_vec())
+        );
     }
 
     #[test]

@@ -414,10 +414,18 @@ The ordinary-genesis store suite passes: 13 tests, one existing opt-in ignored
 (`shared-archive-discovery-tests.log`), including new missing-path, sorted/bounded
 set, conflicting lease, foreign-space, symlink and replaced-parent regressions.
 This is a prerequisite, not production activation: it is not yet called by startup.
-The next integration step must retain archive leases together with the existing
-`CleanSharedGenesisRecovery` entries, check the complete archive/lifecycle sets,
-then drive owner-authenticated recovery before publishing routes. File integrity
-or successful discovery must never be treated as finality.
+Joint discovery now returns lease-owning `CleanSharedGenesisStartupEntry` values.
+It rejects orphan archives before query-slot creation, binds each record to the
+locator validated by `NativeSharedGenesisRecovery::open`, and rechecks archive,
+lifecycle and committee sets before returning. Missing archive, empty archive slot
+and structurally decoded record remain distinct; none is finality. All acquired
+leases remain in the returned entries. The ordinary-genesis suite now passes 14
+tests, one opt-in ignored (`shared-joint-discovery-tests.log`), adding empty-set,
+orphan-before-mutation and malformed-intent preservation coverage. The new joint
+path still needs positive signed-Shared reservation/record coverage, the public
+creation entry point, and lifecycle-controller ownership. Do not activate it in
+startup until owner-authenticated recovery succeeds before route publication.
+No wire format, finality acceptance or bundled artifact was changed.
 
 1. Reviewer examines `7bd66a7d..saga/agents` read-only and returns findings.
    Apply fixes on latest implementation source; advance the reviewer branch only
