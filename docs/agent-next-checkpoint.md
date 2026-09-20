@@ -1,5 +1,12 @@
 # Next review checkpoint: execution isolation and targeted access
 
+Current review handoff: [execution checkpoint](agent-execution-checkpoint-review.md).
+The chronological notes below include superseded intermediate states. Local
+production routing now uses per-Agent inline adapters and exclusive driver
+leases; targeted lookup and pinned-slot checkout are implemented. Full node
+maintenance isolation, runtime/bundle compatibility and generic-runtime history
+validation remain open. This is not release qualification.
+
 Review branch remains frozen at e20cbb76. Implementation base29a745c2 preserves
 all previous Shared/row-state follow-up; it is explicitly unqualified, not a
 release. Implement here, then provide two consolidated review groups.

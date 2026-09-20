@@ -54,6 +54,20 @@ fn canonical_blob_matches(reference: &BlobRef, bytes: &[u8]) -> bool {
     reference.matches(bytes)
 }
 
+/// Exclusive directory cursor immediately before an ActorId in the SDK's
+/// lexicographic byte ordering. Zero is not a legal cursor or actor identity.
+fn actor_lookup_cursor(actor: crate::agent_sdk::ActorId) -> Option<crate::agent_sdk::ActorId> {
+    let mut bytes = actor.0;
+    for byte in bytes.iter_mut().rev() {
+        if *byte != 0 {
+            *byte -= 1;
+            return (bytes != [0; 32]).then_some(crate::agent_sdk::ActorId(bytes));
+        }
+        *byte = u8::MAX;
+    }
+    None
+}
+
 fn sdk_blob_as_legacy(reference: &crate::agent_sdk::BlobRef) -> BlobRef {
     BlobRef {
         hash: Hash(reference.hash.0),
@@ -2721,14 +2735,76 @@ impl<S: AgentImageStore> AgentDriver<S> {
         require_ready: bool,
     ) -> Result<super::invocation_preparation::PhysicalInvocationMaterial, AgentDriverError> {
         let descriptor = clean_image_descriptor(&self.image)?;
-        let record = self
-            .inspect_sdk_actor_directory(&descriptor)?
-            .into_iter()
-            .find(|record| record.entry.actor == actor)
-            .ok_or(AgentDriverError::SdkManagement(
-                crate::agent_sdk::ManagementError::NotFound,
-            ))?;
+        let record = self.inspect_sdk_actor(&descriptor, actor)?;
         self.physical_material_from_record(record, require_ready)
+    }
+
+    /// Use the public sorted-directory cursor contract for an exact lookup:
+    /// one runtime execution and at most one returned record, independent of
+    /// directory page count. This does not eliminate whole-state VM input.
+    fn inspect_sdk_actor(
+        &self,
+        descriptor: &crate::agent_sdk::AgentDescriptor,
+        actor: crate::agent_sdk::ActorId,
+    ) -> Result<crate::agent_sdk::ActorDirectoryRecord, AgentDriverError> {
+        use crate::agent_sdk::{ManagementReply, ManagementRequest, RuntimeOutcome, RuntimeWork};
+        let not_found =
+            || AgentDriverError::SdkManagement(crate::agent_sdk::ManagementError::NotFound);
+        if actor == crate::agent_sdk::ActorId::ZERO {
+            return Err(not_found());
+        }
+        if descriptor.validate().is_err()
+            || self.image.clean_descriptor.as_ref() != Some(descriptor)
+            || descriptor.identity.runtime_program.0 != self.image.runtime_program.0
+            || super::standard::clean_descriptor_to_legacy_config(descriptor)
+                .map_err(AgentDriverError::Lifecycle)?
+                != self.image.config
+        {
+            return Err(AgentDriverError::InvalidRuntime);
+        }
+        let after = actor_lookup_cursor(actor);
+        let state = legacy_state_as_sdk(&self.image.runtime_state);
+        let work = RuntimeWork::Manage {
+            context: crate::agent_sdk::RuntimeExecutionContext::Direct,
+            space: descriptor.identity.space,
+            agent: descriptor.identity.agent,
+            runtime_deployment: descriptor.identity.runtime_deployment,
+            state: state.clone(),
+            request: Box::new(ManagementRequest::InspectActors { after, limit: 1 }),
+            authority: None,
+            observed_slot: self
+                .trust
+                .current_logical_slot()
+                .ok_or(AgentDriverError::TrustUnavailable)?,
+        };
+        let encoded = work
+            .encode()
+            .map_err(|_| AgentDriverError::InvalidRuntime)?;
+        #[cfg(test)]
+        DIRECTORY_EXECUTIONS.with(|count| count.set(count.get() + 1));
+        let returned: crate::agent_sdk::RuntimeTransition =
+            execute_runtime_canonical(&self.runtime_pvm, self.management_gas, &encoded)?;
+        if returned.state != state {
+            return Err(AgentDriverError::InvalidRuntime);
+        }
+        let RuntimeOutcome::Management(Ok(ManagementReply::Actors(page))) = returned.outcome else {
+            return Err(AgentDriverError::InvalidRuntime);
+        };
+        if page.validate().is_err()
+            || page.entries.len() > 1
+            || page
+                .entries
+                .first()
+                .is_some_and(|record| record.entry.actor < actor)
+            || page.entries.len() > descriptor.capabilities.max_actors as usize
+        {
+            return Err(AgentDriverError::InvalidRuntime);
+        }
+        page.entries
+            .into_iter()
+            .next()
+            .filter(|record| record.entry.actor == actor)
+            .ok_or_else(not_found)
     }
 
     fn physical_material_from_record(
@@ -5423,6 +5499,31 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn targeted_actor_lookup_cursor_handles_lexicographic_boundaries() {
+        use crate::agent_sdk::ActorId;
+        assert_eq!(actor_lookup_cursor(ActorId::ZERO), None);
+        let mut one = [0; 32];
+        one[31] = 1;
+        assert_eq!(actor_lookup_cursor(ActorId(one)), None);
+        for index in 0..32 {
+            let mut id = [0; 32];
+            id[index] = 1;
+            let mut predecessor = [0; 32];
+            predecessor[index + 1..].fill(255);
+            assert_eq!(
+                actor_lookup_cursor(ActorId(id)),
+                (predecessor != [0; 32]).then_some(ActorId(predecessor))
+            );
+        }
+        let mut max_predecessor = [255; 32];
+        max_predecessor[31] = 254;
+        assert_eq!(
+            actor_lookup_cursor(ActorId([255; 32])),
+            Some(ActorId(max_predecessor))
+        );
+    }
 
     #[test]
     fn runtime_pvm_failures_preserve_the_driver_error_contract() {

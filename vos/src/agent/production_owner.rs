@@ -8,6 +8,7 @@
 //! publication is touched.
 
 use core::fmt;
+use std::collections::BTreeMap;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -487,6 +488,7 @@ pub(crate) struct AgentProductionOwner {
     supervisor: Option<AgentSupervisorOwner>,
     system: OwnedRouteSlot,
     local: OwnedRouteSlot,
+    local_by_agent: Option<BTreeMap<AgentId, OwnedRouteSlot>>,
     shared: OwnedRouteSlot,
     source: Box<dyn AuthorityInventorySource>,
     accepted_head: Option<AuthorityProjectionHead>,
@@ -605,6 +607,7 @@ impl AgentProductionOwner {
             supervisor: Some(supervisor),
             system: OwnedRouteSlot::Pending(system_attachment),
             local: OwnedRouteSlot::Empty,
+            local_by_agent: None,
             shared: OwnedRouteSlot::Empty,
             source: Box::new(source),
             accepted_head: None,
@@ -615,7 +618,12 @@ impl AgentProductionOwner {
             lifecycle,
         };
         if let Some((lifecycle, capacity)) = &owner.lifecycle {
-            owner.local = OwnedRouteSlot::Pending(lifecycle.local_attachment(*capacity)?);
+            ensure_local_slots(
+                lifecycle.as_ref(),
+                *capacity,
+                &mut owner.local,
+                &mut owner.local_by_agent,
+            )?;
         }
         // Only restored native admission may defer first publication. The
         // caller exposes recovery control, not the unpublished supervisor.
@@ -683,7 +691,14 @@ impl AgentProductionOwner {
         self.completed_local_install = None;
         let started = Instant::now();
         tracing::debug!(agent = ?descriptor.identity.agent, "Local Create lifecycle started");
-        let had_local_attachment = !self.local.is_empty();
+        let had_local_attachment =
+            self.local_by_agent
+                .as_ref()
+                .map_or(!self.local.is_empty(), |slots| {
+                    slots
+                        .get(&descriptor.identity.agent)
+                        .is_some_and(|slot| !slot.is_empty())
+                });
         let (lifecycle, capacity) = self
             .lifecycle
             .as_mut()
@@ -692,9 +707,12 @@ impl AgentProductionOwner {
             .create(descriptor, call, runtime)
             .map_err(AgentProductionOwnerError::Lifecycle)?;
         tracing::debug!(agent = ?result.0, elapsed_ms = started.elapsed().as_millis() as u64, "Local Create lifecycle complete");
-        if self.local.is_empty() {
-            self.local = OwnedRouteSlot::Pending(lifecycle.local_attachment(*capacity)?);
-        }
+        ensure_local_slots(
+            lifecycle.as_ref(),
+            *capacity,
+            &mut self.local,
+            &mut self.local_by_agent,
+        )?;
         let acknowledgement = result.1.commitment();
         if completed_local_publication_matches(
             previous,
@@ -728,7 +746,14 @@ impl AgentProductionOwner {
         }
         self.completed_local_publication = None;
         let previous = self.completed_local_install.take();
-        let had_local_attachment = !self.local.is_empty();
+        let had_local_attachment =
+            self.local_by_agent
+                .as_ref()
+                .map_or(!self.local.is_empty(), |slots| {
+                    slots
+                        .get(&call.managed.agent)
+                        .is_some_and(|slot| !slot.is_empty())
+                });
         let key = AgentRouteKey::new(call.managed.space, call.managed.agent, install.entry.actor)?;
         let runtime = call.managed.runtime_deployment;
         let deployment = install.entry.deployment;
@@ -740,9 +765,12 @@ impl AgentProductionOwner {
         let acknowledgement = lifecycle
             .install(install, call, package)
             .map_err(AgentProductionOwnerError::Lifecycle)?;
-        if self.local.is_empty() {
-            self.local = OwnedRouteSlot::Pending(lifecycle.local_attachment(*capacity)?);
-        }
+        ensure_local_slots(
+            lifecycle.as_ref(),
+            *capacity,
+            &mut self.local,
+            &mut self.local_by_agent,
+        )?;
         let current_identity = self
             .supervisor
             .as_ref()
@@ -882,6 +910,10 @@ impl AgentProductionOwner {
         &mut self,
         attachment: AgentRouteHostAttachment,
     ) -> Result<(), AgentProductionOwnerError> {
+        if self.local_by_agent.is_some() {
+            attachment.retire()?;
+            return Err(AgentProductionOwnerError::DuplicateHost);
+        }
         install_pending(&mut self.local, attachment)
     }
 
@@ -937,6 +969,18 @@ impl AgentProductionOwner {
         );
         accept_head(self.accepted_head, inventory.head)?;
         validate_root_provenance(&inventory, self.system_agent)?;
+        // This lifecycle boundary audits the complete namespace. Serving
+        // requests only validate the root lease and their pinned Agent slot.
+        if self.local_by_agent.is_some() {
+            if let Some((lifecycle, capacity)) = &self.lifecycle {
+                ensure_local_slots(
+                    lifecycle.as_ref(),
+                    *capacity,
+                    &mut self.local,
+                    &mut self.local_by_agent,
+                )?;
+            }
+        }
         let _authenticated_principal = inventory.principal;
 
         let mut system = Vec::new();
@@ -982,7 +1026,25 @@ impl AgentProductionOwner {
             self.request_shutdown();
             return Err(error);
         }
-        reconcile_slot(supervisor, &mut self.local, inventory.head, local)?;
+        if let Some(slots) = &mut self.local_by_agent {
+            let mut projected: BTreeMap<_, _> = local
+                .into_iter()
+                .map(|projection| (projection.descriptor().identity.agent, projection))
+                .collect();
+            if projected.keys().any(|agent| !slots.contains_key(agent)) {
+                return Err(AgentProductionOwnerError::InvalidProjection);
+            }
+            for (agent, slot) in slots {
+                reconcile_slot(
+                    supervisor,
+                    slot,
+                    inventory.head,
+                    projected.remove(agent).into_iter().collect(),
+                )?;
+            }
+        } else {
+            reconcile_slot(supervisor, &mut self.local, inventory.head, local)?;
+        }
         reconcile_slot(supervisor, &mut self.shared, inventory.head, shared)?;
         self.accepted_head = Some(inventory.head);
         // Every successful reconciliation, including a lifecycle-triggered
@@ -1003,7 +1065,10 @@ impl AgentProductionOwner {
         if let Some(supervisor) = self.supervisor.as_ref() {
             supervisor.request_shutdown();
         }
-        for slot in [&self.system, &self.local, &self.shared] {
+        for slot in [&self.system, &self.local, &self.shared]
+            .into_iter()
+            .chain(self.local_by_agent.iter().flat_map(|slots| slots.values()))
+        {
             if let OwnedRouteSlot::Pending(attachment) = slot {
                 let _ = attachment.handle().request_retire();
             }
@@ -1025,7 +1090,14 @@ impl AgentProductionOwner {
 
     fn retire_pending_routes(&mut self) -> Result<(), AgentProductionOwnerError> {
         let mut result = Ok(());
-        for slot in [&mut self.system, &mut self.local, &mut self.shared] {
+        for slot in [&mut self.system, &mut self.local, &mut self.shared]
+            .into_iter()
+            .chain(
+                self.local_by_agent
+                    .iter_mut()
+                    .flat_map(|slots| slots.values_mut()),
+            )
+        {
             if let Err(error) = retire_pending_slot(slot) {
                 result = Err(error);
             }
@@ -1090,6 +1162,37 @@ fn install_pending(
         return Err(AgentProductionOwnerError::DuplicateHost);
     }
     *slot = OwnedRouteSlot::Pending(attachment);
+    Ok(())
+}
+
+fn ensure_local_slots(
+    lifecycle: &dyn super::local_lifecycle::NativeLocalLifecycle,
+    capacity: usize,
+    legacy: &mut OwnedRouteSlot,
+    by_agent: &mut Option<BTreeMap<AgentId, OwnedRouteSlot>>,
+) -> Result<(), AgentProductionOwnerError> {
+    match lifecycle.local_agents()? {
+        None if by_agent.is_none() => {
+            if legacy.is_empty() {
+                *legacy = OwnedRouteSlot::Pending(lifecycle.local_attachment(capacity)?);
+            }
+        }
+        Some(agents) if legacy.is_empty() => {
+            if agents.len() > MAX_INVENTORY_AGENTS
+                || agents.windows(2).any(|pair| pair[0] >= pair[1])
+            {
+                return Err(AgentProductionOwnerError::InvalidConfiguration);
+            }
+            let slots = by_agent.get_or_insert_with(BTreeMap::new);
+            for agent in agents {
+                let slot = slots.entry(agent).or_insert(OwnedRouteSlot::Empty);
+                if slot.is_empty() {
+                    *slot = OwnedRouteSlot::Pending(lifecycle.local_attachment_for_agent(agent)?);
+                }
+            }
+        }
+        _ => return Err(AgentProductionOwnerError::InvalidConfiguration),
+    }
     Ok(())
 }
 
@@ -2170,6 +2273,7 @@ mod tests {
             ),
             system: OwnedRouteSlot::Empty,
             local: OwnedRouteSlot::Empty,
+            local_by_agent: None,
             shared: OwnedRouteSlot::Empty,
             source: Box::new(client(
                 vec![descriptor],

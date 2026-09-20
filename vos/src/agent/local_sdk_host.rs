@@ -3,8 +3,9 @@
 //! This boundary deliberately does not reuse the transitional journal host.
 //! One locked filesystem root is bound to one exact Space and full transport
 //! Node identity, and every child is named by the lowercase canonical SDK
-//! `AgentId`.  Mutating methods require `&mut self`, so one process has a
-//! bounded, serialized admission point without an unbounded worker queue.
+//! `AgentId`. Lifecycle admission remains serialized. Serving work checks out
+//! one exclusive driver and releases the registry mutex; independent Agents
+//! execute on the supervisor's bounded pool, with no per-Agent serving thread.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -13,7 +14,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use fs2::FileExt as _;
 
@@ -168,6 +169,7 @@ struct RootScope {
 struct HostedLocalAgent {
     driver: AgentDriver<FileAgentStore>,
     descriptor: AgentDescriptor,
+    directory: File,
 }
 
 /// Single-writer owner of every clean Local agent under one physical root.
@@ -179,9 +181,292 @@ pub struct LocalAgentHost {
     scope: RootScope,
     trust: Arc<dyn AgentTrustProvider>,
     agents: BTreeMap<AgentId, HostedLocalAgent>,
+    executing: BTreeMap<AgentId, AgentDescriptor>,
+    failed: bool,
+    #[cfg(test)]
+    execution_probe: Option<Arc<dyn Fn(AgentId) + Send + Sync>>,
+}
+
+/// Owns exactly one driver while keeping the root lease alive. The registry
+/// mutex is not held during VM execution, catalog reads or durable publication.
+pub(crate) struct LocalAgentExecution {
+    owner: Arc<Mutex<LocalAgentHost>>,
+    agent: AgentId,
+    slot: PathBuf,
+    scope: RootScope,
+    trust: Arc<dyn AgentTrustProvider>,
+    hosted: Option<HostedLocalAgent>,
+    failed: bool,
+}
+
+impl LocalAgentExecution {
+    pub(crate) fn route_identities(
+        &self,
+    ) -> Result<Vec<super::supervisor::AgentRouteIdentity>, LocalAgentHostError> {
+        let hosted = self.hosted.as_ref().ok_or(LocalAgentHostError::Corrupt)?;
+        let directory = hosted.driver.physical_authority_directory()?;
+        super::supervisor_adapters::route_identities(
+            &hosted.descriptor,
+            directory.records().to_vec(),
+            AgentProfile::Local,
+        )
+        .map_err(|_| LocalAgentHostError::Corrupt)
+    }
+
+    #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+    pub(crate) fn audit_authority_projection(
+        &self,
+        head: crate::agent_sdk::authority::AuthorityProjectionHead,
+        projected: &[super::supervisor_adapters::AgentAuthorityRouteProjection],
+    ) -> Result<LocalAuthorityProjectionAudit, LocalAgentHostError> {
+        use super::supervisor_adapters::{
+            PhysicalAuthorityRouteProjection, physical_material_identity,
+            physical_material_matches_authority, physical_projection_is_exactly_one_ack_ahead,
+        };
+        let hosted = self.hosted.as_ref().ok_or(LocalAgentHostError::Corrupt)?;
+        let directory = hosted.driver.physical_authority_directory()?;
+        let mut actors = Vec::with_capacity(directory.records().len());
+        for record in directory.records() {
+            let material = directory.material(record.entry.actor)?;
+            if material.descriptor != hosted.descriptor
+                || material.descriptor.identity.agent != self.agent
+            {
+                return Err(LocalAgentHostError::Corrupt);
+            }
+            actors.push(material);
+        }
+        if projected.len() == 1
+            && projected[0].descriptor() == &hosted.descriptor
+            && projected[0].actors().len() == actors.len()
+            && actors
+                .iter()
+                .zip(projected[0].actors())
+                .all(|(material, actor)| {
+                    physical_material_matches_authority(material, &hosted.descriptor, actor)
+                })
+        {
+            let identities = actors
+                .iter()
+                .filter(|material| !material.actor.entry.suspended)
+                .map(physical_material_identity)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| LocalAgentHostError::InvalidDescriptor)?;
+            return Ok(LocalAuthorityProjectionAudit::Ready(identities));
+        }
+        let history = hosted
+            .driver
+            .image()
+            .clean_management
+            .as_ref()
+            .ok_or(LocalAgentHostError::Corrupt)?;
+        let physical = PhysicalAuthorityRouteProjection {
+            descriptor: hosted.descriptor.clone(),
+            actors,
+            disposition: history.latest().map(|record| {
+                super::standard::StandardCleanManagementDisposition {
+                    authority: record.authority,
+                    request: record.request,
+                    epoch: record.epoch,
+                    sequence: record.sequence,
+                    observed_slot: record.observed_slot,
+                    result: record.result.clone(),
+                }
+            }),
+        };
+        if physical_projection_is_exactly_one_ack_ahead(head, projected, &[physical]) {
+            Ok(LocalAuthorityProjectionAudit::Lag)
+        } else {
+            Err(LocalAgentHostError::InvalidDescriptor)
+        }
+    }
+
+    pub(crate) fn supervisor_invocation_material(
+        &self,
+        agent: AgentId,
+        actor: crate::agent_sdk::ActorId,
+    ) -> Result<super::invocation_preparation::PhysicalInvocationMaterial, LocalAgentHostError>
+    {
+        if agent != self.agent {
+            return Err(LocalAgentHostError::InvalidScope);
+        }
+        let hosted = self.hosted.as_ref().ok_or(LocalAgentHostError::Corrupt)?;
+        let material = hosted.driver.physical_invocation_material(actor)?;
+        if material.descriptor != hosted.descriptor {
+            return Err(LocalAgentHostError::Corrupt);
+        }
+        Ok(material)
+    }
+
+    fn finish(
+        &mut self,
+        result: Result<RuntimeOutcome, AgentDriverError>,
+    ) -> Result<RuntimeOutcome, LocalAgentHostError> {
+        match result {
+            Ok(outcome) => {
+                let checked = (|| {
+                    let hosted = self.hosted.as_mut().ok_or(LocalAgentHostError::Corrupt)?;
+                    let descriptor = descriptor_from_driver(&hosted.driver)?;
+                    validate_descriptor_for_scope(self.scope, &descriptor)?;
+                    if descriptor.identity.agent != self.agent {
+                        return Err(LocalAgentHostError::Alias);
+                    }
+                    hosted.descriptor = descriptor;
+                    validate_same_directory(&hosted.directory, &self.slot)?;
+                    validate_agent_slot(&self.slot, false)
+                })();
+                if checked.is_err() {
+                    self.failed = true;
+                }
+                checked.map(|()| outcome)
+            }
+            Err(error) => {
+                if matches!(error, AgentDriverError::Store(_)) {
+                    if let Err(error) = self
+                        .hosted
+                        .as_ref()
+                        .ok_or(LocalAgentHostError::Corrupt)
+                        .and_then(|hosted| validate_same_directory(&hosted.directory, &self.slot))
+                    {
+                        self.failed = true;
+                        return Err(error);
+                    }
+                    match LocalAgentHost::open_hosted_at(
+                        self.scope,
+                        self.trust.clone(),
+                        self.agent,
+                        &self.slot,
+                    ) {
+                        Ok(hosted) => self.hosted = Some(hosted),
+                        Err(recovery) => {
+                            self.failed = true;
+                            return Err(recovery);
+                        }
+                    }
+                }
+                Err(error.into())
+            }
+        }
+    }
+
+    pub(crate) fn invoke(
+        &mut self,
+        agent: AgentId,
+        work: InvocationWork,
+        authorization: InvocationAuthorization,
+    ) -> Result<RuntimeOutcome, LocalAgentHostError> {
+        if agent != self.agent || work.agent != agent || work.space != self.scope.space {
+            return Err(LocalAgentHostError::InvalidScope);
+        }
+        let result = self
+            .hosted
+            .as_mut()
+            .ok_or(LocalAgentHostError::Corrupt)?
+            .driver
+            .invoke_sdk(work, authorization);
+        self.finish(result)
+    }
+
+    pub(crate) fn resume_sdk_exact(
+        &mut self,
+        agent: AgentId,
+        work: InvocationWork,
+        authorization: InvocationAuthorization,
+        yielded: crate::agent_sdk::YieldedInvocation,
+    ) -> Result<RuntimeOutcome, LocalAgentHostError> {
+        if agent != self.agent || work.agent != agent || work.space != self.scope.space {
+            return Err(LocalAgentHostError::InvalidScope);
+        }
+        let result = self
+            .hosted
+            .as_mut()
+            .ok_or(LocalAgentHostError::Corrupt)?
+            .driver
+            .resume_sdk_exact(work, authorization, yielded);
+        self.finish(result)
+    }
+
+    pub(crate) fn acknowledge_sdk(
+        &mut self,
+        agent: AgentId,
+        work: InvocationWork,
+        authorization: InvocationAuthorization,
+    ) -> Result<RuntimeOutcome, LocalAgentHostError> {
+        if agent != self.agent || work.agent != agent || work.space != self.scope.space {
+            return Err(LocalAgentHostError::InvalidScope);
+        }
+        let result = self
+            .hosted
+            .as_mut()
+            .ok_or(LocalAgentHostError::Corrupt)?
+            .driver
+            .acknowledge_sdk(work, authorization);
+        self.finish(result)
+    }
+}
+
+impl Drop for LocalAgentExecution {
+    fn drop(&mut self) {
+        let mut owner = self.owner.lock().unwrap_or_else(|error| error.into_inner());
+        owner.failed |= self.failed || std::thread::panicking();
+        if owner.executing.remove(&self.agent).is_none() {
+            owner.failed = true;
+        }
+        if let Some(hosted) = self.hosted.take() {
+            match owner.agents.entry(self.agent) {
+                alloc::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(hosted);
+                }
+                alloc::collections::btree_map::Entry::Occupied(_) => {
+                    owner.failed = true;
+                }
+            }
+        } else {
+            owner.failed = true;
+        }
+    }
 }
 
 impl LocalAgentHost {
+    pub(crate) fn checkout(
+        owner: &Arc<Mutex<Self>>,
+        agent: AgentId,
+    ) -> Result<LocalAgentExecution, LocalAgentHostError> {
+        let mut host = owner.lock().map_err(|_| LocalAgentHostError::Corrupt)?;
+        host.verify_root_identity()?;
+        if host.executing.contains_key(&agent) {
+            return Err(LocalAgentHostError::Busy);
+        }
+        let hosted = host
+            .agents
+            .get(&agent)
+            .ok_or(LocalAgentHostError::NotFound)?;
+        let slot = host.agent_path(agent);
+        validate_same_directory(&hosted.directory, &slot)?;
+        validate_agent_slot(&slot, false)?;
+        let hosted = host
+            .agents
+            .remove(&agent)
+            .ok_or(LocalAgentHostError::NotFound)?;
+        host.executing.insert(agent, hosted.descriptor.clone());
+        #[cfg(test)]
+        let probe = host.execution_probe.clone();
+        let execution = LocalAgentExecution {
+            owner: owner.clone(),
+            agent,
+            slot: host.agent_path(agent),
+            scope: host.scope,
+            trust: host.trust.clone(),
+            hosted: Some(hosted),
+            failed: false,
+        };
+        drop(host);
+        #[cfg(test)]
+        if let Some(probe) = probe {
+            probe(agent);
+        }
+        Ok(execution)
+    }
+
     pub(crate) fn create_with_clean_clock(
         root: impl AsRef<Path>,
         space: SpaceId,
@@ -244,6 +529,10 @@ impl LocalAgentHost {
             scope,
             trust,
             agents: BTreeMap::new(),
+            executing: BTreeMap::new(),
+            failed: false,
+            #[cfg(test)]
+            execution_probe: None,
         })
     }
 
@@ -283,6 +572,10 @@ impl LocalAgentHost {
             scope,
             trust,
             agents: BTreeMap::new(),
+            executing: BTreeMap::new(),
+            failed: false,
+            #[cfg(test)]
+            execution_probe: None,
         };
         host.recover_creating()?;
         for agent in scan_root(&host.root)? {
@@ -321,7 +614,14 @@ impl LocalAgentHost {
 
     pub fn list(&self) -> Result<Vec<AgentId>, LocalAgentHostError> {
         self.verify_root_scope()?;
-        Ok(self.agents.keys().copied().collect())
+        let mut agents: Vec<_> = self
+            .agents
+            .keys()
+            .chain(self.executing.keys())
+            .copied()
+            .collect();
+        agents.sort();
+        Ok(agents)
     }
 
     pub fn show(&self, agent: AgentId) -> Result<&AgentDescriptor, LocalAgentHostError> {
@@ -329,6 +629,7 @@ impl LocalAgentHost {
         self.agents
             .get(&agent)
             .map(|hosted| &hosted.descriptor)
+            .or_else(|| self.executing.get(&agent))
             .ok_or(LocalAgentHostError::NotFound)
     }
 
@@ -342,6 +643,9 @@ impl LocalAgentHost {
     ) -> Result<super::invocation_preparation::PhysicalInvocationMaterial, LocalAgentHostError>
     {
         self.verify_root_scope()?;
+        if self.executing.contains_key(&agent) {
+            return Err(LocalAgentHostError::Busy);
+        }
         let hosted = self
             .agents
             .get(&agent)
@@ -365,6 +669,9 @@ impl LocalAgentHost {
         projected: &[super::supervisor_adapters::AgentAuthorityRouteProjection],
     ) -> Result<LocalAuthorityProjectionAudit, LocalAgentHostError> {
         self.verify_root_scope()?;
+        if !self.executing.is_empty() {
+            return Err(LocalAgentHostError::Busy);
+        }
         match self.audit_authority_projection_exact(projected) {
             Ok(identities) => return Ok(LocalAuthorityProjectionAudit::Ready(identities)),
             Err(error) => {
@@ -477,6 +784,9 @@ impl LocalAgentHost {
         self.verify_root_scope()?;
         self.validate_descriptor(&descriptor)?;
         let agent = descriptor.identity.agent;
+        if self.executing.contains_key(&agent) {
+            return Err(LocalAgentHostError::Busy);
+        }
         if self.agents.contains_key(&agent) {
             let exact = self
                 .agents
@@ -505,7 +815,7 @@ impl LocalAgentHost {
                 _ => Err(LocalAgentHostError::Corrupt),
             };
         }
-        if self.agents.len() >= MAX_LOCAL_HOST_AGENTS {
+        if self.agents.len() + self.executing.len() >= MAX_LOCAL_HOST_AGENTS {
             return Err(LocalAgentHostError::LimitExceeded);
         }
         let stage = self.creating_path(agent);
@@ -566,6 +876,9 @@ impl LocalAgentHost {
         artifacts: SdkManagementArtifacts<'_>,
     ) -> Result<RuntimeOutcome, LocalAgentHostError> {
         self.verify_root_scope()?;
+        if self.executing.contains_key(&agent) {
+            return Err(LocalAgentHostError::Busy);
+        }
         if matches!(request, ManagementRequest::Create(_)) {
             return Err(LocalAgentHostError::InvalidDescriptor);
         }
@@ -596,6 +909,9 @@ impl LocalAgentHost {
     ) -> Result<LocalManagementObservation, LocalAgentHostError> {
         use crate::service::wire::ServiceWire as _;
         self.verify_root_scope()?;
+        if self.executing.contains_key(&agent) {
+            return Err(LocalAgentHostError::Busy);
+        }
         let hosted = self
             .agents
             .get(&agent)
@@ -648,6 +964,9 @@ impl LocalAgentHost {
         authorization: InvocationAuthorization,
     ) -> Result<RuntimeOutcome, LocalAgentHostError> {
         self.verify_root_scope()?;
+        if self.executing.contains_key(&agent) {
+            return Err(LocalAgentHostError::Busy);
+        }
         if invocation.space != self.scope.space || invocation.agent != agent {
             return Err(LocalAgentHostError::InvalidScope);
         }
@@ -667,6 +986,9 @@ impl LocalAgentHost {
         resume: ResumeWork,
     ) -> Result<RuntimeOutcome, LocalAgentHostError> {
         self.verify_root_scope()?;
+        if self.executing.contains_key(&agent) {
+            return Err(LocalAgentHostError::Busy);
+        }
         let result = {
             let hosted = self
                 .agents
@@ -685,6 +1007,9 @@ impl LocalAgentHost {
         yielded: crate::agent_sdk::YieldedInvocation,
     ) -> Result<RuntimeOutcome, LocalAgentHostError> {
         self.verify_root_scope()?;
+        if self.executing.contains_key(&agent) {
+            return Err(LocalAgentHostError::Busy);
+        }
         if work.space != self.scope.space || work.agent != agent {
             return Err(LocalAgentHostError::InvalidScope);
         }
@@ -705,6 +1030,9 @@ impl LocalAgentHost {
         authorization: InvocationAuthorization,
     ) -> Result<RuntimeOutcome, LocalAgentHostError> {
         self.verify_root_scope()?;
+        if self.executing.contains_key(&agent) {
+            return Err(LocalAgentHostError::Busy);
+        }
         if invocation.space != self.scope.space || invocation.agent != agent {
             return Err(LocalAgentHostError::InvalidScope);
         }
@@ -768,18 +1096,32 @@ impl LocalAgentHost {
         expected_agent: AgentId,
         slot: &Path,
     ) -> Result<HostedLocalAgent, LocalAgentHostError> {
+        Self::open_hosted_at(self.scope, self.trust.clone(), expected_agent, slot)
+    }
+
+    fn open_hosted_at(
+        scope: RootScope,
+        trust: Arc<dyn AgentTrustProvider>,
+        expected_agent: AgentId,
+        slot: &Path,
+    ) -> Result<HostedLocalAgent, LocalAgentHostError> {
+        let directory = open_private_directory(slot)?;
         validate_agent_slot(slot, true)?;
-        let mut driver =
-            AgentDriver::open_sdk(FileAgentStore::new(image_path(slot)), self.trust.clone())?;
+        let mut driver = AgentDriver::open_sdk(FileAgentStore::new(image_path(slot)), trust)?;
         driver.reconcile_catalog()?;
         let descriptor = descriptor_from_driver(&driver)?;
-        self.validate_descriptor(&descriptor)?;
+        validate_descriptor_for_scope(scope, &descriptor)?;
         if descriptor.identity.agent != expected_agent {
             return Err(LocalAgentHostError::Alias);
         }
         retire_image_stage(slot)?;
         validate_agent_slot(slot, false)?;
-        Ok(HostedLocalAgent { driver, descriptor })
+        validate_same_directory(&directory, slot)?;
+        Ok(HostedLocalAgent {
+            driver,
+            descriptor,
+            directory,
+        })
     }
 
     fn validate_descriptor(&self, descriptor: &AgentDescriptor) -> Result<(), LocalAgentHostError> {
@@ -830,7 +1172,12 @@ impl LocalAgentHost {
         Ok(())
     }
 
-    fn verify_root_scope(&self) -> Result<(), LocalAgentHostError> {
+    /// Constant-size root ownership checks used by generation-bound execution
+    /// leases. Namespace/catalog enumeration belongs to lifecycle and recovery.
+    fn verify_root_identity(&self) -> Result<(), LocalAgentHostError> {
+        if self.failed {
+            return Err(LocalAgentHostError::Corrupt);
+        }
         let canonical =
             fs::canonicalize(&self.root).map_err(|_| LocalAgentHostError::InvalidRoot)?;
         if canonical != self.canonical_root || canonical != self.root {
@@ -854,16 +1201,38 @@ impl LocalAgentHost {
         {
             return Err(LocalAgentHostError::Corrupt);
         }
+        Ok(())
+    }
+
+    fn verify_root_scope(&self) -> Result<(), LocalAgentHostError> {
+        self.verify_root_identity()?;
         let disk_agents = scan_root(&self.root)?;
-        if disk_agents.len() != self.agents.len()
+        let mut owned: Vec<_> = self
+            .agents
+            .keys()
+            .chain(self.executing.keys())
+            .copied()
+            .collect();
+        owned.sort();
+        if disk_agents.len() != owned.len()
             || !disk_agents
                 .iter()
-                .zip(self.agents.keys())
+                .zip(owned.iter())
                 .all(|(disk, loaded)| disk == loaded)
         {
             return Err(LocalAgentHostError::Corrupt);
         }
         for agent in disk_agents {
+            // This Agent's exclusive execution lease validates its own slot
+            // after publication; concurrent staging files are not corruption.
+            if self.executing.contains_key(&agent) {
+                continue;
+            }
+            let hosted = self
+                .agents
+                .get(&agent)
+                .ok_or(LocalAgentHostError::Corrupt)?;
+            validate_same_directory(&hosted.directory, &self.agent_path(agent))?;
             validate_agent_slot(&self.agent_path(agent), false)?;
         }
         Ok(())
@@ -936,7 +1305,14 @@ fn create_agent_slot(path: &Path) -> Result<(), LocalAgentHostError> {
     sync_directory(path)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static SLOT_VALIDATIONS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
 fn validate_agent_slot(path: &Path, allow_image_stage: bool) -> Result<(), LocalAgentHostError> {
+    #[cfg(test)]
+    SLOT_VALIDATIONS.with(|count| count.set(count.get() + 1));
     require_private_directory(path)?;
     let mut saw_image = false;
     let mut saw_catalog = false;
@@ -2265,6 +2641,338 @@ mod tests {
     }
 
     #[test]
+    fn physical_independent_local_agents_overlap_through_one_supervisor() {
+        use super::super::supervisor::{
+            AgentRouteKey, AgentSupervisorLimits, AgentSupervisorOwner,
+        };
+        use super::super::supervisor_adapters::{
+            AgentInvocationRequest, dispatch_invocation,
+            local_agent_supervisor_attachment_for_agent,
+        };
+        use std::sync::{Condvar, mpsc};
+        use std::time::Duration;
+        let directory = TestDirectory::new("physical-supervisor-overlap");
+        let root = directory.child("agents");
+        let (clock, trust) = clock_trust(1);
+        let mut host = LocalAgentHost::create(&root, space(), node(), trust).unwrap();
+        let runtime = admitted_runtime();
+        let package = admitted_actor();
+        let mut requests = Vec::new();
+        for seed in [7, 8] {
+            let created_at = 1 + 2 * u64::from(seed - 7);
+            clock.store(created_at, Ordering::SeqCst);
+            let descriptor = descriptor(&runtime, seed, AgentProfile::Local, space(), node());
+            let agent = host
+                .create_agent(
+                    runtime.clone(),
+                    descriptor.clone(),
+                    create_receipt(&descriptor, 10),
+                )
+                .unwrap();
+            let install = install_request(&descriptor, &package);
+            clock.store(created_at + 1, Ordering::SeqCst);
+            let installed = host
+                .manage(
+                    agent,
+                    install.clone(),
+                    Some(management_receipt(&descriptor, &install, 2, 1, 10)),
+                    SdkManagementArtifacts::Actor(&package),
+                )
+                .unwrap();
+            assert!(
+                matches!(
+                    installed,
+                    RuntimeOutcome::Management(Ok(ManagementReply::Installed(_)))
+                ),
+                "fixture install failed for {seed}: {installed:?}"
+            );
+            let directory = host.agents[&agent]
+                .driver
+                .physical_authority_directory()
+                .unwrap();
+            let record = &directory.records()[0];
+            let work = invocation(&descriptor, record, &package, seed);
+            let authorization = sdk::InvocationAuthorization::AuthorityReceipt(invocation_receipt(
+                &descriptor,
+                &work,
+                5,
+                5,
+            ));
+            let key = AgentRouteKey::new(space(), agent, record.entry.actor).unwrap();
+            requests.push((
+                agent,
+                key,
+                AgentInvocationRequest::new(
+                    sdk::RuntimeExecutionContext::Direct,
+                    work,
+                    authorization,
+                )
+                .unwrap(),
+            ));
+        }
+        clock.store(5, Ordering::SeqCst);
+        let shared = Arc::new(Mutex::new(host));
+        #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+        {
+            use super::super::supervisor_adapters::AgentAuthorityRouteProjection;
+            use sdk::authority::{AuthorityActorProjection, AuthorityProjectionHead};
+            let head = AuthorityProjectionHead {
+                state_revision: 2.try_into().unwrap(),
+                epoch: 1.try_into().unwrap(),
+                authorization_sequence: 2.try_into().unwrap(),
+                administration_generation: 1.try_into().unwrap(),
+                state_commitment: Hash([0x31; 32]),
+            };
+            let leases: Vec<_> = requests
+                .iter()
+                .map(|(agent, _, _)| LocalAgentHost::checkout(&shared, *agent).unwrap())
+                .collect();
+            for lease in &leases {
+                let hosted = lease.hosted.as_ref().unwrap();
+                let directory = hosted.driver.physical_authority_directory().unwrap();
+                let record = &directory.records()[0];
+                let projection = AgentAuthorityRouteProjection::new(
+                    hosted.descriptor.replica_generation(),
+                    hosted.descriptor.clone(),
+                    vec![AuthorityActorProjection {
+                        agent: lease.agent,
+                        entry: record.entry.clone(),
+                        producer: package.producer(),
+                        contract: package.manifest().contract,
+                        requirements: package.requirements(),
+                        root_provenance: false,
+                        installation_id: record.installation_id,
+                        registry_reservation: record.registry_reservation,
+                        install_request: record.install_request,
+                    }],
+                )
+                .unwrap();
+                let before = super::super::driver::directory_execution_count();
+                assert!(
+                    matches!(lease.audit_authority_projection(head, &[projection]), Ok(LocalAuthorityProjectionAudit::Ready(identities)) if identities.len() == 1)
+                );
+                assert_eq!(
+                    super::super::driver::directory_execution_count() - before,
+                    1
+                );
+                assert!(
+                    shared.try_lock().is_ok(),
+                    "audit must not retain the host-wide mutex"
+                );
+                assert!(matches!(
+                    lease.audit_authority_projection(head, &[]),
+                    Err(LocalAgentHostError::InvalidDescriptor)
+                ));
+            }
+        }
+        let mut supervisor = AgentSupervisorOwner::start(AgentSupervisorLimits::default()).unwrap();
+        for (agent, _, _) in &requests {
+            let (attachment, _) =
+                local_agent_supervisor_attachment_for_agent(shared.clone(), *agent)
+                    .unwrap()
+                    .into_parts();
+            supervisor.attach(attachment).unwrap();
+        }
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (entered, observed) = mpsc::channel();
+        let execution_gate = gate.clone();
+        shared.lock().unwrap().execution_probe = Some(Arc::new(move |agent| {
+            entered.send(agent).unwrap();
+            let (lock, wake) = &*execution_gate;
+            let (released, _) = wake
+                .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(15), |released| {
+                    !*released
+                })
+                .unwrap();
+            assert!(*released, "physical execution gate timed out");
+        }));
+        let mut threads = Vec::new();
+        for (_, key, request) in requests {
+            let handle = supervisor.handle();
+            let snapshot = handle.snapshot(key).unwrap();
+            threads.push(std::thread::spawn(move || {
+                dispatch_invocation(&handle, snapshot, request)
+            }));
+        }
+        // Both concrete adapters must own their real drivers before either
+        // may proceed into physical VM execution. No timing-speedup claim.
+        let first = observed.recv_timeout(Duration::from_secs(5));
+        let second = observed.recv_timeout(Duration::from_secs(5));
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_ne!(first.unwrap(), second.unwrap());
+        for result in results {
+            assert!(
+                matches!(
+                    result,
+                    Ok(
+                        super::super::supervisor_adapters::AgentInvocationResponse::Direct {
+                            outcome: RuntimeOutcome::Completed(Ok(_)),
+                            ..
+                        }
+                    )
+                ),
+                "physical dispatch failed: {result:?}"
+            );
+        }
+        supervisor.shutdown_and_join().unwrap();
+        assert!(shared.lock().unwrap().executing.is_empty());
+    }
+
+    #[test]
+    fn physical_execution_leases_release_registry_and_exclude_same_agent_lifecycle() {
+        let directory = TestDirectory::new("execution-leases");
+        let root = directory.child("agents");
+        let (_, trust) = clock_trust(1);
+        let mut host = LocalAgentHost::create(&root, space(), node(), trust.clone()).unwrap();
+        let runtime = admitted_runtime();
+        let first = descriptor(&runtime, 7, AgentProfile::Local, space(), node());
+        let second = descriptor(&runtime, 8, AgentProfile::Local, space(), node());
+        let a = host
+            .create_agent(runtime.clone(), first.clone(), create_receipt(&first, 10))
+            .unwrap();
+        let b = host
+            .create_agent(runtime, second.clone(), create_receipt(&second, 10))
+            .unwrap();
+        let shared = Arc::new(Mutex::new(host));
+        let before = SLOT_VALIDATIONS.with(|count| count.get());
+        let a_lease = LocalAgentHost::checkout(&shared, a).unwrap();
+        assert_eq!(
+            SLOT_VALIDATIONS.with(|count| count.get()) - before,
+            1,
+            "checkout must inspect only its Agent, not idle neighbors"
+        );
+        let before = SLOT_VALIDATIONS.with(|count| count.get());
+        let b_lease = LocalAgentHost::checkout(&shared, b).unwrap();
+        assert_eq!(SLOT_VALIDATIONS.with(|count| count.get()) - before, 1);
+        assert!(matches!(
+            LocalAgentHost::checkout(&shared, a),
+            Err(LocalAgentHostError::Busy)
+        ));
+        {
+            let mut registry = shared
+                .try_lock()
+                .ok()
+                .expect("VM leases must not hold the registry mutex");
+            assert_eq!(registry.list().unwrap().len(), 2);
+            assert_eq!(registry.show(a).unwrap(), &first);
+            assert!(matches!(
+                registry.manage(
+                    a,
+                    ManagementRequest::InspectActors {
+                        after: None,
+                        limit: 1
+                    },
+                    None,
+                    SdkManagementArtifacts::None
+                ),
+                Err(LocalAgentHostError::Busy)
+            ));
+        }
+        drop(shared);
+        assert!(matches!(
+            LocalAgentHost::open(&root, space(), node(), trust.clone()),
+            Err(LocalAgentHostError::Busy)
+        ));
+        drop(a_lease);
+        assert!(matches!(
+            LocalAgentHost::open(&root, space(), node(), trust.clone()),
+            Err(LocalAgentHostError::Busy)
+        ));
+        drop(b_lease);
+        assert_eq!(
+            LocalAgentHost::open(&root, space(), node(), trust)
+                .unwrap()
+                .list()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn physical_checkout_pins_its_slot_and_defers_unrelated_namespace_audit() {
+        let directory = TestDirectory::new("targeted-slot-validation");
+        let root = directory.child("agents");
+        let (_, trust) = clock_trust(1);
+        let mut host = LocalAgentHost::create(&root, space(), node(), trust).unwrap();
+        let runtime = admitted_runtime();
+        let descriptor = descriptor(&runtime, 7, AgentProfile::Local, space(), node());
+        let agent = host
+            .create_agent(runtime, descriptor.clone(), create_receipt(&descriptor, 10))
+            .unwrap();
+        let shared = Arc::new(Mutex::new(host));
+        let unowned = root.join(encode_agent_id(AgentId([0xee; 32])));
+        create_private_directory(&unowned).unwrap();
+        // Serving an owned Agent does not traverse the unrelated namespace.
+        drop(LocalAgentHost::checkout(&shared, agent).unwrap());
+        // The explicit lifecycle audit still rejects that namespace change.
+        assert_eq!(
+            shared.lock().unwrap().list(),
+            Err(LocalAgentHostError::Corrupt)
+        );
+        fs::remove_dir(&unowned).unwrap();
+        let slot = root.join(encode_agent_id(agent));
+        let moved = directory.child("original-slot");
+        fs::rename(&slot, &moved).unwrap();
+        create_private_directory(&slot).unwrap();
+        assert!(
+            LocalAgentHost::checkout(&shared, agent).is_err(),
+            "a path replacement must not become a new ownership generation"
+        );
+        fs::remove_dir(&slot).unwrap();
+        fs::rename(&moved, &slot).unwrap();
+        drop(LocalAgentHost::checkout(&shared, agent).unwrap());
+    }
+
+    #[test]
+    fn physical_execution_lease_recovers_store_error_and_poison_fails_closed() {
+        let directory = TestDirectory::new("execution-lease-failure");
+        let root = directory.child("agents");
+        let (_, trust) = clock_trust(1);
+        let mut host = LocalAgentHost::create(&root, space(), node(), trust.clone()).unwrap();
+        let runtime = admitted_runtime();
+        let descriptor = descriptor(&runtime, 7, AgentProfile::Local, space(), node());
+        let agent = host
+            .create_agent(runtime, descriptor.clone(), create_receipt(&descriptor, 10))
+            .unwrap();
+        let shared = Arc::new(Mutex::new(host));
+        let mut lease = LocalAgentHost::checkout(&shared, agent).unwrap();
+        assert_eq!(
+            lease.finish(Err(AgentDriverError::Store(AgentStoreError::Unavailable))),
+            Err(LocalAgentHostError::Io)
+        );
+        drop(lease);
+        assert_eq!(shared.lock().unwrap().show(agent).unwrap(), &descriptor);
+
+        let lease = LocalAgentHost::checkout(&shared, agent).unwrap();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _owned = lease;
+            panic!("execution aborted while owning its driver");
+        }));
+        assert!(panicked.is_err());
+        assert!(matches!(
+            LocalAgentHost::checkout(&shared, agent),
+            Err(LocalAgentHostError::Corrupt)
+        ));
+        assert!(shared.lock().unwrap().executing.is_empty());
+        // No uncertain in-memory driver is reused. Recovery reauthenticates
+        // the durable root only after all execution owners have gone away.
+        drop(shared);
+        assert_eq!(
+            LocalAgentHost::open(&root, space(), node(), trust)
+                .unwrap()
+                .show(agent)
+                .unwrap(),
+            &descriptor
+        );
+    }
+
+    #[test]
     fn restart_retires_only_an_empty_unpublished_create_stage() {
         let directory = TestDirectory::new("empty-stage");
         let root = directory.child("agents");
@@ -2554,6 +3262,21 @@ mod tests {
             after: None,
             limit: sdk::MAX_DIRECTORY_PAGE_ENTRIES as u16,
         };
+        // The opaque fixture explicitly implements both full inspection and
+        // targeted inspection of its single actor, using the public cursor
+        // contract rather than the standard runtime's private state layout.
+        let mut predecessor = record.entry.actor.0;
+        for byte in predecessor.iter_mut().rev() {
+            let (value, borrow) = byte.overflowing_sub(1);
+            *byte = value;
+            if !borrow {
+                break;
+            }
+        }
+        let lookup = ManagementRequest::InspectActors {
+            after: (predecessor != [0; 32]).then_some(ActorId(predecessor)),
+            limit: 1,
+        };
         let state = |tag: u8| RuntimeState {
             control: vec![tag.min(0xa3)],
             linear: if tag >= 0xa3 {
@@ -2616,8 +3339,8 @@ mod tests {
             });
         }
         for tag in [0xa1, 0xa2, 0xa3, 0xa4, 0xa5] {
-            for request in [&inspect, &denied] {
-                let inspection = request == &inspect;
+            for request in [&inspect, &lookup, &denied] {
+                let inspection = matches!(request, ManagementRequest::InspectActors { .. });
                 if !inspection && tag >= 0xa3 {
                     continue;
                 }
@@ -2951,6 +3674,21 @@ mod tests {
             output,
             copies: vec![copy],
         });
+        let mut lookup_cases = Vec::new();
+        for case in &target_cases {
+            let mut work = RuntimeWork::decode(&case.input).unwrap();
+            if let RuntimeWork::Manage { request, .. } = &mut work {
+                if request.as_ref() == &inspect {
+                    *request = Box::new(lookup.clone());
+                    lookup_cases.push(ScriptedRuntimeCase {
+                        input: work.encode().unwrap(),
+                        output: case.output.clone(),
+                        copies: Vec::new(),
+                    });
+                }
+            }
+        }
+        target_cases.extend(lookup_cases);
         let target =
             admitted_scripted_runtime_for_test("local-opaque-migration-target", 0xd1, target_cases);
         let target_descriptor = descriptor(&target, 9, AgentProfile::Local, space(), node());
@@ -3423,6 +4161,32 @@ mod tests {
                 "single-enumeration audit must retain the exact physical artifact closure"
             );
             assert!(directory.material(sdk::ActorId([0xee; 32])).is_err());
+            let before_lookup = super::super::driver::directory_execution_count();
+            assert_eq!(
+                driver
+                    .physical_invocation_material(record.entry.actor)
+                    .unwrap(),
+                directory.material(record.entry.actor).unwrap()
+            );
+            assert_eq!(
+                super::super::driver::directory_execution_count() - before_lookup,
+                1,
+                "targeted lookup executes exactly one bounded directory request"
+            );
+            for absent in [sdk::ActorId([1; 32]), sdk::ActorId([255; 32])] {
+                assert_ne!(absent, record.entry.actor);
+                let before = super::super::driver::directory_execution_count();
+                assert!(matches!(
+                    driver.physical_invocation_material(absent),
+                    Err(AgentDriverError::SdkManagement(
+                        sdk::ManagementError::NotFound
+                    ))
+                ));
+                assert_eq!(
+                    super::super::driver::directory_execution_count() - before,
+                    1
+                );
+            }
             assert_eq!(driver.image(), &before_inspection);
         }
 
@@ -3440,8 +4204,21 @@ mod tests {
             RuntimeOutcome::Completed(Err(sdk::InvocationError::InvalidAuthorization))
         );
         let authorization = sdk::InvocationAuthorization::AuthorityReceipt(authority.clone());
-        let completed = host
+        let shared = Arc::new(Mutex::new(host));
+        let mut lease = LocalAgentHost::checkout(&shared, agent).unwrap();
+        assert!(
+            shared.try_lock().is_ok(),
+            "execution must not retain host mutex"
+        );
+        let completed = lease
             .invoke(agent, work.clone(), authorization.clone())
+            .unwrap();
+        drop(lease);
+        let host = Arc::try_unwrap(shared)
+            .ok()
+            .unwrap()
+            .into_inner()
+            .ok()
             .unwrap();
         let RuntimeOutcome::Completed(Ok(reply)) = &completed else {
             panic!("physical invoke did not complete successfully: {completed:?}")

@@ -1100,7 +1100,8 @@ fn physical_material_authorizes_work_at(
     ];
     availability.extend(material.installation_data.clone());
     availability.sort_unstable_by(|left, right| left.reference.cmp(&right.reference));
-    let genesis_publication = invocation_method_name(&work.message).as_deref() == Some("publish_genesis")
+    let genesis_publication = invocation_method_name(&work.message).as_deref()
+        == Some("publish_genesis")
         && work.actor == material.descriptor.authority.issuer.actor
         && work.deployment == material.descriptor.authority.issuer.deployment
         && work.program == material.descriptor.authority.issuer.program
@@ -1110,14 +1111,24 @@ fn physical_material_authorizes_work_at(
         {
             // Publication permits one bound provision blob, never arbitrary
             // replacement/removal of authenticated installation artifacts.
-            if !genesis_publication || work.availability.len() != availability.len() + 1 { return false; }
-            let Some(extra) = work.availability.iter().find(|blob| !availability.iter().any(|base| base.reference == blob.reference)) else {
+            if !genesis_publication || work.availability.len() != availability.len() + 1 {
+                return false;
+            }
+            let Some(extra) = work.availability.iter().find(|blob| {
+                !availability
+                    .iter()
+                    .any(|base| base.reference == blob.reference)
+            }) else {
                 return false;
             };
-            if !super::clean_bootstrap::genesis_issuance::publication_blob_matches(work, extra) { return false; }
+            if !super::clean_bootstrap::genesis_issuance::publication_blob_matches(work, extra) {
+                return false;
+            }
             availability.push(extra.clone());
             availability.sort_unstable_by(|left, right| left.reference.cmp(&right.reference));
-            if availability != work.availability { return false; }
+            if availability != work.availability {
+                return false;
+            }
         }
         #[cfg(not(all(feature = "storage", feature = "network", target_os = "linux")))]
         return false;
@@ -2717,8 +2728,16 @@ pub(crate) fn physical_projection_is_exactly_one_ack_ahead(
 /// supervisor refresh after a durable runtime or actor upgrade.
 #[derive(Clone)]
 pub struct AgentRouteHostHandle {
-    commands: SyncSender<RouteHostCommand>,
+    transport: RouteHostTransport,
     state: Arc<AtomicU8>,
+}
+
+#[derive(Clone)]
+enum RouteHostTransport {
+    Worker(SyncSender<RouteHostCommand>),
+    // Per-Agent ownership executed on the supervisor's bounded pool. Idle
+    // Agents allocate no threads; lifecycle/control calls share the same lock.
+    Inline(Arc<std::sync::Mutex<Box<dyn CleanAgentRouteBackend>>>),
 }
 
 impl AgentRouteHostHandle {
@@ -2844,12 +2863,29 @@ impl AgentRouteHostHandle {
         if !self.is_running() {
             return Err(AgentRouteError::Unavailable);
         }
-        self.commands
-            .try_send(command)
-            .map_err(|error| match error {
-                TrySendError::Full(_) => AgentRouteError::NotReady,
-                TrySendError::Disconnected(_) => AgentRouteError::Unavailable,
-            })
+        match &self.transport {
+            RouteHostTransport::Worker(commands) => {
+                commands.try_send(command).map_err(|error| match error {
+                    TrySendError::Full(_) => AgentRouteError::NotReady,
+                    TrySendError::Disconnected(_) => AgentRouteError::Unavailable,
+                })
+            }
+            RouteHostTransport::Inline(backend) => {
+                let mut backend = backend.lock().map_err(|_| AgentRouteError::Unavailable)?;
+                // Retirement may have started while this caller waited.
+                if !self.is_running() {
+                    return Err(AgentRouteError::Unavailable);
+                }
+                let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                    execute_route_host_command(backend.as_mut(), command)
+                }));
+                if !matches!(result, Ok(None)) {
+                    self.state.store(ROUTE_WORKER_FAILED, Ordering::Release);
+                    return Err(AgentRouteError::Unavailable);
+                }
+                Ok(())
+            }
+        }
     }
 
     pub(crate) fn request_retire(&self) -> Result<(), AgentRouteWorkerError> {
@@ -2865,9 +2901,27 @@ impl AgentRouteHostHandle {
             Err(_) => return Err(AgentRouteWorkerError::Failed),
         }
         let (reply, result) = mpsc::sync_channel(1);
-        self.commands
-            .send(RouteHostCommand::Retire(reply))
-            .map_err(|_| AgentRouteWorkerError::Failed)?;
+        match &self.transport {
+            RouteHostTransport::Worker(commands) => commands
+                .send(RouteHostCommand::Retire(reply))
+                .map_err(|_| AgentRouteWorkerError::Failed)?,
+            RouteHostTransport::Inline(backend) => {
+                let retired = panic::catch_unwind(AssertUnwindSafe(|| {
+                    let mut backend = backend.lock().map_err(|_| AgentRouteWorkerError::Failed)?;
+                    backend.retire()
+                }))
+                .unwrap_or(Err(AgentRouteWorkerError::Panicked));
+                self.state.store(
+                    if retired.is_ok() {
+                        ROUTE_WORKER_CLOSED
+                    } else {
+                        ROUTE_WORKER_FAILED
+                    },
+                    Ordering::Release,
+                );
+                return retired;
+            }
+        }
         result.recv().unwrap_or(Err(AgentRouteWorkerError::Failed))
     }
 }
@@ -3000,6 +3054,46 @@ impl AgentRouteHostAttachment {
     }
 }
 
+struct InlineHostOwner(AgentRouteHostHandle);
+
+impl AgentRouteWorkerOwner for InlineHostOwner {
+    fn request_retire(&mut self) -> Result<(), AgentRouteWorkerError> {
+        self.0.request_retire()
+    }
+
+    fn join(self: Box<Self>) -> Result<(), AgentRouteWorkerError> {
+        // The supervisor drains dispatch ownership before retirement. The
+        // mutex also drains an already-admitted direct control operation.
+        if self.0.state.load(Ordering::Acquire) == ROUTE_WORKER_CLOSED {
+            Ok(())
+        } else {
+            Err(AgentRouteWorkerError::Failed)
+        }
+    }
+}
+
+fn inline_backend<B: CleanAgentRouteBackend>(
+    mut backend: B,
+) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
+    let identities = backend
+        .identities()
+        .map_err(AgentRouteAdapterError::Route)?;
+    let handle = AgentRouteHostHandle {
+        transport: RouteHostTransport::Inline(Arc::new(std::sync::Mutex::new(Box::new(backend)))),
+        state: Arc::new(AtomicU8::new(ROUTE_WORKER_RUNNING)),
+    };
+    Ok(AgentRouteHostAttachment {
+        attachment: AgentRouteAttachment::new(
+            identities,
+            CleanHostRouteAdapter {
+                host: handle.clone(),
+            },
+            InlineHostOwner(handle.clone()),
+        ),
+        handle,
+    })
+}
+
 fn spawn_backend<B: CleanAgentRouteBackend>(
     backend: B,
     queue_capacity: usize,
@@ -3022,7 +3116,10 @@ fn spawn_backend<B: CleanAgentRouteBackend>(
             AgentRouteWorkerError::Failed,
         ));
     }
-    let handle = AgentRouteHostHandle { commands, state };
+    let handle = AgentRouteHostHandle {
+        transport: RouteHostTransport::Worker(commands),
+        state,
+    };
     let mut owner = CleanHostWorkerOwner {
         handle: handle.clone(),
         thread: Some(thread),
@@ -3047,6 +3144,71 @@ fn spawn_backend<B: CleanAgentRouteBackend>(
     })
 }
 
+fn execute_route_host_command(
+    backend: &mut dyn CleanAgentRouteBackend,
+    command: RouteHostCommand,
+) -> Option<bool> {
+    match command {
+        RouteHostCommand::Identities(reply) => {
+            let _ = reply.send(backend.identities());
+        }
+        RouteHostCommand::Ready(reply) => {
+            let _ = reply.send(backend.ready());
+        }
+        RouteHostCommand::Invoke {
+            identity,
+            request,
+            reply,
+        } => {
+            let _ = reply.send(backend.invoke(identity, request));
+        }
+        RouteHostCommand::Resume {
+            identity,
+            request,
+            reply,
+        } => {
+            let _ = reply.send(backend.resume(identity, request));
+        }
+        RouteHostCommand::Acknowledge {
+            identity,
+            request,
+            reply,
+        } => {
+            let _ = reply.send(backend.acknowledge(identity, request));
+        }
+        RouteHostCommand::Prepare { identity, reply } => {
+            let _ = reply.send(backend.prepare(identity));
+        }
+        #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+        RouteHostCommand::AuthorizeProjection {
+            head,
+            projection,
+            reply,
+        } => {
+            let _ = reply.send(backend.authorize_projection(head, &projection));
+        }
+        #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+        RouteHostCommand::AuthorityTarget(reply) => {
+            let _ = reply.send(backend.authority_target());
+        }
+        #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+        RouteHostCommand::AuthorityProjection { query, reply } => {
+            let _ = reply.send(backend.authority_projection(query));
+        }
+        #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+        RouteHostCommand::RecoverAuthorityProjection(reply) => {
+            let _ = reply.send(backend.recover_authority_projection());
+        }
+        RouteHostCommand::Retire(reply) => {
+            let retired = backend.retire();
+            let success = retired.is_ok();
+            let _ = reply.send(retired);
+            return Some(success);
+        }
+    }
+    None
+}
+
 fn route_host_thread<B: CleanAgentRouteBackend>(
     mut backend: B,
     receiver: Receiver<RouteHostCommand>,
@@ -3056,63 +3218,8 @@ fn route_host_thread<B: CleanAgentRouteBackend>(
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         let _ = ready.send(());
         while let Ok(command) = receiver.recv() {
-            match command {
-                RouteHostCommand::Identities(reply) => {
-                    let _ = reply.send(backend.identities());
-                }
-                RouteHostCommand::Ready(reply) => {
-                    let _ = reply.send(backend.ready());
-                }
-                RouteHostCommand::Invoke {
-                    identity,
-                    request,
-                    reply,
-                } => {
-                    let _ = reply.send(backend.invoke(identity, request));
-                }
-                RouteHostCommand::Resume {
-                    identity,
-                    request,
-                    reply,
-                } => {
-                    let _ = reply.send(backend.resume(identity, request));
-                }
-                RouteHostCommand::Acknowledge {
-                    identity,
-                    request,
-                    reply,
-                } => {
-                    let _ = reply.send(backend.acknowledge(identity, request));
-                }
-                RouteHostCommand::Prepare { identity, reply } => {
-                    let _ = reply.send(backend.prepare(identity));
-                }
-                #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-                RouteHostCommand::AuthorizeProjection {
-                    head,
-                    projection,
-                    reply,
-                } => {
-                    let _ = reply.send(backend.authorize_projection(head, &projection));
-                }
-                #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-                RouteHostCommand::AuthorityTarget(reply) => {
-                    let _ = reply.send(backend.authority_target());
-                }
-                #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-                RouteHostCommand::AuthorityProjection { query, reply } => {
-                    let _ = reply.send(backend.authority_projection(query));
-                }
-                #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-                RouteHostCommand::RecoverAuthorityProjection(reply) => {
-                    let _ = reply.send(backend.recover_authority_projection());
-                }
-                RouteHostCommand::Retire(reply) => {
-                    let retired = backend.retire();
-                    let success = retired.is_ok();
-                    let _ = reply.send(retired);
-                    return success;
-                }
+            if let Some(success) = execute_route_host_command(&mut backend, command) {
+                return success;
             }
         }
         false
@@ -3127,7 +3234,7 @@ fn route_host_thread<B: CleanAgentRouteBackend>(
     );
 }
 
-fn route_identities(
+pub(crate) fn route_identities(
     descriptor: &AgentDescriptor,
     records: Vec<ActorDirectoryRecord>,
     expected_profile: AgentProfile,
@@ -3213,14 +3320,23 @@ fn collect_actor_directory(
 
 struct LocalAgentRouteBackend {
     host: Arc<std::sync::Mutex<super::local_sdk_host::LocalAgentHost>>,
+    selected: Option<AgentId>,
 }
 
 impl CleanAgentRouteBackend for LocalAgentRouteBackend {
     fn identities(&mut self) -> Result<Vec<AgentRouteIdentity>, AgentRouteError> {
+        if let Some(agent) = self.selected {
+            return super::local_sdk_host::LocalAgentHost::checkout(&self.host, agent)
+                .and_then(|execution| execution.route_identities())
+                .map_err(map_local_host_error);
+        }
         let mut identities = Vec::new();
         let mut host = self.host.lock().map_err(|_| AgentRouteError::Unavailable)?;
         let agents = host.list().map_err(map_local_host_error)?;
         for agent in agents {
+            if self.selected.is_some_and(|selected| selected != agent) {
+                continue;
+            }
             let descriptor = host.show(agent).map_err(map_local_host_error)?.clone();
             let maximum = descriptor.capabilities.max_actors as usize;
             let records = collect_actor_directory(maximum, |after, limit| {
@@ -3249,10 +3365,16 @@ impl CleanAgentRouteBackend for LocalAgentRouteBackend {
         identity: AgentRouteIdentity,
         request: AgentInvocationRequest,
     ) -> Result<AgentInvocationResponse, AgentRouteError> {
-        if !request.execution.is_direct() {
+        if !request.execution.is_direct()
+            || self
+                .selected
+                .is_some_and(|agent| agent != identity.key().agent())
+        {
             return Err(AgentRouteError::Rejected);
         }
-        let mut host = self.host.lock().map_err(|_| AgentRouteError::Unavailable)?;
+        let mut host =
+            super::local_sdk_host::LocalAgentHost::checkout(&self.host, identity.key().agent())
+                .map_err(map_local_host_error)?;
         let material = host
             .supervisor_invocation_material(identity.key().agent(), identity.key().actor())
             .map_err(map_local_host_error)?;
@@ -3279,10 +3401,16 @@ impl CleanAgentRouteBackend for LocalAgentRouteBackend {
         identity: AgentRouteIdentity,
         request: AgentResumeRequest,
     ) -> Result<AgentResumeResponse, AgentRouteError> {
-        if !request.execution().is_direct() {
+        if !request.execution().is_direct()
+            || self
+                .selected
+                .is_some_and(|agent| agent != identity.key().agent())
+        {
             return Err(AgentRouteError::Rejected);
         }
-        let mut host = self.host.lock().map_err(|_| AgentRouteError::Unavailable)?;
+        let mut host =
+            super::local_sdk_host::LocalAgentHost::checkout(&self.host, identity.key().agent())
+                .map_err(map_local_host_error)?;
         let material = host
             .supervisor_invocation_material(identity.key().agent(), identity.key().actor())
             .map_err(map_local_host_error)?;
@@ -3314,10 +3442,16 @@ impl CleanAgentRouteBackend for LocalAgentRouteBackend {
         identity: AgentRouteIdentity,
         request: AgentAcknowledgementRequest,
     ) -> Result<AgentAcknowledgementResponse, AgentRouteError> {
-        if !request.execution().is_direct() {
+        if !request.execution().is_direct()
+            || self
+                .selected
+                .is_some_and(|agent| agent != identity.key().agent())
+        {
             return Err(AgentRouteError::Rejected);
         }
-        let mut host = self.host.lock().map_err(|_| AgentRouteError::Unavailable)?;
+        let mut host =
+            super::local_sdk_host::LocalAgentHost::checkout(&self.host, identity.key().agent())
+                .map_err(map_local_host_error)?;
         let material = host
             .supervisor_invocation_material(identity.key().agent(), identity.key().actor())
             .map_err(map_local_host_error)?;
@@ -3347,9 +3481,14 @@ impl CleanAgentRouteBackend for LocalAgentRouteBackend {
         &mut self,
         identity: AgentRouteIdentity,
     ) -> Result<super::invocation_preparation::PhysicalInvocationMaterial, AgentRouteError> {
-        self.host
-            .lock()
-            .map_err(|_| AgentRouteError::Unavailable)?
+        if self
+            .selected
+            .is_some_and(|agent| agent != identity.key().agent())
+        {
+            return Err(AgentRouteError::Rejected);
+        }
+        super::local_sdk_host::LocalAgentHost::checkout(&self.host, identity.key().agent())
+            .map_err(map_local_host_error)?
             .supervisor_invocation_material(identity.key().agent(), identity.key().actor())
             .map_err(map_local_host_error)
     }
@@ -3360,14 +3499,23 @@ impl CleanAgentRouteBackend for LocalAgentRouteBackend {
         head: AuthorityProjectionHead,
         projection: &[AgentAuthorityRouteProjection],
     ) -> Result<Vec<AgentRouteIdentity>, AgentRouteError> {
-        let host = self.host.lock().map_err(|_| AgentRouteError::Unavailable)?;
-        match host.audit_authority_projection(head, projection) {
+        let audit = if let Some(agent) = self.selected {
+            super::local_sdk_host::LocalAgentHost::checkout(&self.host, agent)
+                .and_then(|execution| execution.audit_authority_projection(head, projection))
+        } else {
+            self.host
+                .lock()
+                .map_err(|_| AgentRouteError::Unavailable)?
+                .audit_authority_projection(head, projection)
+        };
+        match audit {
             Ok(super::local_sdk_host::LocalAuthorityProjectionAudit::Ready(identities)) => {
                 Ok(identities)
             }
             Ok(super::local_sdk_host::LocalAuthorityProjectionAudit::Lag) => {
                 Err(AgentRouteError::NotReady)
             }
+            Err(super::local_sdk_host::LocalAgentHostError::Busy) => Err(AgentRouteError::NotReady),
             Err(error) => Err(match error {
                 super::local_sdk_host::LocalAgentHostError::InvalidDescriptor
                 | super::local_sdk_host::LocalAgentHostError::NotFound => AgentRouteError::Rejected,
@@ -3411,18 +3559,36 @@ pub fn local_agent_supervisor_attachment(
 }
 
 /// Attach a route worker to the lifecycle owner's existing physical host.
-/// Every route holds the same mutex through admission and execution. The
-/// lifecycle owner must never wait for this worker while holding that mutex.
+/// Requests check out one exclusive Agent driver, releasing the registry
+/// mutex before execution. Lifecycle work on that Agent is refused while its
+/// driver is checked out. The lifecycle owner must never wait for this worker
+/// while holding the registry mutex. This attachment still has one worker;
+/// independent-Agent scheduling requires separate execution attachments.
 /// Retiring a worker drops its reference, not the lifecycle owner's lease.
 pub(crate) fn local_agent_supervisor_attachment_shared(
     host: Arc<std::sync::Mutex<super::local_sdk_host::LocalAgentHost>>,
     queue_capacity: usize,
 ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
     spawn_backend(
-        LocalAgentRouteBackend { host },
+        LocalAgentRouteBackend {
+            host,
+            selected: None,
+        },
         queue_capacity,
         "vos-local-agent-route",
     )
+}
+
+/// One Agent, no dedicated thread. The supervisor pool owns serving work;
+/// the inline backend mutex excludes lifecycle inspection of this same Agent.
+pub(crate) fn local_agent_supervisor_attachment_for_agent(
+    host: Arc<std::sync::Mutex<super::local_sdk_host::LocalAgentHost>>,
+    agent: AgentId,
+) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
+    inline_backend(LocalAgentRouteBackend {
+        host,
+        selected: Some(agent),
+    })
 }
 
 #[cfg(feature = "private-agent-store")]
@@ -4169,6 +4335,67 @@ mod tests {
             self.retired.store(true, Ordering::Release);
             Ok(())
         }
+    }
+
+    #[test]
+    fn inline_backend_retirement_closes_all_cloned_handles() {
+        let request = request(0x61, RuntimeExecutionContext::Direct);
+        let identity = identity(&request);
+        let retired = Arc::new(AtomicBool::new(false));
+        let invokes = Arc::new(AtomicUsize::new(0));
+        let attachment = inline_backend(FakeBackend {
+            identities: Arc::new(Mutex::new(vec![identity])),
+            ready: None,
+            reply: FakeReply::RequestBoundError,
+            invokes: invokes.clone(),
+            retired: retired.clone(),
+        })
+        .unwrap();
+        let handle = attachment.handle();
+        let clone = handle.clone();
+        assert!(
+            handle
+                .invoke(identity, request.clone())
+                .unwrap()
+                .matches_request(&request)
+        );
+        assert_eq!(invokes.load(Ordering::Acquire), 1);
+        attachment.retire().unwrap();
+        assert!(retired.load(Ordering::Acquire));
+        assert!(!clone.is_running());
+        assert_eq!(clone.identities(), Err(AgentRouteError::Unavailable));
+        assert_eq!(
+            clone.invoke(identity, request),
+            Err(AgentRouteError::Unavailable)
+        );
+        assert_eq!(invokes.load(Ordering::Acquire), 1);
+        clone.request_retire().unwrap();
+    }
+
+    #[test]
+    fn inline_backend_panic_unpublishes_and_cannot_reuse_driver() {
+        let request = request(0x62, RuntimeExecutionContext::Direct);
+        let identity = identity(&request);
+        let attachment = inline_backend(FakeBackend {
+            identities: Arc::new(Mutex::new(vec![identity])),
+            ready: None,
+            reply: FakeReply::Panic,
+            invokes: Arc::new(AtomicUsize::new(0)),
+            retired: Arc::new(AtomicBool::new(false)),
+        })
+        .unwrap();
+        let handle = attachment.handle();
+        let mut owner = AgentSupervisorOwner::start(limits()).unwrap();
+        let publication = owner.attach(attachment.into_parts().0).unwrap();
+        let snapshot = publication.snapshots()[0];
+        assert!(dispatch_invocation(&owner.handle(), snapshot, request).is_err());
+        assert!(!handle.is_running());
+        assert_eq!(handle.identities(), Err(AgentRouteError::Unavailable));
+        assert_eq!(
+            owner.handle().snapshot(snapshot.key()),
+            Err(AgentSupervisorError::NotFound)
+        );
+        owner.shutdown_and_join().unwrap();
     }
 
     fn fake_attachment(

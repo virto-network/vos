@@ -1180,6 +1180,15 @@ pub(crate) trait NativeLocalLifecycle: Send {
         &self,
         capacity: usize,
     ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError>;
+    fn local_agents(&self) -> Result<Option<Vec<AgentId>>, AgentRouteAdapterError> {
+        Ok(None)
+    }
+    fn local_attachment_for_agent(
+        &self,
+        _agent: AgentId,
+    ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
+        Err(AgentRouteAdapterError::NoReadyRoutes)
+    }
     fn create(
         &mut self,
         descriptor: AgentDescriptor,
@@ -1278,6 +1287,27 @@ where
         capacity: usize,
     ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
         LocalLifecycleController::local_attachment(self, capacity)
+    }
+    fn local_agents(&self) -> Result<Option<Vec<AgentId>>, AgentRouteAdapterError> {
+        self.local
+            .lock()
+            .map_err(|_| {
+                AgentRouteAdapterError::Route(super::supervisor::AgentRouteError::Unavailable)
+            })?
+            .list()
+            .map(Some)
+            .map_err(|_| {
+                AgentRouteAdapterError::Route(super::supervisor::AgentRouteError::Unavailable)
+            })
+    }
+    fn local_attachment_for_agent(
+        &self,
+        agent: AgentId,
+    ) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
+        super::supervisor_adapters::local_agent_supervisor_attachment_for_agent(
+            self.local.clone(),
+            agent,
+        )
     }
     fn create(
         &mut self,
