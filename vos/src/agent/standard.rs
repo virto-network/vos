@@ -1262,7 +1262,9 @@ impl StandardCleanActorInstallation {
 pub struct StandardLaneEntry {
     pub actor: ActorId,
     pub state_generation: Hash,
+    /// Inline fields only; row collections never enter inner FETCH snapshots.
     pub value: Vec<u8>,
+    pub rows: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
 /// Sparse physical state of all three independently persisted lanes. A
@@ -2154,10 +2156,11 @@ impl StandardAgentRuntime {
         }
         let config = self.created()?;
         let limit = config.runtime_contract.resources.max_runtime_state_bytes as usize;
-        let state = super::wire::encode_standard_runtime_state(&self.snapshot());
-        if state.encoded_len().is_none_or(|bytes| bytes > limit) {
-            return Err(LifecycleError::ResourceLimit);
-        }
+        // Keep only the measured length. Holding this encoded image while
+        // usage accounting snapshots/encodes it again doubles peak heap use.
+        let state_bytes = super::wire::encode_standard_runtime_state(&self.snapshot())
+            .encoded_len().filter(|bytes| *bytes <= limit)
+            .ok_or(LifecycleError::ResourceLimit)?;
         match (&self.clean_descriptor, self.active_resource_policy) {
             (None, None) => Ok(()),
             (Some(descriptor), Some(policy))
@@ -2165,7 +2168,7 @@ impl StandardAgentRuntime {
                     descriptor.capabilities,
                     descriptor.runtime_contract.resources,
                 ) && self
-                    .clean_resource_usage()
+                    .clean_resource_usage_with_state_bytes(state_bytes)
                     .is_ok_and(|usage| policy.admits_usage(usage)) =>
             {
                 Ok(())
@@ -3375,6 +3378,20 @@ impl StandardAgentRuntime {
         work: &crate::agent_sdk::InvocationWork,
         schema_blob: &crate::agent_sdk::RuntimeBlob,
     ) -> Result<(), super::execution::ActorExecutionError> {
+        self.resolve_clean_storage_access(work, schema_blob)
+            .map(|_| ())
+    }
+
+    /// Derive row scope only from this installed actor's exact schema. This
+    /// authenticates the schema and generation, not caller authorization;
+    /// policy admission must still succeed before the scope is used for IO.
+    #[cfg(feature = "pvm")]
+    pub(crate) fn resolve_clean_storage_access(
+        &self,
+        work: &crate::agent_sdk::InvocationWork,
+        schema_blob: &crate::agent_sdk::RuntimeBlob,
+    ) -> Result<super::actor_storage::ActorStorageAccess, super::execution::ActorExecutionError>
+    {
         use super::execution::ActorExecutionError;
         use crate::actors::codec::Decode as _;
         use crate::actors::value::{Msg, TAG_DYNAMIC};
@@ -3383,6 +3400,15 @@ impl StandardAgentRuntime {
             .actors
             .get(&ActorId(work.actor.0))
             .ok_or(ActorExecutionError::NotFound)?;
+        if actor.record.state_generation.0 != work.incarnation.0 {
+            return Err(ActorExecutionError::StaleIncarnation);
+        }
+        if actor.record.entry.deployment.0 != work.deployment.0 {
+            return Err(ActorExecutionError::StaleDeployment);
+        }
+        if actor.record.entry.program.0 != work.program.0 {
+            return Err(ActorExecutionError::WrongProgram);
+        }
         if !clean_reference_matches_record(&schema_blob.reference, &actor.record.agent_schema)
             || !schema_blob.validate()
         {
@@ -3411,7 +3437,27 @@ impl StandardAgentRuntime {
         if method.mode != work.mode {
             return Err(ActorExecutionError::UnsupportedMethod);
         }
-        Ok(())
+        super::actor_storage::ActorStorageAccess::new(&schema, &message.name, work.mode)
+            .map_err(|_| ActorExecutionError::InvalidAvailability)
+    }
+
+    /// Resolve row data from the same actor/incarnation whose installed schema
+    /// authenticates its namespace scope. No host-selected image or lane may
+    /// substitute for these runtime-owned entries. Caller policy admission is
+    /// still required before entering the inner machine.
+    #[cfg(feature = "pvm")]
+    pub(crate) fn resolve_clean_storage_reader<'a>(
+        &'a self,
+        work: &crate::agent_sdk::InvocationWork,
+        schema_blob: &crate::agent_sdk::RuntimeBlob,
+    ) -> Result<super::actor_storage::ActorStorageReader<'a>, super::execution::ActorExecutionError> {
+        let access = self.resolve_clean_storage_access(work, schema_blob)?;
+        let rows = |lane| self.lane_state
+            .lookup(lane, ActorId(work.actor.0), Hash(work.incarnation.0))
+            .map(|entry| &entry.rows);
+        super::actor_storage::ActorStorageReader::from_rows(access, [
+            rows(StateLane::Linear), rows(StateLane::Merge), rows(StateLane::Local),
+        ]).map_err(|_| super::execution::ActorExecutionError::InvalidAvailability)
     }
 
     #[cfg(feature = "pvm")]
@@ -3925,6 +3971,9 @@ impl StandardAgentRuntime {
     /// data required for exact retry and explicit delivery acknowledgement.
     /// A resumed terminal slice consumes its continuation in the same
     /// candidate, so no partially bound result can enter durable state.
+    ///
+    /// Row-producing calls must enclose this method in commit_clean_row_batch
+    /// so the row delta and result share one final resource check and commit.
     #[cfg(feature = "pvm")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_clean_execution(
@@ -3979,6 +4028,65 @@ impl StandardAgentRuntime {
         ));
         *self = candidate;
         Ok(())
+    }
+
+    /// Stage an authenticated lane delta and its terminal/yield transition in
+    /// one candidate. `commit` must perform the existing caller-authorization
+    /// and result/continuation binding; its owned return value is exposed only
+    /// after the complete encoded runtime satisfies signed resource limits.
+    /// Row data must never be committed separately from that transition.
+    #[cfg(feature = "pvm")]
+    pub(crate) fn commit_clean_row_batch<R>(
+        &mut self,
+        work: &crate::agent_sdk::InvocationWork,
+        schema: &crate::agent_sdk::RuntimeBlob,
+        inline: Vec<u8>,
+        changes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        commit: impl FnOnce(&mut Self) -> Result<R, super::execution::ActorExecutionError>,
+    ) -> Result<R, super::execution::ActorExecutionError> {
+        use super::actor_storage::{ActorLaneImage, StorageAccessError};
+        use super::execution::ActorExecutionError;
+        let access = self.resolve_clean_storage_access(work, schema)?;
+        let lane = clean_method_mode(work.mode).write_lane()
+            .ok_or(ActorExecutionError::UnsupportedMethod)?;
+        let clean_lane = work.mode.write_lane().ok_or(ActorExecutionError::UnsupportedMethod)?;
+        let actor = ActorId(work.actor.0);
+        let generation = Hash(work.incarnation.0);
+        let mut candidate = self.clone();
+        let entries = candidate.lane_state.select_mut(lane);
+        let index = entries.binary_search_by_key(&(actor, generation), |entry| (entry.actor, entry.state_generation));
+        let mut image = match index {
+            Ok(index) => ActorLaneImage::from_parts(
+                core::mem::take(&mut entries[index].value),
+                core::mem::take(&mut entries[index].rows),
+            ),
+            Err(_) => ActorLaneImage::default(),
+        };
+        access.apply_batch(clean_lane, &mut image, inline, changes).map_err(|error| match error {
+            StorageAccessError::Image(crate::service::wire::DecodeError::LimitExceeded) => ActorExecutionError::ResultCapacity,
+            _ => ActorExecutionError::InvalidActorOutput,
+        })?;
+        let (value, rows) = image.into_parts();
+        let empty = value.is_empty() && rows.is_empty();
+        match index {
+            Ok(index) if empty => { entries.remove(index); }
+            Ok(index) => { entries[index].value = value; entries[index].rows = rows; }
+            Err(_) if empty => {}
+            Err(index) => {
+                if entries.len() >= MAX_LANE_STATE_ENTRIES {
+                    return Err(ActorExecutionError::ResultCapacity);
+                }
+                entries.insert(index, StandardLaneEntry { actor, state_generation: generation, value, rows });
+            }
+        }
+        let result = commit(&mut candidate)?;
+        candidate.validate_restored_lane_state().map_err(|_| ActorExecutionError::InvalidActorOutput)?;
+        candidate.validate_signed_state_resource().map_err(|error| match error {
+            LifecycleError::ResourceLimit => ActorExecutionError::ResultCapacity,
+            _ => ActorExecutionError::InvalidActorOutput,
+        })?;
+        *self = candidate;
+        Ok(result)
     }
 
     /// Retain an authenticated terminal actor failure without committing any
@@ -4596,10 +4704,10 @@ impl StandardAgentRuntime {
                         actor.record.entry.actor,
                         actor.record.state_generation,
                     )
-                    .map_or(&[][..], |entry| entry.value.as_slice());
+                    .map(|entry| super::actor_storage::ActorLaneImage::encode_parts(&entry.value, &entry.rows));
                 Hash::digest(
                     b"vos/agent/merge-frontier",
-                    &[&actor.record.entry.actor.0, merge],
+                    &[&actor.record.entry.actor.0, merge.as_deref().unwrap_or(&[])],
                 )
             }),
             local_revision: (actor.record.entry.lanes.contains(StateLane::Local)
@@ -4904,6 +5012,17 @@ impl StandardAgentRuntime {
     fn clean_resource_usage(
         &self,
     ) -> Result<crate::agent_sdk::RuntimeResourceUsage, crate::agent_sdk::ManagementError> {
+        let state_bytes = super::wire::encode_standard_runtime_state(&self.snapshot())
+            .encoded_len().ok_or(crate::agent_sdk::ManagementError::ResourceLimit)?;
+        self.clean_resource_usage_with_state_bytes(state_bytes)
+    }
+
+    /// Reuse a length measured from this same immutable runtime, never a
+    /// caller-supplied size. All non-state resource accounting still runs.
+    fn clean_resource_usage_with_state_bytes(
+        &self,
+        state_bytes: usize,
+    ) -> Result<crate::agent_sdk::RuntimeResourceUsage, crate::agent_sdk::ManagementError> {
         use crate::agent_sdk::ManagementError;
 
         let config = self.created().map_err(legacy_management_error)?;
@@ -4948,12 +5067,7 @@ impl StandardAgentRuntime {
                 .checked_add(debt.proof_artifacts)
                 .ok_or(ManagementError::ResourceLimit)?;
         }
-        usage.state_bytes = u32::try_from(
-            super::wire::encode_standard_runtime_state(&self.snapshot())
-                .encoded_len()
-                .ok_or(ManagementError::ResourceLimit)?,
-        )
-        .map_err(|_| ManagementError::ResourceLimit)?;
+        usage.state_bytes = u32::try_from(state_bytes).map_err(|_| ManagementError::ResourceLimit)?;
         Ok(usage)
     }
 
@@ -6463,7 +6577,7 @@ impl StandardLaneState {
         match entries.binary_search_by_key(&(actor, state_generation), |entry| {
             (entry.actor, entry.state_generation)
         }) {
-            Ok(index) if value.is_empty() => {
+            Ok(index) if value.is_empty() && entries[index].rows.is_empty() => {
                 entries.remove(index);
             }
             Ok(index) => entries[index].value = value,
@@ -6478,6 +6592,7 @@ impl StandardLaneState {
                         actor,
                         state_generation,
                         value,
+                        rows: BTreeMap::new(),
                     },
                 );
             }
@@ -6491,8 +6606,8 @@ impl StandardLaneState {
                 && entries.iter().all(|entry| {
                     entry.actor != ActorId::ZERO
                         && entry.state_generation != Hash::ZERO
-                        && !entry.value.is_empty()
-                        && entry.value.len() <= super::execution::MAX_EXECUTION_STATE_BYTES
+                        && !(entry.value.is_empty() && entry.rows.is_empty())
+                        && super::actor_storage::ActorLaneImage::encoded_parts_len(&entry.value, &entry.rows).is_some()
                 })
                 && entries.windows(2).all(|pair| {
                     (pair[0].actor, pair[0].state_generation)
@@ -7770,6 +7885,34 @@ mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
+    fn persisted_rows_survive_inline_updates_and_bind_merge_observation() {
+        let config = config(4);
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+        let mut installed = install(config.identity.agent, None, "rows");
+        installed.entry.lanes = LaneSet::of(StateLane::Merge);
+        installed.requirements.lanes = installed.entry.lanes;
+        let actor = installed.entry.actor;
+        apply_authorized(&mut runtime, &config, LifecycleRequest::Install(installed)).unwrap();
+        set_lane(&mut runtime, actor, StateLane::Merge, &[1]);
+        runtime.lane_state.merge[0].rows.insert(b"s/rows/a".to_vec(), vec![7; 64 * 1024]);
+        let before = runtime.observation(actor, super::super::MethodMode::Merge).unwrap();
+        runtime.lane_state.merge[0].rows.get_mut(b"s/rows/a".as_slice()).unwrap()[0] = 8;
+        let after = runtime.observation(actor, super::super::MethodMode::Merge).unwrap();
+        assert_ne!(before.merge_frontier, after.merge_frontier, "row bytes must bind the observed frontier");
+        let rows = runtime.lane_state.merge[0].rows.clone();
+        set_lane(&mut runtime, actor, StateLane::Merge, &[]);
+        assert!(runtime.lane_state.merge[0].value.is_empty());
+        assert_eq!(runtime.lane_state.merge[0].rows, rows, "empty inline state must not erase rows");
+        runtime.validate_restored_lane_state().unwrap();
+        let encoded = super::super::wire::encode_standard_runtime_state(&runtime.snapshot());
+        let reopened = StandardAgentRuntime::restore(super::super::wire::decode_standard_runtime_state(&encoded).unwrap()).unwrap();
+        assert_eq!(reopened.lane_state, runtime.lane_state);
+        assert_eq!(reopened.observation(actor, super::super::MethodMode::Merge).unwrap(), runtime.observation(actor, super::super::MethodMode::Merge).unwrap());
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
     fn merge_receives_only_merge_state_and_cannot_return_hidden_linear() {
         use crate::agent::execution::{
             ActorExecutionError, ActorExecutionReply, ActorExecutionStatus, ActorInvocation,
@@ -8579,16 +8722,19 @@ mod tests {
             actor,
             state_generation: generation,
             value: vec![1],
+            rows: BTreeMap::new(),
         });
         runtime.lane_state.merge.push(StandardLaneEntry {
             actor,
             state_generation: generation,
             value: vec![2],
+            rows: BTreeMap::new(),
         });
         runtime.lane_state.local.push(StandardLaneEntry {
             actor,
             state_generation: generation,
             value: vec![3],
+            rows: BTreeMap::new(),
         });
         let baseline = super::super::wire::encode_standard_runtime_state(&runtime.snapshot());
         let assert_lanes = |runtime: &StandardAgentRuntime| {
@@ -8851,6 +8997,7 @@ mod tests {
             actor: ActorId([0x79; 32]),
             state_generation: Hash([0x7a; 32]),
             value: vec![1],
+            rows: BTreeMap::new(),
         };
         let mut with_entry = before.clone();
         with_entry.lane_state.linear.push(historical_entry);
@@ -8911,6 +9058,7 @@ mod tests {
             actor: ActorId([0x7b; 32]),
             state_generation: Hash([0x7c; 32]),
             value: vec![1],
+            rows: BTreeMap::new(),
         });
         runtime.lane_revisions.linear = 1;
         let mut downgraded = config.capabilities;
@@ -9883,6 +10031,7 @@ mod tests {
         };
         use crate::agent_sdk::schema::{
             ConstructorContract, ParsedField, ParsedInlineField, ParsedMethod, ParsedSchema,
+            ParsedStorageField,
         };
         use crate::agent_sdk::wire::CanonicalWire as _;
         use crate::agent_sdk::{
@@ -9892,12 +10041,24 @@ mod tests {
 
         let schema = ParsedSchema {
             constructor: ConstructorContract::Forbidden,
-            fields: vec![ParsedField::Inline(ParsedInlineField {
-                source_index: 0,
-                name: "value".into(),
-                type_identity: "core::primitive::u8".into(),
-                persistence: FieldPersistence::State(CleanStateLane::Linear),
-            })],
+            fields: vec![
+                ParsedField::Inline(ParsedInlineField {
+                    source_index: 0,
+                    name: "value".into(),
+                    type_identity: "core::primitive::u8".into(),
+                    persistence: FieldPersistence::State(CleanStateLane::Linear),
+                }),
+                ParsedField::Storage(ParsedStorageField {
+                    source_index: 1,
+                    name: "rows".into(),
+                    type_identity: "test::StorageMap<u32,u64>".into(),
+                    prefix: b"rows/".to_vec(),
+                    lane: CleanStateLane::Linear,
+                    committed: false,
+                    leaf_domain: None,
+                    node_domain: None,
+                }),
+            ],
             methods: vec![ParsedMethod {
                 source_index: 0,
                 name: "write".into(),
@@ -9972,6 +10133,84 @@ mod tests {
         assert_eq!(
             runtime.validate_clean_execution_schema(&work, &schema_blob),
             Ok(())
+        );
+        // The runtime-derived scope permits only the installed namespace.
+        let access = runtime
+            .resolve_clean_storage_access(&work, &schema_blob)
+            .unwrap();
+        let mut image = super::super::actor_storage::ActorLaneImage::default();
+        access
+            .write(
+                CleanStateLane::Linear,
+                &mut image,
+                b"rows/one".to_vec(),
+                Some(vec![7]),
+            )
+            .unwrap();
+        assert_eq!(
+            access.read(CleanStateLane::Linear, &image, b"rows/one"),
+            Ok(Some(&[7][..]))
+        );
+        assert_eq!(
+            access.write(
+                CleanStateLane::Linear,
+                &mut image,
+                b"other/one".to_vec(),
+                Some(vec![8])
+            ),
+            Err(super::super::actor_storage::StorageAccessError::UndeclaredNamespace)
+        );
+        for (field, expected) in [
+            (
+                0,
+                super::super::execution::ActorExecutionError::StaleIncarnation,
+            ),
+            (
+                1,
+                super::super::execution::ActorExecutionError::StaleDeployment,
+            ),
+            (
+                2,
+                super::super::execution::ActorExecutionError::WrongProgram,
+            ),
+            (3, super::super::execution::ActorExecutionError::NotFound),
+            (
+                4,
+                super::super::execution::ActorExecutionError::UnsupportedMethod,
+            ),
+        ] {
+            let mut forged = work.clone();
+            match field {
+                0 => forged.incarnation.0[0] ^= 1,
+                1 => forged.deployment.0[0] ^= 1,
+                2 => forged.program.0[0] ^= 1,
+                3 => forged.actor.0[0] ^= 1,
+                _ => forged.mode = CleanMethodMode::Local,
+            }
+            assert_eq!(
+                runtime
+                    .resolve_clean_storage_access(&forged, &schema_blob)
+                    .err(),
+                Some(expected)
+            );
+        }
+        // A self-consistent replacement blob is not the installed commitment.
+        let mut substituted = schema.clone();
+        let ParsedField::Storage(field) = &mut substituted.fields[1] else {
+            unreachable!()
+        };
+        field.prefix = b"other/".to_vec();
+        let bytes = substituted.encode().unwrap();
+        let replacement = crate::agent_sdk::RuntimeBlob {
+            reference: CleanBlobRef::of_bytes(&bytes),
+            bytes,
+        };
+        assert!(replacement.validate());
+        assert_eq!(
+            runtime
+                .resolve_clean_storage_access(&work, &replacement)
+                .err(),
+            Some(super::super::execution::ActorExecutionError::InvalidAvailability)
         );
         assert_eq!(
             runtime.validate_clean_execution_installation_data(&work, None),

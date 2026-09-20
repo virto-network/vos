@@ -1772,13 +1772,21 @@ where
                     );
                 #[cfg(not(all(feature = "network", target_os = "linux")))]
                 let admin_success = false;
+                #[cfg(all(feature = "network", target_os = "linux"))]
+                let committee_query = super::clean_bootstrap::genesis_issuance::is_committee_query_reply(work, &reply.reply);
+                #[cfg(not(all(feature = "network", target_os = "linux")))]
+                let committee_query = false;
+                #[cfg(all(feature = "network", target_os = "linux"))]
+                let publication = super::clean_bootstrap::genesis_issuance::is_publication_reply(work, &reply.reply);
+                #[cfg(not(all(feature = "network", target_os = "linux")))]
+                let publication = false;
                 if reply.invocation != work.invocation
                     || reply.actor != work.actor
                     || reply.incarnation != work.incarnation
                     || reply.deployment != work.deployment
                     || reply.mode != work.mode
                     || reply.status != crate::agent_sdk::InvocationStatus::Done
-                    || (!admin_success
+                    || (!admin_success && !committee_query && !publication
                         && reply.reply
                             != crate::actors::codec::Encode::encode(
                                 &crate::actors::value::Value::Bytes(Vec::new()),
@@ -1786,7 +1794,7 @@ where
                 {
                     return Err(SharedJournalDriverError::CrossStoreMismatch);
                 }
-                // A proven denial or exactly bound admin success may remain
+                // A proven denial, admin success, query or publication may remain
                 // pending after ACK while terminal evidence is persisted.
                 // Other successes still require their separate lifecycle.
                 continue;
@@ -2201,7 +2209,7 @@ where
         let binding = self.materialization.runtime();
         if *context != RuntimeExecutionContext::Direct
             || *state != RuntimeState::default()
-            || invocation.mode != MethodMode::Linear
+            || !matches!(invocation.mode, MethodMode::Linear | MethodMode::Query)
             || !invocation.validate()
             || invocation.space.0 != binding.space.0
             || invocation.agent.0 != binding.agent.0
@@ -2654,7 +2662,7 @@ where
         else {
             return Err(SharedJournalDriverError::CrossStoreMismatch);
         };
-        if work.mode != crate::agent_sdk::MethodMode::Linear
+        if !matches!(work.mode, crate::agent_sdk::MethodMode::Linear | crate::agent_sdk::MethodMode::Query)
             || !preflight.matches_work(work)
             || preflight.observed_slot > self.executor.current_logical_slot()?
         {
@@ -3393,8 +3401,15 @@ where
                         SharedPhysicalApplyOutcome::Duplicate { index }
                     }
                 };
-                self.executor
-                    .replace_shared_committees(self.ledger.committee_history()?);
+                if matches!(&slot, CommittedSharedRaftSlot::LeaderNoop(_)) {
+                    // A no-op cannot add or activate a committee. Retain the
+                    // complete recovery audit, but avoid a second suffix scan
+                    // and rebuilding the unchanged executor history.
+                    self.ledger.audit_recovery()?;
+                } else {
+                    self.executor
+                        .replace_shared_committees(self.ledger.committee_history()?);
+                }
                 outcome
             }
             CommittedSharedRaftSlot::Command(command)

@@ -87,6 +87,9 @@ struct LinkedElf {
     /// For LLVM relative jump tables: entry = target - subtracted_addr.
     /// Combined with the resolved entry value, we can recover the target.
     sub32_relocs: Vec<(u64, u64)>,
+    /// Bytes whose data-pointer interpretation is already defined by a
+    /// relocation, including non-code targets. Never rescan as raw pointers.
+    data_relocation_ranges: Vec<(u64, u64)>,
     /// Code section address ranges for detecting code pointers.
     code_ranges: Vec<(u64, u64)>,
     /// Every statically reachable RISC-V instruction address. Translation-time
@@ -630,6 +633,7 @@ fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
     let mut lo12_entries: Vec<(u64, u64)> = Vec::new(); // (lo12_addr, hi20_addr)
     let mut abs64_relocs: Vec<(u64, u64, u8)> = Vec::new(); // (offset, target, entry_size)
     let mut sub32_relocs: Vec<(u64, u64)> = Vec::new();
+    let mut data_relocation_ranges = Vec::new();
     // Code address ranges for detecting code pointers
     let code_ranges: Vec<(u64, u64)> = code_sections
         .iter()
@@ -662,6 +666,14 @@ fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
             };
 
             let target_addr = (sym_value as i64 + r_addend) as u64;
+
+            match rtype {
+                RelocType::Abs32 | RelocType::Add32 | RelocType::Sub32 => {
+                    data_relocation_ranges.push((r_offset, r_offset.saturating_add(4)));
+                }
+                RelocType::Abs64 => data_relocation_ranges.push((r_offset, r_offset.saturating_add(8))),
+                _ => {}
+            }
 
             match rtype {
                 RelocType::Abs32 => {
@@ -707,6 +719,8 @@ fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
             }
         }
     }
+
+    let data_relocation_ranges = merge_relocation_ranges(data_relocation_ranges);
 
     // Pass 2: resolve LO12 targets by looking up paired HI20
     for (lo12_addr, hi20_addr) in lo12_entries {
@@ -770,8 +784,11 @@ fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
             }
         }
     }
-    for data in [&ro_data, &rw_data] {
-        for bytes in data.chunks_exact(8) {
+    for (base, data) in [(stack_size, &ro_data), (rw_base, &rw_data)] {
+        for (index, bytes) in data.chunks_exact(8).enumerate() {
+            if overlaps_data_relocation(&data_relocation_ranges, base + index as u64 * 8, 8) {
+                continue;
+            }
             let target = u64::from_le_bytes(bytes.try_into().expect("eight-byte chunk"));
             if is_code_target(target) {
                 control_flow_targets.insert(target);
@@ -853,6 +870,7 @@ fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
         call_targets,
         abs_code_ptrs: abs64_relocs,
         sub32_relocs,
+        data_relocation_ranges,
         code_ranges,
         control_flow_targets,
         entry_vaddr: e_entry,
@@ -860,7 +878,29 @@ fn parse_linked_elf(data: &[u8]) -> Result<LinkedElf, TranspileError> {
     })
 }
 
-/// Translate a code section with relocation awareness.
+/// Relocation metadata owns every byte it covers, including the other half of
+/// an eight-byte heuristic candidate and relocations to non-code addresses.
+fn merge_relocation_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
+fn overlaps_data_relocation(ranges: &[(u64, u64)], address: u64, size: u8) -> bool {
+    let end = address.saturating_add(u64::from(size));
+    let index = ranges.partition_point(|&(start, _)| start < end);
+    index != 0 && ranges[index - 1].1 > address
+}
+
 /// Rewrite code pointers in data sections (LLVM switch/jump tables, vtables).
 ///
 /// Detects code pointers via:
@@ -957,6 +997,10 @@ fn rewrite_data_code_ptrs(
     {
         let mut off = 0;
         while off + 8 <= data.len() {
+            if overlaps_data_relocation(&elf.data_relocation_ranges, base + off as u64, 8) {
+                off += 8;
+                continue;
+            }
             let val = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
             if is_code_addr(val) {
                 let vaddr = base + off as u64;
@@ -1064,7 +1108,7 @@ fn translate_section_linked(
                 if offset + 8 <= data.len() {
                     if elf.control_flow_targets.contains(&(rv_addr + 4)) {
                         return Err(TranspileError::InvalidSection(
-                            "control-flow target splits a relocated AUIPC+JALR call pair".into(),
+                            format!("control-flow target {:#x} splits a relocated AUIPC+JALR call pair at {rv_addr:#x}", rv_addr + 4),
                         ));
                     }
                     let jalr = u32::from_le_bytes([
@@ -1217,6 +1261,22 @@ mod tests {
     use super::*;
     use vos_pvm::{ExitReason, refine};
 
+    #[test]
+    fn relocation_interval_index_matches_byte_overlap() {
+        let original = vec![(20, 24), (4, 8), (6, 14), (24, 28), (4, 8), (40, 48)];
+        let merged = merge_relocation_ranges(original.clone());
+        assert_eq!(merged, vec![(4, 14), (20, 28), (40, 48)]);
+        for address in 0..56 {
+            for size in 1..=8u8 {
+                let expected = original.iter().any(|&(start, end)| {
+                    address < end && start < address + u64::from(size)
+                });
+                assert_eq!(overlaps_data_relocation(&merged, address, size), expected);
+            }
+        }
+        assert!(!overlaps_data_relocation(&[], 4, 8));
+    }
+
     /// Translate a preserved ELF and resolve observed PVM PCs without changing
     /// the production linker API or emitted program. Use only with exact-byte
     /// equality to the observed standard program.
@@ -1315,6 +1375,7 @@ mod tests {
             call_targets: HashMap::from([(CALL_SITE, CALLEE)]),
             abs_code_ptrs: Vec::new(),
             sub32_relocs: Vec::new(),
+            data_relocation_ranges: Vec::new(),
             code_ranges: vec![(TEXT_VADDR, TEXT_VADDR + text.len() as u64)],
             control_flow_targets: HashSet::from([TEXT_VADDR, RETURN_ADDR, CALLEE]),
             entry_vaddr: TEXT_VADDR,

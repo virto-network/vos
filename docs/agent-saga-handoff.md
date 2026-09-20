@@ -12,6 +12,2767 @@ the then-current executable are historical, not additional current blockers.
 The checkpoint is suitable for review/disposable Local testing only; the full
 saga remains unfinished. No merge or push has been performed.
 
+### 2026-09-20: public deferred-generation recovery entrypoint
+
+Added recover_deferred_shared_generations on the system owner for the native
+controller. It bounds and validates the complete archived locator set against
+the host's deferred IDs, rejects duplicate/extra/missing records and mismatched
+recovery targets before replay, independently reproduces each archived candidate
+and authenticates its committee/publication, then completes reopening with the
+opaque proof set. A non-staged/already-completed host is refused immediately.
+Callers retain the six-store recovery owners and archive leases; the method
+does not manufacture finality from supplied records or caller-selected replicas.
+
+The root-only bootstrap test now uses this public entrypoint for its empty
+ordinary set and verifies repeated completion refusal. Native clean_startup and
+running controller still need discovery, archive loading and lifetime ownership
+wiring. A positive root-plus-ordinary reopen/process restart test remains open.
+
+### 2026-09-20: bootstrap admission selects root-first host opening
+
+NativeAuthorityOperationStartupAdmission now offers an explicit
+with_deferred_shared_genesis mode, defaulting off. Bootstrap selects the staged
+host path only in that mode, acquiring the original outer lease and using its
+independent root pins and system Agent identity. Existing admission preparation,
+pending-work reattachment and system route recovery remain in place; ordinary
+generations are deferred for the controller's replay-proof completion. Native
+clean_startup does not select this mode yet, so it cannot silently announce
+readiness without completing ordinary recovery.
+
+The new root-owner test drops/reopens the actual physical system owner from
+retained bootstrap stores (no fresh-plan fallback), preserves target/journal
+identity and completes the empty ordinary phase exactly once: 1/0 in 3.01s
+(deferred-bootstrap-owner.log under shared target/task-tmp/
+committee-query-package.6w5tI7). This is actual root-generation reopening in one
+process, not a root-plus-ordinary/process-restart proof. Full native controller
+and startup integration, broader gates and reproducible release remain open.
+The existing eager Shared coordinator selection also passes 3/0 in 43.89s
+(deferred-bootstrap-eager-regression.log), including source publication/ACK/
+recovery and finality attestation. git diff --check passes.
+
+### 2026-09-20: exact proof-set completion of deferred host opening
+
+Added owner-mediated completion of deferred Shared genesis recovery. It accepts
+only opaque replay-produced proofs, bounds the set by host capacity, validates
+Space/system Agent/Authority binding and current system genesis/admission,
+rejects duplicate ordinary locators, and requires exact membership equality
+with the host's deferred generations. The resulting verifier accepts only the
+exact attested provision; missing provisions have no fallback. It then delegates
+physical reopening to the host under the retained outer lease.
+
+Staged completion is now explicitly one-shot. Eagerly opened hosts and already
+completed staged hosts reject this operation, preventing it from replacing an
+existing verifier after startup. Tests cover exact/mismatched/absent provision
+lookup, duplicate/extraneous proof refusal and non-staged completion refusal;
+the host staging test checks repeated completion refusal. Native startup still
+needs to select staged opening and collect fresh proofs before completion.
+Positive root-plus-ordinary process-restart qualification remains open.
+
+Fresh-package coordinator selection passes 3/0 in 40.83s
+(deferred-finality-proof-set.log); final staged-host one-shot test passes 1/0 in
+0.57s (deferred-completion-once.log). Logs are under shared target/task-tmp/
+committee-query-package.6w5tI7. git diff --check passes.
+
+### 2026-09-20: host regression diagnosis and merge convergence wait
+
+The original serial run completed: 22 pass, 1 fail, 1 ignored in 217.71s
+(deferred-host-regressions-serial.log). The full 4095-entry system-attachment
+capacity test passed. Its only failure was merge-pump waiting for a loopback
+listener under network restrictions. Isolated loopback-enabled execution passes
+1/0 in 1.30s (merge-pump-loopback.log); restricted isolation fails at the listen
+wait (merge-pump-isolated.log).
+
+A loopback-enabled serial run excluding the already-running capacity test passed
+21, failed 1, ignored 1 in 30s (deferred-host-loopback-serial.log). That failure
+was later: the event blob was present but target roots were still empty. The
+test incorrectly used blob availability as its convergence barrier even though
+authenticated blob staging precedes merge-head integration. Changed the existing
+10-second predicate to check both exact event bytes and exact source roots under
+one target-host lock; the final root equality assertion remains. This does not
+increase timeouts or relax the convergence requirement. Initial parallel-suite
+provisioning failures remain unexplained; serial success is not a parallel gate.
+Logs are under shared target/task-tmp/committee-query-package.6w5tI7.
+
+After the predicate fix, loopback-enabled serial selection passes 22/0 with one
+compiled-runtime test ignored in 15.00s (deferred-host-loopback-fixed.log). It
+excludes only the capacity test already passed by the original serial run.
+Focused staged opening also passes 1/0 in 0.53s (deferred-host-rebuild.log).
+No test process from this diagnosis remains running. git diff --check passes.
+
+### 2026-09-20: staged root-first host opening
+
+Added an internal open_system_first path using independently supplied root pins
+and system Agent identity. It retains the outer host lease and opens only that
+system generation through root/QC verification; all other discovered generations
+remain deferred and absent from host listings/routes. Completion verifies all
+deferred ordinary provisions through the supplied finality verifier and physical
+recovery before adding any to the live map. Failure leaves them deferred;
+retries rescan file-stage state under the same lease. Deferred generations count
+toward capacity and cannot be overwritten through provision/portable restore.
+The existing public open/reopen paths remain eager and unchanged in semantics.
+
+This is not yet wired to the bootstrap owner or native startup. The new test
+exercises deferral, lease retention, finality refusal and successful completion
+using the existing ordinary fixture and controlled finality; it does not claim
+end-to-end root-plus-ordinary reopening or cryptographic finality qualification.
+
+Focused staging test passes 1/0 in 0.57s (deferred-generation-finality-final.log
+under shared target/task-tmp/committee-query-package.6w5tI7). The broader parallel
+Shared-host selection fails 6 tests, 17 pass, 1 ignored in 3.84s
+(deferred-host-regressions.log): five Unavailable failures and the new test's
+initial provision reports CorruptResidue before exercising deferral. A serial
+rerun is underway (deferred-host-regressions-serial.log); the new test passes
+there, but merge-pump has failed and system-attachment is still running. Do not
+report the broader gate green or attribute these failures without further checks.
+Initial compilation's borrow conflict was corrected by copying bounded deferred
+IDs before mutating the host. git diff --check passes.
+
+### 2026-09-20: owner-produced replay finality attestation
+
+Added an opaque, non-wire-decodable ReplayVerifiedAgentGenesisFinality for one
+exact provision. Only the root-pinned owner constructs it: reproduce the
+authorized candidate and independently authenticated committee, load/validate
+the exact retained publication, require its positive ACK, then independently
+replay the pinned journal/ledger interval and validate the decision through the
+existing physical-dispatch checks. An archive, signature set or saved reply
+cannot construct this capability, and a missing/unacknowledged publication is
+refused rather than dispatched by the attestation phase.
+
+This is a finality building block, not startup completion. Native startup still
+uses UnavailableAgentFinality. SharedAgentHost currently opens all generation
+namespaces before returning the system owner; ordinary generations need their
+verifier during that open. Integration must establish trusted root-system replay
+before ordinary reopening, retain leases, and obtain fresh attestations on
+restart without a circular callback/host lock. Do not replace the unavailable
+verifier with archive-only validation.
+
+Fresh-package source selection passes 3/0 initially in 40.60s
+(publication-finality-attestation.log) and 3/0 in 41.21s with cross-provision
+refusal (publication-finality-attestation-final.log), under shared target/task-tmp/
+committee-query-package.6w5tI7. The tests refuse attestation before publication,
+accept the exact provision after independent replay without journal growth, and
+reject a structurally valid alternate-epoch provision. These remain source
+fixture tests, not compiled full-system or process-restart qualification.
+git diff --check passes.
+
+### 2026-09-20: first-dispatch archive gate and startup integration audit
+
+Added a failure case before the first publication dispatch: archive insertion
+returns unavailable, the coordinator invalidates admission, neither archive nor
+reply is written, and the journal remains at the post-query index with no
+publication ACK. Publication work is already reserved in this fixture; the
+assertion covers first execution ordering, not a whole fresh process.
+
+Inspected clean_startup: Local lifecycle discovery precedes operation/admin
+admission; Shared genesis admission must be included in that combined admission
+before opening the system owner, with all leases transferred into the running
+controller afterward. Ordinary-agent finality is still UnavailableAgentFinality.
+The AgentGenesisFinalityVerifier contract requires independently authenticated
+live system-Agent history and rechecking reopened generations. Archive integrity,
+quorum signatures and retained ACK alone must not replace that boundary.
+Startup wiring is not claimed complete, and the fail-closed verifier is unchanged.
+
+Fresh-package source selection passes 3/0 in 36.17s
+(publication-first-dispatch-archive-gate.log under shared target/task-tmp/
+committee-query-package.6w5tI7). git diff --check passes.
+
+### 2026-09-20: recovery-to-publication coordinator composition
+
+Added publish_recovered_shared_genesis: it reproduces the replay-authorized
+candidate, authenticates the installed Authority committee, selects and durably
+retains the exact archive against collected signatures, then executes publication,
+retains the decision and ACKs. It reloads exact work and restores all three
+reservations to admission only after success. Any failed phase invalidates the
+old admission snapshot; reopening retains all six store handles. The caller
+must keep the archive's exclusive lease, and signatures are validated against
+the authenticated committee, not trusted because the caller supplied them.
+The returned archive is not finality and no lifecycle reservation is released.
+
+Native controller/startup callsites, signature collection/selection policy,
+independent finality, process restart qualification and release gates remain
+open. This composes existing safety boundaries; it does not expose a new public
+CLI/API or claim production readiness.
+
+Fresh-package source selection passes 3/0 in 35.75s
+(publication-coordinator-composition.log under shared target/task-tmp/
+committee-query-package.6w5tI7). Tests cover archive write refusal without new
+journal entries, invalidated admission, reopening all six stores, successful
+composition, immutable archive retry with no new signatures and restored
+three-reservation admission. The refusal is tested with publication execution
+already pending from lower-level retention-failure tests; it is not a cold-start
+proof that first dispatch never precedes archiving. git diff --check passes.
+
+### 2026-09-20: six-store leased genesis recovery
+
+Native recovery now owns the publication reply as its sixth store. Opening and
+refreshing admission validate/resync reply bytes against exact publication work,
+refuse orphan replies, and retain all three pending reservations. A failed
+refresh keeps admission invalid. into_stores transfers all six handles. Native
+discovery now passes the reply's shared lease into typed recovery instead of
+unconditionally rejecting that phase. Local integrity still does not authenticate
+publication or prove finality: execution/replay remains the owner's boundary.
+
+Tests exercise post-ACK open/resume, retained three-work admission, orphan reply
+refusal, corrupt-reply refusal on open, and invalidation after corruption during
+refresh. The full native controller/startup wiring, process restart proof,
+independent finality and release gates remain unfinished.
+
+Fresh-package source selection passes 3/0 in 28.68s
+(publication-reply-leased-recovery-final.log under shared target/task-tmp/
+committee-query-package.6w5tI7). Initial compilation caught an owner generic-name
+collision; corrected before this passing run. git diff --check passes.
+Native store regression selection passes 62/0 in 0.43s, with the existing
+ignored test and HTTP retry exclusion unchanged (native-six-store-recovery.log).
+
+### 2026-09-20: native publication reply storage and recovery codec
+
+Added immutable role 44, ordinary-agent.genesis-publication-reply, under the
+shared query/reply/publication lease. The GPR1 bound is 68 bytes plus the maximum
+canonical genesis decision and is enforced by both retention and file storage.
+Tests cover replacement/oversize refusal, exact retries, reopening, lease held
+by the last reply handle, interrupted first staging and conflicting successor
+staging. Native store selection passes 62/0 in 0.53s, with one existing ignored
+test and the HTTP retry exclusion unchanged (native-publication-reply-store.log
+under shared target/task-tmp/committee-query-package.6w5tI7).
+
+Added a bounded reply loader checking GPR1, exact work/authorization commitments,
+canonical decision and equality with the provision in retained work, followed
+by exact resync/readback. This returns data, not execution authority. Native
+typed recovery still needs the sixth handle and loader integration; discovery
+explicitly refuses a retained publication reply until then, rather than silently
+omitting it. The full publication controller, finality and release gates remain
+unfinished.
+
+Fresh-package source selection passes 3/0 in 25.37s (publication-reply-load.log),
+including exact decision decoding, mismatched work refusal, resync failures
+before/after write and corrupt trailing bytes. git diff --check passes.
+
+### 2026-09-20: publication ACK and authenticated replay
+
+Publication execution now acknowledges only after exact decision retention.
+The network ACK entrypoint accepts an owner-constructed opaque proof; the owner
+checks all ACK identity fields plus work/authorization commitments and retained
+positive acknowledgment. Already acknowledged invocations replay the pinned
+Invoke/ACK interval instead of dispatching consumed work. Pending-capacity
+recovery classifies canonical publication decisions against the exact provision
+blob in freshly replayed work; stored reply bytes alone grant no authority.
+No finality or lifecycle reservation release is inferred from ACK.
+
+Fresh-package source selection passes 3/0 in 25.91s
+(publication-ack-recovery.log under shared target/task-tmp/
+committee-query-package.6w5tI7). Tests prove no ACK after either retention failure,
+successful ACK after retention, retry without added journal entries, three-work
+reattachment after ACK, reconstruction of missing reply bytes from history and
+refusal of conflicting/corrupt saved bytes. This is still a same-host fixture,
+not process-restart qualification. git diff --check passes.
+
+Native reply-file storage/lease ownership and recovery validation still need
+integration, followed by independently authenticated finality, native startup
+wiring and process-restart/end-to-end/release qualification.
+
+### 2026-09-20: publication execution and retained decision
+
+The coordinator now executes the exact reserved publication using persisted
+management dispatch and validates the returned invocation identity, completion
+status and canonical decision against the selected archive. GPR1 retention
+binds exact work and authorization commitments to that decision, refuses a
+different existing image, and requires commit/readback before returning.
+The method deliberately does not ACK yet: publication ACK capability, post-ACK
+recovery classification, native reply storage/lease ownership and recovery
+validation remain next. Retained decision bytes are not independent finality.
+
+The fresh-package source selection passes 3/0 in 19.79s
+(publication-execution-final.log under shared target/task-tmp/
+committee-query-package.6w5tI7). It executes the source Authority actor through
+the existing coordinator fixture, injects reply-store failures before and after
+write, verifies no ACK in either case, then retains and retries the exact
+decision without new journal entries. This is not compiled full-system/live
+deployment qualification. Initial compilation caught a generic parameter name
+collision with the owner; renamed before the passing run. git diff --check
+passes. The full saga and production release gates remain unfinished.
+
+### 2026-09-20: leased publication reservation in native recovery
+
+NativeSharedGenesisRecovery now owns the publication store as its fifth store
+and validates/includes the optional third pending reservation on open. It
+refuses publication without a query or without authorization, and validates
+publication via the reservation-only loader. Admission borrows the full owner;
+into_stores transfers all five handles. Native discovery now hands the shared
+publication lease into this owner instead of rejecting every publication phase.
+Resume replays authorization/query as before and reloads/preserves publication
+when refreshing admission, rather than reducing the snapshot to two works.
+
+The fresh-package source selection passes 3/0 in 18.22s
+(publication-leased-recovery.log under shared target/task-tmp/
+committee-query-package.6w5tI7). Tests open the three-reservation recovery owner,
+borrow startup admission, detach/reattach, reproduce candidate and committee,
+and confirm refreshed admission still contains exact publication work with no
+new journal entries. Missing-query and corrupt-publication recovery are refused.
+This is same-host recovery, not a completed process-restart/native startup test.
+The factory is still not wired into clean_startup, and publication execution,
+reply/ACK, independent finality and release gates remain open.
+Native store regression selection passes 62/0 in 0.44s, with the existing
+ignored test and HTTP retry exclusion unchanged
+(native-publication-recovery-suite.log). git diff --check passes.
+
+### 2026-09-20: publication reservation recovery validation
+
+GPW1 now has a bounded recovery loader which accepts reservation data only,
+not execution authority or finality. It verifies the preceding query's exact
+domain-derived ID and installed Authority route, publication's candidate claim
+and authorization-derived invocation, provision bytes, journal lineage and
+ordering, preflight, and unchanged base artifacts/origin/work fields. It resyncs
+and reloads exact bytes before returning. Candidate reproduction and independent
+committee authentication remain required before publication execution.
+
+Initial source selection passes 3/0 in 16.27s (publication-recovery-load.log under
+shared target/task-tmp/committee-query-package.6w5tI7), including mismatched
+query invocation and runtime-lineage refusal. Native typed recovery still needs
+to own the publication handle and retain its third reservation when refreshing
+admission; the scanner's explicit refusal remains until that is implemented.
+The extended selection passes 3/0 in 17.31s
+(publication-recovery-reattach.log): failed durability resync returns no recovered
+work, and detaching/reattaching all three reservations allows exact publication
+preparation without adding journal entries. This retains the same host and is
+not a process-restart/native-controller test. git diff --check passes.
+
+### 2026-09-20: native publication file and shared lease
+
+Added role 43, ordinary-agent.genesis-publication, under the existing dedicated
+committee directory. Publication shares the query/reply lease, has its own GPW1
+size bound used by both codec and file backend, and uses immutable commits and
+stage reconciliation. Tests cover exact retries, replacement/oversize refusal,
+lease retention after both query/reply handles drop, reopening, interrupted
+first publication staging and conflicting successor staging.
+
+Native store selection initially passes 62/0 with one existing ignored test
+and the HTTP retry test explicitly skipped (native-publication-store.log under
+shared target/task-tmp/committee-query-package.6w5tI7). Until typed recovery
+owns and validates the third reservation, discovery explicitly refuses any
+publication record; it cannot return an incomplete two-work snapshot. This is
+an intermediate fail-closed boundary, not completed publication recovery.
+The final selection, including an explicit discovery refusal test for retained
+publication data, passes 62/0 with the same exclusions
+(native-publication-store-final.log). git diff --check passes.
+
+### 2026-09-20: retained publication preparation and failure boundaries
+
+Publication preparation now retains the complete GPW1 work and journal anchor
+as a successor to the exact committee query. Retries preserve the original
+preflight and observed slot, validate the candidate/committee/archive binding,
+and check the installed physical artifacts before returning reserved work.
+This does not execute publication or prove finality.
+
+The fresh-Authority-package source test selection passes 3/0 in 16.10s
+(publication-retention.log). Added storage failure tests cover failures before
+write and after write, refusal while durability confirmation keeps failing,
+exact-byte recovery after reopening, immutable conflicts, and corrupt trailing
+bytes without modifying the corrupt image. The selection passes 3/0 in 16.03s
+(publication-retention-failures.log). Both logs are under shared target/task-tmp/
+committee-query-package.6w5tI7. These are in-memory store failure tests, not
+native-file/process-crash tests. git diff --check passes.
+
+Next: add publication storage and its third pending reservation to leased native
+recovery before wiring execution. The current recovery snapshot only contains
+authorization and committee query; it must not be used to recover a publication
+phase. Publication dispatch/reply/ACK, independently authenticated finality,
+native startup/controller wiring and release gates remain open.
+
+### 2026-09-20: publication provision availability validation
+
+Physical dispatch validation now has a narrow provision-blob path for
+publish_genesis on the exact Authority issuer actor/deployment/program/producer
+selected by the descriptor. It requires one extra blob and still compares every
+installed program/schema/policy/configuration byte. The extra provision must be
+bounded, hash-valid and canonically decodable, match the work's Space/system
+Agent, derive the exact invocation from the authorization ID, and reproduce the
+complete canonical compact message. Missing provision or base artifacts,
+unrelated extras, changed preimages and substituted invocation IDs are refused.
+This validates transport data only; actor policy must still verify pending
+authorization and QC. No receipt, finality or policy validation was removed.
+
+Initial source selection passes3/0 in16.48s (publication-availability.log under
+shared target/task-tmp/committee-query-package.6w5tI7). Final run includes the
+narrow Authority-route and missing-artifact checks and passes3/0 in15.52s
+(publication-availability-final.log). The existing physical policy/attestation/
+availability regression passes1/0 (physical-dispatch-regression.log).
+git diff --check passes.
+Publication work/anchor persistence, actual live publication, finality and the
+native controller remain open.
+
+### 2026-09-20: exact compact genesis publication input
+
+The genesis issuance module now builds the exact publication invocation,
+dynamic publish_genesis message and content-addressed provision blob from the
+selected record. It checks the proposal/roster/claim/catalog against the opaque
+authorized candidate, verifies the QC against the independently authenticated
+committee, and enforces both clean-provision and caller-availability bounds.
+The message carries only authorization ID, provision hash and length; no inline
+fallback or ambient blob lookup is added.
+
+The source test derives this input after ambiguous archive selection, checks
+exact invocation and canonical blob/message fields, and refuses substituted
+system-genesis lineage. The focused coordinator test passes1/0 in3.36s
+(genesis-publication-input-final.log under shared target/task-tmp/
+committee-query-package.6w5tI7); git diff --check passes. This is data
+preparation only: persisted publication work/anchor and authenticated dispatch
+remain open. In particular physical_material_authorizes_work currently requires
+exact installed-artifact availability, so publication's additional provision
+blob needs an explicit validated route, not a bypass of that check.
+
+### 2026-09-20: immutable quorum selection before publication
+
+Genesis issuance now selects and retains one archive record. A previously
+stored selection is checked against the replay-authorized candidate's exact
+proposal, roster, claim and catalog, and its QC is verified against independently
+authenticated committee data. A later different valid signer subset cannot
+replace that selection. With no retained record, quorum assembly/verification
+precedes immutable publication and read-back. This is storage publication only,
+not a live Authority decision or finality.
+
+The archive provider now exposes structurally validated record reads and
+recommits exact publish retries through insert_if_absent before read-back. This
+completes durability after an ambiguous previous write rather than treating mere
+visibility as success. The coordinator source test injects failures before and
+after the first archive insertion, then changes the quorum subset and verifies
+that an existing selection and bytes remain unchanged. Focused test evidence:
+genesis-archive-selection.log under shared target/task-tmp/
+committee-query-package.6w5tI7 (1 pass in2.91s). The initial archive regression
+selection had12 passes/1 failure because an old assertion forbade a second
+storage call on exact retry. It now requires that durability call and checks
+unchanged bytes plus no insertion on conflict. Final archive selection passes
+13/0 in1.16s (genesis-archive-regressions-final.log); git diff --check passes.
+Live publication, finality, and the native controller remain open.
+
+### 2026-09-20: endorse against the authenticated committee
+
+The owner now composes recovered preparation with durable genesis issuance.
+Its endorsement entry point obtains the committee through the installed
+Authority's authenticated query/replay path; it does not accept an Authority
+committee from the caller. The caller supplies a scoped signature store and
+signer, while the existing issuance protocol checks exact voter membership,
+pledges the complete claim/committee message, verifies the signature and retains
+it before returning. It returns one endorsement, not publication or finality.
+
+The source coordinator test rejects a foreign signer without invoking it or
+writing a pledge, issues with the configured credential key, retries from the
+retained signature, and checks exact candidate/committee/signature, one signing
+call and no new system journal entry. It also assembles the one-voter fixture's
+QC into archive data. The native_shared_ selection passes3/0 in15.58s
+(authenticated-genesis-endorsement.log under shared target/task-tmp/
+committee-query-package.6w5tI7); git diff --check passes. Native signer
+and signature-file controller ownership, multisigner collection, durable archive
+selection/publication and independently verified finality remain open.
+
+### 2026-09-20: resume preparation through the owning recovery entry
+
+The owner now resumes Shared pre-signing preparation directly through
+NativeSharedGenesisRecovery: it uses the retained admitted runtime, intent,
+issuer and committee query/reply stores without opening another lease set.
+It replays authorization, reproduces the candidate, obtains the authenticated
+committee through query/ACK recovery, and refreshes the exact pending admission.
+The independently supplied replica committee still must match the signed
+descriptor. No QC signature, publication, finality or generation is produced.
+
+Admission is invalidated before any potentially persistent phase extension.
+On failure the old snapshot cannot be contributed to bootstrap; callers must
+reopen the still-leased stores. On success it contains both retained work items.
+Initial focused selection passes3/0 in11.23s (shared-recovery-resume.log under
+shared target/task-tmp/committee-query-package.6w5tI7). The source test resumes
+after reattachment/ACK and checks exact candidate/committee, one total receipt
+signature and no new journal entry. Final selection including corrupt-reply
+failure and stale-admission refusal passes3/0 in12.35s
+(shared-recovery-resume-final.log); git diff --check passes.
+The method remains internal: full signing/publication/controller ownership and
+the native clean_startup call site are not yet integrated.
+
+### 2026-09-20: compose native discovery with leased Shared recovery
+
+The committee-store factory now discovers both the dedicated Shared lifecycle
+directory and committee directory before opening records. It rejects committee
+locators without a matching lifecycle, opens existing intent/issuer leases,
+opens the matching committee pair, and constructs NativeSharedGenesisRecovery
+for each entry against the independently selected valid Authority. A crash before
+query preparation may leave no committee directory; only that known lifecycle's
+empty pair is created. The returned collection owns all four leases per entry.
+The existing LocalLifecycleStoreFactory is reused only as a physical backend;
+Shared recovery, not Local policy, validates the signed intent and runtime.
+
+The focused native test passes1/0 in0.04s (native-recovery-discovery.log under
+shared target/task-tmp/committee-query-package.6w5tI7), covering empty discovery,
+orphan query refusal, invalid intent refusal, lease release on failure and data
+preservation. This is negative composition coverage, not a positive native-file
+end-to-end test. Selected store suite passes61/0 (1 ignored) in0.42s with the
+HTTP loopback case excluded (native-recovery-discovery-suite.log).
+git diff --check passes. The clean_startup
+call site and owning Shared controller remain open; dropping this collection
+after attachment would be incorrect, so startup is not prematurely enabled.
+
+### 2026-09-20: Shared recovery retains the issuance store
+
+NativeSharedGenesisRecovery now owns the issuer lease as well as intent/query/
+reply stores. It opens the issuer against the exact descriptor authority, space
+and agent, verifies any issued receipt against the signed Create, and checks
+eligibility for an unissued initial Create. A committee query requires an issued
+receipt; losing its issuer file cannot silently become a fresh issuer. Orphan
+issuance without authorization and unsupported already-observed application
+phases are refused. into_stores transfers all four leases to the eventual
+controller. None of these structural checks replaces anchored Authority replay.
+
+The focused source test checks that the genuine retained issuance reopens and
+that missing/corrupt issuer state is refused once committee work exists. The
+native_shared_ selection passes3/0 in10.45s (shared-issuer-recovery-final.log
+under shared target/task-tmp/committee-query-package.6w5tI7); git diff --check
+passes. Native scanner/controller composition is
+still open; this closes the recovery ownership boundary, not Shared deployment.
+
+### 2026-09-20: retain the Shared runtime before authorization
+
+Shared proposal preparation now verifies the signed Create, retains the exact
+admitted descriptor-bound runtime package, and reloads it before dispatching
+Authority authorization. Previously it depended on the caller supplying that
+package again. The leased Shared recovery type now re-admits the stored package,
+checks its complete descriptor binding and exposes it to the eventual controller.
+A persisted authorization without its runtime is refused; pristine signed intent
+may still await package retention. Corrupt packages are never accepted as recovery
+inputs. This is a clean-break requirement, not a fallback to a bundled runtime.
+
+Initial native_shared_ selection passes3/0 in9.71s (shared-runtime-retention.log
+under shared target/task-tmp/committee-query-package.6w5tI7). Final coverage also
+checks exact retained bytes and missing/corrupt package refusal.
+Final selection passes3/0 in10.17s (shared-runtime-retention-final.log).
+Native runtime-file load now exact-recommits visible bytes to finish a possibly
+ambiguous prior publication's durability barrier before recovery uses them.
+This also protects callers whose retention helper sees an existing package and
+does not write it again. Native store regressions pass60/0 (1 ignored) in0.43s,
+with the HTTP loopback case excluded (runtime-resync-store-suite.log).
+git diff --check passes.
+Native startup
+controller composition, leased issuer state and replica selection still need
+integration; retaining the runtime does not make ordinary Shared Create complete.
+
+### 2026-09-20: leased Shared-genesis recovery and bootstrap admission
+
+NativeSharedGenesisRecovery now owns the intent/query/reply stores, validates
+the signed Shared Create against the independently selected Authority and exact
+locator, and assembles the retained authorization/query reservation. It rejects
+orphan reply/query images, different locators and unsupported finalized/retired
+phases. Existing replies are checked for canonical exact-query binding, never
+treated as approval, execution or finality. Pristine signed Creates produce no
+pending journal work until authorization has been retained.
+
+NativeAuthorityOperationStartupAdmission can be created from or extended with
+this recovery type. Its lifetime borrows the owning recovery stores, and it
+checks Authority scope, aggregate pending bounds and duplicate invocations
+against pending/retiring work. Existing bootstrap therefore has a typed route
+to attach the full reservation alongside other management work. The coordinator
+test now constructs this admission and reattaches its data before reproducing
+the candidate; a foreign locator is refused.
+
+Host-feature compilation passes (shared-recovery-check.log under shared
+target/task-tmp/committee-query-package.6w5tI7). Focused native_shared_ selection
+passes3/0 in10.08s (shared-recovery-admission.log); git diff --check passes.
+Native clean_startup still does not discover and construct the
+Shared recovery collection: intent/issuer/runtime ownership and the complete
+Shared lifecycle controller must be composed there. This is not daemon restart
+or full lifecycle qualification; signed request validation is not execution
+authority. No merge or push was performed.
+
+### 2026-09-20: bounded native committee-store discovery
+
+CleanAgentGenesisCommitteeStoreFactory pins a dedicated private parent and
+space. It scans through the opened directory descriptor, checks parent identity
+before/after, accepts only canonical same-space locator directory names, refuses
+zero agents/non-directories/symlinks/residue, sorts the bounded result and checks
+duplicates. Discovery does not open/reconcile images or acquire their leases.
+open_existing checks scope and parent identity and opens the joint query/reply
+lease without creating a missing locator directory.
+
+Focused discovery and pair tests pass4/0 (native-committee-discovery.log under
+shared target/task-tmp/committee-query-package.6w5tI7). They cover scanning while
+leases are held, deterministic ordering/bounds, noncreating open, competing-writer
+refusal, wrong-space records and symlink rejection. The existing backend tests
+still cover immutable data and staged publication. This factory is not yet
+called by clean_startup: a Shared recovery/controller must own its leased set
+and validate the linked Create/runtime/issuer data before constructing startup
+admission. No unsigned filesystem data is promoted to authority by discovery.
+Selected store regressions pass60/0 (1 ignored) in0.43s, excluding the HTTP
+loopback case (native-discovery-store-suite.log). git diff --check passes.
+
+### 2026-09-20: recover the complete Create/query reservation
+
+Added a recovery-only query loader that does not require an already reproduced
+opaque candidate. It bounds and decodes GCW1, checks the retained Create
+invocation/route, system anchor lineage, query identity domain, exact public
+preflight and Query method. It returns reservation data only: callers must keep
+the store lease, reattach against independently opened journal history, then
+reproduce the authorized candidate and run normal candidate-bound validation
+before execution. This avoids requiring candidate production before the pending
+reservation can be restored. It does not confer committee trust or finality.
+
+The source coordinator test now detaches and reattaches the full Create/query
+pending set both before query execution and after ACK. It reproduces the exact
+candidate after each attachment and recovers the exact committee after ACK.
+Initial reattachment test passes1/0 in9.22s (query-reattach.log under shared
+target/task-tmp/committee-query-package.6w5tI7). The final recovery-loader test
+also refuses a different runtime anchor or predecessor invocation; final selection
+passes3/0 in9.89s (query-recovery-load-final.log in the same directory).
+git diff --check passes. These tests retain the host and use memory protocol stores;
+they are not process restart or native-file controller qualification. Native
+directory discovery, leased startup-admission assembly and Shared controller
+composition remain open.
+
+### 2026-09-20: native committee-query and reply files
+
+CleanAgentGenesisCommitteeFile::open_pair now opens bounded immutable query and
+reply slots in a locator-derived directory under one shared exclusive lease.
+Dropping only one handle does not permit another writer. CSF1 roles41/42 have
+distinct filenames and domains, fixed entry allowlisting, existing atomic
+staging/reconciliation and exact-recommit durability. Both roles reject changed
+payloads and staged replacement of an existing image. The provider/coordinator
+still authenticates record contents; filesystem integrity is not committee trust.
+
+GCW1/GCR1 maximum image sizes are now shared public constants so native readers
+and protocol decoders use the same bounds. Focused lease/immutability/oversize/
+reopen/staged-publication tests pass2/0 in0.01s (native-committee-stores.log under
+shared target/task-tmp/committee-query-package.6w5tI7). The selected clean-store
+suite passes58/0 (1 ignored) in0.44s with the HTTP loopback case excluded; see
+native-committee-store-suite.log.
+git diff --check passes. No files were written to /tmp. These are physical
+backend tests with opaque payloads, not coordinator+native-file crash tests.
+The pair is not yet opened by a native Shared startup controller; complete
+pending-set reattachment, composition with signing/publication and reservation
+release remain open.
+
+### 2026-09-20: committee-query ACK and replay-authenticated retry
+
+The owner now acknowledges the query only after retaining its validated reply.
+An opaque owner-created capability gates the network ACK path; exact ACK
+identity, work/authorization commitments and positive retained outcome are
+checked before success. Query mode is permitted for pending-result ACK, not
+generic lifecycle retirement. Pending-capacity recovery recognizes a canonical
+committee-query result from replayed history without treating it as finality or
+proof that a reply file was durable.
+
+Post-ACK query retry independently replays the pinned journal's exact Invoke/ACK
+interval, then revalidates and retains its reply. It does not trust a saved
+committee as authority or redispatch consumed work. The existing historical
+denial-replay helper is reused only for its generic exact interval/replay checks;
+the query caller performs its own committee-result validation.
+
+Initial native_shared_ selection passes3/0 in6.17s (query-ack.log under shared
+target/task-tmp/committee-query-package.6w5tI7). Final recovery checks also cover
+pending-capacity reconstruction, missing-reply reconstruction from history and
+refusal to overwrite a corrupt reply image; final selection passes3/0 in7.66s
+(query-ack-recovery.log in the same directory). git diff --check passes.
+The existing admin retained-dispatch recovery regression also passes1/0 in14.71s
+(admin-recovery-regression.log), exercising the shared pending-result path.
+This is source-runtime/memory-store coverage, not daemon restart or compiled
+end-to-end qualification. Native query/reply backends, startup reattachment of
+the full pending set, final publication/finality and reservation release remain
+open. Earlier sections describe the then-current pre-ACK stages.
+
+### 2026-09-20: authenticated committee-query dispatch and reply retention
+
+The owner now dispatches the exact retained Query through persisted-management
+admission, authenticating its route, pinned system generation and journal
+anchor. The network and journal dispatch guards accept Query as well as Linear;
+all preflight, reservation, material and anchored-history checks remain. The
+result is validated and durably retained before return. A pre-existing reply
+file is never used as an independent trust source: retries reauthenticate the
+retained journal result. No ACK is issued yet, so post-ACK recovery and
+retirement integration remain open.
+
+The fresh-package source-runtime coordinator test checks that the selected
+committee uses the configured credential signing key (not the transport key),
+reply retention succeeds, and retry after clock advance returns the exact
+committee without appending a journal entry. Initial dispatch selection passes
+3/0 in4.52s (committee-query-package.6w5tI7/dispatch-final.log under shared
+target/task-tmp). Final selection including reply-store failures before and
+after write passes3/0 in5.14s (dispatch-retention.log in the same directory).
+The test confirms failed retention leaves no positive ACK, later retention
+recovers the exact result without another journal entry, and clock-advanced
+retry leaves the reply image unchanged. git diff --check passes.
+This remains native source execution with memory stores,
+not compiled end-to-end or native daemon restart qualification.
+
+### 2026-09-20: native committee-query preparation joins the Create reservation
+
+The owner now prepares the exact genesis committee query from authenticated
+physical Authority material, persists it as a successor of the existing Create
+reservation, and checks its reserved material on reload. It does not derive a
+new observation/preflight on retry. Pending-envelope and journal-interval
+validation now accept ordered Query as well as Linear; dispatch and retirement
+guards have not yet been extended. No query execution or finality is claimed.
+
+The frozen bundled Authority lacks this query: its installed policy correctly
+refuses preparation without writing a query image. A separate ignored test uses
+AUTHORITY_CANDIDATE_PACKAGE, re-signs the complete package for the fixture, and
+checks positive preparation and exact memory-store reopen after clock advance.
+The candidate package was generated from the existing fresh Authority ELF
+6828d1bbf54dc05e87aebbf72e6900d2f031ccf60b9c364029f9088dc4eae0a0
+using the existing debug vosx actor build, with isolated task-local XDG config.
+Its PVM ProgramId is
+5040d84f292247e56b32b732d0b7ea17f7e83c879b5c98e98a0aa73cfc575625.
+This is a test input, not a reproduced or repinned release package.
+
+Evidence: shared target/task-tmp/committee-query-package.6w5tI7/package/
+SystemAuthority.vos and preparation-final.log. The native_shared_ selection
+including the candidate-package test passes3/0 in3.81s. This harness executes
+Authority source, not the candidate PVM, and retains a shape-only destination
+runtime. Full compiled lifecycle, native file storage, startup reconstruction
+of the extended reservation, authenticated query dispatch, reply-before-ACK and
+retirement remain open. Earlier preparation/diagnostic logs record the stale
+policy and Linear-only reservation failures that led to these changes.
+
+Broader native_management_ selection:1 pass/2 failures in3.12s. Both failures
+return Unavailable at Local Create using the bundled outer runtime, after
+authorization succeeds (management-regressions.log). A control run restoring
+the two original Linear-only guards reproduces the same failures at the same
+call in3.04s (management-linear-only-control.log); this isolates them from the
+Query reservation widening, not a complete root-cause diagnosis. The Query
+guards were restored afterward. Do not report this selection as passing.
+
+### 2026-09-20: retained complete committee query work
+
+RetainedCommitteeQuery now serializes the complete RuntimeWork and journal
+anchor in bounded GCW1 data, bound to the replay-authorized genesis claim and
+approval invocation. Its query invocation has a dedicated domain and cannot
+reuse the authorization invocation identity. Pledge and reload check the exact
+system genesis/admission, candidate, target route, Query method, direct empty
+input state, canonical work encoding and matching preflight observation.
+Recovery requires a fresh opaque candidate and independently selected target;
+the anchor still must be reauthenticated against the live system journal.
+
+Exact pledge/reload completes the durability barrier after ambiguous writes.
+Tests cover failures before/after persistence, reopen of complete work, refusal
+to overwrite it with a refreshed preflight, a different candidate's refusal and
+trailing-byte corruption. These checks extend the existing source coordinator
+test and use memory-store failure injection. Native query file storage, fresh
+physical-material preparation, authenticated dispatch, reply-before-ACK and
+retirement integration are still open. The record itself is not query execution
+or finality evidence.
+The final retained-work coordinator test passed1/0 in2.97s, recorded in
+ordinary-archive-integration.v21i1n/committee-work-retention-final.log.
+
+### 2026-09-20: committee reply retention before ACK
+
+The genesis issuance module now has retain_committee_reply/load_committee_reply
+for the reply-before-ack persistence boundary. They check the independently
+selected Authority target, exact Query method, work/preflight binding, reply
+invocation/actor/incarnation/deployment/mode/status, bounded canonical committee
+bytes and matching space/authority binding. GCR1 stores work and authorization
+commitments with the exact committee. Ambiguous writes reload/recommit; different
+query/authorization bytes cannot replace a retained result. Read-back makes
+exact result data available after ACK without redispatching a consumed query.
+
+This stores reply data only, not a trust proof. The coordinator must still
+persist the complete query work/anchor, authenticate dispatch against the pinned
+system generation, retain this result before ACK, then recover and retire the
+query. That live integration and a dedicated native reply backend remain open.
+Tests use a synthetic reply only to exercise persistence validation, never as
+production committee authority: pre/post-write failure and reopen, exact retry,
+wrong-actor refusal, changed-preflight conflict and trailing-byte corruption.
+The extended coordinator source test passes1/0 in2.84s
+(ordinary-archive-integration.v21i1n/committee-reply-retention-final.log under
+shared target/task-tmp); git diff --check passes. No live query lifecycle or
+file-backed reply recovery qualification is claimed.
+
+### 2026-09-20: publication fixture uses the actual enrolled owner
+
+Removed the signed-publication fixture's workaround that rewrote the bootstrap
+owner and enrollment signature to match the transport principal. It now uses
+the ordinary configured enrolled owner and asserts that it differs from the
+transport principal. The real Authority authorizes that Shared Create and
+publishes/reopens/retries its signed provision in the fixture exercise. Export
+passes1/0 in0.59s (distinct-owner-publication.8ouIQ1/export.log under shared
+target/task-tmp). The compiled publication test now explicitly rejects old
+fixtures whose owner and transport principal match, so its coverage cannot
+silently fall back to the former workaround.
+
+The new exported fixture still signs a synthetic post-state and uses a one-byte
+runtime catalog; it is publication evidence, not a deployable runtime package
+or independent finality proof. The compiled run uses the preserved query-capable
+Authority ELF documented below. Host-authenticated committee consumption still
+needs a retained query/ack lifecycle; no direct unjournaled query shortcut was
+added to the coordinator.
+Compiled publication/refusal/expired-retry passes1/0 in1.47s (compiled.log in
+the new fixture directory), matching complete native inline state and emitting
+no certificate-row writes. The native archive/provider integration also passes
+1/0 in0.02s (native-archive.log), including staged recovery and exact provision
+reproduction with the distinct owner. git diff --check passes.
+
+### 2026-09-20: compiled Authority committee-query candidate
+
+Fresh dirty-source Authority ELF built offline/locked with nightly-2026-03-20
+in27.13s under shared target/task-tmp/authority-committee-query.InkXOo/target.
+SHA-256:6828d1bbf54dc05e87aebbf72e6900d2f031ccf60b9c364029f9088dc4eae0a0.
+This is an unsealed candidate, not a reproduced or pinned release package.
+
+compiled_authority_genesis_committee_query_preserves_state links that ELF,
+reads its actual schema, dispatches the generated Query method with persisted
+certificate rows, and compares the canonical reply to a committee independently
+constructed from configuration fields. Two queries must preserve every inline
+lane and emit no row changes. The first host compilation attempted a private
+actor conversion helper; it was replaced by explicit SDK field construction.
+The query is exercised against the existing512-node fixture, separately from
+the still-failing full-capacity valid enrollment gate. It passes1/0 in1.07s
+(compiled-query-final.log). All5 compiled Authority tests pass together on the
+small node fixture in2.00s (compiled-suite-small.log): loader/schema, committee
+query, malformed-entrypoint refusal, signed publication/retry, and node
+enrollment/removal/retry. Logs share the candidate directory above. git diff
+--check passes. Host-authenticated committee consumption remains unimplemented;
+these tests prove guest behavior, not native trust selection or startup finality.
+
+### 2026-09-20: Authority genesis committee query
+
+The installed Authority now exposes genesis_signing_committee as a read-only
+query. Its bytes come from the same initial_committee helper used by genesis
+publication verification, not from caller input or a guessed root/data-plane
+committee. This matters because native configuration uses the bootstrap
+credential key and enrolled node, while a bootstrap root signer may be distinct
+(the existing source fixture deliberately uses a different root key/node).
+
+The query checks configuration validity and returns the canonical exact
+committee; invalid configuration returns no bytes. A native helper test checks
+space/binding/epoch/member, credential key versus transport key, exact repeat and
+unchanged Linear state. Macro-generated handlers are not callable as ordinary
+Rust methods, so the test exercises the query helper, not guest dispatch.
+Host integration still must authenticate the exact installed actor/query and
+system generation before trusting its output. This does not switch startup to
+a caller-supplied committee or establish current committee-history rotation.
+The new method also requires rebuilt actor/package artifacts before deployment.
+Final native Authority suite passes73/0 with2 fixture exporters ignored in31.13s
+(authority-committee-query-suite-final.log under shared
+target/task-tmp/ordinary-archive-integration.v21i1n). The first full run failed
+only the old12-method schema count; the final schema test checks all13 methods,
+including explicit Query mode and public authorization for the new method.
+git diff --check passes. No new compiled query-dispatch evidence yet.
+
+### 2026-09-20: verified quorum assembly into exact archive data
+
+genesis_issuance::assemble accepts only the opaque coordinator candidate,
+independently selected Authority committee and bounded signature replies. It
+canonicalizes reply order without deduplicating, verifies quorum/membership and
+every signature, then constructs evidence, decision, provision and the exact
+catalog-bearing archive record. It does not grant publication or finality.
+The coordinator must retain this selected record before publication and reload
+it on retry: different valid signature subsets must not replace its exact QC.
+
+The positive coordinator test now covers a three-voter committee: two votes
+succeed, response order does not alter the record, and insufficient votes,
+duplicates, forged signatures, foreign signers and wrong-epoch signatures are
+refused. It publishes/reopens the record through the generic archived provider
+and checks exact reproduction. A separate refusing finality verifier still
+blocks promotion of this fully signed provision. This remains source-runtime
+and memory-store integration, not production committee selection, native file
+composition, live Authority publication or independently replay-backed finality.
+The extended test passes1/0 in3.03s (genesis-quorum-archive-final.log under shared
+target/task-tmp/ordinary-archive-integration.v21i1n). The preceding assembly-only
+run passed1/0 in2.88s (genesis-quorum-assembly.log). git diff --check passes.
+
+### 2026-09-20: native leased genesis signature storage
+
+CleanAgentGenesisSignatureFile implements the existing issuer-store contract
+over ExactFileStore with a dedicated role40 and164-byte payload ceiling shared
+with the signing protocol. Its directory is derived from validated space/agent
+and signer identity, with a fixed file/stage whitelist and exclusive lease.
+Pledge-to-signature replacement uses the existing predecessor-bound atomic
+publication/recovery mechanism; exact recommits retain file and directory sync.
+No new filesystem writer or ambient path input was introduced.
+
+Focused tests cover exclusive reopen, independent signer slots, bounded writes,
+signature-image reopen, initial-stage recovery, matching-predecessor replacement
+recovery and refusal of a stale predecessor. Payloads here are opaque fixture
+bytes: signature verification belongs to the issuance layer. The production
+coordinator does not yet compose this backend with issuance/startup, and native
+file-backed signing fault injection remains required.
+The two focused tests pass in0.01s (native-signature-store.log). The selected
+native store suite passes56/0 with1 ignored in0.68s
+(native-signature-store-suite.log), excluding the HTTP loopback retry case.
+Logs are under shared target/task-tmp/ordinary-archive-integration.v21i1n;
+git diff --check passes.
+
+### 2026-09-20: retained per-signer genesis signature
+
+clean_genesis_issuance.rs adds a crate-internal per-candidate/per-signer slot.
+It requires the opaque replay-authorized candidate and an independently selected
+Authority committee; only a voter key in that committee may sign. The fixed100-byte
+GSI1 pledge binds authorization invocation, signer key and full QC signing message
+(committee epoch/commitment and genesis claim). It is durably committed and
+reloaded before the signer callback. The verified signature extends the record
+to164 bytes, committed/reloaded before return. Every attempt reloads and exact
+retained signatures avoid signing again. Existing pledge/signature images are
+recommitted before use to finish durability after a prior ambiguous write.
+
+The coordinator's positive test exercises this slot with an explicit test
+committee: failures before/after pledge and signature commits, store reopen,
+identical-message resubmission only when signature retention failed, exact retry
+without signing, authorization conflict, corrupt retained signature, invalid
+signer output and an untrusted key. A returned signature forms a verifiable QC
+with the test's one-voter committee. The slot itself returns only one signature,
+not a QC, provision or finality; it is not restricted to one-voter committees.
+
+This is generic store/source-runtime evidence. Native leased signature storage,
+production committee-history selection, signer integration, quorum assembly,
+archive/publication and finality wiring remain open. No filesystem crash or
+production release qualification is implied.
+The extended test passes1/0 in2.70s (genesis-signature-crash-final.log under shared
+target/task-tmp/ordinary-archive-integration.v21i1n); git diff --check passes.
+
+### 2026-09-20: opaque coordinator authorization for genesis issuance
+
+The coordinator now returns AuthorizedSharedGenesisProposal, not a raw tuple.
+Its private fields retain the execution-derived proposal/catalog, exact replica
+committee, authorization invocation and AgentGenesisClaim. The claim's system
+agent comes from independent owner pins; its genesis/admission come from the
+retained authorization anchor already reauthenticated by the issuance path.
+There is no public constructor or wire decoder. A future durable genesis signer
+must require this capability and retain its exact claim before signing; decoding
+an archive or a caller-selected proposal cannot mint the capability.
+
+The positive retry test now also checks all lineage selectors, catalog/claim
+consistency and a changed system genesis producing a different signing claim.
+Durable genesis signing itself is still not implemented, nor publication or
+finality. This type is an authorization boundary, not a finality proof.
+The extended source-runtime test passes1/0 in2.75s
+(ordinary-archive-integration.v21i1n/authorized-proposal-lineage.log under shared
+target/task-tmp); git diff --check passes. No compiled end-to-end or crash-signing
+qualification was added by this check.
+
+### 2026-09-20: positive authenticated Shared proposal retry
+
+native_shared_proposal_reuses_durable_authorization_and_receipt passes1/0
+in2.56s (coordinator-positive-retry.log). The test uses the installed real
+Authority source implementation through the native test executor, a retained
+signed ordinary Shared Create, an enrolled logical owner distinct from its
+transport key, and the new coordinator preparation method. After the first
+approval/receipt/proposal, it drops and reopens both intent and issuer over
+retained memory-store images and advances the logical clock. The repeated
+proposal/catalog are identical; signing count stays1, the system journal does
+not advance, both store images are unchanged, and no destination generation
+is provisioned. This verifies coordinator replay and receipt reuse, not merely
+the standalone host proposal builder.
+
+This is source-runtime evidence with durable-image reload semantics, not a
+compiled Authority/runtime end-to-end run, file crash test, full daemon restart,
+genesis QC issuance, live publication or finality qualification. Those remain
+open. The installed-policy refusal regression also passes1/0 in1.74s
+(coordinator-policy-after-owner-fix.log); git diff --check passes.
+Log location: shared target/task-tmp/ordinary-archive-integration.v21i1n.
+
+### 2026-09-20: logical owner and transport identity separation
+
+Inspection for positive coordinator coverage exposed a pre-existing contradiction:
+Authority enrollment assigns replicas to the enrolled owner, while
+AgentReplicaMember required that owner to be the transport key's principal.
+The member now accepts a nonzero logical owner independently of that key.
+Canonical peer/key agreement, peer-derived node identity, roster ordering,
+duplicate transport/slot rejection, exact descriptor roster matching and the
+authority-certified committee commitment remain required. Construction alone
+does not authenticate an owner mapping; Authority approval and finality remain
+separate mandatory boundaries.
+
+The new genesis test roundtrips a distinct-owner committee and proves it changes
+the committee ID and cannot reuse the original signed provision/claim. All15
+genesis tests pass (replica-owner-genesis.log,0.09s). The multi-replica proposal
+fixture now explicitly uses one logical owner distinct from all four transport
+keys, for both native and compiled guest checks. The selected Shared suites
+pass59/0 with2 ignored in4.07s (distinct-owner-shared.log), excluding the capacity
+and loopback-convergence cases. The compiled runtime candidate passes1/0 in2.20s
+(compiled-distinct-owner.log), using the preserved ELF identified below, not a
+new runtime release. no-default-features compilation passes in4.68s
+(distinct-owner-no-default.log); git diff --check passes.
+No live coordinator/restart or full enrollment-to-finality
+qualification is implied. Logs are in ordinary-archive-integration.v21i1n.
+
+### 2026-09-20: authenticated coordinator proposal preparation
+
+CleanSystemAgentBootstrapOwner::prepare_shared_from_management_intent connects
+the retained clean Create to the existing authenticated management-issuance
+path and then host proposal execution. Before issuing, it checks Shared profile,
+space/agent, complete descriptor/committee roster, local membership and admitted
+runtime binding. The existing issuance path still dispatches the installed
+Authority, checks the exact durable reply, and retains the signed receipt.
+Proposal observation is max(persisted authorization observation, receipt
+valid_from), so retry does not sample a new clock. No extra persistence format
+or finality shortcut was introduced.
+
+This is a crate-internal coordinator step, not a completed public Shared-create
+workflow. It has no native startup caller yet. Positive end-to-end Shared
+authorization/restart coverage, genesis QC issuance, immutable archive
+publication, live Authority publication and independently trusted finality
+remain required. cargo check --offline --locked -p vos --features agent-runtime
+passes with nightly-2025-05-09 (coordinator-proposal-check-final.log,11.38s).
+The installed-policy boundary regression passes1/0 in1.66s
+(coordinator-policy-boundary.log). It now also checks that this preparation
+entrypoint rejects a non-Create retained intent without signing, changing the
+issuer/intent images or advancing the system journal. It is negative coverage,
+not the still-missing positive Shared coordinator lifecycle. git diff --check
+passes.
+Logs remain under shared target/task-tmp/ordinary-archive-integration.v21i1n.
+
+### 2026-09-20: multi-replica proposal execution
+
+The clean proposal fixture now supports a sorted roster with independently
+matched signing keys. A new test executes preparation separately on three voters
+and one observer, comparing every complete proposal and catalog to the same
+source-executed Create fixture. Removing the selected node from the proposed
+committee is refused; no host generation is written. The native test passes1/0
+in0.11s (multi-replica-proposal.log). The existing ignored compiled candidate
+test now also runs this four-member case without either native-runtime oracle,
+as well as the original single-member case:1/0 in2.10s
+(compiled-multi-replica-proposal.log). This uses the preserved runtime ELF named
+below, not newly sealed release artifacts. The selected host suite passes20/0
+with1 ignored in3.55s (multi-replica-shared-suite.log); capacity and live loopback
+tests remain excluded from this selection. All logs are under shared
+target/task-tmp/ordinary-archive-integration.v21i1n. git diff --check passes.
+
+This closes the positive multi-replica preparation coverage gap noted below,
+not live multi-node issuance, committee authorization, transport/principal
+separation, startup finality or release qualification.
+
+### 2026-09-20: clean SDK receipt-to-proposal preparation
+
+SharedAgentHost::prepare_clean_genesis_proposal now constructs the exact replay
+input/catalog from an admitted runtime, clean descriptor, signed management
+receipt and retained observed slot, then executes the existing proposal path.
+The shared input builder checks package identity/contract/capabilities, local
+replica membership, clock bounds and the receipt. The system-root wrapper keeps
+its separate single-local-voter restriction. This avoids using root bootstrap
+as an ordinary multi-replica creation path.
+
+The native test checks exact retry across clock advancement, future-slot
+refusal, substituted package/descriptor and forged receipt refusal, no written
+generation, and rejection of the multi-replica descriptor by system bootstrap.
+The compiled candidate test also compares the clean API's complete proposal
+and catalog with the raw replay path and source-derived fixture. Both positive
+paths currently use a single-replica fixture; positive multi-replica execution
+through this new convenience API still needs coverage. Final selected Shared
+host tests pass19/0 with1 ignored in3.44s (clean-host-proposal-suite-final.log).
+The compiled candidate passes1/0 in1.56s (compiled-clean-host-proposal.log), using
+the same preserved ELF documented below, not a rebuilt release. Logs are in
+ordinary-archive-integration.v21i1n under shared target/task-tmp. The first suite
+run failed a test-only assumption that the fixture already had multiple replicas;
+the corrected test constructs the additional replica explicitly. No signing
+coordinator, durable retained
+proposal slot, Authority publication or independent finality is implied.
+
+### 2026-09-20: host proposal boundary and compiled preparation
+
+SharedAgentHost::prepare_genesis_proposal now exposes runtime-derived ordinary
+Shared proposal preparation to native coordinators. It validates the live host
+lease before and after execution, checks committee space and local membership,
+and uses the host's configured trust and merge identity. It writes no generation
+and returns a proposal, not a seal or trusted finality. The issuer must still
+independently authorize the proposed committee. Provisioning still verifies
+finality before writing an intent; no startup verifier was replaced.
+
+The preceding internal preparation test passed against the preserved runtime
+ELF in row-resource-runtime.5B1apX (SHA-256
+b5913b0b2a552f92edfe36dd2ef35db5e50147c03d35c029beee005cdcd66a8a):
+compiled-proposal.log,1 passed in1.37s. It packages the linked guest and uses
+CleanTrust without either native-runtime oracle, comparing the full proposal
+to independently source-executed Create. This is preserved candidate evidence,
+not a fresh build or a release qualification. The test now exercises the host
+API instead; compiled-host-proposal.log passes1/0 in1.37s. The host regression
+checks exact retry, foreign-space refusal, missing-catalog refusal and denied
+finality with no generation written (host-proposal-checked.log,1/0 in0.05s).
+The selected Shared-host suite passes18/0 with1 ignored in3.33s
+(host-proposal-shared-suite.log), excluding the previously exercised4095-entry
+capacity and live loopback-convergence tests. This is not a full Shared-suite
+or release-gate run. git diff --check also passes.
+Logs are under shared target/task-tmp/ordinary-archive-integration.v21i1n.
+
+Coordinator signing, archive/startup composition, live Authority publication
+and independent trusted finality remain unimplemented integration work.
+
+### 2026-09-20: native pre-certification Shared preparation
+
+LocalJournalAgentDriver::prepare_shared_genesis_candidate now executes the
+ordinary Shared Create with the native replay executor before certification.
+It checks the configured merge node, complete selected replica identity,
+validated committee and exact descriptor roster, then runtime execution and
+exact catalog preimages. Its return type is opaque ReplayPreparedGenesis, not
+a journal seal. The existing finalized-provision path reuses this preparation
+and still requires VerifiedAgentGenesisProvision for seal construction.
+
+shared_genesis_candidate_derives_proposal_without_provisioning exercises the
+new path, checks its proposal against the fixture, rejects substituted replica
+principal and missing/corrupt catalog, and confirms the host has no provisioned
+generation. This uses the source-runtime test executor; it is not new physical
+guest or live Shared issuance qualification.
+Final Shared regression selection passes56/0 with1 ignored in5.26s:
+ordinary-archive-integration.v21i1n/native-candidate-shared-final.log. Selection
+excludes the previously exercised4095-entry capacity and loopback convergence
+tests; it is not a new full Shared-suite run. The earlier pre-new-test selection
+passed55/0 with1 ignored (native-candidate-shared.log).
+
+The production coordinator still needs to consume this candidate through an
+authenticated approval, trusted committee signing, durable archive publication,
+live Authority decision publication and independent finality. Startup remains
+fail-closed for ordinary Shared genesis.
+
+### 2026-09-20: replay-derived ordinary genesis proposal
+
+ReplayPreparedGenesis::ordinary_proposal derives the complete ordinary proposal
+from opaque prepared Create output: exact request, runtime identity, post-state
+commitment, sequence and catalog. It accepts no caller-selected expectations.
+Shared seal verification now compares that complete derived proposal with the
+finality-verified provision, retaining the subsequent actual state/artifact and
+committee checks. Shared replay fixtures use the same conversion rather than
+manually assembling expectations. This is proposal construction only: it neither
+signs, publishes, verifies finality nor grants root provenance.
+
+New regression checks the exact request/locator/catalog and recomputes state/
+artifact commitments, canonical roundtrip and repeat construction without another
+execution. Full replay suite passes56/0 in2.51s; no-default-features Authority
+compilation passes19.67s. Evidence: ordinary-archive-integration.v21i1n/
+replayed-proposal-final.log and replayed-proposal-no-default.log. The initial
+replayed-proposal.log records two stale expectations-only method references,
+fixed before the final successful run.
+
+Native signing remains gated on the authenticated runtime approval path:
+issue_management_intent_with_admission checks persisted work/material identity
+and exact completed reply before the crate-private approval-to-issuer boundary.
+The ordinary-genesis coordinator still needs to prepare the runtime proposal,
+bind it to that approval and trusted committee, and drive signing/archive/
+Authority publication/finality; no signer shortcut was introduced.
+
+### 2026-09-20: signed-fixture native archive/provider composition
+
+The Authority publication exporter now writes runtime-catalog and asserts its
+BlobRef equals the proposal's sole catalog reference. The new ignored CLI test
+ordinary_genesis_provider_persists_signed_fixture_and_recovers_stage consumes
+that fixture and composes ArchivedAgentGenesisProvider with the real leased
+CleanAgentGenesisArchiveFile. It covers normal publication and initial staged
+publication, drop/reopen, byte-exact provision reproduction, exact publish/create
+retry, catalog lookup, malformed catalog refusal without record changes, and
+a second reopen. This closes the prior opaque-payload-only integration gap.
+
+Evidence: shared target/task-tmp/ordinary-archive-integration.v21i1n.
+export-final.log:1 signed fixture export passed0.62s; integration.log:1 native
+composition test passed0.02s. export.log records an initial test-only assertion
+inserted in the wrong exporter, corrected before successful fixture creation.
+Use AUTHORITY_PUBLICATION_FIXTURE pointing to this directory's fixture child
+when rerunning the explicitly ignored integration test.
+
+The fixture has real signatures but a synthetic post-state claim and a one-byte
+runtime preimage. It is not runtime-package admission, independent live finality,
+or a production Shared creation test. The archive/provider/backend are composed
+in this test, not yet in native startup or the production issuance coordinator.
+
+### 2026-09-20: leased native ordinary genesis archive backend
+
+CleanAgentGenesisArchiveFile implements AgentGenesisArchiveStore using the
+existing StoreRoot/ExactFileStore machinery. One validated locator derives one
+private directory under an explicitly configured canonical parent; the backend
+retains its exclusive writer lease. New role39 has its own fixed canonical/stage
+names and per-record size bound. Loads refuse another locator and re-establish
+file/directory durability before returning existing bytes. Insert-if-absent
+keeps the first winner under the mutex/lease; provider reload determines exact
+retry versus conflict. Initial staged publication can complete after reopen;
+predecessor-bearing replacement stages are forbidden for this immutable role.
+
+Focused native tests cover lease exclusion, exact bytes after reopen, immutable
+conflicting insertion, wrong-locator rejection, initial-stage recovery,
+replacement-stage refusal and concurrent insertions preserving one winner.
+All3 pass in0.01s (authority-entry-preflight.Z6rTVF/native-genesis-archive.log).
+The complete clean-store suite passes55/0 in the permitted-loopback rerun
+(native-clean-store-loopback.log). The sandboxed run passed54 and failed only
+credential_discovery_reuses_published_query_across_http_retries at listener
+creation with PermissionDenied (native-clean-store-suite.log).
+
+These tests use opaque backend payloads; the separate provider/codec tests
+validate actual provisions. Native coordinator/provider composition with real
+provisions, signing, live Authority publication and finality remain unwired.
+This backend must not be described as enabling ordinary Shared creation yet.
+
+### 2026-09-20: immutable ordinary genesis archive provider
+
+agent/genesis_archive.rs adds AgentGenesisArchiveStore and
+ArchivedAgentGenesisProvider. The store contract requires bounded loads,
+atomic insert-if-absent, durable success, and no overwrites. The provider binds
+one space, validates each loaded record against the requested locator, reloads
+after insertion, distinguishes absence/corruption/conflict, and never caches
+an ambiguous result. publish accepts a structurally valid externally issued
+record; create reproduces only an already stored exact proposal/catalog and
+returns NotConfigured when absent. This is archive access, not native issuance
+or finality, and it is not wired into startup yet.
+
+The generic regression uses a simulated atomic store: durable-then-error
+publication, reconstruction with the same store, exact retry without another
+write, exact catalog lookup, alternate evidence conflict under the same locator,
+wrong-space refusal, substituted-locator and trailing-byte corruption. Current
+genesis suite passes14/0 in0.09s (authority-entry-preflight.Z6rTVF/
+genesis-archive-provider.log). Filesystem crash/durability, racing insertions,
+native signer/coordinator integration and independent finality remain open.
+Next integration step is a leased bounded native per-locator store implementing
+this contract; no in-memory test result proves its disk durability.
+
+### 2026-09-20: ordinary genesis archive persistence unit
+
+AgentGenesisArchiveRecord in agent/genesis.rs adds a bounded canonical OGAR
+record containing one complete ordinary provision and its exact runtime catalog
+preimage. It checks provision/certificate shape and exact catalog count/reference/
+bytes, with complete-record and nested-payload bounds before copying runtime
+bytes. The bound is per locator, not a whole-registry allowance. The type has
+no finality capability and cannot bypass VerifiedAgentGenesisProvision.
+
+The regression covers exact encode/decode, missing/duplicate/substituted catalog,
+wire/provision/reference/payload corruption, oversized declared length,
+truncation/trailing bytes, and independent NotFinalized rejection after decode.
+The initially selected AGAR tag collided with AgentAuthorityReceipt during
+review; final source uses OGAR. Final genesis suite:13 passed,0 failed in0.13s
+(authority-entry-preflight.Z6rTVF/genesis-archive-codec-final.log). Existing
+management issuer suite:12 passed in2.63s (issuer-suite.log).
+
+This is the archive codec, not a production provider. Still required: durable
+per-locator storage under an exclusive owner, atomic exact/conflicting retry
+handling and crash recovery, native signed issuance, publication through the
+live Authority, independent replay-backed finality, and startup/provider wiring.
+CleanSystemAgentGenesisArchive implements only SystemAgentGenesisProvider;
+CleanManagementIssuer issues management receipts, not ordinary genesis.
+UnavailableAgentFinality is unchanged. The prior fresh-target ELF reproduction
+predates this unused archive API addition and is not a new current-source pin.
+
+### 2026-09-20: Authority candidate fresh-target reproduction
+
+Rebuilt current Authority source with nightly-2026-03-20, cargo actor
+--offline --locked, CARGO_BUILD_JOBS=2, and a new independent target directory:
+shared target/task-tmp/authority-reproduce.ukq1cN/target. build.log succeeds
+in30.64s. The resulting target/riscv64em-vos/release/system_authority.elf is
+byte-identical (cmp) to authority-entry-preflight.Z6rTVF's tested candidate;
+SHA25675f2f8fd0783542924cfbe4b04c65dcbaf07cf4f4ae01ff892d139358190949d.
+This is fresh-output reproducibility from the same dirty worktree/toolchain,
+not an immutable-source export, independent-machine build, package provenance
+seal or release repin. The candidate's existing compiled checks apply to the
+identical ELF bytes; remaining capacity/finality/release gates are unchanged.
+
+The Agent release reproduction script now passes --locked to its host-builder
+and runtime-guest Cargo invocations, so lockfile drift cannot be silently
+resolved during those stages. bash -n and git diff --check pass. The entire
+immutable-source release reproduction recipe was not rerun by this check;
+the system-template build subcommand retains its own dependency/build handling.
+
+### 2026-09-20: Shared no-op history reconstruction
+
+The original Shared campaign completed:55 passed,1 failed,1 ignored in252.31s.
+The4095-entry system_attach_checkpoints_and_drains_raw_tail_before_publishing_route
+test passed. The sole failure is the loopback-listener restriction already
+isolated below; its permitted-network rerun passed. Session28810 is terminal.
+
+Source inspection identifies repeated work in SharedJournalAgentDriver::apply_next:
+every leader no-op called committee_history, which performs a full recovery
+audit then scans the retained suffix again to reconstruct committee history.
+The4095-entry fixture therefore repeatedly visits a growing suffix. This is a
+separate source-level performance finding from the Authority certificate scan;
+it is not a measured explanation of all live Create/Install latency.
+
+For leader no-ops only, retain audit_recovery but omit the redundant history
+reconstruction and executor replacement. transition_state rejects a pending
+committee transition and returns unchanged committee state for a no-op.
+Configuration and PrepareCommitteeChange paths still refresh full history.
+No audit, signature validation, work limit or recovery guard is removed.
+The full suffix audit remains potentially quadratic over a sequence of no-ops.
+
+Added leader_noop_still_rejects_missing_earlier_physical_history at the host
+boundary: apply two valid no-ops, remove the first physical Raft row, then append
+and apply the third. The retained recovery audit must reject the missing earlier
+evidence; logical journal position remains unchanged. Initial focused check
+passes1/0 in0.37s (noop-corruption.log); the assertion is tightened to require
+CorruptResidue specifically; that focused check also passes1/0 in0.43s
+(noop-corruption-exact.log).
+This does not assert physical-slot rollback: apply_foundation_slot precedes the
+recovery audit, as it did before the optimization.
+
+Current-source Shared regressions excluding the long capacity test and loopback
+test:54 passed,0 failed,1 ignored in5.03s (shared-noop-regressions.log in the
+same authority-entry-preflight.Z6rTVF evidence directory). The exact capacity
+test now passes against the changed binary (session75079 exit0):1 passed,0 failed
+in219.03s (shared-noop-capacity.log). This is still slow. The prior252.31s result
+was a broader concurrent suite, and compilation overlapped this exact run;
+these are not controlled before/after timings or a production speedup claim.
+
+### 2026-09-20: broader replay and Shared verification
+
+Current-source replay module:55 passed,0 failed,0 ignored in1.75s, including
+the row-binding and checkpoint-provenance regressions. Authority
+--no-default-features check passes2.50s. Logs are in shared target/task-tmp/
+authority-entry-preflight.Z6rTVF/replay-suite.log and authority-no-default.log.
+
+The57-test agent::shared_ campaign initially remained running (session28810;
+now completed as recorded above); system_attach_checkpoints_and_drains_raw_tail_before_publishing_route
+exercises4095 durable post-snapshot entries. Do not restart merely because it
+exceeds60 seconds. shared-suite.log is not a completed green gate.
+The merge convergence test reported failure in the restricted network sandbox.
+An exact diagnostic rerun (merge-failure-detail.log) locates the failure at the
+five-second localhost-listener assertion, before convergence. With loopback
+networking permitted, the same built test passes1/0 in1.31s (merge-loopback.log).
+No production code or timeout was changed for this environment-specific failure.
+
+### 2026-09-20: Authority entrypoint rejection preflight
+
+Extended the safe Admin ordering to management authorization, management
+finalization, operation issuance ACK, and Private application/retirement ACK:
+decode/context/target/signature checks precede full state auditing. All valid
+requests still undergo the same audit before retry lookup or mutation.
+Operation authorization moves only decode/context/target checks ahead of the
+audit; state-dependent SSH attester authentication remains after it. Query and
+publication paths are unchanged. No resource limits or validations were removed.
+
+Added compiled_authority_malformed_entrypoints_preserve_rows. It exercises
+authorize, authorize_operation, administer, finalize, acknowledge_issuance and
+resolve_private_application with empty malformed payloads against actual schema
+and persisted node rows. It requires Done/refusal, exact full inline state and
+zero row exports. This tests malformed requests, not every signed ACK corruption
+shape; native signed-protocol regressions remain part of the suite.
+
+Evidence: shared target/task-tmp/authority-entry-preflight.Z6rTVF.
+build.log: guest succeeds48.73s; target/riscv64em-vos/release/system_authority.elf
+SHA25675f2f8fd0783542924cfbe4b04c65dcbaf07cf4f4ae01ff892d139358190949d.
+native.log:72 passed,0 failed,2 exporters ignored in38.21s.
+physical-before-fixed.log: previous mFUWVa artifact fails malformed authorize
+with OutOfGas at512 nodes. physical-full-refusals-final.log: new artifact passes
+all six refusals at512 nodes (1 test,1.46s). physical-small.log: all4 compiled
+Authority tests pass1.98s, using node-capacity.ePpKOw/small and the unchanged
+boxed-seed publication fixture. Earlier physical-before.log records a missing
+test Encode import; physical-full-refusals.log records a fixture mismatch between
+absent and explicit empty lanes, corrected by supplying explicit empty lanes
+and retaining exact state equality. These are not remaining runtime failures.
+
+Valid full-capacity enrollment still requires a bounded-validation solution;
+this rejection-only improvement does not qualify production latency, release
+pins, all capacities or trusted-root finality. Candidate remains unsealed.
+
+### 2026-09-20: bounded-validation trust-boundary investigation
+
+Follow-up: ReverifiedRootJournalStore supplies process-local root identity,
+not identity reconstructed from disk. materialize_current_reverified rejects
+its absence before executor setup and matches genesis/admission to heads.
+LocalJournalAgentDriver's root create/open paths use it and validate route
+ownership. This root-runtime path is not automatically proof for the clean
+Authority actor: materialized_system_authority_view still extracts the runtime
+system_authority projection; clean startup separately constructs its system
+archive and still installs UnavailableAgentFinality for ordinary genesis.
+
+Extended ordinary_local_checkpoint_cannot_acquire_root_authority_provenance
+to publish a real Local checkpoint, refuse root materialization with zero
+executor calls, and then successfully reopen unchanged through ordinary replay.
+Focused test passes1/0 in0.03s: authority-preflight.mFUWVa/
+checkpoint-provenance-local.log. The earlier checkpoint-provenance.log records
+an abandoned test extension using the Shared root fixture with ordinary
+prepare_checkpoint; its InvalidRecord is the correct profile rejection, not
+a production defect. The original root-clone test is unchanged.
+
+Do not treat Authority's state_integrity_commitment as an authentication token.
+computed_state_integrity_commitment clones the header, zeros that field and
+hashes its encoding with configuration/ABI: it binds content but has no secret
+or signature. NodeTable::get additionally binds each retrieved certificate to
+its header digest. Neither alone establishes who authorized a restored header.
+
+The outer replay path provides distinct checks: replay_state_commitment hashes
+all four complete lane byte strings with lane-specific domains;
+load_checkpoint_base checks lane BlobRef contents against manifests;
+validate_published_shared_checkpoint matches manifests to the snapshot claim.
+SharedJournalDriver's snapshot installation separately calls certificate.verify
+against the ledger-derived committee and exact expected claim.
+SharedAgentSnapshotCertificate::verify enforces matching committee, voter
+quorum and signatures. journal_audit invokes audit_recovery on reopening.
+These are concrete call-path findings, not yet an end-to-end proof for every
+Authority restore/invocation path, Local profile or trusted-root bootstrapping.
+
+Added replay_state_commitment_binds_row_images_and_lane_identity: ALI1 inline,
+row-key, row-value and deletion changes must alter each lane's commitment;
+moving identical bytes between lanes must also alter the commitment. This
+regression proves content binding, not authentication. Full Authority auditing
+remains enabled. Focused test passes (1 passed,0 failed); log:
+shared target/task-tmp/authority-preflight.mFUWVa/replay-row-binding.log.
+Before replacing it, trace all entry/restore paths from trusted
+genesis/checkpoint to exact guest state and add negative reconstruction tests
+there; preserve enrollment verification and exact touched-row checks.
+
+### 2026-09-20: full-capacity guest gate and Admin signature preflight
+
+The node mutation exporter now accepts AUTHORITY_NODE_INITIAL_COUNT (default1)
+and exports initial-rows alongside the inline state. The compiled lifecycle
+test restores this initial image; old exports without initial-rows must be
+regenerated. The new native capacity test starts with512 verified nodes,
+enrolls the513th, removes it and checks exact retries and refusal images.
+
+Evidence: shared target/task-tmp/authority-node-capacity.ePpKOw contains full
+and small fixture exports. Full native export passes in14.99s; initial/enrolled
+inline states are34558/36622 bytes. Against the previous boxed-seed ELF,
+physical-full.log fails on the first forged-signature phase: the complete
+certificate audit exhausts the20-read quota before signature refusal.
+
+Admin now decodes and checks the call, invocation context, target and signature
+before the full state audit. Valid calls still undergo that audit before retry
+lookup or mutation. This is a rejection-path fix, not bounded valid-call
+validation, and changes neither security checks nor resource ceilings.
+
+Fresh evidence: shared target/task-tmp/authority-preflight.mFUWVa.
+build.log: guest release build succeeds in45.60s. ELF at
+target/riscv64em-vos/release/system_authority.elf has SHA256
+35e0604184e0289eb49a3f0d30b33e4e2c87dc7f286a7a28b67f14059344ef55.
+native.log:72 passed,0 failed,2 exporters ignored in37.46s.
+physical-small.log: all3 compiled Authority regressions pass in1.76s;
+linked program1081398 bytes. Uses the new small node fixture and the previous
+boxed-seed publication-fixture (publication layout is unchanged).
+physical-full.log: capacity test remains FAILED in0.98s. Phase0 now returns
+Done with989142691 gas remaining and no row exports; phase1 valid enrollment
+returns OutOfGas with no row exports, diagnostic total=20 amount=1 maximum=20.
+Thus the inline-size reduction is proven, but valid full-table guest work is
+not qualified. Do not increase quotas or bypass whole-state validation merely
+to turn this test green: bounded validation needs an established authenticated
+state boundary. This candidate is not sealed, repinned or release-qualified.
+
+### 2026-09-20: compiled Authority enrollment/removal and exact row replay
+
+The new signed native fixture starts with the pending bootstrap seed, refuses
+a forged Admin signature without materializing rows, enrolls a second node,
+restores the complete header/row state, repeats enrollment exactly, refuses the
+forged call again, removes the second node and repeats removal after restore.
+The bootstrap certificate remains available after removal. Native fixture
+capture commits the mock overlay with each state checkpoint.
+
+The compiled test decodes the candidate ELF's actual schema, runs administer
+through the inner storage view, atomically applies each exported delta and
+roundtrips its ALI1 image before the next phase. Every complete row image and
+reply matches the native fixture. Enrollment must export rows; removal must
+include a tombstone; retries/refusals must export no rows. This is real guest
+node mutation, not only host handlers or read-only publication.
+
+Evidence: shared target/task-tmp/authority-node-mutations.7sDMWE.
+export.log:1 explicit fixture export passed. physical.log:1 six-phase physical
+test passed in1.80s against the unchanged authority-boxed-seed.Iaq81H ELF
+(SHA25611d26565078bbfeb64903172c3197d2e75885721e8ea0c6f54a1f1cf8bdb4237).
+Rows exported by phase:0/4/0/0/3/0. Gas remaining:
+983109123/946011142/955690113/965600401/939355623/962517166.
+The initial compile.log records a fixture-reader closure lifetime error; an
+explicit &str argument fixes it without changing runtime behavior.
+Final native.log:71 passed,0 failed,2 explicit fixture exporters ignored,35.55s.
+physical-all.log: all3 compiled Authority regressions pass in3.23s against the
+same candidate: schema/loader, row-backed publication and node mutations.
+
+These phases qualify the exercised two-node lifecycle, not full-table guest
+work, all rejection/capacity shapes, trusted-root finality, daemon crash recovery,
+or release artifact provenance. Full certificate audits still scan the table;
+bounded validation and the remaining complete-saga requirements stay open.
+
+### 2026-09-20: production Authority node-table cutover, generation20
+
+AuthorityLinearState.nodes is now NodeTable, not Vec<NodeOwnerRow>. Enrollment
+and removal update its compact header and declared certificate rows inside
+the existing Authority refusal transaction. The bootstrap seed is materialized
+only on a node-table mutation. Owner projections use header indices; certificate
+consumers verify the exact stored row against its header digest. The enclosing
+state integrity commitment now binds that header. Generation20 distinguishes
+the new archived layout from the preceding generation19 schema-only candidate.
+
+Full certificate, role, signature and state validation is deliberately retained,
+streaming certificates rather than allocating another complete vector. This
+does not yet meet bounded guest work for a full table. No signature check or
+work ceiling was weakened. Other Authority collections remain inline.
+
+Native corruption tests now tamper persisted certificate rows inside a refused
+transaction and require full Authority validation to reject each alteration.
+The alternate PAR1/PCA2 history fixture initially failed because it rewound only
+inline state after another history removed a node. It now captures/commits the
+row snapshot with that header and restores both for the alternate branch.
+Fresh native actor fixtures reset their own thread-local mock storage; ordinary
+generated restores do not reset or repair rows. Over-capacity reconstructed
+headers remain explicitly rejected.
+
+Evidence: shared target/task-tmp/authority-node-cutover.e9wq0k:
+native.log:70 passed,0 failed,1 ignored,34.55s. The full256-replica enrollment
+fixture now measures18206 Linear bytes versus the previous76494, below49152.
+This is the exercised header shape, not every complete Authority capacity.
+build.log: fresh locked offline RISC-V build succeeds in41.13s.
+ELF target/riscv64em-vos/release/system_authority.elf SHA256:
+a03d618ae0b16c7010e687b9b38b35e47f32365e51d5ad55aa213400e4f1b1ed.
+export.log:1 signed publication fixture pass,0 failures. The fixture now
+materializes two verified node certificates before publication and exports
+their persisted row image. Physical execution must consume that image through
+schema-derived storage access and must not rewrite certificates during publication.
+Earlier compile and PAR1 fixture failures are retained under
+authority-node-schema.U7uylW/node-cutover-*.log, not counted as final gates.
+
+The initial physical.log passes schema/loader admission (1079899 PVM bytes)
+and missing-blob refusal, but faults during publication with persisted rows.
+diagnostic.log records Fault(0xfefcf000), not a policy refusal; native output
+is green. Storage backend reads still reserved an8192-byte stack probe inside
+the nested validation call chain. The source now allocates that same bounded
+probe on the heap, with unchanged host calls, copy charges, row/stack/heap/gas
+ceilings and complete validation. A separate fresh candidate is retained under
+authority-row-probe.5MrIn6; the initial guest is not counted as an execution pass.
+That probe-only candidate still faults at the identical address/register state;
+physical.log is1 pass/1 failure and is not a fix qualification. Opt-in native
+inner-machine diagnostics now expose the failing PC and can export the exact
+observed program without overwriting an existing file. pc-diagnostic.log plus
+pc-map.log verify byte-exact program identity and map PC273120 to RISC-V
+0x94d140, a stack store in blake2b_simd::portable::compress1_loop. The failure
+is accumulated stack depth, not a missing/corrupt certificate or relaxed gas gate.
+
+NodeTable's pending seed is now Option<Box<NodeOwnerRow>>, retaining its exact
+archived contents while avoiding a complete certificate embedded in every
+cloned Authority stack value, including materialized tables with no seed.
+The separate authority-boxed-seed.Iaq81H candidate builds in31.53s; ELF SHA256:
+11d26565078bbfeb64903172c3197d2e75885721e8ea0c6f54a1f1cf8bdb4237.
+Its newly exported matching fixture passes (export.log,1 test,0 failures).
+The probe buffer remains bounded on the heap; that change alone did not fix
+the observed fault. No stack, heap, host-work or gas ceiling was raised.
+
+Final authority-boxed-seed.Iaq81H/native.log:70 pass,0 fail,1 ignored,33.27s;
+the256-replica fixture's Linear image is now17918 bytes after boxing the seed.
+physical.log: both compiled Authority tests pass in1.68s; PVM1081440 bytes,
+below1280KiB. Publication reads the exported two-node persisted table via the
+actual compiled schema, returns byte-identical native state/decision, preserves
+certificate rows and survives expired exact retry. Gas remaining for missing
+blob/success/retry is993992545/820748188/849795663. The earlier probe-only fault
+is not a remaining failure for this exercised candidate.
+Native storage suite17/0 failures also passes (authority-row-probe.5MrIn6/storage.log).
+Full-table guest work, compiled node mutation, other table conversions, finality,
+release reproduction and live performance gates remain open. No merge or repin.
+
+### 2026-09-20: Authority certificate namespace in clean schema generation19
+
+SystemAuthority now declares node_certificates as a Linear StorageMap with
+the exact prefix s/authority-nodes/. State generation advances18→19; constructors
+only create an empty handle, and generated loading initializes it. The native
+loader regression exercises fresh construction, explicit seed insertion,
+commit/reopen and a substituted certificate across another restore. Restore
+does not seed or repair rows, and the certificate/index check rejects drift.
+The compiled candidate loader check now decodes the actual ELF AAS2 section
+and requires exactly that storage field, prefix and lane before linking/loading.
+
+This wires the signed storage declaration, NOT the live node-policy table:
+AuthorityLinearState still carries the old inline nodes. Replacing that field
+with NodeTable and coordinating its mutation/validation and native dispatch
+isolation remain next. No bootstrap mutation is implicitly added to queries.
+There is no old-schema fallback, bundle repin, merge or production qualification.
+
+Fresh locked offline guest build: shared target/task-tmp/authority-node-schema.U7uylW,
+build.log,41.28s. ELF target/riscv64em-vos/release/system_authority.elf SHA256:
+9f69f933eaef6bbdbcd70efc1d22526d4d28cbb5fa9fdbcb942fabd6e45dad39.
+The initial native.log has69 passes/1 failure/1 ignored: the generation test
+still expected18. It now requires19 for the new declared storage schema.
+The generated-loader test separately passed in row-resource-runtime.5B1apX/node-schema.log.
+native-final.log passes70 tests,0 failures,1 ignored in35.70s. export.log
+exports the generation19 signed publication fixture (1 pass,0 failures).
+
+Physical checks then found a compiler failure, not guest execution:
+physical.log fails both links; link-diagnostic.log locates a spurious target
+0x91ae58 inside the relocated call at0x91ae54. The ELF's rodata at0x10190
+contains a four-byte ADD32/SUB32 relative jump-table entry: its actual target
+is0x92afcc minus table base0x10174, numerically0x91ae58. The adjacent zero word
+made the raw eight-byte pointer heuristic mistake it for an absolute code
+pointer. Relocation metadata already defines that entry's interpretation.
+
+The compiler now excludes every overlapping recognized data-relocation range
+from both heuristic target discovery and raw pointer rewriting, including
+non-code relocation targets. Genuine raw call-interior pointers remain refused.
+The synthetic ELF regression covers the real ADD32/SUB32 shape and a relocation
+covering only the high half of a heuristic candidate; scalar neighbors remain
+unchanged. This is a compiler change requiring release requalification, not
+an artifact or instruction-safety bypass. No original relocation or call-pair
+safety check was removed.
+
+Final compiler-final.log:65 unit tests pass (1 ignored),9 integration tests
+pass,0 failures. physical-fixed.log: both compiled Authority checks pass in3.07s
+using the same ELF and corrected compiler. Linked PVM size1055197 bytes is
+below1280KiB. Publication missing-blob/refusal, success and expired retry all
+return Done, with byte-identical native/guest publication state. Gas remaining
+is994029417/829424427/854176058 respectively. These are the small signed fixture
+and compiled schema/loader gates, not row-table execution, maximum Authority
+capacity, trusted-root finality or an independently reproduced release.
+
+The first overlap implementation linearly scanned all relocations for every
+data word. The outer-runtime regression exposed excessive linking time; after
+its maximum-availability case passed, that superseded test process was
+explicitly interrupted (runtime-regression.log, session20626 exit130).
+The final implementation sorts/merges relocation intervals once and uses a
+binary search per candidate. A unit test compares indexed overlap against
+direct byte-range checks, including adjacent, nested and duplicate intervals.
+compiler-indexed.log passes66 unit tests (1 ignored) and9 integration tests.
+The interrupted run is not completion evidence; fresh indexed-compiler
+physical results are recorded separately below.
+authority-indexed.log: both compiled Authority tests pass again in1.80s with
+the indexed implementation, preserving the same published state and gas values.
+runtime-indexed.log: all3 physical outer-runtime regressions pass in36.38s
+against the preserved row-resource-runtime.5B1apX ELF with the indexed compiler:
+maximum availability, row commit/refusal/retirement, and large-row yield/resume/
+retirement/inspection. Complete physical/native transitions match. This is
+regression coverage for the compiler fix, not a new outer-runtime release pin.
+
+### 2026-09-20: atomic lazy node bootstrap and full-capacity compact header
+
+NodeTable now carries a compact index plus an explicit pending bootstrap
+certificate. Construction and pre-materialization queries perform no storage
+access, so generated constructor replay cannot write or overwrite certificates.
+The first node-table mutation materializes the seed in a nested row transaction
+and publishes its cloned inline header only on acceptance. Stored headers never
+recreate missing certificates. Enclosing Authority handlers must still publish
+their complete inline candidate only after all later policy checks succeed.
+
+The capacity fixture caught a design error before integration: the declared
+MAX_AUTHORITY_NODES is513 (2*MAX_PRIVATE_NODES+1), not the256 nodes in the
+earlier replica fixture.513 full node/owner/digest index entries alone exceed
+48KiB. The header now interns at most64 owner IDs and stores a one-byte owner
+slot per node. The513-node/64-owner header encodes below36KiB. Owner-slot
+removal renumbers surviving references; tests retain exact certificate bindings.
+This is a node-header bound, NOT proof that the complete Authority state fits.
+
+Evidence under shared target/task-tmp/row-resource-runtime.5B1apX:
+node-table.log records the initial256-versus513 capacity-test failure.
+node-table-compact.log:2 focused tests pass after compacting the header.
+node-table-suite.log: final69 native Authority tests pass,0 fail,1 ignored,
+28.19s, including513 nodes/64 owners, overflow refusal, bootstrap conflict,
+outer refusal rollback, encoded-header restore, missing-certificate refusal,
+and owner-slot compaction. node-table-no-default.log: no-default-features
+Authority compilation passes in1.64s, with7 dead-code warnings because the
+component is not yet wired into production Authority state/schema. No new
+guest artifact or live timing is qualified. The next step is that integration,
+including native per-incarnation store isolation and bounded policy validation.
+
+### 2026-09-20: Authority node-certificate storage component (not yet wired)
+
+Added node_storage.rs with a compact node/owner/certificate-digest index and
+StorageMap-backed certificate operations. Reads bind the exact stored row to
+the index; insertion refuses existing keys, removal requires a matching row,
+and explicit bootstrap refuses a nonempty table. Enrollment signature/role
+verification and capacity admission remain required caller responsibilities.
+The native storage mock now exposes commit_dispatch so actor-crate tests can
+exercise a drained overlay and fresh handle without exposing the runtime's
+internal drain API.
+
+The generated clean loader calls the constructor before initializing storage
+handles, including on restore (vos/vos-macros/src/lib.rs, __load_agent_state).
+Therefore bootstrap row writes cannot simply be added to Authority::new.
+Production Authority still uses inline nodes: this component is not the schema,
+bootstrap or state-integrity cutover and does not yet reduce production state.
+Next integration must bind the compact index into the Linear integrity image,
+declare certificate storage in the signed schema, initialize rows exactly once
+through an authorized Linear path, and retain bounded certificate validation.
+Do not claim native row tests qualify that integration or compiled capacity.
+
+Evidence under shared target/task-tmp/row-resource-runtime.5B1apX:
+authority-node-storage.log:66 native Authority tests pass,0 fail,1 ignored,
+30.85s, including bootstrap refusal, commit/reopen, owner/certificate substitution,
+refusal rollback and missing-row removal. node-storage-no-default.log: locked
+offline no-default-features Authority check passes in7.82s; the not-yet-wired
+component produces dead-code warnings. Initial node-storage.log records a
+compile failure from attempting to use the private drain API; the mock helper
+fixes it. No current compiled Authority artifact covers this component yet.
+
+### 2026-09-20: large-row inspection and shared resource-accounting fix
+
+The large-row lifecycle fixtures now execute InspectActors and InspectResources
+after result retirement, for both ordinary completion and yield/resume. They
+compare complete physical/native transition bytes, require unchanged state and
+check reported state bytes against the actual encoded image. The preceding
+row-resume-runtime.wPkIcf candidate panicked on the first inspection despite
+passing the preceding lifecycle (management-guest.log, exit101).
+
+Signed resource validation retained an encoded state while resource accounting
+encoded another complete snapshot. It now retains only the measured length and
+passes that to a private accounting helper on the same immutable runtime. All
+package, policy, artifact, debt and resource checks remain. No caller-provided
+size, state-format change or further heap/gas/availability increase is involved.
+
+Evidence: shared target/task-tmp/row-resource-runtime.5B1apX:
+
+- build.log: fresh locked offline guest build succeeds in35.22s.
+- target/riscv64em-vos/release/agent_runtime.elf SHA256:
+  b5913b0b2a552f92edfe36dd2ef35db5e50147c03d35c029beee005cdcd66a8a.
+- physical.log:3 passed,0 failed,33.69s; maximum availability, ordinary row
+  lifecycle and yielded row lifecycle, including both large-state inspections.
+- clean.log:40 passed,0 failed,4.43s.
+- standard.log:51 passed,0 failed,12.00s.
+- authority.log: current Authority native library suite65 passed,0 failed,
+  1 artifact-dependent ignored,30.23s; not compiled maximum-capacity evidence.
+- no-default.log: locked offline `cargo +nightly-2025-05-09 check -p vos
+  --no-default-features --features agent-runtime` succeeds in8.90s, with268
+  warnings; this is not a clean lint gate.
+
+Large inspection inputs are4004476/4004473 bytes; gas is920851412/998709280
+for actor/resource queries in both fixtures. No controlled live Create/Install
+latency improvement is established. Authority collections remain inline, and
+its complete-state integrity calculation still clones/serializes the image;
+changing storage handles alone would not solve bounded validation. The next
+Authority cutover must coordinate signed storage schema, bootstrap row creation,
+row integrity/validation and native dispatch isolation, then qualify compiled
+capacity. Current source remains uncommitted and incompatible with the frozen
+pre-SLR1 bundle; no merge, push, repin or independent reproduction was done.
+
+### 2026-09-20: large-row yield, restore and completion
+
+The row fixture now has a genuine SUSPEND/capture path: finalization exports
+the first64KiB row only after SUSPEND returns0; restored execution receives1,
+changes the first value byte, exports the replacement and completes. It checks
+the committed row and retained continuation before restore, replacement row and
+removed continuation afterward, then exact Invoke retry, ACK, exact ACK retry
+and rejected post-retirement replay, beside the same60 untouched64KiB rows.
+
+Native execution passed, but the preceding row-retirement-runtime.NTm1B6 guest
+panicked on Resume after successfully committing the yielded slice. Evidence:
+yield-source.log (session58451 exit0,0.15s) and yield-guest.log (session85138
+exit101). apply_clean_resume retained duplicate SDK/legacy rollback bytes. It
+now moves those buffers into one owned image, matching Invoke/ACK; input-bearing
+and stale continuations still reject, with the same rollback bytes and gates.
+No heap/gas/state/availability ceiling or wire format changed for this fix.
+
+Final evidence: shared target/task-tmp/row-resume-runtime.wPkIcf.
+build.log: fresh locked build31.92s, session8733 exit0.
+ELF: target/riscv64em-vos/release/agent_runtime.elf, SHA256
+19bcb91d2d80fa56c50822d867ef7b1672ed8d27fed8190863de2b12913d7b6c.
+clean.log:40 pass,0 fail,4.75s, session68351 exit0.
+physical.log: all3 explicit compiled_runtime_ regressions pass against this
+candidate, session40086 exit0: maximum availability, row commit/failure/retirement,
+and large-state yield/resume/retirement. Full physical transitions equal native
+output throughout. The large Resume input4145773 bytes uses1440141208 gas, below
+the unchanged5-billion management allowance. This closes the exercised suspended
+row lifecycle, not every capacity/crash/proof case or Authority's table conversion.
+No merge, push, repin or independent artifact reproduction was performed.
+
+### 2026-09-20: large-row acknowledgement and durable retirement
+
+The row lifecycle fixture now continues from exact invocation retry through
+acknowledgement, restored exact ACK retry, and rejected invocation replay after
+retirement. It checks that results are removed, actor rows/inline state remain
+unchanged, repeat ACK returns the identical transition, and retired invocation
+returns DivergentInvocation without changing state. All physical output bytes
+are compared with native transitions, for small read/write/failure cases and
+the60-row (3.75MiB unrelated data) case.
+
+This extension exposed another physical panic: the preceding row-stream-runtime
+candidate passed large execution/retry but failed its first large acknowledgement
+(row-stream-runtime.1NeXrB/retirement-guest.log, session66380 exit101). Native
+extended lifecycle passed (retirement-source.log, session31924 exit0,0.12s).
+apply_clean_acknowledge_inner still retained SDK and legacy copies of its
+encoded rollback state. It now moves those buffers into one rollback image,
+as Invoke does, preserving exact failure and repeat-ACK output. No validation,
+state format, heap, gas or other resource ceiling changed.
+
+Final evidence: shared target/task-tmp/row-retirement-runtime.NTm1B6.
+build.log: locked fresh runtime build31.68s, session95105 exit0.
+ELF: target/riscv64em-vos/release/agent_runtime.elf, SHA256
+350554254b2e39eb900fe1a42da65debf77fd839b6a64a0382e81931c93ebe39.
+clean.log:39 pass,0 fail,4.69s, session25836 exit0.
+retirement-guest.log:1 explicit physical lifecycle test pass,0 fail,14.06s,
+session99138 exit0. Large ACK input4072509 bytes uses1160516165 gas; exact ACK
+retry4071372 bytes uses1062720299; retired Invoke4071380 uses1066762818. Each is
+below the unchanged5-billion management allowance, preserves actor state and
+matches native output exactly. This is not a latency or every-state-shape gate.
+availability-guest.log: the same candidate also passes the192KiB physical
+invocation/retry regression (1 pass,0 failures,2.26s, session59614 exit0).
+Authority conversion, large suspended-state paths, reproducible release pins
+and the remaining complete-saga requirements remain open. No merge or push.
+
+### 2026-09-20: physical row persistence and large-state allocation fix
+
+The clean row fixture now canonically decodes complete signed work, compares
+physical outer-runtime transitions byte-for-byte against native execution, and
+restores/retries the result. Cases cover persisted64KiB reads,64KiB exports,
+Panicked/Forbidden/OOG rollback, and a successful export beside60 untouched64KiB
+rows (3.75MiB of unrelated state). All unrelated rows and the exact result are
+preserved. This is synthetic signed runtime work, not Authority table conversion.
+
+The original availability-runtime.cVFFv6 candidate passed every small case but
+panicked on the large state, while native execution passed. rows-guest.log and
+rows-diagnostic.log retain that failure (sessions93671/34634 exit101). Removing
+the duplicate SDK/legacy encoded rollback image from apply_clean_invoke_inner
+alone was insufficient: row-memory-runtime.55KUQC also failed the large physical
+case (rows-guest.log, session70272 exit101). It remains preserved, SHA256
+f24eee992353213f427b62440ebc58fa7ff1d61e794c9b0654e11bb63dfe1f4c.
+
+The completed fix also streams each ALI1 row image directly into its enclosing
+lane frame, patching the same length prefix instead of allocating a complete
+temporary image and copying it. The wire format, rollback bytes, admission and
+validation are unchanged. No heap/gas/resource ceiling was raised for this fix.
+
+Final evidence: shared target/task-tmp/row-stream-runtime.1NeXrB.
+build.log: locked fresh runtime build31.74s, session43200 exit0.
+ELF: target/riscv64em-vos/release/agent_runtime.elf, SHA256
+19e9ec1d2088f7d518f0a456152f103dd971cddb69449cc627a2915b5a18757b.
+rows-guest.log:1 explicit physical test passed,0 failures,6.41s, session1579
+exit0, covering all cases and retries. Large fresh input4005623 bytes uses
+1399879866 gas; retry4072517 bytes uses1175248138, below unchanged5-billion
+management gas. Both full transitions equal native output. This is near-capacity
+coverage, not proof of every4MiB boundary, all slice shapes, or measured peak RAM.
+clean.log:39 pass,0 fail,4.61s, session83065 exit0. codec.log:10 pass,0 fail,0.06s.
+availability-guest.log: the192KiB physical outer-runtime execution/retry also
+passes against this same final candidate (1 pass,0 failures,2.23s, session79098
+exit0); complete transitions still equal native output.
+The first native large-row probe also passed before the allocation fix
+(availability-runtime.cVFFv6/rows-source.log, session34731 exit0).
+No release repin, merge or push. Authority conversion and the full saga gates
+remain unfinished; retained frozen artifacts are unchanged.
+
+### 2026-09-20: physical outer-runtime maximum-availability execution
+
+A new signed clean fixture reads the full192KiB caller payload through an inner
+PVM, returns its length and last eight bytes, and commits one inline byte. Its
+complete RuntimeWork is canonically encoded/decoded before dispatch; resulting
+state is decoded/restored before the same signed invocation is retried at slot99.
+The native regression verifies positive output and exact retry outcome. A separate
+signed one-byte-over-window fixture still fits the larger outer code/schema/policy
+availability envelope but rejects with InvalidInput at caller admission.
+
+A fresh current-source outer runtime was built without changing any bundle pin.
+The explicit ignored test compiled_runtime_maximum_availability_matches_source_and_retry
+uses AGENT_RUNTIME_CANDIDATE_ELF, validates its outer hostcall surface and executes
+both phases in the physical runtime PVM. Complete output bytes match native
+transitions, including SLR1 lane state. Fresh input399484 bytes uses367893979 gas;
+retry input400862 uses269348848, under the unchanged5-billion management budget.
+This is signed synthetic fixture/physical outer execution, not actual trusted-root
+Shared finality, maximum Authority state, daemon restart, independent artifact
+reproduction, a peak-memory benchmark, or production latency qualification.
+
+Evidence: shared target/task-tmp/availability-runtime.cVFFv6.
+build.log: locked runtime guest build26.59s, session9764 exit0.
+ELF: target/riscv64em-vos/release/agent_runtime.elf, SHA256
+55e98092952b98f6d3aab2c0b87d5afa3c70d5fe7ed435b705dbd8fa65977140.
+source.log: native maximum fixture1 pass,0 fail,0.05s, session45452 exit0.
+guest.log: physical test1 pass,0 fail,2.28s, session1811 exit0.
+clean-suite.log:38 pass,0 fail,3.84s, session39568 exit0, including the new
+over-window rejection. The physical test predates only the test-helper rename
+and extra native negative case; runtime implementation/artifact are unchanged.
+No merge, push or repin; the frozen bundle remains incompatible with current
+source and the full suite has not been qualified against a new release.
+
+### 2026-09-20: bounded large-provision transport
+
+Caller availability now shares one192KiB SDK/executor ceiling, including native
+pre-reservation shape checks (previously those also used the48KiB inline-state
+cap per blob). Complete clean-Create provisions have a174921-byte conservative
+wire bound. The signed256-replica fixture's55586 bytes now pass both that bound
+and ActorInvocation admission/exact preimage lookup; its call/approval/QC and
+roundtrip checks remain. Inline state is still48KiB and the256-node Authority
+state still exceeds it. This does not qualify full Shared creation.
+
+Resource changes are explicit: FETCH ceiling460675 bytes derives from complete
+frames/probes plus key/hash/copy work for the caller window; BLAKE2b compression
+ceiling2568 derives from the1024 baseline plus one bounded SDK blob verification
+and framing allowance per blob.20 fetch calls,4096 total host calls, instruction
+gas, stack/heap and inline-state ceilings are unchanged. Row and preimage budget
+tests now derive exhaustion from these ceilings and retain actual yield/restore
+coverage. Successful large-blob transport does not constitute32MiB outer-runtime
+peak-memory, production latency, or release artifact qualification.
+
+Fresh RISC-V fixture evidence: shared target/task-tmp/availability-guest.GVRrNo.
+build.log: locked build29.74s, session96196 exit0. ELF at
+target/riscv64em-vos/release/agent_yield_probe.elf, SHA256
+4bb27075b9dd4b820cf863ef96fb4458ca8b62b5e56356d61b33c9e30bbf1f08.
+execution-fixed.log:1 pass,0 failures,0.17s, session62127 exit0; maximum encoded
+message plus192KiB invocation_blob success/missing/invalid length and unchanged
+state. execution.log records an initial test-module path compile error, fixed
+without changing production behavior. Earlier executor failure from a stale
+36KiB expected counter remains in authority-single-check.7E8Tdq/availability-executor.log.
+
+Final source checks in availability-guest.GVRrNo:
+- executor-suite.log:21 pass,0 fail,4 artifact-dependent ignored,0.02s.
+- clean-wire.log:36 pass,0 fail,4.19s, session35345 exit0.
+- availability-tests.log:7 pass,0 fail,0.09s, session53277 exit0; includes native
+  pre-reservation individual/aggregate rejection and signed maximum roster.
+- sdk.log:167 pass,0 fail,0.08s, session92698 exit0.
+- authority-publication.log:1 pass,0 fail,1 fixture-export ignored,0.56s,
+  session53431 exit0; missing/oversized blob refusal and signed publication retry.
+
+No bundle repin, merge or push. The ten frozen-runtime failures were last
+measured before this resource change; the full wire suite was not rerun here.
+Current source and the frozen bundle remain unqualified together.
+
+### 2026-09-20: node owner/certificate access separation
+
+Authority now separates enrolled_node_owner (a copied principal projection)
+from enrolled_node (an owned certificate row). Replica reconstruction, replica
+membership checks, managed-agent validation and authenticated owner checks use
+the owner-only path; SSH attestation and Private identity verification retain
+the complete certificate path. Enrollment insertion/removal are centralized
+with capacity, duplicate and exact-owner checks, inside the existing Admin
+candidate/transaction. Fast prechecks and full state/certificate validation
+remain. The table is still an inline Vec: this prepares the backend cutover,
+does not change the state format, and does not solve the48KiB capacity gap.
+
+Locked native Authority suite passes65/0 failures,1 ignored,28.77s; evidence:
+authority-single-check.7E8Tdq/authority-node-boundaries.log, session36590 exit0.
+New coverage checks detached certificate ownership, duplicate enrollment refusal,
+wrong-owner removal rollback, absence and exact reinsertion. The earlier
+owner-lookup-only run passed64/0 failures in28.32s (authority-node-access.log,
+session91959 exit0). No fresh guest artifact was built for this refactor.
+
+Remaining cutover must coordinate signed storage schema, table initialization,
+bounded validation and native dispatch/store isolation; simply replacing the
+Vec with a handle would not satisfy these. In particular generated storage
+prefix initialization occurs after actor construction, so bootstrap rows cannot
+be inserted through an uninitialized constructor handle.
+
+### 2026-09-20: Authority mutation acceptance boundaries
+
+authorize_call, authorize_operation_call, administer_call, finalize_application,
+acknowledge_operation_issuance, resolve_private_application and genesis publication
+now enter authority_row_transaction before their unchanged staged handlers.
+Empty byte replies and false acknowledgements roll back rows; successful replies
+leave rows pending for the enclosing runtime commit. No inline candidate or
+validation was removed, and no Authority table has been converted yet.
+
+The nested actor's native-only dev dependency enables vos/std for thread-local
+storage rather than sharing the single-thread guest overlay across test threads.
+Cargo.lock includes that host test dependency graph; RISC-V still uses the
+existing no_std dependency. Native suite:64 pass,0 fail,1 ignored,38.94s;
+authority-single-check.7E8Tdq/authority-row-transactions.log, session88269 exit0.
+The added test covers bool and byte refusal, preserved prior writes, inner
+success discarded by outer refusal, and unchanged positive reply bytes.
+Fresh locked RISC-V build passes in40.16s, session49798 exit0; evidence directory
+shared target/task-tmp/authority-row-guest.bIor6Q, build.log.
+ELF: target/riscv64em-vos/release/system_authority.elf, SHA256
+86b03c49ec8ab78ec1460f79ed71a7c4f2dbab07463ad633e80c9d9fe4ea8d32.
+This candidate is not a repinned release artifact.
+The compiled signed publication regression passes missing-blob refusal,
+byte-identical native/guest publication state and expired exact retry against
+the retained explicit fixture (1 pass,0 failures,1.53s; host build53.76s;
+publication.log, session8214 exit0). This remains a small inner-machine fixture,
+not maximum capacity, actual trusted-root finality, or package qualification.
+
+### 2026-09-20: row-transaction rollback prerequisite
+
+Authority currently rejects operations by discarding an inline-state clone.
+StorageMap clones share the dispatch overlay, so converting those collections
+without a row savepoint would leak refused mutations into a successful reply.
+The storage API now provides synchronous `with_transaction`: Err/unwind restores
+the previous pending delta and clears reads; nested successful scopes remain
+subject to outer rollback. It copies pending writes only, not persistent rows.
+Dispatch draining and cooperative yield reject an open transaction. Ordinary
+actor fields and external effects are not rolled back by this API; Authority
+still needs its inline candidate and explicit acceptance boundary on conversion.
+No Authority table has been converted yet.
+
+All17 native storage tests pass, including replacement/insertion/index rollback,
+nested scopes, unwind and rejected dispatch boundaries. Evidence:
+shared target/task-tmp/authority-single-check.7E8Tdq/storage-savepoints.log.
+
+Fresh RISC-V fixture execution also passes (1 test,0 failures,0.22s; host
+build83s). Local row_rejected stages999 then returns Err from its transaction.
+Both existing key7=41 and absent key9 retain their original state, export no
+rows despite a Done reply, and remain unchanged on subsequent invocations.
+The same test still passes set/get and write/yield/resume/write. This is real
+inner-machine evidence, not Authority integration or signed package admission.
+Evidence: shared target/task-tmp/storage-rollback-guest.uYKuDb/execution.log;
+build.log records an initial fixture macro/borrow error, build-fixed.log succeeds.
+ELF: target/riscv64em-vos/release/agent_yield_probe.elf, SHA256
+fde0047965d95c85a960d482df7180187bcff1ff46e5984f540672b16e9ca084.
+The earlier storage-rust-guest.cSZzlY artifact remains unchanged.
+
+### 2026-09-20: compiled Rust StorageMap dispatch and resume
+
+The no_std PVM storage backend now reads through peek/STORAGE_R without the
+service feature. Clean run_refine drains storage only after inline lane checks,
+exports one ARD1 packet for Done/Yielded and discards failed overlays. A restored
+clean yield clears the prior slice's committed pending writes, tombstones and
+read cache before user code resumes. Existing service dispatch retains its
+own drain path.14 storage tests pass, including explicit drain-status behavior
+and stale-overlay reset (storage-rust-backend.log, session52684 exit0 in the
+authority-single-check.7E8Tdq evidence directory).
+
+The agent-yield fixture now has Local StorageMap row_set/row_yield and LocalQuery
+row_get under s/rows/. A fresh RISC-V build passes; the compiled inner-machine
+test performs set(7,41), get(7), a row8 write/yield/read/replace sequence ending2,
+then get(8). The row image is encoded/decoded between invocations and around
+the real machine yield. All expected replies/deltas and one-yield completion
+pass (1 test,0 failures,0.12s; session97891 exit0). This is explicit fixture
+namespace scope and real guest IO, not signed package admission, installed
+Authority execution, or a daemon/disk restart qualification.
+
+Evidence directory: shared target/task-tmp/storage-rust-guest.cSZzlY.
+ELF: target/riscv64em-vos/release/agent_yield_probe.elf
+SHA256:3ebd8dca9429af413910bd9be20868f9df7b98070422fdd1209bc8aa2b81dab6.
+Logs: build.log (missing alloc::vec import exposed by no_std+pvm),
+build-fixed.log (fixture missing explicit StorageMap import),
+build-import-fixed.log (success1.12s, session32287 exit0), execution.log and
+no-std.log. Both compile errors were repaired without changing bounds. Earlier
+partial build failures remain retained. The ordinary no-default-features check
+also passes (session98206 exit0).
+
+No old package/store was replaced. The frozen guest still predates the SLR1
+format and its ten known wire failures remain open until generation sealing,
+reproducible rebuild/repin and gate rerun. Next substantive work is Authority
+collection conversion and physically bounded access/validation at required
+capacity; full-provision transport, Shared finality and production gates remain
+unfinished. The small compiled map fixture is not maximum-capacity proof.
+
+### 2026-09-20: guest row export reaches atomic clean dispatch
+
+Clean ACTOR_EFFECT_EXPORT accepts one ARD1 row delta per slice. The wire binds
+the SDK ABI, strict unique key order, bounded count/key/value/input bytes, exact
+option tags and full consumption. Producer preflight validates before building
+the buffer, without decoding/cloning it again in the guest. Host dispatch
+charges twice the input length before allocation (guest copy plus owned decoded
+rows) against the existing persisted FETCH quota, then validates signed prefix/
+write-lane ownership. No quota was increased. The4MiB codec ceiling is not an
+invocation-throughput promise; the165763-byte native work budget is still lower.
+
+Inner outcomes now carry exported rows only for Done or a valid captured Yield.
+Panic/fault/forbidden/out-of-gas outcomes discard them. Duplicate export and
+SUSPEND after export reject: a host-side pending delta may not disappear into
+a continuation snapshot. Yield finalizers may export after capture and their
+work remains charged to the continuation. Fresh and resumed clean dispatch
+route nonempty deltas through the atomic row/result/continuation wrapper; empty
+delta calls retain their existing commit path. Legacy dispatch receives no row
+view and cannot use this export decoder.
+
+Actual assembled-PVM clean-dispatch tests create a64KiB row, commit it with inline
+state/result, restore and recover the exact reply. Reported Panicked, Forbidden
+and OutOfGas outputs after export retain neither the row nor inline mutation.
+The earlier real read test remains separate. Focused guest tests2/0 failures
+pass0.21s after43.14s build (storage-guest-export.log, session8161 exit0).
+Broader checks: executor21/0 failures with3 artifact-dependent ignored, codec/
+storage10/0, clean-dispatch36/0 in3.92s (session57688 exit0). Executor rejection
+coverage includes duplicate export, suspension after export, malformed magic,
+undeclared namespace and an input exceeding the native work quota. Codec tests
+include delete/empty distinction, duplicates, malformed ABI/count and trailing
+bytes. No-default-features compilation passes (session25385 exit0).
+
+Logs under shared target/task-tmp/authority-single-check.7E8Tdq:
+storage-export-check.log, storage-guest-export.log, storage-export-executor.log,
+storage-export-codec.log, storage-export-clean-suite.log, storage-export-no-std.log.
+No tests were disabled to pass these checks. The ten known frozen-runtime wire
+failures were not rerun or fixed: generation seal/rebuild/repin remains required.
+
+Next: wire the generated Rust storage backend and end-dispatch drain, including
+continuation overlay handling, then test a compiled Rust actor. The current
+positive writer is an assembled PVM, not a StorageMap guest. Authority conversion,
+maximum-capacity/physical guest qualification, Shared finality and production
+gates remain open. No artifacts, old stores or branch pointers changed.
+
+### 2026-09-20: atomic row/result/continuation commit boundary
+
+StandardAgentRuntime::commit_clean_row_batch now authenticates the installed
+schema/target, stages the canonical delta and inline bytes in one candidate,
+runs the existing terminal/yield transition callback in that candidate, and
+checks restored lane invariants plus complete encoded runtime resource usage
+before replacing live state. The callback must retain the existing caller
+authorization and result/continuation checks; this helper is not an alternate
+authorization path. Its owned result is returned only after final admission.
+Rows move out of the candidate entry into the image primitive without another
+whole-image clone. A failure at any stage discards the candidate.
+
+Native integration verifies64KiB row plus terminal result commit/restore,
+namespace refusal before callback, late failure after result staging, complete
+runtime resource refusal, rows committed with a portable yield, and terminal
+consumption of that continuation together with a replacement row. A forced late
+failure after consuming the continuation preserves the original yielded state
+exactly. This uses native runtime transitions and a test continuation, not a
+guest-generated row mutation or physical restart.
+
+Focused test1/0 failures passes0.03s after21.86s build
+(storage-row-result-yield-atomic.log, session17012 exit0). Broader clean suite
+35/0 failures passes3.79s and no-default-features check passes1.69s
+(storage-row-commit-clean-suite.log, storage-row-commit-no-std.log,
+session4028 exit0). Logs remain under shared target/task-tmp/
+authority-single-check.7E8Tdq. Initial storage-row-result-atomic.log failure is
+retained: directly narrowing only the policy made an inconsistent fixture;
+restore correctly rejected it. The fixed fixture derives config/initial policy
+from its coherently constrained descriptor. No restore validation was relaxed.
+
+Guest mutation export has not been connected to this wrapper yet. The clean
+Rust collection backend therefore remains disabled; no silent write dropping
+is allowed. Authority conversion, physical guest capacity, Shared finality,
+the frozen-bundle format mismatch and the other release gates remain open.
+No source commit, branch movement, repin or external deployment occurred.
+
+### 2026-09-20: clean dispatch reads runtime-owned persisted rows
+
+Fresh and resumed clean invocations now resolve their STORAGE_R view through
+StandardAgentRuntime::resolve_clean_storage_reader, after existing caller
+authorization. The installed schema/incarnation/deployment/program checks
+derive the scope, and row maps come only from that actor's exact incarnation
+in each physical lane. Namespace ownership is validated before use, including
+hidden lanes. The reader owns its small access scope and borrows the persisted
+maps; it does not clone row collections into another image or the inner heap.
+Legacy dispatch remains without row access. Guest collection writes remain
+disabled until their mutations can be exported and committed atomically.
+
+New integration coverage starts with a canonical storage schema/policy and
+signed Authority receipt, seeds a64KiB persisted row, serializes/restores the
+runtime through actual clean dispatch, and reads it using an assembled PVM.
+The inner inline snapshot remains one byte. The guest returns the complete
+row length and copied payload prefix; its inline/result commit preserves rows.
+Restore plus expired exact retry preserves all state except the existing
+result-lane authority clock, which advances to the observed retry slot. This
+is a real guest read, not a guest-created row or a disk/daemon restart claim.
+
+Clean-dispatch suite34 passed,0 failed in3.82s after16.38s build
+(storage-clean-dispatch-suite.log, session46814 exit0). Storage suite9/0 and
+executor20/0 with3 artifact-dependent ignored also pass; no-default-features
+check passes3.12s (session96980 exit0). Logs are in shared target/task-tmp/
+authority-single-check.7E8Tdq: storage-borrowed-reader.log,
+storage-dispatch-executor.log and storage-dispatch-no-std.log.
+The initial storage-clean-dispatch.log failed only the final whole-state retry
+comparison: it incorrectly disallowed the documented authority-clock advance.
+The corrected assertion specifies that exact field change and compares the
+complete decoded state; no production retry behavior was relaxed. The initial
+failure log includes large state dumps and is retained, not printed again.
+
+The prior ten bundled-runtime wire failures remain a generation/release gate;
+this turn did not rebuild or repin the frozen guest. Next are guest mutation
+export and batch/result/continuation commits, Authority conversion/capacity,
+and coordinated artifact qualification. No branch pointers moved and no
+existing stores or artifacts were modified.
+
+### 2026-09-20: runtime row persistence and explicit lane-format cutover
+
+StandardLaneEntry now separates its inline value from an ordered row map.
+The outer lane encoder writes SLR1 after the runtime ABI, and each entry is an
+ALI1 image. Decoding has no raw-inline fallback; wrong lane marker, image magic
+or image ABI rejects. Rows remain outside prepare_execution_state/FETCH inline
+snapshots. Runtime canonical admission uses complete image byte/key/value/count
+bounds while retaining the48KiB aggregate inline limit. Empty inline plus rows
+is canonical; an entirely empty entry still must be omitted. Existing inline
+upserts preserve rows, including when inline becomes empty. Merge observations
+now hash the complete encoded image so changing a row changes the frontier.
+The historical checkpoint fixture was updated for the new row field, not for
+different compaction semantics.
+
+Focused persistence tests3/0 failures pass, including a row-only image above
+the inline ceiling, restore/roundtrip, old framing rejection and oversized row
+rejection. Production-feature Standard runtime suite51/0 failures passes12.18s,
+including row preservation through inline updates and Merge observation/reopen
+binding. Storage image suite9/0 failures passes; no-default-features check
+passes1.91s. Logs under shared target/task-tmp/authority-single-check.7E8Tdq:
+storage-persistence-wire-fixed.log (session50111 exit0),
+storage-persistence-standard.log, storage-persistence-image-tests.log and
+storage-persistence-no-std.log (session96870 exit0).
+The initial storage-persistence-wire.log compile failure is retained: Encoder's
+fixed method takes32 bytes; the four-byte marker now uses explicit byte append.
+
+IMPORTANT: full production-feature wire suite is RED:90 passed,10 failed,
+1 ignored in11.23s (storage-persistence-wire-suite.log; combined session44048
+exit101). All ten failures exercise the frozen bundled runtime, which predates
+SLR1; its decoder in immutable source ba7be457 reads a lane tag immediately
+after the ABI and rejects the new marker. Tests observe Panic rather than Halt.
+No tests were disabled or weakened and no backward decoder was added. Current
+source and bundled guest are NOT deployable together. A coordinated clean
+generation seal/reproducible rebuild/repin and rerun of these tests are required.
+The frozen e20cbb76 Local/Public-policy checkpoint and old stores are unchanged.
+
+Still open: supplying authenticated row views in production dispatch, guest
+mutation export, applying batches in the same candidate as results and machine
+continuations, whole-runtime reservation checks, Authority collection conversion
+and maximum-capacity qualification. The new persistence test seeds rows directly
+and does not claim an end-to-end guest write. Shared finality, production latency
+and the other saga release gates remain open. No branch pointers or artifact
+pins moved.
+
+### 2026-09-20: atomic lane-image row batches
+
+ActorStorageAccess::apply_batch validates the owned write lane, persisted
+namespace ownership, inline ceiling, canonical strictly ordered unique keys,
+per-row bounds, bounded delta input, and final encoded image byte/count limits
+before any mutation. It then removes old touched rows before inserting new
+ones and replaces inline bytes in the same operation. No whole-image clone is
+needed for this primitive; outer runtime result/continuation atomicity remains
+the responsibility of the enclosing commit path, which is not wired yet.
+
+Nine default-feature storage tests pass (0 failures,0.09s; session38262 exit0),
+including late-invalid changes preserving the full before image, query denial,
+empty versus deleted rows, canonical roundtrip, exact delta replay, exact4MiB
+and16384-row images exchanging rows whose new key sorts before the deleted key,
+and final capacity overflow rejecting unchanged. The test constructs the
+maximum-count fixture directly but checks image encoding and namespace admission
+before applying updates. Log: shared target/task-tmp/
+authority-single-check.7E8Tdq/storage-atomic-batch.log. No-default-features
+compilation also passes (storage-atomic-no-std.log, session59667 exit0).
+
+This is a native image primitive, not durable runtime integration or a guest
+capacity qualification. StandardLaneState still stores raw inline bytes; its
+codec/admission/lifecycle paths need a coordinated clean generation change
+before consuming ALI1 images. Guest mutation export, binding image commits to
+results/continuations, and whole-runtime byte reservations remain open. Neither
+capacity blocker nor Shared finality/release gates is closed; no artifact pins,
+branch pointers, or review ranges changed.
+
+### 2026-09-20: bounded inner-machine row reads
+
+The inner executor now has an explicit runtime-owned ActorStorageReader input.
+It validates namespace ownership across supplied images, selects a row's lane
+from the signed prefix (never from guest input), and denies hidden namespaces
+even when no image/row exists. A reader requires a matching clean invocation
+mode; ordinary calls without a reader still reject STORAGE_R. This does not
+authenticate caller policy or bind an arbitrary image to an actor: production
+integration must resolve images from the same installed actor/generation as
+the previously authenticated access scope.
+
+STORAGE_R bounds key and output lengths before allocation, charges key reads
+including misses, returns HOST_NONE only for permitted absence, and implements
+the existing full-length/prefix-copy probe semantics. Copies consume the same
+persisted FETCH byte budget as other native reads. No limits were raised;
+the existing20-call/165763-byte work budget is not a qualified bulk-storage
+capacity promise. Actual assembled PVM tests exercise64KiB values, short/zero
+probes, empty/absent rows, hidden/undeclared namespaces, malformed lengths,
+missing reader/clean context, call/byte exhaustion and two real yield/restore
+cycles. Two full reads fit; the third returns OutOfGas with the latest slice
+state unchanged. Stored images remain byte-identical.
+
+Current-source production-feature executor suite:20 passed,0 failed,3 explicit
+artifact-dependent ignored,0.01s after19.84s build (session3872 exit0).
+Storage suite:7 passed,0 failed,0.01s; no-default-features check3.72s
+(session50912 exit0). Logs under shared target/task-tmp:
+authority-single-check.7E8Tdq/storage-inner-executor.log,
+storage-reader-unit.log and storage-reader-no-std.log. The initial
+storage-inner-read.log failure is retained: the test compared absent input
+lanes with the return frame's present-empty lanes; the fixture now consistently
+uses present-empty lanes. No production behavior was relaxed to repair it.
+
+Production dispatch still does not supply row views, and the clean Rust
+collection backend remains disabled: its old service-effect write path must
+not silently discard clean mutations. Next are runtime image persistence,
+atomic writes/continuations and guest collection dispatch, followed by the
+Authority conversion and real capacity qualification. No artifact pins or
+branches moved; Shared finality and release gates remain open.
+
+### 2026-09-20: installed-schema binding for clean row access
+
+ActorStorageAccess now checks exact declared namespaces and the full six-mode,
+three-lane read/write matrix; denied updates leave images unchanged. The
+StandardAgentRuntime schema-validation boundary derives this scope only after
+checking the installed schema reference/preimage, state-layout and lane set,
+actor incarnation, deployment, program, and selected method/mode. Caller
+authorization remains a separate mandatory gate, not something this scope
+proves. Regression coverage uses an installed actor with an inline field plus
+a storage field: authorized namespace read/write succeeds; foreign namespaces,
+stale identities, wrong modes and a self-consistent replacement schema reject.
+
+Production-feature focused tests pass: installed-schema regression1/0 failures
+(0.02s after1m12s build), codec/access tests6/0 failures (0.01s). No-default-
+features check passes3.77s. Evidence under the shared target task-tmp directory:
+authority-single-check.7E8Tdq/storage-installed-scope.log,
+storage-scope-runtime-feature.log and storage-scope-no-std.log.
+The earlier default-feature access suite also passed6/0 failures in
+storage-access.log. Existing compiler warnings remain; these are not lint or
+whole-workspace release gates.
+
+This is uncommitted source, not deployed storage: StandardLaneState still holds
+raw inline bytes. Guest row IO, runtime image persistence, continuation/atomic
+commit integration and Authority collection conversion remain next. Neither
+the48KiB capacity gaps nor Shared finality are closed. No release pin, branch
+pointer or review boundary changed.
+
+### 2026-09-20: uncommitted Authority publication compile repair
+
+Clean row-storage implementation started with the private ActorLaneImage
+representation (actor_storage.rs). ALI1 separately encodes inline fields and
+ordered row key/value pairs, binding the current ABI. Inline remains48KiB;
+one image is bounded by the existing4MiB outer ceiling, including keys, values
+and all framing; the complete runtime must still reserve its own overhead.
+Rows use the existing64KiB value bound, a64KiB key bound and16384-row count
+bound. These are candidate codec limits, not a newly advertised guest capability.
+Updates reject overflow before mutation; empty values differ from absent rows;
+decoding checks total bytes before allocation, count plausibility, per-item
+bounds, strict key order/uniqueness and complete consumption. Four tests pass
+0.01s after38.26s build (session14586 exit0;
+authority-single-check.7E8Tdq/lane-image.log), including256 separate rows beside
+a maximum inline snapshot and an exact4MiB image. This is only an internal
+codec: StandardLaneState does NOT yet consume it, and no guest storage hostcall
+or Authority table migration has been implemented. Next implement signed
+field-prefix/lane access, bounded row IO and atomic runtime persistence before
+converting Authority collections. Do not reinterpret existing lane bytes as
+this image or claim capacity qualification from its unit tests.
+
+Blob quota across real continuation boundaries is now covered by an assembled
+PVM regression. The actor reads36KiB, suspends, resumes and reads36KiB again,
+suspends again, then the third read exhausts the accumulated native-work quota.
+Both captures retain exact FETCH calls/bytes and valid portable snapshots;
+OutOfGas preserves the last yielded state. This is physical capture/restore,
+not daemon/disk restart or only counter arithmetic. Production-feature executor
+suite passes19/0 failures/3 explicit artifact-dependent ignored,1626 filtered,
+0.01s (session60552 exit0; authority-single-check.7E8Tdq/executor-yield-budget.log).
+All three explicit artifact tests also pass together3/0 failures/0 ignored,
+1645 filtered,1.39s (session41608 exit0, executor-artifacts.log in that directory):
+Rust input/blob decoder, Authority candidate loader (1046074 PVM bytes), and
+native/guest publication-state equality with expired exact retry. Artifact
+paths remain the independently retained input probe and single-check candidate;
+this is not a fresh generation reproduction or maximum-capacity qualification.
+
+Storage-contract audit: RuntimeResourceLimits authenticates outer runtime
+state/catalog/proof ceilings; ActorPackageContract currently carries only its
+ABI. Existing #[storage] handles use the service-runtime backend; a no_std
+non-service backend explicitly panics, and clean run_agent rejects unsupported
+effects. Therefore these handles cannot simply replace Authority's vectors to
+solve capacity without implementing the clean storage execution path. No
+storage redesign or new per-actor capacity contract has been introduced here.
+
+FULL-ROSTER CAPACITY AUDIT: the complete signed256-replica provision is55586
+bytes: proposal18596, roster35947, evidence754, decision237, framing52.
+The regression reuses the full strict pending-Create signature/receipt/QC,
+canonical roundtrip and publication-identity checks, not just a standalone
+roster size. It is valid under MAX_CLEAN_CREATE_GENESIS_PROVISION_BYTES but
+exceeds caller availability49152. All12 genesis tests pass0.09s
+(session26111 exit0; authority-single-check.7E8Tdq/full-provision-capacity.log).
+This passing audit proves the current incompatibility, not successful delivery.
+
+Separately, the existing native full256-replica authorization fixture has76494
+encoded Linear bytes after node enrollment and before adding its Create or
+publication record. This exceeds the49152 inner actor lane ceiling already.
+The full-replica principal-substitution/authorization test passes1/0 failures,
+63 filtered,9.11s after7.93s build (session98914 exit0;
+authority-single-check.7E8Tdq/enrollment-capacity.log). Its assertion explicitly
+records the mismatch so it cannot be misrepresented as guest qualification.
+The runtime package resource contract signs the outer state-image ceiling,
+not a per-actor heap/lane allowance. No existing signed per-actor capacity
+negotiation was found in ActorPackageContract. Thus transport-only expansion
+cannot close maximum support: both transport and persistent Authority state
+must be reconciled with a physically tested bounded execution policy/layout.
+
+RESOLVED FOR THE SMALL FIXTURE: compiled Authority publication now passes all
+three phases against the original exported native fixture: absent blob leaves
+pending state unchanged, valid publication produces identical reply and Linear
+bytes, and expired exact retry preserves the published state. Candidate:
+shared target/task-tmp/authority-single-check.7E8Tdq;
+normal locked/offline RISC-V build36.56s (session23053 exit0), ELF SHA256
+`fc2240a55f2f875d063c20a9c8a731527bbc4fa17fef48c78fcbc2221244e643`.
+Same production-feature harness which rejects the original candidate now
+passes1/0 failures/0 ignored,1645 filtered,1.38s (session44474 exit0,
+publication.log). Remaining gas by phase:994033525,829657706,854184255.
+This is an explicit inner guest test, not real root-backed native finality,
+maximum resource qualification, or sealed/reproduced release artifacts.
+
+Stack investigation with -Zemit-stack-sizes: original provision decoder35648
+bytes and dispatch13432. Separate nested decoding alone still overflowed;
+boxing only the proposal's ReplayInput progressed further but still overflowed.
+Final layout boxes the replay input and provision components and keeps nested
+decoders out of the enclosing frame. Largest decoder scratch frame in the
+measured final-layout build is12256 bytes. Private in-memory layout changes do
+not change canonical wires; the unchanged exported fixture proves exact output
+equivalence. All11 genesis tests pass (session39554 exit0). Failed intermediate
+targets/logs remain at authority-stack.KUdG3H, authority-stack-fix.YcCHUU,
+authority-boxed.keOq2l, authority-boxed-split.wiUvmj, authority-components.oWLXdT
+under shared target/task-tmp.
+
+Final-layout execution then exhausted exactly1024 hash-compression calls
+(publication-quota.log, session93545 exit101). Removed the duplicate
+record_is_valid before candidate insertion: authority_state_is_valid still
+verifies every candidate publication before replacing live state. Publication
+native regressions pass2/0 failures/1 explicit exporter ignored,0.52s
+(session25818 exit0). No stack/heap/gas/hash-quota ceilings were raised.
+The compiled publication regression now requires feature agent-runtime, which
+provides the real hash precompile; pvm alone is not that execution surface.
+Earlier failure paragraphs below are historical, not the current small-fixture
+result. Broader capacity and production gates remain open.
+Final-current-source production-feature rerun also passes1/0 failures/0 ignored,
+1.37s after8.89s build (session50225 exit0,
+authority-single-check.7E8Tdq/publication-current-source.log), with the same
+three gas values. Full updated Authority binary passes63/0 failures/1 explicit
+exporter ignored,27.95s (session25043 exit0, authority-full.log). Final
+no-default-features check passes (session97910 exit0, no-std.log).
+
+To reproduce the physical publication regression, build the current Authority
+ELF from examples/actors with the locked guest toolchain as above, using disk
+target/TMPDIR. Set AUTHORITY_CANDIDATE_ELF to it and
+AUTHORITY_PUBLICATION_FIXTURE to a new directory under that disk scratch root.
+From the worktree root, export then execute:
+
+```sh
+cargo +nightly-2025-05-09 test --locked --offline -p system-authority \
+  tests::export_signed_genesis_publication_fixture -- --ignored --exact
+cargo +nightly-2025-05-09 test --locked --offline -p vos --features agent-runtime --lib \
+  agent::execution::tests::compiled_authority_publication_matches_native_state_and_retry \
+  -- --ignored --exact --nocapture
+```
+
+The exporter refuses an existing output directory, and the execution test
+fails on missing artifacts. Do not substitute the default pvm-only feature.
+
+IMPORTANT: actual compiled Authority publication currently FAILS. Added explicit
+signed fixture export (test export_signed_genesis_publication_fixture; env
+AUTHORITY_PUBLICATION_FIXTURE must name a new directory) and PVM regression
+compiled_authority_publication_matches_native_state_and_retry. Export passes
+1/0 failures,63 filtered,0.30s (session66717 exit0), preserving configuration,
+pending Linear5606 bytes, expected published Linear12102 bytes, canonical
+provision3279 bytes, decision237 bytes, context and authorization. Fixture:
+shared target/task-tmp/authority-blob-guest.GC8HWn/publication-fixture.
+It retains the original synthetic post-state certificate fixture limitation;
+this is not real root-backed finality evidence.
+
+Guest phase0 missing blob returns Done with gas994035172 and unchanged pending
+state. Phase1 valid publication faults with gas971347736 before comparison;
+expired retry phase2 is NOT reached. First failure session78055 exit101,
+publication-execution.log; opt-in test diagnostics reproduce (session64270
+exit101, publication-fault.log): Fault(4277981184)=0xfefcd000,
+SP4277984184=0xfefcdbb8. The canonical actor linker declares64KiB stack
+(.rodata0x10000); standard layout maps it at0xfefd0000..0xfefe0000, so the
+fault and SP are below its lower bound, consistent with stack exhaustion.
+No guest panic diagnostic was emitted. Identify large stack frames next;
+do not call native publication tests or successful loading proof of usability.
+VOS_TEST_INNER_DIAGNOSTICS enables bounded guest debug/raw failure output only
+in tests; production still discards it. All earlier bundle qualification is
+unchanged, and no release pin or resource limit was raised to hide this failure.
+
+Post-reference-consumer full Authority suite passes63/0 failures/0 ignored,
+32.02s (session60168 exit0), including reservation/restart/capacity tests;
+log shared target/task-tmp/agent-blob-guest.9PXZOd/authority-full.log.
+The actual updated system-authority also builds locked/offline for RISC-V
+with nightly-2026-03-20 and two jobs in37.46s (session3454 exit0). Isolated
+disk target/evidence: shared target/task-tmp/authority-blob-guest.GC8HWn.
+ELF target/riscv64em-vos/release/system_authority.elf SHA256:
+`6c50fb115e2bfef25c340aee12aa32c8175c617476fa03e24ec5954fb4e190d6`.
+No package or bundle replaced. This is guest build evidence, not successful
+publication execution or independent reproduction of a sealed generation.
+Explicit candidate-loader regression links that ELF to1044604 PVM bytes,
+below the1280KiB program ceiling, and loads it in the real inner machine.
+Pass1/0 failures/0 ignored,1644 filtered,0.74s after33.87s build
+(session67971 exit0, authority-blob-guest.GC8HWn/loader.log). Reproduce with
+AUTHORITY_CANDIDATE_ELF set to the ELF above and `cargo +nightly-2025-05-09
+test --locked --offline -p vos --features pvm --lib
+agent::execution::tests::compiled_authority_candidate_fits_inner_loader
+-- --ignored --exact --nocapture`, using the disk-backed target/TMPDIR.
+Missing artifact fails explicitly. Loading does not execute publication or
+establish state-capacity feasibility.
+
+Publication's public message now carries authorization, provision_hash and
+provision_len instead of inline provision bytes. The boundary rejects malformed
+IDs/context and above48KiB references before lookup; loads only invocation
+availability; verifies exact length/hash; then calls the existing canonical
+signed-Create/publication validator. No inline/ambient fallback is retained.
+Native regression explicitly injects its loader and checks missing/corrupt data
+leave pending state unchanged, oversized references do not invoke the loader,
+valid publication succeeds, and an expired exact retry survives restart.
+Both publication regressions pass2/0 failures/0 ignored,61 filtered,0.31s
+(session9431 exit0; publication-reference-fixed.log under shared
+target/task-tmp/agent-blob-guest.9PXZOd). Initial compilation caught the older
+generated-message fixture field; corrected it and preserved the failed log.
+The full public Authority guest/host route is not qualified by these handler
+tests. Provisions above48KiB, archive/guest capacity, native issuance/finality,
+and generation sealing/reproducibility remain unresolved.
+
+Rust actors now have Context::invocation_blob(&clean BlobRef). It requires
+clean invocation context, bounds allocation to48KiB before ECALL, distinguishes
+absent data from errors, and verifies returned length/content. Native handlers
+explicitly return UnsupportedHost rather than acquiring an ambient store.
+Extended protected agent-yield fixture and compiled execution regression pass:
+36KiB blob success, missing availability, wrong length and oversized reference,
+all with unchanged Local state, alongside the existing maximum-message query.
+Pass1/0 failed/0 ignored,1643 filtered,0.15s after57.16s host build
+(session19791 exit0). Guest rebuild passes2.19s (session24300 exit0) after fixing
+an overlong role-ID literal; original failure retained. Evidence in shared
+target/task-tmp/agent-blob-guest.9PXZOd/{build.log,build-fixed.log,execution.log}.
+Guest ELF SHA256:
+`3933823bc829714af7c03f130f435569f79ddd8f44927a01a46249be376c4159`.
+This closes the compiled Rust blob-consumer prerequisite, not publication
+integration, capacity reconciliation, full native Shared or artifact repinning.
+
+Inner PREIMAGE_LOOKUP is now implemented against only invocation availability.
+Registers carry hash pointer/output pointer/capacity; success returns full byte
+length, absent returns HOST_NONE, short capacity returns HOST_FULL with no copy.
+Capacity is bounded48KiB. Key reading costs32 work bytes and one FETCH call;
+selected content is charged twice its length before hash verification/copy.
+FETCH counters already persist across continuations; their new ceilings20 calls
+and165763 bytes cover five framed inputs/probes plus four caller keys and total
+48KiB verification/copy. No guest-state, message or availability bound increased
+in this step. Real assembled PVM tests verify36KiB copy, absent data, short
+buffer, repeated-lookup OutOfGas and preserved failure state. Executor suite
+passes18,0 failures,1 artifact-dependent ignored,1625 filtered,0.01s after40.30s
+build (session81959 exit0). Log: shared target/task-tmp/
+agent-input-guest.9TjFzK/preimage-execution.log. Actor convenience API, compiled
+Rust blob-consumer test, publication integration, and generation/repro/repin
+remain outstanding. This is not native Shared release qualification.
+
+Compiled Rust input-boundary regression now passes:1 passed,0 failed,0 ignored,
+1642 filtered,0.04s after21.85s build (session86294 exit0). The exact disposable
+ELF below is linked by link_elf_spi and executes with a protected clean context.
+Largest natural dynamic archive is16377 bytes (payload16327); the next payload
+size crosses16KiB because of archive alignment. The guest returns the correct
+length and preserves canonical Local state. Both the next natural message and
+an explicit16385-byte message reject at invocation validation. This corrects
+the earlier requirement for an exactly16384-byte archive, which this encoding
+cannot represent. It does not qualify large Authority state, blob lookup,
+native Shared finality, or a reproducibly repinned release. The explicit ignored
+test fails on a missing AGENT_INPUT_PROBE_ELF; instructions are in the fixture
+README. Prior fixture-build paragraphs below describe their then-pending state.
+
+The updated agent-yield input probe now builds for the real RISC-V target with
+nightly-2026-03-20, locked/offline cargo actor, two build jobs and disk TMPDIR.
+Isolated target/evidence directory in the shared target:
+`task-tmp/agent-input-guest.9TjFzK` (217MiB); build.log records27.13s and exit0
+(session57768). ELF is `target/riscv64em-vos/release/agent_yield_probe.elf`
+inside that directory, SHA256
+`b42463f2ffdd0ad668249367309c9cc4127ced5f2343a026a11cdb707c023d82`.
+No prior target/package was replaced. Next link this exact ELF with
+vos_pvm_compiler::link_elf_spi and execute the full16KiB actor message under
+the protected clean context. Build success alone does not close execution or
+reproducibility; this is an unqualified disposable fixture, not a release pin.
+
+Extended the existing non-system agent-yield fixture with a read-only
+`input_len(Vec<u8>)` LocalQuery using the same explicit deployment actor role.
+Its small length reply isolates large input decoding from reply capacity, and
+the README requires sizing the complete actor message to16KiB, checking one
+byte over and unchanged Local state. Locked/offline host type-check passes2.07s
+(session41848 exit0, `agent-yield-input-probe-check.log`). No new fixture package
+was introduced and no retained yield package replaced. Compilation to PVM and
+physical execution remain outstanding; this is only fixture preparation.
+
+Full clean resolver regression accepts a validated16KiB SDK message with its
+execution artifacts and a36KiB caller blob. The resolved inner invocation keeps
+the message and only the caller blob; program/schema/policy remain separate.
+Invocation-local lookup returns those exact caller bytes. Missing program
+rejects InvalidAvailability;16KiB+1 fails SDK validation and inner resolution.
+Pass1/1,1641 filtered,0.00s after27.05s build (session2007 exit0,
+`clean-resolver-message-availability.log`). This closes the resolver-specific
+check, not policy authorization of that opaque message, guest blob API wiring,
+compiled Rust actor execution or artifact qualification.
+
+Follow-up source checks after message/FETCH alignment: vos no-default-features
+check passes1.80s (session86151 exit0, `clean-message-fetch-no-std.log`). Existing
+clean execution SDK schema/policy/hash-domain regression passes1/1,1640 filtered,
+0.01s (`clean-message-artifact-boundary.log`, command exit0). This checks schema,
+policy and authorization boundaries; it does not itself exercise full invocation
+availability resolution or a16KiB compiled Rust actor call. Those and artifact
+qualification remain open; no new release qualification is inferred.
+
+Actual inner ECALL regression now fetches three lanes totaling48KiB, exact clean
+control and a16KiB message using the guest's256-byte probe followed by an exact
+retry for each larger frame. The assembled program completes with Done rather
+than exhausting native FETCH work; unchanged over-limit lane assertions still
+reject48KiB+1 and99200 bytes. Pass1/1,1640 filtered,0.01s after22.79s build
+(session44676 exit0, `clean-inner-maximum-fetch.log`). This exercises real inner
+machine FETCH dispatch, not only budget counters, but is not a compiled Rust
+actor allocator test or reproducible runtime/actor bundle qualification.
+
+Source cutover fix aligns MAX_EXECUTION_MESSAGE_BYTES with the existing clean
+SDK16KiB message ceiling; the guest fetch path already uses this constant.
+The shared256-byte probe constant now ties guest fetch_owned to host budget
+accounting. FETCH budget67331 covers three lane tags,48KiB aggregate lanes,
+512-byte control,16KiB message and five256-byte sizing probes. All17 PVM-enabled
+executor tests pass (session96620 exit0, `clean-message-fetch-alignment.log`),
+including exact message acceptance/one-byte-over rejection and all maximum
+frames plus probes exhausting the budget exactly. Actor state/availability
+remain48KiB and reply size remains8KiB. This changes runtime/guest semantics in
+uncommitted source: coordinated generation sealing, compiled-guest tests,
+reproduction and repin remain REQUIRED before qualification or deployment.
+The frozen e20cbb76 artifacts are unchanged.
+
+Clean-path follow-through confirms limits cannot be repaired at one dispatcher:
+`StandardRuntime::resolve_clean_invocation` separates authenticated execution
+artifacts from caller inputs, builds ActorInvocation, then calls its validator.
+That applies the inner8KiB message/four-blob/48KiB availability limits even
+though the SDK InvocationWork message ceiling is16KiB. Actor-state preparation
+also checks the48KiB aggregate lane limit before run_inner_actor; lifecycle
+state validation checks it separately. SDK caller availability intentionally
+matches48KiB, and actor-storage documentation describes a256KiB guest heap.
+Therefore this is a coordinated boundary/heap/contract reconciliation issue,
+not evidence that changing one old constant safely enables4MiB actors. The
+invocation-local preimage helper receives only caller availability after
+execution-artifact role separation; no ambient store is needed for that path.
+
+PVM-enabled executor regression now directly confirms the lane-boundary gap.
+A valid assembled program runs with clean AIC1 context and exactly48KiB input
+lane state; the same program/context rejects48KiB+1 and99200 bytes as InvalidInput,
+although both fit the outer4MiB cap. Pass1/1,1638 filtered (session88518 exit0,
+`clean-inner-state-boundary-pvm.log`, build1m23s). The first default-feature
+command selected zero tests because the test is pvm-gated; its separate log is
+preserved and is not qualification evidence. The test exercises the real inner
+executor boundary with a tiny program, not the compiled Authority actor or its
+allocator limits. No limit, host call or artifact was changed.
+
+Physical-limit audit: `execution.rs` sets individual/aggregate actor lanes and
+aggregate availability to48KiB, FETCH work to64KiB; `run_inner_actor` checks lane
+size before running the guest even with a clean context. These are separate
+from the4MiB outer runtime/Authority archive cap. Existing native-handler
+reservation/capacity tests therefore do NOT prove compiled-guest capacity. The
+99200-byte host fixture must not be described as guest-executable.
+Reconciliation requires physical execution
+qualification, not merely choosing a bigger archive ceiling. No limits changed.
+Lookup tests now independently reject a single blob one byte over48KiB and two
+individually valid blobs exceeding aggregate48KiB, while accepting the exact
+single-blob boundary. Both lookup tests pass2/2,1440 filtered (session71824 exit0,
+`invocation-preimage-byte-limits.log`). Future dispatch must charge work before
+copy/hash and preserve continuation budget accounting; it is not wired yet.
+
+Added the executor-side `ActorInvocation::available_preimage` primitive for the
+large-provision transport path. It only reads this invocation's availability,
+checks collection bounds/canonical order, matches the full requested hash/length
+and verifies the selected bytes. Complete invocation authentication remains the
+caller's prerequisite. A36KiB carried blob is readable despite the smaller
+message limit; absent/cross-invocation lookup misses, while wrong length,
+tampered bytes, duplicate hashes and excessive entry count reject. Targeted
+test passes1/1,1440 filtered (session90799 exit0,
+`invocation-preimage-boundary.log`). This primitive is not yet exposed through
+the inner-machine dispatcher or guest Context API; no host call/ABI permission
+or artifact was changed. Never treat this lookup as an authorization grant.
+
+Consolidated formatted-source checks: full Authority actor63 passed,0 failed,
+0 ignored in102.22s (session23618 exit0, `authority-publication-consolidated.log`);
+all genesis11 passed,0 ignored in0.05s (session48759 exit0,
+`genesis-consolidated.log`); vos no-default-features check passes4.58s
+(session51948 exit0, `genesis-bound-no-std.log`). Formatting was restricted to
+new/touched sections and the new publication module. These changes remain
+uncommitted and are not a bundled guest or full native Shared qualification.
+Next integration boundary: invocation-bound large-provision transport, then
+native issuance/authenticated finality and owner/transport identity handling.
+
+Blob-transport feasibility audit: `Context::blob_get` belongs to ExtensionCtx,
+explicitly unavailable to PVM actors. Inner clean actor execution in
+`vos/src/agent/execution.rs` supplies exactly five sequential FETCH frames
+(Linear, Merge, Local, invocation context, message). Its host-call dispatcher
+supports GAS/FETCH/GROW_HEAP/debug and the configured crypto precompile, with
+all other calls rejected; the service `preimage_lookup` wrapper is not usable
+here. Thus native publication cannot merely replace the inline provision with
+a blob reference and reuse Context::blob_get. The next transport step must
+provide deterministic access to invocation-bound availability at the inner
+actor boundary (with corresponding guest/runtime qualification), or a bounded
+authenticated chunk protocol. No ABI or host-call permission was changed in
+this audit. Do not use ambient host/network lookup as replay evidence.
+
+Transport-boundary regression confirms an integration gap: a valid256-member
+Shared roster (one voter,255 observers) canonically round-trips at35947 bytes,
+already exceeding the16384-byte InvocationWork message limit before enclosing
+proposal/evidence or actor-message framing. The inline `publish_genesis`
+prototype cannot cover the supported roster limit. Native publication must use
+bounded blob availability/reference or a reviewed chunk protocol; do not raise
+the invocation limit or count the one-replica storage fixture as full transport
+coverage. Host regression passes1/1,1439 filtered,0.01s after1m11s build
+(session81498 exit0, `genesis-roster-transport-bound.log`).
+
+Real admission-budget regression now enrolls32 independent Admin credentials
+and issues distinct Shared Creates through generated actor messages. It admits20
+pending Creates, then denies the next atomically: archived state99200 bytes,
+publication reservations3562720, terminal reservations380800. This is below
+the4MiB combined limit but insufficient for another complete reservation; retry
+and agent count limits are not exhausted. Save/reload preserves exact approvals
+and the denial. A signed acknowledgement for one admitted Create succeeds and
+the exact previously denied call then succeeds without changing its sequence.
+Targeted test passes1/1,62 filtered,27.82s (session88716 exit0,
+`authority-publication-capacity-admission.log`). This exercises actual admission
+budget exhaustion, not a4MiB materialized archive or max-sized publications.
+
+Two independently enrolled Admin credentials now exercise simultaneous Shared
+Create reservations. Equal-shape signed requests reserve twice the publication
+and terminal bytes; combined budget edge passes and one byte over fails.
+Both exact approvals survive Linear restart. Acknowledging one releases only
+its reservation while the other approval remains replayable; acknowledging the
+second releases the remainder. Targeted test passes1/1,61 filtered,1.10s
+(session75923 exit0, `authority-publication-multiple-reservations.log`). This
+tests reservation accounting and signed acknowledgement handling, not two
+replay-backed publications or an actually filled near-capacity actor archive.
+
+Shared Create terminal byte reservation is now included in the common state
+budget check. It covers the complete new live ManagedAgentRow (including replica
+and proof-system vectors) and LatestManagementAckRow, exact retained call,
+the16KiB canonical MAA2 ceiling and alignment. It conservatively takes no credit
+for removed pending/previous-ACK rows. Publication leaves this reservation intact;
+Create acknowledgement removes it with the pending record. The signed fixture
+checks observed terminal growth is covered, retention after publication, release
+after ACK and exact combined-budget edges. Full actor suite passes61/61,
+0 ignored,68.63s (session65465 exit0,
+`authority-publication-terminal-budget-full.log`). Maximum-roster and multiple
+simultaneous pending/capacity integration still require coverage; this does not
+reserve terminal bytes for unrelated lifecycle/Private operations.
+
+Pending Shared Creates now reserve publication bytes through the common state
+integrity/size check: bounded clean provision plus exact retained call/approval,
+archived row size and alignment. Every state update must preserve the remaining
+reservations, so unrelated operations cannot spend those bytes. Once the row is
+published it is charged as actual state instead. Create approval uses a cloned
+candidate and returns no approval if reservation cannot fit. The signed fixture
+checks reservation covers observed growth, exact budget edge acceptance,
+one-byte-over and usize overflow rejection, and release after publication/ACK.
+Full actor suite passes61/61,0 ignored,68.65s (session4520 exit0,
+`authority-publication-budget-full.log`). Terminal acknowledgement growth is
+still NOT reserved; worst-case multi-pending/capacity integration remains open.
+
+Introduced `MAX_CLEAN_CREATE_GENESIS_PROVISION_BYTES` from the canonical
+AJI4/AWRK CleanManage/Create framing, bounded descriptor/receipt, empty runtime
+lanes, fixed runtime binding and existing proposal/roster/evidence/decision
+limits. The Authority publication boundary now uses this Create-specific bound
+instead of the generic invocation-sized provision ceiling. Counting complete
+descriptor/receipt limits where only their bodies are embedded is conservative.
+The signed publication/restart/acknowledgement test still passes1/1,60 filtered,
+0.87s (session44582 exit0, `authority-publication-create-bound.log`), asserting
+the fixture fits and the new bound is below4MiB. This does not yet reserve total
+archive/terminal bytes before approval or prove maximum-roster integration.
+
+Sizing evidence from the signed one-replica fixture: archived pending state5600
+bytes, published12096, finalized12184; publication adds6496 bytes and terminal
+acknowledgement adds88. Provision3279, retained call1518, approval1564 bytes.
+The generic provision wire ceiling is6343068 bytes, exceeding the4194304-byte
+state budget. Reserving that generic ceiling cannot work; derive a tighter
+Create-specific bound, including replica/QC limits, archive overhead and
+terminal state, before introducing admission reservations. These small-fixture
+numbers are not worst-case estimates. The test also reloads the acknowledged
+state and verifies the retained decision remains readable. Pass1/1,60 filtered,
+0.82s (session73778 exit0, `authority-publication-sizing.log`).
+
+Full current actor regression now passes61 tests,0 failed,0 ignored,0 filtered
+in68.63s (session51738 exit0, `authority-publication-full.log`), including both
+publication tests and the reservation fix. This is host actor coverage, not a
+new bundled guest qualification.
+
+Capacity audit: Create admission already counts live plus pending agents
+against256; no production managed-agent removal exists in this actor. Thus a
+separate publication row-count reservation is not presently demonstrated to be
+necessary for reachable states. Byte capacity is different: the4MiB SDK runtime
+state cap is enforced by `computed_state_integrity_commitment`, while each new
+publication retains full call, approval and provision bytes. There is no
+pre-approval byte reservation. A sizing/admission solution must guarantee
+publication and terminal acknowledgement capacity before Shared Create is
+approved; publication-time atomic rejection alone does not close that gap.
+
+Reservation audit found and fixed a missing publication-ID exclusion in
+`private_application_invocation_is_unreserved`. The signed publication fixture
+now checks retained-ID reservation after restart and Create acknowledgement:
+Admin, either management/operation pair position, and Private application must
+reject the publication ID; a fresh ID remains available. The focused test
+failed specifically at the Private reservation assertion before the fix
+(session4182 exit101, `authority-publication-reservation-repro.log`) and passes
+afterwards (session70313 exit0,1 passed/60 filtered,0.76s,
+`authority-publication-reservation-fixed.log`). Final state uniqueness already
+included publication IDs; this fixes early admission, not an observed committed
+duplicate. Its allocation estimate now also includes publication rows. The
+initial test-edit compile failure is preserved separately in the `before` log.
+
+Positive signed storage coverage now passes: a real credential-authorized Shared
+Create and signed receipt/QC publish a decision, retain it across Linear
+save/reload, and allow exact retry after expiry and after a signed application
+acknowledgement removes the pending Create. The same valid provision rejects
+wrong actor, wrong mode, wrong invocation and expired first publication without
+changing state. Targeted test passes1/1,60 filtered in0.77s (session87853 exit0),
+`authority-publication-positive-final.log` in the evidence directory below.
+This signs a synthetic post-state claim, not a native replay proof. The fixture
+aligns logical ownership with the transport-key principal; ordinary distinct
+owner/transport identities still need end-to-end reconciliation because the
+genesis roster binds principal to transport key while Authority enrollment
+checks node ownership. The first fixture failure was an unenrolled node chosen
+by the old owner-derived helper; its log is preserved. No production predicate
+was weakened to admit the fixture.
+
+Added a direct generated-message regression for malformed publication while a
+Shared Create approval is pending: no context, normal context, wrong actor and
+wrong mode all leave the state unchanged. Zero invocation is checked at the
+publication function boundary because the public Context setter rejects it
+before dispatch. Saving/reloading the Linear lane retains the exact pending
+approval and no publication. Targeted test passes1/1,59 filtered in0.20s
+(session70408 exit0), `authority-publication-rejection-fixed.log` in the evidence
+directory below. The original failing harness log is preserved: it attempted to
+inject a zero invocation through the validating setter. These malformed-input
+cases do not independently prove each context check or successful publication.
+
+The separate, uncommitted publication prototype now passes the locked/offline
+host library check with nightly-2025-05-09. Fixed the SDK MethodMode import and
+the mutable receiver required by the explicit Linear decision method. Its new
+state field requires actor state version18; schema tests now cover the two new
+Linear methods and that generation. The first actor regression run completed
+57 passed/2 failed, both stale schema expectations; the corrected full rerun
+passed59 tests,0 failed,0 ignored in67.77s (session73094 exit0). The result
+is recorded in `authority-publication-regression-fixed.log` under the shared
+target's `task-tmp/final-review-release.HbPbex` evidence directory.
+
+This is NOT a qualified actor or a completed Shared path. Native publication
+replay coverage, capacity admission, committee history and native
+provider/authenticated finality integration remain outstanding. No artifact
+repin, merge or push was performed. Keep this prototype out of the frozen
+e20cbb76 review/test checkpoint; do not deploy the dirty working tree as that
+release.
+
 ### 2026-09-20: exact genesis-publication invocation identity
 
 `AgentGenesisProvision::publication_invocation` derives a distinct-domain ID

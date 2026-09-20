@@ -4,6 +4,15 @@ use super::auth::{Caller, Forbidden, RoleByte, SpaceRole};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
+/// Failure to read an exact invocation-bound blob through the clean guest ABI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvocationBlobError {
+    NotAgentInvocation,
+    UnsupportedHost,
+    InvalidReference,
+    InvalidResponse,
+}
+
 /// One canonical application identity for a transport-authenticated peer.
 /// Every host ingress must use this helper so route choice cannot
 /// change the persistent [`crate::service::SubjectId`].
@@ -291,6 +300,42 @@ impl<A: Actor> Context<A> {
     /// synthesized when this value is present.
     pub fn agent_invocation_context(&self) -> Option<&crate::agent_sdk::InvocationContext> {
         self.agent_invocation_context.as_ref()
+    }
+
+    /// Read an exact caller-supplied blob from this clean invocation only.
+    /// This never fetches from a node store or network. Missing availability is
+    /// `Ok(None)`; an invalid response is an error, not a missing blob.
+    /// Native handler tests have no implicit blob store and return UnsupportedHost.
+    /// The runtime separately charges lookup work across yields; this method
+    /// bounds allocation before calling it and verifies both returned length and
+    /// content against the clean protocol reference.
+    pub fn invocation_blob(
+        &self,
+        reference: &crate::agent_sdk::BlobRef,
+    ) -> Result<Option<Vec<u8>>, InvocationBlobError> {
+        if self.agent_invocation_context.is_none() {
+            return Err(InvocationBlobError::NotAgentInvocation);
+        }
+        let len = usize::try_from(reference.len).ok()
+            .filter(|len| *len <= crate::agent::execution::MAX_EXECUTION_AVAILABILITY_BYTES)
+            .ok_or(InvocationBlobError::InvalidReference)?;
+        #[cfg(target_arch = "riscv64")]
+        {
+            let mut bytes = alloc::vec![0; len];
+            let result = crate::abi::pvm::hostcalls::preimage_lookup(&reference.hash.0, &mut bytes);
+            if result == crate::abi::error::HOST_NONE {
+                return Ok(None);
+            }
+            if result != reference.len || !reference.matches(&bytes) {
+                return Err(InvocationBlobError::InvalidResponse);
+            }
+            Ok(Some(bytes))
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            let _ = len;
+            Err(InvocationBlobError::UnsupportedHost)
+        }
     }
 
     /// Exact clean origin authenticated for this invocation.
@@ -1391,6 +1436,7 @@ impl<A: Actor> Context<A> {
     /// Checkpoint state and yield to other actors. Resumes next tick.
     /// Each invocation runs one iteration; state is saved automatically.
     pub fn yield_now(&mut self) -> super::run::Yield {
+        assert!(!super::storage::transaction_is_open(), "cannot yield inside a storage transaction");
         #[cfg(feature = "pvm")]
         {
             // Service actors retain their transitional service scheduler
@@ -1424,6 +1470,9 @@ impl<A: Actor> Context<A> {
             };
             #[cfg(not(feature = "service"))]
             let restored = crate::abi::pvm::hostcalls::suspend() == 1;
+            if restored && self.agent_invocation_context.is_some() {
+                super::storage::resume_clean_dispatch();
+            }
             self.self_schedule = !restored;
             super::run::Yield::after_checkpoint(restored)
         }

@@ -1,6 +1,125 @@
 # Reviewing the Agent architecture saga
 
-## Review freeze: `45ff53e0`
+## Current review boundary — 2026-09-20
+
+### Proposed frozen integration candidate (not yet merged)
+
+Use `e20cbb76` as the proposed immutable review candidate, not worktree HEAD.
+This supersedes the open-ended second review range below for the proposed
+integration. Keep two consolidated review groups:
+
+1. `31b0cdbb..f79f0e3d`: architecture, native integration and lifecycle.
+2. `f79f0e3d..e20cbb76`: integrated fixes, recovery, first-run UX and qualification.
+
+The integrated candidate changes241 files,+79307/-59066 against `saga/agents`.
+Its implementation is identical to `45ff53e0`: the intervening diff changes
+only the three saga documentation files. Neither review group is independently
+deployable. This checkpoint does not complete the saga or qualify master.
+
+Read-only revalidation on2026-09-20 confirmed the preserved release executable
+SHA-256 `d11e52eed2e917a53e025536972f375363d30355d602dee2e9e23a3f6950e2cc`.
+Running that executable's `release verify` again against the preserved
+`final-review-release.HbPbex/bundle` succeeded. Evidence directories below live
+under `.worktrees/ch08-c2-native/target/task-tmp/` from the repository root.
+
+- `single-preflight-release.pE0Yxy/host-feature-suite-fixed.log`: historical
+  full parent suite1878 passed,0 failed,4 ignored; nested child summaries are
+  not additional tests. This run covers implementation `45ff53e0`.
+- `current-latency.KD6UwR/probe.log`: preserved binary checksum, Create29s,
+  Install38s, readiness16/20/26s and shutdown0/0/1s.
+- The same directory's `mutation-test.log` and `read-test.log`: one passing
+  test each, including the documented retirement/retry assertions.
+
+These logs were inspected, not rerun. Bundle verification alone does not
+reproduce artifacts or requalify the dirty source. The original fresh-space
+probe remains historical evidence.
+
+Fresh partial smoke on2026-09-20 in `current-latency.0NCyjT` exited0:
+automatic bundled registry/default ingress configuration, system startup,
+HTTP status, SSH keyscan, Local Create29s, Counter Install35s and daemon
+restart passed. Readiness14s/18s still fails the10s production gate; both
+shutdowns took1s without forced cleanup. Post-run loopback listener inspection
+confirmed both test ports closed and no matching daemon remained. Only test
+ports were changed; all stores were newly created in isolated disk-backed XDG
+directories. `probe.sh` and `probe.log` preserve the exact scope and results.
+
+The initial partial smoke did not rerun invocation: the shared target's old
+test-client path now hashes to
+`b1605f783980e8cf76f9e11d09bc7685db04156d72df644d9ac7c22ede346ef5`,
+not the historically qualified `a9405e57...` client.
+
+This gap is now closed for the frozen candidate's Local/Public-policy smoke.
+A clean detached checkout at `.worktrees/agent-review-e20cbb76` built the test
+client with `cargo +nightly-2025-05-09 test --offline --locked -p vosx --bin vosx
+--no-run` (63s, warnings present). The preserved `frozen-vosx-test` in the same
+evidence directory has SHA-256
+`b6537475ef2020b22f6681d2f31f16366ce9469e859b6c882f8ed773a5ec15e7`.
+The release executable still matches the exact checksum above.
+
+`invocation-probe.sh` exited0 using that client and the same newly created
+disposable space. Mutation and read-after-restart each pass one selected test
+(22.50s/22.58s), including positive retirement, exact retry and Counter value7.
+Logs are `invocation-probe.log`, `mutation-test.log`, `read-test.log` and the two
+daemon logs. Readiness25s/21s still fails10s; shutdown2s/0s needs no forced
+cleanup. Final listener/process checks find no remaining test daemon or ports.
+This completes the planned fresh functional smoke, not production latency,
+Private/Attested qualification or validation of the newer dirty source.
+
+Integration sequence:
+
+1. Preserve all post-candidate commits and dirty work in the follow-up worktree.
+2. DONE: validate the exact frozen candidate with a fresh disposable Local-space
+   smoke: automatic system bootstrap, ingress, Create/Install, invocation and
+   restart. Do not reuse stores from another generation.
+3. Report results and known limitations, then obtain approval before advancing
+   `saga/agents`. No merge, push or branch movement has occurred.
+4. Continue the complete saga separately: native ordinary Shared startup and
+   controller integration, positive process-restart proof, compiled Authority
+   capacity, reproducible new-generation artifacts, authenticated reclamation,
+   remaining crash/security coverage, production latency and full release gates.
+
+Do not fold unfinished row-storage/Shared-finality development into this frozen
+candidate merely to empty the worktree. Conversely, do not mark those required
+features complete or remove them from the overall objective.
+
+### Unfinished follow-up inventory
+
+The full saga is unfinished. `saga/agents` is unchanged at `31b0cdbb`; the work
+branch `wip/ch08-runtime-directory` is at `7470d600` with substantial uncommitted
+changes. Nothing has merged or pushed. The current source is not the frozen
+test release, and its full release gates are not green.
+
+For the eventual complete follow-up, the earlier grouping was:
+
+1. `31b0cdbb..f79f0e3d`: architecture and lifecycle.
+2. Everything after `f79f0e3d`, including the current uncommitted follow-up:
+   recovery/performance fixes, artifact work and qualification. There is not yet
+   an immutable final endpoint for this group.
+
+For the uncommitted follow-up, review these related areas together:
+
+- Row storage and runtime transport: atomic deltas, lane/namespace isolation,
+  rollback, yield/resume, complete state commitments and the SLR1/ALI1 wire break.
+- Authority: generation20 certificate rows, signed genesis publication,
+  signature preflight, and exact retry/reconstruction. Valid full-capacity
+  enrollment still exceeds the20-read quota; malformed-call success is not a
+  pass for this gate. Other Authority collections remain inline.
+- Compiler and execution: relocation overlap handling, guest stack/memory fixes,
+  resource accounting and actual compiled-guest evidence. Candidate artifacts
+  are not sealed, independently reproduced or repinned for release.
+- Shared recovery: retain the full audit while avoiding unchanged committee
+  history reconstruction after no-ops; test missing earlier physical history.
+
+Use [current status](agent-saga-status.md) for open requirements and
+[the handoff](agent-saga-handoff.md) for exact test/artifact evidence. The frozen
+`e20cbb76` executable remains the documented disposable Local/Public-policy test
+option, not production qualification and not a deployment of the dirty source.
+Do not reuse old stores with these unqualified wire/state generations.
+
+Everything below is historical, even where older headings or paragraphs say
+"current". Its test results and diff counts apply only to their named commits.
+
+## Historical review freeze: `45ff53e0`
 
 Review the integrated source in two batches:
 

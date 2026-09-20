@@ -42,9 +42,12 @@
 //! [`AgentDelta`](crate::commit::AgentDelta) and replicate as ordinary
 //! effects under CRDT/Raft.
 //!
-//! Storage handles are usable only inside a dispatch on the service
-//! runtime; an uninitialized handle (constructed outside `#[actor]`)
-//! panics on first use.
+//! Clean agent dispatch uses the same overlay with a canonical row export,
+//! committed atomically with inline state and its result/continuation. A
+//! resumed slice clears the already-committed overlay and cached reads.
+//! Service dispatch retains the `AgentDelta` path described above. Handles
+//! require an active runtime dispatch; an uninitialized handle (constructed
+//! outside `#[actor]`) panics on first use.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -66,11 +69,14 @@ pub const PAGE_BYTES: usize = 3072;
 
 // ── Dispatch-scoped overlay ──────────────────────────────────────────
 
+type PendingRows = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
+
 struct DispatchState {
     /// This dispatch's queued mutations: `None` = delete tombstone.
     /// A `BTreeMap` so last-wins per key is applied at queue time and
     /// the drain emits one effect per touched key, in key order.
-    pending: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    pending: PendingRows,
+    transaction_depth: u32,
     /// Rows read from the host this dispatch (`None` = host said
     /// absent). Cleared at dispatch end: an out-of-band CRDT merge may
     /// rewrite rows between dispatches, so nothing cached outlives the
@@ -88,10 +94,52 @@ impl DispatchState {
     const fn new() -> Self {
         Self {
             pending: BTreeMap::new(),
+            transaction_depth: 0,
             cache: BTreeMap::new(),
             witness: None,
         }
     }
+}
+
+/// Stage row mutations as one synchronous operation. `Err` restores the
+/// pending rows from before this operation; `Ok` leaves them staged for the
+/// enclosing dispatch's atomic runtime commit. Nested operations are allowed.
+///
+/// This rolls back storage rows only, not ordinary actor fields or external
+/// effects. Use an inline-state candidate for those fields. Yielding across
+/// this boundary is forbidden: a savepoint must not outlive its committed slice.
+pub fn with_transaction<T, E>(operation: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+    struct Savepoint {
+        pending: Option<PendingRows>,
+        depth: u32,
+    }
+    impl Drop for Savepoint {
+        fn drop(&mut self) {
+            with_state(|state| {
+                assert_eq!(state.transaction_depth, self.depth, "storage transaction order changed");
+                state.transaction_depth -= 1;
+                if let Some(pending) = self.pending.take() {
+                    state.pending = pending;
+                    state.cache.clear();
+                }
+            });
+        }
+    }
+    let mut savepoint = with_state(|state| {
+        let depth = state.transaction_depth.checked_add(1).expect("storage transaction depth overflow");
+        // Copy only this dispatch's pending delta, never the persistent map or
+        // read cache. Existing pending writes remain visible within the scope.
+        let pending = state.pending.clone();
+        state.transaction_depth = depth;
+        Savepoint { pending: Some(pending), depth }
+    });
+    let result = operation();
+    if result.is_ok() { savepoint.pending = None; }
+    result
+}
+
+pub(crate) fn transaction_is_open() -> bool {
+    with_state(|state| state.transaction_depth != 0)
 }
 
 // The guest is single-threaded (one PVM, one dispatch at a time), so a
@@ -135,15 +183,33 @@ pub(crate) fn seed_witness_rows(rows: BTreeMap<Vec<u8>, Option<Vec<u8>>>) {
 /// and drop the read cache + any witnessed rows. Called by the
 /// framework when packing the refine payload; the drained rows become
 /// `Write`/`Delete` effects ahead of the final state write.
-// Only the service message loop drains; other build flavors compile the
-// storage types for their rlib surface without a dispatch cycle.
+// Both the service loop and clean PVM slice finalizer drain this overlay;
+// rlib-only consumers may compile storage without a dispatch cycle.
 #[cfg_attr(not(feature = "service"), allow(dead_code))]
 pub(crate) fn end_dispatch() -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
     with_state(|s| {
+        assert_eq!(s.transaction_depth, 0, "storage transaction crosses dispatch boundary");
         s.cache.clear();
         s.witness = None;
         core::mem::take(&mut s.pending).into_iter().collect()
     })
+}
+
+/// Finish a clean slice. Failed slices discard their overlay; successful and
+/// yielded slices export one canonical delta, never legacy service effects.
+pub(crate) fn finish_clean_dispatch(status: u8) -> Result<Option<Vec<u8>>, crate::service::wire::DecodeError> {
+    let changes = end_dispatch();
+    if changes.is_empty() || !matches!(status, super::STATUS_DONE | super::STATUS_YIELDED) {
+        return Ok(None);
+    }
+    crate::agent::actor_storage::encode_row_delta(&changes).map(Some)
+}
+
+/// A restored machine contains the overlay/cache from before its finalizer
+/// drained them. That slice has already committed; resume must read current
+/// runtime rows and must not re-export its prior writes or tombstones.
+pub(crate) fn resume_clean_dispatch() {
+    drop(end_dispatch());
 }
 
 /// Read one raw row through the same dispatch overlay the typed handles
@@ -262,16 +328,19 @@ fn overlay_store(key: Vec<u8>, value: Option<Vec<u8>>) {
 
 // ── Backend: STORAGE_R on the guest, a mock keyspace on std ─────────
 
-/// Read the full row from the host: probe with a stack buffer, grow to
+/// Read the full row from the host: probe with a bounded heap buffer, grow to
 /// the exact size when larger (`STORAGE_R` copies `min(len, buf)` and
 /// returns the full length). Present-but-empty and absent are distinct.
-#[cfg(all(feature = "service", not(feature = "std")))]
+#[cfg(all(any(feature = "service", feature = "pvm"), not(feature = "std")))]
 fn backend_read(key: &[u8]) -> Option<Vec<u8>> {
     use crate::abi::error::HOST_NONE;
     use crate::abi::pvm::hostcalls;
 
-    let mut probe = [0u8; super::lifecycle::BUF_SIZE];
-    let n = hostcalls::read(key, &mut probe);
+    // A storage read can occur deep inside Authority signature/state audits.
+    // Reserving the 8 KiB probe on each such call frame exhausts the fixed
+    // guest stack. Keep the same probe/copy budget without a large stack local.
+    let mut probe = alloc::vec![0u8; super::lifecycle::BUF_SIZE];
+    let n = hostcalls::peek(key, &mut probe);
     if n == HOST_NONE {
         return None;
     }
@@ -284,12 +353,12 @@ fn backend_read(key: &[u8]) -> Option<Vec<u8>> {
          holds a value the storage types refuse to write",
     );
     let mut full = alloc::vec![0u8; n as usize];
-    let m = hostcalls::read(key, &mut full);
+    let m = hostcalls::peek(key, &mut full);
     assert!(m == n, "storage row changed size mid-dispatch");
     Some(full)
 }
 
-#[cfg(all(not(feature = "service"), not(feature = "std")))]
+#[cfg(all(not(feature = "service"), not(feature = "pvm"), not(feature = "std")))]
 fn backend_read(_key: &[u8]) -> Option<Vec<u8>> {
     panic!("storage types need the service runtime");
 }
@@ -332,6 +401,12 @@ pub mod mock {
                 }
             }
         });
+    }
+
+    /// Finish a successful native test dispatch and persist its staged rows.
+    /// Clears dispatch-local reads exactly as a host commit/reopen does.
+    pub fn commit_dispatch() {
+        commit(super::end_dispatch());
     }
 
     /// Wipe the keyspace AND the dispatch overlay (test isolation —
@@ -1080,6 +1155,112 @@ mod tests {
         let mut k = [0u8; 16];
         k[8..].copy_from_slice(&i.to_be_bytes());
         k
+    }
+
+    #[test]
+    fn failed_storage_transaction_restores_existing_pending_rows_and_index() {
+        fresh();
+        let mut map = map();
+        map.insert(&key(1), &10);
+        let before = with_state(|state| state.pending.clone());
+        let result = with_transaction(|| {
+            assert_eq!(map.get(&key(1)), Some(10));
+            map.insert(&key(1), &20);
+            map.insert(&key(2), &30);
+            map.remove(&key(1));
+            Err::<(), _>("refused")
+        });
+        assert_eq!(result, Err("refused"));
+        assert!(!transaction_is_open());
+        assert_eq!(with_state(|state| state.pending.clone()), before);
+        assert_eq!(map.get(&key(1)), Some(10));
+        assert_eq!(map.get(&key(2)), None);
+        assert_eq!(map.len(), 1);
+        mock::commit(end_dispatch());
+        assert_eq!(map.get(&key(1)), Some(10));
+        assert_eq!(map.get(&key(2)), None);
+    }
+
+    #[test]
+    fn nested_storage_transactions_keep_only_successful_scopes() {
+        fresh();
+        let mut map = map();
+        assert_eq!(with_transaction(|| {
+            map.insert(&key(1), &10);
+            with_transaction(|| { map.insert(&key(2), &20); Ok::<(), ()>(()) })?;
+            Err::<(), ()>(())
+        }), Err(()));
+        assert!(end_dispatch().is_empty());
+        assert_eq!(map.len(), 0);
+        with_transaction(|| {
+            map.insert(&key(1), &10);
+            assert_eq!(with_transaction(|| { map.insert(&key(2), &20); Err::<(), ()>(()) }), Err(()));
+            assert_eq!(map.get(&key(1)), Some(10));
+            assert_eq!(map.get(&key(2)), None);
+            Ok::<(), ()>(())
+        }).unwrap();
+        mock::commit(end_dispatch());
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&key(1)), Some(10));
+        assert_eq!(map.get(&key(2)), None);
+    }
+
+    #[test]
+    fn storage_transaction_unwind_and_dispatch_boundary_are_fail_closed() {
+        fresh();
+        let mut map = map();
+        map.insert(&key(1), &10);
+        let before = with_state(|state| state.pending.clone());
+        for cross_boundary in [false, true] {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_transaction(|| -> Result<(), ()> {
+                    map.insert(&key(2), &20);
+                    assert!(transaction_is_open());
+                    if cross_boundary { let _ = end_dispatch(); }
+                    panic!("abort transaction");
+                })
+            }));
+            assert!(result.is_err());
+            assert!(!transaction_is_open());
+            assert_eq!(with_state(|state| state.pending.clone()), before);
+        }
+    }
+
+    #[test]
+    fn clean_slice_drain_exports_success_and_discards_failure() {
+        for status in [super::super::STATUS_DONE, super::super::STATUS_YIELDED,
+            super::super::STATUS_FORBIDDEN, super::super::STATUS_PANICKED, super::super::STATUS_OOG] {
+            fresh();
+            overlay_store(b"rows/a".to_vec(), Some(vec![7]));
+            overlay_store(b"rows/b".to_vec(), None);
+            overlay_store(b"rows/c".to_vec(), Some(Vec::new()));
+            let delta = finish_clean_dispatch(status).unwrap();
+            if matches!(status, super::super::STATUS_DONE | super::super::STATUS_YIELDED) {
+                assert_eq!(crate::agent::actor_storage::decode_row_delta(&delta.unwrap()).unwrap(), vec![
+                    (b"rows/a".to_vec(), Some(vec![7])), (b"rows/b".to_vec(), None),
+                    (b"rows/c".to_vec(), Some(Vec::new())),
+                ]);
+            } else { assert!(delta.is_none()); }
+            assert!(end_dispatch().is_empty());
+            assert_eq!(overlay_load(b"rows/a"), None, "drain must clear the cached overlay too");
+        }
+    }
+
+    #[test]
+    fn clean_resume_discards_prior_slice_writes_tombstones_and_cached_reads() {
+        fresh();
+        mock::commit(vec![(b"rows/a".to_vec(), Some(vec![1])), (b"rows/b".to_vec(), Some(vec![2]))]);
+        assert_eq!(overlay_load(b"rows/a"), Some(vec![1]));
+        overlay_store(b"rows/a".to_vec(), Some(vec![3]));
+        overlay_store(b"rows/b".to_vec(), None);
+        assert_eq!(overlay_load(b"rows/c"), None);
+        mock::commit(vec![(b"rows/a".to_vec(), Some(vec![4])), (b"rows/b".to_vec(), Some(vec![5])),
+            (b"rows/c".to_vec(), Some(vec![6]))]);
+        resume_clean_dispatch();
+        assert_eq!(overlay_load(b"rows/a"), Some(vec![4]));
+        assert_eq!(overlay_load(b"rows/b"), Some(vec![5]));
+        assert_eq!(overlay_load(b"rows/c"), Some(vec![6]));
+        assert!(finish_clean_dispatch(super::super::STATUS_DONE).unwrap().is_none());
     }
 
     #[test]

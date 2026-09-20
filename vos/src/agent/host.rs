@@ -40,7 +40,7 @@ use super::driver::{AgentTrustProvider, SdkManagementArtifacts};
 use super::execution::{
     ActorExecutionError, ActorExecutionReply, ActorInvocation, MAX_EXECUTION_AVAILABILITY_BYTES,
     MAX_EXECUTION_BLOBS, MAX_EXECUTION_GAS, MAX_EXECUTION_MESSAGE_BYTES,
-    MAX_EXECUTION_POLICY_BYTES, MAX_EXECUTION_PROGRAM_BYTES, MAX_EXECUTION_STATE_BYTES,
+    MAX_EXECUTION_POLICY_BYTES, MAX_EXECUTION_PROGRAM_BYTES,
     RuntimeBlob,
 };
 use super::journal::{CanonicalJournalRecord, ReplayOperation};
@@ -1554,7 +1554,7 @@ fn validate_invocation_shape_before_reservation(
     if invocation
         .availability
         .iter()
-        .any(|blob| blob.bytes.len() > MAX_EXECUTION_STATE_BYTES)
+        .any(|blob| blob.bytes.len() > MAX_EXECUTION_AVAILABILITY_BYTES)
         || availability_bytes.is_none_or(|bytes| bytes > MAX_EXECUTION_AVAILABILITY_BYTES)
     {
         return Err(invalid_invocation_shape());
@@ -5424,6 +5424,28 @@ fn decode_nibble(byte: u8) -> Option<u8> {
 mod tests {
     use super::*;
     use crate::service::SpaceId;
+
+    #[test]
+    fn invocation_reservation_uses_caller_availability_not_inline_state_limit() {
+        let bytes = vec![0x61; MAX_EXECUTION_AVAILABILITY_BYTES];
+        let mut invocation = ActorInvocation {
+            invocation: InvocationId([1; 32]), actor: ActorId([2; 32]),
+            incarnation: Hash([3; 32]), deployment: DeploymentId([4; 32]),
+            program: ProgramId([5; 32]), mode: super::super::MethodMode::Linear,
+            auth: super::super::execution::ActorInvocationAuth::anonymous(),
+            message: vec![1], gas: 1,
+            availability: vec![RuntimeBlob { reference: crate::service::BlobRef::of_bytes(&bytes), bytes }],
+        };
+        assert!(validate_invocation_shape_before_reservation(&invocation).is_ok());
+        assert!(invocation.validate().is_ok());
+        invocation.availability[0].bytes.push(1);
+        assert!(validate_invocation_shape_before_reservation(&invocation).is_err());
+        invocation.availability[0].bytes.pop();
+        invocation.availability.push(RuntimeBlob {
+            reference: crate::service::BlobRef::of_bytes(&[2]), bytes: vec![2],
+        });
+        assert!(validate_invocation_shape_before_reservation(&invocation).is_err());
+    }
 
     struct NoTrust;
 

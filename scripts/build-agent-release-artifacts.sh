@@ -57,7 +57,7 @@ export_source "$builder_revision" "$build_root/builder"
 host_target="$scratch_root/host-$builder_revision"
 (
     cd "$build_root/builder"
-    CARGO_TARGET_DIR="$host_target" cargo "+$host_toolchain" build -p vosx --bin vosx
+    CARGO_TARGET_DIR="$host_target" cargo "+$host_toolchain" build --locked -p vosx --bin vosx
 )
 pinned_vosx="$host_target/debug/vosx"
 
@@ -74,7 +74,7 @@ if [[ $mode == all || $mode == runtime ]]; then
     export_source "$runtime_revision" "$build_root/runtime"
     (
         cd "$build_root/runtime/services/agent-runtime"
-        CARGO_TARGET_DIR="$build_root/runtime-target" cargo "+$guest_toolchain" actor
+        CARGO_TARGET_DIR="$build_root/runtime-target" cargo "+$guest_toolchain" actor --locked
     )
     runtime_elf="$build_root/runtime-target/riscv64em-vos/release/agent_runtime.elf"
     check_digest agent_runtime_elf_blake2b_256 "$runtime_elf"

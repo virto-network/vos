@@ -90,10 +90,45 @@ pub struct NativeAuthorityOperationStartupAdmission<'a> {
     pub(super) pending: Vec<(ManagementJournalAnchor, RuntimeWork)>,
     pub(super) retirements: Vec<[RuntimeWork; 2]>,
     pub(super) has_history: bool,
+    pub(super) defer_shared_genesis: bool,
     _lease: core::marker::PhantomData<&'a mut ()>,
 }
 
 impl<'a> NativeAuthorityOperationStartupAdmission<'a> {
+    /// Open only the independently pinned system Agent during bootstrap.
+    /// The controller must complete ordinary recovery with fresh replay proofs
+    /// before declaring the space ready; all supplied store leases stay borrowed.
+    pub fn with_deferred_shared_genesis(mut self) -> Self {
+        self.defer_shared_genesis = true;
+        self
+    }
+
+    pub fn from_shared_genesis<I, J, Q, R, W, P>(recovery: &'a mut super::NativeSharedGenesisRecovery<I, J, Q, R, W, P>)
+        -> Result<Self, SharedAgentHostError>
+    where I: CleanManagementIssuerStore, J: CleanManagementIssuerStore, Q: CleanManagementIssuerStore, R: CleanManagementIssuerStore {
+        Self { authority: recovery.authority, pending: Vec::new(), retirements: Vec::new(),
+            has_history: false, defer_shared_genesis: false, _lease: core::marker::PhantomData }.include_shared_genesis(recovery)
+    }
+
+    /// Include one verified Shared Create/query reservation while borrowing
+    /// its stores. Call for every discovered entry before opening bootstrap.
+    pub fn include_shared_genesis<I, J, Q, R, W, P>(mut self, recovery: &'a mut super::NativeSharedGenesisRecovery<I, J, Q, R, W, P>)
+        -> Result<Self, SharedAgentHostError>
+    where I: CleanManagementIssuerStore, J: CleanManagementIssuerStore, Q: CleanManagementIssuerStore, R: CleanManagementIssuerStore {
+        if !recovery.admission_valid || recovery.authority != self.authority
+            || self.pending.len().saturating_add(recovery.pending.len()) > super::super::replay::MAX_REPLAY_SUFFIX_ENTRIES
+        { return Err(SharedAgentHostError::ScopeMismatch); }
+        for (_, work) in &recovery.pending {
+            let RuntimeWork::Invoke { invocation, .. } = work else { return Err(SharedAgentHostError::ScopeMismatch); };
+            if self.pending.iter().any(|(_, old)| matches!(old, RuntimeWork::Invoke { invocation: existing, .. } if existing.invocation == invocation.invocation))
+                || self.retirements.iter().flatten().any(|old| matches!(old, RuntimeWork::Invoke { invocation: existing, .. } if existing.invocation == invocation.invocation))
+            { return Err(SharedAgentHostError::Conflict); }
+        }
+        self.has_history |= !recovery.pending.is_empty();
+        self.pending.extend(recovery.pending.iter().cloned());
+        Ok(self)
+    }
+
     /// Add the complete pending admin discovery set while retaining its writer
     /// lease alongside the operation stores. Admin records are never treated
     /// as operation-domain approvals or as already retired work.
@@ -391,6 +426,7 @@ impl<'a> NativeAuthorityOperationStartupAdmission<'a> {
         Ok(Self {
             authority,
             has_history: !records.is_empty(),
+            defer_shared_genesis: false,
             pending: records
                 .into_values()
                 .filter(|record| {

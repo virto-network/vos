@@ -827,7 +827,9 @@ fn management_envelope_key(
         || *context != RuntimeExecutionContext::Direct
         || *state != crate::agent_sdk::RuntimeState::default()
         || !invocation.validate()
-        || invocation.mode != crate::agent_sdk::MethodMode::Linear
+        // A retained lifecycle may query Authority before its next mutation.
+        // Both modes use the ordered journal and the same exact reservation.
+        || !matches!(invocation.mode, crate::agent_sdk::MethodMode::Linear | crate::agent_sdk::MethodMode::Query)
         || **authorization
             != InvocationAuthorization::PublicPreflight(
                 crate::agent_sdk::PublicPreflight::for_work(invocation, *observed_slot),
@@ -4305,7 +4307,7 @@ impl SharedAgentNetworkHost {
         authorization: InvocationAuthorization,
         anchor: &crate::agent::clean_management_intent::ManagementJournalAnchor,
     ) -> Result<RuntimeOutcome, SharedAgentHostError> {
-        if work.mode != crate::agent_sdk::MethodMode::Linear
+        if !matches!(work.mode, crate::agent_sdk::MethodMode::Linear | crate::agent_sdk::MethodMode::Query)
             || !matches!(&authorization, InvocationAuthorization::PublicPreflight(preflight) if preflight.matches_work(&work))
         {
             return Err(SharedAgentHostError::ScopeMismatch);
@@ -4412,6 +4414,24 @@ impl SharedAgentNetworkHost {
         self.acknowledge_pending_management_result(expected, anchor, envelope)
     }
 
+    pub(crate) fn supervisor_acknowledge_genesis_committee(
+        &self,
+        expected: crate::agent::supervisor::AgentRouteIdentity,
+        proof: &crate::agent::clean_bootstrap::RetainedGenesisCommitteeReply,
+    ) -> Result<RuntimeOutcome, SharedAgentHostError> {
+        let (anchor, envelope) = proof.envelope();
+        self.acknowledge_pending_management_result(expected, anchor, envelope)
+    }
+
+    pub(crate) fn supervisor_acknowledge_genesis_publication(
+        &self,
+        expected: crate::agent::supervisor::AgentRouteIdentity,
+        proof: &crate::agent::clean_bootstrap::RetainedGenesisPublicationReply,
+    ) -> Result<RuntimeOutcome, SharedAgentHostError> {
+        let (anchor, envelope) = proof.envelope();
+        self.acknowledge_pending_management_result(expected, anchor, envelope)
+    }
+
     fn acknowledge_pending_management_result(
         &self,
         expected: crate::agent::supervisor::AgentRouteIdentity,
@@ -4471,7 +4491,8 @@ impl SharedAgentNetworkHost {
             admission,
             SupervisorAdmission::ReservedManagementRetirement
                 | SupervisorAdmission::ReservedManagementResult
-        ) && (work.mode != MethodMode::Linear
+        ) && (!(work.mode == MethodMode::Linear
+                || (work.mode == MethodMode::Query && matches!(admission, SupervisorAdmission::ReservedManagementResult)))
             || !matches!(
                 &request,
                 crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Acknowledge { .. }

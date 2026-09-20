@@ -11,7 +11,7 @@
 //! an internally consistent provision, or verifying its embedded QC shape
 //! never promotes it to a replay/bootstrap capability.
 
-use alloc::{vec, vec::Vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 use core::fmt;
 
 use super::committee::{
@@ -69,6 +69,34 @@ pub const MAX_AGENT_GENESIS_PROVISION_BYTES: usize = SERVICE_WIRE_HEADER_BYTES
     + MAX_AGENT_GENESIS_EVIDENCE_BYTES
     + 4
     + MAX_AGENT_GENESIS_DECISION_BYTES;
+
+// AJI4 header, seven fixed 32-byte runtime identities plus package hash/len,
+// operation tag and nested AWRK length. AWRK holds its header, Manage/Direct
+// tags, three identities, four empty state lengths, Create tag, descriptor,
+// Some(receipt) tag, receipt and observed slot. The descriptor and receipt
+// ceilings include their own headers; counting those here is conservative.
+const MAX_CLEAN_CREATE_REPLAY_BYTES: usize = SERVICE_WIRE_HEADER_BYTES
+    + 7 * 32
+    + BLOB_REFERENCE_BYTES
+    + 1
+    + 4
+    + SERVICE_WIRE_HEADER_BYTES
+    + 1
+    + 1
+    + 3 * 32
+    + 4 * 4
+    + 1
+    + crate::agent_sdk::wire::MAX_AGENT_DESCRIPTOR_WIRE_BYTES
+    + 1
+    + crate::agent_sdk::wire::MAX_AUTHORITY_RECEIPT_WIRE_BYTES
+    + 8;
+
+/// Conservative complete provision bound for clean Create only. Unlike the
+/// generic replay ceiling, this excludes invocation availability and populated
+/// runtime state. This is a wire bound, not an Authority archive reservation:
+/// retained call/approval bytes, archive overhead and terminal state are extra.
+pub const MAX_CLEAN_CREATE_GENESIS_PROVISION_BYTES: usize =
+    MAX_AGENT_GENESIS_PROVISION_BYTES - MAX_REPLAY_INPUT_BYTES + MAX_CLEAN_CREATE_REPLAY_BYTES;
 
 const PROPOSAL_ID_DOMAIN: &[u8] = b"vos/agent/genesis-proposal/v1";
 const REPLICA_COMMITTEE_ID_DOMAIN: &[u8] = b"vos/agent/replica-committee/v1";
@@ -239,7 +267,10 @@ impl AgentGenesisExpectations {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentGenesisProposal {
     locator: AgentGenesisLocator,
-    create: ReplayInput,
+    // ReplayInput contains a large tagged operation. Keep it off the stack
+    // while nested provision decoders and signature validators are active.
+    // This is an in-memory layout choice only; the canonical wire is unchanged.
+    create: Box<ReplayInput>,
     expectations: AgentGenesisExpectations,
     catalog: Vec<BlobRef>,
 }
@@ -253,7 +284,7 @@ impl AgentGenesisProposal {
     ) -> Result<Self, AgentGenesisError> {
         let proposal = Self {
             locator,
-            create,
+            create: Box::new(create),
             expectations,
             catalog,
         };
@@ -339,7 +370,7 @@ impl ServiceWire for AgentGenesisProposal {
         let catalog = vec![decode_blob_ref(decoder)?];
         let proposal = Self {
             locator,
-            create,
+            create: Box::new(create),
             expectations,
             catalog,
         };
@@ -350,6 +381,9 @@ impl ServiceWire for AgentGenesisProposal {
 
 /// One authority-certified mapping from logical replica identity to complete
 /// authenticated transport and signing identity.
+/// The logical principal is the enrolled owner, not necessarily the transport
+/// key's principal. Construction checks transport consistency only; the
+/// descriptor and authority-certified committee bind that owner to this node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentReplicaMember {
     replica: AgentReplica,
@@ -397,7 +431,6 @@ impl AgentReplicaMember {
             || self.ed25519_public_key == [0; 32]
             || canonical_ed25519_peer_key(&self.peer_id) != Some(self.ed25519_public_key)
             || NodeId::of_authenticated_peer(&self.peer_id) != self.replica.node
-            || PrincipalId::of_public_key(&self.ed25519_public_key) != self.replica.principal
         {
             return Err(AgentGenesisError::InvalidReplicaCommittee);
         }
@@ -1189,10 +1222,12 @@ impl ServiceWire for AgentGenesisAdmissionRecord {
 /// system-Agent verifier must still prove `decision` finalized.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentGenesisProvision {
-    proposal: AgentGenesisProposal,
-    replicas: AgentReplicaCommittee,
-    evidence: AgentGenesisEvidence,
-    decision: AgentGenesisDecision,
+    // Keep the enclosing decoder/validator frame small while each bounded
+    // component is decoded and checked. These boxes are not wire fields.
+    proposal: Box<AgentGenesisProposal>,
+    replicas: Box<AgentReplicaCommittee>,
+    evidence: Box<AgentGenesisEvidence>,
+    decision: Box<AgentGenesisDecision>,
 }
 
 impl AgentGenesisProvision {
@@ -1203,10 +1238,10 @@ impl AgentGenesisProvision {
         decision: AgentGenesisDecision,
     ) -> Result<Self, AgentGenesisError> {
         let provision = Self {
-            proposal,
-            replicas,
-            evidence,
-            decision,
+            proposal: Box::new(proposal),
+            replicas: Box::new(replicas),
+            evidence: Box::new(evidence),
+            decision: Box::new(decision),
         };
         provision.validate()?;
         Ok(provision)
@@ -1348,25 +1383,85 @@ impl ServiceWire for AgentGenesisProvision {
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         enforce_complete_bound(decoder, MAX_AGENT_GENESIS_PROVISION_BYTES)?;
         let provision = Self {
-            proposal: decode_nested::<AgentGenesisProposal>(
+            proposal: Box::new(decode_nested::<AgentGenesisProposal>(
                 decoder,
                 MAX_AGENT_GENESIS_PROPOSAL_BYTES,
-            )?,
-            replicas: decode_nested::<AgentReplicaCommittee>(
+            )?),
+            replicas: Box::new(decode_nested::<AgentReplicaCommittee>(
                 decoder,
                 MAX_AGENT_REPLICA_COMMITTEE_BYTES,
-            )?,
-            evidence: decode_nested::<AgentGenesisEvidence>(
+            )?),
+            evidence: Box::new(decode_nested::<AgentGenesisEvidence>(
                 decoder,
                 MAX_AGENT_GENESIS_EVIDENCE_BYTES,
-            )?,
-            decision: decode_nested::<AgentGenesisDecision>(
+            )?),
+            decision: Box::new(decode_nested::<AgentGenesisDecision>(
                 decoder,
                 MAX_AGENT_GENESIS_DECISION_BYTES,
-            )?,
+            )?),
         };
         provision.validate().map_err(map_decode_error)?;
         Ok(provision)
+    }
+}
+
+/// Maximum one-provision archive image, including its exact runtime preimage.
+/// Archives store records per locator; this is not a whole-registry bound.
+pub const MAX_AGENT_GENESIS_ARCHIVE_RECORD_BYTES: usize = SERVICE_WIRE_HEADER_BYTES
+    + 4 + MAX_AGENT_GENESIS_PROVISION_BYTES
+    + 4 + BLOB_REFERENCE_BYTES + 4 + MAX_ARTIFACT_CLOSURE_BYTES;
+
+/// Canonical persistence unit for an ordinary genesis provider. Structural
+/// validation and archive recovery confer no finality: every host admission
+/// must still cross the independent [`AgentGenesisFinalityVerifier`] boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentGenesisArchiveRecord {
+    provision: AgentGenesisProvision,
+    catalog: Vec<RuntimeBlob>,
+}
+
+impl AgentGenesisArchiveRecord {
+    pub fn new(
+        provision: AgentGenesisProvision,
+        catalog: Vec<RuntimeBlob>,
+    ) -> Result<Self, AgentGenesisError> {
+        provision.validate()?;
+        validate_agent_genesis_catalog(provision.proposal(), &catalog)?;
+        Ok(Self { provision, catalog })
+    }
+
+    pub const fn provision(&self) -> &AgentGenesisProvision { &self.provision }
+    pub fn catalog(&self) -> &[RuntimeBlob] { &self.catalog }
+}
+
+impl ServiceWire for AgentGenesisArchiveRecord {
+    const MAGIC: [u8; 4] = *b"OGAR";
+
+    fn encode_body(&self, output: &mut Vec<u8>) {
+        let mut encoder = Encoder(output);
+        encoder.bytes(&self.provision.encode());
+        encoder.list(&self.catalog, |encoder, blob| {
+            encode_blob_ref(encoder, &blob.reference);
+            encoder.bytes(&blob.bytes);
+        });
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        enforce_complete_bound(decoder, MAX_AGENT_GENESIS_ARCHIVE_RECORD_BYTES)?;
+        let provision = decode_nested::<AgentGenesisProvision>(decoder, MAX_AGENT_GENESIS_PROVISION_BYTES)?;
+        if decoder.u32()? as usize != GENESIS_CATALOG_REFERENCES {
+            return Err(DecodeError::NonCanonical);
+        }
+        let reference = decode_blob_ref(decoder)?;
+        let bytes = decoder.bytes_ref()?;
+        if bytes.len() > MAX_ARTIFACT_CLOSURE_BYTES {
+            return Err(DecodeError::LimitExceeded);
+        }
+        if reference != provision.proposal().catalog()[0] || !reference.matches(bytes) {
+            return Err(DecodeError::NonCanonical);
+        }
+        // All checks precede copying the potentially large runtime preimage.
+        Ok(Self { provision, catalog: vec![RuntimeBlob { reference, bytes: bytes.to_vec() }] })
     }
 }
 
@@ -1391,6 +1486,9 @@ impl core::error::Error for AgentGenesisProviderError {}
 
 /// Durable archive/issuance boundary. This trait is intentionally not a
 /// trusted verifier and cannot promote its own response.
+/// [`AgentGenesisArchiveRecord`] is the canonical per-locator persistence
+/// unit; implementations must publish it durably before returning a newly
+/// issued provision and must refuse conflicting records for that locator.
 pub trait AgentGenesisProvider: Send + Sync {
     fn create(
         &self,
@@ -1756,6 +1854,9 @@ fn enforce_complete_bound(decoder: &Decoder<'_>, maximum: usize) -> Result<(), D
     }
 }
 
+// Do not retain the nested replay decoder's scratch frame while validating
+// the enclosing (heap-backed) proposal and its certificate.
+#[inline(never)]
 fn decode_nested<T: ServiceWire>(
     decoder: &mut Decoder<'_>,
     maximum: usize,
@@ -2102,8 +2203,66 @@ mod tests {
         );
     }
 
+    fn maximum_replica_members() -> Vec<AgentReplicaMember> {
+        let mut members = (0..MAX_AGENT_REPLICAS)
+            .map(|ordinal| {
+                let mut key = [0x31; 32];
+                key[..2].copy_from_slice(&(ordinal as u16).to_le_bytes());
+                let peer = peer_id(key);
+                let voter = ordinal == 0;
+                AgentReplicaMember::new(
+                    AgentReplica {
+                        node: NodeId::of_authenticated_peer(&peer),
+                        principal: PrincipalId::of_public_key(&key),
+                        role: if voter {
+                            ReplicaRole::Voter
+                        } else {
+                            ReplicaRole::Observer
+                        },
+                    },
+                    peer.clone(),
+                    key,
+                    voter.then(|| derive_replica_raft_slot(&peer)),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        members.sort_by_key(|member| member.replica().node);
+        members
+    }
+
+    #[test]
+    fn maximum_genesis_roster_requires_blob_transport_not_inline_invocation() {
+        let baseline = fixture();
+        let roster = AgentReplicaCommittee::new(
+            baseline.proposal.locator().space,
+            baseline.proposal.locator().agent,
+            AgentProfile::Shared,
+            maximum_replica_members(),
+        )
+        .unwrap();
+        let encoded = roster.encode();
+        assert_eq!(AgentReplicaCommittee::decode(&encoded).unwrap(), roster);
+        assert!(encoded.len() <= MAX_AGENT_REPLICA_COMMITTEE_BYTES);
+        assert!(encoded.len() > crate::agent_sdk::MAX_INVOCATION_MESSAGE_BYTES);
+        println!(
+            "maximum genesis roster={} invocation limit={}",
+            encoded.len(),
+            crate::agent_sdk::MAX_INVOCATION_MESSAGE_BYTES
+        );
+    }
+
     #[test]
     fn pending_clean_create_requires_exact_signed_authorization_before_publication() {
+        check_pending_clean_create(false);
+    }
+
+    #[test]
+    fn maximum_signed_genesis_provision_fits_caller_availability() {
+        check_pending_clean_create(true);
+    }
+
+    fn check_pending_clean_create(maximum_roster: bool) {
         use crate::agent_sdk as sdk;
         use core::num::NonZeroU64;
         use ed25519_dalek::{Signer as _, SigningKey};
@@ -2123,7 +2282,15 @@ mod tests {
                 AuthorityVerifier::verify(self, key, message, signature)
             }
         }
-        let baseline = fixture();
+        let mut baseline = fixture();
+        if maximum_roster {
+            baseline.replicas = AgentReplicaCommittee::new(
+                baseline.proposal.locator().space,
+                baseline.proposal.locator().agent,
+                AgentProfile::Shared,
+                maximum_replica_members(),
+            ).unwrap();
+        }
         let key = SigningKey::from_bytes(&[0x81; 32]);
         let public = key.verifying_key().to_bytes();
         let owner = sdk::PrincipalId::of_public_key(&public);
@@ -2323,6 +2490,34 @@ mod tests {
         let evidence = AgentGenesisEvidence::new(claim, qc).unwrap();
         let decision = AgentGenesisDecision::new(&proposal, &replicas, &evidence).unwrap();
         let provision = AgentGenesisProvision::new(proposal, replicas, evidence, decision).unwrap();
+        if maximum_roster {
+            let encoded = provision.encode();
+            println!("full signed provision={} proposal={} roster={} evidence={} decision={} caller_availability={}",
+                encoded.len(), provision.proposal().encode().len(),
+                provision.replicas().encode().len(), provision.evidence().encode().len(),
+                provision.decision().encode().len(), sdk::MAX_RUNTIME_CALLER_AVAILABILITY_BYTES);
+            assert_eq!(provision.replicas().members().len(), MAX_AGENT_REPLICAS);
+            assert!(encoded.len() <= MAX_CLEAN_CREATE_GENESIS_PROVISION_BYTES);
+            assert!(MAX_CLEAN_CREATE_GENESIS_PROVISION_BYTES <= sdk::MAX_RUNTIME_CALLER_AVAILABILITY_BYTES);
+            assert!(encoded.len() <= sdk::MAX_RUNTIME_CALLER_AVAILABILITY_BYTES);
+            let reference = crate::service::BlobRef::of_bytes(&encoded);
+            let invocation = crate::agent::execution::ActorInvocation {
+                invocation: crate::service::InvocationId([1; 32]),
+                actor: crate::service::ActorId([2; 32]),
+                incarnation: crate::service::Hash([3; 32]),
+                deployment: crate::service::DeploymentId([4; 32]),
+                program: crate::service::ProgramId([5; 32]),
+                mode: crate::agent::MethodMode::Linear,
+                auth: crate::agent::execution::ActorInvocationAuth::anonymous(),
+                message: alloc::vec![1],
+                availability: alloc::vec![crate::agent::execution::RuntimeBlob {
+                    reference: reference.clone(), bytes: encoded,
+                }],
+                gas: 1,
+            };
+            assert!(invocation.validate().is_ok());
+            assert_eq!(invocation.available_preimage(&reference).unwrap().unwrap(), provision.encode());
+        }
         let publication = provision.publication_invocation(call.invocation).unwrap();
         assert_ne!(publication, sdk::InvocationId::ZERO);
         assert_ne!(publication, call.invocation);
@@ -2380,6 +2575,106 @@ mod tests {
                 .verify_pending_create_at(&call, &approval, &baseline.authority, 20, &Strict)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn ordinary_archive_binds_provision_and_exact_catalog_without_granting_finality() {
+        let provision = fixture().provision;
+        let runtime = RuntimeBlob { reference: BlobRef::of_bytes(RUNTIME_BYTES), bytes: RUNTIME_BYTES.to_vec() };
+        let record = AgentGenesisArchiveRecord::new(provision.clone(), vec![runtime.clone()]).unwrap();
+        let encoded = record.encode();
+        assert!(encoded.len() <= MAX_AGENT_GENESIS_ARCHIVE_RECORD_BYTES);
+        let reopened = AgentGenesisArchiveRecord::decode(&encoded).unwrap();
+        assert_eq!(reopened, record);
+        assert_eq!(reopened.encode(), encoded);
+        assert_eq!(reopened.catalog(), &[runtime.clone()]);
+        assert!(AgentGenesisArchiveRecord::new(provision.clone(), vec![]).is_err());
+        assert!(AgentGenesisArchiveRecord::new(provision.clone(), vec![runtime.clone(), runtime]).is_err());
+        let other_bytes = b"substituted runtime".to_vec();
+        let other = RuntimeBlob { reference: BlobRef::of_bytes(&other_bytes), bytes: other_bytes };
+        assert!(AgentGenesisArchiveRecord::new(provision, vec![other]).is_err());
+        let count_offset = SERVICE_WIRE_HEADER_BYTES + 4 + record.provision().encode().len();
+        for offset in [0, SERVICE_WIRE_HEADER_BYTES + 4, count_offset, count_offset + 4, encoded.len() - 1] {
+            let mut corrupt = encoded.clone();
+            corrupt[offset] ^= 1;
+            assert!(AgentGenesisArchiveRecord::decode(&corrupt).is_err(), "offset {offset}");
+        }
+        assert!(AgentGenesisArchiveRecord::decode(&encoded[..encoded.len() - 1]).is_err());
+        let mut oversized_length = encoded.clone();
+        let length_offset = count_offset + 4 + BLOB_REFERENCE_BYTES;
+        oversized_length[length_offset..length_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(AgentGenesisArchiveRecord::decode(&oversized_length).is_err());
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(AgentGenesisArchiveRecord::decode(&trailing).is_err());
+        struct NotFinalized;
+        impl AgentGenesisFinalityVerifier for NotFinalized {
+            fn verify_finalized(&self, _: &AgentGenesisProvision) -> Result<(), AgentGenesisFinalityError> {
+                Err(AgentGenesisFinalityError::NotFinalized)
+            }
+        }
+        assert!(matches!(
+            VerifiedAgentGenesisProvision::verify(reopened.provision().clone(), &NotFinalized),
+            Err(AgentGenesisProvisionVerificationError::Finality(AgentGenesisFinalityError::NotFinalized))
+        ));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn archive_provider_reloads_ambiguous_writes_and_refuses_conflicts() {
+        use super::super::genesis_archive::{AgentGenesisArchiveStore, ArchivedAgentGenesisProvider};
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Default)]
+        struct Store(Arc<Mutex<(Option<Vec<u8>>, bool, usize)>>);
+        impl AgentGenesisArchiveStore for Store {
+            type Error = ();
+            fn load(&self, _: AgentGenesisLocator) -> Result<Option<Vec<u8>>, ()> {
+                Ok(self.0.lock().unwrap().0.clone())
+            }
+            fn insert_if_absent(&self, _: AgentGenesisLocator, record: &[u8]) -> Result<(), ()> {
+                let mut state = self.0.lock().unwrap();
+                state.2 += 1;
+                state.0.get_or_insert_with(|| record.to_vec());
+                if core::mem::take(&mut state.1) { Err(()) } else { Ok(()) }
+            }
+        }
+        let fixture = fixture();
+        let locator = fixture.proposal.locator();
+        let catalog = vec![RuntimeBlob { reference: BlobRef::of_bytes(RUNTIME_BYTES), bytes: RUNTIME_BYTES.to_vec() }];
+        let record = AgentGenesisArchiveRecord::new(fixture.provision.clone(), catalog.clone()).unwrap();
+        let store = Store::default();
+        let archive = ArchivedAgentGenesisProvider::new(locator.space, store.clone()).unwrap();
+        assert_eq!(archive.create(&fixture.proposal, &catalog), Err(AgentGenesisProviderError::NotConfigured));
+        store.0.lock().unwrap().1 = true;
+        assert_eq!(archive.publish(&record), Err(AgentGenesisProviderError::Unavailable));
+        drop(archive);
+        let archive = ArchivedAgentGenesisProvider::new(locator.space, store.clone()).unwrap();
+        archive.publish(&record).unwrap();
+        assert_eq!(store.0.lock().unwrap().2, 2, "exact retry must reestablish the durability barrier");
+        assert_eq!(store.0.lock().unwrap().0.as_deref(), Some(record.encode().as_slice()));
+        assert_eq!(archive.create(&fixture.proposal, &catalog).unwrap(), fixture.provision);
+        assert_eq!(archive.reproduce(locator).unwrap(), fixture.provision);
+        assert_eq!(archive.load_catalog(locator, &catalog[0].reference).unwrap(), Some(RUNTIME_BYTES.to_vec()));
+        assert_eq!(archive.load_catalog(locator, &BlobRef::of_bytes(b"unknown")).unwrap(), None);
+
+        // Structurally consistent alternate evidence for the same locator is
+        // still a conflict. Neither fixture is trusted finality evidence.
+        let mut claim = fixture.evidence.claim().clone();
+        claim.system_genesis = AgentJournalGenesisId::new([0x94; 32]);
+        let certificate = AuthorityQuorumCertificate::new(
+            &fixture.authority, claim.authority_claim(), fixture.evidence.certificate().signatures().to_vec(),
+        ).unwrap();
+        let evidence = AgentGenesisEvidence::new(claim, certificate).unwrap();
+        let decision = AgentGenesisDecision::new(&fixture.proposal, &fixture.replicas, &evidence).unwrap();
+        let other = AgentGenesisProvision::new(fixture.proposal, fixture.replicas, evidence, decision).unwrap();
+        let other = AgentGenesisArchiveRecord::new(other, catalog).unwrap();
+        assert_eq!(archive.publish(&other), Err(AgentGenesisProviderError::Conflict));
+        assert_eq!(archive.reproduce(locator).unwrap(), fixture.provision);
+        assert_eq!(store.0.lock().unwrap().2, 2, "conflicting records must not attempt insertion");
+        assert_eq!(archive.reproduce(AgentGenesisLocator { space: SpaceId([0xa1; 32]), ..locator }), Err(AgentGenesisProviderError::Refused));
+        assert_eq!(archive.reproduce(AgentGenesisLocator { agent: AgentId([0xa2; 32]), ..locator }), Err(AgentGenesisProviderError::Corrupt));
+        store.0.lock().unwrap().0.as_mut().unwrap().push(0);
+        assert_eq!(archive.reproduce(locator), Err(AgentGenesisProviderError::Corrupt));
     }
 
     #[test]
@@ -2598,6 +2893,31 @@ mod tests {
     }
 
     #[test]
+    fn replica_owner_is_distinct_from_transport_but_bound_by_certified_roster() {
+        let fixture = fixture();
+        let original = fixture.replicas.members()[0].clone();
+        let mut logical = original.replica();
+        logical.principal = PrincipalId([0x82; 32]);
+        assert_ne!(logical.principal, PrincipalId::of_public_key(original.ed25519_public_key()));
+        let owner_member = AgentReplicaMember::new(
+            logical, original.peer_id().to_vec(), *original.ed25519_public_key(), original.raft_slot(),
+        ).unwrap();
+        let mut members = fixture.replicas.members().to_vec();
+        members[0] = owner_member;
+        let changed = AgentReplicaCommittee::new(
+            fixture.replicas.space(), fixture.replicas.agent(), fixture.replicas.profile(), members,
+        ).unwrap();
+        assert_ne!(changed.id(), fixture.replicas.id());
+        assert_eq!(AgentReplicaCommittee::decode(&changed.encode()).unwrap(), changed);
+        assert!(fixture.evidence.claim().validate_against(&fixture.proposal, &changed).is_err());
+        // A self-consistent transport mapping cannot replace the owner in an
+        // existing authority-certified provision or its exact descriptor.
+        assert!(AgentGenesisProvision::new(
+            fixture.proposal.clone(), changed, fixture.evidence.clone(), fixture.decision.clone(),
+        ).is_err());
+    }
+
+    #[test]
     fn replica_roster_rejects_identity_order_slot_and_size_tampering() {
         let fixture = fixture();
         let first = fixture.replicas.members()[0].clone();
@@ -2617,7 +2937,7 @@ mod tests {
         );
 
         let mut wrong_principal = first.clone();
-        wrong_principal.replica.principal = PrincipalId([0x82; 32]);
+        wrong_principal.replica.principal = PrincipalId::ZERO;
         assert_eq!(
             wrong_principal.validate_identity(),
             Err(AgentGenesisError::InvalidReplicaCommittee)

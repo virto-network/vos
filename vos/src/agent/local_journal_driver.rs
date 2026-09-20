@@ -4726,10 +4726,30 @@ where
         let [replica] = descriptor.replicas.as_slice() else {
             return Err(LocalReplayExecutorError::WrongReplica.into());
         };
+        if replica.role != crate::agent_sdk::ReplicaRole::Voter
+            || replica.node.0 != merge.node().0
+        {
+            return Err(LocalReplayExecutorError::WrongReplica.into());
+        }
+        Self::clean_shared_genesis_input(
+            descriptor, runtime_package, authority, observed_slot, trust, merge,
+        )
+    }
+
+    /// Build ordinary Shared Create input from an admitted package and signed
+    /// receipt. The caller retains the exact observed slot across retries.
+    /// This does not authorize the replica committee or establish finality.
+    pub(crate) fn clean_shared_genesis_input(
+        descriptor: crate::agent_sdk::AgentDescriptor,
+        runtime_package: &super::package_admission::AdmittedRuntimePackage,
+        authority: crate::agent_sdk::authority::AuthorityReceipt,
+        observed_slot: u64,
+        trust: &Arc<dyn AgentTrustProvider>,
+        merge: &Arc<dyn LocalMergeAuthenticator>,
+    ) -> Result<(ReplayInput, Vec<RuntimeBlob>), LocalJournalDriverError> {
         if descriptor.validate().is_err()
             || descriptor.identity.profile != crate::agent_sdk::AgentProfile::Shared
-            || replica.role != crate::agent_sdk::ReplicaRole::Voter
-            || replica.node.0 != merge.node().0
+            || !descriptor.replicas.iter().any(|replica| replica.node.0 == merge.node().0)
             || descriptor.runtime_package != *runtime_package.package_ref()
             || descriptor.identity.runtime_deployment != runtime_package.deployment()
             || descriptor.identity.runtime_program != runtime_package.program()
@@ -4875,20 +4895,47 @@ where
         trust: Arc<dyn AgentTrustProvider>,
         merge: Arc<dyn LocalMergeAuthenticator>,
     ) -> Result<ReplaySealedSharedGenesis, LocalJournalDriverError> {
-        if replica.node != merge.node() {
+        let provision = verified.provision();
+        let prepared = Self::prepare_shared_genesis_candidate(
+            provision.proposal().create().clone(), replica, provision.replicas(), catalog, trust, merge,
+        )?;
+        ReplaySealedSharedGenesis::from_prepared_verified(verified, prepared).map_err(|error| {
+            LocalJournalDriverError::Replay(
+                error
+                    .map_source(|never| match never {})
+                    .map_executor(|never| match never {}),
+            )
+        })
+    }
+
+    /// Execute an ordinary Shared Create before genesis certification. The
+    /// returned opaque candidate can derive a proposal but cannot initialize
+    /// a journal: only independent finality verification can mint that seal.
+    pub(crate) fn prepare_shared_genesis_candidate(
+        create: ReplayInput,
+        replica: AgentReplica,
+        committee: &AgentReplicaCommittee,
+        catalog: &[RuntimeBlob],
+        trust: Arc<dyn AgentTrustProvider>,
+        merge: Arc<dyn LocalMergeAuthenticator>,
+    ) -> Result<ReplayPreparedGenesis, LocalJournalDriverError> {
+        if replica.node != merge.node()
+            || committee.validate().is_err()
+            || committee.member_by_node(replica.node).map(|member| member.replica()) != Some(replica)
+            || !super::replay::validates_shared_create_committee(&create, committee)
+        {
             return Err(LocalReplayExecutorError::WrongReplica.into());
         }
-        let provision = verified.provision();
         let supplied = SuppliedCatalogBlobResolver::from_catalog(catalog)?;
         let expected_catalog = supplied.blobs.clone();
         let mut executor = StandardLocalReplayExecutor::new_shared(
             supplied,
             trust,
             merge,
-            vec![provision.replicas().clone()],
+            vec![committee.clone()],
         );
         let prepared = ReplayPreparedGenesis::prepare(
-            provision.proposal().create().clone(),
+            create,
             replica,
             &mut executor,
         )
@@ -4902,13 +4949,7 @@ where
         {
             return Err(LocalJournalDriverError::InvalidResult);
         }
-        ReplaySealedSharedGenesis::from_prepared_verified(verified, prepared).map_err(|error| {
-            LocalJournalDriverError::Replay(
-                error
-                    .map_source(|never| match never {})
-                    .map_executor(|never| match never {}),
-            )
-        })
+        Ok(prepared)
     }
 
     fn validate_create_state(
@@ -10785,6 +10826,7 @@ mod tests {
                 actor: ActorId([0xf8; 32]),
                 state_generation: Hash([0xf9; 32]),
                 value: vec![0xfa],
+                rows: Default::default(),
             });
         let before = encode_standard_runtime_state(&before);
         let mut runtime = StandardAgentRuntime::restore(

@@ -481,11 +481,19 @@ pub(crate) fn admitted_standard_runtime_for_test(
     name: &str,
     signing_seed: u8,
 ) -> AdmittedRuntimePackage {
+    admitted_runtime_program_for_test(name, signing_seed, include_bytes!("../../../vosx/blobs/agent_runtime.pvm"))
+}
+
+#[cfg(test)]
+pub(crate) fn admitted_runtime_program_for_test(
+    name: &str,
+    signing_seed: u8,
+    program: &[u8],
+) -> AdmittedRuntimePackage {
     use ed25519_dalek::{Signer as _, SigningKey};
     use vos_agent_sdk::contract::RuntimePackageContract;
     use vos_agent_sdk::package::{PackageArtifact, PackageSigning};
 
-    let program = include_bytes!("../../../vosx/blobs/agent_runtime.pvm");
     let signing = SigningKey::from_bytes(&[signing_seed; 32]);
     let public_key = signing.verifying_key().to_bytes();
     let mut package = PackageEnvelope {

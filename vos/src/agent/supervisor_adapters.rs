@@ -1100,7 +1100,26 @@ fn physical_material_authorizes_work_at(
     ];
     availability.extend(material.installation_data.clone());
     availability.sort_unstable_by(|left, right| left.reference.cmp(&right.reference));
-    if availability != work.availability {
+    let genesis_publication = invocation_method_name(&work.message).as_deref() == Some("publish_genesis")
+        && work.actor == material.descriptor.authority.issuer.actor
+        && work.deployment == material.descriptor.authority.issuer.deployment
+        && work.program == material.descriptor.authority.issuer.program
+        && material.producer == material.descriptor.authority.issuer.producer;
+    if availability != work.availability || genesis_publication {
+        #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+        {
+            // Publication permits one bound provision blob, never arbitrary
+            // replacement/removal of authenticated installation artifacts.
+            if !genesis_publication || work.availability.len() != availability.len() + 1 { return false; }
+            let Some(extra) = work.availability.iter().find(|blob| !availability.iter().any(|base| base.reference == blob.reference)) else {
+                return false;
+            };
+            if !super::clean_bootstrap::genesis_issuance::publication_blob_matches(work, extra) { return false; }
+            availability.push(extra.clone());
+            availability.sort_unstable_by(|left, right| left.reference.cmp(&right.reference));
+            if availability != work.availability { return false; }
+        }
+        #[cfg(not(all(feature = "storage", feature = "network", target_os = "linux")))]
         return false;
     }
 

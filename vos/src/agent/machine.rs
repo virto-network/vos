@@ -180,6 +180,15 @@ impl ActorMachine {
             };
             self.frame[0] = outcome.state.gas;
             self.frame[1..].copy_from_slice(&outcome.state.registers);
+            if matches!(outcome.exit, vos_pvm::inner::InnerExit::Fault(_) | vos_pvm::inner::InnerExit::Panic)
+                && std::env::var_os("VOS_TEST_INNER_DIAGNOSTICS").is_some()
+            {
+                for view in self.test_machines.borrow().views() {
+                    if view.identity.slot == self.id {
+                        std::eprintln!("inner fault pc={:?}", view.machine.map(|machine| machine.pc));
+                    }
+                }
+            }
             match outcome.exit {
                 vos_pvm::inner::InnerExit::Halt => [0, 0],
                 vos_pvm::inner::InnerExit::Panic => [1, 0],

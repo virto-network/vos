@@ -42,7 +42,9 @@ pub mod contract;
 #[cfg(feature = "std")]
 pub mod driver;
 pub mod execution;
+pub(crate) mod actor_storage;
 pub mod genesis;
+pub mod genesis_archive;
 #[cfg(feature = "std")]
 pub mod host;
 pub(crate) mod invocation_history;

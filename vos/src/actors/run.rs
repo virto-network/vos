@@ -1064,7 +1064,7 @@ pub fn run_refine<A: super::Actor>(args_address: u64, args_len: u64) {
         // FETCH reports the complete item length without consuming an item
         // that did not fit, so a small probe followed by one exact retry is
         // both safe and substantially cheaper.
-        const PROBE_BYTES: usize = 256;
+        const PROBE_BYTES: usize = crate::agent::execution::ACTOR_FETCH_PROBE_BYTES;
         let mut bytes = alloc::vec![0u8; core::cmp::min(limit, PROBE_BYTES)];
         let mut len = crate::abi::pvm::ecall::ecall2(
             crate::abi::hostcall::FETCH,
@@ -1261,6 +1261,14 @@ pub fn run_refine<A: super::Actor>(args_address: u64, args_len: u64) {
     }
     if write_lane != Some(crate::agent::StateLane::Local) && local_was_fresh_or_absent {
         local.clear();
+    }
+
+    if let Some(delta) = super::storage::finish_clean_dispatch(status[0])
+        .expect("invalid clean actor storage delta")
+    {
+        assert!(ctx.agent_invocation_context().is_some(), "row export requires clean invocation context");
+        assert_eq!(crate::abi::pvm::hostcalls::actor_effect_export(&delta), 0,
+            "clean actor row export was rejected");
     }
 
     // Pack output: status, three lane lengths/bytes, then reply.

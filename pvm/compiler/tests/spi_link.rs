@@ -160,6 +160,53 @@ fn assemble(insts: &[u32]) -> Vec<u8> {
     insts.iter().flat_map(|i| i.to_le_bytes()).collect()
 }
 
+#[test]
+fn relocated_relative_table_value_is_not_a_raw_call_interior_pointer() {
+    const TEXT: u64 = 0x40_0000;
+    const TABLE: u64 = 0x1_0000;
+    const CALLEE: u64 = TEXT + TABLE + 4;
+    // target - table_base numerically equals the second instruction of a call.
+    // It is a relocated four-byte offset, not an eight-byte absolute pointer.
+    let mut instructions = vec![addi(0, 0, 0); ((CALLEE - TEXT) / 4 + 1) as usize];
+    instructions[0] = (RA << 7) | 0x17;
+    instructions[1] = jalr(RA, RA, 0);
+    instructions[2] = jalr(0, RA, 0);
+    *instructions.last_mut().unwrap() = jalr(0, RA, 0);
+    let text = assemble(&instructions);
+    let table = (CALLEE - TABLE).to_le_bytes();
+    let mut symbols = vec![0; 3 * 24];
+    symbols[24 + 8..24 + 16].copy_from_slice(&CALLEE.to_le_bytes());
+    symbols[48 + 8..48 + 16].copy_from_slice(&TABLE.to_le_bytes());
+    let relocation = |address: u64, symbol: u64, kind: u64| {
+        [address.to_le_bytes(), ((symbol << 32) | kind).to_le_bytes(), 0u64.to_le_bytes()].concat()
+    };
+    let mut relocations = relocation(TEXT, 1, 19); // CALL_PLT
+    let build = |relocations: &[u8]| build_elf(TEXT, &[
+        (".text", 1, 6, TEXT, &text),
+        (".rodata", 1, 2, TABLE, &table),
+        (".symtab", 2, 0, 0, &symbols),
+        (".rela.text", 4, 0, 0, relocations),
+    ]);
+    // Without data relocations this really is a claimed raw interior pointer;
+    // do not weaken the existing fusion-safety rejection to fix the false hit.
+    assert!(matches!(link_elf_spi(&build(&relocations)), Err(TranspileError::InvalidSection(_))));
+    relocations.extend(relocation(TABLE, 1, 35)); // ADD32 target
+    relocations.extend(relocation(TABLE, 2, 39)); // SUB32 table base
+    let blob = link_elf_spi(&build(&relocations)).expect("relative table must not split call pair");
+    let parsed = parse_standard_program(&blob).expect("valid standard program");
+    assert_eq!(&parsed.ro_data[4..8], &[0; 4], "four-byte relocation must not overwrite its neighbor");
+    assert_ne!(&parsed.ro_data[..4], &table[..4], "relative target must still be rewritten");
+
+    // A relocation covering only the high half also excludes the whole raw
+    // eight-byte candidate, even when its symbolic target is not executable.
+    // Both target discovery and pointer rewriting must honor that ownership.
+    let mut high_half = relocation(TEXT, 1, 19);
+    high_half.extend(relocation(TABLE + 4, 0, 1)); // ABS32 to null
+    let blob = link_elf_spi(&build(&high_half)).expect("overlapping relocation excludes heuristic");
+    let parsed = parse_standard_program(&blob).unwrap();
+    assert_eq!(parsed.ro_data, table, "heuristic must not rewrite relocated scalar bytes");
+}
+
 // ---------------------------------------------------------------------------
 // The guests.
 // ---------------------------------------------------------------------------

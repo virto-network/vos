@@ -95,6 +95,10 @@ pub const ACTOR_PRIVATE_FETCH: u32 = 115;
 ///
 /// The host binds the bytes to the currently active PVM VM; the service guest
 /// later validates and canonicalizes them into `Transition`. Refine-only.
+/// In the clean agent executor this slot accepts one canonical ARD1 row delta
+/// per slice instead; installed schema ownership is checked immediately and
+/// only successful/yielded output may commit it with the runtime transition.
+/// These phase-specific payloads never fall back to each other's decoder.
 pub const ACTOR_EFFECT_EXPORT: u32 = 116;
 
 /// Request additional guest heap pages.

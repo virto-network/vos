@@ -56,6 +56,23 @@ pub trait CleanManagementIssuerStore {
     fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error>;
 }
 
+/// Per-candidate genesis signer slot: domain tag, authorization invocation,
+/// signer key, QC signing message, and retained Ed25519 signature.
+pub const MAX_CLEAN_GENESIS_SIGNATURE_IMAGE_BYTES: usize = 4 + 3 * 32 + 64;
+
+/// GCW1 candidate-bound complete committee query and journal anchor.
+pub const MAX_CLEAN_GENESIS_QUERY_IMAGE_BYTES: usize =
+    36 + 64 + 8 + 256 + crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES;
+/// GPW1 complete publication work and journal anchor.
+pub const MAX_CLEAN_GENESIS_PUBLICATION_IMAGE_BYTES: usize =
+    36 + 8 + 256 + crate::agent_sdk::wire::MAX_RUNTIME_WORK_WIRE_BYTES;
+/// GCR1 exact work/authorization commitments and canonical committee result.
+pub const MAX_CLEAN_GENESIS_REPLY_IMAGE_BYTES: usize =
+    68 + crate::agent::committee::MAX_AUTHORITY_COMMITTEE_WIRE_BYTES;
+/// GPR1 exact work/authorization commitments and canonical publication decision.
+pub const MAX_CLEAN_GENESIS_PUBLICATION_REPLY_IMAGE_BYTES: usize =
+    68 + crate::agent::genesis::MAX_AGENT_GENESIS_DECISION_BYTES;
+
 // Reload protocol state while retaining the caller's exclusive store lease.
 // A failed commit may already be durable, so retries must still call load.
 impl<B: CleanManagementIssuerStore + ?Sized> CleanManagementIssuerStore for &mut B {

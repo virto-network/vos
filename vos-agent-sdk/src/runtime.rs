@@ -16,8 +16,10 @@ pub const MAX_INVOCATION_REPLY_BYTES: usize = 16 * 1024;
 pub const MAX_RESUME_INPUT_BYTES: usize = 8 * 1024;
 pub const MAX_RUNTIME_AVAILABILITY_ITEMS: usize = 16;
 /// Caller-selected actor inputs retained across one invocation. This matches
-/// the standard execution ABI's aggregate availability window.
-pub const MAX_RUNTIME_CALLER_AVAILABILITY_BYTES: usize = 48 * 1024;
+/// the standard execution ABI's aggregate availability window. The window
+/// accommodates the complete bounded clean-Create genesis provision, including
+/// the maximum replica roster; inline actor state has a separate smaller cap.
+pub const MAX_RUNTIME_CALLER_AVAILABILITY_BYTES: usize = 192 * 1024;
 /// Largest standard actor PVM staged into one runtime work item.
 pub const MAX_RUNTIME_PROGRAM_BYTES: usize = 1_280 * 1024;
 /// Largest signed actor schema staged alongside the actor PVM.

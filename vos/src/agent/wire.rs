@@ -1331,6 +1331,7 @@ fn encode_standard_lane(state: &StandardRuntimeState, lane: StateLane) -> Vec<u8
     let mut output = Vec::new();
     let mut encoder = Encoder(&mut output);
     encoder.fixed(&super::RUNTIME_ABI_ID.0);
+    encoder.0.extend_from_slice(b"SLR1");
     encoder.u8(lane as u8);
     encoder.u64(match lane {
         StateLane::Linear => state.lane_revisions.linear,
@@ -1353,7 +1354,12 @@ fn encode_standard_lane(state: &StandardRuntimeState, lane: StateLane) -> Vec<u8
     encoder.list(entries, |encoder, entry| {
         encoder.fixed(&entry.actor.0);
         encoder.fixed(&entry.state_generation.0);
-        encoder.bytes(&entry.value);
+        let length_at = encoder.0.len();
+        encoder.u32(0);
+        let image_at = encoder.0.len();
+        super::actor_storage::ActorLaneImage::append_parts(encoder.0, &entry.value, &entry.rows);
+        let image_len = (encoder.0.len() - image_at) as u32;
+        encoder.0[length_at..image_at].copy_from_slice(&image_len.to_le_bytes());
     });
     encoder.list(
         &state
@@ -1887,6 +1893,7 @@ fn decode_standard_lane(
 ) -> Result<DecodedStandardLane, DecodeError> {
     let mut decoder = Decoder::new(bytes);
     if Hash(decoder.fixed()?) != super::RUNTIME_ABI_ID
+        || decoder.take(4)? != b"SLR1"
         || decode_state_lane(decoder.u8()?)? != expected_lane
     {
         return Err(DecodeError::InvalidPlatform);
@@ -1899,18 +1906,18 @@ fn decode_standard_lane(
         |decoder| {
             let actor = ActorId(decoder.fixed()?);
             let state_generation = Hash(decoder.fixed()?);
-            let value = decoder.bytes_ref()?;
+            let (value, rows) = super::actor_storage::ActorLaneImage::decode(decoder.bytes_ref()?)?.into_parts();
             if actor == ActorId::ZERO
                 || state_generation == Hash::ZERO
-                || value.is_empty()
-                || value.len() > super::execution::MAX_EXECUTION_STATE_BYTES
+                || (value.is_empty() && rows.is_empty())
             {
                 return Err(DecodeError::NonCanonical);
             }
             Ok(StandardLaneEntry {
                 actor,
                 state_generation,
-                value: value.to_vec(),
+                value,
+                rows,
             })
         },
     )?;
@@ -2109,6 +2116,7 @@ pub fn apply_standard_execution(
                                                         super::execution::ActorRunOutcome::Completed {
                                                             mut reply,
                                                             state: next_state,
+                                                            ..
                                                         } => {
                                                             if reply.status
                                                                 == ActorExecutionStatus::Done
@@ -2146,6 +2154,7 @@ pub fn apply_standard_execution(
                                                             reply,
                                                             state: next_state,
                                                             continuation,
+                                                            ..
                                                         } => {
                                                             runtime.commit_yielded_execution(
                                                                 &call.invocation,
@@ -2486,7 +2495,12 @@ fn apply_clean_invoke_inner(
 ) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
     use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeTransition};
 
-    let original_state = clean_state_to_legacy(&state);
+    // Keep one owned encoded rollback image, not both SDK and legacy copies.
+    // The fields have identical bytes; only the enclosing wire types differ.
+    let original_state = RuntimeState {
+        control: state.control, linear: state.linear,
+        merge: state.merge, local: state.local,
+    };
     let decoded = decode_standard_runtime_state(&original_state)?;
     let state_limit = standard_state_limit(&decoded);
     let mut runtime =
@@ -2508,14 +2522,14 @@ fn apply_clean_invoke_inner(
         Ok(Some(error)) => {
             let candidate = encode_standard_runtime_state(&runtime.snapshot());
             if candidate.encoded_len().is_none_or(|len| len > state_limit) {
-                return Ok(clean_completed(state, Err(InvocationError::ResultCapacity)));
+                return Ok(clean_completed(legacy_state_to_clean(original_state), Err(InvocationError::ResultCapacity)));
             }
             return Ok(clean_completed(
                 legacy_state_to_clean(candidate),
                 Err(error),
             ));
         }
-        Err(error) => return Ok(clean_completed(state, Err(error))),
+        Err(error) => return Ok(clean_completed(legacy_state_to_clean(original_state), Err(error))),
         Ok(None) => {}
     }
     // A signed non-execution fence needs no actor execution/proof admission.
@@ -2524,14 +2538,14 @@ fn apply_clean_invoke_inner(
         Ok(true) => {
             let candidate = encode_standard_runtime_state(&runtime.snapshot());
             if candidate.encoded_len().is_none_or(|len| len > state_limit) {
-                return Ok(clean_completed(state, Err(InvocationError::ResultCapacity)));
+                return Ok(clean_completed(legacy_state_to_clean(original_state), Err(InvocationError::ResultCapacity)));
             }
             return Ok(clean_completed(
                 legacy_state_to_clean(candidate),
                 Err(InvocationError::ExpiredBeforeExecution),
             ));
         }
-        Err(error) => return Ok(clean_completed(state, Err(error))),
+        Err(error) => return Ok(clean_completed(legacy_state_to_clean(original_state), Err(error))),
         Ok(false) => {}
     }
     let policy_admission = match &admission {
@@ -2563,27 +2577,27 @@ fn apply_clean_invoke_inner(
                     )
                 })
             {
-                return Ok(clean_completed(state, Err(error)));
+                return Ok(clean_completed(legacy_state_to_clean(original_state), Err(error)));
             }
             let candidate = encode_standard_runtime_state(&runtime.snapshot());
             if candidate.encoded_len().is_none_or(|len| len > state_limit) {
-                return Ok(clean_completed(state, Err(InvocationError::ResultCapacity)));
+                return Ok(clean_completed(legacy_state_to_clean(original_state), Err(InvocationError::ResultCapacity)));
             }
             return Ok(clean_completed(
                 legacy_state_to_clean(candidate),
                 Err(error),
             ));
         }
-        return Ok(clean_completed(state, Err(error)));
+        return Ok(clean_completed(legacy_state_to_clean(original_state), Err(error)));
     }
     match runtime.recover_clean_yield(&work, &authorization, observed_slot) {
         Ok(Some(yielded)) => {
             return Ok(RuntimeTransition {
-                state,
+                state: legacy_state_to_clean(original_state),
                 outcome: RuntimeOutcome::Yielded(yielded),
             });
         }
-        Err(error) => return Ok(clean_completed(state, Err(error))),
+        Err(error) => return Ok(clean_completed(legacy_state_to_clean(original_state), Err(error))),
         Ok(None) => {}
     }
     match runtime.recover_clean_execution(&work, &authorization, observed_slot) {
@@ -2601,7 +2615,7 @@ fn apply_clean_invoke_inner(
                 result.map(clean_reply).map_err(clean_error),
             ));
         }
-        Err(error) => return Ok(clean_completed(state, Err(error))),
+        Err(error) => return Ok(clean_completed(legacy_state_to_clean(original_state), Err(error))),
         Ok(None) => {}
     }
     let (invocation, actor_pvm, actor_schema, actor_policies, installation_data) =
@@ -2611,7 +2625,7 @@ fn apply_clean_invoke_inner(
                 if let Err(slot_error) =
                     runtime.validate_clean_unseen_invocation_slot(&authorization, observed_slot)
                 {
-                    return Ok(clean_completed(state, Err(slot_error)));
+                    return Ok(clean_completed(legacy_state_to_clean(original_state), Err(slot_error)));
                 }
                 if let Err(retention_error) = runtime.retain_clean_invocation_error(
                     &work,
@@ -2620,30 +2634,30 @@ fn apply_clean_invoke_inner(
                     observed_slot,
                     None,
                 ) {
-                    return Ok(clean_completed(state, Err(retention_error)));
+                    return Ok(clean_completed(legacy_state_to_clean(original_state), Err(retention_error)));
                 }
                 let candidate = encode_standard_runtime_state(&runtime.snapshot());
                 if candidate.encoded_len().is_none_or(|len| len > state_limit) {
-                    return Ok(clean_completed(state, Err(InvocationError::ResultCapacity)));
+                    return Ok(clean_completed(legacy_state_to_clean(original_state), Err(InvocationError::ResultCapacity)));
                 }
                 return Ok(clean_completed(
                     legacy_state_to_clean(candidate),
                     Err(error),
                 ));
             }
-            Err(error) => return Ok(clean_completed(state, Err(error))),
+            Err(error) => return Ok(clean_completed(legacy_state_to_clean(original_state), Err(error))),
         };
     let (mut result, commit_candidate) =
         match runtime.recover_execution(&invocation, observed_slot) {
             Ok(Some(_)) | Err(ActorExecutionError::DivergentInvocation) => {
                 return Ok(clean_completed(
-                    state,
+                    legacy_state_to_clean(original_state),
                     Err(InvocationError::DivergentInvocation),
                 ));
             }
             unseen => {
                 match runtime.validate_clean_unseen_invocation_slot(&authorization, observed_slot) {
-                    Err(error) => return Ok(clean_completed(state, Err(error))),
+                    Err(error) => return Ok(clean_completed(legacy_state_to_clean(original_state), Err(error))),
                     Ok(()) => {
                         let pristine = runtime.clone();
                         let mut result = match unseen {
@@ -2685,7 +2699,9 @@ fn apply_clean_invoke_inner(
                                 Ok(true) => runtime.prepare_execution_state(&invocation).and_then(
                                     |before| {
                                         let visible = before.visible_for(invocation.mode);
-                                        super::execution::run_inner_actor(
+                                        let outcome = {
+                                        let storage = runtime.resolve_clean_storage_reader(&work, &actor_schema)?;
+                                        super::execution::run_inner_actor_with_storage(
                                             &invocation,
                                             Some(crate::agent_sdk::InvocationContext::from_work(
                                                 &work,
@@ -2697,15 +2713,19 @@ fn apply_clean_invoke_inner(
                                                 .map(|data| data.bytes.as_slice()),
                                             &visible,
                                             None,
+                                            Some(&storage),
                                         )
-                                        .and_then(
+                                        };
+                                        outcome.and_then(
                                             |outcome| match outcome {
                                                 super::execution::ActorRunOutcome::Completed {
                                                     mut reply,
                                                     state: next_state,
+                                                    rows,
                                                 } => {
                                                     if reply.status == ActorExecutionStatus::Done {
-                                                        runtime.commit_clean_execution(
+                                                        let inline = if rows.is_empty() { Vec::new() } else { invocation.mode.write_lane().and_then(|lane| next_state.get(lane)).unwrap_or_default().to_vec() };
+                                                        let commit = |runtime: &mut StandardAgentRuntime| runtime.commit_clean_execution(
                                                             &work,
                                                             &authorization,
                                                             &invocation,
@@ -2714,7 +2734,9 @@ fn apply_clean_invoke_inner(
                                                             next_state,
                                                             observed_slot,
                                                             None,
-                                                        )?;
+                                                        );
+                                                        if rows.is_empty() { commit(&mut runtime)?; }
+                                                        else { runtime.commit_clean_row_batch(&work, &actor_schema, inline, rows, commit)?; }
                                                     }
                                                     Ok(reply)
                                                 }
@@ -2722,8 +2744,10 @@ fn apply_clean_invoke_inner(
                                                     reply,
                                                     state: next_state,
                                                     continuation,
+                                                    rows,
                                                 } => {
-                                                    runtime.commit_yielded_execution(
+                                                    let inline = if rows.is_empty() { Vec::new() } else { invocation.mode.write_lane().and_then(|lane| next_state.get(lane)).unwrap_or_default().to_vec() };
+                                                    let commit = |runtime: &mut StandardAgentRuntime| runtime.commit_yielded_execution(
                                         &invocation,
                                         &reply,
                                         &before,
@@ -2737,7 +2761,9 @@ fn apply_clean_invoke_inner(
                                             ),
                                             authorization.clone(),
                                         )),
-                                    )?;
+                                    );
+                                                    if rows.is_empty() { commit(&mut runtime)?; }
+                                                    else { runtime.commit_clean_row_batch(&work, &actor_schema, inline, rows, commit)?; }
                                                     Ok(reply)
                                                 }
                                             },
@@ -2804,14 +2830,18 @@ fn apply_clean_resume(
             Err(InvocationError::StaleContinuation),
         ));
     }
-    let original_state = clean_state_to_legacy(&state);
+    // Resume needs the same single owned rollback image as Invoke/ACK.
+    let original_state = RuntimeState {
+        control: state.control, linear: state.linear,
+        merge: state.merge, local: state.local,
+    };
     let decoded = decode_standard_runtime_state(&original_state)?;
     let state_limit = standard_state_limit(&decoded);
     let mut runtime =
         StandardAgentRuntime::restore(decoded).map_err(|_| DecodeError::NonCanonical)?;
     let (record, work) = match runtime.resolve_clean_resume(&resume) {
         Ok(value) => value,
-        Err(error) => return Ok(clean_completed(state, Err(error))),
+        Err(error) => return Ok(clean_completed(legacy_state_to_clean(original_state), Err(error))),
     };
     let authorization = record
         .authorization
@@ -2828,22 +2858,22 @@ fn apply_clean_resume(
                     record.observed_slot,
                     Some(record.ready_sequence),
                 ) {
-                    return Ok(clean_completed(state, Err(error)));
+                    return Ok(clean_completed(legacy_state_to_clean(original_state), Err(error)));
                 }
                 let candidate = encode_standard_runtime_state(&runtime.snapshot());
                 if candidate.encoded_len().is_none_or(|len| len > state_limit) {
-                    return Ok(clean_completed(state, Err(InvocationError::ResultCapacity)));
+                    return Ok(clean_completed(legacy_state_to_clean(original_state), Err(InvocationError::ResultCapacity)));
                 }
                 return Ok(clean_completed(
                     legacy_state_to_clean(candidate),
                     Err(error),
                 ));
             }
-            Err(error) => return Ok(clean_completed(state, Err(error))),
+            Err(error) => return Ok(clean_completed(legacy_state_to_clean(original_state), Err(error))),
         };
     if invocation.commitment() != record.request {
         return Ok(clean_completed(
-            state,
+            legacy_state_to_clean(original_state),
             Err(InvocationError::StaleContinuation),
         ));
     }
@@ -2876,7 +2906,9 @@ fn apply_clean_resume(
         })
         .and_then(|before| {
             let visible = before.visible_for(invocation.mode);
-            super::execution::run_inner_actor(
+            let outcome = {
+            let storage = runtime.resolve_clean_storage_reader(&work, &actor_schema)?;
+            super::execution::run_inner_actor_with_storage(
                 &invocation,
                 Some(crate::agent_sdk::InvocationContext::from_work(
                     &work,
@@ -2886,14 +2918,18 @@ fn apply_clean_resume(
                 installation_data.as_ref().map(|data| data.bytes.as_slice()),
                 &visible,
                 Some(record.continuation.clone()),
+                Some(&storage),
             )
-            .and_then(|outcome| match outcome {
+            };
+            outcome.and_then(|outcome| match outcome {
                 super::execution::ActorRunOutcome::Completed {
                     mut reply,
                     state: next_state,
+                    rows,
                 } => {
                     if reply.status == ActorExecutionStatus::Done {
-                        runtime.commit_clean_execution(
+                        let inline = if rows.is_empty() { Vec::new() } else { invocation.mode.write_lane().and_then(|lane| next_state.get(lane)).unwrap_or_default().to_vec() };
+                        let commit = |runtime: &mut StandardAgentRuntime| runtime.commit_clean_execution(
                             &work,
                             &authorization,
                             &invocation,
@@ -2902,7 +2938,9 @@ fn apply_clean_resume(
                             next_state,
                             observed_slot,
                             Some(record.ready_sequence),
-                        )?;
+                        );
+                        if rows.is_empty() { commit(&mut runtime)?; }
+                        else { runtime.commit_clean_row_batch(&work, &actor_schema, inline, rows, commit)?; }
                     } else {
                         terminal_sequence = Some(record.ready_sequence);
                     }
@@ -2912,8 +2950,10 @@ fn apply_clean_resume(
                     reply,
                     state: next_state,
                     continuation,
+                    rows,
                 } => {
-                    runtime.commit_yielded_execution(
+                    let inline = if rows.is_empty() { Vec::new() } else { invocation.mode.write_lane().and_then(|lane| next_state.get(lane)).unwrap_or_default().to_vec() };
+                    let commit = |runtime: &mut StandardAgentRuntime| runtime.commit_yielded_execution(
                         &invocation,
                         &reply,
                         &before,
@@ -2922,7 +2962,9 @@ fn apply_clean_resume(
                         Some(record.ready_sequence),
                         continuation,
                         Some((accepted.clone(), authorization.clone())),
-                    )?;
+                    );
+                    if rows.is_empty() { commit(&mut runtime)?; }
+                    else { runtime.commit_clean_row_batch(&work, &actor_schema, inline, rows, commit)?; }
                     Ok(reply)
                 }
             })
@@ -2983,7 +3025,12 @@ fn apply_clean_acknowledge_inner(
 ) -> Result<crate::agent_sdk::RuntimeTransition, DecodeError> {
     use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeTransition};
 
-    let original_state = clean_state_to_legacy(&state);
+    // Retain one owned rollback image across admission and retirement. Keeping
+    // an additional SDK copy can exhaust the guest heap near the state limit.
+    let original_state = RuntimeState {
+        control: state.control, linear: state.linear,
+        merge: state.merge, local: state.local,
+    };
     let decoded = decode_standard_runtime_state(&original_state)?;
     let state_limit = standard_state_limit(&decoded);
     let mut runtime =
@@ -3006,13 +3053,13 @@ fn apply_clean_acknowledge_inner(
         Ok((acknowledgement, true)) => acknowledgement,
         Ok((acknowledgement, false)) => {
             return Ok(RuntimeTransition {
-                state,
+                state: legacy_state_to_clean(original_state),
                 outcome: RuntimeOutcome::Acknowledged(Ok(acknowledgement)),
             });
         }
         Err(error) => {
             return Ok(RuntimeTransition {
-                state,
+                state: legacy_state_to_clean(original_state),
                 outcome: RuntimeOutcome::Acknowledged(Err(error)),
             });
         }
@@ -3023,7 +3070,7 @@ fn apply_clean_acknowledge_inner(
         .is_none_or(|encoded_len| encoded_len > state_limit)
     {
         return Ok(RuntimeTransition {
-            state,
+            state: legacy_state_to_clean(original_state),
             outcome: RuntimeOutcome::Acknowledged(Err(InvocationError::ResultCapacity)),
         });
     }
@@ -4907,6 +4954,7 @@ pub(crate) mod tests {
                     actor,
                     state_generation: generation,
                     value: vec![0x89],
+                    rows: Default::default(),
                 }],
                 merge: Vec::new(),
                 local: Vec::new(),
@@ -8538,6 +8586,43 @@ pub(crate) mod tests {
     }
 
     #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_resolver_accepts_sdk_message_limit_and_separates_caller_blobs() {
+        let (runtime, mut work) = clean_policy_fixture(
+            crate::agent_sdk::method_policy::AuthorizationPolicySelector::Public,
+        );
+        work.message = vec![1; crate::agent_sdk::MAX_INVOCATION_MESSAGE_BYTES];
+        let bytes = vec![0x61; 36 * 1024];
+        let caller = crate::agent_sdk::RuntimeBlob {
+            reference: crate::agent_sdk::BlobRef::of_bytes(&bytes),
+            bytes: bytes.clone(),
+        };
+        work.availability.push(caller);
+        work.availability.sort_by(|a, b| a.reference.cmp(&b.reference));
+        assert!(work.validate());
+        let (inner, program, schema, policy, _) = runtime.resolve_clean_invocation(&work).unwrap();
+        assert_eq!(inner.message, work.message);
+        assert_eq!(inner.availability.len(), 1);
+        assert_eq!(inner.availability[0].bytes, bytes);
+        assert_ne!(program, bytes);
+        assert_ne!(schema.bytes, bytes);
+        assert_ne!(policy.bytes, bytes);
+        let reference = crate::service::BlobRef::of_bytes(&bytes);
+        assert_eq!(inner.available_preimage(&reference), Ok(Some(bytes.as_slice())));
+
+        let mut missing_program = work.clone();
+        missing_program.availability.retain(|blob| {
+            crate::agent_sdk::ProgramId::of_pvm(&blob.bytes) != work.program
+        });
+        assert!(matches!(runtime.resolve_clean_invocation(&missing_program),
+            Err(crate::agent_sdk::InvocationError::InvalidAvailability)));
+        work.message.push(1);
+        assert!(!work.validate());
+        assert!(matches!(runtime.resolve_clean_invocation(&work),
+            Err(crate::agent_sdk::InvocationError::InvalidInput)));
+    }
+
+    #[cfg(feature = "pvm")]
     fn clean_policy_fixture(
         selector: crate::agent_sdk::method_policy::AuthorizationPolicySelector,
     ) -> (StandardAgentRuntime, crate::agent_sdk::InvocationWork) {
@@ -8581,6 +8666,15 @@ pub(crate) mod tests {
         selector: crate::agent_sdk::method_policy::AuthorizationPolicySelector,
         attestation: crate::agent_sdk::method_policy::AttestationRequirement,
     ) -> (StandardAgentRuntime, crate::agent_sdk::InvocationWork) {
+        clean_policy_fixture_with_storage(selector, attestation, false)
+    }
+
+    #[cfg(feature = "pvm")]
+    fn clean_policy_fixture_with_storage(
+        selector: crate::agent_sdk::method_policy::AuthorizationPolicySelector,
+        attestation: crate::agent_sdk::method_policy::AttestationRequirement,
+        storage: bool,
+    ) -> (StandardAgentRuntime, crate::agent_sdk::InvocationWork) {
         use crate::actors::codec::Encode as _;
         use crate::actors::value::{Msg, TAG_DYNAMIC};
         use crate::agent_sdk::method_policy::{
@@ -8593,7 +8687,7 @@ pub(crate) mod tests {
         use crate::agent_sdk::wire::CanonicalWire as _;
 
         let (runtime, mut work) = clean_resolvable_fixture(false);
-        let schema = ParsedSchema {
+        let mut schema = ParsedSchema {
             constructor: ConstructorContract::Forbidden,
             fields: vec![ParsedField::Inline(ParsedInlineField {
                 source_index: 0,
@@ -8610,6 +8704,14 @@ pub(crate) mod tests {
                 explicit: true,
             }],
         };
+        if storage {
+            schema.fields.push(ParsedField::Storage(crate::agent_sdk::schema::ParsedStorageField {
+                source_index: 1, name: "rows".into(),
+                type_identity: "test::StorageMap<u32,u64>".into(),
+                prefix: b"s/rows/".to_vec(), lane: crate::agent_sdk::StateLane::Linear,
+                committed: false, leaf_domain: None, node_domain: None,
+            }));
+        }
         let schema_bytes = schema.encode().unwrap();
         let schema_blob = crate::agent_sdk::RuntimeBlob {
             reference: crate::agent_sdk::BlobRef::of_bytes(&schema_bytes),
@@ -11514,6 +11616,485 @@ pub(crate) mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
+    fn clean_row_batch_commits_with_result_and_rolls_back_late_failures() {
+        use crate::agent_sdk::method_policy::{AuthorizationPolicySelector, AttestationRequirement};
+        let (pristine, work) = clean_policy_fixture_with_storage(
+            AuthorizationPolicySelector::Public, AttestationRequirement::None, true,
+        );
+        let (invocation, _, schema, _, _) = pristine.resolve_clean_invocation(&work).unwrap();
+        let authorization = crate::agent_sdk::InvocationAuthorization::AuthorityReceipt(
+            clean_authority_receipt(pristine.config().unwrap(), &work),
+        );
+        let before = pristine.prepare_execution_state(&invocation).unwrap();
+        let mut after = before.clone();
+        after.linear = Some(vec![0xa1]);
+        let row = vec![0x74; crate::actors::storage::MAX_VALUE_BYTES];
+        let changes = || vec![(b"s/rows/value".to_vec(), Some(row.clone()))];
+        let commit = |candidate: &mut StandardAgentRuntime| {
+            let mut reply = exact_reply(&invocation, ActorExecutionStatus::Done);
+            candidate.commit_clean_execution(&work, &authorization, &invocation, &mut reply,
+                &before, after.clone(), 1, None)?;
+            Ok(reply)
+        };
+        let mut runtime = pristine.clone();
+        let reply = runtime.commit_clean_row_batch(&work, &schema, vec![0xa1], changes(), &commit).unwrap();
+        assert_eq!(reply.status, ActorExecutionStatus::Done);
+        assert_eq!(runtime.snapshot().invocation_results.len(), 1);
+        assert_eq!(runtime.snapshot().lane_state.linear[0].value, vec![0xa1]);
+        assert_eq!(runtime.resolve_clean_storage_reader(&work, &schema).unwrap().read(b"s/rows/value"), Ok(Some(row.as_slice())));
+        let encoded = encode_standard_runtime_state(&runtime.snapshot());
+        let reopened = StandardAgentRuntime::restore(decode_standard_runtime_state(&encoded).unwrap()).unwrap();
+        assert!(reopened.snapshot() == runtime.snapshot());
+
+        // A late refusal after the result was staged must roll back both.
+        let mut runtime = pristine.clone();
+        let failed = runtime.commit_clean_row_batch(&work, &schema, vec![0xa1], changes(), |candidate| {
+            commit(candidate)?;
+            Err::<(), _>(ActorExecutionError::ResultCapacity)
+        });
+        assert_eq!(failed, Err(ActorExecutionError::ResultCapacity));
+        assert!(runtime.snapshot() == pristine.snapshot());
+
+        // Namespace rejection occurs before the terminal transition runs.
+        let failed = runtime.commit_clean_row_batch(&work, &schema, vec![0xa1], vec![
+            (b"s/rows/value".to_vec(), Some(vec![1])),
+            (b"undeclared/value".to_vec(), None),
+        ], |_candidate| -> Result<(), ActorExecutionError> { panic!("invalid delta reached commit") });
+        assert_eq!(failed, Err(ActorExecutionError::InvalidActorOutput));
+        assert!(runtime.snapshot() == pristine.snapshot());
+
+        // A coherently constrained descriptor admits existing state, but not
+        // row plus result. This is a fixture, not a live policy mutation.
+        let mut limited = pristine.snapshot();
+        let limit = encode_standard_runtime_state(&limited).encoded_len().unwrap();
+        let descriptor = limited.clean_descriptor.as_mut().unwrap();
+        descriptor.runtime_contract.resources.max_runtime_state_bytes = limit as u32;
+        limited.config = Some(super::super::standard::clean_descriptor_to_legacy_config(descriptor).unwrap());
+        limited.active_resource_policy = Some(descriptor.initial_resource_policy());
+        let mut runtime = StandardAgentRuntime::restore(limited).unwrap();
+        let limited_before = runtime.snapshot();
+        assert_eq!(runtime.commit_clean_row_batch(&work, &schema, vec![0xa1], changes(), &commit).err(), Some(ActorExecutionError::ResultCapacity));
+        assert!(runtime.snapshot() == limited_before, "resource refusal must retain neither rows nor result");
+
+        let mut runtime = pristine.clone();
+        runtime.commit_clean_row_batch(&work, &schema, vec![0xa1], changes(), |candidate| {
+            candidate.commit_yielded_execution(&invocation,
+                &exact_reply(&invocation, ActorExecutionStatus::Yielded),
+                &before, after.clone(), 1, None,
+                portable_continuation(&invocation, 1, 3).continuation,
+                Some((super::super::standard::StandardAcceptedInvocation::from_work(&work), authorization.clone())),
+            )
+        }).unwrap();
+        let yielded = runtime.snapshot();
+        assert_eq!(yielded.machine_continuations.len(), 1);
+        assert!(yielded.invocation_results.is_empty());
+        assert_eq!(yielded.lane_state.linear[0].rows.get(b"s/rows/value".as_slice()), Some(&row));
+        let mut resumed = StandardAgentRuntime::restore(yielded.clone()).unwrap();
+        let sequence = yielded.machine_continuations[0].ready_sequence;
+        let before_resume = resumed.prepare_execution_state(&invocation).unwrap();
+        let mut after_resume = before_resume.clone();
+        after_resume.linear = Some(vec![0xa2]);
+        let complete = |candidate: &mut StandardAgentRuntime| {
+            let mut reply = exact_reply(&invocation, ActorExecutionStatus::Done);
+            candidate.commit_clean_execution(&work, &authorization, &invocation, &mut reply,
+                &before_resume, after_resume.clone(), 2, Some(sequence))?;
+            Ok(reply)
+        };
+        let replacement = || vec![(b"s/rows/value".to_vec(), Some(vec![0x75; row.len()]))];
+        assert_eq!(resumed.commit_clean_row_batch(&work, &schema, vec![0xa2], replacement(), |candidate| {
+            complete(candidate)?;
+            Err::<(), _>(ActorExecutionError::ResultCapacity)
+        }), Err(ActorExecutionError::ResultCapacity));
+        assert!(resumed.snapshot() == yielded, "a refused terminal slice must preserve its continuation and rows");
+        resumed.commit_clean_row_batch(&work, &schema, vec![0xa2], replacement(), complete).unwrap();
+        let completed = resumed.snapshot();
+        assert!(completed.machine_continuations.is_empty());
+        assert_eq!(completed.invocation_results.len(), 1);
+        assert_eq!(completed.lane_state.linear[0].value, vec![0xa2]);
+        assert_eq!(completed.lane_state.linear[0].rows.get(b"s/rows/value".as_slice()).unwrap(), &vec![0x75; row.len()]);
+        assert!(StandardAgentRuntime::restore(completed.clone()).unwrap().snapshot() == completed);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_dispatch_reads_persisted_rows_and_retains_exact_result_after_restore() {
+        clean_storage_dispatch_fixture(false, crate::actors::STATUS_DONE, None, 0);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_dispatch_commits_exported_rows_only_for_successful_actor_output() {
+        for status in [crate::actors::STATUS_DONE, crate::actors::STATUS_PANICKED,
+            crate::actors::STATUS_FORBIDDEN, crate::actors::STATUS_OOG] {
+            clean_storage_dispatch_fixture(true, status, None, 0);
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    fn clean_availability_work(size: usize) -> crate::agent_sdk::RuntimeWork {
+        use crate::agent_sdk::{InvocationAuthorization, RuntimeExecutionContext, RuntimeWork};
+        use crate::agent_sdk::method_policy::AuthorizationPolicySelector;
+        use vos_pvm_compiler::assembler::{Assembler, Reg};
+        let (runtime, mut work) = clean_policy_fixture(AuthorizationPolicySelector::Public);
+        let mut payload = vec![0x61; size];
+        payload[size - 8..].fill(0x7b);
+        let reference = crate::agent_sdk::BlobRef::of_bytes(&payload);
+        let base = 2 * vos_pvm::PVM_ZONE_SIZE;
+        let mut data = vec![0; 30];
+        data[0] = crate::actors::STATUS_DONE;
+        data[1..5].copy_from_slice(&1u32.to_le_bytes());
+        data[13] = 0xee;
+        data.extend_from_slice(&reference.hash.0);
+        let buffer = base + data.len() as u32;
+        data.resize(data.len() + size, 0);
+        let mut program = Assembler::new();
+        program.set_rw_data(data)
+            .load_imm_64(Reg::A0, u64::from(base + 30))
+            .load_imm_64(Reg::A1, u64::from(buffer))
+            .load_imm_64(Reg::A2, size as u64)
+            .ecalli(crate::abi::hostcall::PREIMAGE_LOOKUP)
+            .store_u64(Reg::A0, base + 14)
+            .load_imm_64(Reg::A0, u64::from(buffer) + size as u64 - 8)
+            .load_ind_u64(Reg::A1, Reg::A0, 0).store_u64(Reg::A1, base + 22)
+            .load_imm_64(Reg::A0, u64::from(base)).load_imm_64(Reg::A1, 30)
+            .jump_ind(Reg::RA, 0);
+        let bytes = program.build_standard();
+        let blob = work.availability.iter_mut()
+            .find(|blob| crate::agent_sdk::ProgramId::of_pvm(&blob.bytes) == work.program).unwrap();
+        work.program = crate::agent_sdk::ProgramId::of_pvm(&bytes);
+        *blob = crate::agent_sdk::RuntimeBlob { reference: crate::agent_sdk::BlobRef::of_bytes(&bytes), bytes };
+        work.availability.push(crate::agent_sdk::RuntimeBlob { reference, bytes: payload });
+        work.availability.sort_by(|a, b| a.reference.cmp(&b.reference));
+        work.gas = 100_000;
+        let mut state = runtime.snapshot();
+        state.actors[0].record.entry.program = crate::service::ProgramId(work.program.0);
+        let record = &state.actors[0].record;
+        let installation = &mut state.clean_actor_installations.as_mut().unwrap()[0];
+        installation.original.entry = super::super::standard::legacy_actor_record_to_clean(record, installation.commitment).entry;
+        installation.commitment = installation.original.lineage_commitment();
+        let runtime = StandardAgentRuntime::restore(state).unwrap();
+        let authorization = InvocationAuthorization::AuthorityReceipt(clean_authority_receipt(runtime.config().unwrap(), &work));
+        RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
+            state: legacy_state_to_clean(encode_standard_runtime_state(&runtime.snapshot())),
+            invocation: Box::new(work), authorization: Box::new(authorization), observed_slot: 1,
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    fn check_clean_maximum_availability(runtime_program: Option<&[u8]>) {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        use crate::agent_sdk::{InvocationStatus, RuntimeOutcome, RuntimeTransition, RuntimeWork};
+        let mut work = clean_availability_work(super::super::execution::MAX_EXECUTION_AVAILABILITY_BYTES);
+        let mut first_outcome = None;
+        for phase in 0..2 {
+            let input = work.encode().unwrap();
+            let decoded = RuntimeWork::decode(&input).unwrap();
+            let expected = apply_standard_runtime_work(decoded).unwrap();
+            if let Some(program) = runtime_program {
+                let execution = vos_pvm::refine_host::RefineContext::load(
+                    program, &input, super::super::driver::DEFAULT_MANAGEMENT_GAS,
+                ).unwrap().run();
+                assert_eq!(execution.exit, vos_pvm::ExitReason::Halt, "phase={phase}");
+                let output = execution.output_bounded(RuntimeTransition::MAX_ENCODED_BYTES).unwrap();
+                assert_eq!(output, expected.encode().unwrap(), "outer guest/source transition phase={phase}");
+                std::eprintln!("maximum availability phase={phase} input_bytes={} gas_used={}", input.len(), execution.gas_used);
+            }
+            let RuntimeOutcome::Completed(Ok(reply)) = &expected.outcome else { panic!("maximum availability refused: {:?}", expected.outcome) };
+            assert_eq!(reply.status, InvocationStatus::Done);
+            assert_eq!(&reply.reply[..8], &(super::super::execution::MAX_EXECUTION_AVAILABILITY_BYTES as u64).to_le_bytes());
+            assert_eq!(&reply.reply[8..], &[0x7b; 8]);
+            if let Some(first) = &first_outcome { assert_eq!(&expected.outcome, first); }
+            first_outcome = Some(expected.outcome);
+            let reopened = decode_standard_runtime_state(&clean_state_to_legacy(&expected.state)).unwrap();
+            let reopened = StandardAgentRuntime::restore(reopened).unwrap();
+            let RuntimeWork::Invoke { state, observed_slot, .. } = &mut work else { unreachable!() };
+            *state = legacy_state_to_clean(encode_standard_runtime_state(&reopened.snapshot()));
+            *observed_slot = 99;
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_maximum_availability_survives_wire_dispatch_and_exact_retry() {
+        check_clean_maximum_availability(None);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_dispatch_rejects_signed_availability_above_caller_window() {
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        use crate::agent_sdk::{InvocationError, RuntimeOutcome, RuntimeWork};
+        let work = clean_availability_work(super::super::execution::MAX_EXECUTION_AVAILABILITY_BYTES + 1);
+        // Overall wire availability also carries code/schema/policy artifacts;
+        // fitting that larger envelope must not bypass the caller-only window.
+        let encoded = work.encode().unwrap();
+        let decoded = RuntimeWork::decode(&encoded).unwrap();
+        let result = apply_standard_runtime_work(decoded).unwrap();
+        assert_eq!(result.outcome, RuntimeOutcome::Completed(Err(InvocationError::InvalidInput)));
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    #[ignore = "requires AGENT_RUNTIME_CANDIDATE_ELF built from current runtime source"]
+    fn compiled_runtime_maximum_availability_matches_source_and_retry() {
+        let elf = std::fs::read(std::env::var("AGENT_RUNTIME_CANDIDATE_ELF").expect("set current runtime ELF")).unwrap();
+        let program = vos_pvm_compiler::link_elf_spi(&elf).unwrap();
+        vos_pvm::spi::validate_refine_host_calls(&program).unwrap();
+        check_clean_maximum_availability(Some(&program));
+    }
+
+    #[cfg(feature = "pvm")]
+    fn clean_storage_dispatch_fixture(export: bool, status: u8, runtime_program: Option<&[u8]>, padding_rows: usize) {
+        use crate::agent_sdk::{InvocationAuthorization, InvocationStatus, RuntimeExecutionContext, RuntimeOutcome, RuntimeWork};
+        use crate::agent_sdk::wire::CanonicalWire as _;
+        use crate::agent_sdk::method_policy::{AuthorizationPolicySelector, AttestationRequirement};
+        use vos_pvm_compiler::assembler::{Assembler, Reg};
+        let (runtime, mut work) = clean_policy_fixture_with_storage(
+            AuthorizationPolicySelector::Public, AttestationRequirement::None, true,
+        );
+        let key = b"s/rows/value";
+        let yields = status == crate::actors::STATUS_YIELDED;
+        assert!(!yields || export);
+        let mut row = vec![0x73; crate::actors::storage::MAX_VALUE_BYTES];
+        let base = 2 * vos_pvm::PVM_ZONE_SIZE;
+        let mut output = vec![0; 30];
+        output[0] = status;
+        output[1..5].copy_from_slice(&1u32.to_le_bytes());
+        output[13] = 0xee;
+        let mut program = Assembler::new();
+        let buffer;
+        if export {
+            let delta = super::super::actor_storage::encode_row_delta(&[(key.to_vec(), Some(row.clone()))]).unwrap();
+            output.extend_from_slice(&delta);
+            buffer = base + (output.len() - row.len()) as u32;
+            program.set_rw_data(output);
+            if yields {
+                // The runtime captures before finalization. Export only after
+                // SUSPEND returns; restoration returns1 and replaces the row.
+                assert_eq!(crate::actors::STATUS_YIELDED, 1);
+                program.ecalli(crate::abi::hostcall::SUSPEND)
+                    .load_imm_64(Reg::A1, 1).sub_64(Reg::A0, Reg::A1, Reg::A0)
+                    .store_u8(Reg::A0, base)
+                    .load_imm_64(Reg::A1, 0x74).sub_64(Reg::A1, Reg::A1, Reg::A0)
+                    .store_u8(Reg::A1, buffer);
+            }
+            program.load_imm_64(Reg::A0, u64::from(base + 30))
+                .load_imm_64(Reg::A1, delta.len() as u64)
+                .ecalli(crate::abi::hostcall::ACTOR_EFFECT_EXPORT)
+                .load_imm_64(Reg::A0, row.len() as u64);
+        } else {
+            output.extend_from_slice(key);
+            buffer = base + output.len() as u32;
+            output.resize(output.len() + row.len(), 0);
+            program.set_rw_data(output)
+            .load_imm_64(Reg::A0, u64::from(base + 30))
+            .load_imm_64(Reg::A1, key.len() as u64)
+            .load_imm_64(Reg::A2, u64::from(buffer))
+            .load_imm_64(Reg::A3, row.len() as u64)
+            .ecalli(crate::abi::hostcall::STORAGE_R);
+        }
+        program.store_u64(Reg::A0, base + 14)
+            .load_imm_64(Reg::A0, u64::from(buffer))
+            .load_ind_u64(Reg::A1, Reg::A0, 0).store_u64(Reg::A1, base + 22)
+            .load_imm_64(Reg::A0, u64::from(base)).load_imm_64(Reg::A1, if yields { 14 } else { 30 })
+            .jump_ind(Reg::RA, 0);
+        let bytes = program.build_standard();
+        let blob = work.availability.iter_mut()
+            .find(|blob| crate::agent_sdk::ProgramId::of_pvm(&blob.bytes) == work.program).unwrap();
+        work.program = crate::agent_sdk::ProgramId::of_pvm(&bytes);
+        *blob = crate::agent_sdk::RuntimeBlob {
+            reference: crate::agent_sdk::BlobRef::of_bytes(&bytes), bytes,
+        };
+        work.availability.sort_by(|a, b| a.reference.cmp(&b.reference));
+        work.gas = 100_000;
+        let mut state = runtime.snapshot();
+        state.actors[0].record.entry.program = crate::service::ProgramId(work.program.0);
+        let record = &state.actors[0].record;
+        let installation = &mut state.clean_actor_installations.as_mut().unwrap()[0];
+        installation.original.entry = super::super::standard::legacy_actor_record_to_clean(record, installation.commitment).entry;
+        installation.commitment = installation.original.lineage_commitment();
+        for index in 0..padding_rows {
+            state.lane_state.linear[0].rows.insert(
+                alloc::format!("s/rows/padding/{index:04}").into_bytes(),
+                vec![0x45; crate::actors::storage::MAX_VALUE_BYTES],
+            );
+        }
+        if !export { state.lane_state.linear[0].rows.insert(key.to_vec(), row.clone()); }
+        let runtime = StandardAgentRuntime::restore(state).unwrap();
+        let (inner, ..) = runtime.resolve_clean_invocation(&work).unwrap();
+        let inline = runtime.prepare_execution_state(&inner).unwrap();
+        assert_eq!(inline.linear.as_deref(), Some(&[0x89][..]));
+        assert!(inline.encoded_len().unwrap() < row.len());
+        let authorization = InvocationAuthorization::AuthorityReceipt(clean_authority_receipt(runtime.config().unwrap(), &work));
+        let initial = legacy_state_to_clean(encode_standard_runtime_state(&runtime.snapshot()));
+        let execute = |input: RuntimeWork| {
+            let operation = match &input {
+                RuntimeWork::Acknowledge { .. } => "ack",
+                RuntimeWork::Resume { .. } => "resume",
+                RuntimeWork::Manage { .. } => "manage",
+                _ => "invoke",
+            };
+            let encoded = input.encode().unwrap();
+            let decoded = RuntimeWork::decode(&encoded).unwrap();
+            let expected = apply_standard_runtime_work(decoded).unwrap();
+            if let Some(program) = runtime_program {
+                let execution = vos_pvm::refine_host::RefineContext::load(
+                    program, &encoded, super::super::driver::DEFAULT_MANAGEMENT_GAS,
+                ).unwrap().run();
+                if execution.exit != vos_pvm::ExitReason::Halt {
+                    std::eprintln!("row fixture failure pc={} gas_used={} registers={:?}", execution.pc, execution.gas_used, execution.registers);
+                }
+                assert_eq!(execution.exit, vos_pvm::ExitReason::Halt,
+                    "row fixture export={export} status={status} padding_rows={padding_rows}");
+                let output = execution.output_bounded(crate::agent_sdk::RuntimeTransition::MAX_ENCODED_BYTES).unwrap();
+                assert!(output == expected.encode().unwrap(), "physical row transition differs from source");
+                std::eprintln!("row fixture operation={operation} export={export} status={status} padding_rows={padding_rows} input_bytes={} gas_used={}", encoded.len(), execution.gas_used);
+            }
+            expected
+        };
+        let mut result = execute(RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct, state: initial,
+            invocation: Box::new(work.clone()), authorization: Box::new(authorization.clone()), observed_slot: 1,
+        });
+        if yields {
+            let RuntimeOutcome::Yielded(yielded) = &result.outcome else { panic!("row slice did not yield: {:?}", result.outcome) };
+            let decoded = decode_standard_runtime_state(&clean_state_to_legacy(&result.state)).unwrap();
+            assert_eq!(decoded.machine_continuations.len(), 1);
+            assert_eq!(decoded.lane_state.linear[0].rows.get(key.as_slice()), Some(&row));
+            let reopened = StandardAgentRuntime::restore(decoded).unwrap();
+            result = execute(RuntimeWork::Resume {
+                context: RuntimeExecutionContext::Direct,
+                state: legacy_state_to_clean(encode_standard_runtime_state(&reopened.snapshot())),
+                resume: Box::new(clean_resume(yielded, work.availability.clone())),
+            });
+            row[0] = 0x74;
+        }
+        let RuntimeOutcome::Completed(Ok(reply)) = &result.outcome else { panic!("row read failed: {:?}", result.outcome) };
+        let expected_status = match status {
+            crate::actors::STATUS_DONE | crate::actors::STATUS_YIELDED => InvocationStatus::Done,
+            crate::actors::STATUS_PANICKED => InvocationStatus::Panicked,
+            crate::actors::STATUS_FORBIDDEN => InvocationStatus::Forbidden,
+            crate::actors::STATUS_OOG => InvocationStatus::OutOfGas,
+            _ => unreachable!(),
+        };
+        assert_eq!(reply.status, expected_status);
+        if yields {
+            assert!(reply.reply.is_empty());
+        } else if expected_status == InvocationStatus::Done {
+            assert_eq!(&reply.reply[..8], &(row.len() as u64).to_le_bytes());
+            assert_eq!(&reply.reply[8..], &[0x73; 8]);
+        }
+        let decoded = decode_standard_runtime_state(&clean_state_to_legacy(&result.state)).unwrap();
+        assert!(decoded.machine_continuations.is_empty());
+        if expected_status == InvocationStatus::Done {
+            assert_eq!(decoded.lane_state.linear[0].value, vec![0xee]);
+            assert_eq!(decoded.lane_state.linear[0].rows.get(key.as_slice()), Some(&row));
+        } else {
+            assert_eq!(decoded.lane_state.linear[0].value, vec![0x89]);
+            assert!(!decoded.lane_state.linear[0].rows.contains_key(key.as_slice()), "a failed actor must not publish exported rows");
+        }
+        assert_eq!(decoded.lane_state.linear[0].rows.len(), padding_rows + usize::from(expected_status == InvocationStatus::Done));
+        for index in 0..padding_rows {
+            assert_eq!(decoded.lane_state.linear[0].rows.get(alloc::format!("s/rows/padding/{index:04}").as_bytes()), Some(&vec![0x45; row.len()]));
+        }
+        let reopened = StandardAgentRuntime::restore(decoded).unwrap();
+        let mut expected_retry_state = reopened.snapshot();
+        // Exact delivery retries advance the existing result-lane authority
+        // clock, but must not reexecute or change rows, inline state or result.
+        expected_retry_state.lane_revisions.linear_authority_slot = Some(99);
+        let retry = execute(RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct,
+            state: legacy_state_to_clean(encode_standard_runtime_state(&reopened.snapshot())),
+            invocation: Box::new(work.clone()), authorization: Box::new(authorization.clone()), observed_slot: 99,
+        });
+        assert_eq!(retry.outcome, result.outcome);
+        assert!(decode_standard_runtime_state(&clean_state_to_legacy(&retry.state)).unwrap() == expected_retry_state,
+            "retry may advance only the result-lane authority clock");
+        let acknowledged = execute(RuntimeWork::Acknowledge {
+            context: RuntimeExecutionContext::Direct, state: retry.state,
+            invocation: Box::new(work.clone()), authorization: Box::new(authorization.clone()),
+        });
+        assert!(matches!(acknowledged.outcome, RuntimeOutcome::Acknowledged(Ok(_))));
+        let retired = decode_standard_runtime_state(&clean_state_to_legacy(&acknowledged.state)).unwrap();
+        assert!(retired.invocation_results.is_empty());
+        assert!(retired.lane_state == expected_retry_state.lane_state, "retirement changed actor rows or inline state");
+        let reopened = StandardAgentRuntime::restore(retired).unwrap();
+        let repeated_ack = execute(RuntimeWork::Acknowledge {
+            context: RuntimeExecutionContext::Direct,
+            state: legacy_state_to_clean(encode_standard_runtime_state(&reopened.snapshot())),
+            invocation: Box::new(work.clone()), authorization: Box::new(authorization.clone()),
+        });
+        assert!(repeated_ack == acknowledged, "exact acknowledgement retry changed transition");
+        let replayed = execute(RuntimeWork::Invoke {
+            context: RuntimeExecutionContext::Direct, state: repeated_ack.state,
+            invocation: Box::new(work), authorization: Box::new(authorization), observed_slot: 99,
+        });
+        assert_eq!(replayed.outcome, RuntimeOutcome::Completed(Err(crate::agent_sdk::InvocationError::DivergentInvocation)));
+        assert!(replayed.state == acknowledged.state, "retired invocation changed state");
+        if padding_rows != 0 {
+            use crate::agent_sdk::{ManagementReply, ManagementRequest};
+            let config = runtime.config().unwrap();
+            for request in [ManagementRequest::InspectActors { after: None, limit: 1 }, ManagementRequest::InspectResources] {
+                let inspected = execute(RuntimeWork::Manage {
+                    context: RuntimeExecutionContext::Direct,
+                    space: crate::agent_sdk::SpaceId(config.identity.space.0),
+                    agent: crate::agent_sdk::AgentId(config.identity.agent.0),
+                    runtime_deployment: crate::agent_sdk::DeploymentId(config.identity.runtime_deployment.0),
+                    state: replayed.state.clone(), request: Box::new(request), authority: None,
+                    observed_slot: 99,
+                });
+                match &inspected.outcome {
+                    RuntimeOutcome::Management(Ok(ManagementReply::Actors(page))) => assert_eq!(page.entries.len(), 1),
+                    RuntimeOutcome::Management(Ok(ManagementReply::Resources(usage))) => {
+                        assert_eq!(usage.state_bytes as usize, clean_state_to_legacy(&replayed.state).encoded_len().unwrap());
+                    },
+                    other => panic!("large-state inspection failed: {other:?}"),
+                }
+                assert!(inspected.state == replayed.state, "inspection changed row-backed state");
+            }
+        }
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_multi_megabyte_rows_preserve_unrelated_state_and_retry() {
+        clean_storage_dispatch_fixture(true, crate::actors::STATUS_DONE, None, 60);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn clean_multi_megabyte_rows_yield_resume_and_retire() {
+        clean_storage_dispatch_fixture(true, crate::actors::STATUS_YIELDED, None, 60);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    #[ignore = "requires AGENT_RUNTIME_CANDIDATE_ELF built from current runtime source"]
+    fn compiled_runtime_rows_commit_rollback_and_retry_match_source() {
+        let elf = std::fs::read(std::env::var("AGENT_RUNTIME_CANDIDATE_ELF").expect("set current runtime ELF")).unwrap();
+        let program = vos_pvm_compiler::link_elf_spi(&elf).unwrap();
+        vos_pvm::spi::validate_refine_host_calls(&program).unwrap();
+        clean_storage_dispatch_fixture(false, crate::actors::STATUS_DONE, Some(&program), 0);
+        for status in [crate::actors::STATUS_DONE, crate::actors::STATUS_PANICKED,
+            crate::actors::STATUS_FORBIDDEN, crate::actors::STATUS_OOG] {
+            clean_storage_dispatch_fixture(true, status, Some(&program), 0);
+        }
+        clean_storage_dispatch_fixture(true, crate::actors::STATUS_DONE, Some(&program), 60);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    #[ignore = "requires AGENT_RUNTIME_CANDIDATE_ELF built from current runtime source"]
+    fn compiled_runtime_rows_yield_resume_and_retire_match_source() {
+        let elf = std::fs::read(std::env::var("AGENT_RUNTIME_CANDIDATE_ELF").expect("set current runtime ELF")).unwrap();
+        let program = vos_pvm_compiler::link_elf_spi(&elf).unwrap();
+        vos_pvm::spi::validate_refine_host_calls(&program).unwrap();
+        clean_storage_dispatch_fixture(true, crate::actors::STATUS_YIELDED, Some(&program), 60);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
     fn clean_terminal_failure_dispatch_rolls_back_writes_and_retires_after_restart() {
         use crate::agent_sdk::{InvocationStatus, RuntimeOutcome, RuntimeWork};
         for (status, expected) in [
@@ -12773,6 +13354,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn sparse_lane_state_persists_rows_outside_inline_and_rejects_old_framing() {
+        let mut state = sparse_standard_state();
+        let entry = &mut state.lane_state.linear[0];
+        entry.value.clear();
+        entry.rows.insert(b"s/rows/a".to_vec(), vec![7; crate::actors::storage::MAX_VALUE_BYTES]);
+        entry.rows.insert(b"s/rows/b".to_vec(), Vec::new());
+        let encoded = encode_standard_runtime_state(&state);
+        assert!(encoded.linear.len() > super::super::execution::MAX_EXECUTION_STATE_BYTES);
+        assert_eq!(decode_standard_runtime_state(&encoded).unwrap(), state);
+        let restored = super::super::standard::StandardAgentRuntime::restore(state.clone()).unwrap();
+        assert_eq!(restored.snapshot().lane_state, state.lane_state);
+
+        let mut old = encoded.clone();
+        old.linear.drain(32..36);
+        assert_eq!(decode_standard_runtime_state(&old), Err(DecodeError::InvalidPlatform));
+        // Keeping the new lane marker cannot turn an old inline payload into
+        // a row image. Neither wrong magic nor wrong inner ABI has a fallback.
+        let image_start = 32 + 4 + 1 + 8 + 1 + 4 + 32 + 32 + 4;
+        for offset in [image_start, image_start + 4] {
+            let mut corrupt = encoded.clone();
+            corrupt.linear[offset] ^= 1;
+            assert!(decode_standard_runtime_state(&corrupt).is_err());
+        }
+        state.lane_state.linear[0].rows.insert(b"s/rows/c".to_vec(), vec![0; crate::actors::storage::MAX_VALUE_BYTES + 1]);
+        assert!(decode_standard_runtime_state(&encode_standard_runtime_state(&state)).is_err());
+        assert!(super::super::standard::StandardAgentRuntime::restore(state).is_err());
+    }
+
+    #[test]
     fn sparse_lane_state_round_trips_and_missing_is_the_only_empty_encoding() {
         let state = sparse_standard_state();
         let encoded = encode_standard_runtime_state(&state);
@@ -13254,11 +13864,13 @@ pub(crate) mod tests {
                 actor: ActorId([2; 32]),
                 state_generation: Hash([1; 32]),
                 value: vec![1],
+                rows: Default::default(),
             },
             StandardLaneEntry {
                 actor: ActorId([1; 32]),
                 state_generation: Hash([1; 32]),
                 value: vec![2],
+                rows: Default::default(),
             },
         ];
         assert_eq!(
@@ -13274,7 +13886,7 @@ pub(crate) mod tests {
         );
 
         let mut encoded = encode_standard_runtime_state(&state);
-        const LANE_LIST_OFFSET: usize = 32 + 1 + 8 + 1;
+        const LANE_LIST_OFFSET: usize = 32 + 4 + 1 + 8 + 1;
         encoded.linear[LANE_LIST_OFFSET..LANE_LIST_OFFSET + 4].copy_from_slice(
             &u32::try_from(super::super::standard::MAX_LANE_STATE_ENTRIES + 1)
                 .unwrap()

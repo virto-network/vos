@@ -15,6 +15,10 @@
 
 #![cfg_attr(target_arch = "riscv64", no_std)]
 
+mod genesis_publication;
+mod node_storage;
+use genesis_publication::GenesisPublicationRecord;
+
 use core::cmp::{max, min};
 use core::num::NonZeroU64;
 
@@ -1207,7 +1211,7 @@ pub struct AuthorityLinearState {
     authorization_sequence: u64,
     administration_generation: u64,
     credentials: Vec<CredentialRow>,
-    nodes: Vec<NodeOwnerRow>,
+    nodes: node_storage::NodeTable,
     roles: Vec<PrincipalRoleRow>,
     space_role_grants: Vec<SpaceRoleGrantRow>,
     actor_role_grants: Vec<ActorRoleGrantRow>,
@@ -1217,6 +1221,7 @@ pub struct AuthorityLinearState {
     retired_actor_installations: Vec<RetiredActorInstallationRow>,
     retries: Vec<ExactRetryRecord>,
     latest_management_acks: Vec<LatestManagementAckRow>,
+    genesis_publications: Vec<GenesisPublicationRecord>,
     operation_retries: Vec<AuthorityOperationRetryRecord>,
     operation_retirement_floor: u64,
     latest_operation_acks: Vec<LatestOperationAckRow>,
@@ -1241,7 +1246,7 @@ impl AuthorityLinearState {
             authorization_sequence: 0,
             administration_generation: 0,
             credentials: Vec::new(),
-            nodes: Vec::new(),
+            nodes: node_storage::NodeTable::empty(),
             roles: Vec::new(),
             space_role_grants: Vec::new(),
             actor_role_grants: Vec::new(),
@@ -1251,6 +1256,7 @@ impl AuthorityLinearState {
             retired_actor_installations: Vec::new(),
             retries: Vec::new(),
             latest_management_acks: Vec::new(),
+            genesis_publications: Vec::new(),
             operation_retries: Vec::new(),
             operation_retirement_floor: 0,
             latest_operation_acks: Vec::new(),
@@ -1276,8 +1282,7 @@ impl AuthorityLinearState {
             operation_request_high_water: 0,
             admin_request_high_water: 0,
         });
-        let mut nodes = Vec::with_capacity(1);
-        nodes.push(NodeOwnerRow::from_enrollment(
+        let nodes = node_storage::NodeTable::pending_bootstrap(NodeOwnerRow::from_enrollment(
             config.bootstrap_node_enrollment(),
         ));
         let mut roles = Vec::with_capacity(1);
@@ -1304,6 +1309,7 @@ impl AuthorityLinearState {
             retired_actor_installations: Vec::new(),
             retries: Vec::new(),
             latest_management_acks: Vec::new(),
+            genesis_publications: Vec::new(),
             operation_retries: Vec::new(),
             operation_retirement_floor: config.bootstrap_authorization_high_water,
             latest_operation_acks: Vec::new(),
@@ -1332,7 +1338,7 @@ fn computed_state_integrity_commitment(
     image.state_integrity_commitment = [0; 32];
     let configuration_bytes = configuration.encode();
     let state_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&image).ok()?;
-    if state_bytes.len() > MAX_RUNTIME_STATE_BYTES {
+    if !genesis_publication::state_bytes_fit(state, state_bytes.len()) {
         return None;
     }
     Some(Hash::digest(
@@ -1363,11 +1369,13 @@ fn refresh_state_integrity_commitment(
 }
 
 /// Linear policy state for one Space's built-in system Agent.
-#[actor(agent, state_version = 17)]
+#[actor(agent, state_version = 20)]
 pub struct SystemAuthority {
     #[state(const)]
     configuration: SystemAuthorityConfiguration,
     state: AuthorityLinearState,
+    #[storage(linear, prefix = "s/authority-nodes/")]
+    node_certificates: vos::storage::StorageMap<[u8; 32], NodeOwnerRow>,
 }
 
 #[messages(agent)]
@@ -1377,11 +1385,13 @@ impl SystemAuthority {
             return Self {
                 configuration: SystemAuthorityConfiguration::default(),
                 state: AuthorityLinearState::inert(),
+                node_certificates: Default::default(),
             };
         };
         Self {
             configuration,
             state: AuthorityLinearState::bootstrap(configuration),
+            node_certificates: Default::default(),
         }
     }
 
@@ -1404,6 +1414,41 @@ impl SystemAuthority {
             return false;
         };
         finalize_application(&self.configuration, &mut self.state, &ack, &context)
+    }
+
+    /// Publish one certified ordinary Shared genesis against an exact pending
+    /// Create authorization. Publication is distinct from application finality.
+    /// Supply the complete canonical provision as invocation availability;
+    /// the message carries only its exact content hash and length.
+    #[msg(linear)]
+    fn publish_genesis(
+        &mut self,
+        authorization: Vec<u8>,
+        provision_hash: Vec<u8>,
+        provision_len: u64,
+        ctx: &mut Context<Self>,
+    ) -> Vec<u8> {
+        let Some(context) = ctx.agent_invocation_context().copied() else {
+            return Vec::new();
+        };
+        genesis_publication::publish_from_blob(
+            &self.configuration,
+            &mut self.state,
+            &authorization,
+            &provision_hash,
+            provision_len,
+            &context,
+            |reference| ctx.invocation_blob(reference).ok().flatten(),
+        )
+    }
+
+    /// Read a permanent decision through an authenticated runtime invocation.
+    #[msg(linear)]
+    fn genesis_decision(&mut self, agent: Vec<u8>, ctx: &mut Context<Self>) -> Vec<u8> {
+        let Some(context) = ctx.agent_invocation_context().copied() else {
+            return Vec::new();
+        };
+        genesis_publication::read(&self.configuration, &self.state, &agent, &context)
     }
 
     /// Verify one exact ingress-authenticated AOC5 and return its canonical AOP5.
@@ -1480,9 +1525,51 @@ impl SystemAuthority {
     fn actor_projection_page(&self, query: Vec<u8>) -> Vec<u8> {
         actor_projection_page(&self.configuration, &self.state, &query)
     }
+
+    /// Return the exact Authority committee used to verify ordinary genesis
+    /// publication. Callers must authenticate this actor's query execution;
+    /// untrusted response bytes alone do not establish committee authority.
+    #[msg(query)]
+    fn genesis_signing_committee(&self) -> Vec<u8> {
+        genesis_publication::signing_committee(&self.configuration)
+    }
+}
+
+/// Existing handlers publish their inline candidate only on success. Row
+/// handles share an overlay, so their writes need an equivalent refusal
+/// boundary. Success leaves rows staged for the runtime commit, never
+/// committed independently of inline state or the reply.
+fn authority_row_transaction<T: AuthorityMutationOutcome>(operation: impl FnOnce() -> T) -> T {
+    match vos::storage::with_transaction(|| {
+        let outcome = operation();
+        if outcome.accepted() { Ok(outcome) } else { Err(outcome) }
+    }) {
+        Ok(outcome) | Err(outcome) => outcome,
+    }
+}
+
+trait AuthorityMutationOutcome {
+    fn accepted(&self) -> bool;
+}
+
+impl AuthorityMutationOutcome for bool {
+    fn accepted(&self) -> bool { *self }
+}
+
+impl AuthorityMutationOutcome for Vec<u8> {
+    fn accepted(&self) -> bool { !self.is_empty() }
 }
 
 fn resolve_private_application(
+    configuration: &SystemAuthorityConfiguration,
+    state: &mut AuthorityLinearState,
+    encoded_ack: &[u8],
+    context: &InvocationContext,
+) -> bool {
+    authority_row_transaction(|| resolve_private_application_staged(configuration, state, encoded_ack, context))
+}
+
+fn resolve_private_application_staged(
     configuration: &SystemAuthorityConfiguration,
     state: &mut AuthorityLinearState,
     encoded_ack: &[u8],
@@ -1668,11 +1755,7 @@ fn authenticated_projection_query(
             if credential.kind != AuthorityCredentialKind::Ssh as u8 {
                 return None;
             }
-            let node_index = state
-                .nodes
-                .binary_search_by(|row| row.node.cmp(&node.0))
-                .ok()?;
-            let attester = &state.nodes[node_index];
+            let attester = enrolled_node(state, node)?;
             if attester.space != configuration.space
                 || query
                     .verify_ssh_node_attestation_with(
@@ -2025,9 +2108,16 @@ fn authorize_call(
     encoded_call: &[u8],
     context: &InvocationContext,
 ) -> Vec<u8> {
-    if encoded_call.len() > MAX_INVOCATION_MESSAGE_BYTES
-        || !authority_state_is_valid(configuration, state)
-    {
+    authority_row_transaction(|| authorize_call_staged(configuration, state, encoded_call, context))
+}
+
+fn authorize_call_staged(
+    configuration: &SystemAuthorityConfiguration,
+    state: &mut AuthorityLinearState,
+    encoded_call: &[u8],
+    context: &InvocationContext,
+) -> Vec<u8> {
+    if encoded_call.len() > MAX_INVOCATION_MESSAGE_BYTES {
         return Vec::new();
     }
     let Ok(call) = AuthorityCredentialCall::decode(encoded_call) else {
@@ -2040,6 +2130,9 @@ fn authorize_call(
         return Vec::new();
     }
 
+    if !authority_state_is_valid(configuration, state) {
+        return Vec::new();
+    }
     let call_commitment = call.commitment();
     let acknowledgement_invocation = ManagementApproval::derive_acknowledgement_invocation(&call);
     match retry_record(state, call.invocation) {
@@ -2172,9 +2265,16 @@ fn authorize_operation_call(
     encoded_call: &[u8],
     context: &InvocationContext,
 ) -> Vec<u8> {
-    if encoded_call.len() > MAX_INVOCATION_MESSAGE_BYTES
-        || !authority_state_is_valid(configuration, state)
-    {
+    authority_row_transaction(|| authorize_operation_call_staged(configuration, state, encoded_call, context))
+}
+
+fn authorize_operation_call_staged(
+    configuration: &SystemAuthorityConfiguration,
+    state: &mut AuthorityLinearState,
+    encoded_call: &[u8],
+    context: &InvocationContext,
+) -> Vec<u8> {
+    if encoded_call.len() > MAX_INVOCATION_MESSAGE_BYTES {
         return Vec::new();
     }
     let Ok(call) = AuthorityOperationCall::decode(encoded_call) else {
@@ -2183,6 +2283,12 @@ fn authorize_operation_call(
     if !call.matches_invocation_context(context)
         || !authority_target_matches(configuration, &call.authority)
     {
+        return Vec::new();
+    }
+    // Operation authentication may read enrolled SSH attesters. Keep that
+    // state-dependent check after the audit, but reject malformed/cross-context
+    // requests before any table-sized work.
+    if !authority_state_is_valid(configuration, state) {
         return Vec::new();
     }
     let Some(role) = authenticated_operation_role(configuration, state, &call) else {
@@ -2343,9 +2449,16 @@ fn administer_call(
     encoded_call: &[u8],
     context: &InvocationContext,
 ) -> Vec<u8> {
-    if encoded_call.len() > MAX_INVOCATION_MESSAGE_BYTES
-        || !authority_state_is_valid(configuration, state)
-    {
+    authority_row_transaction(|| administer_call_staged(configuration, state, encoded_call, context))
+}
+
+fn administer_call_staged(
+    configuration: &SystemAuthorityConfiguration,
+    state: &mut AuthorityLinearState,
+    encoded_call: &[u8],
+    context: &InvocationContext,
+) -> Vec<u8> {
+    if encoded_call.len() > MAX_INVOCATION_MESSAGE_BYTES {
         return Vec::new();
     }
     let Ok(call) = AuthorityAdminCall::decode(encoded_call) else {
@@ -2355,6 +2468,13 @@ fn administer_call(
         || !authority_target_matches(configuration, &call.authority)
         || call.verify_with(&Ed25519CredentialVerifier).is_err()
     {
+        return Vec::new();
+    }
+
+    // Reject malformed, cross-context and unsigned requests before scanning
+    // stored certificates. All valid-call state checks still run before retry
+    // lookup or mutation; bad signatures must not consume table-sized work.
+    if !authority_state_is_valid(configuration, state) {
         return Vec::new();
     }
 
@@ -2455,13 +2575,7 @@ fn authenticated_admin(state: &AuthorityLinearState, call: &AuthorityAdminCall) 
     {
         return false;
     }
-    let Ok(node_index) = state
-        .nodes
-        .binary_search_by(|row| row.node.cmp(&call.authenticated_node.0))
-    else {
-        return false;
-    };
-    if state.nodes[node_index].owner != call.administrator.0 {
+    if enrolled_node_owner(state, call.authenticated_node) != Some(call.administrator) {
         return false;
     }
     state
@@ -2697,24 +2811,17 @@ fn apply_admin_operation(
             {
                 return false;
             }
-            let Err(index) = state
-                .nodes
-                .binary_search_by(|row| row.node.cmp(&enrollment.node.0))
-            else {
-                return false;
-            };
-            state
-                .nodes
-                .insert(index, NodeOwnerRow::from_enrollment(*enrollment));
-        }
-        AuthorityAdminOperation::UnbindNodeOwner { node, owner } => {
-            let Ok(index) = state.nodes.binary_search_by(|row| row.node.cmp(&node.0)) else {
-                return false;
-            };
-            if state.nodes[index].owner != owner.0 || node_is_in_use(configuration, state, *node) {
+            if !insert_enrolled_node(state, *enrollment) {
                 return false;
             }
-            state.nodes.remove(index);
+        }
+        AuthorityAdminOperation::UnbindNodeOwner { node, owner } => {
+            if enrolled_node_owner(state, *node) != Some(*owner)
+                || node_is_in_use(configuration, state, *node)
+                || !remove_enrolled_node(state, *node, *owner)
+            {
+                return false;
+            }
         }
         AuthorityAdminOperation::SetBuiltinRole { principal, role } => {
             let Ok(index) = state
@@ -2974,6 +3081,10 @@ fn admin_retry_record(
 fn admin_invocation_is_available(state: &AuthorityLinearState, invocation: InvocationId) -> bool {
     invocation != InvocationId::ZERO
         && state
+            .genesis_publications
+            .iter()
+            .all(|record| record.invocation != invocation.0)
+        && state
             .admin_retries
             .iter()
             .all(|record| record.invocation != invocation.0)
@@ -3012,9 +3123,16 @@ fn finalize_application(
     encoded_ack: &[u8],
     context: &InvocationContext,
 ) -> bool {
-    if encoded_ack.len() > MAX_INVOCATION_MESSAGE_BYTES
-        || !authority_state_is_valid(configuration, state)
-    {
+    authority_row_transaction(|| finalize_application_staged(configuration, state, encoded_ack, context))
+}
+
+fn finalize_application_staged(
+    configuration: &SystemAuthorityConfiguration,
+    state: &mut AuthorityLinearState,
+    encoded_ack: &[u8],
+    context: &InvocationContext,
+) -> bool {
+    if encoded_ack.len() > MAX_INVOCATION_MESSAGE_BYTES {
         return false;
     }
     let Ok(ack) = ManagementApplicationAck::decode(encoded_ack) else {
@@ -3024,6 +3142,9 @@ fn finalize_application(
         || !authority_target_matches(configuration, &ack.authority)
         || ack.verify_with(&Ed25519CredentialVerifier).is_err()
     {
+        return false;
+    }
+    if !authority_state_is_valid(configuration, state) {
         return false;
     }
     let ack_commitment = ack.commitment();
@@ -3125,9 +3246,16 @@ fn acknowledge_operation_issuance(
     encoded_ack: &[u8],
     context: &InvocationContext,
 ) -> bool {
-    if encoded_ack.len() > MAX_INVOCATION_MESSAGE_BYTES
-        || !authority_state_is_valid(configuration, state)
-    {
+    authority_row_transaction(|| acknowledge_operation_issuance_staged(configuration, state, encoded_ack, context))
+}
+
+fn acknowledge_operation_issuance_staged(
+    configuration: &SystemAuthorityConfiguration,
+    state: &mut AuthorityLinearState,
+    encoded_ack: &[u8],
+    context: &InvocationContext,
+) -> bool {
+    if encoded_ack.len() > MAX_INVOCATION_MESSAGE_BYTES {
         return false;
     }
     let Ok(ack) = AuthorityOperationIssuanceAck::decode(encoded_ack) else {
@@ -3139,6 +3267,9 @@ fn acknowledge_operation_issuance(
             .verify_with(configuration.binding.sdk(), &Ed25519CredentialVerifier)
             .is_err()
     {
+        return false;
+    }
+    if !authority_state_is_valid(configuration, state) {
         return false;
     }
     let ack_commitment = ack.commitment();
@@ -3224,9 +3355,7 @@ fn acknowledge_private_control_application(
     encoded_ack: &[u8],
     context: &InvocationContext,
 ) -> bool {
-    if encoded_ack.len() > MAX_INVOCATION_MESSAGE_BYTES
-        || !authority_state_is_valid(configuration, state)
-    {
+    if encoded_ack.len() > MAX_INVOCATION_MESSAGE_BYTES {
         return false;
     }
     let Ok(ack) = PrivateControlApplicationAck::decode(encoded_ack) else {
@@ -3238,6 +3367,9 @@ fn acknowledge_private_control_application(
             .verify_with(configuration.binding.sdk(), &Ed25519CredentialVerifier)
             .is_err()
     {
+        return false;
+    }
+    if !authority_state_is_valid(configuration, state) {
         return false;
     }
     let ack_commitment = ack.commitment();
@@ -3353,9 +3485,7 @@ fn retire_private_control_application(
     encoded_ack: &[u8],
     context: &InvocationContext,
 ) -> bool {
-    if encoded_ack.len() > MAX_INVOCATION_MESSAGE_BYTES
-        || !authority_state_is_valid(configuration, state)
-    {
+    if encoded_ack.len() > MAX_INVOCATION_MESSAGE_BYTES {
         return false;
     }
     let Ok(ack) = PrivateControlApplicationRetirementAck::decode(encoded_ack) else {
@@ -3367,6 +3497,9 @@ fn retire_private_control_application(
             .verify_with(configuration.binding.sdk(), &Ed25519CredentialVerifier)
             .is_err()
     {
+        return false;
+    }
+    if !authority_state_is_valid(configuration, state) {
         return false;
     }
     let ack_commitment = ack.commitment();
@@ -4466,6 +4599,9 @@ fn invocation_pair_is_available(
     authorization != InvocationId::ZERO
         && acknowledgement != InvocationId::ZERO
         && authorization != acknowledgement
+        && state.genesis_publications.iter().all(|record| {
+            record.invocation != authorization.0 && record.invocation != acknowledgement.0
+        })
         && state.retries.iter().all(|record| {
             record.invocation != authorization.0
                 && record.invocation != acknowledgement.0
@@ -4520,6 +4656,10 @@ fn private_application_invocation_is_unreserved(
     application: InvocationId,
 ) -> bool {
     application != InvocationId::ZERO
+        && state
+            .genesis_publications
+            .iter()
+            .all(|record| record.invocation != application.0)
         && state.retries.iter().all(|record| {
             record.invocation != application.0 && record.acknowledgement_invocation != application.0
         })
@@ -4637,12 +4777,7 @@ fn authenticated_credential_role(
         return None;
     }
     if let Some(node) = authenticated_node {
-        let node = state
-            .nodes
-            .binary_search_by(|row| row.node.cmp(&node.0))
-            .ok()
-            .map(|index| &state.nodes[index])?;
-        if node.owner != principal.0 {
+        if enrolled_node_owner(state, node) != Some(principal) {
             return None;
         }
     }
@@ -4653,15 +4788,33 @@ fn authenticated_credential_role(
         .map(|index| state.roles[index].role)
 }
 
-fn enrolled_node<'a>(
-    state: &'a AuthorityLinearState,
+/// Called only after certificate/role verification, inside the Admin candidate
+/// and row transaction. Retain table capacity and duplicate refusal here so a
+/// backend change cannot silently turn enrollment into replacement.
+fn insert_enrolled_node(state: &mut AuthorityLinearState, enrollment: NodeEncryptionEnrollment) -> bool {
+    state.nodes.insert_verified(&mut node_storage::rows(), &NodeOwnerRow::from_enrollment(enrollment))
+}
+
+fn remove_enrolled_node(state: &mut AuthorityLinearState, node: vos::agent_sdk::NodeId, owner: PrincipalId) -> bool {
+    state.nodes.remove(&mut node_storage::rows(), node.0, owner.0)
+}
+
+/// Owner-only policy checks must not materialize transport certificates. This
+/// lookup is the owner-index boundary for the row-backed table cutover.
+fn enrolled_node_owner(
+    state: &AuthorityLinearState,
     node: vos::agent_sdk::NodeId,
-) -> Option<&'a NodeOwnerRow> {
-    state
-        .nodes
-        .binary_search_by(|row| row.node.cmp(&node.0))
-        .ok()
-        .map(|index| &state.nodes[index])
+) -> Option<PrincipalId> {
+    state.nodes.owner(node.0).map(PrincipalId)
+}
+
+/// Certificate consumers receive an owned row, never a reference whose
+/// lifetime assumes the entire persistent table is an inline vector.
+fn enrolled_node(
+    state: &AuthorityLinearState,
+    node: vos::agent_sdk::NodeId,
+) -> Option<NodeOwnerRow> {
+    state.nodes.get(&node_storage::rows(), node.0)
 }
 
 fn enrolled_private_identity(
@@ -4689,7 +4842,7 @@ fn enrolled_private_identity_commitment(
 
 fn replicas_are_enrolled(state: &AuthorityLinearState, replicas: &[AgentReplica]) -> bool {
     replicas.iter().all(|replica| {
-        enrolled_node(state, replica.node).is_some_and(|row| row.owner == replica.principal.0)
+        enrolled_node_owner(state, replica.node) == Some(replica.principal)
     })
 }
 
@@ -4700,10 +4853,10 @@ fn enrolled_replicas_for_slots(
     slots
         .iter()
         .map(|slot| {
-            let enrollment = enrolled_node(state, slot.node)?;
+            let principal = enrolled_node_owner(state, slot.node)?;
             Some(AgentReplica {
                 node: slot.node,
-                principal: PrincipalId(enrollment.owner),
+                principal,
                 role: slot.role,
             })
         })
@@ -6026,17 +6179,17 @@ fn managed_agent_projection_is_valid(
             replica.node == [0; 32]
                 || replica.principal == [0; 32]
                 || replica.sdk().is_none()
-                || enrolled_node(state, vos::agent_sdk::NodeId(replica.node)).is_none_or(|node| {
+                || enrolled_node_owner(state, vos::agent_sdk::NodeId(replica.node)).is_none_or(|owner| {
                     if row.agent == configuration.system_agent
                         && replica.node == configuration.bootstrap_node
                     {
                         // The founding operator owns and enrolls the Node,
                         // while the physical replica principal is bound to
                         // that Node's authenticated transport key.
-                        node.owner != configuration.bootstrap_principal
+                        owner.0 != configuration.bootstrap_principal
                             || replica.principal != configuration.bootstrap_replica_principal
                     } else {
-                        node.owner != replica.principal
+                        owner.0 != replica.principal
                     }
                 })
         })
@@ -7008,6 +7161,12 @@ fn authority_state_is_valid(
         && state.nodes.len() <= MAX_AUTHORITY_NODES
         && state.roles.len() <= MAX_AUTHORITY_PRINCIPALS
         && state.managed_agents.len() <= MAX_MANAGED_AGENTS
+        && state.genesis_publications.len() <= MAX_MANAGED_AGENTS
+        && sorted_unique_by(&state.genesis_publications, |row| row.agent)
+        && state
+            .genesis_publications
+            .iter()
+            .all(|row| genesis_publication::record_is_valid(configuration, row))
         && state.managed_actors.len() <= MAX_MANAGED_ACTORS
         && state.retired_actor_installations.len() <= MAX_RETIRED_ACTOR_INSTALLATIONS
         && exact_retry_count(state) <= MAX_EXACT_RETRY_RECORDS
@@ -7022,7 +7181,7 @@ fn authority_state_is_valid(
         && computed_state_integrity_commitment(configuration, state)
             .is_some_and(|commitment| commitment.0 == state.state_integrity_commitment)
         && sorted_unique_by(&state.credentials, |row| row.credential)
-        && sorted_unique_by(&state.nodes, |row| row.node)
+        && state.nodes.index_is_valid()
         && sorted_unique_by(&state.roles, |row| row.principal)
         && sorted_unique_by(&state.managed_agents, |row| row.agent)
         && sorted_unique_by(&state.retries, |row| row.invocation)
@@ -7041,10 +7200,9 @@ fn authority_state_is_valid(
                     .binary_search_by(|role| role.principal.cmp(&row.principal))
                     .is_ok()
         })
-        && state
-            .nodes
-            .iter()
-            .all(|row| node_owner_row_is_valid(configuration, state, row))
+        && state.nodes.all_certificates(&node_storage::rows(), |row| {
+            node_owner_row_is_valid(configuration, state, row)
+        })
         && state.roles.iter().all(|row| {
             row.principal != [0; 32]
                 && state.credentials.iter().any(|credential| {
@@ -7574,7 +7732,7 @@ fn accessible_admin_exists(state: &AuthorityLinearState) -> bool {
                 credential.principal == role.principal
                     && credential.status == CredentialStatus::Active
             })
-            && state.nodes.iter().any(|node| node.owner == role.principal)
+            && state.nodes.indices().any(|node| node.owner == role.principal)
     })
 }
 
@@ -7715,18 +7873,11 @@ fn admin_operation_postcondition(
                 state.credentials[index].principal == principal.0
                     && state.credentials[index].status == CredentialStatus::Revoked
             }),
-        AuthorityAdminOperation::EnrollNode { enrollment } => state
-            .nodes
-            .binary_search_by(|row| row.node.cmp(&enrollment.node.0))
-            .ok()
-            .is_some_and(|index| {
-                state.nodes[index] == NodeOwnerRow::from_enrollment(*enrollment)
-                    && enrollment.space == SpaceId(configuration.space)
-            }),
-        AuthorityAdminOperation::UnbindNodeOwner { node, .. } => state
-            .nodes
-            .binary_search_by(|row| row.node.cmp(&node.0))
-            .is_err(),
+        AuthorityAdminOperation::EnrollNode { enrollment } =>
+            state.nodes.certificate_matches(&NodeOwnerRow::from_enrollment(*enrollment))
+                && enrollment.space == SpaceId(configuration.space),
+        AuthorityAdminOperation::UnbindNodeOwner { node, .. } =>
+            enrolled_node_owner(state, *node).is_none(),
         AuthorityAdminOperation::SetBuiltinRole { principal, role } => state
             .roles
             .binary_search_by(|row| row.principal.cmp(&principal.0))
@@ -7887,6 +8038,7 @@ fn all_invocation_identifiers_are_unique(state: &AuthorityLinearState) -> bool {
             .saturating_add(state.operation_retries.len().saturating_mul(3))
             .saturating_add(state.latest_operation_acks.len().saturating_mul(3))
             .saturating_add(state.admin_retries.len())
+            .saturating_add(state.genesis_publications.len())
             .saturating_add(state.private_applications.len().saturating_mul(3))
             .saturating_add(
                 state
@@ -7895,6 +8047,9 @@ fn all_invocation_identifiers_are_unique(state: &AuthorityLinearState) -> bool {
                     .saturating_mul(3),
             ),
     );
+    for record in &state.genesis_publications {
+        identifiers.push(record.invocation);
+    }
     for record in &state.retries {
         identifiers.push(record.invocation);
         identifiers.push(record.acknowledgement_invocation);
@@ -7962,6 +8117,279 @@ mod tests {
     extern crate std;
 
     use super::*;
+
+    #[test]
+    fn node_access_preserves_certificate_and_exact_owner_boundaries() {
+        vos::storage::mock::reset();
+        let config = configuration();
+        let mut state = AuthorityLinearState::bootstrap(config);
+        let node = vos::agent_sdk::NodeId(config.bootstrap_node);
+        let owner = PrincipalId(config.bootstrap_principal);
+        let original = enrolled_node(&state, node).unwrap();
+        assert_eq!(enrolled_node_owner(&state, node), Some(owner));
+        let mut detached = enrolled_node(&state, node).unwrap();
+        detached.transport_signature[0] ^= 1;
+        assert_eq!(enrolled_node(&state, node), Some(original.clone()));
+        assert!(!insert_enrolled_node(&mut state, config.bootstrap_node_enrollment()));
+        let before = state.clone();
+        assert!(!remove_enrolled_node(&mut state, node, PrincipalId([0xff; 32])));
+        assert_eq!(state, before);
+        assert!(remove_enrolled_node(&mut state, node, owner));
+        assert_eq!(enrolled_node_owner(&state, node), None);
+        assert_eq!(enrolled_node(&state, node), None);
+        assert!(insert_enrolled_node(&mut state, config.bootstrap_node_enrollment()));
+        assert_eq!(enrolled_node(&state, node), Some(original));
+        assert!(state.nodes.index_is_valid());
+        vos::storage::mock::reset();
+    }
+
+    #[test]
+    fn node_certificate_storage_binds_header_and_refuses_rebootstrap() {
+        use node_storage::{NodeRows, bootstrap, insert_verified, read, remove};
+        use vos::storage::mock;
+        mock::reset();
+        let config = configuration();
+        let certificate = NodeOwnerRow::from_enrollment(config.bootstrap_node_enrollment());
+        let mut rows = NodeRows::default();
+        rows.__init(b"test/authority-nodes/");
+        let index = bootstrap(&mut rows, &certificate).unwrap();
+        assert_eq!(read(&rows, &index), Some(certificate.clone()));
+        assert!(bootstrap(&mut rows, &certificate).is_none());
+        assert!(insert_verified(&mut rows, &certificate).is_none());
+        // A fresh handle must see persisted rows, not synthesize constructor data.
+        mock::commit_dispatch();
+        let mut restored = NodeRows::default();
+        restored.__init(b"test/authority-nodes/");
+        assert_eq!(read(&restored, &index), Some(certificate.clone()));
+        assert!(bootstrap(&mut restored, &certificate).is_none());
+        let mut wrong_owner = index;
+        wrong_owner.owner[0] ^= 1;
+        assert!(read(&restored, &wrong_owner).is_none());
+        assert!(!remove(&mut restored, &wrong_owner));
+        // Even an otherwise decodable certificate cannot diverge from the
+        // header commitment. Refusing an operation restores the original row.
+        assert!(!authority_row_transaction(|| {
+            let mut corrupted = certificate.clone();
+            corrupted.transport_signature[0] ^= 1;
+            restored.insert(&index.node, &corrupted);
+            assert!(read(&restored, &index).is_none());
+            assert!(!remove(&mut restored, &index));
+            false
+        }));
+        assert_eq!(read(&restored, &index), Some(certificate));
+        assert!(remove(&mut restored, &index));
+        assert!(read(&restored, &index).is_none());
+        assert!(!remove(&mut restored, &index));
+        mock::reset();
+    }
+
+    #[test]
+    fn generated_authority_loader_initializes_certificate_namespace_without_seeding() {
+        use vos::{Actor, storage::mock};
+        mock::reset();
+        let config = configuration();
+        let installation = config.encode();
+        let mut actor = <SystemAuthority as Actor>::__load_agent_state(
+            Some(&installation), None, None, None,
+        ).unwrap();
+        assert_eq!(SystemAuthority::STATE_SCHEMA_VERSION, 20);
+        assert!(actor.node_certificates.is_empty());
+        let seed = NodeOwnerRow::from_enrollment(config.bootstrap_node_enrollment());
+        assert!(node_storage::bootstrap(&mut actor.node_certificates, &seed).is_some());
+        let linear = actor.__save_agent_lane(vos::agent::StateLane::Linear);
+        mock::commit_dispatch();
+        let mut restored = <SystemAuthority as Actor>::__load_agent_state(
+            Some(&installation), Some(&linear), None, None,
+        ).unwrap();
+        assert_eq!(restored.node_certificates.get(&seed.node), Some(seed.clone()));
+        // Restore must leave existing certificates untouched, even if corrupt;
+        // validation refuses corruption rather than repairing it in a constructor.
+        let mut corrupted = seed.clone();
+        corrupted.transport_signature[0] ^= 1;
+        restored.node_certificates.insert(&seed.node, &corrupted);
+        mock::commit_dispatch();
+        let reopened = <SystemAuthority as Actor>::__load_agent_state(
+            Some(&installation), Some(&linear), None, None,
+        ).unwrap();
+        assert_eq!(reopened.node_certificates.get(&seed.node), Some(corrupted));
+        assert!(node_storage::read(
+            &reopened.node_certificates, &node_storage::NodeIndexRow::of_verified(&seed),
+        ).is_none());
+        assert_eq!(reopened.__save_agent_lane(vos::agent::StateLane::Linear), linear);
+        mock::reset();
+    }
+
+    #[test]
+    fn node_table_bootstrap_is_lazy_atomic_and_not_recreated_on_restore() {
+        use node_storage::{NodeRows, NodeTable};
+        use vos::{Decode, Encode};
+        use vos::storage::mock;
+        mock::reset();
+        let config = configuration();
+        let seed = NodeOwnerRow::from_enrollment(config.bootstrap_node_enrollment());
+        let next = NodeOwnerRow::from_enrollment(signed_node_enrollment(
+            SpaceId(config.space), ADMIN_PRINCIPAL, 0x32,
+        ));
+        let mut table = NodeTable::pending_bootstrap(seed.clone());
+        // Constructor/query access needs no initialized handle and writes no rows.
+        let mut rows = NodeRows::default();
+        assert_eq!(table.get(&rows, seed.node), Some(seed.clone()));
+        assert_eq!(table.owner(seed.node), Some(seed.owner));
+        rows.__init(b"test/authority-node-table/");
+        let pending = table.clone();
+        assert!(!table.insert_verified(&mut rows, &seed));
+        assert_eq!(table, pending);
+        assert!(rows.is_empty());
+        // A conflicting storage generation must not consume the inline seed.
+        rows.insert(&next.node, &next);
+        assert!(!table.insert_verified(&mut rows, &next));
+        assert_eq!(table, pending);
+        assert!(rows.get(&seed.node).is_none());
+        rows.remove(&next.node);
+        // Later Authority refusal rolls back both staged bootstrap certificates;
+        // the caller publishes its inline candidate only on acceptance.
+        let mut candidate = table.clone();
+        assert!(!authority_row_transaction(|| {
+            assert!(candidate.insert_verified(&mut rows, &next));
+            false
+        }));
+        assert!(rows.is_empty());
+        assert_eq!(table, pending);
+        assert!(table.insert_verified(&mut rows, &next));
+        assert!(table.index_is_valid());
+        let encoded = table.encode();
+        mock::commit_dispatch();
+        let restored = NodeTable::try_decode(&encoded).unwrap();
+        assert_eq!(restored, table);
+        assert_eq!(restored.get(&rows, seed.node), Some(seed.clone()));
+        assert_eq!(restored.get(&rows, next.node), Some(next.clone()));
+        rows.remove(&seed.node);
+        assert!(restored.get(&rows, seed.node).is_none());
+        // Owner-only projections need no certificate fetch, but removal must
+        // verify the actual row and refuse a missing/substituted certificate.
+        assert_eq!(table.owner(seed.node), Some(seed.owner));
+        let before = table.clone();
+        assert!(!table.remove(&mut rows, seed.node, seed.owner));
+        assert_eq!(table, before);
+        assert!(!table.remove(&mut rows, next.node, [0xff; 32]));
+        assert_eq!(table, before);
+        assert!(table.remove(&mut rows, next.node, next.owner));
+        assert_eq!(table.owner(next.node), None);
+        mock::reset();
+    }
+
+    #[test]
+    fn node_table_full_capacity_uses_compact_header_and_refuses_overflow() {
+        use node_storage::{NodeRows, NodeTable};
+        use vos::{Decode, Encode};
+        use vos::storage::mock;
+        mock::reset();
+        let config = configuration();
+        let seed = NodeOwnerRow::from_enrollment(config.bootstrap_node_enrollment());
+        let mut table = NodeTable::pending_bootstrap(seed.clone());
+        let mut rows = NodeRows::default();
+        rows.__init(b"test/authority-node-capacity/");
+        for ordinal in 0..MAX_AUTHORITY_NODES - 1 {
+            let mut key_bytes = [0x53; 32];
+            key_bytes[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
+            let key = SigningKey::from_bytes(&key_bytes);
+            let owner_slot = ordinal % MAX_AUTHORITY_PRINCIPALS;
+            let owner = if owner_slot == 0 { ADMIN_PRINCIPAL }
+                else { PrincipalId([0x80 + owner_slot as u8; 32]) };
+            let mut enrollment = NodeEncryptionEnrollment::from_keys(
+                SpaceId(config.space), owner,
+                key.verifying_key().to_bytes(), [0x42; 32], [1; PRIVATE_SIGNATURE_BYTES],
+            );
+            resign_node_enrollment(&mut enrollment, &key);
+            let certificate = NodeOwnerRow::from_enrollment(enrollment);
+            assert!(table.insert_verified(&mut rows, &certificate));
+        }
+        assert_eq!(rows.len() as usize, MAX_AUTHORITY_NODES);
+        assert!(table.index_is_valid());
+        let encoded = table.encode();
+        assert!(encoded.len() < 36 * 1024, "node index alone must remain compact");
+        let before = table.clone();
+        let mut overflow = seed.clone();
+        overflow.node = [0xfe; 32];
+        assert!(!table.insert_verified(&mut rows, &overflow));
+        assert_eq!(table, before);
+        assert_eq!(rows.len() as usize, MAX_AUTHORITY_NODES);
+        mock::commit_dispatch();
+        let restored = NodeTable::try_decode(&encoded).unwrap();
+        assert_eq!(restored, table);
+        assert_eq!(restored.get(&rows, seed.node), Some(seed));
+        mock::reset();
+    }
+
+    #[test]
+    fn node_table_owner_slot_compaction_preserves_certificate_bindings() {
+        use node_storage::{NodeRows, NodeTable};
+        use vos::storage::mock;
+        mock::reset();
+        let config = configuration();
+        let seed = NodeOwnerRow::from_enrollment(config.bootstrap_node_enrollment());
+        let next = NodeOwnerRow::from_enrollment(signed_node_enrollment(
+            SpaceId(config.space), PrincipalId([0xcc; 32]), 0x32,
+        ));
+        let last = NodeOwnerRow::from_enrollment(signed_node_enrollment(
+            SpaceId(config.space), PrincipalId([0xdd; 32]), 0x33,
+        ));
+        let mut rows = NodeRows::default();
+        rows.__init(b"test/authority-node-owners/");
+        let mut table = NodeTable::pending_bootstrap(seed.clone());
+        assert!(table.insert_verified(&mut rows, &next));
+        assert!(table.insert_verified(&mut rows, &last));
+        assert!(table.remove(&mut rows, seed.node, seed.owner));
+        assert!(table.index_is_valid());
+        assert_eq!(table.owner(next.node), Some(next.owner));
+        assert_eq!(table.owner(last.node), Some(last.owner));
+        assert_eq!(table.get(&rows, next.node), Some(next.clone()));
+        assert_eq!(table.get(&rows, last.node), Some(last.clone()));
+        assert!(table.remove(&mut rows, next.node, next.owner));
+        assert_eq!(table.get(&rows, last.node), Some(last.clone()));
+        assert!(table.remove(&mut rows, last.node, last.owner));
+        assert!(table.index_is_valid());
+        assert!(rows.is_empty());
+        // An empty, already-materialized table does not recreate bootstrap.
+        assert_eq!(table.get(&rows, seed.node), None);
+        mock::reset();
+    }
+
+    #[test]
+    fn authority_refusal_rolls_back_rows_without_changing_reply_conventions() {
+        use vos::storage::{StorageMap, mock};
+        mock::reset();
+        let mut rows = StorageMap::<u64, u64>::default();
+        rows.__init(b"test/authority-transaction/");
+        assert!(authority_row_transaction(|| {
+            rows.insert(&1, &41);
+            true
+        }));
+        assert!(!authority_row_transaction(|| {
+            rows.insert(&1, &99);
+            rows.insert(&2, &99);
+            false
+        }));
+        assert_eq!(rows.get(&1), Some(41));
+        assert_eq!(rows.get(&2), None);
+        let refusal: Vec<u8> = authority_row_transaction(|| {
+            assert!(authority_row_transaction(|| {
+                rows.remove(&1);
+                true
+            }));
+            Vec::new()
+        });
+        assert!(refusal.is_empty());
+        assert_eq!(rows.get(&1), Some(41));
+        assert_eq!(rows.len(), 1);
+        let reply = authority_row_transaction(|| {
+            rows.insert(&2, &42);
+            vec![1, 2, 3]
+        });
+        assert_eq!(reply, vec![1, 2, 3]);
+        assert_eq!(rows.get(&2), Some(42));
+        mock::reset();
+    }
     use alloc::boxed::Box;
     use alloc::vec;
     use ed25519_dalek::{Signer as _, SigningKey};
@@ -8089,6 +8517,7 @@ mod tests {
     }
 
     fn actor() -> SystemAuthority {
+        vos::storage::mock::reset();
         SystemAuthority::new(&configuration().encode())
     }
 
@@ -9633,8 +10062,8 @@ mod tests {
         assert_eq!(SystemAuthorityConfiguration::decode(&encoded), Some(config));
         assert_eq!(
             <SystemAuthority as vos::Actor>::STATE_SCHEMA_VERSION,
-            17,
-            "complete projection rows are a clean Linear state generation",
+            20,
+            "row-backed node headers require the new clean state generation",
         );
 
         let mut old_generation = encoded.clone();
@@ -9823,7 +10252,7 @@ mod tests {
         assert_eq!(ssh_projection.principal, ssh_principal);
         assert_eq!(ssh_projection.kind, AuthorityCredentialKind::Ssh);
         assert_ne!(
-            actor.state.nodes[0].owner, ssh_principal.0,
+            actor.state.nodes.indices().next().unwrap().owner, ssh_principal.0,
             "an enrolled ingress Node attests the SSH session, not user ownership",
         );
 
@@ -10982,12 +11411,8 @@ mod tests {
             );
             resign_node_enrollment(&mut enrollment, &transport_key);
             assert!(enrolled_node(&actor.state, enrollment.node).is_none());
-            actor
-                .state
-                .nodes
-                .push(NodeOwnerRow::from_enrollment(enrollment));
+            assert!(insert_enrolled_node(&mut actor.state, enrollment));
         }
-        actor.state.nodes.sort_by_key(|row| row.node);
         assert_eq!(actor.state.nodes.len(), MAX_AGENT_REPLICAS);
         assert!(refresh_state_integrity_commitment(
             &config,
@@ -10995,11 +11420,20 @@ mod tests {
         ));
         assert!(authority_state_is_valid(&config, &actor.state));
 
+        // This establishes the inline header bound, not physical guest work
+        // budgets or the complete state at every Authority capacity shape.
+        let enrolled_state_bytes =
+            <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear).len();
+        println!("full replica enrollment Linear bytes={enrolled_state_bytes} inner_state_limit={}",
+            vos::agent::execution::MAX_EXECUTION_STATE_TOTAL_BYTES);
+        assert!(enrolled_state_bytes <= vos::agent::execution::MAX_EXECUTION_STATE_TOTAL_BYTES,
+            "row-backed enrollment header must fit the physical inline ceiling");
+
         let mut descriptor = descriptor(config, ADMIN_PRINCIPAL, AgentProfile::Shared, 0xa6);
         descriptor.replicas = actor
             .state
             .nodes
-            .iter()
+            .indices()
             .map(|row| AgentReplica {
                 node: NodeId(row.node),
                 principal: ADMIN_PRINCIPAL,
@@ -12828,6 +13262,8 @@ mod tests {
         assert!(actor.state.operation_retries.is_empty());
         assert_eq!(actor.state.latest_operation_acks.len(), 1);
         let unresolved_state = actor.state.clone();
+        vos::storage::mock::commit_dispatch();
+        let unresolved_rows = vos::storage::mock::snapshot();
         let private_agents = actor.state.private_agents.clone();
         let managed_agents = actor.state.managed_agents.clone();
         let managed_actors = actor.state.managed_actors.clone();
@@ -12917,13 +13353,7 @@ mod tests {
                 owner,
             },
         );
-        assert!(
-            restarted
-                .state
-                .nodes
-                .binary_search_by(|row| row.node.cmp(&invited_node.0))
-                .is_err()
-        );
+        assert!(enrolled_node_owner(&restarted.state, invited_node).is_none());
 
         // Retirement resolves the pending capability without advancing its
         // PCTL position, so a fresh credential request may retry that same
@@ -12954,9 +13384,12 @@ mod tests {
 
         // Whichever terminal resolution commits first owns the shared third
         // invocation: the reverse PCA2-then-PAR1 race also fails closed.
+        vos::storage::mock::reset();
+        vos::storage::mock::commit(unresolved_rows.into_iter().map(|(key, value)| (key, Some(value))).collect());
         let mut applied_actor = SystemAuthority {
             configuration: config,
             state: unresolved_state,
+            node_certificates: Default::default(),
         };
         assert!(dispatch_private_application(
             &mut applied_actor,
@@ -13791,6 +14224,7 @@ mod tests {
         let mut collision_actor = SystemAuthority {
             configuration: actor.configuration,
             state: actor.state.clone(),
+            node_certificates: Default::default(),
         };
         let collision_key = signing(0xaf);
         let collision_principal = PrincipalId([0xb0; 32]);
@@ -14991,6 +15425,750 @@ mod tests {
     }
 
     #[test]
+    fn genesis_committee_query_uses_configured_authority_not_transport_key() {
+        use vos::agent::committee::{AuthorityCommittee, AuthorityMemberRole};
+        use vos::service::ServiceWire as _;
+        let config = configuration();
+        let actor = actor();
+        let before = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
+        let bytes = genesis_publication::signing_committee(&actor.configuration);
+        let committee = AuthorityCommittee::decode(&bytes).unwrap();
+        assert_eq!(committee.space().0, config.space);
+        assert_eq!(committee.authority_binding().0, config.binding.sdk().commitment().0);
+        assert_eq!(committee.epoch(), 1);
+        assert_eq!(committee.previous_committee(), None);
+        assert_eq!(committee.members().len(), 1);
+        let member = &committee.members()[0];
+        assert_eq!(member.role(), AuthorityMemberRole::Voter);
+        assert_eq!(member.node().0, config.bootstrap_node);
+        assert_eq!(*member.public_key(), config.bootstrap_credential_public_key);
+        assert_ne!(*member.public_key(), config.bootstrap_node_transport_public_key);
+        assert_eq!(bytes, genesis_publication::signing_committee(&actor.configuration));
+        assert!(before == <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear));
+        let invalid = SystemAuthority::new(&[]);
+        assert!(genesis_publication::signing_committee(&invalid.configuration).is_empty());
+    }
+
+    #[test]
+    fn shared_create_budget_denies_atomically_and_recovers_after_ack() {
+        let config = configuration();
+        let mut actor = actor();
+        let mut calls = Vec::new();
+        for marker in 0x90u8..0xb0 {
+            let key = signing(marker);
+            let principal = PrincipalId([marker; 32]);
+            let node = node_for_principal(config, principal);
+            enroll(
+                &mut actor,
+                &key,
+                principal,
+                node,
+                BuiltinPrincipalRole::Admin,
+            );
+            calls.push(create_call(
+                config,
+                &key,
+                principal,
+                Some(node),
+                marker,
+                AgentProfile::Shared,
+                marker.wrapping_add(0x10),
+            ));
+        }
+        let mut approvals = Vec::new();
+        let mut denied = None;
+        for (index, call) in calls.iter().enumerate() {
+            let before = actor.state.clone();
+            let reply = dispatch(&mut actor, call);
+            if reply.is_empty() {
+                assert_eq!(actor.state, before, "capacity denial must be atomic");
+                denied = Some(index);
+                break;
+            }
+            approvals.push(reply);
+        }
+        let denied = denied.expect("pending reservations must exhaust the byte budget");
+        assert!(denied > 1);
+        assert!(actor.state.retries.len() < MAX_EXACT_RETRY_RECORDS);
+        assert!(live_and_pending_agent_count(&actor.state) < MAX_MANAGED_AGENTS);
+        let archived = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&actor.state)
+            .unwrap()
+            .len();
+        let publication = genesis_publication::reserved_publication_bytes(&actor.state).unwrap();
+        let terminal = genesis_publication::reserved_terminal_bytes(&actor.state).unwrap();
+        assert!(archived + publication + terminal <= MAX_RUNTIME_STATE_BYTES);
+        println!(
+            "Shared Create capacity: admitted={denied} archived={archived} publication_reserved={publication} terminal_reserved={terminal}"
+        );
+        let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
+        let mut restarted = <SystemAuthority as vos::Actor>::__load_agent_state(
+            Some(&config.encode()),
+            Some(&linear),
+            None,
+            None,
+        )
+        .expect("capacity-limited state must remain restartable");
+        assert_eq!(restarted.state, actor.state);
+        assert!(dispatch(&mut restarted, &calls[denied]).is_empty());
+        assert_eq!(restarted.state, actor.state);
+        assert_eq!(dispatch(&mut restarted, &calls[0]), approvals[0]);
+        let approval = ManagementApproval::decode(&approvals[0]).unwrap();
+        assert!(dispatch_application_ack(
+            &mut restarted,
+            &calls[0],
+            &approval
+        ));
+        assert!(!dispatch(&mut restarted, &calls[denied]).is_empty());
+        assert!(authority_state_is_valid(&config, &restarted.state));
+    }
+
+    #[test]
+    fn shared_create_reservations_accumulate_and_release_independently() {
+        let config = configuration();
+        let mut actor = actor();
+        let mut calls = Vec::new();
+        for marker in [0x51, 0x52] {
+            let key = signing(marker);
+            let principal = PrincipalId([marker; 32]);
+            let node = node_for_principal(config, principal);
+            enroll(
+                &mut actor,
+                &key,
+                principal,
+                node,
+                BuiltinPrincipalRole::Admin,
+            );
+            calls.push(create_call(
+                config,
+                &key,
+                principal,
+                Some(node),
+                marker,
+                AgentProfile::Shared,
+                marker.wrapping_add(0x10),
+            ));
+        }
+        let first = dispatch(&mut actor, &calls[0]);
+        assert!(!first.is_empty());
+        let publication = genesis_publication::reserved_publication_bytes(&actor.state).unwrap();
+        let terminal = genesis_publication::reserved_terminal_bytes(&actor.state).unwrap();
+        assert!(publication > 0 && terminal > 0);
+        let second = dispatch(&mut actor, &calls[1]);
+        assert!(!second.is_empty());
+        assert_eq!(actor.state.retries.len(), 2);
+        // Equal-shape descriptors and signed envelopes have equal reservation
+        // sizes despite independently authenticated owners and credentials.
+        assert_eq!(
+            genesis_publication::reserved_publication_bytes(&actor.state),
+            Some(2 * publication)
+        );
+        assert_eq!(
+            genesis_publication::reserved_terminal_bytes(&actor.state),
+            Some(2 * terminal)
+        );
+        let budget_edge = MAX_RUNTIME_STATE_BYTES - 2 * (publication + terminal);
+        assert!(genesis_publication::state_bytes_fit(
+            &actor.state,
+            budget_edge
+        ));
+        assert!(!genesis_publication::state_bytes_fit(
+            &actor.state,
+            budget_edge + 1
+        ));
+        let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
+        let mut restarted = <SystemAuthority as vos::Actor>::__load_agent_state(
+            Some(&config.encode()),
+            Some(&linear),
+            None,
+            None,
+        )
+        .expect("multiple pending reservations must survive restart");
+        assert_eq!(restarted.state, actor.state);
+        assert_eq!(dispatch(&mut restarted, &calls[0]), first);
+        assert_eq!(dispatch(&mut restarted, &calls[1]), second);
+        let approval = ManagementApproval::decode(&first).unwrap();
+        assert!(dispatch_application_ack(
+            &mut restarted,
+            &calls[0],
+            &approval
+        ));
+        assert_eq!(restarted.state.retries.len(), 1);
+        assert_eq!(
+            genesis_publication::reserved_publication_bytes(&restarted.state),
+            Some(publication)
+        );
+        assert_eq!(
+            genesis_publication::reserved_terminal_bytes(&restarted.state),
+            Some(terminal)
+        );
+        assert_eq!(dispatch(&mut restarted, &calls[1]), second);
+        let approval = ManagementApproval::decode(&second).unwrap();
+        assert!(dispatch_application_ack(
+            &mut restarted,
+            &calls[1],
+            &approval
+        ));
+        assert!(restarted.state.retries.is_empty());
+        assert_eq!(
+            genesis_publication::reserved_publication_bytes(&restarted.state),
+            Some(0)
+        );
+        assert_eq!(
+            genesis_publication::reserved_terminal_bytes(&restarted.state),
+            Some(0)
+        );
+        assert!(authority_state_is_valid(&config, &restarted.state));
+    }
+
+    #[test]
+    fn signed_genesis_publication_survives_restart_and_expired_exact_retry() {
+        exercise_signed_genesis_publication(None);
+    }
+
+    #[test]
+    fn node_mutation_rows_and_header_survive_restart_and_exact_retry() {
+        exercise_node_mutations(None, 1);
+    }
+
+    #[test]
+    fn node_mutation_at_declared_capacity_preserves_complete_state() {
+        exercise_node_mutations(None, MAX_AUTHORITY_NODES - 1);
+    }
+
+    #[test]
+    #[ignore = "exports an explicit signed fixture for compiled Authority node mutations"]
+    fn export_signed_node_mutation_fixture() {
+        let directory = std::env::var("AUTHORITY_NODE_FIXTURE").expect("set new fixture directory");
+        std::fs::create_dir(&directory).expect("fixture directory must not exist");
+        let initial_nodes = std::env::var("AUTHORITY_NODE_INITIAL_COUNT")
+            .map(|value| value.parse::<usize>().expect("numeric initial count"))
+            .unwrap_or(1);
+        exercise_node_mutations(Some(std::path::Path::new(&directory)), initial_nodes);
+    }
+
+    fn exercise_node_mutations(export: Option<&std::path::Path>, initial_nodes: usize) {
+        use vos::{Actor, Encode, storage::mock};
+        assert!((1..MAX_AUTHORITY_NODES).contains(&initial_nodes));
+        let mut actor = actor();
+        let config = actor.configuration;
+        for ordinal in 0..initial_nodes - 1 {
+            let mut seed = [0x53; 32];
+            seed[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
+            let transport_key = SigningKey::from_bytes(&seed);
+            let mut enrollment = NodeEncryptionEnrollment::from_keys(
+                SpaceId(config.space), ADMIN_PRINCIPAL, transport_key.verifying_key().to_bytes(),
+                [0x42; 32], [1; PRIVATE_SIGNATURE_BYTES],
+            );
+            resign_node_enrollment(&mut enrollment, &transport_key);
+            assert!(enrollment.verify_with(&Ed25519CredentialVerifier));
+            assert!(insert_enrolled_node(&mut actor.state, enrollment));
+        }
+        if initial_nodes != 1 { assert!(refresh_state_integrity_commitment(&config, &mut actor.state)); }
+        assert!(authority_state_is_valid(&config, &actor.state));
+        assert_eq!(actor.state.nodes.len(), initial_nodes);
+        mock::commit_dispatch();
+        let initial_rows = mock::snapshot();
+        let key = signing(0x21);
+        let enrollment = signed_node_enrollment(SpaceId(config.space), ADMIN_PRINCIPAL, 0x32);
+        let call = admin_call(config, &key, ADMIN_PRINCIPAL, ADMIN_NODE, 0x91, 1,
+            AuthorityAdminOperation::EnrollNode { enrollment });
+        let mut bad = call.clone();
+        bad.signature[0] ^= 1;
+        let initial_linear = actor.__save_agent_lane(StateLane::Linear);
+        assert!(dispatch_admin(&mut actor, &bad).is_empty());
+        assert_eq!(actor.__save_agent_lane(StateLane::Linear), initial_linear);
+        mock::commit_dispatch();
+        assert_eq!(mock::snapshot(), initial_rows, "refusal must not change or materialize rows");
+        let enrolled_reply = dispatch_admin(&mut actor, &call);
+        assert!(!enrolled_reply.is_empty());
+        assert_eq!(actor.state.nodes.len(), initial_nodes + 1);
+        let enrolled_linear = actor.__save_agent_lane(StateLane::Linear);
+        mock::commit_dispatch();
+        let enrolled_rows = mock::snapshot();
+        assert!(!enrolled_rows.is_empty());
+        actor = <SystemAuthority as Actor>::__load_agent_state(
+            Some(&config.encode()), Some(&enrolled_linear), None, None,
+        ).unwrap();
+        assert_eq!(dispatch_admin(&mut actor, &call), enrolled_reply);
+        assert!(dispatch_admin(&mut actor, &bad).is_empty());
+        assert_eq!(actor.__save_agent_lane(StateLane::Linear), enrolled_linear);
+        mock::commit_dispatch();
+        assert_eq!(mock::snapshot(), enrolled_rows);
+        let mut removal = admin_call(config, &key, ADMIN_PRINCIPAL, ADMIN_NODE, 0x92, 2,
+            AuthorityAdminOperation::UnbindNodeOwner { node: enrollment.node, owner: ADMIN_PRINCIPAL });
+        prepare_admin_call(&actor, &mut removal, &key);
+        let removed_reply = dispatch_admin(&mut actor, &removal);
+        assert!(!removed_reply.is_empty());
+        let removed_linear = actor.__save_agent_lane(StateLane::Linear);
+        mock::commit_dispatch();
+        let removed_rows = mock::snapshot();
+        assert_ne!(removed_rows, enrolled_rows);
+        actor = <SystemAuthority as Actor>::__load_agent_state(
+            Some(&config.encode()), Some(&removed_linear), None, None,
+        ).unwrap();
+        assert!(enrolled_node(&actor.state, enrollment.node).is_none());
+        assert_eq!(actor.state.nodes.len(), initial_nodes);
+        assert!(enrolled_node(&actor.state, ADMIN_NODE).is_some());
+        assert_eq!(dispatch_admin(&mut actor, &removal), removed_reply);
+        assert_eq!(actor.__save_agent_lane(StateLane::Linear), removed_linear);
+        mock::commit_dispatch();
+        assert_eq!(mock::snapshot(), removed_rows);
+        if let Some(directory) = export {
+            use std::io::Write as _;
+            for (name, bytes) in [
+                ("configuration", config.encode()),
+                ("initial-linear", initial_linear),
+                ("initial-rows", initial_rows.encode()),
+                ("enrolled-linear", enrolled_linear), ("removed-linear", removed_linear),
+                ("enrolled-rows", enrolled_rows.encode()), ("removed-rows", removed_rows.encode()),
+                ("enroll-call", call.encode().unwrap()), ("bad-call", bad.encode().unwrap()),
+                ("remove-call", removal.encode().unwrap()),
+                ("enroll-context", admin_context(&call).encode().unwrap()),
+                ("remove-context", admin_context(&removal).encode().unwrap()),
+                ("enroll-reply", enrolled_reply), ("remove-reply", removed_reply),
+            ] {
+                std::fs::OpenOptions::new().write(true).create_new(true).open(directory.join(name))
+                    .unwrap().write_all(&bytes).unwrap();
+            }
+        }
+        mock::reset();
+    }
+
+    #[test]
+    #[ignore = "exports an explicit signed fixture for compiled Authority guest execution"]
+    fn export_signed_genesis_publication_fixture() {
+        let directory = std::env::var("AUTHORITY_PUBLICATION_FIXTURE")
+            .expect("set AUTHORITY_PUBLICATION_FIXTURE to a new disk-backed directory");
+        std::fs::create_dir(&directory).expect("fixture directory must not already exist");
+        exercise_signed_genesis_publication(Some(std::path::Path::new(&directory)));
+    }
+
+    fn exercise_signed_genesis_publication(export: Option<&std::path::Path>) {
+        vos::storage::mock::reset();
+        use vos::agent::committee::{
+            AuthorityCommittee, AuthorityCommitteeMember, AuthorityMemberRole,
+            AuthorityQuorumCertificate, AuthoritySignature,
+        };
+        use vos::agent::genesis::*;
+        use vos::agent::journal::{
+            AgentJournalGenesisId, ReplayInput, ReplayOperation, RuntimeBinding,
+            system_genesis_artifact_closure_commitment,
+        };
+        use vos::service::{self as host, ServiceWire as _};
+
+        let mut config = configuration();
+        config.binding.initial_epoch = 1;
+        // Ordinary replicas belong to the enrolled owner, independently of
+        // the node's authenticated transport key. Do not rewrite bootstrap
+        // ownership to make the genesis roster pass transport validation.
+        let owner = PrincipalId(config.bootstrap_principal);
+        assert_ne!(owner.0, config.bootstrap_replica_principal);
+        assert!(config.is_valid());
+        let mut actor = SystemAuthority::new(&config.encode());
+        let mut descriptor = descriptor(config, owner, AgentProfile::Shared, 0xe2);
+        // Materialize a genuine row-backed table before exporting the fixture,
+        // so physical publication must read persisted certificates, not only
+        // the constructor's pending bootstrap seed.
+        let additional = signed_node_enrollment(SpaceId(config.space), owner, 0x32);
+        assert!(additional.verify_with(&Ed25519CredentialVerifier));
+        assert!(insert_enrolled_node(&mut actor.state, additional));
+        assert!(refresh_state_integrity_commitment(&config, &mut actor.state));
+        vos::storage::mock::commit_dispatch();
+        descriptor.replicas[0].node = NodeId(config.bootstrap_node);
+        assert!(authority_state_is_valid(&config, &actor.state));
+        let request = ManagementRequest::Create(Box::new(descriptor.clone()));
+        let call = credential_call(
+            config,
+            &signing(0x21),
+            owner,
+            Some(ADMIN_NODE),
+            0xe1,
+            target_for(&descriptor),
+            request.clone(),
+        );
+        let approval_bytes = dispatch(&mut actor, &call);
+        assert!(
+            !approval_bytes.is_empty(),
+            "fixture Shared Create must be authorized"
+        );
+        let approval = ManagementApproval::decode(&approval_bytes).unwrap();
+        let receipt = receipt_for(config, &approval, 7);
+        let space = host::SpaceId(config.space);
+        let agent = host::AgentId(descriptor.identity.agent.0);
+        let runtime = RuntimeBinding {
+            space,
+            agent,
+            deployment: host::DeploymentId(descriptor.identity.runtime_deployment.0),
+            program: host::ProgramId(descriptor.identity.runtime_program.0),
+            producer: host::ProducerId(descriptor.identity.runtime_producer.0),
+            package: host::BlobRef {
+                hash: host::Hash(descriptor.runtime_package.hash.0),
+                len: descriptor.runtime_package.len,
+            },
+            runtime_abi: vos::agent::RUNTIME_ABI_ID,
+            execution_semantics: vos::agent::EXECUTION_SEMANTICS_ID,
+        };
+        let catalog = vec![runtime.package.clone()];
+        // The test signs a synthetic post-state claim, not a replay proof.
+        let expectations = AgentGenesisExpectations::new(
+            runtime.commitment(),
+            host::Hash(request.commitment().0),
+            host::Hash([0xe5; 32]),
+            system_genesis_artifact_closure_commitment(&catalog).unwrap(),
+            7,
+        )
+        .unwrap();
+        let proposal = AgentGenesisProposal::new(
+            AgentGenesisLocator { space, agent },
+            ReplayInput {
+                runtime,
+                operation: ReplayOperation::CleanManage {
+                    request,
+                    authority: receipt,
+                    observed_slot: OBSERVED_SLOT,
+                },
+            },
+            expectations,
+            catalog,
+        )
+        .unwrap();
+        let peer = config.bootstrap_node_transport_peer_id.to_vec();
+        let replicas = AgentReplicaCommittee::new(
+            space,
+            agent,
+            vos::agent::AgentProfile::Shared,
+            vec![
+                AgentReplicaMember::new(
+                    vos::agent::AgentReplica {
+                        node: host::NodeId(config.bootstrap_node),
+                        principal: host::PrincipalId(owner.0),
+                        role: vos::agent::ReplicaRole::Voter,
+                    },
+                    peer.clone(),
+                    config.bootstrap_node_transport_public_key,
+                    Some(derive_replica_raft_slot(&peer)),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let member = AuthorityCommitteeMember::new(
+            host::NodeId(config.bootstrap_node),
+            config.bootstrap_credential_public_key,
+            AuthorityMemberRole::Voter,
+        )
+        .unwrap();
+        let signer = member.signer();
+        let committee = AuthorityCommittee::new(
+            space,
+            host::Hash(config.binding.sdk().commitment().0),
+            1,
+            None,
+            vec![member],
+        )
+        .unwrap();
+        let claim = AgentGenesisClaim::new(
+            host::AgentId(config.system_agent),
+            AgentJournalGenesisId::new([0xe6; 32]),
+            AgentGenesisAdmissionId::from_bytes([0xe7; 32]),
+            &proposal,
+            &replicas,
+        )
+        .unwrap();
+        let message = AuthorityQuorumCertificate::signing_message(
+            committee.authority_binding(),
+            committee.epoch(),
+            committee.commitment(),
+            claim.authority_claim(),
+        );
+        let qc = AuthorityQuorumCertificate::new(
+            &committee,
+            claim.authority_claim(),
+            vec![
+                AuthoritySignature::new(signer, signing(0x21).sign(&message.0).to_bytes()).unwrap(),
+            ],
+        )
+        .unwrap();
+        let evidence = AgentGenesisEvidence::new(claim, qc).unwrap();
+        let decision = AgentGenesisDecision::new(&proposal, &replicas, &evidence).unwrap();
+        let provision = AgentGenesisProvision::new(proposal, replicas, evidence, decision).unwrap();
+        let bytes = provision.encode();
+        let expected = provision.decision().encode();
+        let provision_ref = vos::agent_sdk::BlobRef::of_bytes(&bytes);
+        let mut context = context(&call);
+        context.invocation = provision.publication_invocation(call.invocation).unwrap();
+        let before = actor.state.clone();
+        let mut wrong_actor = context;
+        wrong_actor.actor = ActorId([0xfa; 32]);
+        let mut wrong_mode = context;
+        wrong_mode.mode = MethodMode::Query;
+        let mut wrong_invocation = context;
+        wrong_invocation.invocation = InvocationId([0xfb; 32]);
+        let mut expired = context;
+        expired.observed_slot = approval.expires_at + 1;
+        for rejected in [wrong_actor, wrong_mode, wrong_invocation, expired] {
+            assert!(
+                genesis_publication::publish(
+                    &config,
+                    &mut actor.state,
+                    &call.invocation.0,
+                    &bytes,
+                    &rejected,
+                )
+                .is_empty()
+            );
+            assert_eq!(actor.state, before);
+        }
+        for supplied in [None, Some(vec![0xff; bytes.len()])] {
+            assert!(genesis_publication::publish_from_blob(
+                &config, &mut actor.state, &call.invocation.0,
+                &provision_ref.hash.0, provision_ref.len, &context, |_| supplied,
+            ).is_empty());
+            assert_eq!(actor.state, before);
+        }
+        assert!(genesis_publication::publish_from_blob(
+            &config, &mut actor.state, &call.invocation.0,
+            &provision_ref.hash.0, vos::agent::execution::MAX_EXECUTION_AVAILABILITY_BYTES as u64 + 1, &context,
+            |_| panic!("oversized reference must reject before lookup"),
+        ).is_empty());
+        assert_eq!(actor.state, before);
+        let pending_linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
+        assert_eq!(genesis_publication::publish_from_blob(
+            &config, &mut actor.state, &call.invocation.0,
+            &provision_ref.hash.0, provision_ref.len, &context,
+            |reference| { assert_eq!(reference, &provision_ref); Some(bytes.clone()) },
+        ), expected);
+        assert_eq!(actor.state.genesis_publications.len(), 1);
+        assert_eq!(actor.state.managed_agents, vec![root_managed_agent(config)]);
+        assert_eq!(provision.proposal().catalog(), &[host::BlobRef::of_bytes(&[0xe2])]);
+        let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
+        if let Some(directory) = export {
+            use std::io::Write as _;
+            for (name, bytes) in [
+                ("configuration", config.encode()),
+                ("pending-linear", pending_linear),
+                ("published-linear", linear.clone()),
+                ("node-rows", vos::Encode::encode(&vos::storage::mock::snapshot())),
+                ("provision", bytes.clone()),
+                ("runtime-catalog", vec![0xe2]),
+                ("decision", expected.clone()),
+                ("context", context.encode().unwrap()),
+                ("authorization", call.invocation.0.to_vec()),
+            ] {
+                std::fs::OpenOptions::new().write(true).create_new(true)
+                    .open(directory.join(name)).unwrap().write_all(&bytes).unwrap();
+            }
+        }
+        let mut restarted = <SystemAuthority as vos::Actor>::__load_agent_state(
+            Some(&config.encode()),
+            Some(&linear),
+            None,
+            None,
+        )
+        .expect("signed publication must survive Linear restart");
+        assert_eq!(restarted.state, actor.state);
+        context.observed_slot = approval.expires_at + 1;
+        assert_eq!(
+            genesis_publication::publish_from_blob(
+                &config,
+                &mut restarted.state,
+                &call.invocation.0,
+                &provision_ref.hash.0,
+                provision_ref.len,
+                &context,
+                |_| Some(bytes.clone()),
+            ),
+            expected
+        );
+        assert_eq!(restarted.state, actor.state);
+        assert_eq!(
+            genesis_publication::read(&config, &restarted.state, &agent.0, &context,),
+            expected
+        );
+        assert_eq!(dispatch(&mut restarted, &call), approval_bytes);
+        let ack = application_ack(config, &restarted.state, &call, &approval);
+        assert!(dispatch_ack(&mut restarted, &ack));
+        assert!(restarted.state.retries.is_empty());
+        let finalized = restarted.state.clone();
+        assert_eq!(
+            genesis_publication::publish(
+                &config,
+                &mut restarted.state,
+                &call.invocation.0,
+                &bytes,
+                &context,
+            ),
+            expected
+        );
+        assert_eq!(restarted.state, finalized);
+        let pending_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&before)
+            .unwrap()
+            .len();
+        let published_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&actor.state)
+            .unwrap()
+            .len();
+        let finalized_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&finalized)
+            .unwrap()
+            .len();
+        println!(
+            "publication sizing: pending={pending_bytes} published={published_bytes} finalized={finalized_bytes} provision={} call={} approval={} state_limit={} provision_wire_limit={}",
+            bytes.len(),
+            call.encode().unwrap().len(),
+            approval_bytes.len(),
+            MAX_RUNTIME_STATE_BYTES,
+            MAX_AGENT_GENESIS_PROVISION_BYTES,
+        );
+        assert!(published_bytes > pending_bytes);
+        let publication_reserved =
+            genesis_publication::reserved_publication_bytes(&before).unwrap();
+        let terminal_reserved = genesis_publication::reserved_terminal_bytes(&before).unwrap();
+        let reserved = publication_reserved + terminal_reserved;
+        assert!(publication_reserved >= published_bytes - pending_bytes);
+        assert!(terminal_reserved >= finalized_bytes - published_bytes);
+        assert_eq!(
+            genesis_publication::reserved_terminal_bytes(&actor.state),
+            Some(terminal_reserved)
+        );
+        assert_eq!(
+            genesis_publication::reserved_terminal_bytes(&finalized),
+            Some(0)
+        );
+        assert!(reserved >= published_bytes - pending_bytes);
+        assert!(genesis_publication::state_bytes_fit(
+            &before,
+            MAX_RUNTIME_STATE_BYTES - reserved,
+        ));
+        assert!(!genesis_publication::state_bytes_fit(
+            &before,
+            MAX_RUNTIME_STATE_BYTES - reserved + 1,
+        ));
+        assert!(!genesis_publication::state_bytes_fit(&before, usize::MAX));
+        assert_eq!(
+            genesis_publication::reserved_publication_bytes(&actor.state),
+            Some(0)
+        );
+        assert_eq!(
+            genesis_publication::reserved_publication_bytes(&finalized),
+            Some(0)
+        );
+        assert!(bytes.len() <= MAX_CLEAN_CREATE_GENESIS_PROVISION_BYTES);
+        assert!(MAX_CLEAN_CREATE_GENESIS_PROVISION_BYTES < MAX_RUNTIME_STATE_BYTES);
+        assert!(published_bytes <= MAX_RUNTIME_STATE_BYTES);
+        assert!(finalized_bytes <= MAX_RUNTIME_STATE_BYTES);
+        let finalized_lane =
+            <SystemAuthority as vos::Actor>::__save_agent_lane(&restarted, StateLane::Linear);
+        let after_ack_restart = <SystemAuthority as vos::Actor>::__load_agent_state(
+            Some(&config.encode()),
+            Some(&finalized_lane),
+            None,
+            None,
+        )
+        .expect("publication must remain readable after acknowledged-state restart");
+        assert_eq!(after_ack_restart.state, finalized);
+        assert_eq!(
+            genesis_publication::read(&config, &after_ack_restart.state, &agent.0, &context,),
+            expected
+        );
+        let fresh = InvocationId([0xfc; 32]);
+        assert!(admin_invocation_is_available(&restarted.state, fresh));
+        assert!(private_application_invocation_is_unreserved(
+            &restarted.state,
+            fresh
+        ));
+        assert!(!admin_invocation_is_available(
+            &restarted.state,
+            context.invocation
+        ));
+        assert!(!invocation_pair_is_available(
+            &restarted.state,
+            context.invocation,
+            fresh
+        ));
+        assert!(!invocation_pair_is_available(
+            &restarted.state,
+            fresh,
+            context.invocation
+        ));
+        assert!(!private_application_invocation_is_unreserved(
+            &restarted.state,
+            context.invocation,
+        ));
+    }
+
+    #[test]
+    fn malformed_genesis_publication_preserves_pending_create_across_restart() {
+        let config = configuration();
+        let call = create_call(
+            config,
+            &signing(0x21),
+            ADMIN_PRINCIPAL,
+            Some(ADMIN_NODE),
+            0xe1,
+            AgentProfile::Shared,
+            0xe2,
+        );
+        let mut actor = actor();
+        let approval = dispatch(&mut actor, &call);
+        assert!(!approval.is_empty());
+        let before = actor.state.clone();
+        let mut valid_context = context(&call);
+        valid_context.invocation = InvocationId([0xe3; 32]);
+        let mut wrong_actor = valid_context;
+        wrong_actor.actor = ActorId([0xe4; 32]);
+        let mut wrong_mode = valid_context;
+        wrong_mode.mode = MethodMode::Query;
+        let mut zero_invocation = valid_context;
+        zero_invocation.invocation = InvocationId::ZERO;
+        for invocation_context in [
+            None,
+            Some(valid_context),
+            Some(wrong_actor),
+            Some(wrong_mode),
+        ] {
+            let mut ctx = Context::new(ServiceId(0));
+            if let Some(value) = invocation_context {
+                ctx.__set_agent_invocation_context(value);
+            }
+            let result = block_on(<SystemAuthority as Message<PublishGenesis>>::handle(
+                &mut actor,
+                PublishGenesis {
+                    authorization: call.invocation.0.to_vec(),
+                    provision_hash: vec![0xff; 32],
+                    provision_len: 32,
+                },
+                &mut ctx,
+            ));
+            assert!(result.is_empty());
+            assert_eq!(actor.state, before);
+        }
+        // The public Context setter rejects a zero invocation before dispatch;
+        // exercise the publication boundary directly for this invalid context.
+        assert!(
+            genesis_publication::publish(
+                &config,
+                &mut actor.state,
+                &call.invocation.0,
+                &[0xff; 32],
+                &zero_invocation,
+            )
+            .is_empty()
+        );
+        assert_eq!(actor.state, before);
+        let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
+        let mut restarted = <SystemAuthority as vos::Actor>::__load_agent_state(
+            Some(&config.encode()),
+            Some(&linear),
+            None,
+            None,
+        )
+        .expect("rejected publication must leave a restartable pending authorization");
+        assert_eq!(restarted.state, before);
+        assert!(restarted.state.genesis_publications.is_empty());
+        assert_eq!(dispatch(&mut restarted, &call), approval);
+        assert_eq!(restarted.state, before);
+    }
+
+    #[test]
     fn pending_create_and_exact_reply_survive_linear_restart_without_becoming_live() {
         let config = configuration();
         let call = create_call(
@@ -15145,6 +16323,7 @@ mod tests {
             let mut actor = SystemAuthority {
                 configuration: pending.configuration,
                 state: pending.state.clone(),
+                node_certificates: Default::default(),
             };
             let before = actor.state.clone();
             assert!(!dispatch_ack(&mut actor, &ack));
@@ -15155,6 +16334,7 @@ mod tests {
         let mut actor = SystemAuthority {
             configuration: pending.configuration,
             state: pending.state.clone(),
+            node_certificates: Default::default(),
         };
         let before = actor.state.clone();
         assert!(!dispatch_ack_bytes(
@@ -15471,7 +16651,7 @@ mod tests {
         let result = AuthorityAdminResult::decode(&enrolled).unwrap();
         assert_eq!(result.call, enroll_call);
         assert_eq!(result.generation.get(), 2);
-        assert!(actor.state.nodes.iter().all(|row| row.owner != principal.0));
+        assert!(actor.state.nodes.indices().all(|row| row.owner != principal.0));
 
         let linear = <SystemAuthority as vos::Actor>::__save_agent_lane(&actor, StateLane::Linear);
         let mut actor = <SystemAuthority as vos::Actor>::__load_agent_state(
@@ -15546,7 +16726,7 @@ mod tests {
             actor
                 .state
                 .nodes
-                .iter()
+                .indices()
                 .filter(|row| row.owner == principal.0)
                 .count(),
             1
@@ -15910,7 +17090,7 @@ mod tests {
             actor
                 .state
                 .nodes
-                .iter()
+                .indices()
                 .all(|row| row.owner != inaccessible.0)
         );
         let mut no_node_admin = admin_call(
@@ -16119,45 +17299,27 @@ mod tests {
             .unwrap()
             .kind = 2;
         assert!(!authority_state_is_valid(&config, &invalid_kind));
-        let mut dangling_node = actor.state.clone();
-        dangling_node
-            .nodes
-            .iter_mut()
-            .find(|row| row.owner == [0xd1; 32])
-            .unwrap()
-            .owner = [0xd4; 32];
-        assert!(!authority_state_is_valid(&config, &dangling_node));
-
-        let node_index = actor
-            .state
-            .nodes
-            .iter()
-            .position(|row| row.owner == [0xd1; 32])
-            .unwrap();
-        let mut wrong_node_space = actor.state.clone();
-        wrong_node_space.nodes[node_index].space[0] ^= 1;
-        assert!(!authority_state_is_valid(&config, &wrong_node_space));
-        let mut wrong_transport_key = actor.state.clone();
-        wrong_transport_key.nodes[node_index].transport_public_key[0] ^= 1;
-        assert!(!authority_state_is_valid(&config, &wrong_transport_key));
-        let mut wrong_peer_id = actor.state.clone();
-        wrong_peer_id.nodes[node_index].transport_peer_id[6] ^= 1;
-        assert!(!authority_state_is_valid(&config, &wrong_peer_id));
-        let mut wrong_x25519 = actor.state.clone();
-        wrong_x25519.nodes[node_index].encryption_public_key[31] |= 0x80;
-        assert!(!authority_state_is_valid(&config, &wrong_x25519));
-        let mut wrong_transport_signature = actor.state.clone();
-        wrong_transport_signature.nodes[node_index].transport_signature[0] ^= 1;
-        assert!(!authority_state_is_valid(
-            &config,
-            &wrong_transport_signature
-        ));
-        let mut wrong_enrollment_commitment = actor.state.clone();
-        wrong_enrollment_commitment.nodes[node_index].enrollment_commitment[0] ^= 1;
-        assert!(!authority_state_is_valid(
-            &config,
-            &wrong_enrollment_commitment
-        ));
+        let node = actor.state.nodes.indices().find(|row| row.owner == [0xd1; 32]).unwrap().node;
+        let original = enrolled_node(&actor.state, NodeId(node)).unwrap();
+        let corruptions: [fn(&mut NodeOwnerRow); 7] = [
+            |row| row.owner = [0xd4; 32],
+            |row| row.space[0] ^= 1,
+            |row| row.transport_public_key[0] ^= 1,
+            |row| row.transport_peer_id[6] ^= 1,
+            |row| row.encryption_public_key[31] |= 0x80,
+            |row| row.transport_signature[0] ^= 1,
+            |row| row.enrollment_commitment[0] ^= 1,
+        ];
+        for corrupt in corruptions {
+            assert!(!authority_row_transaction(|| {
+                let mut changed = original.clone();
+                corrupt(&mut changed);
+                node_storage::rows().insert(&node, &changed);
+                assert!(!authority_state_is_valid(&config, &actor.state));
+                false
+            }));
+            assert_eq!(enrolled_node(&actor.state, NodeId(node)), Some(original.clone()));
+        }
 
         let mut orphaned_agent = actor.state.clone();
         orphaned_agent.managed_agents.push(ManagedAgentRow {
@@ -16286,24 +17448,14 @@ mod tests {
                 [1; PRIVATE_SIGNATURE_BYTES],
             );
             resign_node_enrollment(&mut enrollment, &key);
-            actor
-                .state
-                .nodes
-                .push(NodeOwnerRow::from_enrollment(enrollment));
+            assert!(insert_enrolled_node(&mut actor.state, enrollment));
         }
-        actor.state.nodes.sort_by_key(|row| row.node);
-        assert!(
-            actor
-                .state
-                .nodes
-                .windows(2)
-                .all(|pair| pair[0].node < pair[1].node)
-        );
+        assert!(actor.state.nodes.index_is_valid());
         assert_eq!(actor.state.nodes.len(), MAX_AUTHORITY_NODES);
         let owner_nodes = actor
             .state
             .nodes
-            .iter()
+            .indices()
             .filter(|row| row.owner == owner.0)
             .map(|row| NodeId(row.node))
             .collect::<Vec<_>>();
@@ -16430,8 +17582,7 @@ mod tests {
         resign_node_enrollment(&mut enrollment, &key);
         over_node_bound
             .nodes
-            .push(NodeOwnerRow::from_enrollment(enrollment));
-        over_node_bound.nodes.sort_by_key(|row| row.node);
+            .inject_index_for_test(&NodeOwnerRow::from_enrollment(enrollment));
         assert!(refresh_state_integrity_commitment(
             &config,
             &mut over_node_bound
@@ -16512,42 +17663,49 @@ mod tests {
     #[test]
     fn generated_agent_schema_marks_authority_methods_as_explicit_linear_public_preflight() {
         let method = SystemAuthorityMsg::AGENT_METHODS;
-        assert_eq!(method.len(), 10);
+        assert_eq!(method.len(), 13);
         assert_eq!(method[0].name, "authorize");
         assert_eq!(method[0].mode, vos::agent_sdk::schema::MethodMode::Linear);
         assert!(method[0].explicit);
         assert_eq!(method[1].name, "finalize");
         assert_eq!(method[1].mode, vos::agent_sdk::schema::MethodMode::Linear);
         assert!(method[1].explicit);
-        assert_eq!(method[2].name, "authorize_operation");
+        assert_eq!(method[2].name, "publish_genesis");
         assert_eq!(method[2].mode, vos::agent_sdk::schema::MethodMode::Linear);
         assert!(method[2].explicit);
-        assert_eq!(method[3].name, "acknowledge_issuance");
+        assert_eq!(method[3].name, "genesis_decision");
         assert_eq!(method[3].mode, vos::agent_sdk::schema::MethodMode::Linear);
         assert!(method[3].explicit);
-        assert_eq!(method[4].name, "resolve_private_application");
+        assert_eq!(method[4].name, "authorize_operation");
         assert_eq!(method[4].mode, vos::agent_sdk::schema::MethodMode::Linear);
         assert!(method[4].explicit);
-        assert_eq!(method[5].name, "administer");
+        assert_eq!(method[5].name, "acknowledge_issuance");
         assert_eq!(method[5].mode, vos::agent_sdk::schema::MethodMode::Linear);
         assert!(method[5].explicit);
+        assert_eq!(method[6].name, "resolve_private_application");
+        assert_eq!(method[6].mode, vos::agent_sdk::schema::MethodMode::Linear);
+        assert!(method[6].explicit);
+        assert_eq!(method[7].name, "administer");
+        assert_eq!(method[7].mode, vos::agent_sdk::schema::MethodMode::Linear);
+        assert!(method[7].explicit);
         for (index, name) in [
             "credential_projection",
             "agent_projection_page",
             "agent_replica_projection_page",
             "actor_projection_page",
+            "genesis_signing_committee",
         ]
         .iter()
         .enumerate()
         {
-            assert_eq!(method[index + 6].name, *name);
+            assert_eq!(method[index + 8].name, *name);
             assert_eq!(
-                method[index + 6].mode,
+                method[index + 8].mode,
                 vos::agent_sdk::schema::MethodMode::Query
             );
-            assert!(method[index + 6].explicit);
+            assert!(method[index + 8].explicit);
         }
-        assert_eq!(SystemAuthorityMsg::AGENT_AUTHORIZATIONS.len(), 10);
+        assert_eq!(SystemAuthorityMsg::AGENT_AUTHORIZATIONS.len(), 13);
         assert!(
             SystemAuthorityMsg::AGENT_AUTHORIZATIONS
                 .iter()

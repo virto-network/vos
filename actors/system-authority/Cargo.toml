@@ -22,6 +22,9 @@ vos = { path = "../../vos", default-features = false, features = ["macros", "pvm
 ed25519-dalek = { version = "2", default-features = false }
 vos = { path = "../../vos", default-features = false, features = ["macros", "extension"] }
 
+[target.'cfg(not(target_arch = "riscv64"))'.dev-dependencies]
+vos = { path = "../../vos", default-features = false, features = ["std"] }
+
 [profile.release]
 opt-level = "s"
 lto = true
