@@ -4709,8 +4709,13 @@ pub(crate) mod tests {
         let locator = provision.proposal().locator();
         for staged in [false, true] {
             let fixture = Fixture::new("ordinary-genesis-provider-integration");
+            let archive_parent = fixture.parent.join("archives");
+            ensure_private_directory(&archive_parent).unwrap();
+            let factory =
+                CleanAgentGenesisArchiveStoreFactory::open_existing(&archive_parent, locator.space)
+                    .unwrap();
             let store =
-                CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap();
+                CleanAgentGenesisArchiveFile::open_or_create(&archive_parent, locator).unwrap();
             if staged {
                 stage(&store.store.lock().unwrap(), None, &record.encode());
                 drop(store);
@@ -4723,8 +4728,8 @@ pub(crate) mod tests {
                 provider.publish(&record).unwrap();
                 drop(provider);
             }
-            let store =
-                CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap();
+            assert_eq!(factory.discover(1).unwrap(), vec![locator]);
+            let store = factory.open_archive(locator).unwrap();
             let provider = ArchivedAgentGenesisProvider::new(locator.space, store).unwrap();
             assert_eq!(
                 provider.reproduce(locator).unwrap().encode(),
@@ -4748,9 +4753,12 @@ pub(crate) mod tests {
                 Err(AgentGenesisProviderError::Refused)
             );
             assert_eq!(provider.reproduce(locator).unwrap(), provision);
+            assert!(matches!(
+                factory.open_archive(locator),
+                Err(CleanFileStoreError::Busy)
+            ));
             drop(provider);
-            let store =
-                CleanAgentGenesisArchiveFile::open_or_create(&fixture.parent, locator).unwrap();
+            let store = factory.open_archive(locator).unwrap();
             let provider = ArchivedAgentGenesisProvider::new(locator.space, store).unwrap();
             assert_eq!(
                 provider.reproduce(locator).unwrap().encode(),
@@ -4898,10 +4906,115 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn ordinary_genesis_fresh_reservation_preserves_every_orphan_phase() {
+        use vos::agent::local_lifecycle::LocalLifecycleStoreFactory as _;
+        use vos::agent::sdk::{AgentProfile, ManagementRequest};
+        let (operator, authority, mut descriptor, runtime) =
+            super::super::local_create::tests::fixture();
+        let (_, mut call, _) = super::super::local_create::prepare(
+            &operator,
+            authority,
+            descriptor.clone(),
+            runtime.clone(),
+            core::num::NonZeroU64::new(1).unwrap(),
+            10,
+            30,
+        )
+        .unwrap()
+        .into_parts();
+        descriptor.identity.profile = AgentProfile::Shared;
+        call.managed.profile = AgentProfile::Shared;
+        call.plan = ManagementRequest::Create(Box::new(descriptor.clone()))
+            .authorization_plan()
+            .unwrap();
+        call.invocation = call.expected_invocation();
+        call.signature = operator
+            .sign(&call.signing_bytes())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let locator = vos::agent::genesis::AgentGenesisLocator {
+            space: vos::service::SpaceId(authority.space.0),
+            agent: vos::service::AgentId(descriptor.identity.agent.0),
+        };
+        for orphan in 0..6 {
+            let fixture = Fixture::new("ordinary-genesis-orphan-phase");
+            let mut lifecycle = CleanManagementLifecycleStoreFactory::open_or_create(
+                fixture.parent.join("lifecycle"),
+                authority.space,
+            )
+            .unwrap();
+            let (mut intent, mut issuer) = lifecycle
+                .open(authority.space, descriptor.identity.agent)
+                .unwrap();
+            let committee_path = fixture.parent.join("committee");
+            ensure_private_directory(&committee_path).unwrap();
+            let (mut query, mut reply) =
+                CleanAgentGenesisCommitteeFile::open_pair(&committee_path, locator).unwrap();
+            let mut publication = query.publication();
+            let mut publication_reply = query.publication_reply();
+            match orphan {
+                0 => intent.commit_runtime(runtime.exact_bytes()).unwrap(),
+                1 => issuer.commit(b"orphan issuer").unwrap(),
+                2 => query.commit(b"orphan query").unwrap(),
+                3 => reply.commit(b"orphan reply").unwrap(),
+                4 => publication.commit(b"orphan publication").unwrap(),
+                5 => publication_reply
+                    .commit(b"orphan publication reply")
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            let before = [
+                intent.load().unwrap(),
+                intent.load_runtime().unwrap(),
+                issuer.load().unwrap(),
+                query.load().unwrap(),
+                reply.load().unwrap(),
+                publication.load().unwrap(),
+                publication_reply.load().unwrap(),
+            ];
+            assert!(
+                matches!(
+                    vos::agent::clean_bootstrap::NativeSharedGenesisRecovery::reserve_create(
+                        authority,
+                        locator,
+                        descriptor.clone(),
+                        call.clone(),
+                        runtime.clone(),
+                        (
+                            &mut intent,
+                            &mut issuer,
+                            &mut query,
+                            &mut reply,
+                            &mut publication,
+                            &mut publication_reply
+                        ),
+                    ),
+                    Err(vos::agent::shared_host::SharedAgentHostError::ScopeMismatch)
+                ),
+                "orphan phase {orphan}"
+            );
+            let after = [
+                intent.load().unwrap(),
+                intent.load_runtime().unwrap(),
+                issuer.load().unwrap(),
+                query.load().unwrap(),
+                reply.load().unwrap(),
+                publication.load().unwrap(),
+                publication_reply.load().unwrap(),
+            ];
+            assert_eq!(
+                after, before,
+                "orphan phase {orphan} must not be repaired or replaced"
+            );
+        }
+    }
+
+    #[test]
     fn ordinary_genesis_signed_reservation_retries_and_joint_discovery_holds_leases() {
         use vos::agent::local_lifecycle::LocalLifecycleStoreFactory as _;
         use vos::agent::sdk::{AgentProfile, ManagementRequest};
-        struct FailRuntimeCommit(CleanManagementIntentFile);
+        struct FailRuntimeCommit(CleanManagementIntentFile, bool);
         impl CleanManagementIssuerStore for FailRuntimeCommit {
             type Error = CleanFileStoreError;
             fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
@@ -4915,7 +5028,10 @@ pub(crate) mod tests {
             fn load_runtime(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
                 self.0.load_runtime()
             }
-            fn commit_runtime(&mut self, _: &[u8]) -> Result<(), Self::Error> {
+            fn commit_runtime(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+                if self.1 {
+                    self.0.commit_runtime(bytes)?;
+                }
                 Err(CleanFileStoreError::Corrupt)
             }
         }
@@ -4999,7 +5115,7 @@ pub(crate) mod tests {
                 call.clone(),
                 runtime.clone(),
                 (
-                    FailRuntimeCommit(intent),
+                    FailRuntimeCommit(intent, false),
                     issuer,
                     query,
                     reply,
@@ -5014,6 +5130,38 @@ pub(crate) mod tests {
             .unwrap();
         let retained_intent = intent.load().unwrap().unwrap();
         assert!(intent.load_runtime().unwrap().is_none());
+        let (query, reply) = committee.open_existing(locator).unwrap();
+        let publication = query.publication();
+        let publication_reply = query.publication_reply();
+        assert!(matches!(
+            vos::agent::clean_bootstrap::NativeSharedGenesisRecovery::reserve_create(
+                authority,
+                locator,
+                descriptor.clone(),
+                call.clone(),
+                runtime.clone(),
+                (
+                    FailRuntimeCommit(intent, true),
+                    issuer,
+                    query,
+                    reply,
+                    publication,
+                    publication_reply
+                ),
+            ),
+            Err(vos::agent::shared_host::SharedAgentHostError::Unavailable)
+        ));
+        let (mut intent, issuer) = lifecycle
+            .open_existing(authority.space, descriptor.identity.agent)
+            .unwrap();
+        assert_eq!(
+            intent.load().unwrap().as_deref(),
+            Some(retained_intent.as_slice())
+        );
+        assert_eq!(
+            intent.load_runtime().unwrap().as_deref(),
+            Some(runtime.exact_bytes())
+        );
         let (query, reply) = committee.open_existing(locator).unwrap();
         let publication = query.publication();
         let publication_reply = query.publication_reply();

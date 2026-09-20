@@ -432,10 +432,23 @@ The ordinary-genesis suite passes 15 tests, one opt-in ignored
 (`shared-signed-reservation-crash-tests.log`), including forged-signature refusal,
 exact and conflicting signed retries, a failure between intent/runtime commits,
 byte-identical intent recovery, and joint lease exclusion with absent/empty archive.
-Published-record positive coverage, a production controller/HTTP creation path,
+Joint published-record startup coverage, a production controller/HTTP creation path,
 and controller ownership across startup remain unfinished. Do not activate routes
 until owner-authenticated recovery succeeds before route publication.
 No wire format, finality acceptance or bundled artifact was changed.
+
+Reservation follow-up adds all six orphan-image refusals (runtime, issuer,
+committee query/reply and publication/reply), checking exact bytes before/after,
+and failure reported after runtime publication as well as before it. Exact retry
+preserves the signed intent and recovers the published package. A fresh signed
+Authority publication fixture was exported from current source under task logs
+`shared-reservation-publication.3tUXaD/fixture` (`export.log`: one test passed).
+The archive/provider opt-in test now reopens through non-creating discovery for
+both committed and staged records and checks the held lease. All 17
+ordinary-genesis tests pass, zero ignored (`shared-reservation-publication.3tUXaD/cli-tests.log`).
+This closes positive **archive/provider storage** coverage, not the joint
+published-record startup path. The fixture uses a synthetic runtime catalog;
+it is not physical runtime execution or a released Shared lifecycle campaign.
 
 1. Reviewer examines `7bd66a7d..saga/agents` read-only and returns findings.
    Apply fixes on latest implementation source; advance the reviewer branch only
