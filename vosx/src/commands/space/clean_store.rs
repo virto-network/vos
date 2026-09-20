@@ -802,55 +802,30 @@ pub(crate) struct CleanSharedGenesisStartupEntry {
 }
 
 impl CleanSharedGenesisStartupEntry {
-    /// Extend operation/admin admission with every discovered Shared reservation.
-    /// The returned admission borrows the whole set, including archive leases.
-    /// Pending publication is admitted for recovery but cannot open a route.
-    pub(crate) fn startup_admission<'a>(
-        entries: &'a mut [Self],
-        mut admission: vos::agent::clean_bootstrap::NativeAuthorityOperationStartupAdmission<'a>,
+    /// Transfer every discovered lease to the lifecycle controller. Cached
+    /// decoded records are discarded: recovery re-reads the owned archive.
+    pub(crate) fn into_controller(
+        authority: vos::agent::sdk::authority::AuthorityActorTarget,
+        entries: Vec<Self>,
     ) -> Result<
-        vos::agent::clean_bootstrap::NativeAuthorityOperationStartupAdmission<'a>,
+        vos::agent::clean_bootstrap::NativeSharedGenesisController<
+            CleanManagementIntentFile,
+            CleanManagementIssuerFile,
+            CleanAgentGenesisCommitteeFile,
+            CleanAgentGenesisCommitteeFile,
+            CleanAgentGenesisCommitteeFile,
+            CleanAgentGenesisCommitteeFile,
+            CleanAgentGenesisArchiveFile,
+        >,
         vos::agent::shared_host::SharedAgentHostError,
     > {
-        use vos::agent::shared_host::{MAX_SHARED_HOST_AGENTS, SharedAgentHostError};
-        if entries.len() > MAX_SHARED_HOST_AGENTS {
-            return Err(SharedAgentHostError::CapacityExhausted);
-        }
-        for entry in entries {
-            admission = admission.include_shared_genesis(&mut entry.recovery)?;
-        }
-        Ok(admission.with_deferred_shared_genesis())
-    }
-
-    /// Borrow the complete published set while retaining every archive lease.
-    /// Incomplete publication is recoverable work, not an entry to filter out.
-    /// The returned records remain untrusted until the root-pinned owner replays
-    /// them. Failure leaves every entry and lease with the caller.
-    pub(crate) fn published_recoveries(
-        entries: &mut [Self],
-    ) -> Result<
-        Vec<(
-            &mut CleanSharedGenesisRecovery,
-            &vos::agent::genesis::AgentGenesisArchiveRecord,
-        )>,
-        vos::agent::shared_host::SharedAgentHostError,
-    > {
-        use vos::agent::shared_host::{MAX_SHARED_HOST_AGENTS, SharedAgentHostError};
-        if entries.len() > MAX_SHARED_HOST_AGENTS {
-            return Err(SharedAgentHostError::CapacityExhausted);
-        }
-        entries
-            .iter_mut()
-            .map(|entry| {
-                let Some((_, Some(record))) = &entry.archive else {
-                    return Err(SharedAgentHostError::Unavailable);
-                };
-                if record.provision().proposal().locator() != entry.recovery.locator() {
-                    return Err(SharedAgentHostError::ScopeMismatch);
-                }
-                Ok((&mut entry.recovery, record))
-            })
-            .collect()
+        vos::agent::clean_bootstrap::NativeSharedGenesisController::new(
+            authority,
+            entries
+                .into_iter()
+                .map(|entry| (entry.recovery, entry.archive.map(|(archive, _)| archive)))
+                .collect(),
+        )
     }
 }
 
@@ -5246,7 +5221,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         drop(recovery);
-        let mut entries = archives
+        let entries = archives
             .discover_recovery(&mut lifecycle, &committee, authority, 1)
             .unwrap();
         assert_eq!(entries.len(), 1);
@@ -5256,11 +5231,11 @@ pub(crate) mod tests {
             authority,
         )
         .unwrap();
-        let admission = CleanSharedGenesisStartupEntry::startup_admission(
-            &mut entries,
-            operations.startup_admission().unwrap(),
-        )
-        .unwrap();
+        let mut controller =
+            CleanSharedGenesisStartupEntry::into_controller(authority, entries).unwrap();
+        let admission = controller
+            .startup_admission(operations.startup_admission().unwrap())
+            .unwrap();
         assert!(matches!(
             lifecycle.open_existing(authority.space, descriptor.identity.agent),
             Err(CleanFileStoreError::Busy)
@@ -5278,17 +5253,10 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(matches!(
-            CleanSharedGenesisStartupEntry::startup_admission(
-                &mut entries,
-                foreign_operations.startup_admission().unwrap(),
-            ),
+            controller.startup_admission(foreign_operations.startup_admission().unwrap()),
             Err(vos::agent::shared_host::SharedAgentHostError::ScopeMismatch)
         ));
-        assert!(matches!(
-            CleanSharedGenesisStartupEntry::published_recoveries(&mut entries),
-            Err(vos::agent::shared_host::SharedAgentHostError::Unavailable)
-        ));
-        assert_eq!(entries[0].recovery.locator(), locator);
+        assert!(!controller.is_recovered());
         assert!(matches!(
             lifecycle.open_existing(authority.space, descriptor.identity.agent),
             Err(CleanFileStoreError::Busy)
@@ -5297,7 +5265,7 @@ pub(crate) mod tests {
             committee.open_existing(locator),
             Err(CleanFileStoreError::Busy)
         ));
-        drop(entries);
+        drop(controller);
         let archive =
             CleanAgentGenesisArchiveFile::open_or_create(&archives_path, locator).unwrap();
         assert!(matches!(
@@ -5305,13 +5273,21 @@ pub(crate) mod tests {
             Err(CleanFileStoreError::Busy)
         ));
         drop(archive);
-        let mut entries = archives
+        let entries = archives
             .discover_recovery(&mut lifecycle, &committee, authority, 1)
             .unwrap();
         assert!(entries[0].archive.as_ref().unwrap().1.is_none());
+        let mut controller =
+            CleanSharedGenesisStartupEntry::into_controller(authority, entries).unwrap();
+        assert_eq!(controller.authority(), authority);
+        assert!(!controller.is_recovered());
+        let admission = controller
+            .startup_admission(operations.startup_admission().unwrap())
+            .unwrap();
+        drop(admission);
         assert!(matches!(
-            CleanSharedGenesisStartupEntry::published_recoveries(&mut entries),
-            Err(vos::agent::shared_host::SharedAgentHostError::Unavailable)
+            controller.startup_admission(foreign_operations.startup_admission().unwrap()),
+            Err(vos::agent::shared_host::SharedAgentHostError::ScopeMismatch)
         ));
         assert!(matches!(
             archives.open_archive(locator),
@@ -5325,7 +5301,7 @@ pub(crate) mod tests {
             committee.open_existing(locator),
             Err(CleanFileStoreError::Busy)
         ));
-        drop(entries);
+        drop(controller);
         let (intent, issuer) = lifecycle
             .open_existing(authority.space, descriptor.identity.agent)
             .unwrap();

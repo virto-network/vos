@@ -4,6 +4,128 @@ use super::genesis_issuance::RetainedCommitteeQuery;
 use super::*;
 use crate::agent::clean_management_intent::{CleanManagementIntentSlot, ManagementJournalAnchor};
 
+/// Owns the complete discovered reservation set and its archive leases through
+/// recovery and serving. Construction validates ownership scope, not finality.
+/// Missing archives are retained as incomplete work, never silently filtered.
+pub struct NativeSharedGenesisController<I, J: CleanManagementIssuerStore, Q, R, W, P, A> {
+    authority: AuthorityActorTarget,
+    entries: Vec<(NativeSharedGenesisRecovery<I, J, Q, R, W, P>, Option<A>)>,
+    recovered: bool,
+}
+
+impl<I, J, Q, R, W, P, A> NativeSharedGenesisController<I, J, Q, R, W, P, A>
+where
+    I: super::super::clean_authority_issuer::CleanManagementRuntimeStore,
+    J: CleanManagementIssuerStore,
+    Q: CleanManagementIssuerStore,
+    R: CleanManagementIssuerStore,
+    W: CleanManagementIssuerStore,
+    P: CleanManagementIssuerStore,
+    A: super::super::genesis_archive::AgentGenesisArchiveStore,
+{
+    pub fn new(
+        authority: AuthorityActorTarget,
+        mut entries: Vec<(NativeSharedGenesisRecovery<I, J, Q, R, W, P>, Option<A>)>,
+    ) -> Result<Self, SharedAgentHostError> {
+        if !authority.is_valid() {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        if entries.len() > super::super::shared_host::MAX_SHARED_HOST_AGENTS {
+            return Err(SharedAgentHostError::CapacityExhausted);
+        }
+        if entries
+            .iter()
+            .any(|(recovery, _)| recovery.authority != authority || !recovery.admission_valid)
+        {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        entries.sort_unstable_by_key(|(recovery, _)| recovery.locator.agent);
+        if entries
+            .windows(2)
+            .any(|pair| pair[0].0.locator == pair[1].0.locator)
+        {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        Ok(Self {
+            authority,
+            entries,
+            recovered: false,
+        })
+    }
+
+    pub fn authority(&self) -> AuthorityActorTarget {
+        self.authority
+    }
+
+    pub fn is_recovered(&self) -> bool {
+        self.recovered
+    }
+
+    /// Borrow every store until bootstrap has admitted its retained work.
+    pub fn startup_admission<'a>(
+        &'a mut self,
+        mut admission: NativeAuthorityOperationStartupAdmission<'a>,
+    ) -> Result<NativeAuthorityOperationStartupAdmission<'a>, SharedAgentHostError> {
+        if self.recovered {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        if admission.authority != self.authority {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        for (recovery, _) in &mut self.entries {
+            admission = admission.include_shared_genesis(recovery)?;
+        }
+        Ok(admission.with_deferred_shared_genesis())
+    }
+
+    /// Re-read all leased archives before replaying any entry. Successful
+    /// recovery requires the owner's exact complete deferred set and independent
+    /// live-history verification; archive signatures alone never grant finality.
+    /// Errors retain all stores for an exact retry or orderly shutdown.
+    pub fn recover<B, C, D, S>(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<B, C, D>,
+        signer: &mut S,
+    ) -> Result<(), SharedAgentHostError>
+    where
+        B: CleanSystemAgentBootstrapStore + Send + 'static,
+        C: CleanSystemAgentBootstrapStore + Send + 'static,
+        D: CleanManagementIssuerStore + Send + 'static,
+        S: CleanManagementReceiptSigner,
+    {
+        if self.recovered {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        if owner.authority_target() != self.authority {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let records = self.entries.iter().map(|(recovery, archive)| {
+            let archive = archive.as_ref().ok_or(SharedAgentHostError::Unavailable)?;
+            let bytes = archive.load(recovery.locator)
+                .map_err(|_| SharedAgentHostError::Unavailable)?
+                .ok_or(SharedAgentHostError::Unavailable)?;
+            if bytes.len() > super::super::genesis::MAX_AGENT_GENESIS_ARCHIVE_RECORD_BYTES {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            let record = <super::super::genesis::AgentGenesisArchiveRecord as crate::service::ServiceWire>::decode(&bytes)
+                .map_err(|_| SharedAgentHostError::ScopeMismatch)?;
+            if record.provision().proposal().locator() != recovery.locator {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            Ok(record)
+        }).collect::<Result<Vec<_>, _>>()?;
+        let mut entries: Vec<_> = self
+            .entries
+            .iter_mut()
+            .zip(&records)
+            .map(|((recovery, _), record)| (recovery, record))
+            .collect();
+        owner.recover_deferred_shared_generations(&mut entries, signer)?;
+        self.recovered = true;
+        Ok(())
+    }
+}
+
 /// Owns the stores while bootstrap borrows their validated reservation data.
 /// This authenticates the signed request, not execution, issuance or finality.
 /// The owner must replay the authorization and reproduce its candidate before

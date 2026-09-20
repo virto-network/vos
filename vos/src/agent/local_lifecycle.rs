@@ -1463,6 +1463,45 @@ where
     ) -> Result<super::clean_bootstrap::NativeAuthorityOperationDecision, SharedAgentHostError>;
 }
 
+/// Type erasure preserves the recovery operation and its owned leases, rather
+/// than accepting an arbitrary keepalive payload from startup.
+trait NativeSharedGenesisAccess<P, R, I, S>: Send
+where
+    P: CleanSystemAgentBootstrapStore,
+    R: CleanSystemAgentBootstrapStore,
+    I: CleanManagementIssuerStore,
+{
+    fn recover(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        signer: &mut S,
+    ) -> Result<(), SharedAgentHostError>;
+}
+
+impl<P, R, I, S, B, J, Q, Reply, W, PubReply, A> NativeSharedGenesisAccess<P, R, I, S>
+    for super::clean_bootstrap::NativeSharedGenesisController<B, J, Q, Reply, W, PubReply, A>
+where
+    P: CleanSystemAgentBootstrapStore + Send + 'static,
+    R: CleanSystemAgentBootstrapStore + Send + 'static,
+    I: CleanManagementIssuerStore + Send + 'static,
+    S: CleanManagementReceiptSigner,
+    B: super::clean_authority_issuer::CleanManagementRuntimeStore + Send,
+    J: CleanManagementIssuerStore + Send,
+    Q: CleanManagementIssuerStore + Send,
+    Reply: CleanManagementIssuerStore + Send,
+    W: CleanManagementIssuerStore + Send,
+    PubReply: CleanManagementIssuerStore + Send,
+    A: super::genesis_archive::AgentGenesisArchiveStore,
+{
+    fn recover(
+        &mut self,
+        owner: &mut CleanSystemAgentBootstrapOwner<P, R, I>,
+        signer: &mut S,
+    ) -> Result<(), SharedAgentHostError> {
+        super::clean_bootstrap::NativeSharedGenesisController::recover(self, owner, signer)
+    }
+}
+
 /// Retains one system owner and one physical Local host across route-worker
 /// retirement. Lifecycle calls lock system then Local; route workers lock only
 /// their own host. Never call route-worker methods while either guard is held.
@@ -1484,6 +1523,7 @@ where
     signer: S,
     operations: Option<Box<dyn NativeAuthorityOperationAccess<P, R, I>>>,
     admins: Option<Box<dyn NativeAuthorityAdminAccess<P, R, I>>>,
+    shared_genesis: Option<Box<dyn NativeSharedGenesisAccess<P, R, I, S>>>,
 }
 
 impl<P, R, I, F, S> LocalLifecycleController<P, R, I, F, S>
@@ -1511,7 +1551,48 @@ where
             signer,
             operations: None,
             admins: None,
+            shared_genesis: None,
         })
+    }
+
+    /// Recover the complete Shared set before this controller can be handed to
+    /// the node. Keep all reservation/archive leases until workers are retired
+    /// and the production lifecycle owner is dropped. No archive-only verifier
+    /// is installed, and failed recovery never returns a serving controller.
+    pub fn with_shared_genesis<B, J, Q, Reply, W, PubReply, A>(
+        mut self,
+        shared: super::clean_bootstrap::NativeSharedGenesisController<
+            B,
+            J,
+            Q,
+            Reply,
+            W,
+            PubReply,
+            A,
+        >,
+    ) -> Result<Self, SharedAgentHostError>
+    where
+        B: super::clean_authority_issuer::CleanManagementRuntimeStore + Send + 'static,
+        J: CleanManagementIssuerStore + Send + 'static,
+        Q: CleanManagementIssuerStore + Send + 'static,
+        Reply: CleanManagementIssuerStore + Send + 'static,
+        W: CleanManagementIssuerStore + Send + 'static,
+        PubReply: CleanManagementIssuerStore + Send + 'static,
+        A: super::genesis_archive::AgentGenesisArchiveStore + 'static,
+    {
+        if self.shared_genesis.is_some() {
+            return Err(SharedAgentHostError::Conflict);
+        }
+        let mut shared: Box<dyn NativeSharedGenesisAccess<P, R, I, S>> = Box::new(shared);
+        {
+            let mut system = self
+                .system
+                .lock()
+                .map_err(|_| SharedAgentHostError::Unavailable)?;
+            shared.recover(&mut system, &mut self.signer)?;
+        }
+        self.shared_genesis = Some(shared);
+        Ok(self)
     }
 
     /// Adopt the recovered admin stores for the full production-owner lifetime.
@@ -2116,7 +2197,12 @@ where
             signer,
             operations,
             admins,
+            shared_genesis,
         } = self;
+        assert!(
+            shared_genesis.is_none(),
+            "test extraction must preserve Shared genesis leases"
+        );
         assert!(
             admins.is_none(),
             "test extraction must preserve admin leases"

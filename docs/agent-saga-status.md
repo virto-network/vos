@@ -4,6 +4,26 @@ This is the authoritative status and remaining-work index. Other handoffs are
 navigation or checkpoint-specific evidence, not competing plans. Updated 2026-09-20.
 The complete Agent Architecture Saga remains the objective.
 
+## Read this first
+
+- Reviewer checkpoint: `saga/agents` at `9cd2fa6a`. The review guide applies
+  only to that checkpoint, not the later implementation evidence below.
+- Implementation branch: `wip/ch08-runtime-directory`. Shared reservation,
+  discovery, admission and lifecycle ownership exist, but production startup
+  does not yet call them. Ordinary Shared is
+  still unavailable; helper tests are not deployment qualification.
+- Next functional batch: connect the owned Shared recovery controller to startup
+  before route publication and qualify nonempty published-state recovery and
+  store ownership through worker retirement. Do not bypass
+  finality or broaden this batch into unrelated performance redesign.
+- Release remains open: Local disposable testing has scoped evidence; Shared,
+  backup, other profile gates, production performance and workspace lint remain
+  incomplete. See the remaining acceptance gates below.
+
+Evidence sections are historical observations at their named sources, not
+additional plans. Earlier test counts are superseded only within the same suite
+and scope; they must not be added together or treated as current release results.
+
 ## Review boundary
 
 Review the inventory checkpoint on `saga/agents`, new delta
@@ -405,37 +425,25 @@ Additional gates at `d17794c5`:
   This is a failed release gate, not evidence that every unused API is obsolete:
   several belong to the incomplete Shared/Private integration below.
 
-Shared production integration has begun with non-creating archive discovery in
-`vosx`'s clean file layer. `CleanAgentGenesisArchiveStoreFactory` pins the private
-parent descriptor, discovers bounded canonical space-scoped locators, and opens
-existing archives under exclusive leases without creating missing directories.
-Archive and committee discovery now share the same hardened directory walker.
-The ordinary-genesis store suite passes: 13 tests, one existing opt-in ignored
-(`shared-archive-discovery-tests.log`), including new missing-path, sorted/bounded
-set, conflicting lease, foreign-space, symlink and replaced-parent regressions.
-This is a prerequisite, not production activation: it is not yet called by startup.
-Joint discovery now returns lease-owning `CleanSharedGenesisStartupEntry` values.
-It rejects orphan archives before query-slot creation, binds each record to the
-locator validated by `NativeSharedGenesisRecovery::open`, and rechecks archive,
-lifecycle and committee sets before returning. Missing archive, empty archive slot
-and structurally decoded record remain distinct; none is finality. All acquired
-leases remain in the returned entries. The ordinary-genesis suite now passes 14
-tests, one opt-in ignored (`shared-joint-discovery-tests.log`), adding empty-set,
-orphan-before-mutation and malformed-intent preservation coverage. The new joint
-path now has positive signed-Shared reservation coverage through
-`NativeSharedGenesisRecovery::reserve_create`. This public storage entry point
-verifies the signature, exact Shared descriptor/locator and admitted runtime
-binding before writing; it grants no authorization, finality or route admission.
-Existing reservations undergo full recovery before exact retry can complete a
-missing runtime. Fresh calls refuse orphan phase images rather than repairing them.
-The ordinary-genesis suite passes 15 tests, one opt-in ignored
-(`shared-signed-reservation-crash-tests.log`), including forged-signature refusal,
-exact and conflicting signed retries, a failure between intent/runtime commits,
-byte-identical intent recovery, and joint lease exclusion with absent/empty archive.
-Joint published-record startup coverage, a production controller/HTTP creation path,
-and controller ownership across startup remain unfinished. Do not activate routes
-until owner-authenticated recovery succeeds before route publication.
-No wire format, finality acceptance or bundled artifact was changed.
+### Shared integration prerequisites (implementation only)
+
+Archive and committee discovery share a hardened, bounded, space-scoped directory
+walker. Existing archive opens do not create missing paths; pinned descriptors
+and exclusive leases protect discovery. Joint startup entries retain all leases,
+reject orphan archives before query-slot creation, validate locator bindings and
+recheck the discovered sets. Absent, empty and decoded archives are distinct;
+none establishes finality.
+
+`NativeSharedGenesisRecovery::reserve_create` verifies the signed Shared
+descriptor, locator and admitted runtime before writing. Exact retry can complete
+an interrupted runtime commit only after recovery validation; conflicting retries
+and orphan phase images are refused. This grants no authorization or route
+admission. Wire formats, finality acceptance and bundled artifacts are unchanged.
+
+Earlier incremental test logs remain preserved as
+`shared-archive-discovery-tests.log`, `shared-joint-discovery-tests.log` and
+`shared-signed-reservation-crash-tests.log`. The consolidated results and their
+limits follow; these supersede the earlier counts, not their evidence.
 
 Reservation follow-up adds all six orphan-image refusals (runtime, issuer,
 committee query/reply and publication/reply), checking exact bytes before/after,
@@ -450,27 +458,38 @@ This closes positive **archive/provider storage** coverage, not the joint
 published-record startup path. The fixture uses a synthetic runtime catalog;
 it is not physical runtime execution or a released Shared lifecycle campaign.
 
-The owner recovery API now borrows recovery/record pairs instead of taking owned
-pairs, allowing the controller to retain each archive lease. The CLI's
-`published_recoveries` handoff borrows only a complete, locator-matched published
-set; any absent/empty archive returns unavailable without discarding entries or
-releasing their leases. The existing finality/replay algorithm is unchanged.
-All 17 ordinary-genesis CLI tests pass (`shared-borrowed-recovery-cli-tests.log`);
-the deferred root startup/one-time completion regression passes
-(`shared-borrowed-recovery-owner-test.log`, one test, 2.69s). That owner regression
-has an empty ordinary-Agent set; it does not establish nonempty published Shared
-startup. Formatting passes (`shared-borrowed-recovery-format.log`). The production
-controller and startup call sites remain to be connected and qualified.
+`NativeSharedGenesisController` now owns the complete discovered recovery set and
+archive handles. Its startup admission borrows all leases; recovery re-reads every
+archive, rejects missing/corrupt/mismatched records, and delegates finality to the
+owner's exact-set live-history replay. `LocalLifecycleController::with_shared_genesis`
+performs that recovery before returning a controller suitable for node ownership,
+then retains the stores until lifecycle shutdown. It accepts the concrete protocol
+controller, not an arbitrary keepalive payload or caller-supplied finality proof.
+The superseded CLI-only `startup_admission` and `published_recoveries` helpers have
+been removed; `into_controller` transfers their ownership to this common path.
 
-The CLI startup set can now extend operation/admin admission through the existing
-`include_shared_genesis` verifier for every reservation, and only then request
-deferred Shared opening. The admission borrows the entries and their leases;
-incomplete publication remains recovery work and is still rejected by the later
-published-record handoff. All 17 ordinary-genesis tests pass
-(`shared-startup-admission-tests.log`), including admission for a signed reservation,
-held lifecycle/committee leases, and refusal of a differently pinned Authority.
-This does not yet exercise pending executed Shared query/publication records through
-the CLI adapter, or connect it to the production controller/startup call site.
+Earlier borrowed-handoff and admission evidence remains in
+`shared-borrowed-recovery-cli-tests.log`, `shared-borrowed-recovery-owner-test.log`
+and `shared-startup-admission-tests.log`. Those owner results use an empty ordinary
+set. The production startup call site, nonempty authenticated published recovery,
+and store lifetime through actual worker retirement remain unqualified. No
+production Shared activation, wire/artifact change or permissive finality was added.
+
+Controller evidence: all 17 ordinary-genesis CLI tests pass with the explicit
+signed fixture (`shared-controller-cli-final.log`, zero ignored, 0.96s), including
+file-lease transfer and exclusion through controller drop. Three physical owner
+tests pass (`shared-controller-lifecycle-tests.log`, 7.83s): one-time empty-set
+recovery, lifecycle adoption/release of the physical host, and absent/empty/corrupt
+archive refusal with no signing or ordered-index change and retained ownership
+until drop. The positive owner tests still have no ordinary Shared generation;
+these are ownership/recovery-boundary tests, not nonempty Shared startup evidence.
+Workspace formatting passes (`shared-controller-format.log`). Full release and
+lint gates are not rerun or claimed by this focused batch.
+
+## Continuation plan
+
+The immediate functional batch is item 4; items 2–3 remain performance work,
+not prerequisites to silently add to that batch.
 
 1. Reviewer examines `7bd66a7d..saga/agents` read-only and returns findings.
    Apply fixes on latest implementation source; advance the reviewer branch only

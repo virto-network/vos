@@ -12,7 +12,7 @@ pub(crate) mod genesis_issuance;
 #[path = "clean_genesis_recovery.rs"]
 mod genesis_recovery;
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
-pub use genesis_recovery::NativeSharedGenesisRecovery;
+pub use genesis_recovery::{NativeSharedGenesisController, NativeSharedGenesisRecovery};
 
 #[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
 #[path = "clean_admin_dispatch.rs"]
@@ -9998,9 +9998,158 @@ mod tests {
 
         #[test]
         fn native_deferred_system_bootstrap_reopens_root_and_completes_once() {
+            check_deferred_system_bootstrap(0);
+        }
+
+        #[test]
+        fn native_shared_genesis_controller_completes_empty_deferred_set_once() {
+            check_deferred_system_bootstrap(1);
+        }
+
+        #[test]
+        fn native_shared_genesis_controller_is_adopted_by_lifecycle_owner() {
+            check_deferred_system_bootstrap(2);
+        }
+
+        #[test]
+        fn native_shared_genesis_controller_preserves_incomplete_archive_ownership() {
+            struct Archive {
+                image: Option<Vec<u8>>,
+                lifetime: Arc<()>,
+            }
+            impl crate::agent::genesis_archive::AgentGenesisArchiveStore for Archive {
+                type Error = ();
+                fn load(
+                    &self,
+                    _: crate::agent::genesis::AgentGenesisLocator,
+                ) -> Result<Option<Vec<u8>>, ()> {
+                    let _ = &self.lifetime;
+                    Ok(self.image.clone())
+                }
+                fn insert_if_absent(
+                    &self,
+                    _: crate::agent::genesis::AgentGenesisLocator,
+                    _: &[u8],
+                ) -> Result<(), ()> {
+                    panic!("recovery must not create an archive");
+                }
+            }
+            let mut harness = NativeProjectionOwnerHarness::new("shared-controller-incomplete");
+            let owner = harness.owner.as_mut().unwrap();
+            let runtime = shape_only_runtime();
+            let mut descriptor = owner.pins.descriptor.clone();
+            descriptor.creation_nonce = Hash([0xdd; 32]);
+            descriptor.identity.agent = AgentId::derive(
+                descriptor.identity.space,
+                descriptor.identity.owner,
+                descriptor.creation_nonce.as_bytes(),
+            );
+            descriptor.identity.runtime_deployment = runtime.deployment();
+            descriptor.identity.runtime_program = runtime.program();
+            descriptor.identity.runtime_producer = runtime.producer();
+            descriptor.runtime_package = runtime.package_ref().clone();
+            descriptor.runtime_contract = runtime.manifest().contract;
+            descriptor.capabilities = runtime.capabilities();
+            descriptor.replicas[0].principal = descriptor.identity.owner;
+            let request = ManagementRequest::Create(Box::new(descriptor.clone()));
+            let key = SigningKey::from_bytes(&[CREDENTIAL_SEED; 32]);
+            let (mut call, _) = credential_call_and_approval(&descriptor, &request, &key);
+            call.authority = owner.authority_target();
+            call.invocation = call.expected_invocation();
+            call.signature = key.sign(&call.signing_bytes()).to_bytes();
+            let locator = crate::agent::genesis::AgentGenesisLocator {
+                space: crate::service::SpaceId(descriptor.identity.space.0),
+                agent: HostAgentId(descriptor.identity.agent.0),
+            };
+            let before = owner.ordered_index_for_test().unwrap();
+            for mode in 0..3 {
+                let intent = IssuerMemoryStore::default();
+                let recovery = NativeSharedGenesisRecovery::reserve_create(
+                    owner.authority_target(),
+                    locator,
+                    descriptor.clone(),
+                    call.clone(),
+                    runtime.clone(),
+                    (
+                        intent.clone(),
+                        IssuerMemoryStore::default(),
+                        IssuerMemoryStore::default(),
+                        IssuerMemoryStore::default(),
+                        IssuerMemoryStore::default(),
+                        IssuerMemoryStore::default(),
+                    ),
+                )
+                .unwrap();
+                let before_intent = intent.image.lock().unwrap().clone();
+                let lifetime = Arc::new(());
+                let weak = Arc::downgrade(&lifetime);
+                let archive = if mode == 0 {
+                    None
+                } else {
+                    Some(Archive {
+                        image: (mode == 2).then(|| vec![0xff]),
+                        lifetime: lifetime.clone(),
+                    })
+                };
+                drop(lifetime);
+                let mut controller = NativeSharedGenesisController::new(
+                    owner.authority_target(),
+                    vec![(recovery, archive)],
+                )
+                .unwrap();
+                let mut signer = CountingSigner::new();
+                for _ in 0..2 {
+                    assert_eq!(
+                        controller.recover(owner, &mut signer),
+                        Err(if mode == 2 {
+                            SharedAgentHostError::ScopeMismatch
+                        } else {
+                            SharedAgentHostError::Unavailable
+                        })
+                    );
+                    assert!(!controller.is_recovered());
+                    assert_eq!(owner.ordered_index_for_test().unwrap(), before);
+                    assert_eq!(*intent.image.lock().unwrap(), before_intent);
+                    assert_eq!(signer.calls, 0);
+                    assert_eq!(weak.upgrade().is_some(), mode != 0);
+                }
+                drop(controller);
+                assert!(weak.upgrade().is_none());
+            }
+            harness.stop();
+        }
+
+        fn check_deferred_system_bootstrap(use_controller: u8) {
+            struct NoArchive;
+            impl crate::agent::genesis_archive::AgentGenesisArchiveStore for NoArchive {
+                type Error = ();
+                fn load(
+                    &self,
+                    _: crate::agent::genesis::AgentGenesisLocator,
+                ) -> Result<Option<Vec<u8>>, ()> {
+                    panic!("empty recovery must not read an archive");
+                }
+                fn insert_if_absent(
+                    &self,
+                    _: crate::agent::genesis::AgentGenesisLocator,
+                    _: &[u8],
+                ) -> Result<(), ()> {
+                    panic!("recovery must not publish an archive");
+                }
+            }
             let mut harness = NativeProjectionOwnerHarness::new("deferred-system-bootstrap");
             let owner = harness.owner.take().unwrap();
             let target = owner.authority_target();
+            let mut controller = NativeSharedGenesisController::<
+                IssuerMemoryStore,
+                IssuerMemoryStore,
+                IssuerMemoryStore,
+                IssuerMemoryStore,
+                IssuerMemoryStore,
+                IssuerMemoryStore,
+                NoArchive,
+            >::new(target, Vec::new())
+            .unwrap();
             let before = owner.ordered_index_for_test().unwrap();
             let pins = owner._pins_store.clone();
             let record = owner.record_store.clone();
@@ -10010,8 +10159,12 @@ mod tests {
             let mut operations = OperationTestJournal(harness._directory.0.clone());
             let admission =
                 NativeAuthorityOperationStartupAdmission::load(&mut operations, target, &[])
-                    .unwrap()
-                    .with_deferred_shared_genesis();
+                    .unwrap();
+            let admission = if use_controller != 0 {
+                controller.startup_admission(admission).unwrap()
+            } else {
+                admission.with_deferred_shared_genesis()
+            };
             let mut owner =
                 CleanSystemAgentBootstrapOwner::open_or_bootstrap_with_operation_admission(
                     pins,
@@ -10037,6 +10190,57 @@ mod tests {
             assert_eq!(owner.ordered_index_for_test().unwrap(), before);
             assert_eq!(owner.host.lock().unwrap().len(), 1);
             assert!(owner.host.lock().unwrap().deferred_agent_ids().is_empty());
+            if use_controller == 2 {
+                struct NoLocalStores;
+                impl crate::agent::local_lifecycle::LocalLifecycleStoreFactory for NoLocalStores {
+                    type Intent = IssuerMemoryStore;
+                    type Issuer = IssuerMemoryStore;
+                    type Error = ();
+                    fn discover(&mut self, _: SpaceId, _: usize) -> Result<Vec<AgentId>, ()> {
+                        Ok(Vec::new())
+                    }
+                    fn open_existing(
+                        &mut self,
+                        _: SpaceId,
+                        _: AgentId,
+                    ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                        Err(())
+                    }
+                    fn open(
+                        &mut self,
+                        _: SpaceId,
+                        _: AgentId,
+                    ) -> Result<(Self::Intent, Self::Issuer), ()> {
+                        Err(())
+                    }
+                }
+                let host = Arc::downgrade(&owner.host);
+                let local = crate::agent::local_sdk_host::LocalAgentHost::create(
+                    harness._directory.0.join("local"),
+                    owner.pins.space,
+                    owner.pins.node,
+                    harness.fixture.trust.clone(),
+                )
+                .unwrap();
+                let lifecycle = crate::agent::local_lifecycle::LocalLifecycleController::new(
+                    owner,
+                    local,
+                    NoLocalStores,
+                    CountingSigner::new(),
+                )
+                .unwrap()
+                .with_shared_genesis(controller)
+                .unwrap();
+                assert!(!host.upgrade().unwrap().lock().unwrap().has_deferred_open());
+                assert_eq!(lifecycle.ordered_index_for_test().unwrap(), before);
+                drop(lifecycle);
+                assert!(
+                    host.upgrade().is_none(),
+                    "lifecycle drop must release the physical host"
+                );
+                harness.stop();
+                return;
+            }
             let mut entries: Vec<(
                 &mut NativeSharedGenesisRecovery<
                     IssuerMemoryStore,
@@ -10048,9 +10252,28 @@ mod tests {
                 >,
                 &crate::agent::genesis::AgentGenesisArchiveRecord,
             )> = Vec::new();
-            owner
-                .recover_deferred_shared_generations(&mut entries, &mut CountingSigner::new())
-                .unwrap();
+            if use_controller != 0 {
+                assert!(!controller.is_recovered());
+                controller
+                    .recover(&mut owner, &mut CountingSigner::new())
+                    .unwrap();
+                assert!(controller.is_recovered());
+                assert_eq!(
+                    controller.recover(&mut owner, &mut CountingSigner::new()),
+                    Err(SharedAgentHostError::Conflict)
+                );
+                let admission =
+                    NativeAuthorityOperationStartupAdmission::load(&mut operations, target, &[])
+                        .unwrap();
+                assert!(matches!(
+                    controller.startup_admission(admission),
+                    Err(SharedAgentHostError::Conflict)
+                ));
+            } else {
+                owner
+                    .recover_deferred_shared_generations(&mut entries, &mut CountingSigner::new())
+                    .unwrap();
+            }
             assert_eq!(
                 owner.recover_deferred_shared_generations(&mut entries, &mut CountingSigner::new()),
                 Err(SharedAgentHostError::Conflict)
