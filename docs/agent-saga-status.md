@@ -32,7 +32,7 @@ remains the complete Agent Architecture Saga, not just the next checkpoint.
    publishing routes. Ordinary CLI creation and supervisor serving are **not**
    wired end to end. Opening a physical generation does not make it callable.
 
-### Current route-handle work
+### Current supervisor integration
 
 Implementation follow-up extracts exact-generation supervisor access from the
 existing Shared coordinator. A handle keeps a weak coordinator reference between
@@ -49,11 +49,30 @@ and that surviving cloned handles cannot retain the physical host after shutdown
 The native-outer regression passes in 46.77s
 (`shared-generation-route-handle-lifetime-fixed.log`). The initial boxed test-value
 compile failure remains in `shared-generation-route-handle-lifetime.log`.
-Workspace formatting and diff checks pass. The expanded current physical recipe
-is running in `shared-generation-route-physical-recipe.log`; its terminal result
-must be collected before claiming physical qualification of this extraction.
+Workspace formatting and diff checks pass. The physical route-handle recipe
+(started before the adapter below) is running in
+`shared-generation-route-physical-recipe.log`; collect its terminal result before
+claiming physical qualification of this extraction.
 All eight Shared network tests pass in 0.34s
 (`shared-generation-route-network-suite.log`).
+
+The subsequent generation-specific adapter implements Invoke, Resume, ACK,
+preparation and complete per-generation Authority auditing. It uses the existing
+inline per-Agent backend, not an extra idle thread per Agent. Ordinary audits
+explicitly reject the physical system-bootstrap generation, even if a projection
+strips root-provenance flags from otherwise matching actors. The initial
+worker-backed adapter test passed in 54.04s and its added root-scope test passed
+in 55.93s (`shared-generation-supervisor-adapter.log`,
+`shared-generation-supervisor-root-scope.log`). These are native-outer tests of
+an actor-empty ordinary generation, not an actor-serving campaign.
+
+The inline form passes in 56.02s (`shared-generation-inline-adapter.log`), and
+all four existing inline-retirement/panic regressions pass in 0.01s
+(`shared-generation-inline-retirement.log`). Formatting/diff checks pass.
+These adapter checks are native-outer, not a current physical-recipe pass.
+Production ownership must still
+reconcile the complete ordinary generation set, replace stale generation handles
+on reattachment, and retain lifecycle/archive leases until routes drain.
 
 ## Current evidence and limits
 
@@ -105,8 +124,8 @@ Exact pins remain in `support/production-artifacts.toml` and `vosx/build.rs`.
 
 ## Next coherent batch
 
-1. Finish and verify generation-bound ordinary route handles, including
-   retirement, stale-generation refusal and independent-Agent dispatch.
+1. Qualify installed-actor Invoke/Resume/ACK through the generation adapter,
+   including retirement, stale-generation refusal and independent-Agent dispatch.
 2. Connect recovered ordinary Shared generations to supervisor ownership and
    complete signed Shared creation through the lifecycle/CLI. Keep one network
    owner and retain lifecycle/archive leases through worker retirement.

@@ -1514,6 +1514,27 @@ impl SharedAgentHost {
         self.audit_authority_projection_scoped(head, projected, root, None)
     }
 
+    /// Audit the complete ordinary generation selected by its live route
+    /// handle. No root-provenance exception is available on this path.
+    pub(crate) fn audit_agent_authority_projection(
+        &self,
+        agent: AgentId,
+        head: crate::agent_sdk::authority::AuthorityProjectionHead,
+        projected: &[super::supervisor_adapters::AgentAuthorityRouteProjection],
+    ) -> Result<SharedAuthorityProjectionAudit, SharedAgentHostError> {
+        let hosted = self
+            .agents
+            .get(&agent)
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        if matches!(
+            hosted.intent.authority,
+            SharedGenesisAuthority::SystemBootstrap { .. }
+        ) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        self.audit_authority_projection_scoped(head, projected, None, Some(agent))
+    }
+
     /// Audit only the independently pinned system generation. Ordinary
     /// generations remain subject to their own complete authority audit.
     pub(crate) fn audit_system_authority_projection(

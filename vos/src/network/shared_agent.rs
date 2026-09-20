@@ -2421,6 +2421,17 @@ impl SharedAgentRouteHandle {
             SupervisorAdmission::Ordinary,
         )
     }
+
+    pub(crate) fn audit(
+        &self,
+        head: crate::agent_sdk::authority::AuthorityProjectionHead,
+        projected: &[crate::agent::supervisor_adapters::AgentAuthorityRouteProjection],
+    ) -> Result<crate::agent::shared_host::SharedAuthorityProjectionAudit, SharedAgentHostError>
+    {
+        self.with_generation(|host, agent, _| {
+            host.audit_agent_authority_projection(agent, head, projected)
+        })
+    }
 }
 
 fn acquire_route_activation<'a>(

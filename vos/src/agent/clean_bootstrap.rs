@@ -21025,12 +21025,94 @@ mod tests {
                 descriptor.identity.agent
             );
             let retained_handle = ordinary_handle.clone();
+            let route_attachment = crate::agent::supervisor_adapters::shared_agent_supervisor_attachment_for_generation(
+                ordinary_handle.clone(),
+            ).unwrap();
+            let route_handle = route_attachment.handle();
+            assert!(route_handle.identities().unwrap().is_empty());
+            let ordinary_projection =
+                crate::agent::supervisor_adapters::AgentAuthorityRouteProjection::new(
+                    descriptor.replica_generation(),
+                    descriptor.clone(),
+                    Vec::new(),
+                )
+                .unwrap();
+            assert!(
+                route_handle
+                    .authorize_projection(
+                        placeholder_credential_projection().head,
+                        vec![ordinary_projection],
+                    )
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                route_handle
+                    .authorize_projection(placeholder_credential_projection().head, Vec::new(),)
+                    .is_err(),
+                "the complete selected generation must be present"
+            );
+            let foreign_projection =
+                crate::agent::supervisor_adapters::AgentAuthorityRouteProjection::new(
+                    owner.pins.descriptor.replica_generation(),
+                    owner.pins.descriptor.clone(),
+                    Vec::new(),
+                )
+                .unwrap();
+            assert!(
+                route_handle
+                    .authorize_projection(
+                        placeholder_credential_projection().head,
+                        vec![foreign_projection],
+                    )
+                    .is_err(),
+                "ordinary route cannot audit the system generation"
+            );
+            route_attachment.retire().unwrap();
+            assert!(route_handle.identities().is_err());
+            assert!(
+                retained_handle.projection().is_ok(),
+                "route retirement must not retire the shared network owner"
+            );
             let system_handle = owner
                 ._network_host
                 .supervisor_route_handle(system_agent)
                 .unwrap();
             let authority_actor = owner.pins.authority.issuer.actor;
             let material = system_handle.material(authority_actor).unwrap();
+            let system_projection = system_handle.projection().unwrap();
+            let mut falsely_ordinary = Vec::new();
+            for actor in system_projection.actors {
+                let physical = system_handle.material(actor.entry.actor).unwrap();
+                falsely_ordinary.push(crate::agent_sdk::authority::AuthorityActorProjection {
+                    agent: owner.pins.agent,
+                    entry: physical.actor.entry,
+                    producer: physical.producer,
+                    contract: physical.contract,
+                    requirements: physical.requirements,
+                    root_provenance: false,
+                    installation_id: physical.actor.installation_id,
+                    registry_reservation: physical.actor.registry_reservation,
+                    install_request: physical.install_request,
+                });
+            }
+            let falsely_ordinary =
+                crate::agent::supervisor_adapters::AgentAuthorityRouteProjection::new(
+                    system_projection.descriptor.replica_generation(),
+                    system_projection.descriptor,
+                    falsely_ordinary,
+                )
+                .unwrap();
+            assert!(
+                matches!(
+                    system_handle.audit(
+                        placeholder_credential_projection().head,
+                        &[falsely_ordinary]
+                    ),
+                    Err(SharedAgentHostError::ScopeMismatch),
+                ),
+                "system provenance cannot be stripped through an ordinary audit",
+            );
             let identity =
                 crate::agent::supervisor_adapters::physical_material_identity(&material).unwrap();
             assert_eq!(

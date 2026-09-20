@@ -3810,6 +3810,122 @@ impl CleanAgentRouteBackend for SharedAgentRouteBackend {
     }
 }
 
+/// One backend per exact ordinary generation, borrowing its network owner's
+/// lifecycle without retaining that owner after shutdown. The bounded
+/// supervisor executor supplies dispatch threads, as for ordinary Local Agents.
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+impl CleanAgentRouteBackend for crate::network::shared_agent::SharedAgentRouteHandle {
+    fn identities(&mut self) -> Result<Vec<AgentRouteIdentity>, AgentRouteError> {
+        let projection = self.projection().map_err(map_shared_host_error)?;
+        route_identities(
+            &projection.descriptor,
+            projection.actors,
+            AgentProfile::Shared,
+        )
+    }
+
+    fn invoke(
+        &mut self,
+        identity: AgentRouteIdentity,
+        request: AgentInvocationRequest,
+    ) -> Result<AgentInvocationResponse, AgentRouteError> {
+        if !request.execution.is_direct() {
+            return Err(AgentRouteError::Rejected);
+        }
+        let response_request = request.clone();
+        self.execute(
+            identity,
+            super::shared_journal_driver::CleanInvocationReplayRequest::Invoke {
+                context: RuntimeExecutionContext::Direct,
+                work: request.work,
+                authorization: request.authorization,
+            },
+        )
+        .map(|outcome| AgentInvocationResponse::direct(&response_request, outcome))
+        .map_err(map_shared_host_error)
+    }
+
+    fn resume(
+        &mut self,
+        identity: AgentRouteIdentity,
+        request: AgentResumeRequest,
+    ) -> Result<AgentResumeResponse, AgentRouteError> {
+        if !request.execution().is_direct() {
+            return Err(AgentRouteError::Rejected);
+        }
+        let response_request = request.clone();
+        self.execute(
+            identity,
+            super::shared_journal_driver::CleanInvocationReplayRequest::Resume {
+                context: RuntimeExecutionContext::Direct,
+                work: request.invocation.work,
+                authorization: request.invocation.authorization,
+                yielded: request.yielded,
+            },
+        )
+        .map(|outcome| AgentResumeResponse::direct(&response_request, outcome))
+        .map_err(map_shared_host_error)
+    }
+
+    fn acknowledge(
+        &mut self,
+        identity: AgentRouteIdentity,
+        request: AgentAcknowledgementRequest,
+    ) -> Result<AgentAcknowledgementResponse, AgentRouteError> {
+        if !request.execution().is_direct() {
+            return Err(AgentRouteError::Rejected);
+        }
+        let response_request = request.clone();
+        self.execute(
+            identity,
+            super::shared_journal_driver::CleanInvocationReplayRequest::Acknowledge {
+                work: request.invocation.work,
+                authorization: request.invocation.authorization,
+            },
+        )
+        .map(|outcome| AgentAcknowledgementResponse::new(&response_request, outcome))
+        .map_err(map_shared_host_error)
+    }
+
+    fn prepare(
+        &mut self,
+        identity: AgentRouteIdentity,
+    ) -> Result<super::invocation_preparation::PhysicalInvocationMaterial, AgentRouteError> {
+        let material = self
+            .material(identity.key().actor())
+            .map_err(map_shared_host_error)?;
+        if material.descriptor.identity.space != identity.key().space()
+            || material.descriptor.identity.agent != identity.key().agent()
+        {
+            return Err(AgentRouteError::Rejected);
+        }
+        Ok(material)
+    }
+
+    fn authorize_projection(
+        &mut self,
+        head: AuthorityProjectionHead,
+        projection: &[AgentAuthorityRouteProjection],
+    ) -> Result<Vec<AgentRouteIdentity>, AgentRouteError> {
+        match self.audit(head, projection) {
+            Ok(super::shared_host::SharedAuthorityProjectionAudit::Ready(identities)) => {
+                Ok(identities)
+            }
+            Ok(super::shared_host::SharedAuthorityProjectionAudit::Lag) => {
+                Err(AgentRouteError::NotReady)
+            }
+            Err(error) => Err(map_shared_projection_error(error)),
+        }
+    }
+}
+
+#[cfg(all(feature = "storage", feature = "network", target_os = "linux"))]
+pub(crate) fn shared_agent_supervisor_attachment_for_generation(
+    handle: crate::network::shared_agent::SharedAgentRouteHandle,
+) -> Result<AgentRouteHostAttachment, AgentRouteAdapterError> {
+    inline_backend(handle)
+}
+
 /// Move the complete live Shared-network owner into one bounded supervisor
 /// worker. Its existing `Drop` retires exact network routes and joins Raft,
 /// apply, and Merge workers before this attachment can finish joining.
