@@ -5184,6 +5184,9 @@ pub(crate) mod tests {
         use crate::agent_sdk::{ManagementReply, ManagementRequest, RuntimeOutcome, RuntimeTransition, RuntimeWork};
         let candidate = std::fs::read(std::env::var_os("VOS_AGENT_RUNTIME_COST_CANDIDATE")
             .expect("set an explicitly rebuilt candidate PVM")).unwrap();
+        let baseline = std::env::var_os("VOS_AGENT_RUNTIME_COST_BASELINE")
+            .map(|path| std::fs::read(path).unwrap())
+            .unwrap_or_else(|| include_bytes!("../../../vosx/blobs/agent_runtime.pvm").to_vec());
         let template = clean_sparse_standard_state();
         let descriptor = template.clean_descriptor.as_ref().unwrap();
         for count in [1, 32, 128, 512] {
@@ -5233,7 +5236,7 @@ pub(crate) mod tests {
             let expected = expected.encode().unwrap();
             let mut baseline_gas = None;
             for (label, program) in [
-                ("bundled", include_bytes!("../../../vosx/blobs/agent_runtime.pvm").as_slice()),
+                ("baseline", baseline.as_slice()),
                 ("candidate", candidate.as_slice()),
             ] {
                 let start = std::time::Instant::now();

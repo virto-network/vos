@@ -96,8 +96,8 @@ gas falls from 403,857,168 to 401,982,082 for fresh invocation, 344,973,012 to
 approximately 793 KiB fixtures. This modest reduction does not solve lifecycle
 latency. Candidate ProgramId:
 `d1569e3fbbbd01da0c6fc98be51129202ecee235a9c46500be36bf967380e76f`.
-Logs/candidate are under the shared target's `task-tmp`; bundled artifacts and
-the reviewer branch remain unchanged. Remaining work is reduced full-state and
+Logs/candidate are under the shared target's `task-tmp`; those measurements
+preceded the bundled update below. Remaining work is reduced full-state and
 projection execution cost, followed by artifact reproduction and qualification.
 
 Source commit `1ef5f703` replaces three quadratic restoration operations:
@@ -113,7 +113,7 @@ rejections (`indexed-restore-standard-final.log`). All 108 wire tests pass
 The small-directory physical fixtures retain exact outputs and lower gas than
 the bundled baseline, but use slightly more gas than `17fb38e9` due to indexing
 overhead. This removes specific quadratic operations, not whole-state execution.
-Bundled artifacts and the reviewer branch are still unchanged.
+The reviewer branch still contains the older bundled runtime.
 
 An opt-in physical scaling regression now compares that candidate against the
 bundled guest for a one-entry directory inspection, requiring exact output and
@@ -134,6 +134,29 @@ Run `agent::wire::tests::physical_directory_inspection_scaling` with
 `--ignored --exact --nocapture` and `VOS_AGENT_RUNTIME_COST_CANDIDATE` pointing to
 the rebuilt candidate PVM. The environment variable is required intentionally;
 the test must not silently substitute bundled bytes for the candidate.
+After repinning, set `VOS_AGENT_RUNTIME_COST_BASELINE` to the preserved older
+PVM; otherwise the baseline defaults to the current bundled artifact.
+
+The optimized runtime is now bundled on the implementation branch, with source
+revision `63d524251f71e2ea5431baadca190a9d4ede24f0`. The r18 ABI and both system
+actor templates are unchanged. Candidate Local recovery passes all 21 tests
+(`indexed-restore-local-recovery.log`). A clean exported source rebuild matches
+both ELF and PVM bytes (`indexed-runtime-reproduction.Aa9Ag6` under shared
+`task-tmp`). The standard pinned-builder verifier independently passes
+(`indexed-runtime-reproduction-verifier.log`; implementation evidence directory
+`target/agent-release-reproduction/run.S0FT3e`). ELF BLAKE2b-256:
+`7b8c0cd78b3cdeede173d1b51da89f25e22b123c79dfeffa76696686db76021b`;
+PVM BLAKE2b-256:
+`910978ba494fca8d7728d76743f340c36cd6558c0096bca539f9df2662a4bb01`.
+Bundled qualification passes 21 Local recovery tests (`indexed-bundled-local.log`),
+108 wire tests (five ignored, `indexed-bundled-wire.log`), four CLI admission
+tests (`indexed-bundled-admission.log`), and the explicit physical scaling test
+against preserved pre-update bytes (`indexed-bundled-scaling.log`). The current
+CLI creates and verifies the release bundle under
+`indexed-runtime-reproduction.Aa9Ag6/bundle`. Its SHA-256 is
+`a17265ab927daf90c345e5119a15d0b5759401e7e896cd8b5073a2cb442dcc41`.
+This is not a new release or a reviewer-branch advance. Next qualify fresh-space
+lifecycle with this exact binary; whole-state/projection costs remain open.
 
 Review-checkpoint (`16adf95e`) debug diagnostic: readiness 27s, Create/resume 54s, Install 65s, restart
 37s, both shutdowns under one measured second. These are not production capacity

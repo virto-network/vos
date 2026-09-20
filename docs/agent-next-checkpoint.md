@@ -10,8 +10,10 @@ at `a1ebce16`, artifact reproduction at `f9c362cb`; the subsequent envelope fix
 passes the disposable debug-binary lifecycle campaign. The unchanged readiness
 gate still fails. Review `saga/agents`, not the older `1b977731` checkpoint.
 
-The next work is synchronous node reconciliation and its repeated full-execution
-costs, with explicit freshness, ordering, recovery and performance acceptance.
+Implementation-only work has isolated node reconciliation on a bounded control
+worker and reduced restoration costs. See current status for source revisions,
+candidate and bundled artifact qualification, and the remaining repeated
+full-execution costs. Preserve freshness, ordering and recovery acceptance.
 
 Use [the recovery contract and evidence](agent-recovery-contract.md) for this
 batch, then [the review guide](agent-saga-review.md) for handoff. Do not expand
