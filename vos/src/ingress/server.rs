@@ -34,6 +34,22 @@ fn default_max_connections() -> usize {
 
 const MAX_BLOCKING_REQUESTS: usize = 64;
 
+// Package envelopes can be much larger than ordinary request bodies. Bound
+// them across listeners before buffering, and retain admission through decode
+// and execution even if the HTTP connection is cancelled.
+static LIFECYCLE_UPLOADS: Semaphore = Semaphore::const_new(2);
+
+fn admit_lifecycle_upload(
+    maximum_body: usize,
+    budget: &Semaphore,
+) -> Result<Option<tokio::sync::SemaphorePermit<'_>>, tokio::sync::TryAcquireError> {
+    if maximum_body > MAX_BODY_BYTES {
+        budget.try_acquire().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HttpTlsConfig {
     pub cert: PathBuf,
@@ -185,10 +201,34 @@ async fn handle_request(
     blocking: Arc<Semaphore>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let path = request.uri().path().to_string();
+    let maximum_body = super::limits::request_body_limit(request.method(), request.uri());
+    let upload_permit = match admit_lifecycle_upload(maximum_body, &LIFECYCLE_UPLOADS) {
+        Ok(permit) => permit,
+        Err(_) => {
+            inner.metrics.record_response(503);
+            return Ok(simple(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "lifecycle upload capacity is busy",
+            ));
+        }
+    };
+    if request
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > maximum_body as u64)
+    {
+        inner.metrics.record_response(413);
+        return Ok(simple(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body too large",
+        ));
+    }
     let (parts, body) = request.into_parts();
     let body = match tokio::time::timeout(
         Duration::from_secs(30),
-        Limited::new(body, MAX_BODY_BYTES).collect(),
+        Limited::new(body, maximum_body).collect(),
     )
     .await
     {
@@ -251,6 +291,7 @@ async fn handle_request(
         let work_inner = inner.clone();
         match tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            let _upload_permit = upload_permit;
             #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
             if request.uri().path() == "/__agents/credential" {
                 return handle_clean_credential(&request, &handle);
@@ -398,7 +439,7 @@ fn handle_local_create(
     handle: &IngressHandle,
 ) -> super::types::Response {
     use super::types::{text, with_content_type};
-    if request.body().len() > MAX_BODY_BYTES {
+    if request.body().len() > crate::agent::local_lifecycle::LocalCreateSubmission::MAX_BYTES {
         return text(413, "request body too large");
     }
     use crate::agent::local_lifecycle::{LocalCreateSubmission, LocalLifecycleIngressError};
@@ -622,7 +663,7 @@ fn handle_local_install(
     use super::types::{text, with_content_type};
     use crate::agent::local_lifecycle::{LocalInstallSubmission, LocalLifecycleIngressError};
     use crate::agent::sdk::wire::CanonicalWire as _;
-    if request.body().len() > MAX_BODY_BYTES {
+    if request.body().len() > LocalInstallSubmission::MAX_BYTES {
         return text(413, "request body too large");
     }
     if request.method() != http::Method::POST {
@@ -1027,7 +1068,7 @@ mod tests {
                 "POST",
                 "/__agents/local",
                 "application/octet-stream",
-                vec![0; MAX_BODY_BYTES + 1],
+                vec![0; crate::agent::local_lifecycle::LocalCreateSubmission::MAX_BYTES + 1],
                 413,
             ),
         ] {
@@ -1085,9 +1126,67 @@ mod tests {
     }
     use std::io::{Read, Write};
 
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    #[test]
+    fn lifecycle_package_bodies_above_default_limit_still_require_valid_signatures() {
+        let node = crate::node::VosNode::new();
+        let handle = node.ingress_handle();
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/__agents/local")
+            .header(http::header::CONTENT_TYPE, "application/octet-stream")
+            .body(vec![0; MAX_BODY_BYTES + 1])
+            .unwrap();
+        assert_eq!(handle_local_create(&request, &handle).status().as_u16(), 400);
+        assert_eq!(handle_local_install(&request, &handle).status().as_u16(), 400);
+        assert_eq!(handle_clean_invocation(&request, &handle).status().as_u16(), 413);
+    }
+
     use super::*;
     use crate::node::VosNode;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[test]
+    fn lifecycle_upload_admission_is_bounded_and_released_without_blocking_small_bodies() {
+        let budget = Semaphore::new(2);
+        let first = admit_lifecycle_upload(MAX_BODY_BYTES + 1, &budget).unwrap();
+        let second = admit_lifecycle_upload(MAX_BODY_BYTES + 1, &budget).unwrap();
+        assert!(admit_lifecycle_upload(MAX_BODY_BYTES + 1, &budget).is_err());
+        assert!(admit_lifecycle_upload(MAX_BODY_BYTES, &budget).unwrap().is_none());
+        drop(first);
+        let replacement = admit_lifecycle_upload(MAX_BODY_BYTES + 1, &budget).unwrap();
+        drop((second, replacement));
+        assert_eq!(budget.available_permits(), 2);
+    }
+
+    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_buffers_package_envelopes_but_keeps_other_routes_at_default_limit() {
+        let node = VosNode::new();
+        for (path, expected) in [
+            ("/__agents/local", "HTTP/1.1 400"),
+            ("/__agents/local/install", "HTTP/1.1 400"),
+            ("/__agents/local/", "HTTP/1.1 413"),
+            ("/__agents/invoke", "HTTP/1.1 413"),
+        ] {
+            let (mut client, server) = tokio::io::duplex(2 * MAX_BODY_BYTES);
+            let serving = tokio::spawn(serve_connection(
+                server, node.ingress_handle(), Arc::new(Inner::new(0)),
+                Arc::new(Semaphore::new(2)),
+            ));
+            let body = vec![0; MAX_BODY_BYTES + 1];
+            let headers = format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            client.write_all(headers.as_bytes()).await.unwrap();
+            if expected.ends_with("400") {
+                client.write_all(&body).await.unwrap();
+            }
+            let mut response = String::new();
+            tokio::time::timeout(Duration::from_secs(5), client.read_to_string(&mut response))
+                .await.unwrap().unwrap();
+            assert!(response.starts_with(expected), "{path}: {response}");
+            serving.await.unwrap();
+        }
+    }
 
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
     #[test]

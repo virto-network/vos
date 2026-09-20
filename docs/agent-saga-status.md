@@ -5,15 +5,17 @@ documents are navigation or evidence, not competing plans. Updated 2026-09-20.
 
 ## Branches and qualification
 
-- Reviewer branch: `saga/agents`, checkpoint `1b977731`.
+- Reviewer branch: `saga/agents`, advanced to this integrated review checkpoint
+  from `1b977731`; resolve the exact tip with Git.
 - Implementation: `wip/ch08-runtime-directory`, recovery source `a1ebce16`,
-  followed by this artifact/test-workflow and documentation checkpoint.
+  followed by artifact checkpoint `f9c362cb` and the lifecycle-envelope fix.
 - Master is unchanged; nothing has been pushed.
 - Neither current branch is production-qualified. The full Agent Architecture
   Saga remains the objective; these checkpoints do not narrow it.
 - Bundled artifacts and pins match the r18 source; independent reproduction and
   all 21 bundled Local host tests and CLI bundle verification pass. Disposable
-  current-binary startup/lifecycle qualification remains pending.
+  debug-binary bootstrap, HTTP/SSH, Create/resume, Install and restart pass;
+  the ten-second readiness gate still fails. This is a review checkpoint only.
   Source tests and older preserved releases do not qualify a deployable binary.
 
 Resolve branch tips with Git before review; these identifiers describe this
@@ -46,13 +48,23 @@ Exact logs and limitations: [recovery contract](agent-recovery-contract.md).
 1. Artifact reproduction and repinning are complete: the runtime and both system
    templates rebuild byte-for-byte from immutable r18 source. The 21 bundled Local,
    four package-admission, 18 release-package and three local-config tests pass.
-2. Finish disposable current-binary startup/lifecycle gates; bundle verification passes.
-   Keep failures visible; do not waive them or substitute native execution.
-3. Refresh the reviewer handoff and fast-forward `saga/agents` only after that
-   integrated checkpoint is qualified. The reviewer reports findings; fixes
-   remain on the implementation branch.
-4. Continue the remaining saga gates below. Prioritize synchronous node
-   reconciliation and measured end-to-end performance after recovery/artifacts.
+2. The physical lifecycle probe exposed and verified a fix for stale 1 MiB
+   retained-request/HTTP limits. Package endpoints now use protocol bounds with
+   two process-wide upload permits; ordinary HTTP limits are unchanged. All 52
+   HTTP tests and 105 clean CLI tests pass (one opt-in daemon test remains ignored).
+3. Review this integrated recovery/artifact/envelope checkpoint using the
+   [review guide](agent-saga-review.md). The reviewer reports findings; fixes
+   remain on the implementation branch. No production sign-off is implied.
+4. Next: isolate synchronous node reconciliation and reduce its repeated full
+   invocation/acknowledgement costs without weakening freshness or ordering.
+   Qualify the resulting binary with latency, independent-Agent isolation and
+   recovery tests. Continue the remaining full-saga gates below.
+
+Current debug diagnostic: readiness 27s, Create/resume 54s, Install 65s, restart
+37s, both shutdowns under one measured second. These are not production capacity
+benchmarks; the unchanged 10s readiness test fails. Invocation, optimized release
+performance and multi-profile acceptance are not qualified by this campaign.
+Exact evidence: [recovery contract](agent-recovery-contract.md).
 
 ## Remaining full-saga acceptance gates
 

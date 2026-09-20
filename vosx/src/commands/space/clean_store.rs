@@ -369,8 +369,8 @@ impl StoreRole {
             Self::OrdinaryGenesisPublicationReply => vos::agent::clean_authority_issuer::MAX_CLEAN_GENESIS_PUBLICATION_REPLY_IMAGE_BYTES,
             Self::ManagementIntent => MAX_CLEAN_MANAGEMENT_INTENT_IMAGE_BYTES,
             Self::LifecycleIssuer => MAX_CLEAN_MANAGEMENT_ISSUER_IMAGE_BYTES,
-            Self::LocalCreateRequest => 1024 * 1024,
-            Self::LocalInstallRequest => 1024 * 1024,
+            Self::LocalCreateRequest => vos::agent::local_lifecycle::LocalCreateSubmission::MAX_BYTES,
+            Self::LocalInstallRequest => vos::agent::local_lifecycle::LocalInstallSubmission::MAX_BYTES,
             Self::InvocationRequest => super::local_invocation::MAX_REQUEST_BYTES,
             Self::InvocationResponse => super::local_invocation::MAX_RESPONSE_BYTES,
             Self::InvocationProgress => super::invocation_progress::MAX_PROGRESS_BYTES,
@@ -3487,6 +3487,8 @@ pub(crate) mod tests {
         let fixture = Fixture::new("local-request");
         let first = local_request(2);
         let second = local_request(3);
+        assert_eq!(StoreRole::LocalCreateRequest.maximum_bytes(), vos::agent::local_lifecycle::LocalCreateSubmission::MAX_BYTES);
+        assert_eq!(StoreRole::LocalInstallRequest.maximum_bytes(), vos::agent::local_lifecycle::LocalInstallSubmission::MAX_BYTES);
         let mut store = CleanLocalCreateRequestFile::open_or_create(&fixture.root).unwrap();
         assert!(store.load().unwrap().is_none());
         assert!(matches!(

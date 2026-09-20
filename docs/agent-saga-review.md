@@ -1,9 +1,10 @@
 # Agent saga: review guide
 
 [Current status](agent-saga-status.md) is authoritative for remaining work.
-Review the actual `saga/agents` tip; at this handoff it is `1b977731`.
-The r18 recovery source at `a1ebce16` is on the implementation branch and must
-not be treated as an already-qualified review checkpoint.
+Review the actual `saga/agents` tip, advanced from `1b977731` for this handoff.
+It includes recovery source `a1ebce16`, reproducible r18 artifacts `f9c362cb`,
+and the lifecycle-envelope fix. This is a qualified scoped review checkpoint,
+not a production-qualified release.
 
 Keep two consolidated review groups:
 
@@ -12,11 +13,13 @@ Keep two consolidated review groups:
    retirement, refresh, shutdown and error recovery.
 2. Runtime-independent state access and recovery: targeted lookup, directory
    snapshot reuse, pinned ownership, catalog scan boundaries, public history
-   projection and exact guest/host recovery agreement.
+   projection, exact guest/host recovery agreement, reproducible bundled bytes,
+   durable package-bearing requests and bounded HTTP upload admission.
 
 Useful fixed deltas: `29a745c2..1b977731` covers the reviewed execution work;
-`1b977731..a1ebce16` covers the newer recovery source. The latter still needs
-artifact qualification before advancing the review branch. Earlier Shared and
+`1b977731..saga/agents` is the new integrated review delta. In particular, review
+the two-per-process upload admission lifetime across HTTP cancellation, exact
+endpoint body ceilings, and unchanged ordinary-body limits. Earlier Shared and
 row-state work inherited through `29a745c2` remains subject to the full-saga
 acceptance gates; these review groups do not retroactively qualify it.
 
@@ -24,6 +27,11 @@ Read [the execution checkpoint evidence](agent-execution-checkpoint-review.md)
 and [the recovery contract](agent-recovery-contract.md). Distinguish measured
 coordination from throughput, source tests from bundled-binary behavior, and
 historical release results from current qualification.
+
+The latest debug campaign passes bootstrap, HTTP/SSH, retained Create/resume,
+Counter Install and restart/shutdown. It does not rerun application invocation.
+Readiness remains 27–37s and lifecycle operations 54–65s: unacceptable latency,
+not a throughput benchmark. The ten-second test has not been relaxed or ignored.
 
 Review read-only: no fixes, formatting, branch movement, commits or pushes.
 Return severity, exact commit/file/line, violated invariant, concrete scenario,

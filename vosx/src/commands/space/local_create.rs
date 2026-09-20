@@ -891,7 +891,7 @@ pub(crate) mod tests {
         .unwrap()
         .encode();
         assert_eq!(first, repeated);
-        assert!(first.len() <= 1024 * 1024);
+        assert!(first.len() <= LocalCreateSubmission::MAX_BYTES);
         let (_, call, _) = LocalCreateSubmission::decode(&first).unwrap().into_parts();
         assert_eq!(call.authenticated_node, None);
         assert_eq!(call.request_sequence, sequence);

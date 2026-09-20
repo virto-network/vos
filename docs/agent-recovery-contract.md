@@ -1,11 +1,11 @@
 # Runtime-independent management recovery binding
 
-Status: source committed at `a1ebce16`, after review checkpoint `1b977731`.
+Status: source committed at `a1ebce16`, integrated after checkpoint `1b977731`.
 The original physical reopen regression, broader guest/host coverage and repaired
 scripted fixtures pass with rebuilt r18 guests. Bundled bytes and pins are updated
 in the implementation worktree; independent reproduction and all 21 bundled Local
-tests pass. CLI bundle verification also passes; disposable current-binary startup
-and lifecycle qualification remain pending. See [current status](agent-saga-status.md)
+tests pass. CLI bundle verification and the disposable debug-binary startup and
+lifecycle campaign pass, but the ten-second readiness gate fails. See [current status](agent-saga-status.md)
 for the authoritative plan and branch qualification.
 
 ## Cause and boundary
@@ -124,6 +124,35 @@ Preparation evidence (offline/locked, host `nightly-2025-05-09`): all 170 SDK
 tests and all three Local management-history tests pass. Logs are
 `recovery-commitment-sdk-full.log` and `recovery-commitment-host.log` under the
 shared target's `task-tmp`. Recovery source is committed on the implementation branch;
-the reviewer branch stays at `1b977731` until the integrated batch is ready.
+the reviewer branch includes the integrated batch described in the current status.
 Shared replay, Private control recovery and broader release acceptance retain
 their own existing gates; this Local recovery fix cannot qualify them by proxy.
+
+## Physical lifecycle qualification and envelope regression
+
+The first physical Create with r18 hit `CleanFileStoreError::Oversized`: its signed
+runtime envelope outgrew independent 1 MiB client-store and HTTP body ceilings.
+The fix binds Create/Install storage and exact POST routes to their protocol
+envelope bounds. Ordinary routes retain 1 MiB; two process-wide upload permits
+bound buffering and execution, including detached blocking work after HTTP
+cancellation. Declared oversized bodies are rejected before buffering and streamed
+bodies remain bounded. No signature, canonical decoding or Authority check is waived.
+
+Evidence under the shared target's `task-tmp`:
+
+- `r18-http-tests.log`: 52 pass, with `http-ingress` explicitly enabled.
+- `r18-clean-cli-network.log`: 105 pass, one existing opt-in daemon test ignored.
+- `r18-local-request-tests.log`: three durable/recovery request tests pass.
+- `r18-create-envelope-test.log`: bundled signed submission regression passes.
+- `r18-static-clean-break.log`: retained CLI/negative-surface check passes.
+- `recovery-shutdown-network.log`: unchanged ten-second readiness test fails;
+  the test now isolates its blob cache as well as data and configuration.
+
+`r18-lifecycle.1BKWxo/probe-fixed.log` records debug binary SHA-256
+`a4da3b143c298bbe4003f48963173cd4ba2184e615212b757997d488db30f25b`:
+reopen/readiness 27s, exact pending Create resumed successfully in 54s, fresh Counter
+Install in 65s, restart/recovery in 37s, both clean shutdowns under one measured
+second. HTTP status and SSH host-key exchange pass. The original failed request
+and logs remain in that directory; no operation identity or store was replaced.
+This is functional evidence only: invocation was not repeated, the binary is not
+optimized, and startup/operation latency remains unsuitable for production.

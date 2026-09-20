@@ -72,12 +72,14 @@ impl Drop for TempDir {
 fn space_up_exits_cleanly_on_sigterm() {
     let data_home = TempDir::new("data");
     let config_home = TempDir::new("config");
+    let cache_home = TempDir::new("cache");
     let space_name = "shutdown-smoke";
 
     let created = Command::new(vosx_bin())
         .args(["space", "new", space_name, "--format", "json"])
         .env("XDG_DATA_HOME", data_home.path())
         .env("XDG_CONFIG_HOME", config_home.path())
+        .env("XDG_CACHE_HOME", cache_home.path())
         .env("VOSX_DISABLE_MDNS", "1")
         .output()
         .expect("create space");
@@ -106,6 +108,7 @@ fn space_up_exits_cleanly_on_sigterm() {
             .args(["space", "up", space_name])
             .env("XDG_DATA_HOME", data_home.path())
             .env("XDG_CONFIG_HOME", config_home.path())
+            .env("XDG_CACHE_HOME", cache_home.path())
             .env("VOSX_DISABLE_MDNS", "1")
             .stdout(Stdio::null())
             .stderr(log_file)

@@ -4,12 +4,14 @@ Follow [current status](agent-saga-status.md), the single authoritative plan and
 acceptance-gate index. Do not use chronological notes from older commits as
 current instructions.
 
-The active batch is **runtime-independent recovery plus r18 artifact
-qualification**. Recovery source is committed at `a1ebce16`; its physical
-regression and complete Local suite pass, including the repinned bundled runtime.
-Immutable-source artifact reproduction also passes; disposable current-binary
-startup/lifecycle qualification remains unfinished. The reviewer branch stays at
-`1b977731` until the integrated batch is ready.
+The integrated review batch is **runtime-independent recovery, reproducible r18
+artifacts and bounded lifecycle package envelopes**. Recovery source is committed
+at `a1ebce16`, artifact reproduction at `f9c362cb`; the subsequent envelope fix
+passes the disposable debug-binary lifecycle campaign. The unchanged readiness
+gate still fails. Review `saga/agents`, not the older `1b977731` checkpoint.
+
+The next work is synchronous node reconciliation and its repeated full-execution
+costs, with explicit freshness, ordering, recovery and performance acceptance.
 
 Use [the recovery contract and evidence](agent-recovery-contract.md) for this
 batch, then [the review guide](agent-saga-review.md) for handoff. Do not expand

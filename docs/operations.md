@@ -40,6 +40,12 @@ operation. Server retention is bounded: a retired historical Create may return
 409 after Install; inspect retained signed evidence rather than assuming the
 original Create failed. Do not copy host stores to another path to test recovery.
 
+Local Create/Install carry signed packages, so their exact POST endpoints use
+the bounded lifecycle-envelope size limit rather than the ordinary 1 MiB HTTP
+body limit. At most two package uploads are admitted process-wide, from body
+buffering through execution. Capacity exhaustion returns 503; preserve the
+retained request and resume it rather than allocating a new operation identity.
+
 ## Backup and restore
 
 Stop the daemon before backup:

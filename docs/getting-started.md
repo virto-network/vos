@@ -67,7 +67,9 @@ vosx space install-local-actor demo AGENT_HEX dist/counter.vos --name counter
 Counter requires no constructor input. Other packages may require exact encoded
 `--constructor-data`; arbitrary text or JSON is not a substitute. Installation
 must report a verified acknowledgement before being treated as complete.
-Current-release observations are Create38s and Install45s, not a latency promise.
+Earlier checkpoints recorded multi-second Create and Install operations; those
+historical timings do not qualify the current binary. Consult the
+[current evidence](agent-saga-status.md) for the tested revision and open latency gates.
 
 Do not issue a new operation to retry an uncertain result. Preserve the client
 request stores and use the command's `--resume` option with the same coordinates.
