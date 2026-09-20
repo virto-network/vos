@@ -21011,8 +21011,54 @@ mod tests {
                 Ok(crate::agent::shared_host::SharedAuthorityProjectionAudit::Ready(identities))
                     if identities.len() == 2
             ));
+            let ordinary_handle = owner
+                ._network_host
+                .supervisor_route_handle(locator.agent)
+                .unwrap();
+            assert_eq!(
+                ordinary_handle
+                    .projection()
+                    .unwrap()
+                    .descriptor
+                    .identity
+                    .agent,
+                descriptor.identity.agent
+            );
+            let retained_handle = ordinary_handle.clone();
+            let system_handle = owner
+                ._network_host
+                .supervisor_route_handle(system_agent)
+                .unwrap();
+            let authority_actor = owner.pins.authority.issuer.actor;
+            let material = system_handle.material(authority_actor).unwrap();
+            let identity =
+                crate::agent::supervisor_adapters::physical_material_identity(&material).unwrap();
+            assert_eq!(
+                ordinary_handle.execute(
+                    identity,
+                    crate::agent::shared_journal_driver::CleanInvocationReplayRequest::Invoke {
+                        context: RuntimeExecutionContext::Direct,
+                        work: (**published_work).clone(),
+                        authorization: (**published_auth).clone(),
+                    },
+                ),
+                Err(SharedAgentHostError::ScopeMismatch),
+            );
+            let weak_host = Arc::downgrade(&owner.host);
             harness.owner = Some(owner);
             harness.stop();
+            assert!(
+                weak_host.upgrade().is_none(),
+                "closed route handles must not retain the physical host"
+            );
+            assert!(matches!(
+                retained_handle.projection(),
+                Err(SharedAgentHostError::TransportNotAttached)
+            ));
+            assert!(matches!(
+                system_handle.material(authority_actor),
+                Err(SharedAgentHostError::TransportNotAttached)
+            ));
         }
 
         #[test]

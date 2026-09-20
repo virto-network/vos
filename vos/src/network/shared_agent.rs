@@ -2306,6 +2306,123 @@ struct AttachedGeneration {
     lifecycle: Arc<RwLock<bool>>,
 }
 
+struct SharedGenerationAccess<'a> {
+    coordinator: &'a SharedRouteHandler,
+    fingerprint: &'a AttachmentFingerprint,
+    stale: &'a AtomicBool,
+}
+
+/// Non-owning, exact-generation access for an ordinary supervisor route.
+/// Closed handles cannot retain the physical host or network worker. Each
+/// operation upgrades the coordinator and takes its generation lifecycle lease.
+#[derive(Clone)]
+pub(crate) struct SharedAgentRouteHandle {
+    coordinator: std::sync::Weak<SharedRouteHandler>,
+    fingerprint: AttachmentFingerprint,
+    stale: Arc<AtomicBool>,
+}
+
+impl SharedAgentRouteHandle {
+    fn with_generation<T>(
+        &self,
+        operation: impl FnOnce(
+            &SharedAgentHost,
+            crate::service::AgentId,
+            &crate::agent::shared_host::SharedAgentAttachmentStatus,
+        ) -> Result<T, SharedAgentHostError>,
+    ) -> Result<T, SharedAgentHostError> {
+        let coordinator = self
+            .coordinator
+            .upgrade()
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        let live = coordinator
+            .lifecycle
+            .read()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        if !*live || self.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        let host = coordinator
+            .host
+            .lock()
+            .map_err(|_| SharedAgentHostError::Unavailable)?;
+        let status = host
+            .supervisor_attachment_status(coordinator.agent)?
+            .ok_or(SharedAgentHostError::AgentNotFound)?;
+        if status.transport != SharedAgentTransportState::Attached
+            || AttachmentFingerprint::from_attachment_status(&status)? != self.fingerprint
+        {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        let result = operation(&host, coordinator.agent, &status)?;
+        if self.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn projection(&self) -> Result<SharedAgentRuntimeProjection, SharedAgentHostError> {
+        self.with_generation(|host, agent, status| {
+            let projection = host.clean_runtime_projection(agent)?;
+            if !projection_matches_attachment_status(&projection, status) {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            Ok(projection)
+        })
+    }
+
+    pub(crate) fn material(
+        &self,
+        actor: vos_agent_sdk::ActorId,
+    ) -> Result<
+        crate::agent::invocation_preparation::PhysicalInvocationMaterial,
+        SharedAgentHostError,
+    > {
+        self.with_generation(|host, agent, status| {
+            let material = host.supervisor_invocation_material(agent, actor)?;
+            let projection = SharedAgentRuntimeProjection {
+                descriptor: material.descriptor.clone(),
+                actors: vec![material.actor.clone()],
+            };
+            if !projection_matches_attachment_status(&projection, status) {
+                return Err(SharedAgentHostError::ScopeMismatch);
+            }
+            Ok(material)
+        })
+    }
+
+    pub(crate) fn execute(
+        &self,
+        expected: crate::agent::supervisor::AgentRouteIdentity,
+        request: crate::agent::shared_journal_driver::CleanInvocationReplayRequest,
+    ) -> Result<RuntimeOutcome, SharedAgentHostError> {
+        use crate::agent::shared_journal_driver::CleanInvocationReplayRequest;
+        if matches!(
+            &request,
+            CleanInvocationReplayRequest::Invoke { context, .. }
+                | CleanInvocationReplayRequest::Resume { context, .. }
+                if !context.is_direct()
+        ) {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
+        let coordinator = self
+            .coordinator
+            .upgrade()
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        SharedAgentNetworkHost::execute_generation(
+            SharedGenerationAccess {
+                coordinator: &coordinator,
+                fingerprint: &self.fingerprint,
+                stale: &self.stale,
+            },
+            expected,
+            request,
+            false,
+            SupervisorAdmission::Ordinary,
+        )
+    }
+}
+
 fn acquire_route_activation<'a>(
     lifecycle: &'a RwLock<bool>,
     stale: &AtomicBool,
@@ -4116,6 +4233,24 @@ impl SharedAgentNetworkHost {
         self.supervisor_projections_scoped(Some(agent))
     }
 
+    pub(crate) fn supervisor_route_handle(
+        &self,
+        agent: crate::service::AgentId,
+    ) -> Result<SharedAgentRouteHandle, SharedAgentHostError> {
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        if attached.stale.load(Ordering::Acquire) {
+            return Err(SharedAgentHostError::TransportNotAttached);
+        }
+        Ok(SharedAgentRouteHandle {
+            coordinator: Arc::downgrade(&attached.coordinator),
+            fingerprint: attached.fingerprint.clone(),
+            stale: Arc::clone(&attached.stale),
+        })
+    }
+
     fn supervisor_projections_scoped(
         &mut self,
         only: Option<crate::service::AgentId>,
@@ -4540,6 +4675,31 @@ impl SharedAgentNetworkHost {
         terminal_only: bool,
         admission: SupervisorAdmission<'_>,
     ) -> Result<RuntimeOutcome, SharedAgentHostError> {
+        let agent = crate::service::AgentId(request.work().agent.0);
+        let attached = self
+            .generations
+            .get(&agent)
+            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        Self::execute_generation(
+            SharedGenerationAccess {
+                coordinator: &attached.coordinator,
+                fingerprint: &attached.fingerprint,
+                stale: &attached.stale,
+            },
+            expected,
+            request,
+            terminal_only,
+            admission,
+        )
+    }
+
+    fn execute_generation(
+        attached: SharedGenerationAccess<'_>,
+        expected: crate::agent::supervisor::AgentRouteIdentity,
+        request: crate::agent::shared_journal_driver::CleanInvocationReplayRequest,
+        terminal_only: bool,
+        admission: SupervisorAdmission<'_>,
+    ) -> Result<RuntimeOutcome, SharedAgentHostError> {
         let work = request.work();
         if matches!(
             admission,
@@ -4557,13 +4717,13 @@ impl SharedAgentNetworkHost {
         }
         let authorization = request.authorization();
         let agent = crate::service::AgentId(work.agent.0);
-        let attached = self
-            .generations
-            .get(&agent)
-            .ok_or(SharedAgentHostError::TransportNotAttached)?;
+        if agent != attached.coordinator.agent {
+            return Err(SharedAgentHostError::ScopeMismatch);
+        }
         // Keep the same lifecycle -> host order as the network route handler.
         // `retire` releases its host guard before requesting the write lease.
         let live = attached
+            .coordinator
             .lifecycle
             .read()
             .map_err(|_| SharedAgentHostError::Unavailable)?;
@@ -4571,7 +4731,8 @@ impl SharedAgentNetworkHost {
             return Err(SharedAgentHostError::TransportNotAttached);
         }
         {
-            let host = self
+            let host = attached
+                .coordinator
                 .host
                 .lock()
                 .map_err(|_| SharedAgentHostError::Unavailable)?;
@@ -4579,7 +4740,7 @@ impl SharedAgentNetworkHost {
                 .supervisor_attachment_status(agent)?
                 .ok_or(SharedAgentHostError::AgentNotFound)?;
             if status.transport != SharedAgentTransportState::Attached
-                || AttachmentFingerprint::from_attachment_status(&status)? != attached.fingerprint
+                || AttachmentFingerprint::from_attachment_status(&status)? != *attached.fingerprint
             {
                 return Err(SharedAgentHostError::TransportNotAttached);
             }
@@ -4679,21 +4840,27 @@ impl SharedAgentNetworkHost {
             InvocationScope::Ordered
                 if matches!(admission, SupervisorAdmission::ReservedProjection) =>
             {
-                self.invoke_reserved_clean_operation(agent, request, terminal_only)
+                attached
+                    .coordinator
+                    .submit_reserved_clean_ordered_operation(request, terminal_only)
                     .map(|submission| submission.outcome)
             }
-            InvocationScope::Ordered if terminal_only => self
-                .invoke_terminal_clean_operation(agent, request)
+            InvocationScope::Ordered if terminal_only => attached
+                .coordinator
+                .submit_terminal_clean_ordered_operation(request)
                 .map(|submission| submission.outcome),
-            InvocationScope::Ordered => self
-                .invoke_clean_operation(agent, request)
+            InvocationScope::Ordered => attached
+                .coordinator
+                .submit_clean_ordered_operation(request)
                 .map(|submission| submission.outcome),
-            InvocationScope::Merge => self
+            InvocationScope::Merge => attached
+                .coordinator
                 .host
                 .lock()
                 .map_err(|_| SharedAgentHostError::Unavailable)?
                 .apply_clean_merge_operation(agent, request),
-            InvocationScope::Local => self
+            InvocationScope::Local => attached
+                .coordinator
                 .host
                 .lock()
                 .map_err(|_| SharedAgentHostError::Unavailable)?
@@ -4701,28 +4868,8 @@ impl SharedAgentNetworkHost {
         }
     }
 
-    /// Submit an exact clean ordered invocation through the generation's
-    /// authenticated one-owner Raft proposer and synchronous apply path.
-    pub(crate) fn invoke_clean(
-        &self,
-        agent: crate::service::AgentId,
-        work: crate::agent_sdk::InvocationWork,
-        authorization: crate::agent_sdk::InvocationAuthorization,
-    ) -> Result<CleanOrderedSubmission, SharedAgentHostError> {
-        let attached = self
-            .generations
-            .get(&agent)
-            .ok_or(SharedAgentHostError::TransportNotAttached)?;
-        if attached.stale.load(Ordering::Acquire) {
-            return Err(SharedAgentHostError::TransportNotAttached);
-        }
-        attached
-            .coordinator
-            .submit_clean_ordered(work, authorization)
-    }
-
     /// Internal root bootstrap only; ordinary routed calls retain their exact
-    /// caller-supplied authorization and use `invoke_clean`.
+    /// caller-supplied authorization and use the supervisor execution path.
     pub(crate) fn invoke_bootstrap(
         &self,
         agent: crate::service::AgentId,
@@ -4748,56 +4895,6 @@ impl SharedAgentNetworkHost {
                 None,
                 InvocationClock::Bootstrap,
             )
-    }
-
-    fn invoke_clean_operation(
-        &self,
-        agent: crate::service::AgentId,
-        request: crate::agent::shared_journal_driver::CleanInvocationReplayRequest,
-    ) -> Result<CleanOrderedSubmission, SharedAgentHostError> {
-        let attached = self
-            .generations
-            .get(&agent)
-            .ok_or(SharedAgentHostError::TransportNotAttached)?;
-        if attached.stale.load(Ordering::Acquire) {
-            return Err(SharedAgentHostError::TransportNotAttached);
-        }
-        attached.coordinator.submit_clean_ordered_operation(request)
-    }
-
-    fn invoke_terminal_clean_operation(
-        &self,
-        agent: crate::service::AgentId,
-        request: crate::agent::shared_journal_driver::CleanInvocationReplayRequest,
-    ) -> Result<CleanOrderedSubmission, SharedAgentHostError> {
-        let attached = self
-            .generations
-            .get(&agent)
-            .ok_or(SharedAgentHostError::TransportNotAttached)?;
-        if attached.stale.load(Ordering::Acquire) {
-            return Err(SharedAgentHostError::TransportNotAttached);
-        }
-        attached
-            .coordinator
-            .submit_terminal_clean_ordered_operation(request)
-    }
-
-    fn invoke_reserved_clean_operation(
-        &self,
-        agent: crate::service::AgentId,
-        request: crate::agent::shared_journal_driver::CleanInvocationReplayRequest,
-        terminal_only: bool,
-    ) -> Result<CleanOrderedSubmission, SharedAgentHostError> {
-        let attached = self
-            .generations
-            .get(&agent)
-            .ok_or(SharedAgentHostError::TransportNotAttached)?;
-        if attached.stale.load(Ordering::Acquire) {
-            return Err(SharedAgentHostError::TransportNotAttached);
-        }
-        attached
-            .coordinator
-            .submit_reserved_clean_ordered_operation(request, terminal_only)
     }
 
     /// Submit an exact clean management request, including any deterministic
