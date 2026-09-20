@@ -1252,6 +1252,7 @@ impl RuntimePreparationCache {
 fn profile_refine_machines(
     context: RefineContext,
     input_bytes: usize,
+    work_tag: Option<u8>,
 ) -> vos_pvm::refine::Invocation {
     use vos_pvm::refine_host::{RefineMachineIdentity, RefineObservation};
     let index = |identity| usize::from(!matches!(identity, RefineMachineIdentity::Outer));
@@ -1291,7 +1292,7 @@ fn profile_refine_machines(
         _ => {}
     });
     eprintln!(
-        "refine_machine_profile input_bytes={input_bytes} gas_used={} outer_instructions={} inner_instructions={} outer_observed_us={} inner_observed_us={} host_calls={host_calls}",
+        "refine_machine_profile work_tag={work_tag:?} input_bytes={input_bytes} gas_used={} outer_instructions={} inner_instructions={} outer_observed_us={} inner_observed_us={} host_calls={host_calls}",
         result.gas_used, instructions[0], instructions[1], elapsed[0], elapsed[1]
     );
     assert_eq!(outer_pc_counts.iter().sum::<u64>(), instructions[0]);
@@ -3319,10 +3320,17 @@ impl<R: CatalogBlobResolver> StandardLocalReplayExecutor<R> {
             .load(runtime_pvm, input, gas)
             .map_err(|_| LocalReplayExecutorError::RuntimeOutput)?;
         #[cfg(test)]
-        let invocation = if input.len() > 700_000
+        let invocation = if (input.len() > 700_000
+            || std::env::var_os("VOS_AGENT_PROFILE_REFINE_ALL_INPUTS").is_some())
             && std::env::var_os("VOS_AGENT_PROFILE_REFINE_MACHINES").is_some()
         {
-            profile_refine_machines(context, input.len())
+            profile_refine_machines(
+                context,
+                input.len(),
+                input
+                    .get(4 + crate::agent_sdk::RUNTIME_ABI_ID.as_bytes().len())
+                    .copied(),
+            )
         } else {
             context.run()
         };
