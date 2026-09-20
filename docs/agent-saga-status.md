@@ -462,6 +462,16 @@ has an empty ordinary-Agent set; it does not establish nonempty published Shared
 startup. Formatting passes (`shared-borrowed-recovery-format.log`). The production
 controller and startup call sites remain to be connected and qualified.
 
+The CLI startup set can now extend operation/admin admission through the existing
+`include_shared_genesis` verifier for every reservation, and only then request
+deferred Shared opening. The admission borrows the entries and their leases;
+incomplete publication remains recovery work and is still rejected by the later
+published-record handoff. All 17 ordinary-genesis tests pass
+(`shared-startup-admission-tests.log`), including admission for a signed reservation,
+held lifecycle/committee leases, and refusal of a differently pinned Authority.
+This does not yet exercise pending executed Shared query/publication records through
+the CLI adapter, or connect it to the production controller/startup call site.
+
 1. Reviewer examines `7bd66a7d..saga/agents` read-only and returns findings.
    Apply fixes on latest implementation source; advance the reviewer branch only
    at qualified checkpoints. Do not mix reviewer edits with implementation work.

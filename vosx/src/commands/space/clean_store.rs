@@ -802,6 +802,26 @@ pub(crate) struct CleanSharedGenesisStartupEntry {
 }
 
 impl CleanSharedGenesisStartupEntry {
+    /// Extend operation/admin admission with every discovered Shared reservation.
+    /// The returned admission borrows the whole set, including archive leases.
+    /// Pending publication is admitted for recovery but cannot open a route.
+    pub(crate) fn startup_admission<'a>(
+        entries: &'a mut [Self],
+        mut admission: vos::agent::clean_bootstrap::NativeAuthorityOperationStartupAdmission<'a>,
+    ) -> Result<
+        vos::agent::clean_bootstrap::NativeAuthorityOperationStartupAdmission<'a>,
+        vos::agent::shared_host::SharedAgentHostError,
+    > {
+        use vos::agent::shared_host::{MAX_SHARED_HOST_AGENTS, SharedAgentHostError};
+        if entries.len() > MAX_SHARED_HOST_AGENTS {
+            return Err(SharedAgentHostError::CapacityExhausted);
+        }
+        for entry in entries {
+            admission = admission.include_shared_genesis(&mut entry.recovery)?;
+        }
+        Ok(admission.with_deferred_shared_genesis())
+    }
+
     /// Borrow the complete published set while retaining every archive lease.
     /// Incomplete publication is recoverable work, not an entry to filter out.
     /// The returned records remain untrusted until the root-pinned owner replays
@@ -5231,6 +5251,39 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(entries.len(), 1);
         assert!(entries[0].archive.is_none());
+        let mut operations = CleanNativeAuthorityOperationJournal::open_or_create(
+            fixture.parent.join("operations"),
+            authority,
+        )
+        .unwrap();
+        let admission = CleanSharedGenesisStartupEntry::startup_admission(
+            &mut entries,
+            operations.startup_admission().unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            lifecycle.open_existing(authority.space, descriptor.identity.agent),
+            Err(CleanFileStoreError::Busy)
+        ));
+        assert!(matches!(
+            committee.open_existing(locator),
+            Err(CleanFileStoreError::Busy)
+        ));
+        drop(admission);
+        let mut foreign_authority = authority;
+        foreign_authority.binding.policy.0[0] ^= 1;
+        let mut foreign_operations = CleanNativeAuthorityOperationJournal::open_or_create(
+            fixture.parent.join("foreign-operations"),
+            foreign_authority,
+        )
+        .unwrap();
+        assert!(matches!(
+            CleanSharedGenesisStartupEntry::startup_admission(
+                &mut entries,
+                foreign_operations.startup_admission().unwrap(),
+            ),
+            Err(vos::agent::shared_host::SharedAgentHostError::ScopeMismatch)
+        ));
         assert!(matches!(
             CleanSharedGenesisStartupEntry::published_recoveries(&mut entries),
             Err(vos::agent::shared_host::SharedAgentHostError::Unavailable)
