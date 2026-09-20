@@ -1787,20 +1787,25 @@ impl StandardAgentRuntime {
             (None, None) => {}
             _ => return Err(LifecycleError::InvalidRequest),
         }
-        let mut pending = state.actors;
+        // Preserve the prior first-ready ordering without repeatedly scanning
+        // and shifting the remaining forest. Each edge becomes ready once.
+        let mut ready = BTreeSet::new();
+        let mut children: BTreeMap<ActorId, Vec<usize>> = BTreeMap::new();
+        let mut pending: Vec<_> = state.actors.into_iter().map(Some).collect();
+        for (index, actor) in pending.iter().enumerate() {
+            match actor.as_ref().unwrap().record.entry.parent {
+                None => { ready.insert(index); }
+                Some(parent) => children.entry(parent).or_default().push(index),
+            }
+        }
+        let mut restored = 0;
+        let mut installation_ids = BTreeSet::new();
+        let mut artifact_usage = ArtifactResourceUsage::default();
+        let config = runtime.created()?;
+        artifact_usage.insert(&config.runtime_package, config.runtime_contract.resources)?;
         let mut suspended = Vec::new();
-        while !pending.is_empty() {
-            let Some(index) = pending.iter().position(|actor| {
-                actor.record.entry.parent.is_none()
-                    || actor
-                        .record
-                        .entry
-                        .parent
-                        .is_some_and(|parent| runtime.actors.contains_key(&parent))
-            }) else {
-                return Err(LifecycleError::InvalidRequest);
-            };
-            let StandardActorState { mut record, debt } = pending.remove(index);
+        while let Some(index) = ready.pop_first() {
+            let StandardActorState { mut record, debt } = pending[index].take().unwrap();
             if record.entry.suspended {
                 suspended.push((record.entry.actor, record.entry.deployment));
                 record.entry.suspended = false;
@@ -1858,10 +1863,7 @@ impl StandardAgentRuntime {
                 )
                 || record.state_layout == Hash::ZERO
                 || runtime.expected_actor_id(&record.entry) != actor_id
-                || runtime
-                    .actors
-                    .values()
-                    .any(|actor| actor.record.installation_id == record.installation_id)
+                || !installation_ids.insert(record.installation_id)
             {
                 return Err(LifecycleError::InvalidRequest);
             }
@@ -1872,13 +1874,12 @@ impl StandardAgentRuntime {
             if runtime.actors.len() >= config.capabilities.max_actors as usize {
                 return Err(LifecycleError::DirectoryFull);
             }
-            validate_artifact_resources(
-                config.runtime_contract.resources,
-                core::iter::once(&config.runtime_package)
-                    .chain(runtime.actors.values().flat_map(actor_artifact_references))
-                    .chain([&record.package, &record.agent_schema, &record.role_policies])
-                    .chain(record.installation_data.iter()),
-            )?;
+            for reference in [&record.package, &record.agent_schema, &record.role_policies]
+                .into_iter()
+                .chain(record.installation_data.iter())
+            {
+                artifact_usage.insert(reference, config.runtime_contract.resources)?;
+            }
             runtime.actors.insert(
                 actor_id,
                 ManagedActor {
@@ -1888,6 +1889,14 @@ impl StandardAgentRuntime {
                     clean_installation,
                 },
             );
+            restored += 1;
+            if let Some(indices) = children.remove(&actor_id) {
+                ready.extend(indices);
+            }
+        }
+        if restored != pending.len() {
+            // Missing parents and cycles never become ready.
+            return Err(LifecycleError::InvalidRequest);
         }
         runtime.retired_installation_ids = state.retired_installation_ids.into_iter().collect();
         for (actor, expected_deployment) in suspended {
@@ -10723,6 +10732,48 @@ mod tests {
             LifecycleReply::RuntimeUpgraded(identity)
                 if identity.runtime_deployment == DeploymentId([0xa9; 32])
         ));
+    }
+
+    #[test]
+    fn indexed_restore_preserves_forest_and_cross_actor_validation() {
+        let config = config(64);
+        let mut runtime = StandardAgentRuntime::new();
+        create_authorized(&mut runtime, &config, 1).unwrap();
+        let mut parents = [None; 8];
+        for index in 0..64 {
+            let branch = index % parents.len();
+            let request = install(
+                config.identity.agent,
+                parents[branch],
+                &alloc::format!("node-{index}"),
+            );
+            parents[branch] = Some(request.entry.actor);
+            runtime.install(request, Hash([0xb5; 32])).unwrap();
+        }
+        let snapshot = runtime.snapshot();
+        assert!(snapshot.actors.iter().enumerate().any(|(index, actor)| {
+            actor.record.entry.parent.is_some_and(|parent| {
+                snapshot.actors[index + 1..].iter().any(|later| later.record.entry.actor == parent)
+            })
+        }), "fixture must include children sorted before their parents");
+        let restored = StandardAgentRuntime::restore(snapshot.clone()).unwrap();
+        assert_eq!(restored.snapshot(), snapshot);
+
+        let mut duplicate = snapshot.clone();
+        duplicate.actors[1].record.installation_id = duplicate.actors[0].record.installation_id;
+        assert!(matches!(StandardAgentRuntime::restore(duplicate), Err(LifecycleError::InvalidRequest)));
+
+        // Identical references are shared by all actors. A conflicting length
+        // on a later actor must still be rejected by incremental accounting.
+        let mut ambiguous = snapshot.clone();
+        ambiguous.actors[1].record.package.len += 1;
+        ambiguous.actors[1].record.entry.package.len += 1;
+        assert!(matches!(StandardAgentRuntime::restore(ambiguous), Err(LifecycleError::InvalidRequest)));
+
+        let mut cycle = snapshot;
+        let actor = cycle.actors[0].record.entry.actor;
+        cycle.actors[0].record.entry.parent = Some(actor);
+        assert!(matches!(StandardAgentRuntime::restore(cycle), Err(LifecycleError::InvalidRequest)));
     }
 
     #[test]

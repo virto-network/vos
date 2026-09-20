@@ -84,7 +84,7 @@ That log measures six inventory queries at 26.453s; they still perform full
 invocation and acknowledgement. This is the next cost to address, not evidence
 that background scheduling alone made lifecycle operations fast.
 
-The next source change removes duplicate Standard-runtime restoration from
+Source commit `17fb38e9` removes duplicate Standard-runtime restoration from
 management, invocation, resume and acknowledgement execution. Structural decode
 feeds one fully validating restoration; the public state decoder remains fully
 validated. `single-restore-wire-verified.log` records 108 passing wire tests
@@ -99,6 +99,22 @@ latency. Candidate ProgramId:
 Logs/candidate are under the shared target's `task-tmp`; bundled artifacts and
 the reviewer branch remain unchanged. Remaining work is reduced full-state and
 projection execution cost, followed by artifact reproduction and qualification.
+
+The following implementation replaces three quadratic restoration operations:
+remaining-forest scans/vector removal, duplicate installation-ID scans, and
+rebuilding artifact usage for each actor. Indexed readiness preserves first-ready
+ordering; a set and incremental hash/length accounting retain the same checks.
+All 52 Standard tests pass, including the 4,096-actor round trip and a new
+64-actor multi-branch forest with duplicate-ID, conflicting-length and cycle
+rejections (`indexed-restore-standard-final.log`). All 108 wire tests pass
+(four ignored) with candidate comparisons enabled
+(`indexed-restore-wire-physical.log`). Optimized candidate ProgramId:
+`413558cfebdadca3a5aaa438a2daeef425aa33e67309909d72e9313dfb03a07b`.
+The small-directory physical fixtures retain exact outputs and lower gas than
+the bundled baseline, but use slightly more gas than `17fb38e9` due to indexing
+overhead. Large-directory physical scaling and memory budgets remain unqualified;
+this removes specific quadratic operations, not whole-state execution. Bundled
+artifacts and the reviewer branch are still unchanged.
 
 Review-checkpoint (`16adf95e`) debug diagnostic: readiness 27s, Create/resume 54s, Install 65s, restart
 37s, both shutdowns under one measured second. These are not production capacity
