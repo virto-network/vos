@@ -3889,6 +3889,16 @@ impl StandardAgentRuntime {
             return Err(ActorExecutionError::AuthorityExpired);
         }
         let accepted = StandardAcceptedInvocation::from_work(work);
+        // Establish the complete SDK-to-execution correspondence before any
+        // lane/result publication, not only when a later ACK reconstructs it.
+        // Identity equality alone does not bind message, gas, legacy auth or
+        // the application availability selected from the signed SDK work.
+        let (resolved, ..) = self
+            .resolve_clean_invocation(work)
+            .map_err(|_| ActorExecutionError::InvalidActorOutput)?;
+        if resolved != *invocation {
+            return Err(ActorExecutionError::InvalidActorOutput);
+        }
         if !accepted.validate_accepted()
             || invocation.invocation.0 != work.invocation.0
             || invocation.actor.0 != work.actor.0

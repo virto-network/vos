@@ -119,6 +119,22 @@ from preimages before excluding them from application availability. A compact
 ACK must preserve that binding or cleanly eliminate the redundant legacy
 representation, not simply omit the comparison.
 
+The success commit now verifies the entire resolved ActorInvocation against
+the supplied execution request before publishing lanes/results, matching the
+existing terminal-failure path's correspondence requirement. The new regression
+rejects substituted message, gas, legacy auth and application availability
+without mutating runtime or reply. All 109 wire tests pass (five ignored,
+`clean-success-correspondence.log`). This is internal-boundary hardening, not
+evidence of an externally reachable exploit or a speedup: it adds resolution
+work pending the cutover. Importantly, the legacy commitment hashes application
+preimages themselves, so it cannot be reconstructed from references alone.
+The planned clean break must use the authenticated SDK work commitment as the
+clean result identity, require exact equality on restoration/retry/retirement,
+and refuse clean results through legacy recovery/ACK entry points. Establish
+full work/execution correspondence before commit, bump the runtime ABI for the
+changed retained-state semantics, and qualify standard/custom recovery and
+new artifacts together. No old-state compatibility shortcut is intended.
+
 1. Reviewer examines the scoped checkpoint read-only and returns findings.
    Implementation agent applies fixes on latest source.
 2. Implement a versioned reference-only retirement request bound to exact retained

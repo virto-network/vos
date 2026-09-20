@@ -9370,6 +9370,42 @@ pub(crate) mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
+    fn clean_success_commit_rejects_substituted_execution_without_mutation() {
+        use crate::agent_sdk::method_policy::AuthorizationPolicySelector;
+        use crate::agent_sdk::{InvocationAuthorization, PublicPreflight};
+        let (mut runtime, work) = clean_policy_fixture(AuthorizationPolicySelector::Public);
+        let authorization = InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&work, 1));
+        let (invocation, ..) = runtime.resolve_clean_invocation(&work).unwrap();
+        let before = runtime.prepare_execution_state(&invocation).unwrap();
+        let snapshot = runtime.snapshot();
+        let mut variants = vec![invocation.clone(); 4];
+        variants[0].message.push(0x91);
+        variants[1].gas -= 1;
+        variants[2].auth.principal = Some(crate::service::PrincipalId([0x91; 32]));
+        let bytes = b"unaccepted application input".to_vec();
+        variants[3].availability.push(super::super::execution::RuntimeBlob {
+            reference: crate::service::BlobRef::of_bytes(&bytes), bytes,
+        });
+        for substituted in variants {
+            let mut after = before.clone();
+            after.linear = Some(vec![0xa7]);
+            let mut reply = exact_reply(&substituted, ActorExecutionStatus::Done);
+            let original_reply = reply.clone();
+            assert_eq!(runtime.commit_clean_execution(
+                &work, &authorization, &substituted, &mut reply, &before, after, 1, None,
+            ), Err(ActorExecutionError::InvalidActorOutput));
+            assert_eq!(runtime.snapshot(), snapshot);
+            assert_eq!(reply, original_reply);
+        }
+        let mut reply = exact_reply(&invocation, ActorExecutionStatus::Done);
+        runtime.commit_clean_execution(
+            &work, &authorization, &invocation, &mut reply, &before, before.clone(), 1, None,
+        ).unwrap();
+        assert_eq!(runtime.snapshot().invocation_results.len(), 1);
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
     fn public_preflight_is_policy_gated_and_persists_exact_retry_ack_and_continuation_binding() {
         use crate::agent_sdk::method_policy::AuthorizationPolicySelector;
         use crate::agent_sdk::{
