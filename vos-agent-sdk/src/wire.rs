@@ -3743,7 +3743,7 @@ impl CanonicalWire for InvocationRetirement {
         encode_invocation_roles(encoder, self.roles);
         encoder.bytes(&self.message);
         encode_optional_blob(encoder, &self.installation_data);
-        encode_required_refs(encoder, &self.availability);
+        encode_required_refs(encoder, &self.required);
         encoder.u64(self.gas);
         encoder.bool(self.recovery_only);
     }
@@ -3766,7 +3766,7 @@ impl CanonicalWire for InvocationRetirement {
         let value = Self {
             space, agent, runtime_deployment, invocation, actor, incarnation,
             deployment, program, mode, origin, roles, message, installation_data,
-            availability, gas: decoder.u64()?, recovery_only: decoder.bool()?,
+            required: availability, gas: decoder.u64()?, recovery_only: decoder.bool()?,
         };
         value.validate().then_some(value).ok_or(DecodeError::NonCanonical)
     }
@@ -6525,13 +6525,13 @@ mod tests {
         invalid.installation_data = None;
         cases.push(invalid);
         let mut invalid = valid.clone();
-        invalid.availability.clear();
+        invalid.required.clear();
         cases.push(invalid);
         let mut invalid = valid.clone();
-        invalid.availability.push(invalid.availability[0].clone());
+        invalid.required.push(invalid.required[0].clone());
         cases.push(invalid);
         let mut invalid = valid.clone();
-        invalid.availability[0].len = u64::MAX;
+        invalid.required[0].len = u64::MAX;
         cases.push(invalid);
         let mut invalid = valid.clone();
         invalid.message.resize(MAX_INVOCATION_MESSAGE_BYTES + 1, 0);
@@ -6572,6 +6572,24 @@ mod tests {
         work.origin.capability = Some(CapabilityId([0x91; 32]));
         let authorization = InvocationAuthorization::PublicPreflight(PublicPreflight::for_work(&work, 45));
         assert!(!authorization.matches_retirement(&InvocationRetirement::from_work(&work)));
+    }
+
+    #[test]
+    fn retained_acceptance_shares_metadata_but_refuses_recovery_only_creation() {
+        let mut work = invocation();
+        let bytes = b"accepted artifact".to_vec();
+        work.availability.push(RuntimeBlob { reference: BlobRef::of_bytes(&bytes), bytes });
+        let accepted = InvocationRetirement::from_work(&work);
+        assert!(accepted.validate_accepted());
+        assert_eq!(accepted.with_availability(work.availability.clone()), work);
+        assert!(!accepted.with_availability(alloc::vec![RuntimeBlob {
+            reference: work.availability[0].reference.clone(),
+            bytes: b"wrong preimage".to_vec(),
+        }]).validate());
+        work.recovery_only = true;
+        let recovery = InvocationRetirement::from_work(&work);
+        assert!(recovery.validate());
+        assert!(!recovery.validate_accepted());
     }
 
     fn invocation_context() -> InvocationContext {

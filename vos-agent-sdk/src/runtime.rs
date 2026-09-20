@@ -310,7 +310,7 @@ pub struct InvocationRetirement {
     pub recovery_only: bool,
     pub message: Vec<u8>,
     pub installation_data: Option<BlobRef>,
-    pub availability: Vec<BlobRef>,
+    pub required: Vec<BlobRef>,
 }
 
 impl InvocationRetirement {
@@ -334,7 +334,7 @@ impl InvocationRetirement {
             recovery_only: work.recovery_only,
             message: work.message.clone(),
             installation_data: work.installation_data.clone(),
-            availability: work.availability.iter().map(|blob| blob.reference.clone()).collect(),
+            required: work.availability.iter().map(|blob| blob.reference.clone()).collect(),
         }
     }
 
@@ -350,7 +350,7 @@ impl InvocationRetirement {
             && self.origin.validate()
             && self.roles.validate_for(self.origin)
             && self.message.len() <= MAX_INVOCATION_MESSAGE_BYTES
-            && required_refs_valid(&self.availability, self.installation_data.as_ref())
+            && required_refs_valid(&self.required, self.installation_data.as_ref())
             && self.gas != 0
     }
 
@@ -358,6 +358,35 @@ impl InvocationRetirement {
     /// bind artifact content without carrying it in a retirement request.
     pub fn commitment(&self) -> Hash {
         crate::wire::invocation_retirement_commitment(self)
+    }
+
+    /// Persisted acceptance cannot originate from recovery-only delivery.
+    pub fn validate_accepted(&self) -> bool {
+        !self.recovery_only && self.validate()
+    }
+
+    /// Reattach supplied bytes for execution/resume. This is construction, not
+    /// validation: the caller must require the exact reference set and validate
+    /// every preimage before execution. Retirement never needs this conversion.
+    pub fn with_availability(&self, availability: Vec<RuntimeBlob>) -> InvocationWork {
+        InvocationWork {
+            space: self.space,
+            agent: self.agent,
+            runtime_deployment: self.runtime_deployment,
+            invocation: self.invocation,
+            actor: self.actor,
+            incarnation: self.incarnation,
+            deployment: self.deployment,
+            program: self.program,
+            mode: self.mode,
+            origin: self.origin,
+            roles: self.roles,
+            message: self.message.clone(),
+            installation_data: self.installation_data.clone(),
+            availability,
+            gas: self.gas,
+            recovery_only: self.recovery_only,
+        }
     }
 }
 

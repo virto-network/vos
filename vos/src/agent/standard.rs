@@ -375,127 +375,9 @@ pub(crate) struct StandardMachineContinuation {
     pub continuation: super::execution::ActorMachineContinuation,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StandardAcceptedInvocation {
-    pub space: crate::agent_sdk::SpaceId,
-    pub agent: crate::agent_sdk::AgentId,
-    pub runtime_deployment: crate::agent_sdk::DeploymentId,
-    pub invocation: crate::agent_sdk::InvocationId,
-    pub actor: crate::agent_sdk::ActorId,
-    pub incarnation: crate::agent_sdk::Hash,
-    pub deployment: crate::agent_sdk::DeploymentId,
-    pub program: crate::agent_sdk::ProgramId,
-    pub mode: crate::agent_sdk::MethodMode,
-    pub origin: crate::agent_sdk::InvocationOrigin,
-    pub roles: crate::agent_sdk::InvocationRoleClaims,
-    pub message: Vec<u8>,
-    pub installation_data: Option<crate::agent_sdk::BlobRef>,
-    pub required: Vec<crate::agent_sdk::BlobRef>,
-    pub gas: u64,
-    pub recovery_only: bool,
-}
-
-impl StandardAcceptedInvocation {
-    fn commitment(&self) -> crate::agent_sdk::Hash {
-        // Only references enter the SDK commitment. These payload-free blobs
-        // reconstruct its canonical input; they must never be executed or
-        // treated as validated availability.
-        self.with_availability(
-            self.required
-                .iter()
-                .map(|reference| crate::agent_sdk::RuntimeBlob {
-                    reference: reference.clone(),
-                    bytes: Vec::new(),
-                })
-                .collect(),
-        )
-        .commitment()
-    }
-
-    pub(crate) fn from_work(work: &crate::agent_sdk::InvocationWork) -> Self {
-        Self {
-            space: work.space,
-            agent: work.agent,
-            runtime_deployment: work.runtime_deployment,
-            invocation: work.invocation,
-            actor: work.actor,
-            incarnation: work.incarnation,
-            deployment: work.deployment,
-            program: work.program,
-            mode: work.mode,
-            origin: work.origin,
-            roles: work.roles,
-            message: work.message.clone(),
-            installation_data: work.installation_data.clone(),
-            required: work
-                .availability
-                .iter()
-                .map(|blob| blob.reference.clone())
-                .collect(),
-            gas: work.gas,
-            recovery_only: work.recovery_only,
-        }
-    }
-
-    pub(crate) fn with_availability(
-        &self,
-        availability: Vec<crate::agent_sdk::RuntimeBlob>,
-    ) -> crate::agent_sdk::InvocationWork {
-        crate::agent_sdk::InvocationWork {
-            space: self.space,
-            agent: self.agent,
-            runtime_deployment: self.runtime_deployment,
-            invocation: self.invocation,
-            actor: self.actor,
-            incarnation: self.incarnation,
-            deployment: self.deployment,
-            program: self.program,
-            mode: self.mode,
-            origin: self.origin,
-            roles: self.roles,
-            message: self.message.clone(),
-            installation_data: self.installation_data.clone(),
-            availability,
-            gas: self.gas,
-            recovery_only: self.recovery_only,
-        }
-    }
-
-    pub(crate) fn validate(&self) -> bool {
-        self.space != crate::agent_sdk::SpaceId::ZERO
-            && self.agent != crate::agent_sdk::AgentId::ZERO
-            && self.runtime_deployment != crate::agent_sdk::DeploymentId::ZERO
-            && self.invocation != crate::agent_sdk::InvocationId::ZERO
-            && self.actor != crate::agent_sdk::ActorId::ZERO
-            && self.incarnation != crate::agent_sdk::Hash::ZERO
-            && self.deployment != crate::agent_sdk::DeploymentId::ZERO
-            && self.program != crate::agent_sdk::ProgramId::ZERO
-            && self.origin.validate()
-            && self.roles.validate_for(self.origin)
-            && self.message.len() <= crate::agent_sdk::MAX_INVOCATION_MESSAGE_BYTES
-            && self.gas != 0
-            && !self.recovery_only
-            && self.required.len() <= crate::agent_sdk::MAX_RUNTIME_AVAILABILITY_ITEMS
-            && self.installation_data.as_ref().is_none_or(|reference| {
-                reference.hash != crate::agent_sdk::Hash::ZERO
-                    && reference.len <= crate::agent_sdk::MAX_INSTALLATION_DATA_BYTES as u64
-                    && self.required.iter().any(|required| required == reference)
-            })
-            && self.required.windows(2).all(|pair| pair[0] < pair[1])
-            && self.required.iter().all(|reference| {
-                reference.hash != crate::agent_sdk::Hash::ZERO
-                    && (reference.len != 0 || self.installation_data.as_ref() == Some(reference))
-                    && reference.len <= crate::agent_sdk::MAX_RUNTIME_AVAILABILITY_BYTES as u64
-            })
-            && self
-                .required
-                .iter()
-                .try_fold(0u64, |total, reference| total.checked_add(reference.len))
-                .is_some_and(|total| {
-                    total <= crate::agent_sdk::MAX_RUNTIME_AVAILABILITY_BYTES as u64
-                })
-    }
-}
+// Retained acceptance and compact retirement share one portable metadata
+// contract. State validation additionally refuses recovery-only acceptance.
+pub(crate) type StandardAcceptedInvocation = crate::agent_sdk::InvocationRetirement;
 
 /// Immutable clean authorization accepted with one retained terminal `Done`.
 ///
@@ -545,7 +427,7 @@ impl StandardMachineContinuation {
     pub(crate) fn validate_record(&self) -> bool {
         let clean_pair = match (&self.accepted, &self.authorization) {
             (Some(accepted), Some(authorization)) => {
-                accepted.validate()
+                accepted.validate_accepted()
                     && accepted.invocation.0 == self.invocation.0
                     && accepted.actor.0 == self.actor.0
                     && accepted.incarnation.0 == self.incarnation.0
@@ -1911,7 +1793,7 @@ impl StandardAgentRuntime {
             let clean_binding_valid = match result.clean.as_ref() {
                 None => true,
                 Some(binding) => {
-                    binding.accepted.validate()
+                    binding.accepted.validate_accepted()
                         && binding.work != crate::agent_sdk::Hash::ZERO
                         && binding.authorization.commitment() != crate::agent_sdk::Hash::ZERO
                         && binding.accepted.invocation.0 == result.invocation.0
@@ -2742,7 +2624,7 @@ impl StandardAgentRuntime {
             .clean_descriptor
             .as_ref()
             .ok_or(InvocationError::NotCreated)?;
-        if !accepted.validate()
+        if !accepted.validate_accepted()
             || !clean_authorization_matches_accepted(
                 accepted,
                 authorization,
@@ -4007,7 +3889,7 @@ impl StandardAgentRuntime {
             return Err(ActorExecutionError::AuthorityExpired);
         }
         let accepted = StandardAcceptedInvocation::from_work(work);
-        if !accepted.validate()
+        if !accepted.validate_accepted()
             || invocation.invocation.0 != work.invocation.0
             || invocation.actor.0 != work.actor.0
             || invocation.incarnation.0 != work.incarnation.0
@@ -4433,7 +4315,7 @@ impl StandardAgentRuntime {
         let binding = &record.binding;
         self.clean_descriptor.is_some()
             && record.error.is_durable_exact_outcome()
-            && binding.accepted.validate()
+            && binding.accepted.validate_accepted()
             && binding.work != crate::agent_sdk::Hash::ZERO
             && self.result_storage_supported(record.storage())
             && Self::clean_error_authorization_window_is_valid(

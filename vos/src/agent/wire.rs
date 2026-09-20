@@ -1799,7 +1799,7 @@ fn decode_accepted_invocation(
         recovery_only: decoder.bool()?,
     };
     value
-        .validate()
+        .validate_accepted()
         .then_some(value)
         .ok_or(DecodeError::NonCanonical)
 }

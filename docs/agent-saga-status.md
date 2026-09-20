@@ -106,6 +106,19 @@ This type is not yet connected to RuntimeWork or production ACK execution.
 The runtime ABI and artifacts remain unchanged until the coordinated cutover;
 no current-binary latency improvement is claimed from this foundation.
 
+Retained results and continuations now use that SDK metadata type directly
+instead of a duplicate StandardAcceptedInvocation struct. Commitment calculation
+no longer constructs empty-payload RuntimeBlobs. Persisted acceptance still
+rejects recovery-only work through explicit `validate_accepted` checks; state
+encoding is unchanged. Tests pass: 177 SDK (`shared-retirement-sdk-final.log`),
+108 wire (five ignored, `shared-retirement-wire.log`) and 52 Standard
+(`shared-retirement-standard.log`). RuntimeWork ACK remains full-work for now.
+The cutover must account for its additional legacy ActorInvocation request
+commitment check: today reconstructing that request identifies artifact roles
+from preimages before excluding them from application availability. A compact
+ACK must preserve that binding or cleanly eliminate the redundant legacy
+representation, not simply omit the comparison.
+
 1. Reviewer examines the scoped checkpoint read-only and returns findings.
    Implementation agent applies fixes on latest source.
 2. Implement a versioned reference-only retirement request bound to exact retained
