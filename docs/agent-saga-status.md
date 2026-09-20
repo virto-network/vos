@@ -140,15 +140,69 @@ Earlier immutable resolution reduced the measured Credential Invoke+ACK gas
 released cost. Large compiled directories, idle-Agent scaling, mixed load,
 resource budgets and tail latency remain unqualified.
 
+## Implementation follow-up: optimized-host baseline
+
+Implementation-only qualification harness:
+`bash scripts/check-agent-local-lifecycle.sh VOSX TEST_CLIENT COUNTER_PACKAGE [DISK_EVIDENCE_ROOT]`.
+Build inputs first; the harness freezes and hashes them, creates a fresh isolated
+space, verifies the embedded release bundle, checks generated ingress defaults,
+runs Create/Install/restart/mutation/retirement/retry/read, and stops its exact
+child daemons. It records millisecond phase timings and one-second Linux process
+samples (RSS/high-water RSS, threads, CPU ticks and file descriptors). Samples
+are not guaranteed resource peaks. The script exits nonzero if any readiness
+exceeds ten seconds even when functional checks pass; zero matching Rust tests
+cannot count as a pass. This harness does not establish load or all-profile gates.
+The first optimized-host campaign is complete; the reviewer branch remains
+`9cd2fa6a`. It does not change that checkpoint's debug-host evidence above.
+Build: `cargo +nightly-2025-05-09 build --release --offline --locked -p vosx --bin vosx`,
+normal fat LTO/single codegen unit, no profile override. Log:
+`inventory-release-cli-build.log` (6m30s). Host source/artifacts are `9cd2fa6a`.
+The test client remains the frozen debug client used above, not a release client.
+
+Evidence is in implementation
+`target/agent-lifecycle-qualification/indexed-lifecycle.FzlxZI/`; console log
+`inventory-release-lifecycle.log` is under the task log root above.
+Release CLI SHA-256:
+`d101f21eb210a8e1ba975280098117768d62e64de22eec6d5428db2bec73818e`.
+The embedded bundle, generated HTTP/SSH, Create/Install, restart, mutation,
+positive retirement, exact retry and read-after-restart pass. All four daemons
+stop normally and the test ports are closed. The harness exits **1 as intended**
+because one restart exceeds the unchanged readiness gate:
+
+| Phase | Milliseconds |
+| --- | ---: |
+| Fresh readiness | 8,068 |
+| Create | 16,003 |
+| Install | 21,974 |
+| First restart readiness | 11,022 |
+| Mutation readiness / test | 5,922 / 20,647 |
+| Read readiness / test | 6,328 / 20,717 |
+
+Managed mutation/read attempts take 18.91s/19.00s; client assertions add overhead.
+Shutdowns are 307/305/914/1,017ms. Across daemon samples, maximum observed RSS is
+288,204 KiB, reported RSS high-water 299,408 KiB, threads 42, FDs 264.
+Initial-daemon last observed CPU time is 4,287 ticks at 100 ticks/s over roughly
+45s of sampled lifetime. These are one-user samples, not hard capacity bounds.
+
+The initial one-Agent inventory takes 2.528s; the post-Create two-Agent refresh
+takes 2.750s, still one query. First restart spends about 5.936s opening the
+Shared host (difference between cumulative recovery markers), then 2.815s in
+inventory. Release optimization improves but does not eliminate execution/replay
+cost. **The released-host readiness gate still fails**, and managed operations
+remain seconds-long. Do not attribute all remaining delay to debug compilation.
+The retained CLI/documentation clean-break check also passes
+(`inventory-clean-break.log`).
+
 ## Next sequence
 
 1. Reviewer examines `7bd66a7d..saga/agents` read-only and returns findings.
    Apply fixes on latest implementation source; advance the reviewer branch only
    at qualified checkpoints. Do not mix reviewer edits with implementation work.
-2. Establish released-binary phase/cost baselines for startup, managed
-   invocation/ACK and inventory at fixed one-, two- and growing-Agent sizes.
-   Keep exact binary/artifact identities, CPU/RAM/FD and queue/tail measurements.
-   Do not treat the debug campaign as a passed production latency gate.
+2. Extend the optimized-host baseline to growing-Agent directories and independent
+   versus same-Agent workloads. Attribute the measured Shared reopen and managed
+   invocation/ACK cost before changing recovery or runtime boundaries. Keep exact
+   identities, CPU/RAM/FD and queue/tail measurements; neither current campaign
+   passes the production latency/capacity gates.
 3. Address whole-state/touched-state and incremental-publication costs with an
    explicit common runtime contract, recovery invariants and growth acceptance;
    preserve fresh revision-consistent projections and scheduling isolation.
