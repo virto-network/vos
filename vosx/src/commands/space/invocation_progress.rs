@@ -9,7 +9,9 @@ use vos::agent::supervisor_adapters::{
 };
 
 pub(crate) const MAX_PROGRESS_BYTES: usize = 64 * 1024 * 1024;
-const MAX_STEPS: usize = 64;
+const MAX_RESUME_STEPS: usize = 64;
+// Terminal retirement must not compete with resume history for its final slot.
+const MAX_STEPS: usize = MAX_RESUME_STEPS + 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +34,40 @@ enum Action {
 }
 
 impl Action {
+    // JSON encodes protocol bytes as hex. Reserve before sending, so receiving
+    // a maximum-sized durable reply cannot strand an executed operation.
+    fn required_reply_capacity(&self, call: &AgentInvocationRequest) -> anyhow::Result<usize> {
+        let reply = 2 * super::local_invocation::MAX_RESPONSE_BYTES + 2;
+        match self {
+            Self::Acknowledge(_) => Ok(reply),
+            Self::Resume(_) => {
+                let ack = Self::Acknowledge(
+                    AgentAcknowledgementRequest::new(
+                        RuntimeExecutionContext::Direct,
+                        None,
+                        call.work().clone(),
+                        call.authorization().clone(),
+                    )
+                    .map_err(|error| anyhow::anyhow!("invalid retirement request: {error:?}"))?,
+                );
+                // One resume reply, one terminal request/reply and JSON framing.
+                Ok(reply + 2 * ack.encode()?.len() + reply + 64)
+            }
+        }
+    }
+
+    fn ensure_history_slot(&self, index: usize) -> anyhow::Result<()> {
+        let limit = match self {
+            Self::Resume(_) => MAX_RESUME_STEPS,
+            Self::Acknowledge(_) => MAX_STEPS,
+        };
+        anyhow::ensure!(
+            index < limit,
+            "continuation resume limit reached; history preserved; unchanged retries cannot advance without supported history extension"
+        );
+        Ok(())
+    }
+
     fn for_outcome(
         request: &AgentInvocationRequest,
         outcome: &RuntimeOutcome,
@@ -111,6 +147,26 @@ impl Action {
 }
 
 impl Progress {
+    fn ensure_reply_capacity(
+        &self,
+        action: &Action,
+        call: &AgentInvocationRequest,
+    ) -> anyhow::Result<()> {
+        let retained = self.encode()?.len();
+        let reserve = action.required_reply_capacity(call)?;
+        Self::check_reserved_capacity(retained, reserve)
+    }
+
+    fn check_reserved_capacity(retained: usize, reserve: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            retained
+                .checked_add(reserve)
+                .is_some_and(|total| total <= MAX_PROGRESS_BYTES),
+            "continuation byte budget exhausted before dispatch; history preserved; unchanged retries cannot advance without supported history extension"
+        );
+        Ok(())
+    }
+
     pub(crate) fn new(request: &[u8]) -> anyhow::Result<Self> {
         let request = super::local_invocation::validate_request(request)?;
         Ok(Self {
@@ -175,6 +231,7 @@ impl Progress {
         for (index, exchange) in self.exchanges.iter().enumerate() {
             let action = Action::for_outcome(&call, &outcome)?
                 .ok_or_else(|| anyhow::anyhow!("history continues after acknowledgement"))?;
+            action.ensure_history_slot(index)?;
             anyhow::ensure!(
                 exchange.request == hex::encode(action.encode()?),
                 "continuation request differs from saved predecessor"
@@ -260,16 +317,15 @@ pub(crate) fn continue_retained(
             .last()
             .is_none_or(|last| last.response.is_some())
         {
-            anyhow::ensure!(
-                progress.exchanges.len() < MAX_STEPS,
-                "continuation history is full; preserved without discarding predecessors"
-            );
+            action.ensure_history_slot(progress.exchanges.len())?;
             progress.exchanges.push(Exchange {
                 request: hex::encode(&bytes),
                 response: None,
             });
+            progress.ensure_reply_capacity(&action, &call)?;
             store.publish_progress(&progress.encode()?)?;
         }
+        progress.ensure_reply_capacity(&action, &call)?;
         let reply = super::local_create::post_binary(
             address,
             action.path(),
@@ -290,7 +346,9 @@ pub(crate) fn continue_retained(
 
 pub(crate) fn run(root: &std::path::Path, address: std::net::SocketAddr) -> anyhow::Result<()> {
     continue_retained(root, address).map_err(|error| {
-        anyhow::anyhow!("{error}; continuation history retained, retry exact pending work")
+        anyhow::anyhow!(
+            "{error}; continuation history retained; do not create a replacement invocation"
+        )
     })?;
     crate::output::print_json(&serde_json::json!({"delivery_retired": true}));
     Ok(())

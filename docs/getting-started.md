@@ -76,17 +76,18 @@ replay after Install may return409 because server retention is bounded; inspect
 the retained signed evidence. See [Operations](operations.md) for invocation and
 recovery boundaries.
 
-## Back up a stopped Space
+## Backup limitation after first startup
 
-```bash
-vosx space backup demo /var/backups/vos/demo-2026-09-10
-vosx space restore /var/backups/vos/demo-2026-09-10 \
-  --node-key /secure/demo-node.key
-```
+The Space initialized by this walkthrough cannot currently use `space backup`,
+even after a clean stop and before installing any application actors. First
+startup automatically creates `system-agent`, which the registry-only portable
+backup format deliberately refuses.
 
-Backup is fail-closed and never archives the node identity secret. Retain that
-key separately. The command refuses unsupported live Agent/service generations
-rather than copying opaque stores as if they were portable.
+The backup/restore commands support only registry-only, pre-native Spaces;
+native Agent portable export and restore remain unfinished. Do not work around
+the refusal by deleting system stores or treating a raw copy as a supported
+portable backup. Keep the node identity secret separately: portable backup
+never archives it. Use disposable data for this checkpoint's testing.
 
 See [Actors and packages](actors.md) for the package boundary and
 [Operations](operations.md) for the current operational gate.

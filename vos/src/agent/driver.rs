@@ -2216,6 +2216,42 @@ fn verify_authority_admission(
     })
 }
 
+/// Physically verified records borrowed from one immutable driver generation.
+#[cfg(test)]
+std::thread_local! {
+    static DIRECTORY_EXECUTIONS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn directory_execution_count() -> usize {
+    DIRECTORY_EXECUTIONS.with(core::cell::Cell::get)
+}
+
+pub(crate) struct PhysicalAuthorityDirectory<'a, S> {
+    driver: &'a AgentDriver<S>,
+    records: Vec<crate::agent_sdk::ActorDirectoryRecord>,
+}
+
+impl<S: AgentImageStore> PhysicalAuthorityDirectory<'_, S> {
+    pub(crate) fn records(&self) -> &[crate::agent_sdk::ActorDirectoryRecord] {
+        &self.records
+    }
+
+    pub(crate) fn material(
+        &self,
+        actor: crate::agent_sdk::ActorId,
+    ) -> Result<super::invocation_preparation::PhysicalInvocationMaterial, AgentDriverError> {
+        let index = self
+            .records
+            .binary_search_by_key(&actor, |record| record.entry.actor)
+            .map_err(|_| {
+                AgentDriverError::SdkManagement(crate::agent_sdk::ManagementError::NotFound)
+            })?;
+        self.driver
+            .physical_material_from_record(self.records[index].clone(), false)
+    }
+}
+
 /// One loaded process-local agent. Calls are serialized by mutable access.
 ///
 /// The driver is intentionally restricted to [`AgentProfile::Local`]. A
@@ -2606,8 +2642,11 @@ impl<S: AgentImageStore> AgentDriver<S> {
             let encoded = work
                 .encode()
                 .map_err(|_| AgentDriverError::InvalidRuntime)?;
-            let returned: crate::agent_sdk::RuntimeTransition =
-                execute_runtime_canonical(runtime_pvm, management_gas, &encoded)?;
+            let returned: crate::agent_sdk::RuntimeTransition = {
+                #[cfg(test)]
+                DIRECTORY_EXECUTIONS.with(|count| count.set(count.get() + 1));
+                execute_runtime_canonical(runtime_pvm, management_gas, &encoded)?
+            };
             if returned.state != legacy_state_as_sdk(&image.runtime_state) {
                 return Err(AgentDriverError::InvalidRuntime);
             }
@@ -2655,6 +2694,7 @@ impl<S: AgentImageStore> AgentDriver<S> {
     /// Authority reconciliation uses the same authenticated physical closure
     /// as invocation preparation, but must also inspect suspended actors so an
     /// omitted or altered non-routable installation cannot escape the audit.
+    #[cfg(test)]
     pub(crate) fn physical_authority_material(
         &self,
         actor: crate::agent_sdk::ActorId,
@@ -2662,9 +2702,38 @@ impl<S: AgentImageStore> AgentDriver<S> {
         self.physical_material(actor, false)
     }
 
+    /// A single physically executed directory, bound by borrowing to this
+    /// immutable driver image. Records cannot be supplied or replaced by the
+    /// caller; mutable lifecycle/execution access cannot coexist with the view.
+    pub(crate) fn physical_authority_directory(
+        &self,
+    ) -> Result<PhysicalAuthorityDirectory<'_, S>, AgentDriverError> {
+        let descriptor = clean_image_descriptor(&self.image)?;
+        Ok(PhysicalAuthorityDirectory {
+            driver: self,
+            records: self.inspect_sdk_actor_directory(&descriptor)?,
+        })
+    }
+
     fn physical_material(
         &self,
         actor: crate::agent_sdk::ActorId,
+        require_ready: bool,
+    ) -> Result<super::invocation_preparation::PhysicalInvocationMaterial, AgentDriverError> {
+        let descriptor = clean_image_descriptor(&self.image)?;
+        let record = self
+            .inspect_sdk_actor_directory(&descriptor)?
+            .into_iter()
+            .find(|record| record.entry.actor == actor)
+            .ok_or(AgentDriverError::SdkManagement(
+                crate::agent_sdk::ManagementError::NotFound,
+            ))?;
+        self.physical_material_from_record(record, require_ready)
+    }
+
+    fn physical_material_from_record(
+        &self,
+        record: crate::agent_sdk::ActorDirectoryRecord,
         require_ready: bool,
     ) -> Result<super::invocation_preparation::PhysicalInvocationMaterial, AgentDriverError> {
         let descriptor = clean_image_descriptor(&self.image)?;
@@ -2690,13 +2759,6 @@ impl<S: AgentImageStore> AgentDriver<S> {
         if runtime_pvm != runtime_package.program_bytes() || runtime_pvm != self.runtime_pvm {
             return Err(AgentDriverError::RuntimeProgramMismatch);
         }
-        let record = self
-            .inspect_sdk_actor_directory(&descriptor)?
-            .into_iter()
-            .find(|record| record.entry.actor == actor)
-            .ok_or(AgentDriverError::SdkManagement(
-                crate::agent_sdk::ManagementError::NotFound,
-            ))?;
         if require_ready && record.entry.suspended {
             return Err(AgentDriverError::SdkManagement(
                 crate::agent_sdk::ManagementError::InvalidRequest,

@@ -392,16 +392,12 @@ impl LocalAgentHost {
             {
                 return Err(LocalAgentHostError::InvalidDescriptor);
             }
-            let directory = hosted
-                .driver
-                .inspect_sdk_actor_directory(&hosted.descriptor)?;
-            if directory.len() != authority.actors().len() {
+            let directory = hosted.driver.physical_authority_directory()?;
+            if directory.records().len() != authority.actors().len() {
                 return Err(LocalAgentHostError::InvalidDescriptor);
             }
             for actor in authority.actors() {
-                let material = hosted
-                    .driver
-                    .physical_authority_material(actor.entry.actor)?;
+                let material = directory.material(actor.entry.actor)?;
                 if !super::supervisor_adapters::physical_material_matches_authority(
                     &material,
                     authority.descriptor(),
@@ -434,14 +430,10 @@ impl LocalAgentHost {
                 .clean_management
                 .as_ref()
                 .ok_or(LocalAgentHostError::Corrupt)?;
-            let directory = hosted
-                .driver
-                .inspect_sdk_actor_directory(&hosted.descriptor)?;
-            let mut actors = Vec::with_capacity(directory.len());
-            for actor in &directory {
-                let material = hosted
-                    .driver
-                    .physical_authority_material(actor.entry.actor)?;
+            let directory = hosted.driver.physical_authority_directory()?;
+            let mut actors = Vec::with_capacity(directory.records().len());
+            for actor in directory.records() {
+                let material = directory.material(actor.entry.actor)?;
                 if material.descriptor != hosted.descriptor
                     || material.descriptor.identity.agent != *agent
                 {
@@ -1684,15 +1676,28 @@ mod tests {
     }
 
     fn admitted_runtime() -> AdmittedRuntimePackage {
+        // Explicit candidate qualification only; default tests retain the
+        // bundled-release gate and must not silently substitute a new guest.
+        let candidate = std::env::var_os("AGENT_RUNTIME_CANDIDATE_ELF").map(|path| {
+            let elf = std::fs::read(&path).unwrap();
+            let program = vos_pvm_compiler::link_elf_spi(&elf).unwrap();
+            vos_pvm::spi::validate_refine_host_calls(&program).unwrap();
+            eprintln!(
+                "Local host candidate runtime: {}",
+                std::path::Path::new(&path).display()
+            );
+            program
+        });
+        let runtime = candidate.as_deref().unwrap_or(RUNTIME_PVM);
         let package = sign_package(PackageEnvelope {
             manifest: PackageManifest::AgentRuntime(AgentRuntimePackageManifest {
                 name: "standard-local-runtime".into(),
-                outer_program: BlobRef::of_bytes(RUNTIME_PVM),
+                outer_program: BlobRef::of_bytes(runtime),
                 contract: RuntimePackageContract::canonical(),
                 capabilities: RuntimeCapabilities::standard(),
                 signing: package_signing(),
             }),
-            artifacts: vec![artifact(RUNTIME_PVM)],
+            artifacts: vec![artifact(runtime)],
         });
         admit_runtime_package(&package.encode().unwrap()).unwrap()
     }
@@ -3394,6 +3399,32 @@ mod tests {
             page.entries
         );
         assert_eq!(host.agents[&agent].driver.image(), &before_inspection);
+
+        {
+            let driver = &host.agents[&agent].driver;
+            let before = super::super::driver::directory_execution_count();
+            let directory = driver.physical_authority_directory().unwrap();
+            assert_eq!(directory.records(), page.entries);
+            let after = super::super::driver::directory_execution_count();
+            assert_eq!(after - before, 1, "fixture directory requires one page");
+            for _ in 0..3 {
+                directory.material(record.entry.actor).unwrap();
+            }
+            assert_eq!(
+                super::super::driver::directory_execution_count(),
+                after,
+                "material lookup must not execute the directory again"
+            );
+            assert_eq!(
+                directory.material(record.entry.actor).unwrap(),
+                driver
+                    .physical_authority_material(record.entry.actor)
+                    .unwrap(),
+                "single-enumeration audit must retain the exact physical artifact closure"
+            );
+            assert!(directory.material(sdk::ActorId([0xee; 32])).is_err());
+            assert_eq!(driver.image(), &before_inspection);
+        }
 
         let work = invocation(&descriptor, &record, &actor_package, 0xa1);
         let authority = invocation_receipt(&descriptor, &work, 50, 50);

@@ -140,6 +140,211 @@ fn directory() -> std::path::PathBuf {
     root
 }
 
+fn boundary_history(resumes: usize, completed: bool) -> (Vec<u8>, Vec<u8>, Progress) {
+    let (request, response, _) = fixture();
+    let call = super::super::local_invocation::validate_request(&request).unwrap();
+    let AgentInvocationResponse::Direct {
+        outcome: RuntimeOutcome::Yielded(mut yielded),
+        ..
+    } = AgentInvocationResponse::decode(&response).unwrap()
+    else {
+        panic!()
+    };
+    let mut progress = Progress::new(&request).unwrap();
+    for index in 0..resumes {
+        let resume = AgentResumeRequest::new(
+            RuntimeExecutionContext::Direct,
+            None,
+            call.work().clone(),
+            call.authorization().clone(),
+            yielded.clone(),
+        )
+        .unwrap();
+        yielded.ready_sequence += 1;
+        yielded.continuation = BlobRef::of_bytes(&yielded.ready_sequence.to_le_bytes());
+        let outcome = if completed && index + 1 == resumes {
+            RuntimeOutcome::Completed(Err(InvocationError::NotFound))
+        } else {
+            RuntimeOutcome::Yielded(yielded.clone())
+        };
+        progress.exchanges.push(Exchange {
+            request: hex::encode(resume.encode().unwrap()),
+            response: Some(hex::encode(
+                AgentResumeResponse::Direct {
+                    request: resume.commitment(),
+                    outcome,
+                }
+                .encode()
+                .unwrap(),
+            )),
+        });
+    }
+    (request, response, progress)
+}
+
+#[test]
+fn terminal_slot_survives_full_resume_history_and_reopen() {
+    for resumes in [63, 64] {
+        let (request, response, expected) = boundary_history(resumes, true);
+        let root = directory();
+        let path = root.join("delivery");
+        let mut store = CleanInvocationFile::open_or_create(&path).unwrap();
+        store.publish_request(&request).unwrap();
+        store.publish_response(&response).unwrap();
+        let mut progress = Progress::new(&request).unwrap();
+        for exchange in expected.exchanges {
+            progress.exchanges.push(Exchange {
+                request: exchange.request,
+                response: None,
+            });
+            store.publish_progress(&progress.encode().unwrap()).unwrap();
+            progress.exchanges.last_mut().unwrap().response = exchange.response;
+            store.publish_progress(&progress.encode().unwrap()).unwrap();
+        }
+        let (_, _, fixture_exchanges) = fixture();
+        let (_, ack, reply) = fixture_exchanges.last().unwrap();
+        let action = Action::Acknowledge(AgentAcknowledgementRequest::decode(ack).unwrap());
+        action
+            .ensure_history_slot(progress.exchanges.len())
+            .unwrap();
+        progress.exchanges.push(Exchange {
+            request: hex::encode(ack),
+            response: None,
+        });
+        store.publish_progress(&progress.encode().unwrap()).unwrap();
+        drop(store);
+        let mut store = CleanInvocationFile::open_or_create(&path).unwrap();
+        progress = Progress::decode(
+            &store.load_progress().unwrap().unwrap(),
+            &request,
+            &response,
+        )
+        .unwrap();
+        assert!(!progress.is_retired(&request, &response).unwrap());
+        assert_eq!(progress.exchanges.last().unwrap().request, hex::encode(ack));
+        progress.exchanges.last_mut().unwrap().response = Some(hex::encode(reply));
+        store.publish_progress(&progress.encode().unwrap()).unwrap();
+        drop(store);
+        let mut store = CleanInvocationFile::open_or_create(&path).unwrap();
+        let bytes = store.load_progress().unwrap().unwrap();
+        let retired = Progress::decode(&bytes, &request, &response).unwrap();
+        assert!(retired.is_retired(&request, &response).unwrap());
+        assert_eq!(retired.encode().unwrap(), bytes);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn reserved_terminal_slot_cannot_be_used_for_another_resume() {
+    let (request, response, progress) = boundary_history(64, false);
+    let bytes = progress.encode().unwrap();
+    let recovered = Progress::decode(&bytes, &request, &response).unwrap();
+    let call = super::super::local_invocation::validate_request(&request).unwrap();
+    let action = Action::for_outcome(&call, &recovered.outcome(&request, &response).unwrap())
+        .unwrap()
+        .unwrap();
+    assert!(
+        action
+            .ensure_history_slot(64)
+            .unwrap_err()
+            .to_string()
+            .contains("unchanged retries cannot advance")
+    );
+    assert_eq!(recovered.encode().unwrap(), bytes);
+    let (request, response, invalid) = boundary_history(65, false);
+    assert!(Progress::decode(&invalid.encode().unwrap(), &request, &response).is_err());
+}
+
+#[test]
+fn dispatch_reserves_reply_and_terminal_bytes_before_sending() {
+    let (request, response, _) = fixture();
+    let call = super::super::local_invocation::validate_request(&request).unwrap();
+    let progress = Progress::new(&request).unwrap();
+    let resume = Action::for_outcome(&call, &progress.outcome(&request, &response).unwrap())
+        .unwrap()
+        .unwrap();
+    let ack = Action::for_outcome(
+        &call,
+        &RuntimeOutcome::Completed(Err(InvocationError::NotFound)),
+    )
+    .unwrap()
+    .unwrap();
+    let reserve = resume.required_reply_capacity(&call).unwrap();
+    assert!(reserve > 2 * ack.required_reply_capacity(&call).unwrap());
+    progress.ensure_reply_capacity(&resume, &call).unwrap();
+    Progress::check_reserved_capacity(MAX_PROGRESS_BYTES - reserve, reserve).unwrap();
+    assert!(Progress::check_reserved_capacity(MAX_PROGRESS_BYTES - reserve + 1, reserve).is_err());
+    assert!(Progress::check_reserved_capacity(usize::MAX, reserve).is_err());
+}
+
+#[test]
+fn full_history_retries_exact_terminal_ack_after_transport_failure() {
+    use std::io::{Read as _, Write as _};
+    let (request, response, expected) = boundary_history(64, true);
+    let root = directory();
+    let path = root.join("delivery");
+    let mut store = CleanInvocationFile::open_or_create(&path).unwrap();
+    store.publish_request(&request).unwrap();
+    store.publish_response(&response).unwrap();
+    let mut progress = Progress::new(&request).unwrap();
+    for exchange in expected.exchanges {
+        progress.exchanges.push(Exchange {
+            request: exchange.request,
+            response: None,
+        });
+        store.publish_progress(&progress.encode().unwrap()).unwrap();
+        progress.exchanges.last_mut().unwrap().response = exchange.response;
+        store.publish_progress(&progress.encode().unwrap()).unwrap();
+    }
+    drop(store);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (_, _, exchanges) = fixture();
+    let (_, ack, reply) = exchanges.last().unwrap().clone();
+    let server = std::thread::spawn(move || {
+        for status in [503, 200] {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
+                assert!(header.len() < 8192);
+            }
+            assert!(
+                String::from_utf8(header)
+                    .unwrap()
+                    .starts_with("POST /__agents/acknowledge HTTP/1.1\r\n")
+            );
+            let mut body = vec![0; ack.len()];
+            stream.read_exact(&mut body).unwrap();
+            assert_eq!(body, ack);
+            write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", reply.len()).unwrap();
+            stream.write_all(&reply).unwrap();
+        }
+    });
+    assert!(continue_retained(&path, address).is_err());
+    let mut reopened = CleanInvocationFile::open_or_create(&path).unwrap();
+    let pending = Progress::decode(
+        &reopened.load_progress().unwrap().unwrap(),
+        &request,
+        &response,
+    )
+    .unwrap();
+    assert_eq!(pending.exchanges.len(), 65);
+    assert!(pending.exchanges.last().unwrap().response.is_none());
+    drop(reopened);
+    continue_retained(&path, address).unwrap();
+    server.join().unwrap();
+    // Retired replay must not contact a transport at all.
+    continue_retained(&path, "127.0.0.1:1".parse().unwrap()).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn progress_requires_exact_predecessors_and_monotonic_publication() {
     let (request, response, exchanges) = fixture();

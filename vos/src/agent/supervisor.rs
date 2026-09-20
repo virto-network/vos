@@ -534,6 +534,7 @@ impl AgentSupervisorHandle {
                 snapshot,
                 payload,
                 reply,
+                admitted_at: std::time::Instant::now(),
             }) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
@@ -854,6 +855,7 @@ enum Command {
         snapshot: AgentRouteSnapshot,
         payload: Vec<u8>,
         reply: SyncSender<Result<Vec<u8>, AgentSupervisorError>>,
+        admitted_at: std::time::Instant,
     },
     Wake,
     #[cfg(test)]
@@ -927,9 +929,19 @@ impl SupervisorWorker {
                     snapshot,
                     payload,
                     reply,
+                    admitted_at,
                 } => {
                     shared.queued_dispatches.fetch_sub(1, Ordering::AcqRel);
+                    let started = std::time::Instant::now();
+                    let queue_wait_us = started.duration_since(admitted_at).as_micros();
                     let result = self.dispatch(snapshot, &payload, shared);
+                    tracing::debug!(
+                        queue_wait_us,
+                        service_us = started.elapsed().as_micros(),
+                        payload_bytes = payload.len(),
+                        succeeded = result.is_ok(),
+                        "Agent supervisor dispatch completed"
+                    );
                     let _ = reply.send(result);
                 }
                 Command::Wake => {}
