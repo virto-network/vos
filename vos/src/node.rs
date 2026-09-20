@@ -1336,9 +1336,7 @@ pub struct VosNode {
     /// to ingress only after its initial authenticated reconciliation and is
     /// stopped and joined with the node.
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
-    clean_agent_owner: Option<crate::agent::production_owner::AgentProductionOwner>,
-    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
-    clean_agent_owner_error: Option<crate::agent::production_owner::AgentProductionOwnerError>,
+    clean_agent_owner: Option<crate::agent::production_worker::AgentProductionWorker>,
     /// Live read-only ingress exposure. Route mutation and lifecycle ownership
     /// stay in `clean_agent_owner`; shutdown clears this slot before joining.
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
@@ -5746,8 +5744,6 @@ impl VosNode {
             #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
             clean_agent_owner: None,
             #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
-            clean_agent_owner_error: None,
-            #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
             clean_agent_ingress_supervisor: Arc::new(RwLock::new(None)),
             #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
             clean_agent_recovering: Arc::new(AtomicBool::new(false)),
@@ -5915,9 +5911,12 @@ impl VosNode {
             );
         }
         self.clean_agent_owner
-            .as_mut()
+            .as_ref()
             .ok_or(crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration)?
-            .create_local_disposition(descriptor, call, runtime)
+            .call(move |owner| {
+                owner.ok_or(crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration)?
+                    .create_local_disposition(descriptor, call, runtime)
+            })?
     }
 
     /// Native policy decision: issued authorization or synchronized signed denial.
@@ -5936,10 +5935,15 @@ impl VosNode {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(crate::agent::shared_host::SharedAgentHostError::Unavailable);
         }
+        let call = call.clone();
         self.clean_agent_owner
-            .as_mut()
+            .as_ref()
             .ok_or(crate::agent::shared_host::SharedAgentHostError::Unavailable)?
-            .authorize_operation(call, context, issued_at)
+            .call(move |owner| {
+                owner.ok_or(crate::agent::shared_host::SharedAgentHostError::Unavailable)?
+                    .authorize_operation(&call, context, issued_at)
+            })
+            .map_err(|_| crate::agent::shared_host::SharedAgentHostError::Unavailable)?
     }
 
     /// Attach the native owner. Normal ingress is exposed only after initial
@@ -5947,7 +5951,7 @@ impl VosNode {
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
     pub(crate) fn attach_clean_agent_owner(
         &mut self,
-        mut owner: crate::agent::production_owner::AgentProductionOwner,
+        owner: crate::agent::production_owner::AgentProductionOwner,
     ) -> Result<(), crate::agent::production_owner::AgentProductionOwnerError> {
         use crate::agent::production_owner::AgentProductionOwnerError;
 
@@ -5967,11 +5971,17 @@ impl VosNode {
             let _ = owner.shutdown_and_join();
             return Err(AgentProductionOwnerError::InvalidConfiguration);
         };
-        owner.set_shutdown_signal(Arc::clone(&self.shutdown));
-        self.clean_agent_owner = Some(owner);
         self.clean_agent_recovering
             .store(handle.is_none(), Ordering::Release);
         *exposed = handle;
+        drop(exposed);
+        self.clean_agent_owner = Some(crate::agent::production_worker::AgentProductionWorker::start(
+            owner,
+            self.shutdown.clone(),
+            self.clean_agent_ingress_supervisor.clone(),
+            self.clean_agent_recovering.clone(),
+            self.clean_local_lifecycle_queue.clone(),
+        )?);
         Ok(())
     }
 
@@ -5995,7 +6005,13 @@ impl VosNode {
         attachment: crate::agent::supervisor_adapters::AgentRouteHostAttachment,
     ) -> Result<(), crate::agent::production_owner::AgentProductionOwnerError> {
         match self.clean_agent_owner.as_mut() {
-            Some(owner) => owner.install_local_host(attachment),
+            Some(worker) => worker.call(move |owner| match owner {
+                Some(owner) => owner.install_local_host(attachment),
+                None => {
+                    attachment.retire()?;
+                    Err(crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration)
+                }
+            })?,
             None => {
                 attachment.retire()?;
                 Err(crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration)
@@ -6011,7 +6027,13 @@ impl VosNode {
         attachment: crate::agent::supervisor_adapters::AgentRouteHostAttachment,
     ) -> Result<(), crate::agent::production_owner::AgentProductionOwnerError> {
         match self.clean_agent_owner.as_mut() {
-            Some(owner) => owner.install_shared_host(attachment),
+            Some(worker) => worker.call(move |owner| match owner {
+                Some(owner) => owner.install_shared_host(attachment),
+                None => {
+                    attachment.retire()?;
+                    Err(crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration)
+                }
+            })?,
             None => {
                 attachment.retire()?;
                 Err(crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration)
@@ -8242,6 +8264,9 @@ impl VosNode {
                         .local_agent_host
                         .as_ref()
                         .map_or(idle, |host| idle.min(host.idle_for()));
+                    #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
+                    let idle = self.clean_agent_owner.as_ref()
+                        .map_or(idle, |worker| idle.min(worker.idle_for()));
                     if idle >= threshold {
                         self.signal_node_shutdown();
                         break;
@@ -8368,112 +8393,15 @@ impl VosNode {
 
     #[cfg(all(feature = "network", feature = "storage", target_os = "linux"))]
     fn drive_clean_agent_owner(&mut self) -> bool {
-        match self.clean_local_lifecycle_queue.pop() {
-            Ok(Some(request)) if !self.shutdown.load(Ordering::Acquire) => {
-                use crate::agent::local_lifecycle::PendingLocalLifecycle;
-                match request {
-                    PendingLocalLifecycle::PrepareAdmin { draft, reply } => {
-                        let result = self
-                            .clean_agent_owner
-                            .as_mut()
-                            .ok_or(crate::agent::shared_host::SharedAgentHostError::Unavailable)
-                            .and_then(|owner| owner.prepare_admin(&draft));
-                        let _ = reply.try_send(result);
-                    }
-                    PendingLocalLifecycle::SubmitAdmin {
-                        call,
-                        preparation,
-                        reply,
-                    } => {
-                        let result = self
-                            .clean_agent_owner
-                            .as_mut()
-                            .ok_or(crate::agent::shared_host::SharedAgentHostError::Unavailable)
-                            .and_then(|owner| owner.submit_admin(&call, &preparation));
-                        let _ = reply.try_send(result);
-                    }
-                    PendingLocalLifecycle::PrepareOperation { call, reply } => {
-                        let result = self
-                            .clean_agent_owner
-                            .as_mut()
-                            .ok_or(crate::agent::shared_host::SharedAgentHostError::Unavailable)
-                            .and_then(|owner| owner.prepare_operation(&call));
-                        let _ = reply.try_send(result);
-                    }
-                    PendingLocalLifecycle::AuthorizeOperation { submission, reply } => {
-                        let (call, context, issued_at) = submission.into_parts();
-                        let result =
-                            self.authorize_clean_agent_operation(&call, context, issued_at);
-                        let _ = reply.try_send(result);
-                    }
-                    PendingLocalLifecycle::Create(request) => {
-                        let result = self.create_clean_local_agent(
-                            request.descriptor,
-                            request.call,
-                            request.runtime,
-                        );
-                        let _ = request.reply.try_send(result);
-                    }
-                    PendingLocalLifecycle::Install { submission, reply } => {
-                        let (install, call, package) = submission.into_parts();
-                        let result = self.clean_agent_owner.as_mut()
-                            .ok_or(crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration)
-                            .and_then(|owner| owner.install_local_actor(install, call, package));
-                        let _ = reply.try_send(result);
-                    }
-                }
-            }
-            Ok(Some(request)) => {
-                request.reject();
-            }
-            Ok(None) => {}
-            Err(_) => {
-                self.signal_node_shutdown();
-                return false;
-            }
-        }
-        // Shutdown may arrive while an accepted lifecycle request is running.
-        // Finish and reply to that request above, but do not start another
-        // potentially expensive inventory pass before leaving the router loop.
         if self.shutdown.load(Ordering::Acquire) {
+            self.signal_node_shutdown();
             return false;
         }
-        let result = self
-            .clean_agent_owner
-            .as_mut()
-            .map(|owner| owner.drive_if_due(Instant::now()));
-        match result {
-            None | Some(Ok(_)) => {
-                if self.clean_agent_recovering.load(Ordering::Acquire) {
-                    if let Some(owner) = self
-                        .clean_agent_owner
-                        .as_ref()
-                        .filter(|owner| owner.is_ready())
-                    {
-                        let exposure = owner.ingress().and_then(|handle| {
-                            *self.clean_agent_ingress_supervisor.write().map_err(|_| crate::agent::production_owner::AgentProductionOwnerError::InvalidConfiguration)? = Some(handle);
-                            Ok(())
-                        });
-                        if let Err(error) = exposure {
-                            self.clean_agent_owner_error.get_or_insert(error);
-                            self.signal_node_shutdown();
-                            return false;
-                        }
-                        self.clean_agent_recovering.store(false, Ordering::Release);
-                        tracing::info!("Clean Agent recovery complete; verified routes ready");
-                    }
-                }
-                true
-            }
-            Some(Err(
-                crate::agent::production_owner::AgentProductionOwnerError::ShutdownRequested,
-            )) if self.shutdown.load(Ordering::Acquire) => false,
-            Some(Err(error)) => {
-                self.clean_agent_owner_error.get_or_insert(error);
-                self.signal_node_shutdown();
-                false
-            }
+        if self.clean_agent_owner.as_ref().is_some_and(|worker| !worker.is_running()) {
+            self.signal_node_shutdown();
+            return false;
         }
+        true
     }
 
     fn local_agent_host_failed(&self) -> bool {
@@ -9445,8 +9373,7 @@ impl VosNode {
                 .clean_agent_owner
                 .take()
                 .and_then(|owner| owner.shutdown_and_join().err());
-            let clean_error = self.clean_agent_owner_error.take().or(shutdown_error);
-            if let Some(error) = clean_error {
+            if let Some(error) = shutdown_error {
                 warn!(%error, "node: clean Agent production owner did not shut down cleanly");
                 agent_host_error.get_or_insert(crate::agent::host::AgentHostError::Unavailable);
             }
@@ -16357,7 +16284,7 @@ mod tests {
         assert!(node.drive_clean_agent_owner());
         node.shutdown_handle().store(true, Ordering::Release);
         assert!(!node.drive_clean_agent_owner());
-        assert!(node.clean_agent_owner_error.is_none());
+        assert!(node.clean_agent_owner.is_none());
     }
 
     #[test]

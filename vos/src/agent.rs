@@ -93,6 +93,8 @@ pub mod private_sync;
     target_os = "linux"
 ))]
 pub mod production_owner;
+#[cfg(all(feature = "std", feature = "storage", feature = "network", target_os = "linux"))]
+pub(crate) mod production_worker;
 pub(crate) mod replay;
 #[cfg(feature = "std")]
 pub(crate) mod runtime_pvm;

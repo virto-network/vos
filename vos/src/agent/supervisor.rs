@@ -463,6 +463,21 @@ impl fmt::Debug for AgentSupervisorHandle {
 }
 
 impl AgentSupervisorHandle {
+    /// Crate-private cancellation for the node's separately owned control worker.
+    pub(crate) fn request_shutdown(&self) {
+        let admission = self.shared.admission.lock();
+        let _admission = match admission {
+            Ok(admission) => admission,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if self.shared.state.compare_exchange(
+            SUPERVISOR_RUNNING, SUPERVISOR_CLOSING, Ordering::AcqRel, Ordering::Acquire,
+        ).is_ok() {
+            self.shared.clear_publication();
+            let _ = self.shared.commands.try_send(Command::Wake);
+        }
+    }
+
     pub fn is_running(&self) -> bool {
         self.shared.state.load(Ordering::Acquire) == SUPERVISOR_RUNNING
     }
@@ -797,26 +812,7 @@ impl AgentSupervisorOwner {
     /// Stop admission and synchronously hide every route. Worker retirement
     /// and joins are completed by [`Self::shutdown_and_join`] or `Drop`.
     pub fn request_shutdown(&self) {
-        let admission = self.handle.shared.admission.lock();
-        let _admission = match admission {
-            Ok(admission) => admission,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if self
-            .handle
-            .shared
-            .state
-            .compare_exchange(
-                SUPERVISOR_RUNNING,
-                SUPERVISOR_CLOSING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            self.handle.shared.clear_publication();
-            let _ = self.handle.shared.commands.try_send(Command::Wake);
-        }
+        self.handle.request_shutdown();
     }
 
     pub fn shutdown_and_join(mut self) -> Result<(), AgentSupervisorError> {

@@ -5,10 +5,10 @@ documents are navigation or evidence, not competing plans. Updated 2026-09-20.
 
 ## Branches and qualification
 
-- Reviewer branch: `saga/agents`, advanced to this integrated review checkpoint
-  from `1b977731`; resolve the exact tip with Git.
+- Reviewer branch: `saga/agents`, integrated checkpoint `16adf95e`.
 - Implementation: `wip/ch08-runtime-directory`, recovery source `a1ebce16`,
-  followed by artifact checkpoint `f9c362cb` and the lifecycle-envelope fix.
+  followed by artifact checkpoint `f9c362cb`, the lifecycle-envelope fix, and
+  newer control-worker isolation work not yet on the review branch.
 - Master is unchanged; nothing has been pushed.
 - Neither current branch is production-qualified. The full Agent Architecture
   Saga remains the objective; these checkpoints do not narrow it.
@@ -55,10 +55,34 @@ Exact logs and limitations: [recovery contract](agent-recovery-contract.md).
 3. Review this integrated recovery/artifact/envelope checkpoint using the
    [review guide](agent-saga-review.md). The reviewer reports findings; fixes
    remain on the implementation branch. No production sign-off is implied.
-4. Next: isolate synchronous node reconciliation and reduce its repeated full
-   invocation/acknowledgement costs without weakening freshness or ordering.
+4. Next: consolidate control-worker isolation with reduction of repeated full
+   inventory invocation/acknowledgement costs, without weakening freshness or ordering.
    Qualify the resulting binary with latency, independent-Agent isolation and
    recovery tests. Continue the remaining full-saga gates below.
+
+The newer implementation moves lifecycle dispatch and periodic reconciliation
+into one bounded control worker; the node loop only observes worker health.
+Ordering, authenticated projections and complete publication remain owned by
+the existing production owner. Cancellation hides admission without acquiring
+that busy owner, drains/rejects queued requests, and reports worker failures at
+collection. Idle-exit accounting includes active control work. This addresses
+scheduling isolation, not the number or cost of physical inventory executions.
+Keep the reviewer checkpoint stable until the next consolidated performance batch.
+
+Control-worker evidence under the shared target's `task-tmp`: 19 owner/worker tests
+in `control-worker-complete-tests.log`, 56 supervisor/adapter tests in
+`control-worker-supervisor-tests.log`, and seven targeted node tests in
+`control-worker-node-tests.log`. The pre-idle-accounting debug worker binary
+(`9345a05e6aba0a3227daf5b204c9251894ac032fee1df17ab0ddb892a2de55ca`)
+passes fresh bootstrap/HTTP/SSH/Create/Install/restart/shutdown in
+`control-worker-lifecycle.Pn9l9R/probe.log`: readiness 26s, Create 52s, Install 71s,
+restart 52s. This is neither a latency improvement nor release qualification.
+The final idle-accounting binary
+(`c766fa97f20a9fdc535fc404c7b3393210f2985827fb270e00015a5bba545bfd`)
+also passes reopen and `space up --once` (`idle-mode.log` in the same directory).
+That log measures six inventory queries at 26.453s; they still perform full
+invocation and acknowledgement. This is the next cost to address, not evidence
+that background scheduling alone made lifecycle operations fast.
 
 Current debug diagnostic: readiness 27s, Create/resume 54s, Install 65s, restart
 37s, both shutdowns under one measured second. These are not production capacity
