@@ -2,6 +2,50 @@
 
 This is a source-review checkpoint, not a deployment or architectural sign-off.
 
+## Follow-up checkpoint: supervisor refresh isolation
+
+Review this incremental change from `817e528c` to the commit containing this
+section, now carried on `saga/agents`. The change is confined to the supervisor
+and checkpoint documentation; no runtime, catalog, store or artifact changes.
+
+Refresh callbacks execute on one bounded maintenance worker, separate from
+serving workers. The coordinator validates and reserves the complete proposed
+generation before dispatching that callback, then checks its exact response and
+publishes atomically. Old and proposed Agent lanes remain behind a lifecycle
+barrier. Unrelated dispatch continues. Attach and subsequent refresh commands
+wait in deferred storage bounded by the configured command-queue capacity;
+excess control work returns Busy. Independent detach remains available.
+
+Shutdown closes publication/admission, drains serving and maintenance workers,
+rejects pending controls and refuses late refresh publication. Stale detach
+tokens cannot retire the replacement generation. Refresh errors and panics
+retire the affected attachment while leaving unrelated routes usable.
+
+Evidence (host `nightly-2025-05-09`, offline/locked):
+
+- 56 supervisor/adapter tests pass (`refresh-isolation-final.log`).
+- Held-refresh regression: Agent B's immediate request completes before
+  Agent A's refresh is released; A's request is refused behind the barrier.
+- Shutdown regression: an in-flight refresh is drained but never published.
+- Both preceding regressions pass 20 repetitions each
+  (`refresh-isolation-repeat.log`); these are deterministic coordination tests,
+  not throughput or latency-distribution measurements.
+- Deferred control overload, stale detach, exact-generation replacement,
+  refresh failure and panic cleanup pass.
+- `vosx` binary check passes (`refresh-isolation-vosx-check.log`).
+
+All logs remain in the shared target's `task-tmp` directory. Refresh tracing
+records worker-queue wait and callback service time (not total deferred wait).
+
+Limits: Attach reconciliation and retirement callbacks can still occupy the
+coordinator. Node inventory/reconciliation remains synchronous, and target
+catalog traversal still holds the registry mutex. VM memory budgeting,
+whole-state costs, generic-runtime recovery, bundle compatibility and release
+qualification are unchanged. This does not claim complete maintenance isolation.
+
+Next bounded implementation topic: move target-catalog traversal outside the
+registry mutex while retaining exclusive Agent ownership and tamper checks.
+
 ## Reviewer follow-up: inline retirement
 
 The P2 in `target/agent-review-92ce97f4.kUhgwO/REVIEW.md` is fixed in

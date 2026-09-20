@@ -1,5 +1,26 @@
 # Next review checkpoint: execution isolation and targeted access
 
+## Implemented checkpoint objective: supervisor refresh isolation
+
+Move refresh reconciliation to one bounded maintenance worker, leaving the
+coordinator responsible for exact generation validation and atomic publication.
+Keep old and proposed Agent lanes behind lifecycle barriers; unrelated serving
+work must complete while a refresh is deliberately held. Qualify stale replies,
+refresh failure, detach, shutdown and bounded deferred control admission. Then
+publish the tested checkpoint on `saga/agents` for review.
+
+Implemented and verified: 56 supervisor/adapter tests pass, `vosx` checks, and
+the held-refresh and shutdown regressions pass 20 repetitions each. See the
+refresh-isolation section of the reviewer handoff for the exact limits and
+remaining work. This closes this checkpoint, not the full-saga goal.
+
+This objective does not include catalog-scan relocation, node inventory worker
+scheduling, generic-runtime recovery or artifact repinning. Those remain open.
+The external goal tracker still holds the unfinished full-saga goal; it cannot
+be replaced through the available goal API without incorrectly completing it.
+
+## Previous checkpoint
+
 Current review handoff: [execution checkpoint](agent-execution-checkpoint-review.md).
 The chronological notes below include superseded intermediate states. Local
 production routing now uses per-Agent inline adapters and exclusive driver

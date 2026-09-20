@@ -738,7 +738,9 @@ impl AgentSupervisorOwner {
     /// The old snapshots remain visible while the adapter validates the
     /// complete replacement. Any adapter failure retires the attachment
     /// fail-closed; a successful replacement has no partially published
-    /// intermediate state.
+    /// intermediate state. Refresh validation runs on a bounded maintenance
+    /// worker. Dispatch to old/proposed Agent lanes is refused until the
+    /// lifecycle barrier completes; unrelated Agent lanes remain runnable.
     pub fn refresh(
         &mut self,
         publication: &AgentRoutePublication,
@@ -892,12 +894,31 @@ struct CompletedDispatch {
     result: Result<Vec<u8>, AgentSupervisorError>,
 }
 
+struct ActiveRefresh {
+    old_generation: AgentRouteReadinessGeneration,
+    lanes: BTreeSet<lanes::Lane>,
+}
+
+struct CompletedRefresh {
+    old_generation: AgentRouteReadinessGeneration,
+    generation: AgentRouteReadinessGeneration,
+    snapshots: Vec<AgentRouteSnapshot>,
+    route: Box<dyn AgentRoute>,
+    result: Result<(), AgentSupervisorError>,
+    reply: SyncSender<Result<AgentRoutePublication, AgentSupervisorError>>,
+}
+
 struct SupervisorWorker {
     routes: PublishedRoutes,
     attachments: BTreeMap<AgentRouteReadinessGeneration, ActiveAttachment>,
     next_generation: u64,
     dispatches: lanes::Scheduler<PendingDispatch>,
     pool: Option<lanes::Pool<CompletedDispatch>>,
+    // One outstanding refresh reserves its proposed identities. Attach and
+    // other refresh commands wait in bounded deferred control storage, so no
+    // competing publication can invalidate that reservation before commit.
+    refresh_pool: Option<lanes::Pool<CompletedRefresh>>,
+    refreshing: Option<ActiveRefresh>,
     deferred: std::collections::VecDeque<Command>,
 }
 
@@ -909,6 +930,8 @@ impl SupervisorWorker {
             next_generation: 1,
             dispatches: lanes::Scheduler::new(limits.inflight_capacity, Self::worker_count(limits)),
             pool: None,
+            refresh_pool: None,
+            refreshing: None,
             deferred: std::collections::VecDeque::new(),
         }
     }
@@ -922,7 +945,10 @@ impl SupervisorWorker {
 
     fn run(&mut self, receiver: &Receiver<Command>, shared: &SupervisorShared) -> WorkerExit {
         loop {
-            if self.collect_completions(shared).is_err() || self.start_dispatches(shared).is_err() {
+            if self.collect_refresh_completions(shared).is_err()
+                || self.collect_completions(shared).is_err()
+                || self.start_dispatches(shared).is_err()
+            {
                 return WorkerExit::Failed;
             }
             let state = shared.state.load(Ordering::Acquire);
@@ -933,15 +959,10 @@ impl SupervisorWorker {
                     WorkerExit::Failed
                 };
             }
-            let ready_control = self.deferred.iter().position(|command| {
-                let publication = match command {
-                    Command::Refresh { publication, .. } | Command::Detach { publication, .. } => {
-                        publication
-                    }
-                    _ => unreachable!(),
-                };
-                !self.publication_busy(publication)
-            });
+            let ready_control = self
+                .deferred
+                .iter()
+                .position(|command| !self.control_busy(command));
             let command = match ready_control.map(|index| self.deferred.remove(index).unwrap()) {
                 Some(command) => command,
                 None => match receiver.recv() {
@@ -960,6 +981,21 @@ impl SupervisorWorker {
                     WorkerExit::Failed
                 };
             }
+            if self.control_busy(&command) {
+                if self.deferred.len() >= shared.limits.queue_capacity {
+                    if reject_command(command, shared, AgentSupervisorError::Busy).is_err() {
+                        return WorkerExit::Failed;
+                    }
+                } else {
+                    if let Command::Refresh { publication, .. }
+                    | Command::Detach { publication, .. } = &command
+                    {
+                        self.cancel_attachment_dispatches(publication.generation, shared);
+                    }
+                    self.deferred.push_back(command);
+                }
+                continue;
+            }
             match command {
                 Command::Attach { attachment, reply } => {
                     let result = self.attach(attachment, shared);
@@ -970,25 +1006,13 @@ impl SupervisorWorker {
                     identities,
                     reply,
                 } => {
-                    if self.publication_busy(&publication) {
-                        self.cancel_attachment_dispatches(publication.generation, shared);
-                        self.deferred.push_back(Command::Refresh {
-                            publication,
-                            identities,
-                            reply,
-                        });
-                        continue;
+                    if let Err(error) =
+                        self.begin_refresh(publication, identities, reply.clone(), shared)
+                    {
+                        let _ = reply.send(Err(error));
                     }
-                    let result = self.refresh(publication, identities, shared);
-                    let _ = reply.send(result);
                 }
                 Command::Detach { publication, reply } => {
-                    if self.publication_busy(&publication) {
-                        self.cancel_attachment_dispatches(publication.generation, shared);
-                        self.deferred
-                            .push_back(Command::Detach { publication, reply });
-                        continue;
-                    }
                     let result = self.detach(publication, shared);
                     let _ = reply.send(result);
                 }
@@ -1010,9 +1034,8 @@ impl SupervisorWorker {
                             admitted_at,
                             attachment: published.attachment,
                         };
-                        let closing = self.deferred.iter().any(|command| matches!(command,
-                            Command::Refresh { publication, .. } | Command::Detach { publication, .. }
-                            if publication.snapshots.iter().any(|route| route.key().space == snapshot.key().space && route.key().agent == snapshot.key().agent)));
+                        let closing = self
+                            .lane_blocked(lanes::Lane(snapshot.key().space, snapshot.key().agent));
                         if closing {
                             shared.queued_dispatches.fetch_sub(1, Ordering::AcqRel);
                             let _ = pending.reply.send(Err(AgentSupervisorError::StaleSnapshot));
@@ -1039,10 +1062,74 @@ impl SupervisorWorker {
     }
 
     fn publication_busy(&self, publication: &AgentRoutePublication) -> bool {
+        if self.refreshing.as_ref().is_some_and(|refresh| {
+            refresh.old_generation == publication.generation
+                || publication.snapshots.iter().any(|snapshot| {
+                    refresh
+                        .lanes
+                        .contains(&lanes::Lane(snapshot.key().space, snapshot.key().agent))
+                })
+        }) {
+            return true;
+        }
         self.attachments.contains_key(&publication.generation)
             && publication.snapshots.iter().any(|snapshot| {
                 self.dispatches
                     .is_active(lanes::Lane(snapshot.key().space, snapshot.key().agent))
+            })
+    }
+
+    fn control_busy(&self, command: &Command) -> bool {
+        match command {
+            Command::Attach { .. } => self.refreshing.is_some(),
+            Command::Refresh {
+                publication,
+                identities,
+                ..
+            } => {
+                self.refreshing.is_some()
+                    || self.publication_busy(publication)
+                    || identities.iter().any(|identity| {
+                        self.dispatches
+                            .is_active(lanes::Lane(identity.key.space, identity.key.agent))
+                    })
+            }
+            Command::Detach { publication, .. } => self.publication_busy(publication),
+            _ => false,
+        }
+    }
+
+    fn lane_blocked(&self, lane: lanes::Lane) -> bool {
+        Self::lane_blocked_by(self.refreshing.as_ref(), &self.deferred, lane)
+    }
+
+    fn lane_blocked_by(
+        refreshing: Option<&ActiveRefresh>,
+        deferred: &std::collections::VecDeque<Command>,
+        lane: lanes::Lane,
+    ) -> bool {
+        refreshing.is_some_and(|refresh| refresh.lanes.contains(&lane))
+            || deferred.iter().any(|command| {
+                let publication = match command {
+                    Command::Refresh {
+                        publication,
+                        identities,
+                        ..
+                    } => {
+                        if identities.iter().any(|identity| {
+                            lanes::Lane(identity.key.space, identity.key.agent) == lane
+                        }) {
+                            return true;
+                        }
+                        publication
+                    }
+                    Command::Detach { publication, .. } => publication,
+                    _ => return false,
+                };
+                publication
+                    .snapshots
+                    .iter()
+                    .any(|snapshot| lanes::Lane(snapshot.key().space, snapshot.key().agent) == lane)
             })
     }
 
@@ -1068,9 +1155,11 @@ impl SupervisorWorker {
             self.attachments
                 .get(&pending.attachment)
                 .is_none_or(|active| active.route.is_some())
-                && !self.deferred.iter().any(|command| matches!(command,
-                    Command::Refresh { publication, .. } | Command::Detach { publication, .. }
-                    if publication.snapshots.iter().any(|route| route.key().space == pending.snapshot.key().space && route.key().agent == pending.snapshot.key().agent)))
+                && !Self::lane_blocked_by(
+                    self.refreshing.as_ref(),
+                    &self.deferred,
+                    lanes::Lane(pending.snapshot.key().space, pending.snapshot.key().agent),
+                )
         }) {
             shared.queued_dispatches.fetch_sub(1, Ordering::AcqRel);
             let pending = ready.job;
@@ -1085,7 +1174,9 @@ impl SupervisorWorker {
                     lanes::Pool::with_wake(
                         Self::worker_count(shared.limits),
                         shared.limits.inflight_capacity,
-                        move || { let _ = commands.try_send(Command::Wake); },
+                        move || {
+                            let _ = commands.try_send(Command::Wake);
+                        },
                     )
                     .map_err(|_| ())?,
                 );
@@ -1332,12 +1423,13 @@ impl SupervisorWorker {
         ))
     }
 
-    fn refresh(
+    fn begin_refresh(
         &mut self,
         publication: AgentRoutePublication,
         mut identities: Vec<AgentRouteIdentity>,
+        reply: SyncSender<Result<AgentRoutePublication, AgentSupervisorError>>,
         shared: &SupervisorShared,
-    ) -> Result<AgentRoutePublication, AgentSupervisorError> {
+    ) -> Result<(), AgentSupervisorError> {
         let old_generation = publication.generation;
         let Some(active) = self.attachments.get(&old_generation) else {
             return Err(AgentSupervisorError::StaleSnapshot);
@@ -1351,44 +1443,121 @@ impl SupervisorWorker {
                 Ok(prepared) => prepared,
                 Err(error) => return Err(self.fail_attachment(old_generation, shared, error)),
             };
-        let reconciled = {
-            let active = self
-                .attachments
-                .get_mut(&old_generation)
-                .ok_or(AgentSupervisorError::OwnerFailed)?;
-            panic::catch_unwind(AssertUnwindSafe(|| {
-                active
-                    .route
-                    .as_mut()
-                    .expect("lifecycle barrier")
-                    .reconcile(&snapshots)
-            }))
-        };
-        match reconciled {
-            Ok(Ok(actual)) if actual == snapshots => {}
-            Ok(Ok(_)) => {
-                return Err(self.fail_attachment(
-                    old_generation,
-                    shared,
-                    AgentSupervisorError::ReconcileMismatch,
-                ));
-            }
-            Ok(Err(error)) => {
-                return Err(self.fail_attachment(
-                    old_generation,
-                    shared,
-                    AgentSupervisorError::Route(error),
-                ));
-            }
-            Err(_) => {
-                return Err(self.fail_attachment(
-                    old_generation,
-                    shared,
-                    AgentSupervisorError::RoutePanicked,
-                ));
-            }
-        }
 
+        if self.refresh_pool.is_none() {
+            let commands = shared.commands.clone();
+            self.refresh_pool = Some(
+                lanes::Pool::with_wake(1, 1, move || {
+                    let _ = commands.try_send(Command::Wake);
+                })
+                .map_err(|_| {
+                    self.fail_attachment(old_generation, shared, AgentSupervisorError::OwnerFailed)
+                })?,
+            );
+        }
+        self.cancel_attachment_dispatches(old_generation, shared);
+        let blocked = publication
+            .snapshots
+            .iter()
+            .chain(&snapshots)
+            .map(|snapshot| lanes::Lane(snapshot.key().space, snapshot.key().agent))
+            .collect();
+        let mut route = self
+            .attachments
+            .get_mut(&old_generation)
+            .and_then(|active| active.route.take())
+            .ok_or(AgentSupervisorError::OwnerFailed)?;
+        self.refreshing = Some(ActiveRefresh {
+            old_generation,
+            lanes: blocked,
+        });
+        let admitted_at = std::time::Instant::now();
+        let job = Box::new(move || {
+            let started = std::time::Instant::now();
+            let result = match panic::catch_unwind(AssertUnwindSafe(|| route.reconcile(&snapshots)))
+            {
+                Ok(Ok(actual)) if actual == snapshots => Ok(()),
+                Ok(Ok(_)) => Err(AgentSupervisorError::ReconcileMismatch),
+                Ok(Err(error)) => Err(AgentSupervisorError::Route(error)),
+                Err(_) => Err(AgentSupervisorError::RoutePanicked),
+            };
+            tracing::debug!(
+                queue_wait_us = started.duration_since(admitted_at).as_micros(),
+                service_us = started.elapsed().as_micros(),
+                routes = snapshots.len(),
+                succeeded = result.is_ok(),
+                "Agent supervisor refresh reconciled"
+            );
+            CompletedRefresh {
+                old_generation,
+                generation,
+                snapshots,
+                route,
+                result,
+                reply,
+            }
+        });
+        if self.refresh_pool.as_ref().unwrap().submit(job).is_err() {
+            self.refreshing = None;
+            return Err(self.fail_attachment(
+                old_generation,
+                shared,
+                AgentSupervisorError::OwnerFailed,
+            ));
+        }
+        Ok(())
+    }
+
+    fn collect_refresh_completions(&mut self, shared: &SupervisorShared) -> Result<(), ()> {
+        let Some(pool) = self.refresh_pool.as_ref() else {
+            return Ok(());
+        };
+        match pool.completions.try_recv() {
+            Ok(Ok(completed)) => self.finish_refresh(completed, shared),
+            Ok(Err(())) | Err(TryRecvError::Disconnected) => Err(()),
+            Err(TryRecvError::Empty) => Ok(()),
+        }
+    }
+
+    fn finish_refresh(
+        &mut self,
+        completed: CompletedRefresh,
+        shared: &SupervisorShared,
+    ) -> Result<(), ()> {
+        let CompletedRefresh {
+            old_generation,
+            generation,
+            snapshots,
+            route,
+            result,
+            reply,
+        } = completed;
+        if self
+            .refreshing
+            .take()
+            .is_none_or(|refresh| refresh.old_generation != old_generation)
+        {
+            return Err(());
+        }
+        let active = self.attachments.get_mut(&old_generation).ok_or(())?;
+        if active.route.replace(route).is_some() {
+            return Err(());
+        }
+        let result = match result {
+            Ok(()) => self.publish_refresh(old_generation, generation, snapshots, shared),
+            Err(error) => Err(self.fail_attachment(old_generation, shared, error)),
+        };
+        let _ = reply.send(result);
+        Ok(())
+    }
+
+    fn publish_refresh(
+        &mut self,
+        old_generation: AgentRouteReadinessGeneration,
+        generation: AgentRouteReadinessGeneration,
+        snapshots: Vec<AgentRouteSnapshot>,
+        shared: &SupervisorShared,
+    ) -> Result<AgentRoutePublication, AgentSupervisorError> {
         let replacement = AgentRoutePublication {
             generation,
             snapshots: snapshots.clone(),
@@ -1510,6 +1679,17 @@ impl SupervisorWorker {
             for completion in pool.completions.try_iter() {
                 if completion
                     .and_then(|completed| self.finish_dispatch(completed, shared))
+                    .is_err()
+                {
+                    error.get_or_insert(AgentSupervisorError::OwnerFailed);
+                }
+            }
+        }
+        if let Some(mut pool) = self.refresh_pool.take() {
+            pool.join();
+            for completion in pool.completions.try_iter() {
+                if completion
+                    .and_then(|completed| self.finish_refresh(completed, shared))
                     .is_err()
                 {
                     error.get_or_insert(AgentSupervisorError::OwnerFailed);
@@ -1716,6 +1896,10 @@ mod tests {
         MismatchAfterReady {
             calls: u8,
         },
+        FailureAfterReady {
+            calls: u8,
+            panic: bool,
+        },
     }
 
     enum DispatchBehavior {
@@ -1752,6 +1936,16 @@ mod tests {
         ) -> Result<Vec<AgentRouteSnapshot>, AgentRouteError> {
             match &mut self.reconcile {
                 ReconcileBehavior::Ready => Ok(proposed.to_vec()),
+                ReconcileBehavior::FailureAfterReady { calls, panic } => {
+                    *calls += 1;
+                    if *calls == 1 {
+                        return Ok(proposed.to_vec());
+                    }
+                    if *panic {
+                        panic!("intentional refresh panic");
+                    }
+                    Err(AgentRouteError::Unavailable)
+                }
                 ReconcileBehavior::Mismatch => {
                     let mut actual = proposed.to_vec();
                     actual[0].identity.actor_program = ProgramId([0xfe; 32]);
@@ -2297,6 +2491,229 @@ mod tests {
         );
         assert_eq!(handle.dispatch(current, vec![5]).unwrap(), vec![5]);
         owner.shutdown_and_join().unwrap();
+    }
+
+    #[test]
+    fn held_refresh_allows_unrelated_dispatch_and_blocks_its_own_agent() {
+        let mut owner = AgentSupervisorOwner::start(limits(3, 4, 4, 128)).unwrap();
+        let a = identity(1, 1, 1, AgentProfile::Local);
+        let b = identity(1, 2, 1, AgentProfile::Local);
+        let (entered, observed) = mpsc::sync_channel(1);
+        let (release, wait) = mpsc::sync_channel(1);
+        let publication = owner
+            .attach(attachment(
+                vec![a],
+                FakeRoute {
+                    reconcile: ReconcileBehavior::BlockAfterReady {
+                        calls: 0,
+                        started: entered,
+                        release: wait,
+                    },
+                    dispatch: DispatchBehavior::Echo,
+                },
+                Arc::new(WorkerRecord::default()),
+            ))
+            .unwrap();
+        owner
+            .attach(attachment(
+                vec![b],
+                FakeRoute::ready(),
+                Arc::new(WorkerRecord::default()),
+            ))
+            .unwrap();
+        let handle = owner.handle();
+        let old = handle.snapshot(a.key()).unwrap();
+        let independent = handle.snapshot(b.key()).unwrap();
+        let mut upgraded = a;
+        upgraded.runtime_deployment = DeploymentId([0xa5; 32]);
+        let refresh = thread::spawn(move || {
+            let result = owner.refresh(&publication, vec![upgraded]);
+            (owner, result)
+        });
+        observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (done, completed) = mpsc::sync_channel(1);
+        let client = handle.clone();
+        let call = thread::spawn(move || {
+            let same = client.dispatch(old, vec![1]);
+            let other = client.dispatch(independent, vec![2]);
+            let _ = done.send((same, other));
+        });
+        let before_release = completed.recv_timeout(Duration::from_secs(3));
+        assert_eq!(handle.snapshot(a.key()).unwrap(), old);
+        release.send(()).unwrap();
+        let (owner, result) = refresh.join().unwrap();
+        call.join().unwrap();
+        assert_eq!(
+            before_release.unwrap(),
+            (Err(AgentSupervisorError::StaleSnapshot), Ok(vec![2]))
+        );
+        let updated = result.unwrap().snapshots()[0];
+        assert_eq!(handle.snapshot(a.key()).unwrap(), updated);
+        assert_eq!(handle.snapshot(b.key()).unwrap(), independent);
+        assert_eq!(
+            handle.dispatch(old, vec![3]),
+            Err(AgentSupervisorError::StaleSnapshot)
+        );
+        assert_eq!(handle.dispatch(updated, vec![4]), Ok(vec![4]));
+        owner.shutdown_and_join().unwrap();
+    }
+
+    #[test]
+    fn refresh_error_and_panic_retire_only_the_affected_attachment() {
+        for panics in [false, true] {
+            let mut owner = AgentSupervisorOwner::start(limits(2, 2, 2, 64)).unwrap();
+            let a = identity(1, 1, 1, AgentProfile::Local);
+            let b = identity(1, 2, 1, AgentProfile::Local);
+            let record = Arc::new(WorkerRecord::default());
+            let publication = owner
+                .attach(attachment(
+                    vec![a],
+                    FakeRoute {
+                        reconcile: ReconcileBehavior::FailureAfterReady {
+                            calls: 0,
+                            panic: panics,
+                        },
+                        dispatch: DispatchBehavior::Echo,
+                    },
+                    record.clone(),
+                ))
+                .unwrap();
+            owner
+                .attach(attachment(
+                    vec![b],
+                    FakeRoute::ready(),
+                    Arc::new(WorkerRecord::default()),
+                ))
+                .unwrap();
+            let handle = owner.handle();
+            let independent = handle.snapshot(b.key()).unwrap();
+            let expected = if panics {
+                AgentSupervisorError::RoutePanicked
+            } else {
+                AgentSupervisorError::Route(AgentRouteError::Unavailable)
+            };
+            assert_eq!(owner.refresh(&publication, vec![a]), Err(expected));
+            assert_eq!(
+                handle.snapshot(a.key()),
+                Err(AgentSupervisorError::NotFound)
+            );
+            assert!(record.joined.load(Ordering::Acquire));
+            assert_eq!(handle.dispatch(independent, vec![9]), Ok(vec![9]));
+            owner.shutdown_and_join().unwrap();
+        }
+    }
+
+    #[test]
+    fn held_refresh_bounds_deferred_control_and_rejects_stale_detach() {
+        let mut owner = AgentSupervisorOwner::start(limits(2, 2, 2, 64)).unwrap();
+        let a = identity(1, 1, 1, AgentProfile::Local);
+        let (entered, observed) = mpsc::sync_channel(1);
+        let (release, wait) = mpsc::sync_channel(1);
+        let publication = owner
+            .attach(attachment(
+                vec![a],
+                FakeRoute {
+                    reconcile: ReconcileBehavior::BlockAfterReady {
+                        calls: 0,
+                        started: entered,
+                        release: wait,
+                    },
+                    dispatch: DispatchBehavior::Echo,
+                },
+                Arc::new(WorkerRecord::default()),
+            ))
+            .unwrap();
+        let handle = owner.handle();
+        let (reply, refreshed) = mpsc::sync_channel(1);
+        handle
+            .shared
+            .commands
+            .send(Command::Refresh {
+                publication: publication.clone(),
+                identities: vec![a],
+                reply,
+            })
+            .unwrap();
+        observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        let mut results = Vec::new();
+        for _ in 0..3 {
+            let (reply, result) = mpsc::sync_channel(1);
+            handle
+                .shared
+                .commands
+                .send(Command::Detach {
+                    publication: publication.clone(),
+                    reply,
+                })
+                .unwrap();
+            results.push(result);
+        }
+        let refused = results[2].recv_timeout(Duration::from_secs(3));
+        let pending = results[0].try_recv().is_err() && results[1].try_recv().is_err();
+        release.send(()).unwrap();
+        let replacement = refreshed
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(refused.unwrap(), Err(AgentSupervisorError::Busy));
+        assert!(pending);
+        for result in &results[..2] {
+            assert_eq!(
+                result.recv_timeout(Duration::from_secs(3)).unwrap(),
+                Err(AgentSupervisorError::StaleSnapshot)
+            );
+        }
+        let current = handle.snapshot(a.key()).unwrap();
+        assert_eq!(current, replacement.snapshots()[0]);
+        assert_eq!(handle.dispatch(current, vec![7]), Ok(vec![7]));
+        owner.shutdown_and_join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_drains_held_refresh_without_publishing_its_completion() {
+        let mut owner = AgentSupervisorOwner::start(limits(2, 2, 2, 64)).unwrap();
+        let a = identity(1, 1, 1, AgentProfile::Local);
+        let (entered, observed) = mpsc::sync_channel(1);
+        let (release, wait) = mpsc::sync_channel(1);
+        let record = Arc::new(WorkerRecord::default());
+        let publication = owner
+            .attach(attachment(
+                vec![a],
+                FakeRoute {
+                    reconcile: ReconcileBehavior::BlockAfterReady {
+                        calls: 0,
+                        started: entered,
+                        release: wait,
+                    },
+                    dispatch: DispatchBehavior::Echo,
+                },
+                record.clone(),
+            ))
+            .unwrap();
+        let handle = owner.handle();
+        let (reply, result) = mpsc::sync_channel(1);
+        handle
+            .shared
+            .commands
+            .send(Command::Refresh {
+                publication,
+                identities: vec![a],
+                reply,
+            })
+            .unwrap();
+        observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        owner.request_shutdown();
+        let shutdown = thread::spawn(move || owner.shutdown_and_join());
+        let unpublished = handle.snapshot(a.key()).is_err();
+        release.send(()).unwrap();
+        assert_eq!(
+            result.recv_timeout(Duration::from_secs(3)).unwrap(),
+            Err(AgentSupervisorError::Closed)
+        );
+        shutdown.join().unwrap().unwrap();
+        assert!(unpublished);
+        assert!(record.joined.load(Ordering::Acquire));
+        assert!(handle.snapshot(a.key()).is_err());
     }
 
     #[test]
