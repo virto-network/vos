@@ -111,9 +111,10 @@ measurement. Preserve the check; reusing prior validation needs an explicit
 immutable binding, not omission of authorization or correspondence validation.
 Whole-state transport/publication and sequential directory projections remain.
 
-## Next sequence
+## Implementation follow-up (not yet on reviewer branch)
 
-Implementation-only follow-up after review checkpoint `7bd66a7d`: Invoke and
+Source `eef8890a`, integrated artifacts `07c7d1b8`, after review checkpoint
+`7bd66a7d`: Invoke and
 Resume now retain an immutable resolved-invocation object through execution.
 It borrows the original SDK work and privately owns the resolved inputs plus
 the complete actor record. Commit still authenticates work/authorization and
@@ -142,18 +143,60 @@ from checkpoint 853,869,674 to 766,337,681 (10.3%), ACK uses 20,954,277, and the
 pair totals 787,291,958 (24.3% below r18). Invoke alone remains about 0.4% above
 r18. This supports the repeated-resolution attribution but does not establish
 whole-query or released-node latency. Four CLI bundled-admission tests pass
-(`resolved-bundled-admission.log`). The optimized runtime has not repeated the
-full disposable CLI lifecycle campaign; the review checkpoint's recorded CLI
-timings remain specific to that older runtime.
+(`resolved-bundled-admission.log`). The review checkpoint's recorded CLI timings
+above remain specific to that older runtime.
+
+### Latest integrated lifecycle evidence
+
+Rebuilt debug CLI: `resolved-lifecycle-cli-build.log`, SHA-256
+`c45f3415464e8d8d628975074e8e85673208b27109281f93d46270c1ea461d23`.
+Test client SHA-256:
+`615cb3f7bf28a10256ca45497d2cadff54756f319f2f326ee20f0f47130dbc44`.
+Fresh fixed-path campaign: `indexed-lifecycle.resolved.QtFlV7/`.
+`probe.log` passes bundled bootstrap, HTTP/SSH, Create, Install and restart:
+21s readiness, 37s Create, 46s Install, 26s restart, both shutdowns below 1s.
+Generated ingress defaults are preserved in `generated-local.toml`; only test
+ports change. Mutation/positive retirement/exact retry passes in 28.36s
+(`mutation-test.log`, managed attempt 26.40s). Read-after-restart passes in
+30.34s (`read-test.log`, managed attempt 28.28s). The invocation campaign's
+readiness is 31s/27s and shutdowns 2s/1s (`invocation-probe.log`); the complete
+script exits zero and all four probe daemons have stopped. This qualifies only
+the disposable Local/Public-policy workflow, not the remaining profile gates.
+
+The same run's `up.log` attributes 11.549s to the Create lifecycle phase and
+19.793s to the following two-Agent inventory refresh. Its six query dispatches
+consume 19.790s in total. This is end-to-end debug-host diagnostic evidence,
+not released capacity qualification. It supports the combined-projection work
+below rather than treating the Invoke gas optimization as sufficient.
+
+Earlier setup evidence is retained in `resolved-lifecycle.ekSIW8/`: initial
+bootstrap/Create/Install/restart passed, but the mutation fixture rejected the
+directory prefix before dispatch. Renaming that store then failed reopening
+with `Host(CorruptResidue)`; its original path was restored, and qualification
+restarted in the fresh fixed-path campaign above. No safety guard was weakened.
+Journal store identity binds canonical path and lock nonce; both focused tests
+pass in `resolved-store-identity.log`. Directory relocation is not a qualified
+backup/restore workflow.
+
+## Next sequence
 
 1. Reviewer examines `c8028394..saga/agents` read-only and returns findings;
    implementation applies fixes on latest source.
-2. Address repeat Invoke validation through a safely bound resolved-work contract;
-   measure total request cost without weakening commit checks.
+2. The immutable-resolution source, reproduced runtime and integrated Local
+   lifecycle evidence above are ready for the next scoped review handoff.
+   Keep the current reviewer branch fixed until that handoff; apply returned
+   findings on latest implementation. Remaining repeated validation and total
+   request cost still need measurement.
 3. Reduce authenticated inventory projection work with explicit revision,
    freshness, availability and ordering. Preserve same-head pagination, cache
    invalidation on refresh failure and durable retirement; no custom-state decoding
-   shortcuts or discarded guest state.
+   shortcuts or discarded guest state. Start with a bounded combined projection
+   design to amortize the repeated authenticated invocation/retirement pairs;
+   enforce total response bounds rather than merely increasing page sizes.
+   Acceptance must cover exact credential/nonce/Authority binding, one revision,
+   revocation and visibility filtering, interrupted pagination, pending-query
+   recovery, and unchanged-head reuse. Compare complete refresh cost and runtime
+   execution counts at fixed one-, two- and growing-Agent inventories.
 4. Develop bounded touched-state access/incremental publication and qualify costs
    against directory growth, idle Agents and independent workloads.
 5. Continue every full-saga gate below; the checkpoint does not narrow the goal.
