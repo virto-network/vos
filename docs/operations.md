@@ -48,6 +48,11 @@ retained request and resume it rather than allocating a new operation identity.
 
 ## Backup and restore
 
+Native backup after Agent bootstrap is currently unavailable. The commands below
+apply only to supported archive generations; they are not a backup/recovery
+procedure for a running Agent space. Do not substitute raw store copies or
+directory relocation. See [current acceptance gates](agent-saga-status.md).
+
 Stop the daemon before backup:
 
 ```bash

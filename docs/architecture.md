@@ -1,5 +1,12 @@
 # Architecture
 
+This page describes the Agent architecture and protocol contracts, not release
+qualification across every profile. The current checkpoint qualifies a scoped
+Local workflow. Ordinary Shared startup/finality, complete Private/Attested
+lifecycle, post-bootstrap native backup/restore, and production scaling remain
+acceptance gates. See [current saga status](agent-saga-status.md) for evidence
+and remaining work, and [Operations](operations.md) for supported commands.
+
 A VOS node belongs to one Space. Every Space contains a protected system
 Agent with an authority actor and a catalog actor, plus any number of Local,
 Shared, and Private Agents. An Agent is the durable unit of identity,
@@ -53,7 +60,8 @@ roles. A Private Agent rejects Linear actor schemas in this release.
 
 ## Runtime and actor boundary
 
-The AgentRuntime is an outer standard program. It owns actor discovery,
+The AgentRuntime is an admitted outer program; the bundled standard runtime is
+one implementation of the public runtime contract. It owns actor discovery,
 lifecycle, scheduling, state-lane projection, continuations, retained results,
 and exactly-once acknowledgement. Actors execute through bounded inner
 machines created and controlled by the runtime. At most 63 inner machines may

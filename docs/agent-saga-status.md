@@ -353,6 +353,24 @@ and diff checks pass. The instrumentation is diagnostic, not a performance fix.
 
 ## Next sequence
 
+Workspace gate follow-up: `cargo +nightly-2025-05-09 test --workspace --no-run
+--offline --locked` passes at source `496c4ea0` (6m10s), log
+`saga-workspace-test-build.log`. This builds default workspace test targets;
+it does not run them or include every optional feature/standalone guest.
+The serial `test --workspace --lib --offline --locked -- --test-threads=1`
+campaign passes (`saga-workspace-lib-tests.log`): 2,406 tests, zero failures,
+six explicitly ignored, counting each crate's final summary rather than nested
+child-harness output. Includes 1,590 `vos`, 182 SDK and 120 PVM-proof library tests;
+the main `vos` suite takes 226.74s. Uses disk-backed `TMPDIR` and the existing
+`agent-r19-artifacts/scripted` ELF explicitly selected. This is the default
+workspace library gate, not CLI binary tests, integration execution, ignored or
+all-feature tests, or freshly rebuilt standalone guests. Other warnings remain;
+this is not a lint/format gate pass.
+Architecture and operator docs now distinguish protocol design from current
+profile qualification and explicitly warn that post-bootstrap native backup is
+unavailable. The production inventory owner's test-only descriptor import is
+scoped to tests; no runtime or artifact behavior changes.
+
 1. Reviewer examines `7bd66a7d..saga/agents` read-only and returns findings.
    Apply fixes on latest implementation source; advance the reviewer branch only
    at qualified checkpoints. Do not mix reviewer edits with implementation work.

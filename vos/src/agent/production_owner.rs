@@ -24,7 +24,9 @@ use super::sdk::authority::{
     AuthorityProjectionQuery, AuthorityProjectionSelector, MAX_AUTHORITY_INVENTORY_PAGE_ENTRIES,
 };
 use super::sdk::wire::CanonicalWire;
-use super::sdk::{AgentDescriptor, AgentId, AgentProfile, NodeId, PrincipalId};
+#[cfg(test)]
+use super::sdk::AgentDescriptor;
+use super::sdk::{AgentId, AgentProfile, NodeId, PrincipalId};
 use super::supervisor::{
     AgentRouteIdentity, AgentRouteKey, AgentRoutePublication, AgentSupervisorError,
     AgentSupervisorHandle, AgentSupervisorLimits, AgentSupervisorOwner,
