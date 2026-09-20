@@ -450,6 +450,18 @@ This closes positive **archive/provider storage** coverage, not the joint
 published-record startup path. The fixture uses a synthetic runtime catalog;
 it is not physical runtime execution or a released Shared lifecycle campaign.
 
+The owner recovery API now borrows recovery/record pairs instead of taking owned
+pairs, allowing the controller to retain each archive lease. The CLI's
+`published_recoveries` handoff borrows only a complete, locator-matched published
+set; any absent/empty archive returns unavailable without discarding entries or
+releasing their leases. The existing finality/replay algorithm is unchanged.
+All 17 ordinary-genesis CLI tests pass (`shared-borrowed-recovery-cli-tests.log`);
+the deferred root startup/one-time completion regression passes
+(`shared-borrowed-recovery-owner-test.log`, one test, 2.69s). That owner regression
+has an empty ordinary-Agent set; it does not establish nonempty published Shared
+startup. Formatting passes (`shared-borrowed-recovery-format.log`). The production
+controller and startup call sites remain to be connected and qualified.
+
 1. Reviewer examines `7bd66a7d..saga/agents` read-only and returns findings.
    Apply fixes on latest implementation source; advance the reviewer branch only
    at qualified checkpoints. Do not mix reviewer edits with implementation work.

@@ -801,6 +801,39 @@ pub(crate) struct CleanSharedGenesisStartupEntry {
     )>,
 }
 
+impl CleanSharedGenesisStartupEntry {
+    /// Borrow the complete published set while retaining every archive lease.
+    /// Incomplete publication is recoverable work, not an entry to filter out.
+    /// The returned records remain untrusted until the root-pinned owner replays
+    /// them. Failure leaves every entry and lease with the caller.
+    pub(crate) fn published_recoveries(
+        entries: &mut [Self],
+    ) -> Result<
+        Vec<(
+            &mut CleanSharedGenesisRecovery,
+            &vos::agent::genesis::AgentGenesisArchiveRecord,
+        )>,
+        vos::agent::shared_host::SharedAgentHostError,
+    > {
+        use vos::agent::shared_host::{MAX_SHARED_HOST_AGENTS, SharedAgentHostError};
+        if entries.len() > MAX_SHARED_HOST_AGENTS {
+            return Err(SharedAgentHostError::CapacityExhausted);
+        }
+        entries
+            .iter_mut()
+            .map(|entry| {
+                let Some((_, Some(record))) = &entry.archive else {
+                    return Err(SharedAgentHostError::Unavailable);
+                };
+                if record.provision().proposal().locator() != entry.recovery.locator() {
+                    return Err(SharedAgentHostError::ScopeMismatch);
+                }
+                Ok((&mut entry.recovery, record))
+            })
+            .collect()
+    }
+}
+
 impl CleanAgentGenesisArchiveStoreFactory {
     pub(crate) fn discover_recovery(
         &self,
@@ -5193,11 +5226,15 @@ pub(crate) mod tests {
         )
         .unwrap();
         drop(recovery);
-        let entries = archives
+        let mut entries = archives
             .discover_recovery(&mut lifecycle, &committee, authority, 1)
             .unwrap();
         assert_eq!(entries.len(), 1);
         assert!(entries[0].archive.is_none());
+        assert!(matches!(
+            CleanSharedGenesisStartupEntry::published_recoveries(&mut entries),
+            Err(vos::agent::shared_host::SharedAgentHostError::Unavailable)
+        ));
         assert_eq!(entries[0].recovery.locator(), locator);
         assert!(matches!(
             lifecycle.open_existing(authority.space, descriptor.identity.agent),
@@ -5215,10 +5252,14 @@ pub(crate) mod tests {
             Err(CleanFileStoreError::Busy)
         ));
         drop(archive);
-        let entries = archives
+        let mut entries = archives
             .discover_recovery(&mut lifecycle, &committee, authority, 1)
             .unwrap();
         assert!(entries[0].archive.as_ref().unwrap().1.is_none());
+        assert!(matches!(
+            CleanSharedGenesisStartupEntry::published_recoveries(&mut entries),
+            Err(vos::agent::shared_host::SharedAgentHostError::Unavailable)
+        ));
         assert!(matches!(
             archives.open_archive(locator),
             Err(CleanFileStoreError::Busy)

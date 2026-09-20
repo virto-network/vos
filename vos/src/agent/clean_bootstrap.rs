@@ -3615,12 +3615,14 @@ where
     /// The caller must keep the archive and all lifecycle stores exclusively
     /// leased for the running controller's lifetime. Archive data is not trusted:
     /// each entry is independently reauthenticated against live system history.
+    /// Borrow the entries so callers retain ownership of their archive leases
+    /// throughout replay and subsequent controller construction.
     /// Missing, duplicate or extra locators fail before any entry is replayed.
     pub fn recover_deferred_shared_generations<B, J, Q, ReplyStore, W, PubReply, S>(
         &mut self,
         entries: &mut [(
-            NativeSharedGenesisRecovery<B, J, Q, ReplyStore, W, PubReply>,
-            super::genesis::AgentGenesisArchiveRecord,
+            &mut NativeSharedGenesisRecovery<B, J, Q, ReplyStore, W, PubReply>,
+            &super::genesis::AgentGenesisArchiveRecord,
         )],
         receipt_signer: &mut S,
     ) -> Result<(), SharedAgentHostError>
@@ -10036,7 +10038,7 @@ mod tests {
             assert_eq!(owner.host.lock().unwrap().len(), 1);
             assert!(owner.host.lock().unwrap().deferred_agent_ids().is_empty());
             let mut entries: Vec<(
-                NativeSharedGenesisRecovery<
+                &mut NativeSharedGenesisRecovery<
                     IssuerMemoryStore,
                     IssuerMemoryStore,
                     IssuerMemoryStore,
@@ -10044,7 +10046,7 @@ mod tests {
                     IssuerMemoryStore,
                     IssuerMemoryStore,
                 >,
-                crate::agent::genesis::AgentGenesisArchiveRecord,
+                &crate::agent::genesis::AgentGenesisArchiveRecord,
             )> = Vec::new();
             owner
                 .recover_deferred_shared_generations(&mut entries, &mut CountingSigner::new())
