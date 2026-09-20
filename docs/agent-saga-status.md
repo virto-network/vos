@@ -12,7 +12,8 @@ The complete Agent Architecture Saga remains the objective.
   discovers and owns Shared recovery before route publication. Ordinary Shared
   creation/serving is still incomplete; recovery wiring is not deployment
   qualification.
-- Next functional batch: qualify nonempty published-state recovery, complete
+- Next functional batch: reproduce/pin the Authority publication stack fix,
+  qualify nonempty published-state recovery, complete
   ordinary Shared provisioning/network/route ownership, and verify store
   ownership through worker retirement. Do not bypass
   finality or broaden this batch into unrelated performance redesign.
@@ -516,6 +517,45 @@ integration run, not a released performance comparison or nonempty Shared test.
 The optional harness mode is recorded in `recovery-mode.txt`; default campaigns
 remain unchanged. Source was the tracked implementation delta atop `9c2f19bf`;
 the frozen binaries and script, rather than that base hash alone, identify the run.
+
+### Publication stack failure and source fix (not bundled yet)
+
+The full opt-in publication test against the **currently bundled Authority**
+fails before its reply-store fault injection. Authenticated replay returns
+`InvocationStatus::Panicked` with 925,777,243 gas remaining, not OutOfGas.
+Inner diagnostics locate a fault at `0xfefcf000`, just below the actor's 64 KiB
+stack; SP is `0xfefcffb8`. Exact-byte ELF/PVM matching maps PC 917555 to
+`memcpy`'s return-address store, called from BLAKE2b `fill_buf`. Logs:
+`shared-bundled-publication-baseline.log`,
+`shared-bundled-publication-inner-diagnostic.log`,
+`shared-publication-exact-fault-map.log`, `shared-publication-caller-map.log`.
+The first attempted ELF mapping was rejected because it did not reproduce the
+observed program (`shared-publication-fault-map.log`); no conclusions use it.
+
+The proposal decoder now returns the large nested ReplayInput already boxed
+from a separate non-inlined frame. This avoids retaining a by-value scratch
+slot during enclosing validation. Wire bytes, validation and stack/gas bounds
+are unchanged. The PC diagnostic also resolves indirect return addresses and
+reports mismatched artifacts without dumping megabytes of byte arrays.
+An obsolete negative test expecting the bundled committee-query method to be
+absent now checks exact persisted preparation/retry without journal advancement.
+
+Fresh canonical templates are in task logs `shared-stack-candidate.W3knrR/`.
+Candidate Authority package SHA-256:
+`d1e571d8a962f341dd9520e0f5203f0aa7ba8842622565738a96241cf49aa190`.
+Its full signed publication/retry/crash-recovery test passes in 35.14s
+(`publication-test.log`), still using a 64 KiB actor stack. All 15 genesis wire
+tests pass (`shared-boxed-genesis-wire-tests.log`), and the corrected bundled
+proposal/query test passes in 3.40s (`shared-bundled-proposal-current.log`).
+Compiler library tests pass: 66, one diagnostic opt-in ignored
+(`shared-stack-compiler-tests.log`); workspace formatting passes
+(`shared-stack-format.log`). The exact artifact PC/return mapping was run
+separately with explicit inputs and passed.
+The publication fixture still has **no provisioned ordinary generation** and
+uses the native outer-runtime shortcut; this does not qualify nonempty recovery
+or a released Shared lifecycle. Bundled artifacts/manifest remain unchanged and
+retain the demonstrated publication failure until immutable-source reproduction
+and artifact integration are completed. No fallback or quota increase masks it.
 
 ## Continuation plan
 

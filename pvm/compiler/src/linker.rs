@@ -1288,12 +1288,31 @@ mod tests {
     fn resolve_observed_standard_program_pcs() {
         let elf = std::fs::read(std::env::var_os("VOS_PROFILE_ELF").unwrap()).unwrap();
         let expected = std::fs::read(std::env::var_os("VOS_PROFILE_PVM").unwrap()).unwrap();
-        assert_eq!(link_elf_spi(&elf).unwrap(), expected);
+        assert!(
+            link_elf_spi(&elf).unwrap() == expected,
+            "ELF does not reproduce the observed program"
+        );
         let translated = transpile_elf(&elf, true, OpcodeEncoding::Standard).unwrap();
+        let mut pcs: Vec<u32> = std::env::var("VOS_PROFILE_PCS")
+            .unwrap()
+            .split(',')
+            .map(|value| value.parse().unwrap())
+            .collect();
+        if let Ok(returns) = std::env::var("VOS_PROFILE_RETURN_ADDRESSES") {
+            for value in returns.split(',') {
+                let address: usize = value.parse().unwrap();
+                assert!(
+                    address != 0 && address % 2 == 0,
+                    "invalid indirect return address"
+                );
+                let pc = translated.jump_table[address / 2 - 1];
+                eprintln!("return_address address={address} pc={pc}");
+                pcs.push(pc);
+            }
+        }
         let mut addresses: Vec<_> = translated.address_map.into_iter().collect();
         addresses.sort_unstable_by_key(|&(rv, pc)| (pc, rv));
-        for value in std::env::var("VOS_PROFILE_PCS").unwrap().split(',') {
-            let pc: u32 = value.parse().unwrap();
+        for pc in pcs {
             assert!((pc as usize) < translated.code.len());
             assert_eq!(translated.bitmask[pc as usize], 1);
             let &(rv, mapped_pc) = addresses

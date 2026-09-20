@@ -362,7 +362,7 @@ impl ServiceWire for AgentGenesisProposal {
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         enforce_complete_bound(decoder, MAX_AGENT_GENESIS_PROPOSAL_BYTES)?;
         let locator = decode_nested::<AgentGenesisLocator>(decoder, LOCATOR_WIRE_BYTES)?;
-        let create = decode_nested::<ReplayInput>(decoder, MAX_REPLAY_INPUT_BYTES)?;
+        let create = decode_boxed_nested::<ReplayInput>(decoder, MAX_REPLAY_INPUT_BYTES)?;
         let expectations = decode_expectations(decoder)?;
         if decoder.u32()? as usize != GENESIS_CATALOG_REFERENCES {
             return Err(DecodeError::NonCanonical);
@@ -370,7 +370,7 @@ impl ServiceWire for AgentGenesisProposal {
         let catalog = vec![decode_blob_ref(decoder)?];
         let proposal = Self {
             locator,
-            create: Box::new(create),
+            create,
             expectations,
             catalog,
         };
@@ -1881,6 +1881,17 @@ fn decode_nested<T: ServiceWire>(
         return Err(DecodeError::LimitExceeded);
     }
     T::decode(bytes)
+}
+
+// Returning the large ReplayInput by value leaves its scratch slot in the
+// enclosing proposal frame even after Box::new moves it. Allocate in a separate
+// frame so subsequent proposal/QC validation does not retain that stack cost.
+#[inline(never)]
+fn decode_boxed_nested<T: ServiceWire>(
+    decoder: &mut Decoder<'_>,
+    maximum: usize,
+) -> Result<Box<T>, DecodeError> {
+    decode_nested(decoder, maximum).map(Box::new)
 }
 
 fn enforce_encoded_bound<T: ServiceWire>(

@@ -19344,7 +19344,7 @@ mod tests {
         }
 
         #[test]
-        #[ignore = "requires a fresh Authority package with the genesis committee query"]
+        #[ignore = "requires an explicit Authority candidate package for full publication/recovery qualification"]
         fn native_shared_committee_query_preparation_uses_candidate_package() {
             let bytes = std::fs::read(
                 std::env::var("AUTHORITY_CANDIDATE_PACKAGE")
@@ -19359,7 +19359,7 @@ mod tests {
 
         fn check_shared_proposal_and_committee_preparation(
             fixture: PhysicalFixture,
-            supports_query: bool,
+            complete_publication: bool,
         ) {
             use crate::agent::clean_management_intent::{
                 CleanManagementIntent, CleanManagementIntentSlot,
@@ -19515,12 +19515,20 @@ mod tests {
                     .is_none()
             );
             let mut query_store = IssuerMemoryStore::default();
-            if !supports_query {
-                assert_eq!(
-                    owner.prepare_genesis_committee_query(&prepared, &slot, &mut query_store),
-                    Err(SharedAgentHostError::ScopeMismatch)
+            if !complete_publication {
+                let pending = owner
+                    .prepare_genesis_committee_query(&prepared, &slot, &mut query_store)
+                    .unwrap();
+                let image = query_store.image.lock().unwrap().clone();
+                assert!(image.is_some());
+                assert!(
+                    owner
+                        .prepare_genesis_committee_query(&prepared, &slot, &mut query_store)
+                        .unwrap()
+                        == pending
                 );
-                assert!(query_store.image.lock().unwrap().is_none());
+                assert_eq!(*query_store.image.lock().unwrap(), image);
+                assert_eq!(owner.ordered_index_for_test().unwrap(), applied);
                 harness.stop();
                 return;
             }
@@ -20377,7 +20385,16 @@ mod tests {
                     ),
                     Err(SharedAgentHostError::Unavailable)
                 );
-                assert_eq!(failed.inner.image.lock().unwrap().is_some(), after_write);
+                assert_eq!(
+                    failed.inner.image.lock().unwrap().is_some(),
+                    after_write,
+                    "publication did not reach the injected store boundary: {:?}",
+                    owner.host.lock().unwrap().replay_durable_management_denial(
+                        system_agent,
+                        &retained_publication.anchor,
+                        &retained_publication.work,
+                    )
+                );
                 assert!(
                     !owner
                         .host
