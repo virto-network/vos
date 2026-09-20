@@ -397,6 +397,13 @@ Additional gates at `d17794c5`:
   remain attributed to their pre-format sources; tests were not rerun here.
   Bundled artifacts and their immutable source pins are unchanged. Lint warnings
   and the other release gates remain open.
+- The repository's workspace Clippy command (the four exceptions already in
+  `just check-all`, otherwise `-D warnings`) fails at `ac1b2860` with 358
+  diagnostics in `vos` (`saga-workspace-clippy.log`). Of those, 279 report
+  never-used/read/constructed items; the rest include enum layout and ordinary
+  style findings. No new lint allowances or automatic deletions were applied.
+  This is a failed release gate, not evidence that every unused API is obsolete:
+  several belong to the incomplete Shared/Private integration below.
 
 1. Reviewer examines `7bd66a7d..saga/agents` read-only and returns findings.
    Apply fixes on latest implementation source; advance the reviewer branch only
@@ -412,7 +419,19 @@ Additional gates at `d17794c5`:
 3. Address whole-state/touched-state and incremental-publication costs with an
    explicit common runtime contract, recovery invariants and growth acceptance;
    preserve fresh revision-consistent projections and scheduling isolation.
-4. Continue every full-saga gate below. This checkpoint does not narrow the goal.
+4. Complete ordinary Shared production integration as a cohesive functional
+   batch, rather than deleting its currently unused components to satisfy lint.
+   Startup still installs `UnavailableAgentFinality`. The root-pinned owner
+   already has exact replay attestations and `recover_deferred_shared_generations`,
+   but its ordinary genesis preparation/publication/recovery flow has no CLI/node
+   caller. Wire durable, exclusively leased intent/issuer/query/reply/publication
+   stores and the genesis archive into the lifecycle owner; recover the complete
+   deferred set before exposing routes. Creation must go through signed issuance,
+   publication and positive retirement. Never replace the unavailable verifier
+   with archive-only acceptance or a permissive verifier. Acceptance requires a
+   released create/replicate/restart/recovery campaign plus missing/substituted
+   publication and interrupted-write refusal, not just the existing source tests.
+5. Continue every full-saga gate below. This checkpoint does not narrow the goal.
 
 ## Remaining full-saga acceptance gates
 
